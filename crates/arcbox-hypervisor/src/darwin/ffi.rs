@@ -481,6 +481,30 @@ impl VirtualMachine {
         }
     }
 
+    /// Creates a new virtual machine with a dispatch queue.
+    pub fn new_with_queue(config: &VmConfiguration, queue: *mut AnyObject) -> VZResult<Self> {
+        unsafe {
+            let cls = get_class("VZVirtualMachine").ok_or_else(|| VZError {
+                code: -1,
+                message: "VZVirtualMachine class not found".into(),
+            })?;
+            let alloc = msg_send!(cls, alloc);
+            let obj = msg_send!(alloc, initWithConfiguration: config.as_ptr(), queue: queue);
+            if obj.is_null() {
+                return Err(VZError {
+                    code: -1,
+                    message: "Failed to create VZVirtualMachine".into(),
+                });
+            }
+            Ok(Self { inner: obj })
+        }
+    }
+
+    /// Returns the inner object pointer.
+    pub fn as_ptr(&self) -> *mut AnyObject {
+        self.inner
+    }
+
     /// Gets the current state.
     pub fn state(&self) -> VZVirtualMachineState {
         unsafe {
@@ -532,6 +556,43 @@ impl VirtualMachine {
             } else {
                 Err(extract_nserror(error))
             }
+        }
+    }
+
+    /// Starts the VM asynchronously.
+    ///
+    /// This dispatches the start operation and returns immediately.
+    /// Use `state()` to poll for completion.
+    pub fn start_async(&self) {
+        unsafe {
+            // Create a simple completion handler block that does nothing
+            // The actual completion is detected by polling state()
+            let sel = sel!(startWithCompletionHandler:);
+            let func: unsafe extern "C" fn(*const AnyObject, Sel, *const c_void) =
+                std::mem::transmute(objc_msgSend as *const c_void);
+
+            // Pass nil as completion handler - we'll poll state instead
+            func(self.inner as *const AnyObject, sel, ptr::null());
+        }
+    }
+
+    /// Pauses the VM asynchronously.
+    pub fn pause_async(&self) {
+        unsafe {
+            let sel = sel!(pauseWithCompletionHandler:);
+            let func: unsafe extern "C" fn(*const AnyObject, Sel, *const c_void) =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            func(self.inner as *const AnyObject, sel, ptr::null());
+        }
+    }
+
+    /// Resumes the VM asynchronously.
+    pub fn resume_async(&self) {
+        unsafe {
+            let sel = sel!(resumeWithCompletionHandler:);
+            let func: unsafe extern "C" fn(*const AnyObject, Sel, *const c_void) =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            func(self.inner as *const AnyObject, sel, ptr::null());
         }
     }
 }
@@ -807,6 +868,143 @@ pub fn min_memory_size() -> u64 {
     unsafe {
         let cls = get_class("VZVirtualMachineConfiguration").unwrap();
         msg_send_u64!(cls, minimumAllowedMemorySize)
+    }
+}
+
+// ============================================================================
+// Dispatch Queue
+// ============================================================================
+
+// Dispatch queue FFI
+unsafe extern "C" {
+    fn dispatch_queue_create(label: *const i8, attr: *const c_void) -> *mut AnyObject;
+}
+
+/// Creates a dispatch queue for VM operations.
+pub fn create_dispatch_queue(label: &str) -> *mut AnyObject {
+    unsafe {
+        let label_cstr = std::ffi::CString::new(label).unwrap();
+        let queue = dispatch_queue_create(
+            label_cstr.as_ptr(),
+            ptr::null(), // DISPATCH_QUEUE_SERIAL
+        );
+        queue
+    }
+}
+
+// dispatch_release FFI
+unsafe extern "C" {
+    fn dispatch_release(object: *mut AnyObject);
+}
+
+/// Releases a dispatch queue.
+pub fn release_dispatch_queue(queue: *mut AnyObject) {
+    if !queue.is_null() {
+        unsafe {
+            dispatch_release(queue);
+        }
+    }
+}
+
+// ============================================================================
+// Serial Port / Console
+// ============================================================================
+
+/// Creates a file handle for serial port attachment.
+pub fn create_file_handle_for_reading(fd: i32) -> VZResult<*mut AnyObject> {
+    unsafe {
+        let cls = get_class("NSFileHandle").ok_or_else(|| VZError {
+            code: -1,
+            message: "NSFileHandle class not found".into(),
+        })?;
+        let obj = msg_send!(cls, alloc);
+
+        let sel = sel!(initWithFileDescriptor:);
+        let func: unsafe extern "C" fn(*mut AnyObject, Sel, i32) -> *mut AnyObject =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        let handle = func(obj, sel, fd);
+
+        if handle.is_null() {
+            return Err(VZError {
+                code: -1,
+                message: "Failed to create NSFileHandle".into(),
+            });
+        }
+        Ok(handle)
+    }
+}
+
+/// Creates a serial port attachment from file handles.
+pub fn create_serial_port_attachment(
+    read_handle: *mut AnyObject,
+    write_handle: *mut AnyObject,
+) -> VZResult<*mut AnyObject> {
+    unsafe {
+        let cls = get_class("VZFileHandleSerialPortAttachment").ok_or_else(|| VZError {
+            code: -1,
+            message: "VZFileHandleSerialPortAttachment class not found".into(),
+        })?;
+        let obj = msg_send!(cls, alloc);
+        let attachment = msg_send!(obj, initWithFileHandleForReading: read_handle, fileHandleForWriting: write_handle);
+
+        if attachment.is_null() {
+            return Err(VZError {
+                code: -1,
+                message: "Failed to create serial port attachment".into(),
+            });
+        }
+        Ok(attachment)
+    }
+}
+
+/// Creates a VirtIO console port configuration.
+pub fn create_console_port_configuration() -> VZResult<*mut AnyObject> {
+    unsafe {
+        let cls = get_class("VZVirtioConsolePortConfiguration").ok_or_else(|| VZError {
+            code: -1,
+            message: "VZVirtioConsolePortConfiguration class not found".into(),
+        })?;
+        let obj = msg_send!(cls, new);
+        if obj.is_null() {
+            return Err(VZError {
+                code: -1,
+                message: "Failed to create console port configuration".into(),
+            });
+        }
+        Ok(obj)
+    }
+}
+
+/// Sets the attachment on a console port.
+pub fn set_console_port_attachment(port: *mut AnyObject, attachment: *mut AnyObject) {
+    unsafe {
+        msg_send_void!(port, setAttachment: attachment);
+    }
+}
+
+/// Sets the name on a console port.
+pub fn set_console_port_name(port: *mut AnyObject, name: &str) {
+    unsafe {
+        let name_str = nsstring(name);
+        msg_send_void!(port, setName: name_str);
+    }
+}
+
+/// Marks a console port as the console.
+pub fn set_console_port_is_console(port: *mut AnyObject, is_console: bool) {
+    unsafe {
+        let sel = sel!(setIsConsole:);
+        let func: unsafe extern "C" fn(*const AnyObject, Sel, Bool) =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        func(port as *const AnyObject, sel, Bool::new(is_console));
+    }
+}
+
+/// Sets console ports on a console device.
+pub fn set_console_device_ports(device: *mut AnyObject, ports: &[*mut AnyObject]) {
+    unsafe {
+        let array = nsarray(ports);
+        msg_send_void!(device, setPorts: array);
     }
 }
 

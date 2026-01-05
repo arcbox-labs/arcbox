@@ -1,13 +1,17 @@
 //! Virtual machine implementation for macOS.
 
+use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::time::Duration;
+
+use objc2::runtime::AnyObject;
 
 use crate::{
     config::VmConfig,
     error::HypervisorError,
     traits::VirtualMachine,
-    types::VirtioDeviceConfig,
+    types::{VirtioDeviceConfig, VirtioDeviceType},
 };
 
 use super::ffi;
@@ -57,6 +61,16 @@ pub struct DarwinVm {
     vz_config: Option<ffi::VmConfiguration>,
     /// VZ virtual machine handle.
     vz_vm: Option<ffi::VirtualMachine>,
+    /// Dispatch queue for VM operations.
+    dispatch_queue: *mut AnyObject,
+    /// Storage devices (raw pointers for VZ).
+    storage_devices: Vec<*mut AnyObject>,
+    /// Network devices.
+    network_devices: Vec<*mut AnyObject>,
+    /// Console device.
+    console_device: Option<*mut AnyObject>,
+    /// Serial port file descriptors (read, write).
+    serial_fds: Option<(RawFd, RawFd)>,
 }
 
 // Safety: The VZ handles are properly synchronized and only accessed
@@ -71,6 +85,10 @@ impl DarwinVm {
 
         // Allocate guest memory
         let memory = DarwinMemory::new(config.memory_size)?;
+
+        // Create dispatch queue for VM operations
+        let queue_label = format!("com.arcbox.vm.{}", id);
+        let dispatch_queue = ffi::create_dispatch_queue(&queue_label);
 
         // Create VZ configuration
         let vz_config = ffi::VmConfiguration::new()
@@ -101,14 +119,8 @@ impl DarwinVm {
             vz_config.set_entropy_devices(&[entropy]);
         }
 
-        // Validate configuration
-        vz_config
-            .validate()
-            .map_err(|e| HypervisorError::VmCreationFailed(format!("Invalid config: {}", e)))?;
-
-        // Create the VM
-        let vz_vm = ffi::VirtualMachine::new(&vz_config)
-            .map_err(|e| HypervisorError::VmCreationFailed(e.to_string()))?;
+        // Note: We don't validate or create VM yet - devices may be added later
+        // The VM will be created in finalize_configuration()
 
         tracing::info!(
             "Created VM {}: vcpus={}, memory={}MB",
@@ -125,8 +137,133 @@ impl DarwinVm {
             state: RwLock::new(VmState::Created),
             running: AtomicBool::new(false),
             vz_config: Some(vz_config),
-            vz_vm: Some(vz_vm),
+            vz_vm: None,
+            dispatch_queue,
+            storage_devices: Vec::new(),
+            network_devices: Vec::new(),
+            console_device: None,
+            serial_fds: None,
         })
+    }
+
+    /// Configures a serial console using PTY.
+    ///
+    /// Returns the path to the slave PTY device that can be used to connect.
+    pub fn setup_serial_console(&mut self) -> Result<String, HypervisorError> {
+        // Create a PTY pair
+        let mut master_fd: libc::c_int = 0;
+        let mut slave_fd: libc::c_int = 0;
+
+        unsafe {
+            let mut slave_name = [0u8; 256];
+            let ret = libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                slave_name.as_mut_ptr() as *mut i8,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            if ret != 0 {
+                return Err(HypervisorError::DeviceError(
+                    "Failed to create PTY".to_string(),
+                ));
+            }
+
+            let slave_path = std::ffi::CStr::from_ptr(slave_name.as_ptr() as *const i8)
+                .to_string_lossy()
+                .into_owned();
+
+            // Store FDs for later use
+            self.serial_fds = Some((master_fd, master_fd)); // Use master for both read/write
+
+            tracing::info!("Created serial console at {}", slave_path);
+
+            // Create serial port attachment
+            let read_handle = ffi::create_file_handle_for_reading(master_fd)
+                .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+            let write_handle = ffi::create_file_handle_for_reading(master_fd)
+                .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+
+            let attachment = ffi::create_serial_port_attachment(read_handle, write_handle)
+                .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+
+            // Create console port configuration
+            let port = ffi::create_console_port_configuration()
+                .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+            ffi::set_console_port_attachment(port, attachment);
+            ffi::set_console_port_name(port, "console");
+            ffi::set_console_port_is_console(port, true);
+
+            // Create console device and set ports
+            let console = ffi::create_console_device()
+                .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+            ffi::set_console_device_ports(console, &[port]);
+
+            self.console_device = Some(console);
+
+            Ok(slave_path)
+        }
+    }
+
+    /// Finalizes configuration and creates the actual VZ VM.
+    fn finalize_configuration(&mut self) -> Result<(), HypervisorError> {
+        let vz_config = self.vz_config.as_ref().ok_or_else(|| {
+            HypervisorError::VmCreationFailed("No VZ configuration".to_string())
+        })?;
+
+        // Set storage devices
+        if !self.storage_devices.is_empty() {
+            vz_config.set_storage_devices(&self.storage_devices);
+        }
+
+        // Set network devices
+        if !self.network_devices.is_empty() {
+            vz_config.set_network_devices(&self.network_devices);
+        }
+
+        // Set console device
+        if let Some(console) = self.console_device {
+            vz_config.set_console_devices(&[console]);
+        }
+
+        // Validate configuration
+        vz_config
+            .validate()
+            .map_err(|e| HypervisorError::VmCreationFailed(format!("Invalid config: {}", e)))?;
+
+        // Create the VM with dispatch queue
+        let vz_vm = ffi::VirtualMachine::new_with_queue(vz_config, self.dispatch_queue)
+            .map_err(|e| HypervisorError::VmCreationFailed(e.to_string()))?;
+
+        self.vz_vm = Some(vz_vm);
+
+        tracing::debug!("VM {} configuration finalized", self.id);
+
+        Ok(())
+    }
+
+    /// Waits for the VM to reach a specific state.
+    fn wait_for_state(&self, target: ffi::VZVirtualMachineState, timeout: Duration) -> Result<(), HypervisorError> {
+        let start = std::time::Instant::now();
+        let poll_interval = Duration::from_millis(10);
+
+        loop {
+            if let Some(ref vm) = self.vz_vm {
+                let state = vm.state();
+                if state == target {
+                    return Ok(());
+                }
+                if state == ffi::VZVirtualMachineState::Error {
+                    return Err(HypervisorError::VmError("VM entered error state".to_string()));
+                }
+            }
+
+            if start.elapsed() > timeout {
+                return Err(HypervisorError::Timeout("Timed out waiting for VM state".to_string()));
+            }
+
+            std::thread::sleep(poll_interval);
+        }
     }
 
     /// Returns the VM ID.
@@ -224,9 +361,72 @@ impl VirtualMachine for DarwinVm {
             ));
         }
 
-        // TODO: Add device to VZ configuration
-        // This would involve creating the appropriate VZ*DeviceConfiguration
-        // and adding it to the VM configuration.
+        match device.device_type {
+            VirtioDeviceType::Block => {
+                // Create block device
+                if let Some(ref path) = device.path {
+                    let attachment = ffi::create_disk_attachment(path, device.read_only)
+                        .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+                    let block_device = ffi::create_block_device(attachment)
+                        .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+                    self.storage_devices.push(block_device);
+                    tracing::debug!("Added block device: {}", path);
+                }
+            }
+            VirtioDeviceType::Net => {
+                // Create network device with NAT
+                let attachment = ffi::create_nat_attachment()
+                    .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+                let network_device = ffi::create_network_device(attachment)
+                    .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+
+                // Set random MAC address
+                if let Ok(mac) = ffi::create_random_mac() {
+                    ffi::set_network_mac(network_device, mac);
+                }
+
+                self.network_devices.push(network_device);
+                tracing::debug!("Added network device with NAT");
+            }
+            VirtioDeviceType::Console => {
+                // Console is handled separately via setup_serial_console()
+                tracing::debug!("Console device will be configured separately");
+            }
+            VirtioDeviceType::Fs => {
+                // Create filesystem device
+                if let (Some(path), Some(tag)) = (&device.path, &device.tag) {
+                    let directory = ffi::create_shared_directory(path, device.read_only)
+                        .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+                    let share = ffi::create_single_directory_share(directory)
+                        .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+                    let fs_device = ffi::create_fs_device(tag, share)
+                        .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+
+                    // Add to directory sharing devices
+                    if let Some(ref config) = self.vz_config {
+                        config.set_directory_sharing_devices(&[fs_device]);
+                    }
+                    tracing::debug!("Added filesystem device: {} -> {}", tag, path);
+                }
+            }
+            VirtioDeviceType::Vsock => {
+                // Create vsock device
+                let socket_device = ffi::create_socket_device()
+                    .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+                if let Some(ref config) = self.vz_config {
+                    config.set_socket_devices(&[socket_device]);
+                }
+                tracing::debug!("Added vsock device");
+            }
+            VirtioDeviceType::Rng => {
+                // Entropy device is already added in new()
+                tracing::debug!("Entropy device already configured");
+            }
+            _ => {
+                // Other device types (Balloon, Gpu) not yet supported on Darwin
+                tracing::warn!("Device type {:?} not supported on Darwin", device.device_type);
+            }
+        }
 
         tracing::debug!(
             "Added {:?} device to VM {}",
@@ -248,16 +448,38 @@ impl VirtualMachine for DarwinVm {
 
         self.set_state(VmState::Starting);
 
-        // Note: Starting a VM with Virtualization.framework requires running on
-        // the main thread with a run loop. For now, we just update state.
-        // Real implementation would use async start with completion handler.
+        // Finalize configuration if VM hasn't been created yet
+        if self.vz_vm.is_none() {
+            self.finalize_configuration()?;
+        }
 
-        self.running.store(true, Ordering::SeqCst);
-        self.set_state(VmState::Running);
+        // Check if VM can start
+        if let Some(ref vm) = self.vz_vm {
+            if !vm.can_start() {
+                self.set_state(VmState::Error);
+                return Err(HypervisorError::VmError("VM cannot start".to_string()));
+            }
 
-        tracing::info!("Started VM {}", self.id);
+            // Start the VM asynchronously
+            vm.start_async();
 
-        Ok(())
+            // Wait for VM to reach Running state
+            match self.wait_for_state(ffi::VZVirtualMachineState::Running, Duration::from_secs(30)) {
+                Ok(()) => {
+                    self.running.store(true, Ordering::SeqCst);
+                    self.set_state(VmState::Running);
+                    tracing::info!("Started VM {}", self.id);
+                    Ok(())
+                }
+                Err(e) => {
+                    self.set_state(VmState::Error);
+                    Err(e)
+                }
+            }
+        } else {
+            self.set_state(VmState::Error);
+            Err(HypervisorError::VmError("No VZ VM instance".to_string()))
+        }
     }
 
     fn pause(&mut self) -> Result<(), HypervisorError> {
@@ -269,10 +491,18 @@ impl VirtualMachine for DarwinVm {
             });
         }
 
-        // Note: Real implementation would call async pause with completion handler
+        if let Some(ref vm) = self.vz_vm {
+            if !vm.can_pause() {
+                return Err(HypervisorError::VmError("VM cannot pause".to_string()));
+            }
+
+            vm.pause_async();
+
+            // Wait for VM to reach Paused state
+            self.wait_for_state(ffi::VZVirtualMachineState::Paused, Duration::from_secs(10))?;
+        }
 
         self.set_state(VmState::Paused);
-
         tracing::info!("Paused VM {}", self.id);
 
         Ok(())
@@ -287,10 +517,18 @@ impl VirtualMachine for DarwinVm {
             });
         }
 
-        // Note: Real implementation would call async resume with completion handler
+        if let Some(ref vm) = self.vz_vm {
+            if !vm.can_resume() {
+                return Err(HypervisorError::VmError("VM cannot resume".to_string()));
+            }
+
+            vm.resume_async();
+
+            // Wait for VM to reach Running state
+            self.wait_for_state(ffi::VZVirtualMachineState::Running, Duration::from_secs(10))?;
+        }
 
         self.set_state(VmState::Running);
-
         tracing::info!("Resumed VM {}", self.id);
 
         Ok(())
@@ -308,8 +546,17 @@ impl VirtualMachine for DarwinVm {
         self.set_state(VmState::Stopping);
 
         if let Some(ref vm) = self.vz_vm {
-            // Try to stop, but don't fail if already stopped
-            let _ = vm.stop();
+            // Try graceful stop first
+            if vm.can_request_stop() {
+                let _ = vm.request_stop();
+                // Give it a moment to stop gracefully
+                std::thread::sleep(Duration::from_millis(500));
+            }
+
+            // Force stop if still running
+            if vm.state() != ffi::VZVirtualMachineState::Stopped {
+                let _ = vm.stop();
+            }
         }
 
         self.running.store(false, Ordering::SeqCst);
@@ -326,6 +573,21 @@ impl Drop for DarwinVm {
         // Stop VM if running
         if self.is_running() {
             let _ = self.stop();
+        }
+
+        // Close serial FDs
+        if let Some((read_fd, write_fd)) = self.serial_fds.take() {
+            unsafe {
+                libc::close(read_fd);
+                if write_fd != read_fd {
+                    libc::close(write_fd);
+                }
+            }
+        }
+
+        // Release dispatch queue
+        if !self.dispatch_queue.is_null() {
+            ffi::release_dispatch_queue(self.dispatch_queue);
         }
 
         // VZ handles are automatically released by Rust's drop

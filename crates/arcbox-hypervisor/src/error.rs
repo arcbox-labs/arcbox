@@ -48,6 +48,14 @@ pub enum HypervisorError {
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 
+    /// VM runtime error.
+    #[error("VM error: {0}")]
+    VmError(String),
+
+    /// Operation timed out.
+    #[error("timeout: {0}")]
+    Timeout(String),
+
     /// Platform-specific error.
     #[cfg(target_os = "macos")]
     #[error("darwin error: {0}")]

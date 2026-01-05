@@ -128,6 +128,80 @@ pub struct VirtioDeviceConfig {
     pub device_type: VirtioDeviceType,
     /// Device-specific configuration.
     pub config: Vec<u8>,
+    /// Path to device (for block/fs devices).
+    pub path: Option<String>,
+    /// Whether the device is read-only.
+    pub read_only: bool,
+    /// Tag for filesystem devices.
+    pub tag: Option<String>,
+}
+
+impl VirtioDeviceConfig {
+    /// Creates a new block device configuration.
+    pub fn block(path: impl Into<String>, read_only: bool) -> Self {
+        Self {
+            device_type: VirtioDeviceType::Block,
+            config: Vec::new(),
+            path: Some(path.into()),
+            read_only,
+            tag: None,
+        }
+    }
+
+    /// Creates a new network device configuration.
+    pub fn network() -> Self {
+        Self {
+            device_type: VirtioDeviceType::Net,
+            config: Vec::new(),
+            path: None,
+            read_only: false,
+            tag: None,
+        }
+    }
+
+    /// Creates a new console device configuration.
+    pub fn console() -> Self {
+        Self {
+            device_type: VirtioDeviceType::Console,
+            config: Vec::new(),
+            path: None,
+            read_only: false,
+            tag: None,
+        }
+    }
+
+    /// Creates a new filesystem device configuration.
+    pub fn filesystem(path: impl Into<String>, tag: impl Into<String>, read_only: bool) -> Self {
+        Self {
+            device_type: VirtioDeviceType::Fs,
+            config: Vec::new(),
+            path: Some(path.into()),
+            read_only,
+            tag: Some(tag.into()),
+        }
+    }
+
+    /// Creates a new vsock device configuration.
+    pub fn vsock() -> Self {
+        Self {
+            device_type: VirtioDeviceType::Vsock,
+            config: Vec::new(),
+            path: None,
+            read_only: false,
+            tag: None,
+        }
+    }
+
+    /// Creates a new entropy device configuration.
+    pub fn entropy() -> Self {
+        Self {
+            device_type: VirtioDeviceType::Rng,
+            config: Vec::new(),
+            path: None,
+            read_only: false,
+            tag: None,
+        }
+    }
 }
 
 /// VirtIO device types.
