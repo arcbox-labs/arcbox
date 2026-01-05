@@ -1,0 +1,27 @@
+[package]
+name = "arcbox-hypervisor"
+description = "Cross-platform hypervisor abstraction layer for ArcBox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# nix for ioctl macros
+nix = { version = "0.29", features = ["ioctl"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[features]
+default = []
