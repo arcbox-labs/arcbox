@@ -10,6 +10,7 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+pub mod daemon;
 pub mod docker;
 pub mod exec;
 pub mod images;
@@ -94,6 +95,9 @@ pub enum Commands {
     /// Manage Docker CLI integration
     #[command(subcommand)]
     Docker(docker::DockerCommands),
+
+    /// Start the ArcBox daemon
+    Daemon(daemon::DaemonArgs),
 
     /// Display system-wide information
     Info,
