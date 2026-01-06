@@ -1,0 +1,648 @@
+//! Integration tests for Docker API handlers.
+//!
+//! These tests verify the Docker Engine API compatibility layer works correctly.
+
+use arcbox_core::{Config, Runtime};
+use arcbox_docker::api::create_router;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
+use std::sync::Arc;
+use tempfile::TempDir;
+use tower::ServiceExt;
+
+/// Creates a test runtime with a temporary data directory.
+async fn create_test_runtime() -> (Arc<Runtime>, TempDir) {
+    let tmp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config = Config {
+        data_dir: tmp_dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let runtime = Arc::new(Runtime::new(config).expect("Failed to create runtime"));
+    runtime.init().await.expect("Failed to init runtime");
+    (runtime, tmp_dir)
+}
+
+// ============================================================================
+// System API Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_ping() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let response = app
+        .oneshot(Request::builder().uri("/_ping").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_version() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert!(json.get("Version").is_some());
+    assert!(json.get("ApiVersion").is_some());
+    assert!(json.get("Os").is_some());
+    assert!(json.get("Arch").is_some());
+}
+
+#[tokio::test]
+async fn test_info() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/info")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert!(json.get("Containers").is_some());
+    assert!(json.get("Images").is_some());
+    assert!(json.get("ServerVersion").is_some());
+}
+
+// ============================================================================
+// Container API Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_list_containers_empty() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/containers/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert!(json.is_array());
+    assert_eq!(json.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_create_container() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let body = serde_json::json!({
+        "Image": "alpine:latest",
+        "Cmd": ["echo", "hello"]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/containers/create?name=test-container")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert!(json.get("Id").is_some());
+    assert!(json.get("Warnings").is_some());
+}
+
+#[tokio::test]
+async fn test_container_lifecycle() {
+    let (runtime, _tmp) = create_test_runtime().await;
+
+    // Create container
+    let app = create_router(Arc::clone(&runtime));
+    let create_body = serde_json::json!({
+        "Image": "nginx:latest"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/containers/create")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&create_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let container_id = json["Id"].as_str().unwrap().to_string();
+
+    // Start container
+    let app = create_router(Arc::clone(&runtime));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/containers/{}/start", container_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // List containers (should show running)
+    let app = create_router(Arc::clone(&runtime));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/containers/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 1);
+
+    // Stop container
+    let app = create_router(Arc::clone(&runtime));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/containers/{}/stop", container_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // Remove container
+    let app = create_router(Arc::clone(&runtime));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/containers/{}", container_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // List containers (should be empty)
+    let app = create_router(Arc::clone(&runtime));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/containers/json?all=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_inspect_container() {
+    let (runtime, _tmp) = create_test_runtime().await;
+
+    // Create container
+    let app = create_router(Arc::clone(&runtime));
+    let create_body = serde_json::json!({
+        "Image": "alpine:latest"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/containers/create?name=inspect-test")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&create_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let container_id = json["Id"].as_str().unwrap().to_string();
+
+    // Inspect container
+    let app = create_router(Arc::clone(&runtime));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/containers/{}/json", container_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert!(json.get("Id").is_some());
+    assert!(json.get("State").is_some());
+    assert!(json.get("Config").is_some());
+    assert!(json.get("Name").is_some());
+}
+
+#[tokio::test]
+async fn test_container_not_found() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/containers/nonexistent/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ============================================================================
+// Exec API Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_exec_create() {
+    let (runtime, _tmp) = create_test_runtime().await;
+
+    // Create and start container first
+    let app = create_router(Arc::clone(&runtime));
+    let create_body = serde_json::json!({
+        "Image": "alpine:latest"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/containers/create")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&create_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let container_id = json["Id"].as_str().unwrap().to_string();
+
+    // Start container
+    let app = create_router(Arc::clone(&runtime));
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(format!("/containers/{}/start", container_id))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Create exec
+    let app = create_router(Arc::clone(&runtime));
+    let exec_body = serde_json::json!({
+        "Cmd": ["ls", "-la"],
+        "AttachStdout": true,
+        "AttachStderr": true
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/containers/{}/exec", container_id))
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&exec_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("Id").is_some());
+}
+
+// ============================================================================
+// Network API Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_list_networks() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/networks")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // Should have at least the default bridge network
+    assert!(json.is_array());
+    let networks = json.as_array().unwrap();
+    assert!(networks.iter().any(|n| n["Name"] == "bridge"));
+}
+
+#[tokio::test]
+async fn test_create_network() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let body = serde_json::json!({
+        "Name": "test-network",
+        "Driver": "bridge"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/networks/create")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("Id").is_some());
+}
+
+// ============================================================================
+// Volume API Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_list_volumes() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/volumes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert!(json.get("Volumes").is_some());
+    assert!(json.get("Warnings").is_some());
+}
+
+#[tokio::test]
+async fn test_create_volume() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let body = serde_json::json!({
+        "Name": "test-volume"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/volumes/create")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["Name"], "test-volume");
+    assert!(json.get("Mountpoint").is_some());
+}
+
+#[tokio::test]
+async fn test_volume_lifecycle() {
+    let (runtime, _tmp) = create_test_runtime().await;
+
+    // Create volume
+    let app = create_router(Arc::clone(&runtime));
+    let create_body = serde_json::json!({
+        "Name": "lifecycle-volume"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/volumes/create")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&create_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Inspect volume
+    let app = create_router(Arc::clone(&runtime));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/volumes/lifecycle-volume")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Remove volume
+    let app = create_router(Arc::clone(&runtime));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/volumes/lifecycle-volume")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // Verify removed
+    let app = create_router(Arc::clone(&runtime));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/volumes/lifecycle-volume")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// ============================================================================
+// Image API Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_list_images() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/images/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert!(json.is_array());
+}
+
+// ============================================================================
+// Versioned API Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_versioned_api() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    // Test v1.43 (current)
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1.43/_ping")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_older_api_version() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    // Test v1.24 (minimum supported)
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1.24/_ping")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
