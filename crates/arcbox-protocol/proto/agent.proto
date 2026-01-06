@@ -1,0 +1,290 @@
+// Agent service protocol definitions.
+//
+// This service runs inside the guest VM and handles requests from the host.
+//
+// Design sources:
+// - internal-docs/architecture/cli-api.md (proto/agent.proto section)
+// - kata-containers agent protocol (conceptual reference)
+// - containerd shim v2 interface patterns
+
+syntax = "proto3";
+
+package arcbox.agent;
+
+import "common.proto";
+
+// AgentService runs inside the guest VM.
+service AgentService {
+    // Health check.
+    rpc Ping(PingRequest) returns (PingResponse);
+
+    // Gets system information.
+    rpc GetSystemInfo(arcbox.common.Empty) returns (SystemInfo);
+
+    // Creates a container.
+    rpc CreateContainer(CreateContainerRequest) returns (CreateContainerResponse);
+
+    // Starts a container.
+    rpc StartContainer(StartContainerRequest) returns (arcbox.common.Empty);
+
+    // Stops a container.
+    rpc StopContainer(StopContainerRequest) returns (arcbox.common.Empty);
+
+    // Removes a container.
+    rpc RemoveContainer(RemoveContainerRequest) returns (arcbox.common.Empty);
+
+    // Lists containers.
+    rpc ListContainers(ListContainersRequest) returns (ListContainersResponse);
+
+    // Reads a file from the guest filesystem.
+    rpc ReadFile(ReadFileRequest) returns (stream FileChunk);
+
+    // Writes a file to the guest filesystem.
+    rpc WriteFile(stream FileChunk) returns (WriteFileResponse);
+
+    // Executes a command.
+    rpc Exec(ExecRequest) returns (stream ExecOutput);
+
+    // Gets container stats.
+    rpc Stats(StatsRequest) returns (stream ContainerStats);
+}
+
+// Ping request.
+message PingRequest {
+    // Optional payload.
+    string message = 1;
+}
+
+// Ping response.
+message PingResponse {
+    // Response payload.
+    string message = 1;
+    // Agent version.
+    string version = 2;
+}
+
+// System information from the guest.
+message SystemInfo {
+    // Kernel version.
+    string kernel_version = 1;
+    // OS name.
+    string os_name = 2;
+    // OS version.
+    string os_version = 3;
+    // Architecture.
+    string arch = 4;
+    // Total memory in bytes.
+    uint64 total_memory = 5;
+    // Available memory in bytes.
+    uint64 available_memory = 6;
+    // Number of CPUs.
+    uint32 cpu_count = 7;
+    // Load average (1, 5, 15 minutes).
+    repeated double load_average = 8;
+    // Hostname.
+    string hostname = 9;
+    // Uptime in seconds.
+    uint64 uptime = 10;
+}
+
+// Request to create a container (forwarded to containerd).
+message CreateContainerRequest {
+    // Container name.
+    string name = 1;
+    // Image reference.
+    string image = 2;
+    // Command to run.
+    repeated string cmd = 3;
+    // Entrypoint.
+    repeated string entrypoint = 4;
+    // Environment variables.
+    map<string, string> env = 5;
+    // Working directory.
+    string working_dir = 6;
+    // User.
+    string user = 7;
+    // Mounts.
+    repeated arcbox.common.Mount mounts = 8;
+    // TTY allocation.
+    bool tty = 9;
+}
+
+// Response to create container.
+message CreateContainerResponse {
+    // Container ID.
+    string id = 1;
+}
+
+// Request to start a container.
+message StartContainerRequest {
+    // Container ID.
+    string id = 1;
+}
+
+// Request to stop a container.
+message StopContainerRequest {
+    // Container ID.
+    string id = 1;
+    // Timeout in seconds.
+    uint32 timeout = 2;
+}
+
+// Request to remove a container.
+message RemoveContainerRequest {
+    // Container ID.
+    string id = 1;
+    // Force removal.
+    bool force = 2;
+}
+
+// Request to list containers.
+message ListContainersRequest {
+    // Show all containers.
+    bool all = 1;
+}
+
+// Response to list containers.
+message ListContainersResponse {
+    // List of containers.
+    repeated ContainerInfo containers = 1;
+}
+
+// Container information.
+message ContainerInfo {
+    // Container ID.
+    string id = 1;
+    // Container name.
+    string name = 2;
+    // Image reference.
+    string image = 3;
+    // State.
+    string state = 4;
+    // Status.
+    string status = 5;
+    // Creation time.
+    int64 created = 6;
+}
+
+// Request to read a file.
+message ReadFileRequest {
+    // File path.
+    string path = 1;
+    // Offset in bytes.
+    int64 offset = 2;
+    // Maximum bytes to read (0 = all).
+    int64 limit = 3;
+}
+
+// File chunk for streaming file operations.
+message FileChunk {
+    // File path (only in first chunk for writes).
+    string path = 1;
+    // File data.
+    bytes data = 2;
+    // Offset in file.
+    int64 offset = 3;
+    // Is this the last chunk.
+    bool eof = 4;
+    // File mode (only for writes, in first chunk).
+    uint32 mode = 5;
+}
+
+// Response to write file.
+message WriteFileResponse {
+    // Bytes written.
+    int64 bytes_written = 1;
+}
+
+// Request to execute a command.
+message ExecRequest {
+    // Container ID (empty for host).
+    string container_id = 1;
+    // Command to execute.
+    repeated string cmd = 2;
+    // Environment variables.
+    map<string, string> env = 3;
+    // Working directory.
+    string working_dir = 4;
+    // User to run as.
+    string user = 5;
+    // Allocate TTY.
+    bool tty = 6;
+}
+
+// Exec output.
+message ExecOutput {
+    // Stream type: stdout, stderr.
+    string stream = 1;
+    // Output data.
+    bytes data = 2;
+    // Exit code (only set when done).
+    int32 exit_code = 3;
+    // Is this the final message.
+    bool done = 4;
+}
+
+// Request for container stats.
+message StatsRequest {
+    // Container ID.
+    string container_id = 1;
+    // Stream updates.
+    bool stream = 2;
+}
+
+// Container statistics.
+message ContainerStats {
+    // Container ID.
+    string container_id = 1;
+    // CPU usage.
+    CpuStats cpu = 2;
+    // Memory usage.
+    MemoryStats memory = 3;
+    // Network I/O.
+    NetworkStats network = 4;
+    // Block I/O.
+    BlockStats block = 5;
+    // Timestamp.
+    arcbox.common.Timestamp timestamp = 6;
+}
+
+// CPU statistics.
+message CpuStats {
+    // CPU usage in nanoseconds.
+    uint64 usage_ns = 1;
+    // System CPU usage in nanoseconds.
+    uint64 system_ns = 2;
+    // CPU usage percentage.
+    double usage_percent = 3;
+}
+
+// Memory statistics.
+message MemoryStats {
+    // Memory usage in bytes.
+    uint64 usage = 1;
+    // Memory limit in bytes.
+    uint64 limit = 2;
+    // Memory usage percentage.
+    double usage_percent = 3;
+    // Cache in bytes.
+    uint64 cache = 4;
+}
+
+// Network statistics.
+message NetworkStats {
+    // Bytes received.
+    uint64 rx_bytes = 1;
+    // Bytes transmitted.
+    uint64 tx_bytes = 2;
+    // Packets received.
+    uint64 rx_packets = 3;
+    // Packets transmitted.
+    uint64 tx_packets = 4;
+}
+
+// Block I/O statistics.
+message BlockStats {
+    // Bytes read.
+    uint64 read_bytes = 1;
+    // Bytes written.
+    uint64 write_bytes = 2;
+}
