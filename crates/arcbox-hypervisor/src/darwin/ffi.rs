@@ -161,11 +161,24 @@ fn nsstring(s: &str) -> *mut AnyObject {
 }
 
 /// Creates an NSURL from a file path.
+/// Converts relative paths to absolute paths to ensure correct URL creation.
 fn nsurl_file_path(path: &str) -> *mut AnyObject {
+    // Convert relative paths to absolute paths
+    let abs_path = if std::path::Path::new(path).is_absolute() {
+        path.to_string()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path).to_string_lossy().to_string())
+            .unwrap_or_else(|_| path.to_string())
+    };
+
     unsafe {
         let cls = get_class("NSURL").expect("NSURL class not found");
-        let path_str = nsstring(path);
-        msg_send!(cls, fileURLWithPath: path_str)
+        let path_str = nsstring(&abs_path);
+        let url: *mut AnyObject = msg_send!(cls, fileURLWithPath: path_str);
+        // Retain to prevent autorelease - caller is responsible for release
+        let _: *mut AnyObject = msg_send!(url, retain);
+        url
     }
 }
 
@@ -396,6 +409,13 @@ impl VmConfiguration {
         }
     }
 
+    /// Sets the platform configuration.
+    pub fn set_platform(&self, platform: *mut AnyObject) {
+        unsafe {
+            msg_send_void!(self.inner, setPlatform: platform);
+        }
+    }
+
     /// Validates the configuration.
     pub fn validate(&self) -> VZResult<()> {
         unsafe {
@@ -412,6 +432,26 @@ impl VmConfiguration {
     /// Returns the inner object pointer.
     pub fn as_ptr(&self) -> *mut AnyObject {
         self.inner
+    }
+}
+
+/// Creates a generic platform configuration for Linux VMs.
+pub fn create_generic_platform() -> VZResult<*mut AnyObject> {
+    unsafe {
+        let cls = get_class("VZGenericPlatformConfiguration").ok_or_else(|| VZError {
+            code: -1,
+            message: "VZGenericPlatformConfiguration class not found".into(),
+        })?;
+        let obj = msg_send!(cls, new);
+        if obj.is_null() {
+            return Err(VZError {
+                code: -1,
+                message: "Failed to create generic platform".into(),
+            });
+        }
+        // Retain to prevent autorelease
+        let _: *mut AnyObject = msg_send!(obj, retain);
+        Ok(obj)
     }
 }
 
@@ -563,16 +603,85 @@ impl VirtualMachine {
         unsafe { msg_send_bool!(self.inner, canRequestStop).as_bool() }
     }
 
-    /// Stops the VM synchronously.
-    pub fn stop(&self) -> VZResult<()> {
-        unsafe {
-            let mut error: *mut AnyObject = ptr::null_mut();
-            let result = msg_send_bool!(self.inner, stopWithError: &mut error);
-            if result.as_bool() {
-                Ok(())
-            } else {
-                Err(extract_nserror(error))
+    /// Checks if the VM can stop.
+    pub fn can_stop(&self) -> bool {
+        unsafe { msg_send_bool!(self.inner, canStop).as_bool() }
+    }
+
+    /// Stops the VM asynchronously (macOS 12.0+).
+    ///
+    /// WARNING: This is a destructive operation. It stops the VM without
+    /// giving the guest a chance to stop cleanly.
+    pub fn stop_async(&self) {
+        // Block layout for void (^)(NSError *)
+        #[repr(C)]
+        struct CompletionBlock {
+            isa: *const c_void,
+            flags: i32,
+            reserved: i32,
+            invoke: unsafe extern "C" fn(*const c_void, *mut AnyObject),
+            descriptor: *const BlockDescriptor,
+        }
+
+        #[repr(C)]
+        struct BlockDescriptor {
+            reserved: u64,
+            size: u64,
+        }
+
+        unsafe extern "C" fn stop_completion_handler(_block: *const c_void, error: *mut AnyObject) {
+            unsafe {
+                if !error.is_null() {
+                    let desc: *mut AnyObject = msg_send!(error, localizedDescription);
+                    let error_msg = if !desc.is_null() {
+                        nsstring_to_string(desc)
+                    } else {
+                        "Unknown error".to_string()
+                    };
+                    tracing::error!("VM stop failed: {}", error_msg);
+                } else {
+                    tracing::debug!("VM stop completion handler called (success)");
+                }
             }
+        }
+
+        unsafe extern "C" {
+            static _NSConcreteStackBlock: *const c_void;
+            fn _Block_copy(block: *const c_void) -> *const c_void;
+        }
+
+        struct BlockPtr(*const c_void);
+        unsafe impl Send for BlockPtr {}
+        unsafe impl Sync for BlockPtr {}
+
+        static STOP_BLOCK_PTR: std::sync::OnceLock<BlockPtr> = std::sync::OnceLock::new();
+
+        let block_ptr = STOP_BLOCK_PTR.get_or_init(|| {
+            unsafe {
+                static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+                    reserved: 0,
+                    size: 40,
+                };
+
+                let stack_block = CompletionBlock {
+                    isa: _NSConcreteStackBlock,
+                    flags: 0,
+                    reserved: 0,
+                    invoke: stop_completion_handler,
+                    descriptor: &DESCRIPTOR,
+                };
+
+                let heap_block = _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
+                BlockPtr(heap_block)
+            }
+        });
+
+        unsafe {
+            let sel = sel!(stopWithCompletionHandler:);
+            let func: unsafe extern "C" fn(*const AnyObject, Sel, *const c_void) =
+                std::mem::transmute(objc_msgSend as *const c_void);
+
+            func(self.inner as *const AnyObject, sel, block_ptr.0);
         }
     }
 
@@ -594,35 +703,230 @@ impl VirtualMachine {
     /// This dispatches the start operation and returns immediately.
     /// Use `state()` to poll for completion.
     pub fn start_async(&self) {
+        // Block layout for void (^)(NSError *)
+        #[repr(C)]
+        struct CompletionBlock {
+            isa: *const c_void,
+            flags: i32,
+            reserved: i32,
+            invoke: unsafe extern "C" fn(*const c_void, *mut AnyObject),
+            descriptor: *const BlockDescriptor,
+        }
+
+        #[repr(C)]
+        struct BlockDescriptor {
+            reserved: u64,
+            size: u64,
+        }
+
+        // Static completion handler function - block pointer is first arg
+        unsafe extern "C" fn completion_handler(_block: *const c_void, error: *mut AnyObject) {
+            unsafe {
+                if !error.is_null() {
+                    // Extract error description from NSError
+                    let desc: *mut AnyObject = msg_send!(error, localizedDescription);
+                    let error_msg = if !desc.is_null() {
+                        nsstring_to_string(desc)
+                    } else {
+                        "Unknown error".to_string()
+                    };
+                    tracing::error!("VM start failed: {}", error_msg);
+                } else {
+                    tracing::debug!("VM start completion handler called (success)");
+                }
+            }
+        }
+
+        // Block runtime functions
+        unsafe extern "C" {
+            static _NSConcreteStackBlock: *const c_void;
+            fn _Block_copy(block: *const c_void) -> *const c_void;
+        }
+
+        // Wrapper to make raw pointer Send + Sync safe
+        struct BlockPtr(*const c_void);
+        unsafe impl Send for BlockPtr {}
+        unsafe impl Sync for BlockPtr {}
+
+        // Use a properly copied block that lives forever
+        static BLOCK_PTR: std::sync::OnceLock<BlockPtr> = std::sync::OnceLock::new();
+
+        let block_ptr = BLOCK_PTR.get_or_init(|| {
+            unsafe {
+                static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+                    reserved: 0,
+                    size: 40, // size of CompletionBlock
+                };
+
+                // Create a stack block and copy it to heap
+                let stack_block = CompletionBlock {
+                    isa: _NSConcreteStackBlock,
+                    flags: 0, // No special flags for stack block
+                    reserved: 0,
+                    invoke: completion_handler,
+                    descriptor: &DESCRIPTOR,
+                };
+
+                // _Block_copy moves the block to the heap and makes it permanent
+                let heap_block = _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
+                BlockPtr(heap_block)
+            }
+        });
+
         unsafe {
-            // Create a simple completion handler block that does nothing
-            // The actual completion is detected by polling state()
             let sel = sel!(startWithCompletionHandler:);
             let func: unsafe extern "C" fn(*const AnyObject, Sel, *const c_void) =
                 std::mem::transmute(objc_msgSend as *const c_void);
 
-            // Pass nil as completion handler - we'll poll state instead
-            func(self.inner as *const AnyObject, sel, ptr::null());
+            func(self.inner as *const AnyObject, sel, block_ptr.0);
         }
     }
 
     /// Pauses the VM asynchronously.
     pub fn pause_async(&self) {
+        // Block layout for void (^)(NSError *)
+        #[repr(C)]
+        struct CompletionBlock {
+            isa: *const c_void,
+            flags: i32,
+            reserved: i32,
+            invoke: unsafe extern "C" fn(*const c_void, *mut AnyObject),
+            descriptor: *const BlockDescriptor,
+        }
+
+        #[repr(C)]
+        struct BlockDescriptor {
+            reserved: u64,
+            size: u64,
+        }
+
+        unsafe extern "C" fn pause_completion_handler(_block: *const c_void, error: *mut AnyObject) {
+            unsafe {
+                if !error.is_null() {
+                    let desc: *mut AnyObject = msg_send!(error, localizedDescription);
+                    let error_msg = if !desc.is_null() {
+                        nsstring_to_string(desc)
+                    } else {
+                        "Unknown error".to_string()
+                    };
+                    tracing::error!("VM pause failed: {}", error_msg);
+                } else {
+                    tracing::debug!("VM pause completion handler called (success)");
+                }
+            }
+        }
+
+        unsafe extern "C" {
+            static _NSConcreteStackBlock: *const c_void;
+            fn _Block_copy(block: *const c_void) -> *const c_void;
+        }
+
+        struct BlockPtr(*const c_void);
+        unsafe impl Send for BlockPtr {}
+        unsafe impl Sync for BlockPtr {}
+
+        static PAUSE_BLOCK_PTR: std::sync::OnceLock<BlockPtr> = std::sync::OnceLock::new();
+
+        let block_ptr = PAUSE_BLOCK_PTR.get_or_init(|| {
+            unsafe {
+                static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+                    reserved: 0,
+                    size: 40,
+                };
+
+                let stack_block = CompletionBlock {
+                    isa: _NSConcreteStackBlock,
+                    flags: 0,
+                    reserved: 0,
+                    invoke: pause_completion_handler,
+                    descriptor: &DESCRIPTOR,
+                };
+
+                let heap_block = _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
+                BlockPtr(heap_block)
+            }
+        });
+
         unsafe {
             let sel = sel!(pauseWithCompletionHandler:);
             let func: unsafe extern "C" fn(*const AnyObject, Sel, *const c_void) =
                 std::mem::transmute(objc_msgSend as *const c_void);
-            func(self.inner as *const AnyObject, sel, ptr::null());
+
+            func(self.inner as *const AnyObject, sel, block_ptr.0);
         }
     }
 
     /// Resumes the VM asynchronously.
     pub fn resume_async(&self) {
+        // Block layout for void (^)(NSError *)
+        #[repr(C)]
+        struct CompletionBlock {
+            isa: *const c_void,
+            flags: i32,
+            reserved: i32,
+            invoke: unsafe extern "C" fn(*const c_void, *mut AnyObject),
+            descriptor: *const BlockDescriptor,
+        }
+
+        #[repr(C)]
+        struct BlockDescriptor {
+            reserved: u64,
+            size: u64,
+        }
+
+        unsafe extern "C" fn resume_completion_handler(_block: *const c_void, error: *mut AnyObject) {
+            unsafe {
+                if !error.is_null() {
+                    let desc: *mut AnyObject = msg_send!(error, localizedDescription);
+                    let error_msg = if !desc.is_null() {
+                        nsstring_to_string(desc)
+                    } else {
+                        "Unknown error".to_string()
+                    };
+                    tracing::error!("VM resume failed: {}", error_msg);
+                } else {
+                    tracing::debug!("VM resume completion handler called (success)");
+                }
+            }
+        }
+
+        unsafe extern "C" {
+            static _NSConcreteStackBlock: *const c_void;
+            fn _Block_copy(block: *const c_void) -> *const c_void;
+        }
+
+        struct BlockPtr(*const c_void);
+        unsafe impl Send for BlockPtr {}
+        unsafe impl Sync for BlockPtr {}
+
+        static RESUME_BLOCK_PTR: std::sync::OnceLock<BlockPtr> = std::sync::OnceLock::new();
+
+        let block_ptr = RESUME_BLOCK_PTR.get_or_init(|| {
+            unsafe {
+                static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+                    reserved: 0,
+                    size: 40,
+                };
+
+                let stack_block = CompletionBlock {
+                    isa: _NSConcreteStackBlock,
+                    flags: 0,
+                    reserved: 0,
+                    invoke: resume_completion_handler,
+                    descriptor: &DESCRIPTOR,
+                };
+
+                let heap_block = _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
+                BlockPtr(heap_block)
+            }
+        });
+
         unsafe {
             let sel = sel!(resumeWithCompletionHandler:);
             let func: unsafe extern "C" fn(*const AnyObject, Sel, *const c_void) =
                 std::mem::transmute(objc_msgSend as *const c_void);
-            func(self.inner as *const AnyObject, sel, ptr::null());
+
+            func(self.inner as *const AnyObject, sel, block_ptr.0);
         }
     }
 }
@@ -749,6 +1053,8 @@ pub fn create_entropy_device() -> VZResult<*mut AnyObject> {
                 message: "Failed to create entropy device".into(),
             });
         }
+        // Retain to prevent autorelease
+        let _: *mut AnyObject = msg_send!(obj, retain);
         Ok(obj)
     }
 }
@@ -902,6 +1208,92 @@ pub fn min_memory_size() -> u64 {
 }
 
 // ============================================================================
+// CFRunLoop
+// ============================================================================
+
+/// Opaque type for CFRunLoop
+pub type CFRunLoopRef = *mut c_void;
+
+/// Run loop run result
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CFRunLoopRunResult {
+    Finished = 1,
+    Stopped = 2,
+    TimedOut = 3,
+    HandledSource = 4,
+}
+
+// CFRunLoop FFI
+unsafe extern "C" {
+    fn CFRunLoopGetMain() -> CFRunLoopRef;
+    fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+    fn CFRunLoopRun();
+    fn CFRunLoopStop(rl: CFRunLoopRef);
+    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, returnAfterSourceHandled: bool) -> i32;
+}
+
+// kCFRunLoopDefaultMode is a CFStringRef constant
+unsafe extern "C" {
+    static kCFRunLoopDefaultMode: *const c_void;
+}
+
+/// Gets the main CFRunLoop.
+pub fn cf_run_loop_get_main() -> CFRunLoopRef {
+    unsafe { CFRunLoopGetMain() }
+}
+
+/// Gets the current thread's CFRunLoop.
+pub fn cf_run_loop_get_current() -> CFRunLoopRef {
+    unsafe { CFRunLoopGetCurrent() }
+}
+
+/// Runs the current run loop indefinitely.
+pub fn cf_run_loop_run() {
+    unsafe { CFRunLoopRun() }
+}
+
+/// Stops a run loop.
+pub fn cf_run_loop_stop(rl: CFRunLoopRef) {
+    unsafe { CFRunLoopStop(rl) }
+}
+
+/// Runs the run loop in default mode for up to the specified duration.
+/// Returns the result indicating why the run loop exited.
+pub fn cf_run_loop_run_in_mode(seconds: f64, return_after_source_handled: bool) -> CFRunLoopRunResult {
+    unsafe {
+        let result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, return_after_source_handled);
+        match result {
+            1 => CFRunLoopRunResult::Finished,
+            2 => CFRunLoopRunResult::Stopped,
+            3 => CFRunLoopRunResult::TimedOut,
+            4 => CFRunLoopRunResult::HandledSource,
+            _ => CFRunLoopRunResult::TimedOut,
+        }
+    }
+}
+
+/// Runs the run loop, processing events until the predicate returns true or timeout.
+pub fn run_loop_until<F>(mut predicate: F, timeout_secs: f64) -> bool
+where
+    F: FnMut() -> bool,
+{
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs_f64(timeout_secs);
+
+    while !predicate() {
+        if start.elapsed() > timeout {
+            return false;
+        }
+
+        // Run the run loop for a short interval
+        cf_run_loop_run_in_mode(0.01, true);
+    }
+
+    true
+}
+
+// ============================================================================
 // Dispatch Queue
 // ============================================================================
 
@@ -909,21 +1301,14 @@ pub fn min_memory_size() -> u64 {
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const i8, attr: *const c_void) -> *mut AnyObject;
     fn dispatch_sync(queue: *mut AnyObject, block: *const c_void);
+    fn dispatch_async(queue: *mut AnyObject, block: *const c_void);
     // dispatch_get_main_queue is a macro - we access _dispatch_main_q directly
     static _dispatch_main_q: *mut AnyObject;
 }
 
-// Block trampoline for dispatch_sync
-type DispatchBlock = unsafe extern "C" fn(*mut c_void);
-
-unsafe extern "C" fn block_invoke(context: *mut c_void) {
-    unsafe {
-        let closure: &mut Box<dyn FnMut()> = &mut *(context as *mut Box<dyn FnMut()>);
-        closure();
-    }
-}
-
 /// Executes a closure synchronously on the given dispatch queue.
+///
+/// Uses dispatch_sync_f which is simpler than block-based dispatch_sync.
 pub fn dispatch_sync_closure<F: FnMut()>(queue: *mut AnyObject, mut f: F) {
     if queue.is_null() {
         // If no queue, just execute directly
@@ -931,50 +1316,21 @@ pub fn dispatch_sync_closure<F: FnMut()>(queue: *mut AnyObject, mut f: F) {
         return;
     }
 
+    // Use dispatch_sync_f instead of dispatch_sync with blocks
+    // dispatch_sync_f takes a function pointer and context directly
+    unsafe extern "C" {
+        fn dispatch_sync_f(queue: *mut AnyObject, context: *mut c_void, work: unsafe extern "C" fn(*mut c_void));
+    }
+
+    unsafe extern "C" fn trampoline<F: FnMut()>(context: *mut c_void) {
+        unsafe {
+            let f = &mut *(context as *mut F);
+            f();
+        }
+    }
+
     unsafe {
-        // For simplicity, we'll use dispatch_sync with a block literal approach
-        // This is a simplified version - real implementation would need proper block support
-        let mut closure: Box<dyn FnMut()> = Box::new(f);
-        let closure_ptr = &mut closure as *mut Box<dyn FnMut()> as *mut c_void;
-
-        // Create a simple block structure
-        // Note: This is a simplified approach - proper implementation would use block_copy
-        #[repr(C)]
-        struct Block {
-            isa: *const c_void,
-            flags: i32,
-            reserved: i32,
-            invoke: DispatchBlock,
-            descriptor: *const BlockDescriptor,
-            context: *mut c_void,
-        }
-
-        #[repr(C)]
-        struct BlockDescriptor {
-            reserved: u64,
-            size: u64,
-        }
-
-        static BLOCK_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
-            reserved: 0,
-            size: std::mem::size_of::<Block>() as u64,
-        };
-
-        // _NSConcreteStackBlock
-        unsafe extern "C" {
-            static _NSConcreteStackBlock: *const c_void;
-        }
-
-        let block = Block {
-            isa: _NSConcreteStackBlock,
-            flags: 1 << 29, // BLOCK_HAS_COPY_DISPOSE not set for stack block
-            reserved: 0,
-            invoke: block_invoke,
-            descriptor: &BLOCK_DESCRIPTOR,
-            context: closure_ptr,
-        };
-
-        dispatch_sync(queue, &block as *const Block as *const c_void);
+        dispatch_sync_f(queue, &mut f as *mut F as *mut c_void, trampoline::<F>);
     }
 }
 
@@ -1103,11 +1459,28 @@ pub fn set_console_port_is_console(port: *mut AnyObject, is_console: bool) {
     }
 }
 
-/// Sets console ports on a console device.
-pub fn set_console_device_ports(device: *mut AnyObject, ports: &[*mut AnyObject]) {
+/// Gets the ports array from a console device.
+/// Returns VZVirtioConsolePortConfigurationArray, not a standard NSArray.
+pub fn get_console_device_ports(device: *mut AnyObject) -> *mut AnyObject {
     unsafe {
-        let array = nsarray(ports);
-        msg_send_void!(device, setPorts: array);
+        msg_send!(device, ports)
+    }
+}
+
+/// Sets maximum port count on the console ports array.
+pub fn set_ports_array_max_count(ports_array: *mut AnyObject, count: u64) {
+    unsafe {
+        msg_send_void_u64!(ports_array, setMaximumPortCount: count);
+    }
+}
+
+/// Sets a port at a specific index in the console ports array.
+pub fn set_port_at_index(ports_array: *mut AnyObject, port: *mut AnyObject, index: u64) {
+    unsafe {
+        let sel = sel!(setObject:atIndexedSubscript:);
+        let func: unsafe extern "C" fn(*const AnyObject, Sel, *mut AnyObject, u64) =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        func(ports_array as *const AnyObject, sel, port, index);
     }
 }
 
@@ -1221,5 +1594,63 @@ mod tests {
 
         assert_eq!(config.cpu_count(), 2);
         assert_eq!(config.memory_size(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_run_loop_until_immediate() {
+        // Test immediate completion
+        let result = run_loop_until(|| true, 1.0);
+        assert!(result, "run_loop_until should return true when predicate is immediately true");
+    }
+
+    #[test]
+    fn test_run_loop_until_timeout() {
+        // Test timeout
+        let start = std::time::Instant::now();
+        let result = run_loop_until(|| false, 0.1);
+        let elapsed = start.elapsed();
+
+        assert!(!result, "run_loop_until should return false on timeout");
+        assert!(elapsed.as_secs_f64() >= 0.1, "Should have waited at least 0.1 seconds");
+        assert!(elapsed.as_secs_f64() < 0.5, "Should not have waited too long");
+    }
+
+    #[test]
+    fn test_run_loop_until_delayed() {
+        // Test delayed completion
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = flag.clone();
+
+        // Spawn a thread to set the flag after 50ms
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            flag_clone.store(true, Ordering::SeqCst);
+        });
+
+        let result = run_loop_until(|| flag.load(Ordering::SeqCst), 1.0);
+        assert!(result, "run_loop_until should return true when predicate becomes true");
+    }
+
+    #[test]
+    fn test_cf_run_loop_run_in_mode() {
+        // Test running the run loop for a short interval
+        let result = cf_run_loop_run_in_mode(0.01, true);
+
+        // Result should be Finished (no sources) or TimedOut
+        // When there are no run loop sources, the run loop exits immediately with Finished
+        assert!(
+            result == CFRunLoopRunResult::Finished || result == CFRunLoopRunResult::TimedOut,
+            "Expected Finished or TimedOut, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_main_queue() {
+        let queue = get_main_queue();
+        assert!(!queue.is_null(), "Main dispatch queue should not be null");
     }
 }

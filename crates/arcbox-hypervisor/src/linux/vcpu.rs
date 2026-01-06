@@ -237,19 +237,46 @@ impl KvmVcpu {
         entry_point: u64,
         dtb_addr: u64,
     ) -> Result<(), HypervisorError> {
+        use super::ffi::arm64_regs;
+
         // ARM64 Linux boot protocol:
         // x0 = physical address of DTB
         // PC = kernel entry point
         // All other registers should be 0
+        // PSTATE should be EL1h with interrupts masked
 
-        // TODO: Set up ARM64 registers using KVM_SET_ONE_REG
-        // This requires defining the ARM64 register IDs
+        // Set x0 = DTB address
+        self.vcpu_fd.set_one_reg(arm64_regs::X0, dtb_addr).map_err(|e| {
+            HypervisorError::VcpuRunError(format!("Failed to set x0: {}", e))
+        })?;
+
+        // Set PC = entry point
+        self.vcpu_fd.set_one_reg(arm64_regs::PC, entry_point).map_err(|e| {
+            HypervisorError::VcpuRunError(format!("Failed to set PC: {}", e))
+        })?;
+
+        // Set PSTATE for EL1h with interrupts masked
+        let pstate = arm64_regs::PSTATE_EL1H
+            | arm64_regs::PSTATE_D
+            | arm64_regs::PSTATE_A
+            | arm64_regs::PSTATE_I
+            | arm64_regs::PSTATE_F;
+        self.vcpu_fd.set_one_reg(arm64_regs::PSTATE, pstate).map_err(|e| {
+            HypervisorError::VcpuRunError(format!("Failed to set PSTATE: {}", e))
+        })?;
+
+        // Clear other important registers
+        self.vcpu_fd.set_one_reg(arm64_regs::X1, 0).ok(); // Ignore errors for optional regs
+        self.vcpu_fd.set_one_reg(arm64_regs::X2, 0).ok();
+        self.vcpu_fd.set_one_reg(arm64_regs::X3, 0).ok();
+        self.vcpu_fd.set_one_reg(arm64_regs::SP, 0).ok();
 
         tracing::debug!(
-            "vCPU {} setup for Linux boot: entry={:#x}, dtb={:#x}",
+            "vCPU {} setup for Linux boot: entry={:#x}, dtb={:#x}, pstate={:#x}",
             self.id,
             entry_point,
-            dtb_addr
+            dtb_addr,
+            pstate
         );
 
         Ok(())
@@ -270,9 +297,9 @@ impl KvmVcpu {
                         (self.vcpu_fd.kvm_run() as *const _ as *const u8).add(io.data_offset as usize)
                     };
                     let data = match io.size {
-                        1 => unsafe { *data_ptr } as u64,
-                        2 => unsafe { *(data_ptr as *const u16) } as u64,
-                        4 => unsafe { *(data_ptr as *const u32) } as u64,
+                        1 => (unsafe { *data_ptr }) as u64,
+                        2 => (unsafe { *(data_ptr as *const u16) }) as u64,
+                        4 => (unsafe { *(data_ptr as *const u32) }) as u64,
                         _ => 0,
                     };
                     VcpuExit::IoOut {
@@ -489,6 +516,31 @@ impl Vcpu for KvmVcpu {
 
     fn id(&self) -> u32 {
         self.id
+    }
+
+    fn set_io_result(&mut self, value: u64) -> Result<(), HypervisorError> {
+        // For I/O IN operations, write the result back to the data area
+        let bytes = value.to_le_bytes();
+        unsafe {
+            let kvm_run = self.vcpu_fd.kvm_run_mut();
+            let io = kvm_run.exit_data.io;
+            let size = io.size as usize;
+            let data_ptr = (kvm_run as *mut _ as *mut u8).add(io.data_offset as usize);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), data_ptr, size.min(8));
+        }
+        Ok(())
+    }
+
+    fn set_mmio_result(&mut self, value: u64) -> Result<(), HypervisorError> {
+        // For MMIO read operations, write the result back to the mmio data area
+        let bytes = value.to_le_bytes();
+        unsafe {
+            let kvm_run = self.vcpu_fd.kvm_run_mut();
+            let mmio = &mut kvm_run.exit_data.mmio;
+            let len = (mmio.len as usize).min(8);
+            mmio.data[..len].copy_from_slice(&bytes[..len]);
+        }
+        Ok(())
     }
 }
 

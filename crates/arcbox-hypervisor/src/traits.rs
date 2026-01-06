@@ -35,10 +35,28 @@ pub trait VirtualMachine: Send + Sync {
     /// The guest memory type for this VM.
     type Memory: GuestMemory;
 
+    /// Returns whether this VM uses managed execution.
+    ///
+    /// **Managed execution** (returns `true`):
+    /// - The hypervisor manages vCPU execution internally
+    /// - `start()` begins VM execution, `stop()` ends it
+    /// - `create_vcpu()` is optional/placeholder
+    /// - Examples: macOS Virtualization.framework
+    ///
+    /// **Manual execution** (returns `false`):
+    /// - The caller must create vCPU threads and call `vcpu.run()` in a loop
+    /// - `start()` and `stop()` are optional state markers
+    /// - Examples: Linux KVM
+    fn is_managed_execution(&self) -> bool {
+        false // Default to manual execution (KVM-style)
+    }
+
     /// Returns a reference to the guest memory.
     fn memory(&self) -> &Self::Memory;
 
     /// Creates a new vCPU.
+    ///
+    /// For managed execution VMs, this may return a placeholder vCPU.
     ///
     /// # Errors
     ///
