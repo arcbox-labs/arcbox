@@ -16,6 +16,8 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
 ipnetwork = "0.20"
 hashbrown = "0.14"
 crossbeam-utils = "0.8"

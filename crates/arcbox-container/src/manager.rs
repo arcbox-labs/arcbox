@@ -105,6 +105,95 @@ impl ContainerManager {
         Ok(())
     }
 
+    /// Kills a container with a signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container cannot be killed.
+    pub fn kill(&self, id: &ContainerId, signal: &str) -> Result<()> {
+        let mut containers = self
+            .containers
+            .write()
+            .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
+
+        let container = containers
+            .get_mut(id)
+            .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+
+        if container.state != ContainerState::Running {
+            return Err(ContainerError::InvalidState(format!(
+                "cannot kill container in state {}",
+                container.state
+            )));
+        }
+
+        // TODO: Send kill signal to arcbox-agent
+        container.state = ContainerState::Exited;
+        // SIGKILL (9) -> 137, SIGTERM (15) -> 143
+        container.exit_code = Some(if signal == "SIGKILL" || signal == "9" {
+            137
+        } else {
+            143
+        });
+        Ok(())
+    }
+
+    /// Restarts a container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container cannot be restarted.
+    pub fn restart(&self, id: &ContainerId) -> Result<()> {
+        // First stop if running.
+        {
+            let containers = self
+                .containers
+                .read()
+                .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
+
+            let container = containers
+                .get(id)
+                .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+
+            if container.state == ContainerState::Running {
+                drop(containers);
+                self.stop(id)?;
+            }
+        }
+
+        // Reset state to allow restart.
+        {
+            let mut containers = self
+                .containers
+                .write()
+                .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
+
+            if let Some(c) = containers.get_mut(id) {
+                c.state = ContainerState::Created;
+                c.exit_code = None;
+            }
+        }
+
+        // Start the container.
+        self.start(id)
+    }
+
+    /// Waits for a container to exit and returns its exit code.
+    ///
+    /// Note: This is a simplified implementation that returns immediately
+    /// if the container is not running. A full implementation would use
+    /// async channels to wait for state changes.
+    #[must_use]
+    pub fn wait(&self, id: &ContainerId) -> Option<i32> {
+        let containers = self.containers.read().ok()?;
+        let container = containers.get(id)?;
+
+        match container.state {
+            ContainerState::Exited | ContainerState::Dead => container.exit_code,
+            _ => None,
+        }
+    }
+
     /// Removes a container.
     ///
     /// # Errors

@@ -102,16 +102,45 @@ impl Default for NetConfig {
     }
 }
 
+use std::collections::HashMap;
+use std::sync::RwLock;
+
+/// Docker-style network.
+#[derive(Debug, Clone)]
+pub struct Network {
+    /// Network ID.
+    pub id: String,
+    /// Network name.
+    pub name: String,
+    /// Network driver.
+    pub driver: String,
+    /// Network scope.
+    pub scope: String,
+    /// Whether the network is internal.
+    pub internal: bool,
+    /// Whether the network is attachable.
+    pub attachable: bool,
+    /// Creation timestamp.
+    pub created: chrono::DateTime<chrono::Utc>,
+    /// Labels.
+    pub labels: HashMap<String, String>,
+}
+
 /// Network manager.
 pub struct NetworkManager {
     config: NetConfig,
+    /// User-created networks.
+    networks: RwLock<HashMap<String, Network>>,
 }
 
 impl NetworkManager {
     /// Creates a new network manager.
     #[must_use]
     pub fn new(config: NetConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            networks: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Returns the network configuration.
@@ -138,5 +167,93 @@ impl NetworkManager {
     pub fn stop(&mut self) -> Result<()> {
         // TODO: Cleanup network
         Ok(())
+    }
+
+    /// Creates a new Docker-style network.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the network cannot be created.
+    pub fn create_network(
+        &self,
+        name: &str,
+        driver: Option<&str>,
+        labels: HashMap<String, String>,
+    ) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string().replace('-', "");
+        let network = Network {
+            id: id.clone(),
+            name: name.to_string(),
+            driver: driver.unwrap_or("bridge").to_string(),
+            scope: "local".to_string(),
+            internal: false,
+            attachable: false,
+            created: chrono::Utc::now(),
+            labels,
+        };
+
+        let mut networks = self
+            .networks
+            .write()
+            .map_err(|_| NetError::Config("lock poisoned".to_string()))?;
+        networks.insert(id.clone(), network);
+
+        Ok(id)
+    }
+
+    /// Gets a network by ID or name.
+    #[must_use]
+    pub fn get_network(&self, id_or_name: &str) -> Option<Network> {
+        let networks = self.networks.read().ok()?;
+
+        // First try by ID.
+        if let Some(network) = networks.get(id_or_name) {
+            return Some(network.clone());
+        }
+
+        // Then try by name.
+        networks
+            .values()
+            .find(|n| n.name == id_or_name)
+            .cloned()
+    }
+
+    /// Lists all networks.
+    #[must_use]
+    pub fn list_networks(&self) -> Vec<Network> {
+        self.networks
+            .read()
+            .map(|n| n.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Removes a network.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the network cannot be removed.
+    pub fn remove_network(&self, id_or_name: &str) -> Result<()> {
+        let mut networks = self
+            .networks
+            .write()
+            .map_err(|_| NetError::Config("lock poisoned".to_string()))?;
+
+        // Try by ID first.
+        if networks.remove(id_or_name).is_some() {
+            return Ok(());
+        }
+
+        // Then try by name.
+        let id_to_remove = networks
+            .iter()
+            .find(|(_, n)| n.name == id_or_name)
+            .map(|(id, _)| id.clone());
+
+        if let Some(id) = id_to_remove {
+            networks.remove(&id);
+            return Ok(());
+        }
+
+        Err(NetError::Config(format!("network {} not found", id_or_name)))
     }
 }

@@ -147,13 +147,59 @@ pub async fn create_container(
 
 /// Inspect container.
 pub async fn inspect_container(
+    State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
+    Query(_params): Query<HashMap<String, String>>,
 ) -> Result<Json<ContainerInspectResponse>> {
-    let _size = params.get("size").map(|v| v == "true").unwrap_or(false);
+    let container_id = arcbox_container::state::ContainerId::from_string(&id);
+    let container = state
+        .runtime
+        .container_manager()
+        .get(&container_id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
 
-    // TODO: Get container from arcbox-core
-    Err(DockerError::ContainerNotFound(id))
+    let state_response = ContainerState {
+        status: container.state.to_string().to_lowercase(),
+        running: container.state == arcbox_container::state::ContainerState::Running,
+        paused: container.state == arcbox_container::state::ContainerState::Paused,
+        restarting: container.state == arcbox_container::state::ContainerState::Restarting,
+        oom_killed: false,
+        dead: container.state == arcbox_container::state::ContainerState::Dead,
+        pid: 0,
+        exit_code: container.exit_code.unwrap_or(0),
+        error: String::new(),
+        started_at: container
+            .started_at
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_default(),
+        finished_at: String::new(),
+    };
+
+    Ok(Json(ContainerInspectResponse {
+        id: container.id.to_string(),
+        created: container.created.to_rfc3339(),
+        path: String::new(),
+        args: vec![],
+        state: state_response,
+        image: container.image.clone(),
+        name: format!("/{}", container.name),
+        restart_count: 0,
+        config: ContainerConfig {
+            hostname: container.name.clone(),
+            user: String::new(),
+            env: vec![],
+            cmd: vec![],
+            image: container.image.clone(),
+            working_dir: String::new(),
+            entrypoint: None,
+            labels: HashMap::new(),
+            tty: false,
+            open_stdin: false,
+        },
+        host_config: HostConfig::default(),
+        network_settings: NetworkSettings::default(),
+        mounts: vec![],
+    }))
 }
 
 /// Start container.
@@ -206,28 +252,46 @@ pub async fn stop_container(
 
 /// Kill container.
 pub async fn kill_container(
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<StatusCode> {
-    let _signal = params.get("signal").cloned().unwrap_or_else(|| "SIGKILL".to_string());
-    let _ = id;
+    let signal = params
+        .get("signal")
+        .cloned()
+        .unwrap_or_else(|| "SIGKILL".to_string());
+    let container_id = arcbox_container::state::ContainerId::from_string(&id);
 
-    // TODO: Kill container via arcbox-core
+    state
+        .runtime
+        .container_manager()
+        .kill(&container_id, &signal)
+        .map_err(|e| match e {
+            arcbox_container::ContainerError::NotFound(_) => DockerError::ContainerNotFound(id),
+            arcbox_container::ContainerError::InvalidState(msg) => DockerError::Conflict(msg),
+            _ => DockerError::Server(e.to_string()),
+        })?;
+
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Restart container.
 pub async fn restart_container(
+    State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
+    Query(_params): Query<HashMap<String, String>>,
 ) -> Result<StatusCode> {
-    let _timeout = params
-        .get("t")
-        .and_then(|t| t.parse().ok())
-        .unwrap_or(10u32);
-    let _ = id;
+    let container_id = arcbox_container::state::ContainerId::from_string(&id);
 
-    // TODO: Restart container via arcbox-core
+    state
+        .runtime
+        .container_manager()
+        .restart(&container_id)
+        .map_err(|e| match e {
+            arcbox_container::ContainerError::NotFound(_) => DockerError::ContainerNotFound(id),
+            _ => DockerError::Server(e.to_string()),
+        })?;
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -267,17 +331,42 @@ pub async fn remove_container(
 
 /// Wait for container.
 pub async fn wait_container(
+    State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
+    Query(_params): Query<HashMap<String, String>>,
 ) -> Result<Json<WaitResponse>> {
-    let _condition = params.get("condition").cloned();
-    let _ = id;
+    let container_id = arcbox_container::state::ContainerId::from_string(&id);
 
-    // TODO: Wait for container via arcbox-core
-    Ok(Json(WaitResponse {
-        status_code: 0,
-        error: None,
-    }))
+    // Check if container exists.
+    let container = state
+        .runtime
+        .container_manager()
+        .get(&container_id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+
+    // If already exited, return immediately.
+    if let Some(exit_code) = state.runtime.container_manager().wait(&container_id) {
+        return Ok(Json(WaitResponse {
+            status_code: i64::from(exit_code),
+            error: None,
+        }));
+    }
+
+    // If still running, return current state.
+    // Note: A full implementation would use async channels to wait for exit.
+    if container.state == arcbox_container::state::ContainerState::Running {
+        // For now, just return 0 as a placeholder.
+        // In a real implementation, we'd wait for the container to exit.
+        Ok(Json(WaitResponse {
+            status_code: 0,
+            error: None,
+        }))
+    } else {
+        Ok(Json(WaitResponse {
+            status_code: i64::from(container.exit_code.unwrap_or(0)),
+            error: None,
+        }))
+    }
 }
 
 /// Container logs query parameters.
@@ -308,14 +397,37 @@ fn default_true() -> bool {
 }
 
 /// Get container logs.
+///
+/// TODO: Full implementation requires:
+/// 1. Extend agent.proto with LogsRequest/LogEntry messages
+/// 2. Implement logs streaming in arcbox-agent
+/// 3. Add logs method to AgentClient
+/// 4. Stream logs back via Docker raw-stream format
+///
+/// For now, returns empty response to allow Docker CLI compatibility.
 pub async fn container_logs(
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Query(params): Query<LogsQuery>,
 ) -> Result<impl IntoResponse> {
-    let _ = (id, params);
+    // Verify container exists.
+    let container_id = arcbox_container::state::ContainerId::from_string(&id);
+    if state.runtime.container_manager().get(&container_id).is_none() {
+        return Err(DockerError::ContainerNotFound(id));
+    }
 
-    // TODO: Stream logs from arcbox-core
-    // For now, return empty response with proper content type
+    // Log query parameters for debugging.
+    tracing::debug!(
+        container = %id,
+        follow = params.follow,
+        stdout = params.stdout,
+        stderr = params.stderr,
+        tail = ?params.tail,
+        "container logs request"
+    );
+
+    // Return empty response with Docker raw-stream format.
+    // Full implementation requires Agent protocol support.
     Ok((
         StatusCode::OK,
         [(
@@ -332,28 +444,66 @@ pub async fn container_logs(
 
 /// Create exec instance.
 pub async fn exec_create(
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<ExecCreateRequest>,
 ) -> Result<(StatusCode, Json<ExecCreateResponse>)> {
-    let _ = (id, body);
+    use arcbox_container::{ExecConfig, ContainerId};
 
-    // TODO: Create exec via arcbox-core
+    // Verify container exists.
+    let container_id = ContainerId::from_string(&id);
+    if state.runtime.container_manager().get(&container_id).is_none() {
+        return Err(DockerError::ContainerNotFound(id));
+    }
+
+    // Build exec config.
+    let config = ExecConfig {
+        container_id,
+        cmd: body.cmd,
+        env: body.env.unwrap_or_default(),
+        working_dir: body.working_dir,
+        attach_stdin: body.attach_stdin.unwrap_or(false),
+        attach_stdout: body.attach_stdout.unwrap_or(true),
+        attach_stderr: body.attach_stderr.unwrap_or(true),
+        tty: body.tty.unwrap_or(false),
+        user: body.user,
+        privileged: body.privileged.unwrap_or(false),
+    };
+
+    // Create exec instance.
+    let exec_id = state.runtime.exec_manager().create(config);
+
     Ok((
         StatusCode::CREATED,
         Json(ExecCreateResponse {
-            id: uuid::Uuid::new_v4().to_string().replace('-', ""),
+            id: exec_id.to_string(),
         }),
     ))
 }
 
 /// Start exec instance.
 pub async fn exec_start(
+    State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(body): Json<ExecStartRequest>,
+    Json(_body): Json<ExecStartRequest>,
 ) -> Result<impl IntoResponse> {
-    let _ = (id, body);
+    use arcbox_container::ExecId;
 
-    // TODO: Start exec via arcbox-core
+    let exec_id = ExecId::from_string(&id);
+
+    // Start the exec.
+    state
+        .runtime
+        .exec_manager()
+        .start(&exec_id)
+        .map_err(|e| match e {
+            arcbox_container::ContainerError::NotFound(_) => {
+                DockerError::NotImplemented(format!("exec {id} not found"))
+            }
+            e => DockerError::Server(e.to_string()),
+        })?;
+
+    // Return raw stream format (empty for now since exec completes immediately).
     Ok((
         StatusCode::OK,
         [(
@@ -366,21 +516,58 @@ pub async fn exec_start(
 
 /// Resize exec TTY.
 pub async fn exec_resize(
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<StatusCode> {
-    let _h: Option<u32> = params.get("h").and_then(|v| v.parse().ok());
-    let _w: Option<u32> = params.get("w").and_then(|v| v.parse().ok());
-    let _ = id;
+    use arcbox_container::ExecId;
 
-    // TODO: Resize exec via arcbox-core
+    let h: u32 = params.get("h").and_then(|v| v.parse().ok()).unwrap_or(24);
+    let w: u32 = params.get("w").and_then(|v| v.parse().ok()).unwrap_or(80);
+
+    let exec_id = ExecId::from_string(&id);
+
+    state
+        .runtime
+        .exec_manager()
+        .resize(&exec_id, h, w)
+        .map_err(|e| match e {
+            arcbox_container::ContainerError::NotFound(_) => {
+                DockerError::NotImplemented(format!("exec {id} not found"))
+            }
+            e => DockerError::Server(e.to_string()),
+        })?;
+
     Ok(StatusCode::OK)
 }
 
 /// Inspect exec instance.
-pub async fn exec_inspect(Path(id): Path<String>) -> Result<Json<ExecInspectResponse>> {
-    // TODO: Inspect exec via arcbox-core
-    Err(DockerError::NotImplemented(format!("exec inspect {id}")))
+pub async fn exec_inspect(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ExecInspectResponse>> {
+    use arcbox_container::ExecId;
+
+    let exec_id = ExecId::from_string(&id);
+
+    let exec = state
+        .runtime
+        .exec_manager()
+        .get(&exec_id)
+        .ok_or_else(|| DockerError::NotImplemented(format!("exec {id} not found")))?;
+
+    Ok(Json(ExecInspectResponse {
+        can_remove: !exec.running,
+        container_id: exec.config.container_id.to_string(),
+        detach_keys: String::new(),
+        exit_code: exec.exit_code.unwrap_or(0),
+        id: exec.id.to_string(),
+        open_stderr: exec.config.attach_stderr,
+        open_stdin: exec.config.attach_stdin,
+        open_stdout: exec.config.attach_stdout,
+        running: exec.running,
+        pid: exec.pid.map_or(0, |p| p as i32),
+    }))
 }
 
 // ============================================================================
@@ -427,9 +614,39 @@ pub async fn list_images(
 }
 
 /// Inspect image.
-pub async fn inspect_image(Path(id): Path<String>) -> Result<Json<ImageInspectResponse>> {
-    // TODO: Get image from arcbox-core
-    Err(DockerError::ImageNotFound(id))
+pub async fn inspect_image(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ImageInspectResponse>> {
+    use arcbox_image::ImageRef;
+
+    // Try to parse as image reference.
+    let reference = ImageRef::parse(&id).ok_or_else(|| DockerError::ImageNotFound(id.clone()))?;
+
+    let image = state
+        .runtime
+        .image_store()
+        .get(&reference)
+        .ok_or_else(|| DockerError::ImageNotFound(id.clone()))?;
+
+    Ok(Json(ImageInspectResponse {
+        id: format!("sha256:{}", image.id),
+        repo_tags: vec![image.reference.to_string()],
+        repo_digests: vec![],
+        parent: String::new(),
+        comment: String::new(),
+        created: image.created.to_rfc3339(),
+        author: String::new(),
+        architecture: std::env::consts::ARCH.to_string(),
+        os: "linux".to_string(),
+        size: image.size as i64,
+        virtual_size: image.size as i64,
+        config: ContainerConfig::default(),
+        root_fs: RootFS {
+            root_type: "layers".to_string(),
+            layers: vec![],
+        },
+    }))
 }
 
 /// Pull image query parameters.
@@ -450,22 +667,35 @@ pub struct PullImageQuery {
 }
 
 /// Pull image.
+///
+/// TODO: ImagePuller has lifetime issues in its async internals that need to be fixed.
+/// Currently returns a placeholder response.
 pub async fn pull_image(Query(params): Query<PullImageQuery>) -> Result<impl IntoResponse> {
     let image = params.from_image.unwrap_or_default();
     let tag = params.tag.unwrap_or_else(|| "latest".to_string());
-    let _ = (image, tag);
 
-    // TODO: Pull image via arcbox-core
-    // Returns newline-delimited JSON progress
-    let progress = serde_json::json!({
-        "status": "Pulling from library/nginx",
-        "id": "latest"
-    });
+    // Return NDJSON progress format (placeholder).
+    let mut output = String::new();
+
+    output.push_str(&format!(
+        "{}\n",
+        serde_json::json!({"status": format!("Pulling from library/{}", image)})
+    ));
+
+    output.push_str(&format!(
+        "{}\n",
+        serde_json::json!({"status": "Pull complete", "id": tag})
+    ));
+
+    output.push_str(&format!(
+        "{}\n",
+        serde_json::json!({"status": format!("Status: Image is up to date for {}:{}", image, tag)})
+    ));
 
     Ok((
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
-        format!("{}\n", progress),
+        output,
     ))
 }
 
@@ -482,23 +712,73 @@ pub struct RemoveImageQuery {
 
 /// Remove image.
 pub async fn remove_image(
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Query(_params): Query<RemoveImageQuery>,
 ) -> Result<Json<Vec<ImageDeleteResponse>>> {
-    // TODO: Remove image via arcbox-core
-    Err(DockerError::ImageNotFound(id))
+    use arcbox_image::ImageRef;
+
+    let reference = ImageRef::parse(&id).ok_or_else(|| DockerError::ImageNotFound(id.clone()))?;
+
+    // Get image info before removing for response.
+    let image = state
+        .runtime
+        .image_store()
+        .get(&reference)
+        .ok_or_else(|| DockerError::ImageNotFound(id.clone()))?;
+
+    let image_id = image.id.clone();
+    let image_ref = image.reference.to_string();
+
+    // Remove the image.
+    state
+        .runtime
+        .image_store()
+        .remove(&reference)
+        .map_err(|e| DockerError::Server(e.to_string()))?;
+
+    Ok(Json(vec![
+        ImageDeleteResponse {
+            untagged: Some(image_ref),
+            deleted: None,
+        },
+        ImageDeleteResponse {
+            untagged: None,
+            deleted: Some(format!("sha256:{}", image_id)),
+        },
+    ]))
 }
 
 /// Tag image.
 pub async fn tag_image(
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<StatusCode> {
-    let _repo = params.get("repo").cloned();
-    let _tag = params.get("tag").cloned();
-    let _ = id;
+    use arcbox_image::ImageRef;
 
-    // TODO: Tag image via arcbox-core
+    let repo = params
+        .get("repo")
+        .ok_or_else(|| DockerError::BadRequest("missing 'repo' parameter".to_string()))?;
+    let tag = params.get("tag").map_or("latest", |s| s.as_str());
+
+    // Parse source reference.
+    let source = ImageRef::parse(&id).ok_or_else(|| DockerError::ImageNotFound(id.clone()))?;
+
+    // Build target reference.
+    let target = ImageRef::parse(&format!("{repo}:{tag}"))
+        .ok_or_else(|| DockerError::BadRequest(format!("invalid target reference: {repo}:{tag}")))?;
+
+    // Tag the image.
+    state
+        .runtime
+        .image_store()
+        .tag(&source, &target)
+        .map_err(|e| match e {
+            arcbox_image::ImageError::NotFound(_) => DockerError::ImageNotFound(id),
+            e => DockerError::Server(e.to_string()),
+        })?;
+
     Ok(StatusCode::CREATED)
 }
 
@@ -508,11 +788,13 @@ pub async fn tag_image(
 
 /// List networks.
 pub async fn list_networks(
+    State(state): State<AppState>,
     Query(_params): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<NetworkSummary>>> {
-    // TODO: Get networks from arcbox-core
-    // Return default bridge network
-    Ok(Json(vec![NetworkSummary {
+    let networks = state.runtime.network_manager().list_networks();
+
+    // Start with default bridge network.
+    let mut result = vec![NetworkSummary {
         name: "bridge".to_string(),
         id: "bridge".to_string(),
         created: chrono::Utc::now().to_rfc3339(),
@@ -523,36 +805,105 @@ pub async fn list_networks(
         attachable: false,
         ingress: false,
         labels: HashMap::new(),
-    }]))
+    }];
+
+    // Add user-created networks.
+    result.extend(networks.into_iter().map(|n| NetworkSummary {
+        name: n.name,
+        id: n.id,
+        created: n.created.to_rfc3339(),
+        scope: n.scope,
+        driver: n.driver,
+        enable_ipv6: false,
+        internal: n.internal,
+        attachable: n.attachable,
+        ingress: false,
+        labels: n.labels,
+    }));
+
+    Ok(Json(result))
 }
 
 /// Create network.
 pub async fn create_network(
+    State(state): State<AppState>,
     Json(body): Json<NetworkCreateRequest>,
 ) -> Result<(StatusCode, Json<NetworkCreateResponse>)> {
-    let _ = body;
+    let id = state
+        .runtime
+        .network_manager()
+        .create_network(
+            &body.name,
+            body.driver.as_deref(),
+            body.labels.unwrap_or_default(),
+        )
+        .map_err(|e| DockerError::Server(e.to_string()))?;
 
-    // TODO: Create network via arcbox-core
     Ok((
         StatusCode::CREATED,
-        Json(NetworkCreateResponse {
-            id: uuid::Uuid::new_v4().to_string().replace('-', ""),
-            warning: None,
-        }),
+        Json(NetworkCreateResponse { id, warning: None }),
     ))
 }
 
 /// Inspect network.
-pub async fn inspect_network(Path(id): Path<String>) -> Result<Json<NetworkSummary>> {
-    // TODO: Get network from arcbox-core
-    Err(DockerError::NetworkNotFound(id))
+pub async fn inspect_network(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<NetworkSummary>> {
+    // Check for default bridge network.
+    if id == "bridge" {
+        return Ok(Json(NetworkSummary {
+            name: "bridge".to_string(),
+            id: "bridge".to_string(),
+            created: chrono::Utc::now().to_rfc3339(),
+            scope: "local".to_string(),
+            driver: "bridge".to_string(),
+            enable_ipv6: false,
+            internal: false,
+            attachable: false,
+            ingress: false,
+            labels: HashMap::new(),
+        }));
+    }
+
+    let network = state
+        .runtime
+        .network_manager()
+        .get_network(&id)
+        .ok_or_else(|| DockerError::NetworkNotFound(id))?;
+
+    Ok(Json(NetworkSummary {
+        name: network.name,
+        id: network.id,
+        created: network.created.to_rfc3339(),
+        scope: network.scope,
+        driver: network.driver,
+        enable_ipv6: false,
+        internal: network.internal,
+        attachable: network.attachable,
+        ingress: false,
+        labels: network.labels,
+    }))
 }
 
 /// Remove network.
-pub async fn remove_network(Path(id): Path<String>) -> Result<StatusCode> {
-    let _ = id;
+pub async fn remove_network(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
+    // Cannot remove default bridge network.
+    if id == "bridge" {
+        return Err(DockerError::Conflict(
+            "cannot remove default bridge network".to_string(),
+        ));
+    }
 
-    // TODO: Remove network via arcbox-core
+    state
+        .runtime
+        .network_manager()
+        .remove_network(&id)
+        .map_err(|_| DockerError::NetworkNotFound(id))?;
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -562,32 +913,62 @@ pub async fn remove_network(Path(id): Path<String>) -> Result<StatusCode> {
 
 /// List volumes.
 pub async fn list_volumes(
+    State(state): State<AppState>,
     Query(_params): Query<HashMap<String, String>>,
 ) -> Result<Json<VolumeListResponse>> {
-    // TODO: Get volumes from arcbox-core
+    let vm = state
+        .runtime
+        .volume_manager()
+        .read()
+        .map_err(|_| DockerError::Server("lock poisoned".to_string()))?;
+
+    let volumes = vm
+        .list()
+        .iter()
+        .map(|v| VolumeSummary {
+            name: v.name.clone(),
+            driver: v.driver.clone(),
+            mountpoint: v.mountpoint.display().to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            labels: v.labels.clone(),
+            scope: "local".to_string(),
+            options: HashMap::new(),
+        })
+        .collect();
+
     Ok(Json(VolumeListResponse {
-        volumes: vec![],
+        volumes,
         warnings: vec![],
     }))
 }
 
 /// Create volume.
 pub async fn create_volume(
+    State(state): State<AppState>,
     Json(body): Json<VolumeCreateRequest>,
 ) -> Result<(StatusCode, Json<VolumeSummary>)> {
     let name = body
         .name
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace('-', ""));
 
-    // TODO: Create volume via arcbox-core
+    let mut vm = state
+        .runtime
+        .volume_manager()
+        .write()
+        .map_err(|_| DockerError::Server("lock poisoned".to_string()))?;
+
+    let volume = vm
+        .create(&name)
+        .map_err(|e| DockerError::Server(e.to_string()))?;
+
     Ok((
         StatusCode::CREATED,
         Json(VolumeSummary {
-            name,
-            driver: body.driver.unwrap_or_else(|| "local".to_string()),
-            mountpoint: String::new(),
+            name: volume.name.clone(),
+            driver: volume.driver.clone(),
+            mountpoint: volume.mountpoint.display().to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
-            labels: body.labels.unwrap_or_default(),
+            labels: volume.labels.clone(),
             scope: "local".to_string(),
             options: body.driver_opts.unwrap_or_default(),
         }),
@@ -595,19 +976,51 @@ pub async fn create_volume(
 }
 
 /// Inspect volume.
-pub async fn inspect_volume(Path(name): Path<String>) -> Result<Json<VolumeSummary>> {
-    // TODO: Get volume from arcbox-core
-    Err(DockerError::VolumeNotFound(name))
+pub async fn inspect_volume(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<VolumeSummary>> {
+    let vm = state
+        .runtime
+        .volume_manager()
+        .read()
+        .map_err(|_| DockerError::Server("lock poisoned".to_string()))?;
+
+    let volume = vm
+        .get(&name)
+        .ok_or_else(|| DockerError::VolumeNotFound(name.clone()))?;
+
+    Ok(Json(VolumeSummary {
+        name: volume.name.clone(),
+        driver: volume.driver.clone(),
+        mountpoint: volume.mountpoint.display().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        labels: volume.labels.clone(),
+        scope: "local".to_string(),
+        options: HashMap::new(),
+    }))
 }
 
 /// Remove volume.
 pub async fn remove_volume(
+    State(state): State<AppState>,
     Path(name): Path<String>,
     Query(_params): Query<HashMap<String, String>>,
 ) -> Result<StatusCode> {
-    let _ = name;
+    let mut vm = state
+        .runtime
+        .volume_manager()
+        .write()
+        .map_err(|_| DockerError::Server("lock poisoned".to_string()))?;
 
-    // TODO: Remove volume via arcbox-core
+    // Check if volume exists first.
+    if vm.get(&name).is_none() {
+        return Err(DockerError::VolumeNotFound(name));
+    }
+
+    vm.remove(&name)
+        .map_err(|e| DockerError::Server(e.to_string()))?;
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -677,8 +1090,9 @@ fn num_cpus() -> i64 {
 }
 
 fn total_memory() -> i64 {
-    // TODO: Get actual memory using sysinfo or similar
-    8 * 1024 * 1024 * 1024 // 8GB default
+    use sysinfo::System;
+    let sys = System::new_all();
+    sys.total_memory() as i64
 }
 
 fn hostname() -> String {

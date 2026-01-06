@@ -31,6 +31,10 @@ pub enum DockerError {
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
 
+    /// Bad request.
+    #[error("Bad request: {0}")]
+    BadRequest(String),
+
     /// Conflict (e.g., container already exists).
     #[error("Conflict: {0}")]
     Conflict(String),
@@ -57,7 +61,7 @@ impl DockerError {
             | Self::ImageNotFound(_)
             | Self::VolumeNotFound(_)
             | Self::NetworkNotFound(_) => StatusCode::NOT_FOUND,
-            Self::InvalidParameter(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidParameter(_) | Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Server(_) | Self::Context(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,

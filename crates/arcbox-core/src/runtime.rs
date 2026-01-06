@@ -6,9 +6,10 @@ use crate::error::Result;
 use crate::event::EventBus;
 use crate::machine::MachineManager;
 use crate::vm::VmManager;
-use arcbox_container::ContainerManager;
+use arcbox_container::{ContainerManager, ExecManager, VolumeManager};
 use arcbox_image::ImageStore;
-use std::sync::Arc;
+use arcbox_net::NetworkManager;
+use std::sync::{Arc, RwLock};
 
 /// ArcBox runtime.
 ///
@@ -26,6 +27,12 @@ pub struct Runtime {
     container_manager: Arc<ContainerManager>,
     /// Image store.
     image_store: Arc<ImageStore>,
+    /// Volume manager.
+    volume_manager: Arc<RwLock<VolumeManager>>,
+    /// Network manager.
+    network_manager: Arc<NetworkManager>,
+    /// Exec manager.
+    exec_manager: Arc<ExecManager>,
     /// Agent connection pool.
     agent_pool: Arc<AgentPool>,
 }
@@ -42,6 +49,11 @@ impl Runtime {
         let machine_manager = Arc::new(MachineManager::new(VmManager::new(), config.data_dir.clone()));
         let container_manager = Arc::new(ContainerManager::new());
         let image_store = Arc::new(ImageStore::new(config.data_dir.join("images"))?);
+        let volume_manager = Arc::new(RwLock::new(VolumeManager::new(
+            config.data_dir.join("volumes"),
+        )));
+        let network_manager = Arc::new(NetworkManager::new(arcbox_net::NetConfig::default()));
+        let exec_manager = Arc::new(ExecManager::new());
         let agent_pool = Arc::new(AgentPool::new());
 
         Ok(Self {
@@ -51,6 +63,9 @@ impl Runtime {
             machine_manager,
             container_manager,
             image_store,
+            volume_manager,
+            network_manager,
+            exec_manager,
             agent_pool,
         })
     }
@@ -89,6 +104,24 @@ impl Runtime {
     #[must_use]
     pub fn image_store(&self) -> &Arc<ImageStore> {
         &self.image_store
+    }
+
+    /// Returns the volume manager.
+    #[must_use]
+    pub fn volume_manager(&self) -> &Arc<RwLock<VolumeManager>> {
+        &self.volume_manager
+    }
+
+    /// Returns the network manager.
+    #[must_use]
+    pub fn network_manager(&self) -> &Arc<NetworkManager> {
+        &self.network_manager
+    }
+
+    /// Returns the exec manager.
+    #[must_use]
+    pub fn exec_manager(&self) -> &Arc<ExecManager> {
+        &self.exec_manager
     }
 
     /// Returns the agent connection pool.

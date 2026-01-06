@@ -290,6 +290,41 @@ impl ImageStore {
         Ok(())
     }
 
+    /// Tags an existing image with a new reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source image doesn't exist or tagging fails.
+    pub fn tag(&self, source: &ImageRef, target: &ImageRef) -> Result<()> {
+        let source_image = self
+            .get(source)
+            .ok_or_else(|| ImageError::NotFound(source.full_name()))?;
+
+        let new_image = LocalImage {
+            reference: target.clone(),
+            id: source_image.id.clone(),
+            created: chrono::Utc::now(),
+            size: source_image.size,
+        };
+
+        {
+            let mut images = self
+                .images
+                .write()
+                .map_err(|_| ImageError::Storage("lock poisoned".to_string()))?;
+            images.insert(target.full_name(), new_image);
+        }
+
+        self.save_index()?;
+
+        info!(
+            source = %source,
+            target = %target,
+            "tagged image"
+        );
+        Ok(())
+    }
+
     /// Loads the image index from disk.
     fn load_index(base_dir: &Path) -> Result<HashMap<String, LocalImage>> {
         let index_path = base_dir.join("index.json");
