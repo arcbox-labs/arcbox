@@ -382,6 +382,52 @@ impl DarwinVm {
         }).filter(|s| !s.is_empty())
     }
 
+    /// Connects to a vsock port on the guest.
+    ///
+    /// This establishes a vsock connection to the specified port number
+    /// on the guest VM. The VM must be running and have a vsock device
+    /// configured.
+    ///
+    /// # Arguments
+    /// * `port` - The port number to connect to (e.g., 1024 for agent)
+    ///
+    /// # Returns
+    /// A file descriptor for the connection that can be used for I/O.
+    ///
+    /// # Errors
+    /// Returns an error if the VM is not running, no vsock device is
+    /// configured, or the connection fails.
+    pub fn connect_vsock(&self, port: u32) -> Result<std::os::unix::io::RawFd, HypervisorError> {
+        // Check VM is running
+        let state = self.state();
+        if state != VmState::Running {
+            return Err(HypervisorError::InvalidState {
+                expected: "Running".to_string(),
+                actual: format!("{:?}", state),
+            });
+        }
+
+        // Get the VZ VM's socket device
+        let vz_vm = self.vz_vm.as_ref().ok_or_else(|| {
+            HypervisorError::VmError("No VZ VM instance".to_string())
+        })?;
+
+        let socket_device = ffi::vm_first_socket_device(vz_vm.as_ptr()).ok_or_else(|| {
+            HypervisorError::DeviceError("No vsock device configured".to_string())
+        })?;
+
+        // Connect to the port
+        tracing::debug!("Connecting to vsock port {} on VM {}", port, self.id);
+
+        let fd = ffi::vsock_connect_to_port(socket_device, port).map_err(|e| {
+            HypervisorError::DeviceError(format!("vsock connect failed: {}", e))
+        })?;
+
+        tracing::debug!("Connected to vsock port {}, fd={}", port, fd);
+
+        Ok(fd)
+    }
+
     /// Returns the VM ID.
     #[must_use]
     pub fn id(&self) -> u64 {

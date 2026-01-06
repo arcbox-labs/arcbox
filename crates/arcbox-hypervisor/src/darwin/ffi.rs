@@ -1524,6 +1524,242 @@ pub fn free_memory(ptr: *mut u8, size: u64) {
 }
 
 // ============================================================================
+// Vsock Support
+// ============================================================================
+
+/// Gets the socket devices from a running VM.
+///
+/// Returns an NSArray of VZVirtioSocketDevice objects.
+pub fn vm_socket_devices(vm: *mut AnyObject) -> *mut AnyObject {
+    if vm.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { msg_send!(vm, socketDevices) }
+}
+
+/// Represents a vsock connection result.
+pub struct VsockConnectionResult {
+    /// The file descriptor for the connection, or -1 on error.
+    pub fd: i32,
+    /// Error message if connection failed.
+    pub error: Option<String>,
+}
+
+/// Global state for vsock connection completion.
+/// This is used because Objective-C blocks with captured Rust state are complex.
+static VSOCK_CONN_RESULT: std::sync::OnceLock<std::sync::Mutex<Option<VsockConnectionResult>>> =
+    std::sync::OnceLock::new();
+static VSOCK_CONN_CONDVAR: std::sync::OnceLock<std::sync::Condvar> = std::sync::OnceLock::new();
+
+/// Connects to a port on a vsock device.
+///
+/// This is an async operation that uses a completion handler.
+/// The function blocks until the connection completes or fails.
+///
+/// # Arguments
+/// * `socket_device` - The VZVirtioSocketDevice to connect through
+/// * `port` - The port number to connect to
+///
+/// # Returns
+/// The file descriptor for the connection, or an error.
+///
+/// # Safety
+/// This function is NOT thread-safe for concurrent vsock connections.
+/// Only one vsock connection should be made at a time.
+pub fn vsock_connect_to_port(socket_device: *mut AnyObject, port: u32) -> VZResult<i32> {
+    if socket_device.is_null() {
+        return Err(VZError {
+            code: -1,
+            message: "socket_device is null".to_string(),
+        });
+    }
+
+    // Initialize globals
+    let result_mutex = VSOCK_CONN_RESULT.get_or_init(|| std::sync::Mutex::new(None));
+    let condvar = VSOCK_CONN_CONDVAR.get_or_init(|| std::sync::Condvar::new());
+
+    // Clear previous result
+    {
+        let mut guard = result_mutex.lock().unwrap();
+        *guard = None;
+    }
+
+    // Block layout for void (^)(VZVirtioSocketConnection *, NSError *)
+    #[repr(C)]
+    struct VsockCompletionBlock {
+        isa: *const c_void,
+        flags: i32,
+        reserved: i32,
+        invoke: unsafe extern "C" fn(*const c_void, *mut AnyObject, *mut AnyObject),
+        descriptor: *const BlockDescriptor,
+    }
+
+    #[repr(C)]
+    struct BlockDescriptor {
+        reserved: u64,
+        size: u64,
+    }
+
+    unsafe extern "C" fn vsock_completion_handler(
+        _block: *const c_void,
+        connection: *mut AnyObject,
+        error: *mut AnyObject,
+    ) {
+        let conn_result = unsafe {
+            if !error.is_null() {
+                let description: *mut AnyObject = msg_send!(error, localizedDescription);
+                let error_msg = if !description.is_null() {
+                    nsstring_to_string(description)
+                } else {
+                    "Unknown error".to_string()
+                };
+                VsockConnectionResult {
+                    fd: -1,
+                    error: Some(error_msg),
+                }
+            } else if !connection.is_null() {
+                let fd: i32 = msg_send_i32!(connection, fileDescriptor);
+                VsockConnectionResult { fd, error: None }
+            } else {
+                VsockConnectionResult {
+                    fd: -1,
+                    error: Some("Connection is null".to_string()),
+                }
+            }
+        };
+
+        // Store result and signal
+        if let Some(mutex) = VSOCK_CONN_RESULT.get() {
+            if let Ok(mut guard) = mutex.lock() {
+                *guard = Some(conn_result);
+            }
+        }
+        if let Some(cv) = VSOCK_CONN_CONDVAR.get() {
+            cv.notify_one();
+        }
+    }
+
+    unsafe extern "C" {
+        static _NSConcreteStackBlock: *const c_void;
+        fn _Block_copy(block: *const c_void) -> *const c_void;
+    }
+
+    struct BlockPtr(*const c_void);
+    unsafe impl Send for BlockPtr {}
+    unsafe impl Sync for BlockPtr {}
+
+    // Create and copy the block
+    static VSOCK_BLOCK_PTR: std::sync::OnceLock<BlockPtr> = std::sync::OnceLock::new();
+
+    let block_ptr = VSOCK_BLOCK_PTR.get_or_init(|| unsafe {
+        static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+            reserved: 0,
+            size: 40,
+        };
+
+        let stack_block = VsockCompletionBlock {
+            isa: _NSConcreteStackBlock,
+            flags: 0,
+            reserved: 0,
+            invoke: vsock_completion_handler,
+            descriptor: &DESCRIPTOR,
+        };
+
+        let heap_block = _Block_copy(&stack_block as *const VsockCompletionBlock as *const c_void);
+        BlockPtr(heap_block)
+    });
+
+    unsafe {
+        // Call connectToPort:completionHandler:
+        let sel = sel!(connectToPort:completionHandler:);
+        let func: unsafe extern "C" fn(*mut AnyObject, Sel, u32, *const c_void) =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        func(socket_device, sel, port, block_ptr.0);
+
+        // Wait for completion with timeout, running the run loop to process callbacks
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(10);
+
+        loop {
+            // Run the run loop briefly to allow the completion handler to be called
+            cf_run_loop_run_in_mode(0.1, true);
+
+            // Check if we have a result
+            let guard = result_mutex.lock().unwrap();
+            if guard.is_some() {
+                // We have a result
+                match &*guard {
+                    Some(conn_result) => {
+                        if let Some(ref err) = conn_result.error {
+                            return Err(VZError {
+                                code: -1,
+                                message: err.clone(),
+                            });
+                        } else if conn_result.fd >= 0 {
+                            return Ok(conn_result.fd);
+                        } else {
+                            return Err(VZError {
+                                code: -1,
+                                message: "Invalid file descriptor".to_string(),
+                            });
+                        }
+                    }
+                    None => unreachable!(),
+                }
+            }
+            drop(guard);
+
+            // Check timeout
+            if start.elapsed() > timeout {
+                return Err(VZError {
+                    code: -1,
+                    message: "Connection timed out".to_string(),
+                });
+            }
+        }
+    }
+}
+
+/// Gets the first socket device from a VM, if any.
+pub fn vm_first_socket_device(vm: *mut AnyObject) -> Option<*mut AnyObject> {
+    let devices = vm_socket_devices(vm);
+    if devices.is_null() {
+        return None;
+    }
+
+    unsafe {
+        let count: usize = msg_send_u64!(devices, count) as usize;
+        if count == 0 {
+            return None;
+        }
+
+        // Use specific function for objectAtIndex: which takes NSUInteger
+        let sel = sel!(objectAtIndex:);
+        let func: unsafe extern "C" fn(*const AnyObject, Sel, usize) -> *mut AnyObject =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        let device = func(devices as *const AnyObject, sel, 0usize);
+
+        if device.is_null() {
+            None
+        } else {
+            Some(device)
+        }
+    }
+}
+
+/// Sends a message returning an i32.
+macro_rules! msg_send_i32 {
+    ($obj:expr, $sel:ident) => {{
+        let sel = sel!($sel);
+        let func: unsafe extern "C" fn(*const AnyObject, Sel) -> i32 =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        func($obj as *const _ as *const AnyObject, sel)
+    }};
+}
+
+pub(crate) use msg_send_i32;
+
+// ============================================================================
 // Tests
 // ============================================================================
 
