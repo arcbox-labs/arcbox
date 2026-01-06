@@ -79,4 +79,8 @@ pub enum NetError {
     /// Checksum error.
     #[error("checksum error: {0}")]
     Checksum(String),
+
+    /// mDNS error.
+    #[error("mDNS error: {0}")]
+    Mdns(String),
 }

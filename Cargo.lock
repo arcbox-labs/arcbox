@@ -259,6 +259,7 @@ dependencies = [
  "ipnetwork",
  "libc",
  "nix",
+ "socket2 0.5.10",
  "thiserror",
  "tokio",
  "tracing",
