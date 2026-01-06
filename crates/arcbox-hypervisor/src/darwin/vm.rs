@@ -67,8 +67,8 @@ pub struct DarwinVm {
     storage_devices: Vec<*mut AnyObject>,
     /// Network devices.
     network_devices: Vec<*mut AnyObject>,
-    /// Console device.
-    console_device: Option<*mut AnyObject>,
+    /// Serial port configuration (for serialPorts).
+    serial_port: Option<*mut AnyObject>,
     /// Serial port file descriptors (read, write).
     serial_fds: Option<(RawFd, RawFd)>,
 }
@@ -152,71 +152,63 @@ impl DarwinVm {
             dispatch_queue,
             storage_devices: Vec::new(),
             network_devices: Vec::new(),
-            console_device: None,
+            serial_port: None,
             serial_fds: None,
         })
     }
 
-    /// Configures a serial console using PTY.
+    /// Configures a serial console using pipes.
     ///
-    /// Returns the path to the slave PTY device that can be used to connect.
+    /// Returns "pipe" on success. Use `read_console_output()` to read output.
+    /// Note: Console output may not work with all Linux kernels. Virtio console
+    /// driver must be properly configured in the guest kernel.
     pub fn setup_serial_console(&mut self) -> Result<String, HypervisorError> {
-        // Create a PTY pair
-        let mut master_fd: libc::c_int = 0;
-        let mut slave_fd: libc::c_int = 0;
+        // Create two pipes: one for input to VM, one for output from VM
+        // input_pipe: we write to [1], VM reads from [0]
+        // output_pipe: VM writes to [1], we read from [0]
+        let mut input_pipe: [libc::c_int; 2] = [0, 0];
+        let mut output_pipe: [libc::c_int; 2] = [0, 0];
 
         unsafe {
-            let mut slave_name = [0u8; 256];
-            let ret = libc::openpty(
-                &mut master_fd,
-                &mut slave_fd,
-                slave_name.as_mut_ptr() as *mut i8,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
-            if ret != 0 {
+            if libc::pipe(input_pipe.as_mut_ptr()) != 0 {
                 return Err(HypervisorError::DeviceError(
-                    "Failed to create PTY".to_string(),
+                    "Failed to create input pipe".to_string(),
+                ));
+            }
+            if libc::pipe(output_pipe.as_mut_ptr()) != 0 {
+                libc::close(input_pipe[0]);
+                libc::close(input_pipe[1]);
+                return Err(HypervisorError::DeviceError(
+                    "Failed to create output pipe".to_string(),
                 ));
             }
 
-            let slave_path = std::ffi::CStr::from_ptr(slave_name.as_ptr() as *const i8)
-                .to_string_lossy()
-                .into_owned();
+            // Store FDs: (read_from_vm, write_to_vm)
+            // read_from_vm = output_pipe[0] (we read VM output)
+            // write_to_vm = input_pipe[1] (we send input to VM)
+            self.serial_fds = Some((output_pipe[0], input_pipe[1]));
 
-            // Store FDs for later use
-            self.serial_fds = Some((master_fd, master_fd)); // Use master for both read/write
+            tracing::info!("Created serial console pipes: input={}/{}, output={}/{}",
+                input_pipe[0], input_pipe[1], output_pipe[0], output_pipe[1]);
 
-            tracing::info!("Created serial console at {}", slave_path);
-
-            // Create serial port attachment with file handles for the PTY master
-            let read_handle = ffi::create_file_handle_for_reading(master_fd)
+            // Create serial port attachment
+            // fileHandleForReading: VZ reads input to send to guest (from input_pipe[0])
+            // fileHandleForWriting: VZ writes guest output (to output_pipe[1])
+            let read_handle = ffi::create_file_handle_for_reading(input_pipe[0])
                 .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-            let write_handle = ffi::create_file_handle_for_reading(master_fd)
+            let write_handle = ffi::create_file_handle_for_reading(output_pipe[1])
                 .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
             let attachment = ffi::create_serial_port_attachment(read_handle, write_handle)
                 .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
 
-            // Create and configure console port
-            let port = ffi::create_console_port_configuration()
+            // Use VZVirtioConsoleDeviceSerialPortConfiguration with serialPorts
+            let serial_port = ffi::create_virtio_serial_port_configuration(attachment)
                 .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-            ffi::set_console_port_attachment(port, attachment);
-            ffi::set_console_port_name(port, "console");
-            ffi::set_console_port_is_console(port, true);
 
-            // Create console device and set ports
-            // VZVirtioConsoleDeviceConfiguration.ports is a special array class,
-            // not a standard NSArray. We need to use its specific API.
-            let console = ffi::create_console_device()
-                .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-            let ports_array = ffi::get_console_device_ports(console);
-            ffi::set_ports_array_max_count(ports_array, 1);
-            ffi::set_port_at_index(ports_array, port, 0);
+            self.serial_port = Some(serial_port);
+            tracing::debug!("Serial port configured (will be added to serialPorts)");
 
-            self.console_device = Some(console);
-            tracing::debug!("Console device configured");
-
-            Ok(slave_path)
+            Ok("pipe".to_string())
         }
     }
 
@@ -236,9 +228,10 @@ impl DarwinVm {
             vz_config.set_network_devices(&self.network_devices);
         }
 
-        // Set console device
-        if let Some(console) = self.console_device {
-            vz_config.set_console_devices(&[console]);
+        // Set serial ports (appears as hvc0 in guest)
+        if let Some(serial_port) = self.serial_port {
+            vz_config.set_serial_ports(&[serial_port]);
+            tracing::debug!("Added serial port to configuration");
         }
 
         // Validate configuration
@@ -301,37 +294,69 @@ impl DarwinVm {
     /// This is a non-blocking read that returns whatever data is currently
     /// available in the PTY buffer.
     pub fn read_console_output(&self) -> Result<String, HypervisorError> {
-        let (master_fd, _) = self.serial_fds.ok_or_else(|| {
+        let (read_fd, _) = self.serial_fds.ok_or_else(|| {
             HypervisorError::DeviceError("Console not configured".to_string())
         })?;
 
-        // Set non-blocking mode for the read
+        tracing::debug!("read_console_output called, fd={}", read_fd);
+
+        // Check if fd is valid
         unsafe {
-            let flags = libc::fcntl(master_fd, libc::F_GETFL);
-            libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            let flags = libc::fcntl(read_fd, libc::F_GETFL);
+            if flags == -1 {
+                let errno = *libc::__error();
+                tracing::warn!("fcntl F_GETFL failed on fd {}: errno={}", read_fd, errno);
+                return Ok(String::new());
+            }
+
+            // Use poll to check if data is available
+            let mut pfd = libc::pollfd {
+                fd: read_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let poll_result = libc::poll(&mut pfd, 1, 0);
+            tracing::debug!("poll on fd {}: result={}, revents={:#x}", read_fd, poll_result, pfd.revents);
+
+            // Set non-blocking mode for the read
+            libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
 
             let mut buffer = vec![0u8; 4096];
             let mut output = String::new();
+            let mut total_bytes = 0isize;
 
             loop {
                 let bytes_read = libc::read(
-                    master_fd,
+                    read_fd,
                     buffer.as_mut_ptr() as *mut libc::c_void,
                     buffer.len(),
                 );
 
                 if bytes_read > 0 {
+                    total_bytes += bytes_read;
                     if let Ok(s) = std::str::from_utf8(&buffer[..bytes_read as usize]) {
                         output.push_str(s);
                     }
+                } else if bytes_read == 0 {
+                    // EOF
+                    break;
                 } else {
-                    // No more data available (EAGAIN/EWOULDBLOCK) or error
+                    // Error - check if it's EAGAIN/EWOULDBLOCK
+                    let errno = *libc::__error();
+                    if errno != libc::EAGAIN && errno != libc::EWOULDBLOCK {
+                        tracing::warn!("Console read error on fd {}: errno={}", read_fd, errno);
+                    }
                     break;
                 }
             }
 
+            // Log if we read any data
+            if total_bytes > 0 {
+                tracing::debug!("Read {} bytes from console fd {}", total_bytes, read_fd);
+            }
+
             // Restore blocking mode
-            libc::fcntl(master_fd, libc::F_SETFL, flags);
+            libc::fcntl(read_fd, libc::F_SETFL, flags);
 
             Ok(output)
         }
@@ -419,7 +444,7 @@ impl DarwinVm {
         // Connect to the port
         tracing::debug!("Connecting to vsock port {} on VM {}", port, self.id);
 
-        let fd = ffi::vsock_connect_to_port(socket_device, port).map_err(|e| {
+        let fd = ffi::vsock_connect_to_port(socket_device, self.dispatch_queue, port).map_err(|e| {
             HypervisorError::DeviceError(format!("vsock connect failed: {}", e))
         })?;
 
