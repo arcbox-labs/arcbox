@@ -1,0 +1,257 @@
+// Image service protocol definitions.
+//
+// This service handles container image operations.
+//
+// Design sources:
+// - internal-docs/architecture/cli-api.md (proto/image.proto section)
+// - Docker Engine API v1.43 Images endpoints
+// - OCI Distribution Specification for registry operations
+
+syntax = "proto3";
+
+package arcbox.image;
+
+import "common.proto";
+
+// ImageService manages container images.
+service ImageService {
+    // Pulls an image from a registry.
+    rpc Pull(PullImageRequest) returns (stream PullProgress);
+
+    // Pushes an image to a registry.
+    rpc Push(PushImageRequest) returns (stream PushProgress);
+
+    // Lists images.
+    rpc List(ListImagesRequest) returns (ListImagesResponse);
+
+    // Inspects an image.
+    rpc Inspect(InspectImageRequest) returns (ImageInfo);
+
+    // Removes an image.
+    rpc Remove(RemoveImageRequest) returns (RemoveImageResponse);
+
+    // Tags an image.
+    rpc Tag(TagImageRequest) returns (arcbox.common.Empty);
+
+    // Builds an image from a Dockerfile.
+    rpc Build(stream BuildContext) returns (stream BuildProgress);
+
+    // Checks if an image exists locally.
+    rpc Exists(ExistsImageRequest) returns (ExistsImageResponse);
+}
+
+// Request to pull an image.
+message PullImageRequest {
+    // Image reference (e.g., "ubuntu:22.04", "docker.io/library/nginx:latest").
+    string reference = 1;
+    // Registry authentication (base64-encoded JSON).
+    string auth = 2;
+    // Platform to pull (e.g., "linux/arm64").
+    string platform = 3;
+}
+
+// Progress update during pull.
+message PullProgress {
+    // Layer ID or digest.
+    string id = 1;
+    // Status message.
+    string status = 2;
+    // Progress detail.
+    string progress = 3;
+    // Bytes downloaded.
+    int64 current = 4;
+    // Total bytes.
+    int64 total = 5;
+}
+
+// Request to push an image.
+message PushImageRequest {
+    // Image reference to push.
+    string reference = 1;
+    // Registry authentication.
+    string auth = 2;
+}
+
+// Progress update during push.
+message PushProgress {
+    // Layer ID.
+    string id = 1;
+    // Status message.
+    string status = 2;
+    // Progress detail.
+    string progress = 3;
+    // Bytes uploaded.
+    int64 current = 4;
+    // Total bytes.
+    int64 total = 5;
+}
+
+// Request to list images.
+message ListImagesRequest {
+    // Show all images (including intermediate layers).
+    bool all = 1;
+    // Filters as JSON-encoded map.
+    string filters = 2;
+    // Show digests.
+    bool digests = 3;
+}
+
+// Response to list images.
+message ListImagesResponse {
+    // List of images.
+    repeated ImageSummary images = 1;
+}
+
+// Summary information about an image.
+message ImageSummary {
+    // Image ID.
+    string id = 1;
+    // Repository tags.
+    repeated string repo_tags = 2;
+    // Repository digests.
+    repeated string repo_digests = 3;
+    // Creation timestamp.
+    int64 created = 4;
+    // Image size in bytes.
+    int64 size = 5;
+    // Virtual size in bytes.
+    int64 virtual_size = 6;
+    // Number of containers using this image.
+    int64 containers = 7;
+    // Labels.
+    map<string, string> labels = 8;
+}
+
+// Request to inspect an image.
+message InspectImageRequest {
+    // Image ID or reference.
+    string id = 1;
+}
+
+// Detailed image information.
+message ImageInfo {
+    // Image ID.
+    string id = 1;
+    // Repository tags.
+    repeated string repo_tags = 2;
+    // Repository digests.
+    repeated string repo_digests = 3;
+    // Parent image ID.
+    string parent = 4;
+    // Comment.
+    string comment = 5;
+    // Creation timestamp.
+    string created = 6;
+    // Author.
+    string author = 7;
+    // Architecture.
+    string architecture = 8;
+    // OS.
+    string os = 9;
+    // OS version.
+    string os_version = 10;
+    // Image size in bytes.
+    int64 size = 11;
+    // Virtual size in bytes.
+    int64 virtual_size = 12;
+    // Container configuration.
+    ImageConfig config = 13;
+    // Root filesystem.
+    RootFS root_fs = 14;
+}
+
+// Image configuration.
+message ImageConfig {
+    // Hostname.
+    string hostname = 1;
+    // Domain name.
+    string domainname = 2;
+    // User.
+    string user = 3;
+    // Environment variables.
+    repeated string env = 4;
+    // Command.
+    repeated string cmd = 5;
+    // Entrypoint.
+    repeated string entrypoint = 6;
+    // Working directory.
+    string working_dir = 7;
+    // Labels.
+    map<string, string> labels = 8;
+    // Exposed ports.
+    map<string, arcbox.common.Empty> exposed_ports = 9;
+    // Volumes.
+    map<string, arcbox.common.Empty> volumes = 10;
+}
+
+// Root filesystem information.
+message RootFS {
+    // Type (usually "layers").
+    string type = 1;
+    // Layer digests.
+    repeated string layers = 2;
+}
+
+// Request to remove an image.
+message RemoveImageRequest {
+    // Image ID or reference.
+    string id = 1;
+    // Force removal.
+    bool force = 2;
+    // Remove untagged parents.
+    bool prune_parents = 3;
+}
+
+// Response to remove image.
+message RemoveImageResponse {
+    // Deleted image IDs.
+    repeated string deleted = 1;
+    // Untagged references.
+    repeated string untagged = 2;
+}
+
+// Request to tag an image.
+message TagImageRequest {
+    // Source image ID or reference.
+    string source = 1;
+    // Target repository.
+    string repo = 2;
+    // Target tag.
+    string tag = 3;
+}
+
+// Build context chunk.
+message BuildContext {
+    // Tar archive chunk.
+    bytes data = 1;
+    // Is this the last chunk.
+    bool eof = 2;
+}
+
+// Progress update during build.
+message BuildProgress {
+    // Stream type.
+    string stream = 1;
+    // Status message.
+    string status = 2;
+    // Progress detail.
+    string progress = 3;
+    // Error message.
+    string error = 4;
+    // Aux data (image ID on success).
+    string aux = 5;
+}
+
+// Request to check if an image exists.
+message ExistsImageRequest {
+    // Image reference.
+    string reference = 1;
+}
+
+// Response to exists check.
+message ExistsImageResponse {
+    // Whether the image exists.
+    bool exists = 1;
+    // Image ID if exists.
+    string id = 2;
+}

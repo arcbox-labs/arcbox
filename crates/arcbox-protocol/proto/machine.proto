@@ -1,0 +1,255 @@
+// Machine service protocol definitions.
+//
+// This service manages virtual machines.
+//
+// Design sources:
+// - internal-docs/architecture/cli-api.md (MachineCommands section)
+// - OrbStack's machine management API (conceptual reference)
+// - Lima VM management interface patterns
+
+syntax = "proto3";
+
+package arcbox.machine;
+
+import "common.proto";
+
+// MachineService manages virtual machines.
+service MachineService {
+    // Creates a new virtual machine.
+    rpc Create(CreateMachineRequest) returns (CreateMachineResponse);
+
+    // Starts a stopped machine.
+    rpc Start(StartMachineRequest) returns (arcbox.common.Empty);
+
+    // Stops a running machine.
+    rpc Stop(StopMachineRequest) returns (arcbox.common.Empty);
+
+    // Removes a machine.
+    rpc Remove(RemoveMachineRequest) returns (arcbox.common.Empty);
+
+    // Lists machines.
+    rpc List(ListMachinesRequest) returns (ListMachinesResponse);
+
+    // Inspects a machine.
+    rpc Inspect(InspectMachineRequest) returns (MachineInfo);
+
+    // Executes a command in a machine.
+    rpc Exec(MachineExecRequest) returns (stream MachineExecOutput);
+
+    // Gets the SSH connection info.
+    rpc SSHInfo(SSHInfoRequest) returns (SSHInfoResponse);
+}
+
+// Request to create a machine.
+message CreateMachineRequest {
+    // Machine name.
+    string name = 1;
+    // Number of CPUs.
+    uint32 cpus = 2;
+    // Memory in bytes.
+    uint64 memory = 3;
+    // Disk size in bytes.
+    uint64 disk_size = 4;
+    // Linux distribution (e.g., "ubuntu", "alpine").
+    string distro = 5;
+    // Version of the distribution.
+    string version = 6;
+    // Architecture (e.g., "aarch64", "x86_64").
+    string arch = 7;
+    // Directory mounts.
+    repeated DirectoryMount mounts = 8;
+    // SSH public key.
+    string ssh_public_key = 9;
+}
+
+// Directory mount configuration.
+message DirectoryMount {
+    // Host directory path.
+    string host_path = 1;
+    // Guest mount point.
+    string guest_path = 2;
+    // Read-only flag.
+    bool readonly = 3;
+}
+
+// Response to create machine.
+message CreateMachineResponse {
+    // Machine ID.
+    string id = 1;
+}
+
+// Request to start a machine.
+message StartMachineRequest {
+    // Machine ID or name.
+    string id = 1;
+}
+
+// Request to stop a machine.
+message StopMachineRequest {
+    // Machine ID or name.
+    string id = 1;
+    // Force stop.
+    bool force = 2;
+}
+
+// Request to remove a machine.
+message RemoveMachineRequest {
+    // Machine ID or name.
+    string id = 1;
+    // Force removal.
+    bool force = 2;
+    // Remove volumes.
+    bool volumes = 3;
+}
+
+// Request to list machines.
+message ListMachinesRequest {
+    // Show all machines (including stopped).
+    bool all = 1;
+}
+
+// Response to list machines.
+message ListMachinesResponse {
+    // List of machines.
+    repeated MachineSummary machines = 1;
+}
+
+// Summary information about a machine.
+message MachineSummary {
+    // Machine ID.
+    string id = 1;
+    // Machine name.
+    string name = 2;
+    // State (running, stopped, etc.).
+    string state = 3;
+    // Number of CPUs.
+    uint32 cpus = 4;
+    // Memory in bytes.
+    uint64 memory = 5;
+    // Disk size in bytes.
+    uint64 disk_size = 6;
+    // IP address.
+    string ip_address = 7;
+    // Creation timestamp.
+    int64 created = 8;
+}
+
+// Request to inspect a machine.
+message InspectMachineRequest {
+    // Machine ID or name.
+    string id = 1;
+}
+
+// Detailed machine information.
+message MachineInfo {
+    // Machine ID.
+    string id = 1;
+    // Machine name.
+    string name = 2;
+    // State.
+    string state = 3;
+    // Hardware configuration.
+    MachineHardware hardware = 4;
+    // Network configuration.
+    MachineNetwork network = 5;
+    // Storage configuration.
+    MachineStorage storage = 6;
+    // OS information.
+    MachineOS os = 7;
+    // Creation timestamp.
+    arcbox.common.Timestamp created = 8;
+    // Last start timestamp.
+    arcbox.common.Timestamp started_at = 9;
+    // Directory mounts.
+    repeated DirectoryMount mounts = 10;
+}
+
+// Machine hardware configuration.
+message MachineHardware {
+    // Number of CPUs.
+    uint32 cpus = 1;
+    // Memory in bytes.
+    uint64 memory = 2;
+    // Architecture.
+    string arch = 3;
+}
+
+// Machine network configuration.
+message MachineNetwork {
+    // IP address.
+    string ip_address = 1;
+    // Gateway.
+    string gateway = 2;
+    // MAC address.
+    string mac_address = 3;
+    // DNS servers.
+    repeated string dns_servers = 4;
+}
+
+// Machine storage configuration.
+message MachineStorage {
+    // Disk size in bytes.
+    uint64 disk_size = 1;
+    // Disk format.
+    string disk_format = 2;
+    // Disk path.
+    string disk_path = 3;
+}
+
+// Machine OS information.
+message MachineOS {
+    // Distribution name.
+    string distro = 1;
+    // Version.
+    string version = 2;
+    // Kernel version.
+    string kernel = 3;
+}
+
+// Request to execute a command in a machine.
+message MachineExecRequest {
+    // Machine ID or name.
+    string id = 1;
+    // Command to execute.
+    repeated string cmd = 2;
+    // Working directory.
+    string working_dir = 3;
+    // User to run as.
+    string user = 4;
+    // Environment variables.
+    map<string, string> env = 5;
+    // Allocate TTY.
+    bool tty = 6;
+}
+
+// Exec output from a machine.
+message MachineExecOutput {
+    // Stream type: stdout or stderr.
+    string stream = 1;
+    // Output data.
+    bytes data = 2;
+    // Exit code (only set on completion).
+    int32 exit_code = 3;
+    // Is this the final message.
+    bool done = 4;
+}
+
+// Request for SSH connection info.
+message SSHInfoRequest {
+    // Machine ID or name.
+    string id = 1;
+}
+
+// SSH connection information.
+message SSHInfoResponse {
+    // Host to connect to.
+    string host = 1;
+    // Port number.
+    uint32 port = 2;
+    // Username.
+    string user = 3;
+    // Private key path (if using key-based auth).
+    string identity_file = 4;
+    // SSH command string.
+    string command = 5;
+}
