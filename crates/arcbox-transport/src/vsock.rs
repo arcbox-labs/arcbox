@@ -22,8 +22,6 @@ use bytes::Bytes;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-#[cfg(target_os = "macos")]
-use std::os::fd::OwnedFd;
 
 /// Default port for ArcBox agent communication.
 pub const DEFAULT_AGENT_PORT: u32 = 10000;
@@ -273,45 +271,133 @@ mod linux {
 #[cfg(target_os = "macos")]
 mod darwin {
     use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd as StdOwnedFd, RawFd};
 
-    /// Placeholder vsock stream for macOS.
-    /// Real implementation requires Virtualization.framework FFI bindings.
+    /// Vsock stream for macOS.
+    ///
+    /// On macOS, vsock connections are obtained through the Virtualization.framework
+    /// via the hypervisor layer. This struct wraps a file descriptor returned from
+    /// VZVirtioSocketDevice's connection.
     pub struct VsockStream {
-        _marker: std::marker::PhantomData<()>,
+        fd: StdOwnedFd,
     }
 
     impl VsockStream {
-        pub async fn read(&mut self, _buf: &mut [u8]) -> Result<usize> {
-            Err(TransportError::Protocol(
-                "vsock not yet implemented on macOS".to_string(),
-            ))
+        /// Creates a new vsock stream from an existing file descriptor.
+        ///
+        /// On macOS, this fd comes from `DarwinVm::connect_vsock()` which uses
+        /// VZVirtioSocketDevice internally.
+        ///
+        /// # Safety
+        /// The caller must ensure the fd is a valid connected vsock fd.
+        pub fn from_raw_fd(fd: RawFd) -> Result<Self> {
+            if fd < 0 {
+                return Err(TransportError::ConnectionRefused(
+                    "Invalid file descriptor".to_string(),
+                ));
+            }
+            Ok(Self {
+                fd: unsafe { StdOwnedFd::from_raw_fd(fd) },
+            })
         }
 
-        pub async fn write(&mut self, _buf: &[u8]) -> Result<usize> {
-            Err(TransportError::Protocol(
-                "vsock not yet implemented on macOS".to_string(),
-            ))
+        /// Returns the raw file descriptor.
+        pub fn as_raw_fd(&self) -> RawFd {
+            self.fd.as_raw_fd()
+        }
+
+        /// Sets the socket to non-blocking mode.
+        fn set_nonblocking(&self) -> Result<()> {
+            let flags = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0 {
+                return Err(TransportError::Io(std::io::Error::last_os_error()));
+            }
+            let result = unsafe {
+                libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+            };
+            if result < 0 {
+                return Err(TransportError::Io(std::io::Error::last_os_error()));
+            }
+            Ok(())
+        }
+
+        /// Reads data from the socket.
+        pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+            self.set_nonblocking()?;
+
+            loop {
+                let result = unsafe {
+                    libc::read(
+                        self.fd.as_raw_fd(),
+                        buf.as_mut_ptr().cast::<libc::c_void>(),
+                        buf.len(),
+                    )
+                };
+
+                if result >= 0 {
+                    return Ok(result as usize);
+                }
+
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    // Yield to allow other tasks to run
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                return Err(TransportError::Io(err));
+            }
+        }
+
+        /// Writes data to the socket.
+        pub async fn write(&mut self, buf: &[u8]) -> Result<usize> {
+            self.set_nonblocking()?;
+
+            loop {
+                let result = unsafe {
+                    libc::write(
+                        self.fd.as_raw_fd(),
+                        buf.as_ptr().cast::<libc::c_void>(),
+                        buf.len(),
+                    )
+                };
+
+                if result >= 0 {
+                    return Ok(result as usize);
+                }
+
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                return Err(TransportError::Io(err));
+            }
         }
     }
 
+    /// On macOS, direct vsock connection is not supported.
+    /// Use `VsockStream::from_raw_fd()` with a fd obtained from the hypervisor layer.
     pub fn connect_vsock(_addr: VsockAddr) -> Result<VsockStream> {
-        // TODO: Implement using Virtualization.framework
-        // VZVirtioSocketDevice provides vsock functionality
+        // On macOS, vsock connections must go through the hypervisor's VZVirtioSocketDevice.
+        // The connection fd should be obtained from DarwinVm::connect_vsock() and then
+        // wrapped using VsockStream::from_raw_fd().
         Err(TransportError::Protocol(
-            "vsock not yet implemented on macOS".to_string(),
+            "macOS vsock requires connection through hypervisor".to_string(),
         ))
     }
 
-    pub fn bind_vsock(_port: u32) -> Result<OwnedFd> {
+    /// On macOS, vsock binding is not supported from the host side.
+    /// The guest uses vsock listeners; the host connects to them.
+    pub fn bind_vsock(_port: u32) -> Result<StdOwnedFd> {
         Err(TransportError::Protocol(
-            "vsock not yet implemented on macOS".to_string(),
+            "vsock bind not supported on macOS host".to_string(),
         ))
     }
 
     #[allow(dead_code)]
-    pub fn accept_vsock(_listener_fd: &OwnedFd) -> Result<(VsockStream, VsockAddr)> {
+    pub fn accept_vsock(_listener_fd: &StdOwnedFd) -> Result<(VsockStream, VsockAddr)> {
         Err(TransportError::Protocol(
-            "vsock not yet implemented on macOS".to_string(),
+            "vsock accept not supported on macOS host".to_string(),
         ))
     }
 }
@@ -354,6 +440,39 @@ impl VsockTransport {
             addr,
             stream: Some(stream),
         }
+    }
+
+    /// Creates a transport from an existing stream (macOS).
+    #[cfg(target_os = "macos")]
+    pub fn from_stream(stream: VsockStream, addr: VsockAddr) -> Self {
+        Self {
+            addr,
+            stream: Some(stream),
+        }
+    }
+
+    /// Creates a transport from a raw file descriptor (macOS).
+    ///
+    /// On macOS, vsock connections are obtained through the hypervisor layer
+    /// (DarwinVm::connect_vsock). This method allows wrapping that fd into
+    /// a transport.
+    ///
+    /// # Arguments
+    /// * `fd` - A connected vsock file descriptor from the hypervisor
+    /// * `addr` - The vsock address (for tracking purposes)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let fd = vm.connect_vsock(1024)?;
+    /// let transport = VsockTransport::from_raw_fd(fd, VsockAddr::new(cid, 1024))?;
+    /// ```
+    #[cfg(target_os = "macos")]
+    pub fn from_raw_fd(fd: std::os::unix::io::RawFd, addr: VsockAddr) -> Result<Self> {
+        let stream = darwin::VsockStream::from_raw_fd(fd)?;
+        Ok(Self {
+            addr,
+            stream: Some(stream),
+        })
     }
 }
 
