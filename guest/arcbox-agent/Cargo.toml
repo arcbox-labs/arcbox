@@ -21,7 +21,7 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-nix = { workspace = true, features = ["mount", "process", "sched", "signal"] }
+nix = { workspace = true, features = ["mount", "process", "sched", "signal", "feature"] }
 libc = { workspace = true }
 prost = { workspace = true }
 uuid = { workspace = true }
@@ -29,6 +29,8 @@ bytes = { workspace = true }
 futures = { workspace = true }
 chrono = { workspace = true }
 hostname = { workspace = true }
+notify = "7"
+tokio-stream = { workspace = true }
 
 # vsock is Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]

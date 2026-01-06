@@ -19,19 +19,20 @@ mod linux {
 
     use anyhow::{Context, Result};
     use tokio::io::{AsyncRead, AsyncWrite};
-    use tokio::sync::RwLock;
+    use tokio::sync::{mpsc, RwLock};
     use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 
     use super::AGENT_PORT;
     use crate::container::{ContainerHandle, ContainerRuntime, ContainerState};
+    use crate::log_watcher::{watch_log_file, LogWatchOptions};
     use crate::rpc::{
         parse_request, read_message, write_response, ErrorResponse, RpcRequest, RpcResponse,
         AGENT_VERSION,
     };
 
     use arcbox_protocol::agent::{
-        ContainerInfo, CreateContainerResponse, ExecOutput, ListContainersResponse, PingResponse,
-        SystemInfo,
+        ContainerInfo, CreateContainerResponse, ExecOutput, ListContainersResponse, LogEntry,
+        LogsRequest, PingResponse, SystemInfo,
     };
 
     /// Agent state shared across connections.
@@ -54,6 +55,14 @@ mod linux {
         }
     }
 
+    /// Result from handling a request - either a single response or a stream.
+    enum RequestResult {
+        /// Single response.
+        Single(RpcResponse),
+        /// Streaming response (for logs follow=true).
+        Stream(mpsc::Receiver<LogEntry>, mpsc::Sender<()>),
+    }
+
     /// The Guest Agent.
     ///
     /// Listens on vsock and handles RPC requests from the host.
@@ -73,7 +82,7 @@ mod linux {
         /// Runs the agent, listening on vsock.
         pub async fn run(&self) -> Result<()> {
             let addr = VsockAddr::new(VMADDR_CID_ANY, AGENT_PORT);
-            let listener =
+            let mut listener =
                 VsockListener::bind(addr).context("failed to bind vsock listener")?;
 
             tracing::info!("Agent listening on vsock port {}", AGENT_PORT);
@@ -106,6 +115,7 @@ mod linux {
     /// Handles a single vsock connection.
     ///
     /// Reads RPC requests, processes them, and writes responses.
+    /// Supports both single responses and streaming responses (for logs follow=true).
     async fn handle_connection<S>(mut stream: S, state: Arc<RwLock<AgentState>>) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -127,34 +137,87 @@ mod linux {
             tracing::debug!("Received message type {:?}", msg_type);
 
             // Parse and handle the request
-            let response = match parse_request(msg_type, &payload) {
+            let result = match parse_request(msg_type, &payload) {
                 Ok(request) => handle_request(request, &state).await,
                 Err(e) => {
                     tracing::warn!("Failed to parse request: {}", e);
-                    RpcResponse::Error(ErrorResponse::new(400, format!("invalid request: {}", e)))
+                    RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
+                        400,
+                        format!("invalid request: {}", e),
+                    )))
                 }
             };
 
-            // Write the response
-            write_response(&mut stream, &response).await?;
+            // Handle the result
+            match result {
+                RequestResult::Single(response) => {
+                    // Write single response
+                    write_response(&mut stream, &response).await?;
+                }
+                RequestResult::Stream(mut log_rx, cancel_tx) => {
+                    // Stream multiple LogEntry responses
+                    tracing::debug!("Starting log stream");
+
+                    // Keep streaming until the receiver is closed or client disconnects
+                    loop {
+                        tokio::select! {
+                            // Check for new log entries
+                            entry = log_rx.recv() => {
+                                match entry {
+                                    Some(log_entry) => {
+                                        let response = RpcResponse::LogEntry(log_entry);
+                                        if let Err(e) = write_response(&mut stream, &response).await {
+                                            tracing::debug!("Client disconnected during streaming: {}", e);
+                                            // Signal cancellation to the watcher
+                                            let _ = cancel_tx.send(()).await;
+                                            return Ok(());
+                                        }
+                                    }
+                                    None => {
+                                        // Watcher channel closed
+                                        tracing::debug!("Log stream ended");
+                                        break;
+                                    }
+                                }
+                            }
+                            // Also check if we can read from stream (to detect disconnect)
+                            // This uses a peek to avoid consuming actual request data
+                            _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
+                                // Periodic check - continue streaming
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
     /// Handles a single RPC request.
-    async fn handle_request(request: RpcRequest, state: &Arc<RwLock<AgentState>>) -> RpcResponse {
+    async fn handle_request(
+        request: RpcRequest,
+        state: &Arc<RwLock<AgentState>>,
+    ) -> RequestResult {
         match request {
-            RpcRequest::Ping(req) => handle_ping(req),
-            RpcRequest::GetSystemInfo => handle_get_system_info().await,
-            RpcRequest::CreateContainer(req) => handle_create_container(req, state).await,
-            RpcRequest::StartContainer(req) => handle_start_container(&req.id, state).await,
+            RpcRequest::Ping(req) => RequestResult::Single(handle_ping(req)),
+            RpcRequest::GetSystemInfo => RequestResult::Single(handle_get_system_info().await),
+            RpcRequest::CreateContainer(req) => {
+                RequestResult::Single(handle_create_container(req, state).await)
+            }
+            RpcRequest::StartContainer(req) => {
+                RequestResult::Single(handle_start_container(&req.id, state).await)
+            }
             RpcRequest::StopContainer(req) => {
-                handle_stop_container(&req.id, req.timeout, state).await
+                RequestResult::Single(handle_stop_container(&req.id, req.timeout, state).await)
             }
             RpcRequest::RemoveContainer(req) => {
-                handle_remove_container(&req.id, req.force, state).await
+                RequestResult::Single(handle_remove_container(&req.id, req.force, state).await)
             }
-            RpcRequest::ListContainers(req) => handle_list_containers(req.all, state).await,
-            RpcRequest::Exec(req) => handle_exec(req, state).await,
+            RpcRequest::ListContainers(req) => {
+                RequestResult::Single(handle_list_containers(req.all, state).await)
+            }
+            RpcRequest::Exec(req) => RequestResult::Single(handle_exec(req, state).await),
+            RpcRequest::Logs(req) => handle_logs(req, state).await,
         }
     }
 
@@ -451,6 +514,101 @@ mod linux {
                 RpcResponse::ExecOutput(output)
             }
             Err(e) => RpcResponse::Error(ErrorResponse::new(500, format!("exec failed: {}", e))),
+        }
+    }
+
+    /// Handles a Logs request.
+    ///
+    /// When follow=true, returns a streaming response that watches the log file.
+    /// When follow=false, returns a single response with current log content.
+    async fn handle_logs(req: LogsRequest, state: &Arc<RwLock<AgentState>>) -> RequestResult {
+        tracing::info!(
+            "Logs: container_id={}, follow={}, tail={}",
+            req.container_id,
+            req.follow,
+            req.tail
+        );
+
+        // Verify container exists.
+        {
+            let state = state.read().await;
+            if state.runtime.get_container(&req.container_id).is_none() {
+                return RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
+                    404,
+                    format!("container not found: {}", req.container_id),
+                )));
+            }
+        }
+
+        // Container log file path.
+        let log_path = format!("/var/log/containers/{}.log", req.container_id);
+
+        // Handle streaming mode (follow=true)
+        if req.follow {
+            return handle_logs_stream(req, log_path).await;
+        }
+
+        // Non-streaming mode: read current log content
+        let log_data = match std::fs::read_to_string(&log_path) {
+            Ok(data) => data,
+            Err(e) => {
+                // If log file doesn't exist, return empty log entry.
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return RequestResult::Single(RpcResponse::LogEntry(LogEntry {
+                        stream: "stdout".to_string(),
+                        data: Vec::new(),
+                        timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+                    }));
+                }
+                return RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
+                    500,
+                    format!("failed to read logs: {}", e),
+                )));
+            }
+        };
+
+        // Apply tail filter if specified.
+        let lines: Vec<&str> = log_data.lines().collect();
+        let output_lines = if req.tail > 0 {
+            let start = lines.len().saturating_sub(req.tail as usize);
+            &lines[start..]
+        } else {
+            &lines[..]
+        };
+
+        let output = output_lines.join("\n");
+
+        RequestResult::Single(RpcResponse::LogEntry(LogEntry {
+            stream: if req.stdout { "stdout" } else { "stderr" }.to_string(),
+            data: output.into_bytes(),
+            timestamp: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+        }))
+    }
+
+    /// Handles streaming logs (follow=true).
+    async fn handle_logs_stream(req: LogsRequest, log_path: String) -> RequestResult {
+        let options = LogWatchOptions {
+            stdout: req.stdout,
+            stderr: req.stderr,
+            timestamps: req.timestamps,
+            tail: req.tail,
+            since: req.since,
+            until: req.until,
+        };
+
+        // Create cancellation channel
+        let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+
+        // Start log watcher
+        match watch_log_file(&log_path, options, cancel_rx).await {
+            Ok(log_rx) => RequestResult::Stream(log_rx, cancel_tx),
+            Err(e) => {
+                tracing::error!("Failed to start log watcher: {}", e);
+                RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
+                    500,
+                    format!("failed to start log stream: {}", e),
+                )))
+            }
         }
     }
 }
