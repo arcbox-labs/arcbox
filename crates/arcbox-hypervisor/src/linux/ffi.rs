@@ -6,8 +6,8 @@
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
 
-use std::fs::{File, OpenOptions};
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::fs::OpenOptions;
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::ptr;
 
 // ============================================================================
@@ -98,6 +98,51 @@ pub const KVM_CAP_MAX_VCPU_ID: u32 = 128;
 pub const KVM_CAP_ARM_VM_IPA_SIZE: u32 = 165;
 
 // ============================================================================
+// ARM64 Register IDs
+// ============================================================================
+
+#[cfg(target_arch = "aarch64")]
+pub mod arm64_regs {
+    /// KVM register type bits
+    const KVM_REG_ARM64: u64 = 0x6000_0000_0000_0000;
+    const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
+    const KVM_REG_ARM_CORE: u64 = 0x0010_0000_0000_0000;
+
+    /// Macro to create ARM64 core register IDs
+    macro_rules! arm64_core_reg {
+        ($offset:expr) => {
+            KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (($offset as u64) * 2)
+        };
+    }
+
+    // General purpose registers x0-x30
+    pub const X0: u64 = arm64_core_reg!(0);
+    pub const X1: u64 = arm64_core_reg!(1);
+    pub const X2: u64 = arm64_core_reg!(2);
+    pub const X3: u64 = arm64_core_reg!(3);
+    pub const X29: u64 = arm64_core_reg!(29); // FP
+    pub const X30: u64 = arm64_core_reg!(30); // LR
+
+    // Stack pointer
+    pub const SP: u64 = arm64_core_reg!(31);
+
+    // Program counter
+    pub const PC: u64 = arm64_core_reg!(32);
+
+    // Processor state (PSTATE/CPSR)
+    pub const PSTATE: u64 = arm64_core_reg!(33);
+
+    /// PSTATE bits for EL1h (Exception Level 1, SP_ELx)
+    pub const PSTATE_EL1H: u64 = 0x0000_0005;
+
+    /// PSTATE bits for EL1 with interrupts masked
+    pub const PSTATE_D: u64 = 1 << 9; // Debug mask
+    pub const PSTATE_A: u64 = 1 << 8; // SError mask
+    pub const PSTATE_I: u64 = 1 << 7; // IRQ mask
+    pub const PSTATE_F: u64 = 1 << 6; // FIQ mask
+}
+
+// ============================================================================
 // KVM Exit Reasons
 // ============================================================================
 
@@ -164,7 +209,7 @@ pub struct KvmIrqfd {
 
 /// IOEVENTFD configuration.
 #[repr(C)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct KvmIoeventfd {
     pub datamatch: u64,
     pub addr: u64,
@@ -172,6 +217,19 @@ pub struct KvmIoeventfd {
     pub fd: i32,
     pub flags: u32,
     pub pad: [u8; 36],
+}
+
+impl Default for KvmIoeventfd {
+    fn default() -> Self {
+        Self {
+            datamatch: 0,
+            addr: 0,
+            len: 0,
+            fd: 0,
+            flags: 0,
+            pad: [0; 36],
+        }
+    }
 }
 
 /// x86_64 general purpose registers.
@@ -257,7 +315,7 @@ pub struct KvmSregs {
 /// CPUID entry.
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct KvmCpuidEntry2 {
     pub function: u32,
     pub index: u32,
@@ -691,7 +749,7 @@ impl KvmVcpuFd {
     ///
     /// The returned reference is only valid while the vCPU is not running.
     pub unsafe fn kvm_run(&self) -> &KvmRun {
-        &*self.kvm_run
+        unsafe { &*self.kvm_run }
     }
 
     /// Gets the KVM run structure mutably.
@@ -700,7 +758,7 @@ impl KvmVcpuFd {
     ///
     /// The returned reference is only valid while the vCPU is not running.
     pub unsafe fn kvm_run_mut(&self) -> &mut KvmRun {
-        &mut *self.kvm_run
+        unsafe { &mut *self.kvm_run }
     }
 
     /// Gets the general purpose registers.

@@ -86,9 +86,9 @@ impl DarwinVm {
         // Allocate guest memory
         let memory = DarwinMemory::new(config.memory_size)?;
 
-        // Use main dispatch queue for VM operations
-        // VZVirtualMachine requires all operations to be on its designated queue
-        let dispatch_queue = ffi::get_main_queue();
+        // Create a custom serial queue for VM operations
+        // VZVirtualMachine requires all operations to be called from its designated queue
+        let dispatch_queue = ffi::create_dispatch_queue(&format!("com.arcbox.vm.{}", id));
 
         // Create VZ configuration
         let vz_config = ffi::VmConfiguration::new()
@@ -98,26 +98,37 @@ impl DarwinVm {
         vz_config.set_cpu_count(config.vcpu_count as u64);
         vz_config.set_memory_size(config.memory_size);
 
+        // Set up generic platform for Linux VMs on Apple Silicon
+        let platform = ffi::create_generic_platform()
+            .map_err(|e| HypervisorError::VmCreationFailed(format!("Failed to create platform: {}", e)))?;
+        vz_config.set_platform(platform);
+        tracing::debug!("Set generic platform configuration");
+
         // Set up boot loader if kernel path is specified
         if let Some(ref kernel_path) = config.kernel_path {
             let boot_loader = ffi::LinuxBootLoader::new(kernel_path)
-                .map_err(|e| HypervisorError::VmCreationFailed(e.to_string()))?;
+                .map_err(|e| HypervisorError::VmCreationFailed(format!("Failed to create boot loader: {}", e)))?;
+            tracing::debug!("Created boot loader for kernel: {}", kernel_path);
 
             if let Some(ref cmdline) = config.kernel_cmdline {
                 boot_loader.set_command_line(cmdline);
+                tracing::debug!("Set kernel cmdline: {}", cmdline);
             }
 
             if let Some(ref initrd_path) = config.initrd_path {
                 boot_loader.set_initial_ramdisk(initrd_path);
+                tracing::debug!("Set initrd: {}", initrd_path);
             }
 
             vz_config.set_boot_loader(&boot_loader);
+            tracing::debug!("Boot loader configured");
         }
 
         // Add entropy device for random number generation
-        if let Ok(entropy) = ffi::create_entropy_device() {
-            vz_config.set_entropy_devices(&[entropy]);
-        }
+        let entropy = ffi::create_entropy_device()
+            .map_err(|e| HypervisorError::VmCreationFailed(format!("Failed to create entropy device: {}", e)))?;
+        vz_config.set_entropy_devices(&[entropy]);
+        tracing::debug!("Entropy device configured");
 
         // Note: We don't validate or create VM yet - devices may be added later
         // The VM will be created in finalize_configuration()
@@ -178,16 +189,15 @@ impl DarwinVm {
 
             tracing::info!("Created serial console at {}", slave_path);
 
-            // Create serial port attachment
+            // Create serial port attachment with file handles for the PTY master
             let read_handle = ffi::create_file_handle_for_reading(master_fd)
                 .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
             let write_handle = ffi::create_file_handle_for_reading(master_fd)
                 .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-
             let attachment = ffi::create_serial_port_attachment(read_handle, write_handle)
                 .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
 
-            // Create console port configuration
+            // Create and configure console port
             let port = ffi::create_console_port_configuration()
                 .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
             ffi::set_console_port_attachment(port, attachment);
@@ -195,11 +205,16 @@ impl DarwinVm {
             ffi::set_console_port_is_console(port, true);
 
             // Create console device and set ports
+            // VZVirtioConsoleDeviceConfiguration.ports is a special array class,
+            // not a standard NSArray. We need to use its specific API.
             let console = ffi::create_console_device()
                 .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-            ffi::set_console_device_ports(console, &[port]);
+            let ports_array = ffi::get_console_device_ports(console);
+            ffi::set_ports_array_max_count(ports_array, 1);
+            ffi::set_port_at_index(ports_array, port, 0);
 
             self.console_device = Some(console);
+            tracing::debug!("Console device configured");
 
             Ok(slave_path)
         }
@@ -243,13 +258,18 @@ impl DarwinVm {
     }
 
     /// Waits for the VM to reach a specific state.
+    ///
+    /// This function polls the VM state directly (state property should be thread-safe to read).
     fn wait_for_state(&self, target: ffi::VZVirtualMachineState, timeout: Duration) -> Result<(), HypervisorError> {
         let start = std::time::Instant::now();
-        let poll_interval = Duration::from_millis(10);
+        let poll_interval = Duration::from_millis(100);
 
         loop {
             if let Some(ref vm) = self.vz_vm {
+                // Read state directly - VZVirtualMachine.state should be thread-safe
                 let state = vm.state();
+                tracing::debug!("VM {} current state: {:?}, target: {:?}", self.id, state, target);
+
                 if state == target {
                     return Ok(());
                 }
@@ -259,11 +279,107 @@ impl DarwinVm {
             }
 
             if start.elapsed() > timeout {
+                if let Some(ref vm) = self.vz_vm {
+                    let state = vm.state();
+                    return Err(HypervisorError::Timeout(format!(
+                        "Timed out waiting for VM state {:?}, current state: {:?}",
+                        target, state
+                    )));
+                }
                 return Err(HypervisorError::Timeout("Timed out waiting for VM state".to_string()));
             }
 
             std::thread::sleep(poll_interval);
         }
+    }
+
+    /// Reads available console output from the PTY.
+    ///
+    /// Returns the output as a String. Returns an empty string if no output
+    /// is available or if the console hasn't been set up.
+    ///
+    /// This is a non-blocking read that returns whatever data is currently
+    /// available in the PTY buffer.
+    pub fn read_console_output(&self) -> Result<String, HypervisorError> {
+        let (master_fd, _) = self.serial_fds.ok_or_else(|| {
+            HypervisorError::DeviceError("Console not configured".to_string())
+        })?;
+
+        // Set non-blocking mode for the read
+        unsafe {
+            let flags = libc::fcntl(master_fd, libc::F_GETFL);
+            libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+
+            let mut buffer = vec![0u8; 4096];
+            let mut output = String::new();
+
+            loop {
+                let bytes_read = libc::read(
+                    master_fd,
+                    buffer.as_mut_ptr() as *mut libc::c_void,
+                    buffer.len(),
+                );
+
+                if bytes_read > 0 {
+                    if let Ok(s) = std::str::from_utf8(&buffer[..bytes_read as usize]) {
+                        output.push_str(s);
+                    }
+                } else {
+                    // No more data available (EAGAIN/EWOULDBLOCK) or error
+                    break;
+                }
+            }
+
+            // Restore blocking mode
+            libc::fcntl(master_fd, libc::F_SETFL, flags);
+
+            Ok(output)
+        }
+    }
+
+    /// Writes input to the console.
+    ///
+    /// This sends data to the guest's serial console input.
+    pub fn write_console_input(&self, input: &str) -> Result<usize, HypervisorError> {
+        let (master_fd, _) = self.serial_fds.ok_or_else(|| {
+            HypervisorError::DeviceError("Console not configured".to_string())
+        })?;
+
+        unsafe {
+            let bytes_written = libc::write(
+                master_fd,
+                input.as_ptr() as *const libc::c_void,
+                input.len(),
+            );
+
+            if bytes_written < 0 {
+                return Err(HypervisorError::DeviceError(format!(
+                    "Failed to write to console: errno={}",
+                    *libc::__error()
+                )));
+            }
+
+            Ok(bytes_written as usize)
+        }
+    }
+
+    /// Returns the path to the slave PTY device.
+    ///
+    /// This can be used with tools like `screen` or `minicom` to connect
+    /// to the VM's serial console interactively.
+    pub fn console_path(&self) -> Option<String> {
+        self.serial_fds.map(|(master_fd, _)| {
+            unsafe {
+                let slave_name = libc::ptsname(master_fd);
+                if !slave_name.is_null() {
+                    std::ffi::CStr::from_ptr(slave_name)
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    String::new()
+                }
+            }
+        }).filter(|s| !s.is_empty())
     }
 
     /// Returns the VM ID.
@@ -300,6 +416,11 @@ impl DarwinVm {
 impl VirtualMachine for DarwinVm {
     type Vcpu = DarwinVcpu;
     type Memory = DarwinMemory;
+
+    fn is_managed_execution(&self) -> bool {
+        // Darwin Virtualization.framework manages vCPU execution internally
+        true
+    }
 
     fn memory(&self) -> &Self::Memory {
         &self.memory
@@ -453,22 +574,16 @@ impl VirtualMachine for DarwinVm {
             self.finalize_configuration()?;
         }
 
-        // Check if VM can start
+        // Start the VM
+        // All VZ operations must be dispatched to the VM's designated queue
         if let Some(ref vm) = self.vz_vm {
-            tracing::debug!("Checking if VM {} can start...", self.id);
-
-            let can_start = vm.can_start();
-            tracing::debug!("VM {} can_start: {}", self.id, can_start);
-
-            if !can_start {
-                self.set_state(VmState::Error);
-                return Err(HypervisorError::VmError("VM cannot start".to_string()));
-            }
-
             tracing::debug!("Starting VM {} asynchronously...", self.id);
 
-            // Start the VM asynchronously
-            vm.start_async();
+            // Start the VM asynchronously on its queue
+            let queue = self.dispatch_queue;
+            ffi::dispatch_sync_closure(queue, || {
+                vm.start_async();
+            });
 
             tracing::debug!("Waiting for VM {} to reach Running state...", self.id);
 
@@ -481,6 +596,11 @@ impl VirtualMachine for DarwinVm {
                     Ok(())
                 }
                 Err(e) => {
+                    // Check actual VM state for better error message
+                    if let Some(ref vz) = self.vz_vm {
+                        let state = vz.state();
+                        tracing::error!("VM {} failed to start, current state: {:?}", self.id, state);
+                    }
                     self.set_state(VmState::Error);
                     Err(e)
                 }
@@ -501,13 +621,10 @@ impl VirtualMachine for DarwinVm {
         }
 
         if let Some(ref vm) = self.vz_vm {
-            if !vm.can_pause() {
-                return Err(HypervisorError::VmError("VM cannot pause".to_string()));
-            }
-
-            vm.pause_async();
-
-            // Wait for VM to reach Paused state
+            let queue = self.dispatch_queue;
+            ffi::dispatch_sync_closure(queue, || {
+                vm.pause_async();
+            });
             self.wait_for_state(ffi::VZVirtualMachineState::Paused, Duration::from_secs(10))?;
         }
 
@@ -527,13 +644,10 @@ impl VirtualMachine for DarwinVm {
         }
 
         if let Some(ref vm) = self.vz_vm {
-            if !vm.can_resume() {
-                return Err(HypervisorError::VmError("VM cannot resume".to_string()));
-            }
-
-            vm.resume_async();
-
-            // Wait for VM to reach Running state
+            let queue = self.dispatch_queue;
+            ffi::dispatch_sync_closure(queue, || {
+                vm.resume_async();
+            });
             self.wait_for_state(ffi::VZVirtualMachineState::Running, Duration::from_secs(10))?;
         }
 
@@ -555,16 +669,29 @@ impl VirtualMachine for DarwinVm {
         self.set_state(VmState::Stopping);
 
         if let Some(ref vm) = self.vz_vm {
-            // Try graceful stop first
-            if vm.can_request_stop() {
-                let _ = vm.request_stop();
-                // Give it a moment to stop gracefully
-                std::thread::sleep(Duration::from_millis(500));
-            }
+            // Check if VM can be stopped
+            let can_stop = vm.can_stop();
+            tracing::debug!("VM {} can_stop: {}", self.id, can_stop);
 
-            // Force stop if still running
-            if vm.state() != ffi::VZVirtualMachineState::Stopped {
-                let _ = vm.stop();
+            if can_stop {
+                // Use async stop API (macOS 12.0+)
+                let queue = self.dispatch_queue;
+                ffi::dispatch_sync_closure(queue, || {
+                    vm.stop_async();
+                });
+
+                // Wait for VM to reach Stopped state
+                match self.wait_for_state(ffi::VZVirtualMachineState::Stopped, Duration::from_secs(10)) {
+                    Ok(()) => {
+                        tracing::debug!("VM {} reached Stopped state", self.id);
+                    }
+                    Err(e) => {
+                        tracing::warn!("VM {} stop wait failed: {}", self.id, e);
+                        // Continue with cleanup even if wait fails
+                    }
+                }
+            } else {
+                tracing::warn!("VM {} cannot be stopped (canStop=false), forcing state change", self.id);
             }
         }
 
@@ -594,11 +721,10 @@ impl Drop for DarwinVm {
             }
         }
 
-        // Note: We're using the main queue now, so don't release it
-        // If we switch to custom queues, uncomment:
-        // if !self.dispatch_queue.is_null() {
-        //     ffi::release_dispatch_queue(self.dispatch_queue);
-        // }
+        // Release the custom dispatch queue
+        if !self.dispatch_queue.is_null() {
+            ffi::release_dispatch_queue(self.dispatch_queue);
+        }
 
         // VZ handles are automatically released by Rust's drop
 
