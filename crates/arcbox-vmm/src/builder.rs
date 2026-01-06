@@ -300,6 +300,9 @@ impl VmBuilder {
             enable_rosetta: self.enable_rosetta,
             serial_console: self.console_config.is_some(),
             virtio_console: self.console_config.is_some(),
+            shared_dirs: Vec::new(),
+            networking: !self.network_devices.is_empty(),
+            vsock: true,
         };
 
         tracing::info!(

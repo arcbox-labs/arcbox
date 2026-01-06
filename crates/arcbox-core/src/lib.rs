@@ -47,4 +47,4 @@ pub use config::Config;
 pub use error::{CoreError, Result};
 pub use machine::MachineManager;
 pub use runtime::Runtime;
-pub use vm::VmManager;
+pub use vm::{SharedDirConfig, VmConfig, VmManager};
