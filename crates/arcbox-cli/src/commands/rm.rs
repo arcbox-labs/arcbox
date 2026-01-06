@@ -1,5 +1,6 @@
 //! Rm (remove container) command implementation.
 
+use crate::client;
 use anyhow::Result;
 use clap::Args;
 
@@ -25,11 +26,22 @@ pub struct RmArgs {
 
 /// Executes the rm command.
 pub async fn execute(args: RmArgs) -> Result<()> {
-    for container in &args.containers {
-        tracing::info!("Removing container: {}", container);
+    let daemon = client::get_client().await?;
 
-        // TODO: Connect to daemon and remove container
-        println!("{container}");
+    for container in &args.containers {
+        let path = format!(
+            "/v1.43/containers/{}?force={}&v={}",
+            container, args.force, args.volumes
+        );
+
+        match daemon.delete(&path).await {
+            Ok(()) => {
+                println!("{container}");
+            }
+            Err(e) => {
+                eprintln!("Error removing {}: {}", container, e);
+            }
+        }
     }
 
     Ok(())
