@@ -37,12 +37,14 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod cache;
+pub mod dispatcher;
 pub mod error;
 pub mod fuse;
 pub mod passthrough;
 pub mod server;
 
 pub use cache::{NegativeCache, NegativeCacheConfig, NegativeCacheStats};
+pub use dispatcher::{DispatcherConfig, FuseDispatcher, RequestContext, ResponseBuilder};
 pub use error::{FsError, Result};
 pub use fuse::{FuseAttr, FuseInHeader, FuseOpcode, FuseOutHeader, StatFs};
 pub use passthrough::{DirEntry, FileType, PassthroughConfig, PassthroughFs};

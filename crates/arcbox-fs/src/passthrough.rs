@@ -95,6 +95,21 @@ impl FileType {
     fn is_dir(self) -> bool {
         self == Self::Directory
     }
+
+    /// Converts to dirent type (DT_*).
+    #[must_use]
+    pub fn to_dirent_type(self) -> u32 {
+        match self {
+            Self::Regular => libc::DT_REG as u32,
+            Self::Directory => libc::DT_DIR as u32,
+            Self::Symlink => libc::DT_LNK as u32,
+            Self::BlockDevice => libc::DT_BLK as u32,
+            Self::CharDevice => libc::DT_CHR as u32,
+            Self::Fifo => libc::DT_FIFO as u32,
+            Self::Socket => libc::DT_SOCK as u32,
+            Self::Unknown => libc::DT_UNKNOWN as u32,
+        }
+    }
 }
 
 // ============================================================================
