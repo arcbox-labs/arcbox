@@ -1,0 +1,18 @@
+[package]
+name = "arcbox-fs-enhanced"
+description = "Enhanced filesystem with intelligent caching for ArcBox Pro"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "BSL-1.1"
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-fs = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+default = []
