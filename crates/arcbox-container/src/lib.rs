@@ -38,11 +38,14 @@
 
 pub mod config;
 pub mod error;
+pub mod exec;
 pub mod manager;
 pub mod state;
 pub mod volume;
 
 pub use config::ContainerConfig;
 pub use error::{ContainerError, Result};
+pub use exec::{ExecConfig, ExecId, ExecInstance, ExecManager};
 pub use manager::ContainerManager;
 pub use state::{Container, ContainerId, ContainerState};
+pub use volume::{Volume, VolumeManager};

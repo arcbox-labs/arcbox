@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 arcbox-container = { workspace = true }
 arcbox-core = { workspace = true }
+arcbox-image = { workspace = true }
 arcbox-protocol = { workspace = true }
 arcbox-transport = { workspace = true }
 thiserror = { workspace = true }
@@ -29,6 +30,9 @@ chrono = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
 dirs = { workspace = true }
+sysinfo = "0.32"
+tokio-stream = "0.1"
+futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
