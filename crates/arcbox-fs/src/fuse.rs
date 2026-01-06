@@ -108,3 +108,25 @@ pub struct FuseAttr {
     pub blksize: u32,
     pub padding: u32,
 }
+
+/// Filesystem statistics.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct StatFs {
+    /// Total data blocks in filesystem.
+    pub blocks: u64,
+    /// Free blocks in filesystem.
+    pub bfree: u64,
+    /// Free blocks available to unprivileged user.
+    pub bavail: u64,
+    /// Total file nodes in filesystem.
+    pub files: u64,
+    /// Free file nodes in filesystem.
+    pub ffree: u64,
+    /// Optimal transfer block size.
+    pub bsize: u32,
+    /// Maximum length of filenames.
+    pub namelen: u32,
+    /// Fragment size.
+    pub frsize: u32,
+}
