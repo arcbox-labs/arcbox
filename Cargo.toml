@@ -99,6 +99,9 @@ pin-project-lite = "0.2"
 # Bytes and buffer
 bytes = "1"
 
+# Concurrent data structures
+dashmap = "6"
+
 # Configuration
 figment = { version = "0.10", features = ["toml", "env"] }
 dirs = "6"
