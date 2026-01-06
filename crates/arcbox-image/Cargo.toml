@@ -1,0 +1,46 @@
+[package]
+name = "arcbox-image"
+description = "Container image management for ArcBox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+
+# HTTP client for registry communication
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Compression and archive handling
+flate2 = "1"
+tar = "0.4"
+
+# SHA256 digest calculation
+sha2 = "0.10"
+hex = "0.4"
+
+# URL encoding for auth
+urlencoding = "2"
+
+# Async I/O utilities
+tokio-util = { version = "0.7", features = ["io"] }
+
+# Directory management
+dirs = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+
+[features]
+default = []
