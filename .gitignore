@@ -1,2 +1,10 @@
 /target
 **/CLAUDE.md
+
+# macOS
+.DS_Store
+
+# Test resources (binary)
+tests/resources/*.img
+tests/resources/Image-*
+tests/resources/vmlinuz-*
