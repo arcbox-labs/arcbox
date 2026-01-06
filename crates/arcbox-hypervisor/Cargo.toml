@@ -12,8 +12,10 @@ authors.workspace = true
 thiserror = { workspace = true }
 tracing = { workspace = true }
 libc = { workspace = true }
+tokio = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+arcbox-vz = { path = "../arcbox-vz" }
 objc2 = "0.6"
 block2 = "0.6"
 

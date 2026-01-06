@@ -1,4 +1,6 @@
 //! macOS Virtualization.framework hypervisor implementation.
+//!
+//! This implementation uses `arcbox-vz` for the underlying Virtualization.framework bindings.
 
 use crate::{
     config::VmConfig,
@@ -7,7 +9,6 @@ use crate::{
     types::{CpuArch, PlatformCapabilities},
 };
 
-use super::ffi;
 use super::vm::DarwinVm;
 
 /// macOS hypervisor implementation using Virtualization.framework.
@@ -34,8 +35,8 @@ impl DarwinHypervisor {
     ///
     /// Returns an error if Virtualization.framework is not available.
     pub fn new() -> Result<Self, HypervisorError> {
-        // Check if Virtualization.framework is supported
-        if !ffi::is_supported() {
+        // Check if Virtualization.framework is supported using arcbox-vz
+        if !arcbox_vz::is_supported() {
             return Err(HypervisorError::UnsupportedPlatform(
                 "Virtualization.framework not available".to_string(),
             ));
@@ -53,12 +54,16 @@ impl DarwinHypervisor {
         Ok(Self { capabilities })
     }
 
-    /// Detects platform capabilities.
+    /// Detects platform capabilities using arcbox-vz.
     fn detect_capabilities() -> PlatformCapabilities {
-        let max_vcpus = ffi::max_cpu_count();
-        let max_memory = ffi::max_memory_size();
-        // Rosetta availability requires checking if we're on ARM64
-        let rosetta = cfg!(target_arch = "aarch64");
+        let max_vcpus = arcbox_vz::max_cpu_count();
+        let max_memory = arcbox_vz::max_memory_size();
+
+        // Check Rosetta availability using arcbox-vz
+        let rosetta = matches!(
+            arcbox_vz::LinuxRosettaDirectoryShare::availability(),
+            arcbox_vz::RosettaAvailability::Supported | arcbox_vz::RosettaAvailability::NotInstalled
+        );
 
         // Determine supported architectures
         let mut supported_archs = vec![CpuArch::native()];
@@ -167,7 +172,7 @@ mod tests {
     #[test]
     fn test_hypervisor_creation() {
         // This test will only pass on macOS with Virtualization.framework
-        if !ffi::is_supported() {
+        if !arcbox_vz::is_supported() {
             println!("Virtualization not supported, skipping");
             return;
         }
@@ -181,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_config_validation() {
-        if !ffi::is_supported() {
+        if !arcbox_vz::is_supported() {
             println!("Virtualization not supported, skipping");
             return;
         }

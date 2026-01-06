@@ -127,12 +127,17 @@ dependencies = [
 name = "arcbox-api"
 version = "0.1.0"
 dependencies = [
+ "arcbox-container",
  "arcbox-core",
  "arcbox-docker",
+ "arcbox-image",
  "arcbox-protocol",
+ "async-stream",
+ "libc",
  "prost",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-build",
  "tracing",
@@ -258,6 +263,7 @@ dependencies = [
 name = "arcbox-hypervisor"
 version = "0.1.0"
 dependencies = [
+ "arcbox-vz",
  "block2",
  "libc",
  "nix 0.29.0",
@@ -407,6 +413,18 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "arcbox-vz"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "objc2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

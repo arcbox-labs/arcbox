@@ -6,6 +6,7 @@ members = [
     # ============================================
 
     # Low-level infrastructure
+    "crates/arcbox-vz",
     "crates/arcbox-hypervisor",
     "crates/arcbox-vmm",
     "crates/arcbox-virtio",
@@ -94,6 +95,8 @@ hyper = { version = "1", features = ["full"] }
 # Async utilities
 futures = "0.3"
 async-trait = "0.1"
+async-stream = "0.3"
+tokio-stream = "0.1"
 pin-project-lite = "0.2"
 
 # Bytes and buffer
@@ -123,6 +126,7 @@ nix = { version = "0.29", features = ["fs", "process", "socket", "ioctl", "mman"
 libc = "0.2"
 
 # Internal crates (Core layer)
+arcbox-vz = { path = "crates/arcbox-vz" }
 arcbox-hypervisor = { path = "crates/arcbox-hypervisor" }
 arcbox-vmm = { path = "crates/arcbox-vmm" }
 arcbox-virtio = { path = "crates/arcbox-virtio" }
