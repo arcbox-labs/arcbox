@@ -1,5 +1,6 @@
 //! ArcBox runtime.
 
+use crate::agent_client::AgentPool;
 use crate::config::Config;
 use crate::error::Result;
 use crate::event::EventBus;
@@ -25,6 +26,8 @@ pub struct Runtime {
     container_manager: Arc<ContainerManager>,
     /// Image store.
     image_store: Arc<ImageStore>,
+    /// Agent connection pool.
+    agent_pool: Arc<AgentPool>,
 }
 
 impl Runtime {
@@ -39,6 +42,7 @@ impl Runtime {
         let machine_manager = Arc::new(MachineManager::new(VmManager::new(), config.data_dir.clone()));
         let container_manager = Arc::new(ContainerManager::new());
         let image_store = Arc::new(ImageStore::new(config.data_dir.join("images"))?);
+        let agent_pool = Arc::new(AgentPool::new());
 
         Ok(Self {
             config,
@@ -47,6 +51,7 @@ impl Runtime {
             machine_manager,
             container_manager,
             image_store,
+            agent_pool,
         })
     }
 
@@ -84,6 +89,12 @@ impl Runtime {
     #[must_use]
     pub fn image_store(&self) -> &Arc<ImageStore> {
         &self.image_store
+    }
+
+    /// Returns the agent connection pool.
+    #[must_use]
+    pub fn agent_pool(&self) -> &Arc<AgentPool> {
+        &self.agent_pool
     }
 
     /// Initializes the runtime.

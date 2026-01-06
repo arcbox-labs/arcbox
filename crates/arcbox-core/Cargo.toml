@@ -18,6 +18,8 @@ arcbox-container = { workspace = true }
 arcbox-image = { workspace = true }
 arcbox-protocol = { workspace = true }
 arcbox-transport = { workspace = true }
+bytes = { workspace = true }
+prost = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
