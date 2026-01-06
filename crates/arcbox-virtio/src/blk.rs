@@ -719,7 +719,7 @@ impl VirtioBlock {
     pub fn process_descriptor_chain(
         &self,
         descriptors: &[Descriptor],
-        memory: &[u8],
+        memory: &mut [u8],
     ) -> Result<(usize, BlockStatus)> {
         if descriptors.is_empty() {
             return Err(VirtioError::InvalidQueue("Empty descriptor chain".into()));
@@ -745,9 +745,10 @@ impl VirtioBlock {
                 // Read: write data to guest memory
                 // Data descriptors should be writable
                 let mut total_bytes = 0;
+                let mut current_sector = header.sector;
                 for desc in descriptors.iter().skip(1) {
                     if !desc.is_write_only() {
-                        continue; // Skip status descriptor
+                        continue; // Skip read-only descriptors
                     }
                     if desc.len == 1 {
                         continue; // Status byte
@@ -759,8 +760,15 @@ impl VirtioBlock {
                         return Err(VirtioError::InvalidQueue("Data out of bounds".into()));
                     }
 
-                    // TODO: Actually read into memory (requires mutable slice)
-                    total_bytes += desc.len as usize;
+                    // Actually read from disk into guest memory
+                    let data = &mut memory[start..end];
+                    match self.handle_read(current_sector, data) {
+                        Ok(n) => {
+                            total_bytes += n;
+                            current_sector += (n as u64) / 512;
+                        }
+                        Err(_) => return Ok((0, BlockStatus::IoErr)),
+                    }
                 }
                 Ok((total_bytes, BlockStatus::Ok))
             }
