@@ -1,0 +1,28 @@
+[package]
+name = "arcbox-api"
+description = "API server for ArcBox (gRPC + REST)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-core = { workspace = true }
+arcbox-protocol = { workspace = true }
+arcbox-docker = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default = []
