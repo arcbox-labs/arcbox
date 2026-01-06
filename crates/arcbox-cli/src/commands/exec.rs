@@ -1,6 +1,6 @@
 //! Exec command implementation.
 
-use crate::client::{self, ExecCreateRequest, ExecCreateResponse};
+use arcbox_cli::client::{self, ExecCreateRequest, ExecCreateResponse};
 use anyhow::Result;
 use clap::Args;
 
