@@ -1,10 +1,10 @@
 //! ArcBox CLI - High-performance container and VM runtime.
 
 use anyhow::Result;
+use arcbox_cli::client;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-pub mod client;
 mod commands;
 
 use commands::{Cli, Commands};

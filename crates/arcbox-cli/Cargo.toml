@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+name = "arcbox_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "arcbox"
 path = "src/main.rs"
@@ -34,3 +38,13 @@ tower = "0.5"
 
 [features]
 default = []
+
+[dev-dependencies]
+tempfile = "3.14"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
+axum = { workspace = true }
+tower = "0.5"
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = "0.1"
+assert_cmd = "2.0"
+predicates = "3.1"

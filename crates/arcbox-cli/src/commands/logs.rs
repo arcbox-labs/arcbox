@@ -1,6 +1,6 @@
 //! Logs command implementation.
 
-use crate::client;
+use arcbox_cli::client;
 use anyhow::Result;
 use clap::Args;
 
