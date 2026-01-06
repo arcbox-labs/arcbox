@@ -17,6 +17,11 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
+arcbox-container = { workspace = true }
+arcbox-image = { workspace = true }
+libc = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

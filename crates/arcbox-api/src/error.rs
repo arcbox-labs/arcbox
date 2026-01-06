@@ -23,4 +23,12 @@ pub enum ApiError {
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Configuration error.
+    #[error("configuration error: {0}")]
+    Config(String),
+
+    /// Transport error.
+    #[error("transport error: {0}")]
+    Transport(String),
 }

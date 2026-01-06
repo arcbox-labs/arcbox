@@ -1,10 +1,18 @@
 //! API server implementation.
 
 use crate::error::Result;
+use crate::generated::{
+    container_service_server::ContainerServiceServer,
+    image_service_server::ImageServiceServer,
+    machine_service_server::MachineServiceServer,
+    system_service_server::SystemServiceServer,
+};
+use crate::grpc::{ContainerServiceImpl, ImageServiceImpl, MachineServiceImpl, SystemServiceImpl};
 use arcbox_core::{Config, Runtime};
 use arcbox_docker::{DockerApiServer, ServerConfig as DockerConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tonic::transport::Server;
 
 /// API server configuration.
 #[derive(Debug, Clone)]
@@ -71,16 +79,46 @@ impl ApiServer {
             }
         });
 
-        // TODO: Start gRPC server
-        tracing::info!("ArcBox API server running");
+        // Create gRPC services
+        let container_service = ContainerServiceImpl::new(Arc::clone(&self.runtime));
+        let machine_service = MachineServiceImpl::new(Arc::clone(&self.runtime));
+        let image_service = ImageServiceImpl::new(Arc::clone(&self.runtime));
+        let system_service = SystemServiceImpl::new(Arc::clone(&self.runtime));
+
+        // Parse gRPC address
+        let grpc_addr = self
+            .config
+            .grpc_addr
+            .parse()
+            .map_err(|e| crate::error::ApiError::Config(format!("invalid gRPC address: {}", e)))?;
+
+        tracing::info!("ArcBox API server starting");
         tracing::info!("  gRPC: {}", self.config.grpc_addr);
         tracing::info!(
             "  Docker API: {}",
             self.config.docker_socket.display()
         );
 
-        // Wait for shutdown signal
-        tokio::signal::ctrl_c().await?;
+        // Build gRPC server
+        let grpc_server = Server::builder()
+            .add_service(ContainerServiceServer::new(container_service))
+            .add_service(MachineServiceServer::new(machine_service))
+            .add_service(ImageServiceServer::new(image_service))
+            .add_service(SystemServiceServer::new(system_service))
+            .serve_with_shutdown(grpc_addr, async {
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("failed to listen for ctrl-c");
+                tracing::info!("Received shutdown signal");
+            });
+
+        tracing::info!("ArcBox API server running");
+
+        // Run gRPC server
+        grpc_server.await.map_err(|e| {
+            crate::error::ApiError::Transport(format!("gRPC server error: {}", e))
+        })?;
+
         tracing::info!("Shutting down...");
 
         docker_handle.abort();
