@@ -44,7 +44,8 @@ pub mod server;
 
 pub use cache::{NegativeCache, NegativeCacheConfig, NegativeCacheStats};
 pub use error::{FsError, Result};
-pub use passthrough::PassthroughConfig;
+pub use fuse::{FuseAttr, FuseInHeader, FuseOpcode, FuseOutHeader, StatFs};
+pub use passthrough::{DirEntry, FileType, PassthroughConfig, PassthroughFs};
 pub use server::FsServer;
 
 /// Filesystem configuration.
