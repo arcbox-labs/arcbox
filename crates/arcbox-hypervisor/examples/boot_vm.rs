@@ -195,6 +195,32 @@ fn main() {
                     println!("[{}s] VM state: {:?}, running: {}", i + 1, vm.state(), vm.is_running());
                 }
 
+                // Test vsock connection if enabled
+                // Note: Without an agent running in the guest, vsock connection will timeout
+                // as Virtualization.framework waits for the guest to accept the connection.
+                if enable_vsock && false {  // Disabled by default - enable when agent is present
+                    println!();
+                    println!("Testing vsock connection to port 1024 (agent)...");
+                    println!("Note: This will timeout if no agent is running in the guest.");
+                    match vm.connect_vsock(1024) {
+                        Ok(fd) => {
+                            println!("Vsock connection successful! fd={}", fd);
+                            // Close the fd since we're just testing
+                            unsafe { libc::close(fd); }
+                        }
+                        Err(e) => {
+                            // Connection failure is expected if no agent is running
+                            println!("Vsock connection failed (expected if no agent): {}", e);
+                        }
+                    }
+                } else if enable_vsock {
+                    println!();
+                    println!("Vsock device configured. To test vsock connection:");
+                    println!("  1. Build agent: cargo build -p arcbox-agent --target aarch64-unknown-linux-musl");
+                    println!("  2. Add agent to initramfs");
+                    println!("  3. Enable vsock test in this example");
+                }
+
                 println!();
                 println!("Stopping VM...");
                 match vm.stop() {
