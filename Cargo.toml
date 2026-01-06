@@ -20,6 +20,7 @@ members = [
 
     # Communication (see architecture/cli-api.md)
     "crates/arcbox-protocol",
+    "crates/arcbox-grpc",
     "crates/arcbox-transport",
     "crates/arcbox-docker",
 
@@ -136,6 +137,7 @@ arcbox-container = { path = "crates/arcbox-container" }
 arcbox-image = { path = "crates/arcbox-image" }
 arcbox-oci = { path = "crates/arcbox-oci" }
 arcbox-protocol = { path = "crates/arcbox-protocol" }
+arcbox-grpc = { path = "crates/arcbox-grpc" }
 arcbox-transport = { path = "crates/arcbox-transport" }
 arcbox-docker = { path = "crates/arcbox-docker" }
 arcbox-core = { path = "crates/arcbox-core" }
