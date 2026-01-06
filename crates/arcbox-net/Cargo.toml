@@ -1,0 +1,27 @@
+[package]
+name = "arcbox-net"
+description = "High-performance network stack for ArcBox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-virtio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
+ipnetwork = "0.20"
+hashbrown = "0.14"
+crossbeam-utils = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default = []
