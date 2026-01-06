@@ -1,0 +1,49 @@
+[package]
+name = "arcbox-vz"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Safe Rust bindings for Apple's Virtualization.framework"
+repository = "https://github.com/arcboxd/arcbox"
+keywords = ["virtualization", "macos", "apple", "vm", "hypervisor"]
+categories = ["os::macos-apis", "virtualization"]
+
+[dependencies]
+# Objective-C runtime
+objc2 = "0.6"
+
+# Async runtime
+tokio = { version = "1", features = ["sync", "rt", "io-util", "net", "time"] }
+
+# Error handling
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+
+# Utilities
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS-specific dependencies (none for now, using FFI directly)
+
+[features]
+default = []
+# Enable macOS 12+ features
+macos-12 = []
+# Enable macOS 13+ features
+macos-13 = ["macos-12"]
+# Enable macOS 14+ features (save/restore)
+macos-14 = ["macos-13"]
+
+[[example]]
+name = "simple_vm"
+path = "examples/simple_vm.rs"
+
+[[example]]
+name = "vsock_echo"
+path = "examples/vsock_echo.rs"
