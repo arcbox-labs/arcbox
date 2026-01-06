@@ -1,0 +1,30 @@
+[package]
+name = "arcbox-grpc"
+description = "gRPC service clients and servers for ArcBox (tonic + prost)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Protocol message definitions
+arcbox-protocol = { workspace = true }
+
+# gRPC
+tonic = { workspace = true }
+prost = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
