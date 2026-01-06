@@ -3,9 +3,9 @@
 //! Provides HTTP client for connecting to the ArcBox daemon via Unix socket.
 
 use anyhow::{Context, Result};
-use http_body_util::{BodyExt, Empty, Full};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use hyper::{Method, Request, StatusCode};
+use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -57,6 +57,12 @@ impl DaemonClient {
         serde_json::from_slice(&body).context("failed to parse response")
     }
 
+    /// Performs a GET request returning raw bytes.
+    pub async fn get_raw(&self, path: &str) -> Result<Vec<u8>> {
+        let body = self.request(Method::GET, path, None::<()>).await?;
+        Ok(body.to_vec())
+    }
+
     /// Performs a POST request with a JSON body.
     pub async fn post<T: DeserializeOwned, B: Serialize>(
         &self,
@@ -73,9 +79,103 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Performs a POST request returning raw bytes.
+    pub async fn post_raw<B: Serialize>(&self, path: &str, body: Option<B>) -> Result<Vec<u8>> {
+        let body = self.request(Method::POST, path, body).await?;
+        Ok(body.to_vec())
+    }
+
     /// Performs a DELETE request.
     pub async fn delete(&self, path: &str) -> Result<()> {
         self.request(Method::DELETE, path, None::<()>).await?;
+        Ok(())
+    }
+
+    /// Streams logs from the daemon, calling the callback for each frame.
+    pub async fn stream_logs<F>(&self, path: &str, mut callback: F) -> Result<()>
+    where
+        F: FnMut(&[u8]),
+    {
+        use std::io::{stdout, Write};
+
+        // Connect to Unix socket
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to connect to daemon at {}",
+                    self.socket_path.display()
+                )
+            })?;
+
+        let io = TokioIo::new(stream);
+
+        // Create HTTP connection
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .context("HTTP handshake failed")?;
+
+        // Spawn connection handler
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::error!("Connection error: {}", e);
+            }
+        });
+
+        // Build request
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("http://localhost{}", path))
+            .header("Host", "localhost")
+            .body(Full::new(Bytes::new()))
+            .context("failed to build request")?;
+
+        // Send request
+        let response = sender
+            .send_request(request)
+            .await
+            .context("failed to send request")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("daemon returned error {}", status);
+        }
+
+        // Stream response body
+        let mut body = response.into_body();
+        let mut buffer = Vec::new();
+
+        while let Some(frame) = body.frame().await {
+            let frame = frame.context("failed to read frame")?;
+            if let Some(data) = frame.data_ref() {
+                // Process Docker log frames
+                buffer.extend_from_slice(data);
+
+                // Process complete frames from buffer
+                while buffer.len() >= 8 {
+                    let size = u32::from_be_bytes([
+                        buffer[4], buffer[5], buffer[6], buffer[7],
+                    ]) as usize;
+
+                    let frame_end = 8 + size;
+                    if buffer.len() < frame_end {
+                        break;
+                    }
+
+                    let content = &buffer[8..frame_end];
+                    callback(content);
+                    stdout().flush().ok();
+
+                    buffer.drain(..frame_end);
+                }
+            }
+        }
+
+        // Process any remaining data
+        if !buffer.is_empty() {
+            callback(&buffer);
+        }
+
         Ok(())
     }
 
@@ -181,7 +281,7 @@ pub struct ContainerSummary {
 }
 
 /// Create container request.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct CreateContainerRequest {
     pub image: String,
@@ -200,6 +300,27 @@ pub struct CreateContainerRequest {
     pub attach_stdin: bool,
     pub attach_stdout: bool,
     pub attach_stderr: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_config: Option<HostConfig>,
+}
+
+/// Host configuration for container.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct HostConfig {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub binds: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_bindings: Option<std::collections::HashMap<String, Vec<PortBinding>>>,
+    pub auto_remove: bool,
+}
+
+/// Port binding configuration.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PortBinding {
+    pub host_ip: String,
+    pub host_port: String,
 }
 
 /// Create container response.
@@ -259,6 +380,13 @@ pub struct ExecCreateRequest {
 #[serde(rename_all = "PascalCase")]
 pub struct ExecCreateResponse {
     pub id: String,
+}
+
+/// Container wait response.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ContainerWaitResponse {
+    pub status_code: i64,
 }
 
 /// Image summary.

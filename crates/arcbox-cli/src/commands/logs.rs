@@ -1,5 +1,6 @@
 //! Logs command implementation.
 
+use crate::client;
 use anyhow::Result;
 use clap::Args;
 
@@ -36,14 +37,94 @@ pub struct LogsArgs {
 
 /// Executes the logs command.
 pub async fn execute(args: LogsArgs) -> Result<()> {
-    tracing::info!("Fetching logs for container: {}", args.container);
+    let daemon = client::get_client().await?;
 
-    // TODO: Connect to daemon and stream logs
-    println!("arcbox logs {}", args.container);
+    // Build query parameters
+    let mut params = vec![
+        ("stdout".to_string(), "true".to_string()),
+        ("stderr".to_string(), "true".to_string()),
+    ];
 
     if args.follow {
-        // TODO: Stream logs
+        params.push(("follow".to_string(), "true".to_string()));
+    }
+
+    if args.timestamps {
+        params.push(("timestamps".to_string(), "true".to_string()));
+    }
+
+    if args.tail != "all" {
+        params.push(("tail".to_string(), args.tail.clone()));
+    }
+
+    if let Some(ref since) = args.since {
+        params.push(("since".to_string(), since.clone()));
+    }
+
+    if let Some(ref until) = args.until {
+        params.push(("until".to_string(), until.clone()));
+    }
+
+    if args.details {
+        params.push(("details".to_string(), "true".to_string()));
+    }
+
+    let query = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let path = format!("/v1.43/containers/{}/logs?{}", args.container, query);
+
+    if args.follow {
+        // Streaming mode
+        daemon.stream_logs(&path, print_log_frame).await?;
+    } else {
+        // Non-streaming mode: get all logs at once
+        let logs = daemon.get_raw(&path).await?;
+        print_logs(&logs);
     }
 
     Ok(())
+}
+
+/// Prints container logs, handling Docker's multiplexed stream format.
+fn print_logs(data: &[u8]) {
+    // Docker log format: [stream_type (1 byte)][padding (3 bytes)][size (4 bytes)][data]
+    let mut offset = 0;
+    while offset + 8 <= data.len() {
+        let size = u32::from_be_bytes([
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]) as usize;
+
+        let end = offset + 8 + size;
+        if end > data.len() {
+            break;
+        }
+
+        let content = &data[offset + 8..end];
+        if let Ok(s) = std::str::from_utf8(content) {
+            print!("{}", s);
+        }
+
+        offset = end;
+    }
+
+    // If not in Docker format, print as-is
+    if offset == 0 && !data.is_empty() {
+        if let Ok(s) = std::str::from_utf8(data) {
+            print!("{}", s);
+        }
+    }
+}
+
+/// Callback for processing log frames.
+fn print_log_frame(data: &[u8]) {
+    if let Ok(s) = std::str::from_utf8(data) {
+        print!("{}", s);
+    }
 }

@@ -1,5 +1,6 @@
 //! Exec command implementation.
 
+use crate::client::{self, ExecCreateRequest, ExecCreateResponse};
 use anyhow::Result;
 use clap::Args;
 
@@ -44,18 +45,76 @@ pub struct ExecArgs {
 
 /// Executes the exec command.
 pub async fn execute(args: ExecArgs) -> Result<()> {
-    tracing::info!(
-        "Executing command in container: {} {:?}",
-        args.container,
-        args.command
-    );
+    let daemon = client::get_client().await?;
 
-    // TODO: Connect to daemon and execute command
-    println!(
-        "arcbox exec {} {}",
-        args.container,
-        args.command.join(" ")
-    );
+    // Create exec instance
+    let create_path = format!("/v1.43/containers/{}/exec", args.container);
+    let create_request = ExecCreateRequest {
+        attach_stdin: args.interactive && !args.detach,
+        attach_stdout: !args.detach,
+        attach_stderr: !args.detach,
+        tty: args.tty,
+        cmd: args.command.clone(),
+        env: args.env.clone(),
+        working_dir: args.workdir.clone(),
+    };
+
+    let create_response: ExecCreateResponse = daemon.post(&create_path, Some(&create_request)).await?;
+    let exec_id = create_response.id;
+
+    // Start exec instance
+    let start_path = format!("/v1.43/exec/{}/start", exec_id);
+    let start_request = ExecStartRequest {
+        detach: args.detach,
+        tty: args.tty,
+    };
+
+    if args.detach {
+        // Detached mode: just start and return
+        daemon.post_empty(&start_path, Some(&start_request)).await?;
+        println!("{}", exec_id);
+    } else {
+        // Attached mode: start and get output
+        // TODO: Implement proper streaming for interactive mode
+        if args.interactive || args.tty {
+            tracing::warn!("Interactive/TTY exec mode not fully implemented yet");
+        }
+
+        // For now, use post_raw which returns the response body
+        let output = daemon.post_raw(&start_path, Some(&start_request)).await?;
+
+        // Print output
+        if !output.is_empty() {
+            if let Ok(s) = std::str::from_utf8(&output) {
+                print!("{}", s);
+            }
+        }
+
+        // Get exec inspect to get exit code
+        let inspect_path = format!("/v1.43/exec/{}/json", exec_id);
+        if let Ok(inspect) = daemon.get::<ExecInspect>(&inspect_path).await {
+            if inspect.exit_code != 0 {
+                std::process::exit(inspect.exit_code);
+            }
+        }
+    }
 
     Ok(())
+}
+
+/// Exec start request.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ExecStartRequest {
+    detach: bool,
+    tty: bool,
+}
+
+/// Exec inspect response.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ExecInspect {
+    #[serde(default)]
+    exit_code: i32,
+    running: bool,
 }
