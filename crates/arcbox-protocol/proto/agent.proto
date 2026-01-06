@@ -47,6 +47,9 @@ service AgentService {
 
     // Gets container stats.
     rpc Stats(StatsRequest) returns (stream ContainerStats);
+
+    // Gets container logs.
+    rpc Logs(LogsRequest) returns (stream LogEntry);
 }
 
 // Ping request.
@@ -287,4 +290,34 @@ message BlockStats {
     uint64 read_bytes = 1;
     // Bytes written.
     uint64 write_bytes = 2;
+}
+
+// Request for container logs.
+message LogsRequest {
+    // Container ID.
+    string container_id = 1;
+    // Follow logs (stream new entries).
+    bool follow = 2;
+    // Include stdout.
+    bool stdout = 3;
+    // Include stderr.
+    bool stderr = 4;
+    // Only entries since this timestamp (Unix seconds, 0 = all).
+    int64 since = 5;
+    // Only entries until this timestamp (Unix seconds, 0 = now).
+    int64 until = 6;
+    // Include timestamps in output.
+    bool timestamps = 7;
+    // Tail N lines (0 = all).
+    int64 tail = 8;
+}
+
+// Log entry.
+message LogEntry {
+    // Stream type: "stdout" or "stderr".
+    string stream = 1;
+    // Log data.
+    bytes data = 2;
+    // Timestamp (Unix nanoseconds).
+    int64 timestamp = 3;
 }

@@ -14,6 +14,7 @@ mod agent;
 // but only used at runtime on Linux where vsock is available.
 mod container;
 mod exec;
+mod log_watcher;
 mod rpc;
 
 // Mount module uses Linux-specific syscalls (mount/umount).

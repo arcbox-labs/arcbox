@@ -23,8 +23,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use arcbox_protocol::agent::{
     CreateContainerRequest, CreateContainerResponse, ExecOutput, ExecRequest,
-    ListContainersRequest, ListContainersResponse, PingRequest, PingResponse,
-    RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
+    ListContainersRequest, ListContainersResponse, LogEntry, LogsRequest, PingRequest,
+    PingResponse, RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
 };
 use arcbox_protocol::Empty;
 
@@ -44,6 +44,7 @@ pub enum MessageType {
     RemoveContainerRequest = 0x0013,
     ListContainersRequest = 0x0014,
     ExecRequest = 0x0020,
+    LogsRequest = 0x0021,
 
     // Response types (0x1000 - 0x1FFF)
     PingResponse = 0x1001,
@@ -54,6 +55,7 @@ pub enum MessageType {
     RemoveContainerResponse = 0x1013,
     ListContainersResponse = 0x1014,
     ExecOutput = 0x1020,
+    LogEntry = 0x1021,
 
     // Special types
     Empty = 0x0000,
@@ -72,6 +74,7 @@ impl MessageType {
             0x0013 => Some(Self::RemoveContainerRequest),
             0x0014 => Some(Self::ListContainersRequest),
             0x0020 => Some(Self::ExecRequest),
+            0x0021 => Some(Self::LogsRequest),
             0x1001 => Some(Self::PingResponse),
             0x1002 => Some(Self::GetSystemInfoResponse),
             0x1010 => Some(Self::CreateContainerResponse),
@@ -80,6 +83,7 @@ impl MessageType {
             0x1013 => Some(Self::RemoveContainerResponse),
             0x1014 => Some(Self::ListContainersResponse),
             0x1020 => Some(Self::ExecOutput),
+            0x1021 => Some(Self::LogEntry),
             0x0000 => Some(Self::Empty),
             0xFFFF => Some(Self::Error),
             _ => None,
@@ -137,6 +141,7 @@ pub enum RpcRequest {
     RemoveContainer(RemoveContainerRequest),
     ListContainers(ListContainersRequest),
     Exec(ExecRequest),
+    Logs(LogsRequest),
 }
 
 /// RPC response envelope.
@@ -148,6 +153,7 @@ pub enum RpcResponse {
     Empty,
     ListContainers(ListContainersResponse),
     ExecOutput(ExecOutput),
+    LogEntry(LogEntry),
     Error(ErrorResponse),
 }
 
@@ -161,6 +167,7 @@ impl RpcResponse {
             Self::Empty => MessageType::Empty,
             Self::ListContainers(_) => MessageType::ListContainersResponse,
             Self::ExecOutput(_) => MessageType::ExecOutput,
+            Self::LogEntry(_) => MessageType::LogEntry,
             Self::Error(_) => MessageType::Error,
         }
     }
@@ -174,6 +181,7 @@ impl RpcResponse {
             Self::Empty => Empty::default().encode_to_vec(),
             Self::ListContainers(msg) => msg.encode_to_vec(),
             Self::ExecOutput(msg) => msg.encode_to_vec(),
+            Self::LogEntry(msg) => msg.encode_to_vec(),
             Self::Error(err) => err.encode(),
         }
     }
@@ -274,6 +282,10 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
         MessageType::ExecRequest => {
             let req = ExecRequest::decode(payload)?;
             Ok(RpcRequest::Exec(req))
+        }
+        MessageType::LogsRequest => {
+            let req = LogsRequest::decode(payload)?;
+            Ok(RpcRequest::Logs(req))
         }
         _ => anyhow::bail!("unexpected message type: {:?}", msg_type),
     }
