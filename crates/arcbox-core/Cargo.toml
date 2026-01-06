@@ -1,0 +1,35 @@
+[package]
+name = "arcbox-core"
+description = "Core orchestration layer for ArcBox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-hypervisor = { workspace = true }
+arcbox-vmm = { workspace = true }
+arcbox-virtio = { workspace = true }
+arcbox-fs = { workspace = true }
+arcbox-net = { workspace = true }
+arcbox-container = { workspace = true }
+arcbox-image = { workspace = true }
+arcbox-protocol = { workspace = true }
+arcbox-transport = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+figment = { workspace = true }
+uuid = { workspace = true }
+dirs = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+
+[features]
+default = []
