@@ -8,3 +8,5 @@
 tests/resources/*.img
 tests/resources/Image-*
 tests/resources/vmlinuz-*
+tests/resources/initramfs-*
+tests/resources/modloop-*
