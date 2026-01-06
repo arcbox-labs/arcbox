@@ -34,6 +34,8 @@ pub struct MachineInfo {
     pub state: MachineState,
     /// Underlying VM ID.
     pub vm_id: VmId,
+    /// vsock CID for agent communication (assigned when VM starts).
+    pub cid: Option<u32>,
     /// Number of CPUs.
     pub cpus: u32,
     /// Memory in MB.
@@ -96,6 +98,7 @@ impl MachineManager {
                     name: persisted.name.clone(),
                     state: persisted.state.into(),
                     vm_id,
+                    cid: None, // Will be assigned when VM starts
                     cpus: persisted.cpus,
                     memory_mb: persisted.memory_mb,
                     disk_gb: persisted.disk_gb,
@@ -141,6 +144,7 @@ impl MachineManager {
             name: config.name.clone(),
             state: MachineState::Created,
             vm_id,
+            cid: None, // Will be assigned when VM starts
             cpus: config.cpus,
             memory_mb: config.memory_mb,
             disk_gb: config.disk_gb,
@@ -163,23 +167,124 @@ impl MachineManager {
     ///
     /// Returns an error if the machine cannot be started.
     pub fn start(&self, name: &str) -> Result<()> {
-        let mut machines = self
-            .machines
-            .write()
-            .map_err(|_| CoreError::Machine("lock poisoned".to_string()))?;
+        // First, count running machines and get VM ID.
+        let (vm_id, running_count) = {
+            let machines = self
+                .machines
+                .read()
+                .map_err(|_| CoreError::Machine("lock poisoned".to_string()))?;
 
-        let machine = machines
-            .get_mut(name)
-            .ok_or_else(|| CoreError::NotFound(name.to_string()))?;
+            let machine = machines
+                .get(name)
+                .ok_or_else(|| CoreError::NotFound(name.to_string()))?;
+
+            // Count running machines. CIDs 0, 1 are reserved, 2 is the host. We start from 3.
+            let running_count = machines
+                .values()
+                .filter(|m| m.state == MachineState::Running && m.cid.is_some())
+                .count() as u32;
+
+            (machine.vm_id.clone(), running_count)
+        };
 
         // Start underlying VM
-        self.vm_manager.start(&machine.vm_id)?;
-        machine.state = MachineState::Running;
+        self.vm_manager.start(&vm_id)?;
+
+        // Update machine state
+        {
+            let mut machines = self
+                .machines
+                .write()
+                .map_err(|_| CoreError::Machine("lock poisoned".to_string()))?;
+
+            if let Some(machine) = machines.get_mut(name) {
+                machine.state = MachineState::Running;
+                machine.cid = Some(3 + running_count);
+
+                tracing::info!(
+                    "Machine '{}' started with CID {}",
+                    name,
+                    machine.cid.unwrap()
+                );
+            }
+        }
 
         // Update persisted state
         let _ = self.persistence.update_state(name, MachineState::Running);
 
         Ok(())
+    }
+
+    /// Gets the vsock CID for a running machine.
+    #[must_use]
+    pub fn get_cid(&self, name: &str) -> Option<u32> {
+        self.machines.read().ok()?.get(name)?.cid
+    }
+
+    /// Connects to the agent on a running machine.
+    ///
+    /// Returns an `AgentClient` that can be used to communicate with the
+    /// guest agent for container operations.
+    ///
+    /// # Errors
+    /// Returns an error if the machine is not found, not running, or connection fails.
+    #[cfg(target_os = "macos")]
+    pub fn connect_agent(&self, name: &str) -> Result<crate::agent_client::AgentClient> {
+        use crate::agent_client::{AgentClient, AGENT_PORT};
+
+        let machines = self
+            .machines
+            .read()
+            .map_err(|_| CoreError::Machine("lock poisoned".to_string()))?;
+
+        let machine = machines
+            .get(name)
+            .ok_or_else(|| CoreError::NotFound(name.to_string()))?;
+
+        if machine.state != MachineState::Running {
+            return Err(CoreError::InvalidState(format!(
+                "machine '{}' is not running",
+                name
+            )));
+        }
+
+        let cid = machine
+            .cid
+            .ok_or_else(|| CoreError::Machine("CID not assigned".to_string()))?;
+
+        // Connect to the agent via vsock through the VM
+        let fd = self.vm_manager.connect_vsock(&machine.vm_id, AGENT_PORT)?;
+
+        AgentClient::from_fd(cid, fd)
+    }
+
+    /// Connects to the agent on a running machine (Linux).
+    #[cfg(target_os = "linux")]
+    pub fn connect_agent(&self, name: &str) -> Result<crate::agent_client::AgentClient> {
+        use crate::agent_client::AgentClient;
+
+        let machines = self
+            .machines
+            .read()
+            .map_err(|_| CoreError::Machine("lock poisoned".to_string()))?;
+
+        let machine = machines
+            .get(name)
+            .ok_or_else(|| CoreError::NotFound(name.to_string()))?;
+
+        if machine.state != MachineState::Running {
+            return Err(CoreError::InvalidState(format!(
+                "machine '{}' is not running",
+                name
+            )));
+        }
+
+        let cid = machine
+            .cid
+            .ok_or_else(|| CoreError::Machine("CID not assigned".to_string()))?;
+
+        // On Linux, AgentClient connects directly via AF_VSOCK
+        Ok(AgentClient::new(cid))
     }
 
     /// Stops a machine.
