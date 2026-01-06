@@ -1,0 +1,41 @@
+[package]
+name = "arcbox-agent"
+description = "Guest agent for ArcBox VMs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "arcbox-agent"
+path = "src/main.rs"
+
+[dependencies]
+arcbox-protocol = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+nix = { workspace = true, features = ["mount", "process", "sched", "signal"] }
+libc = { workspace = true }
+prost = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+chrono = { workspace = true }
+hostname = { workspace = true }
+
+# vsock is Linux-only
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = "0.5"
+
+[features]
+default = []
+
+# When building for the guest VM (Linux), vsock is fully functional.
+# On macOS host, we provide stubs for development/testing.
