@@ -1,0 +1,20 @@
+[package]
+name = "arcbox-snapshot"
+description = "Snapshot and restore functionality for ArcBox Pro"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "BSL-1.1"
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+[features]
+default = []
