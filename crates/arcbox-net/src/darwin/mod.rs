@@ -16,10 +16,35 @@
 //! - **NAT (Shared)**: VMs share host's network connection via NAT
 //! - **Host-Only**: VMs can only communicate with host
 //! - **Bridged**: VMs appear as separate devices on the network
+//!
+//! # vmnet.framework
+//!
+//! The vmnet backend provides direct access to virtual network interfaces:
+//!
+//! ```ignore
+//! use arcbox_net::darwin::{Vmnet, VmnetConfig, VmnetMode};
+//!
+//! // Create a NAT (shared) network.
+//! let vmnet = Vmnet::new_shared()?;
+//!
+//! // Or create with custom configuration.
+//! let config = VmnetConfig::shared()
+//!     .with_mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])
+//!     .with_mtu(1500);
+//! let vmnet = Vmnet::new(config)?;
+//!
+//! // Read/write packets.
+//! let mut buf = [0u8; 1500];
+//! let n = vmnet.read_packet(&mut buf)?;
+//! vmnet.write_packet(&buf[..n])?;
+//! ```
 
 pub mod nat;
+pub mod vmnet;
+pub mod vmnet_ffi;
 
 pub use nat::DarwinNatNetwork;
+pub use vmnet::{Vmnet, VmnetConfig, VmnetMode};
 
 use std::net::Ipv4Addr;
 
