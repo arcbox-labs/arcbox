@@ -7,10 +7,39 @@
 
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::Once;
 
 use objc2::ffi::{objc_getClass, objc_msgSend};
 use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
 use objc2::sel;
+
+// ============================================================================
+// Framework Loading
+// ============================================================================
+
+static FRAMEWORK_INIT: Once = Once::new();
+
+/// Ensures Virtualization.framework is loaded.
+fn ensure_framework_loaded() {
+    FRAMEWORK_INIT.call_once(|| {
+        unsafe {
+            // Load Virtualization.framework using dlopen
+            let path = std::ffi::CString::new(
+                "/System/Library/Frameworks/Virtualization.framework/Virtualization"
+            ).unwrap();
+            let handle = libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+            if handle.is_null() {
+                let err = libc::dlerror();
+                if !err.is_null() {
+                    let err_str = std::ffi::CStr::from_ptr(err).to_string_lossy();
+                    tracing::error!("Failed to load Virtualization.framework: {}", err_str);
+                }
+            } else {
+                tracing::debug!("Virtualization.framework loaded successfully");
+            }
+        }
+    });
+}
 
 // ============================================================================
 // Objective-C Runtime Helpers
@@ -18,6 +47,7 @@ use objc2::sel;
 
 /// Gets an Objective-C class by name.
 fn get_class(name: &str) -> Option<&'static AnyClass> {
+    ensure_framework_loaded();
     let name_cstr = std::ffi::CString::new(name).ok()?;
     unsafe {
         let cls = objc_getClass(name_cstr.as_ptr());
@@ -878,6 +908,79 @@ pub fn min_memory_size() -> u64 {
 // Dispatch queue FFI
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const i8, attr: *const c_void) -> *mut AnyObject;
+    fn dispatch_sync(queue: *mut AnyObject, block: *const c_void);
+    // dispatch_get_main_queue is a macro - we access _dispatch_main_q directly
+    static _dispatch_main_q: *mut AnyObject;
+}
+
+// Block trampoline for dispatch_sync
+type DispatchBlock = unsafe extern "C" fn(*mut c_void);
+
+unsafe extern "C" fn block_invoke(context: *mut c_void) {
+    unsafe {
+        let closure: &mut Box<dyn FnMut()> = &mut *(context as *mut Box<dyn FnMut()>);
+        closure();
+    }
+}
+
+/// Executes a closure synchronously on the given dispatch queue.
+pub fn dispatch_sync_closure<F: FnMut()>(queue: *mut AnyObject, mut f: F) {
+    if queue.is_null() {
+        // If no queue, just execute directly
+        f();
+        return;
+    }
+
+    unsafe {
+        // For simplicity, we'll use dispatch_sync with a block literal approach
+        // This is a simplified version - real implementation would need proper block support
+        let mut closure: Box<dyn FnMut()> = Box::new(f);
+        let closure_ptr = &mut closure as *mut Box<dyn FnMut()> as *mut c_void;
+
+        // Create a simple block structure
+        // Note: This is a simplified approach - proper implementation would use block_copy
+        #[repr(C)]
+        struct Block {
+            isa: *const c_void,
+            flags: i32,
+            reserved: i32,
+            invoke: DispatchBlock,
+            descriptor: *const BlockDescriptor,
+            context: *mut c_void,
+        }
+
+        #[repr(C)]
+        struct BlockDescriptor {
+            reserved: u64,
+            size: u64,
+        }
+
+        static BLOCK_DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+            reserved: 0,
+            size: std::mem::size_of::<Block>() as u64,
+        };
+
+        // _NSConcreteStackBlock
+        unsafe extern "C" {
+            static _NSConcreteStackBlock: *const c_void;
+        }
+
+        let block = Block {
+            isa: _NSConcreteStackBlock,
+            flags: 1 << 29, // BLOCK_HAS_COPY_DISPOSE not set for stack block
+            reserved: 0,
+            invoke: block_invoke,
+            descriptor: &BLOCK_DESCRIPTOR,
+            context: closure_ptr,
+        };
+
+        dispatch_sync(queue, &block as *const Block as *const c_void);
+    }
+}
+
+/// Gets the main dispatch queue.
+pub fn get_main_queue() -> *mut AnyObject {
+    unsafe { _dispatch_main_q }
 }
 
 /// Creates a dispatch queue for VM operations.

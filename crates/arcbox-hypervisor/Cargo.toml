@@ -16,12 +16,21 @@ libc = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 
+# Link Virtualization.framework on macOS
+[target.'cfg(target_os = "macos")'.build-dependencies]
+# None needed - we use runtime linking
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # nix for ioctl macros
 nix = { version = "0.29", features = ["ioctl"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[example]]
+name = "boot_vm"
+required-features = []
 
 [features]
 default = []
