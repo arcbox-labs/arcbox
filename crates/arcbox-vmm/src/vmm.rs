@@ -3,6 +3,7 @@
 //! The VMM (Virtual Machine Monitor) orchestrates all components needed to run
 //! a virtual machine: hypervisor, vCPUs, memory, and devices.
 
+use std::any::Any;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,9 +15,10 @@ use crate::irq::IrqChip;
 use crate::memory::MemoryManager;
 use crate::vcpu::VcpuManager;
 
-use arcbox_hypervisor::{
-    create_hypervisor, GuestAddress, Hypervisor, VirtualMachine, VmConfig,
-};
+use arcbox_hypervisor::VmConfig;
+
+/// Type-erased VM handle for managed execution mode.
+type ManagedVm = Box<dyn Any + Send + Sync>;
 
 /// VMM-specific configuration.
 #[derive(Debug, Clone)]
@@ -115,7 +117,7 @@ pub struct Vmm {
     state: VmmState,
     /// Running flag for graceful shutdown.
     running: Arc<AtomicBool>,
-    /// vCPU manager.
+    /// vCPU manager (for manual execution mode).
     vcpu_manager: Option<VcpuManager>,
     /// Memory manager.
     memory_manager: Option<MemoryManager>,
@@ -125,6 +127,11 @@ pub struct Vmm {
     irq_chip: Option<IrqChip>,
     /// Event loop.
     event_loop: Option<EventLoop>,
+    /// Whether using managed execution mode (e.g., Darwin Virtualization.framework).
+    managed_execution: bool,
+    /// Type-erased VM handle for managed execution mode.
+    /// Stored to keep the VM alive and for lifecycle control.
+    managed_vm: Option<ManagedVm>,
 }
 
 impl Vmm {
@@ -167,6 +174,8 @@ impl Vmm {
             device_manager: None,
             irq_chip: None,
             event_loop: None,
+            managed_execution: false,
+            managed_vm: None,
         })
     }
 
@@ -206,6 +215,74 @@ impl Vmm {
         self.state = VmmState::Initializing;
         tracing::info!("Initializing VMM");
 
+        // Platform-specific initialization
+        #[cfg(target_os = "macos")]
+        {
+            self.initialize_darwin()?;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            self.initialize_linux()?;
+        }
+
+        tracing::info!("VMM initialized successfully");
+        Ok(())
+    }
+
+    /// Darwin-specific initialization using Virtualization.framework.
+    #[cfg(target_os = "macos")]
+    fn initialize_darwin(&mut self) -> Result<()> {
+        use arcbox_hypervisor::darwin::DarwinHypervisor;
+        use arcbox_hypervisor::traits::{Hypervisor, VirtualMachine};
+
+        let hypervisor = DarwinHypervisor::new()?;
+        tracing::debug!("Platform capabilities: {:?}", hypervisor.capabilities());
+
+        let vm_config = self.config.to_vm_config();
+        let vm = hypervisor.create_vm(vm_config)?;
+
+        // Check if this is managed execution
+        self.managed_execution = vm.is_managed_execution();
+        tracing::info!("Using managed execution mode: {}", self.managed_execution);
+
+        // Initialize memory manager
+        let mut memory_manager = MemoryManager::new();
+        memory_manager.initialize(self.config.memory_size)?;
+
+        // Initialize device manager
+        let device_manager = DeviceManager::new();
+
+        // Initialize IRQ chip
+        let irq_chip = IrqChip::new()?;
+
+        // Initialize event loop
+        let event_loop = EventLoop::new()?;
+
+        // Store managers
+        self.memory_manager = Some(memory_manager);
+        self.device_manager = Some(device_manager);
+        self.irq_chip = Some(irq_chip);
+        self.event_loop = Some(event_loop);
+
+        // For managed execution, we don't create vCPU threads
+        // Instead, store the VM for lifecycle management
+        if self.managed_execution {
+            tracing::debug!("Managed execution: skipping vCPU thread creation");
+            self.managed_vm = Some(Box::new(vm));
+        } else {
+            // This shouldn't happen on Darwin, but handle it anyway
+            let vcpu_manager = VcpuManager::new(self.config.vcpu_count);
+            // Note: Darwin vCPUs are placeholders, but we add them anyway
+            self.vcpu_manager = Some(vcpu_manager);
+        }
+
+        Ok(())
+    }
+
+    /// Linux-specific initialization using KVM.
+    #[cfg(target_os = "linux")]
+    fn initialize_linux(&mut self) -> Result<()> {
         // Create hypervisor and VM
         let hypervisor = create_hypervisor()?;
         let vm_config = self.config.to_vm_config();
@@ -213,6 +290,9 @@ impl Vmm {
         tracing::debug!("Platform capabilities: {:?}", hypervisor.capabilities());
 
         let mut vm = hypervisor.create_vm(vm_config)?;
+
+        // KVM uses manual execution mode
+        self.managed_execution = false;
 
         // Initialize memory manager
         let mut memory_manager = MemoryManager::new();
@@ -243,7 +323,6 @@ impl Vmm {
         self.vcpu_manager = Some(vcpu_manager);
         self.event_loop = Some(event_loop);
 
-        tracing::info!("VMM initialized successfully");
         Ok(())
     }
 
@@ -267,9 +346,17 @@ impl Vmm {
 
         tracing::info!("Starting VMM");
 
-        // Start vCPUs
-        if let Some(ref mut vcpu_manager) = self.vcpu_manager {
-            vcpu_manager.start()?;
+        if self.managed_execution {
+            // For managed execution, start the VM directly
+            #[cfg(target_os = "macos")]
+            {
+                self.start_managed_vm()?;
+            }
+        } else {
+            // For manual execution, start vCPU threads
+            if let Some(ref mut vcpu_manager) = self.vcpu_manager {
+                vcpu_manager.start()?;
+            }
         }
 
         // Start event loop
@@ -281,6 +368,20 @@ impl Vmm {
         self.state = VmmState::Running;
 
         tracing::info!("VMM started");
+        Ok(())
+    }
+
+    /// Starts the managed VM (Darwin-specific).
+    #[cfg(target_os = "macos")]
+    fn start_managed_vm(&mut self) -> Result<()> {
+        use arcbox_hypervisor::darwin::DarwinVm;
+        use arcbox_hypervisor::traits::VirtualMachine;
+
+        if let Some(ref mut managed_vm) = self.managed_vm {
+            if let Some(vm) = managed_vm.downcast_mut::<DarwinVm>() {
+                vm.start().map_err(VmmError::Hypervisor)?;
+            }
+        }
         Ok(())
     }
 
@@ -299,12 +400,33 @@ impl Vmm {
 
         tracing::info!("Pausing VMM");
 
-        if let Some(ref mut vcpu_manager) = self.vcpu_manager {
-            vcpu_manager.pause()?;
+        if self.managed_execution {
+            #[cfg(target_os = "macos")]
+            {
+                self.pause_managed_vm()?;
+            }
+        } else {
+            if let Some(ref mut vcpu_manager) = self.vcpu_manager {
+                vcpu_manager.pause()?;
+            }
         }
 
         self.state = VmmState::Paused;
         tracing::info!("VMM paused");
+        Ok(())
+    }
+
+    /// Pauses the managed VM (Darwin-specific).
+    #[cfg(target_os = "macos")]
+    fn pause_managed_vm(&mut self) -> Result<()> {
+        use arcbox_hypervisor::darwin::DarwinVm;
+        use arcbox_hypervisor::traits::VirtualMachine;
+
+        if let Some(ref mut managed_vm) = self.managed_vm {
+            if let Some(vm) = managed_vm.downcast_mut::<DarwinVm>() {
+                vm.pause().map_err(VmmError::Hypervisor)?;
+            }
+        }
         Ok(())
     }
 
@@ -323,12 +445,33 @@ impl Vmm {
 
         tracing::info!("Resuming VMM");
 
-        if let Some(ref mut vcpu_manager) = self.vcpu_manager {
-            vcpu_manager.resume()?;
+        if self.managed_execution {
+            #[cfg(target_os = "macos")]
+            {
+                self.resume_managed_vm()?;
+            }
+        } else {
+            if let Some(ref mut vcpu_manager) = self.vcpu_manager {
+                vcpu_manager.resume()?;
+            }
         }
 
         self.state = VmmState::Running;
         tracing::info!("VMM resumed");
+        Ok(())
+    }
+
+    /// Resumes the managed VM (Darwin-specific).
+    #[cfg(target_os = "macos")]
+    fn resume_managed_vm(&mut self) -> Result<()> {
+        use arcbox_hypervisor::darwin::DarwinVm;
+        use arcbox_hypervisor::traits::VirtualMachine;
+
+        if let Some(ref mut managed_vm) = self.managed_vm {
+            if let Some(vm) = managed_vm.downcast_mut::<DarwinVm>() {
+                vm.resume().map_err(VmmError::Hypervisor)?;
+            }
+        }
         Ok(())
     }
 
@@ -351,13 +494,34 @@ impl Vmm {
             event_loop.stop();
         }
 
-        // Stop vCPUs
-        if let Some(ref mut vcpu_manager) = self.vcpu_manager {
-            vcpu_manager.stop()?;
+        if self.managed_execution {
+            #[cfg(target_os = "macos")]
+            {
+                self.stop_managed_vm()?;
+            }
+        } else {
+            // Stop vCPUs
+            if let Some(ref mut vcpu_manager) = self.vcpu_manager {
+                vcpu_manager.stop()?;
+            }
         }
 
         self.state = VmmState::Stopped;
         tracing::info!("VMM stopped");
+        Ok(())
+    }
+
+    /// Stops the managed VM (Darwin-specific).
+    #[cfg(target_os = "macos")]
+    fn stop_managed_vm(&mut self) -> Result<()> {
+        use arcbox_hypervisor::darwin::DarwinVm;
+        use arcbox_hypervisor::traits::VirtualMachine;
+
+        if let Some(ref mut managed_vm) = self.managed_vm {
+            if let Some(vm) = managed_vm.downcast_mut::<DarwinVm>() {
+                vm.stop().map_err(VmmError::Hypervisor)?;
+            }
+        }
         Ok(())
     }
 
