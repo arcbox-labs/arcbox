@@ -19,6 +19,7 @@ libc = { workspace = true }
 ipnetwork = "0.20"
 hashbrown = "0.14"
 crossbeam-utils = "0.8"
+socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

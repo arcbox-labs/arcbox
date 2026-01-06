@@ -44,6 +44,8 @@ pub mod datapath;
 pub mod dhcp;
 pub mod dns;
 pub mod error;
+pub mod mdns;
+pub mod mdns_protocol;
 pub mod nat;
 pub mod nat_engine;
 pub mod port_forward;
