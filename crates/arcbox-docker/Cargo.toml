@@ -26,9 +26,13 @@ hostname = { workspace = true }
 hyper-util = { version = "0.1", features = ["tokio"] }
 uuid = { workspace = true }
 chrono = { workspace = true }
+sha2 = "0.10"
+hex = "0.4"
+dirs = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
 
 [features]
 default = []

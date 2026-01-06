@@ -39,11 +39,13 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod api;
+pub mod context;
 pub mod error;
 pub mod handlers;
 pub mod server;
 pub mod types;
 
+pub use context::{ContextStatus, DockerContextManager};
 pub use error::{DockerError, Result};
 pub use server::{DockerApiServer, ServerConfig};
 

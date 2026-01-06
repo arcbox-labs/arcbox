@@ -42,6 +42,10 @@ pub enum DockerError {
     /// Not implemented.
     #[error("Not implemented: {0}")]
     NotImplemented(String),
+
+    /// Context management error.
+    #[error("Context error: {0}")]
+    Context(String),
 }
 
 impl DockerError {
@@ -55,7 +59,7 @@ impl DockerError {
             | Self::NetworkNotFound(_) => StatusCode::NOT_FOUND,
             Self::InvalidParameter(_) => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,
-            Self::Server(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Server(_) | Self::Context(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
         }
     }
