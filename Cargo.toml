@@ -104,6 +104,7 @@ dashmap = "6"
 
 # Configuration
 figment = { version = "0.10", features = ["toml", "env"] }
+toml = "0.8"
 dirs = "6"
 
 # UUID
