@@ -86,10 +86,12 @@ impl ImagePuller {
         }
 
         // 3. Download layers in parallel.
+        // Clone layers to avoid lifetime issues with async closures.
         let layers_to_download: Vec<_> = manifest
             .layers
             .iter()
             .filter(|l| !self.store.blob_exists(&l.digest))
+            .cloned()
             .collect();
 
         if layers_to_download.is_empty() {
@@ -107,35 +109,38 @@ impl ImagePuller {
                 }
             }
 
+            // Clone references needed in async tasks.
+            let client = &self.client;
+            let store = &self.store;
+            let repo = reference.repository.clone();
+
             // Download layers concurrently.
             let results: Vec<Result<()>> = stream::iter(layers_to_download)
                 .map(|layer| {
-                    let client = &self.client;
-                    let store = &self.store;
                     let progress = self.progress.clone();
+                    let repo = repo.clone();
+                    let digest = layer.digest.clone();
+                    let size = layer.size;
 
                     async move {
-                        let digest = &layer.digest;
-                        let size = layer.size;
-
                         debug!(digest = %digest, size = size, "downloading layer");
 
                         let data = if let Some(p) = &progress {
                             let p = p.clone();
-                            let digest_clone = digest.clone();
+                            let digest_for_progress = digest.clone();
                             client
-                                .get_blob_with_progress(reference, digest, size, move |downloaded, total| {
-                                    p.layer_progress(&digest_clone, downloaded, total);
-                                })
+                                .get_blob_by_repo(&repo, &digest, size, Some(move |downloaded, total| {
+                                    p.layer_progress(&digest_for_progress, downloaded, total);
+                                }))
                                 .await?
                         } else {
-                            client.get_blob(reference, digest).await?
+                            client.get_blob_by_repo(&repo, &digest, size, None::<fn(u64, u64)>).await?
                         };
 
-                        store.store_blob(&data, Some(digest))?;
+                        store.store_blob(&data, Some(&digest))?;
 
                         if let Some(p) = &progress {
-                            p.layer_complete(digest);
+                            p.layer_complete(&digest);
                         }
 
                         debug!(digest = %digest, "layer downloaded");

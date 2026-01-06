@@ -335,6 +335,73 @@ impl RegistryClient {
         Ok(data)
     }
 
+    /// Gets a blob by repository name with optional progress callback.
+    ///
+    /// This variant takes owned strings to work better with async closures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blob cannot be fetched.
+    #[instrument(skip(self, progress))]
+    pub async fn get_blob_by_repo<F>(
+        &self,
+        repository: &str,
+        digest: &str,
+        expected_size: u64,
+        progress: Option<F>,
+    ) -> Result<Vec<u8>>
+    where
+        F: FnMut(u64, u64),
+    {
+        let url = format!(
+            "{}/v2/{}/blobs/{}",
+            self.registry_url, repository, digest
+        );
+
+        debug!(url = %url, expected_size = expected_size, "fetching blob by repo");
+
+        let response = self
+            .request_with_auth(reqwest::Method::GET, &url, repository)
+            .await?;
+
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
+            return Err(ImageError::NotFound(format!("blob {digest}")));
+        }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ImageError::Registry(format!(
+                "failed to fetch blob: {status} - {body}"
+            )));
+        }
+
+        // Stream the response and track progress.
+        let mut stream = response.bytes_stream();
+        let capacity = usize::try_from(expected_size).unwrap_or(usize::MAX).min(256 * 1024 * 1024);
+        let mut data = Vec::with_capacity(capacity);
+        let mut downloaded: u64 = 0;
+
+        if let Some(mut progress_fn) = progress {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    ImageError::Registry(format!("failed to read blob chunk: {e}"))
+                })?;
+                downloaded += chunk.len() as u64;
+                data.extend_from_slice(&chunk);
+                progress_fn(downloaded, expected_size);
+            }
+        } else {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    ImageError::Registry(format!("failed to read blob chunk: {e}"))
+                })?;
+                data.extend_from_slice(&chunk);
+            }
+        }
+
+        Ok(data)
+    }
+
     /// Makes an authenticated request to the registry.
     ///
     /// Handles token authentication (401 challenge) automatically.

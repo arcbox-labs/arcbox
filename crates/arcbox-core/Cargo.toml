@@ -23,6 +23,7 @@ prost = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 serde = { workspace = true }
 figment = { workspace = true }
 uuid = { workspace = true }
