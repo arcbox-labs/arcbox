@@ -20,6 +20,17 @@ use arcbox_hypervisor::VmConfig;
 /// Type-erased VM handle for managed execution mode.
 type ManagedVm = Box<dyn Any + Send + Sync>;
 
+/// Shared directory configuration for VirtioFS.
+#[derive(Debug, Clone)]
+pub struct SharedDirConfig {
+    /// Host path to share.
+    pub host_path: PathBuf,
+    /// Tag for mounting in guest.
+    pub tag: String,
+    /// Whether the share is read-only.
+    pub read_only: bool,
+}
+
 /// VMM-specific configuration.
 #[derive(Debug, Clone)]
 pub struct VmmConfig {
@@ -39,6 +50,12 @@ pub struct VmmConfig {
     pub serial_console: bool,
     /// Enable virtio-console.
     pub virtio_console: bool,
+    /// Shared directories for VirtioFS.
+    pub shared_dirs: Vec<SharedDirConfig>,
+    /// Enable networking.
+    pub networking: bool,
+    /// Enable vsock.
+    pub vsock: bool,
 }
 
 impl Default for VmmConfig {
@@ -52,6 +69,9 @@ impl Default for VmmConfig {
             enable_rosetta: false,
             serial_console: true,
             virtio_console: true,
+            shared_dirs: Vec::new(),
+            networking: true,
+            vsock: true,
         }
     }
 }
@@ -235,16 +255,47 @@ impl Vmm {
     fn initialize_darwin(&mut self) -> Result<()> {
         use arcbox_hypervisor::darwin::DarwinHypervisor;
         use arcbox_hypervisor::traits::{Hypervisor, VirtualMachine};
+        use arcbox_hypervisor::VirtioDeviceConfig;
 
         let hypervisor = DarwinHypervisor::new()?;
         tracing::debug!("Platform capabilities: {:?}", hypervisor.capabilities());
 
         let vm_config = self.config.to_vm_config();
-        let vm = hypervisor.create_vm(vm_config)?;
+        let mut vm = hypervisor.create_vm(vm_config)?;
 
         // Check if this is managed execution
         self.managed_execution = vm.is_managed_execution();
         tracing::info!("Using managed execution mode: {}", self.managed_execution);
+
+        // Add VirtioFS devices for shared directories
+        for shared_dir in &self.config.shared_dirs {
+            let device_config = VirtioDeviceConfig::filesystem(
+                shared_dir.host_path.to_string_lossy(),
+                &shared_dir.tag,
+                shared_dir.read_only,
+            );
+            vm.add_virtio_device(device_config)?;
+            tracing::info!(
+                "Added VirtioFS share: {} -> {} (read_only: {})",
+                shared_dir.tag,
+                shared_dir.host_path.display(),
+                shared_dir.read_only
+            );
+        }
+
+        // Add networking if enabled
+        if self.config.networking {
+            let net_config = VirtioDeviceConfig::network();
+            vm.add_virtio_device(net_config)?;
+            tracing::info!("Added network device with NAT");
+        }
+
+        // Add vsock if enabled
+        if self.config.vsock {
+            let vsock_config = VirtioDeviceConfig::vsock();
+            vm.add_virtio_device(vsock_config)?;
+            tracing::info!("Added vsock device");
+        }
 
         // Initialize memory manager
         let mut memory_manager = MemoryManager::new();

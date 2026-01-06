@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::RwLock;
 use uuid::Uuid;
 
-use arcbox_vmm::{Vmm, VmmConfig};
+use arcbox_vmm::{SharedDirConfig as VmmSharedDirConfig, Vmm, VmmConfig};
 
 /// VM identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -66,6 +66,36 @@ pub struct VmInfo {
     pub memory_mb: u64,
 }
 
+/// Shared directory configuration for VirtioFS.
+#[derive(Debug, Clone)]
+pub struct SharedDirConfig {
+    /// Host path to share.
+    pub host_path: String,
+    /// Tag for mounting in guest (e.g., "share").
+    pub tag: String,
+    /// Whether the share is read-only.
+    pub read_only: bool,
+}
+
+impl SharedDirConfig {
+    /// Creates a new shared directory configuration.
+    #[must_use]
+    pub fn new(host_path: impl Into<String>, tag: impl Into<String>) -> Self {
+        Self {
+            host_path: host_path.into(),
+            tag: tag.into(),
+            read_only: false,
+        }
+    }
+
+    /// Sets the share as read-only.
+    #[must_use]
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+}
+
 /// VM configuration.
 #[derive(Debug, Clone)]
 pub struct VmConfig {
@@ -79,6 +109,12 @@ pub struct VmConfig {
     pub initrd: Option<String>,
     /// Kernel command line.
     pub cmdline: Option<String>,
+    /// Shared directories for VirtioFS.
+    pub shared_dirs: Vec<SharedDirConfig>,
+    /// Enable networking.
+    pub networking: bool,
+    /// Enable vsock.
+    pub vsock: bool,
 }
 
 impl Default for VmConfig {
@@ -89,6 +125,9 @@ impl Default for VmConfig {
             kernel: None,
             initrd: None,
             cmdline: None,
+            shared_dirs: Vec::new(),
+            networking: true,
+            vsock: true,
         }
     }
 }
@@ -168,6 +207,17 @@ impl VmManager {
         entry.info.state = VmState::Starting;
 
         // Convert our config to VMM config
+        let shared_dirs: Vec<VmmSharedDirConfig> = entry
+            .config
+            .shared_dirs
+            .iter()
+            .map(|sd| VmmSharedDirConfig {
+                host_path: PathBuf::from(&sd.host_path),
+                tag: sd.tag.clone(),
+                read_only: sd.read_only,
+            })
+            .collect();
+
         let vmm_config = VmmConfig {
             vcpu_count: entry.config.cpus,
             memory_size: entry.config.memory_mb * 1024 * 1024,
@@ -182,6 +232,9 @@ impl VmManager {
             enable_rosetta: false,
             serial_console: true,
             virtio_console: true,
+            shared_dirs,
+            networking: entry.config.networking,
+            vsock: entry.config.vsock,
         };
 
         // Create and start VMM

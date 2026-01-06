@@ -73,4 +73,4 @@ pub use device::{DeviceId, DeviceInfo, DeviceManager, DeviceType, DeviceTreeEntr
 pub use error::{Result, VmmError};
 pub use fdt::{FdtBuilder, FdtConfig};
 pub use vcpu::{DeviceManagerExitHandler, ExitHandler, VcpuManager};
-pub use vmm::{Vmm, VmmConfig, VmmState};
+pub use vmm::{SharedDirConfig, Vmm, VmmConfig, VmmState};
