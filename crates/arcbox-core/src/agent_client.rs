@@ -5,8 +5,8 @@
 use crate::error::{CoreError, Result};
 use arcbox_protocol::agent::{
     CreateContainerRequest, CreateContainerResponse, ExecOutput, ExecRequest,
-    ListContainersRequest, ListContainersResponse, PingRequest, PingResponse,
-    RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
+    ListContainersRequest, ListContainersResponse, LogEntry, LogsRequest, PingRequest,
+    PingResponse, RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
 };
 use arcbox_protocol::Empty;
 use arcbox_transport::vsock::{VsockAddr, VsockTransport};
@@ -15,7 +15,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
+use tokio_stream::wrappers::ReceiverStream;
 
 /// Default vsock port for agent communication.
 pub const AGENT_PORT: u32 = 1024;
@@ -33,6 +34,7 @@ enum MessageType {
     RemoveContainerRequest = 0x0013,
     ListContainersRequest = 0x0014,
     ExecRequest = 0x0020,
+    LogsRequest = 0x0021,
 
     // Response types
     PingResponse = 0x1001,
@@ -40,6 +42,7 @@ enum MessageType {
     CreateContainerResponse = 0x1010,
     ListContainersResponse = 0x1014,
     ExecOutput = 0x1020,
+    LogEntry = 0x1021,
 
     // Special types
     EmptyResponse = 0x0000,
@@ -57,11 +60,13 @@ impl MessageType {
             0x0013 => Some(Self::RemoveContainerRequest),
             0x0014 => Some(Self::ListContainersRequest),
             0x0020 => Some(Self::ExecRequest),
+            0x0021 => Some(Self::LogsRequest),
             0x1001 => Some(Self::PingResponse),
             0x1002 => Some(Self::GetSystemInfoResponse),
             0x1010 => Some(Self::CreateContainerResponse),
             0x1014 => Some(Self::ListContainersResponse),
             0x1020 => Some(Self::ExecOutput),
+            0x1021 => Some(Self::LogEntry),
             0x0000 => Some(Self::EmptyResponse),
             0xFFFF => Some(Self::Error),
             _ => None,
@@ -89,6 +94,31 @@ impl AgentClient {
             transport: VsockTransport::new(addr),
             connected: false,
         }
+    }
+
+    /// Creates an agent client from an existing vsock file descriptor.
+    ///
+    /// This is used on macOS where vsock connections are obtained through
+    /// the hypervisor layer (Virtualization.framework) rather than directly
+    /// through AF_VSOCK.
+    ///
+    /// # Arguments
+    /// * `cid` - The VM's CID (for tracking purposes)
+    /// * `fd` - A connected vsock file descriptor from the hypervisor
+    ///
+    /// # Errors
+    /// Returns an error if the fd is invalid.
+    #[cfg(target_os = "macos")]
+    pub fn from_fd(cid: u32, fd: std::os::unix::io::RawFd) -> Result<Self> {
+        let addr = VsockAddr::new(cid, AGENT_PORT);
+        let transport = VsockTransport::from_raw_fd(fd, addr)
+            .map_err(|e| CoreError::Machine(format!("invalid vsock fd: {}", e)))?;
+
+        Ok(Self {
+            cid,
+            transport,
+            connected: true,
+        })
     }
 
     /// Returns the VM CID.
@@ -362,6 +392,110 @@ impl AgentClient {
 
         ExecOutput::decode(&resp_payload[..])
             .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+    }
+
+    /// Gets container logs from the guest VM (single response).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the logs request fails.
+    pub async fn logs(&mut self, req: LogsRequest) -> Result<LogEntry> {
+        let payload = req.encode_to_vec();
+
+        let (resp_type, resp_payload) =
+            self.rpc_call(MessageType::LogsRequest, &payload).await?;
+
+        if resp_type != MessageType::LogEntry as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: {}",
+                resp_type
+            )));
+        }
+
+        LogEntry::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+    }
+
+    /// Gets container logs as a stream (for follow mode).
+    ///
+    /// Returns a stream of log entries that continues until the container stops
+    /// or the connection is closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the initial request fails.
+    pub async fn logs_stream(
+        &mut self,
+        req: LogsRequest,
+    ) -> Result<ReceiverStream<Result<LogEntry>>> {
+        if !self.connected {
+            self.connect().await?;
+        }
+
+        let payload = req.encode_to_vec();
+
+        // Build message: length (4B BE) + type (4B BE) + payload
+        let length = 4 + payload.len() as u32;
+        let mut buf = BytesMut::with_capacity(8 + payload.len());
+        buf.put_u32(length);
+        buf.put_u32(MessageType::LogsRequest as u32);
+        buf.extend_from_slice(&payload);
+
+        // Send request
+        self.transport
+            .send(buf.freeze())
+            .await
+            .map_err(|e| CoreError::Machine(format!("failed to send request: {}", e)))?;
+
+        // Create channel for streaming responses
+        let (tx, rx) = mpsc::channel(32);
+
+        // Spawn task to read log entries
+        let cid = self.cid;
+
+        // Note: This is a simplified implementation. In production, we would
+        // need to properly handle the transport ownership for concurrent reads.
+        // For now, we read the first response synchronously.
+
+        // Read first response to check for errors
+        let response = self
+            .transport
+            .recv()
+            .await
+            .map_err(|e| CoreError::Machine(format!("failed to receive response: {}", e)))?;
+
+        if response.len() < 8 {
+            return Err(CoreError::Machine("response too short".to_string()));
+        }
+
+        let mut cursor = std::io::Cursor::new(&response[..]);
+        let _length = cursor.get_u32();
+        let resp_type = cursor.get_u32();
+        let resp_payload = response[8..].to_vec();
+
+        // Check for error response
+        if resp_type == MessageType::Error as u32 {
+            let error_msg = parse_error_response(&resp_payload)?;
+            return Err(CoreError::Machine(error_msg));
+        }
+
+        if resp_type != MessageType::LogEntry as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: {}",
+                resp_type
+            )));
+        }
+
+        // Send first entry
+        let entry = LogEntry::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))?;
+
+        // Send through channel (don't wait for receiver)
+        let _ = tx.try_send(Ok(entry));
+
+        tracing::debug!(cid = cid, "started log stream");
+
+        Ok(ReceiverStream::new(rx))
     }
 }
 

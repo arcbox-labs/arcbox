@@ -368,6 +368,46 @@ impl VmManager {
         tracing::info!("Removed VM {}", id);
         Ok(())
     }
+
+    /// Connects to a vsock port on a running VM.
+    ///
+    /// This establishes a vsock connection to the specified port number
+    /// on the guest VM. The VM must be running.
+    ///
+    /// # Arguments
+    /// * `id` - The VM ID
+    /// * `port` - The port number to connect to (e.g., 1024 for agent)
+    ///
+    /// # Returns
+    /// A file descriptor for the connection that can be used for I/O.
+    ///
+    /// # Errors
+    /// Returns an error if the VM is not found, not running, or connection fails.
+    pub fn connect_vsock(&self, id: &VmId, port: u32) -> Result<std::os::unix::io::RawFd> {
+        let vms = self
+            .vms
+            .read()
+            .map_err(|_| CoreError::Vm("lock poisoned".to_string()))?;
+
+        let entry = vms
+            .get(id)
+            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+
+        if entry.info.state != VmState::Running {
+            return Err(CoreError::InvalidState(format!(
+                "cannot connect vsock: VM is {:?}",
+                entry.info.state
+            )));
+        }
+
+        let vmm = entry
+            .vmm
+            .as_ref()
+            .ok_or_else(|| CoreError::Vm("VMM not initialized".to_string()))?;
+
+        vmm.connect_vsock(port)
+            .map_err(|e| CoreError::Vm(format!("vsock connect failed: {}", e)))
+    }
 }
 
 impl Default for VmManager {

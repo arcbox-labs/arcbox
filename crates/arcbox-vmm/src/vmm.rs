@@ -576,6 +576,50 @@ impl Vmm {
         Ok(())
     }
 
+    /// Connects to a vsock port on the guest VM.
+    ///
+    /// This establishes a vsock connection to the specified port number
+    /// on the guest VM. The VM must be running.
+    ///
+    /// # Arguments
+    /// * `port` - The port number to connect to (e.g., 1024 for agent)
+    ///
+    /// # Returns
+    /// A file descriptor for the connection that can be used for I/O.
+    ///
+    /// # Errors
+    /// Returns an error if the VM is not running or the connection fails.
+    #[cfg(target_os = "macos")]
+    pub fn connect_vsock(&self, port: u32) -> Result<std::os::unix::io::RawFd> {
+        use arcbox_hypervisor::darwin::DarwinVm;
+
+        if self.state != VmmState::Running {
+            return Err(VmmError::InvalidState(format!(
+                "cannot connect vsock: VMM is {:?}",
+                self.state
+            )));
+        }
+
+        if let Some(ref managed_vm) = self.managed_vm {
+            if let Some(vm) = managed_vm.downcast_ref::<DarwinVm>() {
+                return vm.connect_vsock(port).map_err(VmmError::Hypervisor);
+            }
+        }
+
+        Err(VmmError::InvalidState(
+            "vsock not available in manual execution mode".to_string(),
+        ))
+    }
+
+    /// Connects to a vsock port on the guest VM (Linux stub).
+    #[cfg(target_os = "linux")]
+    pub fn connect_vsock(&self, _port: u32) -> Result<std::os::unix::io::RawFd> {
+        // On Linux, vsock connections are made directly via AF_VSOCK socket
+        Err(VmmError::InvalidState(
+            "use AF_VSOCK socket directly on Linux".to_string(),
+        ))
+    }
+
     /// Runs the VMM until it exits.
     ///
     /// This is the main event loop that blocks until the VM exits.
