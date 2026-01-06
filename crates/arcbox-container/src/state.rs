@@ -83,6 +83,8 @@ pub struct Container {
     pub name: String,
     /// Image name.
     pub image: String,
+    /// Machine name (VM where container runs).
+    pub machine_name: Option<String>,
     /// Current state.
     pub state: ContainerState,
     /// Creation time.
@@ -101,6 +103,26 @@ impl Container {
             id: ContainerId::new(),
             name: name.into(),
             image: image.into(),
+            machine_name: None,
+            state: ContainerState::Created,
+            created: Utc::now(),
+            started_at: None,
+            exit_code: None,
+        }
+    }
+
+    /// Creates a new container for a specific machine.
+    #[must_use]
+    pub fn new_for_machine(
+        name: impl Into<String>,
+        image: impl Into<String>,
+        machine: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: ContainerId::new(),
+            name: name.into(),
+            image: image.into(),
+            machine_name: Some(machine.into()),
             state: ContainerState::Created,
             created: Utc::now(),
             started_at: None,

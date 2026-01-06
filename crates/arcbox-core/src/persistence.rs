@@ -201,6 +201,7 @@ mod tests {
             cpus: 4,
             memory_mb: 4096,
             disk_gb: 50,
+            cid: None,
         };
 
         persistence.save(&info).unwrap();
@@ -225,6 +226,7 @@ mod tests {
                 cpus: 2,
                 memory_mb: 2048,
                 disk_gb: 20,
+                cid: None,
             };
             persistence.save(&info).unwrap();
         }
@@ -248,6 +250,7 @@ mod tests {
             cpus: 2,
             memory_mb: 2048,
             disk_gb: 20,
+            cid: None,
         };
 
         persistence.save(&info).unwrap();
