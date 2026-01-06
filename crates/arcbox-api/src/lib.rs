@@ -30,8 +30,18 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod error;
+pub mod generated;
 pub mod grpc;
 pub mod server;
 
+// Re-export generated types for convenience.
+pub use generated::{
+    container_service_client, container_service_server,
+    image_service_client, image_service_server,
+    machine_service_client, machine_service_server,
+    system_service_client, system_service_server,
+};
+
 pub use error::{ApiError, Result};
+pub use grpc::{ContainerServiceImpl, ImageServiceImpl, MachineServiceImpl, SystemServiceImpl};
 pub use server::{ApiServer, ApiServerConfig};
