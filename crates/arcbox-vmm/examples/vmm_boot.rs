@@ -38,6 +38,9 @@ fn main() {
         enable_rosetta: false,
         serial_console: true,
         virtio_console: true,
+        shared_dirs: Vec::new(),
+        networking: false,
+        vsock: false,
     };
 
     println!("VMM Configuration:");
