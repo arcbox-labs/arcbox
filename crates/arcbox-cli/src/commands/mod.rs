@@ -10,6 +10,7 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+pub mod docker;
 pub mod exec;
 pub mod images;
 pub mod logs;
@@ -89,6 +90,10 @@ pub enum Commands {
     /// Manage Linux machines
     #[command(subcommand)]
     Machine(machine::MachineCommands),
+
+    /// Manage Docker CLI integration
+    #[command(subcommand)]
+    Docker(docker::DockerCommands),
 
     /// Display system-wide information
     Info,
