@@ -27,6 +27,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
+hyper = { workspace = true }
+hyper-util = "0.1"
+http-body-util = "0.1"
+tower = "0.5"
 
 [features]
 default = []

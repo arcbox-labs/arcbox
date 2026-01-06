@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+pub mod client;
 mod commands;
 
 use commands::{Cli, Commands};
@@ -58,10 +59,30 @@ async fn execute_info() -> Result<()> {
             .unwrap_or(1)
     );
 
-    // TODO: Connect to daemon and get actual info
-    println!("Containers: 0");
-    println!("Images: 0");
-    println!("Machines: 0");
+    // Try to connect to daemon for runtime info
+    let daemon = client::DaemonClient::new();
+    if daemon.is_running().await {
+        // Get container count
+        let containers: Vec<client::ContainerSummary> = daemon
+            .get("/v1.43/containers/json?all=true")
+            .await
+            .unwrap_or_default();
+        println!("Containers: {}", containers.len());
+
+        // Get image count
+        let images: Vec<client::ImageSummary> = daemon
+            .get("/v1.43/images/json")
+            .await
+            .unwrap_or_default();
+        println!("Images: {}", images.len());
+
+        // TODO: Get machine count from gRPC API
+        println!("Machines: 0");
+    } else {
+        println!("Containers: (daemon not running)");
+        println!("Images: (daemon not running)");
+        println!("Machines: (daemon not running)");
+    }
 
     Ok(())
 }

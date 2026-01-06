@@ -1,5 +1,6 @@
 //! Stop command implementation.
 
+use crate::client;
 use anyhow::Result;
 use clap::Args;
 
@@ -16,9 +17,11 @@ pub struct StopArgs {
 
 /// Executes the stop command.
 pub async fn execute(args: StopArgs) -> Result<()> {
-    tracing::info!("Stopping container: {}", args.container);
+    let daemon = client::get_client().await?;
 
-    // TODO: Connect to daemon and stop container
+    let path = format!("/v1.43/containers/{}/stop?t={}", args.container, args.time);
+    daemon.post_empty::<()>(&path, None).await?;
+
     println!("{}", args.container);
 
     Ok(())

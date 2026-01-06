@@ -1,5 +1,6 @@
 //! Start command implementation.
 
+use crate::client;
 use anyhow::Result;
 use clap::Args;
 
@@ -20,10 +21,17 @@ pub struct StartArgs {
 
 /// Executes the start command.
 pub async fn execute(args: StartArgs) -> Result<()> {
-    tracing::info!("Starting container: {}", args.container);
+    let daemon = client::get_client().await?;
 
-    // TODO: Connect to daemon and start container
+    let path = format!("/v1.43/containers/{}/start", args.container);
+    daemon.post_empty::<()>(&path, None).await?;
+
     println!("{}", args.container);
+
+    // TODO: Implement attach mode if args.attach is set
+    if args.attach {
+        tracing::warn!("Attach mode not yet implemented");
+    }
 
     Ok(())
 }
