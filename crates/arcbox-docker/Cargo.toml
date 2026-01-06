@@ -17,6 +17,7 @@ arcbox-transport = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+bytes = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
@@ -35,8 +36,11 @@ tokio-stream = "0.1"
 futures = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = "3"
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"
+hyper = { workspace = true }
 
 [features]
 default = []

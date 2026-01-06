@@ -7,12 +7,16 @@ use crate::api::AppState;
 use crate::error::{DockerError, Result};
 use crate::types::*;
 use arcbox_container::config::ContainerConfig as CoreContainerConfig;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
+use bytes::Bytes;
+use futures::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
+use tokio_stream::wrappers::ReceiverStream;
 
 // ============================================================================
 // Container Handlers
@@ -396,25 +400,44 @@ fn default_true() -> bool {
     true
 }
 
+/// Encodes data in Docker multiplexed stream format.
+///
+/// Format: [stream_type, 0, 0, 0, size (4 bytes BE), data]
+/// stream_type: 1=stdout, 2=stderr
+fn encode_docker_stream(stream_type: u8, data: &[u8]) -> Vec<u8> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+
+    let mut output = Vec::with_capacity(8 + data.len());
+    output.push(stream_type);
+    output.extend_from_slice(&[0, 0, 0]);
+    output.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    output.extend_from_slice(data);
+    output
+}
+
 /// Get container logs.
 ///
-/// TODO: Full implementation requires:
-/// 1. Extend agent.proto with LogsRequest/LogEntry messages
-/// 2. Implement logs streaming in arcbox-agent
-/// 3. Add logs method to AgentClient
-/// 4. Stream logs back via Docker raw-stream format
+/// Returns logs in Docker raw-stream format:
+/// - For TTY containers: plain text
+/// - For non-TTY containers: 8-byte header + data
+///   Header: [stream_type (1 byte), 0, 0, 0, size (4 bytes big-endian)]
+///   stream_type: 0=stdin, 1=stdout, 2=stderr
 ///
-/// For now, returns empty response to allow Docker CLI compatibility.
+/// When `follow=true`, returns a streaming response.
 pub async fn container_logs(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(params): Query<LogsQuery>,
-) -> Result<impl IntoResponse> {
-    // Verify container exists.
+) -> Result<Response> {
+    // Verify container exists and get machine name.
     let container_id = arcbox_container::state::ContainerId::from_string(&id);
-    if state.runtime.container_manager().get(&container_id).is_none() {
-        return Err(DockerError::ContainerNotFound(id));
-    }
+    let container = state
+        .runtime
+        .container_manager()
+        .get(&container_id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
 
     // Log query parameters for debugging.
     tracing::debug!(
@@ -426,16 +449,149 @@ pub async fn container_logs(
         "container logs request"
     );
 
-    // Return empty response with Docker raw-stream format.
-    // Full implementation requires Agent protocol support.
-    Ok((
-        StatusCode::OK,
-        [(
+    // Parse tail parameter.
+    let tail: i64 = params
+        .tail
+        .as_ref()
+        .and_then(|t| {
+            if t == "all" {
+                Some(0)
+            } else {
+                t.parse().ok()
+            }
+        })
+        .unwrap_or(0);
+
+    // Get machine name from container.
+    let machine_name = container.machine_name.clone().unwrap_or_else(|| "default".to_string());
+
+    // Check if we should stream (follow mode).
+    if params.follow {
+        // Streaming mode: return a streaming response.
+        return container_logs_stream(
+            state,
+            id,
+            machine_name,
+            params.stdout,
+            params.stderr,
+            params.since.unwrap_or(0),
+            params.until.unwrap_or(0),
+            params.timestamps,
+            tail,
+        )
+        .await;
+    }
+
+    // Non-streaming mode: get all logs at once.
+    let log_data = match state
+        .runtime
+        .container_logs(
+            &machine_name,
+            &id,
+            false,
+            params.stdout,
+            params.stderr,
+            params.since.unwrap_or(0),
+            params.until.unwrap_or(0),
+            params.timestamps,
+            tail,
+        )
+        .await
+    {
+        Ok(entry) => entry.data,
+        Err(e) => {
+            tracing::warn!("Failed to get logs from agent: {}", e);
+            // Return empty response if agent is not available.
+            Vec::new()
+        }
+    };
+
+    // Encode in Docker multiplexed stream format.
+    let stream_type: u8 = if params.stdout { 1 } else { 2 };
+    let output = encode_docker_stream(stream_type, &log_data);
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(
             axum::http::header::CONTENT_TYPE,
             "application/vnd.docker.raw-stream",
-        )],
-        "",
-    ))
+        )
+        .body(Body::from(output))
+        .unwrap())
+}
+
+/// Streaming container logs handler.
+async fn container_logs_stream(
+    state: AppState,
+    container_id: String,
+    machine_name: String,
+    stdout: bool,
+    stderr: bool,
+    since: i64,
+    until: i64,
+    timestamps: bool,
+    tail: i64,
+) -> Result<Response> {
+    // Try to get log stream from agent.
+    let log_stream = match state
+        .runtime
+        .container_logs_stream(
+            &machine_name,
+            &container_id,
+            stdout,
+            stderr,
+            since,
+            until,
+            timestamps,
+            tail,
+        )
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::warn!("Failed to get log stream from agent: {}", e);
+            // Return empty streaming response.
+            let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Bytes, std::io::Error>>(1);
+            drop(tx); // Close immediately.
+            let body = Body::from_stream(ReceiverStream::new(rx));
+
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/vnd.docker.raw-stream",
+                )
+                .body(body)
+                .unwrap());
+        }
+    };
+
+    // Transform log entries to Docker stream format.
+    let stream_type: u8 = if stdout { 1 } else { 2 };
+    let body_stream = log_stream.map(move |result| {
+        match result {
+            Ok(entry) => {
+                let encoded = encode_docker_stream(stream_type, &entry.data);
+                Ok::<_, std::io::Error>(Bytes::from(encoded))
+            }
+            Err(e) => {
+                tracing::warn!("Log stream error: {}", e);
+                // Return empty bytes on error to keep stream alive.
+                Ok(Bytes::new())
+            }
+        }
+    });
+
+    let body = Body::from_stream(body_stream);
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/vnd.docker.raw-stream",
+        )
+        .body(body)
+        .unwrap())
 }
 
 // ============================================================================
@@ -667,30 +823,62 @@ pub struct PullImageQuery {
 }
 
 /// Pull image.
-///
-/// TODO: ImagePuller has lifetime issues in its async internals that need to be fixed.
-/// Currently returns a placeholder response.
-pub async fn pull_image(Query(params): Query<PullImageQuery>) -> Result<impl IntoResponse> {
+pub async fn pull_image(
+    State(state): State<AppState>,
+    Query(params): Query<PullImageQuery>,
+) -> Result<impl IntoResponse> {
+    use arcbox_image::{ImageRef, RegistryClient};
+    use arcbox_image::pull::ImagePuller;
+
     let image = params.from_image.unwrap_or_default();
     let tag = params.tag.unwrap_or_else(|| "latest".to_string());
 
-    // Return NDJSON progress format (placeholder).
+    // Parse image reference.
+    let reference = ImageRef::parse(&format!("{image}:{tag}"))
+        .ok_or_else(|| DockerError::BadRequest(format!("invalid image reference: {image}:{tag}")))?;
+
+    // Build NDJSON output.
     let mut output = String::new();
 
+    // Initial status.
     output.push_str(&format!(
         "{}\n",
-        serde_json::json!({"status": format!("Pulling from library/{}", image)})
+        serde_json::json!({"status": format!("Pulling from {}", reference.repository)})
     ));
 
-    output.push_str(&format!(
-        "{}\n",
-        serde_json::json!({"status": "Pull complete", "id": tag})
-    ));
+    // Pull the image.
+    let store = state.runtime.image_store().clone();
+    let client = RegistryClient::new(&reference.registry);
+    let puller = ImagePuller::new(store, client);
 
-    output.push_str(&format!(
-        "{}\n",
-        serde_json::json!({"status": format!("Status: Image is up to date for {}:{}", image, tag)})
-    ));
+    match puller.pull(&reference).await {
+        Ok(image_id) => {
+            // Short ID for display.
+            let short_id = image_id.strip_prefix("sha256:").unwrap_or(&image_id);
+            let short_id = &short_id[..12.min(short_id.len())];
+
+            output.push_str(&format!(
+                "{}\n",
+                serde_json::json!({"status": "Pull complete", "id": short_id})
+            ));
+
+            output.push_str(&format!(
+                "{}\n",
+                serde_json::json!({"status": format!("Digest: {}", image_id)})
+            ));
+
+            output.push_str(&format!(
+                "{}\n",
+                serde_json::json!({"status": format!("Status: Downloaded newer image for {}:{}", image, tag)})
+            ));
+        }
+        Err(e) => {
+            output.push_str(&format!(
+                "{}\n",
+                serde_json::json!({"error": e.to_string()})
+            ));
+        }
+    }
 
     Ok((
         StatusCode::OK,
