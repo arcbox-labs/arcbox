@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
         Commands::Rmi(args) => commands::images::execute_rmi(args).await,
         Commands::Machine(cmd) => commands::machine::execute(cmd).await,
         Commands::Docker(cmd) => commands::docker::execute(cmd).await,
+        Commands::Daemon(args) => commands::daemon::execute(args).await,
         Commands::Info => execute_info().await,
         Commands::Version => commands::version::execute().await,
     }
