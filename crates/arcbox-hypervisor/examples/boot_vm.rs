@@ -41,6 +41,7 @@ fn main() {
     let mut disk_path = None;
     let mut enable_net = false;
     let mut enable_vsock = false;
+    let mut custom_cmdline: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -55,6 +56,10 @@ fn main() {
             "--vsock" => {
                 enable_vsock = true;
                 i += 1;
+            }
+            "--cmdline" if i + 1 < args.len() => {
+                custom_cmdline = Some(args[i + 1].clone());
+                i += 2;
             }
             _ if initrd_path.is_none() && !args[i].starts_with("--") => {
                 initrd_path = Some(args[i].clone());
@@ -95,12 +100,15 @@ fn main() {
         println!();
 
         // Create VM config
+        let cmdline = custom_cmdline.unwrap_or_else(|| {
+            "console=hvc0 loglevel=8 root=/dev/ram0 rdinit=/init".to_string()
+        });
         let config = VmConfig {
             vcpu_count: 2,
             memory_size: 512 * 1024 * 1024, // 512MB
             arch: CpuArch::native(),
             kernel_path: Some(kernel_path.clone()),
-            kernel_cmdline: Some("console=hvc0 earlycon root=/dev/ram0 rdinit=/bin/sh".to_string()),
+            kernel_cmdline: Some(cmdline),
             initrd_path,
             ..Default::default()
         };
@@ -181,44 +189,46 @@ fn main() {
                 println!();
 
                 // Run for a while, reading console output
+                // Read more frequently at the start to catch early boot messages
+                println!("Reading console output...");
                 for i in 0..30 {
-                    std::thread::sleep(Duration::from_secs(1));
+                    std::thread::sleep(Duration::from_millis(500));
 
                     // Read and print console output
                     match vm.read_console_output() {
-                        Ok(output) if !output.is_empty() => {
-                            print!("{}", output);
+                        Ok(output) => {
+                            if !output.is_empty() {
+                                print!("{}", output);
+                            }
                         }
-                        _ => {}
+                        Err(e) => {
+                            println!("[console read error: {}]", e);
+                        }
                     }
 
-                    println!("[{}s] VM state: {:?}, running: {}", i + 1, vm.state(), vm.is_running());
+                    if i % 2 == 1 {
+                        println!("[{}s] VM state: {:?}, running: {}", (i + 1) / 2, vm.state(), vm.is_running());
+                    }
                 }
 
                 // Test vsock connection if enabled
-                // Note: Without an agent running in the guest, vsock connection will timeout
-                // as Virtualization.framework waits for the guest to accept the connection.
-                if enable_vsock && false {  // Disabled by default - enable when agent is present
+                if enable_vsock {
                     println!();
-                    println!("Testing vsock connection to port 1024 (agent)...");
-                    println!("Note: This will timeout if no agent is running in the guest.");
-                    match vm.connect_vsock(1024) {
-                        Ok(fd) => {
-                            println!("Vsock connection successful! fd={}", fd);
-                            // Close the fd since we're just testing
-                            unsafe { libc::close(fd); }
-                        }
-                        Err(e) => {
-                            // Connection failure is expected if no agent is running
-                            println!("Vsock connection failed (expected if no agent): {}", e);
+                    // Try multiple ports: 2222 (PUI PUI socat), 1024 (arcbox-agent)
+                    for port in [2222u32, 1024] {
+                        println!("Testing vsock connection to port {}...", port);
+                        match vm.connect_vsock(port) {
+                            Ok(fd) => {
+                                println!("  Vsock port {} connected! fd={}", port, fd);
+                                // Close the fd since we're just testing
+                                unsafe { libc::close(fd); }
+                                break;
+                            }
+                            Err(e) => {
+                                println!("  Vsock port {} failed: {}", port, e);
+                            }
                         }
                     }
-                } else if enable_vsock {
-                    println!();
-                    println!("Vsock device configured. To test vsock connection:");
-                    println!("  1. Build agent: cargo build -p arcbox-agent --target aarch64-unknown-linux-musl");
-                    println!("  2. Add agent to initramfs");
-                    println!("  3. Enable vsock test in this example");
                 }
 
                 println!();

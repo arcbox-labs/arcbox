@@ -401,6 +401,14 @@ impl VmConfiguration {
         }
     }
 
+    /// Sets serial ports.
+    pub fn set_serial_ports(&self, ports: &[*mut AnyObject]) {
+        unsafe {
+            let array = nsarray(ports);
+            msg_send_void!(self.inner, setSerialPorts: array);
+        }
+    }
+
     /// Sets directory sharing devices.
     pub fn set_directory_sharing_devices(&self, devices: &[*mut AnyObject]) {
         unsafe {
@@ -1370,6 +1378,8 @@ pub fn release_dispatch_queue(queue: *mut AnyObject) {
 // ============================================================================
 
 /// Creates a file handle for serial port attachment.
+/// Uses `initWithFileDescriptor:closeOnDealloc:NO` to prevent NSFileHandle from
+/// closing the file descriptor when deallocated.
 pub fn create_file_handle_for_reading(fd: i32) -> VZResult<*mut AnyObject> {
     unsafe {
         let cls = get_class("NSFileHandle").ok_or_else(|| VZError {
@@ -1378,10 +1388,11 @@ pub fn create_file_handle_for_reading(fd: i32) -> VZResult<*mut AnyObject> {
         })?;
         let obj = msg_send!(cls, alloc);
 
-        let sel = sel!(initWithFileDescriptor:);
-        let func: unsafe extern "C" fn(*mut AnyObject, Sel, i32) -> *mut AnyObject =
+        // Use initWithFileDescriptor:closeOnDealloc: to prevent double-close
+        let sel = sel!(initWithFileDescriptor:closeOnDealloc:);
+        let func: unsafe extern "C" fn(*mut AnyObject, Sel, i32, bool) -> *mut AnyObject =
             std::mem::transmute(objc_msgSend as *const c_void);
-        let handle = func(obj, sel, fd);
+        let handle = func(obj, sel, fd, false);
 
         if handle.is_null() {
             return Err(VZError {
@@ -1389,6 +1400,8 @@ pub fn create_file_handle_for_reading(fd: i32) -> VZResult<*mut AnyObject> {
                 message: "Failed to create NSFileHandle".into(),
             });
         }
+
+        tracing::debug!("Created NSFileHandle for fd {}", fd);
         Ok(handle)
     }
 }
@@ -1438,6 +1451,33 @@ pub fn create_console_port_configuration() -> VZResult<*mut AnyObject> {
 pub fn set_console_port_attachment(port: *mut AnyObject, attachment: *mut AnyObject) {
     unsafe {
         msg_send_void!(port, setAttachment: attachment);
+    }
+}
+
+/// Creates a VirtIO console device serial port configuration.
+/// This is simpler than VZVirtioConsoleDeviceConfiguration - it creates a single
+/// serial port that appears as hvc0 in the guest.
+pub fn create_virtio_serial_port_configuration(
+    attachment: *mut AnyObject,
+) -> VZResult<*mut AnyObject> {
+    unsafe {
+        let cls = get_class("VZVirtioConsoleDeviceSerialPortConfiguration").ok_or_else(|| {
+            VZError {
+                code: -1,
+                message: "VZVirtioConsoleDeviceSerialPortConfiguration class not found".into(),
+            }
+        })?;
+        // Use new and then set attachment (inherited from VZSerialPortConfiguration)
+        let port: *mut AnyObject = msg_send!(cls, new);
+        if port.is_null() {
+            return Err(VZError {
+                code: -1,
+                message: "Failed to create virtio serial port configuration".into(),
+            });
+        }
+        // Set the attachment property
+        msg_send_void!(port, setAttachment: attachment);
+        Ok(port)
     }
 }
 
@@ -1558,6 +1598,7 @@ static VSOCK_CONN_CONDVAR: std::sync::OnceLock<std::sync::Condvar> = std::sync::
 ///
 /// # Arguments
 /// * `socket_device` - The VZVirtioSocketDevice to connect through
+/// * `vm_queue` - The dispatch queue for the VM (required for async operations)
 /// * `port` - The port number to connect to
 ///
 /// # Returns
@@ -1566,7 +1607,11 @@ static VSOCK_CONN_CONDVAR: std::sync::OnceLock<std::sync::Condvar> = std::sync::
 /// # Safety
 /// This function is NOT thread-safe for concurrent vsock connections.
 /// Only one vsock connection should be made at a time.
-pub fn vsock_connect_to_port(socket_device: *mut AnyObject, port: u32) -> VZResult<i32> {
+pub fn vsock_connect_to_port(
+    socket_device: *mut AnyObject,
+    vm_queue: *mut AnyObject,
+    port: u32,
+) -> VZResult<i32> {
     if socket_device.is_null() {
         return Err(VZError {
             code: -1,
@@ -1574,9 +1619,16 @@ pub fn vsock_connect_to_port(socket_device: *mut AnyObject, port: u32) -> VZResu
         });
     }
 
+    if vm_queue.is_null() {
+        return Err(VZError {
+            code: -1,
+            message: "vm_queue is null".to_string(),
+        });
+    }
+
     // Initialize globals
     let result_mutex = VSOCK_CONN_RESULT.get_or_init(|| std::sync::Mutex::new(None));
-    let condvar = VSOCK_CONN_CONDVAR.get_or_init(|| std::sync::Condvar::new());
+    let _condvar = VSOCK_CONN_CONDVAR.get_or_init(|| std::sync::Condvar::new());
 
     // Clear previous result
     {
@@ -1605,6 +1657,9 @@ pub fn vsock_connect_to_port(socket_device: *mut AnyObject, port: u32) -> VZResu
         connection: *mut AnyObject,
         error: *mut AnyObject,
     ) {
+        tracing::debug!("vsock_completion_handler called: connection={:?}, error={:?}",
+            connection, error);
+
         let conn_result = unsafe {
             if !error.is_null() {
                 let description: *mut AnyObject = msg_send!(error, localizedDescription);
@@ -1613,14 +1668,17 @@ pub fn vsock_connect_to_port(socket_device: *mut AnyObject, port: u32) -> VZResu
                 } else {
                     "Unknown error".to_string()
                 };
+                tracing::debug!("vsock connection error: {}", error_msg);
                 VsockConnectionResult {
                     fd: -1,
                     error: Some(error_msg),
                 }
             } else if !connection.is_null() {
                 let fd: i32 = msg_send_i32!(connection, fileDescriptor);
+                tracing::debug!("vsock connection success: fd={}", fd);
                 VsockConnectionResult { fd, error: None }
             } else {
+                tracing::debug!("vsock connection: both connection and error are null");
                 VsockConnectionResult {
                     fd: -1,
                     error: Some("Connection is null".to_string()),
@@ -1632,10 +1690,12 @@ pub fn vsock_connect_to_port(socket_device: *mut AnyObject, port: u32) -> VZResu
         if let Some(mutex) = VSOCK_CONN_RESULT.get() {
             if let Ok(mut guard) = mutex.lock() {
                 *guard = Some(conn_result);
+                tracing::debug!("vsock result stored in mutex");
             }
         }
         if let Some(cv) = VSOCK_CONN_CONDVAR.get() {
             cv.notify_one();
+            tracing::debug!("vsock condvar notified");
         }
     }
 
@@ -1669,24 +1729,77 @@ pub fn vsock_connect_to_port(socket_device: *mut AnyObject, port: u32) -> VZResu
         BlockPtr(heap_block)
     });
 
-    unsafe {
+    // Context for dispatch_async_f
+    #[repr(C)]
+    struct VsockConnectContext {
+        socket_device: *mut AnyObject,
+        port: u32,
+        completion_block: *const c_void,
+    }
+
+    unsafe impl Send for VsockConnectContext {}
+    unsafe impl Sync for VsockConnectContext {}
+
+    // Function to be called on the VM's dispatch queue
+    unsafe extern "C" fn vsock_connect_on_queue(context: *mut c_void) {
+        // SAFETY: context is a valid pointer to VsockConnectContext created by Box::into_raw
+        let ctx = unsafe { &*(context as *const VsockConnectContext) };
+        tracing::debug!(
+            "vsock_connect_on_queue: device={:?}, port={}, block={:?}",
+            ctx.socket_device,
+            ctx.port,
+            ctx.completion_block
+        );
+
         // Call connectToPort:completionHandler:
         let sel = sel!(connectToPort:completionHandler:);
+        // SAFETY: objc_msgSend is a valid function pointer
         let func: unsafe extern "C" fn(*mut AnyObject, Sel, u32, *const c_void) =
-            std::mem::transmute(objc_msgSend as *const c_void);
-        func(socket_device, sel, port, block_ptr.0);
+            unsafe { std::mem::transmute(objc_msgSend as *const c_void) };
+        // SAFETY: ctx fields are valid pointers set during context creation
+        unsafe { func(ctx.socket_device, sel, ctx.port, ctx.completion_block) };
+    }
 
-        // Wait for completion with timeout, running the run loop to process callbacks
+    unsafe extern "C" {
+        fn dispatch_async_f(
+            queue: *mut AnyObject,
+            context: *mut c_void,
+            work: unsafe extern "C" fn(*mut c_void),
+        );
+    }
+
+    // Create context on heap so it lives until the async work completes
+    let context = Box::new(VsockConnectContext {
+        socket_device,
+        port,
+        completion_block: block_ptr.0,
+    });
+    let context_ptr = Box::into_raw(context);
+
+    unsafe {
+        tracing::debug!(
+            "Dispatching vsock connect to VM queue: queue={:?}, port={}",
+            vm_queue,
+            port
+        );
+
+        // Dispatch the connect call to the VM's queue
+        dispatch_async_f(vm_queue, context_ptr as *mut c_void, vsock_connect_on_queue);
+
+        // Wait for completion with timeout
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(10);
 
         loop {
-            // Run the run loop briefly to allow the completion handler to be called
-            cf_run_loop_run_in_mode(0.1, true);
+            // Sleep briefly to allow the dispatch queue to process
+            std::thread::sleep(std::time::Duration::from_millis(100));
 
             // Check if we have a result
             let guard = result_mutex.lock().unwrap();
             if guard.is_some() {
+                // Clean up context
+                drop(Box::from_raw(context_ptr));
+
                 // We have a result
                 match &*guard {
                     Some(conn_result) => {
@@ -1711,6 +1824,8 @@ pub fn vsock_connect_to_port(socket_device: *mut AnyObject, port: u32) -> VZResu
 
             // Check timeout
             if start.elapsed() > timeout {
+                // Clean up context
+                drop(Box::from_raw(context_ptr));
                 return Err(VZError {
                     code: -1,
                     message: "Connection timed out".to_string(),
