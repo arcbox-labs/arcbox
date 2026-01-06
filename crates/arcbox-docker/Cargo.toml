@@ -1,0 +1,34 @@
+[package]
+name = "arcbox-docker"
+description = "Docker REST API compatibility layer for ArcBox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-container = { workspace = true }
+arcbox-core = { workspace = true }
+arcbox-protocol = { workspace = true }
+arcbox-transport = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hostname = { workspace = true }
+hyper-util = { version = "0.1", features = ["tokio"] }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default = []
