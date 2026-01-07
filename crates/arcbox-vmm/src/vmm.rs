@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::device::DeviceManager;
 use crate::error::{Result, VmmError};
 use crate::event::EventLoop;
-use crate::irq::IrqChip;
+use crate::irq::{Gsi, IrqChip, IrqTriggerCallback};
 use crate::memory::MemoryManager;
 use crate::vcpu::VcpuManager;
 
@@ -143,8 +143,8 @@ pub struct Vmm {
     memory_manager: Option<MemoryManager>,
     /// Device manager.
     device_manager: Option<DeviceManager>,
-    /// IRQ chip.
-    irq_chip: Option<IrqChip>,
+    /// IRQ chip (Arc for sharing with callback).
+    irq_chip: Option<Arc<IrqChip>>,
     /// Event loop.
     event_loop: Option<EventLoop>,
     /// Whether using managed execution mode (e.g., Darwin Virtualization.framework).
@@ -305,7 +305,25 @@ impl Vmm {
         let device_manager = DeviceManager::new();
 
         // Initialize IRQ chip
-        let irq_chip = IrqChip::new()?;
+        let irq_chip = Arc::new(IrqChip::new()?);
+
+        // Set up IRQ callback for Darwin.
+        // Virtualization.framework handles VirtIO interrupts internally,
+        // so we set up a no-op callback that logs when IRQ is triggered.
+        {
+            let callback: IrqTriggerCallback = Box::new(|gsi: Gsi, level: bool| {
+                // Darwin Virtualization.framework handles VirtIO interrupts internally.
+                // For custom devices, interrupt injection is not supported.
+                tracing::trace!(
+                    "Darwin IRQ callback: gsi={}, level={} (handled by framework)",
+                    gsi,
+                    level
+                );
+                Ok(())
+            });
+            irq_chip.set_trigger_callback(Arc::new(callback));
+            tracing::debug!("Darwin: IRQ callback configured (framework-managed)");
+        }
 
         // Initialize event loop
         let event_loop = EventLoop::new()?;
@@ -334,6 +352,10 @@ impl Vmm {
     /// Linux-specific initialization using KVM.
     #[cfg(target_os = "linux")]
     fn initialize_linux(&mut self) -> Result<()> {
+        use std::sync::Mutex;
+        use arcbox_hypervisor::linux::KvmVm;
+        use arcbox_hypervisor::traits::VirtualMachine;
+
         // Create hypervisor and VM
         let hypervisor = create_hypervisor()?;
         let vm_config = self.config.to_vm_config();
@@ -353,7 +375,7 @@ impl Vmm {
         let device_manager = DeviceManager::new();
 
         // Initialize IRQ chip
-        let irq_chip = IrqChip::new()?;
+        let irq_chip = Arc::new(IrqChip::new()?);
 
         // Initialize vCPU manager
         let mut vcpu_manager = VcpuManager::new(self.config.vcpu_count);
@@ -362,6 +384,30 @@ impl Vmm {
         for i in 0..self.config.vcpu_count {
             let vcpu = vm.create_vcpu(i)?;
             vcpu_manager.add_vcpu(vcpu)?;
+        }
+
+        // Wrap VM in Arc<Mutex> for callback access
+        let vm_arc: Arc<Mutex<KvmVm>> = Arc::new(Mutex::new(vm));
+
+        // Set up IRQ callback that calls KVM's set_irq_line
+        {
+            let vm_weak = Arc::downgrade(&vm_arc);
+            let callback: IrqTriggerCallback = Box::new(move |gsi: Gsi, level: bool| {
+                if let Some(vm_strong) = vm_weak.upgrade() {
+                    let vm_guard = vm_strong.lock().map_err(|_| {
+                        crate::error::VmmError::Irq("Failed to lock VM for IRQ".to_string())
+                    })?;
+                    vm_guard.set_irq_line(gsi, level).map_err(|e| {
+                        crate::error::VmmError::Irq(format!("KVM IRQ injection failed: {}", e))
+                    })?;
+                    tracing::trace!("KVM: Triggered IRQ gsi={}, level={}", gsi, level);
+                } else {
+                    tracing::warn!("KVM: VM dropped, cannot inject IRQ gsi={}", gsi);
+                }
+                Ok(())
+            });
+            irq_chip.set_trigger_callback(Arc::new(callback));
+            tracing::debug!("Linux KVM: IRQ callback connected to VM");
         }
 
         // Initialize event loop
@@ -373,6 +419,9 @@ impl Vmm {
         self.irq_chip = Some(irq_chip);
         self.vcpu_manager = Some(vcpu_manager);
         self.event_loop = Some(event_loop);
+
+        // Store VM for lifecycle management (also keeps Arc alive for callback)
+        self.managed_vm = Some(Box::new(vm_arc));
 
         Ok(())
     }

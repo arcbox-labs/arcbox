@@ -482,6 +482,79 @@ impl DarwinVm {
         tracing::debug!("VM {} state: {:?} -> {:?}", self.id, *state, new_state);
         *state = new_state;
     }
+
+    // ========================================================================
+    // IRQ Injection Interface (Darwin)
+    //
+    // NOTE: Apple's Virtualization.framework does NOT expose interrupt injection
+    // APIs. VirtIO device interrupts are handled internally by the framework.
+    //
+    // For custom devices that need interrupt injection, consider:
+    // 1. Using Hypervisor.framework directly (hv_vcpu_inject_extint)
+    // 2. Using virtio-based signaling through existing VirtIO devices
+    // 3. Using shared memory + polling as a fallback
+    //
+    // The methods below are stubs that log warnings when called.
+    // ========================================================================
+
+    /// Sets the IRQ line level (stub - not supported on Darwin).
+    ///
+    /// Darwin Virtualization.framework handles VirtIO interrupts internally.
+    /// This method logs a warning and returns success to maintain API compatibility.
+    pub fn set_irq_line(&self, gsi: u32, level: bool) -> Result<(), HypervisorError> {
+        tracing::warn!(
+            "set_irq_line(gsi={}, level={}) called on Darwin VM {} - \
+            Virtualization.framework handles interrupts internally",
+            gsi,
+            level,
+            self.id
+        );
+        // Return Ok to allow code that uses this to continue working,
+        // but the interrupt won't actually be injected.
+        Ok(())
+    }
+
+    /// Triggers an edge-triggered interrupt (stub - not supported on Darwin).
+    pub fn trigger_edge_irq(&self, gsi: u32) -> Result<(), HypervisorError> {
+        tracing::warn!(
+            "trigger_edge_irq(gsi={}) called on Darwin VM {} - not supported",
+            gsi,
+            self.id
+        );
+        Ok(())
+    }
+
+    /// Registers an eventfd for IRQ injection (stub - not supported on Darwin).
+    ///
+    /// On Darwin, VirtIO devices use framework-managed interrupts.
+    /// For custom interrupt handling, use vsock or shared memory.
+    pub fn register_irqfd(
+        &self,
+        _eventfd: RawFd,
+        gsi: u32,
+        _resample_fd: Option<RawFd>,
+    ) -> Result<(), HypervisorError> {
+        tracing::warn!(
+            "register_irqfd(gsi={}) called on Darwin VM {} - not supported, \
+            use vsock or VirtIO for guest signaling",
+            gsi,
+            self.id
+        );
+        // Return error since this is a fundamental limitation
+        Err(HypervisorError::DeviceError(
+            "IRQFD not supported on Darwin Virtualization.framework".to_string(),
+        ))
+    }
+
+    /// Unregisters an eventfd (stub - not supported on Darwin).
+    pub fn unregister_irqfd(&self, _eventfd: RawFd, gsi: u32) -> Result<(), HypervisorError> {
+        tracing::warn!(
+            "unregister_irqfd(gsi={}) called on Darwin VM {} - not supported",
+            gsi,
+            self.id
+        );
+        Ok(())
+    }
 }
 
 impl VirtualMachine for DarwinVm {
@@ -525,8 +598,11 @@ impl VirtualMachine for DarwinVm {
             }
         }
 
-        // Create vCPU
-        let vcpu = DarwinVcpu::new(id);
+        // Create vCPU with VZ VM pointer for state queries.
+        // On Virtualization.framework, vCPU execution is managed internally,
+        // so the vCPU needs access to the VM's state for run() to work properly.
+        let vz_vm_ptr = self.vz_vm.as_ref().map_or(std::ptr::null_mut(), |vm| vm.as_ptr());
+        let vcpu = DarwinVcpu::new_managed(id, vz_vm_ptr);
 
         // Record creation
         {
@@ -539,7 +615,12 @@ impl VirtualMachine for DarwinVm {
             vcpus.push(id);
         }
 
-        tracing::debug!("Created vCPU {} for VM {}", id, self.id);
+        tracing::debug!(
+            "Created vCPU {} for VM {} (managed execution, vz_vm={:?})",
+            id,
+            self.id,
+            vz_vm_ptr
+        );
 
         Ok(vcpu)
     }
@@ -772,6 +853,14 @@ impl VirtualMachine for DarwinVm {
         tracing::info!("Stopped VM {}", self.id);
 
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 

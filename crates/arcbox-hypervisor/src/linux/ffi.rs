@@ -58,6 +58,11 @@ pub const KVM_CREATE_PIT2: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x77, KvmP
 pub const KVM_SET_IDENTITY_MAP_ADDR: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x48, u64);
 pub const KVM_IRQFD: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x76, KvmIrqfd);
 pub const KVM_IOEVENTFD: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x79, KvmIoeventfd);
+pub const KVM_IRQ_LINE: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x61, KvmIrqLevel);
+pub const KVM_SET_GSI_ROUTING: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x6a, KvmIrqRouting);
+
+// vCPU ioctls for interrupt injection
+pub const KVM_INTERRUPT: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x86, KvmInterrupt);
 
 // vCPU ioctls
 pub const KVM_RUN: nix::sys::ioctl::ioctl_num_type = kvm_io!(0x80);
@@ -230,6 +235,107 @@ impl Default for KvmIoeventfd {
             pad: [0; 36],
         }
     }
+}
+
+/// IRQ level for KVM_IRQ_LINE.
+#[repr(C)]
+#[derive(Debug, Clone, Default)]
+pub struct KvmIrqLevel {
+    /// IRQ number (GSI for in-kernel irqchip, or legacy PIC IRQ).
+    /// For ARM, this encodes: (irq & 0xff) | ((irq_type & 0xff) << 24)
+    pub irq: u32,
+    /// Level: 0 = deassert, 1 = assert.
+    pub level: u32,
+}
+
+/// External interrupt injection (for vCPU).
+#[repr(C)]
+#[derive(Debug, Clone, Default)]
+pub struct KvmInterrupt {
+    /// Interrupt vector (0-255 for x86).
+    pub irq: u32,
+}
+
+/// IRQFD flags.
+pub const KVM_IRQFD_FLAG_DEASSIGN: u32 = 1 << 0;
+pub const KVM_IRQFD_FLAG_RESAMPLE: u32 = 1 << 1;
+
+/// IOEVENTFD flags.
+pub const KVM_IOEVENTFD_FLAG_PIO: u32 = 1 << 0;
+pub const KVM_IOEVENTFD_FLAG_DATAMATCH: u32 = 1 << 1;
+pub const KVM_IOEVENTFD_FLAG_DEASSIGN: u32 = 1 << 2;
+pub const KVM_IOEVENTFD_FLAG_VIRTIO_CCW_NOTIFY: u32 = 1 << 3;
+
+/// GSI routing entry type.
+pub const KVM_IRQ_ROUTING_IRQCHIP: u32 = 1;
+pub const KVM_IRQ_ROUTING_MSI: u32 = 2;
+pub const KVM_IRQ_ROUTING_S390_ADAPTER: u32 = 3;
+pub const KVM_IRQ_ROUTING_HV_SINT: u32 = 4;
+
+/// IRQ routing entry for in-kernel irqchip.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KvmIrqRoutingIrqchip {
+    pub irqchip: u32,
+    pub pin: u32,
+}
+
+/// IRQ routing entry for MSI.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KvmIrqRoutingMsi {
+    pub address_lo: u32,
+    pub address_hi: u32,
+    pub data: u32,
+    pub devid: u32,
+}
+
+/// Union for IRQ routing entry data.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union KvmIrqRoutingUnion {
+    pub irqchip: KvmIrqRoutingIrqchip,
+    pub msi: KvmIrqRoutingMsi,
+    pub pad: [u32; 8],
+}
+
+impl Default for KvmIrqRoutingUnion {
+    fn default() -> Self {
+        Self { pad: [0; 8] }
+    }
+}
+
+/// Single IRQ routing entry.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KvmIrqRoutingEntry {
+    pub gsi: u32,
+    pub type_: u32,
+    pub flags: u32,
+    pub pad: u32,
+    pub u: KvmIrqRoutingUnion,
+}
+
+impl Default for KvmIrqRoutingEntry {
+    fn default() -> Self {
+        Self {
+            gsi: 0,
+            type_: 0,
+            flags: 0,
+            pad: 0,
+            u: KvmIrqRoutingUnion::default(),
+        }
+    }
+}
+
+/// IRQ routing table header.
+/// Note: The actual entries follow this header in memory (variable length).
+#[repr(C)]
+#[derive(Debug, Clone, Default)]
+pub struct KvmIrqRouting {
+    pub nr: u32,
+    pub flags: u32,
+    // Followed by: entries: [KvmIrqRoutingEntry; nr]
 }
 
 /// x86_64 general purpose registers.
@@ -707,6 +813,162 @@ impl KvmVmFd {
         Ok(init)
     }
 
+    /// Sets the IRQ line level.
+    ///
+    /// This is used to assert or deassert an IRQ line on the in-kernel irqchip.
+    /// For edge-triggered interrupts, assert then deassert.
+    /// For level-triggered interrupts, assert and keep asserted until acknowledged.
+    ///
+    /// # Arguments
+    /// * `irq` - The GSI (Global System Interrupt) number
+    /// * `level` - true to assert, false to deassert
+    pub fn set_irq_line(&self, irq: u32, level: bool) -> KvmResult<()> {
+        let irq_level = KvmIrqLevel {
+            irq,
+            level: if level { 1 } else { 0 },
+        };
+        let ret = unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                KVM_IRQ_LINE,
+                &irq_level as *const _ as libc::c_ulong,
+            )
+        };
+        if ret < 0 {
+            return Err(KvmError::from(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Registers an eventfd for IRQ injection (IRQFD).
+    ///
+    /// When the eventfd is written to, KVM will inject the specified GSI
+    /// into the guest. This is the preferred method for high-performance
+    /// interrupt delivery as it avoids kernel transitions.
+    ///
+    /// # Arguments
+    /// * `fd` - The eventfd file descriptor
+    /// * `gsi` - The GSI to inject
+    /// * `resample_fd` - Optional eventfd for level-triggered IRQ resampling
+    pub fn register_irqfd(&self, fd: RawFd, gsi: u32, resample_fd: Option<RawFd>) -> KvmResult<()> {
+        let mut irqfd = KvmIrqfd {
+            fd: fd as u32,
+            gsi,
+            flags: 0,
+            resamplefd: 0,
+            pad: [0; 16],
+        };
+
+        if let Some(resample) = resample_fd {
+            irqfd.flags |= KVM_IRQFD_FLAG_RESAMPLE;
+            irqfd.resamplefd = resample as u32;
+        }
+
+        let ret = unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                KVM_IRQFD,
+                &irqfd as *const _ as libc::c_ulong,
+            )
+        };
+        if ret < 0 {
+            return Err(KvmError::from(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Unregisters an eventfd for IRQ injection.
+    pub fn unregister_irqfd(&self, fd: RawFd, gsi: u32) -> KvmResult<()> {
+        let irqfd = KvmIrqfd {
+            fd: fd as u32,
+            gsi,
+            flags: KVM_IRQFD_FLAG_DEASSIGN,
+            resamplefd: 0,
+            pad: [0; 16],
+        };
+
+        let ret = unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                KVM_IRQFD,
+                &irqfd as *const _ as libc::c_ulong,
+            )
+        };
+        if ret < 0 {
+            return Err(KvmError::from(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Registers an IOEVENTFD for MMIO writes.
+    ///
+    /// When a guest write occurs at the specified address, KVM will signal
+    /// the eventfd instead of exiting to userspace. This is used for VirtIO
+    /// queue notification.
+    ///
+    /// # Arguments
+    /// * `addr` - The MMIO address to watch
+    /// * `len` - The access size (1, 2, 4, or 8 bytes)
+    /// * `fd` - The eventfd file descriptor to signal
+    /// * `datamatch` - Optional: only trigger on matching data value
+    pub fn register_ioeventfd(
+        &self,
+        addr: u64,
+        len: u32,
+        fd: RawFd,
+        datamatch: Option<u64>,
+    ) -> KvmResult<()> {
+        let mut ioeventfd = KvmIoeventfd {
+            addr,
+            len,
+            fd: fd as i32,
+            flags: 0,
+            datamatch: 0,
+            pad: [0; 36],
+        };
+
+        if let Some(match_val) = datamatch {
+            ioeventfd.datamatch = match_val;
+            ioeventfd.flags |= KVM_IOEVENTFD_FLAG_DATAMATCH;
+        }
+
+        let ret = unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                KVM_IOEVENTFD,
+                &ioeventfd as *const _ as libc::c_ulong,
+            )
+        };
+        if ret < 0 {
+            return Err(KvmError::from(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Unregisters an IOEVENTFD.
+    pub fn unregister_ioeventfd(&self, addr: u64, len: u32, fd: RawFd) -> KvmResult<()> {
+        let ioeventfd = KvmIoeventfd {
+            addr,
+            len,
+            fd: fd as i32,
+            flags: KVM_IOEVENTFD_FLAG_DEASSIGN,
+            datamatch: 0,
+            pad: [0; 36],
+        };
+
+        let ret = unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                KVM_IOEVENTFD,
+                &ioeventfd as *const _ as libc::c_ulong,
+            )
+        };
+        if ret < 0 {
+            return Err(KvmError::from(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
     /// Returns the raw file descriptor.
     pub fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
@@ -903,6 +1165,47 @@ impl KvmVcpuFd {
     pub fn set_immediate_exit(&self, enable: bool) {
         unsafe {
             (*self.kvm_run).immediate_exit = if enable { 1 } else { 0 };
+        }
+    }
+
+    /// Injects an external interrupt into the vCPU (x86 only).
+    ///
+    /// This is used to inject an interrupt directly into the vCPU.
+    /// The vCPU must be in a state where it can receive interrupts
+    /// (i.e., `ready_for_interrupt_injection` is true).
+    ///
+    /// # Arguments
+    /// * `irq` - The interrupt vector (0-255)
+    #[cfg(target_arch = "x86_64")]
+    pub fn inject_interrupt(&self, irq: u32) -> KvmResult<()> {
+        let interrupt = KvmInterrupt { irq };
+        let ret = unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                KVM_INTERRUPT,
+                &interrupt as *const _ as libc::c_ulong,
+            )
+        };
+        if ret < 0 {
+            return Err(KvmError::from(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Checks if the vCPU is ready for interrupt injection.
+    ///
+    /// Returns true if an interrupt can be injected via `inject_interrupt`.
+    pub fn ready_for_interrupt(&self) -> bool {
+        unsafe { (*self.kvm_run).ready_for_interrupt_injection != 0 }
+    }
+
+    /// Requests an interrupt window exit.
+    ///
+    /// When set, the next KVM_RUN will exit with KVM_EXIT_IRQ_WINDOW_OPEN
+    /// when the vCPU becomes ready to receive interrupts.
+    pub fn request_interrupt_window(&self, enable: bool) {
+        unsafe {
+            (*self.kvm_run).request_interrupt_window = if enable { 1 } else { 0 };
         }
     }
 

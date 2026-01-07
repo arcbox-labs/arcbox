@@ -3,6 +3,8 @@
 //! These traits define the platform-agnostic interface that all hypervisor
 //! backends must implement.
 
+use std::any::Any;
+
 use crate::{
     config::VmConfig,
     error::HypervisorError,
@@ -97,6 +99,15 @@ pub trait VirtualMachine: Send + Sync {
     ///
     /// Returns an error if the VM cannot be stopped.
     fn stop(&mut self) -> Result<(), HypervisorError>;
+
+    /// Returns the VM as a reference to `Any` for downcasting.
+    ///
+    /// This allows the caller to downcast the VM to its concrete type
+    /// for platform-specific operations like IRQ injection.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Returns the VM as a mutable reference to `Any` for downcasting.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 /// Virtual CPU trait for executing guest code.
