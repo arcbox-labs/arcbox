@@ -4,6 +4,7 @@ use arcbox_cli::client::{
     self, CreateContainerRequest, CreateContainerResponse, ContainerWaitResponse,
     HostConfig, PortBinding,
 };
+use arcbox_cli::terminal::InteractiveSession;
 use anyhow::Result;
 use clap::Args;
 use std::collections::HashMap;
@@ -100,14 +101,33 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     if args.detach {
         // Detached mode: print container ID and exit
         println!("{}", client::short_id(&container_id));
-    } else {
-        // Foreground mode: wait for container to exit
-        // TODO: Implement proper attach with stdin/stdout streaming
-        if args.tty || args.interactive {
-            tracing::warn!("Interactive/TTY mode not fully implemented yet");
+    } else if args.tty || args.interactive {
+        // Interactive/TTY mode: attach for bidirectional streaming
+        let stream = daemon
+            .upgrade_attach(&container_id, args.interactive, args.tty)
+            .await?;
+        let (reader, writer) = tokio::io::split(stream);
+
+        // Run interactive session
+        let session = InteractiveSession::new(reader, writer, args.tty);
+        session.run().await?;
+
+        // Wait for container to exit and get exit code
+        let wait_path = format!("/v1.43/containers/{}/wait", container_id);
+        let wait_response: ContainerWaitResponse = daemon.post(&wait_path, None::<()>).await?;
+
+        // Remove container if --rm flag is set
+        if args.rm {
+            let rm_path = format!("/v1.43/containers/{}", container_id);
+            let _ = daemon.delete(&rm_path).await;
         }
 
-        // Wait for container to exit
+        // Exit with container's exit code
+        if wait_response.status_code != 0 {
+            std::process::exit(wait_response.status_code as i32);
+        }
+    } else {
+        // Non-interactive foreground mode: wait for container and get logs
         let wait_path = format!("/v1.43/containers/{}/wait", container_id);
         let wait_response: ContainerWaitResponse = daemon.post(&wait_path, None::<()>).await?;
 

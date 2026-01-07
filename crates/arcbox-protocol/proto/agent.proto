@@ -110,6 +110,11 @@ message CreateContainerRequest {
     repeated arcbox.common.Mount mounts = 8;
     // TTY allocation.
     bool tty = 9;
+    // Keep stdin open.
+    bool open_stdin = 10;
+    // Root filesystem path (extracted OCI image).
+    // When set, the container will be chrooted into this directory.
+    string rootfs = 11;
 }
 
 // Response to create container.
@@ -224,6 +229,46 @@ message ExecOutput {
     int32 exit_code = 3;
     // Is this the final message.
     bool done = 4;
+}
+
+// Request to start an exec instance.
+message ExecStartRequest {
+    // Exec ID.
+    string exec_id = 1;
+    // Container ID.
+    string container_id = 2;
+    // Command to execute.
+    repeated string cmd = 3;
+    // Environment variables.
+    map<string, string> env = 4;
+    // Working directory.
+    string working_dir = 5;
+    // User to run as.
+    string user = 6;
+    // Allocate TTY.
+    bool tty = 7;
+    // Detach mode (run in background).
+    bool detach = 8;
+    // Initial terminal width.
+    uint32 tty_width = 9;
+    // Initial terminal height.
+    uint32 tty_height = 10;
+}
+
+// Exec start response.
+message ExecStartResponse {
+    // Process ID in guest.
+    uint32 pid = 1;
+}
+
+// Request to resize exec TTY.
+message ExecResizeRequest {
+    // Exec ID.
+    string exec_id = 1;
+    // New terminal width.
+    uint32 width = 2;
+    // New terminal height.
+    uint32 height = 3;
 }
 
 // Request for container stats.

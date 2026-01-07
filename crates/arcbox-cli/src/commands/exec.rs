@@ -1,6 +1,7 @@
 //! Exec command implementation.
 
 use arcbox_cli::client::{self, ExecCreateRequest, ExecCreateResponse};
+use arcbox_cli::terminal::InteractiveSession;
 use anyhow::Result;
 use clap::Args;
 
@@ -73,14 +74,24 @@ pub async fn execute(args: ExecArgs) -> Result<()> {
         // Detached mode: just start and return
         daemon.post_empty(&start_path, Some(&start_request)).await?;
         println!("{}", exec_id);
-    } else {
-        // Attached mode: start and get output
-        // TODO: Implement proper streaming for interactive mode
-        if args.interactive || args.tty {
-            tracing::warn!("Interactive/TTY exec mode not fully implemented yet");
-        }
+    } else if args.interactive || args.tty {
+        // Interactive/TTY mode: upgrade connection for bidirectional streaming
+        let stream = daemon.upgrade_exec(&exec_id, Some(&start_request)).await?;
+        let (reader, writer) = tokio::io::split(stream);
 
-        // For now, use post_raw which returns the response body
+        // Run interactive session
+        let session = InteractiveSession::new(reader, writer, args.tty);
+        session.run().await?;
+
+        // Get exec inspect to get exit code
+        let inspect_path = format!("/v1.43/exec/{}/json", exec_id);
+        if let Ok(inspect) = daemon.get::<ExecInspect>(&inspect_path).await {
+            if inspect.exit_code != 0 {
+                std::process::exit(inspect.exit_code);
+            }
+        }
+    } else {
+        // Non-interactive attached mode: use post_raw which returns the response body
         let output = daemon.post_raw(&start_path, Some(&start_request)).await?;
 
         // Print output

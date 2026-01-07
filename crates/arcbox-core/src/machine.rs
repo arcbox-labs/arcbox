@@ -5,7 +5,8 @@
 
 use crate::error::{CoreError, Result};
 use crate::persistence::MachinePersistence;
-use crate::vm::{VmConfig, VmId, VmManager};
+use crate::vm::{SharedDirConfig, VmConfig, VmId, VmManager};
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
@@ -42,6 +43,8 @@ pub struct MachineInfo {
     pub memory_mb: u64,
     /// Disk size in GB.
     pub disk_gb: u64,
+    /// Creation time.
+    pub created_at: DateTime<Utc>,
 }
 
 /// Machine configuration.
@@ -73,6 +76,8 @@ pub struct MachineManager {
     machines: RwLock<HashMap<String, MachineInfo>>,
     vm_manager: VmManager,
     persistence: MachinePersistence,
+    /// Data directory for VirtioFS sharing.
+    data_dir: PathBuf,
 }
 
 impl MachineManager {
@@ -82,6 +87,13 @@ impl MachineManager {
         let machines_dir = data_dir.join("machines");
         let persistence = MachinePersistence::new(&machines_dir);
 
+        // Create the default shared directory config for VirtioFS
+        // This shares the data_dir (e.g., ~/.arcbox) with the guest at /arcbox
+        let shared_dirs = vec![SharedDirConfig::new(
+            data_dir.to_string_lossy().to_string(),
+            "arcbox",
+        )];
+
         // Load persisted machines
         let mut machines = HashMap::new();
         for persisted in persistence.load_all() {
@@ -89,6 +101,7 @@ impl MachineManager {
             let vm_config = VmConfig {
                 cpus: persisted.cpus,
                 memory_mb: persisted.memory_mb,
+                shared_dirs: shared_dirs.clone(),
                 ..Default::default()
             };
 
@@ -102,6 +115,7 @@ impl MachineManager {
                     cpus: persisted.cpus,
                     memory_mb: persisted.memory_mb,
                     disk_gb: persisted.disk_gb,
+                    created_at: persisted.created_at,
                 };
                 machines.insert(persisted.name, info);
             }
@@ -113,6 +127,7 @@ impl MachineManager {
             machines: RwLock::new(machines),
             vm_manager,
             persistence,
+            data_dir,
         }
     }
 
@@ -132,10 +147,18 @@ impl MachineManager {
             return Err(CoreError::AlreadyExists(config.name));
         }
 
+        // Create shared directory for container rootfs via VirtioFS
+        // This shares data_dir (e.g., ~/.arcbox) with the guest at /arcbox
+        let shared_dirs = vec![SharedDirConfig::new(
+            self.data_dir.to_string_lossy().to_string(),
+            "arcbox",
+        )];
+
         // Create underlying VM
         let vm_config = VmConfig {
             cpus: config.cpus,
             memory_mb: config.memory_mb,
+            shared_dirs,
             ..Default::default()
         };
         let vm_id = self.vm_manager.create(vm_config)?;
@@ -148,6 +171,7 @@ impl MachineManager {
             cpus: config.cpus,
             memory_mb: config.memory_mb,
             disk_gb: config.disk_gb,
+            created_at: Utc::now(),
         };
 
         // Persist the machine config

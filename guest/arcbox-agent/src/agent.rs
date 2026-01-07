@@ -25,26 +25,30 @@ mod linux {
     use super::AGENT_PORT;
     use crate::container::{ContainerHandle, ContainerRuntime, ContainerState};
     use crate::log_watcher::{watch_log_file, LogWatchOptions};
+    use crate::pty::ExecSession;
     use crate::rpc::{
         parse_request, read_message, write_response, ErrorResponse, RpcRequest, RpcResponse,
         AGENT_VERSION,
     };
 
     use arcbox_protocol::agent::{
-        ContainerInfo, CreateContainerResponse, ExecOutput, ListContainersResponse, LogEntry,
-        LogsRequest, PingResponse, SystemInfo,
+        ContainerInfo, CreateContainerResponse, ExecOutput, ExecStartResponse,
+        ListContainersResponse, LogEntry, LogsRequest, PingResponse, SystemInfo,
     };
 
     /// Agent state shared across connections.
     pub struct AgentState {
         /// Container runtime.
         pub runtime: ContainerRuntime,
+        /// Active exec sessions by ID.
+        pub exec_sessions: HashMap<String, ExecSession>,
     }
 
     impl AgentState {
         pub fn new() -> Self {
             Self {
                 runtime: ContainerRuntime::new(),
+                exec_sessions: HashMap::new(),
             }
         }
     }
@@ -216,8 +220,17 @@ mod linux {
             RpcRequest::ListContainers(req) => {
                 RequestResult::Single(handle_list_containers(req.all, state).await)
             }
+            RpcRequest::KillContainer(req) => {
+                RequestResult::Single(handle_kill_container(&req.id, &req.signal, state).await)
+            }
             RpcRequest::Exec(req) => RequestResult::Single(handle_exec(req, state).await),
             RpcRequest::Logs(req) => handle_logs(req, state).await,
+            RpcRequest::ExecStart(req) => {
+                RequestResult::Single(handle_exec_start(req, state).await)
+            }
+            RpcRequest::ExecResize(req) => {
+                RequestResult::Single(handle_exec_resize(req, state).await)
+            }
         }
     }
 
@@ -344,6 +357,13 @@ mod linux {
             pid: None,
             exit_code: None,
             created_at: chrono::Utc::now(),
+            tty: req.tty,
+            open_stdin: req.open_stdin,
+            rootfs: if req.rootfs.is_empty() {
+                None
+            } else {
+                Some(req.rootfs)
+            },
         };
 
         // Store in runtime
@@ -401,6 +421,24 @@ mod linux {
             Err(e) => {
                 tracing::error!("Failed to remove container {}: {}", id, e);
                 RpcResponse::Error(ErrorResponse::new(500, format!("failed to remove: {}", e)))
+            }
+        }
+    }
+
+    /// Handles a KillContainer request.
+    async fn handle_kill_container(
+        id: &str,
+        signal: &str,
+        state: &Arc<RwLock<AgentState>>,
+    ) -> RpcResponse {
+        tracing::info!("KillContainer: id={}, signal={}", id, signal);
+
+        let mut state = state.write().await;
+        match state.runtime.signal_container(id, signal).await {
+            Ok(()) => RpcResponse::Empty,
+            Err(e) => {
+                tracing::error!("Failed to kill container {}: {}", id, e);
+                RpcResponse::Error(ErrorResponse::new(500, format!("failed to kill: {}", e)))
             }
         }
     }
@@ -515,6 +553,268 @@ mod linux {
             }
             Err(e) => RpcResponse::Error(ErrorResponse::new(500, format!("exec failed: {}", e))),
         }
+    }
+
+    /// Handles an ExecStart request (with PTY support).
+    async fn handle_exec_start(
+        req: arcbox_protocol::agent::ExecStartRequest,
+        state: &Arc<RwLock<AgentState>>,
+    ) -> RpcResponse {
+        tracing::info!(
+            "ExecStart: exec_id={}, container_id={}, cmd={:?}, tty={}, detach={}",
+            req.exec_id,
+            req.container_id,
+            req.cmd,
+            req.tty,
+            req.detach
+        );
+
+        if req.cmd.is_empty() {
+            return RpcResponse::Error(ErrorResponse::new(400, "empty command"));
+        }
+
+        // Determine terminal size (use defaults if not specified).
+        let cols = if req.tty_width > 0 { req.tty_width as u16 } else { 80 };
+        let rows = if req.tty_height > 0 { req.tty_height as u16 } else { 24 };
+
+        // Create exec session.
+        let session = match ExecSession::new(req.exec_id.clone(), req.tty, cols, rows) {
+            Ok(s) => s,
+            Err(e) => {
+                return RpcResponse::Error(ErrorResponse::new(
+                    500,
+                    format!("failed to create exec session: {}", e),
+                ));
+            }
+        };
+
+        // Execute the command using fork+exec with PTY.
+        let result = execute_with_pty(&req, session).await;
+
+        match result {
+            Ok((pid, exit_code, stdout, stderr)) => {
+                // Store session if detached (for future resize/management).
+                if req.detach && exit_code.is_none() {
+                    // In detach mode with no exit code, process is still running.
+                    // Session management would go here in a full implementation.
+                    tracing::debug!("Exec {} running in detached mode with pid {}", req.exec_id, pid);
+                }
+
+                RpcResponse::ExecStart(ExecStartResponse { pid })
+            }
+            Err(e) => {
+                RpcResponse::Error(ErrorResponse::new(500, format!("exec_start failed: {}", e)))
+            }
+        }
+    }
+
+    /// Executes a command with PTY support.
+    ///
+    /// Returns (pid, exit_code, stdout, stderr).
+    async fn execute_with_pty(
+        req: &arcbox_protocol::agent::ExecStartRequest,
+        mut session: ExecSession,
+    ) -> Result<(u32, Option<i32>, Vec<u8>, Vec<u8>)> {
+        use nix::sys::wait::{waitpid, WaitStatus};
+        use nix::unistd::{fork, ForkResult};
+        use std::ffi::CString;
+        use std::os::unix::io::AsRawFd;
+
+        let env: HashMap<String, String> = req.env.clone().into_iter().collect();
+        let env_vec: Vec<(String, String)> = env.into_iter().collect();
+
+        // Prepare command and args as CStrings.
+        let cmd = match CString::new(req.cmd[0].as_str()) {
+            Ok(c) => c,
+            Err(e) => anyhow::bail!("invalid command: {}", e),
+        };
+
+        let args: Vec<CString> = req
+            .cmd
+            .iter()
+            .map(|s| CString::new(s.as_str()).unwrap_or_default())
+            .collect();
+
+        let env_strings: Vec<CString> = env_vec
+            .iter()
+            .map(|(k, v)| CString::new(format!("{}={}", k, v)).unwrap_or_default())
+            .collect();
+
+        // Fork and exec.
+        // SAFETY: fork() is unsafe but we handle both parent and child paths.
+        let fork_result = unsafe { fork() };
+
+        match fork_result {
+            Ok(ForkResult::Parent { child }) => {
+                // Parent process.
+                let pid = child.as_raw() as u32;
+                session.pid = Some(pid);
+                session.running = true;
+
+                // Close slave side in parent.
+                if let Some(ref mut pty) = session.pty {
+                    let _ = pty.pty_mut().close_slave();
+                }
+
+                if req.detach {
+                    // In detach mode, return immediately without waiting.
+                    return Ok((pid, None, Vec::new(), Vec::new()));
+                }
+
+                // Wait for child and collect output.
+                let mut stdout = Vec::new();
+
+                // Read from PTY master if we have one.
+                if let Some(ref pty) = session.pty {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match pty.pty().read_output(&mut buf) {
+                            Ok(0) => {
+                                // Non-blocking read, no data available.
+                                // Check if child has exited.
+                                match waitpid(child, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                                    Ok(WaitStatus::Exited(_, code)) => {
+                                        session.running = false;
+                                        session.exit_code = Some(code);
+                                        return Ok((pid, Some(code), stdout, Vec::new()));
+                                    }
+                                    Ok(WaitStatus::Signaled(_, sig, _)) => {
+                                        session.running = false;
+                                        let code = 128 + sig as i32;
+                                        session.exit_code = Some(code);
+                                        return Ok((pid, Some(code), stdout, Vec::new()));
+                                    }
+                                    Ok(WaitStatus::StillAlive) => {
+                                        // Still running, sleep briefly and continue.
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                        continue;
+                                    }
+                                    _ => {
+                                        // Other status, continue waiting.
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                        continue;
+                                    }
+                                }
+                            }
+                            Ok(n) => {
+                                stdout.extend_from_slice(&buf[..n]);
+                            }
+                            Err(e) => {
+                                tracing::warn!("PTY read error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Wait for child to finish.
+                match waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, code)) => {
+                        session.running = false;
+                        session.exit_code = Some(code);
+                        Ok((pid, Some(code), stdout, Vec::new()))
+                    }
+                    Ok(WaitStatus::Signaled(_, sig, _)) => {
+                        session.running = false;
+                        let code = 128 + sig as i32;
+                        session.exit_code = Some(code);
+                        Ok((pid, Some(code), stdout, Vec::new()))
+                    }
+                    Ok(_) => {
+                        // Unexpected status.
+                        Ok((pid, Some(-1), stdout, Vec::new()))
+                    }
+                    Err(e) => {
+                        anyhow::bail!("waitpid failed: {}", e);
+                    }
+                }
+            }
+            Ok(ForkResult::Child) => {
+                // Child process.
+                // Setup PTY slave as controlling terminal if in TTY mode.
+                if let Some(ref pty) = session.pty {
+                    // SAFETY: We're in the child process after fork.
+                    if let Err(e) = unsafe { pty.pty().setup_slave_for_child() } {
+                        eprintln!("Failed to setup PTY: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+
+                // Change working directory if specified.
+                if !req.working_dir.is_empty() {
+                    if let Err(e) = std::env::set_current_dir(&req.working_dir) {
+                        eprintln!("Failed to change directory: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+
+                // Execute the command.
+                let c_args: Vec<&std::ffi::CStr> = args.iter().map(|s| s.as_c_str()).collect();
+                let c_env: Vec<&std::ffi::CStr> = env_strings.iter().map(|s| s.as_c_str()).collect();
+
+                // This never returns on success.
+                let _ = nix::unistd::execve(&cmd, &c_args, &c_env);
+
+                // If we get here, execve failed.
+                eprintln!("execve failed: {}", std::io::Error::last_os_error());
+                std::process::exit(127);
+            }
+            Err(e) => {
+                anyhow::bail!("fork failed: {}", e);
+            }
+        }
+    }
+
+    /// Handles an ExecResize request.
+    async fn handle_exec_resize(
+        req: arcbox_protocol::agent::ExecResizeRequest,
+        state: &Arc<RwLock<AgentState>>,
+    ) -> RpcResponse {
+        tracing::info!(
+            "ExecResize: exec_id={}, width={}, height={}",
+            req.exec_id,
+            req.width,
+            req.height
+        );
+
+        let mut state = state.write().await;
+
+        // Find the exec session.
+        let session = match state.exec_sessions.get_mut(&req.exec_id) {
+            Some(s) => s,
+            None => {
+                return RpcResponse::Error(ErrorResponse::new(
+                    404,
+                    format!("exec session not found: {}", req.exec_id),
+                ));
+            }
+        };
+
+        // Check if session has PTY.
+        if !session.has_tty() {
+            return RpcResponse::Error(ErrorResponse::new(
+                400,
+                "exec session does not have a TTY",
+            ));
+        }
+
+        // Check if session is still running.
+        if !session.running {
+            return RpcResponse::Error(ErrorResponse::new(
+                400,
+                "exec session is not running",
+            ));
+        }
+
+        // Resize the PTY.
+        if let Err(e) = session.resize(req.width as u16, req.height as u16) {
+            return RpcResponse::Error(ErrorResponse::new(
+                500,
+                format!("failed to resize: {}", e),
+            ));
+        }
+
+        RpcResponse::Empty
     }
 
     /// Handles a Logs request.

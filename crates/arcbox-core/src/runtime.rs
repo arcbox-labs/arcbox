@@ -7,7 +7,7 @@ use crate::event::EventBus;
 use crate::machine::{MachineManager, MachineState};
 use crate::vm::VmManager;
 use arcbox_container::{ContainerConfig, ContainerId, ContainerManager, ContainerState, ExecManager, VolumeManager};
-use arcbox_image::ImageStore;
+use arcbox_image::{ImageRef, ImageStore};
 use arcbox_net::NetworkManager;
 use arcbox_protocol::agent::{CreateContainerRequest, LogEntry, LogsRequest};
 use tokio_stream::wrappers::ReceiverStream;
@@ -167,14 +167,94 @@ impl Runtime {
         Ok(())
     }
 
-    /// Shuts down the runtime.
+    /// Shuts down the runtime gracefully.
+    ///
+    /// This performs the following in order:
+    /// 1. Stop all running containers
+    /// 2. Stop all running VMs/machines
+    /// 3. Clean up network resources
     ///
     /// # Errors
     ///
     /// Returns an error if shutdown fails.
     pub async fn shutdown(&self) -> Result<()> {
         tracing::info!("ArcBox runtime shutting down");
-        // TODO: Stop all VMs and containers
+
+        // 1. Stop all running containers.
+        let containers = self.container_manager.list();
+        for container in containers {
+            if container.state == arcbox_container::ContainerState::Running {
+                tracing::debug!("Stopping container {}", container.id);
+                if let Some(machine_name) = &container.machine_name {
+                    // Try to stop via agent (with timeout).
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        self.stop_container(machine_name, &container.id, 5),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {
+                            tracing::info!("Container {} stopped", container.id);
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!("Failed to stop container {}: {}", container.id, e);
+                        }
+                        Err(_) => {
+                            tracing::warn!("Timeout stopping container {}", container.id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Stop all running machines/VMs.
+        let machines = self.machine_manager.list();
+        for machine in machines {
+            if machine.state == MachineState::Running {
+                tracing::debug!("Stopping machine {}", machine.name);
+                match self.machine_manager.stop(&machine.name) {
+                    Ok(()) => {
+                        tracing::info!("Machine {} stopped", machine.name);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to stop machine {}: {}", machine.name, e);
+                    }
+                }
+            }
+        }
+
+        // 3. Stop network manager.
+        if let Err(e) = self.network_manager.stop() {
+            tracing::warn!("Failed to stop network manager: {}", e);
+        }
+
+        tracing::info!("ArcBox runtime shutdown complete");
+        Ok(())
+    }
+
+    /// Shuts down the runtime forcefully.
+    ///
+    /// Skips graceful container/VM shutdown and immediately cleans up.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if shutdown fails.
+    pub async fn shutdown_force(&self) -> Result<()> {
+        tracing::warn!("ArcBox runtime force shutdown");
+
+        // Force stop all machines (kill VMs).
+        let machines = self.machine_manager.list();
+        for machine in machines {
+            if machine.state == MachineState::Running {
+                tracing::debug!("Force stopping machine {}", machine.name);
+                let _ = self.machine_manager.stop(&machine.name);
+            }
+        }
+
+        // Stop network manager.
+        let _ = self.network_manager.stop();
+
+        tracing::info!("ArcBox runtime force shutdown complete");
         Ok(())
     }
 
@@ -222,6 +302,27 @@ impl Runtime {
             // For now, we'll rely on the agent communication for actual container state
         }
 
+        // Extract image to create rootfs
+        let image_ref = ImageRef::parse(&config.image).ok_or_else(|| {
+            CoreError::Config(format!("invalid image reference: {}", config.image))
+        })?;
+
+        // Prepare container rootfs by extracting image layers
+        let host_rootfs = self
+            .image_store
+            .prepare_container_rootfs(&container_id.to_string(), &image_ref)?;
+
+        tracing::info!(
+            "Prepared rootfs for container {}: {}",
+            container_id,
+            host_rootfs.display()
+        );
+
+        // Calculate guest-side rootfs path
+        // The VirtioFS share "arcbox" maps data_dir to /arcbox in guest
+        // So containers/{id}/rootfs on host becomes /arcbox/containers/{id}/rootfs in guest
+        let guest_rootfs = format!("/arcbox/containers/{}/rootfs", container_id);
+
         // Send create request to agent
         let agent = self.agent_pool.get(cid).await;
         let mut agent = agent.write().await;
@@ -235,7 +336,9 @@ impl Runtime {
             working_dir: config.working_dir.clone().unwrap_or_default(),
             user: config.user.clone().unwrap_or_default(),
             mounts: vec![],
-            tty: false,
+            tty: config.tty.unwrap_or(false),
+            open_stdin: config.open_stdin.unwrap_or(false),
+            rootfs: guest_rootfs,
         };
 
         agent.create_container(req).await?;
@@ -264,13 +367,13 @@ impl Runtime {
             .get_cid(machine_name)
             .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
 
-        // Update local state
-        self.container_manager.start(container_id)?;
-
         // Send start request to agent
         let agent = self.agent_pool.get(cid).await;
         let mut agent = agent.write().await;
         agent.start_container(&container_id.to_string()).await?;
+
+        // Update local state after successful agent call
+        self.container_manager.start(container_id).await?;
 
         tracing::info!(
             "Started container {} in machine '{}'",
@@ -302,8 +405,8 @@ impl Runtime {
         let mut agent = agent.write().await;
         agent.stop_container(&container_id.to_string(), timeout).await?;
 
-        // Update local state
-        self.container_manager.stop(container_id)?;
+        // Update local state after successful agent call
+        self.container_manager.stop(container_id, timeout).await?;
 
         tracing::info!(
             "Stopped container {} in machine '{}'",
@@ -450,5 +553,141 @@ impl Runtime {
         let stream = agent.logs_stream(req).await?;
 
         Ok(stream)
+    }
+
+    /// Kills a container in a machine with a signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container cannot be killed.
+    pub async fn kill_container(
+        &self,
+        machine_name: &str,
+        container_id: &ContainerId,
+        signal: &str,
+    ) -> Result<()> {
+        let cid = self
+            .machine_manager
+            .get_cid(machine_name)
+            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+
+        // Send stop request to agent with 0 timeout (immediate kill).
+        // Note: The agent protocol doesn't have a dedicated kill RPC,
+        // so we use stop with timeout=0 for SIGKILL behavior.
+        let timeout = if signal == "SIGKILL" || signal == "9" {
+            0 // Immediate termination
+        } else {
+            1 // Brief timeout for SIGTERM
+        };
+
+        let agent = self.agent_pool.get(cid).await;
+        let mut agent = agent.write().await;
+        agent.kill_container(&container_id.to_string(), signal).await?;
+
+        // Update local state after successful agent call.
+        self.container_manager.kill(container_id, signal).await?;
+
+        tracing::info!(
+            "Killed container {} in machine '{}' with signal {}",
+            container_id,
+            machine_name,
+            signal
+        );
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // Exec operations (coordinating ExecManager + Agent)
+    // =========================================================================
+
+    /// Executes a command in a container.
+    ///
+    /// This is the main exec entry point that coordinates between
+    /// ExecManager (local metadata) and Agent (actual execution).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if execution fails.
+    pub async fn exec_container(
+        &self,
+        machine_name: &str,
+        container_id: &str,
+        cmd: Vec<String>,
+        env: std::collections::HashMap<String, String>,
+        working_dir: String,
+        user: String,
+        tty: bool,
+    ) -> Result<arcbox_protocol::agent::ExecOutput> {
+        let cid = self
+            .machine_manager
+            .get_cid(machine_name)
+            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+
+        let agent = self.agent_pool.get(cid).await;
+        let mut agent = agent.write().await;
+
+        let req = arcbox_protocol::agent::ExecRequest {
+            container_id: container_id.to_string(),
+            cmd,
+            env,
+            working_dir,
+            user,
+            tty,
+        };
+
+        let output = agent.exec(req).await?;
+
+        tracing::debug!(
+            "Executed command in container {} (machine '{}'), exit_code: {}",
+            container_id,
+            machine_name,
+            output.exit_code
+        );
+
+        Ok(output)
+    }
+
+    /// Executes a command in the VM (not in a container).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if execution fails.
+    pub async fn exec_machine(
+        &self,
+        machine_name: &str,
+        cmd: Vec<String>,
+        env: std::collections::HashMap<String, String>,
+        working_dir: String,
+        user: String,
+        tty: bool,
+    ) -> Result<arcbox_protocol::agent::ExecOutput> {
+        let cid = self
+            .machine_manager
+            .get_cid(machine_name)
+            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+
+        let agent = self.agent_pool.get(cid).await;
+        let mut agent = agent.write().await;
+
+        // Empty container_id means execute in VM namespace.
+        let req = arcbox_protocol::agent::ExecRequest {
+            container_id: String::new(),
+            cmd,
+            env,
+            working_dir,
+            user,
+            tty,
+        };
+
+        let output = agent.exec(req).await?;
+
+        tracing::debug!(
+            "Executed command in machine '{}', exit_code: {}",
+            machine_name,
+            output.exit_code
+        );
+
+        Ok(output)
     }
 }

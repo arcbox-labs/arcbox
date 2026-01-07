@@ -15,6 +15,7 @@ mod agent;
 mod container;
 mod exec;
 mod log_watcher;
+mod pty;
 mod rpc;
 
 // Mount module uses Linux-specific syscalls (mount/umount).

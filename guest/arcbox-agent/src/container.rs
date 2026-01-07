@@ -2,10 +2,23 @@
 //!
 //! This module manages container lifecycle within the guest VM.
 //! It handles container creation, starting, stopping, and removal.
+//!
+//! ## Container Isolation
+//!
+//! When a rootfs is provided, containers are isolated using:
+//! - Mount namespace (CLONE_NEWNS) for filesystem isolation
+//! - Chroot to restrict filesystem access
+//! - Special mounts (/proc, /sys, /dev) for proper Linux operation
 
+use crate::pty::PtyHandle;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -55,12 +68,23 @@ pub struct ContainerHandle {
     pub exit_code: Option<i32>,
     /// Creation timestamp.
     pub created_at: DateTime<Utc>,
+    /// Whether TTY is enabled.
+    pub tty: bool,
+    /// Whether stdin is open.
+    pub open_stdin: bool,
+    /// Root filesystem path.
+    ///
+    /// When set, the container will be chrooted into this directory.
+    /// This should point to an extracted OCI image rootfs.
+    pub rootfs: Option<String>,
 }
 
 /// Running process handle.
 struct ProcessHandle {
     /// The child process.
     child: Child,
+    /// PTY handle (if TTY mode).
+    pty: Option<PtyHandle>,
 }
 
 /// Container runtime managing all containers.
@@ -117,6 +141,16 @@ impl ContainerRuntime {
 
     /// Starts a container.
     pub async fn start_container(&mut self, id: &str) -> Result<()> {
+        self.start_container_with_size(id, 80, 24).await
+    }
+
+    /// Starts a container with specified terminal size.
+    pub async fn start_container_with_size(
+        &mut self,
+        id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<()> {
         let container = self
             .containers
             .get_mut(id)
@@ -130,27 +164,101 @@ impl ContainerRuntime {
             anyhow::bail!("container has no command");
         }
 
+        let use_tty = container.tty;
+        let command = container.command.clone();
+        let working_dir = container.working_dir.clone();
+        let env = container.env.clone();
+        let rootfs = container.rootfs.clone();
+
         tracing::info!(
-            "Starting container {}: cmd={:?}, workdir={}",
+            "Starting container {}: cmd={:?}, workdir={}, tty={}, rootfs={:?}",
             id,
-            container.command,
-            container.working_dir
+            command,
+            working_dir,
+            use_tty,
+            rootfs
         );
 
         // Build the command
-        let mut cmd = Command::new(&container.command[0]);
-        cmd.args(&container.command[1..]);
-        cmd.current_dir(&container.working_dir);
+        let mut cmd = Command::new(&command[0]);
+        cmd.args(&command[1..]);
+        cmd.current_dir(&working_dir);
 
         // Set environment variables
-        for (key, value) in &container.env {
+        for (key, value) in &env {
             cmd.env(key, value);
         }
 
-        // Configure stdio
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        // Configure stdio based on TTY mode
+        let pty_handle = if use_tty {
+            // Create PTY for TTY mode
+            let pty = PtyHandle::new(cols, rows)
+                .context("failed to create PTY")?;
+
+            let slave_fd = pty.slave_fd();
+            let rootfs_for_exec = rootfs.clone();
+
+            // Configure process to use PTY slave
+            // SAFETY: pre_exec runs after fork, before exec
+            unsafe {
+                cmd.pre_exec(move || {
+                    // Setup rootfs isolation if provided
+                    if let Some(ref rootfs_path) = rootfs_for_exec {
+                        setup_container_rootfs(rootfs_path)?;
+                    }
+
+                    // Create new session
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+
+                    // Set controlling terminal
+                    if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+
+                    // Duplicate slave to stdin/stdout/stderr
+                    if libc::dup2(slave_fd, libc::STDIN_FILENO) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(slave_fd, libc::STDOUT_FILENO) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(slave_fd, libc::STDERR_FILENO) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+
+                    // Close slave if not already stdin/stdout/stderr
+                    if slave_fd > libc::STDERR_FILENO {
+                        libc::close(slave_fd);
+                    }
+
+                    Ok(())
+                });
+            }
+
+            // Set TERM environment variable
+            cmd.env("TERM", "xterm-256color");
+
+            Some(pty)
+        } else {
+            // Non-TTY mode: use pipes
+            // Setup rootfs isolation if provided
+            if let Some(ref rootfs_path) = rootfs {
+                let rootfs_for_exec = rootfs_path.clone();
+                // SAFETY: pre_exec runs after fork, before exec
+                unsafe {
+                    cmd.pre_exec(move || {
+                        setup_container_rootfs(&rootfs_for_exec)
+                    });
+                }
+            }
+
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+            None
+        };
 
         // Spawn the process
         let child = cmd.spawn().context("failed to spawn container process")?;
@@ -167,7 +275,13 @@ impl ContainerRuntime {
         }
 
         let mut processes = self.processes.lock().await;
-        processes.insert(id.to_string(), ProcessHandle { child });
+        processes.insert(
+            id.to_string(),
+            ProcessHandle {
+                child,
+                pty: pty_handle,
+            },
+        );
 
         Ok(())
     }
@@ -323,12 +437,293 @@ impl ContainerRuntime {
 
         anyhow::bail!("container process not found")
     }
+
+    /// Sends a signal to a container.
+    pub async fn signal_container(&mut self, id: &str, signal: &str) -> Result<()> {
+        let container = self
+            .containers
+            .get(id)
+            .context("container not found")?;
+
+        if container.state != ContainerState::Running {
+            anyhow::bail!("container is not running");
+        }
+
+        let pid = container.pid.context("container has no PID")?;
+
+        tracing::info!("Sending signal {} to container {} (PID {})", signal, id, pid);
+
+        // Parse signal name or number
+        let sig_num = parse_signal(signal)?;
+
+        #[cfg(target_os = "linux")]
+        {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+
+            let nix_pid = Pid::from_raw(pid as i32);
+            let nix_signal = Signal::try_from(sig_num).context("invalid signal number")?;
+            kill(nix_pid, nix_signal).context("failed to send signal")?;
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let result = unsafe { libc::kill(pid as i32, sig_num) };
+            if result != 0 {
+                anyhow::bail!("failed to send signal: {}", std::io::Error::last_os_error());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Resizes the TTY for a container.
+    pub async fn resize_tty(&self, id: &str, cols: u16, rows: u16) -> Result<()> {
+        tracing::debug!("ResizeTty for {}: {}x{}", id, cols, rows);
+
+        let processes = self.processes.lock().await;
+        if let Some(process_handle) = processes.get(id) {
+            if let Some(ref pty) = process_handle.pty {
+                pty.resize(cols, rows)?;
+                tracing::debug!("Container {} TTY resized to {}x{}", id, cols, rows);
+                return Ok(());
+            } else {
+                tracing::debug!("Container {} has no TTY", id);
+            }
+        } else {
+            tracing::debug!("Container {} process not found", id);
+        }
+
+        Ok(())
+    }
+
+    /// Gets the PTY master file descriptor for a container.
+    ///
+    /// Returns `None` if the container is not running or doesn't have a TTY.
+    pub async fn get_pty_master_fd(&self, id: &str) -> Option<std::os::unix::io::RawFd> {
+        let processes = self.processes.lock().await;
+        processes.get(id).and_then(|p| p.pty.as_ref().map(|pty| pty.master_fd()))
+    }
+}
+
+/// Parses a signal name or number string into a signal number.
+fn parse_signal(signal: &str) -> Result<i32> {
+    // First try to parse as a number
+    if let Ok(num) = signal.parse::<i32>() {
+        return Ok(num);
+    }
+
+    // Try to parse as a signal name (with or without "SIG" prefix)
+    let sig_name = signal.to_uppercase();
+    let sig_name = sig_name.strip_prefix("SIG").unwrap_or(&sig_name);
+
+    match sig_name {
+        "HUP" => Ok(libc::SIGHUP),
+        "INT" => Ok(libc::SIGINT),
+        "QUIT" => Ok(libc::SIGQUIT),
+        "ILL" => Ok(libc::SIGILL),
+        "TRAP" => Ok(libc::SIGTRAP),
+        "ABRT" | "IOT" => Ok(libc::SIGABRT),
+        "BUS" => Ok(libc::SIGBUS),
+        "FPE" => Ok(libc::SIGFPE),
+        "KILL" => Ok(libc::SIGKILL),
+        "USR1" => Ok(libc::SIGUSR1),
+        "SEGV" => Ok(libc::SIGSEGV),
+        "USR2" => Ok(libc::SIGUSR2),
+        "PIPE" => Ok(libc::SIGPIPE),
+        "ALRM" => Ok(libc::SIGALRM),
+        "TERM" => Ok(libc::SIGTERM),
+        "CHLD" => Ok(libc::SIGCHLD),
+        "CONT" => Ok(libc::SIGCONT),
+        "STOP" => Ok(libc::SIGSTOP),
+        "TSTP" => Ok(libc::SIGTSTP),
+        "TTIN" => Ok(libc::SIGTTIN),
+        "TTOU" => Ok(libc::SIGTTOU),
+        "URG" => Ok(libc::SIGURG),
+        "XCPU" => Ok(libc::SIGXCPU),
+        "XFSZ" => Ok(libc::SIGXFSZ),
+        "VTALRM" => Ok(libc::SIGVTALRM),
+        "PROF" => Ok(libc::SIGPROF),
+        "WINCH" => Ok(libc::SIGWINCH),
+        "IO" | "POLL" => Ok(libc::SIGIO),
+        "SYS" => Ok(libc::SIGSYS),
+        _ => anyhow::bail!("unknown signal: {}", signal),
+    }
 }
 
 impl Default for ContainerRuntime {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// =============================================================================
+// Container Isolation Helpers
+// =============================================================================
+
+/// Sets up container rootfs environment in pre_exec.
+///
+/// This function:
+/// 1. Creates a new mount namespace
+/// 2. Remounts root as private to prevent mount propagation
+/// 3. Mounts essential filesystems (proc, sys, dev)
+/// 4. Chroots into the rootfs
+///
+/// # Safety
+///
+/// This must be called in a pre_exec context (after fork, before exec).
+#[cfg(target_os = "linux")]
+unsafe fn setup_container_rootfs(rootfs: &str) -> std::io::Result<()> {
+    let rootfs_c = CString::new(rootfs).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid rootfs path")
+    })?;
+
+    // Create new mount namespace
+    if libc::unshare(libc::CLONE_NEWNS) < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Make root mount private to prevent propagation
+    let none = CString::new("none").unwrap();
+    let slash = CString::new("/").unwrap();
+    if libc::mount(
+        none.as_ptr(),
+        slash.as_ptr(),
+        std::ptr::null(),
+        libc::MS_REC | libc::MS_PRIVATE,
+        std::ptr::null(),
+    ) < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Setup essential mounts in the new rootfs
+    setup_container_mounts(rootfs)?;
+
+    // Chroot into the rootfs
+    if libc::chroot(rootfs_c.as_ptr()) < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Change to root directory
+    let root = CString::new("/").unwrap();
+    if libc::chdir(root.as_ptr()) < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+/// Sets up essential mounts inside the container rootfs.
+#[cfg(target_os = "linux")]
+unsafe fn setup_container_mounts(rootfs: &str) -> std::io::Result<()> {
+    // Mount /proc
+    let proc_path = format!("{}/proc", rootfs);
+    if Path::new(&proc_path).exists() {
+        let proc_src = CString::new("proc").unwrap();
+        let proc_dst = CString::new(proc_path).unwrap();
+        let proc_type = CString::new("proc").unwrap();
+
+        if libc::mount(
+            proc_src.as_ptr(),
+            proc_dst.as_ptr(),
+            proc_type.as_ptr(),
+            0,
+            std::ptr::null(),
+        ) < 0
+        {
+            // Non-fatal: /proc might already be mounted or not supported
+            tracing::warn!("Failed to mount /proc: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    // Mount /sys (sysfs)
+    let sys_path = format!("{}/sys", rootfs);
+    if Path::new(&sys_path).exists() {
+        let sys_src = CString::new("sysfs").unwrap();
+        let sys_dst = CString::new(sys_path).unwrap();
+        let sys_type = CString::new("sysfs").unwrap();
+
+        if libc::mount(
+            sys_src.as_ptr(),
+            sys_dst.as_ptr(),
+            sys_type.as_ptr(),
+            libc::MS_RDONLY,
+            std::ptr::null(),
+        ) < 0
+        {
+            tracing::warn!("/sys mount failed: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    // Bind mount /dev from host
+    // This is simpler than creating all device nodes manually
+    let dev_path = format!("{}/dev", rootfs);
+    if Path::new(&dev_path).exists() {
+        let dev_src = CString::new("/dev").unwrap();
+        let dev_dst = CString::new(dev_path).unwrap();
+
+        if libc::mount(
+            dev_src.as_ptr(),
+            dev_dst.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REC,
+            std::ptr::null(),
+        ) < 0
+        {
+            tracing::warn!("/dev bind mount failed: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    // Mount /dev/pts for PTY support
+    let devpts_path = format!("{}/dev/pts", rootfs);
+    if Path::new(&devpts_path).exists() {
+        let devpts_src = CString::new("devpts").unwrap();
+        let devpts_dst = CString::new(devpts_path).unwrap();
+        let devpts_type = CString::new("devpts").unwrap();
+        let devpts_opts = CString::new("newinstance,ptmxmode=0666").unwrap();
+
+        if libc::mount(
+            devpts_src.as_ptr(),
+            devpts_dst.as_ptr(),
+            devpts_type.as_ptr(),
+            0,
+            devpts_opts.as_ptr() as *const libc::c_void,
+        ) < 0
+        {
+            // PTY mount might fail if already mounted via /dev bind mount
+            tracing::debug!("/dev/pts mount: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    Ok(())
+}
+
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+unsafe fn setup_container_rootfs(_rootfs: &str) -> std::io::Result<()> {
+    // Container isolation is only implemented for Linux
+    // On other platforms (like macOS host for development), just chroot
+    let rootfs_c = CString::new(_rootfs).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid rootfs path")
+    })?;
+
+    // SAFETY: rootfs_c is a valid CString
+    unsafe {
+        if libc::chroot(rootfs_c.as_ptr()) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    let root = CString::new("/").unwrap();
+    // SAFETY: root is a valid CString
+    unsafe {
+        if libc::chdir(root.as_ptr()) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -347,6 +742,9 @@ mod tests {
             pid: None,
             exit_code: None,
             created_at: Utc::now(),
+            tty: false,
+            open_stdin: false,
+            rootfs: None,
         }
     }
 
@@ -366,6 +764,9 @@ mod tests {
             pid: None,
             exit_code: None,
             created_at: Utc::now(),
+            tty: false,
+            open_stdin: false,
+            rootfs: None,
         }
     }
 

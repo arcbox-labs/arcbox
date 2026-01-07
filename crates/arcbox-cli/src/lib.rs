@@ -3,3 +3,4 @@
 //! This module exposes the CLI client and utilities for testing.
 
 pub mod client;
+pub mod terminal;

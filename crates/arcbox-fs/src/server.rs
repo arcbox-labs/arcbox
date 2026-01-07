@@ -3,8 +3,13 @@
 //! This module provides the FUSE server that handles filesystem requests
 //! from the guest VM. On Darwin, the native VZ framework handles virtio-fs,
 //! so this is primarily used for Linux KVM.
+//!
+//! The [`FsServer`] implements [`arcbox_virtio::fs::FuseRequestHandler`] to
+//! integrate with the VirtIO-FS device.
 
 use std::sync::Arc;
+
+use arcbox_virtio::fs::{FuseRequestHandler, FuseSession};
 
 use crate::dispatcher::{DispatcherConfig, FuseDispatcher};
 use crate::error::{FsError, Result};
@@ -150,6 +155,35 @@ impl FsServer {
     #[must_use]
     pub fn dispatcher(&self) -> Option<&FuseDispatcher> {
         self.dispatcher.as_ref()
+    }
+}
+
+// ============================================================================
+// FuseRequestHandler Implementation
+// ============================================================================
+
+impl FuseRequestHandler for FsServer {
+    fn handle_request(&self, request: &[u8]) -> arcbox_virtio::Result<Vec<u8>> {
+        self.handle_request(request).map_err(|e| {
+            arcbox_virtio::VirtioError::DeviceError {
+                device: "fs".to_string(),
+                message: e.to_string(),
+            }
+        })
+    }
+
+    fn on_init(&self, session: &FuseSession) {
+        tracing::info!(
+            "FsServer received FUSE_INIT: version {}.{}, max_readahead={}, max_write={}",
+            session.major(),
+            session.minor(),
+            session.max_readahead(),
+            session.max_write()
+        );
+    }
+
+    fn on_destroy(&self) {
+        tracing::info!("FsServer received FUSE_DESTROY");
     }
 }
 

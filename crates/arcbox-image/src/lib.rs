@@ -18,6 +18,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod error;
+pub mod extract;
 pub mod layer;
 pub mod manifest;
 pub mod pull;
@@ -25,6 +26,7 @@ pub mod registry;
 pub mod store;
 
 pub use error::{ImageError, Result};
+pub use extract::RootfsBuilder;
 pub use manifest::{ImageConfig, ImageManifest, ManifestList, Platform, PlatformManifest};
 pub use pull::{ImagePuller, PullProgress};
 pub use registry::{ManifestResponse, RegistryAuth, RegistryClient};

@@ -3,14 +3,18 @@
 //! Provides RPC communication with the arcbox-agent running inside guest VMs.
 
 use crate::error::{CoreError, Result};
+use arcbox_container::AgentConnection;
 use arcbox_protocol::agent::{
     CreateContainerRequest, CreateContainerResponse, ExecOutput, ExecRequest,
-    ListContainersRequest, ListContainersResponse, LogEntry, LogsRequest, PingRequest,
-    PingResponse, RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
+    ExecResizeRequest, ExecStartRequest, ExecStartResponse, ListContainersRequest,
+    ListContainersResponse, LogEntry, LogsRequest, PingRequest, PingResponse,
+    RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
 };
+use arcbox_protocol::container::KillContainerRequest;
 use arcbox_protocol::Empty;
 use arcbox_transport::vsock::{VsockAddr, VsockTransport};
 use arcbox_transport::Transport;
+use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use prost::Message;
 use std::collections::HashMap;
@@ -33,8 +37,11 @@ enum MessageType {
     StopContainerRequest = 0x0012,
     RemoveContainerRequest = 0x0013,
     ListContainersRequest = 0x0014,
+    KillContainerRequest = 0x0015,
     ExecRequest = 0x0020,
     LogsRequest = 0x0021,
+    ExecStartRequest = 0x0022,
+    ExecResizeRequest = 0x0023,
 
     // Response types
     PingResponse = 0x1001,
@@ -43,6 +50,7 @@ enum MessageType {
     ListContainersResponse = 0x1014,
     ExecOutput = 0x1020,
     LogEntry = 0x1021,
+    ExecStartResponse = 0x1022,
 
     // Special types
     EmptyResponse = 0x0000,
@@ -59,14 +67,18 @@ impl MessageType {
             0x0012 => Some(Self::StopContainerRequest),
             0x0013 => Some(Self::RemoveContainerRequest),
             0x0014 => Some(Self::ListContainersRequest),
+            0x0015 => Some(Self::KillContainerRequest),
             0x0020 => Some(Self::ExecRequest),
             0x0021 => Some(Self::LogsRequest),
+            0x0022 => Some(Self::ExecStartRequest),
+            0x0023 => Some(Self::ExecResizeRequest),
             0x1001 => Some(Self::PingResponse),
             0x1002 => Some(Self::GetSystemInfoResponse),
             0x1010 => Some(Self::CreateContainerResponse),
             0x1014 => Some(Self::ListContainersResponse),
             0x1020 => Some(Self::ExecOutput),
             0x1021 => Some(Self::LogEntry),
+            0x1022 => Some(Self::ExecStartResponse),
             0x0000 => Some(Self::EmptyResponse),
             0xFFFF => Some(Self::Error),
             _ => None,
@@ -322,6 +334,32 @@ impl AgentClient {
         Ok(())
     }
 
+    /// Kills a container in the guest VM with a signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container cannot be killed.
+    pub async fn kill_container(&mut self, id: &str, signal: &str) -> Result<()> {
+        let req = KillContainerRequest {
+            id: id.to_string(),
+            signal: signal.to_string(),
+        };
+        let payload = req.encode_to_vec();
+
+        let (resp_type, _) = self
+            .rpc_call(MessageType::KillContainerRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::EmptyResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: {}",
+                resp_type
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Removes a container from the guest VM.
     ///
     /// # Errors
@@ -497,6 +535,51 @@ impl AgentClient {
 
         Ok(ReceiverStream::new(rx))
     }
+
+    /// Starts an exec instance in the guest VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the exec start fails.
+    pub async fn exec_start(&mut self, req: ExecStartRequest) -> Result<ExecStartResponse> {
+        let payload = req.encode_to_vec();
+
+        let (resp_type, resp_payload) = self
+            .rpc_call(MessageType::ExecStartRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::ExecStartResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: {}",
+                resp_type
+            )));
+        }
+
+        ExecStartResponse::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+    }
+
+    /// Resizes an exec instance's TTY in the guest VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the resize fails.
+    pub async fn exec_resize(&mut self, req: ExecResizeRequest) -> Result<()> {
+        let payload = req.encode_to_vec();
+
+        let (resp_type, _) = self
+            .rpc_call(MessageType::ExecResizeRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::EmptyResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: {}",
+                resp_type
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 /// Parses an error response from the agent.
@@ -564,6 +647,41 @@ impl AgentPool {
 impl Default for AgentPool {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Wrapper for `AgentClient` that implements `AgentConnection` trait.
+///
+/// This wrapper allows `AgentClient` to be used with `ContainerManager`.
+pub struct AgentClientWrapper {
+    client: RwLock<AgentClient>,
+}
+
+impl AgentClientWrapper {
+    /// Creates a new wrapper from an `AgentClient`.
+    #[must_use]
+    pub fn new(client: AgentClient) -> Self {
+        Self {
+            client: RwLock::new(client),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentConnection for AgentClientWrapper {
+    async fn start_container(&self, id: &str) -> std::result::Result<(), String> {
+        let mut client = self.client.write().await;
+        client.start_container(id).await.map_err(|e| e.to_string())
+    }
+
+    async fn stop_container(&self, id: &str, timeout: u32) -> std::result::Result<(), String> {
+        let mut client = self.client.write().await;
+        client.stop_container(id, timeout).await.map_err(|e| e.to_string())
+    }
+
+    async fn kill_container(&self, id: &str, signal: &str) -> std::result::Result<(), String> {
+        let mut client = self.client.write().await;
+        client.kill_container(id, signal).await.map_err(|e| e.to_string())
     }
 }
 

@@ -23,9 +23,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use arcbox_protocol::agent::{
     CreateContainerRequest, CreateContainerResponse, ExecOutput, ExecRequest,
-    ListContainersRequest, ListContainersResponse, LogEntry, LogsRequest, PingRequest,
-    PingResponse, RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
+    ExecResizeRequest, ExecStartRequest, ExecStartResponse, ListContainersRequest,
+    ListContainersResponse, LogEntry, LogsRequest, PingRequest, PingResponse,
+    RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
 };
+use arcbox_protocol::container::KillContainerRequest;
 use arcbox_protocol::Empty;
 
 /// Agent version string.
@@ -43,8 +45,11 @@ pub enum MessageType {
     StopContainerRequest = 0x0012,
     RemoveContainerRequest = 0x0013,
     ListContainersRequest = 0x0014,
+    KillContainerRequest = 0x0015,
     ExecRequest = 0x0020,
     LogsRequest = 0x0021,
+    ExecStartRequest = 0x0022,
+    ExecResizeRequest = 0x0023,
 
     // Response types (0x1000 - 0x1FFF)
     PingResponse = 0x1001,
@@ -54,8 +59,10 @@ pub enum MessageType {
     StopContainerResponse = 0x1012,
     RemoveContainerResponse = 0x1013,
     ListContainersResponse = 0x1014,
+    KillContainerResponse = 0x1015,
     ExecOutput = 0x1020,
     LogEntry = 0x1021,
+    ExecStartResponse = 0x1022,
 
     // Special types
     Empty = 0x0000,
@@ -73,8 +80,11 @@ impl MessageType {
             0x0012 => Some(Self::StopContainerRequest),
             0x0013 => Some(Self::RemoveContainerRequest),
             0x0014 => Some(Self::ListContainersRequest),
+            0x0015 => Some(Self::KillContainerRequest),
             0x0020 => Some(Self::ExecRequest),
             0x0021 => Some(Self::LogsRequest),
+            0x0022 => Some(Self::ExecStartRequest),
+            0x0023 => Some(Self::ExecResizeRequest),
             0x1001 => Some(Self::PingResponse),
             0x1002 => Some(Self::GetSystemInfoResponse),
             0x1010 => Some(Self::CreateContainerResponse),
@@ -82,8 +92,10 @@ impl MessageType {
             0x1012 => Some(Self::StopContainerResponse),
             0x1013 => Some(Self::RemoveContainerResponse),
             0x1014 => Some(Self::ListContainersResponse),
+            0x1015 => Some(Self::KillContainerResponse),
             0x1020 => Some(Self::ExecOutput),
             0x1021 => Some(Self::LogEntry),
+            0x1022 => Some(Self::ExecStartResponse),
             0x0000 => Some(Self::Empty),
             0xFFFF => Some(Self::Error),
             _ => None,
@@ -140,8 +152,11 @@ pub enum RpcRequest {
     StopContainer(StopContainerRequest),
     RemoveContainer(RemoveContainerRequest),
     ListContainers(ListContainersRequest),
+    KillContainer(KillContainerRequest),
     Exec(ExecRequest),
     Logs(LogsRequest),
+    ExecStart(ExecStartRequest),
+    ExecResize(ExecResizeRequest),
 }
 
 /// RPC response envelope.
@@ -154,6 +169,7 @@ pub enum RpcResponse {
     ListContainers(ListContainersResponse),
     ExecOutput(ExecOutput),
     LogEntry(LogEntry),
+    ExecStart(ExecStartResponse),
     Error(ErrorResponse),
 }
 
@@ -168,6 +184,7 @@ impl RpcResponse {
             Self::ListContainers(_) => MessageType::ListContainersResponse,
             Self::ExecOutput(_) => MessageType::ExecOutput,
             Self::LogEntry(_) => MessageType::LogEntry,
+            Self::ExecStart(_) => MessageType::ExecStartResponse,
             Self::Error(_) => MessageType::Error,
         }
     }
@@ -182,6 +199,7 @@ impl RpcResponse {
             Self::ListContainers(msg) => msg.encode_to_vec(),
             Self::ExecOutput(msg) => msg.encode_to_vec(),
             Self::LogEntry(msg) => msg.encode_to_vec(),
+            Self::ExecStart(msg) => msg.encode_to_vec(),
             Self::Error(err) => err.encode(),
         }
     }
@@ -279,6 +297,10 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
             let req = ListContainersRequest::decode(payload)?;
             Ok(RpcRequest::ListContainers(req))
         }
+        MessageType::KillContainerRequest => {
+            let req = KillContainerRequest::decode(payload)?;
+            Ok(RpcRequest::KillContainer(req))
+        }
         MessageType::ExecRequest => {
             let req = ExecRequest::decode(payload)?;
             Ok(RpcRequest::Exec(req))
@@ -286,6 +308,14 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
         MessageType::LogsRequest => {
             let req = LogsRequest::decode(payload)?;
             Ok(RpcRequest::Logs(req))
+        }
+        MessageType::ExecStartRequest => {
+            let req = ExecStartRequest::decode(payload)?;
+            Ok(RpcRequest::ExecStart(req))
+        }
+        MessageType::ExecResizeRequest => {
+            let req = ExecResizeRequest::decode(payload)?;
+            Ok(RpcRequest::ExecResize(req))
         }
         _ => anyhow::bail!("unexpected message type: {:?}", msg_type),
     }

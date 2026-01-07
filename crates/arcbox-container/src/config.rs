@@ -30,6 +30,10 @@ pub struct ContainerConfig {
     pub labels: HashMap<String, String>,
     /// Restart policy.
     pub restart_policy: RestartPolicy,
+    /// TTY allocation.
+    pub tty: Option<bool>,
+    /// Keep stdin open.
+    pub open_stdin: Option<bool>,
 }
 
 /// Volume mount configuration.
