@@ -15,7 +15,7 @@ libc = { workspace = true }
 tokio = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-arcbox-vz = { path = "../arcbox-vz" }
+arcbox-vz = { workspace = true }
 objc2 = "0.6"
 block2 = "0.6"
 

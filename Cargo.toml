@@ -29,6 +29,9 @@ members = [
     "crates/arcbox-api",
     "crates/arcbox-cli",
 
+    # Facade crate
+    "crates/arcbox",
+
     # Guest components
     "guest/arcbox-agent",
 
@@ -51,7 +54,7 @@ members = [
 #   - arcboxd/arcbox-k8s       (Kubernetes integration)
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -127,27 +130,30 @@ nix = { version = "0.29", features = ["fs", "process", "socket", "ioctl", "mman"
 libc = "0.2"
 
 # Internal crates (Core layer)
-arcbox-vz = { path = "crates/arcbox-vz" }
-arcbox-hypervisor = { path = "crates/arcbox-hypervisor" }
-arcbox-vmm = { path = "crates/arcbox-vmm" }
-arcbox-virtio = { path = "crates/arcbox-virtio" }
-arcbox-fs = { path = "crates/arcbox-fs" }
-arcbox-net = { path = "crates/arcbox-net" }
-arcbox-container = { path = "crates/arcbox-container" }
-arcbox-image = { path = "crates/arcbox-image" }
-arcbox-oci = { path = "crates/arcbox-oci" }
-arcbox-protocol = { path = "crates/arcbox-protocol" }
-arcbox-grpc = { path = "crates/arcbox-grpc" }
-arcbox-transport = { path = "crates/arcbox-transport" }
-arcbox-docker = { path = "crates/arcbox-docker" }
-arcbox-core = { path = "crates/arcbox-core" }
-arcbox-api = { path = "crates/arcbox-api" }
+arcbox-vz = { version = "0.0.1-alpha.1", path = "crates/arcbox-vz" }
+arcbox-hypervisor = { version = "0.0.1-alpha.1", path = "crates/arcbox-hypervisor" }
+arcbox-vmm = { version = "0.0.1-alpha.1", path = "crates/arcbox-vmm" }
+arcbox-virtio = { version = "0.0.1-alpha.1", path = "crates/arcbox-virtio" }
+arcbox-fs = { version = "0.0.1-alpha.1", path = "crates/arcbox-fs" }
+arcbox-net = { version = "0.0.1-alpha.1", path = "crates/arcbox-net" }
+arcbox-container = { version = "0.0.1-alpha.2", path = "crates/arcbox-container" }
+arcbox-image = { version = "0.0.1-alpha.1", path = "crates/arcbox-image" }
+arcbox-oci = { version = "0.0.1-alpha.1", path = "crates/arcbox-oci" }
+arcbox-protocol = { version = "0.0.1-alpha.1", path = "crates/arcbox-protocol" }
+arcbox-grpc = { version = "0.0.1-alpha.1", path = "crates/arcbox-grpc" }
+arcbox-transport = { version = "0.0.1-alpha.1", path = "crates/arcbox-transport" }
+arcbox-docker = { version = "0.0.1-alpha.1", path = "crates/arcbox-docker" }
+arcbox-core = { version = "0.0.1-alpha.2", path = "crates/arcbox-core" }
+arcbox-api = { version = "0.0.1-alpha.1", path = "crates/arcbox-api" }
+arcbox-cli = { version = "0.0.1-alpha.1", path = "crates/arcbox-cli" }
+arcbox-agent = { version = "0.0.1-alpha.1", path = "guest/arcbox-agent" }
+arcbox = { version = "0.0.1-alpha.1", path = "crates/arcbox" }
 
 # Internal crates (Pro layer)
-arcbox-fs-enhanced = { path = "pro/arcbox-fs-enhanced" }
-arcbox-net-advanced = { path = "pro/arcbox-net-advanced" }
-arcbox-snapshot = { path = "pro/arcbox-snapshot" }
-arcbox-perf = { path = "pro/arcbox-perf" }
+arcbox-fs-enhanced = { version = "0.0.1-alpha.1", path = "pro/arcbox-fs-enhanced" }
+arcbox-net-advanced = { version = "0.0.1-alpha.1", path = "pro/arcbox-net-advanced" }
+arcbox-snapshot = { version = "0.0.1-alpha.1", path = "pro/arcbox-snapshot" }
+arcbox-perf = { version = "0.0.1-alpha.1", path = "pro/arcbox-perf" }
 
 [profile.release]
 lto = true

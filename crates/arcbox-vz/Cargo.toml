@@ -1,10 +1,10 @@
 [package]
 name = "arcbox-vz"
-version = "0.1.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Safe Rust bindings for Apple's Virtualization.framework"
-repository = "https://github.com/arcboxd/arcbox"
+repository.workspace = true
 keywords = ["virtualization", "macos", "apple", "vm", "hypervisor"]
 categories = ["os::macos-apis", "virtualization"]
 

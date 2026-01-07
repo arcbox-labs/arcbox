@@ -101,8 +101,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
+name = "arcbox"
+version = "0.0.0"
+dependencies = [
+ "arcbox-hypervisor",
+ "arcbox-image",
+ "arcbox-protocol",
+ "arcbox-virtio",
+]
+
+[[package]]
 name = "arcbox-agent"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "arcbox-protocol",
@@ -127,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-api"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "arcbox-container",
  "arcbox-core",
@@ -147,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-cli"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "arcbox-core",
@@ -168,6 +178,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tower 0.5.2",
  "tracing",
  "tracing-subscriber",
@@ -175,12 +186,13 @@ dependencies = [
 
 [[package]]
 name = "arcbox-container"
-version = "0.1.0"
+version = "0.0.1-alpha.2"
 dependencies = [
  "arcbox-image",
  "chrono",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -189,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-core"
-version = "0.1.0"
+version = "0.0.1-alpha.2"
 dependencies = [
  "arcbox-container",
  "arcbox-fs",
@@ -216,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-docker"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "arcbox-container",
  "arcbox-core",
@@ -249,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-fs"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "arcbox-virtio",
  "bytes",
@@ -264,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-fs-enhanced"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "arcbox-fs",
  "thiserror",
@@ -274,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-grpc"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "arcbox-protocol",
  "prost",
@@ -288,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-hypervisor"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "arcbox-vz",
  "block2",
@@ -303,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-image"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "bytes",
  "chrono",
@@ -326,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-net"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "arcbox-virtio",
  "bytes",
@@ -345,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-net-advanced"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "arcbox-net",
  "thiserror",
@@ -355,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-oci"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "chrono",
  "serde",
@@ -369,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-perf"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "serde",
  "thiserror",
@@ -379,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-protocol"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "prost",
  "prost-build",
@@ -390,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-snapshot"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "chrono",
  "serde",
@@ -402,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-transport"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "arcbox-protocol",
  "async-trait",
@@ -416,7 +428,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-virtio"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "arcbox-hypervisor",
  "async-trait",
@@ -430,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-vmm"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "arcbox-hypervisor",
  "arcbox-virtio",
@@ -444,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-vz"
-version = "0.1.0"
+version = "0.0.1-alpha.1"
 dependencies = [
  "libc",
  "objc2",

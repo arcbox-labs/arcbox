@@ -21,7 +21,7 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-nix = { workspace = true, features = ["mount", "process", "sched", "signal", "feature"] }
+nix = { workspace = true, features = ["mount", "process", "sched", "signal", "feature", "term"] }
 libc = { workspace = true }
 prost = { workspace = true }
 uuid = { workspace = true }

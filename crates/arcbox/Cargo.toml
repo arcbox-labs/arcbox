@@ -1,0 +1,31 @@
+[package]
+name = "arcbox"
+description = "High-performance container and VM runtime"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["container", "vm", "virtualization", "docker", "runtime"]
+categories = ["virtualization", "development-tools"]
+
+[dependencies]
+# Re-export core crates (temporarily commented for initial publish)
+arcbox-hypervisor = { workspace = true }
+arcbox-virtio = { workspace = true }
+arcbox-image = { workspace = true }
+arcbox-protocol = { workspace = true }
+# TODO: uncomment after publishing these crates
+# arcbox-vmm = { workspace = true }
+# arcbox-container = { workspace = true }
+# arcbox-fs = { workspace = true }
+# arcbox-net = { workspace = true }
+# arcbox-core = { workspace = true }
+
+[features]
+default = []
+# Enable all features
+full = ["pro"]
+# Pro features (BSL-1.1 licensed)
+pro = []
