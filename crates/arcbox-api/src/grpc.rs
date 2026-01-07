@@ -18,7 +18,7 @@ use crate::generated::{
 };
 use arcbox_container::{ContainerConfig, ContainerId, ContainerState};
 use arcbox_core::Runtime;
-use arcbox_image::ImageRef;
+use arcbox_image::{ImagePuller, ImageRef, RegistryClient};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::Stream;
@@ -221,11 +221,87 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
 
     async fn container_logs(
         &self,
-        _request: Request<ContainerLogsRequest>,
+        request: Request<ContainerLogsRequest>,
     ) -> Result<Response<Self::ContainerLogsStream>, Status> {
-        // TODO: Implement log streaming via agent.
-        let stream = async_stream::stream! {
-            yield Err(Status::unimplemented("container logs not yet implemented"));
+        let req = request.into_inner();
+        let container_id = ContainerId::from_string(&req.id);
+
+        // Get container to find its machine.
+        let container = self
+            .runtime
+            .container_manager()
+            .get(&container_id)
+            .ok_or_else(|| Status::not_found("container not found"))?;
+
+        let machine_name = container
+            .machine_name
+            .ok_or_else(|| Status::internal("container has no machine assigned"))?;
+
+        // Create a streaming response.
+        let runtime = Arc::clone(&self.runtime);
+        let follow = req.follow;
+        let stdout = req.stdout;
+        let stderr = req.stderr;
+        let since = req.since;
+        let until = req.until;
+        let timestamps = req.timestamps;
+        let tail = req.tail;
+
+        let stream = async_stream::try_stream! {
+            if follow {
+                // Use streaming logs.
+                let mut log_stream = runtime
+                    .container_logs_stream(
+                        &machine_name,
+                        &container_id.to_string(),
+                        stdout,
+                        stderr,
+                        since,
+                        until,
+                        timestamps,
+                        tail,
+                    )
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+
+                use tokio_stream::StreamExt;
+                while let Some(result) = log_stream.next().await {
+                    match result {
+                        Ok(entry) => {
+                            yield LogEntry {
+                                timestamp: entry.timestamp,
+                                stream: entry.stream,
+                                data: entry.data,
+                            };
+                        }
+                        Err(e) => {
+                            Err(Status::internal(e.to_string()))?;
+                        }
+                    }
+                }
+            } else {
+                // Get logs once.
+                let entry = runtime
+                    .container_logs(
+                        &machine_name,
+                        &container_id.to_string(),
+                        false,
+                        stdout,
+                        stderr,
+                        since,
+                        until,
+                        timestamps,
+                        tail,
+                    )
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+
+                yield LogEntry {
+                    timestamp: entry.timestamp,
+                    stream: entry.stream,
+                    data: entry.data,
+                };
+            }
         };
 
         Ok(Response::new(Box::pin(stream)))
@@ -236,11 +312,67 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
 
     async fn exec_container(
         &self,
-        _request: Request<ExecContainerRequest>,
+        request: Request<ExecContainerRequest>,
     ) -> Result<Response<Self::ExecContainerStream>, Status> {
-        // TODO: Implement exec via agent.
-        let stream = async_stream::stream! {
-            yield Err(Status::unimplemented("exec not yet implemented"));
+        let req = request.into_inner();
+        let container_id = ContainerId::from_string(&req.id);
+
+        // Get container to find its machine.
+        let container = self
+            .runtime
+            .container_manager()
+            .get(&container_id)
+            .ok_or_else(|| Status::not_found("container not found"))?;
+
+        let machine_name = container
+            .machine_name
+            .ok_or_else(|| Status::internal("container has no machine assigned"))?;
+
+        // Get CID for the machine.
+        let cid = self
+            .runtime
+            .machine_manager()
+            .get_cid(&machine_name)
+            .ok_or_else(|| Status::internal("machine has no CID"))?;
+
+        // Build exec request for agent.
+        let agent_req = arcbox_protocol::agent::ExecRequest {
+            container_id: req.id.clone(),
+            cmd: req.cmd,
+            env: req.env,
+            working_dir: req.working_dir,
+            user: req.user,
+            tty: req.tty,
+        };
+
+        let agent_pool = Arc::clone(self.runtime.agent_pool());
+
+        let stream = async_stream::try_stream! {
+            let agent = agent_pool.get(cid).await;
+            let mut agent = agent.write().await;
+
+            let output = agent
+                .exec(agent_req)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            // Yield output data if present.
+            if !output.data.is_empty() {
+                yield ExecOutput {
+                    stream: output.stream.clone(),
+                    data: output.data.clone(),
+                    exit_code: 0,
+                    done: false,
+                };
+            }
+
+            // Final message with exit code.
+            yield ExecOutput {
+                stream: String::new(),
+                data: Vec::new(),
+                exit_code: output.exit_code,
+                done: true,
+            };
         };
 
         Ok(Response::new(Box::pin(stream)))
@@ -384,11 +516,56 @@ impl machine_service_server::MachineService for MachineServiceImpl {
 
     async fn exec_machine(
         &self,
-        _request: Request<ExecMachineRequest>,
+        request: Request<ExecMachineRequest>,
     ) -> Result<Response<Self::ExecMachineStream>, Status> {
-        // TODO: Implement exec via agent.
-        let stream = async_stream::stream! {
-            yield Err(Status::unimplemented("machine exec not yet implemented"));
+        let req = request.into_inner();
+        let machine_name = req.id;
+
+        // Get CID for the machine.
+        let cid = self
+            .runtime
+            .machine_manager()
+            .get_cid(&machine_name)
+            .ok_or_else(|| Status::not_found("machine not found or not running"))?;
+
+        // Build exec request for agent (empty container_id for VM-level exec).
+        let agent_req = arcbox_protocol::agent::ExecRequest {
+            container_id: String::new(), // Empty = run in VM namespace, not in a container
+            cmd: req.cmd,
+            env: req.env,
+            working_dir: req.working_dir,
+            user: req.user,
+            tty: req.tty,
+        };
+
+        let agent_pool = Arc::clone(self.runtime.agent_pool());
+
+        let stream = async_stream::try_stream! {
+            let agent = agent_pool.get(cid).await;
+            let mut agent = agent.write().await;
+
+            let output = agent
+                .exec(agent_req)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            // Yield output data if present.
+            if !output.data.is_empty() {
+                yield ExecOutput {
+                    stream: output.stream.clone(),
+                    data: output.data.clone(),
+                    exit_code: 0,
+                    done: false,
+                };
+            }
+
+            // Final message with exit code.
+            yield ExecOutput {
+                stream: String::new(),
+                data: Vec::new(),
+                exit_code: output.exit_code,
+                done: true,
+            };
         };
 
         Ok(Response::new(Box::pin(stream)))
@@ -399,14 +576,140 @@ impl machine_service_server::MachineService for MachineServiceImpl {
 
     async fn shell_machine(
         &self,
-        _request: Request<tonic::Streaming<ShellInput>>,
+        request: Request<tonic::Streaming<ShellInput>>,
     ) -> Result<Response<Self::ShellMachineStream>, Status> {
-        // TODO: Implement interactive shell via agent.
-        let stream = async_stream::stream! {
-            yield Err(Status::unimplemented("machine shell not yet implemented"));
+        let machine_name = {
+            // Extract machine name from metadata (the client should send it).
+            request
+                .metadata()
+                .get("machine-id")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+                .ok_or_else(|| Status::invalid_argument("missing machine-id header"))?
+        };
+
+        // Get CID for the machine.
+        let cid = self
+            .runtime
+            .machine_manager()
+            .get_cid(&machine_name)
+            .ok_or_else(|| Status::not_found("machine not found or not running"))?;
+
+        let agent_pool = Arc::clone(self.runtime.agent_pool());
+        let mut input_stream = request.into_inner();
+
+        let stream = async_stream::try_stream! {
+            let agent = agent_pool.get(cid).await;
+            let mut agent = agent.write().await;
+
+            // Start a shell session - use exec with /bin/sh.
+            let shell_req = arcbox_protocol::agent::ExecRequest {
+                container_id: String::new(),
+                cmd: vec!["/bin/sh".to_string()],
+                env: std::collections::HashMap::new(),
+                working_dir: String::new(),
+                user: String::new(),
+                tty: true,
+            };
+
+            let output = agent
+                .exec(shell_req)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            // Yield initial output.
+            yield ShellOutput {
+                data: output.data,
+                exit_code: output.exit_code,
+                done: output.done,
+            };
+
+            // Process input from client (simplified - in a real implementation,
+            // we'd need bidirectional streaming to the agent).
+            use tokio_stream::StreamExt;
+            while let Some(result) = input_stream.next().await {
+                match result {
+                    Ok(_input) => {
+                        // In a full implementation, we'd send input to the agent
+                        // and yield output back. For now, we just acknowledge.
+                        // This requires a more complex bidirectional protocol with the agent.
+                    }
+                    Err(e) => {
+                        Err(Status::internal(format!("input stream error: {}", e)))?;
+                    }
+                }
+            }
+
+            // Final output when stream ends.
+            yield ShellOutput {
+                data: Vec::new(),
+                exit_code: 0,
+                done: true,
+            };
         };
 
         Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+/// Channel-based pull progress reporter for gRPC streaming.
+struct ChannelPullProgress {
+    tx: tokio::sync::mpsc::Sender<Result<PullProgress, Status>>,
+}
+
+impl ChannelPullProgress {
+    fn new(tx: tokio::sync::mpsc::Sender<Result<PullProgress, Status>>) -> Self {
+        Self { tx }
+    }
+
+    fn short_digest(digest: &str) -> String {
+        let s = digest.strip_prefix("sha256:").unwrap_or(digest);
+        s[..12.min(s.len())].to_string()
+    }
+}
+
+impl arcbox_image::PullProgress for ChannelPullProgress {
+    fn layer_start(&self, digest: &str, size: u64) {
+        let short = Self::short_digest(digest);
+        let tx = self.tx.clone();
+        let _ = tx.try_send(Ok(PullProgress {
+            status: format!("Downloading {short}"),
+            id: digest.to_string(),
+            progress: format!("0/{size}"),
+            error: String::new(),
+        }));
+    }
+
+    fn layer_progress(&self, digest: &str, downloaded: u64, total: u64) {
+        let short = Self::short_digest(digest);
+        let tx = self.tx.clone();
+        let _ = tx.try_send(Ok(PullProgress {
+            status: format!("Downloading {short}"),
+            id: digest.to_string(),
+            progress: format!("{downloaded}/{total}"),
+            error: String::new(),
+        }));
+    }
+
+    fn layer_complete(&self, digest: &str) {
+        let short = Self::short_digest(digest);
+        let tx = self.tx.clone();
+        let _ = tx.try_send(Ok(PullProgress {
+            status: format!("Downloaded {short}"),
+            id: digest.to_string(),
+            progress: "complete".to_string(),
+            error: String::new(),
+        }));
+    }
+
+    fn complete(&self, image_id: &str) {
+        let tx = self.tx.clone();
+        let _ = tx.try_send(Ok(PullProgress {
+            status: "Pull complete".to_string(),
+            id: image_id.to_string(),
+            progress: String::new(),
+            error: String::new(),
+        }));
     }
 }
 
@@ -432,24 +735,50 @@ impl image_service_server::ImageService for ImageServiceImpl {
         &self,
         request: Request<PullImageRequest>,
     ) -> Result<Response<Self::PullImageStream>, Status> {
-        let _req = request.into_inner();
+        let req = request.into_inner();
 
-        // TODO: Implement actual image pull with progress streaming.
-        let stream = async_stream::stream! {
-            yield Ok(PullProgress {
-                status: "Pulling image...".to_string(),
-                id: String::new(),
-                progress: String::new(),
-                error: String::new(),
-            });
-            yield Ok(PullProgress {
-                status: "Pull complete".to_string(),
-                id: String::new(),
-                progress: String::new(),
-                error: String::new(),
-            });
-        };
+        let image_ref = ImageRef::parse(&req.reference)
+            .ok_or_else(|| Status::invalid_argument("invalid image reference"))?;
 
+        let store = self.runtime.image_store().clone();
+        let registry = image_ref.registry.clone();
+
+        // Create a channel to send progress updates.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<PullProgress, Status>>(32);
+
+        // Create channel-based progress reporter.
+        let progress = ChannelPullProgress::new(tx.clone());
+
+        // Spawn the pull task.
+        tokio::spawn(async move {
+            let client = RegistryClient::new(&registry);
+            let puller = ImagePuller::new(store, client).with_progress(progress);
+
+            match puller.pull(&image_ref).await {
+                Ok(image_id) => {
+                    let _ = tx
+                        .send(Ok(PullProgress {
+                            status: "Pull complete".to_string(),
+                            id: image_id,
+                            progress: String::new(),
+                            error: String::new(),
+                        }))
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Ok(PullProgress {
+                            status: "Error".to_string(),
+                            id: String::new(),
+                            progress: String::new(),
+                            error: e.to_string(),
+                        }))
+                        .await;
+                }
+            }
+        });
+
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(stream)))
     }
 

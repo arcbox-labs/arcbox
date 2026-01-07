@@ -26,6 +26,7 @@ pub mod store;
 
 pub use error::{ImageError, Result};
 pub use manifest::{ImageConfig, ImageManifest, ManifestList, Platform, PlatformManifest};
+pub use pull::{ImagePuller, PullProgress};
 pub use registry::{ManifestResponse, RegistryAuth, RegistryClient};
 pub use store::ImageStore;
 
