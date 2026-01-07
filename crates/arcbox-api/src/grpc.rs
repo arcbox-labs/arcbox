@@ -8,13 +8,13 @@ use crate::generated::{
     GetVersionRequest, GetVersionResponse, InspectContainerRequest, InspectContainerResponse,
     InspectImageRequest, InspectImageResponse, InspectMachineRequest, InspectMachineResponse,
     ListContainersRequest, ListContainersResponse, ListImagesRequest, ListImagesResponse,
-    ListMachinesRequest, ListMachinesResponse, LogEntry, MachineSummary, PingRequest, PingResponse,
-    PullImageRequest, PullProgress, RemoveContainerRequest, RemoveContainerResponse,
-    RemoveImageRequest, RemoveImageResponse, RemoveMachineRequest, RemoveMachineResponse,
-    ShellInput, ShellOutput, StartContainerRequest, StartContainerResponse, StartMachineRequest,
-    StartMachineResponse, StopContainerRequest, StopContainerResponse, StopMachineRequest,
-    StopMachineResponse, TagImageRequest, TagImageResponse, WaitContainerRequest,
-    WaitContainerResponse,
+    ListMachinesRequest, ListMachinesResponse, LogEntry, MachineSummary, Mount, PingRequest,
+    PingResponse, PortBinding, PullImageRequest, PullProgress, RemoveContainerRequest,
+    RemoveContainerResponse, RemoveImageRequest, RemoveImageResponse, RemoveMachineRequest,
+    RemoveMachineResponse, ShellInput, ShellOutput, StartContainerRequest, StartContainerResponse,
+    StartMachineRequest, StartMachineResponse, StopContainerRequest, StopContainerResponse,
+    StopMachineRequest, StopMachineResponse, TagImageRequest, TagImageResponse,
+    WaitContainerRequest, WaitContainerResponse,
 };
 use arcbox_container::{ContainerConfig, ContainerId, ContainerState};
 use arcbox_core::Runtime;
@@ -90,6 +90,7 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
         self.runtime
             .container_manager()
             .start(&id)
+            .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(StartContainerResponse {}))
@@ -99,11 +100,14 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
         &self,
         request: Request<StopContainerRequest>,
     ) -> Result<Response<StopContainerResponse>, Status> {
-        let id = ContainerId::from_string(request.into_inner().id);
+        let req = request.into_inner();
+        let id = ContainerId::from_string(req.id);
+        let timeout = req.timeout;
 
         self.runtime
             .container_manager()
-            .stop(&id)
+            .stop(&id, timeout)
+            .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(StopContainerResponse {}))
@@ -169,6 +173,54 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
             .get(&id)
             .ok_or_else(|| Status::not_found("container not found"))?;
 
+        // Extract config fields if available
+        let (cmd, entrypoint, env, working_dir, mounts, ports, labels) =
+            if let Some(ref config) = container.config {
+                (
+                    config.cmd.clone(),
+                    config.entrypoint.clone(),
+                    config.env.clone(),
+                    config.working_dir.clone().unwrap_or_default(),
+                    config
+                        .volumes
+                        .iter()
+                        .map(|v| Mount {
+                            source: v.source.clone(),
+                            target: v.target.clone(),
+                            r#type: "bind".to_string(),
+                            readonly: v.read_only,
+                        })
+                        .collect(),
+                    // Parse exposed ports in format "port/protocol" to PortBinding
+                    config
+                        .exposed_ports
+                        .iter()
+                        .filter_map(|p| {
+                            let parts: Vec<&str> = p.split('/').collect();
+                            parts.first().and_then(|port_str| {
+                                port_str.parse::<u32>().ok().map(|port| PortBinding {
+                                    container_port: port,
+                                    host_port: port,
+                                    protocol: parts.get(1).unwrap_or(&"tcp").to_string(),
+                                    host_ip: String::new(),
+                                })
+                            })
+                        })
+                        .collect(),
+                    config.labels.clone(),
+                )
+            } else {
+                (
+                    vec![],
+                    vec![],
+                    std::collections::HashMap::new(),
+                    String::new(),
+                    vec![],
+                    vec![],
+                    std::collections::HashMap::new(),
+                )
+            };
+
         Ok(Response::new(InspectContainerResponse {
             id: container.id.to_string(),
             name: container.name,
@@ -180,22 +232,25 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
                 paused: container.state == ContainerState::Paused,
                 restarting: container.state == ContainerState::Restarting,
                 dead: container.state == ContainerState::Dead,
-                pid: 0,
+                pid: 0, // PID is managed by guest agent, not tracked on host
                 exit_code: container.exit_code.unwrap_or(0),
                 error: String::new(),
                 started_at: container
                     .started_at
                     .map(|t| t.to_rfc3339())
                     .unwrap_or_default(),
-                finished_at: String::new(),
+                finished_at: container
+                    .finished_at
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_default(),
             }),
-            cmd: vec![],
-            entrypoint: vec![],
-            env: std::collections::HashMap::new(),
-            working_dir: String::new(),
-            mounts: vec![],
-            ports: vec![],
-            labels: std::collections::HashMap::new(),
+            cmd,
+            entrypoint,
+            env,
+            working_dir,
+            mounts,
+            ports,
+            labels,
         }))
     }
 
@@ -409,6 +464,21 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             cpus: req.cpus,
             memory_mb,
             disk_gb,
+            kernel: if req.kernel.is_empty() {
+                None
+            } else {
+                Some(req.kernel)
+            },
+            initrd: if req.initrd.is_empty() {
+                None
+            } else {
+                Some(req.initrd)
+            },
+            cmdline: if req.cmdline.is_empty() {
+                None
+            } else {
+                Some(req.cmdline)
+            },
         };
 
         self.runtime
@@ -475,7 +545,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 state: format!("{:?}", m.state).to_lowercase(),
                 cpus: m.cpus,
                 memory: m.memory_mb * 1024 * 1024,
-                created: 0, // TODO: Add created timestamp to MachineInfo
+                created: m.created_at.timestamp(),
             })
             .collect();
 
@@ -503,11 +573,11 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             cpus: machine.cpus,
             memory: machine.memory_mb * 1024 * 1024,
             disk_size: machine.disk_gb * 1024 * 1024 * 1024,
-            created: 0, // TODO: Add created timestamp
-            kernel: String::new(),
-            initrd: String::new(),
-            cmdline: String::new(),
-            cid: 0, // TODO: Add CID for vsock
+            created: machine.created_at.timestamp(),
+            kernel: machine.kernel.unwrap_or_default(),
+            initrd: machine.initrd.unwrap_or_default(),
+            cmdline: machine.cmdline.unwrap_or_default(),
+            cid: machine.cid.unwrap_or(0),
         }))
     }
 

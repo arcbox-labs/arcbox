@@ -102,16 +102,24 @@ impl NatConfig {
     }
 }
 
-/// NAT network manager (cross-platform stub).
+/// NAT network manager (cross-platform).
+///
+/// Uses `IpAllocator` for proper IP address pool management.
 pub struct NatNetwork {
     config: NatConfig,
+    /// IP address allocator for the DHCP range.
+    allocator: std::sync::Mutex<IpAllocator>,
 }
 
 impl NatNetwork {
     /// Creates a new NAT network.
     #[must_use]
     pub fn new(config: NatConfig) -> Self {
-        Self { config }
+        let allocator = IpAllocator::new(config.dhcp_start, config.dhcp_end);
+        Self {
+            config,
+            allocator: std::sync::Mutex::new(allocator),
+        }
     }
 
     /// Returns the gateway address.
@@ -120,11 +128,66 @@ impl NatNetwork {
         self.config.gateway
     }
 
-    /// Allocates an IP address.
+    /// Returns the subnet network.
     #[must_use]
+    pub fn subnet(&self) -> Ipv4Network {
+        self.config.network()
+    }
+
+    /// Allocates an IP address from the pool.
+    ///
+    /// Returns `None` if no addresses are available.
     pub fn allocate_ip(&self) -> Option<Ipv4Addr> {
-        // TODO: Implement IP allocation
-        Some(self.config.dhcp_start)
+        self.allocator.lock().ok()?.allocate()
+    }
+
+    /// Allocates a specific IP address.
+    ///
+    /// Returns `true` if the address was successfully allocated,
+    /// `false` if it's already allocated or out of range.
+    pub fn allocate_specific(&self, ip: Ipv4Addr) -> bool {
+        self.allocator
+            .lock()
+            .ok()
+            .map(|mut a| a.allocate_specific(ip))
+            .unwrap_or(false)
+    }
+
+    /// Releases an IP address back to the pool.
+    pub fn release_ip(&self, ip: Ipv4Addr) {
+        if let Ok(mut allocator) = self.allocator.lock() {
+            allocator.release(ip);
+        }
+    }
+
+    /// Checks if an IP address is available.
+    #[must_use]
+    pub fn is_available(&self, ip: Ipv4Addr) -> bool {
+        self.allocator
+            .lock()
+            .ok()
+            .map(|a| a.is_available(ip))
+            .unwrap_or(false)
+    }
+
+    /// Returns the number of allocated addresses.
+    #[must_use]
+    pub fn allocated_count(&self) -> usize {
+        self.allocator
+            .lock()
+            .ok()
+            .map(|a| a.allocated_count())
+            .unwrap_or(0)
+    }
+
+    /// Returns the number of available addresses.
+    #[must_use]
+    pub fn available_count(&self) -> usize {
+        self.allocator
+            .lock()
+            .ok()
+            .map(|a| a.available_count())
+            .unwrap_or(0)
     }
 }
 

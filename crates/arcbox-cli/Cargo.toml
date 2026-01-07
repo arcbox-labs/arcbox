@@ -17,11 +17,20 @@ name = "arcbox"
 path = "src/main.rs"
 
 [dependencies]
+arcbox-api = { workspace = true }
 arcbox-core = { workspace = true }
 arcbox-docker = { workspace = true }
+arcbox-grpc = { workspace = true }
 arcbox-image = { workspace = true }
 arcbox-protocol = { workspace = true }
 arcbox-transport = { workspace = true }
+tonic = { workspace = true }
+tower = "0.5"
+hyper = { workspace = true }
+hyper-util = "0.1"
+http-body-util = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = "0.7"
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -31,10 +40,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
-hyper = { workspace = true }
-hyper-util = "0.1"
-http-body-util = "0.1"
-tower = "0.5"
+crossterm = { workspace = true }
 
 [features]
 default = []

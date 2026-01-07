@@ -4,6 +4,7 @@
 
 use crate::error::{CoreError, Result};
 use crate::machine::{MachineInfo, MachineState};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -19,10 +20,27 @@ pub struct PersistedMachine {
     pub memory_mb: u64,
     /// Disk size in GB.
     pub disk_gb: u64,
+    /// Kernel path.
+    #[serde(default)]
+    pub kernel: Option<String>,
+    /// Initrd path.
+    #[serde(default)]
+    pub initrd: Option<String>,
+    /// Kernel command line.
+    #[serde(default)]
+    pub cmdline: Option<String>,
     /// Last known state.
     pub state: PersistedState,
     /// VM ID (for correlation).
     pub vm_id: String,
+    /// Creation timestamp.
+    #[serde(default = "default_created_at")]
+    pub created_at: DateTime<Utc>,
+}
+
+/// Default creation time for backward compatibility with old configs.
+fn default_created_at() -> DateTime<Utc> {
+    Utc::now()
 }
 
 /// Persisted machine state.
@@ -62,8 +80,12 @@ impl From<&MachineInfo> for PersistedMachine {
             cpus: info.cpus,
             memory_mb: info.memory_mb,
             disk_gb: info.disk_gb,
+            kernel: info.kernel.clone(),
+            initrd: info.initrd.clone(),
+            cmdline: info.cmdline.clone(),
             state: info.state.into(),
             vm_id: info.vm_id.to_string(),
+            created_at: info.created_at,
         }
     }
 }
@@ -194,6 +216,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let persistence = MachinePersistence::new(temp.path());
 
+        let created_at = Utc::now();
         let info = MachineInfo {
             name: "test-vm".to_string(),
             state: MachineState::Created,
@@ -201,7 +224,11 @@ mod tests {
             cpus: 4,
             memory_mb: 4096,
             disk_gb: 50,
+            kernel: Some("/path/to/kernel".to_string()),
+            initrd: Some("/path/to/initrd".to_string()),
+            cmdline: Some("console=ttyS0".to_string()),
             cid: None,
+            created_at,
         };
 
         persistence.save(&info).unwrap();
@@ -210,6 +237,11 @@ mod tests {
         assert_eq!(loaded.name, "test-vm");
         assert_eq!(loaded.cpus, 4);
         assert_eq!(loaded.memory_mb, 4096);
+        assert_eq!(loaded.kernel, Some("/path/to/kernel".to_string()));
+        assert_eq!(loaded.initrd, Some("/path/to/initrd".to_string()));
+        assert_eq!(loaded.cmdline, Some("console=ttyS0".to_string()));
+        // Check created_at is preserved (within 1 second tolerance)
+        assert!((loaded.created_at - created_at).num_seconds().abs() < 1);
     }
 
     #[test]
@@ -226,7 +258,11 @@ mod tests {
                 cpus: 2,
                 memory_mb: 2048,
                 disk_gb: 20,
+                kernel: None,
+                initrd: None,
+                cmdline: None,
                 cid: None,
+                created_at: Utc::now(),
             };
             persistence.save(&info).unwrap();
         }
@@ -250,7 +286,11 @@ mod tests {
             cpus: 2,
             memory_mb: 2048,
             disk_gb: 20,
+            kernel: None,
+            initrd: None,
+            cmdline: None,
             cid: None,
+            created_at: Utc::now(),
         };
 
         persistence.save(&info).unwrap();

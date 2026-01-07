@@ -11,7 +11,7 @@ use crate::{
     config::VmConfig,
     error::HypervisorError,
     traits::VirtualMachine,
-    types::{VirtioDeviceConfig, VirtioDeviceType},
+    types::{DeviceSnapshot, VirtioDeviceConfig, VirtioDeviceType},
 };
 
 use super::ffi;
@@ -861,6 +861,100 @@ impl VirtualMachine for DarwinVm {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+
+    fn vcpu_count(&self) -> u32 {
+        self.config.vcpu_count as u32
+    }
+
+    fn snapshot_devices(&self) -> Result<Vec<DeviceSnapshot>, HypervisorError> {
+        // LIMITATION: Virtualization.framework does not expose device state.
+        //
+        // VirtIO device state is managed internally by the framework.
+        // For proper snapshot/restore, one would need to use Hypervisor.framework
+        // or implement device state capture through the guest agent.
+        //
+        // We return basic device metadata without internal state.
+        let mut snapshots = Vec::new();
+
+        // Record storage devices (no internal state available)
+        for (idx, _device) in self.storage_devices.iter().enumerate() {
+            snapshots.push(DeviceSnapshot {
+                device_type: VirtioDeviceType::Block,
+                name: format!("block-{}", idx),
+                state: Vec::new(), // No state available
+            });
+        }
+
+        // Record network devices
+        for (idx, _device) in self.network_devices.iter().enumerate() {
+            snapshots.push(DeviceSnapshot {
+                device_type: VirtioDeviceType::Net,
+                name: format!("net-{}", idx),
+                state: Vec::new(),
+            });
+        }
+
+        // Record serial port if configured
+        if self.serial_port.is_some() {
+            snapshots.push(DeviceSnapshot {
+                device_type: VirtioDeviceType::Console,
+                name: "serial-0".to_string(),
+                state: Vec::new(),
+            });
+        }
+
+        tracing::warn!(
+            "snapshot_devices: returning {} device metadata (no internal state on Darwin)",
+            snapshots.len()
+        );
+
+        Ok(snapshots)
+    }
+
+    fn restore_devices(&mut self, snapshots: &[DeviceSnapshot]) -> Result<(), HypervisorError> {
+        // LIMITATION: Virtualization.framework does not support device state restore.
+        //
+        // Device state is managed internally by the framework. Restoring device
+        // state would require recreating the entire VM with the same configuration.
+        //
+        // For now, we just log the attempt and verify device types match.
+        tracing::warn!(
+            "restore_devices: Darwin does not support device state restore ({} devices)",
+            snapshots.len()
+        );
+
+        // Verify that the snapshot device types roughly match our configuration
+        let mut expected_blocks = self.storage_devices.len();
+        let mut expected_nets = self.network_devices.len();
+
+        for snapshot in snapshots {
+            match snapshot.device_type {
+                VirtioDeviceType::Block => {
+                    if expected_blocks == 0 {
+                        tracing::warn!(
+                            "Snapshot has more block devices than current VM configuration"
+                        );
+                    } else {
+                        expected_blocks -= 1;
+                    }
+                }
+                VirtioDeviceType::Net => {
+                    if expected_nets == 0 {
+                        tracing::warn!(
+                            "Snapshot has more network devices than current VM configuration"
+                        );
+                    } else {
+                        expected_nets -= 1;
+                    }
+                }
+                _ => {
+                    // Other device types are informational
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

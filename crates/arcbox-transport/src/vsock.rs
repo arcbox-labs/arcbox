@@ -4,8 +4,15 @@
 //!
 //! ## Platform Support
 //!
-//! - **Linux**: Uses AF_VSOCK socket family via nix crate
-//! - **macOS**: Uses Virtualization.framework (requires FFI bindings)
+//! - **Linux**: Uses AF_VSOCK socket family directly via nix crate.
+//!   Standard `bind()` and `connect()` operations work as expected.
+//!
+//! - **macOS**: Uses Virtualization.framework (`VZVirtioSocketDevice`).
+//!   Requires integration with the hypervisor layer:
+//!   - For connections: Use [`VsockTransport::from_raw_fd()`] with an fd
+//!     obtained from `VirtioSocketDevice::connect()`.
+//!   - For listening: Use [`VsockListener::from_channel()`] with a channel
+//!     connected to `VirtioSocketListener::accept()`.
 //!
 //! ## CID (Context ID) Values
 //!
@@ -13,6 +20,49 @@
 //! - `VMADDR_CID_LOCAL` (1): Local communication
 //! - `VMADDR_CID_HOST` (2): Host (from guest perspective)
 //! - 3+: Guest VMs
+//!
+//! ## macOS Usage Example
+//!
+//! ```rust,ignore
+//! use arcbox_vz::{VirtualMachine, VirtioSocketDevice};
+//! use arcbox_transport::vsock::{VsockListener, VsockTransport, VsockAddr, IncomingVsockConnection};
+//! use tokio::sync::mpsc;
+//!
+//! // Get socket device from running VM
+//! let vm: VirtualMachine = /* ... */;
+//! let device = &vm.socket_devices()[0];
+//!
+//! // === Connecting to guest ===
+//! let conn = device.connect(1024).await?;
+//! let fd = conn.into_raw_fd();
+//! let transport = VsockTransport::from_raw_fd(fd, VsockAddr::new(cid, 1024))?;
+//!
+//! // === Listening for guest connections ===
+//! let mut vz_listener = device.listen(1024)?;
+//! let (tx, rx) = mpsc::unbounded_channel();
+//!
+//! // Bridge VZ listener to transport layer
+//! tokio::spawn(async move {
+//!     loop {
+//!         match vz_listener.accept().await {
+//!             Ok(conn) => {
+//!                 let incoming = IncomingVsockConnection {
+//!                     fd: conn.into_raw_fd(),
+//!                     source_port: conn.source_port(),
+//!                     destination_port: conn.destination_port(),
+//!                 };
+//!                 if tx.send(incoming).is_err() {
+//!                     break;
+//!                 }
+//!             }
+//!             Err(_) => break,
+//!         }
+//!     }
+//! });
+//!
+//! let mut listener = VsockListener::from_channel(1024, rx);
+//! let transport = listener.accept().await?;
+//! ```
 
 use crate::error::{Result, TransportError};
 use crate::{Transport, TransportListener};
@@ -272,6 +322,18 @@ mod linux {
 mod darwin {
     use super::*;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd as StdOwnedFd, RawFd};
+    use tokio::sync::mpsc;
+
+    /// Information about an incoming vsock connection.
+    #[derive(Debug, Clone)]
+    pub struct IncomingVsockConnection {
+        /// File descriptor for the connection.
+        pub fd: RawFd,
+        /// Source port (guest port).
+        pub source_port: u32,
+        /// Destination port (host port).
+        pub destination_port: u32,
+    }
 
     /// Vsock stream for macOS.
     ///
@@ -388,6 +450,7 @@ mod darwin {
 
     /// On macOS, vsock binding is not supported from the host side.
     /// The guest uses vsock listeners; the host connects to them.
+    #[allow(dead_code)]
     pub fn bind_vsock(_port: u32) -> Result<StdOwnedFd> {
         Err(TransportError::Protocol(
             "vsock bind not supported on macOS host".to_string(),
@@ -399,6 +462,102 @@ mod darwin {
         Err(TransportError::Protocol(
             "vsock accept not supported on macOS host".to_string(),
         ))
+    }
+
+    /// Vsock listener handle for macOS.
+    ///
+    /// On macOS, vsock listening is done through VZVirtioSocketDevice.
+    /// This handle wraps a channel that receives incoming connections
+    /// from the Virtualization.framework layer.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use arcbox_vz::VirtioSocketDevice;
+    /// use arcbox_transport::vsock::{VsockListener, IncomingVsockConnection};
+    /// use tokio::sync::mpsc;
+    ///
+    /// // In arcbox-core or higher layer:
+    /// let device: &VirtioSocketDevice = /* from VM */;
+    /// let vz_listener = device.listen(port)?;
+    ///
+    /// // Create channel for bridging
+    /// let (tx, rx) = mpsc::unbounded_channel();
+    ///
+    /// // Spawn task to forward connections
+    /// tokio::spawn(async move {
+    ///     loop {
+    ///         if let Ok(conn) = vz_listener.accept().await {
+    ///             let _ = tx.send(IncomingVsockConnection {
+    ///                 fd: conn.as_raw_fd(),
+    ///                 source_port: conn.source_port(),
+    ///                 destination_port: conn.destination_port(),
+    ///             });
+    ///         }
+    ///     }
+    /// });
+    ///
+    /// // Create transport listener
+    /// let listener = VsockListener::from_channel(port, rx);
+    /// ```
+    #[allow(dead_code)]
+    pub struct VsockListenerHandle {
+        /// Port number being listened on.
+        port: u32,
+        /// Channel receiver for incoming connections.
+        receiver: mpsc::UnboundedReceiver<IncomingVsockConnection>,
+    }
+
+    #[allow(dead_code)]
+    impl VsockListenerHandle {
+        /// Creates a new listener handle from a channel.
+        ///
+        /// # Arguments
+        ///
+        /// * `port` - The port number being listened on
+        /// * `receiver` - Channel receiver for incoming connections from VZ layer
+        pub fn new(port: u32, receiver: mpsc::UnboundedReceiver<IncomingVsockConnection>) -> Self {
+            Self { port, receiver }
+        }
+
+        /// Returns the port number.
+        pub fn port(&self) -> u32 {
+            self.port
+        }
+
+        /// Accepts an incoming connection.
+        ///
+        /// Waits for a connection to arrive on the channel.
+        pub async fn accept(&mut self) -> Result<(VsockStream, VsockAddr)> {
+            match self.receiver.recv().await {
+                Some(conn) => {
+                    let stream = VsockStream::from_raw_fd(conn.fd)?;
+                    let addr = VsockAddr::new(VsockAddr::CID_ANY, conn.source_port);
+                    Ok((stream, addr))
+                }
+                None => Err(TransportError::ConnectionReset),
+            }
+        }
+
+        /// Tries to accept a connection without blocking.
+        pub fn try_accept(&mut self) -> Option<Result<(VsockStream, VsockAddr)>> {
+            match self.receiver.try_recv() {
+                Ok(conn) => {
+                    let stream = VsockStream::from_raw_fd(conn.fd);
+                    match stream {
+                        Ok(s) => {
+                            let addr = VsockAddr::new(VsockAddr::CID_ANY, conn.source_port);
+                            Some(Ok((s, addr)))
+                        }
+                        Err(e) => Some(Err(e)),
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => None,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    Some(Err(TransportError::ConnectionReset))
+                }
+            }
+        }
     }
 }
 
@@ -551,16 +710,25 @@ impl Transport for VsockTransport {
 }
 
 /// Vsock listener for accepting connections.
+///
+/// On Linux, this uses AF_VSOCK sockets directly.
+/// On macOS, this requires a channel connected to VZVirtioSocketDevice.
 pub struct VsockListener {
     port: u32,
     #[cfg(target_os = "linux")]
     listener_fd: Option<OwnedFd>,
     #[cfg(target_os = "macos")]
-    _bound: bool,
+    handle: Option<darwin::VsockListenerHandle>,
 }
 
 impl VsockListener {
     /// Creates a new vsock listener on the given port.
+    ///
+    /// # Platform Notes
+    ///
+    /// - **Linux**: After calling `bind()`, the listener will be ready to accept connections.
+    /// - **macOS**: Use `from_channel()` instead to provide a channel connected to
+    ///   VZVirtioSocketDevice. Calling `bind()` on this listener will fail.
     #[must_use]
     pub fn new(port: u32) -> Self {
         Self {
@@ -568,7 +736,69 @@ impl VsockListener {
             #[cfg(target_os = "linux")]
             listener_fd: None,
             #[cfg(target_os = "macos")]
-            _bound: false,
+            handle: None,
+        }
+    }
+
+    /// Creates a listener from a channel (macOS).
+    ///
+    /// On macOS, vsock listening is done through VZVirtioSocketDevice.
+    /// This method creates a listener that receives connections from a channel
+    /// bridged to the Virtualization.framework layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `port` - The port number being listened on
+    /// * `receiver` - Channel receiver for incoming connections
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use arcbox_vz::VirtioSocketDevice;
+    /// use arcbox_transport::vsock::{VsockListener, IncomingVsockConnection};
+    /// use tokio::sync::mpsc;
+    ///
+    /// // Get socket device from running VM
+    /// let device: &VirtioSocketDevice = &vm.socket_devices()[0];
+    ///
+    /// // Create VZ listener
+    /// let mut vz_listener = device.listen(port)?;
+    ///
+    /// // Create channel for bridging
+    /// let (tx, rx) = mpsc::unbounded_channel();
+    ///
+    /// // Spawn task to forward connections
+    /// tokio::spawn(async move {
+    ///     loop {
+    ///         match vz_listener.accept().await {
+    ///             Ok(conn) => {
+    ///                 let incoming = IncomingVsockConnection {
+    ///                     fd: conn.into_raw_fd(),
+    ///                     source_port: conn.source_port(),
+    ///                     destination_port: conn.destination_port(),
+    ///                 };
+    ///                 if tx.send(incoming).is_err() {
+    ///                     break;
+    ///                 }
+    ///             }
+    ///             Err(_) => break,
+    ///         }
+    ///     }
+    /// });
+    ///
+    /// // Create transport listener
+    /// let mut listener = VsockListener::from_channel(port, rx);
+    /// let transport = listener.accept().await?;
+    /// ```
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn from_channel(
+        port: u32,
+        receiver: tokio::sync::mpsc::UnboundedReceiver<darwin::IncomingVsockConnection>,
+    ) -> Self {
+        Self {
+            port,
+            handle: Some(darwin::VsockListenerHandle::new(port, receiver)),
         }
     }
 
@@ -598,7 +828,16 @@ impl TransportListener for VsockListener {
 
         #[cfg(target_os = "macos")]
         {
-            darwin::bind_vsock(self.port)?;
+            // On macOS, binding is done through VZVirtioSocketDevice.
+            // If a handle was provided via from_channel(), we're already "bound".
+            // Otherwise, return an error explaining the correct usage.
+            if self.handle.is_none() {
+                return Err(TransportError::Protocol(
+                    "macOS vsock requires VZVirtioSocketDevice. Use VsockListener::from_channel() \
+                     with a channel connected to VirtioSocketListener."
+                        .to_string(),
+                ));
+            }
         }
 
         Ok(())
@@ -618,9 +857,15 @@ impl TransportListener for VsockListener {
 
         #[cfg(target_os = "macos")]
         {
-            Err(TransportError::Protocol(
-                "vsock not yet implemented on macOS".to_string(),
-            ))
+            let handle = self.handle.as_mut().ok_or_else(|| {
+                TransportError::Protocol(
+                    "macOS vsock listener not initialized. Use VsockListener::from_channel()."
+                        .to_string(),
+                )
+            })?;
+
+            let (stream, addr) = handle.accept().await?;
+            Ok(VsockTransport::from_stream(stream, addr))
         }
     }
 
@@ -632,12 +877,16 @@ impl TransportListener for VsockListener {
 
         #[cfg(target_os = "macos")]
         {
-            self._bound = false;
+            self.handle.take();
         }
 
         Ok(())
     }
 }
+
+// Re-export macOS-specific types for use by callers.
+#[cfg(target_os = "macos")]
+pub use darwin::IncomingVsockConnection;
 
 #[cfg(test)]
 mod tests {
@@ -658,5 +907,23 @@ mod tests {
     fn test_vsock_transport_not_connected() {
         let transport = VsockTransport::new(VsockAddr::host(1234));
         assert!(!transport.is_connected());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_vsock_listener_from_channel() {
+        use tokio::sync::mpsc;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let listener = VsockListener::from_channel(1024, rx);
+        assert_eq!(listener.port(), 1024);
+
+        // Channel can send connections
+        let conn = IncomingVsockConnection {
+            fd: 42,
+            source_port: 2000,
+            destination_port: 1024,
+        };
+        assert!(tx.send(conn).is_ok());
     }
 }

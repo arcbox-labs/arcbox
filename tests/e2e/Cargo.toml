@@ -1,0 +1,55 @@
+[package]
+name = "arcbox-e2e"
+version = "0.0.1-alpha.1"
+edition = "2024"
+publish = false
+description = "End-to-end integration tests for ArcBox"
+
+[dependencies]
+# ArcBox crates
+arcbox-core = { path = "../../crates/arcbox-core" }
+arcbox-image = { path = "../../crates/arcbox-image" }
+arcbox-container = { path = "../../crates/arcbox-container" }
+arcbox-protocol = { path = "../../crates/arcbox-protocol" }
+arcbox-vmm = { path = "../../crates/arcbox-vmm" }
+
+# Async runtime
+tokio = { version = "1", features = ["full", "test-util"] }
+
+# UUID generation
+uuid = { version = "1", features = ["v4"] }
+
+# Testing utilities
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Process management
+nix = { version = "0.29", features = ["process", "signal"] }
+
+# HTTP client for Docker API testing
+reqwest = { version = "0.12", features = ["json"] }
+
+[dev-dependencies]
+test-log = { version = "0.2", features = ["trace"] }
+serial_test = "3"
+
+[[test]]
+name = "vm_lifecycle"
+path = "tests/vm_lifecycle.rs"
+
+[[test]]
+name = "image_ops"
+path = "tests/image_ops.rs"
+
+[[test]]
+name = "container_lifecycle"
+path = "tests/container_lifecycle.rs"
+
+[[test]]
+name = "full_workflow"
+path = "tests/full_workflow.rs"

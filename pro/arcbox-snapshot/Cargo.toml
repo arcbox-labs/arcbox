@@ -15,6 +15,13 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
+lz4_flex = "0.11"
+arcbox-hypervisor = { path = "../../crates/arcbox-hypervisor" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true }
 
 [features]
 default = []
+criu = []

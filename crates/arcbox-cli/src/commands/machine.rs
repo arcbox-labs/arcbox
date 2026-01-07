@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use arcbox_core::machine::{MachineConfig, MachineState};
 use arcbox_core::{Config, Runtime};
 use clap::{Args, Subcommand};
+use std::collections::HashMap;
+use std::io::Write;
 use std::sync::OnceLock;
 
 /// Global runtime instance.
@@ -62,6 +64,15 @@ pub struct CreateArgs {
     /// Directory mounts (host:guest)
     #[arg(short, long)]
     pub mount: Vec<String>,
+    /// Custom kernel path (for advanced users / testing)
+    #[arg(long)]
+    pub kernel: Option<String>,
+    /// Custom initrd/initramfs path (for advanced users / testing)
+    #[arg(long)]
+    pub initrd: Option<String>,
+    /// Custom kernel command line (for advanced users / testing)
+    #[arg(long)]
+    pub cmdline: Option<String>,
 }
 
 #[derive(Args)]
@@ -147,6 +158,9 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
         cpus: args.cpus,
         memory_mb: args.memory,
         disk_gb: args.disk,
+        kernel: args.kernel.clone(),
+        initrd: args.initrd.clone(),
+        cmdline: args.cmdline.clone(),
     };
 
     runtime
@@ -295,12 +309,48 @@ async fn execute_ssh(args: SshArgs) -> Result<()> {
         anyhow::bail!("Machine '{}' is not running", args.name);
     }
 
-    if args.command.is_empty() {
-        println!("SSH into '{}' (interactive mode not yet implemented)", args.name);
-        // TODO: Implement interactive SSH via vsock
+    // Determine command to execute
+    let (cmd, tty) = if args.command.is_empty() {
+        // Interactive mode: launch default shell
+        (vec!["/bin/sh".to_string(), "-l".to_string()], true)
     } else {
-        println!("SSH into '{}': {}", args.name, args.command.join(" "));
-        // TODO: Execute command via vsock
+        // Execute provided command
+        (args.command.clone(), false)
+    };
+
+    // Execute command in the VM via agent
+    let output = runtime
+        .exec_machine(
+            &args.name,
+            cmd.clone(),
+            HashMap::new(),
+            String::new(),
+            String::new(),
+            tty,
+        )
+        .await
+        .context("Failed to execute command in machine")?;
+
+    // Print output based on stream type
+    if !output.data.is_empty() {
+        match output.stream.as_str() {
+            "stderr" => {
+                std::io::stderr()
+                    .write_all(&output.data)
+                    .context("Failed to write stderr")?;
+            }
+            _ => {
+                // Default to stdout for "stdout" or empty stream
+                std::io::stdout()
+                    .write_all(&output.data)
+                    .context("Failed to write stdout")?;
+            }
+        }
+    }
+
+    // Exit with the command's exit code
+    if output.exit_code != 0 {
+        std::process::exit(output.exit_code);
     }
 
     Ok(())
@@ -319,8 +369,40 @@ async fn execute_exec(args: ExecArgs) -> Result<()> {
         anyhow::bail!("Machine '{}' is not running", args.name);
     }
 
-    println!("Exec in '{}': {}", args.name, args.command.join(" "));
-    // TODO: Execute command via vsock to agent
+    // Execute command in the VM via agent (non-TTY mode for exec)
+    let output = runtime
+        .exec_machine(
+            &args.name,
+            args.command.clone(),
+            HashMap::new(),
+            String::new(),
+            String::new(),
+            false, // Non-interactive exec
+        )
+        .await
+        .context("Failed to execute command in machine")?;
+
+    // Print output based on stream type
+    if !output.data.is_empty() {
+        match output.stream.as_str() {
+            "stderr" => {
+                std::io::stderr()
+                    .write_all(&output.data)
+                    .context("Failed to write stderr")?;
+            }
+            _ => {
+                // Default to stdout for "stdout" or empty stream
+                std::io::stdout()
+                    .write_all(&output.data)
+                    .context("Failed to write stdout")?;
+            }
+        }
+    }
+
+    // Exit with the command's exit code
+    if output.exit_code != 0 {
+        std::process::exit(output.exit_code);
+    }
 
     Ok(())
 }

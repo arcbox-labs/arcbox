@@ -45,7 +45,10 @@ pub mod volume;
 
 pub use config::ContainerConfig;
 pub use error::{ContainerError, Result};
-pub use exec::{ExecConfig, ExecId, ExecInstance, ExecManager};
-pub use manager::ContainerManager;
+pub use exec::{
+    ExecAgentConnection, ExecConfig, ExecId, ExecInstance, ExecManager, ExecStartParams,
+    ExecStartResult,
+};
+pub use manager::{AgentConnection, ContainerManager};
 pub use state::{Container, ContainerId, ContainerState};
-pub use volume::{Volume, VolumeManager};
+pub use volume::{PruneResult, Volume, VolumeCreateOptions, VolumeManager};

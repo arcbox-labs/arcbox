@@ -1,5 +1,6 @@
 //! Container state management.
 
+use crate::config::ContainerConfig;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -91,8 +92,12 @@ pub struct Container {
     pub created: DateTime<Utc>,
     /// Start time (if running).
     pub started_at: Option<DateTime<Utc>>,
+    /// Finish time (if exited).
+    pub finished_at: Option<DateTime<Utc>>,
     /// Exit code (if exited).
     pub exit_code: Option<i32>,
+    /// Container configuration (cmd, env, mounts, etc.).
+    pub config: Option<ContainerConfig>,
 }
 
 impl Container {
@@ -107,7 +112,26 @@ impl Container {
             state: ContainerState::Created,
             created: Utc::now(),
             started_at: None,
+            finished_at: None,
             exit_code: None,
+            config: None,
+        }
+    }
+
+    /// Creates a new container with configuration.
+    #[must_use]
+    pub fn with_config(name: impl Into<String>, config: ContainerConfig) -> Self {
+        Self {
+            id: ContainerId::new(),
+            name: name.into(),
+            image: config.image.clone(),
+            machine_name: None,
+            state: ContainerState::Created,
+            created: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            exit_code: None,
+            config: Some(config),
         }
     }
 
@@ -126,7 +150,30 @@ impl Container {
             state: ContainerState::Created,
             created: Utc::now(),
             started_at: None,
+            finished_at: None,
             exit_code: None,
+            config: None,
+        }
+    }
+
+    /// Creates a new container for a specific machine with configuration.
+    #[must_use]
+    pub fn with_config_for_machine(
+        name: impl Into<String>,
+        config: ContainerConfig,
+        machine: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: ContainerId::new(),
+            name: name.into(),
+            image: config.image.clone(),
+            machine_name: Some(machine.into()),
+            state: ContainerState::Created,
+            created: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            exit_code: None,
+            config: Some(config),
         }
     }
 

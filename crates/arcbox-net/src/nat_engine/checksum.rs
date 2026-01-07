@@ -258,15 +258,107 @@ pub fn checksum_simd(data: &[u8]) -> u16 {
     unsafe { checksum_simd_neon(data) }
 }
 
-/// SIMD-optimized checksum for x86_64.
+/// SIMD-optimized checksum for x86_64 using SSSE3.
 ///
-/// Note: For simplicity, this falls back to the scalar implementation.
-/// ARM64 NEON is the primary optimization target for this project.
+/// Uses SSSE3 intrinsics to process 16 bytes at a time, with correct handling
+/// of network byte order (big-endian 16-bit words).
+///
+/// SSSE3 is required for the `pshufb` instruction used for byte swapping.
+/// SSSE3 is available on all x86_64 CPUs since Intel Core 2 (2006) and
+/// AMD Barcelona (2007), covering essentially all modern x86_64 systems.
+///
+/// # Safety
+///
+/// This function uses `#[target_feature(enable = "ssse3")]` and requires SSSE3 support.
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn checksum_simd_ssse3(data: &[u8]) -> u16 {
+    use std::arch::x86_64::*;
+
+    // SAFETY: All SSE/SSSE3 intrinsics below are safe to call because:
+    // 1. We have #[target_feature(enable = "ssse3")] ensuring SSSE3 is available
+    // 2. Pointers passed to _mm_loadu_si128 are valid (from slice with length >= 16)
+    unsafe {
+        // Accumulator: two 64-bit sums (we'll combine them at the end).
+        let mut sum_lo = _mm_setzero_si128();
+        let mut sum_hi = _mm_setzero_si128();
+
+        // Shuffle mask to swap bytes within 16-bit words for big-endian interpretation.
+        // Network byte order is big-endian, x86 is little-endian.
+        // This mask converts [0,1,2,3,4,5,...] to [1,0,3,2,5,4,...] (swap adjacent bytes).
+        let swap_mask = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+
+        let chunks = data.chunks_exact(16);
+        let remainder = chunks.remainder();
+
+        for chunk in chunks {
+            // Load 16 bytes from memory (unaligned load).
+            let bytes = _mm_loadu_si128(chunk.as_ptr().cast());
+
+            // Swap bytes within each 16-bit word for big-endian interpretation.
+            let swapped = _mm_shuffle_epi8(bytes, swap_mask);
+
+            // Unpack low and high halves to 32-bit words and add to accumulators.
+            // _mm_unpacklo_epi16 with zero unpacks low 4 u16s to low 4 u32s.
+            // _mm_unpackhi_epi16 with zero unpacks high 4 u16s to high 4 u32s.
+            let zero = _mm_setzero_si128();
+            let words_lo = _mm_unpacklo_epi16(swapped, zero); // 4 x u32 (words 0-3)
+            let words_hi = _mm_unpackhi_epi16(swapped, zero); // 4 x u32 (words 4-7)
+
+            // Add to accumulators.
+            sum_lo = _mm_add_epi32(sum_lo, words_lo);
+            sum_hi = _mm_add_epi32(sum_hi, words_hi);
+        }
+
+        // Combine lo and hi accumulators.
+        let sum = _mm_add_epi32(sum_lo, sum_hi);
+
+        // Horizontal sum of the four 32-bit lanes.
+        // _mm_hadd_epi32: [a,b,c,d] + [a,b,c,d] => [a+b,c+d,a+b,c+d]
+        let hadd1 = _mm_hadd_epi32(sum, sum);
+        let hadd2 = _mm_hadd_epi32(hadd1, hadd1);
+        let sum32 = _mm_cvtsi128_si32(hadd2) as u32;
+
+        // Process remainder bytes using scalar code.
+        let mut scalar_sum = sum32;
+        let mut i = 0;
+        while i + 1 < remainder.len() {
+            // Read big-endian 16-bit word.
+            let word = u16::from_be_bytes([remainder[i], remainder[i + 1]]);
+            scalar_sum = scalar_sum.wrapping_add(word as u32);
+            i += 2;
+        }
+
+        // Handle odd byte (padded with zero on the right in network order).
+        if i < remainder.len() {
+            scalar_sum = scalar_sum.wrapping_add((remainder[i] as u32) << 8);
+        }
+
+        // Fold 32-bit sum into 16-bit checksum.
+        while scalar_sum > 0xFFFF {
+            scalar_sum = (scalar_sum & 0xFFFF) + (scalar_sum >> 16);
+        }
+
+        !scalar_sum as u16
+    }
+}
+
+/// SIMD-optimized checksum for x86_64 (safe wrapper).
+///
+/// This function detects SSSE3 support at runtime and uses the optimized
+/// SIMD implementation if available, otherwise falls back to scalar.
+#[cfg(target_arch = "x86_64")]
+#[inline]
 pub fn checksum_simd(data: &[u8]) -> u16 {
-    // TODO: Implement proper x86_64 AVX/SSE optimization if needed.
-    // For now, use scalar path since ARM64 is the primary target.
-    checksum(data)
+    // Check for SSSE3 support at runtime.
+    // On modern x86_64 CPUs, SSSE3 is virtually always available.
+    if is_x86_feature_detected!("ssse3") {
+        // SAFETY: We just verified SSSE3 is available.
+        unsafe { checksum_simd_ssse3(data) }
+    } else {
+        // Fallback to scalar implementation for ancient CPUs.
+        checksum(data)
+    }
 }
 
 /// Fallback for non-SIMD architectures.

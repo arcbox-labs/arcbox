@@ -45,7 +45,11 @@ pub use config::{VmConfig, VmConfigBuilder};
 pub use error::{HypervisorError, Result};
 pub use memory::{GuestAddress, MemoryRegion};
 pub use traits::{GuestMemory, Hypervisor, Vcpu, VirtualMachine};
-pub use types::{CpuArch, PlatformCapabilities, Registers, VcpuExit, VirtioDeviceConfig};
+pub use types::{
+    Arm64Registers, CpuArch, DeviceSnapshot, DirtyPageInfo, MemoryRegionSnapshot,
+    PlatformCapabilities, Registers, VcpuExit, VcpuSnapshot, VirtioDeviceConfig,
+    VirtioDeviceType, VmSnapshot,
+};
 
 /// Creates the appropriate hypervisor for the current platform.
 ///

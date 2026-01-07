@@ -1,7 +1,9 @@
 //! Common types used across the hypervisor crate.
 
+use serde::{Deserialize, Serialize};
+
 /// CPU architecture.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CpuArch {
     /// x86_64 / AMD64
     X86_64,
@@ -56,7 +58,7 @@ impl Default for PlatformCapabilities {
 }
 
 /// CPU register state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Registers {
     // General purpose registers (x86_64)
     pub rax: u64,
@@ -205,7 +207,7 @@ impl VirtioDeviceConfig {
 }
 
 /// VirtIO device types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VirtioDeviceType {
     /// Block device.
     Block,
@@ -223,4 +225,124 @@ pub enum VirtioDeviceType {
     Balloon,
     /// GPU device.
     Gpu,
+}
+
+// ============================================================================
+// Snapshot Types
+// ============================================================================
+
+/// ARM64 register state for snapshots.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Arm64Registers {
+    /// General purpose registers X0-X30.
+    pub x: [u64; 31],
+    /// Stack pointer (SP).
+    pub sp: u64,
+    /// Program counter (PC).
+    pub pc: u64,
+    /// Processor state (PSTATE/CPSR).
+    pub pstate: u64,
+    /// Floating point control register.
+    pub fpcr: u64,
+    /// Floating point status register.
+    pub fpsr: u64,
+    /// Vector registers Q0-Q31 (128-bit each, stored as [u64; 2]).
+    pub v: [[u64; 2]; 32],
+}
+
+/// vCPU snapshot state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VcpuSnapshot {
+    /// vCPU ID.
+    pub id: u32,
+    /// CPU architecture.
+    pub arch: CpuArch,
+    /// x86_64 registers (if applicable).
+    pub x86_regs: Option<Registers>,
+    /// ARM64 registers (if applicable).
+    pub arm64_regs: Option<Arm64Registers>,
+    /// Additional architecture-specific state (opaque bytes).
+    pub extra_state: Vec<u8>,
+}
+
+impl VcpuSnapshot {
+    /// Creates a new x86_64 vCPU snapshot.
+    #[must_use]
+    pub fn new_x86(id: u32, regs: Registers) -> Self {
+        Self {
+            id,
+            arch: CpuArch::X86_64,
+            x86_regs: Some(regs),
+            arm64_regs: None,
+            extra_state: Vec::new(),
+        }
+    }
+
+    /// Creates a new ARM64 vCPU snapshot.
+    #[must_use]
+    pub fn new_arm64(id: u32, regs: Arm64Registers) -> Self {
+        Self {
+            id,
+            arch: CpuArch::Aarch64,
+            x86_regs: None,
+            arm64_regs: Some(regs),
+            extra_state: Vec::new(),
+        }
+    }
+}
+
+/// Device snapshot state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceSnapshot {
+    /// Device type.
+    pub device_type: VirtioDeviceType,
+    /// Device name/identifier.
+    pub name: String,
+    /// Device-specific state (serialized).
+    pub state: Vec<u8>,
+}
+
+/// Memory region info for snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryRegionSnapshot {
+    /// Guest physical address start.
+    pub guest_addr: u64,
+    /// Region size in bytes.
+    pub size: u64,
+    /// Whether this region is read-only.
+    pub read_only: bool,
+    /// Offset in the memory dump file.
+    pub file_offset: u64,
+}
+
+/// Dirty page tracking info.
+#[derive(Debug, Clone)]
+pub struct DirtyPageInfo {
+    /// Guest physical address of the page.
+    pub guest_addr: u64,
+    /// Page size (usually 4KB).
+    pub size: u64,
+}
+
+/// Full VM snapshot metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmSnapshot {
+    /// Snapshot format version.
+    pub version: u32,
+    /// CPU architecture.
+    pub arch: CpuArch,
+    /// vCPU states.
+    pub vcpus: Vec<VcpuSnapshot>,
+    /// Device states.
+    pub devices: Vec<DeviceSnapshot>,
+    /// Memory region info.
+    pub memory_regions: Vec<MemoryRegionSnapshot>,
+    /// Total memory size.
+    pub total_memory: u64,
+    /// Whether memory is compressed.
+    pub compressed: bool,
+    /// Compression algorithm (if compressed).
+    pub compression: Option<String>,
+    /// Parent snapshot ID (for incremental).
+    pub parent_id: Option<String>,
 }

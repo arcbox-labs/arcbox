@@ -6,6 +6,7 @@ use crate::{
     error::HypervisorError,
     memory::{GuestAddress, MemoryRegion},
     traits::GuestMemory,
+    types::DirtyPageInfo,
 };
 
 use super::ffi;
@@ -19,6 +20,10 @@ pub struct DarwinMemory {
     regions: RwLock<Vec<MappedRegion>>,
     /// Total memory size.
     total_size: u64,
+    /// Whether dirty page tracking is enabled.
+    /// Note: Virtualization.framework doesn't support dirty page tracking,
+    /// so this is always false effectively.
+    dirty_tracking_enabled: std::sync::atomic::AtomicBool,
 }
 
 /// A mapped memory region with its host backing.
@@ -59,6 +64,7 @@ impl DarwinMemory {
         Ok(Self {
             regions: RwLock::new(vec![region]),
             total_size: size,
+            dirty_tracking_enabled: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -195,6 +201,85 @@ impl GuestMemory for DarwinMemory {
 
     fn size(&self) -> u64 {
         self.total_size
+    }
+
+    fn enable_dirty_tracking(&mut self) -> Result<(), HypervisorError> {
+        // LIMITATION: Virtualization.framework does not support dirty page tracking.
+        //
+        // Unlike KVM which provides KVM_GET_DIRTY_LOG, Virtualization.framework
+        // is a high-level API that doesn't expose memory change tracking.
+        //
+        // For incremental snapshots on macOS, alternatives include:
+        // 1. Use memory checksums to detect changed pages (expensive)
+        // 2. Use guest agent to track writes (requires guest cooperation)
+        // 3. Accept full memory dumps only
+        tracing::warn!("Dirty page tracking not supported on Virtualization.framework");
+        self.dirty_tracking_enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn disable_dirty_tracking(&mut self) -> Result<(), HypervisorError> {
+        self.dirty_tracking_enabled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn get_dirty_pages(&mut self) -> Result<Vec<DirtyPageInfo>, HypervisorError> {
+        // LIMITATION: Virtualization.framework does not support dirty page tracking.
+        //
+        // Since we cannot actually track dirty pages, we return an empty list.
+        // Callers should fall back to full memory snapshots.
+        if !self
+            .dirty_tracking_enabled
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(HypervisorError::SnapshotError(
+                "Dirty tracking not enabled".to_string(),
+            ));
+        }
+
+        tracing::warn!("get_dirty_pages: returning empty list (not supported on Darwin)");
+        Ok(Vec::new())
+    }
+
+    fn dump_all(&self, buf: &mut [u8]) -> Result<(), HypervisorError> {
+        if (buf.len() as u64) < self.total_size {
+            return Err(HypervisorError::MemoryError(format!(
+                "Buffer too small: {} bytes, need {} bytes",
+                buf.len(),
+                self.total_size
+            )));
+        }
+
+        let regions = self.regions.read().map_err(|_| {
+            HypervisorError::MemoryError("Lock poisoned".to_string())
+        })?;
+
+        // Copy each region to the appropriate offset in the buffer.
+        // Regions are assumed to be non-overlapping and cover guest physical addresses.
+        for region in regions.iter() {
+            let offset = region.guest_addr.raw() as usize;
+            let end = offset + region.size as usize;
+
+            if end > buf.len() {
+                return Err(HypervisorError::MemoryError(format!(
+                    "Region at {} with size {} exceeds buffer",
+                    region.guest_addr, region.size
+                )));
+            }
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    region.host_addr,
+                    buf[offset..end].as_mut_ptr(),
+                    region.size as usize,
+                );
+            }
+        }
+
+        tracing::debug!("Dumped {} bytes of guest memory", self.total_size);
+        Ok(())
     }
 }
 

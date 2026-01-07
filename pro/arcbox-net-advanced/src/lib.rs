@@ -19,6 +19,9 @@
 pub mod dns;
 pub mod vpn;
 
+pub use dns::{DnsRecord, DnsRecordData, DnsResolver, DnsResponse, RecordType, SplitDnsResolver};
+pub use vpn::{VpnDetector, VpnInterface, VpnType};
+
 /// Advanced network configuration.
 #[derive(Debug, Clone, Default)]
 pub struct AdvancedNetConfig {

@@ -18,7 +18,9 @@ arcbox-container = { workspace = true }
 arcbox-image = { workspace = true }
 arcbox-protocol = { workspace = true }
 arcbox-transport = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true }
 prost = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

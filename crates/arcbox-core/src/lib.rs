@@ -42,7 +42,7 @@ pub mod persistence;
 pub mod runtime;
 pub mod vm;
 
-pub use agent_client::{AgentClient, AgentPool};
+pub use agent_client::{AgentClient, AgentClientWrapper, AgentPool};
 pub use config::Config;
 pub use error::{CoreError, Result};
 pub use machine::MachineManager;

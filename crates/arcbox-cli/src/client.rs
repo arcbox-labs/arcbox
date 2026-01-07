@@ -91,8 +91,156 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Upgrades HTTP connection for exec interactive mode.
+    ///
+    /// Returns the underlying stream for bidirectional communication.
+    pub async fn upgrade_exec<B: Serialize>(
+        &self,
+        exec_id: &str,
+        body: Option<B>,
+    ) -> Result<tokio::io::DuplexStream> {
+        let path = format!("/v1.43/exec/{}/start", exec_id);
+        self.upgrade_connection(&path, body).await
+    }
+
+    /// Upgrades HTTP connection for container attach.
+    ///
+    /// Returns the underlying stream for bidirectional communication.
+    pub async fn upgrade_attach(
+        &self,
+        container_id: &str,
+        stdin: bool,
+        tty: bool,
+    ) -> Result<tokio::io::DuplexStream> {
+        let path = format!(
+            "/v1.43/containers/{}/attach?stream=1&stdin={}&stdout=1&stderr={}",
+            container_id, stdin, !tty
+        );
+        self.upgrade_connection::<()>(&path, None).await
+    }
+
+    /// Upgrades HTTP connection for bidirectional streaming.
+    ///
+    /// This sends an HTTP request and then returns a duplex stream that
+    /// allows reading/writing directly to the connection.
+    async fn upgrade_connection<B: Serialize>(
+        &self,
+        path: &str,
+        body: Option<B>,
+    ) -> Result<tokio::io::DuplexStream> {
+        // Connect to Unix socket
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to connect to daemon at {}",
+                    self.socket_path.display()
+                )
+            })?;
+
+        let io = TokioIo::new(stream);
+
+        // Create HTTP connection
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .context("HTTP handshake failed")?;
+
+        // Spawn connection handler
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::debug!("Upgrade connection closed: {}", e);
+            }
+        });
+
+        // Build request with Upgrade header for streaming
+        let request = if let Some(body) = body {
+            let body_bytes = serde_json::to_vec(&body).context("failed to serialize body")?;
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://localhost{}", path))
+                .header("Host", "localhost")
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body_bytes.len())
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "tcp")
+                .body(Full::new(Bytes::from(body_bytes)))
+                .context("failed to build request")?
+        } else {
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://localhost{}", path))
+                .header("Host", "localhost")
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "tcp")
+                .body(Full::new(Bytes::new()))
+                .context("failed to build request")?
+        };
+
+        // Send request
+        let response = sender
+            .send_request(request)
+            .await
+            .context("failed to send upgrade request")?;
+
+        let status = response.status();
+
+        // Check for successful upgrade (101 Switching Protocols) or 200 OK
+        if !status.is_success() && status != hyper::StatusCode::SWITCHING_PROTOCOLS {
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .context("failed to read response")?
+                .to_bytes();
+            let error_msg = String::from_utf8_lossy(&body);
+            anyhow::bail!("daemon returned error {}: {}", status, error_msg);
+        }
+
+        // Create a duplex stream for bidirectional communication.
+        // We use a pair of channels to bridge between the HTTP body and our stream.
+        let (client_duplex, server_duplex) = tokio::io::duplex(4096);
+
+        // Spawn a task to forward data from HTTP response body to client
+        let mut body = response.into_body();
+        let (mut server_read, mut server_write) = tokio::io::split(server_duplex);
+
+        // Forward response body to client read side
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Some(frame) = body.frame().await {
+                match frame {
+                    Ok(f) => {
+                        if let Some(data) = f.data_ref() {
+                            if server_write.write_all(data).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok(client_duplex)
+    }
+
     /// Streams logs from the daemon, calling the callback for each frame.
     pub async fn stream_logs<F>(&self, path: &str, mut callback: F) -> Result<()>
+    where
+        F: FnMut(&[u8]),
+    {
+        self.stream_logs_with_cancel(path, &mut callback, tokio_util::sync::CancellationToken::new()).await
+    }
+
+    /// Streams logs from the daemon with cancellation support.
+    ///
+    /// The stream will be cancelled when the cancellation token is triggered.
+    pub async fn stream_logs_with_cancel<F>(
+        &self,
+        path: &str,
+        callback: &mut F,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> Result<()>
     where
         F: FnMut(&[u8]),
     {
@@ -118,7 +266,7 @@ impl DaemonClient {
         // Spawn connection handler
         tokio::spawn(async move {
             if let Err(e) = conn.await {
-                tracing::error!("Connection error: {}", e);
+                tracing::debug!("Log stream connection closed: {}", e);
             }
         });
 
@@ -141,40 +289,79 @@ impl DaemonClient {
             anyhow::bail!("daemon returned error {}", status);
         }
 
-        // Stream response body
+        // Stream response body with cancellation support
         let mut body = response.into_body();
-        let mut buffer = Vec::new();
+        let mut buffer = Vec::with_capacity(4096);
+        let mut frames_processed = 0u64;
 
-        while let Some(frame) = body.frame().await {
-            let frame = frame.context("failed to read frame")?;
-            if let Some(data) = frame.data_ref() {
-                // Process Docker log frames
-                buffer.extend_from_slice(data);
+        loop {
+            tokio::select! {
+                biased;
 
-                // Process complete frames from buffer
-                while buffer.len() >= 8 {
-                    let size = u32::from_be_bytes([
-                        buffer[4], buffer[5], buffer[6], buffer[7],
-                    ]) as usize;
+                // Check for cancellation
+                _ = cancel_token.cancelled() => {
+                    tracing::debug!("Log stream cancelled after {} frames", frames_processed);
+                    break;
+                }
 
-                    let frame_end = 8 + size;
-                    if buffer.len() < frame_end {
-                        break;
+                // Read next frame
+                frame_result = body.frame() => {
+                    match frame_result {
+                        Some(Ok(frame)) => {
+                            if let Some(data) = frame.data_ref() {
+                                // Extend buffer with new data
+                                buffer.extend_from_slice(data);
+
+                                // Process all complete frames from buffer
+                                while let Some((stream_type, content)) = extract_log_frame(&buffer) {
+                                    let frame_size = 8 + content.len();
+
+                                    // Call the callback with the log content
+                                    // stream_type: 0 = stdin, 1 = stdout, 2 = stderr
+                                    let _ = stream_type; // Can be used to route output
+                                    callback(content);
+                                    frames_processed += 1;
+
+                                    // Remove processed frame from buffer
+                                    buffer.drain(..frame_size);
+                                }
+
+                                // Flush output periodically
+                                if frames_processed % 10 == 0 {
+                                    stdout().flush().ok();
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            tracing::debug!("Error reading log frame: {}", e);
+                            break;
+                        }
+                        None => {
+                            // Stream ended
+                            break;
+                        }
                     }
-
-                    let content = &buffer[8..frame_end];
-                    callback(content);
-                    stdout().flush().ok();
-
-                    buffer.drain(..frame_end);
                 }
             }
         }
 
-        // Process any remaining data
-        if !buffer.is_empty() {
-            callback(&buffer);
+        // Process any remaining complete frames in buffer
+        while let Some((_, content)) = extract_log_frame(&buffer) {
+            let frame_size = 8 + content.len();
+            callback(content);
+            buffer.drain(..frame_size);
         }
+
+        // If there's incomplete data left, try to print it as-is
+        if !buffer.is_empty() {
+            // Check if it might be raw (non-multiplexed) output
+            if buffer.len() < 8 || buffer[0] > 2 {
+                callback(&buffer);
+            }
+        }
+
+        stdout().flush().ok();
+        tracing::debug!("Log stream completed after {} frames", frames_processed);
 
         Ok(())
     }
@@ -450,6 +637,28 @@ pub fn relative_time(timestamp: i64) -> String {
     } else {
         format!("{} days ago", diff / 86400)
     }
+}
+
+/// Extracts a single log frame from a buffer.
+///
+/// Docker log format: [stream_type (1 byte)][padding (3 bytes)][size (4 bytes BE)][data]
+/// - stream_type: 0 = stdin, 1 = stdout, 2 = stderr
+///
+/// Returns (stream_type, content) if a complete frame is available, None otherwise.
+fn extract_log_frame(buffer: &[u8]) -> Option<(u8, &[u8])> {
+    if buffer.len() < 8 {
+        return None;
+    }
+
+    let stream_type = buffer[0];
+    let size = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]) as usize;
+
+    let frame_end = 8 + size;
+    if buffer.len() < frame_end {
+        return None;
+    }
+
+    Some((stream_type, &buffer[8..frame_end]))
 }
 
 #[cfg(test)]

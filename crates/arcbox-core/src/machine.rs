@@ -43,6 +43,12 @@ pub struct MachineInfo {
     pub memory_mb: u64,
     /// Disk size in GB.
     pub disk_gb: u64,
+    /// Kernel path.
+    pub kernel: Option<String>,
+    /// Initrd path.
+    pub initrd: Option<String>,
+    /// Kernel command line.
+    pub cmdline: Option<String>,
     /// Creation time.
     pub created_at: DateTime<Utc>,
 }
@@ -58,6 +64,12 @@ pub struct MachineConfig {
     pub memory_mb: u64,
     /// Disk size in GB.
     pub disk_gb: u64,
+    /// Kernel path.
+    pub kernel: Option<String>,
+    /// Initrd path.
+    pub initrd: Option<String>,
+    /// Kernel command line.
+    pub cmdline: Option<String>,
 }
 
 impl Default for MachineConfig {
@@ -67,6 +79,9 @@ impl Default for MachineConfig {
             cpus: 4,
             memory_mb: 4096,
             disk_gb: 50,
+            kernel: None,
+            initrd: None,
+            cmdline: None,
         }
     }
 }
@@ -101,6 +116,9 @@ impl MachineManager {
             let vm_config = VmConfig {
                 cpus: persisted.cpus,
                 memory_mb: persisted.memory_mb,
+                kernel: persisted.kernel.clone(),
+                initrd: persisted.initrd.clone(),
+                cmdline: persisted.cmdline.clone(),
                 shared_dirs: shared_dirs.clone(),
                 ..Default::default()
             };
@@ -115,6 +133,9 @@ impl MachineManager {
                     cpus: persisted.cpus,
                     memory_mb: persisted.memory_mb,
                     disk_gb: persisted.disk_gb,
+                    kernel: persisted.kernel.clone(),
+                    initrd: persisted.initrd.clone(),
+                    cmdline: persisted.cmdline,
                     created_at: persisted.created_at,
                 };
                 machines.insert(persisted.name, info);
@@ -158,6 +179,9 @@ impl MachineManager {
         let vm_config = VmConfig {
             cpus: config.cpus,
             memory_mb: config.memory_mb,
+            kernel: config.kernel.clone(),
+            initrd: config.initrd.clone(),
+            cmdline: config.cmdline.clone(),
             shared_dirs,
             ..Default::default()
         };
@@ -171,6 +195,9 @@ impl MachineManager {
             cpus: config.cpus,
             memory_mb: config.memory_mb,
             disk_gb: config.disk_gb,
+            kernel: config.kernel,
+            initrd: config.initrd,
+            cmdline: config.cmdline,
             created_at: Utc::now(),
         };
 

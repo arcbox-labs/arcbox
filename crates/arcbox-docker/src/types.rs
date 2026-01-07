@@ -698,6 +698,16 @@ pub struct VolumeCreateRequest {
     pub labels: Option<HashMap<String, String>>,
 }
 
+/// Volume prune response.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct VolumePruneResponse {
+    /// Volumes deleted.
+    pub volumes_deleted: Vec<String>,
+    /// Space reclaimed in bytes.
+    pub space_reclaimed: u64,
+}
+
 // ============================================================================
 // System Types
 // ============================================================================

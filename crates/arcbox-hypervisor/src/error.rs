@@ -56,6 +56,14 @@ pub enum HypervisorError {
     #[error("timeout: {0}")]
     Timeout(String),
 
+    /// Snapshot error.
+    #[error("snapshot error: {0}")]
+    SnapshotError(String),
+
+    /// Feature not supported.
+    #[error("not supported: {0}")]
+    NotSupported(String),
+
     /// Platform-specific error.
     #[cfg(target_os = "macos")]
     #[error("darwin error: {0}")]

@@ -19,6 +19,9 @@
 pub mod cache;
 pub mod prefetch;
 
+pub use cache::{CacheConfig, CacheStats, FileCache};
+pub use prefetch::{PrefetchConfig, PrefetchEngine, PrefetchStats};
+
 /// Enhanced filesystem configuration.
 #[derive(Debug, Clone)]
 pub struct EnhancedFsConfig {

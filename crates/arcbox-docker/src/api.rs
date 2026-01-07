@@ -59,6 +59,7 @@ pub fn create_router(runtime: Arc<Runtime>) -> Router {
         // Volume endpoints
         .route("/volumes", get(handlers::list_volumes))
         .route("/volumes/create", post(handlers::create_volume))
+        .route("/volumes/prune", post(handlers::prune_volumes))
         .route("/volumes/:name", get(handlers::inspect_volume))
         .route("/volumes/:name", delete(handlers::remove_volume))
         // Versioned API routes (Docker compatibility)
@@ -123,6 +124,7 @@ fn versioned_router() -> Router<AppState> {
         // Volumes
         .route("/volumes", get(handlers::list_volumes))
         .route("/volumes/create", post(handlers::create_volume))
+        .route("/volumes/prune", post(handlers::prune_volumes))
         .route("/volumes/:name", get(handlers::inspect_volume))
         .route("/volumes/:name", delete(handlers::remove_volume))
 }

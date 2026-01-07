@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::{
     error::HypervisorError,
     traits::Vcpu,
-    types::{Registers, VcpuExit},
+    types::{CpuArch, Registers, VcpuExit, VcpuSnapshot},
 };
 
 use super::ffi::{
@@ -540,6 +540,75 @@ impl Vcpu for KvmVcpu {
             let len = (mmio.len as usize).min(8);
             mmio.data[..len].copy_from_slice(&bytes[..len]);
         }
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Result<VcpuSnapshot, HypervisorError> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let regs = self.get_regs()?;
+            Ok(VcpuSnapshot::new_x86(self.id, regs))
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            use super::ffi::arm64_regs;
+
+            // Read ARM64 registers
+            let mut arm_regs = crate::types::Arm64Registers::default();
+
+            // Read X0-X30
+            for i in 0..31 {
+                let reg_id = arm64_regs::X0 + (i as u64) * 2; // Each reg is 2 u64s apart in encoding
+                if let Ok(val) = self.vcpu_fd.get_one_reg(reg_id) {
+                    arm_regs.x[i] = val;
+                }
+            }
+
+            // Read SP, PC, PSTATE
+            arm_regs.sp = self.vcpu_fd.get_one_reg(arm64_regs::SP).unwrap_or(0);
+            arm_regs.pc = self.vcpu_fd.get_one_reg(arm64_regs::PC).unwrap_or(0);
+            arm_regs.pstate = self.vcpu_fd.get_one_reg(arm64_regs::PSTATE).unwrap_or(0);
+
+            // Note: FPCR, FPSR, and vector registers would need additional KVM_GET_ONE_REG calls
+
+            Ok(VcpuSnapshot::new_arm64(self.id, arm_regs))
+        }
+    }
+
+    fn restore(&mut self, snapshot: &VcpuSnapshot) -> Result<(), HypervisorError> {
+        if snapshot.id != self.id {
+            return Err(HypervisorError::SnapshotError(format!(
+                "vCPU ID mismatch: expected {}, got {}",
+                self.id, snapshot.id
+            )));
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if let Some(regs) = &snapshot.x86_regs {
+                self.set_regs(regs)?;
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            use super::ffi::arm64_regs;
+
+            if let Some(arm_regs) = &snapshot.arm64_regs {
+                // Restore X0-X30
+                for i in 0..31 {
+                    let reg_id = arm64_regs::X0 + (i as u64) * 2;
+                    let _ = self.vcpu_fd.set_one_reg(reg_id, arm_regs.x[i]);
+                }
+
+                // Restore SP, PC, PSTATE
+                let _ = self.vcpu_fd.set_one_reg(arm64_regs::SP, arm_regs.sp);
+                let _ = self.vcpu_fd.set_one_reg(arm64_regs::PC, arm_regs.pc);
+                let _ = self.vcpu_fd.set_one_reg(arm64_regs::PSTATE, arm_regs.pstate);
+            }
+        }
+
         Ok(())
     }
 }

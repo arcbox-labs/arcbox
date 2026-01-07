@@ -3,9 +3,10 @@
 //! Manages exec instances for running commands inside containers.
 
 use crate::state::ContainerId;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 /// Exec instance ID.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -111,10 +112,67 @@ impl ExecInstance {
     }
 }
 
+/// Exec start request for agent communication.
+#[derive(Debug, Clone)]
+pub struct ExecStartParams {
+    /// Exec ID.
+    pub exec_id: String,
+    /// Container ID.
+    pub container_id: String,
+    /// Command to execute.
+    pub cmd: Vec<String>,
+    /// Environment variables.
+    pub env: Vec<(String, String)>,
+    /// Working directory.
+    pub working_dir: Option<String>,
+    /// User to run as.
+    pub user: Option<String>,
+    /// Allocate TTY.
+    pub tty: bool,
+    /// Detach mode.
+    pub detach: bool,
+    /// Initial TTY width.
+    pub tty_width: u32,
+    /// Initial TTY height.
+    pub tty_height: u32,
+}
+
+/// Exec start result from agent.
+#[derive(Debug, Clone)]
+pub struct ExecStartResult {
+    /// Process ID in guest.
+    pub pid: u32,
+    /// Standard output (if not detached and not TTY).
+    pub stdout: Vec<u8>,
+    /// Standard error (if not detached and not TTY).
+    pub stderr: Vec<u8>,
+    /// Exit code (if not detached).
+    pub exit_code: Option<i32>,
+}
+
+/// Trait for exec agent communication.
+///
+/// Abstracts communication with the guest VM agent for exec operations.
+#[async_trait]
+pub trait ExecAgentConnection: Send + Sync {
+    /// Starts an exec instance in the guest VM.
+    async fn exec_start(&self, params: ExecStartParams) -> Result<ExecStartResult, String>;
+
+    /// Resizes an exec instance's TTY.
+    async fn exec_resize(
+        &self,
+        exec_id: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String>;
+}
+
 /// Exec manager.
 pub struct ExecManager {
     /// Exec instances by ID.
     execs: RwLock<HashMap<String, ExecInstance>>,
+    /// Agent connection for exec operations.
+    agent: Option<Arc<dyn ExecAgentConnection>>,
 }
 
 impl ExecManager {
@@ -123,7 +181,22 @@ impl ExecManager {
     pub fn new() -> Self {
         Self {
             execs: RwLock::new(HashMap::new()),
+            agent: None,
         }
+    }
+
+    /// Creates a new exec manager with an agent connection.
+    #[must_use]
+    pub fn with_agent(agent: Arc<dyn ExecAgentConnection>) -> Self {
+        Self {
+            execs: RwLock::new(HashMap::new()),
+            agent: Some(agent),
+        }
+    }
+
+    /// Sets the agent connection.
+    pub fn set_agent(&mut self, agent: Arc<dyn ExecAgentConnection>) {
+        self.agent = Some(agent);
     }
 
     /// Creates a new exec instance.
@@ -146,51 +219,164 @@ impl ExecManager {
 
     /// Starts an exec instance.
     ///
+    /// Sends an ExecStartRequest to the agent and waits for completion.
+    /// If detach=true, returns immediately after the process starts.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The exec instance ID
+    /// * `detach` - If true, run in background and return immediately
+    /// * `tty_width` - Initial TTY width (if TTY mode)
+    /// * `tty_height` - Initial TTY height (if TTY mode)
+    ///
     /// # Errors
     ///
     /// Returns an error if the exec cannot be started.
-    pub fn start(&self, id: &ExecId) -> crate::Result<()> {
-        let mut execs = self
-            .execs
-            .write()
-            .map_err(|_| crate::ContainerError::Runtime("lock poisoned".to_string()))?;
+    pub async fn start(
+        &self,
+        id: &ExecId,
+        detach: bool,
+        tty_width: u32,
+        tty_height: u32,
+    ) -> crate::Result<ExecStartResult> {
+        // First validate state and get config (holding lock briefly).
+        let (config, exec_id_str) = {
+            let mut execs = self
+                .execs
+                .write()
+                .map_err(|_| crate::ContainerError::Runtime("lock poisoned".to_string()))?;
 
-        let exec = execs
-            .get_mut(&id.to_string())
-            .ok_or_else(|| crate::ContainerError::NotFound(id.to_string()))?;
+            let exec = execs
+                .get_mut(&id.to_string())
+                .ok_or_else(|| crate::ContainerError::NotFound(id.to_string()))?;
 
-        if exec.running {
-            return Err(crate::ContainerError::InvalidState(
-                "exec is already running".to_string(),
-            ));
+            if exec.running {
+                return Err(crate::ContainerError::InvalidState(
+                    "exec is already running".to_string(),
+                ));
+            }
+
+            exec.running = true;
+            (exec.config.clone(), exec.id.to_string())
+        };
+
+        // Build the exec start params.
+        let params = ExecStartParams {
+            exec_id: exec_id_str.clone(),
+            container_id: config.container_id.to_string(),
+            cmd: config.cmd.clone(),
+            env: config
+                .env
+                .iter()
+                .filter_map(|s| {
+                    let parts: Vec<&str> = s.splitn(2, '=').collect();
+                    if parts.len() == 2 {
+                        Some((parts[0].to_string(), parts[1].to_string()))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            working_dir: config.working_dir.clone(),
+            user: config.user.clone(),
+            tty: config.tty,
+            detach,
+            tty_width,
+            tty_height,
+        };
+
+        // Send request to agent if connected.
+        let result = if let Some(ref agent) = self.agent {
+            agent.exec_start(params).await.map_err(|e| {
+                crate::ContainerError::Runtime(format!("agent exec_start failed: {}", e))
+            })?
+        } else {
+            // No agent - return empty result (for testing without VM).
+            ExecStartResult {
+                pid: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_code: Some(0),
+            }
+        };
+
+        // Update local state after agent call.
+        {
+            let mut execs = self
+                .execs
+                .write()
+                .map_err(|_| crate::ContainerError::Runtime("lock poisoned".to_string()))?;
+
+            if let Some(exec) = execs.get_mut(&exec_id_str) {
+                exec.pid = Some(result.pid);
+
+                if let Some(exit_code) = result.exit_code {
+                    // Process has exited.
+                    exec.running = false;
+                    exec.exit_code = Some(exit_code);
+                }
+                // If detached, process is still running (no exit_code yet).
+            }
         }
 
-        exec.running = true;
-        // TODO: Actually start the exec via agent communication
-        // For now, immediately mark as completed
-        exec.running = false;
-        exec.exit_code = Some(0);
-
-        Ok(())
+        Ok(result)
     }
 
     /// Resizes the exec TTY.
     ///
+    /// Sends a resize request to the agent to update the PTY window size.
+    ///
     /// # Errors
     ///
     /// Returns an error if the resize fails.
-    pub fn resize(&self, id: &ExecId, _height: u32, _width: u32) -> crate::Result<()> {
-        let execs = self
-            .execs
-            .read()
-            .map_err(|_| crate::ContainerError::Runtime("lock poisoned".to_string()))?;
+    pub async fn resize(&self, id: &ExecId, width: u32, height: u32) -> crate::Result<()> {
+        // Validate exec exists and has TTY.
+        {
+            let execs = self
+                .execs
+                .read()
+                .map_err(|_| crate::ContainerError::Runtime("lock poisoned".to_string()))?;
 
-        if !execs.contains_key(&id.to_string()) {
-            return Err(crate::ContainerError::NotFound(id.to_string()));
+            let exec = execs
+                .get(&id.to_string())
+                .ok_or_else(|| crate::ContainerError::NotFound(id.to_string()))?;
+
+            if !exec.config.tty {
+                return Err(crate::ContainerError::InvalidState(
+                    "exec does not have a TTY".to_string(),
+                ));
+            }
+
+            if !exec.running {
+                return Err(crate::ContainerError::InvalidState(
+                    "exec is not running".to_string(),
+                ));
+            }
         }
 
-        // TODO: Resize TTY via agent communication
+        // Send resize to agent if connected.
+        if let Some(ref agent) = self.agent {
+            agent
+                .exec_resize(&id.to_string(), width, height)
+                .await
+                .map_err(|e| {
+                    crate::ContainerError::Runtime(format!("agent exec_resize failed: {}", e))
+                })?;
+        }
+
         Ok(())
+    }
+
+    /// Marks an exec instance as completed.
+    ///
+    /// Called when the agent notifies that an exec process has exited.
+    pub fn notify_exit(&self, id: &ExecId, exit_code: i32) {
+        if let Ok(mut execs) = self.execs.write() {
+            if let Some(exec) = execs.get_mut(&id.to_string()) {
+                exec.running = false;
+                exec.exit_code = Some(exit_code);
+            }
+        }
     }
 
     /// Lists all exec instances for a container.
@@ -236,8 +422,8 @@ mod tests {
         assert!(exec.exit_code.is_none());
     }
 
-    #[test]
-    fn test_start_exec() {
+    #[tokio::test]
+    async fn test_start_exec() {
         let manager = ExecManager::new();
         let config = ExecConfig {
             container_id: ContainerId::from_string("test-container"),
@@ -246,10 +432,74 @@ mod tests {
         };
 
         let id = manager.create(config);
-        manager.start(&id).unwrap();
+        // Default width/height for non-TTY mode.
+        let result = manager.start(&id, false, 80, 24).await.unwrap();
 
         let exec = manager.get(&id).unwrap();
         assert!(!exec.running);
         assert_eq!(exec.exit_code, Some(0));
+        assert_eq!(result.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_start_exec_detached() {
+        let manager = ExecManager::new();
+        let config = ExecConfig {
+            container_id: ContainerId::from_string("test-container"),
+            cmd: vec!["sleep".to_string(), "10".to_string()],
+            ..Default::default()
+        };
+
+        let id = manager.create(config);
+        // Without agent, detach mode still returns immediately with exit_code=0.
+        let result = manager.start(&id, true, 80, 24).await.unwrap();
+
+        // Without agent, it returns exit_code=0 immediately.
+        assert_eq!(result.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_resize_without_tty() {
+        let manager = ExecManager::new();
+        let config = ExecConfig {
+            container_id: ContainerId::from_string("test-container"),
+            cmd: vec!["echo".to_string(), "hello".to_string()],
+            tty: false,
+            ..Default::default()
+        };
+
+        let id = manager.create(config);
+
+        // Resize should fail because exec doesn't have TTY.
+        let result = manager.resize(&id, 100, 40).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_notify_exit() {
+        let manager = ExecManager::new();
+        let config = ExecConfig {
+            container_id: ContainerId::from_string("test-container"),
+            cmd: vec!["sleep".to_string(), "10".to_string()],
+            ..Default::default()
+        };
+
+        let id = manager.create(config);
+
+        // Manually set running state.
+        {
+            let mut execs = manager.execs.write().unwrap();
+            if let Some(exec) = execs.get_mut(&id.to_string()) {
+                exec.running = true;
+                exec.pid = Some(12345);
+            }
+        }
+
+        // Notify exit.
+        manager.notify_exit(&id, 42);
+
+        let exec = manager.get(&id).unwrap();
+        assert!(!exec.running);
+        assert_eq!(exec.exit_code, Some(42));
     }
 }

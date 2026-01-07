@@ -13,6 +13,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
+chrono = { workspace = true }
+libc = { workspace = true }
 
 [features]
 default = []

@@ -262,6 +262,9 @@ impl VirtualMachine {
     }
 
     /// Pauses the virtual machine.
+    ///
+    /// The VM must be in the Running state. After pausing, the VM will be
+    /// in the Paused state and can be resumed with `resume()`.
     pub async fn pause(&self) -> VZResult<()> {
         if !self.can_pause() {
             return Err(VZError::InvalidState {
@@ -270,12 +273,66 @@ impl VirtualMachine {
             });
         }
 
-        // Similar implementation to stop()
-        // TODO: Implement with proper completion handler
+        let inner = self.inner;
+        self.queue.sync(|| unsafe {
+            static PAUSE_BLOCK: OnceLock<BlockPtr> = OnceLock::new();
+
+            let block_ptr = PAUSE_BLOCK.get_or_init(|| {
+                #[repr(C)]
+                struct CompletionBlock {
+                    isa: *const c_void,
+                    flags: i32,
+                    reserved: i32,
+                    invoke: unsafe extern "C" fn(*const c_void, *mut AnyObject),
+                    descriptor: *const crate::ffi::BlockDescriptor,
+                }
+
+                unsafe extern "C" fn pause_handler(_block: *const c_void, error: *mut AnyObject) {
+                    unsafe {
+                        if !error.is_null() {
+                            let desc = msg_send!(error, localizedDescription);
+                            tracing::error!("VM pause failed: {}", nsstring_to_string(desc));
+                        }
+                    }
+                }
+
+                let stack_block = CompletionBlock {
+                    isa: _NSConcreteStackBlock,
+                    flags: 0,
+                    reserved: 0,
+                    invoke: pause_handler,
+                    descriptor: &SIMPLE_BLOCK_DESCRIPTOR,
+                };
+
+                let heap_block =
+                    _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
+                BlockPtr(heap_block)
+            });
+
+            let sel = objc2::sel!(pauseWithCompletionHandler:);
+            let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel, *const c_void) =
+                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
+            func(inner as *const AnyObject, sel, block_ptr.0);
+        });
+
+        // Poll for paused state.
+        let timeout = Duration::from_secs(10);
+        let start = std::time::Instant::now();
+
+        while self.state() != VirtualMachineState::Paused {
+            if start.elapsed() > timeout {
+                return Err(VZError::Timeout("Pause operation timed out".into()));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
         Ok(())
     }
 
     /// Resumes a paused virtual machine.
+    ///
+    /// The VM must be in the Paused state. After resuming, the VM will
+    /// return to the Running state.
     pub async fn resume(&self) -> VZResult<()> {
         if !self.can_resume() {
             return Err(VZError::InvalidState {
@@ -284,7 +341,59 @@ impl VirtualMachine {
             });
         }
 
-        // TODO: Implement with proper completion handler
+        let inner = self.inner;
+        self.queue.sync(|| unsafe {
+            static RESUME_BLOCK: OnceLock<BlockPtr> = OnceLock::new();
+
+            let block_ptr = RESUME_BLOCK.get_or_init(|| {
+                #[repr(C)]
+                struct CompletionBlock {
+                    isa: *const c_void,
+                    flags: i32,
+                    reserved: i32,
+                    invoke: unsafe extern "C" fn(*const c_void, *mut AnyObject),
+                    descriptor: *const crate::ffi::BlockDescriptor,
+                }
+
+                unsafe extern "C" fn resume_handler(_block: *const c_void, error: *mut AnyObject) {
+                    unsafe {
+                        if !error.is_null() {
+                            let desc = msg_send!(error, localizedDescription);
+                            tracing::error!("VM resume failed: {}", nsstring_to_string(desc));
+                        }
+                    }
+                }
+
+                let stack_block = CompletionBlock {
+                    isa: _NSConcreteStackBlock,
+                    flags: 0,
+                    reserved: 0,
+                    invoke: resume_handler,
+                    descriptor: &SIMPLE_BLOCK_DESCRIPTOR,
+                };
+
+                let heap_block =
+                    _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
+                BlockPtr(heap_block)
+            });
+
+            let sel = objc2::sel!(resumeWithCompletionHandler:);
+            let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel, *const c_void) =
+                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
+            func(inner as *const AnyObject, sel, block_ptr.0);
+        });
+
+        // Poll for running state.
+        let timeout = Duration::from_secs(10);
+        let start = std::time::Instant::now();
+
+        while self.state() != VirtualMachineState::Running {
+            if start.elapsed() > timeout {
+                return Err(VZError::Timeout("Resume operation timed out".into()));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
         Ok(())
     }
 

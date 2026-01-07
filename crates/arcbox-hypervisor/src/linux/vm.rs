@@ -6,9 +6,9 @@ use std::sync::{Arc, RwLock};
 use crate::{
     config::VmConfig,
     error::HypervisorError,
-    memory::GuestAddress,
+    memory::{GuestAddress, PAGE_SIZE},
     traits::VirtualMachine,
-    types::{VirtioDeviceConfig, VirtioDeviceType},
+    types::{DeviceSnapshot, DirtyPageInfo, VirtioDeviceConfig, VirtioDeviceType},
 };
 
 use std::os::unix::io::RawFd;
@@ -48,6 +48,23 @@ const VIRTIO_IRQ_BASE: u32 = 5;
 
 /// Maximum number of VirtIO devices.
 const MAX_VIRTIO_DEVICES: usize = 32;
+
+// ============================================================================
+// Memory Slot Tracking for Dirty Logging
+// ============================================================================
+
+/// Information about a memory slot for dirty page tracking.
+#[derive(Debug, Clone)]
+struct MemorySlotInfo {
+    /// Slot ID.
+    slot: u32,
+    /// Guest physical address.
+    guest_phys_addr: u64,
+    /// Size in bytes.
+    size: u64,
+    /// Host virtual address.
+    userspace_addr: u64,
+}
 
 // ============================================================================
 // VirtIO Device Tracking
@@ -118,6 +135,10 @@ pub struct KvmVm {
     virtio_devices: RwLock<Vec<VirtioDeviceInfo>>,
     /// Next VirtIO IRQ offset.
     next_virtio_irq: AtomicU32,
+    /// Memory slots for dirty page tracking.
+    memory_slots: RwLock<Vec<MemorySlotInfo>>,
+    /// Whether dirty page tracking is enabled.
+    dirty_tracking_enabled: AtomicBool,
 }
 
 // Safety: All mutable state is properly synchronized.
@@ -158,6 +179,14 @@ impl KvmVm {
             HypervisorError::VmCreationFailed(format!("Failed to map guest memory: {}", e))
         })?;
 
+        // Track the main memory slot for dirty page tracking.
+        let main_slot = MemorySlotInfo {
+            slot: 0,
+            guest_phys_addr: 0,
+            size: config.memory_size,
+            userspace_addr: memory.host_address() as u64,
+        };
+
         tracing::info!(
             "Created KVM VM {}: vcpus={}, memory={}MB",
             id,
@@ -178,6 +207,8 @@ impl KvmVm {
             running: AtomicBool::new(false),
             virtio_devices: RwLock::new(Vec::new()),
             next_virtio_irq: AtomicU32::new(0),
+            memory_slots: RwLock::new(vec![main_slot]),
+            dirty_tracking_enabled: AtomicBool::new(false),
         })
     }
 
@@ -446,6 +477,205 @@ impl KvmVm {
             notify_fd: d.notify_fd,
         }).collect())
     }
+
+    // ========================================================================
+    // Dirty Page Tracking
+    // ========================================================================
+
+    /// Enables dirty page tracking for all memory regions.
+    ///
+    /// When enabled, KVM tracks which pages have been written to by the guest.
+    /// Use `get_dirty_pages` to retrieve and clear the dirty page bitmap.
+    ///
+    /// This is useful for:
+    /// - Live migration: Only transfer modified pages
+    /// - Snapshotting: Track incremental changes
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if dirty logging cannot be enabled.
+    pub fn enable_dirty_tracking(&self) -> Result<(), HypervisorError> {
+        if self.dirty_tracking_enabled.load(Ordering::SeqCst) {
+            // Already enabled.
+            return Ok(());
+        }
+
+        let slots = self.memory_slots.read().map_err(|_| {
+            HypervisorError::SnapshotError("Lock poisoned".to_string())
+        })?;
+
+        // Enable dirty logging for all memory slots.
+        for slot in slots.iter() {
+            self.vm_fd
+                .enable_dirty_logging(
+                    slot.slot,
+                    slot.guest_phys_addr,
+                    slot.size,
+                    slot.userspace_addr,
+                )
+                .map_err(|e| {
+                    HypervisorError::SnapshotError(format!(
+                        "Failed to enable dirty logging for slot {}: {}",
+                        slot.slot, e
+                    ))
+                })?;
+
+            tracing::debug!(
+                "Enabled dirty logging for slot {}: guest={:#x}, size={}MB",
+                slot.slot,
+                slot.guest_phys_addr,
+                slot.size / (1024 * 1024)
+            );
+        }
+
+        self.dirty_tracking_enabled.store(true, Ordering::SeqCst);
+        tracing::info!("Dirty page tracking enabled for VM {}", self.id);
+
+        Ok(())
+    }
+
+    /// Disables dirty page tracking for all memory regions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if dirty logging cannot be disabled.
+    pub fn disable_dirty_tracking(&self) -> Result<(), HypervisorError> {
+        if !self.dirty_tracking_enabled.load(Ordering::SeqCst) {
+            // Already disabled.
+            return Ok(());
+        }
+
+        let slots = self.memory_slots.read().map_err(|_| {
+            HypervisorError::SnapshotError("Lock poisoned".to_string())
+        })?;
+
+        // Disable dirty logging for all memory slots.
+        for slot in slots.iter() {
+            self.vm_fd
+                .disable_dirty_logging(
+                    slot.slot,
+                    slot.guest_phys_addr,
+                    slot.size,
+                    slot.userspace_addr,
+                )
+                .map_err(|e| {
+                    HypervisorError::SnapshotError(format!(
+                        "Failed to disable dirty logging for slot {}: {}",
+                        slot.slot, e
+                    ))
+                })?;
+        }
+
+        self.dirty_tracking_enabled.store(false, Ordering::SeqCst);
+        tracing::info!("Dirty page tracking disabled for VM {}", self.id);
+
+        Ok(())
+    }
+
+    /// Returns whether dirty page tracking is enabled.
+    #[must_use]
+    pub fn is_dirty_tracking_enabled(&self) -> bool {
+        self.dirty_tracking_enabled.load(Ordering::SeqCst)
+    }
+
+    /// Gets the list of dirty pages across all memory regions.
+    ///
+    /// This retrieves and clears the dirty page bitmap from KVM.
+    /// Each call returns pages that were written since the last call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if dirty tracking is not enabled or if the
+    /// dirty log cannot be retrieved.
+    pub fn get_dirty_pages(&self) -> Result<Vec<DirtyPageInfo>, HypervisorError> {
+        if !self.dirty_tracking_enabled.load(Ordering::SeqCst) {
+            return Err(HypervisorError::SnapshotError(
+                "Dirty tracking not enabled".to_string(),
+            ));
+        }
+
+        let slots = self.memory_slots.read().map_err(|_| {
+            HypervisorError::SnapshotError("Lock poisoned".to_string())
+        })?;
+
+        let mut dirty_pages = Vec::new();
+
+        for slot in slots.iter() {
+            // Get the dirty bitmap for this slot.
+            let bitmap = self
+                .vm_fd
+                .get_dirty_log(slot.slot, slot.size, PAGE_SIZE)
+                .map_err(|e| {
+                    HypervisorError::SnapshotError(format!(
+                        "Failed to get dirty log for slot {}: {}",
+                        slot.slot, e
+                    ))
+                })?;
+
+            // Parse the bitmap to extract dirty page addresses.
+            let pages = Self::parse_dirty_bitmap(
+                &bitmap,
+                slot.guest_phys_addr,
+                slot.size,
+            );
+
+            tracing::debug!(
+                "Slot {}: {} dirty pages out of {} total",
+                slot.slot,
+                pages.len(),
+                slot.size / PAGE_SIZE
+            );
+
+            dirty_pages.extend(pages);
+        }
+
+        tracing::debug!(
+            "get_dirty_pages: found {} dirty pages total",
+            dirty_pages.len()
+        );
+
+        Ok(dirty_pages)
+    }
+
+    /// Parses a dirty bitmap to extract individual dirty page addresses.
+    ///
+    /// # Arguments
+    /// * `bitmap` - The bitmap from KVM_GET_DIRTY_LOG
+    /// * `base_addr` - The guest physical address of the region start
+    /// * `size` - Total size of the region
+    ///
+    /// # Returns
+    /// A vector of DirtyPageInfo for each dirty page.
+    fn parse_dirty_bitmap(
+        bitmap: &[u64],
+        base_addr: u64,
+        size: u64,
+    ) -> Vec<DirtyPageInfo> {
+        let mut pages = Vec::new();
+        let num_pages = size / PAGE_SIZE;
+
+        for (word_idx, &word) in bitmap.iter().enumerate() {
+            if word == 0 {
+                // Skip words with no dirty pages.
+                continue;
+            }
+
+            // Check each bit in the word.
+            for bit_idx in 0..64 {
+                if (word >> bit_idx) & 1 != 0 {
+                    let page_num = (word_idx as u64 * 64) + bit_idx as u64;
+                    if page_num < num_pages {
+                        pages.push(DirtyPageInfo {
+                            guest_addr: base_addr + page_num * PAGE_SIZE,
+                            size: PAGE_SIZE,
+                        });
+                    }
+                }
+            }
+        }
+
+        pages
+    }
 }
 
 impl VirtualMachine for KvmVm {
@@ -664,6 +894,110 @@ impl VirtualMachine for KvmVm {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+
+    fn vcpu_count(&self) -> u32 {
+        self.config.vcpu_count
+    }
+
+    fn snapshot_devices(&self) -> Result<Vec<DeviceSnapshot>, HypervisorError> {
+        let devices = self
+            .virtio_devices
+            .read()
+            .map_err(|_| HypervisorError::SnapshotError("Lock poisoned".to_string()))?;
+
+        let mut snapshots = Vec::with_capacity(devices.len());
+
+        for device in devices.iter() {
+            // KVM VirtIO devices don't have internal state accessible from host.
+            // The actual device state is managed by the VMM layer (e.g., arcbox-virtio).
+            // We record the device configuration here; the VMM would need to
+            // serialize its own device state.
+            let state_bytes = bincode_serialize_device_config(device);
+
+            snapshots.push(DeviceSnapshot {
+                device_type: device.device_type.clone(),
+                name: format!(
+                    "{:?}-{}",
+                    device.device_type,
+                    snapshots.len()
+                ),
+                state: state_bytes,
+            });
+        }
+
+        tracing::debug!(
+            "snapshot_devices: captured {} device configurations",
+            snapshots.len()
+        );
+
+        Ok(snapshots)
+    }
+
+    fn restore_devices(&mut self, snapshots: &[DeviceSnapshot]) -> Result<(), HypervisorError> {
+        // KVM device restoration is complex:
+        // 1. VirtIO MMIO regions must be at the same addresses
+        // 2. IRQs must be assigned to the same GSIs
+        // 3. The VMM layer must restore internal device state
+        //
+        // For now, we verify that the device configuration matches.
+        let devices = self
+            .virtio_devices
+            .read()
+            .map_err(|_| HypervisorError::SnapshotError("Lock poisoned".to_string()))?;
+
+        if snapshots.len() != devices.len() {
+            return Err(HypervisorError::SnapshotError(format!(
+                "Device count mismatch: snapshot has {}, VM has {}",
+                snapshots.len(),
+                devices.len()
+            )));
+        }
+
+        for (snapshot, device) in snapshots.iter().zip(devices.iter()) {
+            if snapshot.device_type != device.device_type {
+                return Err(HypervisorError::SnapshotError(format!(
+                    "Device type mismatch: snapshot has {:?}, VM has {:?}",
+                    snapshot.device_type, device.device_type
+                )));
+            }
+        }
+
+        tracing::debug!(
+            "restore_devices: verified {} device configurations",
+            snapshots.len()
+        );
+
+        Ok(())
+    }
+}
+
+/// Serializes device configuration to bytes for snapshot storage.
+fn bincode_serialize_device_config(device: &VirtioDeviceInfo) -> Vec<u8> {
+    // Simple serialization of device config for snapshot purposes.
+    // A full implementation would use serde/bincode.
+    let mut bytes = Vec::new();
+
+    // Serialize device type as u8
+    let type_byte = match device.device_type {
+        VirtioDeviceType::Block => 0u8,
+        VirtioDeviceType::Net => 1,
+        VirtioDeviceType::Console => 2,
+        VirtioDeviceType::Rng => 3,
+        VirtioDeviceType::Balloon => 4,
+        VirtioDeviceType::Fs => 5,
+        VirtioDeviceType::Vsock => 6,
+        VirtioDeviceType::Gpu => 7,
+    };
+    bytes.push(type_byte);
+
+    // Serialize MMIO base and size
+    bytes.extend_from_slice(&device.mmio_base.to_le_bytes());
+    bytes.extend_from_slice(&device.mmio_size.to_le_bytes());
+
+    // Serialize IRQ
+    bytes.extend_from_slice(&device.irq.to_le_bytes());
+
+    bytes
 }
 
 impl Drop for KvmVm {
@@ -829,5 +1163,82 @@ mod tests {
         let fs_config = VirtioDeviceConfig::filesystem("/share", "share");
         let result = vm.add_virtio_device(fs_config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_dirty_bitmap_empty() {
+        let bitmap: Vec<u64> = vec![0; 4];
+        let pages = KvmVm::parse_dirty_bitmap(&bitmap, 0, 1024 * 1024);
+        assert!(pages.is_empty());
+    }
+
+    #[test]
+    fn test_parse_dirty_bitmap_all_dirty() {
+        // 64 pages = 1 word, all bits set.
+        let bitmap: Vec<u64> = vec![u64::MAX];
+        let pages = KvmVm::parse_dirty_bitmap(&bitmap, 0, 64 * PAGE_SIZE);
+        assert_eq!(pages.len(), 64);
+
+        // Verify first and last page addresses.
+        assert_eq!(pages[0].guest_addr, 0);
+        assert_eq!(pages[0].size, PAGE_SIZE);
+        assert_eq!(pages[63].guest_addr, 63 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn test_parse_dirty_bitmap_sparse() {
+        // Only pages 0, 63, 64, and 127 are dirty (first and last of two words).
+        let mut bitmap: Vec<u64> = vec![0; 2];
+        bitmap[0] = 1 | (1 << 63); // Page 0 and 63.
+        bitmap[1] = 1 | (1 << 63); // Page 64 and 127.
+
+        let pages = KvmVm::parse_dirty_bitmap(&bitmap, 0x1000_0000, 128 * PAGE_SIZE);
+        assert_eq!(pages.len(), 4);
+
+        assert_eq!(pages[0].guest_addr, 0x1000_0000);
+        assert_eq!(pages[1].guest_addr, 0x1000_0000 + 63 * PAGE_SIZE);
+        assert_eq!(pages[2].guest_addr, 0x1000_0000 + 64 * PAGE_SIZE);
+        assert_eq!(pages[3].guest_addr, 0x1000_0000 + 127 * PAGE_SIZE);
+    }
+
+    #[test]
+    #[ignore] // Requires /dev/kvm
+    fn test_dirty_tracking_enable_disable() {
+        let kvm = Arc::new(KvmSystem::open().expect("Failed to open KVM"));
+        let mmap_size = kvm.vcpu_mmap_size().expect("Failed to get mmap size");
+
+        let config = VmConfig {
+            vcpu_count: 1,
+            memory_size: 16 * 1024 * 1024, // 16MB
+            ..Default::default()
+        };
+
+        let vm = KvmVm::new(kvm, mmap_size, config).unwrap();
+
+        // Initially disabled.
+        assert!(!vm.is_dirty_tracking_enabled());
+
+        // Cannot get dirty pages when not enabled.
+        assert!(vm.get_dirty_pages().is_err());
+
+        // Enable dirty tracking.
+        vm.enable_dirty_tracking().unwrap();
+        assert!(vm.is_dirty_tracking_enabled());
+
+        // Re-enabling is a no-op.
+        vm.enable_dirty_tracking().unwrap();
+        assert!(vm.is_dirty_tracking_enabled());
+
+        // Can get dirty pages (should be all pages initially).
+        let pages = vm.get_dirty_pages().unwrap();
+        // All pages might be marked dirty initially.
+        println!("Initial dirty pages: {}", pages.len());
+
+        // Disable dirty tracking.
+        vm.disable_dirty_tracking().unwrap();
+        assert!(!vm.is_dirty_tracking_enabled());
+
+        // Cannot get dirty pages when disabled.
+        assert!(vm.get_dirty_pages().is_err());
     }
 }

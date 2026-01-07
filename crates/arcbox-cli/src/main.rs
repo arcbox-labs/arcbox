@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use arcbox_cli::client;
+use arcbox_core::{Config, Runtime};
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -76,8 +77,13 @@ async fn execute_info() -> Result<()> {
             .unwrap_or_default();
         println!("Images: {}", images.len());
 
-        // TODO: Get machine count from gRPC API
-        println!("Machines: 0");
+        // Get machine count from Runtime
+        let machine_count = Config::load()
+            .ok()
+            .and_then(|config| Runtime::new(config).ok())
+            .map(|runtime| runtime.machine_manager().list().len())
+            .unwrap_or(0);
+        println!("Machines: {}", machine_count);
     } else {
         println!("Containers: (daemon not running)");
         println!("Images: (daemon not running)");

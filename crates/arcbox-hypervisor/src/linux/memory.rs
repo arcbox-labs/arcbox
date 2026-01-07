@@ -2,10 +2,13 @@
 
 use std::sync::RwLock;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::{
     error::HypervisorError,
-    memory::{GuestAddress, MemoryRegion},
+    memory::{GuestAddress, MemoryRegion, PAGE_SIZE},
     traits::GuestMemory,
+    types::DirtyPageInfo,
 };
 
 use super::ffi;
@@ -21,6 +24,8 @@ pub struct KvmMemory {
     total_size: u64,
     /// Base host address (for the primary region).
     base_host_addr: *mut u8,
+    /// Whether dirty page tracking is enabled.
+    dirty_tracking_enabled: AtomicBool,
 }
 
 /// A mapped memory region with its host backing.
@@ -70,6 +75,7 @@ impl KvmMemory {
             regions: RwLock::new(vec![region]),
             total_size: size,
             base_host_addr: host_addr,
+            dirty_tracking_enabled: AtomicBool::new(false),
         })
     }
 
@@ -319,6 +325,107 @@ impl GuestMemory for KvmMemory {
 
     fn size(&self) -> u64 {
         self.total_size
+    }
+
+    fn enable_dirty_tracking(&mut self) -> Result<(), HypervisorError> {
+        // KVM supports dirty page tracking via KVM_SET_USER_MEMORY_REGION with
+        // KVM_MEM_LOG_DIRTY_PAGES flag, and KVM_GET_DIRTY_LOG to retrieve dirty pages.
+        //
+        // Note: This requires re-registering memory regions with the dirty logging flag.
+        // For simplicity, we just set a flag here. The actual KVM_SET_USER_MEMORY_REGION
+        // calls would need to be done in the VM layer where we have access to the VM fd.
+        self.dirty_tracking_enabled.store(true, Ordering::SeqCst);
+        tracing::debug!("Dirty page tracking enabled");
+        Ok(())
+    }
+
+    fn disable_dirty_tracking(&mut self) -> Result<(), HypervisorError> {
+        self.dirty_tracking_enabled.store(false, Ordering::SeqCst);
+        tracing::debug!("Dirty page tracking disabled");
+        Ok(())
+    }
+
+    fn get_dirty_pages(&mut self) -> Result<Vec<DirtyPageInfo>, HypervisorError> {
+        // KVM dirty page tracking works via KVM_GET_DIRTY_LOG ioctl on the VM fd.
+        // This returns a bitmap of dirty pages for a given memory slot.
+        //
+        // Since we don't have access to the VM fd here, this method would need to
+        // be called through the VM layer. For now, return an error indicating
+        // that the caller should use the VM-level API.
+        //
+        // In a full implementation, this would:
+        // 1. Call KVM_GET_DIRTY_LOG for each memory slot
+        // 2. Parse the bitmap to get list of dirty page addresses
+        // 3. Clear the dirty log
+        if !self.dirty_tracking_enabled.load(Ordering::SeqCst) {
+            return Err(HypervisorError::SnapshotError(
+                "Dirty tracking not enabled".to_string(),
+            ));
+        }
+
+        // Placeholder: return all pages as dirty (conservative approach)
+        // A real implementation would use KVM_GET_DIRTY_LOG
+        let regions = self
+            .regions
+            .read()
+            .map_err(|_| HypervisorError::MemoryError("Lock poisoned".to_string()))?;
+
+        let mut dirty_pages = Vec::new();
+        for region in regions.iter() {
+            let num_pages = region.size / PAGE_SIZE;
+            for page_idx in 0..num_pages {
+                dirty_pages.push(DirtyPageInfo {
+                    guest_addr: region.guest_addr.raw() + page_idx * PAGE_SIZE,
+                    size: PAGE_SIZE,
+                });
+            }
+        }
+
+        tracing::warn!(
+            "get_dirty_pages: returning all {} pages as dirty (KVM_GET_DIRTY_LOG not implemented)",
+            dirty_pages.len()
+        );
+
+        Ok(dirty_pages)
+    }
+
+    fn dump_all(&self, buf: &mut [u8]) -> Result<(), HypervisorError> {
+        if (buf.len() as u64) < self.total_size {
+            return Err(HypervisorError::MemoryError(format!(
+                "Buffer too small: {} bytes, need {} bytes",
+                buf.len(),
+                self.total_size
+            )));
+        }
+
+        let regions = self
+            .regions
+            .read()
+            .map_err(|_| HypervisorError::MemoryError("Lock poisoned".to_string()))?;
+
+        // Copy each region to the appropriate offset in the buffer.
+        for region in regions.iter() {
+            let offset = region.guest_addr.raw() as usize;
+            let end = offset + region.size as usize;
+
+            if end > buf.len() {
+                return Err(HypervisorError::MemoryError(format!(
+                    "Region at {} with size {} exceeds buffer",
+                    region.guest_addr, region.size
+                )));
+            }
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    region.host_addr,
+                    buf[offset..end].as_mut_ptr(),
+                    region.size as usize,
+                );
+            }
+        }
+
+        tracing::debug!("Dumped {} bytes of guest memory", self.total_size);
+        Ok(())
     }
 }
 

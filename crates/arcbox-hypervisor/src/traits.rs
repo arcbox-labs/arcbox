@@ -9,7 +9,10 @@ use crate::{
     config::VmConfig,
     error::HypervisorError,
     memory::GuestAddress,
-    types::{PlatformCapabilities, Registers, VcpuExit, VirtioDeviceConfig},
+    types::{
+        DeviceSnapshot, DirtyPageInfo, PlatformCapabilities, Registers, VcpuExit, VcpuSnapshot,
+        VirtioDeviceConfig,
+    },
 };
 
 /// Main hypervisor trait for creating and managing virtual machines.
@@ -108,6 +111,23 @@ pub trait VirtualMachine: Send + Sync {
 
     /// Returns the VM as a mutable reference to `Any` for downcasting.
     fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    /// Returns the number of vCPUs in the VM.
+    fn vcpu_count(&self) -> u32;
+
+    /// Gets snapshots of all device states.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if device states cannot be captured.
+    fn snapshot_devices(&self) -> Result<Vec<DeviceSnapshot>, HypervisorError>;
+
+    /// Restores device states from snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if device states cannot be restored.
+    fn restore_devices(&mut self, snapshots: &[DeviceSnapshot]) -> Result<(), HypervisorError>;
 }
 
 /// Virtual CPU trait for executing guest code.
@@ -155,6 +175,20 @@ pub trait Vcpu: Send {
     ///
     /// Returns an error if the result cannot be set.
     fn set_mmio_result(&mut self, value: u64) -> Result<(), HypervisorError>;
+
+    /// Creates a snapshot of the vCPU state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot cannot be created.
+    fn snapshot(&self) -> Result<VcpuSnapshot, HypervisorError>;
+
+    /// Restores the vCPU state from a snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state cannot be restored.
+    fn restore(&mut self, snapshot: &VcpuSnapshot) -> Result<(), HypervisorError>;
 }
 
 /// Guest memory trait for reading/writing guest physical memory.
@@ -188,4 +222,36 @@ pub trait GuestMemory: Send + Sync {
 
     /// Returns the total size of guest memory in bytes.
     fn size(&self) -> u64;
+
+    /// Enables dirty page tracking.
+    ///
+    /// After enabling, use `get_dirty_pages()` to retrieve modified pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if dirty tracking cannot be enabled.
+    fn enable_dirty_tracking(&mut self) -> Result<(), HypervisorError>;
+
+    /// Disables dirty page tracking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if dirty tracking cannot be disabled.
+    fn disable_dirty_tracking(&mut self) -> Result<(), HypervisorError>;
+
+    /// Gets and clears the list of dirty pages since the last call.
+    ///
+    /// This resets the dirty bitmap after returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if dirty pages cannot be retrieved.
+    fn get_dirty_pages(&mut self) -> Result<Vec<DirtyPageInfo>, HypervisorError>;
+
+    /// Reads all guest memory into a buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if memory cannot be read.
+    fn dump_all(&self, buf: &mut [u8]) -> Result<(), HypervisorError>;
 }

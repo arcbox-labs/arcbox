@@ -60,6 +60,7 @@ pub const KVM_IRQFD: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x76, KvmIrqfd);
 pub const KVM_IOEVENTFD: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x79, KvmIoeventfd);
 pub const KVM_IRQ_LINE: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x61, KvmIrqLevel);
 pub const KVM_SET_GSI_ROUTING: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x6a, KvmIrqRouting);
+pub const KVM_GET_DIRTY_LOG: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x42, KvmDirtyLog);
 
 // vCPU ioctls for interrupt injection
 pub const KVM_INTERRUPT: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0x86, KvmInterrupt);
@@ -177,6 +178,26 @@ pub const KVM_EXIT_IO_OUT: u8 = 1;
 
 pub const KVM_MEM_LOG_DIRTY_PAGES: u32 = 1 << 0;
 pub const KVM_MEM_READONLY: u32 = 1 << 1;
+
+// ============================================================================
+// Dirty Log Structures
+// ============================================================================
+
+/// Structure for KVM_GET_DIRTY_LOG ioctl.
+///
+/// This is used to retrieve a bitmap of dirty pages for a memory slot.
+/// Each bit in the bitmap represents one page (typically 4KB).
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct KvmDirtyLog {
+    /// Memory slot ID.
+    pub slot: u32,
+    /// Padding for alignment.
+    pub padding: u32,
+    /// Pointer to userspace bitmap buffer.
+    /// The buffer must be large enough to hold (memory_size / page_size / 8) bytes.
+    pub dirty_bitmap: *mut u64,
+}
 
 // ============================================================================
 // Data Structures
@@ -967,6 +988,111 @@ impl KvmVmFd {
             return Err(KvmError::from(std::io::Error::last_os_error()));
         }
         Ok(())
+    }
+
+    /// Enables dirty page logging for a memory slot.
+    ///
+    /// This updates the memory region to enable the `KVM_MEM_LOG_DIRTY_PAGES` flag.
+    /// After enabling, dirty pages can be retrieved with `get_dirty_log`.
+    ///
+    /// # Arguments
+    /// * `slot` - The memory slot ID
+    /// * `guest_phys_addr` - Guest physical address of the region
+    /// * `memory_size` - Size of the memory region
+    /// * `userspace_addr` - Host virtual address of the memory
+    pub fn enable_dirty_logging(
+        &self,
+        slot: u32,
+        guest_phys_addr: u64,
+        memory_size: u64,
+        userspace_addr: u64,
+    ) -> KvmResult<()> {
+        let region = KvmUserspaceMemoryRegion {
+            slot,
+            flags: KVM_MEM_LOG_DIRTY_PAGES,
+            guest_phys_addr,
+            memory_size,
+            userspace_addr,
+        };
+
+        self.set_user_memory_region(&region)
+    }
+
+    /// Disables dirty page logging for a memory slot.
+    ///
+    /// This updates the memory region to remove the `KVM_MEM_LOG_DIRTY_PAGES` flag.
+    ///
+    /// # Arguments
+    /// * `slot` - The memory slot ID
+    /// * `guest_phys_addr` - Guest physical address of the region
+    /// * `memory_size` - Size of the memory region
+    /// * `userspace_addr` - Host virtual address of the memory
+    pub fn disable_dirty_logging(
+        &self,
+        slot: u32,
+        guest_phys_addr: u64,
+        memory_size: u64,
+        userspace_addr: u64,
+    ) -> KvmResult<()> {
+        let region = KvmUserspaceMemoryRegion {
+            slot,
+            flags: 0,
+            guest_phys_addr,
+            memory_size,
+            userspace_addr,
+        };
+
+        self.set_user_memory_region(&region)
+    }
+
+    /// Gets the dirty page bitmap for a memory slot.
+    ///
+    /// The bitmap is a bit array where each bit represents one page.
+    /// A bit set to 1 indicates the corresponding page was written to since
+    /// the last call to `get_dirty_log`.
+    ///
+    /// **Important**: Calling this function clears the dirty log for the slot.
+    ///
+    /// # Arguments
+    /// * `slot` - The memory slot ID
+    /// * `memory_size` - Size of the memory region (used to determine bitmap size)
+    /// * `page_size` - Page size (typically 4096 bytes)
+    ///
+    /// # Returns
+    /// A vector of u64 values representing the dirty bitmap.
+    /// Each bit corresponds to a page: bit 0 of word 0 is page 0, etc.
+    pub fn get_dirty_log(
+        &self,
+        slot: u32,
+        memory_size: u64,
+        page_size: u64,
+    ) -> KvmResult<Vec<u64>> {
+        // Calculate the number of pages and bitmap size.
+        let num_pages = (memory_size + page_size - 1) / page_size;
+        let bitmap_size = ((num_pages + 63) / 64) as usize; // Round up to u64
+
+        // Allocate and zero the bitmap buffer.
+        let mut bitmap: Vec<u64> = vec![0; bitmap_size];
+
+        let dirty_log = KvmDirtyLog {
+            slot,
+            padding: 0,
+            dirty_bitmap: bitmap.as_mut_ptr(),
+        };
+
+        let ret = unsafe {
+            libc::ioctl(
+                self.fd.as_raw_fd(),
+                KVM_GET_DIRTY_LOG,
+                &dirty_log as *const _ as libc::c_ulong,
+            )
+        };
+
+        if ret < 0 {
+            return Err(KvmError::from(std::io::Error::last_os_error()));
+        }
+
+        Ok(bitmap)
     }
 
     /// Returns the raw file descriptor.

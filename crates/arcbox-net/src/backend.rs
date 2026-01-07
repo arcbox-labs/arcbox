@@ -18,11 +18,12 @@ pub trait NetworkBackend: Send + Sync {
 }
 
 /// TAP backend for Linux.
+///
+/// This is a wrapper around `LinuxTap` that conforms to the `NetworkBackend` trait.
 #[cfg(target_os = "linux")]
 pub struct TapBackend {
-    // TODO: TAP file descriptor
-    mac: [u8; 6],
-    mtu: u16,
+    /// Inner TAP device.
+    inner: crate::linux::LinuxTap,
 }
 
 #[cfg(target_os = "linux")]
@@ -33,30 +34,81 @@ impl TapBackend {
     ///
     /// Returns an error if the TAP device cannot be created.
     pub fn new(name: &str, mac: [u8; 6], mtu: u16) -> Result<Self> {
-        // TODO: Create TAP device
-        let _ = name;
-        Ok(Self { mac, mtu })
+        let config = crate::linux::TapConfig::new()
+            .with_name(name)
+            .with_mac(mac)
+            .with_mtu(mtu);
+        let inner = crate::linux::LinuxTap::new(config)?;
+        Ok(Self { inner })
+    }
+
+    /// Creates a new TAP backend with default settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the TAP device cannot be created.
+    pub fn new_default() -> Result<Self> {
+        let inner = crate::linux::LinuxTap::new(crate::linux::TapConfig::default())?;
+        Ok(Self { inner })
+    }
+
+    /// Creates a new TAP backend with custom configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the TAP device cannot be created.
+    pub fn with_config(config: crate::linux::TapConfig) -> Result<Self> {
+        let inner = crate::linux::LinuxTap::new(config)?;
+        Ok(Self { inner })
+    }
+
+    /// Returns the TAP device name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    /// Brings the TAP interface up.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
+    pub fn bring_up(&self) -> Result<()> {
+        self.inner.bring_up()
+    }
+
+    /// Brings the TAP interface down.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the operation fails.
+    pub fn bring_down(&self) -> Result<()> {
+        self.inner.bring_down()
+    }
+
+    /// Returns the raw file descriptor.
+    #[must_use]
+    pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.inner.as_raw_fd()
     }
 }
 
 #[cfg(target_os = "linux")]
 impl NetworkBackend for TapBackend {
-    fn send(&self, _data: &[u8]) -> Result<usize> {
-        // TODO: Write to TAP
-        Ok(0)
+    fn send(&self, data: &[u8]) -> Result<usize> {
+        self.inner.send(data)
     }
 
-    fn recv(&self, _buf: &mut [u8]) -> Result<usize> {
-        // TODO: Read from TAP
-        Ok(0)
+    fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+        self.inner.recv(buf)
     }
 
     fn mac(&self) -> [u8; 6] {
-        self.mac
+        self.inner.mac()
     }
 
     fn mtu(&self) -> u16 {
-        self.mtu
+        self.inner.mtu()
     }
 }
 

@@ -3,6 +3,7 @@
 use arcbox_cli::client;
 use anyhow::Result;
 use clap::Args;
+use tokio_util::sync::CancellationToken;
 
 /// Arguments for the logs command.
 #[derive(Args)]
@@ -78,8 +79,27 @@ pub async fn execute(args: LogsArgs) -> Result<()> {
     let path = format!("/v1.43/containers/{}/logs?{}", args.container, query);
 
     if args.follow {
-        // Streaming mode
-        daemon.stream_logs(&path, print_log_frame).await?;
+        // Streaming mode with Ctrl+C handling
+        let cancel_token = CancellationToken::new();
+        let cancel_clone = cancel_token.clone();
+
+        // Setup Ctrl+C handler
+        let ctrl_c_task = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                tracing::debug!("Received Ctrl+C, cancelling log stream");
+                cancel_clone.cancel();
+            }
+        });
+
+        // Stream logs with cancellation support
+        let result = daemon
+            .stream_logs_with_cancel(&path, &mut print_log_frame, cancel_token)
+            .await;
+
+        // Abort the Ctrl+C handler task
+        ctrl_c_task.abort();
+
+        result?;
     } else {
         // Non-streaming mode: get all logs at once
         let logs = daemon.get_raw(&path).await?;

@@ -217,6 +217,7 @@ pub async fn start_container(
         .runtime
         .container_manager()
         .start(&container_id)
+        .await
         .map_err(|e| match e {
             arcbox_container::ContainerError::NotFound(_) => DockerError::ContainerNotFound(id),
             _ => DockerError::Server(e.to_string()),
@@ -238,14 +239,16 @@ pub struct StopContainerQuery {
 pub async fn stop_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(_params): Query<StopContainerQuery>,
+    Query(params): Query<StopContainerQuery>,
 ) -> Result<StatusCode> {
     let container_id = arcbox_container::state::ContainerId::from_string(&id);
+    let timeout = params.t.unwrap_or(10); // Default 10 seconds timeout
 
     state
         .runtime
         .container_manager()
-        .stop(&container_id)
+        .stop(&container_id, timeout)
+        .await
         .map_err(|e| match e {
             arcbox_container::ContainerError::NotFound(_) => DockerError::ContainerNotFound(id),
             _ => DockerError::Server(e.to_string()),
@@ -266,31 +269,48 @@ pub async fn kill_container(
         .unwrap_or_else(|| "SIGKILL".to_string());
     let container_id = arcbox_container::state::ContainerId::from_string(&id);
 
-    state
+    // Get container to find its machine.
+    let container = state
         .runtime
         .container_manager()
-        .kill(&container_id, &signal)
-        .map_err(|e| match e {
-            arcbox_container::ContainerError::NotFound(_) => DockerError::ContainerNotFound(id),
-            arcbox_container::ContainerError::InvalidState(msg) => DockerError::Conflict(msg),
-            _ => DockerError::Server(e.to_string()),
-        })?;
+        .get(&container_id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+
+    let machine_name = container
+        .machine_name
+        .unwrap_or_else(|| "default".to_string());
+
+    // Kill through Runtime -> Agent.
+    state
+        .runtime
+        .kill_container(&machine_name, &container_id, &signal)
+        .await
+        .map_err(|e| DockerError::Server(e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Restart container query parameters.
+#[derive(Debug, Deserialize)]
+pub struct RestartContainerQuery {
+    /// Timeout in seconds.
+    pub t: Option<u32>,
 }
 
 /// Restart container.
 pub async fn restart_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(_params): Query<HashMap<String, String>>,
+    Query(params): Query<RestartContainerQuery>,
 ) -> Result<StatusCode> {
     let container_id = arcbox_container::state::ContainerId::from_string(&id);
+    let timeout = params.t.unwrap_or(10);
 
     state
         .runtime
         .container_manager()
-        .restart(&container_id)
+        .restart(&container_id, timeout)
+        .await
         .map_err(|e| match e {
             arcbox_container::ContainerError::NotFound(_) => DockerError::ContainerNotFound(id),
             _ => DockerError::Server(e.to_string()),
@@ -334,6 +354,8 @@ pub async fn remove_container(
 }
 
 /// Wait for container.
+///
+/// Blocks until the container exits and returns the exit code.
 pub async fn wait_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -341,35 +363,22 @@ pub async fn wait_container(
 ) -> Result<Json<WaitResponse>> {
     let container_id = arcbox_container::state::ContainerId::from_string(&id);
 
-    // Check if container exists.
-    let container = state
-        .runtime
-        .container_manager()
-        .get(&container_id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
-
-    // If already exited, return immediately.
-    if let Some(exit_code) = state.runtime.container_manager().wait(&container_id) {
-        return Ok(Json(WaitResponse {
-            status_code: i64::from(exit_code),
-            error: None,
-        }));
+    // Check if container exists first.
+    if state.runtime.container_manager().get(&container_id).is_none() {
+        return Err(DockerError::ContainerNotFound(id.clone()));
     }
 
-    // If still running, return current state.
-    // Note: A full implementation would use async channels to wait for exit.
-    if container.state == arcbox_container::state::ContainerState::Running {
-        // For now, just return 0 as a placeholder.
-        // In a real implementation, we'd wait for the container to exit.
-        Ok(Json(WaitResponse {
-            status_code: 0,
-            error: None,
-        }))
-    } else {
-        Ok(Json(WaitResponse {
-            status_code: i64::from(container.exit_code.unwrap_or(0)),
-            error: None,
-        }))
+    // Wait for container to exit asynchronously.
+    match state.runtime.container_manager().wait_async(&container_id).await {
+        Ok(exit_code) => {
+            Ok(Json(WaitResponse {
+                status_code: i64::from(exit_code),
+                error: None,
+            }))
+        }
+        Err(e) => {
+            Err(DockerError::Server(format!("wait failed: {}", e)))
+        }
     }
 }
 
@@ -647,26 +656,75 @@ pub async fn exec_start(
 
     let exec_id = ExecId::from_string(&id);
 
-    // Start the exec.
-    state
+    // Get exec instance.
+    let exec = state
         .runtime
         .exec_manager()
-        .start(&exec_id)
-        .map_err(|e| match e {
-            arcbox_container::ContainerError::NotFound(_) => {
-                DockerError::NotImplemented(format!("exec {id} not found"))
-            }
-            e => DockerError::Server(e.to_string()),
+        .get(&exec_id)
+        .ok_or_else(|| DockerError::NotImplemented(format!("exec {id} not found")))?;
+
+    // Get container to find its machine.
+    let container = state
+        .runtime
+        .container_manager()
+        .get(&exec.config.container_id)
+        .ok_or_else(|| {
+            DockerError::ContainerNotFound(exec.config.container_id.to_string())
         })?;
 
-    // Return raw stream format (empty for now since exec completes immediately).
+    let machine_name = container
+        .machine_name
+        .unwrap_or_else(|| "default".to_string());
+
+    // Convert env from Vec<String> to HashMap.
+    let env: std::collections::HashMap<String, String> = exec
+        .config
+        .env
+        .iter()
+        .filter_map(|e| {
+            let parts: Vec<&str> = e.splitn(2, '=').collect();
+            if parts.len() == 2 {
+                Some((parts[0].to_string(), parts[1].to_string()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Execute through Runtime -> Agent.
+    let output = state
+        .runtime
+        .exec_container(
+            &machine_name,
+            &exec.config.container_id.to_string(),
+            exec.config.cmd.clone(),
+            env,
+            exec.config.working_dir.clone().unwrap_or_default(),
+            exec.config.user.clone().unwrap_or_default(),
+            exec.config.tty,
+        )
+        .await
+        .map_err(|e| DockerError::Server(e.to_string()))?;
+
+    // Mark exec as started in ExecManager.
+    // Use default TTY size since the actual exec already completed via agent.
+    let _ = state
+        .runtime
+        .exec_manager()
+        .start(&exec_id, false, 80, 24)
+        .await;
+
+    // Encode output in Docker stream format.
+    let stream_type: u8 = if exec.config.attach_stdout { 1 } else { 2 };
+    let encoded = encode_docker_stream(stream_type, &output.data);
+
     Ok((
         StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
             "application/vnd.docker.raw-stream",
         )],
-        "",
+        encoded,
     ))
 }
 
@@ -687,6 +745,7 @@ pub async fn exec_resize(
         .runtime
         .exec_manager()
         .resize(&exec_id, h, w)
+        .await
         .map_err(|e| match e {
             arcbox_container::ContainerError::NotFound(_) => {
                 DockerError::NotImplemented(format!("exec {id} not found"))
@@ -1117,9 +1176,9 @@ pub async fn list_volumes(
             name: v.name.clone(),
             driver: v.driver.clone(),
             mountpoint: v.mountpoint.display().to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: v.created_at.to_rfc3339(),
             labels: v.labels.clone(),
-            scope: "local".to_string(),
+            scope: v.scope.clone(),
             options: HashMap::new(),
         })
         .collect();
@@ -1135,9 +1194,13 @@ pub async fn create_volume(
     State(state): State<AppState>,
     Json(body): Json<VolumeCreateRequest>,
 ) -> Result<(StatusCode, Json<VolumeSummary>)> {
-    let name = body
-        .name
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().replace('-', ""));
+    use arcbox_container::VolumeCreateOptions;
+
+    let options = VolumeCreateOptions {
+        name: body.name,
+        driver: body.driver,
+        labels: body.labels.unwrap_or_default(),
+    };
 
     let mut vm = state
         .runtime
@@ -1146,7 +1209,7 @@ pub async fn create_volume(
         .map_err(|_| DockerError::Server("lock poisoned".to_string()))?;
 
     let volume = vm
-        .create(&name)
+        .create(options)
         .map_err(|e| DockerError::Server(e.to_string()))?;
 
     Ok((
@@ -1155,9 +1218,9 @@ pub async fn create_volume(
             name: volume.name.clone(),
             driver: volume.driver.clone(),
             mountpoint: volume.mountpoint.display().to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: volume.created_at.to_rfc3339(),
             labels: volume.labels.clone(),
-            scope: "local".to_string(),
+            scope: volume.scope.clone(),
             options: body.driver_opts.unwrap_or_default(),
         }),
     ))
@@ -1175,16 +1238,16 @@ pub async fn inspect_volume(
         .map_err(|_| DockerError::Server("lock poisoned".to_string()))?;
 
     let volume = vm
-        .get(&name)
+        .inspect(&name)
         .ok_or_else(|| DockerError::VolumeNotFound(name.clone()))?;
 
     Ok(Json(VolumeSummary {
         name: volume.name.clone(),
         driver: volume.driver.clone(),
         mountpoint: volume.mountpoint.display().to_string(),
-        created_at: chrono::Utc::now().to_rfc3339(),
+        created_at: volume.created_at.to_rfc3339(),
         labels: volume.labels.clone(),
-        scope: "local".to_string(),
+        scope: volume.scope.clone(),
         options: HashMap::new(),
     }))
 }
@@ -1210,6 +1273,27 @@ pub async fn remove_volume(
         .map_err(|e| DockerError::Server(e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Prune unused volumes.
+pub async fn prune_volumes(
+    State(state): State<AppState>,
+    Query(_params): Query<HashMap<String, String>>,
+) -> Result<Json<VolumePruneResponse>> {
+    let mut vm = state
+        .runtime
+        .volume_manager()
+        .write()
+        .map_err(|_| DockerError::Server("lock poisoned".to_string()))?;
+
+    let result = vm
+        .prune()
+        .map_err(|e| DockerError::Server(e.to_string()))?;
+
+    Ok(Json(VolumePruneResponse {
+        volumes_deleted: result.volumes_deleted,
+        space_reclaimed: result.space_reclaimed,
+    }))
 }
 
 // ============================================================================
