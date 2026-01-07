@@ -183,14 +183,79 @@ pub fn udp_checksum(
 
 /// SIMD-optimized checksum for ARM64 NEON.
 ///
-/// TODO: Implement proper NEON optimization with correct big-endian word handling.
-/// For now, use scalar path to ensure correctness.
+/// Uses NEON intrinsics to process 16 bytes at a time, with correct handling
+/// of network byte order (big-endian 16-bit words).
+///
+/// # Safety
+///
+/// This function uses `#[target_feature(enable = "neon")]` and requires NEON support.
+/// On AArch64, NEON is always available as part of the architecture specification.
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+pub unsafe fn checksum_simd_neon(data: &[u8]) -> u16 {
+    use std::arch::aarch64::*;
+
+    // SAFETY: All NEON intrinsics below are safe to call because:
+    // 1. We have #[target_feature(enable = "neon")] ensuring NEON is available
+    // 2. Pointer passed to vld1q_u8 is valid (from slice with length >= 16)
+    unsafe {
+        let mut sum = vdupq_n_u32(0);
+        let chunks = data.chunks_exact(16);
+        let remainder = chunks.remainder();
+
+        for chunk in chunks {
+            // Load 16 bytes from memory
+            let bytes = vld1q_u8(chunk.as_ptr());
+
+            // Network byte order is big-endian. On little-endian ARM64, we need to
+            // swap bytes within each 16-bit word to get the correct checksum value.
+            // vrev16q_u8 swaps adjacent bytes: [0,1,2,3,...] -> [1,0,3,2,...]
+            let swapped = vrev16q_u8(bytes);
+
+            // Now interpret as 16-bit words (already in correct order for summation)
+            let words = vreinterpretq_u16_u8(swapped);
+
+            // Pairwise add and accumulate to 32-bit to avoid overflow
+            // vpadalq_u16 adds adjacent pairs of u16 into u32 accumulators
+            sum = vpadalq_u16(sum, words);
+        }
+
+        // Horizontal sum of the four 32-bit lanes
+        let sum32 = vaddvq_u32(sum);
+
+        // Process remainder bytes using scalar code
+        let mut scalar_sum = sum32;
+        let mut i = 0;
+        while i + 1 < remainder.len() {
+            // Read big-endian 16-bit word
+            let word = u16::from_be_bytes([remainder[i], remainder[i + 1]]);
+            scalar_sum = scalar_sum.wrapping_add(word as u32);
+            i += 2;
+        }
+
+        // Handle odd byte (padded with zero on the right in network order)
+        if i < remainder.len() {
+            scalar_sum = scalar_sum.wrapping_add((remainder[i] as u32) << 8);
+        }
+
+        // Fold 32-bit sum into 16-bit checksum
+        while scalar_sum > 0xFFFF {
+            scalar_sum = (scalar_sum & 0xFFFF) + (scalar_sum >> 16);
+        }
+
+        !scalar_sum as u16
+    }
+}
+
+/// SIMD-optimized checksum for ARM64 NEON (safe wrapper).
+///
+/// This is the public safe interface that calls the unsafe NEON implementation.
+/// NEON is always available on AArch64 processors.
+#[cfg(target_arch = "aarch64")]
+#[inline]
 pub fn checksum_simd(data: &[u8]) -> u16 {
-    // The previous NEON implementation had a bug treating bytes individually
-    // instead of as big-endian 16-bit words. Use scalar for correctness.
-    // Proper NEON optimization can be added later with byte swapping.
-    checksum(data)
+    // SAFETY: NEON is mandatory on AArch64 architecture
+    unsafe { checksum_simd_neon(data) }
 }
 
 /// SIMD-optimized checksum for x86_64.
