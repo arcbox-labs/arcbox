@@ -6,6 +6,7 @@ use crate::error::{CoreError, Result};
 use crate::event::EventBus;
 use crate::machine::{MachineManager, MachineState};
 use crate::vm::VmManager;
+use crate::vm_lifecycle::{VmLifecycleConfig, VmLifecycleManager, DEFAULT_MACHINE_NAME};
 use arcbox_container::{ContainerConfig, ContainerId, ContainerManager, ContainerState, ExecManager, VolumeManager};
 use arcbox_image::{ImageRef, ImageStore};
 use arcbox_net::NetworkManager;
@@ -25,6 +26,8 @@ pub struct Runtime {
     vm_manager: Arc<VmManager>,
     /// Machine manager.
     machine_manager: Arc<MachineManager>,
+    /// VM lifecycle manager (automatic VM management).
+    vm_lifecycle: Arc<VmLifecycleManager>,
     /// Container manager.
     container_manager: Arc<ContainerManager>,
     /// Image store.
@@ -46,9 +49,29 @@ impl Runtime {
     ///
     /// Returns an error if the image store cannot be created.
     pub fn new(config: Config) -> Result<Self> {
+        Self::with_vm_lifecycle_config(config, VmLifecycleConfig::default())
+    }
+
+    /// Creates a new runtime with custom VM lifecycle configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the image store cannot be created.
+    pub fn with_vm_lifecycle_config(
+        config: Config,
+        vm_lifecycle_config: VmLifecycleConfig,
+    ) -> Result<Self> {
         let event_bus = EventBus::new();
         let vm_manager = Arc::new(VmManager::new());
         let machine_manager = Arc::new(MachineManager::new(VmManager::new(), config.data_dir.clone()));
+
+        // Create VM lifecycle manager with the machine manager
+        let vm_lifecycle = Arc::new(VmLifecycleManager::new(
+            machine_manager.clone(),
+            config.data_dir.clone(),
+            vm_lifecycle_config,
+        ));
+
         let container_manager = Arc::new(ContainerManager::new());
         let image_store = Arc::new(ImageStore::new(config.data_dir.join("images"))?);
         let volume_manager = Arc::new(RwLock::new(VolumeManager::new(
@@ -63,6 +86,7 @@ impl Runtime {
             event_bus,
             vm_manager,
             machine_manager,
+            vm_lifecycle,
             container_manager,
             image_store,
             volume_manager,
@@ -132,6 +156,33 @@ impl Runtime {
         &self.agent_pool
     }
 
+    /// Returns the VM lifecycle manager.
+    #[must_use]
+    pub fn vm_lifecycle(&self) -> &Arc<VmLifecycleManager> {
+        &self.vm_lifecycle
+    }
+
+    /// Ensures the default VM is running and ready for container operations.
+    ///
+    /// This is the main entry point for automatic VM lifecycle management.
+    /// If the VM is not running, it will be created and started automatically.
+    /// This method is idempotent and safe to call multiple times.
+    ///
+    /// Returns the vsock CID of the running VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the VM cannot be started or becomes unhealthy.
+    pub async fn ensure_vm_ready(&self) -> Result<u32> {
+        self.vm_lifecycle.ensure_ready().await
+    }
+
+    /// Returns the default machine name used for automatic VM lifecycle.
+    #[must_use]
+    pub fn default_machine_name(&self) -> &'static str {
+        DEFAULT_MACHINE_NAME
+    }
+
     /// Gets an agent client for a machine.
     ///
     /// On macOS, this uses the hypervisor layer to establish vsock connections.
@@ -171,8 +222,9 @@ impl Runtime {
     ///
     /// This performs the following in order:
     /// 1. Stop all running containers
-    /// 2. Stop all running VMs/machines
-    /// 3. Clean up network resources
+    /// 2. Shutdown VM lifecycle manager (handles default VM)
+    /// 3. Stop any remaining machines/VMs
+    /// 4. Clean up network resources
     ///
     /// # Errors
     ///
@@ -207,10 +259,15 @@ impl Runtime {
             }
         }
 
-        // 2. Stop all running machines/VMs.
+        // 2. Shutdown VM lifecycle manager (gracefully stops default VM).
+        if let Err(e) = self.vm_lifecycle.shutdown().await {
+            tracing::warn!("Failed to shutdown VM lifecycle manager: {}", e);
+        }
+
+        // 3. Stop any remaining machines/VMs (non-default VMs).
         let machines = self.machine_manager.list();
         for machine in machines {
-            if machine.state == MachineState::Running {
+            if machine.state == MachineState::Running && machine.name != DEFAULT_MACHINE_NAME {
                 tracing::debug!("Stopping machine {}", machine.name);
                 match self.machine_manager.stop(&machine.name) {
                     Ok(()) => {
@@ -223,7 +280,7 @@ impl Runtime {
             }
         }
 
-        // 3. Stop network manager.
+        // 4. Stop network manager.
         if let Err(e) = self.network_manager.stop() {
             tracing::warn!("Failed to stop network manager: {}", e);
         }
@@ -242,10 +299,15 @@ impl Runtime {
     pub async fn shutdown_force(&self) -> Result<()> {
         tracing::warn!("ArcBox runtime force shutdown");
 
-        // Force stop all machines (kill VMs).
+        // Force stop VM lifecycle manager (immediate VM termination).
+        if let Err(e) = self.vm_lifecycle.force_stop().await {
+            tracing::warn!("Failed to force stop VM lifecycle manager: {}", e);
+        }
+
+        // Force stop any remaining machines (non-default VMs).
         let machines = self.machine_manager.list();
         for machine in machines {
-            if machine.state == MachineState::Running {
+            if machine.state == MachineState::Running && machine.name != DEFAULT_MACHINE_NAME {
                 tracing::debug!("Force stopping machine {}", machine.name);
                 let _ = self.machine_manager.stop(&machine.name);
             }
@@ -296,11 +358,10 @@ impl Runtime {
         let container_id = self.container_manager.create(config.clone())?;
 
         // Update container with machine name
-        if let Some(mut container) = self.container_manager.get(&container_id) {
-            container.machine_name = Some(machine_name.to_string());
-            // Note: ContainerManager doesn't have an update method, so we'd need to add one
-            // For now, we'll rely on the agent communication for actual container state
-        }
+        let machine_name_clone = machine_name.to_string();
+        self.container_manager.update(&container_id, |container| {
+            container.machine_name = Some(machine_name_clone);
+        })?;
 
         // Extract image to create rootfs
         let image_ref = ImageRef::parse(&config.image).ok_or_else(|| {
@@ -323,10 +384,6 @@ impl Runtime {
         // So containers/{id}/rootfs on host becomes /arcbox/containers/{id}/rootfs in guest
         let guest_rootfs = format!("/arcbox/containers/{}/rootfs", container_id);
 
-        // Send create request to agent
-        let agent = self.agent_pool.get(cid).await;
-        let mut agent = agent.write().await;
-
         let req = CreateContainerRequest {
             name: config.name.clone().unwrap_or_default(),
             image: config.image.clone(),
@@ -339,9 +396,21 @@ impl Runtime {
             tty: config.tty.unwrap_or(false),
             open_stdin: config.open_stdin.unwrap_or(false),
             rootfs: guest_rootfs,
+            id: container_id.to_string(),
         };
 
-        agent.create_container(req).await?;
+        // Send create request to agent
+        #[cfg(target_os = "macos")]
+        {
+            let mut agent = self.machine_manager.connect_agent(machine_name)?;
+            agent.create_container(req).await?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let agent = self.agent_pool.get(cid).await;
+            let mut agent = agent.write().await;
+            agent.create_container(req).await?;
+        }
 
         tracing::info!(
             "Created container {} in machine '{}'",
@@ -368,9 +437,18 @@ impl Runtime {
             .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
 
         // Send start request to agent
-        let agent = self.agent_pool.get(cid).await;
-        let mut agent = agent.write().await;
-        agent.start_container(&container_id.to_string()).await?;
+        let container_id_str = container_id.to_string();
+        #[cfg(target_os = "macos")]
+        {
+            let mut agent = self.machine_manager.connect_agent(machine_name)?;
+            agent.start_container(&container_id_str).await?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let agent = self.agent_pool.get(cid).await;
+            let mut agent = agent.write().await;
+            agent.start_container(&container_id_str).await?;
+        }
 
         // Update local state after successful agent call
         self.container_manager.start(container_id).await?;
@@ -401,9 +479,18 @@ impl Runtime {
             .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
 
         // Send stop request to agent first
-        let agent = self.agent_pool.get(cid).await;
-        let mut agent = agent.write().await;
-        agent.stop_container(&container_id.to_string(), timeout).await?;
+        let container_id_str = container_id.to_string();
+        #[cfg(target_os = "macos")]
+        {
+            let mut agent = self.machine_manager.connect_agent(machine_name)?;
+            agent.stop_container(&container_id_str, timeout).await?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let agent = self.agent_pool.get(cid).await;
+            let mut agent = agent.write().await;
+            agent.stop_container(&container_id_str, timeout).await?;
+        }
 
         // Update local state after successful agent call
         self.container_manager.stop(container_id, timeout).await?;
@@ -434,9 +521,18 @@ impl Runtime {
             .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
 
         // Send remove request to agent first
-        let agent = self.agent_pool.get(cid).await;
-        let mut agent = agent.write().await;
-        agent.remove_container(&container_id.to_string(), force).await?;
+        let container_id_str = container_id.to_string();
+        #[cfg(target_os = "macos")]
+        {
+            let mut agent = self.machine_manager.connect_agent(machine_name)?;
+            agent.remove_container(&container_id_str, force).await?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let agent = self.agent_pool.get(cid).await;
+            let mut agent = agent.write().await;
+            agent.remove_container(&container_id_str, force).await?;
+        }
 
         // Update local state
         self.container_manager.remove(container_id)?;
@@ -465,9 +561,19 @@ impl Runtime {
             .get_cid(machine_name)
             .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
 
-        let agent = self.agent_pool.get(cid).await;
-        let mut agent = agent.write().await;
-        let response = agent.list_containers(all).await?;
+        let response = {
+            #[cfg(target_os = "macos")]
+            {
+                let mut agent = self.machine_manager.connect_agent(machine_name)?;
+                agent.list_containers(all).await?
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let agent = self.agent_pool.get(cid).await;
+                let mut agent = agent.write().await;
+                agent.list_containers(all).await?
+            }
+        };
 
         Ok(response.containers)
     }
@@ -494,9 +600,6 @@ impl Runtime {
             .get_cid(machine_name)
             .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
 
-        let agent = self.agent_pool.get(cid).await;
-        let mut agent = agent.write().await;
-
         let req = LogsRequest {
             container_id: container_id.to_string(),
             follow,
@@ -508,7 +611,19 @@ impl Runtime {
             tail,
         };
 
-        let response = agent.logs(req).await?;
+        let response = {
+            #[cfg(target_os = "macos")]
+            {
+                let mut agent = self.machine_manager.connect_agent(machine_name)?;
+                agent.logs(req).await?
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let agent = self.agent_pool.get(cid).await;
+                let mut agent = agent.write().await;
+                agent.logs(req).await?
+            }
+        };
 
         Ok(response)
     }
@@ -536,9 +651,6 @@ impl Runtime {
             .get_cid(machine_name)
             .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
 
-        let agent = self.agent_pool.get(cid).await;
-        let mut agent = agent.write().await;
-
         let req = LogsRequest {
             container_id: container_id.to_string(),
             follow: true, // Always true for streaming
@@ -550,7 +662,19 @@ impl Runtime {
             tail,
         };
 
-        let stream = agent.logs_stream(req).await?;
+        let stream = {
+            #[cfg(target_os = "macos")]
+            {
+                let mut agent = self.machine_manager.connect_agent(machine_name)?;
+                agent.logs_stream(req).await?
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let agent = self.agent_pool.get(cid).await;
+                let mut agent = agent.write().await;
+                agent.logs_stream(req).await?
+            }
+        };
 
         Ok(stream)
     }
@@ -580,9 +704,18 @@ impl Runtime {
             1 // Brief timeout for SIGTERM
         };
 
-        let agent = self.agent_pool.get(cid).await;
-        let mut agent = agent.write().await;
-        agent.kill_container(&container_id.to_string(), signal).await?;
+        let container_id_str = container_id.to_string();
+        #[cfg(target_os = "macos")]
+        {
+            let mut agent = self.machine_manager.connect_agent(machine_name)?;
+            agent.kill_container(&container_id_str, signal).await?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let agent = self.agent_pool.get(cid).await;
+            let mut agent = agent.write().await;
+            agent.kill_container(&container_id_str, signal).await?;
+        }
 
         // Update local state after successful agent call.
         self.container_manager.kill(container_id, signal).await?;
@@ -624,9 +757,6 @@ impl Runtime {
             .get_cid(machine_name)
             .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
 
-        let agent = self.agent_pool.get(cid).await;
-        let mut agent = agent.write().await;
-
         let req = arcbox_protocol::agent::ExecRequest {
             container_id: container_id.to_string(),
             cmd,
@@ -636,7 +766,19 @@ impl Runtime {
             tty,
         };
 
-        let output = agent.exec(req).await?;
+        let output = {
+            #[cfg(target_os = "macos")]
+            {
+                let mut agent = self.machine_manager.connect_agent(machine_name)?;
+                agent.exec(req).await?
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let agent = self.agent_pool.get(cid).await;
+                let mut agent = agent.write().await;
+                agent.exec(req).await?
+            }
+        };
 
         tracing::debug!(
             "Executed command in container {} (machine '{}'), exit_code: {}",
@@ -667,9 +809,6 @@ impl Runtime {
             .get_cid(machine_name)
             .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
 
-        let agent = self.agent_pool.get(cid).await;
-        let mut agent = agent.write().await;
-
         // Empty container_id means execute in VM namespace.
         let req = arcbox_protocol::agent::ExecRequest {
             container_id: String::new(),
@@ -680,7 +819,19 @@ impl Runtime {
             tty,
         };
 
-        let output = agent.exec(req).await?;
+        let output = {
+            #[cfg(target_os = "macos")]
+            {
+                let mut agent = self.machine_manager.connect_agent(machine_name)?;
+                agent.exec(req).await?
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let agent = self.agent_pool.get(cid).await;
+                let mut agent = agent.write().await;
+                agent.exec(req).await?
+            }
+        };
 
         tracing::debug!(
             "Executed command in machine '{}', exit_code: {}",

@@ -80,10 +80,25 @@ else
     echo "  Warning: vsock modules not found in modloop"
 fi
 
+# Copy fuse/virtiofs modules
+echo "Adding fuse/virtiofs kernel modules..."
+FUSE_SRC="$MODLOOP_EXTRACT/modules/$KERNEL_VERSION/kernel/fs/fuse"
+mkdir -p "$WORK_DIR/lib/modules/$KERNEL_VERSION/kernel/fs/fuse"
+if [ -d "$FUSE_SRC" ]; then
+    cp "$FUSE_SRC/fuse.ko" "$WORK_DIR/lib/modules/$KERNEL_VERSION/kernel/fs/fuse/" 2>/dev/null || true
+    cp "$FUSE_SRC/virtiofs.ko" "$WORK_DIR/lib/modules/$KERNEL_VERSION/kernel/fs/fuse/" 2>/dev/null || true
+    echo "  Copied fuse/virtiofs modules"
+    ls -la "$WORK_DIR/lib/modules/$KERNEL_VERSION/kernel/fs/fuse/"
+else
+    echo "  Warning: fuse modules not found in modloop"
+fi
+
 # Update modules.dep for the new modules
 echo "kernel/net/vmw_vsock/vsock.ko:" >> "$WORK_DIR/lib/modules/$KERNEL_VERSION/modules.dep"
 echo "kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko: kernel/net/vmw_vsock/vsock.ko" >> "$WORK_DIR/lib/modules/$KERNEL_VERSION/modules.dep"
 echo "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko: kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko" >> "$WORK_DIR/lib/modules/$KERNEL_VERSION/modules.dep"
+echo "kernel/fs/fuse/fuse.ko:" >> "$WORK_DIR/lib/modules/$KERNEL_VERSION/modules.dep"
+echo "kernel/fs/fuse/virtiofs.ko: kernel/fs/fuse/fuse.ko" >> "$WORK_DIR/lib/modules/$KERNEL_VERSION/modules.dep"
 
 # Cleanup modloop extract
 rm -rf "$MODLOOP_EXTRACT"
@@ -95,12 +110,12 @@ cat > "$WORK_DIR/init" << 'INIT_EOF'
 # ArcBox init script
 
 # Mount essential filesystems
-/bin/mount -t proc proc /proc
-/bin/mount -t sysfs sysfs /sys
-/bin/mount -t devtmpfs devtmpfs /dev
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox mount -t devtmpfs devtmpfs /dev
 
 # Set hostname
-/bin/hostname arcbox-vm
+/bin/busybox hostname arcbox-vm
 
 # Print boot message
 echo "=================================="
@@ -109,7 +124,24 @@ echo "=================================="
 echo ""
 
 # Check kernel version
-echo "Kernel: $(uname -r)"
+echo "Kernel: $(/bin/busybox uname -r)"
+echo ""
+
+# Load fuse/virtiofs modules first (needed for VirtioFS mount)
+echo "Loading fuse/virtiofs modules..."
+/sbin/modprobe fuse 2>/dev/null && echo "  Loaded: fuse" || echo "  Failed: fuse"
+/sbin/modprobe virtiofs 2>/dev/null && echo "  Loaded: virtiofs" || echo "  Failed: virtiofs"
+echo ""
+
+# Mount VirtioFS share for host data (/arcbox)
+echo "Mounting VirtioFS..."
+/bin/busybox mkdir -p /arcbox
+if /bin/busybox mount -t virtiofs arcbox /arcbox; then
+    echo "  VirtioFS mounted at /arcbox"
+    /bin/busybox ls -la /arcbox 2>/dev/null | /bin/busybox head -5
+else
+    echo "  VirtioFS mount FAILED"
+fi
 echo ""
 
 # Load vsock modules in correct order
@@ -120,7 +152,7 @@ echo "Loading vsock modules..."
 echo ""
 
 # Give kernel time to create device
-sleep 1
+/bin/busybox sleep 1
 
 # Check if vsock device exists
 if [ -e /dev/vsock ]; then
@@ -136,7 +168,7 @@ echo ""
 
 # List loaded modules
 echo "Loaded modules:"
-/bin/cat /proc/modules | head -10
+/bin/busybox cat /proc/modules | /bin/busybox head -10
 echo ""
 
 # Start arcbox-agent in foreground with debug output

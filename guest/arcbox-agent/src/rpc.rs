@@ -27,7 +27,7 @@ use arcbox_protocol::agent::{
     ListContainersResponse, LogEntry, LogsRequest, PingRequest, PingResponse,
     RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
 };
-use arcbox_protocol::container::KillContainerRequest;
+use arcbox_protocol::container::{KillContainerRequest, WaitContainerRequest, WaitContainerResponse};
 use arcbox_protocol::Empty;
 
 /// Agent version string.
@@ -46,6 +46,7 @@ pub enum MessageType {
     RemoveContainerRequest = 0x0013,
     ListContainersRequest = 0x0014,
     KillContainerRequest = 0x0015,
+    WaitContainerRequest = 0x0016,
     ExecRequest = 0x0020,
     LogsRequest = 0x0021,
     ExecStartRequest = 0x0022,
@@ -60,6 +61,7 @@ pub enum MessageType {
     RemoveContainerResponse = 0x1013,
     ListContainersResponse = 0x1014,
     KillContainerResponse = 0x1015,
+    WaitContainerResponse = 0x1016,
     ExecOutput = 0x1020,
     LogEntry = 0x1021,
     ExecStartResponse = 0x1022,
@@ -81,6 +83,7 @@ impl MessageType {
             0x0013 => Some(Self::RemoveContainerRequest),
             0x0014 => Some(Self::ListContainersRequest),
             0x0015 => Some(Self::KillContainerRequest),
+            0x0016 => Some(Self::WaitContainerRequest),
             0x0020 => Some(Self::ExecRequest),
             0x0021 => Some(Self::LogsRequest),
             0x0022 => Some(Self::ExecStartRequest),
@@ -93,6 +96,7 @@ impl MessageType {
             0x1013 => Some(Self::RemoveContainerResponse),
             0x1014 => Some(Self::ListContainersResponse),
             0x1015 => Some(Self::KillContainerResponse),
+            0x1016 => Some(Self::WaitContainerResponse),
             0x1020 => Some(Self::ExecOutput),
             0x1021 => Some(Self::LogEntry),
             0x1022 => Some(Self::ExecStartResponse),
@@ -153,6 +157,7 @@ pub enum RpcRequest {
     RemoveContainer(RemoveContainerRequest),
     ListContainers(ListContainersRequest),
     KillContainer(KillContainerRequest),
+    WaitContainer(WaitContainerRequest),
     Exec(ExecRequest),
     Logs(LogsRequest),
     ExecStart(ExecStartRequest),
@@ -167,6 +172,7 @@ pub enum RpcResponse {
     CreateContainer(CreateContainerResponse),
     Empty,
     ListContainers(ListContainersResponse),
+    WaitContainer(WaitContainerResponse),
     ExecOutput(ExecOutput),
     LogEntry(LogEntry),
     ExecStart(ExecStartResponse),
@@ -182,6 +188,7 @@ impl RpcResponse {
             Self::CreateContainer(_) => MessageType::CreateContainerResponse,
             Self::Empty => MessageType::Empty,
             Self::ListContainers(_) => MessageType::ListContainersResponse,
+            Self::WaitContainer(_) => MessageType::WaitContainerResponse,
             Self::ExecOutput(_) => MessageType::ExecOutput,
             Self::LogEntry(_) => MessageType::LogEntry,
             Self::ExecStart(_) => MessageType::ExecStartResponse,
@@ -197,6 +204,7 @@ impl RpcResponse {
             Self::CreateContainer(msg) => msg.encode_to_vec(),
             Self::Empty => Empty::default().encode_to_vec(),
             Self::ListContainers(msg) => msg.encode_to_vec(),
+            Self::WaitContainer(msg) => msg.encode_to_vec(),
             Self::ExecOutput(msg) => msg.encode_to_vec(),
             Self::LogEntry(msg) => msg.encode_to_vec(),
             Self::ExecStart(msg) => msg.encode_to_vec(),
@@ -300,6 +308,10 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
         MessageType::KillContainerRequest => {
             let req = KillContainerRequest::decode(payload)?;
             Ok(RpcRequest::KillContainer(req))
+        }
+        MessageType::WaitContainerRequest => {
+            let req = WaitContainerRequest::decode(payload)?;
+            Ok(RpcRequest::WaitContainer(req))
         }
         MessageType::ExecRequest => {
             let req = ExecRequest::decode(payload)?;

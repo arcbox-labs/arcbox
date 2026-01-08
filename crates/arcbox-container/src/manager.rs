@@ -24,6 +24,11 @@ pub trait AgentConnection: Send + Sync {
 
     /// Kills a container in the guest VM with a signal.
     async fn kill_container(&self, id: &str, signal: &str) -> std::result::Result<(), String>;
+
+    /// Waits for a container to exit in the guest VM.
+    ///
+    /// Returns the exit code when the container exits.
+    async fn wait_container(&self, id: &str) -> std::result::Result<i32, String>;
 }
 
 /// Container manager.
@@ -90,6 +95,25 @@ impl ContainerManager {
 
         containers.insert(id.clone(), container);
         Ok(id)
+    }
+
+    /// Updates a container in the manager.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container is not found or lock is poisoned.
+    pub fn update(&self, id: &ContainerId, f: impl FnOnce(&mut Container)) -> Result<()> {
+        let mut containers = self
+            .containers
+            .write()
+            .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
+
+        let container = containers
+            .get_mut(id)
+            .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+
+        f(container);
+        Ok(())
     }
 
     /// Starts a container.
@@ -333,7 +357,19 @@ impl ContainerManager {
             }
         }
 
-        // Subscribe to exit notifications.
+        // If we have an agent, ask it to wait for the container.
+        // This is the primary mechanism for knowing when a container exits.
+        if let Some(ref agent) = self.agent {
+            let exit_code = agent.wait_container(&id.to_string()).await
+                .map_err(|e| ContainerError::Runtime(format!("agent wait failed: {}", e)))?;
+
+            // Update container state.
+            self.notify_exit(id, exit_code);
+
+            return Ok(exit_code);
+        }
+
+        // Fallback: subscribe to exit notifications (for testing or if agent is unavailable).
         let mut receiver = self.exit_sender.subscribe();
         let target_id = id.clone();
 

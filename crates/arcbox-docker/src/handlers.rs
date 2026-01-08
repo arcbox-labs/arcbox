@@ -110,6 +110,14 @@ pub async fn create_container(
     Query(params): Query<CreateContainerQuery>,
     Json(body): Json<ContainerCreateRequest>,
 ) -> Result<(StatusCode, Json<ContainerCreateResponse>)> {
+    // Ensure VM is ready before creating container.
+    // This transparently starts the VM if needed (OrbStack-like UX).
+    state
+        .runtime
+        .ensure_vm_ready()
+        .await
+        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {}", e)))?;
+
     // Convert env from Vec<String> ("KEY=VALUE") to HashMap
     let env: HashMap<String, String> = body
         .env
@@ -134,10 +142,12 @@ pub async fn create_container(
         ..Default::default()
     };
 
+    // Create container using the default machine.
+    let machine_name = state.runtime.default_machine_name();
     let container_id = state
         .runtime
-        .container_manager()
-        .create(config)
+        .create_container(machine_name, config)
+        .await
         .map_err(|e| DockerError::Server(e.to_string()))?;
 
     Ok((
@@ -162,6 +172,10 @@ pub async fn inspect_container(
         .get(&container_id)
         .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
 
+    // Extract configuration from container
+    let container_config = container.config.as_ref();
+
+    // Build state response with all available fields
     let state_response = ContainerState {
         status: container.state.to_string().to_lowercase(),
         running: container.state == arcbox_container::state::ContainerState::Running,
@@ -169,26 +183,71 @@ pub async fn inspect_container(
         restarting: container.state == arcbox_container::state::ContainerState::Restarting,
         oom_killed: false,
         dead: container.state == arcbox_container::state::ContainerState::Dead,
-        pid: 0,
+        pid: 0, // PID not tracked in container state currently
         exit_code: container.exit_code.unwrap_or(0),
         error: String::new(),
         started_at: container
             .started_at
             .map(|t| t.to_rfc3339())
             .unwrap_or_default(),
-        finished_at: String::new(),
+        finished_at: container
+            .finished_at
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_default(),
     };
 
-    Ok(Json(ContainerInspectResponse {
-        id: container.id.to_string(),
-        created: container.created.to_rfc3339(),
-        path: String::new(),
-        args: vec![],
-        state: state_response,
-        image: container.image.clone(),
-        name: format!("/{}", container.name),
-        restart_count: 0,
-        config: ContainerConfig {
+    // Extract command path and args from config
+    let (path, args) = if let Some(cfg) = container_config {
+        if !cfg.entrypoint.is_empty() {
+            // Use entrypoint as path, cmd as args
+            (
+                cfg.entrypoint.first().cloned().unwrap_or_default(),
+                cfg.entrypoint.iter().skip(1).cloned().collect::<Vec<_>>()
+                    .into_iter()
+                    .chain(cfg.cmd.iter().cloned())
+                    .collect(),
+            )
+        } else if !cfg.cmd.is_empty() {
+            // Use first cmd element as path, rest as args
+            (
+                cfg.cmd.first().cloned().unwrap_or_default(),
+                cfg.cmd.iter().skip(1).cloned().collect(),
+            )
+        } else {
+            (String::new(), vec![])
+        }
+    } else {
+        (String::new(), vec![])
+    };
+
+    // Build container config response
+    let config_response = if let Some(cfg) = container_config {
+        // Convert env HashMap to Docker's KEY=VALUE format
+        let env: Vec<String> = cfg
+            .env
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+
+        ContainerConfig {
+            hostname: cfg.name.clone().unwrap_or_else(|| container.name.clone()),
+            user: cfg.user.clone().unwrap_or_default(),
+            env,
+            cmd: cfg.cmd.clone(),
+            image: cfg.image.clone(),
+            working_dir: cfg.working_dir.clone().unwrap_or_default(),
+            entrypoint: if cfg.entrypoint.is_empty() {
+                None
+            } else {
+                Some(cfg.entrypoint.clone())
+            },
+            labels: cfg.labels.clone(),
+            tty: cfg.tty.unwrap_or(false),
+            open_stdin: cfg.open_stdin.unwrap_or(false),
+        }
+    } else {
+        // Fallback to minimal config
+        ContainerConfig {
             hostname: container.name.clone(),
             user: String::new(),
             env: vec![],
@@ -199,10 +258,43 @@ pub async fn inspect_container(
             labels: HashMap::new(),
             tty: false,
             open_stdin: false,
-        },
+        }
+    };
+
+    // Build mounts from volume configuration
+    let mounts = if let Some(cfg) = container_config {
+        cfg.volumes
+            .iter()
+            .map(|v| MountPoint {
+                mount_type: if v.source.starts_with('/') {
+                    "bind".to_string()
+                } else {
+                    "volume".to_string()
+                },
+                source: v.source.clone(),
+                destination: v.target.clone(),
+                mode: if v.read_only { "ro" } else { "rw" }.to_string(),
+                rw: !v.read_only,
+                propagation: "rprivate".to_string(),
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
+    Ok(Json(ContainerInspectResponse {
+        id: container.id.to_string(),
+        created: container.created.to_rfc3339(),
+        path,
+        args,
+        state: state_response,
+        image: container.image.clone(),
+        name: format!("/{}", container.name),
+        restart_count: 0,
+        config: config_response,
         host_config: HostConfig::default(),
         network_settings: NetworkSettings::default(),
-        mounts: vec![],
+        mounts,
     }))
 }
 
@@ -211,17 +303,33 @@ pub async fn start_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode> {
-    let container_id = arcbox_container::state::ContainerId::from_string(&id);
-
+    // Ensure VM is ready before starting container.
     state
         .runtime
-        .container_manager()
-        .start(&container_id)
+        .ensure_vm_ready()
         .await
-        .map_err(|e| match e {
-            arcbox_container::ContainerError::NotFound(_) => DockerError::ContainerNotFound(id),
-            _ => DockerError::Server(e.to_string()),
-        })?;
+        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {}", e)))?;
+
+    let container_id = arcbox_container::state::ContainerId::from_string(&id);
+
+    // Get container to find its machine, or use default.
+    let container = state
+        .runtime
+        .container_manager()
+        .get(&container_id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+
+    let machine_name = container
+        .machine_name
+        .clone()
+        .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
+
+    // Start through Runtime -> Agent.
+    state
+        .runtime
+        .start_container(&machine_name, &container_id)
+        .await
+        .map_err(|e| DockerError::Server(e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -244,15 +352,24 @@ pub async fn stop_container(
     let container_id = arcbox_container::state::ContainerId::from_string(&id);
     let timeout = params.t.unwrap_or(10); // Default 10 seconds timeout
 
-    state
+    // Get container to find its machine.
+    let container = state
         .runtime
         .container_manager()
-        .stop(&container_id, timeout)
+        .get(&container_id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+
+    let machine_name = container
+        .machine_name
+        .clone()
+        .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
+
+    // Stop through Runtime -> Agent.
+    state
+        .runtime
+        .stop_container(&machine_name, &container_id, timeout)
         .await
-        .map_err(|e| match e {
-            arcbox_container::ContainerError::NotFound(_) => DockerError::ContainerNotFound(id),
-            _ => DockerError::Server(e.to_string()),
-        })?;
+        .map_err(|e| DockerError::Server(e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -278,7 +395,8 @@ pub async fn kill_container(
 
     let machine_name = container
         .machine_name
-        .unwrap_or_else(|| "default".to_string());
+        .clone()
+        .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
 
     // Kill through Runtime -> Agent.
     state
@@ -303,18 +421,40 @@ pub async fn restart_container(
     Path(id): Path<String>,
     Query(params): Query<RestartContainerQuery>,
 ) -> Result<StatusCode> {
+    // Ensure VM is ready before restarting container.
+    state
+        .runtime
+        .ensure_vm_ready()
+        .await
+        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {}", e)))?;
+
     let container_id = arcbox_container::state::ContainerId::from_string(&id);
     let timeout = params.t.unwrap_or(10);
 
-    state
+    // Get container to find its machine.
+    let container = state
         .runtime
         .container_manager()
-        .restart(&container_id, timeout)
+        .get(&container_id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+
+    let machine_name = container
+        .machine_name
+        .clone()
+        .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
+
+    // Restart = stop + start through Runtime -> Agent.
+    state
+        .runtime
+        .stop_container(&machine_name, &container_id, timeout)
         .await
-        .map_err(|e| match e {
-            arcbox_container::ContainerError::NotFound(_) => DockerError::ContainerNotFound(id),
-            _ => DockerError::Server(e.to_string()),
-        })?;
+        .map_err(|e| DockerError::Server(e.to_string()))?;
+
+    state
+        .runtime
+        .start_container(&machine_name, &container_id)
+        .await
+        .map_err(|e| DockerError::Server(e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -337,18 +477,41 @@ pub struct RemoveContainerQuery {
 pub async fn remove_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(_params): Query<RemoveContainerQuery>,
+    Query(params): Query<RemoveContainerQuery>,
 ) -> Result<StatusCode> {
     let container_id = arcbox_container::state::ContainerId::from_string(&id);
 
-    state
+    // Get container to find its machine.
+    let container = state
         .runtime
         .container_manager()
-        .remove(&container_id)
-        .map_err(|e| match e {
-            arcbox_container::ContainerError::NotFound(_) => DockerError::ContainerNotFound(id),
-            _ => DockerError::Server(e.to_string()),
-        })?;
+        .get(&container_id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+
+    let machine_name = container
+        .machine_name
+        .clone()
+        .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
+
+    // Remove through Runtime -> Agent (if VM is running).
+    // If VM is not running, just remove from local state.
+    if state.runtime.vm_lifecycle().is_running().await {
+        state
+            .runtime
+            .remove_container(&machine_name, &container_id, params.force)
+            .await
+            .map_err(|e| DockerError::Server(e.to_string()))?;
+    } else {
+        // VM not running, just remove from local state.
+        state
+            .runtime
+            .container_manager()
+            .remove(&container_id)
+            .map_err(|e| match e {
+                arcbox_container::ContainerError::NotFound(_) => DockerError::ContainerNotFound(id),
+                _ => DockerError::Server(e.to_string()),
+            })?;
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -363,23 +526,39 @@ pub async fn wait_container(
 ) -> Result<Json<WaitResponse>> {
     let container_id = arcbox_container::state::ContainerId::from_string(&id);
 
-    // Check if container exists first.
-    if state.runtime.container_manager().get(&container_id).is_none() {
-        return Err(DockerError::ContainerNotFound(id.clone()));
-    }
+    // Check if container exists and get its machine name.
+    let container = state.runtime.container_manager().get(&container_id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
 
-    // Wait for container to exit asynchronously.
-    match state.runtime.container_manager().wait_async(&container_id).await {
-        Ok(exit_code) => {
-            Ok(Json(WaitResponse {
-                status_code: i64::from(exit_code),
-                error: None,
-            }))
-        }
-        Err(e) => {
-            Err(DockerError::Server(format!("wait failed: {}", e)))
-        }
-    }
+    let machine_name = container.machine_name.clone()
+        .ok_or_else(|| DockerError::Server("container has no machine assigned".to_string()))?;
+
+    // Connect to agent and wait for container to exit.
+    #[cfg(target_os = "macos")]
+    let exit_code = {
+        let mut agent = state.runtime.machine_manager().connect_agent(&machine_name)
+            .map_err(|e| DockerError::Server(format!("failed to connect to agent: {}", e)))?;
+        agent.wait_container(&id).await
+            .map_err(|e| DockerError::Server(format!("wait failed: {}", e)))?
+    };
+
+    #[cfg(target_os = "linux")]
+    let exit_code = {
+        let cid = state.runtime.machine_manager().get_cid(&machine_name)
+            .ok_or_else(|| DockerError::Server("machine has no CID".to_string()))?;
+        let agent = state.runtime.agent_pool().get(cid).await;
+        let mut agent = agent.write().await;
+        agent.wait_container(&id).await
+            .map_err(|e| DockerError::Server(format!("wait failed: {}", e)))?
+    };
+
+    // Update container state.
+    state.runtime.container_manager().notify_exit(&container_id, exit_code);
+
+    Ok(Json(WaitResponse {
+        status_code: i64::from(exit_code),
+        error: None,
+    }))
 }
 
 /// Container logs query parameters.
@@ -472,7 +651,10 @@ pub async fn container_logs(
         .unwrap_or(0);
 
     // Get machine name from container.
-    let machine_name = container.machine_name.clone().unwrap_or_else(|| "default".to_string());
+    let machine_name = container
+        .machine_name
+        .clone()
+        .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
 
     // Check if we should stream (follow mode).
     if params.follow {
@@ -674,7 +856,15 @@ pub async fn exec_start(
 
     let machine_name = container
         .machine_name
-        .unwrap_or_else(|| "default".to_string());
+        .clone()
+        .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
+
+    // Ensure VM is ready before executing.
+    state
+        .runtime
+        .ensure_vm_ready()
+        .await
+        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {}", e)))?;
 
     // Convert env from Vec<String> to HashMap.
     let env: std::collections::HashMap<String, String> = exec

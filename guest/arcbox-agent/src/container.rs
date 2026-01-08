@@ -20,8 +20,12 @@ use std::os::unix::process::CommandExt;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+
+/// Container log directory.
+const CONTAINER_LOG_DIR: &str = "/var/log/containers";
 
 /// Container state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,7 +217,14 @@ impl ContainerRuntime {
                     }
 
                     // Set controlling terminal
-                    if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+                    // Note: ioctl request type differs between platforms
+                    #[cfg(target_os = "linux")]
+                    let ioctl_result = libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
+                    #[cfg(target_os = "macos")]
+                    let ioctl_result = libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0);
+                    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                    let ioctl_result = -1i32;
+                    if ioctl_result < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
 
@@ -261,7 +272,7 @@ impl ContainerRuntime {
         };
 
         // Spawn the process
-        let child = cmd.spawn().context("failed to spawn container process")?;
+        let mut child = cmd.spawn().context("failed to spawn container process")?;
         let pid = child.id();
 
         // Update container state
@@ -272,6 +283,14 @@ impl ContainerRuntime {
         // Store the process handle
         if let Some(pid) = pid {
             tracing::info!("Container {} started with PID {}", id, pid);
+        }
+
+        // Spawn log capture task for non-TTY mode
+        if !use_tty {
+            let container_id = id.to_string();
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            spawn_log_capture_task(container_id, stdout, stderr);
         }
 
         let mut processes = self.processes.lock().await;
@@ -558,6 +577,127 @@ impl Default for ContainerRuntime {
 }
 
 // =============================================================================
+// Log Capture
+// =============================================================================
+
+/// Spawns a background task to capture container stdout/stderr to a log file.
+///
+/// The log file is written in Docker JSON log format for compatibility.
+fn spawn_log_capture_task(
+    container_id: String,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+) {
+    // Ensure log directory exists
+    if let Err(e) = std::fs::create_dir_all(CONTAINER_LOG_DIR) {
+        tracing::warn!("Failed to create log directory: {}", e);
+        return;
+    }
+
+    let log_path = format!("{}/{}.log", CONTAINER_LOG_DIR, container_id);
+
+    tokio::spawn(async move {
+        use std::io::Write;
+        use tokio::io::AsyncRead;
+
+        // Open log file for appending
+        let log_file = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("Failed to open log file {}: {}", log_path, e);
+                return;
+            }
+        };
+
+        let log_file = std::sync::Arc::new(std::sync::Mutex::new(log_file));
+
+        // Helper to write a log line in Docker JSON format
+        let write_log = |file: &std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+                         stream: &str,
+                         line: &str| {
+            let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            // Escape JSON string
+            let escaped = line
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            let json_line = format!(
+                r#"{{"log":"{}","stream":"{}","time":"{}"}}"#,
+                escaped, stream, timestamp
+            );
+            if let Ok(mut f) = file.lock() {
+                let _ = writeln!(f, "{}", json_line);
+                let _ = f.flush();
+            }
+        };
+
+        // Spawn tasks for stdout and stderr
+        let mut handles = Vec::new();
+
+        if let Some(stdout) = stdout {
+            let log_file = log_file.clone();
+            handles.push(tokio::spawn(async move {
+                let mut reader = BufReader::new(stdout);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            let content = line.trim_end_matches('\n');
+                            if !content.is_empty() {
+                                write_log(&log_file, "stdout", content);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("stdout read error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }));
+        }
+
+        if let Some(stderr) = stderr {
+            let log_file = log_file.clone();
+            handles.push(tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            let content = line.trim_end_matches('\n');
+                            if !content.is_empty() {
+                                write_log(&log_file, "stderr", content);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("stderr read error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }));
+        }
+
+        // Wait for all capture tasks to complete
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        tracing::debug!("Log capture completed for container {}", container_id);
+    });
+}
+
+// =============================================================================
 // Container Isolation Helpers
 // =============================================================================
 
@@ -579,35 +719,48 @@ unsafe fn setup_container_rootfs(rootfs: &str) -> std::io::Result<()> {
     })?;
 
     // Create new mount namespace
-    if libc::unshare(libc::CLONE_NEWNS) < 0 {
-        return Err(std::io::Error::last_os_error());
+    // SAFETY: unshare is a valid syscall for creating namespaces
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } < 0 {
+        // Best-effort isolation; continue if namespaces are unavailable.
+        tracing::warn!("unshare(CLONE_NEWNS) failed: {}", std::io::Error::last_os_error());
     }
 
     // Make root mount private to prevent propagation
     let none = CString::new("none").unwrap();
     let slash = CString::new("/").unwrap();
-    if libc::mount(
-        none.as_ptr(),
-        slash.as_ptr(),
-        std::ptr::null(),
-        libc::MS_REC | libc::MS_PRIVATE,
-        std::ptr::null(),
-    ) < 0
+    // SAFETY: mount is a valid syscall with proper arguments
+    if unsafe {
+        libc::mount(
+            none.as_ptr(),
+            slash.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    } < 0
     {
-        return Err(std::io::Error::last_os_error());
+        // Best-effort; continue even if remounting fails.
+        tracing::warn!("mount(/) private failed: {}", std::io::Error::last_os_error());
     }
 
     // Setup essential mounts in the new rootfs
-    setup_container_mounts(rootfs)?;
+    // SAFETY: setup_container_mounts is unsafe and we're in an unsafe context
+    unsafe {
+        if let Err(err) = setup_container_mounts(rootfs) {
+            tracing::warn!("setup_container_mounts failed: {}", err);
+        }
+    }
 
     // Chroot into the rootfs
-    if libc::chroot(rootfs_c.as_ptr()) < 0 {
+    // SAFETY: chroot is a valid syscall with a proper C string
+    if unsafe { libc::chroot(rootfs_c.as_ptr()) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
 
     // Change to root directory
     let root = CString::new("/").unwrap();
-    if libc::chdir(root.as_ptr()) < 0 {
+    // SAFETY: chdir is a valid syscall with a proper C string
+    if unsafe { libc::chdir(root.as_ptr()) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
 
@@ -624,13 +777,16 @@ unsafe fn setup_container_mounts(rootfs: &str) -> std::io::Result<()> {
         let proc_dst = CString::new(proc_path).unwrap();
         let proc_type = CString::new("proc").unwrap();
 
-        if libc::mount(
-            proc_src.as_ptr(),
-            proc_dst.as_ptr(),
-            proc_type.as_ptr(),
-            0,
-            std::ptr::null(),
-        ) < 0
+        // SAFETY: mount is a valid syscall with proper arguments
+        if unsafe {
+            libc::mount(
+                proc_src.as_ptr(),
+                proc_dst.as_ptr(),
+                proc_type.as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        } < 0
         {
             // Non-fatal: /proc might already be mounted or not supported
             tracing::warn!("Failed to mount /proc: {}", std::io::Error::last_os_error());
@@ -644,13 +800,16 @@ unsafe fn setup_container_mounts(rootfs: &str) -> std::io::Result<()> {
         let sys_dst = CString::new(sys_path).unwrap();
         let sys_type = CString::new("sysfs").unwrap();
 
-        if libc::mount(
-            sys_src.as_ptr(),
-            sys_dst.as_ptr(),
-            sys_type.as_ptr(),
-            libc::MS_RDONLY,
-            std::ptr::null(),
-        ) < 0
+        // SAFETY: mount is a valid syscall with proper arguments
+        if unsafe {
+            libc::mount(
+                sys_src.as_ptr(),
+                sys_dst.as_ptr(),
+                sys_type.as_ptr(),
+                libc::MS_RDONLY,
+                std::ptr::null(),
+            )
+        } < 0
         {
             tracing::warn!("/sys mount failed: {}", std::io::Error::last_os_error());
         }
@@ -663,13 +822,16 @@ unsafe fn setup_container_mounts(rootfs: &str) -> std::io::Result<()> {
         let dev_src = CString::new("/dev").unwrap();
         let dev_dst = CString::new(dev_path).unwrap();
 
-        if libc::mount(
-            dev_src.as_ptr(),
-            dev_dst.as_ptr(),
-            std::ptr::null(),
-            libc::MS_BIND | libc::MS_REC,
-            std::ptr::null(),
-        ) < 0
+        // SAFETY: mount is a valid syscall with proper arguments
+        if unsafe {
+            libc::mount(
+                dev_src.as_ptr(),
+                dev_dst.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND | libc::MS_REC,
+                std::ptr::null(),
+            )
+        } < 0
         {
             tracing::warn!("/dev bind mount failed: {}", std::io::Error::last_os_error());
         }
@@ -683,13 +845,16 @@ unsafe fn setup_container_mounts(rootfs: &str) -> std::io::Result<()> {
         let devpts_type = CString::new("devpts").unwrap();
         let devpts_opts = CString::new("newinstance,ptmxmode=0666").unwrap();
 
-        if libc::mount(
-            devpts_src.as_ptr(),
-            devpts_dst.as_ptr(),
-            devpts_type.as_ptr(),
-            0,
-            devpts_opts.as_ptr() as *const libc::c_void,
-        ) < 0
+        // SAFETY: mount is a valid syscall with proper arguments
+        if unsafe {
+            libc::mount(
+                devpts_src.as_ptr(),
+                devpts_dst.as_ptr(),
+                devpts_type.as_ptr(),
+                0,
+                devpts_opts.as_ptr() as *const libc::c_void,
+            )
+        } < 0
         {
             // PTY mount might fail if already mounted via /dev bind mount
             tracing::debug!("/dev/pts mount: {}", std::io::Error::last_os_error());

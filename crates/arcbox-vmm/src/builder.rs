@@ -300,9 +300,18 @@ impl VmBuilder {
             enable_rosetta: self.enable_rosetta,
             serial_console: self.console_config.is_some(),
             virtio_console: self.console_config.is_some(),
-            shared_dirs: Vec::new(),
+            shared_dirs: self
+                .shared_dirs
+                .iter()
+                .map(|cfg| crate::SharedDirConfig {
+                    host_path: cfg.host_path.clone(),
+                    tag: cfg.tag.clone(),
+                    read_only: cfg.read_only,
+                })
+                .collect(),
             networking: !self.network_devices.is_empty(),
-            vsock: true,
+            vsock: self.vsock_config.is_some(),
+            guest_cid: self.vsock_config.as_ref().map(|cfg| cfg.guest_cid as u32),
         };
 
         tracing::info!(

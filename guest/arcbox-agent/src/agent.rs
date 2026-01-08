@@ -223,6 +223,9 @@ mod linux {
             RpcRequest::KillContainer(req) => {
                 RequestResult::Single(handle_kill_container(&req.id, &req.signal, state).await)
             }
+            RpcRequest::WaitContainer(req) => {
+                RequestResult::Single(handle_wait_container(&req.id, state).await)
+            }
             RpcRequest::Exec(req) => RequestResult::Single(handle_exec(req, state).await),
             RpcRequest::Logs(req) => handle_logs(req, state).await,
             RpcRequest::ExecStart(req) => {
@@ -325,7 +328,11 @@ mod linux {
     ) -> RpcResponse {
         tracing::info!("CreateContainer: name={}, image={}", req.name, req.image);
 
-        let container_id = uuid::Uuid::new_v4().to_string();
+        let container_id = if req.id.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            req.id.clone()
+        };
 
         // Convert environment variables
         let env: Vec<(String, String)> = req.env.into_iter().collect();
@@ -439,6 +446,28 @@ mod linux {
             Err(e) => {
                 tracing::error!("Failed to kill container {}: {}", id, e);
                 RpcResponse::Error(ErrorResponse::new(500, format!("failed to kill: {}", e)))
+            }
+        }
+    }
+
+    /// Handles a WaitContainer request.
+    ///
+    /// Blocks until the container exits and returns its exit code.
+    async fn handle_wait_container(id: &str, state: &Arc<RwLock<AgentState>>) -> RpcResponse {
+        tracing::info!("WaitContainer: id={}", id);
+
+        let mut state = state.write().await;
+        match state.runtime.wait_container(id).await {
+            Ok(exit_code) => {
+                tracing::info!("Container {} exited with code {}", id, exit_code);
+                RpcResponse::WaitContainer(arcbox_protocol::container::WaitContainerResponse {
+                    status_code: i64::from(exit_code),
+                    error: String::new(),
+                })
+            }
+            Err(e) => {
+                tracing::error!("Failed to wait for container {}: {}", id, e);
+                RpcResponse::Error(ErrorResponse::new(500, format!("failed to wait: {}", e)))
             }
         }
     }
@@ -867,13 +896,20 @@ mod linux {
             }
         };
 
+        // Parse Docker JSON log format and extract log content
+        let mut output_lines = Vec::new();
+        for line in log_data.lines() {
+            if let Some(parsed) = parse_docker_log_line(line, req.stdout, req.stderr) {
+                output_lines.push(parsed);
+            }
+        }
+
         // Apply tail filter if specified.
-        let lines: Vec<&str> = log_data.lines().collect();
         let output_lines = if req.tail > 0 {
-            let start = lines.len().saturating_sub(req.tail as usize);
-            &lines[start..]
+            let start = output_lines.len().saturating_sub(req.tail as usize);
+            output_lines[start..].to_vec()
         } else {
-            &lines[..]
+            output_lines
         };
 
         let output = output_lines.join("\n");
@@ -909,6 +945,27 @@ mod linux {
                     format!("failed to start log stream: {}", e),
                 )))
             }
+        }
+    }
+
+    /// Parses a Docker JSON log line and extracts the log content.
+    ///
+    /// Docker JSON log format: {"log":"content","stream":"stdout|stderr","time":"..."}
+    ///
+    /// Returns the log content if the line matches the requested streams,
+    /// or None if it should be filtered out.
+    fn parse_docker_log_line(line: &str, stdout: bool, stderr: bool) -> Option<String> {
+        // Try to parse as JSON
+        let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
+
+        let stream = parsed.get("stream")?.as_str()?;
+        let log = parsed.get("log")?.as_str()?;
+
+        // Filter by stream type
+        match stream {
+            "stdout" if stdout => Some(log.to_string()),
+            "stderr" if stderr => Some(log.to_string()),
+            _ => None,
         }
     }
 }

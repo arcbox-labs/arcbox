@@ -10,7 +10,7 @@ use arcbox_protocol::agent::{
     ListContainersResponse, LogEntry, LogsRequest, PingRequest, PingResponse,
     RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
 };
-use arcbox_protocol::container::KillContainerRequest;
+use arcbox_protocol::container::{KillContainerRequest, WaitContainerRequest, WaitContainerResponse};
 use arcbox_protocol::Empty;
 use arcbox_transport::vsock::{VsockAddr, VsockTransport};
 use arcbox_transport::Transport;
@@ -38,6 +38,7 @@ enum MessageType {
     RemoveContainerRequest = 0x0013,
     ListContainersRequest = 0x0014,
     KillContainerRequest = 0x0015,
+    WaitContainerRequest = 0x0016,
     ExecRequest = 0x0020,
     LogsRequest = 0x0021,
     ExecStartRequest = 0x0022,
@@ -45,6 +46,7 @@ enum MessageType {
 
     // Response types
     PingResponse = 0x1001,
+    WaitContainerResponse = 0x1016,
     GetSystemInfoResponse = 0x1002,
     CreateContainerResponse = 0x1010,
     ListContainersResponse = 0x1014,
@@ -68,11 +70,13 @@ impl MessageType {
             0x0013 => Some(Self::RemoveContainerRequest),
             0x0014 => Some(Self::ListContainersRequest),
             0x0015 => Some(Self::KillContainerRequest),
+            0x0016 => Some(Self::WaitContainerRequest),
             0x0020 => Some(Self::ExecRequest),
             0x0021 => Some(Self::LogsRequest),
             0x0022 => Some(Self::ExecStartRequest),
             0x0023 => Some(Self::ExecResizeRequest),
             0x1001 => Some(Self::PingResponse),
+            0x1016 => Some(Self::WaitContainerResponse),
             0x1002 => Some(Self::GetSystemInfoResponse),
             0x1010 => Some(Self::CreateContainerResponse),
             0x1014 => Some(Self::ListContainersResponse),
@@ -358,6 +362,37 @@ impl AgentClient {
         }
 
         Ok(())
+    }
+
+    /// Waits for a container to exit in the guest VM.
+    ///
+    /// Blocks until the container exits and returns its exit code.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the wait fails.
+    pub async fn wait_container(&mut self, id: &str) -> Result<i32> {
+        let req = WaitContainerRequest {
+            id: id.to_string(),
+            condition: String::new(),
+        };
+        let payload = req.encode_to_vec();
+
+        let (resp_type, resp_payload) = self
+            .rpc_call(MessageType::WaitContainerRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::WaitContainerResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: {}",
+                resp_type
+            )));
+        }
+
+        let resp = WaitContainerResponse::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))?;
+
+        Ok(resp.status_code as i32)
     }
 
     /// Removes a container from the guest VM.
@@ -682,6 +717,11 @@ impl AgentConnection for AgentClientWrapper {
     async fn kill_container(&self, id: &str, signal: &str) -> std::result::Result<(), String> {
         let mut client = self.client.write().await;
         client.kill_container(id, signal).await.map_err(|e| e.to_string())
+    }
+
+    async fn wait_container(&self, id: &str) -> std::result::Result<i32, String> {
+        let mut client = self.client.write().await;
+        client.wait_container(id).await.map_err(|e| e.to_string())
     }
 }
 
