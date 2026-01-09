@@ -9,6 +9,7 @@
 //!   --disk <path>    Attach a block device
 //!   --net            Enable NAT networking
 //!   --vsock          Enable vsock device
+//!   --virtiofs <path>  Enable VirtioFS sharing (path to share)
 
 use std::env;
 use std::time::Duration;
@@ -27,6 +28,7 @@ fn main() {
         eprintln!("  --disk <path>    Attach a block device");
         eprintln!("  --net            Enable NAT networking");
         eprintln!("  --vsock          Enable vsock device");
+        eprintln!("  --virtiofs <path>  Enable VirtioFS sharing");
         eprintln!();
         eprintln!("Example:");
         eprintln!("  {} tests/resources/Image-arm64 tests/resources/initramfs-arm64", args[0]);
@@ -41,6 +43,7 @@ fn main() {
     let mut disk_path = None;
     let mut enable_net = false;
     let mut enable_vsock = false;
+    let mut virtiofs_path: Option<String> = None;
     let mut custom_cmdline: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
@@ -56,6 +59,10 @@ fn main() {
             "--vsock" => {
                 enable_vsock = true;
                 i += 1;
+            }
+            "--virtiofs" if i + 1 < args.len() => {
+                virtiofs_path = Some(args[i + 1].clone());
+                i += 2;
             }
             "--cmdline" if i + 1 < args.len() => {
                 custom_cmdline = Some(args[i + 1].clone());
@@ -123,6 +130,11 @@ fn main() {
         }
         println!("  Network: {}", if enable_net { "enabled (NAT)" } else { "disabled" });
         println!("  Vsock: {}", if enable_vsock { "enabled" } else { "disabled" });
+        if let Some(ref fs_path) = virtiofs_path {
+            println!("  VirtioFS: {} -> arcbox", fs_path);
+        } else {
+            println!("  VirtioFS: disabled");
+        }
         println!("  vCPUs: {}", config.vcpu_count);
         println!("  Memory: {} MB", config.memory_size / (1024 * 1024));
         println!("  Cmdline: {:?}", config.kernel_cmdline);
@@ -160,6 +172,16 @@ fn main() {
             match vm.add_virtio_device(vsock_config) {
                 Ok(()) => println!("Vsock device added successfully"),
                 Err(e) => eprintln!("Warning: Failed to add vsock device: {}", e),
+            }
+        }
+
+        // Add VirtioFS device if requested
+        if let Some(ref fs_path) = virtiofs_path {
+            println!("Adding VirtioFS device: {} -> arcbox", fs_path);
+            let fs_config = VirtioDeviceConfig::filesystem(fs_path, "arcbox", false);
+            match vm.add_virtio_device(fs_config) {
+                Ok(()) => println!("VirtioFS device added successfully"),
+                Err(e) => eprintln!("Warning: Failed to add VirtioFS device: {}", e),
             }
         }
 
