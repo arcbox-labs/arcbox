@@ -3,6 +3,21 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Port binding configuration.
+///
+/// Maps a container port to a host port for port forwarding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortBinding {
+    /// Host IP to bind to (empty or "0.0.0.0" for all interfaces).
+    pub host_ip: String,
+    /// Host port number.
+    pub host_port: u16,
+    /// Container port number.
+    pub container_port: u16,
+    /// Protocol (tcp or udp).
+    pub protocol: String,
+}
+
 /// Container configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContainerConfig {
@@ -22,6 +37,8 @@ pub struct ContainerConfig {
     pub user: Option<String>,
     /// Exposed ports.
     pub exposed_ports: Vec<String>,
+    /// Port bindings (host:container port mappings).
+    pub port_bindings: Vec<PortBinding>,
     /// Volume mounts.
     pub volumes: Vec<VolumeMount>,
     /// Resource limits.

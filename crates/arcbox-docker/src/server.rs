@@ -88,7 +88,14 @@ impl DockerApiServer {
                     .serve_connection_with_upgrades(TokioIo::new(stream), hyper_service)
                     .await
                 {
-                    tracing::error!("Error serving connection: {}", err);
+                    // Ignore normal connection shutdown errors (client closed connection)
+                    let err_str = err.to_string();
+                    if !err_str.contains("shutting down")
+                        && !err_str.contains("connection reset")
+                        && !err_str.contains("broken pipe")
+                    {
+                        tracing::error!("Error serving connection: {}", err);
+                    }
                 }
             });
         }

@@ -1,20 +1,22 @@
 //! gRPC service implementations.
 
 use crate::generated::{
-    container_service_server, image_service_server, machine_service_server, system_service_server,
-    ContainerLogsRequest, ContainerState as ProtoContainerState, ContainerSummary,
-    CreateContainerRequest, CreateContainerResponse, CreateMachineRequest, CreateMachineResponse,
-    ExecContainerRequest, ExecMachineRequest, ExecOutput, GetInfoRequest, GetInfoResponse,
-    GetVersionRequest, GetVersionResponse, InspectContainerRequest, InspectContainerResponse,
-    InspectImageRequest, InspectImageResponse, InspectMachineRequest, InspectMachineResponse,
-    ListContainersRequest, ListContainersResponse, ListImagesRequest, ListImagesResponse,
-    ListMachinesRequest, ListMachinesResponse, LogEntry, MachineSummary, Mount, PingRequest,
+    container_service_server, image_service_server, machine_service_server, network_service_server,
+    system_service_server, ContainerLogsRequest, ContainerState as ProtoContainerState,
+    ContainerSummary, CreateContainerRequest, CreateContainerResponse, CreateMachineRequest,
+    CreateMachineResponse, CreateNetworkRequest, CreateNetworkResponse, ExecContainerRequest,
+    ExecMachineRequest, ExecOutput, GetInfoRequest, GetInfoResponse, GetVersionRequest,
+    GetVersionResponse, InspectContainerRequest, InspectContainerResponse, InspectImageRequest,
+    InspectImageResponse, InspectMachineRequest, InspectMachineResponse, InspectNetworkRequest,
+    InspectNetworkResponse, ListContainersRequest, ListContainersResponse, ListImagesRequest,
+    ListImagesResponse, ListMachinesRequest, ListMachinesResponse, ListNetworksRequest,
+    ListNetworksResponse, LogEntry, MachineSummary, Mount, NetworkSummary, PingRequest,
     PingResponse, PortBinding, PullImageRequest, PullProgress, RemoveContainerRequest,
     RemoveContainerResponse, RemoveImageRequest, RemoveImageResponse, RemoveMachineRequest,
-    RemoveMachineResponse, ShellInput, ShellOutput, StartContainerRequest, StartContainerResponse,
-    StartMachineRequest, StartMachineResponse, StopContainerRequest, StopContainerResponse,
-    StopMachineRequest, StopMachineResponse, TagImageRequest, TagImageResponse,
-    WaitContainerRequest, WaitContainerResponse,
+    RemoveMachineResponse, RemoveNetworkRequest, RemoveNetworkResponse, ShellInput, ShellOutput,
+    StartContainerRequest, StartContainerResponse, StartMachineRequest, StartMachineResponse,
+    StopContainerRequest, StopContainerResponse, StopMachineRequest, StopMachineResponse,
+    TagImageRequest, TagImageResponse, WaitContainerRequest, WaitContainerResponse,
 };
 use arcbox_container::{ContainerConfig, ContainerId, ContainerState};
 use arcbox_core::Runtime;
@@ -1046,6 +1048,107 @@ impl system_service_server::SystemService for SystemServiceImpl {
     ) -> Result<Response<PingResponse>, Status> {
         Ok(Response::new(PingResponse {
             api_version: "1.0.0".to_string(),
+        }))
+    }
+}
+
+/// Network service implementation.
+pub struct NetworkServiceImpl {
+    runtime: Arc<Runtime>,
+}
+
+impl NetworkServiceImpl {
+    /// Creates a new network service.
+    #[must_use]
+    pub fn new(runtime: Arc<Runtime>) -> Self {
+        Self { runtime }
+    }
+}
+
+#[tonic::async_trait]
+impl network_service_server::NetworkService for NetworkServiceImpl {
+    async fn create_network(
+        &self,
+        request: Request<CreateNetworkRequest>,
+    ) -> Result<Response<CreateNetworkResponse>, Status> {
+        let req = request.into_inner();
+
+        let driver = if req.driver.is_empty() {
+            None
+        } else {
+            Some(req.driver.as_str())
+        };
+
+        let id = self
+            .runtime
+            .network_manager()
+            .create_network(&req.name, driver, req.labels)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(CreateNetworkResponse { id }))
+    }
+
+    async fn remove_network(
+        &self,
+        request: Request<RemoveNetworkRequest>,
+    ) -> Result<Response<RemoveNetworkResponse>, Status> {
+        let id = request.into_inner().id;
+
+        self.runtime
+            .network_manager()
+            .remove_network(&id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(RemoveNetworkResponse {}))
+    }
+
+    async fn list_networks(
+        &self,
+        _request: Request<ListNetworksRequest>,
+    ) -> Result<Response<ListNetworksResponse>, Status> {
+        let networks = self.runtime.network_manager().list_networks();
+
+        let summaries: Vec<_> = networks
+            .into_iter()
+            .map(|n| NetworkSummary {
+                id: n.id,
+                name: n.name,
+                driver: n.driver,
+                scope: n.scope,
+                created: n.created.to_rfc3339(),
+                internal: n.internal,
+                attachable: n.attachable,
+                labels: n.labels,
+            })
+            .collect();
+
+        Ok(Response::new(ListNetworksResponse {
+            networks: summaries,
+        }))
+    }
+
+    async fn inspect_network(
+        &self,
+        request: Request<InspectNetworkRequest>,
+    ) -> Result<Response<InspectNetworkResponse>, Status> {
+        let id = request.into_inner().id;
+
+        let network = self
+            .runtime
+            .network_manager()
+            .get_network(&id)
+            .ok_or_else(|| Status::not_found("network not found"))?;
+
+        Ok(Response::new(InspectNetworkResponse {
+            id: network.id,
+            name: network.name,
+            driver: network.driver,
+            scope: network.scope,
+            created: network.created.to_rfc3339(),
+            internal: network.internal,
+            attachable: network.attachable,
+            labels: network.labels,
+            containers: std::collections::HashMap::new(),
         }))
     }
 }

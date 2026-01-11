@@ -99,6 +99,25 @@ service ImageService {
 }
 
 // =============================================================================
+// Network Service
+// =============================================================================
+
+// NetworkService manages Docker networks.
+service NetworkService {
+    // Creates a new network.
+    rpc CreateNetwork(CreateNetworkRequest) returns (CreateNetworkResponse);
+
+    // Removes a network.
+    rpc RemoveNetwork(RemoveNetworkRequest) returns (RemoveNetworkResponse);
+
+    // Lists networks.
+    rpc ListNetworks(ListNetworksRequest) returns (ListNetworksResponse);
+
+    // Inspects a network.
+    rpc InspectNetwork(InspectNetworkRequest) returns (InspectNetworkResponse);
+}
+
+// =============================================================================
 // System Service
 // =============================================================================
 
@@ -618,4 +637,96 @@ message PingRequest {}
 message PingResponse {
     // API version.
     string api_version = 1;
+}
+
+// =============================================================================
+// Network Messages
+// =============================================================================
+
+message CreateNetworkRequest {
+    // Network name.
+    string name = 1;
+    // Driver (e.g., "bridge", "host", "none").
+    string driver = 2;
+    // Internal network (not connected to external network).
+    bool internal = 3;
+    // Labels.
+    map<string, string> labels = 4;
+}
+
+message CreateNetworkResponse {
+    // Network ID.
+    string id = 1;
+}
+
+message RemoveNetworkRequest {
+    // Network ID or name.
+    string id = 1;
+}
+
+message RemoveNetworkResponse {}
+
+message ListNetworksRequest {
+    // Filter by labels.
+    map<string, string> filters = 1;
+}
+
+message ListNetworksResponse {
+    repeated NetworkSummary networks = 1;
+}
+
+message NetworkSummary {
+    // Network ID.
+    string id = 1;
+    // Network name.
+    string name = 2;
+    // Driver.
+    string driver = 3;
+    // Scope (local, global).
+    string scope = 4;
+    // Created timestamp (RFC3339).
+    string created = 5;
+    // Internal network.
+    bool internal = 6;
+    // Attachable.
+    bool attachable = 7;
+    // Labels.
+    map<string, string> labels = 8;
+}
+
+message InspectNetworkRequest {
+    // Network ID or name.
+    string id = 1;
+}
+
+message InspectNetworkResponse {
+    // Network ID.
+    string id = 1;
+    // Network name.
+    string name = 2;
+    // Driver.
+    string driver = 3;
+    // Scope.
+    string scope = 4;
+    // Created timestamp (RFC3339).
+    string created = 5;
+    // Internal network.
+    bool internal = 6;
+    // Attachable.
+    bool attachable = 7;
+    // Labels.
+    map<string, string> labels = 8;
+    // Connected containers.
+    map<string, NetworkContainer> containers = 9;
+}
+
+message NetworkContainer {
+    // Container name.
+    string name = 1;
+    // Container endpoint ID.
+    string endpoint_id = 2;
+    // IPv4 address.
+    string ipv4_address = 3;
+    // IPv6 address.
+    string ipv6_address = 4;
 }

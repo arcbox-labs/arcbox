@@ -5,9 +5,10 @@ use crate::generated::{
     container_service_server::ContainerServiceServer,
     image_service_server::ImageServiceServer,
     machine_service_server::MachineServiceServer,
+    network_service_server::NetworkServiceServer,
     system_service_server::SystemServiceServer,
 };
-use crate::grpc::{ContainerServiceImpl, ImageServiceImpl, MachineServiceImpl, SystemServiceImpl};
+use crate::grpc::{ContainerServiceImpl, ImageServiceImpl, MachineServiceImpl, NetworkServiceImpl, SystemServiceImpl};
 use arcbox_core::{Config, Runtime};
 use arcbox_docker::{DockerApiServer, ServerConfig as DockerConfig};
 use std::path::PathBuf;
@@ -83,6 +84,7 @@ impl ApiServer {
         let container_service = ContainerServiceImpl::new(Arc::clone(&self.runtime));
         let machine_service = MachineServiceImpl::new(Arc::clone(&self.runtime));
         let image_service = ImageServiceImpl::new(Arc::clone(&self.runtime));
+        let network_service = NetworkServiceImpl::new(Arc::clone(&self.runtime));
         let system_service = SystemServiceImpl::new(Arc::clone(&self.runtime));
 
         // Parse gRPC address
@@ -104,6 +106,7 @@ impl ApiServer {
             .add_service(ContainerServiceServer::new(container_service))
             .add_service(MachineServiceServer::new(machine_service))
             .add_service(ImageServiceServer::new(image_service))
+            .add_service(NetworkServiceServer::new(network_service))
             .add_service(SystemServiceServer::new(system_service))
             .serve_with_shutdown(grpc_addr, async {
                 tokio::signal::ctrl_c()

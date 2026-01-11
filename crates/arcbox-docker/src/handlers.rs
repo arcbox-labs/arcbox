@@ -28,12 +28,12 @@ use tokio_stream::wrappers::ReceiverStream;
 #[derive(Debug, Deserialize)]
 pub struct ListContainersQuery {
     /// Show all containers.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool")]
     pub all: bool,
     /// Limit results.
     pub limit: Option<i32>,
     /// Show sizes.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool")]
     pub size: bool,
     /// Filters (JSON encoded).
     pub filters: Option<String>,
@@ -53,21 +53,40 @@ pub async fn list_containers(
             show_all
                 || c.state == arcbox_container::state::ContainerState::Running
         })
-        .map(|c| ContainerSummary {
-            id: c.id.to_string(),
-            names: vec![format!("/{}", c.name)],
-            image: c.image.clone(),
-            image_id: String::new(),
-            command: String::new(),
-            created: c.created.timestamp(),
-            ports: vec![],
-            size_rw: None,
-            size_root_fs: None,
-            labels: HashMap::new(),
-            state: c.state.to_string(),
-            status: format_container_status(c),
-            network_settings: None,
-            mounts: None,
+        .map(|c| {
+            // Extract ports from container config.
+            let ports = c.config.as_ref().map_or(vec![], |cfg| {
+                cfg.port_bindings
+                    .iter()
+                    .map(|pb| Port {
+                        private_port: pb.container_port,
+                        public_port: Some(pb.host_port),
+                        port_type: pb.protocol.clone(),
+                        ip: if pb.host_ip.is_empty() {
+                            Some("0.0.0.0".to_string())
+                        } else {
+                            Some(pb.host_ip.clone())
+                        },
+                    })
+                    .collect()
+            });
+
+            ContainerSummary {
+                id: c.id.to_string(),
+                names: vec![format!("/{}", c.name)],
+                image: c.image.clone(),
+                image_id: String::new(),
+                command: String::new(),
+                created: c.created.timestamp(),
+                ports,
+                size_rw: None,
+                size_root_fs: None,
+                labels: HashMap::new(),
+                state: c.state.to_string(),
+                status: format_container_status(c),
+                network_settings: None,
+                mounts: None,
+            }
         })
         .collect();
 
@@ -159,6 +178,46 @@ pub async fn create_container(
         })
         .unwrap_or_default();
 
+    // Parse port bindings from host_config.
+    // Docker format: {"80/tcp": [{"HostIp": "", "HostPort": "8080"}]}
+    let port_bindings = body
+        .host_config
+        .as_ref()
+        .and_then(|hc| hc.port_bindings.as_ref())
+        .map(|bindings| {
+            bindings
+                .iter()
+                .flat_map(|(container_port_proto, host_bindings)| {
+                    // Parse container port and protocol (e.g., "80/tcp" or "53/udp")
+                    let (container_port, protocol) = {
+                        let parts: Vec<&str> = container_port_proto.split('/').collect();
+                        let port: u16 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(0);
+                        let proto = parts.get(1).unwrap_or(&"tcp").to_string();
+                        (port, proto)
+                    };
+
+                    host_bindings.iter().filter_map(move |hb| {
+                        let host_port: u16 = hb
+                            .host_port
+                            .as_ref()
+                            .and_then(|p| p.parse().ok())
+                            .unwrap_or(0);
+                        if container_port > 0 && host_port > 0 {
+                            Some(arcbox_container::config::PortBinding {
+                                host_ip: hb.host_ip.clone().unwrap_or_default(),
+                                host_port,
+                                container_port,
+                                protocol: protocol.clone(),
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let config = CoreContainerConfig {
         name: params.name,
         image: body.image,
@@ -168,6 +227,7 @@ pub async fn create_container(
         working_dir: body.working_dir,
         user: body.user,
         volumes,
+        port_bindings,
         ..Default::default()
     };
 
@@ -492,13 +552,13 @@ pub async fn restart_container(
 #[derive(Debug, Deserialize)]
 pub struct RemoveContainerQuery {
     /// Force remove.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool")]
     pub force: bool,
     /// Remove volumes.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool")]
     pub v: bool,
     /// Remove link.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool")]
     pub link: bool,
 }
 
@@ -617,15 +677,45 @@ fn default_true() -> bool {
     true
 }
 
+/// Deserialize a boolean from query string.
+///
+/// Docker CLI sends booleans as "true", "false", "1", "0", or empty string.
+/// We need to be lenient and handle all these cases.
 fn deserialize_bool<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
 where
     D: Deserializer<'de>,
 {
     let value = String::deserialize(deserializer)?;
-    match value.as_str() {
-        "true" | "1" => Ok(true),
-        "false" | "0" => Ok(false),
-        _ => Err(de::Error::custom("provided string was not `true` or `false`")),
+    match value.to_lowercase().as_str() {
+        "true" | "1" | "yes" => Ok(true),
+        "false" | "0" | "no" | "" => Ok(false),
+        _ => {
+            // Be lenient: treat unknown values as false instead of erroring
+            tracing::warn!("Unknown boolean value '{}', treating as false", value);
+            Ok(false)
+        }
+    }
+}
+
+/// Deserialize an optional boolean from query string.
+///
+/// Returns None if the value is empty or not provided.
+fn deserialize_option_bool<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value: Option<String> = Option::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(s) => match s.to_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(Some(true)),
+            "false" | "0" | "no" => Ok(Some(false)),
+            "" => Ok(None),
+            _ => {
+                tracing::warn!("Unknown boolean value '{}', treating as None", s);
+                Ok(None)
+            }
+        },
     }
 }
 
@@ -1197,10 +1287,10 @@ pub async fn exec_inspect(
 #[derive(Debug, Deserialize)]
 pub struct ListImagesQuery {
     /// Show all images.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool")]
     pub all: bool,
     /// Show digests.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool")]
     pub digests: bool,
     /// Filters (JSON encoded).
     pub filters: Option<String>,
@@ -1354,10 +1444,10 @@ pub async fn pull_image(
 #[derive(Debug, Deserialize)]
 pub struct RemoveImageQuery {
     /// Force removal.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool")]
     pub force: bool,
     /// Do not delete untagged parents.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool")]
     pub noprune: bool,
 }
 

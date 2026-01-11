@@ -85,7 +85,8 @@ impl ContainerManager {
             .clone()
             .unwrap_or_else(|| format!("container_{}", uuid::Uuid::new_v4()));
 
-        let container = Container::new(name, &config.image);
+        // Use with_config to store the full configuration (including port_bindings).
+        let container = Container::with_config(name, config);
         let id = container.id.clone();
 
         let mut containers = self

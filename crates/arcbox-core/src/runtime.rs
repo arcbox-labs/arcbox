@@ -7,17 +7,23 @@ use crate::event::EventBus;
 use crate::machine::{MachineManager, MachineState};
 use crate::vm::VmManager;
 use crate::vm_lifecycle::{VmLifecycleConfig, VmLifecycleManager, DEFAULT_MACHINE_NAME};
-use arcbox_container::{ContainerConfig, ContainerId, ContainerManager, ContainerState, ExecManager, VolumeManager};
+use arcbox_container::{ContainerConfig, ContainerId, ContainerManager, ExecManager, VolumeManager};
 use arcbox_image::{ImageRef, ImageStore};
-use arcbox_net::NetworkManager;
+use arcbox_net::{NetworkManager, port_forward::{PortForwarder, PortForwardRule}};
 use arcbox_protocol::agent::{CreateContainerRequest, LogEntry, LogsRequest};
 use arcbox_protocol::Mount;
 use tokio_stream::wrappers::ReceiverStream;
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, RwLock};
+use tokio::sync::RwLock as TokioRwLock;
 
 /// ArcBox runtime.
 ///
 /// The main entry point for the ArcBox system, managing all components.
+/// Default guest VM IP address in NAT network.
+const DEFAULT_GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 2);
+
 pub struct Runtime {
     /// Configuration.
     config: Config,
@@ -41,6 +47,8 @@ pub struct Runtime {
     exec_manager: Arc<ExecManager>,
     /// Agent connection pool.
     agent_pool: Arc<AgentPool>,
+    /// Port forwarders for each container (keyed by container ID).
+    port_forwarders: Arc<TokioRwLock<HashMap<String, PortForwarder>>>,
 }
 
 impl Runtime {
@@ -94,6 +102,7 @@ impl Runtime {
             network_manager,
             exec_manager,
             agent_pool,
+            port_forwarders: Arc::new(TokioRwLock::new(HashMap::new())),
         })
     }
 
@@ -369,6 +378,10 @@ impl Runtime {
             CoreError::Config(format!("invalid image reference: {}", config.image))
         })?;
 
+        // Get image config for default entrypoint/cmd
+        let image_config = self.image_store.get_image_config(&image_ref)?;
+        let image_container_config = &image_config.config;
+
         // Prepare container rootfs by extracting image layers
         let host_rootfs = self
             .image_store
@@ -414,11 +427,30 @@ impl Runtime {
             })
             .collect();
 
+        // Use config values if provided, otherwise fall back to image defaults.
+        let entrypoint = if config.entrypoint.is_empty() {
+            image_container_config.entrypoint.clone().unwrap_or_default()
+        } else {
+            config.entrypoint.clone()
+        };
+        let cmd = if config.cmd.is_empty() {
+            image_container_config.cmd.clone().unwrap_or_default()
+        } else {
+            config.cmd.clone()
+        };
+
+        tracing::debug!(
+            "Container {} entrypoint={:?}, cmd={:?}",
+            container_id,
+            entrypoint,
+            cmd
+        );
+
         let req = CreateContainerRequest {
             name: config.name.clone().unwrap_or_default(),
             image: config.image.clone(),
-            cmd: config.cmd.clone(),
-            entrypoint: config.entrypoint.clone(),
+            cmd,
+            entrypoint,
             env: config.env.clone(),
             working_dir: config.working_dir.clone().unwrap_or_default(),
             user: config.user.clone().unwrap_or_default(),
@@ -483,6 +515,9 @@ impl Runtime {
         // Update local state after successful agent call
         self.container_manager.start(container_id).await?;
 
+        // Start port forwarding if configured.
+        self.start_port_forwarding(machine_name, container_id).await?;
+
         tracing::info!(
             "Started container {} in machine '{}'",
             container_id,
@@ -490,6 +525,158 @@ impl Runtime {
         );
 
         Ok(())
+    }
+
+    /// Gets the VM's IP address by executing a command in the guest.
+    ///
+    /// Returns the first IPv4 address found on a non-loopback interface.
+    /// Retries a few times if network is not yet configured.
+    async fn get_guest_ip(&self, machine_name: &str) -> Result<Ipv4Addr> {
+        const MAX_RETRIES: u32 = 5;
+        const RETRY_DELAY_MS: u64 = 500;
+
+        for attempt in 0..MAX_RETRIES {
+            // Try to get IP address from the VM using cat /var/log/network.log
+            // which is written by the init script after network configuration.
+            // Also try ip addr as a fallback.
+            let output = self.exec_machine(
+                machine_name,
+                vec![
+                    "/bin/busybox".to_string(),
+                    "cat".to_string(),
+                    "/var/log/network.log".to_string(),
+                ],
+                std::collections::HashMap::new(),
+                String::new(),
+                String::new(),
+                false,
+            ).await?;
+
+            let stdout = String::from_utf8_lossy(&output.data);
+            tracing::debug!("network log (attempt {}): exit_code={}, output={:?}",
+                attempt + 1, output.exit_code, stdout);
+
+            // Parse the output to find an IP address.
+            // network.log format: "Network configured: eth0 -> 192.168.64.2/24"
+            // or: "No network interface found"
+            for line in stdout.lines() {
+                let line = line.trim();
+
+                // network.log format: "Network configured: eth0 -> 192.168.64.2/24"
+                if line.contains("Network configured:") && line.contains(" -> ") {
+                    if let Some(ip_part) = line.split(" -> ").nth(1) {
+                        // Remove CIDR notation if present
+                        let ip_str = ip_part.split('/').next().unwrap_or(ip_part);
+                        if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                            tracing::info!("Discovered guest IP from network.log: {}", ip);
+                            return Ok(ip);
+                        }
+                    }
+                }
+
+                // ip addr format: "inet 192.168.64.2/24 ..."
+                if line.starts_with("inet ") && !line.contains("127.0.0.1") {
+                    if let Some(ip_cidr) = line.strip_prefix("inet ") {
+                        if let Some(ip_str) = ip_cidr.split('/').next() {
+                            let ip_str = ip_str.split_whitespace().next().unwrap_or(ip_str);
+                            if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                                tracing::info!("Discovered guest IP: {}", ip);
+                                return Ok(ip);
+                            }
+                        }
+                    }
+                }
+
+                // ifconfig format: "inet addr:192.168.64.2 ..."
+                if line.contains("inet addr:") && !line.contains("127.0.0.1") {
+                    if let Some(addr_part) = line.split("inet addr:").nth(1) {
+                        if let Some(ip_str) = addr_part.split_whitespace().next() {
+                            if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                                tracing::info!("Discovered guest IP: {}", ip);
+                                return Ok(ip);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // No IP found yet, wait and retry if not last attempt.
+            if attempt < MAX_RETRIES - 1 {
+                tracing::debug!(
+                    "Guest IP not found on attempt {}, retrying in {}ms",
+                    attempt + 1,
+                    RETRY_DELAY_MS
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+            }
+        }
+
+        tracing::warn!("Could not discover guest IP after {} attempts, using default {}",
+            MAX_RETRIES, DEFAULT_GUEST_IP);
+        Ok(DEFAULT_GUEST_IP)
+    }
+
+    /// Starts port forwarding for a container based on its configuration.
+    async fn start_port_forwarding(
+        &self,
+        machine_name: &str,
+        container_id: &ContainerId,
+    ) -> Result<()> {
+        let container = self.container_manager.get(container_id)
+            .ok_or_else(|| CoreError::NotFound(container_id.to_string()))?;
+
+        let port_bindings = match &container.config {
+            Some(cfg) if !cfg.port_bindings.is_empty() => &cfg.port_bindings,
+            _ => return Ok(()), // No port bindings configured
+        };
+
+        // Get the actual guest IP address.
+        let guest_ip = self.get_guest_ip(machine_name).await?;
+
+        let mut forwarder = PortForwarder::new();
+
+        for binding in port_bindings {
+            // Determine host IP to bind (0.0.0.0 if not specified)
+            let host_ip: Ipv4Addr = if binding.host_ip.is_empty() || binding.host_ip == "0.0.0.0" {
+                Ipv4Addr::UNSPECIFIED
+            } else {
+                binding.host_ip.parse().unwrap_or(Ipv4Addr::UNSPECIFIED)
+            };
+
+            let host_addr = SocketAddr::V4(SocketAddrV4::new(host_ip, binding.host_port));
+            let guest_addr = SocketAddr::V4(SocketAddrV4::new(guest_ip, binding.container_port));
+
+            let rule = match binding.protocol.to_lowercase().as_str() {
+                "udp" => PortForwardRule::udp(host_addr, guest_addr),
+                _ => PortForwardRule::tcp(host_addr, guest_addr),
+            };
+
+            forwarder.add_rule(rule);
+            tracing::info!(
+                "Port forward rule added: {} -> {} ({})",
+                host_addr,
+                guest_addr,
+                binding.protocol
+            );
+        }
+
+        // Start all forwarders.
+        forwarder.start().await?;
+
+        // Store the forwarder.
+        let mut forwarders = self.port_forwarders.write().await;
+        forwarders.insert(container_id.to_string(), forwarder);
+
+        Ok(())
+    }
+
+    /// Stops port forwarding for a container.
+    async fn stop_port_forwarding(&self, container_id: &ContainerId) {
+        let mut forwarders = self.port_forwarders.write().await;
+        if let Some(mut forwarder) = forwarders.remove(&container_id.to_string()) {
+            forwarder.stop().await;
+            tracing::debug!("Stopped port forwarding for container {}", container_id);
+        }
     }
 
     /// Stops a container in a machine.
@@ -521,6 +708,9 @@ impl Runtime {
             let mut agent = agent.write().await;
             agent.stop_container(&container_id_str, timeout).await?;
         }
+
+        // Stop port forwarding first.
+        self.stop_port_forwarding(container_id).await;
 
         // Update local state after successful agent call
         self.container_manager.stop(container_id, timeout).await?;
@@ -602,6 +792,9 @@ impl Runtime {
             let mut agent = agent.write().await;
             agent.remove_container(&container_id_str, force).await?;
         }
+
+        // Stop port forwarding if any.
+        self.stop_port_forwarding(container_id).await;
 
         // Update local state
         self.container_manager.remove(container_id)?;
@@ -785,6 +978,9 @@ impl Runtime {
             let mut agent = agent.write().await;
             agent.kill_container(&container_id_str, signal).await?;
         }
+
+        // Stop port forwarding.
+        self.stop_port_forwarding(container_id).await;
 
         // Update local state after successful agent call.
         self.container_manager.kill(container_id, signal).await?;
