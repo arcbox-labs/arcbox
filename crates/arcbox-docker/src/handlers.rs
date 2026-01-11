@@ -7,6 +7,7 @@ use crate::api::AppState;
 use crate::error::{DockerError, Result};
 use crate::types::*;
 use arcbox_container::config::ContainerConfig as CoreContainerConfig;
+use arcbox_protocol::agent::LogEntry;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -15,6 +16,7 @@ use axum::Json;
 use bytes::Bytes;
 use futures::StreamExt;
 use serde::Deserialize;
+use serde::de::{self, Deserializer};
 use std::collections::HashMap;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -131,6 +133,32 @@ pub async fn create_container(
         })
         .collect();
 
+    // Parse volume binds from host_config into VolumeMount structs.
+    // Format: /host/path:/container/path[:ro|rw]
+    let volumes = body
+        .host_config
+        .as_ref()
+        .and_then(|hc| hc.binds.as_ref())
+        .map(|binds| {
+            binds
+                .iter()
+                .filter_map(|bind| {
+                    let parts: Vec<&str> = bind.split(':').collect();
+                    if parts.len() >= 2 {
+                        let read_only = parts.get(2).is_some_and(|&opt| opt == "ro");
+                        Some(arcbox_container::config::VolumeMount {
+                            source: parts[0].to_string(),
+                            target: parts[1].to_string(),
+                            read_only,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let config = CoreContainerConfig {
         name: params.name,
         image: body.image,
@@ -139,6 +167,7 @@ pub async fn create_container(
         env,
         working_dir: body.working_dir,
         user: body.user,
+        volumes,
         ..Default::default()
     };
 
@@ -565,20 +594,20 @@ pub async fn wait_container(
 #[derive(Debug, Deserialize)]
 pub struct LogsQuery {
     /// Follow log output.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool")]
     pub follow: bool,
     /// Show stdout.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "deserialize_bool")]
     pub stdout: bool,
     /// Show stderr.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "deserialize_bool")]
     pub stderr: bool,
     /// Since timestamp.
     pub since: Option<i64>,
     /// Until timestamp.
     pub until: Option<i64>,
     /// Show timestamps.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool")]
     pub timestamps: bool,
     /// Tail lines.
     pub tail: Option<String>,
@@ -586,6 +615,18 @@ pub struct LogsQuery {
 
 fn default_true() -> bool {
     true
+}
+
+fn deserialize_bool<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    match value.as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(de::Error::custom("provided string was not `true` or `false`")),
+    }
 }
 
 /// Encodes data in Docker multiplexed stream format.
@@ -674,32 +715,76 @@ pub async fn container_logs(
     }
 
     // Non-streaming mode: get all logs at once.
-    let log_data = match state
-        .runtime
-        .container_logs(
-            &machine_name,
-            &id,
-            false,
-            params.stdout,
-            params.stderr,
-            params.since.unwrap_or(0),
-            params.until.unwrap_or(0),
-            params.timestamps,
-            tail,
-        )
-        .await
-    {
-        Ok(entry) => entry.data,
-        Err(e) => {
-            tracing::warn!("Failed to get logs from agent: {}", e);
-            // Return empty response if agent is not available.
-            Vec::new()
+    let mut log_entries = Vec::new();
+
+    if params.stdout && params.stderr {
+        let stdout_entry = state
+            .runtime
+            .container_logs(
+                &machine_name,
+                &id,
+                false,
+                true,
+                false,
+                params.since.unwrap_or(0),
+                params.until.unwrap_or(0),
+                params.timestamps,
+                tail,
+            )
+            .await;
+        let stderr_entry = state
+            .runtime
+            .container_logs(
+                &machine_name,
+                &id,
+                false,
+                false,
+                true,
+                params.since.unwrap_or(0),
+                params.until.unwrap_or(0),
+                params.timestamps,
+                tail,
+            )
+            .await;
+
+        if let Ok(entry) = stdout_entry {
+            log_entries.push(entry);
         }
-    };
+        if let Ok(entry) = stderr_entry {
+            log_entries.push(entry);
+        }
+    } else {
+        let log_entry = state
+            .runtime
+            .container_logs(
+                &machine_name,
+                &id,
+                false,
+                params.stdout,
+                params.stderr,
+                params.since.unwrap_or(0),
+                params.until.unwrap_or(0),
+                params.timestamps,
+                tail,
+            )
+            .await;
+
+        if let Ok(entry) = log_entry {
+            log_entries.push(entry);
+        }
+    }
+
+    if log_entries.is_empty() {
+        tracing::warn!("Failed to get logs from agent");
+        log_entries.push(LogEntry::default());
+    }
 
     // Encode in Docker multiplexed stream format.
-    let stream_type: u8 = if params.stdout { 1 } else { 2 };
-    let output = encode_docker_stream(stream_type, &log_data);
+    let mut output = Vec::new();
+    for entry in log_entries {
+        let stream_type: u8 = if entry.stream == "stderr" { 2 } else { 1 };
+        output.extend_from_slice(&encode_docker_stream(stream_type, &entry.data));
+    }
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -758,10 +843,10 @@ async fn container_logs_stream(
     };
 
     // Transform log entries to Docker stream format.
-    let stream_type: u8 = if stdout { 1 } else { 2 };
     let body_stream = log_stream.map(move |result| {
         match result {
             Ok(entry) => {
+                let stream_type: u8 = if entry.stream == "stderr" { 2 } else { 1 };
                 let encoded = encode_docker_stream(stream_type, &entry.data);
                 Ok::<_, std::io::Error>(Bytes::from(encoded))
             }
@@ -782,6 +867,135 @@ async fn container_logs_stream(
             "application/vnd.docker.raw-stream",
         )
         .body(body)
+        .unwrap())
+}
+
+// ============================================================================
+// Attach Handler
+// ============================================================================
+
+/// Attach to container query parameters.
+#[derive(Debug, Deserialize)]
+pub struct AttachContainerQuery {
+    /// Attach to stdin.
+    #[serde(default, deserialize_with = "deserialize_bool")]
+    pub stdin: bool,
+    /// Attach to stdout.
+    #[serde(default = "default_true", deserialize_with = "deserialize_bool")]
+    pub stdout: bool,
+    /// Attach to stderr.
+    #[serde(default = "default_true", deserialize_with = "deserialize_bool")]
+    pub stderr: bool,
+    /// Stream output.
+    #[serde(default, deserialize_with = "deserialize_bool")]
+    pub stream: bool,
+    /// Return logs.
+    #[serde(default, deserialize_with = "deserialize_bool")]
+    pub logs: bool,
+}
+
+/// Attach to a container.
+///
+/// This endpoint starts the container (if not running) and streams its output.
+/// For non-TTY containers, output is encoded in Docker multiplexed stream format.
+///
+/// Docker CLI expects either:
+/// - 101 Switching Protocols (for interactive/TTY)
+/// - 200 OK with Content-Type: application/vnd.docker.raw-stream (for non-interactive)
+pub async fn attach_container(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<AttachContainerQuery>,
+) -> Result<Response> {
+    tracing::debug!("attach_container: id={}, stdout={}, stderr={}, stream={}",
+                    id, params.stdout, params.stderr, params.stream);
+
+    let container_id = arcbox_container::state::ContainerId::from_string(&id);
+
+    // Check if container exists.
+    let container = state
+        .runtime
+        .container_manager()
+        .get(&container_id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+
+    let machine_name = container
+        .machine_name
+        .clone()
+        .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
+
+    // Ensure VM is ready.
+    state
+        .runtime
+        .ensure_vm_ready()
+        .await
+        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {}", e)))?;
+
+    // Start container if not running.
+    let container_state = container.state;
+    tracing::debug!("attach_container: container state = {:?}", container_state);
+
+    if container_state == arcbox_container::state::ContainerState::Created {
+        tracing::debug!("attach_container: starting container {}", id);
+        state
+            .runtime
+            .start_container(&machine_name, &container_id)
+            .await
+            .map_err(|e| {
+                tracing::error!("attach_container: failed to start container: {}", e);
+                DockerError::Server(e.to_string())
+            })?;
+        tracing::debug!("attach_container: container started");
+    } else {
+        tracing::debug!("attach_container: container already in state {:?}, not starting", container_state);
+    }
+
+    // Wait for container to finish and get output.
+    tracing::debug!("attach_container: waiting for container to finish");
+    let exit_result = state
+        .runtime
+        .wait_container(&machine_name, &container_id.to_string())
+        .await;
+
+    match &exit_result {
+        Ok(code) => tracing::debug!("attach_container: container exited with code {}", code),
+        Err(e) => tracing::error!("attach_container: wait_container failed: {}", e),
+    }
+
+    // Get logs after container finishes.
+    tracing::debug!("attach_container: getting logs");
+    let log_entry = state
+        .runtime
+        .container_logs(
+            &machine_name,
+            &id,
+            false, // follow
+            params.stdout,
+            params.stderr,
+            0,     // since
+            0,     // until
+            false, // timestamps
+            -1,    // tail (all)
+        )
+        .await
+        .unwrap_or_default();
+
+    // Encode in Docker multiplexed stream format.
+    let stream_type: u8 = if log_entry.stream == "stderr" { 2 } else { 1 };
+    let output = encode_docker_stream(stream_type, &log_entry.data);
+
+    // If there was an error waiting, still return what we have.
+    if let Err(e) = exit_result {
+        tracing::warn!("Error waiting for container: {}", e);
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            "application/vnd.docker.raw-stream",
+        )
+        .body(Body::from(output))
         .unwrap())
 }
 

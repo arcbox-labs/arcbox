@@ -41,6 +41,7 @@ fn main() {
         shared_dirs: Vec::new(),
         networking: false,
         vsock: false,
+        guest_cid: None,
     };
 
     println!("VMM Configuration:");

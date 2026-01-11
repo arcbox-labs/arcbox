@@ -483,13 +483,96 @@ impl LinuxFirewall {
     pub fn remove_nat_rule(&mut self, rule: &NatRule) -> Result<()> {
         match self.backend {
             FirewallBackend::Iptables => self.remove_nat_rule_iptables(rule),
-            FirewallBackend::Nftables => {
-                // nftables requires rule handles for deletion
-                // For simplicity, we just flush and recreate
-                tracing::warn!("nftables rule removal not implemented, use teardown()");
-                Ok(())
+            FirewallBackend::Nftables => self.remove_nat_rule_nftables(rule),
+        }
+    }
+
+    /// Removes NAT rule using nftables.
+    ///
+    /// nftables requires rule handles for deletion. This method queries the
+    /// current rules, finds the matching one by its pattern, and deletes it.
+    fn remove_nat_rule_nftables(&self, rule: &NatRule) -> Result<()> {
+        // Build the pattern to search for in the rule.
+        let source_pattern = rule.source.to_string();
+        let nat_pattern = match rule.nat_type {
+            NatType::Masquerade => "masquerade".to_string(),
+            NatType::Snat => format!(
+                "snat to {}",
+                rule.snat_addr.expect("SNAT requires snat_addr")
+            ),
+        };
+
+        // Find and delete matching rules in the postrouting chain.
+        self.delete_nft_rule_by_pattern("postrouting", &[&source_pattern, &nat_pattern])?;
+
+        tracing::debug!("Removed NAT rule: {:?}", rule);
+        Ok(())
+    }
+
+    /// Finds and deletes an nftables rule by matching patterns.
+    ///
+    /// Queries the chain with `-a` flag to get handles, then deletes matching rules.
+    fn delete_nft_rule_by_pattern(&self, chain: &str, patterns: &[&str]) -> Result<()> {
+        // Query rules with handles.
+        let output = Command::new("nft")
+            .args(["-a", "list", "chain", "ip", "arcbox", chain])
+            .output()
+            .map_err(|e| NetError::Firewall(format!("Failed to list nft rules: {}", e)))?;
+
+        if !output.status.success() {
+            // Chain might not exist, which is fine.
+            return Ok(());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Parse output to find matching rules.
+        // nftables output format: "... handle <N>"
+        for line in stdout.lines() {
+            // Check if all patterns match this line.
+            let matches = patterns.iter().all(|p| line.contains(p));
+
+            if matches {
+                // Extract handle from the line.
+                if let Some(handle) = Self::extract_nft_handle(line) {
+                    tracing::debug!("Found matching rule with handle {}: {}", handle, line.trim());
+
+                    // Delete by handle.
+                    let result = Command::new("nft")
+                        .args(["delete", "rule", "ip", "arcbox", chain, "handle", &handle.to_string()])
+                        .output();
+
+                    match result {
+                        Ok(out) if out.status.success() => {
+                            tracing::debug!("Deleted nft rule with handle {}", handle);
+                        }
+                        Ok(out) => {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            tracing::warn!("Failed to delete nft rule {}: {}", handle, stderr);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to run nft delete: {}", e);
+                        }
+                    }
+                }
             }
         }
+
+        Ok(())
+    }
+
+    /// Extracts the handle number from an nftables rule line.
+    ///
+    /// Line format: "... # handle 123"
+    fn extract_nft_handle(line: &str) -> Option<u64> {
+        // Look for "handle" followed by a number.
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        for i in 0..parts.len().saturating_sub(1) {
+            if parts[i] == "handle" {
+                return parts[i + 1].parse().ok();
+            }
+        }
+        None
     }
 
     /// Removes NAT rule using iptables.
@@ -603,11 +686,29 @@ impl LinuxFirewall {
     pub fn remove_dnat_rule(&mut self, rule: &DnatRule) -> Result<()> {
         match self.backend {
             FirewallBackend::Iptables => self.remove_dnat_rule_iptables(rule),
-            FirewallBackend::Nftables => {
-                tracing::warn!("nftables rule removal not implemented, use teardown()");
-                Ok(())
-            }
+            FirewallBackend::Nftables => self.remove_dnat_rule_nftables(rule),
         }
+    }
+
+    /// Removes DNAT rule using nftables.
+    fn remove_dnat_rule_nftables(&self, rule: &DnatRule) -> Result<()> {
+        let protocols = match rule.protocol {
+            Protocol::Tcp => vec!["tcp"],
+            Protocol::Udp => vec!["udp"],
+            Protocol::Both => vec!["tcp", "udp"],
+        };
+
+        for proto in protocols {
+            // Build patterns to match the rule.
+            let dport_pattern = format!("dport {}", rule.host_port);
+            let dnat_pattern = format!("dnat to {}:{}", rule.guest_ip, rule.guest_port);
+
+            // Find and delete matching rules in the prerouting chain.
+            self.delete_nft_rule_by_pattern("prerouting", &[proto, &dport_pattern, &dnat_pattern])?;
+        }
+
+        tracing::debug!("Removed DNAT rule: {:?}", rule);
+        Ok(())
     }
 
     /// Removes DNAT rule using iptables.

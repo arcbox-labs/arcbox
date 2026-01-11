@@ -1675,8 +1675,22 @@ pub fn vsock_connect_to_port(
                 }
             } else if !connection.is_null() {
                 let fd: i32 = msg_send_i32!(connection, fileDescriptor);
-                tracing::debug!("vsock connection success: fd={}", fd);
-                VsockConnectionResult { fd, error: None }
+                // Duplicate the fd so it stays valid even if the connection object is released.
+                let dup_fd = unsafe { libc::dup(fd) };
+                if dup_fd < 0 {
+                    let errno = *libc::__error();
+                    tracing::debug!("vsock connection dup failed: errno={}", errno);
+                    VsockConnectionResult {
+                        fd: -1,
+                        error: Some(format!("dup failed: errno={}", errno)),
+                    }
+                } else {
+                    tracing::debug!("vsock connection success: fd={} (dup={})", fd, dup_fd);
+                    VsockConnectionResult {
+                        fd: dup_fd,
+                        error: None,
+                    }
+                }
             } else {
                 tracing::debug!("vsock connection: both connection and error are null");
                 VsockConnectionResult {

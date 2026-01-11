@@ -668,6 +668,242 @@ async fn test_container_logs_tail() {
 }
 
 // ============================================================================
+// Container Output Capture Tests (Log Capture Feature)
+// ============================================================================
+
+/// Test that container stdout is captured via run command.
+#[tokio::test]
+#[ignore = "requires VM resources and network"]
+async fn test_container_stdout_capture() {
+    if skip_if_missing_resources() {
+        return;
+    }
+
+    let mut harness = TestHarness::with_defaults().expect("failed to create harness");
+
+    harness.setup_full_environment().await.expect("failed to setup");
+
+    harness
+        .run_command_success(&["pull", images::ALPINE])
+        .expect("failed to pull");
+
+    // Run container that outputs to stdout
+    let output = harness
+        .run_command(&[
+            "run",
+            "--rm",
+            images::ALPINE,
+            "sh",
+            "-c",
+            "echo stdout-test-message",
+        ])
+        .expect("failed to run");
+
+    assert!(output.status.success(), "Run should succeed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("stdout-test-message"),
+        "Stdout should be captured: {}",
+        stdout
+    );
+}
+
+/// Test that container stderr is captured via run command.
+#[tokio::test]
+#[ignore = "requires VM resources and network"]
+async fn test_container_stderr_capture() {
+    if skip_if_missing_resources() {
+        return;
+    }
+
+    let mut harness = TestHarness::with_defaults().expect("failed to create harness");
+
+    harness.setup_full_environment().await.expect("failed to setup");
+
+    harness
+        .run_command_success(&["pull", images::ALPINE])
+        .expect("failed to pull");
+
+    // Run container that outputs to stderr
+    let output = harness
+        .run_command(&[
+            "run",
+            "--rm",
+            images::ALPINE,
+            "sh",
+            "-c",
+            "echo stderr-test-message >&2",
+        ])
+        .expect("failed to run");
+
+    // Stderr content should appear in output
+    let all_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        all_output.contains("stderr-test-message"),
+        "Stderr should be captured: {}",
+        all_output
+    );
+}
+
+/// Test that both stdout and stderr are captured.
+#[tokio::test]
+#[ignore = "requires VM resources and network"]
+async fn test_container_stdout_stderr_both() {
+    if skip_if_missing_resources() {
+        return;
+    }
+
+    let mut harness = TestHarness::with_defaults().expect("failed to create harness");
+
+    harness.setup_full_environment().await.expect("failed to setup");
+
+    harness
+        .run_command_success(&["pull", images::ALPINE])
+        .expect("failed to pull");
+
+    // Run container that outputs to both stdout and stderr
+    let output = harness
+        .run_command(&[
+            "run",
+            "--rm",
+            images::ALPINE,
+            "sh",
+            "-c",
+            "echo out-msg && echo err-msg >&2",
+        ])
+        .expect("failed to run");
+
+    let all_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        all_output.contains("out-msg"),
+        "Stdout should be captured: {}",
+        all_output
+    );
+    assert!(
+        all_output.contains("err-msg"),
+        "Stderr should be captured: {}",
+        all_output
+    );
+}
+
+/// Test that multiline output is captured correctly.
+#[tokio::test]
+#[ignore = "requires VM resources and network"]
+async fn test_container_multiline_output_capture() {
+    if skip_if_missing_resources() {
+        return;
+    }
+
+    let mut harness = TestHarness::with_defaults().expect("failed to create harness");
+
+    harness.setup_full_environment().await.expect("failed to setup");
+
+    harness
+        .run_command_success(&["pull", images::ALPINE])
+        .expect("failed to pull");
+
+    // Run container that outputs multiple lines
+    let output = harness
+        .run_command(&[
+            "run",
+            "--rm",
+            images::ALPINE,
+            "sh",
+            "-c",
+            "echo line-one; echo line-two; echo line-three",
+        ])
+        .expect("failed to run");
+
+    assert!(output.status.success(), "Run should succeed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("line-one"), "Should have line-one: {}", stdout);
+    assert!(stdout.contains("line-two"), "Should have line-two: {}", stdout);
+    assert!(stdout.contains("line-three"), "Should have line-three: {}", stdout);
+}
+
+/// Test that container run preserves exit code.
+#[tokio::test]
+#[ignore = "requires VM resources and network"]
+async fn test_container_run_exit_code_propagation() {
+    if skip_if_missing_resources() {
+        return;
+    }
+
+    let mut harness = TestHarness::with_defaults().expect("failed to create harness");
+
+    harness.setup_full_environment().await.expect("failed to setup");
+
+    harness
+        .run_command_success(&["pull", images::ALPINE])
+        .expect("failed to pull");
+
+    // Test exit code 0
+    let output = harness
+        .run_command(&[
+            "run",
+            "--rm",
+            images::ALPINE,
+            "sh",
+            "-c",
+            "exit 0",
+        ])
+        .expect("failed to run");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Exit code 0 should be preserved"
+    );
+
+    // Test exit code 1
+    let output = harness
+        .run_command(&[
+            "run",
+            "--rm",
+            images::ALPINE,
+            "sh",
+            "-c",
+            "exit 1",
+        ])
+        .expect("failed to run");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "Exit code 1 should be preserved"
+    );
+
+    // Test exit code 42
+    let output = harness
+        .run_command(&[
+            "run",
+            "--rm",
+            images::ALPINE,
+            "sh",
+            "-c",
+            "exit 42",
+        ])
+        .expect("failed to run");
+
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "Exit code 42 should be preserved"
+    );
+}
+
+// ============================================================================
 // Container Run Tests
 // ============================================================================
 

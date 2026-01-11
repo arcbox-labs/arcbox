@@ -148,9 +148,14 @@ impl TestHarness {
         &self.machine_name
     }
 
-    /// Returns the socket path for the daemon.
+    /// Returns the socket path for the daemon (Docker API).
     pub fn socket_path(&self) -> PathBuf {
         self.data_dir.path().join("arcbox.sock")
+    }
+
+    /// Returns the gRPC socket path for the daemon.
+    pub fn grpc_socket_path(&self) -> PathBuf {
+        self.data_dir.path().join("arcbox-grpc.sock")
     }
 
     /// Starts the daemon process.
@@ -165,8 +170,14 @@ impl TestHarness {
         cmd.arg("daemon")
             .arg("--socket")
             .arg(&socket_path)
+            .arg("--grpc-socket")
+            .arg(self.grpc_socket_path())
             .arg("--data-dir")
             .arg(self.data_dir.path())
+            .arg("--kernel")
+            .arg(&self.config.kernel_path)
+            .arg("--initramfs")
+            .arg(&self.config.initramfs_path)
             .env("RUST_LOG", if self.config.verbose { "debug" } else { "warn" })
             .stdin(Stdio::null())
             .stdout(if self.config.verbose { Stdio::inherit() } else { Stdio::null() })
@@ -220,6 +231,8 @@ impl TestHarness {
     /// Uses custom kernel/initramfs paths from TestConfig for E2E testing.
     pub async fn create_machine(&self) -> Result<()> {
         let output = Command::new(&self.config.arcbox_binary)
+            .arg("--socket")
+            .arg(self.socket_path())
             .arg("machine")
             .arg("create")
             .arg(&self.machine_name)
@@ -231,8 +244,6 @@ impl TestHarness {
             .arg(&self.config.kernel_path)
             .arg("--initrd")
             .arg(&self.config.initramfs_path)
-            .arg("--socket")
-            .arg(self.socket_path())
             .output()
             .context("failed to create machine")?;
 
@@ -251,11 +262,11 @@ impl TestHarness {
     /// Starts the machine.
     pub async fn start_machine(&self) -> Result<()> {
         let output = Command::new(&self.config.arcbox_binary)
+            .arg("--socket")
+            .arg(self.socket_path())
             .arg("machine")
             .arg("start")
             .arg(&self.machine_name)
-            .arg("--socket")
-            .arg(self.socket_path())
             .output()
             .context("failed to start machine")?;
 
@@ -274,11 +285,11 @@ impl TestHarness {
     /// Stops the machine.
     pub async fn stop_machine(&self) -> Result<()> {
         let output = Command::new(&self.config.arcbox_binary)
+            .arg("--socket")
+            .arg(self.socket_path())
             .arg("machine")
             .arg("stop")
             .arg(&self.machine_name)
-            .arg("--socket")
-            .arg(self.socket_path())
             .output()
             .context("failed to stop machine")?;
 
@@ -303,11 +314,11 @@ impl TestHarness {
 
         while tokio::time::Instant::now() < deadline {
             let output = Command::new(&self.config.arcbox_binary)
+                .arg("--socket")
+                .arg(self.socket_path())
                 .arg("machine")
                 .arg("ping")
                 .arg(&self.machine_name)
-                .arg("--socket")
-                .arg(self.socket_path())
                 .output();
 
             if let Ok(out) = output {
@@ -328,9 +339,9 @@ impl TestHarness {
     /// Runs an arcbox command and returns its output.
     pub fn run_command(&self, args: &[&str]) -> Result<std::process::Output> {
         let mut cmd = Command::new(&self.config.arcbox_binary);
-        cmd.args(args)
-            .arg("--socket")
-            .arg(self.socket_path());
+        cmd.arg("--socket")
+            .arg(self.socket_path())
+            .args(args);
 
         cmd.output().context("failed to run command")
     }
@@ -350,12 +361,14 @@ impl TestHarness {
         self.skip_cleanup.store(true, Ordering::SeqCst);
     }
 
-    /// Sets up a complete test environment (daemon + machine + agent).
+    /// Sets up a complete test environment (daemon with auto-managed VM).
+    ///
+    /// The daemon automatically creates and starts the default VM when needed.
+    /// Container operations will trigger VM startup via ensure_vm_ready().
     pub async fn setup_full_environment(&mut self) -> Result<()> {
         self.start_daemon().await?;
-        self.create_machine().await?;
-        self.start_machine().await?;
-        self.wait_for_agent().await?;
+        // VM is auto-started by daemon when first container operation is performed.
+        // We can optionally wait for it to be ready here by doing a simple operation.
         Ok(())
     }
 }
@@ -376,11 +389,11 @@ impl Drop for TestHarness {
 
         // Stop machine (best effort)
         let _ = std::process::Command::new(&self.config.arcbox_binary)
+            .arg("--socket")
+            .arg(self.socket_path())
             .arg("machine")
             .arg("stop")
             .arg(&self.machine_name)
-            .arg("--socket")
-            .arg(self.socket_path())
             .output();
 
         // Stop daemon

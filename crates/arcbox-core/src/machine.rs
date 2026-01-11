@@ -26,6 +26,33 @@ pub enum MachineState {
     Stopped,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_assign_cid_propagates_to_vm_config() {
+        let temp_dir = tempdir().unwrap();
+        let vm_manager = VmManager::new();
+        let machine_manager = MachineManager::new(vm_manager, temp_dir.path().to_path_buf());
+
+        let name = machine_manager
+            .create(MachineConfig {
+                name: "cid-test".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let (vm_id, cid) = machine_manager.assign_cid_for_start(&name).unwrap();
+        assert_eq!(cid, 3);
+        assert_eq!(
+            machine_manager.vm_manager.guest_cid_for_test(&vm_id),
+            Some(cid)
+        );
+    }
+}
+
 /// Machine information.
 #[derive(Debug, Clone)]
 pub struct MachineInfo {
@@ -218,7 +245,37 @@ impl MachineManager {
     ///
     /// Returns an error if the machine cannot be started.
     pub fn start(&self, name: &str) -> Result<()> {
-        // First, count running machines and get VM ID.
+        let (vm_id, cid) = self.assign_cid_for_start(name)?;
+
+        // Start underlying VM
+        self.vm_manager.start(&vm_id)?;
+
+        // Update machine state
+        {
+            let mut machines = self
+                .machines
+                .write()
+                .map_err(|_| CoreError::Machine("lock poisoned".to_string()))?;
+
+            if let Some(machine) = machines.get_mut(name) {
+                machine.state = MachineState::Running;
+                machine.cid = Some(cid);
+
+                tracing::info!(
+                    "Machine '{}' started with CID {}",
+                    name,
+                    machine.cid.unwrap()
+                );
+            }
+        }
+
+        // Update persisted state
+        let _ = self.persistence.update_state(name, MachineState::Running);
+
+        Ok(())
+    }
+
+    fn assign_cid_for_start(&self, name: &str) -> Result<(VmId, u32)> {
         let (vm_id, running_count) = {
             let machines = self
                 .machines
@@ -238,32 +295,10 @@ impl MachineManager {
             (machine.vm_id.clone(), running_count)
         };
 
-        // Start underlying VM
-        self.vm_manager.start(&vm_id)?;
+        let cid = 3 + running_count;
+        self.vm_manager.set_guest_cid(&vm_id, cid)?;
 
-        // Update machine state
-        {
-            let mut machines = self
-                .machines
-                .write()
-                .map_err(|_| CoreError::Machine("lock poisoned".to_string()))?;
-
-            if let Some(machine) = machines.get_mut(name) {
-                machine.state = MachineState::Running;
-                machine.cid = Some(3 + running_count);
-
-                tracing::info!(
-                    "Machine '{}' started with CID {}",
-                    name,
-                    machine.cid.unwrap()
-                );
-            }
-        }
-
-        // Update persisted state
-        let _ = self.persistence.update_state(name, MachineState::Running);
-
-        Ok(())
+        Ok((vm_id, cid))
     }
 
     /// Gets the vsock CID for a running machine.
@@ -336,6 +371,28 @@ impl MachineManager {
 
         // On Linux, AgentClient connects directly via AF_VSOCK
         Ok(AgentClient::new(cid))
+    }
+
+    /// Reads serial console output for a running machine (macOS only).
+    #[cfg(target_os = "macos")]
+    pub fn read_console_output(&self, name: &str) -> Result<String> {
+        let machines = self
+            .machines
+            .read()
+            .map_err(|_| CoreError::Machine("lock poisoned".to_string()))?;
+
+        let machine = machines
+            .get(name)
+            .ok_or_else(|| CoreError::NotFound(name.to_string()))?;
+
+        if machine.state != MachineState::Running {
+            return Err(CoreError::InvalidState(format!(
+                "machine '{}' is not running",
+                name
+            )));
+        }
+
+        self.vm_manager.read_console_output(&machine.vm_id)
     }
 
     /// Stops a machine.

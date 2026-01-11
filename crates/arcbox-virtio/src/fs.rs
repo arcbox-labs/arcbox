@@ -24,6 +24,7 @@
 //! ```
 
 use crate::error::{Result, VirtioError};
+use crate::queue::VirtQueue;
 use crate::{VirtioDevice, VirtioDeviceId};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -447,6 +448,8 @@ pub struct VirtioFs {
     session: FuseSession,
     /// Request handler (provided by arcbox-fs).
     handler: Option<Arc<dyn FuseRequestHandler>>,
+    /// Request queues for FUSE traffic.
+    request_queues: Vec<VirtQueue>,
     /// Whether the device is activated.
     activated: bool,
 }
@@ -470,6 +473,7 @@ impl VirtioFs {
             acked_features: 0,
             session: FuseSession::new(),
             handler: None,
+            request_queues: Vec::new(),
             activated: false,
         }
     }
@@ -483,6 +487,7 @@ impl VirtioFs {
             acked_features: 0,
             session: FuseSession::new(),
             handler: Some(handler),
+            request_queues: Vec::new(),
             activated: false,
         }
     }
@@ -607,6 +612,86 @@ impl VirtioFs {
             }
         }
     }
+
+    /// Processes a single request queue and writes responses into guest memory.
+    ///
+    /// Returns a list of completed descriptor heads and their response lengths.
+    pub fn process_queue(
+        &mut self,
+        queue_index: usize,
+        memory: &mut [u8],
+    ) -> Result<Vec<(u16, u32)>> {
+        // First, collect all pending requests from the queue
+        // This releases the borrow on self.request_queues
+        let pending_requests = {
+            let queue = self.request_queues.get_mut(queue_index).ok_or_else(|| {
+                VirtioError::NotReady(format!(
+                    "request queue {} not available",
+                    queue_index
+                ))
+            })?;
+
+            let mut requests = Vec::new();
+            while let Some((head_idx, chain)) = queue.pop_avail() {
+                let mut request_data = Vec::new();
+                let mut write_buffers = Vec::new();
+
+                for desc in chain {
+                    let start = desc.addr as usize;
+                    let end = start + desc.len as usize;
+                    if end > memory.len() {
+                        return Err(VirtioError::InvalidQueue(
+                            "descriptor out of bounds".to_string(),
+                        ));
+                    }
+
+                    if desc.is_write_only() {
+                        write_buffers.push((start, desc.len as usize));
+                    } else {
+                        request_data.extend_from_slice(&memory[start..end]);
+                    }
+                }
+
+                if write_buffers.is_empty() {
+                    return Err(VirtioError::InvalidQueue(
+                        "no writable descriptors for response".to_string(),
+                    ));
+                }
+
+                requests.push((head_idx, request_data, write_buffers));
+            }
+            requests
+        };
+
+        // Now process all requests (self.request_queues borrow is released)
+        let mut completions = Vec::new();
+        for (head_idx, request_data, write_buffers) in pending_requests {
+            let response = self.process_request(&request_data)?;
+            let mut remaining = response.as_slice();
+            let mut written = 0usize;
+
+            for (start, len) in write_buffers {
+                if remaining.is_empty() {
+                    break;
+                }
+
+                let copy_len = len.min(remaining.len());
+                memory[start..start + copy_len].copy_from_slice(&remaining[..copy_len]);
+                remaining = &remaining[copy_len..];
+                written += copy_len;
+            }
+
+            if !remaining.is_empty() {
+                return Err(VirtioError::InvalidQueue(
+                    "response buffer too small".to_string(),
+                ));
+            }
+
+            completions.push((head_idx, written as u32));
+        }
+
+        Ok(completions)
+    }
 }
 
 impl VirtioDevice for VirtioFs {
@@ -660,8 +745,22 @@ impl VirtioDevice for VirtioFs {
             });
         }
 
+        if self.config.num_queues == 0 {
+            return Err(VirtioError::DeviceError {
+                device: "fs".to_string(),
+                message: "num_queues must be greater than 0".to_string(),
+            });
+        }
+
         // Reset session state for fresh start
         self.session.reset();
+
+        // Create request queues
+        let mut queues = Vec::with_capacity(self.config.num_queues as usize);
+        for _ in 0..self.config.num_queues {
+            queues.push(VirtQueue::new(self.config.queue_size)?);
+        }
+        self.request_queues = queues;
 
         // Mark as activated
         // Note: The FUSE_INIT handshake will happen when the guest driver
@@ -682,6 +781,7 @@ impl VirtioDevice for VirtioFs {
         self.acked_features = 0;
         self.session.reset();
         self.activated = false;
+        self.request_queues.clear();
 
         // Notify handler of reset
         if let Some(handler) = &self.handler {
@@ -695,6 +795,8 @@ impl VirtioDevice for VirtioFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::queue::flags;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ==========================================================================
     // FsConfig Tests
@@ -861,6 +963,7 @@ mod tests {
 
         assert!(fs.activate().is_ok());
         assert!(fs.is_activated());
+        assert_eq!(fs.request_queues.len(), 1);
 
         // Activating again should be idempotent
         assert!(fs.activate().is_ok());
@@ -888,6 +991,7 @@ mod tests {
         assert_eq!(fs.acked_features, 0);
         assert!(!fs.is_activated());
         assert!(!fs.session.is_initialized());
+        assert!(fs.request_queues.is_empty());
     }
 
     #[test]
@@ -1034,6 +1138,124 @@ mod tests {
 
         let result = session.handle_init(&request);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fs_activate_creates_multiple_queues() {
+        let config = FsConfig {
+            shared_dir: "/tmp".to_string(),
+            num_queues: 2,
+            queue_size: 16,
+            ..Default::default()
+        };
+        let mut fs = VirtioFs::new(config);
+        fs.activate().unwrap();
+        assert_eq!(fs.request_queues.len(), 2);
+    }
+
+    #[test]
+    fn test_fs_process_queue_roundtrip() {
+        struct TestHandler {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl FuseRequestHandler for TestHandler {
+            fn handle_request(&self, request: &[u8]) -> Result<Vec<u8>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let unique = u64::from_le_bytes([
+                    request[8], request[9], request[10], request[11],
+                    request[12], request[13], request[14], request[15],
+                ]);
+                Ok(FuseResponse::new(unique, b"ok".to_vec()).into_data())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(TestHandler { calls: Arc::clone(&calls) });
+
+        let config = FsConfig {
+            shared_dir: "/tmp".to_string(),
+            queue_size: 16,
+            ..Default::default()
+        };
+        let mut fs = VirtioFs::with_handler(config, handler);
+        fs.activate().unwrap();
+
+        let queue = fs.request_queues.get_mut(0).unwrap();
+        let mut memory = vec![0u8; 1024];
+
+        // Build FUSE_INIT request
+        let mut init_req = vec![0u8; 56];
+        init_req[0..4].copy_from_slice(&56u32.to_le_bytes());
+        init_req[4..8].copy_from_slice(&VirtioFs::FUSE_INIT.to_le_bytes());
+        init_req[8..16].copy_from_slice(&1u64.to_le_bytes());
+        init_req[40..44].copy_from_slice(&FUSE_KERNEL_VERSION.to_le_bytes());
+        init_req[44..48].copy_from_slice(&FUSE_KERNEL_MINOR_VERSION.to_le_bytes());
+        init_req[48..52].copy_from_slice(&(64 * 1024u32).to_le_bytes());
+        init_req[52..56].copy_from_slice(&(FUSE_ASYNC_READ | FUSE_BIG_WRITES).to_le_bytes());
+
+        let init_req_offset = 0usize;
+        let init_resp_offset = 128usize;
+        memory[init_req_offset..init_req_offset + init_req.len()].copy_from_slice(&init_req);
+
+        queue.set_descriptor(
+            0,
+            crate::queue::Descriptor {
+                addr: init_req_offset as u64,
+                len: init_req.len() as u32,
+                flags: flags::NEXT,
+                next: 1,
+            },
+        ).unwrap();
+        queue.set_descriptor(
+            1,
+            crate::queue::Descriptor {
+                addr: init_resp_offset as u64,
+                len: 80,
+                flags: flags::WRITE,
+                next: 0,
+            },
+        ).unwrap();
+
+        // Build a simple FUSE request that goes to the handler
+        let mut other_req = vec![0u8; 40];
+        other_req[0..4].copy_from_slice(&40u32.to_le_bytes());
+        other_req[4..8].copy_from_slice(&1u32.to_le_bytes());
+        other_req[8..16].copy_from_slice(&2u64.to_le_bytes());
+
+        let other_req_offset = 256usize;
+        let other_resp_offset = 512usize;
+        memory[other_req_offset..other_req_offset + other_req.len()].copy_from_slice(&other_req);
+
+        queue.set_descriptor(
+            2,
+            crate::queue::Descriptor {
+                addr: other_req_offset as u64,
+                len: other_req.len() as u32,
+                flags: flags::NEXT,
+                next: 3,
+            },
+        ).unwrap();
+        queue.set_descriptor(
+            3,
+            crate::queue::Descriptor {
+                addr: other_resp_offset as u64,
+                len: 32,
+                flags: flags::WRITE,
+                next: 0,
+            },
+        ).unwrap();
+
+        queue.add_avail(0).unwrap();
+        queue.add_avail(2).unwrap();
+
+        let completions = fs.process_queue(0, &mut memory).unwrap();
+        assert_eq!(completions.len(), 2);
+        assert!(fs.session.is_initialized());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let response = &memory[other_resp_offset..other_resp_offset + 18];
+        assert_eq!(&response[16..18], b"ok");
     }
 
     // ==========================================================================

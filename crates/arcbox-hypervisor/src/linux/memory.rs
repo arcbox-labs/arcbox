@@ -1,8 +1,9 @@
 //! Guest memory implementation for Linux KVM.
 
+use std::os::unix::io::RawFd;
 use std::sync::RwLock;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::{
     error::HypervisorError,
@@ -24,6 +25,10 @@ pub struct KvmMemory {
     total_size: u64,
     /// Base host address (for the primary region).
     base_host_addr: *mut u8,
+    /// KVM VM fd for dirty logging (set by VM after creation).
+    vm_fd: AtomicI32,
+    /// Memory slots tracked for dirty logging.
+    memory_slots: RwLock<Vec<MemorySlotInfo>>,
     /// Whether dirty page tracking is enabled.
     dirty_tracking_enabled: AtomicBool,
 }
@@ -40,6 +45,20 @@ struct MappedRegion {
     read_only: bool,
     /// Whether this region was allocated by us (vs provided externally).
     owned: bool,
+}
+
+/// Memory slot tracking for dirty logging.
+struct MemorySlotInfo {
+    /// Slot ID.
+    slot: u32,
+    /// Guest physical address.
+    guest_phys_addr: u64,
+    /// Size in bytes.
+    size: u64,
+    /// Host virtual address.
+    userspace_addr: u64,
+    /// Base flags for the slot (e.g. read-only).
+    flags: u32,
 }
 
 // Safety: The host_addr pointer points to mmap'd memory that is valid
@@ -75,6 +94,8 @@ impl KvmMemory {
             regions: RwLock::new(vec![region]),
             total_size: size,
             base_host_addr: host_addr,
+            vm_fd: AtomicI32::new(-1),
+            memory_slots: RwLock::new(Vec::new()),
             dirty_tracking_enabled: AtomicBool::new(false),
         })
     }
@@ -189,6 +210,181 @@ impl KvmMemory {
         );
 
         Ok(())
+    }
+
+    /// Attaches the KVM VM fd for dirty logging.
+    pub fn attach_vm_fd(&self, vm_fd: RawFd) {
+        self.vm_fd.store(vm_fd, Ordering::SeqCst);
+    }
+
+    /// Registers a memory slot for dirty logging.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the slot list cannot be updated.
+    pub fn register_slot(
+        &self,
+        slot: u32,
+        guest_phys_addr: u64,
+        size: u64,
+        userspace_addr: u64,
+        flags: u32,
+    ) -> Result<(), HypervisorError> {
+        let mut slots = self
+            .memory_slots
+            .write()
+            .map_err(|_| HypervisorError::SnapshotError("Lock poisoned".to_string()))?;
+
+        if let Some(existing) = slots.iter_mut().find(|s| s.slot == slot) {
+            existing.guest_phys_addr = guest_phys_addr;
+            existing.size = size;
+            existing.userspace_addr = userspace_addr;
+            existing.flags = flags;
+        } else {
+            slots.push(MemorySlotInfo {
+                slot,
+                guest_phys_addr,
+                size,
+                userspace_addr,
+                flags,
+            });
+        }
+
+        if self.dirty_tracking_enabled.load(Ordering::SeqCst) {
+            let fd = self.vm_fd()?;
+            let slot_info = slots.iter().find(|s| s.slot == slot).unwrap();
+            self.update_dirty_logging(fd, slot_info, true)?;
+        }
+
+        Ok(())
+    }
+
+    /// Unregisters a memory slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the slot list cannot be updated.
+    pub fn unregister_slot(&self, slot: u32) -> Result<(), HypervisorError> {
+        let mut slots = self
+            .memory_slots
+            .write()
+            .map_err(|_| HypervisorError::SnapshotError("Lock poisoned".to_string()))?;
+        slots.retain(|entry| entry.slot != slot);
+        Ok(())
+    }
+
+    /// Updates the dirty tracking enabled flag from external callers.
+    pub fn set_dirty_tracking_enabled(&self, enabled: bool) {
+        self.dirty_tracking_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    fn vm_fd(&self) -> Result<RawFd, HypervisorError> {
+        let fd = self.vm_fd.load(Ordering::SeqCst);
+        if fd < 0 {
+            return Err(HypervisorError::SnapshotError(
+                "KVM VM fd not attached".to_string(),
+            ));
+        }
+        Ok(fd)
+    }
+
+    fn update_dirty_logging(
+        &self,
+        fd: RawFd,
+        slot: &MemorySlotInfo,
+        enable: bool,
+    ) -> Result<(), HypervisorError> {
+        let flags = if enable {
+            slot.flags | ffi::KVM_MEM_LOG_DIRTY_PAGES
+        } else {
+            slot.flags
+        };
+
+        let region = ffi::KvmUserspaceMemoryRegion {
+            slot: slot.slot,
+            flags,
+            guest_phys_addr: slot.guest_phys_addr,
+            memory_size: slot.size,
+            userspace_addr: slot.userspace_addr,
+        };
+
+        let ret = unsafe {
+            libc::ioctl(
+                fd,
+                ffi::KVM_SET_USER_MEMORY_REGION,
+                &region as *const _ as libc::c_ulong,
+            )
+        };
+
+        if ret < 0 {
+            return Err(HypervisorError::SnapshotError(format!(
+                "Failed to {} dirty logging for slot {}: {}",
+                if enable { "enable" } else { "disable" },
+                slot.slot,
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn get_dirty_log(
+        &self,
+        fd: RawFd,
+        slot: &MemorySlotInfo,
+    ) -> Result<Vec<u64>, HypervisorError> {
+        let num_pages = (slot.size + PAGE_SIZE - 1) / PAGE_SIZE;
+        let bitmap_size = ((num_pages + 63) / 64) as usize;
+        let mut bitmap: Vec<u64> = vec![0; bitmap_size];
+
+        let dirty_log = ffi::KvmDirtyLog {
+            slot: slot.slot,
+            padding: 0,
+            dirty_bitmap: bitmap.as_mut_ptr(),
+        };
+
+        let ret = unsafe {
+            libc::ioctl(
+                fd,
+                ffi::KVM_GET_DIRTY_LOG,
+                &dirty_log as *const _ as libc::c_ulong,
+            )
+        };
+
+        if ret < 0 {
+            return Err(HypervisorError::SnapshotError(format!(
+                "Failed to get dirty log for slot {}: {}",
+                slot.slot,
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        Ok(bitmap)
+    }
+
+    fn parse_dirty_bitmap(bitmap: &[u64], base_addr: u64, size: u64) -> Vec<DirtyPageInfo> {
+        let mut pages = Vec::new();
+        let num_pages = size / PAGE_SIZE;
+
+        for (word_idx, &word) in bitmap.iter().enumerate() {
+            if word == 0 {
+                continue;
+            }
+
+            for bit_idx in 0..64 {
+                if (word >> bit_idx) & 1 != 0 {
+                    let page_num = (word_idx as u64 * 64) + bit_idx as u64;
+                    if page_num < num_pages {
+                        pages.push(DirtyPageInfo {
+                            guest_addr: base_addr + page_num * PAGE_SIZE,
+                            size: PAGE_SIZE,
+                        });
+                    }
+                }
+            }
+        }
+
+        pages
     }
 
     /// Finds the region containing the given address.
@@ -328,63 +524,64 @@ impl GuestMemory for KvmMemory {
     }
 
     fn enable_dirty_tracking(&mut self) -> Result<(), HypervisorError> {
-        // KVM supports dirty page tracking via KVM_SET_USER_MEMORY_REGION with
-        // KVM_MEM_LOG_DIRTY_PAGES flag, and KVM_GET_DIRTY_LOG to retrieve dirty pages.
-        //
-        // Note: This requires re-registering memory regions with the dirty logging flag.
-        // For simplicity, we just set a flag here. The actual KVM_SET_USER_MEMORY_REGION
-        // calls would need to be done in the VM layer where we have access to the VM fd.
+        if self.dirty_tracking_enabled.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let fd = self.vm_fd()?;
+        let slots = self
+            .memory_slots
+            .read()
+            .map_err(|_| HypervisorError::SnapshotError("Lock poisoned".to_string()))?;
+
+        for slot in slots.iter() {
+            self.update_dirty_logging(fd, slot, true)?;
+        }
+
         self.dirty_tracking_enabled.store(true, Ordering::SeqCst);
         tracing::debug!("Dirty page tracking enabled");
         Ok(())
     }
 
     fn disable_dirty_tracking(&mut self) -> Result<(), HypervisorError> {
+        if !self.dirty_tracking_enabled.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let fd = self.vm_fd()?;
+        let slots = self
+            .memory_slots
+            .read()
+            .map_err(|_| HypervisorError::SnapshotError("Lock poisoned".to_string()))?;
+
+        for slot in slots.iter() {
+            self.update_dirty_logging(fd, slot, false)?;
+        }
+
         self.dirty_tracking_enabled.store(false, Ordering::SeqCst);
         tracing::debug!("Dirty page tracking disabled");
         Ok(())
     }
 
     fn get_dirty_pages(&mut self) -> Result<Vec<DirtyPageInfo>, HypervisorError> {
-        // KVM dirty page tracking works via KVM_GET_DIRTY_LOG ioctl on the VM fd.
-        // This returns a bitmap of dirty pages for a given memory slot.
-        //
-        // Since we don't have access to the VM fd here, this method would need to
-        // be called through the VM layer. For now, return an error indicating
-        // that the caller should use the VM-level API.
-        //
-        // In a full implementation, this would:
-        // 1. Call KVM_GET_DIRTY_LOG for each memory slot
-        // 2. Parse the bitmap to get list of dirty page addresses
-        // 3. Clear the dirty log
         if !self.dirty_tracking_enabled.load(Ordering::SeqCst) {
             return Err(HypervisorError::SnapshotError(
                 "Dirty tracking not enabled".to_string(),
             ));
         }
 
-        // Placeholder: return all pages as dirty (conservative approach)
-        // A real implementation would use KVM_GET_DIRTY_LOG
-        let regions = self
-            .regions
+        let fd = self.vm_fd()?;
+        let slots = self
+            .memory_slots
             .read()
-            .map_err(|_| HypervisorError::MemoryError("Lock poisoned".to_string()))?;
+            .map_err(|_| HypervisorError::SnapshotError("Lock poisoned".to_string()))?;
 
         let mut dirty_pages = Vec::new();
-        for region in regions.iter() {
-            let num_pages = region.size / PAGE_SIZE;
-            for page_idx in 0..num_pages {
-                dirty_pages.push(DirtyPageInfo {
-                    guest_addr: region.guest_addr.raw() + page_idx * PAGE_SIZE,
-                    size: PAGE_SIZE,
-                });
-            }
+        for slot in slots.iter() {
+            let bitmap = self.get_dirty_log(fd, slot)?;
+            let pages = Self::parse_dirty_bitmap(&bitmap, slot.guest_phys_addr, slot.size);
+            dirty_pages.extend(pages);
         }
-
-        tracing::warn!(
-            "get_dirty_pages: returning all {} pages as dirty (KVM_GET_DIRTY_LOG not implemented)",
-            dirty_pages.len()
-        );
 
         Ok(dirty_pages)
     }

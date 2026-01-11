@@ -410,7 +410,10 @@ fn test_all_devices_reset_cleanly() {
     vsock.reset();
 
     // Filesystem
-    let mut fs = VirtioFs::new(FsConfig::default());
+    let mut fs = VirtioFs::new(FsConfig {
+        shared_dir: "/tmp".to_string(),
+        ..Default::default()
+    });
     fs.activate().unwrap();
     fs.reset();
 }

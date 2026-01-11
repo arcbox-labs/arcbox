@@ -9,6 +9,7 @@ use nix::pty::{openpty, OpenptyResult, Winsize};
 use nix::sys::termios::{self, SetArg, Termios};
 use nix::unistd::{close, dup2, read, setsid, write};
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
+use std::sync::Mutex;
 
 /// PTY master/slave pair.
 pub struct Pty {
@@ -17,7 +18,8 @@ pub struct Pty {
     /// Slave side of the PTY (for the child process).
     slave: OwnedFd,
     /// Original terminal settings (for restoration).
-    original_termios: Option<Termios>,
+    /// Wrapped in Mutex for thread-safety (Termios contains RefCell).
+    original_termios: Mutex<Option<Termios>>,
 }
 
 impl Pty {
@@ -36,7 +38,7 @@ impl Pty {
         Ok(Self {
             master,
             slave,
-            original_termios: None,
+            original_termios: Mutex::new(None),
         })
     }
 
@@ -62,7 +64,7 @@ impl Pty {
         Ok(Self {
             master,
             slave,
-            original_termios: None,
+            original_termios: Mutex::new(None),
         })
     }
 
@@ -132,6 +134,11 @@ impl Pty {
 
         // Set the slave as the controlling terminal
         // SAFETY: TIOCSCTTY is a valid ioctl for setting controlling terminal
+        #[cfg(target_os = "linux")]
+        let ret = unsafe {
+            libc::ioctl(self.slave.as_raw_fd(), libc::TIOCSCTTY, 0)
+        };
+        #[cfg(target_os = "macos")]
         let ret = unsafe {
             libc::ioctl(self.slave.as_raw_fd(), libc::TIOCSCTTY as libc::c_ulong, 0)
         };
@@ -167,12 +174,14 @@ impl Pty {
     }
 
     /// Sets raw mode on the PTY slave.
-    pub fn set_raw_mode(&mut self) -> Result<()> {
+    pub fn set_raw_mode(&self) -> Result<()> {
         let mut termios = termios::tcgetattr(&self.slave)
             .context("failed to get terminal attributes")?;
 
         // Save original settings
-        self.original_termios = Some(termios.clone());
+        if let Ok(mut guard) = self.original_termios.lock() {
+            *guard = Some(termios.clone());
+        }
 
         // Set raw mode
         termios::cfmakeraw(&mut termios);
@@ -185,9 +194,11 @@ impl Pty {
 
     /// Restores original terminal settings.
     pub fn restore_termios(&self) -> Result<()> {
-        if let Some(ref original) = self.original_termios {
-            termios::tcsetattr(&self.slave, SetArg::TCSANOW, original)
-                .context("failed to restore terminal settings")?;
+        if let Ok(guard) = self.original_termios.lock() {
+            if let Some(ref original) = *guard {
+                termios::tcsetattr(&self.slave, SetArg::TCSANOW, original)
+                    .context("failed to restore terminal settings")?;
+            }
         }
         Ok(())
     }

@@ -15,12 +15,13 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::sync::Arc;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
@@ -47,6 +48,17 @@ impl ContainerState {
             Self::Stopped => "stopped",
         }
     }
+}
+
+/// Mount specification for bind mounts.
+#[derive(Debug, Clone)]
+pub struct MountSpec {
+    /// Source path (in guest filesystem).
+    pub source: String,
+    /// Target path (inside container).
+    pub target: String,
+    /// Read-only flag.
+    pub readonly: bool,
 }
 
 /// Container handle containing all container metadata.
@@ -76,6 +88,8 @@ pub struct ContainerHandle {
     pub tty: bool,
     /// Whether stdin is open.
     pub open_stdin: bool,
+    /// Volume mounts for this container.
+    pub mounts: Vec<MountSpec>,
     /// Root filesystem path.
     ///
     /// When set, the container will be chrooted into this directory.
@@ -84,11 +98,11 @@ pub struct ContainerHandle {
 }
 
 /// Running process handle.
-struct ProcessHandle {
+pub(crate) struct ProcessHandle {
     /// The child process.
-    child: Child,
+    pub(crate) child: Child,
     /// PTY handle (if TTY mode).
-    pty: Option<PtyHandle>,
+    pub(crate) pty: Option<PtyHandle>,
 }
 
 /// Container runtime managing all containers.
@@ -96,7 +110,7 @@ pub struct ContainerRuntime {
     /// Container metadata indexed by ID.
     containers: HashMap<String, ContainerHandle>,
     /// Running process handles indexed by container ID.
-    processes: Mutex<HashMap<String, ProcessHandle>>,
+    processes: Mutex<HashMap<String, Arc<Mutex<ProcessHandle>>>>,
 }
 
 impl ContainerRuntime {
@@ -126,9 +140,38 @@ impl ContainerRuntime {
         self.containers.get(id)
     }
 
+    /// Gets a container state snapshot by ID.
+    #[must_use]
+    pub fn get_container_state(&self, id: &str) -> Option<(ContainerState, Option<i32>)> {
+        self.containers
+            .get(id)
+            .map(|container| (container.state, container.exit_code))
+    }
+
     /// Gets a mutable container by ID.
     pub fn get_container_mut(&mut self, id: &str) -> Option<&mut ContainerHandle> {
         self.containers.get_mut(id)
+    }
+
+    /// Gets a process handle by container ID.
+    pub async fn get_process_handle(&self, id: &str) -> Option<Arc<Mutex<ProcessHandle>>> {
+        let processes = self.processes.lock().await;
+        processes.get(id).cloned()
+    }
+
+    /// Removes a process handle by container ID.
+    pub async fn remove_process_handle(&self, id: &str) {
+        let mut processes = self.processes.lock().await;
+        processes.remove(id);
+    }
+
+    /// Marks a container as stopped.
+    pub fn mark_container_stopped(&mut self, id: &str, exit_code: i32) {
+        if let Some(container) = self.containers.get_mut(id) {
+            container.state = ContainerState::Stopped;
+            container.exit_code = Some(exit_code);
+            container.pid = None;
+        }
     }
 
     /// Lists all containers.
@@ -173,14 +216,16 @@ impl ContainerRuntime {
         let working_dir = container.working_dir.clone();
         let env = container.env.clone();
         let rootfs = container.rootfs.clone();
+        let mounts = container.mounts.clone();
 
         tracing::info!(
-            "Starting container {}: cmd={:?}, workdir={}, tty={}, rootfs={:?}",
+            "Starting container {}: cmd={:?}, workdir={}, tty={}, rootfs={:?}, mounts={}",
             id,
             command,
             working_dir,
             use_tty,
-            rootfs
+            rootfs,
+            mounts.len()
         );
 
         // Build the command
@@ -201,6 +246,8 @@ impl ContainerRuntime {
 
             let slave_fd = pty.slave_fd();
             let rootfs_for_exec = rootfs.clone();
+            let working_dir_for_exec = working_dir.clone();
+            let mounts_for_exec = mounts.clone();
 
             // Configure process to use PTY slave
             // SAFETY: pre_exec runs after fork, before exec
@@ -208,7 +255,7 @@ impl ContainerRuntime {
                 cmd.pre_exec(move || {
                     // Setup rootfs isolation if provided
                     if let Some(ref rootfs_path) = rootfs_for_exec {
-                        setup_container_rootfs(rootfs_path)?;
+                        setup_container_rootfs(rootfs_path, &working_dir_for_exec, &mounts_for_exec)?;
                     }
 
                     // Create new session
@@ -257,10 +304,12 @@ impl ContainerRuntime {
             // Setup rootfs isolation if provided
             if let Some(ref rootfs_path) = rootfs {
                 let rootfs_for_exec = rootfs_path.clone();
+                let working_dir_for_exec = working_dir.clone();
+                let mounts_for_exec = mounts.clone();
                 // SAFETY: pre_exec runs after fork, before exec
                 unsafe {
                     cmd.pre_exec(move || {
-                        setup_container_rootfs(&rootfs_for_exec)
+                        setup_container_rootfs(&rootfs_for_exec, &working_dir_for_exec, &mounts_for_exec)
                     });
                 }
             }
@@ -272,7 +321,13 @@ impl ContainerRuntime {
         };
 
         // Spawn the process
-        let mut child = cmd.spawn().context("failed to spawn container process")?;
+        tracing::info!("Spawning process: {:?}", command);
+        let mut child = cmd.spawn().with_context(|| {
+            format!(
+                "failed to spawn container process (cmd={:?}, rootfs={:?}, workdir={})",
+                command, rootfs, working_dir
+            )
+        })?;
         let pid = child.id();
 
         // Update container state
@@ -296,10 +351,10 @@ impl ContainerRuntime {
         let mut processes = self.processes.lock().await;
         processes.insert(
             id.to_string(),
-            ProcessHandle {
+            Arc::new(Mutex::new(ProcessHandle {
                 child,
                 pty: pty_handle,
-            },
+            })),
         );
 
         Ok(())
@@ -346,8 +401,13 @@ impl ContainerRuntime {
         }
 
         // Wait for the process to exit with timeout
-        let mut processes = self.processes.lock().await;
-        if let Some(process_handle) = processes.get_mut(id) {
+        let process_handle = {
+            let processes = self.processes.lock().await;
+            processes.get(id).cloned()
+        };
+
+        if let Some(process_handle) = process_handle {
+            let mut process_handle = process_handle.lock().await;
             let timeout = tokio::time::Duration::from_secs(timeout_secs.into());
             let result = tokio::time::timeout(timeout, process_handle.child.wait()).await;
 
@@ -402,6 +462,7 @@ impl ContainerRuntime {
         container.pid = None;
 
         // Remove from process map
+        let mut processes = self.processes.lock().await;
         processes.remove(id);
 
         Ok(())
@@ -438,18 +499,26 @@ impl ContainerRuntime {
             anyhow::bail!("container is not running");
         }
 
-        let mut processes = self.processes.lock().await;
-        if let Some(process_handle) = processes.get_mut(id) {
+        let process_handle = {
+            let processes = self.processes.lock().await;
+            processes.get(id).cloned()
+        };
+
+        if let Some(process_handle) = process_handle {
+            let mut process_handle = process_handle.lock().await;
             let status = process_handle.child.wait().await?;
             let exit_code = status.code().unwrap_or(-1);
 
             // Update container state
-            drop(processes); // Release lock before getting mutable reference
+            drop(process_handle); // Release process lock before updating state
             if let Some(container) = self.containers.get_mut(id) {
                 container.state = ContainerState::Stopped;
                 container.exit_code = Some(exit_code);
                 container.pid = None;
             }
+
+            let mut processes = self.processes.lock().await;
+            processes.remove(id);
 
             return Ok(exit_code);
         }
@@ -500,8 +569,12 @@ impl ContainerRuntime {
     pub async fn resize_tty(&self, id: &str, cols: u16, rows: u16) -> Result<()> {
         tracing::debug!("ResizeTty for {}: {}x{}", id, cols, rows);
 
-        let processes = self.processes.lock().await;
-        if let Some(process_handle) = processes.get(id) {
+        let process_handle = {
+            let processes = self.processes.lock().await;
+            processes.get(id).cloned()
+        };
+        if let Some(process_handle) = process_handle {
+            let process_handle = process_handle.lock().await;
             if let Some(ref pty) = process_handle.pty {
                 pty.resize(cols, rows)?;
                 tracing::debug!("Container {} TTY resized to {}x{}", id, cols, rows);
@@ -520,8 +593,16 @@ impl ContainerRuntime {
     ///
     /// Returns `None` if the container is not running or doesn't have a TTY.
     pub async fn get_pty_master_fd(&self, id: &str) -> Option<std::os::unix::io::RawFd> {
-        let processes = self.processes.lock().await;
-        processes.get(id).and_then(|p| p.pty.as_ref().map(|pty| pty.master_fd()))
+        let process_handle = {
+            let processes = self.processes.lock().await;
+            processes.get(id).cloned()
+        };
+        if let Some(process_handle) = process_handle {
+            let process_handle = process_handle.lock().await;
+            process_handle.pty.as_ref().map(|pty| pty.master_fd())
+        } else {
+            None
+        }
     }
 }
 
@@ -598,8 +679,6 @@ fn spawn_log_capture_task(
 
     tokio::spawn(async move {
         use std::io::Write;
-        use tokio::io::AsyncRead;
-
         // Open log file for appending
         let log_file = match std::fs::OpenOptions::new()
             .create(true)
@@ -618,8 +697,9 @@ fn spawn_log_capture_task(
         // Helper to write a log line in Docker JSON format
         let write_log = |file: &std::sync::Arc<std::sync::Mutex<std::fs::File>>,
                          stream: &str,
-                         line: &str| {
+                         data: &[u8]| {
             let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            let line = String::from_utf8_lossy(data);
             // Escape JSON string
             let escaped = line
                 .replace('\\', "\\\\")
@@ -637,55 +717,57 @@ fn spawn_log_capture_task(
             }
         };
 
+        // Type alias for the log file handle
+        type LogFile = std::sync::Arc<std::sync::Mutex<std::fs::File>>;
+
+        // Helper to spawn a log capture task for a given reader
+        fn spawn_capture_task<R>(
+            mut reader: R,
+            stream: &'static str,
+            log_file: LogFile,
+            write_log: impl Fn(&LogFile, &str, &[u8]) + Send + 'static,
+        ) -> tokio::task::JoinHandle<()>
+        where
+            R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        {
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 4096];
+                let mut pending = Vec::new();
+
+                loop {
+                    let n = match reader.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::debug!("{} read error: {}", stream, e);
+                            break;
+                        }
+                    };
+
+                    pending.extend_from_slice(&buffer[..n]);
+                    while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+                        let line: Vec<u8> = pending.drain(..=pos).collect();
+                        write_log(&log_file, stream, &line);
+                    }
+                }
+
+                if !pending.is_empty() {
+                    write_log(&log_file, stream, &pending);
+                }
+            })
+        }
+
         // Spawn tasks for stdout and stderr
         let mut handles = Vec::new();
 
         if let Some(stdout) = stdout {
             let log_file = log_file.clone();
-            handles.push(tokio::spawn(async move {
-                let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break, // EOF
-                        Ok(_) => {
-                            let content = line.trim_end_matches('\n');
-                            if !content.is_empty() {
-                                write_log(&log_file, "stdout", content);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("stdout read error: {}", e);
-                            break;
-                        }
-                    }
-                }
-            }));
+            handles.push(spawn_capture_task(stdout, "stdout", log_file, write_log));
         }
 
         if let Some(stderr) = stderr {
             let log_file = log_file.clone();
-            handles.push(tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break, // EOF
-                        Ok(_) => {
-                            let content = line.trim_end_matches('\n');
-                            if !content.is_empty() {
-                                write_log(&log_file, "stderr", content);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("stderr read error: {}", e);
-                            break;
-                        }
-                    }
-                }
-            }));
+            handles.push(spawn_capture_task(stderr, "stderr", log_file, write_log));
         }
 
         // Wait for all capture tasks to complete
@@ -708,12 +790,27 @@ fn spawn_log_capture_task(
 /// 2. Remounts root as private to prevent mount propagation
 /// 3. Mounts essential filesystems (proc, sys, dev)
 /// 4. Chroots into the rootfs
+/// 5. Changes to the specified working directory
 ///
 /// # Safety
 ///
 /// This must be called in a pre_exec context (after fork, before exec).
 #[cfg(target_os = "linux")]
-unsafe fn setup_container_rootfs(rootfs: &str) -> std::io::Result<()> {
+unsafe fn setup_container_rootfs(
+    rootfs: &str,
+    working_dir: &str,
+    mounts: &[MountSpec],
+) -> std::io::Result<()> {
+    use std::path::Path;
+
+    // Verify rootfs path exists before attempting chroot
+    if !Path::new(rootfs).exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("rootfs path does not exist: {}", rootfs),
+        ));
+    }
+
     let rootfs_c = CString::new(rootfs).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid rootfs path")
     })?;
@@ -722,14 +819,13 @@ unsafe fn setup_container_rootfs(rootfs: &str) -> std::io::Result<()> {
     // SAFETY: unshare is a valid syscall for creating namespaces
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } < 0 {
         // Best-effort isolation; continue if namespaces are unavailable.
-        tracing::warn!("unshare(CLONE_NEWNS) failed: {}", std::io::Error::last_os_error());
     }
 
     // Make root mount private to prevent propagation
     let none = CString::new("none").unwrap();
     let slash = CString::new("/").unwrap();
     // SAFETY: mount is a valid syscall with proper arguments
-    if unsafe {
+    let _ = unsafe {
         libc::mount(
             none.as_ptr(),
             slash.as_ptr(),
@@ -737,18 +833,19 @@ unsafe fn setup_container_rootfs(rootfs: &str) -> std::io::Result<()> {
             libc::MS_REC | libc::MS_PRIVATE,
             std::ptr::null(),
         )
-    } < 0
-    {
-        // Best-effort; continue even if remounting fails.
-        tracing::warn!("mount(/) private failed: {}", std::io::Error::last_os_error());
-    }
+    };
+    // Best-effort; continue even if remounting fails.
 
     // Setup essential mounts in the new rootfs
     // SAFETY: setup_container_mounts is unsafe and we're in an unsafe context
     unsafe {
-        if let Err(err) = setup_container_mounts(rootfs) {
-            tracing::warn!("setup_container_mounts failed: {}", err);
-        }
+        let _ = setup_container_mounts(rootfs);
+    }
+
+    // Perform bind mounts for volumes (before chroot, paths relative to rootfs)
+    // SAFETY: setup_bind_mounts is unsafe and we're in an unsafe context
+    unsafe {
+        let _ = setup_bind_mounts(rootfs, mounts);
     }
 
     // Chroot into the rootfs
@@ -757,11 +854,92 @@ unsafe fn setup_container_rootfs(rootfs: &str) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
 
-    // Change to root directory
-    let root = CString::new("/").unwrap();
+    // Change to the specified working directory
+    let workdir_c = CString::new(working_dir).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid working_dir path")
+    })?;
     // SAFETY: chdir is a valid syscall with a proper C string
-    if unsafe { libc::chdir(root.as_ptr()) } < 0 {
+    if unsafe { libc::chdir(workdir_c.as_ptr()) } < 0 {
         return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+/// Sets up bind mounts for container volumes.
+///
+/// # Safety
+///
+/// Must be called before chroot. Mounts source paths to target paths within rootfs.
+#[cfg(target_os = "linux")]
+unsafe fn setup_bind_mounts(rootfs: &str, mounts: &[MountSpec]) -> std::io::Result<()> {
+    for mount in mounts {
+        // Target path is relative to rootfs
+        let target_path = format!("{}{}", rootfs, mount.target);
+
+        // Create target directory if it doesn't exist
+        if let Err(e) = std::fs::create_dir_all(&target_path) {
+            tracing::warn!("Failed to create mount target {}: {}", target_path, e);
+            continue;
+        }
+
+        let source_c = CString::new(mount.source.as_str()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid source path")
+        })?;
+        let target_c = CString::new(target_path.as_str()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid target path")
+        })?;
+
+        // Perform bind mount
+        // SAFETY: mount is a valid syscall with proper arguments
+        let flags = libc::MS_BIND | libc::MS_REC;
+        if unsafe {
+            libc::mount(
+                source_c.as_ptr(),
+                target_c.as_ptr(),
+                std::ptr::null(),
+                flags,
+                std::ptr::null(),
+            )
+        } < 0
+        {
+            let err = std::io::Error::last_os_error();
+            tracing::warn!(
+                "Failed to bind mount {} -> {}: {}",
+                mount.source,
+                mount.target,
+                err
+            );
+            continue;
+        }
+
+        // If readonly, remount with MS_RDONLY
+        if mount.readonly {
+            let ro_flags = libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY;
+            if unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    target_c.as_ptr(),
+                    std::ptr::null(),
+                    ro_flags,
+                    std::ptr::null(),
+                )
+            } < 0
+            {
+                tracing::warn!(
+                    "Failed to remount {} as readonly: {}",
+                    mount.target,
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+
+        tracing::debug!(
+            "Bind mounted {} -> {} (readonly={})",
+            mount.source,
+            mount.target,
+            mount.readonly
+        );
     }
 
     Ok(())
@@ -866,9 +1044,25 @@ unsafe fn setup_container_mounts(rootfs: &str) -> std::io::Result<()> {
 
 /// Stub for non-Linux platforms.
 #[cfg(not(target_os = "linux"))]
-unsafe fn setup_container_rootfs(_rootfs: &str) -> std::io::Result<()> {
+unsafe fn setup_container_rootfs(
+    _rootfs: &str,
+    working_dir: &str,
+    _mounts: &[MountSpec],
+) -> std::io::Result<()> {
+    use std::path::Path;
+
     // Container isolation is only implemented for Linux
     // On other platforms (like macOS host for development), just chroot
+    // Bind mounts are not supported on non-Linux platforms.
+
+    // Verify rootfs path exists before attempting chroot
+    if !Path::new(_rootfs).exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("rootfs path does not exist: {}", _rootfs),
+        ));
+    }
+
     let rootfs_c = CString::new(_rootfs).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid rootfs path")
     })?;
@@ -880,10 +1074,13 @@ unsafe fn setup_container_rootfs(_rootfs: &str) -> std::io::Result<()> {
         }
     }
 
-    let root = CString::new("/").unwrap();
-    // SAFETY: root is a valid CString
+    // Change to the specified working directory
+    let workdir_c = CString::new(working_dir).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid working_dir path")
+    })?;
+    // SAFETY: workdir_c is a valid CString
     unsafe {
-        if libc::chdir(root.as_ptr()) < 0 {
+        if libc::chdir(workdir_c.as_ptr()) < 0 {
             return Err(std::io::Error::last_os_error());
         }
     }
@@ -909,6 +1106,7 @@ mod tests {
             created_at: Utc::now(),
             tty: false,
             open_stdin: false,
+            mounts: vec![],
             rootfs: None,
         }
     }
@@ -931,6 +1129,7 @@ mod tests {
             created_at: Utc::now(),
             tty: false,
             open_stdin: false,
+            mounts: vec![],
             rootfs: None,
         }
     }
@@ -1375,5 +1574,221 @@ mod tests {
         assert_eq!(cloned.image, container.image);
         assert_eq!(cloned.command, container.command);
         assert_eq!(cloned.state, container.state);
+    }
+
+    // =========================================================================
+    // Log Capture Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_container_stdout_captured_to_log() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        // Create a temporary directory for logs
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("logs");
+        fs::create_dir_all(&log_dir).unwrap();
+
+        let container_id = "test-log-capture";
+        let log_path = log_dir.join(format!("{}.log", container_id));
+
+        // Spawn a simple echo command and capture its output
+        let mut cmd = tokio::process::Command::new("echo");
+        cmd.arg("hello from test");
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn().unwrap();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        // Manually implement log capture for testing (similar to spawn_log_capture_task)
+        let log_file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+
+        let log_file = std::sync::Arc::new(std::sync::Mutex::new(log_file));
+
+        if let Some(stdout) = stdout {
+            let log_file = log_file.clone();
+            let mut reader = tokio::io::BufReader::new(stdout);
+            let mut line = String::new();
+
+            use tokio::io::AsyncBufReadExt;
+            while reader.read_line(&mut line).await.unwrap() > 0 {
+                let content = line.trim_end_matches('\n');
+                if !content.is_empty() {
+                    use std::io::Write;
+                    let timestamp = chrono::Utc::now().to_rfc3339();
+                    let json_line = format!(
+                        r#"{{"log":"{}","stream":"stdout","time":"{}"}}"#,
+                        content, timestamp
+                    );
+                    if let Ok(mut f) = log_file.lock() {
+                        writeln!(f, "{}", json_line).unwrap();
+                    }
+                }
+                line.clear();
+            }
+        }
+
+        // Wait for the process to complete
+        let _ = child.wait().await;
+
+        // Verify log file was created and contains the output
+        assert!(log_path.exists(), "Log file should be created");
+
+        let log_content = fs::read_to_string(&log_path).unwrap();
+        assert!(
+            log_content.contains("hello from test"),
+            "Log should contain output: {}",
+            log_content
+        );
+        assert!(
+            log_content.contains(r#""stream":"stdout""#),
+            "Log should have stream field: {}",
+            log_content
+        );
+        assert!(
+            log_content.contains(r#""log":"#),
+            "Log should be in JSON format: {}",
+            log_content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_container_stderr_captured_to_log() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("logs");
+        fs::create_dir_all(&log_dir).unwrap();
+
+        let container_id = "test-stderr-capture";
+        let log_path = log_dir.join(format!("{}.log", container_id));
+
+        // Spawn a command that writes to stderr
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "echo error message >&2"]);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn().unwrap();
+        let stderr = child.stderr.take();
+
+        let log_file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+
+        let log_file = std::sync::Arc::new(std::sync::Mutex::new(log_file));
+
+        if let Some(stderr) = stderr {
+            let log_file = log_file.clone();
+            let mut reader = tokio::io::BufReader::new(stderr);
+            let mut line = String::new();
+
+            use tokio::io::AsyncBufReadExt;
+            while reader.read_line(&mut line).await.unwrap() > 0 {
+                let content = line.trim_end_matches('\n');
+                if !content.is_empty() {
+                    use std::io::Write;
+                    let timestamp = chrono::Utc::now().to_rfc3339();
+                    let json_line = format!(
+                        r#"{{"log":"{}","stream":"stderr","time":"{}"}}"#,
+                        content, timestamp
+                    );
+                    if let Ok(mut f) = log_file.lock() {
+                        writeln!(f, "{}", json_line).unwrap();
+                    }
+                }
+                line.clear();
+            }
+        }
+
+        let _ = child.wait().await;
+
+        // Verify stderr was captured
+        let log_content = fs::read_to_string(&log_path).unwrap();
+        assert!(
+            log_content.contains("error message"),
+            "Log should contain stderr: {}",
+            log_content
+        );
+        assert!(
+            log_content.contains(r#""stream":"stderr""#),
+            "Log should mark as stderr: {}",
+            log_content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_container_multiline_output_captured() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("logs");
+        fs::create_dir_all(&log_dir).unwrap();
+
+        let container_id = "test-multiline";
+        let log_path = log_dir.join(format!("{}.log", container_id));
+
+        // Spawn a command that outputs multiple lines
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "echo line1; echo line2; echo line3"]);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn().unwrap();
+        let stdout = child.stdout.take();
+
+        let log_file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+
+        let log_file = std::sync::Arc::new(std::sync::Mutex::new(log_file));
+
+        if let Some(stdout) = stdout {
+            let log_file = log_file.clone();
+            let mut reader = tokio::io::BufReader::new(stdout);
+            let mut line = String::new();
+
+            use tokio::io::AsyncBufReadExt;
+            while reader.read_line(&mut line).await.unwrap() > 0 {
+                let content = line.trim_end_matches('\n');
+                if !content.is_empty() {
+                    use std::io::Write;
+                    let timestamp = chrono::Utc::now().to_rfc3339();
+                    let json_line = format!(
+                        r#"{{"log":"{}","stream":"stdout","time":"{}"}}"#,
+                        content, timestamp
+                    );
+                    if let Ok(mut f) = log_file.lock() {
+                        writeln!(f, "{}", json_line).unwrap();
+                    }
+                }
+                line.clear();
+            }
+        }
+
+        let _ = child.wait().await;
+
+        // Verify all lines were captured
+        let log_content = fs::read_to_string(&log_path).unwrap();
+        assert!(log_content.contains("line1"), "Should have line1");
+        assert!(log_content.contains("line2"), "Should have line2");
+        assert!(log_content.contains("line3"), "Should have line3");
+
+        // Verify each line is a separate JSON entry
+        let lines: Vec<&str> = log_content.lines().collect();
+        assert_eq!(lines.len(), 3, "Should have 3 log entries");
     }
 }

@@ -318,8 +318,13 @@ async fn test_workflow_volume_mount() {
         .run_command_success(&["pull", images::ALPINE])
         .expect("failed to pull");
 
-    // Create a test file in the host data directory
-    let test_dir = harness.data_dir().join("test-volume");
+    // Create a test file in the host data directory under volumes/_data
+    // The data_dir is shared to the guest as the "arcbox" VirtioFS tag.
+    let test_dir = harness
+        .data_dir()
+        .join("volumes")
+        .join("test-volume")
+        .join("_data");
     std::fs::create_dir_all(&test_dir).expect("failed to create test dir");
     std::fs::write(test_dir.join("hello.txt"), "hello from host").expect("failed to write");
 
@@ -337,20 +342,18 @@ async fn test_workflow_volume_mount() {
         ])
         .expect("failed to run");
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("hello from host"),
-            "Should read mounted file: {}",
-            stdout
-        );
-    } else {
-        // Volume mounts might not be fully implemented yet
-        eprintln!(
-            "Volume mount test skipped (not implemented?): {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    assert!(
+        output.status.success(),
+        "Volume mount should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello from host"),
+        "Should read mounted file: {}",
+        stdout
+    );
 }
 
 // ============================================================================

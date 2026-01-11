@@ -115,6 +115,8 @@ pub struct VmConfig {
     pub networking: bool,
     /// Enable vsock.
     pub vsock: bool,
+    /// Guest CID for vsock connections (Linux).
+    pub guest_cid: Option<u32>,
 }
 
 impl Default for VmConfig {
@@ -128,6 +130,7 @@ impl Default for VmConfig {
             shared_dirs: Vec::new(),
             networking: true,
             vsock: true,
+            guest_cid: None,
         }
     }
 }
@@ -182,6 +185,65 @@ impl VmManager {
         Ok(id)
     }
 
+    /// Sets the guest CID for an existing VM configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the VM is running or not found.
+    pub fn set_guest_cid(&self, id: &VmId, guest_cid: u32) -> Result<()> {
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|_| CoreError::Vm("lock poisoned".to_string()))?;
+
+        let entry = vms
+            .get_mut(id)
+            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+
+        if matches!(entry.info.state, VmState::Running | VmState::Starting) {
+            return Err(CoreError::InvalidState(format!(
+                "cannot set guest_cid while VM is {:?}",
+                entry.info.state
+            )));
+        }
+
+        entry.config.guest_cid = Some(guest_cid);
+        Ok(())
+    }
+
+    fn build_vmm_config(entry: &VmEntry) -> VmmConfig {
+        let shared_dirs: Vec<VmmSharedDirConfig> = entry
+            .config
+            .shared_dirs
+            .iter()
+            .map(|sd| VmmSharedDirConfig {
+                host_path: PathBuf::from(&sd.host_path),
+                tag: sd.tag.clone(),
+                read_only: sd.read_only,
+            })
+            .collect();
+
+        VmmConfig {
+            vcpu_count: entry.config.cpus,
+            memory_size: entry.config.memory_mb * 1024 * 1024,
+            kernel_path: entry
+                .config
+                .kernel
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            kernel_cmdline: entry.config.cmdline.clone().unwrap_or_default(),
+            initrd_path: entry.config.initrd.as_ref().map(PathBuf::from),
+            enable_rosetta: false,
+            serial_console: true,
+            virtio_console: true,
+            shared_dirs,
+            networking: entry.config.networking,
+            vsock: entry.config.vsock,
+            guest_cid: entry.config.guest_cid,
+        }
+    }
+
     /// Starts a VM.
     ///
     /// # Errors
@@ -206,36 +268,7 @@ impl VmManager {
 
         entry.info.state = VmState::Starting;
 
-        // Convert our config to VMM config
-        let shared_dirs: Vec<VmmSharedDirConfig> = entry
-            .config
-            .shared_dirs
-            .iter()
-            .map(|sd| VmmSharedDirConfig {
-                host_path: PathBuf::from(&sd.host_path),
-                tag: sd.tag.clone(),
-                read_only: sd.read_only,
-            })
-            .collect();
-
-        let vmm_config = VmmConfig {
-            vcpu_count: entry.config.cpus,
-            memory_size: entry.config.memory_mb * 1024 * 1024,
-            kernel_path: entry
-                .config
-                .kernel
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_default(),
-            kernel_cmdline: entry.config.cmdline.clone().unwrap_or_default(),
-            initrd_path: entry.config.initrd.as_ref().map(PathBuf::from),
-            enable_rosetta: false,
-            serial_console: true,
-            virtio_console: true,
-            shared_dirs,
-            networking: entry.config.networking,
-            vsock: entry.config.vsock,
-        };
+        let vmm_config = Self::build_vmm_config(entry);
 
         // Create and start VMM
         let mut vmm = Vmm::new(vmm_config).map_err(|e| CoreError::Vm(e.to_string()))?;
@@ -407,6 +440,83 @@ impl VmManager {
 
         vmm.connect_vsock(port)
             .map_err(|e| CoreError::Vm(format!("vsock connect failed: {}", e)))
+    }
+
+    /// Reads serial console output from a running VM (macOS only).
+    #[cfg(target_os = "macos")]
+    pub fn read_console_output(&self, id: &VmId) -> Result<String> {
+        let vms = self
+            .vms
+            .read()
+            .map_err(|_| CoreError::Vm("lock poisoned".to_string()))?;
+
+        let entry = vms
+            .get(id)
+            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+
+        if entry.info.state != VmState::Running {
+            return Err(CoreError::InvalidState(format!(
+                "cannot read console output: VM is {:?}",
+                entry.info.state
+            )));
+        }
+
+        let vmm = entry
+            .vmm
+            .as_ref()
+            .ok_or_else(|| CoreError::Vm("VMM not initialized".to_string()))?;
+
+        vmm.read_console_output()
+            .map_err(|e| CoreError::Vm(format!("read console failed: {}", e)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn guest_cid_for_test(&self, id: &VmId) -> Option<u32> {
+        self.vms
+            .read()
+            .ok()?
+            .get(id)
+            .and_then(|entry| entry.config.guest_cid)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_vmm_config_for_test(&self, id: &VmId) -> Result<VmmConfig> {
+        let vms = self
+            .vms
+            .read()
+            .map_err(|_| CoreError::Vm("lock poisoned".to_string()))?;
+        let entry = vms
+            .get(id)
+            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+        Ok(Self::build_vmm_config(entry))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_set_guest_cid_updates_vm_config() {
+        let manager = VmManager::new();
+        let mut config = VmConfig::default();
+        config.guest_cid = None;
+
+        let vm_id = manager.create(config).unwrap();
+
+        manager.set_guest_cid(&vm_id, 7).unwrap();
+        assert_eq!(manager.guest_cid_for_test(&vm_id), Some(7));
+    }
+
+    #[test]
+    fn test_build_vmm_config_includes_guest_cid() {
+        let manager = VmManager::new();
+        let mut config = VmConfig::default();
+        config.guest_cid = Some(9);
+
+        let vm_id = manager.create(config).unwrap();
+        let vmm_config = manager.build_vmm_config_for_test(&vm_id).unwrap();
+        assert_eq!(vmm_config.guest_cid, Some(9));
     }
 }
 
