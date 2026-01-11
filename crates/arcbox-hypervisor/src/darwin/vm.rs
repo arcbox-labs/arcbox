@@ -21,6 +21,12 @@ use super::vcpu::DarwinVcpu;
 /// Global VM ID counter.
 static VM_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Reserved vsock port for IRQ signaling.
+///
+/// This port is used by the host to send IRQ signals to the guest.
+/// The guest arcbox-agent listens on this port and handles incoming IRQ signals.
+const VSOCK_IRQ_SIGNAL_PORT: u32 = 1025;
+
 /// Virtual machine state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmState {
@@ -71,6 +77,17 @@ pub struct DarwinVm {
     serial_port: Option<*mut AnyObject>,
     /// Serial port file descriptors (read, write).
     serial_fds: Option<(RawFd, RawFd)>,
+    /// Device configuration metadata for snapshots.
+    ///
+    /// Since Virtualization.framework doesn't expose device state, we store
+    /// the original configuration to enable re-creation on restore.
+    device_configs: Vec<VirtioDeviceConfig>,
+    /// Vsock file descriptor for IRQ signaling (if established).
+    ///
+    /// Since Darwin's Virtualization.framework doesn't expose direct IRQ injection,
+    /// we use vsock-based signaling as an alternative. The host sends IRQ signals
+    /// through this connection, and the guest agent handles them.
+    vsock_irq_fd: RwLock<Option<RawFd>>,
 }
 
 // Safety: The VZ handles are properly synchronized and only accessed
@@ -154,6 +171,8 @@ impl DarwinVm {
             network_devices: Vec::new(),
             serial_port: None,
             serial_fds: None,
+            device_configs: Vec::new(),
+            vsock_irq_fd: RwLock::new(None),
         })
     }
 
@@ -489,45 +508,152 @@ impl DarwinVm {
     // NOTE: Apple's Virtualization.framework does NOT expose interrupt injection
     // APIs. VirtIO device interrupts are handled internally by the framework.
     //
-    // For custom devices that need interrupt injection, consider:
-    // 1. Using Hypervisor.framework directly (hv_vcpu_inject_extint)
-    // 2. Using virtio-based signaling through existing VirtIO devices
-    // 3. Using shared memory + polling as a fallback
+    // For custom devices that need interrupt injection, we use vsock-based
+    // signaling as an alternative. The host sends IRQ signals through a
+    // vsock connection, and the guest agent handles them.
     //
-    // The methods below are stubs that log warnings when called.
+    // Protocol: [opcode(1)] [gsi(4)] [level(1)]
+    // - opcode 0x01: set_irq_line
+    // - opcode 0x02: trigger_edge_irq
     // ========================================================================
 
-    /// Sets the IRQ line level (stub - not supported on Darwin).
+    /// IRQ signal opcodes for vsock protocol.
+    const IRQ_OPCODE_SET_LINE: u8 = 0x01;
+    const IRQ_OPCODE_EDGE_TRIGGER: u8 = 0x02;
+
+    /// Sets up vsock-based IRQ signaling.
     ///
-    /// Darwin Virtualization.framework handles VirtIO interrupts internally.
-    /// This method logs a warning and returns success to maintain API compatibility.
+    /// This establishes a vsock connection to the guest agent on the reserved
+    /// IRQ signal port. Once established, `set_irq_line` and `trigger_edge_irq`
+    /// will send signals through this connection.
+    ///
+    /// # Note
+    /// The VM must be running and have a vsock device configured.
+    /// The guest agent must be listening on `VSOCK_IRQ_SIGNAL_PORT`.
+    pub fn setup_irq_signaling(&self) -> Result<(), HypervisorError> {
+        // Check if already set up
+        {
+            let irq_fd = self.vsock_irq_fd.read().unwrap();
+            if irq_fd.is_some() {
+                tracing::debug!("IRQ signaling already set up for VM {}", self.id);
+                return Ok(());
+            }
+        }
+
+        tracing::info!(
+            "Setting up vsock-based IRQ signaling for VM {} on port {}",
+            self.id,
+            VSOCK_IRQ_SIGNAL_PORT
+        );
+
+        let fd = self.connect_vsock(VSOCK_IRQ_SIGNAL_PORT)?;
+
+        let mut irq_fd = self.vsock_irq_fd.write().unwrap();
+        *irq_fd = Some(fd);
+
+        tracing::info!(
+            "IRQ signaling established for VM {}, fd={}",
+            self.id,
+            fd
+        );
+
+        Ok(())
+    }
+
+    /// Tears down vsock-based IRQ signaling.
+    pub fn teardown_irq_signaling(&self) {
+        let mut irq_fd = self.vsock_irq_fd.write().unwrap();
+        if let Some(fd) = irq_fd.take() {
+            tracing::debug!("Closing IRQ signaling fd {} for VM {}", fd, self.id);
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+
+    /// Sends an IRQ signal through the vsock connection.
+    ///
+    /// Returns true if the signal was sent successfully, false if no IRQ
+    /// signaling connection is established.
+    fn send_irq_signal(&self, opcode: u8, gsi: u32, level: bool) -> bool {
+        let irq_fd = self.vsock_irq_fd.read().unwrap();
+        if let Some(fd) = *irq_fd {
+            // Protocol: [opcode(1)] [gsi(4 LE)] [level(1)]
+            let mut buf = [0u8; 6];
+            buf[0] = opcode;
+            buf[1..5].copy_from_slice(&gsi.to_le_bytes());
+            buf[5] = u8::from(level);
+
+            let written = unsafe {
+                libc::write(fd, buf.as_ptr() as *const libc::c_void, 6)
+            };
+
+            if written == 6 {
+                tracing::trace!(
+                    "Sent IRQ signal: opcode={}, gsi={}, level={} on VM {}",
+                    opcode,
+                    gsi,
+                    level,
+                    self.id
+                );
+                return true;
+            }
+            tracing::warn!(
+                "Failed to send IRQ signal on VM {}: wrote {} bytes instead of 6",
+                self.id,
+                written
+            );
+        }
+        false
+    }
+
+    /// Sets the IRQ line level.
+    ///
+    /// If vsock-based IRQ signaling is established (via `setup_irq_signaling`),
+    /// this sends a signal to the guest agent. Otherwise, it falls back to
+    /// logging a warning since Virtualization.framework doesn't expose direct
+    /// IRQ injection.
     pub fn set_irq_line(&self, gsi: u32, level: bool) -> Result<(), HypervisorError> {
+        // Try vsock-based signaling first
+        if self.send_irq_signal(Self::IRQ_OPCODE_SET_LINE, gsi, level) {
+            return Ok(());
+        }
+
+        // Fall back to warning
         tracing::warn!(
             "set_irq_line(gsi={}, level={}) called on Darwin VM {} - \
-            Virtualization.framework handles interrupts internally",
+            no IRQ signaling connection, call setup_irq_signaling() first",
             gsi,
             level,
             self.id
         );
-        // Return Ok to allow code that uses this to continue working,
-        // but the interrupt won't actually be injected.
         Ok(())
     }
 
-    /// Triggers an edge-triggered interrupt (stub - not supported on Darwin).
+    /// Triggers an edge-triggered interrupt.
+    ///
+    /// If vsock-based IRQ signaling is established, this sends a signal to
+    /// the guest agent. Otherwise, it logs a warning.
     pub fn trigger_edge_irq(&self, gsi: u32) -> Result<(), HypervisorError> {
+        // Try vsock-based signaling first (level is always true for edge-triggered)
+        if self.send_irq_signal(Self::IRQ_OPCODE_EDGE_TRIGGER, gsi, true) {
+            return Ok(());
+        }
+
+        // Fall back to warning
         tracing::warn!(
-            "trigger_edge_irq(gsi={}) called on Darwin VM {} - not supported",
+            "trigger_edge_irq(gsi={}) called on Darwin VM {} - \
+            no IRQ signaling connection, call setup_irq_signaling() first",
             gsi,
             self.id
         );
         Ok(())
     }
 
-    /// Registers an eventfd for IRQ injection (stub - not supported on Darwin).
+    /// Registers an eventfd for IRQ injection.
     ///
-    /// On Darwin, VirtIO devices use framework-managed interrupts.
-    /// For custom interrupt handling, use vsock or shared memory.
+    /// On Darwin, this is not supported. Use vsock-based signaling instead
+    /// by calling `setup_irq_signaling()` and then `set_irq_line()`.
     pub fn register_irqfd(
         &self,
         _eventfd: RawFd,
@@ -536,17 +662,16 @@ impl DarwinVm {
     ) -> Result<(), HypervisorError> {
         tracing::warn!(
             "register_irqfd(gsi={}) called on Darwin VM {} - not supported, \
-            use vsock or VirtIO for guest signaling",
+            use setup_irq_signaling() + set_irq_line() for IRQ injection",
             gsi,
             self.id
         );
-        // Return error since this is a fundamental limitation
         Err(HypervisorError::DeviceError(
-            "IRQFD not supported on Darwin Virtualization.framework".to_string(),
+            "IRQFD not supported on Darwin - use vsock-based IRQ signaling".to_string(),
         ))
     }
 
-    /// Unregisters an eventfd (stub - not supported on Darwin).
+    /// Unregisters an eventfd (not supported on Darwin).
     pub fn unregister_irqfd(&self, _eventfd: RawFd, gsi: u32) -> Result<(), HypervisorError> {
         tracing::warn!(
             "unregister_irqfd(gsi={}) called on Darwin VM {} - not supported",
@@ -707,6 +832,9 @@ impl VirtualMachine for DarwinVm {
             self.id
         );
 
+        // Store device configuration for snapshot/restore
+        self.device_configs.push(device);
+
         Ok(())
     }
 
@@ -723,6 +851,11 @@ impl VirtualMachine for DarwinVm {
 
         // Finalize configuration if VM hasn't been created yet
         if self.vz_vm.is_none() {
+            if std::env::var("ARCBOX_ENABLE_CONSOLE").as_deref() == Ok("1") {
+                if let Err(err) = self.setup_serial_console() {
+                    tracing::warn!("Failed to set up serial console: {}", err);
+                }
+            }
             self.finalize_configuration()?;
         }
 
@@ -745,6 +878,9 @@ impl VirtualMachine for DarwinVm {
                     self.running.store(true, Ordering::SeqCst);
                     self.set_state(VmState::Running);
                     tracing::info!("Started VM {}", self.id);
+                    if let Some(path) = self.console_path() {
+                        tracing::info!("Serial console attached at {}", path);
+                    }
                     Ok(())
                 }
                 Err(e) => {
@@ -868,90 +1004,132 @@ impl VirtualMachine for DarwinVm {
     }
 
     fn snapshot_devices(&self) -> Result<Vec<DeviceSnapshot>, HypervisorError> {
-        // LIMITATION: Virtualization.framework does not expose device state.
+        // Darwin Virtualization.framework does not expose internal device state.
+        // However, we store the device configuration metadata which allows:
+        // 1. Verifying device configuration matches on restore
+        // 2. Re-creating devices with the same configuration
         //
-        // VirtIO device state is managed internally by the framework.
-        // For proper snapshot/restore, one would need to use Hypervisor.framework
-        // or implement device state capture through the guest agent.
-        //
-        // We return basic device metadata without internal state.
+        // The `state` field contains serialized VirtioDeviceConfig.
         let mut snapshots = Vec::new();
 
-        // Record storage devices (no internal state available)
-        for (idx, _device) in self.storage_devices.iter().enumerate() {
+        for (idx, config) in self.device_configs.iter().enumerate() {
+            // Serialize the device configuration to JSON bytes
+            let state = serde_json::to_vec(config).unwrap_or_default();
+
+            let name = match config.device_type {
+                VirtioDeviceType::Block => {
+                    if let Some(ref path) = config.path {
+                        format!("block-{}-{}", idx, path.rsplit('/').next().unwrap_or("disk"))
+                    } else {
+                        format!("block-{}", idx)
+                    }
+                }
+                VirtioDeviceType::Net => format!("net-{}", idx),
+                VirtioDeviceType::Console => "console-0".to_string(),
+                VirtioDeviceType::Fs => {
+                    if let Some(ref tag) = config.tag {
+                        format!("fs-{}", tag)
+                    } else {
+                        format!("fs-{}", idx)
+                    }
+                }
+                VirtioDeviceType::Vsock => "vsock-0".to_string(),
+                _ => format!("device-{}", idx),
+            };
+
             snapshots.push(DeviceSnapshot {
-                device_type: VirtioDeviceType::Block,
-                name: format!("block-{}", idx),
-                state: Vec::new(), // No state available
+                device_type: config.device_type,
+                name,
+                state,
             });
         }
 
-        // Record network devices
-        for (idx, _device) in self.network_devices.iter().enumerate() {
-            snapshots.push(DeviceSnapshot {
-                device_type: VirtioDeviceType::Net,
-                name: format!("net-{}", idx),
-                state: Vec::new(),
-            });
-        }
-
-        // Record serial port if configured
+        // Also record serial port if configured (not in device_configs)
         if self.serial_port.is_some() {
             snapshots.push(DeviceSnapshot {
                 device_type: VirtioDeviceType::Console,
                 name: "serial-0".to_string(),
-                state: Vec::new(),
+                state: Vec::new(), // Serial state is managed by guest
             });
         }
 
-        tracing::warn!(
-            "snapshot_devices: returning {} device metadata (no internal state on Darwin)",
-            snapshots.len()
+        tracing::debug!(
+            "snapshot_devices: captured {} device configurations for VM {}",
+            snapshots.len(),
+            self.id
         );
 
         Ok(snapshots)
     }
 
     fn restore_devices(&mut self, snapshots: &[DeviceSnapshot]) -> Result<(), HypervisorError> {
-        // LIMITATION: Virtualization.framework does not support device state restore.
+        // Darwin Virtualization.framework does not support live device state restore.
+        // However, we can validate that the snapshot device configuration matches
+        // the current VM configuration.
         //
-        // Device state is managed internally by the framework. Restoring device
-        // state would require recreating the entire VM with the same configuration.
-        //
-        // For now, we just log the attempt and verify device types match.
-        tracing::warn!(
-            "restore_devices: Darwin does not support device state restore ({} devices)",
-            snapshots.len()
+        // For actual device restore, the VM should be recreated with the same
+        // configuration from the snapshot metadata.
+        tracing::info!(
+            "restore_devices: validating {} devices for VM {}",
+            snapshots.len(),
+            self.id
         );
 
-        // Verify that the snapshot device types roughly match our configuration
-        let mut expected_blocks = self.storage_devices.len();
-        let mut expected_nets = self.network_devices.len();
+        // Deserialize and validate device configurations
+        let mut mismatches = Vec::new();
 
         for snapshot in snapshots {
-            match snapshot.device_type {
-                VirtioDeviceType::Block => {
-                    if expected_blocks == 0 {
-                        tracing::warn!(
-                            "Snapshot has more block devices than current VM configuration"
-                        );
-                    } else {
-                        expected_blocks -= 1;
+            // Try to deserialize the stored configuration
+            if !snapshot.state.is_empty() {
+                if let Ok(stored_config) = serde_json::from_slice::<VirtioDeviceConfig>(&snapshot.state) {
+                    // Find matching device in current configuration
+                    let matches = self.device_configs.iter().any(|current| {
+                        current.device_type == stored_config.device_type
+                            && current.path == stored_config.path
+                            && current.tag == stored_config.tag
+                    });
+
+                    if !matches {
+                        mismatches.push(format!(
+                            "{:?} device '{}' (path={:?}, tag={:?})",
+                            stored_config.device_type,
+                            snapshot.name,
+                            stored_config.path,
+                            stored_config.tag
+                        ));
                     }
-                }
-                VirtioDeviceType::Net => {
-                    if expected_nets == 0 {
-                        tracing::warn!(
-                            "Snapshot has more network devices than current VM configuration"
-                        );
-                    } else {
-                        expected_nets -= 1;
-                    }
-                }
-                _ => {
-                    // Other device types are informational
                 }
             }
+        }
+
+        if !mismatches.is_empty() {
+            tracing::warn!(
+                "restore_devices: {} device(s) in snapshot don't match current configuration: {:?}",
+                mismatches.len(),
+                mismatches
+            );
+        }
+
+        // Verify device count by type
+        let snapshot_blocks = snapshots.iter().filter(|s| s.device_type == VirtioDeviceType::Block).count();
+        let snapshot_nets = snapshots.iter().filter(|s| s.device_type == VirtioDeviceType::Net).count();
+        let current_blocks = self.storage_devices.len();
+        let current_nets = self.network_devices.len();
+
+        if snapshot_blocks != current_blocks {
+            tracing::warn!(
+                "Block device count mismatch: snapshot has {}, current VM has {}",
+                snapshot_blocks,
+                current_blocks
+            );
+        }
+
+        if snapshot_nets != current_nets {
+            tracing::warn!(
+                "Network device count mismatch: snapshot has {}, current VM has {}",
+                snapshot_nets,
+                current_nets
+            );
         }
 
         Ok(())

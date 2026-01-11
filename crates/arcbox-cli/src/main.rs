@@ -14,6 +14,16 @@ use commands::{Cli, Commands};
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Set ARCBOX_SOCKET env var if --socket was provided.
+    // This makes it available to DaemonClient via its env var lookup.
+    // SAFETY: This is called at the start of main(), before any threads are spawned,
+    // and we're the only ones modifying this environment variable.
+    if let Some(ref socket) = cli.socket {
+        unsafe {
+            std::env::set_var("ARCBOX_SOCKET", socket.as_os_str());
+        }
+    }
+
     // Initialize logging based on debug flag
     let filter = if cli.debug {
         "arcbox=debug,arcbox_cli=debug"
@@ -42,6 +52,7 @@ async fn main() -> Result<()> {
         Commands::Rmi(args) => commands::images::execute_rmi(args).await,
         Commands::Machine(cmd) => commands::machine::execute(cmd).await,
         Commands::Docker(cmd) => commands::docker::execute(cmd).await,
+        Commands::Boot(cmd) => commands::boot::execute(cmd).await,
         Commands::Daemon(args) => commands::daemon::execute(args).await,
         Commands::Info => execute_info().await,
         Commands::Version => commands::version::execute().await,

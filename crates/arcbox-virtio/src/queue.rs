@@ -174,6 +174,40 @@ impl VirtQueue {
         self.ready = ready;
     }
 
+    /// Updates a descriptor entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index is out of range.
+    pub fn set_descriptor(&mut self, idx: u16, descriptor: Descriptor) -> Result<()> {
+        if idx >= self.size {
+            return Err(VirtioError::InvalidQueue(
+                "descriptor index out of bounds".to_string(),
+            ));
+        }
+
+        self.desc_table[idx as usize] = descriptor;
+        Ok(())
+    }
+
+    /// Adds a descriptor chain head to the available ring.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the descriptor index is out of range.
+    pub fn add_avail(&mut self, head_idx: u16) -> Result<()> {
+        if head_idx >= self.size {
+            return Err(VirtioError::InvalidQueue(
+                "available index out of bounds".to_string(),
+            ));
+        }
+
+        let ring_idx = (self.avail.idx % self.size) as usize;
+        self.avail.ring[ring_idx] = head_idx;
+        self.avail.idx = self.avail.idx.wrapping_add(1);
+        Ok(())
+    }
+
     /// Checks if there are available descriptors.
     #[must_use]
     pub fn has_available(&self) -> bool {

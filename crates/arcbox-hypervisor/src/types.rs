@@ -124,7 +124,7 @@ pub enum VcpuExit {
 }
 
 /// VirtIO device configuration for attaching to a VM.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtioDeviceConfig {
     /// Device type.
     pub device_type: VirtioDeviceType,

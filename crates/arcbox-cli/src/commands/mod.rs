@@ -9,7 +9,9 @@
 //! - System operations (version, info)
 
 use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
+pub mod boot;
 pub mod daemon;
 pub mod docker;
 pub mod exec;
@@ -33,6 +35,12 @@ pub struct Cli {
     /// Command to execute
     #[command(subcommand)]
     pub command: Commands,
+
+    /// Unix socket path for daemon connection
+    ///
+    /// Can also be set via ARCBOX_SOCKET or DOCKER_HOST environment variables.
+    #[arg(long, global = true)]
+    pub socket: Option<PathBuf>,
 
     /// Output format
     #[arg(long, global = true, default_value = "table")]
@@ -95,6 +103,10 @@ pub enum Commands {
     /// Manage Docker CLI integration
     #[command(subcommand)]
     Docker(docker::DockerCommands),
+
+    /// Manage boot assets (kernel/initramfs)
+    #[command(subcommand)]
+    Boot(boot::BootCommands),
 
     /// Start the ArcBox daemon
     Daemon(daemon::DaemonArgs),

@@ -187,6 +187,15 @@ impl KvmVm {
             userspace_addr: memory.host_address() as u64,
         };
 
+        memory.attach_vm_fd(vm_fd.as_raw_fd());
+        memory.register_slot(
+            main_slot.slot,
+            main_slot.guest_phys_addr,
+            main_slot.size,
+            main_slot.userspace_addr,
+            0,
+        )?;
+
         tracing::info!(
             "Created KVM VM {}: vcpus={}, memory={}MB",
             id,
@@ -292,14 +301,19 @@ impl KvmVm {
     ) -> Result<u32, HypervisorError> {
         let slot = self.next_slot.fetch_add(1, Ordering::SeqCst);
 
-        let mut flags = 0u32;
+        let mut base_flags = 0u32;
         if read_only {
-            flags |= ffi::KVM_MEM_READONLY;
+            base_flags |= ffi::KVM_MEM_READONLY;
+        }
+
+        let mut region_flags = base_flags;
+        if self.dirty_tracking_enabled.load(Ordering::SeqCst) {
+            region_flags |= ffi::KVM_MEM_LOG_DIRTY_PAGES;
         }
 
         let region = KvmUserspaceMemoryRegion {
             slot,
-            flags,
+            flags: region_flags,
             guest_phys_addr: guest_addr.raw(),
             memory_size: size,
             userspace_addr: host_addr as u64,
@@ -308,6 +322,21 @@ impl KvmVm {
         self.vm_fd.set_user_memory_region(&region).map_err(|e| {
             HypervisorError::MemoryError(format!("Failed to add memory region: {}", e))
         })?;
+
+        {
+            let mut slots = self.memory_slots.write().map_err(|_| {
+                HypervisorError::SnapshotError("Lock poisoned".to_string())
+            })?;
+            slots.push(MemorySlotInfo {
+                slot,
+                guest_phys_addr: guest_addr.raw(),
+                size,
+                userspace_addr: host_addr as u64,
+            });
+        }
+
+        self.memory
+            .register_slot(slot, guest_addr.raw(), size, host_addr as u64, base_flags)?;
 
         tracing::debug!(
             "Added memory region {} at {}: {}MB, read_only={}",
@@ -333,6 +362,15 @@ impl KvmVm {
         self.vm_fd.set_user_memory_region(&region).map_err(|e| {
             HypervisorError::MemoryError(format!("Failed to remove memory region: {}", e))
         })?;
+
+        {
+            let mut slots = self.memory_slots.write().map_err(|_| {
+                HypervisorError::SnapshotError("Lock poisoned".to_string())
+            })?;
+            slots.retain(|entry| entry.slot != slot);
+        }
+
+        self.memory.unregister_slot(slot)?;
 
         tracing::debug!("Removed memory region {}", slot);
 
@@ -529,6 +567,7 @@ impl KvmVm {
         }
 
         self.dirty_tracking_enabled.store(true, Ordering::SeqCst);
+        self.memory.set_dirty_tracking_enabled(true);
         tracing::info!("Dirty page tracking enabled for VM {}", self.id);
 
         Ok(())
@@ -567,6 +606,7 @@ impl KvmVm {
         }
 
         self.dirty_tracking_enabled.store(false, Ordering::SeqCst);
+        self.memory.set_dirty_tracking_enabled(false);
         tracing::info!("Dirty page tracking disabled for VM {}", self.id);
 
         Ok(())

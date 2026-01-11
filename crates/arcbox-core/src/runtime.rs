@@ -11,6 +11,7 @@ use arcbox_container::{ContainerConfig, ContainerId, ContainerManager, Container
 use arcbox_image::{ImageRef, ImageStore};
 use arcbox_net::NetworkManager;
 use arcbox_protocol::agent::{CreateContainerRequest, LogEntry, LogsRequest};
+use arcbox_protocol::Mount;
 use tokio_stream::wrappers::ReceiverStream;
 use std::sync::{Arc, RwLock};
 
@@ -384,6 +385,35 @@ impl Runtime {
         // So containers/{id}/rootfs on host becomes /arcbox/containers/{id}/rootfs in guest
         let guest_rootfs = format!("/arcbox/containers/{}/rootfs", container_id);
 
+        // Convert volume mounts to protocol Mount type with path translation.
+        // Host paths under data_dir are translated to /arcbox/... in guest.
+        let data_dir_str = self.config.data_dir.to_string_lossy();
+        let mounts: Vec<Mount> = config
+            .volumes
+            .iter()
+            .map(|v| {
+                // Translate host path to guest-accessible path.
+                // If source is under data_dir, map to /arcbox/...
+                let guest_source = if v.source.starts_with(data_dir_str.as_ref()) {
+                    v.source.replacen(data_dir_str.as_ref(), "/arcbox", 1)
+                } else {
+                    // For paths outside data_dir, keep as-is.
+                    // TODO: Add VirtioFS share for home directory to support arbitrary paths.
+                    tracing::warn!(
+                        "Volume source '{}' is outside data_dir, mount may fail",
+                        v.source
+                    );
+                    v.source.clone()
+                };
+                Mount {
+                    source: guest_source,
+                    target: v.target.clone(),
+                    r#type: "bind".to_string(),
+                    readonly: v.read_only,
+                }
+            })
+            .collect();
+
         let req = CreateContainerRequest {
             name: config.name.clone().unwrap_or_default(),
             image: config.image.clone(),
@@ -392,7 +422,7 @@ impl Runtime {
             env: config.env.clone(),
             working_dir: config.working_dir.clone().unwrap_or_default(),
             user: config.user.clone().unwrap_or_default(),
-            mounts: vec![],
+            mounts,
             tty: config.tty.unwrap_or(false),
             open_stdin: config.open_stdin.unwrap_or(false),
             rootfs: guest_rootfs,
@@ -502,6 +532,45 @@ impl Runtime {
         );
 
         Ok(())
+    }
+
+    /// Waits for a container to finish and returns its exit code.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the wait operation fails.
+    pub async fn wait_container(
+        &self,
+        machine_name: &str,
+        container_id: &str,
+    ) -> Result<i32> {
+        let cid = self
+            .machine_manager
+            .get_cid(machine_name)
+            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+
+        let exit_code = {
+            #[cfg(target_os = "macos")]
+            {
+                let mut agent = self.machine_manager.connect_agent(machine_name)?;
+                agent.wait_container(container_id).await?
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let agent = self.agent_pool.get(cid).await;
+                let mut agent = agent.write().await;
+                agent.wait_container(container_id).await?
+            }
+        };
+
+        tracing::debug!(
+            "Container {} exited with code {} in machine '{}'",
+            container_id,
+            exit_code,
+            machine_name
+        );
+
+        Ok(exit_code)
     }
 
     /// Removes a container from a machine.

@@ -19,11 +19,11 @@ mod linux {
 
     use anyhow::{Context, Result};
     use tokio::io::{AsyncRead, AsyncWrite};
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::{mpsc, Mutex, RwLock};
     use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 
     use super::AGENT_PORT;
-    use crate::container::{ContainerHandle, ContainerRuntime, ContainerState};
+    use crate::container::{ContainerHandle, ContainerRuntime, ContainerState, MountSpec};
     use crate::log_watcher::{watch_log_file, LogWatchOptions};
     use crate::pty::ExecSession;
     use crate::rpc::{
@@ -35,11 +35,12 @@ mod linux {
         ContainerInfo, CreateContainerResponse, ExecOutput, ExecStartResponse,
         ListContainersResponse, LogEntry, LogsRequest, PingResponse, SystemInfo,
     };
+    use chrono::{DateTime, Utc};
 
     /// Agent state shared across connections.
     pub struct AgentState {
         /// Container runtime.
-        pub runtime: ContainerRuntime,
+        pub runtime: Arc<Mutex<ContainerRuntime>>,
         /// Active exec sessions by ID.
         pub exec_sessions: HashMap<String, ExecSession>,
     }
@@ -47,7 +48,7 @@ mod linux {
     impl AgentState {
         pub fn new() -> Self {
             Self {
-                runtime: ContainerRuntime::new(),
+                runtime: Arc::new(Mutex::new(ContainerRuntime::new())),
                 exec_sessions: HashMap::new(),
             }
         }
@@ -65,6 +66,13 @@ mod linux {
         Single(RpcResponse),
         /// Streaming response (for logs follow=true).
         Stream(mpsc::Receiver<LogEntry>, mpsc::Sender<()>),
+    }
+
+    struct ParsedLogLine {
+        stream: String,
+        log: String,
+        timestamp: Option<DateTime<Utc>>,
+        raw_time: Option<String>,
     }
 
     /// The Guest Agent.
@@ -337,6 +345,17 @@ mod linux {
         // Convert environment variables
         let env: Vec<(String, String)> = req.env.into_iter().collect();
 
+        // Convert mounts from protocol type to internal type
+        let mounts: Vec<MountSpec> = req
+            .mounts
+            .into_iter()
+            .map(|m| MountSpec {
+                source: m.source,
+                target: m.target,
+                readonly: m.readonly,
+            })
+            .collect();
+
         // Build the command
         let cmd = if !req.entrypoint.is_empty() {
             let mut full_cmd = req.entrypoint;
@@ -366,6 +385,7 @@ mod linux {
             created_at: chrono::Utc::now(),
             tty: req.tty,
             open_stdin: req.open_stdin,
+            mounts,
             rootfs: if req.rootfs.is_empty() {
                 None
             } else {
@@ -374,10 +394,12 @@ mod linux {
         };
 
         // Store in runtime
-        {
-            let mut state = state.write().await;
-            state.runtime.add_container(handle);
-        }
+        let runtime = {
+            let state = state.read().await;
+            Arc::clone(&state.runtime)
+        };
+        let mut runtime = runtime.lock().await;
+        runtime.add_container(handle);
 
         RpcResponse::CreateContainer(CreateContainerResponse { id: container_id })
     }
@@ -386,8 +408,12 @@ mod linux {
     async fn handle_start_container(id: &str, state: &Arc<RwLock<AgentState>>) -> RpcResponse {
         tracing::info!("StartContainer: id={}", id);
 
-        let mut state = state.write().await;
-        match state.runtime.start_container(id).await {
+        let runtime = {
+            let state = state.read().await;
+            Arc::clone(&state.runtime)
+        };
+        let mut runtime = runtime.lock().await;
+        match runtime.start_container(id).await {
             Ok(()) => RpcResponse::Empty,
             Err(e) => {
                 tracing::error!("Failed to start container {}: {}", id, e);
@@ -404,8 +430,12 @@ mod linux {
     ) -> RpcResponse {
         tracing::info!("StopContainer: id={}, timeout={}s", id, timeout);
 
-        let mut state = state.write().await;
-        match state.runtime.stop_container(id, timeout).await {
+        let runtime = {
+            let state = state.read().await;
+            Arc::clone(&state.runtime)
+        };
+        let mut runtime = runtime.lock().await;
+        match runtime.stop_container(id, timeout).await {
             Ok(()) => RpcResponse::Empty,
             Err(e) => {
                 tracing::error!("Failed to stop container {}: {}", id, e);
@@ -422,8 +452,12 @@ mod linux {
     ) -> RpcResponse {
         tracing::info!("RemoveContainer: id={}, force={}", id, force);
 
-        let mut state = state.write().await;
-        match state.runtime.remove_container(id, force).await {
+        let runtime = {
+            let state = state.read().await;
+            Arc::clone(&state.runtime)
+        };
+        let mut runtime = runtime.lock().await;
+        match runtime.remove_container(id, force).await {
             Ok(()) => RpcResponse::Empty,
             Err(e) => {
                 tracing::error!("Failed to remove container {}: {}", id, e);
@@ -440,8 +474,12 @@ mod linux {
     ) -> RpcResponse {
         tracing::info!("KillContainer: id={}, signal={}", id, signal);
 
-        let mut state = state.write().await;
-        match state.runtime.signal_container(id, signal).await {
+        let runtime = {
+            let state = state.read().await;
+            Arc::clone(&state.runtime)
+        };
+        let mut runtime = runtime.lock().await;
+        match runtime.signal_container(id, signal).await {
             Ok(()) => RpcResponse::Empty,
             Err(e) => {
                 tracing::error!("Failed to kill container {}: {}", id, e);
@@ -456,29 +494,80 @@ mod linux {
     async fn handle_wait_container(id: &str, state: &Arc<RwLock<AgentState>>) -> RpcResponse {
         tracing::info!("WaitContainer: id={}", id);
 
-        let mut state = state.write().await;
-        match state.runtime.wait_container(id).await {
-            Ok(exit_code) => {
-                tracing::info!("Container {} exited with code {}", id, exit_code);
-                RpcResponse::WaitContainer(arcbox_protocol::container::WaitContainerResponse {
-                    status_code: i64::from(exit_code),
-                    error: String::new(),
-                })
+        let runtime = {
+            let state = state.read().await;
+            Arc::clone(&state.runtime)
+        };
+
+        let (container_state, exit_code, process_handle) = {
+            let runtime = runtime.lock().await;
+            let (state, code) = match runtime.get_container_state(id) {
+                Some(state) => state,
+                None => {
+                    return RpcResponse::Error(ErrorResponse::new(404, "container not found"));
+                }
+            };
+            let process_handle = if state == ContainerState::Running {
+                runtime.get_process_handle(id).await
+            } else {
+                None
+            };
+            (state, code, process_handle)
+        };
+
+        if container_state == ContainerState::Stopped {
+            let exit_code = exit_code.unwrap_or(-1);
+            tracing::info!("Container {} exited with code {}", id, exit_code);
+            return RpcResponse::WaitContainer(arcbox_protocol::container::WaitContainerResponse {
+                status_code: i64::from(exit_code),
+                error: String::new(),
+            });
+        }
+
+        let process_handle = match process_handle {
+            Some(handle) => handle,
+            None => {
+                return RpcResponse::Error(ErrorResponse::new(
+                    500,
+                    "container process not found",
+                ));
             }
+        };
+
+        let exit_code = match process_handle.lock().await.child.wait().await {
+            Ok(status) => status.code().unwrap_or(-1),
             Err(e) => {
                 tracing::error!("Failed to wait for container {}: {}", id, e);
-                RpcResponse::Error(ErrorResponse::new(500, format!("failed to wait: {}", e)))
+                return RpcResponse::Error(ErrorResponse::new(500, format!("failed to wait: {}", e)));
             }
+        };
+
+        {
+            let mut runtime = runtime.lock().await;
+            runtime.mark_container_stopped(id, exit_code);
         }
+        {
+            let runtime = runtime.lock().await;
+            runtime.remove_process_handle(id).await;
+        }
+
+        tracing::info!("Container {} exited with code {}", id, exit_code);
+        RpcResponse::WaitContainer(arcbox_protocol::container::WaitContainerResponse {
+            status_code: i64::from(exit_code),
+            error: String::new(),
+        })
     }
 
     /// Handles a ListContainers request.
     async fn handle_list_containers(all: bool, state: &Arc<RwLock<AgentState>>) -> RpcResponse {
         tracing::debug!("ListContainers: all={}", all);
 
-        let state = state.read().await;
-        let containers: Vec<ContainerInfo> = state
-            .runtime
+        let runtime = {
+            let state = state.read().await;
+            Arc::clone(&state.runtime)
+        };
+        let runtime = runtime.lock().await;
+        let containers: Vec<ContainerInfo> = runtime
             .list_containers(all)
             .iter()
             .map(|h| ContainerInfo {
@@ -536,8 +625,12 @@ mod linux {
         }
 
         // Otherwise, execute in the specified container
-        let state = state.read().await;
-        let container = match state.runtime.get_container(&req.container_id) {
+        let runtime = {
+            let state = state.read().await;
+            Arc::clone(&state.runtime)
+        };
+        let runtime = runtime.lock().await;
+        let container = match runtime.get_container(&req.container_id) {
             Some(c) => c,
             None => {
                 return RpcResponse::Error(ErrorResponse::new(
@@ -860,8 +953,12 @@ mod linux {
 
         // Verify container exists.
         {
-            let state = state.read().await;
-            if state.runtime.get_container(&req.container_id).is_none() {
+            let runtime = {
+                let state = state.read().await;
+                Arc::clone(&state.runtime)
+            };
+            let runtime = runtime.lock().await;
+            if runtime.get_container(&req.container_id).is_none() {
                 return RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
                     404,
                     format!("container not found: {}", req.container_id),
@@ -900,7 +997,25 @@ mod linux {
         let mut output_lines = Vec::new();
         for line in log_data.lines() {
             if let Some(parsed) = parse_docker_log_line(line, req.stdout, req.stderr) {
-                output_lines.push(parsed);
+                if let Some(ts) = parsed.timestamp {
+                    if req.since > 0 && ts.timestamp() < req.since {
+                        continue;
+                    }
+                    if req.until > 0 && ts.timestamp() > req.until {
+                        continue;
+                    }
+                }
+
+                let formatted = if req.timestamps {
+                    match parsed.raw_time.as_deref() {
+                        Some(raw) => format!("{} {}", raw, parsed.log),
+                        None => parsed.log,
+                    }
+                } else {
+                    parsed.log
+                };
+
+                output_lines.push(formatted);
             }
         }
 
@@ -912,7 +1027,7 @@ mod linux {
             output_lines
         };
 
-        let output = output_lines.join("\n");
+        let output = output_lines.join("");
 
         RequestResult::Single(RpcResponse::LogEntry(LogEntry {
             stream: if req.stdout { "stdout" } else { "stderr" }.to_string(),
@@ -954,17 +1069,32 @@ mod linux {
     ///
     /// Returns the log content if the line matches the requested streams,
     /// or None if it should be filtered out.
-    fn parse_docker_log_line(line: &str, stdout: bool, stderr: bool) -> Option<String> {
+    fn parse_docker_log_line(line: &str, stdout: bool, stderr: bool) -> Option<ParsedLogLine> {
         // Try to parse as JSON
         let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
 
         let stream = parsed.get("stream")?.as_str()?;
         let log = parsed.get("log")?.as_str()?;
+        let raw_time = parsed.get("time").and_then(|value| value.as_str()).map(|s| s.to_string());
+        let timestamp = raw_time
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|time| time.with_timezone(&Utc));
 
         // Filter by stream type
         match stream {
-            "stdout" if stdout => Some(log.to_string()),
-            "stderr" if stderr => Some(log.to_string()),
+            "stdout" if stdout => Some(ParsedLogLine {
+                stream: stream.to_string(),
+                log: log.to_string(),
+                timestamp,
+                raw_time,
+            }),
+            "stderr" if stderr => Some(ParsedLogLine {
+                stream: stream.to_string(),
+                log: log.to_string(),
+                timestamp,
+                raw_time,
+            }),
             _ => None,
         }
     }
@@ -1028,9 +1158,114 @@ pub async fn run() -> Result<()> {
     agent.run().await
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // Docker Log Format Parsing Tests
+    // =========================================================================
+
+    /// Helper to parse Docker JSON log line for testing.
+    fn parse_docker_log_line(line: &str, stdout: bool, stderr: bool) -> Option<String> {
+        let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
+        let stream = parsed.get("stream")?.as_str()?;
+        let log = parsed.get("log")?.as_str()?;
+
+        match stream {
+            "stdout" if stdout => Some(log.to_string()),
+            "stderr" if stderr => Some(log.to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_parse_docker_log_stdout() {
+        let line = r#"{"log":"hello world","stream":"stdout","time":"2024-01-08T12:00:00Z"}"#;
+
+        let result = parse_docker_log_line(line, true, false);
+        assert_eq!(result, Some("hello world".to_string()));
+
+        // Should filter out when stdout=false
+        let result = parse_docker_log_line(line, false, true);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_docker_log_stderr() {
+        let line = r#"{"log":"error message","stream":"stderr","time":"2024-01-08T12:00:00Z"}"#;
+
+        let result = parse_docker_log_line(line, false, true);
+        assert_eq!(result, Some("error message".to_string()));
+
+        // Should filter out when stderr=false
+        let result = parse_docker_log_line(line, true, false);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_docker_log_both_streams() {
+        let stdout_line = r#"{"log":"stdout msg","stream":"stdout","time":"2024-01-08T12:00:00Z"}"#;
+        let stderr_line = r#"{"log":"stderr msg","stream":"stderr","time":"2024-01-08T12:00:00Z"}"#;
+
+        // Both enabled
+        assert_eq!(
+            parse_docker_log_line(stdout_line, true, true),
+            Some("stdout msg".to_string())
+        );
+        assert_eq!(
+            parse_docker_log_line(stderr_line, true, true),
+            Some("stderr msg".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_docker_log_invalid_json() {
+        let invalid = "not json";
+        assert_eq!(parse_docker_log_line(invalid, true, true), None);
+
+        let incomplete = r#"{"log":"test"}"#; // Missing stream field
+        assert_eq!(parse_docker_log_line(incomplete, true, true), None);
+    }
+
+    #[test]
+    fn test_parse_docker_log_special_characters() {
+        // Test with escaped characters
+        let line = r#"{"log":"line with \"quotes\" and \\backslash","stream":"stdout","time":"2024-01-08T12:00:00Z"}"#;
+
+        let result = parse_docker_log_line(line, true, false);
+        assert_eq!(
+            result,
+            Some(r#"line with "quotes" and \backslash"#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_docker_log_empty_content() {
+        let line = r#"{"log":"","stream":"stdout","time":"2024-01-08T12:00:00Z"}"#;
+
+        let result = parse_docker_log_line(line, true, false);
+        assert_eq!(result, Some("".to_string()));
+    }
+
+    #[test]
+    fn test_parse_docker_log_multiline_content() {
+        // Docker typically escapes newlines in log content
+        let line = r#"{"log":"line1\\nline2","stream":"stdout","time":"2024-01-08T12:00:00Z"}"#;
+
+        let result = parse_docker_log_line(line, true, false);
+        assert!(result.is_some());
+        // The escaped newline should be preserved
+        assert!(result.unwrap().contains("\\n"));
+    }
+
+    // =========================================================================
+    // Agent Creation Tests
+    // =========================================================================
 
     #[test]
     fn test_agent_creation() {

@@ -430,6 +430,40 @@ mod tests {
     }
 
     #[test]
+    fn test_irq_device_trigger_chain() {
+        let chip = Arc::new(IrqChip::new().unwrap());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+
+        let callback: IrqTriggerCallback = Box::new(move |gsi, level| {
+            events_clone.lock().unwrap().push((gsi, level));
+            Ok(())
+        });
+        chip.set_trigger_callback(Arc::new(callback));
+
+        // Use a legacy IRQ to exercise pending tracking.
+        let irq: Irq = 5;
+        {
+            let mut configs = chip.irq_configs.write().unwrap();
+            configs.insert(
+                irq,
+                IrqConfig {
+                    gsi: 5,
+                    trigger_mode: TriggerMode::Edge,
+                    asserted: false,
+                },
+            );
+        }
+
+        assert!(!chip.is_pending(irq));
+        chip.trigger_irq(irq).unwrap();
+        assert!(!chip.is_pending(irq));
+
+        let recorded = events.lock().unwrap();
+        assert_eq!(recorded.as_slice(), &[(5, true), (5, false)]);
+    }
+
+    #[test]
     fn test_irq_trigger_with_callback() {
         let chip = IrqChip::new().unwrap();
         let trigger_count = Arc::new(AtomicUsize::new(0));

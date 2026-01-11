@@ -260,15 +260,23 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
     ) -> Result<Response<WaitContainerResponse>, Status> {
         let id = ContainerId::from_string(request.into_inner().id);
 
-        // Wait for container to exit.
-        // Note: This is a simplified implementation. A full implementation
-        // would use async channels to wait for state changes.
-        let exit_code = self.runtime.container_manager().wait(&id).unwrap_or(0);
-
-        Ok(Response::new(WaitContainerResponse {
-            status_code: i64::from(exit_code),
-            error: String::new(),
-        }))
+        // Wait for container to exit asynchronously.
+        // Uses broadcast channel to efficiently wait for state changes.
+        match self.runtime.container_manager().wait_async(&id).await {
+            Ok(exit_code) => Ok(Response::new(WaitContainerResponse {
+                status_code: i64::from(exit_code),
+                error: String::new(),
+            })),
+            Err(e) => {
+                // Check if it's a not-found error
+                let error_str = e.to_string();
+                if error_str.contains("not found") {
+                    Err(Status::not_found(error_str))
+                } else {
+                    Err(Status::internal(error_str))
+                }
+            }
+        }
     }
 
     type ContainerLogsStream =

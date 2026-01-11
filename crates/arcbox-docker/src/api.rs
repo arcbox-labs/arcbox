@@ -39,6 +39,7 @@ pub fn create_router(runtime: Arc<Runtime>) -> Router {
         .route("/containers/:id/kill", post(handlers::kill_container))
         .route("/containers/:id/wait", post(handlers::wait_container))
         .route("/containers/:id/logs", get(handlers::container_logs))
+        .route("/containers/:id/attach", post(handlers::attach_container))
         .route("/containers/:id", delete(handlers::remove_container))
         // Exec endpoints
         .route("/containers/:id/exec", post(handlers::exec_create))
@@ -104,6 +105,7 @@ fn versioned_router() -> Router<AppState> {
         .route("/containers/:id/kill", post(handlers::kill_container))
         .route("/containers/:id/wait", post(handlers::wait_container))
         .route("/containers/:id/logs", get(handlers::container_logs))
+        .route("/containers/:id/attach", post(handlers::attach_container))
         .route("/containers/:id", delete(handlers::remove_container))
         // Exec
         .route("/containers/:id/exec", post(handlers::exec_create))

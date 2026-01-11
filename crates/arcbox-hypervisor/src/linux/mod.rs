@@ -23,4 +23,4 @@ mod vm;
 pub use hypervisor::KvmHypervisor;
 pub use memory::KvmMemory;
 pub use vcpu::KvmVcpu;
-pub use vm::KvmVm;
+pub use vm::{KvmVm, VirtioDeviceInfo};

@@ -22,10 +22,37 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     /// Creates a new daemon client with the default socket path.
+    ///
+    /// Socket path resolution order:
+    /// 1. ARCBOX_SOCKET environment variable
+    /// 2. DOCKER_HOST environment variable (unix:// prefix stripped)
+    /// 3. Default socket path (/var/run/arcbox.sock)
     pub fn new() -> Self {
-        Self {
-            socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
+        let socket_path = Self::resolve_socket_path();
+        Self { socket_path }
+    }
+
+    /// Resolves the socket path from environment variables or default.
+    fn resolve_socket_path() -> PathBuf {
+        // 1. Check ARCBOX_SOCKET first (takes precedence)
+        if let Ok(path) = std::env::var("ARCBOX_SOCKET") {
+            return PathBuf::from(path);
         }
+
+        // 2. Check DOCKER_HOST (e.g., "unix:///tmp/arcbox.sock")
+        if let Ok(host) = std::env::var("DOCKER_HOST") {
+            if let Some(path) = host.strip_prefix("unix://") {
+                return PathBuf::from(path);
+            }
+            // If DOCKER_HOST is set but not a unix socket, log and fall through
+            tracing::debug!(
+                "DOCKER_HOST is set but not a unix socket: {}, using default",
+                host
+            );
+        }
+
+        // 3. Default
+        PathBuf::from(DEFAULT_SOCKET_PATH)
     }
 
     /// Creates a new daemon client with a custom socket path.
@@ -47,7 +74,8 @@ impl DaemonClient {
 
     /// Pings the daemon.
     pub async fn ping(&self) -> Result<()> {
-        let _: serde_json::Value = self.get("/_ping").await?;
+        // _ping returns "OK" as plain text, not JSON
+        let _ = self.get_raw("/_ping").await?;
         Ok(())
     }
 
@@ -83,6 +111,14 @@ impl DaemonClient {
     pub async fn post_raw<B: Serialize>(&self, path: &str, body: Option<B>) -> Result<Vec<u8>> {
         let body = self.request(Method::POST, path, body).await?;
         Ok(body.to_vec())
+    }
+
+    /// Performs a POST request returning a streaming response as string.
+    ///
+    /// This is used for endpoints like /images/create that return newline-delimited JSON.
+    pub async fn post_streaming(&self, path: &str) -> Result<String> {
+        let body = self.request(Method::POST, path, None::<()>).await?;
+        String::from_utf8(body.to_vec()).context("invalid UTF-8 in response")
     }
 
     /// Performs a DELETE request.

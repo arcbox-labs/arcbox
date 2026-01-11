@@ -110,6 +110,8 @@ message CreateContainerRequest {
     repeated arcbox.common.Mount mounts = 8;
     // TTY allocation.
     bool tty = 9;
+    // Optional container ID to keep host/guest IDs in sync.
+    string id = 10;
 }
 
 // Response to create container.

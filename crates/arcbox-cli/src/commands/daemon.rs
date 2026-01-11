@@ -40,6 +40,14 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
 
+    /// Custom kernel path for VM boot.
+    #[arg(long)]
+    pub kernel: Option<PathBuf>,
+
+    /// Custom initramfs path for VM boot.
+    #[arg(long)]
+    pub initramfs: Option<PathBuf>,
+
     /// Run in foreground (don't daemonize).
     #[arg(long, short = 'f', default_value = "true")]
     pub foreground: bool,
@@ -69,8 +77,20 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
         ..Default::default()
     };
 
-    // Initialize runtime.
-    let runtime = Arc::new(Runtime::new(config).context("Failed to create runtime")?);
+    // Build VM lifecycle config with custom kernel/initramfs if provided.
+    let mut vm_lifecycle_config = arcbox_core::VmLifecycleConfig::default();
+    if let Some(kernel) = args.kernel {
+        vm_lifecycle_config.default_vm.kernel = Some(kernel);
+    }
+    if let Some(initramfs) = args.initramfs {
+        vm_lifecycle_config.default_vm.initramfs = Some(initramfs);
+    }
+
+    // Initialize runtime with custom VM lifecycle config.
+    let runtime = Arc::new(
+        Runtime::with_vm_lifecycle_config(config, vm_lifecycle_config)
+            .context("Failed to create runtime")?
+    );
     runtime.init().await.context("Failed to initialize runtime")?;
 
     info!(data_dir = %data_dir.display(), "Runtime initialized");

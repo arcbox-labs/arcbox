@@ -665,17 +665,8 @@ impl Transport for VsockTransport {
     async fn send(&mut self, data: Bytes) -> Result<()> {
         let stream = self.stream.as_mut().ok_or(TransportError::NotConnected)?;
 
-        // Write length prefix (4 bytes, little-endian)
-        let len = data.len() as u32;
-        let len_bytes = len.to_le_bytes();
-
+        // Write data as-is (RPC framing includes length + type + payload).
         let mut written = 0;
-        while written < 4 {
-            written += stream.write(&len_bytes[written..]).await?;
-        }
-
-        // Write data
-        written = 0;
         while written < data.len() {
             written += stream.write(&data[written..]).await?;
         }
@@ -686,21 +677,24 @@ impl Transport for VsockTransport {
     async fn recv(&mut self) -> Result<Bytes> {
         let stream = self.stream.as_mut().ok_or(TransportError::NotConnected)?;
 
-        // Read length prefix (4 bytes, little-endian)
+        // Read length prefix (4 bytes, big-endian).
         let mut len_buf = [0u8; 4];
         let mut read = 0;
         while read < 4 {
             read += stream.read(&mut len_buf[read..]).await?;
         }
-        let len = u32::from_le_bytes(len_buf) as usize;
+        let len = u32::from_be_bytes(len_buf) as usize;
 
-        // Read data
-        let mut buf = vec![0u8; len];
+        // Read data and return the full framed message (length + payload).
+        let mut buf = Vec::with_capacity(4 + len);
+        buf.extend_from_slice(&len_buf);
+        let mut payload = vec![0u8; len];
         read = 0;
         while read < len {
-            read += stream.read(&mut buf[read..]).await?;
+            read += stream.read(&mut payload[read..]).await?;
         }
 
+        buf.extend_from_slice(&payload);
         Ok(Bytes::from(buf))
     }
 

@@ -115,6 +115,8 @@ message CreateContainerRequest {
     // Root filesystem path (extracted OCI image).
     // When set, the container will be chrooted into this directory.
     string rootfs = 11;
+    // Optional container ID to keep host/guest IDs in sync.
+    string id = 12;
 }
 
 // Response to create container.
