@@ -11,19 +11,20 @@
 //! - Special mounts (/proc, /sys, /dev) for proper Linux operation
 
 use crate::pty::PtyHandle;
+use crate::shim::{BroadcastWriter, ProcessShim};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::process::Stdio;
-use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 /// Container log directory.
 const CONTAINER_LOG_DIR: &str = "/var/log/containers";
@@ -103,6 +104,10 @@ pub(crate) struct ProcessHandle {
     pub(crate) child: Child,
     /// PTY handle (if TTY mode).
     pub(crate) pty: Option<PtyHandle>,
+    /// Shim shutdown token.
+    pub(crate) shim_shutdown: Option<CancellationToken>,
+    /// Broadcast writer for attach clients.
+    pub(crate) broadcaster: Option<Arc<BroadcastWriter>>,
 }
 
 /// Container runtime managing all containers.
@@ -157,6 +162,23 @@ impl ContainerRuntime {
     pub async fn get_process_handle(&self, id: &str) -> Option<Arc<Mutex<ProcessHandle>>> {
         let processes = self.processes.lock().await;
         processes.get(id).cloned()
+    }
+
+    /// Gets the log broadcaster for a container.
+    ///
+    /// Returns `None` if the container doesn't exist or has no broadcaster.
+    /// The broadcaster can be used to subscribe to real-time log output.
+    pub async fn get_log_broadcaster(&self, id: &str) -> Option<Arc<BroadcastWriter>> {
+        let processes = self.processes.lock().await;
+        processes
+            .get(id)
+            .and_then(|handle_arc| {
+                // Try to lock without blocking
+                match handle_arc.try_lock() {
+                    Ok(handle) => handle.broadcaster.clone(),
+                    Err(_) => None,
+                }
+            })
     }
 
     /// Removes a process handle by container ID.
@@ -340,13 +362,62 @@ impl ContainerRuntime {
             tracing::info!("Container {} started with PID {}", id, pid);
         }
 
-        // Spawn log capture task for non-TTY mode
-        if !use_tty {
-            let container_id = id.to_string();
+        // Create and start the shim for log capture (both TTY and non-TTY modes)
+        let (shim_shutdown, broadcaster) = if use_tty {
+            // TTY mode: use PTY master for log capture
+            if let Some(ref pty) = pty_handle {
+                let pty_master_fd = pty.master_fd();
+                match ProcessShim::with_pty(id.to_string(), pty_master_fd) {
+                    Ok(shim) => {
+                        let shutdown = shim.shutdown_token();
+                        let broadcaster = shim.broadcaster();
+                        let container_id = id.to_string();
+                        tokio::spawn(async move {
+                            if let Err(e) = shim.run().await {
+                                tracing::error!("Shim error for {}: {}", container_id, e);
+                            }
+                        });
+                        (Some(shutdown), Some(broadcaster))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to create shim for {}: {}", id, e);
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            // Non-TTY mode: use stdout/stderr pipes
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
-            spawn_log_capture_task(container_id, stdout, stderr);
-        }
+            if let (Some(stdout), Some(stderr)) = (stdout, stderr) {
+                let stdout_fd = stdout.as_raw_fd();
+                let stderr_fd = stderr.as_raw_fd();
+                // Prevent the ChildStdout/ChildStderr from closing the fds
+                std::mem::forget(stdout);
+                std::mem::forget(stderr);
+                match ProcessShim::with_pipes(id.to_string(), stdout_fd, stderr_fd) {
+                    Ok(shim) => {
+                        let shutdown = shim.shutdown_token();
+                        let broadcaster = shim.broadcaster();
+                        let container_id = id.to_string();
+                        tokio::spawn(async move {
+                            if let Err(e) = shim.run().await {
+                                tracing::error!("Shim error for {}: {}", container_id, e);
+                            }
+                        });
+                        (Some(shutdown), Some(broadcaster))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to create shim for {}: {}", id, e);
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None)
+            }
+        };
 
         let mut processes = self.processes.lock().await;
         processes.insert(
@@ -354,6 +425,8 @@ impl ContainerRuntime {
             Arc::new(Mutex::new(ProcessHandle {
                 child,
                 pty: pty_handle,
+                shim_shutdown,
+                broadcaster,
             })),
         );
 
@@ -655,128 +728,6 @@ impl Default for ContainerRuntime {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// =============================================================================
-// Log Capture
-// =============================================================================
-
-/// Spawns a background task to capture container stdout/stderr to a log file.
-///
-/// The log file is written in Docker JSON log format for compatibility.
-fn spawn_log_capture_task(
-    container_id: String,
-    stdout: Option<tokio::process::ChildStdout>,
-    stderr: Option<tokio::process::ChildStderr>,
-) {
-    // Ensure log directory exists
-    if let Err(e) = std::fs::create_dir_all(CONTAINER_LOG_DIR) {
-        tracing::warn!("Failed to create log directory: {}", e);
-        return;
-    }
-
-    let log_path = format!("{}/{}.log", CONTAINER_LOG_DIR, container_id);
-
-    tokio::spawn(async move {
-        use std::io::Write;
-        // Open log file for appending
-        let log_file = match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::error!("Failed to open log file {}: {}", log_path, e);
-                return;
-            }
-        };
-
-        let log_file = std::sync::Arc::new(std::sync::Mutex::new(log_file));
-
-        // Helper to write a log line in Docker JSON format
-        let write_log = |file: &std::sync::Arc<std::sync::Mutex<std::fs::File>>,
-                         stream: &str,
-                         data: &[u8]| {
-            let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-            let line = String::from_utf8_lossy(data);
-            // Escape JSON string
-            let escaped = line
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\n', "\\n")
-                .replace('\r', "\\r")
-                .replace('\t', "\\t");
-            let json_line = format!(
-                r#"{{"log":"{}","stream":"{}","time":"{}"}}"#,
-                escaped, stream, timestamp
-            );
-            if let Ok(mut f) = file.lock() {
-                let _ = writeln!(f, "{}", json_line);
-                let _ = f.flush();
-            }
-        };
-
-        // Type alias for the log file handle
-        type LogFile = std::sync::Arc<std::sync::Mutex<std::fs::File>>;
-
-        // Helper to spawn a log capture task for a given reader
-        fn spawn_capture_task<R>(
-            mut reader: R,
-            stream: &'static str,
-            log_file: LogFile,
-            write_log: impl Fn(&LogFile, &str, &[u8]) + Send + 'static,
-        ) -> tokio::task::JoinHandle<()>
-        where
-            R: tokio::io::AsyncRead + Unpin + Send + 'static,
-        {
-            tokio::spawn(async move {
-                let mut buffer = vec![0u8; 4096];
-                let mut pending = Vec::new();
-
-                loop {
-                    let n = match reader.read(&mut buffer).await {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(e) => {
-                            tracing::debug!("{} read error: {}", stream, e);
-                            break;
-                        }
-                    };
-
-                    pending.extend_from_slice(&buffer[..n]);
-                    while let Some(pos) = pending.iter().position(|b| *b == b'\n') {
-                        let line: Vec<u8> = pending.drain(..=pos).collect();
-                        write_log(&log_file, stream, &line);
-                    }
-                }
-
-                if !pending.is_empty() {
-                    write_log(&log_file, stream, &pending);
-                }
-            })
-        }
-
-        // Spawn tasks for stdout and stderr
-        let mut handles = Vec::new();
-
-        if let Some(stdout) = stdout {
-            let log_file = log_file.clone();
-            handles.push(spawn_capture_task(stdout, "stdout", log_file, write_log));
-        }
-
-        if let Some(stderr) = stderr {
-            let log_file = log_file.clone();
-            handles.push(spawn_capture_task(stderr, "stderr", log_file, write_log));
-        }
-
-        // Wait for all capture tasks to complete
-        for handle in handles {
-            let _ = handle.await;
-        }
-
-        tracing::debug!("Log capture completed for container {}", container_id);
-    });
 }
 
 // =============================================================================

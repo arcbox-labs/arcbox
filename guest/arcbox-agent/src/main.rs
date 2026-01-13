@@ -17,6 +17,7 @@ mod exec;
 mod log_watcher;
 mod pty;
 mod rpc;
+mod shim;
 
 // Mount module uses Linux-specific syscalls (mount/umount).
 #[cfg(target_os = "linux")]
