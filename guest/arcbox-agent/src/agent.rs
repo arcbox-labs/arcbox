@@ -167,35 +167,47 @@ mod linux {
                     write_response(&mut stream, &response).await?;
                 }
                 RequestResult::Stream(mut log_rx, cancel_tx) => {
-                    // Stream multiple LogEntry responses
+                    // Stream multiple LogEntry responses.
+                    // This follows Docker's pattern where log streaming continues until:
+                    // 1. The container stops (watcher channel closes)
+                    // 2. The client disconnects
+                    // 3. An error occurs
                     tracing::debug!("Starting log stream");
 
-                    // Keep streaming until the receiver is closed or client disconnects
+                    // Keep streaming until the receiver is closed or client disconnects.
                     loop {
                         tokio::select! {
-                            // Check for new log entries
+                            biased; // Prioritize log entries over timeout checks
+
+                            // Check for new log entries.
                             entry = log_rx.recv() => {
                                 match entry {
                                     Some(log_entry) => {
                                         let response = RpcResponse::LogEntry(log_entry);
                                         if let Err(e) = write_response(&mut stream, &response).await {
                                             tracing::debug!("Client disconnected during streaming: {}", e);
-                                            // Signal cancellation to the watcher
+                                            // Signal cancellation to the watcher.
                                             let _ = cancel_tx.send(()).await;
                                             return Ok(());
                                         }
                                     }
                                     None => {
-                                        // Watcher channel closed
-                                        tracing::debug!("Log stream ended");
+                                        // Watcher channel closed - container stopped or log file removed.
+                                        tracing::debug!("Log stream ended (watcher channel closed)");
+                                        // Send empty response to signal end of stream.
+                                        if let Err(e) = write_response(&mut stream, &RpcResponse::Empty).await {
+                                            tracing::debug!("Failed to send stream end marker: {}", e);
+                                        }
                                         break;
                                     }
                                 }
                             }
-                            // Also check if we can read from stream (to detect disconnect)
-                            // This uses a peek to avoid consuming actual request data
+
+                            // Periodic timeout to check connection liveness.
+                            // This also allows the select! to be responsive to cancellation.
                             _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
-                                // Periodic check - continue streaming
+                                // Continue streaming - this timeout just prevents blocking forever.
+                                tracing::trace!("Log stream heartbeat");
                                 continue;
                             }
                         }

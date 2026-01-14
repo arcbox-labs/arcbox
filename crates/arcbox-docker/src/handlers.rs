@@ -254,11 +254,11 @@ pub async fn inspect_container(
     Path(id): Path<String>,
     Query(_params): Query<HashMap<String, String>>,
 ) -> Result<Json<ContainerInspectResponse>> {
-    let container_id = arcbox_container::state::ContainerId::from_string(&id);
+    // Use resolve() to support both ID and name lookups.
     let container = state
         .runtime
         .container_manager()
-        .get(&container_id)
+        .resolve(&id)
         .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
 
     // Extract configuration from container
@@ -751,11 +751,11 @@ pub async fn container_logs(
     Query(params): Query<LogsQuery>,
 ) -> Result<Response> {
     // Verify container exists and get machine name.
-    let container_id = arcbox_container::state::ContainerId::from_string(&id);
+    // Use resolve() to support both ID and name lookups.
     let container = state
         .runtime
         .container_manager()
-        .get(&container_id)
+        .resolve(&id)
         .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
 
     // Log query parameters for debugging.
@@ -787,12 +787,15 @@ pub async fn container_logs(
         .clone()
         .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
 
+    // Use resolved container ID for agent communication.
+    let container_id = container.id.to_string();
+
     // Check if we should stream (follow mode).
     if params.follow {
         // Streaming mode: return a streaming response.
         return container_logs_stream(
             state,
-            id,
+            container_id,
             machine_name,
             params.stdout,
             params.stderr,
@@ -812,7 +815,7 @@ pub async fn container_logs(
             .runtime
             .container_logs(
                 &machine_name,
-                &id,
+                &container_id,
                 false,
                 true,
                 false,
@@ -826,7 +829,7 @@ pub async fn container_logs(
             .runtime
             .container_logs(
                 &machine_name,
-                &id,
+                &container_id,
                 false,
                 false,
                 true,
@@ -848,7 +851,7 @@ pub async fn container_logs(
             .runtime
             .container_logs(
                 &machine_name,
-                &id,
+                &container_id,
                 false,
                 params.stdout,
                 params.stderr,
@@ -865,7 +868,7 @@ pub async fn container_logs(
     }
 
     if log_entries.is_empty() {
-        tracing::warn!("Failed to get logs from agent");
+        tracing::warn!(container_id = %container_id, "Failed to get logs from agent");
         log_entries.push(LogEntry::default());
     }
 

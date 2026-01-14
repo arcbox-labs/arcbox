@@ -491,13 +491,155 @@ impl AgentClient {
 
     /// Gets container logs as a stream (for follow mode).
     ///
-    /// Returns a stream of log entries that continues until the container stops
-    /// or the connection is closed.
+    /// Creates a dedicated streaming connection to avoid blocking the main client.
+    /// The stream continues until the container stops, an error occurs, or the
+    /// receiver is dropped.
+    ///
+    /// # Architecture
+    ///
+    /// This method creates a new vsock connection specifically for streaming,
+    /// following Docker's pattern where log streaming uses a dedicated channel.
+    /// This allows the main AgentClient to remain usable for other operations.
     ///
     /// # Errors
     ///
-    /// Returns an error if the initial request fails.
+    /// Returns an error if connection or initial request fails.
     pub async fn logs_stream(
+        &mut self,
+        req: LogsRequest,
+    ) -> Result<ReceiverStream<Result<LogEntry>>> {
+        // Create a dedicated transport for streaming.
+        // This avoids blocking the main client connection.
+        let addr = VsockAddr::new(self.cid, AGENT_PORT);
+        let mut stream_transport = VsockTransport::new(addr);
+
+        // Connect the streaming transport.
+        #[cfg(target_os = "macos")]
+        {
+            // On macOS, we need to get a new fd from the hypervisor.
+            // For now, reuse the existing transport for the initial request,
+            // then hand off to a background task.
+            // TODO: Support creating new vsock connections on macOS.
+            return self.logs_stream_shared(req).await;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            stream_transport
+                .connect()
+                .await
+                .map_err(|e| CoreError::Machine(format!("failed to connect stream transport: {}", e)))?;
+        }
+
+        let payload = req.encode_to_vec();
+
+        // Build message: length (4B BE) + type (4B BE) + payload
+        let length = 4 + payload.len() as u32;
+        let mut buf = BytesMut::with_capacity(8 + payload.len());
+        buf.put_u32(length);
+        buf.put_u32(MessageType::LogsRequest as u32);
+        buf.extend_from_slice(&payload);
+
+        // Send request on the dedicated stream transport.
+        stream_transport
+            .send(buf.freeze())
+            .await
+            .map_err(|e| CoreError::Machine(format!("failed to send request: {}", e)))?;
+
+        // Create channel for streaming responses.
+        // Buffer size of 256 provides good throughput while limiting memory usage.
+        let (tx, rx) = mpsc::channel(256);
+        let cid = self.cid;
+
+        // Spawn background task to continuously read log entries.
+        tokio::spawn(async move {
+            let _cleanup = LogStreamCleanup { cid };
+
+            loop {
+                // Read response with timeout to detect stale connections.
+                let recv_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    stream_transport.recv(),
+                )
+                .await;
+
+                let response = match recv_result {
+                    Ok(Ok(data)) => data,
+                    Ok(Err(e)) => {
+                        tracing::debug!(cid = cid, "log stream transport error: {}", e);
+                        let _ = tx.send(Err(CoreError::Machine(e.to_string()))).await;
+                        break;
+                    }
+                    Err(_) => {
+                        // Timeout - continue waiting for more logs.
+                        // This is normal for containers with infrequent output.
+                        tracing::trace!(cid = cid, "log stream timeout, continuing...");
+                        continue;
+                    }
+                };
+
+                if response.len() < 8 {
+                    tracing::warn!(cid = cid, "log stream received short response");
+                    continue;
+                }
+
+                let mut cursor = std::io::Cursor::new(&response[..]);
+                let _length = cursor.get_u32();
+                let resp_type = cursor.get_u32();
+                let resp_payload = response[8..].to_vec();
+
+                // Check for error response.
+                if resp_type == MessageType::Error as u32 {
+                    let error_msg = parse_error_response(&resp_payload)
+                        .unwrap_or_else(|_| "unknown error".to_string());
+                    let _ = tx.send(Err(CoreError::Machine(error_msg))).await;
+                    break;
+                }
+
+                // Check for stream end marker.
+                if resp_type == MessageType::EmptyResponse as u32 {
+                    tracing::debug!(cid = cid, "log stream ended (received end marker)");
+                    break;
+                }
+
+                if resp_type != MessageType::LogEntry as u32 {
+                    tracing::warn!(
+                        cid = cid,
+                        "unexpected response type in log stream: {}",
+                        resp_type
+                    );
+                    continue;
+                }
+
+                // Parse log entry.
+                let entry = match LogEntry::decode(&resp_payload[..]) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::warn!(cid = cid, "failed to decode log entry: {}", e);
+                        continue;
+                    }
+                };
+
+                // Send to channel. If receiver is dropped, exit gracefully.
+                if tx.send(Ok(entry)).await.is_err() {
+                    tracing::debug!(cid = cid, "log stream receiver dropped");
+                    break;
+                }
+            }
+
+            tracing::debug!(cid = cid, "log stream task exiting");
+        });
+
+        tracing::debug!(cid = self.cid, "started log stream");
+        Ok(ReceiverStream::new(rx))
+    }
+
+    /// Takes ownership of the transport and runs log streaming in a background task.
+    ///
+    /// On macOS, each call to `connect_agent` creates a new AgentClient with its
+    /// own transport, so we can safely take ownership here.
+    #[cfg(target_os = "macos")]
+    async fn logs_stream_shared(
         &mut self,
         req: LogsRequest,
     ) -> Result<ReceiverStream<Result<LogEntry>>> {
@@ -514,60 +656,105 @@ impl AgentClient {
         buf.put_u32(MessageType::LogsRequest as u32);
         buf.extend_from_slice(&payload);
 
-        // Send request
+        // Send request.
         self.transport
             .send(buf.freeze())
             .await
             .map_err(|e| CoreError::Machine(format!("failed to send request: {}", e)))?;
 
-        // Create channel for streaming responses
-        let (tx, rx) = mpsc::channel(32);
-
-        // Spawn task to read log entries
+        // Create channel for streaming responses.
+        let (tx, rx) = mpsc::channel(256);
         let cid = self.cid;
 
-        // Note: This is a simplified implementation. In production, we would
-        // need to properly handle the transport ownership for concurrent reads.
-        // For now, we read the first response synchronously.
+        // Take ownership of the transport for the background task.
+        // This is safe on macOS because each logs_stream call uses a fresh AgentClient
+        // created by connect_agent, so the transport is not shared.
+        let addr = VsockAddr::new(self.cid, AGENT_PORT);
+        let mut stream_transport = std::mem::replace(
+            &mut self.transport,
+            VsockTransport::new(addr),
+        );
+        self.connected = false; // Mark as disconnected since we took the transport
 
-        // Read first response to check for errors
-        let response = self
-            .transport
-            .recv()
-            .await
-            .map_err(|e| CoreError::Machine(format!("failed to receive response: {}", e)))?;
+        // Spawn background task to continuously read log entries.
+        tokio::spawn(async move {
+            let _cleanup = LogStreamCleanup { cid };
 
-        if response.len() < 8 {
-            return Err(CoreError::Machine("response too short".to_string()));
-        }
+            loop {
+                // Read response with timeout.
+                let recv_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    stream_transport.recv(),
+                )
+                .await;
 
-        let mut cursor = std::io::Cursor::new(&response[..]);
-        let _length = cursor.get_u32();
-        let resp_type = cursor.get_u32();
-        let resp_payload = response[8..].to_vec();
+                let response = match recv_result {
+                    Ok(Ok(data)) => data,
+                    Ok(Err(e)) => {
+                        tracing::debug!(cid = cid, "log stream transport error: {}", e);
+                        let _ = tx.send(Err(CoreError::Machine(e.to_string()))).await;
+                        break;
+                    }
+                    Err(_) => {
+                        // Timeout - continue waiting for more logs.
+                        tracing::trace!(cid = cid, "log stream timeout, continuing...");
+                        continue;
+                    }
+                };
 
-        // Check for error response
-        if resp_type == MessageType::Error as u32 {
-            let error_msg = parse_error_response(&resp_payload)?;
-            return Err(CoreError::Machine(error_msg));
-        }
+                if response.len() < 8 {
+                    tracing::warn!(cid = cid, "log stream received short response");
+                    continue;
+                }
 
-        if resp_type != MessageType::LogEntry as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: {}",
-                resp_type
-            )));
-        }
+                let mut cursor = std::io::Cursor::new(&response[..]);
+                let _length = cursor.get_u32();
+                let resp_type = cursor.get_u32();
+                let resp_payload = response[8..].to_vec();
 
-        // Send first entry
-        let entry = LogEntry::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))?;
+                // Check for error response.
+                if resp_type == MessageType::Error as u32 {
+                    let error_msg = parse_error_response(&resp_payload)
+                        .unwrap_or_else(|_| "unknown error".to_string());
+                    let _ = tx.send(Err(CoreError::Machine(error_msg))).await;
+                    break;
+                }
 
-        // Send through channel (don't wait for receiver)
-        let _ = tx.try_send(Ok(entry));
+                // Check for stream end marker.
+                if resp_type == MessageType::EmptyResponse as u32 {
+                    tracing::debug!(cid = cid, "log stream ended (received end marker)");
+                    break;
+                }
 
-        tracing::debug!(cid = cid, "started log stream");
+                if resp_type != MessageType::LogEntry as u32 {
+                    tracing::warn!(
+                        cid = cid,
+                        "unexpected response type in log stream: {}",
+                        resp_type
+                    );
+                    continue;
+                }
 
+                // Parse log entry.
+                let entry = match LogEntry::decode(&resp_payload[..]) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::warn!(cid = cid, "failed to decode log entry: {}", e);
+                        continue;
+                    }
+                };
+
+                // Send to channel. If receiver is dropped, exit gracefully.
+                if tx.send(Ok(entry)).await.is_err() {
+                    tracing::debug!(cid = cid, "log stream receiver dropped");
+                    break;
+                }
+            }
+
+            tracing::debug!(cid = cid, "log stream task exiting");
+        });
+
+        tracing::debug!(cid = cid, "started log stream (macOS)");
         Ok(ReceiverStream::new(rx))
     }
 
@@ -614,6 +801,19 @@ impl AgentClient {
         }
 
         Ok(())
+    }
+}
+
+/// Cleanup guard for log stream tasks.
+///
+/// Ensures proper logging when the streaming task exits.
+struct LogStreamCleanup {
+    cid: u32,
+}
+
+impl Drop for LogStreamCleanup {
+    fn drop(&mut self) {
+        tracing::trace!(cid = self.cid, "log stream cleanup complete");
     }
 }
 

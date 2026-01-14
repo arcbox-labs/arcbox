@@ -216,14 +216,35 @@ fn read_new_content(file: &mut std::fs::File, pos: &mut u64) -> Result<Vec<Strin
 
 /// Parses a log line into a LogEntry.
 ///
-/// Log format can be:
-/// - Plain text: "message"
-/// - With stream prefix: "stdout: message" or "stderr: message"
-/// - With timestamp: "2024-01-01T00:00:00Z stdout: message"
+/// Supports two log formats:
+/// 1. Docker JSON format: `{"log":"message\n","stream":"stdout","time":"2024-01-01T00:00:00Z"}`
+/// 2. Legacy plain text formats:
+///    - Plain text: "message"
+///    - With stream prefix: "stdout: message" or "stderr: message"
+///    - With timestamp: "2024-01-01T00:00:00Z stdout: message"
 fn parse_log_line(line: &str, options: &LogWatchOptions) -> LogEntry {
     let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
-    // Try to parse structured log format
+    // Try to parse Docker JSON format first.
+    if line.starts_with('{') {
+        if let Some(entry) = parse_docker_json_line(line) {
+            // Build output data with optional timestamp.
+            let output_data = if options.timestamps {
+                let ts = chrono::DateTime::from_timestamp_nanos(entry.timestamp);
+                format!("{} {}", ts.format("%Y-%m-%dT%H:%M:%S%.9fZ"), String::from_utf8_lossy(&entry.data))
+            } else {
+                String::from_utf8_lossy(&entry.data).to_string()
+            };
+
+            return LogEntry {
+                stream: entry.stream,
+                data: output_data.into_bytes(),
+                timestamp: entry.timestamp,
+            };
+        }
+    }
+
+    // Fallback to legacy structured log format.
     // Format: [timestamp] [stream]: message
     let (timestamp, stream, data) = parse_structured_line(line);
 
@@ -243,6 +264,88 @@ fn parse_log_line(line: &str, options: &LogWatchOptions) -> LogEntry {
         data: output_data.into_bytes(),
         timestamp: final_timestamp,
     }
+}
+
+/// Parses a Docker JSON format log line.
+///
+/// Format: `{"log":"message\n","stream":"stdout","time":"2024-01-01T00:00:00.123456789Z"}`
+fn parse_docker_json_line(line: &str) -> Option<LogEntry> {
+    // Manual parsing to avoid serde dependency overhead.
+    // Extract "log" field.
+    let log_start = line.find(r#""log":""#)? + 7;
+    let log_end = find_json_string_end(line, log_start)?;
+    let log_content = unescape_json_string(&line[log_start..log_end]);
+
+    // Extract "stream" field.
+    let stream_start = line.find(r#""stream":""#)? + 10;
+    let stream_end = find_json_string_end(line, stream_start)?;
+    let stream = line[stream_start..stream_end].to_string();
+
+    // Extract "time" field and parse timestamp.
+    let time_start = line.find(r#""time":""#)? + 8;
+    let time_end = find_json_string_end(line, time_start)?;
+    let time_str = &line[time_start..time_end];
+    let timestamp = chrono::DateTime::parse_from_rfc3339(time_str)
+        .ok()?
+        .timestamp_nanos_opt()
+        .unwrap_or(0);
+
+    Some(LogEntry {
+        stream,
+        data: log_content.into_bytes(),
+        timestamp,
+    })
+}
+
+/// Finds the end of a JSON string value (position of closing quote).
+fn find_json_string_end(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return Some(i),
+            b'\\' => i += 2, // Skip escaped character.
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Unescapes a JSON string value.
+fn unescape_json_string(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('r') => result.push('\r'),
+                Some('t') => result.push('\t'),
+                Some('"') => result.push('"'),
+                Some('\\') => result.push('\\'),
+                Some('/') => result.push('/'),
+                Some('u') => {
+                    // Parse \uXXXX unicode escape.
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(code) {
+                            result.push(ch);
+                        }
+                    }
+                }
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
 }
 
 /// Parses a structured log line.
@@ -406,5 +509,60 @@ mod tests {
         assert!(ts.is_some());
         assert_eq!(stream, Some("stdout".to_string()));
         assert_eq!(msg, "message");
+    }
+
+    #[test]
+    fn test_parse_docker_json_line() {
+        // Standard Docker JSON format.
+        let line = r#"{"log":"hello world\n","stream":"stdout","time":"2024-01-15T10:30:00.123456789Z"}"#;
+        let entry = parse_docker_json_line(line).unwrap();
+
+        assert_eq!(entry.stream, "stdout");
+        assert_eq!(String::from_utf8_lossy(&entry.data), "hello world\n");
+        assert!(entry.timestamp > 0);
+    }
+
+    #[test]
+    fn test_parse_docker_json_line_stderr() {
+        let line = r#"{"log":"error message\n","stream":"stderr","time":"2024-01-15T10:30:00Z"}"#;
+        let entry = parse_docker_json_line(line).unwrap();
+
+        assert_eq!(entry.stream, "stderr");
+        assert_eq!(String::from_utf8_lossy(&entry.data), "error message\n");
+    }
+
+    #[test]
+    fn test_parse_docker_json_line_with_escapes() {
+        // Test JSON escape sequences.
+        let line = r#"{"log":"line with \"quotes\" and \\backslash\n","stream":"stdout","time":"2024-01-15T10:30:00Z"}"#;
+        let entry = parse_docker_json_line(line).unwrap();
+
+        assert_eq!(String::from_utf8_lossy(&entry.data), "line with \"quotes\" and \\backslash\n");
+    }
+
+    #[test]
+    fn test_parse_log_line_docker_format() {
+        let options = LogWatchOptions::default();
+        let line = r#"{"log":"test message\n","stream":"stdout","time":"2024-01-15T10:30:00Z"}"#;
+        let entry = parse_log_line(line, &options);
+
+        assert_eq!(entry.stream, "stdout");
+        assert_eq!(String::from_utf8_lossy(&entry.data), "test message\n");
+    }
+
+    #[test]
+    fn test_unescape_json_string() {
+        assert_eq!(unescape_json_string("hello"), "hello");
+        assert_eq!(unescape_json_string("hello\\n"), "hello\n");
+        assert_eq!(unescape_json_string("\\\"quoted\\\""), "\"quoted\"");
+        assert_eq!(unescape_json_string("back\\\\slash"), "back\\slash");
+        assert_eq!(unescape_json_string("tab\\there"), "tab\there");
+    }
+
+    #[test]
+    fn test_find_json_string_end() {
+        assert_eq!(find_json_string_end(r#"hello""#, 0), Some(5));
+        assert_eq!(find_json_string_end(r#"he\"llo""#, 0), Some(7));
+        assert_eq!(find_json_string_end(r#"no closing quote"#, 0), None);
     }
 }

@@ -460,6 +460,46 @@ impl ContainerManager {
         self.containers.read().ok()?.get(id).cloned()
     }
 
+    /// Resolves a container by ID prefix or name.
+    ///
+    /// This method supports Docker-compatible container resolution:
+    /// - Full container ID (12 hex characters)
+    /// - ID prefix (minimum 3 characters for uniqueness)
+    /// - Container name (exact match)
+    ///
+    /// Returns None if no container matches or if the prefix is ambiguous.
+    #[must_use]
+    pub fn resolve(&self, id_or_name: &str) -> Option<Container> {
+        let containers = self.containers.read().ok()?;
+
+        // First, try exact ID match.
+        let container_id = ContainerId::from_string(id_or_name);
+        if let Some(container) = containers.get(&container_id) {
+            return Some(container.clone());
+        }
+
+        // Try name match.
+        for container in containers.values() {
+            if container.name == id_or_name {
+                return Some(container.clone());
+            }
+        }
+
+        // Try ID prefix match (minimum 3 characters for safety).
+        if id_or_name.len() >= 3 {
+            let mut matches: Vec<&Container> = containers
+                .values()
+                .filter(|c| c.id.as_str().starts_with(id_or_name))
+                .collect();
+
+            if matches.len() == 1 {
+                return Some(matches.remove(0).clone());
+            }
+        }
+
+        None
+    }
+
     /// Lists all containers.
     #[must_use]
     pub fn list(&self) -> Vec<Container> {

@@ -300,7 +300,7 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
 
         let machine_name = container
             .machine_name
-            .ok_or_else(|| Status::internal("container has no machine assigned"))?;
+            .unwrap_or_else(|| self.runtime.default_machine_name().to_string());
 
         // Create a streaming response.
         let runtime = Arc::clone(&self.runtime);
@@ -391,7 +391,7 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
 
         let machine_name = container
             .machine_name
-            .ok_or_else(|| Status::internal("container has no machine assigned"))?;
+            .unwrap_or_else(|| self.runtime.default_machine_name().to_string());
 
         // Get CID for the machine.
         let cid = self

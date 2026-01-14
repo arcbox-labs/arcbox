@@ -18,17 +18,31 @@
 //!                         └─────────────────┘
 //! ```
 //!
+//! ## Log Rotation
+//!
+//! The [`RotatingJsonFileWriter`] implements Docker-compatible log rotation:
+//!
+//! - `max_size`: Maximum size of each log file before rotation (default: 20MB)
+//! - `max_files`: Maximum number of rotated files to keep (default: 5)
+//! - `compress`: Whether to compress rotated files (default: true)
+//!
+//! File naming convention:
+//! - `container.log` - Current log file
+//! - `container.log.1` - Most recently rotated file (uncompressed for tools)
+//! - `container.log.2.gz` - Older rotated files (compressed)
+//!
 //! ## Key Components
 //!
 //! - [`OutputSource`]: Trait abstracting PTY and Pipe readers
 //! - [`LogWriter`]: Trait for log output destinations
+//! - [`RotatingJsonFileWriter`]: JSON log writer with rotation support
 //! - [`ProcessShim`]: Main shim implementation managing I/O copying
 //! - [`BroadcastWriter`]: Tee writer for attach clients
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Read as StdRead, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -347,6 +361,292 @@ impl LogWriter for JsonFileWriter {
         let mut file = self.file.lock().await;
         file.flush()
     }
+}
+
+// =============================================================================
+// Rotating JSON File Writer
+// =============================================================================
+
+/// Default maximum log file size (20 MB).
+const DEFAULT_MAX_SIZE: u64 = 20 * 1024 * 1024;
+
+/// Default maximum number of log files to keep.
+const DEFAULT_MAX_FILES: u32 = 5;
+
+/// Log rotation configuration.
+#[derive(Debug, Clone)]
+pub struct LogRotationConfig {
+    /// Maximum size of each log file in bytes.
+    pub max_size: u64,
+    /// Maximum number of rotated files to keep.
+    pub max_files: u32,
+    /// Whether to compress rotated files using gzip.
+    pub compress: bool,
+}
+
+impl Default for LogRotationConfig {
+    fn default() -> Self {
+        Self {
+            max_size: DEFAULT_MAX_SIZE,
+            max_files: DEFAULT_MAX_FILES,
+            compress: true,
+        }
+    }
+}
+
+/// Docker-compatible JSON log writer with rotation support.
+///
+/// Implements the same rotation strategy as Docker's json-file and local drivers:
+/// - Rotates when file size exceeds `max_size`
+/// - Keeps at most `max_files` rotated files
+/// - Optionally compresses old log files
+///
+/// # File Naming
+///
+/// - `container.log` - Current active log file
+/// - `container.log.1` - Most recently rotated (kept uncompressed for tool compatibility)
+/// - `container.log.2.gz` - Older files (compressed if enabled)
+///
+/// # Thread Safety
+///
+/// All operations are protected by an async mutex, ensuring safe concurrent writes.
+pub struct RotatingJsonFileWriter {
+    /// Log file path (without rotation suffix).
+    path: PathBuf,
+    /// Rotation configuration.
+    config: LogRotationConfig,
+    /// Current file handle with buffering.
+    file: Mutex<BufWriter<File>>,
+    /// Current file size (tracked to avoid syscalls).
+    size: Mutex<u64>,
+}
+
+impl RotatingJsonFileWriter {
+    /// Creates a new rotating JSON file writer.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the log file (without rotation suffix)
+    /// * `config` - Rotation configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the log file cannot be created or opened.
+    pub fn new(path: impl AsRef<Path>, config: LogRotationConfig) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+
+        // Ensure parent directory exists.
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+
+        let size = file.metadata()?.len();
+
+        Ok(Self {
+            path,
+            config,
+            file: Mutex::new(BufWriter::new(file)),
+            size: Mutex::new(size),
+        })
+    }
+
+    /// Creates a writer with default rotation configuration.
+    pub fn with_defaults(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::new(path, LogRotationConfig::default())
+    }
+
+    /// Returns the rotation configuration.
+    #[must_use]
+    pub fn config(&self) -> &LogRotationConfig {
+        &self.config
+    }
+
+    /// Performs log rotation.
+    ///
+    /// This method:
+    /// 1. Closes the current log file
+    /// 2. Renames existing rotated files (.N -> .N+1)
+    /// 3. Renames current file to .1
+    /// 4. Deletes files exceeding max_files
+    /// 5. Creates a new empty log file
+    /// 6. Optionally compresses .1 to .1.gz in background
+    async fn rotate(&self) -> io::Result<()> {
+        tracing::debug!(path = ?self.path, "rotating log file");
+
+        let mut file_guard = self.file.lock().await;
+
+        // Flush and close current file.
+        file_guard.flush()?;
+        drop(file_guard);
+
+        // Perform file rotation.
+        self.rotate_files()?;
+
+        // Reopen fresh log file.
+        let new_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&self.path)?;
+
+        // Update internal state.
+        *self.file.lock().await = BufWriter::new(new_file);
+        *self.size.lock().await = 0;
+
+        // Compress .1 file in background if enabled.
+        if self.config.compress && self.config.max_files > 1 {
+            let path = self.path.clone();
+            tokio::spawn(async move {
+                if let Err(e) = compress_log_file(&path) {
+                    tracing::warn!(path = ?path, error = %e, "failed to compress rotated log file");
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Rotates existing log files by renaming them.
+    fn rotate_files(&self) -> io::Result<()> {
+        let max_files = self.config.max_files;
+        let compress = self.config.compress;
+
+        if max_files < 2 {
+            // No rotation needed, just truncate.
+            return Ok(());
+        }
+
+        let extension = if compress { ".gz" } else { "" };
+
+        // Delete oldest file if it exists.
+        let oldest = format!("{}.{}{}", self.path.display(), max_files - 1, extension);
+        if Path::new(&oldest).exists() {
+            fs::remove_file(&oldest)?;
+        }
+
+        // Rename files: .N-1 -> .N, .N-2 -> .N-1, ...
+        for i in (2..max_files).rev() {
+            let from = format!("{}.{}{}", self.path.display(), i - 1, extension);
+            let to = format!("{}.{}{}", self.path.display(), i, extension);
+            if Path::new(&from).exists() {
+                fs::rename(&from, &to)?;
+            }
+        }
+
+        // Rename current file to .1 (always uncompressed initially).
+        let rotated_path = format!("{}.1", self.path.display());
+        if self.path.exists() {
+            fs::rename(&self.path, &rotated_path)?;
+        }
+
+        Ok(())
+    }
+
+    /// Escapes a string for JSON output.
+    fn escape_json(data: &[u8]) -> String {
+        let s = String::from_utf8_lossy(data);
+        s.chars()
+            .map(|c| match c {
+                '"' => "\\\"".to_string(),
+                '\\' => "\\\\".to_string(),
+                '\n' => "\\n".to_string(),
+                '\r' => "\\r".to_string(),
+                '\t' => "\\t".to_string(),
+                c if c.is_control() => format!("\\u{:04x}", c as u32),
+                c => c.to_string(),
+            })
+            .collect()
+    }
+
+    /// Formats a timestamp as RFC3339 with nanosecond precision.
+    fn format_timestamp(nanos: i64) -> String {
+        let secs = nanos / 1_000_000_000;
+        let nsecs = (nanos % 1_000_000_000) as u32;
+        let dt = chrono::DateTime::from_timestamp(secs, nsecs)
+            .unwrap_or_else(chrono::Utc::now);
+        dt.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string()
+    }
+}
+
+#[async_trait::async_trait]
+impl LogWriter for RotatingJsonFileWriter {
+    async fn write(&self, entry: &LogEntry) -> io::Result<()> {
+        let log = Self::escape_json(&entry.data);
+        let stream = entry.stream.as_str();
+        let time = Self::format_timestamp(entry.timestamp);
+
+        let line = format!(
+            r#"{{"log":"{}","stream":"{}","time":"{}"}}"#,
+            log, stream, time
+        );
+        let line_bytes = line.as_bytes();
+        let line_len = line_bytes.len() as u64 + 1; // +1 for newline
+
+        // Check if rotation is needed before writing.
+        let current_size = *self.size.lock().await;
+        if self.config.max_size > 0 && current_size + line_len > self.config.max_size {
+            self.rotate().await?;
+        }
+
+        // Write the log entry.
+        {
+            let mut file = self.file.lock().await;
+            writeln!(file, "{}", line)?;
+        }
+
+        // Update size counter.
+        *self.size.lock().await += line_len;
+
+        Ok(())
+    }
+
+    async fn flush(&self) -> io::Result<()> {
+        let mut file = self.file.lock().await;
+        file.flush()
+    }
+}
+
+/// Compresses a rotated log file (.1) to gzip format (.1.gz).
+///
+/// This function:
+/// 1. Reads the uncompressed .1 file
+/// 2. Writes compressed data to .1.gz
+/// 3. Deletes the original .1 file on success
+fn compress_log_file(base_path: &Path) -> io::Result<()> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    let source_path = format!("{}.1", base_path.display());
+    let dest_path = format!("{}.1.gz", base_path.display());
+
+    // Check if source exists.
+    if !Path::new(&source_path).exists() {
+        return Ok(());
+    }
+
+    // Read source file.
+    let mut source = File::open(&source_path)?;
+    let mut data = Vec::new();
+    source.read_to_end(&mut data)?;
+    drop(source);
+
+    // Write compressed file.
+    let dest_file = File::create(&dest_path)?;
+    let mut encoder = GzEncoder::new(dest_file, Compression::default());
+    encoder.write_all(&data)?;
+    encoder.finish()?;
+
+    // Remove source file.
+    fs::remove_file(&source_path)?;
+
+    tracing::debug!(source = %source_path, dest = %dest_path, "compressed log file");
+
+    Ok(())
 }
 
 // =============================================================================
@@ -1432,5 +1732,107 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1));
         let t2 = now_nanos();
         assert!(t2 >= t1);
+    }
+
+    // =========================================================================
+    // Log Rotation Tests
+    // =========================================================================
+
+    #[test]
+    fn test_log_rotation_config_default() {
+        let config = LogRotationConfig::default();
+        assert_eq!(config.max_size, 20 * 1024 * 1024); // 20 MB
+        assert_eq!(config.max_files, 5);
+        assert!(config.compress);
+    }
+
+    #[tokio::test]
+    async fn test_rotating_json_file_writer_basic() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        let config = LogRotationConfig {
+            max_size: 1024 * 1024, // 1 MB
+            max_files: 3,
+            compress: false,
+        };
+
+        let writer = RotatingJsonFileWriter::new(&log_path, config).unwrap();
+
+        let entry = LogEntry {
+            stream: StreamType::Stdout,
+            data: Bytes::from("test message\n"),
+            timestamp: 1705315800_000000000,
+            partial: false,
+        };
+
+        writer.write(&entry).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let mut content = String::new();
+        File::open(&log_path)
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+
+        assert!(content.contains(r#""log":"test message\n""#));
+        assert!(content.contains(r#""stream":"stdout""#));
+    }
+
+    #[tokio::test]
+    async fn test_rotating_json_file_writer_rotation() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        // Use small max_size to trigger rotation quickly.
+        let config = LogRotationConfig {
+            max_size: 200, // 200 bytes
+            max_files: 3,
+            compress: false,
+        };
+
+        let writer = RotatingJsonFileWriter::new(&log_path, config).unwrap();
+
+        // Write enough entries to trigger rotation.
+        for i in 0..10 {
+            let entry = LogEntry {
+                stream: StreamType::Stdout,
+                data: Bytes::from(format!("message number {} with some padding\n", i)),
+                timestamp: 1705315800_000000000 + i as i64,
+                partial: false,
+            };
+            writer.write(&entry).await.unwrap();
+        }
+        writer.flush().await.unwrap();
+
+        // Check that rotation happened.
+        let rotated_1 = temp_dir.path().join("test.log.1");
+        let rotated_2 = temp_dir.path().join("test.log.2");
+
+        // At least one rotation should have happened.
+        assert!(
+            rotated_1.exists() || rotated_2.exists(),
+            "rotation should have created .1 or .2 files"
+        );
+
+        // Original file should still exist.
+        assert!(log_path.exists(), "current log file should exist");
+    }
+
+    #[test]
+    fn test_rotating_json_escape() {
+        // Test that RotatingJsonFileWriter uses the same escaping as JsonFileWriter.
+        assert_eq!(RotatingJsonFileWriter::escape_json(b"hello"), "hello");
+        assert_eq!(RotatingJsonFileWriter::escape_json(b"hello\n"), "hello\\n");
+        assert_eq!(RotatingJsonFileWriter::escape_json(b"say \"hi\""), "say \\\"hi\\\"");
+    }
+
+    #[test]
+    fn test_rotating_timestamp_format() {
+        let nanos = 1705315800_123456789i64;
+        let formatted = RotatingJsonFileWriter::format_timestamp(nanos);
+        assert!(formatted.starts_with("2024-01-15T"));
+        assert!(formatted.ends_with("Z"));
+        assert!(formatted.contains(".123456789"));
     }
 }
