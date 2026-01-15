@@ -179,6 +179,9 @@ pub struct VmLifecycleConfig {
     pub max_retries: u32,
     /// Default VM configuration.
     pub default_vm: DefaultVmConfig,
+    /// Skip VM check (for testing only).
+    /// When true, `ensure_ready()` returns immediately with a mock CID.
+    pub skip_vm_check: bool,
 }
 
 impl Default for VmLifecycleConfig {
@@ -191,6 +194,7 @@ impl Default for VmLifecycleConfig {
             health_check_interval: Duration::from_secs(DEFAULT_HEALTH_CHECK_INTERVAL_SECS),
             max_retries: DEFAULT_MAX_RETRIES,
             default_vm: DefaultVmConfig::default(),
+            skip_vm_check: false,
         }
     }
 }
@@ -494,6 +498,17 @@ impl VmLifecycleManager {
 
     /// Ensures VM is ready with custom timeout.
     pub async fn ensure_ready_with_timeout(&self, timeout: Duration) -> Result<u32> {
+        // Skip VM check for testing.
+        if self.config.skip_vm_check {
+            tracing::debug!("ensure_ready: skipping VM check (test mode)");
+            // Register a mock machine so that container operations work.
+            let mock_cid = 3;
+            self.machine_manager
+                .register_mock_machine(DEFAULT_MACHINE_NAME, mock_cid)?;
+            // Return a mock CID for testing.
+            return Ok(mock_cid);
+        }
+
         // Serialize state transitions
         let _lock = self.transition_lock.lock().await;
 

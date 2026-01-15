@@ -8,7 +8,28 @@ use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CString};
 use std::sync::{Mutex, OnceLock};
+use thiserror::Error;
 use tokio::sync::mpsc;
+
+/// Errors that can occur in delegate operations.
+#[derive(Debug, Error)]
+pub enum DelegateError {
+    /// Failed to create the Objective-C delegate class.
+    #[error("failed to create delegate class")]
+    ClassCreationFailed,
+    /// Failed to add instance variable to delegate class.
+    #[error("failed to add ivar to delegate class")]
+    IvarAddFailed,
+    /// Failed to add method to delegate class.
+    #[error("failed to add method to delegate class")]
+    MethodAddFailed,
+    /// Failed to create delegate instance.
+    #[error("failed to create delegate instance")]
+    InstanceCreationFailed,
+    /// Delegate class not initialized.
+    #[error("delegate class not initialized")]
+    ClassNotInitialized,
+}
 
 // ============================================================================
 // FFI Declarations
@@ -112,29 +133,44 @@ fn send_connection(handle: ListenerHandle, conn: IncomingConnection) -> bool {
 // VZVirtioSocketListenerDelegate Implementation
 // ============================================================================
 
-/// Wrapper for class pointer that implements Send + Sync.
-struct ClassPtr(*const AnyClass);
+/// Wrapper for optional class pointer that implements Send + Sync.
+struct ClassResult(Result<*const AnyClass, DelegateError>);
 
 // Safety: The class is registered once and never modified.
 // Objective-C classes are thread-safe for reading.
-unsafe impl Send for ClassPtr {}
-unsafe impl Sync for ClassPtr {}
+// The error variant contains no pointers.
+unsafe impl Send for ClassResult {}
+unsafe impl Sync for ClassResult {}
 
 /// Class pointer for our delegate implementation.
-static DELEGATE_CLASS: OnceLock<ClassPtr> = OnceLock::new();
+static DELEGATE_CLASS: OnceLock<ClassResult> = OnceLock::new();
 
 /// Name of the ivar storing the handle.
 const HANDLE_IVAR: &[u8] = b"_listenerHandle\0";
 
 /// Gets or creates the delegate class.
-pub fn get_delegate_class() -> *const AnyClass {
-    DELEGATE_CLASS.get_or_init(|| {
-        ClassPtr(unsafe { create_delegate_class() })
-    }).0
+///
+/// # Errors
+///
+/// Returns an error if the delegate class cannot be created.
+pub fn get_delegate_class() -> Result<*const AnyClass, DelegateError> {
+    let result = DELEGATE_CLASS.get_or_init(|| {
+        ClassResult(unsafe { create_delegate_class() })
+    });
+    // Clone the result since we can't move out of OnceLock
+    match &result.0 {
+        Ok(ptr) => Ok(*ptr),
+        Err(e) => Err(match e {
+            DelegateError::ClassCreationFailed => DelegateError::ClassCreationFailed,
+            DelegateError::IvarAddFailed => DelegateError::IvarAddFailed,
+            DelegateError::MethodAddFailed => DelegateError::MethodAddFailed,
+            _ => DelegateError::ClassNotInitialized,
+        }),
+    }
 }
 
 /// Creates the VZSocketListenerDelegate Objective-C class dynamically.
-unsafe fn create_delegate_class() -> *const AnyClass {
+unsafe fn create_delegate_class() -> Result<*const AnyClass, DelegateError> {
     unsafe {
         // Get NSObject as superclass
         let nsobj_name = CString::new("NSObject").unwrap();
@@ -149,9 +185,10 @@ unsafe fn create_delegate_class() -> *const AnyClass {
             let existing = objc2::ffi::objc_getClass(class_name.as_ptr()) as *const AnyClass;
             if !existing.is_null() {
                 tracing::debug!("Delegate class already exists, reusing");
-                return existing;
+                return Ok(existing);
             }
-            panic!("Failed to create delegate class");
+            tracing::error!("Failed to create delegate class");
+            return Err(DelegateError::ClassCreationFailed);
         }
 
         // Add instance variable to store handle
@@ -164,7 +201,8 @@ unsafe fn create_delegate_class() -> *const AnyClass {
             ivar_type.as_ptr(),
         );
         if !added.as_bool() {
-            panic!("Failed to add handle ivar to delegate class");
+            tracing::error!("Failed to add handle ivar to delegate class");
+            return Err(DelegateError::IvarAddFailed);
         }
 
         // Add the delegate method
@@ -182,7 +220,8 @@ unsafe fn create_delegate_class() -> *const AnyClass {
             method_types.as_ptr(),
         );
         if !added.as_bool() {
-            panic!("Failed to add delegate method");
+            tracing::error!("Failed to add delegate method");
+            return Err(DelegateError::MethodAddFailed);
         }
 
         // Register the class
@@ -190,7 +229,7 @@ unsafe fn create_delegate_class() -> *const AnyClass {
 
         tracing::debug!("Created delegate class: ArcBoxSocketListenerDelegate");
 
-        new_class as *const AnyClass
+        Ok(new_class as *const AnyClass)
     }
 }
 
@@ -277,9 +316,14 @@ unsafe extern "C" fn should_accept_connection(
 // ============================================================================
 
 /// Creates a new delegate instance with the given handle.
-pub fn create_delegate_instance(handle: ListenerHandle) -> *mut AnyObject {
+///
+/// # Errors
+///
+/// Returns an error if the delegate class cannot be created or if
+/// instance allocation fails.
+pub fn create_delegate_instance(handle: ListenerHandle) -> Result<*mut AnyObject, DelegateError> {
     unsafe {
-        let cls = get_delegate_class();
+        let cls = get_delegate_class()?;
 
         // Alloc and init
         let alloc_sel = objc2::sel!(alloc);
@@ -294,7 +338,8 @@ pub fn create_delegate_instance(handle: ListenerHandle) -> *mut AnyObject {
         let instance = init_fn(instance, init_sel);
 
         if instance.is_null() {
-            panic!("Failed to create delegate instance");
+            tracing::error!("Failed to create delegate instance");
+            return Err(DelegateError::InstanceCreationFailed);
         }
 
         // Set the handle ivar
@@ -306,6 +351,6 @@ pub fn create_delegate_instance(handle: ListenerHandle) -> *mut AnyObject {
 
         tracing::debug!("Created delegate instance {:?} with handle {}", instance, handle);
 
-        instance
+        Ok(instance)
     }
 }

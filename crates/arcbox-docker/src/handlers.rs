@@ -1870,3 +1870,360 @@ fn hostname() -> String {
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "arcbox".to_string())
 }
+
+// ============================================================================
+// Additional Container Handlers
+// ============================================================================
+
+/// Pause container.
+///
+/// Pauses all processes within a container.
+pub async fn pause_container(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
+    let container = state
+        .runtime
+        .container_manager()
+        .resolve(&id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+
+    // Check if container is running.
+    if container.state != arcbox_container::state::ContainerState::Running {
+        return Err(DockerError::Conflict(format!(
+            "container {} is not running",
+            id
+        )));
+    }
+
+    // Update state to paused.
+    state
+        .runtime
+        .container_manager()
+        .update(&container.id, |c| {
+            c.state = arcbox_container::state::ContainerState::Paused;
+        })
+        .map_err(|e| DockerError::Server(e.to_string()))?;
+
+    // TODO: Send pause signal to agent when VM is running.
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Unpause container.
+///
+/// Resumes a paused container.
+pub async fn unpause_container(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode> {
+    let container = state
+        .runtime
+        .container_manager()
+        .resolve(&id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+
+    // Check if container is paused.
+    if container.state != arcbox_container::state::ContainerState::Paused {
+        return Err(DockerError::Conflict(format!(
+            "container {} is not paused",
+            id
+        )));
+    }
+
+    // Update state to running.
+    state
+        .runtime
+        .container_manager()
+        .update(&container.id, |c| {
+            c.state = arcbox_container::state::ContainerState::Running;
+        })
+        .map_err(|e| DockerError::Server(e.to_string()))?;
+
+    // TODO: Send unpause signal to agent when VM is running.
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Rename container query.
+#[derive(Debug, Deserialize)]
+pub struct RenameContainerQuery {
+    /// New name for the container.
+    pub name: String,
+}
+
+/// Rename container.
+pub async fn rename_container(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<RenameContainerQuery>,
+) -> Result<StatusCode> {
+    let container = state
+        .runtime
+        .container_manager()
+        .resolve(&id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+
+    // Update container name.
+    state
+        .runtime
+        .container_manager()
+        .update(&container.id, |c| {
+            c.name = query.name.clone();
+        })
+        .map_err(|e| DockerError::Server(e.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Container top response.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ContainerTopResponse {
+    /// Column titles.
+    pub titles: Vec<String>,
+    /// Process list.
+    pub processes: Vec<Vec<String>>,
+}
+
+/// Get container processes (top).
+///
+/// Lists processes running inside a container.
+pub async fn container_top(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(_params): Query<HashMap<String, String>>,
+) -> Result<Json<ContainerTopResponse>> {
+    let container = state
+        .runtime
+        .container_manager()
+        .resolve(&id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+
+    // Check if container is running.
+    if container.state != arcbox_container::state::ContainerState::Running {
+        return Err(DockerError::Conflict(format!(
+            "container {} is not running",
+            id
+        )));
+    }
+
+    // TODO: Get actual process list from agent.
+    // For now, return a placeholder response.
+    Ok(Json(ContainerTopResponse {
+        titles: vec![
+            "UID".to_string(),
+            "PID".to_string(),
+            "PPID".to_string(),
+            "C".to_string(),
+            "STIME".to_string(),
+            "TTY".to_string(),
+            "TIME".to_string(),
+            "CMD".to_string(),
+        ],
+        processes: vec![],
+    }))
+}
+
+/// Container stats response (single snapshot).
+#[derive(Debug, serde::Serialize)]
+pub struct ContainerStatsResponse {
+    /// Container ID.
+    pub id: String,
+    /// Container name.
+    pub name: String,
+    /// Read time.
+    pub read: String,
+    /// CPU stats.
+    pub cpu_stats: CpuStats,
+    /// Previous CPU stats.
+    pub precpu_stats: CpuStats,
+    /// Memory stats.
+    pub memory_stats: MemoryStats,
+    /// Network stats.
+    pub networks: HashMap<String, NetworkStats>,
+}
+
+/// CPU statistics.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct CpuStats {
+    /// CPU usage.
+    pub cpu_usage: CpuUsage,
+    /// System CPU usage.
+    pub system_cpu_usage: u64,
+    /// Number of online CPUs.
+    pub online_cpus: u32,
+}
+
+/// CPU usage details.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct CpuUsage {
+    /// Total CPU usage.
+    pub total_usage: u64,
+    /// Per-CPU usage.
+    pub percpu_usage: Vec<u64>,
+    /// Usage in kernel mode.
+    pub usage_in_kernelmode: u64,
+    /// Usage in user mode.
+    pub usage_in_usermode: u64,
+}
+
+/// Memory statistics.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct MemoryStats {
+    /// Current memory usage.
+    pub usage: u64,
+    /// Maximum memory usage.
+    pub max_usage: u64,
+    /// Memory limit.
+    pub limit: u64,
+}
+
+/// Network statistics.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct NetworkStats {
+    /// Bytes received.
+    pub rx_bytes: u64,
+    /// Packets received.
+    pub rx_packets: u64,
+    /// Receive errors.
+    pub rx_errors: u64,
+    /// Receive drops.
+    pub rx_dropped: u64,
+    /// Bytes transmitted.
+    pub tx_bytes: u64,
+    /// Packets transmitted.
+    pub tx_packets: u64,
+    /// Transmit errors.
+    pub tx_errors: u64,
+    /// Transmit drops.
+    pub tx_dropped: u64,
+}
+
+/// Container stats query.
+#[derive(Debug, Deserialize)]
+pub struct ContainerStatsQuery {
+    /// Stream stats (default true).
+    #[serde(default = "default_true", deserialize_with = "deserialize_bool")]
+    pub stream: bool,
+    /// Return one-shot stats (default false).
+    #[serde(default, deserialize_with = "deserialize_bool")]
+    pub one_shot: bool,
+}
+
+/// Get container stats.
+///
+/// Returns resource usage statistics for a container.
+pub async fn container_stats(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(_query): Query<ContainerStatsQuery>,
+) -> Result<Json<ContainerStatsResponse>> {
+    let container = state
+        .runtime
+        .container_manager()
+        .resolve(&id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+
+    // Check if container is running (stats only available for running containers).
+    if container.state != arcbox_container::state::ContainerState::Running {
+        return Err(DockerError::Conflict(format!(
+            "container {} is not running",
+            id
+        )));
+    }
+
+    // TODO: Get actual stats from agent.
+    // For now, return placeholder stats.
+    let now = chrono::Utc::now().to_rfc3339();
+
+    Ok(Json(ContainerStatsResponse {
+        id: container.id.to_string(),
+        name: format!("/{}", container.name),
+        read: now,
+        cpu_stats: CpuStats {
+            online_cpus: num_cpus() as u32,
+            ..Default::default()
+        },
+        precpu_stats: CpuStats::default(),
+        memory_stats: MemoryStats {
+            limit: total_memory() as u64,
+            ..Default::default()
+        },
+        networks: HashMap::new(),
+    }))
+}
+
+/// Prune containers response.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ContainerPruneResponse {
+    /// Deleted container IDs.
+    pub containers_deleted: Vec<String>,
+    /// Space reclaimed in bytes.
+    pub space_reclaimed: u64,
+}
+
+/// Prune stopped containers.
+pub async fn prune_containers(
+    State(state): State<AppState>,
+    Query(_params): Query<HashMap<String, String>>,
+) -> Result<Json<ContainerPruneResponse>> {
+    let containers = state.runtime.container_manager().list();
+
+    // Find stopped containers.
+    let stopped: Vec<_> = containers
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.state,
+                arcbox_container::state::ContainerState::Exited
+                    | arcbox_container::state::ContainerState::Dead
+            )
+        })
+        .collect();
+
+    let mut deleted = Vec::new();
+
+    for container in stopped {
+        if state
+            .runtime
+            .container_manager()
+            .remove(&container.id)
+            .is_ok()
+        {
+            deleted.push(container.id.to_string());
+        }
+    }
+
+    Ok(Json(ContainerPruneResponse {
+        containers_deleted: deleted,
+        space_reclaimed: 0, // TODO: Calculate actual space reclaimed.
+    }))
+}
+
+/// Container changes response.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ContainerChangeItem {
+    /// Path to the changed file.
+    pub path: String,
+    /// Kind of change (0=Modified, 1=Added, 2=Deleted).
+    pub kind: i32,
+}
+
+/// Get container filesystem changes.
+pub async fn container_changes(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<ContainerChangeItem>>> {
+    let _container = state
+        .runtime
+        .container_manager()
+        .resolve(&id)
+        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+
+    // TODO: Get actual filesystem changes from agent.
+    // For now, return empty list.
+    Ok(Json(vec![]))
+}

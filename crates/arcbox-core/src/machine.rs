@@ -51,6 +51,43 @@ mod tests {
             Some(cid)
         );
     }
+
+    #[test]
+    fn test_register_mock_machine() {
+        let temp_dir = tempdir().unwrap();
+        let vm_manager = VmManager::new();
+        let machine_manager = MachineManager::new(vm_manager, temp_dir.path().to_path_buf());
+
+        // Register a mock machine.
+        machine_manager
+            .register_mock_machine("test-mock", 42)
+            .unwrap();
+
+        // Verify the machine exists.
+        let machine = machine_manager.get("test-mock").expect("machine should exist");
+        assert_eq!(machine.name, "test-mock");
+        assert_eq!(machine.cid, Some(42));
+        assert_eq!(machine.state, MachineState::Running);
+    }
+
+    #[test]
+    fn test_register_mock_machine_idempotent() {
+        let temp_dir = tempdir().unwrap();
+        let vm_manager = VmManager::new();
+        let machine_manager = MachineManager::new(vm_manager, temp_dir.path().to_path_buf());
+
+        // Register twice should succeed (idempotent).
+        machine_manager
+            .register_mock_machine("test-idempotent", 10)
+            .unwrap();
+        machine_manager
+            .register_mock_machine("test-idempotent", 20)
+            .unwrap();
+
+        // Should still have the first CID (not overwritten).
+        let machine = machine_manager.get("test-idempotent").unwrap();
+        assert_eq!(machine.cid, Some(10));
+    }
 }
 
 /// Machine information.
@@ -484,6 +521,42 @@ impl MachineManager {
         let _ = self.persistence.remove(name);
 
         tracing::info!("Removed machine '{}'", name);
+        Ok(())
+    }
+
+    /// Registers a mock machine for testing purposes.
+    ///
+    /// This method creates a machine entry without creating an actual VM.
+    /// The machine will be in Running state with a mock CID.
+    ///
+    /// # Note
+    /// This is intended for unit testing only and should not be used in production.
+    pub fn register_mock_machine(&self, name: &str, cid: u32) -> Result<()> {
+        let mut machines = self
+            .machines
+            .write()
+            .map_err(|_| CoreError::Machine("lock poisoned".to_string()))?;
+
+        if machines.contains_key(name) {
+            return Ok(()); // Already registered
+        }
+
+        let info = MachineInfo {
+            name: name.to_string(),
+            state: MachineState::Running,
+            vm_id: VmId::new(), // Fake VM ID
+            cid: Some(cid),
+            cpus: 4,
+            memory_mb: 4096,
+            disk_gb: 50,
+            kernel: None,
+            initrd: None,
+            cmdline: None,
+            created_at: Utc::now(),
+        };
+
+        machines.insert(name.to_string(), info);
+        tracing::debug!("Registered mock machine '{}' with CID {}", name, cid);
         Ok(())
     }
 }

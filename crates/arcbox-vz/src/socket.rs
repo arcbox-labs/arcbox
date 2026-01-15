@@ -296,14 +296,16 @@ impl VirtioSocketDevice {
             let handle = register_listener(tx);
 
             // Create delegate instance with handle
-            let delegate = create_delegate_instance(handle);
-            if delegate.is_null() {
-                unregister_listener(handle);
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to create delegate instance".into(),
-                });
-            }
+            let delegate = match create_delegate_instance(handle) {
+                Ok(d) => d,
+                Err(e) => {
+                    unregister_listener(handle);
+                    return Err(VZError::Internal {
+                        code: -1,
+                        message: format!("Failed to create delegate instance: {}", e),
+                    });
+                }
+            };
 
             // Set delegate on listener: [listener setDelegate:delegate]
             tracing::debug!("Setting delegate {:?} on listener {:?}", delegate, listener_obj);

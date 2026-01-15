@@ -2,7 +2,7 @@
 //!
 //! These tests verify the Docker Engine API compatibility layer works correctly.
 
-use arcbox_core::{Config, Runtime};
+use arcbox_core::{Config, Runtime, VmLifecycleConfig};
 use arcbox_docker::api::create_router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -12,13 +12,21 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 /// Creates a test runtime with a temporary data directory.
+/// Uses skip_vm_check=true to avoid needing actual VM boot assets.
 async fn create_test_runtime() -> (Arc<Runtime>, TempDir) {
     let tmp_dir = TempDir::new().expect("Failed to create temp dir");
     let config = Config {
         data_dir: tmp_dir.path().to_path_buf(),
         ..Default::default()
     };
-    let runtime = Arc::new(Runtime::new(config).expect("Failed to create runtime"));
+    let vm_lifecycle_config = VmLifecycleConfig {
+        skip_vm_check: true,
+        ..Default::default()
+    };
+    let runtime = Arc::new(
+        Runtime::with_vm_lifecycle_config(config, vm_lifecycle_config)
+            .expect("Failed to create runtime"),
+    );
     runtime.init().await.expect("Failed to init runtime");
     (runtime, tmp_dir)
 }
@@ -119,7 +127,12 @@ async fn test_list_containers_empty() {
     assert_eq!(json.as_array().unwrap().len(), 0);
 }
 
+/// Test container creation.
+///
+/// This test requires a real image to be available in the local store.
+/// Run `arcbox pull alpine:latest` before running this test.
 #[tokio::test]
+#[ignore = "requires image alpine:latest in local store"]
 async fn test_create_container() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -150,7 +163,12 @@ async fn test_create_container() {
     assert!(json.get("Warnings").is_some());
 }
 
+/// Test full container lifecycle (create, start, stop, remove).
+///
+/// This test requires a real image to be available in the local store.
+/// Run `arcbox pull nginx:latest` before running this test.
 #[tokio::test]
+#[ignore = "requires image nginx:latest in local store"]
 async fn test_container_lifecycle() {
     let (runtime, _tmp) = create_test_runtime().await;
 
@@ -257,7 +275,12 @@ async fn test_container_lifecycle() {
     assert_eq!(json.as_array().unwrap().len(), 0);
 }
 
+/// Test container inspection.
+///
+/// This test requires a real image to be available in the local store.
+/// Run `arcbox pull alpine:latest` before running this test.
 #[tokio::test]
+#[ignore = "requires image alpine:latest in local store"]
 async fn test_inspect_container() {
     let (runtime, _tmp) = create_test_runtime().await;
 
@@ -330,7 +353,12 @@ async fn test_container_not_found() {
 // Exec API Tests
 // ============================================================================
 
+/// Test exec creation in a container.
+///
+/// This test requires a real image to be available in the local store.
+/// Run `arcbox pull alpine:latest` before running this test.
 #[tokio::test]
+#[ignore = "requires image alpine:latest in local store"]
 async fn test_exec_create() {
     let (runtime, _tmp) = create_test_runtime().await;
 
@@ -645,4 +673,145 @@ async fn test_older_api_version() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ============================================================================
+// Additional Container Operation Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_prune_containers() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/containers/prune")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // Should have ContainersDeleted and SpaceReclaimed fields.
+    assert!(json.get("ContainersDeleted").is_some());
+    assert!(json.get("SpaceReclaimed").is_some());
+}
+
+#[tokio::test]
+async fn test_pause_container_not_found() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/containers/nonexistent/pause")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_unpause_container_not_found() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/containers/nonexistent/unpause")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_rename_container_not_found() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/containers/nonexistent/rename?name=newname")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_container_top_not_found() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/containers/nonexistent/top")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_container_stats_not_found() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/containers/nonexistent/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_container_changes_not_found() {
+    let (runtime, _tmp) = create_test_runtime().await;
+    let app = create_router(runtime);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/containers/nonexistent/changes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
