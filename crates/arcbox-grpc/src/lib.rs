@@ -56,13 +56,13 @@ pub mod agent {
 }
 
 // Convenience re-exports for clients
-pub use machine::machine_service_client::MachineServiceClient;
+pub use agent::agent_service_client::AgentServiceClient;
 pub use container::container_service_client::ContainerServiceClient;
 pub use image::image_service_client::ImageServiceClient;
-pub use agent::agent_service_client::AgentServiceClient;
+pub use machine::machine_service_client::MachineServiceClient;
 
 // Convenience re-exports for servers
-pub use machine::machine_service_server::{MachineService, MachineServiceServer};
+pub use agent::agent_service_server::{AgentService, AgentServiceServer};
 pub use container::container_service_server::{ContainerService, ContainerServiceServer};
 pub use image::image_service_server::{ImageService, ImageServiceServer};
-pub use agent::agent_service_server::{AgentService, AgentServiceServer};
+pub use machine::machine_service_server::{MachineService, MachineServiceServer};

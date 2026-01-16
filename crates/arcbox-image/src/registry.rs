@@ -3,15 +3,15 @@
 //! Supports Docker Hub and OCI-compliant registries with token authentication.
 
 use futures::StreamExt;
-use reqwest::{header, Client, StatusCode};
+use reqwest::{Client, StatusCode, header};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, instrument, trace};
 
+use crate::ImageRef;
 use crate::error::{ImageError, Result};
 use crate::manifest::{ImageManifest, ManifestList};
-use crate::ImageRef;
 
 /// Docker Hub registry URL.
 const DOCKER_REGISTRY_URL: &str = "https://registry-1.docker.io";
@@ -187,9 +187,10 @@ impl RegistryClient {
             .unwrap_or("")
             .to_string();
 
-        let body = response.bytes().await.map_err(|e| {
-            ImageError::Registry(format!("failed to read manifest body: {e}"))
-        })?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ImageError::Registry(format!("failed to read manifest body: {e}")))?;
 
         trace!(content_type = %content_type, body_len = body.len(), "received manifest");
 
@@ -214,7 +215,10 @@ impl RegistryClient {
         repository: &str,
         digest: &str,
     ) -> Result<ImageManifest> {
-        let url = format!("{}/v2/{}/manifests/{}", self.registry_url, repository, digest);
+        let url = format!(
+            "{}/v2/{}/manifests/{}",
+            self.registry_url, repository, digest
+        );
 
         debug!(url = %url, "fetching manifest by digest");
 
@@ -230,9 +234,10 @@ impl RegistryClient {
             )));
         }
 
-        let body = response.bytes().await.map_err(|e| {
-            ImageError::Registry(format!("failed to read manifest body: {e}"))
-        })?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| ImageError::Registry(format!("failed to read manifest body: {e}")))?;
 
         let manifest: ImageManifest = serde_json::from_slice(&body)?;
         Ok(manifest)
@@ -269,9 +274,10 @@ impl RegistryClient {
             )));
         }
 
-        let bytes = response.bytes().await.map_err(|e| {
-            ImageError::Registry(format!("failed to read blob body: {e}"))
-        })?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| ImageError::Registry(format!("failed to read blob body: {e}")))?;
 
         Ok(bytes.to_vec())
     }
@@ -319,14 +325,15 @@ impl RegistryClient {
         // Stream the response and track progress.
         let mut stream = response.bytes_stream();
         // Pre-allocate based on expected size, capped at reasonable limit for safety.
-        let capacity = usize::try_from(expected_size).unwrap_or(usize::MAX).min(256 * 1024 * 1024);
+        let capacity = usize::try_from(expected_size)
+            .unwrap_or(usize::MAX)
+            .min(256 * 1024 * 1024);
         let mut data = Vec::with_capacity(capacity);
         let mut downloaded: u64 = 0;
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| {
-                ImageError::Registry(format!("failed to read blob chunk: {e}"))
-            })?;
+            let chunk = chunk
+                .map_err(|e| ImageError::Registry(format!("failed to read blob chunk: {e}")))?;
             downloaded += chunk.len() as u64;
             data.extend_from_slice(&chunk);
             progress(downloaded, expected_size);
@@ -353,10 +360,7 @@ impl RegistryClient {
     where
         F: FnMut(u64, u64),
     {
-        let url = format!(
-            "{}/v2/{}/blobs/{}",
-            self.registry_url, repository, digest
-        );
+        let url = format!("{}/v2/{}/blobs/{}", self.registry_url, repository, digest);
 
         debug!(url = %url, expected_size = expected_size, "fetching blob by repo");
 
@@ -377,24 +381,24 @@ impl RegistryClient {
 
         // Stream the response and track progress.
         let mut stream = response.bytes_stream();
-        let capacity = usize::try_from(expected_size).unwrap_or(usize::MAX).min(256 * 1024 * 1024);
+        let capacity = usize::try_from(expected_size)
+            .unwrap_or(usize::MAX)
+            .min(256 * 1024 * 1024);
         let mut data = Vec::with_capacity(capacity);
         let mut downloaded: u64 = 0;
 
         if let Some(mut progress_fn) = progress {
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| {
-                    ImageError::Registry(format!("failed to read blob chunk: {e}"))
-                })?;
+                let chunk = chunk
+                    .map_err(|e| ImageError::Registry(format!("failed to read blob chunk: {e}")))?;
                 downloaded += chunk.len() as u64;
                 data.extend_from_slice(&chunk);
                 progress_fn(downloaded, expected_size);
             }
         } else {
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| {
-                    ImageError::Registry(format!("failed to read blob chunk: {e}"))
-                })?;
+                let chunk = chunk
+                    .map_err(|e| ImageError::Registry(format!("failed to read blob chunk: {e}")))?;
                 data.extend_from_slice(&chunk);
             }
         }
@@ -477,9 +481,7 @@ impl RegistryClient {
             .headers()
             .get(header::WWW_AUTHENTICATE)
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                ImageError::Auth("missing WWW-Authenticate header".to_string())
-            })?;
+            .ok_or_else(|| ImageError::Auth("missing WWW-Authenticate header".to_string()))?;
 
         trace!(header = %header, "parsing WWW-Authenticate");
 
@@ -498,7 +500,9 @@ impl RegistryClient {
         }
 
         if challenge.realm.is_empty() {
-            return Err(ImageError::Auth("invalid WWW-Authenticate header".to_string()));
+            return Err(ImageError::Auth(
+                "invalid WWW-Authenticate header".to_string(),
+            ));
         }
 
         Ok(challenge)
@@ -555,9 +559,9 @@ pub fn select_platform_manifest(list: &ManifestList) -> Option<&crate::manifest:
     let arch = current_arch();
 
     // Container images are always for Linux.
-    list.manifests.iter().find(|m| {
-        m.platform.os == "linux" && m.platform.architecture == arch
-    })
+    list.manifests
+        .iter()
+        .find(|m| m.platform.os == "linux" && m.platform.architecture == arch)
 }
 
 /// Returns the current architecture in Docker/OCI format.

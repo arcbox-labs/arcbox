@@ -30,7 +30,7 @@
 //! Docker context, allowing transparent use of Docker CLI:
 //!
 //! ```bash
-//! docker context create arcbox --docker "host=unix:///var/run/arcbox-docker.sock"
+//! docker context create arcbox --docker "host=unix:///home/you/.arcbox/docker.sock"
 //! docker context use arcbox
 //! docker ps  # Now uses ArcBox!
 //! ```

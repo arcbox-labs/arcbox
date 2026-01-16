@@ -41,7 +41,12 @@ async fn test_ping() {
     let app = create_router(runtime);
 
     let response = app
-        .oneshot(Request::builder().uri("/_ping").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/_ping")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -80,12 +85,7 @@ async fn test_info() {
     let app = create_router(runtime);
 
     let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/info")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(Request::builder().uri("/info").body(Body::empty()).unwrap())
         .await
         .unwrap();
 

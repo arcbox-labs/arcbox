@@ -4,22 +4,24 @@
 
 use crate::error::{CoreError, Result};
 use arcbox_container::AgentConnection;
-use arcbox_protocol::agent::{
-    CreateContainerRequest, CreateContainerResponse, ExecOutput, ExecRequest,
-    ExecResizeRequest, ExecStartRequest, ExecStartResponse, ListContainersRequest,
-    ListContainersResponse, LogEntry, LogsRequest, PingRequest, PingResponse,
-    RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
-};
-use arcbox_protocol::container::{KillContainerRequest, WaitContainerRequest, WaitContainerResponse};
 use arcbox_protocol::Empty;
-use arcbox_transport::vsock::{VsockAddr, VsockTransport};
+use arcbox_protocol::agent::{
+    AttachInput, AttachOutput, AttachRequest, CreateContainerRequest, CreateContainerResponse,
+    ExecOutput, ExecRequest, ExecResizeRequest, ExecStartRequest, ExecStartResponse,
+    ListContainersRequest, ListContainersResponse, LogEntry, LogsRequest, PingRequest,
+    PingResponse, RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
+};
+use arcbox_protocol::container::{
+    KillContainerRequest, WaitContainerRequest, WaitContainerResponse,
+};
 use arcbox_transport::Transport;
+use arcbox_transport::vsock::{VsockAddr, VsockTransport};
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Default vsock port for agent communication.
@@ -43,6 +45,8 @@ enum MessageType {
     LogsRequest = 0x0021,
     ExecStartRequest = 0x0022,
     ExecResizeRequest = 0x0023,
+    AttachRequest = 0x0024,
+    AttachInput = 0x0025,
 
     // Response types
     PingResponse = 0x1001,
@@ -53,6 +57,7 @@ enum MessageType {
     ExecOutput = 0x1020,
     LogEntry = 0x1021,
     ExecStartResponse = 0x1022,
+    AttachOutput = 0x1023,
 
     // Special types
     EmptyResponse = 0x0000,
@@ -75,6 +80,8 @@ impl MessageType {
             0x0021 => Some(Self::LogsRequest),
             0x0022 => Some(Self::ExecStartRequest),
             0x0023 => Some(Self::ExecResizeRequest),
+            0x0024 => Some(Self::AttachRequest),
+            0x0025 => Some(Self::AttachInput),
             0x1001 => Some(Self::PingResponse),
             0x1016 => Some(Self::WaitContainerResponse),
             0x1002 => Some(Self::GetSystemInfoResponse),
@@ -83,6 +90,7 @@ impl MessageType {
             0x1020 => Some(Self::ExecOutput),
             0x1021 => Some(Self::LogEntry),
             0x1022 => Some(Self::ExecStartResponse),
+            0x1023 => Some(Self::AttachOutput),
             0x0000 => Some(Self::EmptyResponse),
             0xFFFF => Some(Self::Error),
             _ => None,
@@ -453,8 +461,7 @@ impl AgentClient {
     pub async fn exec(&mut self, req: ExecRequest) -> Result<ExecOutput> {
         let payload = req.encode_to_vec();
 
-        let (resp_type, resp_payload) =
-            self.rpc_call(MessageType::ExecRequest, &payload).await?;
+        let (resp_type, resp_payload) = self.rpc_call(MessageType::ExecRequest, &payload).await?;
 
         if resp_type != MessageType::ExecOutput as u32 {
             return Err(CoreError::Machine(format!(
@@ -475,8 +482,7 @@ impl AgentClient {
     pub async fn logs(&mut self, req: LogsRequest) -> Result<LogEntry> {
         let payload = req.encode_to_vec();
 
-        let (resp_type, resp_payload) =
-            self.rpc_call(MessageType::LogsRequest, &payload).await?;
+        let (resp_type, resp_payload) = self.rpc_call(MessageType::LogsRequest, &payload).await?;
 
         if resp_type != MessageType::LogEntry as u32 {
             return Err(CoreError::Machine(format!(
@@ -525,10 +531,9 @@ impl AgentClient {
 
         #[cfg(target_os = "linux")]
         {
-            stream_transport
-                .connect()
-                .await
-                .map_err(|e| CoreError::Machine(format!("failed to connect stream transport: {}", e)))?;
+            stream_transport.connect().await.map_err(|e| {
+                CoreError::Machine(format!("failed to connect stream transport: {}", e))
+            })?;
         }
 
         let payload = req.encode_to_vec();
@@ -670,10 +675,8 @@ impl AgentClient {
         // This is safe on macOS because each logs_stream call uses a fresh AgentClient
         // created by connect_agent, so the transport is not shared.
         let addr = VsockAddr::new(self.cid, AGENT_PORT);
-        let mut stream_transport = std::mem::replace(
-            &mut self.transport,
-            VsockTransport::new(addr),
-        );
+        let mut stream_transport =
+            std::mem::replace(&mut self.transport, VsockTransport::new(addr));
         self.connected = false; // Mark as disconnected since we took the transport
 
         // Spawn background task to continuously read log entries.
@@ -802,6 +805,140 @@ impl AgentClient {
 
         Ok(())
     }
+
+    /// Attaches to a running container for bidirectional I/O.
+    ///
+    /// Returns a stream of outputs and a sender for stdin/resize messages.
+    pub async fn attach_stream(
+        &mut self,
+        req: AttachRequest,
+    ) -> Result<(
+        ReceiverStream<Result<AttachOutput>>,
+        mpsc::Sender<AttachInput>,
+    )> {
+        if !self.connected {
+            self.connect().await?;
+        }
+
+        let payload = req.encode_to_vec();
+
+        // Build message: length (4B BE) + type (4B BE) + payload
+        let length = 4 + payload.len() as u32;
+        let mut buf = BytesMut::with_capacity(8 + payload.len());
+        buf.put_u32(length);
+        buf.put_u32(MessageType::AttachRequest as u32);
+        buf.extend_from_slice(&payload);
+
+        // Send request.
+        self.transport
+            .send(buf.freeze())
+            .await
+            .map_err(|e| CoreError::Machine(format!("failed to send attach request: {}", e)))?;
+
+        // Take ownership of transport for streaming.
+        let addr = VsockAddr::new(self.cid, AGENT_PORT);
+        let transport = std::mem::replace(&mut self.transport, VsockTransport::new(addr));
+        self.connected = false;
+
+        let transport = Arc::new(tokio::sync::Mutex::new(transport));
+        let (tx_out, rx_out) = mpsc::channel(256);
+        let (tx_in, mut rx_in) = mpsc::channel::<AttachInput>(64);
+        let cid = self.cid;
+
+        // Reader task: forward attach outputs.
+        {
+            let transport = Arc::clone(&transport);
+            let tx_out = tx_out.clone();
+            tokio::spawn(async move {
+                let _cleanup = AttachStreamCleanup { cid };
+                loop {
+                    let response = {
+                        let mut locked = transport.lock().await;
+                        locked.recv().await
+                    };
+
+                    let data = match response {
+                        Ok(d) => d,
+                        Err(e) => {
+                            let _ = tx_out.send(Err(CoreError::Machine(e.to_string()))).await;
+                            break;
+                        }
+                    };
+
+                    if data.len() < 8 {
+                        let _ = tx_out
+                            .send(Err(CoreError::Machine("short attach response".to_string())))
+                            .await;
+                        break;
+                    }
+
+                    let mut cursor = std::io::Cursor::new(&data[..]);
+                    let _length = cursor.get_u32();
+                    let resp_type = cursor.get_u32();
+                    let resp_payload = data[8..].to_vec();
+
+                    if resp_type == MessageType::Error as u32 {
+                        let error_msg = parse_error_response(&resp_payload)
+                            .unwrap_or_else(|_| "unknown error".to_string());
+                        let _ = tx_out.send(Err(CoreError::Machine(error_msg))).await;
+                        break;
+                    }
+
+                    if resp_type == MessageType::EmptyResponse as u32 {
+                        // End of stream
+                        break;
+                    }
+
+                    if resp_type != MessageType::AttachOutput as u32 {
+                        tracing::warn!(
+                            cid = cid,
+                            "unexpected response type in attach stream: {}",
+                            resp_type
+                        );
+                        continue;
+                    }
+
+                    match AttachOutput::decode(&resp_payload[..]) {
+                        Ok(out) => {
+                            if tx_out.send(Ok(out)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(cid = cid, "failed to decode attach output: {}", e);
+                        }
+                    }
+                }
+            });
+        }
+
+        // Writer task: forward stdin/resizes.
+        {
+            let transport = Arc::clone(&transport);
+            tokio::spawn(async move {
+                while let Some(input) = rx_in.recv().await {
+                    let payload = input.encode_to_vec();
+                    let length = 4 + payload.len() as u32;
+                    let mut buf = BytesMut::with_capacity(8 + payload.len());
+                    buf.put_u32(length);
+                    buf.put_u32(MessageType::AttachInput as u32);
+                    buf.extend_from_slice(&payload);
+
+                    let send_result = {
+                        let mut locked = transport.lock().await;
+                        locked.send(buf.freeze()).await
+                    };
+
+                    if let Err(e) = send_result {
+                        tracing::warn!(cid = cid, "failed to send attach input: {}", e);
+                        break;
+                    }
+                }
+            });
+        }
+
+        Ok((ReceiverStream::new(rx_out), tx_in))
+    }
 }
 
 /// Cleanup guard for log stream tasks.
@@ -814,6 +951,17 @@ struct LogStreamCleanup {
 impl Drop for LogStreamCleanup {
     fn drop(&mut self) {
         tracing::trace!(cid = self.cid, "log stream cleanup complete");
+    }
+}
+
+/// Cleanup guard for attach stream tasks.
+struct AttachStreamCleanup {
+    cid: u32,
+}
+
+impl Drop for AttachStreamCleanup {
+    fn drop(&mut self) {
+        tracing::trace!(cid = self.cid, "attach stream cleanup complete");
     }
 }
 
@@ -911,12 +1059,18 @@ impl AgentConnection for AgentClientWrapper {
 
     async fn stop_container(&self, id: &str, timeout: u32) -> std::result::Result<(), String> {
         let mut client = self.client.write().await;
-        client.stop_container(id, timeout).await.map_err(|e| e.to_string())
+        client
+            .stop_container(id, timeout)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn kill_container(&self, id: &str, signal: &str) -> std::result::Result<(), String> {
         let mut client = self.client.write().await;
-        client.kill_container(id, signal).await.map_err(|e| e.to_string())
+        client
+            .kill_container(id, signal)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn wait_container(&self, id: &str) -> std::result::Result<i32, String> {

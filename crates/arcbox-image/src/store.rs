@@ -12,10 +12,10 @@
 //! ```
 
 use crate::{
+    ImageRef,
     error::{ImageError, Result},
     layer::LayerStore,
     manifest::ImageManifest,
-    ImageRef,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -397,7 +397,8 @@ mod tests {
         assert!(result.is_ok());
 
         // Wrong digest.
-        let wrong_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let wrong_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
         let result = store.store_blob(data, Some(wrong_digest));
         assert!(result.is_err());
     }

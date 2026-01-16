@@ -6,17 +6,25 @@ use crate::error::{CoreError, Result};
 use crate::event::EventBus;
 use crate::machine::{MachineManager, MachineState};
 use crate::vm::VmManager;
-use crate::vm_lifecycle::{VmLifecycleConfig, VmLifecycleManager, DEFAULT_MACHINE_NAME};
-use arcbox_container::{ContainerConfig, ContainerId, ContainerManager, ExecManager, VolumeManager};
-use arcbox_image::{ImageRef, ImageStore};
-use arcbox_net::{NetworkManager, port_forward::{PortForwarder, PortForwardRule}};
-use arcbox_protocol::agent::{CreateContainerRequest, LogEntry, LogsRequest};
+use crate::vm_lifecycle::{DEFAULT_MACHINE_NAME, VmLifecycleConfig, VmLifecycleManager};
+use arcbox_container::{
+    ContainerConfig, ContainerId, ContainerManager, ExecManager, VolumeManager,
+};
+use arcbox_image::{ImageError, ImagePuller, ImageRef, ImageStore, RegistryClient};
+use arcbox_net::{
+    NetworkManager,
+    port_forward::{PortForwardRule, PortForwarder},
+};
 use arcbox_protocol::Mount;
-use tokio_stream::wrappers::ReceiverStream;
+use arcbox_protocol::agent::{
+    AttachInput, AttachOutput, AttachRequest, CreateContainerRequest, LogEntry, LogsRequest,
+};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, RwLock};
 use tokio::sync::RwLock as TokioRwLock;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 /// ArcBox runtime.
 ///
@@ -72,11 +80,15 @@ impl Runtime {
     ) -> Result<Self> {
         let event_bus = EventBus::new();
         let vm_manager = Arc::new(VmManager::new());
-        let machine_manager = Arc::new(MachineManager::new(VmManager::new(), config.data_dir.clone()));
+        let machine_manager = Arc::new(MachineManager::new(
+            VmManager::new(),
+            config.data_dir.clone(),
+        ));
 
         // Create VM lifecycle manager with the machine manager
         let vm_lifecycle = Arc::new(VmLifecycleManager::new(
             machine_manager.clone(),
+            event_bus.clone(),
             config.data_dir.clone(),
             vm_lifecycle_config,
         ));
@@ -360,9 +372,9 @@ impl Runtime {
             )));
         }
 
-        let cid = machine.cid.ok_or_else(|| {
-            CoreError::Machine("machine has no CID assigned".to_string())
-        })?;
+        let cid = machine
+            .cid
+            .ok_or_else(|| CoreError::Machine("machine has no CID assigned".to_string()))?;
 
         // Create container in local state first
         let container_id = self.container_manager.create(config.clone())?;
@@ -377,6 +389,18 @@ impl Runtime {
         let image_ref = ImageRef::parse(&config.image).ok_or_else(|| {
             CoreError::Config(format!("invalid image reference: {}", config.image))
         })?;
+
+        // Check if image exists locally, if not, pull it automatically (Docker-like UX).
+        if let Err(ImageError::NotFound(_)) = self.image_store.get_image_config(&image_ref) {
+            tracing::info!(
+                "Image {} not found locally, pulling from registry...",
+                config.image
+            );
+            let client = RegistryClient::new(&image_ref.registry);
+            let puller = ImagePuller::new(self.image_store.clone(), client);
+            puller.pull(&image_ref).await?;
+            tracing::info!("Successfully pulled image {}", config.image);
+        }
 
         // Get image config for default entrypoint/cmd
         let image_config = self.image_store.get_image_config(&image_ref)?;
@@ -429,7 +453,10 @@ impl Runtime {
 
         // Use config values if provided, otherwise fall back to image defaults.
         let entrypoint = if config.entrypoint.is_empty() {
-            image_container_config.entrypoint.clone().unwrap_or_default()
+            image_container_config
+                .entrypoint
+                .clone()
+                .unwrap_or_default()
         } else {
             config.entrypoint.clone()
         };
@@ -516,7 +543,8 @@ impl Runtime {
         self.container_manager.start(container_id).await?;
 
         // Start port forwarding if configured.
-        self.start_port_forwarding(machine_name, container_id).await?;
+        self.start_port_forwarding(machine_name, container_id)
+            .await?;
 
         tracing::info!(
             "Started container {} in machine '{}'",
@@ -539,22 +567,28 @@ impl Runtime {
             // Try to get IP address from the VM using cat /var/log/network.log
             // which is written by the init script after network configuration.
             // Also try ip addr as a fallback.
-            let output = self.exec_machine(
-                machine_name,
-                vec![
-                    "/bin/busybox".to_string(),
-                    "cat".to_string(),
-                    "/var/log/network.log".to_string(),
-                ],
-                std::collections::HashMap::new(),
-                String::new(),
-                String::new(),
-                false,
-            ).await?;
+            let output = self
+                .exec_machine(
+                    machine_name,
+                    vec![
+                        "/bin/busybox".to_string(),
+                        "cat".to_string(),
+                        "/var/log/network.log".to_string(),
+                    ],
+                    std::collections::HashMap::new(),
+                    String::new(),
+                    String::new(),
+                    false,
+                )
+                .await?;
 
             let stdout = String::from_utf8_lossy(&output.data);
-            tracing::debug!("network log (attempt {}): exit_code={}, output={:?}",
-                attempt + 1, output.exit_code, stdout);
+            tracing::debug!(
+                "network log (attempt {}): exit_code={}, output={:?}",
+                attempt + 1,
+                output.exit_code,
+                stdout
+            );
 
             // Parse the output to find an IP address.
             // network.log format: "Network configured: eth0 -> 192.168.64.2/24"
@@ -611,8 +645,11 @@ impl Runtime {
             }
         }
 
-        tracing::warn!("Could not discover guest IP after {} attempts, using default {}",
-            MAX_RETRIES, DEFAULT_GUEST_IP);
+        tracing::warn!(
+            "Could not discover guest IP after {} attempts, using default {}",
+            MAX_RETRIES,
+            DEFAULT_GUEST_IP
+        );
         Ok(DEFAULT_GUEST_IP)
     }
 
@@ -622,7 +659,9 @@ impl Runtime {
         machine_name: &str,
         container_id: &ContainerId,
     ) -> Result<()> {
-        let container = self.container_manager.get(container_id)
+        let container = self
+            .container_manager
+            .get(container_id)
             .ok_or_else(|| CoreError::NotFound(container_id.to_string()))?;
 
         let port_bindings = match &container.config {
@@ -729,11 +768,7 @@ impl Runtime {
     /// # Errors
     ///
     /// Returns an error if the wait operation fails.
-    pub async fn wait_container(
-        &self,
-        machine_name: &str,
-        container_id: &str,
-    ) -> Result<i32> {
+    pub async fn wait_container(&self, machine_name: &str, container_id: &str) -> Result<i32> {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
@@ -939,6 +974,168 @@ impl Runtime {
         };
 
         Ok(stream)
+    }
+
+    /// Attaches to a running container for interactive I/O.
+    ///
+    /// Returns a stream of outputs and a sender for stdin/resize messages.
+    pub async fn container_attach(
+        &self,
+        machine_name: &str,
+        container_id: &str,
+        exec_id: Option<String>,
+        attach_stdin: bool,
+        attach_stdout: bool,
+        attach_stderr: bool,
+        tty_width: u32,
+        tty_height: u32,
+    ) -> Result<(
+        ReceiverStream<Result<AttachOutput>>,
+        mpsc::Sender<AttachInput>,
+    )> {
+        let cid = self
+            .machine_manager
+            .get_cid(machine_name)
+            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+
+        let req = AttachRequest {
+            container_id: container_id.to_string(),
+            attach_stdin,
+            attach_stdout,
+            attach_stderr,
+            tty_width,
+            tty_height,
+            exec_id: exec_id.unwrap_or_default(),
+        };
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut agent = self.machine_manager.connect_agent(machine_name)?;
+            agent
+                .attach_stream(req)
+                .await
+                .map_err(|e| CoreError::Machine(e.to_string()))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let agent = self.agent_pool.get(cid).await;
+            let mut agent = agent.write().await;
+            agent
+                .attach_stream(req)
+                .await
+                .map_err(|e| CoreError::Machine(e.to_string()))
+        }
+    }
+
+    /// Attaches to an exec session using the same attach stream pipeline.
+    pub async fn exec_attach(
+        &self,
+        machine_name: &str,
+        exec_id: &str,
+        attach_stdin: bool,
+        attach_stdout: bool,
+        attach_stderr: bool,
+        tty_width: u32,
+        tty_height: u32,
+    ) -> Result<(
+        ReceiverStream<Result<AttachOutput>>,
+        mpsc::Sender<AttachInput>,
+    )> {
+        self.container_attach(
+            machine_name,
+            "",
+            Some(exec_id.to_string()),
+            attach_stdin,
+            attach_stdout,
+            attach_stderr,
+            tty_width,
+            tty_height,
+        )
+        .await
+    }
+
+    /// Starts an exec session in the guest VM (streaming-ready).
+    pub async fn exec_start_streaming(
+        &self,
+        machine_name: &str,
+        exec_id: &str,
+        container_id: &str,
+        cmd: Vec<String>,
+        env: std::collections::HashMap<String, String>,
+        working_dir: Option<String>,
+        user: Option<String>,
+        tty: bool,
+        detach: bool,
+        tty_width: u32,
+        tty_height: u32,
+    ) -> Result<u32> {
+        let cid = self
+            .machine_manager
+            .get_cid(machine_name)
+            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+
+        let req = arcbox_protocol::agent::ExecStartRequest {
+            exec_id: exec_id.to_string(),
+            container_id: container_id.to_string(),
+            cmd,
+            env,
+            working_dir: working_dir.unwrap_or_default(),
+            user: user.unwrap_or_default(),
+            tty,
+            detach,
+            tty_width,
+            tty_height,
+        };
+
+        let resp = {
+            #[cfg(target_os = "macos")]
+            {
+                let mut agent = self.machine_manager.connect_agent(machine_name)?;
+                agent.exec_start(req).await?
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let agent = self.agent_pool.get(cid).await;
+                let mut agent = agent.write().await;
+                agent.exec_start(req).await?
+            }
+        };
+
+        Ok(resp.pid)
+    }
+
+    /// Resizes an exec session PTY.
+    pub async fn exec_resize(
+        &self,
+        machine_name: &str,
+        exec_id: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let cid = self
+            .machine_manager
+            .get_cid(machine_name)
+            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+
+        let req = arcbox_protocol::agent::ExecResizeRequest {
+            exec_id: exec_id.to_string(),
+            width,
+            height,
+        };
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut agent = self.machine_manager.connect_agent(machine_name)?;
+            agent.exec_resize(req).await?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let agent = self.agent_pool.get(cid).await;
+            let mut agent = agent.write().await;
+            agent.exec_resize(req).await?;
+        }
+
+        Ok(())
     }
 
     /// Kills a container in a machine with a signal.

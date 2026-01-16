@@ -117,10 +117,7 @@ impl TransportListener for UnixSocketListener {
     }
 
     async fn accept(&mut self) -> Result<Self::Transport> {
-        let listener = self
-            .listener
-            .as_ref()
-            .ok_or(TransportError::NotConnected)?;
+        let listener = self.listener.as_ref().ok_or(TransportError::NotConnected)?;
 
         let (stream, _) = listener.accept().await?;
         Ok(UnixTransport::from_stream(stream))

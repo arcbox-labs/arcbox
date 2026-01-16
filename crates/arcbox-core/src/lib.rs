@@ -52,6 +52,6 @@ pub use machine::MachineManager;
 pub use runtime::Runtime;
 pub use vm::{SharedDirConfig, VmConfig, VmManager};
 pub use vm_lifecycle::{
-    DefaultVmConfig, HealthMonitor, VmLifecycleConfig, VmLifecycleManager, VmLifecycleState,
-    DEFAULT_MACHINE_NAME,
+    DEFAULT_MACHINE_NAME, DefaultVmConfig, HealthMonitor, VmLifecycleConfig, VmLifecycleManager,
+    VmLifecycleState,
 };

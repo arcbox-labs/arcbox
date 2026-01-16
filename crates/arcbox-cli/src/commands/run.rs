@@ -1,11 +1,11 @@
 //! Run command implementation.
 
+use anyhow::Result;
 use arcbox_cli::client::{
-    self, CreateContainerRequest, CreateContainerResponse, ContainerWaitResponse,
-    HostConfig, PortBinding,
+    self, ContainerWaitResponse, CreateContainerRequest, CreateContainerResponse, HostConfig,
+    PortBinding,
 };
 use arcbox_cli::terminal::InteractiveSession;
-use anyhow::Result;
 use clap::Args;
 use std::collections::HashMap;
 
@@ -170,10 +170,13 @@ fn build_host_config(args: &RunArgs) -> HostConfig {
         for publish in &args.publish {
             if let Some((host, container)) = parse_port_mapping(publish) {
                 let container_port = format!("{}/tcp", container);
-                port_bindings.entry(container_port).or_default().push(PortBinding {
-                    host_ip: String::new(),
-                    host_port: host.to_string(),
-                });
+                port_bindings
+                    .entry(container_port)
+                    .or_default()
+                    .push(PortBinding {
+                        host_ip: String::new(),
+                        host_port: host.to_string(),
+                    });
             }
         }
 

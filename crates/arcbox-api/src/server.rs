@@ -2,13 +2,14 @@
 
 use crate::error::Result;
 use crate::generated::{
-    container_service_server::ContainerServiceServer,
-    image_service_server::ImageServiceServer,
-    machine_service_server::MachineServiceServer,
-    network_service_server::NetworkServiceServer,
+    container_service_server::ContainerServiceServer, image_service_server::ImageServiceServer,
+    machine_service_server::MachineServiceServer, network_service_server::NetworkServiceServer,
     system_service_server::SystemServiceServer,
 };
-use crate::grpc::{ContainerServiceImpl, ImageServiceImpl, MachineServiceImpl, NetworkServiceImpl, SystemServiceImpl};
+use crate::grpc::{
+    ContainerServiceImpl, ImageServiceImpl, MachineServiceImpl, NetworkServiceImpl,
+    SystemServiceImpl,
+};
 use arcbox_core::{Config, Runtime};
 use arcbox_docker::{DockerApiServer, ServerConfig as DockerConfig};
 use std::path::PathBuf;
@@ -88,18 +89,14 @@ impl ApiServer {
         let system_service = SystemServiceImpl::new(Arc::clone(&self.runtime));
 
         // Parse gRPC address
-        let grpc_addr = self
-            .config
-            .grpc_addr
-            .parse()
-            .map_err(|e| crate::error::ApiError::Config(format!("invalid gRPC address: {}", e)))?;
+        let grpc_addr =
+            self.config.grpc_addr.parse().map_err(|e| {
+                crate::error::ApiError::Config(format!("invalid gRPC address: {}", e))
+            })?;
 
         tracing::info!("ArcBox API server starting");
         tracing::info!("  gRPC: {}", self.config.grpc_addr);
-        tracing::info!(
-            "  Docker API: {}",
-            self.config.docker_socket.display()
-        );
+        tracing::info!("  Docker API: {}", self.config.docker_socket.display());
 
         // Build gRPC server
         let grpc_server = Server::builder()
@@ -118,9 +115,9 @@ impl ApiServer {
         tracing::info!("ArcBox API server running");
 
         // Run gRPC server
-        grpc_server.await.map_err(|e| {
-            crate::error::ApiError::Transport(format!("gRPC server error: {}", e))
-        })?;
+        grpc_server
+            .await
+            .map_err(|e| crate::error::ApiError::Transport(format!("gRPC server error: {}", e)))?;
 
         tracing::info!("Shutting down...");
 

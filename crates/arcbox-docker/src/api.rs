@@ -6,8 +6,8 @@
 use crate::handlers;
 use arcbox_core::Runtime;
 use axum::{
-    routing::{delete, get, post},
     Router,
+    routing::{delete, get, post},
 };
 use std::sync::Arc;
 
@@ -29,6 +29,7 @@ pub fn create_router(runtime: Arc<Runtime>) -> Router {
         .route("/info", get(handlers::get_info))
         .route("/_ping", get(handlers::ping))
         .route("/_ping", axum::routing::head(handlers::ping))
+        .route("/events", get(handlers::events))
         // Container endpoints
         .route("/containers/json", get(handlers::list_containers))
         .route("/containers/create", post(handlers::create_container))
@@ -102,6 +103,7 @@ fn versioned_router() -> Router<AppState> {
         .route("/version", get(handlers::get_version))
         .route("/info", get(handlers::get_info))
         .route("/_ping", get(handlers::ping))
+        .route("/events", get(handlers::events))
         // Containers
         .route("/containers/json", get(handlers::list_containers))
         .route("/containers/create", post(handlers::create_container))

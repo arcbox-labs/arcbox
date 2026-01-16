@@ -21,10 +21,10 @@
 //! let rootfs = builder.finalize()?;
 //! ```
 
+use crate::ImageRef;
 use crate::error::{ImageError, Result};
 use crate::manifest::ImageManifest;
 use crate::store::ImageStore;
-use crate::ImageRef;
 
 use flate2::read::GzDecoder;
 use std::collections::HashSet;
@@ -412,10 +412,7 @@ impl ImageStore {
     /// # Errors
     ///
     /// Returns an error if the config cannot be read.
-    pub fn get_image_config(
-        &self,
-        reference: &ImageRef,
-    ) -> Result<crate::manifest::ImageConfig> {
+    pub fn get_image_config(&self, reference: &ImageRef) -> Result<crate::manifest::ImageConfig> {
         let manifest = self.get_manifest(reference)?;
         let config_data = self.get_blob(&manifest.config.digest)?;
         let config: crate::manifest::ImageConfig = serde_json::from_slice(&config_data)?;
@@ -528,10 +525,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let rootfs = dir.path().join("rootfs");
 
-        let layer_data = create_test_layer(&[
-            ("file1.txt", b"hello"),
-            ("dir/file2.txt", b"world"),
-        ]);
+        let layer_data = create_test_layer(&[("file1.txt", b"hello"), ("dir/file2.txt", b"world")]);
 
         let mut builder = RootfsBuilder::new(&rootfs).unwrap();
         builder.extract_layer_from_bytes(&layer_data).unwrap();
@@ -550,10 +544,7 @@ mod tests {
         let rootfs = dir.path().join("rootfs");
 
         // Layer 1: create files
-        let layer1 = create_test_layer(&[
-            ("file1.txt", b"keep me"),
-            ("file2.txt", b"delete me"),
-        ]);
+        let layer1 = create_test_layer(&[("file1.txt", b"keep me"), ("file2.txt", b"delete me")]);
 
         // Layer 2: whiteout file2.txt
         let layer2 = create_test_layer(&[(".wh.file2.txt", b"")]);
@@ -632,5 +623,61 @@ mod tests {
 
         let content = fs::read_to_string(rootfs.join("file.txt")).unwrap();
         assert_eq!(content, "modified");
+    }
+
+    #[test]
+    fn test_get_manifest_not_found() {
+        let dir = tempdir().unwrap();
+        let store = ImageStore::new(dir.path().to_path_buf()).unwrap();
+
+        let reference = ImageRef::parse("nonexistent/image:latest").unwrap();
+        let result = store.get_manifest(&reference);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ImageError::NotFound(msg) => {
+                assert!(
+                    msg.contains("manifest reference not found"),
+                    "Error should indicate manifest not found: {}",
+                    msg
+                );
+            }
+            err => panic!("Expected NotFound error, got: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_get_image_config_not_found() {
+        let dir = tempdir().unwrap();
+        let store = ImageStore::new(dir.path().to_path_buf()).unwrap();
+
+        let reference = ImageRef::parse("alpine:latest").unwrap();
+        let result = store.get_image_config(&reference);
+
+        // Should return NotFound since the image hasn't been pulled.
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ImageError::NotFound(_) => {
+                // Expected - image doesn't exist locally.
+            }
+            err => panic!("Expected NotFound error, got: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_image_not_found_triggers_auto_pull_condition() {
+        // This test verifies the error type that triggers auto-pull in runtime.
+        // The auto-pull logic in runtime.rs checks for ImageError::NotFound.
+        let dir = tempdir().unwrap();
+        let store = ImageStore::new(dir.path().to_path_buf()).unwrap();
+
+        let reference = ImageRef::parse("busybox:latest").unwrap();
+        let result = store.get_image_config(&reference);
+
+        // Verify this returns the exact error type that runtime uses to trigger auto-pull.
+        assert!(
+            matches!(result, Err(ImageError::NotFound(_))),
+            "Missing image should return ImageError::NotFound to trigger auto-pull"
+        );
     }
 }

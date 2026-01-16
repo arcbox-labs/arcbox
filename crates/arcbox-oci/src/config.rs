@@ -159,7 +159,11 @@ impl Spec {
                 destination: "/proc".to_string(),
                 source: Some("proc".to_string()),
                 mount_type: Some("proc".to_string()),
-                options: Some(vec!["nosuid".to_string(), "noexec".to_string(), "nodev".to_string()]),
+                options: Some(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                ]),
                 ..Default::default()
             },
             Mount {
@@ -1485,7 +1489,11 @@ mod tests {
         // Valid semver versions should pass.
         for version in ["1.0.0", "1.2.0", "2.0.0-rc1", "1.0.0-alpha+build"] {
             let json = format!(r#"{{"ociVersion": "{}"}}"#, version);
-            assert!(Spec::from_json(&json).is_ok(), "Version {} should be valid", version);
+            assert!(
+                Spec::from_json(&json).is_ok(),
+                "Version {} should be valid",
+                version
+            );
         }
     }
 }

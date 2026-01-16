@@ -7,13 +7,18 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use tokio::net::UnixStream;
 
 /// Default socket path for the ArcBox daemon.
-pub const DEFAULT_SOCKET_PATH: &str = "/var/run/arcbox.sock";
+fn default_socket_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".arcbox")
+        .join("docker.sock")
+}
 
 /// Daemon client for Docker-compatible API communication.
 pub struct DaemonClient {
@@ -26,7 +31,7 @@ impl DaemonClient {
     /// Socket path resolution order:
     /// 1. ARCBOX_SOCKET environment variable
     /// 2. DOCKER_HOST environment variable (unix:// prefix stripped)
-    /// 3. Default socket path (/var/run/arcbox.sock)
+    /// 3. Default socket path (~/.arcbox/docker.sock)
     pub fn new() -> Self {
         let socket_path = Self::resolve_socket_path();
         Self { socket_path }
@@ -52,7 +57,7 @@ impl DaemonClient {
         }
 
         // 3. Default
-        PathBuf::from(DEFAULT_SOCKET_PATH)
+        default_socket_path()
     }
 
     /// Creates a new daemon client with a custom socket path.
@@ -265,7 +270,12 @@ impl DaemonClient {
     where
         F: FnMut(&[u8]),
     {
-        self.stream_logs_with_cancel(path, &mut callback, tokio_util::sync::CancellationToken::new()).await
+        self.stream_logs_with_cancel(
+            path,
+            &mut callback,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
     }
 
     /// Streams logs from the daemon with cancellation support.
@@ -280,7 +290,7 @@ impl DaemonClient {
     where
         F: FnMut(&[u8]),
     {
-        use std::io::{stdout, Write};
+        use std::io::{Write, stdout};
 
         // Connect to Unix socket
         let stream = UnixStream::connect(&self.socket_path)
@@ -652,11 +662,7 @@ pub fn truncate(s: &str, max_len: usize) -> String {
 
 /// Formats a container ID (first 12 characters).
 pub fn short_id(id: &str) -> &str {
-    if id.len() > 12 {
-        &id[..12]
-    } else {
-        id
-    }
+    if id.len() > 12 { &id[..12] } else { id }
 }
 
 /// Formats a relative time string.

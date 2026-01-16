@@ -413,7 +413,10 @@ mod tests {
 
     #[test]
     fn test_hook_context_state_json() {
-        let state = State::new("test-container".to_string(), std::path::PathBuf::from("/bundle"));
+        let state = State::new(
+            "test-container".to_string(),
+            std::path::PathBuf::from("/bundle"),
+        );
         let context = HookContext::new(state, std::path::PathBuf::from("/bundle"));
 
         let json = context.state_json().unwrap();
@@ -445,17 +448,13 @@ mod tests {
     #[test]
     fn test_hooks_serialization_roundtrip() {
         let hooks = Hooks {
-            create_runtime: vec![
-                Hook::new("/usr/bin/setup").with_timeout(30),
-            ],
+            create_runtime: vec![Hook::new("/usr/bin/setup").with_timeout(30)],
             poststart: vec![
                 Hook::new("/usr/bin/notify")
                     .with_args(vec!["notify".to_string()])
                     .with_env(vec!["SOCKET=/run/notify.sock".to_string()]),
             ],
-            poststop: vec![
-                Hook::new("/usr/bin/cleanup"),
-            ],
+            poststop: vec![Hook::new("/usr/bin/cleanup")],
             ..Default::default()
         };
 

@@ -1,8 +1,8 @@
 //! Exec command implementation.
 
+use anyhow::Result;
 use arcbox_cli::client::{self, ExecCreateRequest, ExecCreateResponse};
 use arcbox_cli::terminal::InteractiveSession;
-use anyhow::Result;
 use clap::Args;
 
 /// Arguments for the exec command.
@@ -60,7 +60,8 @@ pub async fn execute(args: ExecArgs) -> Result<()> {
         working_dir: args.workdir.clone(),
     };
 
-    let create_response: ExecCreateResponse = daemon.post(&create_path, Some(&create_request)).await?;
+    let create_response: ExecCreateResponse =
+        daemon.post(&create_path, Some(&create_request)).await?;
     let exec_id = create_response.id;
 
     // Start exec instance

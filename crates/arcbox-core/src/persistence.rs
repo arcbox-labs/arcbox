@@ -124,9 +124,8 @@ impl MachinePersistence {
         fs::create_dir_all(&dir)?;
 
         let persisted = PersistedMachine::from(machine);
-        let content = toml::to_string_pretty(&persisted).map_err(|e| {
-            CoreError::Machine(format!("Failed to serialize config: {}", e))
-        })?;
+        let content = toml::to_string_pretty(&persisted)
+            .map_err(|e| CoreError::Machine(format!("Failed to serialize config: {}", e)))?;
 
         fs::write(self.config_path(&machine.name), content)?;
 
@@ -141,13 +140,11 @@ impl MachinePersistence {
     /// Returns an error if the configuration cannot be loaded.
     pub fn load(&self, name: &str) -> Result<PersistedMachine> {
         let path = self.config_path(name);
-        let content = fs::read_to_string(&path).map_err(|e| {
-            CoreError::NotFound(format!("Machine config not found: {}", e))
-        })?;
+        let content = fs::read_to_string(&path)
+            .map_err(|e| CoreError::NotFound(format!("Machine config not found: {}", e)))?;
 
-        toml::from_str(&content).map_err(|e| {
-            CoreError::Machine(format!("Failed to parse config: {}", e))
-        })
+        toml::from_str(&content)
+            .map_err(|e| CoreError::Machine(format!("Failed to parse config: {}", e)))
     }
 
     /// Lists all saved machines.
@@ -195,9 +192,8 @@ impl MachinePersistence {
         let mut machine = self.load(name)?;
         machine.state = state.into();
 
-        let content = toml::to_string_pretty(&machine).map_err(|e| {
-            CoreError::Machine(format!("Failed to serialize config: {}", e))
-        })?;
+        let content = toml::to_string_pretty(&machine)
+            .map_err(|e| CoreError::Machine(format!("Failed to serialize config: {}", e)))?;
 
         fs::write(self.config_path(name), content)?;
 

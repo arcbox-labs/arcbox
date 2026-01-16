@@ -54,7 +54,9 @@ fn execute_enable(manager: &DockerContextManager) -> Result<()> {
         return Ok(());
     }
 
-    manager.enable().context("Failed to enable Docker integration")?;
+    manager
+        .enable()
+        .context("Failed to enable Docker integration")?;
 
     println!("Docker integration enabled.");
     println!();
@@ -67,7 +69,10 @@ fn execute_enable(manager: &DockerContextManager) -> Result<()> {
     // Warn if socket doesn't exist.
     if !manager.socket_path().exists() {
         println!();
-        println!("Warning: ArcBox Docker socket not found at {}", manager.socket_path().display());
+        println!(
+            "Warning: ArcBox Docker socket not found at {}",
+            manager.socket_path().display()
+        );
         println!("Make sure the ArcBox daemon is running.");
     }
 
@@ -81,7 +86,9 @@ fn execute_disable(manager: &DockerContextManager) -> Result<()> {
         return Ok(());
     }
 
-    manager.disable().context("Failed to disable Docker integration")?;
+    manager
+        .disable()
+        .context("Failed to disable Docker integration")?;
 
     println!("Docker integration disabled.");
     println!("The previous default Docker context has been restored.");
@@ -129,17 +136,8 @@ fn execute_status(manager: &DockerContextManager) -> Result<()> {
 
 /// Returns the default socket path for the Docker-compatible API.
 fn default_socket_path() -> PathBuf {
-    // Use platform-specific path.
-    #[cfg(target_os = "macos")]
-    {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".arcbox")
-            .join("docker.sock")
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        PathBuf::from("/var/run/arcbox-docker.sock")
-    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".arcbox")
+        .join("docker.sock")
 }

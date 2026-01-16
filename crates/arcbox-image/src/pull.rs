@@ -12,11 +12,11 @@ use futures::stream::{self, StreamExt};
 use tracing::{debug, info};
 
 use crate::{
+    ImageRef,
     error::{ImageError, Result},
     manifest::ImageManifest,
-    registry::{select_platform_manifest, ManifestResponse, RegistryClient},
+    registry::{ManifestResponse, RegistryClient, select_platform_manifest},
     store::ImageStore,
-    ImageRef,
 };
 
 /// Maximum concurrent layer downloads.
@@ -80,7 +80,10 @@ impl ImagePuller {
         );
 
         if !self.store.blob_exists(&manifest.config.digest) {
-            let config_data = self.client.get_blob(reference, &manifest.config.digest).await?;
+            let config_data = self
+                .client
+                .get_blob(reference, &manifest.config.digest)
+                .await?;
             self.store
                 .store_blob(&config_data, Some(&manifest.config.digest))?;
         }
@@ -97,10 +100,7 @@ impl ImagePuller {
         if layers_to_download.is_empty() {
             debug!("all layers already exist locally");
         } else {
-            info!(
-                count = layers_to_download.len(),
-                "downloading layers"
-            );
+            info!(count = layers_to_download.len(), "downloading layers");
 
             // Report layer starts.
             for layer in &layers_to_download {
@@ -129,12 +129,19 @@ impl ImagePuller {
                             let p = p.clone();
                             let digest_for_progress = digest.clone();
                             client
-                                .get_blob_by_repo(&repo, &digest, size, Some(move |downloaded, total| {
-                                    p.layer_progress(&digest_for_progress, downloaded, total);
-                                }))
+                                .get_blob_by_repo(
+                                    &repo,
+                                    &digest,
+                                    size,
+                                    Some(move |downloaded, total| {
+                                        p.layer_progress(&digest_for_progress, downloaded, total);
+                                    }),
+                                )
                                 .await?
                         } else {
-                            client.get_blob_by_repo(&repo, &digest, size, None::<fn(u64, u64)>).await?
+                            client
+                                .get_blob_by_repo(&repo, &digest, size, None::<fn(u64, u64)>)
+                                .await?
                         };
 
                         store.store_blob(&data, Some(&digest))?;
@@ -328,7 +335,10 @@ mod tests {
         // Short digest.
         assert_eq!(ConsoleProgress::short_digest("sha256:abc"), "abc");
         // No prefix.
-        assert_eq!(ConsoleProgress::short_digest("abc123def456789"), "abc123def456");
+        assert_eq!(
+            ConsoleProgress::short_digest("abc123def456789"),
+            "abc123def456"
+        );
         // Empty.
         assert_eq!(ConsoleProgress::short_digest(""), "");
         // Just prefix.

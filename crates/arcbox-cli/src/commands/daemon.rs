@@ -9,10 +9,8 @@
 use anyhow::{Context, Result};
 use arcbox_api::{
     ContainerServiceImpl, ImageServiceImpl, MachineServiceImpl, SystemServiceImpl,
-    container_service_server::ContainerServiceServer,
-    image_service_server::ImageServiceServer,
-    machine_service_server::MachineServiceServer,
-    system_service_server::SystemServiceServer,
+    container_service_server::ContainerServiceServer, image_service_server::ImageServiceServer,
+    machine_service_server::MachineServiceServer, system_service_server::SystemServiceServer,
 };
 use arcbox_core::{Config, Runtime};
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
@@ -28,9 +26,9 @@ use tracing::{info, warn};
 /// Arguments for the daemon command.
 #[derive(Debug, Args)]
 pub struct DaemonArgs {
-    /// Unix socket path for Docker API.
-    #[arg(long, default_value = "/var/run/arcbox.sock")]
-    pub socket: PathBuf,
+    /// Unix socket path for Docker API (default: ~/.arcbox/docker.sock).
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
 
     /// Unix socket path for gRPC API (desktop/GUI clients).
     #[arg(long)]
@@ -67,9 +65,12 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
             .map(|h| h.join(".arcbox"))
             .unwrap_or_else(|| PathBuf::from("/var/lib/arcbox"))
     });
+    let socket_path = args.socket.unwrap_or_else(|| data_dir.join("docker.sock"));
 
     // Determine gRPC socket path (defaults to same directory as data_dir).
-    let grpc_socket = args.grpc_socket.unwrap_or_else(|| data_dir.join("arcbox.sock"));
+    let grpc_socket = args
+        .grpc_socket
+        .unwrap_or_else(|| data_dir.join("arcbox.sock"));
 
     // Create configuration.
     let config = Config {
@@ -89,15 +90,18 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
     // Initialize runtime with custom VM lifecycle config.
     let runtime = Arc::new(
         Runtime::with_vm_lifecycle_config(config, vm_lifecycle_config)
-            .context("Failed to create runtime")?
+            .context("Failed to create runtime")?,
     );
-    runtime.init().await.context("Failed to initialize runtime")?;
+    runtime
+        .init()
+        .await
+        .context("Failed to initialize runtime")?;
 
     info!(data_dir = %data_dir.display(), "Runtime initialized");
 
     // Configure Docker API server.
     let server_config = ServerConfig {
-        socket_path: args.socket.clone(),
+        socket_path: socket_path.clone(),
     };
 
     let docker_server = DockerApiServer::new(server_config, Arc::clone(&runtime));
@@ -114,7 +118,7 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
 
     // Enable Docker CLI integration if requested.
     if args.docker_integration {
-        match DockerContextManager::new(args.socket.clone()) {
+        match DockerContextManager::new(socket_path.clone()) {
             Ok(ctx_manager) => {
                 if let Err(e) = ctx_manager.enable() {
                     warn!("Failed to enable Docker integration: {}", e);
@@ -130,7 +134,7 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
 
     // Print startup info.
     println!("ArcBox daemon started");
-    println!("  Docker API: {}", args.socket.display());
+    println!("  Docker API: {}", socket_path.display());
     println!("  gRPC API:   {}", grpc_socket.display());
     println!("  Data:       {}", data_dir.display());
     println!();
@@ -148,11 +152,14 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
     docker_handle.abort();
     grpc_handle.abort();
 
-    runtime.shutdown().await.context("Failed to shutdown runtime")?;
+    runtime
+        .shutdown()
+        .await
+        .context("Failed to shutdown runtime")?;
 
     // Disable Docker integration if it was enabled.
     if args.docker_integration {
-        if let Ok(ctx_manager) = DockerContextManager::new(args.socket) {
+        if let Ok(ctx_manager) = DockerContextManager::new(socket_path) {
             let _ = ctx_manager.disable();
         }
     }
@@ -175,8 +182,10 @@ async fn start_grpc_server(
     }
 
     // Bind Unix socket.
-    let listener = UnixListener::bind(&socket_path)
-        .context(format!("Failed to bind gRPC socket: {}", socket_path.display()))?;
+    let listener = UnixListener::bind(&socket_path).context(format!(
+        "Failed to bind gRPC socket: {}",
+        socket_path.display()
+    ))?;
     let incoming = UnixListenerStream::new(listener);
 
     info!(socket = %socket_path.display(), "gRPC server listening");

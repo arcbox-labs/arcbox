@@ -22,9 +22,16 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            socket_path: PathBuf::from("/var/run/arcbox-docker.sock"),
+            socket_path: default_socket_path(),
         }
     }
+}
+
+fn default_socket_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".arcbox")
+        .join("docker.sock")
 }
 
 /// Docker API server.

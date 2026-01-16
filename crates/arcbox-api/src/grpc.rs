@@ -1,22 +1,22 @@
 //! gRPC service implementations.
 
 use crate::generated::{
-    container_service_server, image_service_server, machine_service_server, network_service_server,
-    system_service_server, ContainerLogsRequest, ContainerState as ProtoContainerState,
-    ContainerSummary, CreateContainerRequest, CreateContainerResponse, CreateMachineRequest,
-    CreateMachineResponse, CreateNetworkRequest, CreateNetworkResponse, ExecContainerRequest,
-    ExecMachineRequest, ExecOutput, GetInfoRequest, GetInfoResponse, GetVersionRequest,
-    GetVersionResponse, InspectContainerRequest, InspectContainerResponse, InspectImageRequest,
-    InspectImageResponse, InspectMachineRequest, InspectMachineResponse, InspectNetworkRequest,
-    InspectNetworkResponse, ListContainersRequest, ListContainersResponse, ListImagesRequest,
-    ListImagesResponse, ListMachinesRequest, ListMachinesResponse, ListNetworksRequest,
-    ListNetworksResponse, LogEntry, MachineSummary, Mount, NetworkSummary, PingRequest,
-    PingResponse, PortBinding, PullImageRequest, PullProgress, RemoveContainerRequest,
-    RemoveContainerResponse, RemoveImageRequest, RemoveImageResponse, RemoveMachineRequest,
-    RemoveMachineResponse, RemoveNetworkRequest, RemoveNetworkResponse, ShellInput, ShellOutput,
-    StartContainerRequest, StartContainerResponse, StartMachineRequest, StartMachineResponse,
-    StopContainerRequest, StopContainerResponse, StopMachineRequest, StopMachineResponse,
-    TagImageRequest, TagImageResponse, WaitContainerRequest, WaitContainerResponse,
+    ContainerLogsRequest, ContainerState as ProtoContainerState, ContainerSummary,
+    CreateContainerRequest, CreateContainerResponse, CreateMachineRequest, CreateMachineResponse,
+    CreateNetworkRequest, CreateNetworkResponse, ExecContainerRequest, ExecMachineRequest,
+    ExecOutput, GetInfoRequest, GetInfoResponse, GetVersionRequest, GetVersionResponse,
+    InspectContainerRequest, InspectContainerResponse, InspectImageRequest, InspectImageResponse,
+    InspectMachineRequest, InspectMachineResponse, InspectNetworkRequest, InspectNetworkResponse,
+    ListContainersRequest, ListContainersResponse, ListImagesRequest, ListImagesResponse,
+    ListMachinesRequest, ListMachinesResponse, ListNetworksRequest, ListNetworksResponse, LogEntry,
+    MachineSummary, Mount, NetworkSummary, PingRequest, PingResponse, PortBinding,
+    PullImageRequest, PullProgress, RemoveContainerRequest, RemoveContainerResponse,
+    RemoveImageRequest, RemoveImageResponse, RemoveMachineRequest, RemoveMachineResponse,
+    RemoveNetworkRequest, RemoveNetworkResponse, ShellInput, ShellOutput, StartContainerRequest,
+    StartContainerResponse, StartMachineRequest, StartMachineResponse, StopContainerRequest,
+    StopContainerResponse, StopMachineRequest, StopMachineResponse, TagImageRequest,
+    TagImageResponse, WaitContainerRequest, WaitContainerResponse, container_service_server,
+    image_service_server, machine_service_server, network_service_server, system_service_server,
 };
 use arcbox_container::{ContainerConfig, ContainerId, ContainerState};
 use arcbox_core::Runtime;
@@ -1015,12 +1015,7 @@ impl system_service_server::SystemService for SystemServiceImpl {
             arch: std::env::consts::ARCH.to_string(),
             mem_total: total_memory(),
             ncpu: num_cpus(),
-            data_dir: self
-                .runtime
-                .config()
-                .data_dir
-                .to_string_lossy()
-                .to_string(),
+            data_dir: self.runtime.config().data_dir.to_string_lossy().to_string(),
         }))
     }
 
@@ -1042,10 +1037,7 @@ impl system_service_server::SystemService for SystemServiceImpl {
         }))
     }
 
-    async fn ping(
-        &self,
-        _request: Request<PingRequest>,
-    ) -> Result<Response<PingResponse>, Status> {
+    async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         Ok(Response::new(PingResponse {
             api_version: "1.0.0".to_string(),
         }))
@@ -1195,11 +1187,7 @@ fn total_memory() -> i64 {
             )
         };
 
-        if ret == 0 {
-            size as i64
-        } else {
-            0
-        }
+        if ret == 0 { size as i64 } else { 0 }
     }
 
     #[cfg(target_os = "linux")]

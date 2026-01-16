@@ -41,14 +41,10 @@ pub use arcbox_virtio as virtio;
 /// Prelude module for common imports.
 pub mod prelude {
     // Hypervisor traits
-    pub use crate::hypervisor::{
-        GuestMemory, Hypervisor, Vcpu, VirtualMachine,
-    };
+    pub use crate::hypervisor::{GuestMemory, Hypervisor, Vcpu, VirtualMachine};
 
     // Common types
-    pub use crate::hypervisor::{
-        GuestAddress, HypervisorError, VcpuExit, VmConfig,
-    };
+    pub use crate::hypervisor::{GuestAddress, HypervisorError, VcpuExit, VmConfig};
 
     // TODO: uncomment after publishing vmm
     // pub use crate::vmm::{Vmm, VmmConfig};

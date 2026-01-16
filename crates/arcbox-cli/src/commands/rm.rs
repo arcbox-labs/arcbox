@@ -1,7 +1,7 @@
 //! Rm (remove container) command implementation.
 
-use arcbox_cli::client;
 use anyhow::Result;
+use arcbox_cli::client;
 use clap::Args;
 
 /// Arguments for the rm command.

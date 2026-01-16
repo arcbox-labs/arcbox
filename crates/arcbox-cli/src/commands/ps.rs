@@ -1,7 +1,7 @@
 //! Ps (list containers) command implementation.
 
-use arcbox_cli::client::{self, ContainerSummary};
 use anyhow::Result;
+use arcbox_cli::client::{self, ContainerSummary};
 use clap::Args;
 
 /// Arguments for the ps command.

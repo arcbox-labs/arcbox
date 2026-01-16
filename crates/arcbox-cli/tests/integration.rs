@@ -8,13 +8,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Json;
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::Json;
-use axum::Router;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use tokio::net::UnixListener;
@@ -202,10 +202,7 @@ async fn create_container(
     )
 }
 
-async fn start_container(
-    State(state): State<SharedState>,
-    Path(id): Path<String>,
-) -> StatusCode {
+async fn start_container(State(state): State<SharedState>, Path(id): Path<String>) -> StatusCode {
     let mut state = state.write().await;
     if let Some(container) = state.containers.get_mut(&id) {
         container.state = "running".to_string();
@@ -216,10 +213,7 @@ async fn start_container(
     }
 }
 
-async fn stop_container(
-    State(state): State<SharedState>,
-    Path(id): Path<String>,
-) -> StatusCode {
+async fn stop_container(State(state): State<SharedState>, Path(id): Path<String>) -> StatusCode {
     let mut state = state.write().await;
     if let Some(container) = state.containers.get_mut(&id) {
         container.state = "exited".to_string();
@@ -231,10 +225,7 @@ async fn stop_container(
     }
 }
 
-async fn remove_container(
-    State(state): State<SharedState>,
-    Path(id): Path<String>,
-) -> StatusCode {
+async fn remove_container(State(state): State<SharedState>, Path(id): Path<String>) -> StatusCode {
     let mut state = state.write().await;
     if state.containers.remove(&id).is_some() {
         StatusCode::NO_CONTENT
@@ -390,8 +381,7 @@ async fn start_mock_server(socket_path: PathBuf) -> SharedState {
                     tokio::spawn(async move {
                         let io = hyper_util::rt::TokioIo::new(stream);
                         // Use hyper_util's TowerToHyperService to adapt axum Router.
-                        let service =
-                            hyper_util::service::TowerToHyperService::new(router);
+                        let service = hyper_util::service::TowerToHyperService::new(router);
                         if let Err(e) = hyper::server::conn::http1::Builder::new()
                             .serve_connection(io, service)
                             .await
@@ -461,7 +451,10 @@ mod client_tests {
             "Cmd": ["echo", "hello"]
         });
         let response: serde_json::Value = client
-            .post("/v1.43/containers/create?name=test-container", Some(&create_req))
+            .post(
+                "/v1.43/containers/create?name=test-container",
+                Some(&create_req),
+            )
             .await
             .unwrap();
 
@@ -669,7 +662,7 @@ mod client_tests {
 }
 
 mod helper_tests {
-    use arcbox_cli::client::{short_id, truncate, relative_time};
+    use arcbox_cli::client::{relative_time, short_id, truncate};
 
     #[test]
     fn test_short_id() {
@@ -684,7 +677,10 @@ mod helper_tests {
     #[test]
     fn test_truncate() {
         assert_eq!(truncate("hello world", 20), "hello world");
-        assert_eq!(truncate("hello world this is a long string", 15), "hello world ...");
+        assert_eq!(
+            truncate("hello world this is a long string", 15),
+            "hello world ..."
+        );
         assert_eq!(truncate("hi", 10), "hi");
         assert_eq!(truncate("", 10), "");
     }

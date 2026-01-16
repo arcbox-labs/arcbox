@@ -159,12 +159,7 @@ pub trait ExecAgentConnection: Send + Sync {
     async fn exec_start(&self, params: ExecStartParams) -> Result<ExecStartResult, String>;
 
     /// Resizes an exec instance's TTY.
-    async fn exec_resize(
-        &self,
-        exec_id: &str,
-        width: u32,
-        height: u32,
-    ) -> Result<(), String>;
+    async fn exec_resize(&self, exec_id: &str, width: u32, height: u32) -> Result<(), String>;
 }
 
 /// Exec manager.

@@ -228,8 +228,6 @@ pub type ProgressCallback = Box<dyn Fn(DownloadProgress) + Send + Sync>;
 pub struct BootAssetProvider {
     /// Configuration.
     config: BootAssetConfig,
-    /// HTTP client for downloads.
-    client: reqwest::Client,
 }
 
 impl BootAssetProvider {
@@ -240,13 +238,20 @@ impl BootAssetProvider {
 
     /// Creates a new boot asset provider with custom configuration.
     pub fn with_config(config: BootAssetConfig) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
-            .user_agent(format!("arcbox/{}", BOOT_ASSET_VERSION))
-            .build()
-            .expect("failed to create HTTP client");
+        Self {
+            config,
+        }
+    }
 
-        Self { config, client }
+    fn build_http_client(&self) -> Result<reqwest::Client> {
+        let builder = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
+            .user_agent(format!("arcbox/{}", BOOT_ASSET_VERSION));
+
+        builder
+            .build()
+            .map_err(|e| CoreError::Config(format!("failed to create HTTP client: {}", e)))
     }
 
     /// Sets custom kernel path.
@@ -374,9 +379,9 @@ impl BootAssetProvider {
         let cache_dir = self.config.version_cache_dir();
 
         // Create cache directory.
-        fs::create_dir_all(&cache_dir).await.map_err(|e| {
-            CoreError::Config(format!("failed to create cache directory: {}", e))
-        })?;
+        fs::create_dir_all(&cache_dir)
+            .await
+            .map_err(|e| CoreError::Config(format!("failed to create cache directory: {}", e)))?;
 
         // Download checksum first (if verification enabled).
         let expected_checksum = if self.config.verify_checksum {
@@ -467,10 +472,7 @@ impl BootAssetProvider {
             });
         }
 
-        tracing::info!(
-            "Boot assets downloaded to {}",
-            cache_dir.display()
-        );
+        tracing::info!("Boot assets downloaded to {}", cache_dir.display());
 
         Ok(())
     }
@@ -484,9 +486,13 @@ impl BootAssetProvider {
     ) -> Result<()> {
         tracing::info!("Downloading: {}", url);
 
-        let response = self.client.get(url).send().await.map_err(|e| {
-            CoreError::Config(format!("failed to download {}: {}", url, e))
-        })?;
+        let client = self.build_http_client()?;
+
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| CoreError::Config(format!("failed to download {}: {}", url, e)))?;
 
         if !response.status().is_success() {
             return Err(CoreError::Config(format!(
@@ -501,21 +507,19 @@ impl BootAssetProvider {
 
         // Create temporary file.
         let temp_path = dest.with_extension("tmp");
-        let mut file = tokio::fs::File::create(&temp_path).await.map_err(|e| {
-            CoreError::Config(format!("failed to create file: {}", e))
-        })?;
+        let mut file = tokio::fs::File::create(&temp_path)
+            .await
+            .map_err(|e| CoreError::Config(format!("failed to create file: {}", e)))?;
 
         // Stream download.
         let mut stream = response.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| {
-                CoreError::Config(format!("download error: {}", e))
-            })?;
+            let chunk = chunk.map_err(|e| CoreError::Config(format!("download error: {}", e)))?;
 
-            file.write_all(&chunk).await.map_err(|e| {
-                CoreError::Config(format!("write error: {}", e))
-            })?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| CoreError::Config(format!("write error: {}", e)))?;
 
             downloaded += chunk.len() as u64;
 
@@ -528,20 +532,16 @@ impl BootAssetProvider {
             }
         }
 
-        file.flush().await.map_err(|e| {
-            CoreError::Config(format!("flush error: {}", e))
-        })?;
+        file.flush()
+            .await
+            .map_err(|e| CoreError::Config(format!("flush error: {}", e)))?;
 
         // Rename to final path.
-        fs::rename(&temp_path, dest).await.map_err(|e| {
-            CoreError::Config(format!("rename error: {}", e))
-        })?;
+        fs::rename(&temp_path, dest)
+            .await
+            .map_err(|e| CoreError::Config(format!("rename error: {}", e)))?;
 
-        tracing::debug!(
-            "Downloaded {} bytes to {}",
-            downloaded,
-            dest.display()
-        );
+        tracing::debug!("Downloaded {} bytes to {}", downloaded, dest.display());
 
         Ok(())
     }
@@ -549,10 +549,13 @@ impl BootAssetProvider {
     /// Downloads and parses checksum file.
     async fn download_checksum(&self) -> Result<String> {
         let url = self.config.checksum_url();
+        let client = self.build_http_client()?;
 
-        let response = self.client.get(&url).send().await.map_err(|e| {
-            CoreError::Config(format!("failed to download checksum: {}", e))
-        })?;
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| CoreError::Config(format!("failed to download checksum: {}", e)))?;
 
         if !response.status().is_success() {
             return Err(CoreError::Config(format!(
@@ -561,9 +564,10 @@ impl BootAssetProvider {
             )));
         }
 
-        let text = response.text().await.map_err(|e| {
-            CoreError::Config(format!("failed to read checksum: {}", e))
-        })?;
+        let text = response
+            .text()
+            .await
+            .map_err(|e| CoreError::Config(format!("failed to read checksum: {}", e)))?;
 
         // Parse checksum (format: "sha256sum  filename" or just "sha256sum").
         let checksum = text
@@ -584,9 +588,9 @@ impl BootAssetProvider {
 
     /// Computes SHA256 checksum of a file.
     async fn compute_file_checksum(&self, path: &Path) -> Result<String> {
-        let data = fs::read(path).await.map_err(|e| {
-            CoreError::Config(format!("failed to read file for checksum: {}", e))
-        })?;
+        let data = fs::read(path)
+            .await
+            .map_err(|e| CoreError::Config(format!("failed to read file for checksum: {}", e)))?;
 
         let mut hasher = Sha256::new();
         hasher.update(&data);
@@ -602,16 +606,15 @@ impl BootAssetProvider {
 
         // Run extraction in blocking task.
         tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::open(&bundle_path).map_err(|e| {
-                CoreError::Config(format!("failed to open bundle: {}", e))
-            })?;
+            let file = std::fs::File::open(&bundle_path)
+                .map_err(|e| CoreError::Config(format!("failed to open bundle: {}", e)))?;
 
             let decoder = GzDecoder::new(file);
             let mut archive = Archive::new(decoder);
 
-            archive.unpack(&dest_dir).map_err(|e| {
-                CoreError::Config(format!("failed to extract bundle: {}", e))
-            })?;
+            archive
+                .unpack(&dest_dir)
+                .map_err(|e| CoreError::Config(format!("failed to extract bundle: {}", e)))?;
 
             Ok(())
         })
@@ -635,16 +638,15 @@ impl BootAssetProvider {
     /// Checks if boot assets are cached.
     pub fn is_cached(&self) -> bool {
         let cache_dir = self.config.version_cache_dir();
-        cache_dir.join(KERNEL_FILENAME).exists()
-            && cache_dir.join(INITRAMFS_FILENAME).exists()
+        cache_dir.join(KERNEL_FILENAME).exists() && cache_dir.join(INITRAMFS_FILENAME).exists()
     }
 
     /// Clears the boot asset cache.
     pub async fn clear_cache(&self) -> Result<()> {
         if self.config.cache_dir.exists() {
-            fs::remove_dir_all(&self.config.cache_dir).await.map_err(|e| {
-                CoreError::Config(format!("failed to clear cache: {}", e))
-            })?;
+            fs::remove_dir_all(&self.config.cache_dir)
+                .await
+                .map_err(|e| CoreError::Config(format!("failed to clear cache: {}", e)))?;
         }
         Ok(())
     }
@@ -657,13 +659,15 @@ impl BootAssetProvider {
             return Ok(versions);
         }
 
-        let mut entries = fs::read_dir(&self.config.cache_dir).await.map_err(|e| {
-            CoreError::Config(format!("failed to read cache dir: {}", e))
-        })?;
+        let mut entries = fs::read_dir(&self.config.cache_dir)
+            .await
+            .map_err(|e| CoreError::Config(format!("failed to read cache dir: {}", e)))?;
 
-        while let Some(entry) = entries.next_entry().await.map_err(|e| {
-            CoreError::Config(format!("failed to read cache entry: {}", e))
-        })? {
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| CoreError::Config(format!("failed to read cache entry: {}", e)))?
+        {
             let path = entry.path();
             if path.is_dir() {
                 if let Some(name) = path.file_name() {

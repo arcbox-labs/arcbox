@@ -21,7 +21,11 @@ fn test_container_lifecycle_simulation() {
     // Step 1: Create bundle.
     let bundle = BundleBuilder::new()
         .hostname("lifecycle-test")
-        .args(vec!["sh".to_string(), "-c".to_string(), "echo hello".to_string()])
+        .args(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo hello".to_string(),
+        ])
         .add_env("TEST_VAR", "test_value")
         .cwd("/")
         .user(0, 0)
@@ -192,7 +196,10 @@ fn test_hooks_integration() {
     spec.hooks = Some(Hooks {
         create_runtime: vec![
             Hook::new("/usr/bin/setup-network")
-                .with_args(vec!["setup-network".to_string(), "--type=bridge".to_string()])
+                .with_args(vec![
+                    "setup-network".to_string(),
+                    "--type=bridge".to_string(),
+                ])
                 .with_timeout(30),
         ],
         poststart: vec![
@@ -221,10 +228,7 @@ fn test_hooks_integration() {
     assert!(hooks.validate().is_ok());
 
     // Test hook context creation.
-    let state = arcbox_oci::State::new(
-        "hook-test".to_string(),
-        bundle.path().to_path_buf(),
-    );
+    let state = arcbox_oci::State::new("hook-test".to_string(), bundle.path().to_path_buf());
     let context = HookContext::new(state, bundle.path().to_path_buf());
 
     let state_json = context.state_json().unwrap();
@@ -370,7 +374,10 @@ fn test_oci_spec_complete_roundtrip() {
     spec.domainname = Some("test.local".to_string());
 
     spec.annotations = HashMap::from([
-        ("org.opencontainers.image.authors".to_string(), "Test".to_string()),
+        (
+            "org.opencontainers.image.authors".to_string(),
+            "Test".to_string(),
+        ),
         ("custom.annotation".to_string(), "value".to_string()),
     ]);
 
@@ -464,10 +471,10 @@ fn test_container_state_full_metadata() {
     // Set all metadata.
     state.name = Some("my-web-server".to_string());
     state.image = Some("nginx:alpine".to_string());
-    state.oci_state.annotations.insert(
-        "io.kubernetes.pod.name".to_string(),
-        "web-pod".to_string(),
-    );
+    state
+        .oci_state
+        .annotations
+        .insert("io.kubernetes.pod.name".to_string(), "web-pod".to_string());
 
     // Lifecycle.
     state.mark_created().unwrap();
@@ -483,5 +490,10 @@ fn test_container_state_full_metadata() {
     assert_eq!(loaded.status(), Status::Running);
     assert_eq!(loaded.oci_state.pid, Some(54321));
     assert!(loaded.started.is_some());
-    assert!(loaded.oci_state.annotations.contains_key("io.kubernetes.pod.name"));
+    assert!(
+        loaded
+            .oci_state
+            .annotations
+            .contains_key("io.kubernetes.pod.name")
+    );
 }

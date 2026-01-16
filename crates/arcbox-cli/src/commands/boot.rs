@@ -121,11 +121,7 @@ async fn status(data_dir: PathBuf) -> anyhow::Result<()> {
 
         if kernel.exists() {
             let meta = std::fs::metadata(&kernel)?;
-            println!(
-                "  Kernel:    {} ({} bytes)",
-                kernel.display(),
-                meta.len()
-            );
+            println!("  Kernel:    {} ({} bytes)", kernel.display(), meta.len());
         }
 
         if initramfs.exists() {

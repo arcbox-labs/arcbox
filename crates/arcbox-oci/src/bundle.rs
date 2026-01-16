@@ -332,7 +332,7 @@ impl BundleBuilder {
 
 /// Utilities for working with bundles.
 pub mod utils {
-    use super::{paths, OciError, Result};
+    use super::{OciError, Result, paths};
     use std::path::{Path, PathBuf};
 
     /// Check if a directory is a valid OCI bundle.
@@ -643,7 +643,11 @@ mod tests {
 
         let bundle = BundleBuilder::new()
             .hostname("full-test")
-            .args(vec!["nginx".to_string(), "-g".to_string(), "daemon off;".to_string()])
+            .args(vec![
+                "nginx".to_string(),
+                "-g".to_string(),
+                "daemon off;".to_string(),
+            ])
             .env(vec!["PATH=/usr/bin".to_string()])
             .add_env("NGINX_HOST", "localhost")
             .cwd("/var/www")

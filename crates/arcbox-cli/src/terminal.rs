@@ -6,9 +6,9 @@
 use anyhow::{Context, Result};
 use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode};
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 /// Terminal size (width x height).
@@ -57,7 +57,7 @@ impl ResizeWatcher {
     /// Creates a new resize watcher that monitors SIGWINCH signals.
     #[cfg(unix)]
     pub fn new() -> Result<Self> {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let (tx, rx) = mpsc::unbounded_channel();
         let shutdown = Arc::new(AtomicBool::new(false));

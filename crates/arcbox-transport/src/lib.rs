@@ -33,7 +33,7 @@ pub mod error;
 pub mod unix;
 pub mod vsock;
 
-pub use error::{TransportError, Result};
+pub use error::{Result, TransportError};
 pub use unix::UnixTransport;
 pub use vsock::VsockTransport;
 

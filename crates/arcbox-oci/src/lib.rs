@@ -82,7 +82,7 @@ pub mod state;
 pub use bundle::{Bundle, BundleBuilder};
 pub use config::{
     Capabilities, ConsoleSize, CpuResources, Device, IdMapping, Linux, MemoryResources, Mount,
-    Namespace, NamespaceType, Process, Resources, Rlimit, Root, Seccomp, Spec, User, OCI_VERSION,
+    Namespace, NamespaceType, OCI_VERSION, Process, Resources, Rlimit, Root, Seccomp, Spec, User,
 };
 pub use error::{OciError, Result};
 pub use hooks::{Hook, HookContext, HookResult, HookType, Hooks};

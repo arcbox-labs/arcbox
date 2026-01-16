@@ -146,9 +146,10 @@ impl ContainerManager {
 
         // Send start command to agent if connected.
         if let Some(ref agent) = self.agent {
-            agent.start_container(id.as_str()).await.map_err(|e| {
-                ContainerError::Runtime(format!("agent start failed: {}", e))
-            })?;
+            agent
+                .start_container(id.as_str())
+                .await
+                .map_err(|e| ContainerError::Runtime(format!("agent start failed: {}", e)))?;
         }
 
         // Update local state after successful agent call.
@@ -198,9 +199,10 @@ impl ContainerManager {
 
         // Send stop command to agent if connected.
         if let Some(ref agent) = self.agent {
-            agent.stop_container(id.as_str(), timeout).await.map_err(|e| {
-                ContainerError::Runtime(format!("agent stop failed: {}", e))
-            })?;
+            agent
+                .stop_container(id.as_str(), timeout)
+                .await
+                .map_err(|e| ContainerError::Runtime(format!("agent stop failed: {}", e)))?;
         }
 
         // Update local state after successful agent call.
@@ -246,9 +248,10 @@ impl ContainerManager {
 
         // Send kill command to agent if connected.
         if let Some(ref agent) = self.agent {
-            agent.kill_container(id.as_str(), signal).await.map_err(|e| {
-                ContainerError::Runtime(format!("agent kill failed: {}", e))
-            })?;
+            agent
+                .kill_container(id.as_str(), signal)
+                .await
+                .map_err(|e| ContainerError::Runtime(format!("agent kill failed: {}", e)))?;
         }
 
         // Update local state after successful agent call.
@@ -344,10 +347,13 @@ impl ContainerManager {
     pub async fn wait_async(&self, id: &ContainerId) -> Result<i32> {
         // First check if already exited.
         {
-            let containers = self.containers.read()
+            let containers = self
+                .containers
+                .read()
                 .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
 
-            let container = containers.get(id)
+            let container = containers
+                .get(id)
                 .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
 
             match container.state {
@@ -361,7 +367,9 @@ impl ContainerManager {
         // If we have an agent, ask it to wait for the container.
         // This is the primary mechanism for knowing when a container exits.
         if let Some(ref agent) = self.agent {
-            let exit_code = agent.wait_container(&id.to_string()).await
+            let exit_code = agent
+                .wait_container(&id.to_string())
+                .await
                 .map_err(|e| ContainerError::Runtime(format!("agent wait failed: {}", e)))?;
 
             // Update container state.
@@ -378,7 +386,9 @@ impl ContainerManager {
         loop {
             // Check again in case it exited between our check and subscribe.
             {
-                let containers = self.containers.read()
+                let containers = self
+                    .containers
+                    .read()
                     .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
 
                 if let Some(container) = containers.get(&target_id) {

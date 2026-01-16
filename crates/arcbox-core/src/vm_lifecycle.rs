@@ -29,10 +29,11 @@
 
 use crate::boot_assets::{BootAssetConfig, BootAssetProvider, BootAssets};
 use crate::error::{CoreError, Result};
+use crate::event::{Event, EventBus};
 use crate::machine::{MachineConfig, MachineInfo, MachineManager, MachineState};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -99,7 +100,10 @@ impl VmLifecycleState {
     /// Returns true if VM needs to be started.
     #[must_use]
     pub fn needs_start(&self) -> bool {
-        matches!(self, Self::NotExist | Self::Created | Self::Stopped | Self::Failed)
+        matches!(
+            self,
+            Self::NotExist | Self::Created | Self::Stopped | Self::Failed
+        )
     }
 
     /// Returns the state name for logging.
@@ -400,7 +404,7 @@ impl RecoveryPolicy {
 /// ## Usage
 ///
 /// ```ignore
-/// let manager = VmLifecycleManager::new(machine_manager, config);
+/// let manager = VmLifecycleManager::new(machine_manager, event_bus, data_dir, config);
 ///
 /// // Ensure VM is ready before any container operation
 /// let agent = manager.ensure_ready().await?;
@@ -411,6 +415,8 @@ impl RecoveryPolicy {
 pub struct VmLifecycleManager {
     /// Machine manager for VM operations.
     machine_manager: Arc<MachineManager>,
+    /// Event bus.
+    event_bus: EventBus,
     /// Current lifecycle state.
     state: RwLock<VmLifecycleState>,
     /// Health monitor.
@@ -431,6 +437,7 @@ impl VmLifecycleManager {
     /// Creates a new VM lifecycle manager.
     pub fn new(
         machine_manager: Arc<MachineManager>,
+        event_bus: EventBus,
         data_dir: PathBuf,
         config: VmLifecycleConfig,
     ) -> Self {
@@ -457,6 +464,7 @@ impl VmLifecycleManager {
 
         Self {
             machine_manager,
+            event_bus,
             state: RwLock::new(initial_state),
             health_monitor,
             boot_assets,
@@ -559,6 +567,9 @@ impl VmLifecycleManager {
             match self.create_default_machine().await {
                 Ok(()) => {
                     *self.state.write().await = VmLifecycleState::Created;
+                    self.event_bus.publish(Event::MachineCreated {
+                        name: DEFAULT_MACHINE_NAME.to_string(),
+                    });
                 }
                 Err(e) => {
                     *self.state.write().await = VmLifecycleState::Failed;
@@ -577,6 +588,9 @@ impl VmLifecycleManager {
                 Ok(()) => {
                     tracing::info!("Default VM started successfully");
                     *self.state.write().await = VmLifecycleState::Running;
+                    self.event_bus.publish(Event::MachineStarted {
+                        name: DEFAULT_MACHINE_NAME.to_string(),
+                    });
                     return Ok(());
                 }
                 Err(e) => {
@@ -618,7 +632,12 @@ impl VmLifecycleManager {
             disk_gb: self.config.default_vm.disk_gb,
             kernel: Some(assets.kernel.to_string_lossy().to_string()),
             initrd: Some(assets.initramfs.to_string_lossy().to_string()),
-            cmdline: self.config.default_vm.cmdline.clone().or(Some(assets.cmdline)),
+            cmdline: self
+                .config
+                .default_vm
+                .cmdline
+                .clone()
+                .or(Some(assets.cmdline)),
         };
 
         tracing::info!(
@@ -709,6 +728,9 @@ impl VmLifecycleManager {
             Ok(()) => {
                 *self.state.write().await = VmLifecycleState::Stopped;
                 tracing::info!("Default VM stopped");
+                self.event_bus.publish(Event::MachineStopped {
+                    name: DEFAULT_MACHINE_NAME.to_string(),
+                });
                 Ok(())
             }
             Err(e) => {
@@ -732,6 +754,9 @@ impl VmLifecycleManager {
         let _ = self.machine_manager.remove(DEFAULT_MACHINE_NAME, true);
 
         *self.state.write().await = VmLifecycleState::NotExist;
+        self.event_bus.publish(Event::MachineStopped {
+            name: DEFAULT_MACHINE_NAME.to_string(),
+        });
 
         Ok(())
     }

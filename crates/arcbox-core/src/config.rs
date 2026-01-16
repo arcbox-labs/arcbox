@@ -25,15 +25,15 @@
 //! dns = ["8.8.8.8", "8.8.4.4"]
 //!
 //! [docker]
-//! socket_path = "/var/run/arcbox-docker.sock"
+//! socket_path = "~/.arcbox/docker.sock"
 //!
 //! [logging]
 //! level = "info"
 //! ```
 
 use figment::{
-    providers::{Env, Format, Serialized, Toml},
     Figment,
+    providers::{Env, Format, Serialized, Toml},
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -222,10 +222,17 @@ pub struct DockerConfig {
 impl Default for DockerConfig {
     fn default() -> Self {
         Self {
-            socket_path: PathBuf::from("/var/run/arcbox-docker.sock"),
+            socket_path: default_docker_socket_path(),
             enabled: true,
         }
     }
+}
+
+fn default_docker_socket_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".arcbox")
+        .join("docker.sock")
 }
 
 /// Logging configuration.

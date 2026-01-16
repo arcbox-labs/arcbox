@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use arcbox_image::{pull::ConsoleProgress, ImageRef, ImageStore, RegistryClient};
+use arcbox_image::{ImageRef, ImageStore, RegistryClient, pull::ConsoleProgress};
 use clap::Args;
 
 use crate::client::DaemonClient;

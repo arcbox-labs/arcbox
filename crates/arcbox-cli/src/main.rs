@@ -33,8 +33,7 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| filter.into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
         )
         .with(tracing_subscriber::fmt::layer().with_target(false))
         .init();
@@ -82,10 +81,8 @@ async fn execute_info() -> Result<()> {
         println!("Containers: {}", containers.len());
 
         // Get image count
-        let images: Vec<client::ImageSummary> = daemon
-            .get("/v1.43/images/json")
-            .await
-            .unwrap_or_default();
+        let images: Vec<client::ImageSummary> =
+            daemon.get("/v1.43/images/json").await.unwrap_or_default();
         println!("Images: {}", images.len());
 
         // Get machine count from Runtime

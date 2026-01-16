@@ -64,7 +64,9 @@ mod tests {
             .unwrap();
 
         // Verify the machine exists.
-        let machine = machine_manager.get("test-mock").expect("machine should exist");
+        let machine = machine_manager
+            .get("test-mock")
+            .expect("machine should exist");
         assert_eq!(machine.name, "test-mock");
         assert_eq!(machine.cid, Some(42));
         assert_eq!(machine.state, MachineState::Running);
@@ -353,7 +355,7 @@ impl MachineManager {
     /// Returns an error if the machine is not found, not running, or connection fails.
     #[cfg(target_os = "macos")]
     pub fn connect_agent(&self, name: &str) -> Result<crate::agent_client::AgentClient> {
-        use crate::agent_client::{AgentClient, AGENT_PORT};
+        use crate::agent_client::{AGENT_PORT, AgentClient};
 
         let machines = self
             .machines

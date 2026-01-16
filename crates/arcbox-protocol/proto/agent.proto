@@ -45,6 +45,9 @@ service AgentService {
     // Executes a command.
     rpc Exec(ExecRequest) returns (stream ExecOutput);
 
+    // Attaches to a running container for interactive I/O.
+    rpc Attach(AttachRequest) returns (stream AttachOutput);
+
     // Gets container stats.
     rpc Stats(StatsRequest) returns (stream ContainerStats);
 
@@ -257,6 +260,24 @@ message ExecStartRequest {
     uint32 tty_height = 10;
 }
 
+// Attach request for container interactive session.
+message AttachRequest {
+    // Container ID to attach to.
+    string container_id = 1;
+    // Attach stdin.
+    bool attach_stdin = 2;
+    // Attach stdout.
+    bool attach_stdout = 3;
+    // Attach stderr.
+    bool attach_stderr = 4;
+    // Terminal width for TTY containers.
+    uint32 tty_width = 5;
+    // Terminal height for TTY containers.
+    uint32 tty_height = 6;
+    // Exec session ID when attaching to an exec.
+    string exec_id = 7;
+}
+
 // Exec start response.
 message ExecStartResponse {
     // Process ID in guest.
@@ -271,6 +292,26 @@ message ExecResizeRequest {
     uint32 width = 2;
     // New terminal height.
     uint32 height = 3;
+}
+
+// Attach input for stdin/resizes.
+message AttachInput {
+    // Raw input data for the container.
+    bytes data = 1;
+    // Resize flag.
+    bool resize = 2;
+    // New terminal width (when resize=true).
+    uint32 width = 3;
+    // New terminal height (when resize=true).
+    uint32 height = 4;
+}
+
+// Attach output for stdout/stderr.
+message AttachOutput {
+    // Stream name: stdout/stderr.
+    string stream = 1;
+    // Output data chunk.
+    bytes data = 2;
 }
 
 // Request for container stats.

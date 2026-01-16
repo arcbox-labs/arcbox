@@ -72,7 +72,6 @@ use bytes::Bytes;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-
 /// Default port for ArcBox agent communication.
 pub const DEFAULT_AGENT_PORT: u32 = 10000;
 
@@ -118,8 +117,8 @@ impl VsockAddr {
 mod linux {
     use super::*;
     use nix::sys::socket::{
-        accept, bind, connect, listen, socket, AddressFamily, Backlog, SockFlag, SockType,
-        SockaddrLike,
+        AddressFamily, Backlog, SockFlag, SockType, SockaddrLike, accept, bind, connect, listen,
+        socket,
     };
     use std::mem;
 
@@ -168,8 +167,9 @@ mod linux {
             if flags < 0 {
                 return Err(TransportError::Io(std::io::Error::last_os_error()));
             }
-            let result =
-                unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            let result = unsafe {
+                libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+            };
             if result < 0 {
                 return Err(TransportError::Io(std::io::Error::last_os_error()));
             }

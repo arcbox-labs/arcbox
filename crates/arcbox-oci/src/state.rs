@@ -497,8 +497,14 @@ mod tests {
 
     #[test]
     fn test_status_valid_transitions() {
-        assert_eq!(Status::Creating.valid_transitions(), vec!["created", "stopped"]);
-        assert_eq!(Status::Created.valid_transitions(), vec!["running", "stopped"]);
+        assert_eq!(
+            Status::Creating.valid_transitions(),
+            vec!["created", "stopped"]
+        );
+        assert_eq!(
+            Status::Created.valid_transitions(),
+            vec!["running", "stopped"]
+        );
         assert_eq!(Status::Running.valid_transitions(), vec!["stopped"]);
         assert!(Status::Stopped.valid_transitions().is_empty());
     }
@@ -529,8 +535,12 @@ mod tests {
         let mut state = State::new("test".to_string(), PathBuf::from("/bundle"));
         assert!(state.annotations.is_empty());
 
-        state.annotations.insert("key1".to_string(), "value1".to_string());
-        state.annotations.insert("key2".to_string(), "value2".to_string());
+        state
+            .annotations
+            .insert("key1".to_string(), "value1".to_string());
+        state
+            .annotations
+            .insert("key2".to_string(), "value2".to_string());
 
         assert_eq!(state.annotations.len(), 2);
         assert_eq!(state.annotations.get("key1"), Some(&"value1".to_string()));
@@ -761,7 +771,9 @@ mod tests {
     fn test_state_json_roundtrip() {
         let mut state = State::new("roundtrip-test".to_string(), PathBuf::from("/bundle"));
         state.pid = Some(12345);
-        state.annotations.insert("test.key".to_string(), "test.value".to_string());
+        state
+            .annotations
+            .insert("test.key".to_string(), "test.value".to_string());
 
         let json = state.to_json().unwrap();
         let parsed: State = serde_json::from_str(&json).unwrap();
