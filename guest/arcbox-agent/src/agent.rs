@@ -15,25 +15,31 @@ pub const AGENT_PORT: u32 = 1024;
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::HashMap;
+    use std::os::unix::io::AsRawFd;
+    use std::process::Stdio;
     use std::sync::Arc;
 
     use anyhow::{Context, Result};
-    use tokio::io::{AsyncRead, AsyncWrite};
-    use tokio::sync::{mpsc, Mutex, RwLock};
-    use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
+    use prost::Message;
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+    use tokio::process::{Child, ChildStdin, Command};
+    use tokio::sync::{Mutex, RwLock, mpsc};
+    use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
 
     use super::AGENT_PORT;
-    use crate::container::{ContainerHandle, ContainerRuntime, ContainerState, MountSpec};
-    use crate::log_watcher::{watch_log_file, LogWatchOptions};
-    use crate::pty::ExecSession;
+    use crate::container::{ContainerHandle, ContainerRuntime, ContainerState, MountSpec, setup_container_rootfs};
+    use crate::log_watcher::{LogWatchOptions, watch_log_file};
+    use crate::pty::{ExecSession, PtyHandle};
     use crate::rpc::{
-        parse_request, read_message, write_response, ErrorResponse, RpcRequest, RpcResponse,
-        AGENT_VERSION,
+        AGENT_VERSION, ErrorResponse, MessageType, RpcRequest, RpcResponse, parse_request,
+        read_message, write_response,
     };
+    use crate::shim::{BroadcastWriter, ProcessShim, StreamType};
 
     use arcbox_protocol::agent::{
-        ContainerInfo, CreateContainerResponse, ExecOutput, ExecStartResponse,
-        ListContainersResponse, LogEntry, LogsRequest, PingResponse, SystemInfo,
+        AttachInput, AttachOutput, AttachRequest, ContainerInfo, CreateContainerResponse,
+        ExecOutput, ExecStartResponse, ListContainersResponse, LogEntry, LogsRequest, PingResponse,
+        SystemInfo,
     };
     use chrono::{DateTime, Utc};
 
@@ -41,15 +47,15 @@ mod linux {
     pub struct AgentState {
         /// Container runtime.
         pub runtime: Arc<Mutex<ContainerRuntime>>,
-        /// Active exec sessions by ID.
-        pub exec_sessions: HashMap<String, ExecSession>,
+        /// Active exec processes by ID.
+        pub exec_processes: HashMap<String, Arc<Mutex<ExecProcess>>>,
     }
 
     impl AgentState {
         pub fn new() -> Self {
             Self {
                 runtime: Arc::new(Mutex::new(ContainerRuntime::new())),
-                exec_sessions: HashMap::new(),
+                exec_processes: HashMap::new(),
             }
         }
     }
@@ -66,6 +72,38 @@ mod linux {
         Single(RpcResponse),
         /// Streaming response (for logs follow=true).
         Stream(mpsc::Receiver<LogEntry>, mpsc::Sender<()>),
+        /// Interactive attach session (bidirectional).
+        Attach(AttachSession),
+    }
+
+    /// Attach session wiring for bidirectional streaming.
+    struct AttachSession {
+        /// Output stream from container.
+        output_rx: mpsc::Receiver<AttachOutput>,
+        /// Target process handle for stdin/resize.
+        process: AttachTarget,
+        /// Whether stdin is allowed.
+        attach_stdin: bool,
+        /// Whether container is TTY.
+        tty: bool,
+        /// Optional initial resize (cols, rows).
+        initial_size: Option<(u16, u16)>,
+    }
+
+    /// Attach target (container or exec process).
+    enum AttachTarget {
+        Container(Arc<Mutex<crate::container::ProcessHandle>>),
+        Exec(Arc<Mutex<ExecProcess>>),
+    }
+
+    /// Exec process handle for streaming.
+    struct ExecProcess {
+        child: Option<Child>,
+        pid: u32,
+        stdin: Option<ChildStdin>,
+        pty: Option<PtyHandle>,
+        broadcaster: Arc<BroadcastWriter>,
+        tty: bool,
     }
 
     struct ParsedLogLine {
@@ -213,15 +251,77 @@ mod linux {
                         }
                     }
                 }
+                RequestResult::Attach(mut session) => {
+                    // Apply initial resize if requested.
+                    if let (true, Some((cols, rows))) = (session.tty, session.initial_size) {
+                        match &session.process {
+                            AttachTarget::Container(handle) => {
+                                if let Some(pty_handle) = handle.lock().await.pty.as_ref() {
+                                    if let Err(e) = pty_handle.resize(cols, rows) {
+                                        tracing::warn!("Attach initial resize failed: {}", e);
+                                    }
+                                }
+                            }
+                            AttachTarget::Exec(handle) => {
+                                if let Some(pty_handle) = handle.lock().await.pty.as_ref() {
+                                    if let Err(e) = pty_handle.resize(cols, rows) {
+                                        tracing::warn!("Attach initial resize failed: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    loop {
+                        tokio::select! {
+                            maybe_out = session.output_rx.recv() => {
+                                match maybe_out {
+                                    Some(out) => {
+                                        let response = RpcResponse::AttachOutput(out);
+                                        if let Err(e) = write_response(&mut stream, &response).await {
+                                            tracing::debug!("Client disconnected during attach output: {}", e);
+                                            break;
+                                        }
+                                    }
+                                    None => {
+                                        // Output stream ended; signal end of stream.
+                                        let _ = write_response(&mut stream, &RpcResponse::Empty).await;
+                                        break;
+                                    }
+                                }
+                            }
+                            inbound = read_message(&mut stream) => {
+                                match inbound {
+                                    Ok((MessageType::AttachInput, payload)) => {
+                                        match AttachInput::decode(&payload[..]) {
+                                            Ok(input) => {
+                                                if let Err(e) = handle_attach_input(&session, input).await {
+                                                    tracing::warn!("Attach input handling failed: {}", e);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("Invalid attach input: {}", e);
+                                            }
+                                        }
+                                    }
+                                    Ok((other_type, _)) => {
+                                        tracing::warn!("Unexpected message in attach session: {:?}", other_type);
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!("Attach session read error/close: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
     /// Handles a single RPC request.
-    async fn handle_request(
-        request: RpcRequest,
-        state: &Arc<RwLock<AgentState>>,
-    ) -> RequestResult {
+    async fn handle_request(request: RpcRequest, state: &Arc<RwLock<AgentState>>) -> RequestResult {
         match request {
             RpcRequest::Ping(req) => RequestResult::Single(handle_ping(req)),
             RpcRequest::GetSystemInfo => RequestResult::Single(handle_get_system_info().await),
@@ -253,6 +353,14 @@ mod linux {
             }
             RpcRequest::ExecResize(req) => {
                 RequestResult::Single(handle_exec_resize(req, state).await)
+            }
+            RpcRequest::Attach(req) => handle_attach(req, state).await,
+            RpcRequest::AttachInput(_) => {
+                // AttachInput is only valid within an attach session.
+                RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
+                    400,
+                    "AttachInput outside attach session",
+                )))
             }
         }
     }
@@ -539,10 +647,7 @@ mod linux {
         let process_handle = match process_handle {
             Some(handle) => handle,
             None => {
-                return RpcResponse::Error(ErrorResponse::new(
-                    500,
-                    "container process not found",
-                ));
+                return RpcResponse::Error(ErrorResponse::new(500, "container process not found"));
             }
         };
 
@@ -550,7 +655,10 @@ mod linux {
             Ok(status) => status.code().unwrap_or(-1),
             Err(e) => {
                 tracing::error!("Failed to wait for container {}: {}", id, e);
-                return RpcResponse::Error(ErrorResponse::new(500, format!("failed to wait: {}", e)));
+                return RpcResponse::Error(ErrorResponse::new(
+                    500,
+                    format!("failed to wait: {}", e),
+                ));
             }
         };
 
@@ -621,11 +729,7 @@ mod linux {
         req: arcbox_protocol::agent::ExecRequest,
         state: &Arc<RwLock<AgentState>>,
     ) -> RpcResponse {
-        tracing::info!(
-            "Exec: container_id={}, cmd={:?}",
-            req.container_id,
-            req.cmd
-        );
+        tracing::info!("Exec: container_id={}, cmd={:?}", req.container_id, req.cmd);
 
         if req.cmd.is_empty() {
             return RpcResponse::Error(ErrorResponse::new(400, "empty command"));
@@ -707,39 +811,245 @@ mod linux {
             return RpcResponse::Error(ErrorResponse::new(400, "empty command"));
         }
 
-        // Determine terminal size (use defaults if not specified).
-        let cols = if req.tty_width > 0 { req.tty_width as u16 } else { 80 };
-        let rows = if req.tty_height > 0 { req.tty_height as u16 } else { 24 };
+        // Get container's rootfs, mounts, and working_dir for namespace setup.
+        let (container_rootfs, container_mounts, container_workdir) = {
+            let runtime = {
+                let state = state.read().await;
+                Arc::clone(&state.runtime)
+            };
+            let runtime = runtime.lock().await;
+            match runtime.get_container(&req.container_id) {
+                Some(container) => (
+                    container.rootfs.clone(),
+                    container.mounts.clone(),
+                    container.working_dir.clone(),
+                ),
+                None => {
+                    return RpcResponse::Error(ErrorResponse::new(
+                        404,
+                        format!("container not found: {}", req.container_id),
+                    ));
+                }
+            }
+        };
 
-        // Create exec session.
-        let session = match ExecSession::new(req.exec_id.clone(), req.tty, cols, rows) {
-            Ok(s) => s,
+        // Determine terminal size (use defaults if not specified).
+        let cols = if req.tty_width > 0 {
+            req.tty_width as u16
+        } else {
+            80
+        };
+        let rows = if req.tty_height > 0 {
+            req.tty_height as u16
+        } else {
+            24
+        };
+
+        // Build command.
+        let mut cmd = Command::new(&req.cmd[0]);
+        cmd.args(&req.cmd[1..]);
+        if !req.working_dir.is_empty() {
+            cmd.current_dir(&req.working_dir);
+        }
+        for (k, v) in &req.env {
+            cmd.env(k, v);
+        }
+
+        let mut pty_handle = None;
+
+        if req.tty {
+            let pty = match PtyHandle::new(cols, rows) {
+                Ok(p) => p,
+                Err(e) => {
+                    return RpcResponse::Error(ErrorResponse::new(
+                        500,
+                        format!("failed to create PTY: {}", e),
+                    ));
+                }
+            };
+            let slave_fd = pty.slave_fd();
+            let rootfs_for_exec = container_rootfs.clone();
+            let mounts_for_exec = container_mounts.clone();
+            let workdir_for_exec = if req.working_dir.is_empty() {
+                container_workdir.clone()
+            } else {
+                req.working_dir.clone()
+            };
+            // SAFETY: pre_exec runs after fork, before exec
+            unsafe {
+                cmd.pre_exec(move || {
+                    // Setup rootfs isolation if container has a rootfs.
+                    if let Some(ref rootfs_path) = rootfs_for_exec {
+                        setup_container_rootfs(rootfs_path, &workdir_for_exec, &mounts_for_exec)?;
+                    }
+
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    #[cfg(target_os = "linux")]
+                    let ioctl_result = libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
+                    #[cfg(target_os = "macos")]
+                    let ioctl_result = libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0);
+                    if ioctl_result < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(slave_fd, libc::STDIN_FILENO) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(slave_fd, libc::STDOUT_FILENO) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(slave_fd, libc::STDERR_FILENO) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if slave_fd > libc::STDERR_FILENO {
+                        libc::close(slave_fd);
+                    }
+                    Ok(())
+                });
+            }
+            cmd.env("TERM", "xterm-256color");
+            pty_handle = Some(pty);
+        } else {
+            // Non-TTY: setup rootfs isolation if container has a rootfs.
+            if let Some(ref rootfs_path) = container_rootfs {
+                let rootfs_for_exec = rootfs_path.clone();
+                let mounts_for_exec = container_mounts.clone();
+                let workdir_for_exec = if req.working_dir.is_empty() {
+                    container_workdir.clone()
+                } else {
+                    req.working_dir.clone()
+                };
+                // SAFETY: pre_exec runs after fork, before exec
+                unsafe {
+                    cmd.pre_exec(move || {
+                        setup_container_rootfs(&rootfs_for_exec, &workdir_for_exec, &mounts_for_exec)
+                    });
+                }
+            }
+            cmd.stdin(Stdio::piped());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+        }
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
             Err(e) => {
                 return RpcResponse::Error(ErrorResponse::new(
                     500,
-                    format!("failed to create exec session: {}", e),
+                    format!("failed to spawn exec process: {}", e),
                 ));
             }
         };
 
-        // Execute the command using fork+exec with PTY.
-        let result = execute_with_pty(&req, session).await;
+        let pid = child.id().unwrap_or_default();
+        let stdin_handle = child.stdin.take();
 
-        match result {
-            Ok((pid, exit_code, stdout, stderr)) => {
-                // Store session if detached (for future resize/management).
-                if req.detach && exit_code.is_none() {
-                    // In detach mode with no exit code, process is still running.
-                    // Session management would go here in a full implementation.
-                    tracing::debug!("Exec {} running in detached mode with pid {}", req.exec_id, pid);
+        // Close slave in parent to allow EOF/exit detection; master is kept for attach/resize.
+        if let Some(ref mut pty) = pty_handle {
+            let _ = pty.pty_mut().close_slave();
+        }
+
+        let broadcaster = if let Some(ref pty) = pty_handle {
+            match ProcessShim::with_pty(req.exec_id.clone(), pty.master_fd()) {
+                Ok(shim) => {
+                    let broadcast = shim.broadcaster();
+                    tokio::spawn(async move {
+                        if let Err(e) = shim.run().await {
+                            tracing::error!("Exec shim error (pty): {}", e);
+                        }
+                    });
+                    broadcast
                 }
-
-                RpcResponse::ExecStart(ExecStartResponse { pid })
+                Err(e) => {
+                    tracing::warn!("Exec shim create failed (pty): {}", e);
+                    Arc::new(BroadcastWriter::new())
+                }
             }
-            Err(e) => {
-                RpcResponse::Error(ErrorResponse::new(500, format!("exec_start failed: {}", e)))
+        } else {
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            if let (Some(stdout), Some(stderr)) = (stdout, stderr) {
+                let stdout_fd = stdout.as_raw_fd();
+                let stderr_fd = stderr.as_raw_fd();
+                std::mem::forget(stdout);
+                std::mem::forget(stderr);
+                match ProcessShim::with_pipes(req.exec_id.clone(), stdout_fd, stderr_fd) {
+                    Ok(shim) => {
+                        let broadcast = shim.broadcaster();
+                        tokio::spawn(async move {
+                            if let Err(e) = shim.run().await {
+                                tracing::error!("Exec shim error (pipes): {}", e);
+                            }
+                        });
+                        broadcast
+                    }
+                    Err(e) => {
+                        tracing::warn!("Exec shim create failed (pipes): {}", e);
+                        Arc::new(BroadcastWriter::new())
+                    }
+                }
+            } else {
+                Arc::new(BroadcastWriter::new())
+            }
+        };
+
+        {
+            let mut guard = state.write().await;
+            guard.exec_processes.insert(
+                req.exec_id.clone(),
+                Arc::new(Mutex::new(ExecProcess {
+                    child: Some(child),
+                    pid,
+                    stdin: stdin_handle,
+                    pty: pty_handle,
+                    broadcaster,
+                    tty: req.tty,
+                })),
+            );
+        }
+
+        // Cleanup task: wait for process exit, then delay removal so late attaches can still replay backlog.
+        {
+            let state = Arc::clone(state);
+            let exec_id = req.exec_id.clone();
+            let proc = {
+                let state_guard = state.read().await;
+                state_guard.exec_processes.get(&exec_id).cloned()
+            };
+
+            if let Some(proc) = proc {
+                tokio::spawn(async move {
+                    // Wait for child to exit.
+                    // Take ownership of child to wait without blocking the mutex.
+                    let child = {
+                        let mut guard = proc.lock().await;
+                        guard.child.take()
+                    };
+
+                    if let Some(mut child) = child {
+                        if let Err(e) = child.wait().await {
+                            tracing::warn!("Exec {} wait failed: {}", exec_id, e);
+                        }
+                    }
+
+                    // Drop stdin/PTY handles but keep broadcaster for a short grace period.
+                    {
+                        let mut guard = proc.lock().await;
+                        guard.stdin.take();
+                        guard.pty.take();
+                    }
+
+                    // Keep session alive briefly to allow late attach to replay backlog.
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+                    let mut guard = state.write().await;
+                    guard.exec_processes.remove(&exec_id);
+                });
             }
         }
+
+        RpcResponse::ExecStart(ExecStartResponse { pid })
     }
 
     /// Executes a command with PTY support.
@@ -749,8 +1059,8 @@ mod linux {
         req: &arcbox_protocol::agent::ExecStartRequest,
         mut session: ExecSession,
     ) -> Result<(u32, Option<i32>, Vec<u8>, Vec<u8>)> {
-        use nix::sys::wait::{waitpid, WaitStatus};
-        use nix::unistd::{fork, ForkResult};
+        use nix::sys::wait::{WaitStatus, waitpid};
+        use nix::unistd::{ForkResult, fork};
         use std::ffi::CString;
         use std::os::unix::io::AsRawFd;
 
@@ -820,12 +1130,14 @@ mod linux {
                                     }
                                     Ok(WaitStatus::StillAlive) => {
                                         // Still running, sleep briefly and continue.
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(10))
+                                            .await;
                                         continue;
                                     }
                                     _ => {
                                         // Other status, continue waiting.
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(10))
+                                            .await;
                                         continue;
                                     }
                                 }
@@ -884,7 +1196,8 @@ mod linux {
 
                 // Execute the command.
                 let c_args: Vec<&std::ffi::CStr> = args.iter().map(|s| s.as_c_str()).collect();
-                let c_env: Vec<&std::ffi::CStr> = env_strings.iter().map(|s| s.as_c_str()).collect();
+                let c_env: Vec<&std::ffi::CStr> =
+                    env_strings.iter().map(|s| s.as_c_str()).collect();
 
                 // This never returns on success.
                 let _ = nix::unistd::execve(&cmd, &c_args, &c_env);
@@ -911,11 +1224,13 @@ mod linux {
             req.height
         );
 
-        let mut state = state.write().await;
+        let proc = {
+            let state = state.read().await;
+            state.exec_processes.get(&req.exec_id).cloned()
+        };
 
-        // Find the exec session.
-        let session = match state.exec_sessions.get_mut(&req.exec_id) {
-            Some(s) => s,
+        let proc = match proc {
+            Some(p) => p,
             None => {
                 return RpcResponse::Error(ErrorResponse::new(
                     404,
@@ -924,31 +1239,252 @@ mod linux {
             }
         };
 
-        // Check if session has PTY.
-        if !session.has_tty() {
-            return RpcResponse::Error(ErrorResponse::new(
+        let mut handle = proc.lock().await;
+        if let Some(ref pty) = handle.pty {
+            if let Err(e) = pty.resize(req.width as u16, req.height as u16) {
+                return RpcResponse::Error(ErrorResponse::new(
+                    500,
+                    format!("failed to resize: {}", e),
+                ));
+            }
+            RpcResponse::Empty
+        } else {
+            RpcResponse::Error(ErrorResponse::new(400, "exec session does not have a TTY"))
+        }
+    }
+
+    /// Handles an Attach request (sets up bidirectional streaming).
+    async fn handle_attach(req: AttachRequest, state: &Arc<RwLock<AgentState>>) -> RequestResult {
+        tracing::info!(
+            "Attach: container_id={}, exec_id={}, stdin={}, stdout={}, stderr={}, size={}x{}",
+            req.container_id,
+            req.exec_id,
+            req.attach_stdin,
+            req.attach_stdout,
+            req.attach_stderr,
+            req.tty_width,
+            req.tty_height
+        );
+
+        if !req.attach_stdout && !req.attach_stderr {
+            return RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
                 400,
-                "exec session does not have a TTY",
-            ));
+                "must attach to stdout or stderr",
+            )));
         }
 
-        // Check if session is still running.
-        if !session.running {
-            return RpcResponse::Error(ErrorResponse::new(
-                400,
-                "exec session is not running",
-            ));
+        // Access runtime.
+        let runtime = {
+            let state = state.read().await;
+            Arc::clone(&state.runtime)
+        };
+
+        // Resolve target: exec or container.
+        let (attach_stdin_allowed, is_tty, initial_size, target, broadcaster) =
+            if !req.exec_id.is_empty() {
+                let mut guard = state.write().await;
+                let proc = match guard.exec_processes.get(&req.exec_id) {
+                    Some(p) => Arc::clone(p),
+                    None => {
+                        return RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
+                            404,
+                            format!("exec session not found: {}", req.exec_id),
+                        )));
+                    }
+                };
+
+                let is_tty = proc.lock().await.tty;
+                let resize = if req.tty_width > 0 && req.tty_height > 0 {
+                    Some((req.tty_width as u16, req.tty_height as u16))
+                } else {
+                    None
+                };
+                let broadcaster = proc.lock().await.broadcaster.clone();
+
+                (
+                    req.attach_stdin,
+                    is_tty,
+                    resize,
+                    AttachTarget::Exec(proc),
+                    broadcaster,
+                )
+            } else {
+                // Validate container and gather metadata.
+                let (attach_stdin_allowed, is_tty, initial_size) = {
+                    let runtime = runtime.lock().await;
+                    let container = match runtime.get_container(&req.container_id) {
+                        Some(c) => c,
+                        None => {
+                            return RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
+                                404,
+                                format!("container not found: {}", req.container_id),
+                            )));
+                        }
+                    };
+
+                    if container.state != ContainerState::Running {
+                        return RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
+                            400,
+                            "container is not running",
+                        )));
+                    }
+
+                    let resize = if req.tty_width > 0 && req.tty_height > 0 {
+                        Some((req.tty_width as u16, req.tty_height as u16))
+                    } else {
+                        None
+                    };
+
+                    (
+                        req.attach_stdin && container.open_stdin,
+                        container.tty,
+                        resize,
+                    )
+                };
+
+                // Get process handle.
+                let process_handle = {
+                    let runtime = runtime.lock().await;
+                    match runtime.get_process_handle(&req.container_id).await {
+                        Some(handle) => handle,
+                        None => {
+                            return RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
+                                500,
+                                "container process not found",
+                            )));
+                        }
+                    }
+                };
+
+                // Subscribe to broadcaster.
+                let broadcaster = {
+                    let runtime = runtime.lock().await;
+                    runtime.get_log_broadcaster(&req.container_id).await
+                };
+
+                let broadcaster = match broadcaster {
+                    Some(b) => b,
+                    None => {
+                        return RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
+                            500,
+                            "log broadcaster unavailable",
+                        )));
+                    }
+                };
+
+                (
+                    attach_stdin_allowed,
+                    is_tty,
+                    initial_size,
+                    AttachTarget::Container(process_handle),
+                    broadcaster,
+                )
+            };
+
+        let include_stdout = req.attach_stdout;
+        let include_stderr = req.attach_stderr;
+        let mut log_rx = broadcaster.subscribe().await;
+
+        // Channel for outgoing attach output.
+        let (tx, rx) = mpsc::channel(64);
+
+        tokio::spawn(async move {
+            while let Some(entry) = log_rx.recv().await {
+                let stream_name = match entry.stream {
+                    StreamType::Stderr => "stderr",
+                    _ => "stdout",
+                };
+
+                // Filter streams.
+                if stream_name == "stdout" && !include_stdout {
+                    continue;
+                }
+                if stream_name == "stderr" && !include_stderr {
+                    continue;
+                }
+
+                let out = AttachOutput {
+                    stream: stream_name.to_string(),
+                    data: entry.data.to_vec(),
+                };
+
+                if tx.send(out).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        RequestResult::Attach(AttachSession {
+            output_rx: rx,
+            process: target,
+            attach_stdin: attach_stdin_allowed,
+            tty: is_tty,
+            initial_size,
+        })
+    }
+
+    /// Applies stdin and resize operations for an attach session.
+    async fn handle_attach_input(session: &AttachSession, input: AttachInput) -> Result<()> {
+        // Handle resize first for TTY sessions.
+        if session.tty && input.resize {
+            match &session.process {
+                AttachTarget::Container(handle) => {
+                    if let Some(pty) = handle.lock().await.pty.as_ref() {
+                        let cols = input.width.min(u32::from(u16::MAX)) as u16;
+                        let rows = input.height.min(u32::from(u16::MAX)) as u16;
+                        pty.resize(cols, rows)?;
+                    }
+                }
+                AttachTarget::Exec(handle) => {
+                    if let Some(pty) = handle.lock().await.pty.as_ref() {
+                        let cols = input.width.min(u32::from(u16::MAX)) as u16;
+                        let rows = input.height.min(u32::from(u16::MAX)) as u16;
+                        pty.resize(cols, rows)?;
+                    }
+                }
+            }
         }
 
-        // Resize the PTY.
-        if let Err(e) = session.resize(req.width as u16, req.height as u16) {
-            return RpcResponse::Error(ErrorResponse::new(
-                500,
-                format!("failed to resize: {}", e),
-            ));
+        // Handle stdin data.
+        if session.attach_stdin && !input.data.is_empty() {
+            tracing::debug!("attach input: received {} bytes", input.data.len());
+            match &session.process {
+                AttachTarget::Container(handle) => {
+                    let mut handle = handle.lock().await;
+                    if let Some(ref pty) = handle.pty {
+                        let _ = pty.write_input(&input.data)?;
+                    } else if let Some(stdin) = handle.stdin.as_mut() {
+                        stdin.write_all(&input.data).await?;
+                    }
+                }
+                AttachTarget::Exec(handle) => {
+                    let mut handle = handle.lock().await;
+                    if let Some(ref pty) = handle.pty {
+                        let _ = pty.write_input(&input.data)?;
+                    } else if let Some(stdin) = handle.stdin.as_mut() {
+                        stdin.write_all(&input.data).await?;
+                    }
+                }
+            }
+        } else if session.attach_stdin && input.data.is_empty() && !input.resize {
+            // Client closed stdin; terminate exec stdin/PTY to allow process exit.
+            tracing::debug!("attach input: client closed stdin");
+            match &session.process {
+                AttachTarget::Container(handle) => {
+                    let mut handle = handle.lock().await;
+                    // Best-effort: close stdin for non-TTY containers.
+                    handle.stdin.take();
+                }
+                AttachTarget::Exec(handle) => {
+                    let mut handle = handle.lock().await;
+                    // Close stdin/PTY to deliver EOF; let the process exit naturally.
+                    handle.stdin.take();
+                    handle.pty.take();
+                }
+            }
         }
 
-        RpcResponse::Empty
+        Ok(())
     }
 
     /// Handles a Logs request.
@@ -1087,7 +1623,10 @@ mod linux {
 
         let stream = parsed.get("stream")?.as_str()?;
         let log = parsed.get("log")?.as_str()?;
-        let raw_time = parsed.get("time").and_then(|value| value.as_str()).map(|s| s.to_string());
+        let raw_time = parsed
+            .get("time")
+            .and_then(|value| value.as_str())
+            .map(|s| s.to_string());
         let timestamp = raw_time
             .as_deref()
             .and_then(|value| DateTime::parse_from_rfc3339(value).ok())

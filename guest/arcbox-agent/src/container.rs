@@ -17,12 +17,12 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::unix::io::AsRawFd;
-use std::sync::Arc;
 use std::os::unix::process::CommandExt;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::process::Stdio;
-use tokio::process::{Child, Command};
+use std::sync::Arc;
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -102,6 +102,8 @@ pub struct ContainerHandle {
 pub(crate) struct ProcessHandle {
     /// The child process.
     pub(crate) child: Child,
+    /// Child stdin (non-TTY).
+    pub(crate) stdin: Option<ChildStdin>,
     /// PTY handle (if TTY mode).
     pub(crate) pty: Option<PtyHandle>,
     /// Shim shutdown token.
@@ -170,15 +172,13 @@ impl ContainerRuntime {
     /// The broadcaster can be used to subscribe to real-time log output.
     pub async fn get_log_broadcaster(&self, id: &str) -> Option<Arc<BroadcastWriter>> {
         let processes = self.processes.lock().await;
-        processes
-            .get(id)
-            .and_then(|handle_arc| {
-                // Try to lock without blocking
-                match handle_arc.try_lock() {
-                    Ok(handle) => handle.broadcaster.clone(),
-                    Err(_) => None,
-                }
-            })
+        processes.get(id).and_then(|handle_arc| {
+            // Try to lock without blocking
+            match handle_arc.try_lock() {
+                Ok(handle) => handle.broadcaster.clone(),
+                Err(_) => None,
+            }
+        })
     }
 
     /// Removes a process handle by container ID.
@@ -220,10 +220,7 @@ impl ContainerRuntime {
         cols: u16,
         rows: u16,
     ) -> Result<()> {
-        let container = self
-            .containers
-            .get_mut(id)
-            .context("container not found")?;
+        let container = self.containers.get_mut(id).context("container not found")?;
 
         if container.state == ContainerState::Running {
             anyhow::bail!("container is already running");
@@ -234,6 +231,7 @@ impl ContainerRuntime {
         }
 
         let use_tty = container.tty;
+        let open_stdin = container.open_stdin;
         let command = container.command.clone();
         let working_dir = container.working_dir.clone();
         let env = container.env.clone();
@@ -263,8 +261,7 @@ impl ContainerRuntime {
         // Configure stdio based on TTY mode
         let pty_handle = if use_tty {
             // Create PTY for TTY mode
-            let pty = PtyHandle::new(cols, rows)
-                .context("failed to create PTY")?;
+            let pty = PtyHandle::new(cols, rows).context("failed to create PTY")?;
 
             let slave_fd = pty.slave_fd();
             let rootfs_for_exec = rootfs.clone();
@@ -277,7 +274,11 @@ impl ContainerRuntime {
                 cmd.pre_exec(move || {
                     // Setup rootfs isolation if provided
                     if let Some(ref rootfs_path) = rootfs_for_exec {
-                        setup_container_rootfs(rootfs_path, &working_dir_for_exec, &mounts_for_exec)?;
+                        setup_container_rootfs(
+                            rootfs_path,
+                            &working_dir_for_exec,
+                            &mounts_for_exec,
+                        )?;
                     }
 
                     // Create new session
@@ -331,12 +332,20 @@ impl ContainerRuntime {
                 // SAFETY: pre_exec runs after fork, before exec
                 unsafe {
                     cmd.pre_exec(move || {
-                        setup_container_rootfs(&rootfs_for_exec, &working_dir_for_exec, &mounts_for_exec)
+                        setup_container_rootfs(
+                            &rootfs_for_exec,
+                            &working_dir_for_exec,
+                            &mounts_for_exec,
+                        )
                     });
                 }
             }
 
-            cmd.stdin(Stdio::null());
+            if open_stdin {
+                cmd.stdin(Stdio::piped());
+            } else {
+                cmd.stdin(Stdio::null());
+            }
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::piped());
             None
@@ -351,6 +360,7 @@ impl ContainerRuntime {
             )
         })?;
         let pid = child.id();
+        let stdin_handle = child.stdin.take();
 
         // Update container state
         container.state = ContainerState::Running;
@@ -424,6 +434,7 @@ impl ContainerRuntime {
             id.to_string(),
             Arc::new(Mutex::new(ProcessHandle {
                 child,
+                stdin: stdin_handle,
                 pty: pty_handle,
                 shim_shutdown,
                 broadcaster,
@@ -435,10 +446,7 @@ impl ContainerRuntime {
 
     /// Stops a container.
     pub async fn stop_container(&mut self, id: &str, timeout_secs: u32) -> Result<()> {
-        let container = self
-            .containers
-            .get_mut(id)
-            .context("container not found")?;
+        let container = self.containers.get_mut(id).context("container not found")?;
 
         if container.state != ContainerState::Running {
             anyhow::bail!("container is not running");
@@ -456,7 +464,7 @@ impl ContainerRuntime {
         // Send SIGTERM first
         #[cfg(target_os = "linux")]
         {
-            use nix::sys::signal::{kill, Signal};
+            use nix::sys::signal::{Signal, kill};
             use nix::unistd::Pid;
 
             let nix_pid = Pid::from_raw(pid as i32);
@@ -506,7 +514,7 @@ impl ContainerRuntime {
 
                     #[cfg(target_os = "linux")]
                     {
-                        use nix::sys::signal::{kill, Signal};
+                        use nix::sys::signal::{Signal, kill};
                         use nix::unistd::Pid;
 
                         let nix_pid = Pid::from_raw(pid as i32);
@@ -601,10 +609,7 @@ impl ContainerRuntime {
 
     /// Sends a signal to a container.
     pub async fn signal_container(&mut self, id: &str, signal: &str) -> Result<()> {
-        let container = self
-            .containers
-            .get(id)
-            .context("container not found")?;
+        let container = self.containers.get(id).context("container not found")?;
 
         if container.state != ContainerState::Running {
             anyhow::bail!("container is not running");
@@ -612,14 +617,19 @@ impl ContainerRuntime {
 
         let pid = container.pid.context("container has no PID")?;
 
-        tracing::info!("Sending signal {} to container {} (PID {})", signal, id, pid);
+        tracing::info!(
+            "Sending signal {} to container {} (PID {})",
+            signal,
+            id,
+            pid
+        );
 
         // Parse signal name or number
         let sig_num = parse_signal(signal)?;
 
         #[cfg(target_os = "linux")]
         {
-            use nix::sys::signal::{kill, Signal};
+            use nix::sys::signal::{Signal, kill};
             use nix::unistd::Pid;
 
             let nix_pid = Pid::from_raw(pid as i32);
@@ -747,7 +757,7 @@ impl Default for ContainerRuntime {
 ///
 /// This must be called in a pre_exec context (after fork, before exec).
 #[cfg(target_os = "linux")]
-unsafe fn setup_container_rootfs(
+pub(crate) unsafe fn setup_container_rootfs(
     rootfs: &str,
     working_dir: &str,
     mounts: &[MountSpec],
@@ -962,7 +972,10 @@ unsafe fn setup_container_mounts(rootfs: &str) -> std::io::Result<()> {
             )
         } < 0
         {
-            tracing::warn!("/dev bind mount failed: {}", std::io::Error::last_os_error());
+            tracing::warn!(
+                "/dev bind mount failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
     }
 
@@ -995,7 +1008,7 @@ unsafe fn setup_container_mounts(rootfs: &str) -> std::io::Result<()> {
 
 /// Stub for non-Linux platforms.
 #[cfg(not(target_os = "linux"))]
-unsafe fn setup_container_rootfs(
+pub(crate) unsafe fn setup_container_rootfs(
     _rootfs: &str,
     working_dir: &str,
     _mounts: &[MountSpec],
@@ -1225,10 +1238,8 @@ mod tests {
         let mut runtime = ContainerRuntime::new();
 
         // Use sleep to keep the process alive long enough to check PID
-        let container = create_test_container(
-            "pid-test",
-            vec!["sleep".to_string(), "0.1".to_string()],
-        );
+        let container =
+            create_test_container("pid-test", vec!["sleep".to_string(), "0.1".to_string()]);
         runtime.add_container(container);
 
         runtime.start_container("pid-test").await.unwrap();
@@ -1254,10 +1265,8 @@ mod tests {
     async fn test_start_already_running_container() {
         let mut runtime = ContainerRuntime::new();
 
-        let container = create_test_container(
-            "double-start",
-            vec!["sleep".to_string(), "1".to_string()],
-        );
+        let container =
+            create_test_container("double-start", vec!["sleep".to_string(), "1".to_string()]);
         runtime.add_container(container);
 
         // Start once
@@ -1333,10 +1342,8 @@ mod tests {
     async fn test_stop_running_container() {
         let mut runtime = ContainerRuntime::new();
 
-        let container = create_test_container(
-            "stop-test",
-            vec!["sleep".to_string(), "60".to_string()],
-        );
+        let container =
+            create_test_container("stop-test", vec!["sleep".to_string(), "60".to_string()]);
         runtime.add_container(container);
 
         runtime.start_container("stop-test").await.unwrap();
@@ -1389,7 +1396,10 @@ mod tests {
         let _ = runtime.wait_container("remove-test").await;
 
         // Now remove it
-        runtime.remove_container("remove-test", false).await.unwrap();
+        runtime
+            .remove_container("remove-test", false)
+            .await
+            .unwrap();
 
         assert!(runtime.get_container("remove-test").is_none());
     }
@@ -1398,10 +1408,8 @@ mod tests {
     async fn test_remove_running_container_without_force() {
         let mut runtime = ContainerRuntime::new();
 
-        let container = create_test_container(
-            "force-remove",
-            vec!["sleep".to_string(), "60".to_string()],
-        );
+        let container =
+            create_test_container("force-remove", vec!["sleep".to_string(), "60".to_string()]);
         runtime.add_container(container);
 
         runtime.start_container("force-remove").await.unwrap();
@@ -1419,16 +1427,17 @@ mod tests {
     async fn test_remove_running_container_with_force() {
         let mut runtime = ContainerRuntime::new();
 
-        let container = create_test_container(
-            "force-remove",
-            vec!["sleep".to_string(), "60".to_string()],
-        );
+        let container =
+            create_test_container("force-remove", vec!["sleep".to_string(), "60".to_string()]);
         runtime.add_container(container);
 
         runtime.start_container("force-remove").await.unwrap();
 
         // Remove with force
-        runtime.remove_container("force-remove", true).await.unwrap();
+        runtime
+            .remove_container("force-remove", true)
+            .await
+            .unwrap();
 
         assert!(runtime.get_container("force-remove").is_none());
     }
@@ -1741,5 +1750,32 @@ mod tests {
         // Verify each line is a separate JSON entry
         let lines: Vec<&str> = log_content.lines().collect();
         assert_eq!(lines.len(), 3, "Should have 3 log entries");
+    }
+
+    #[tokio::test]
+    async fn test_start_container_keeps_stdin_when_open() {
+        let mut runtime = ContainerRuntime::new();
+        let mut container = create_test_container("stdin-open", vec!["cat".to_string()]);
+        container.open_stdin = true;
+        runtime.add_container(container);
+
+        runtime.start_container("stdin-open").await.unwrap();
+
+        let handle = runtime
+            .get_process_handle("stdin-open")
+            .await
+            .expect("process handle");
+        {
+            let mut handle = handle.lock().await;
+            assert!(
+                handle.stdin.is_some(),
+                "stdin should be kept open when open_stdin=true"
+            );
+            if let Some(pid) = handle.child.id() {
+                let _ = handle.child.start_kill();
+                let _ = handle.child.wait().await;
+                tracing::debug!("Killed test process {}", pid);
+            }
+        }
     }
 }
