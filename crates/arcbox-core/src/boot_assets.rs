@@ -37,9 +37,9 @@ use tokio::io::AsyncWriteExt;
 // Constants
 // =============================================================================
 
-/// Current boot asset version.
-/// This should match the arcbox release version.
-pub const BOOT_ASSET_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Default boot asset version.
+/// This is pinned to a known-good kernel/initramfs bundle.
+pub const BOOT_ASSET_VERSION: &str = "0.0.1-alpha.2";
 
 /// Base URL for boot asset downloads.
 /// Assets are hosted on GitHub Releases.
@@ -104,7 +104,7 @@ impl Default for BootAssetConfig {
 
         Self {
             cdn_base_url: DEFAULT_CDN_BASE_URL.to_string(),
-            version: BOOT_ASSET_VERSION.to_string(),
+            version: default_boot_asset_version(),
             arch: arch.to_string(),
             cache_dir,
             verify_checksum: true,
@@ -158,6 +158,10 @@ impl BootAssetConfig {
     pub fn checksum_url(&self) -> String {
         format!("{}{}", self.bundle_url(), CHECKSUM_SUFFIX)
     }
+}
+
+fn default_boot_asset_version() -> String {
+    std::env::var("ARCBOX_BOOT_ASSET_VERSION").unwrap_or_else(|_| BOOT_ASSET_VERSION.to_string())
 }
 
 // =============================================================================
@@ -723,6 +727,9 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_default_config() {
@@ -732,6 +739,30 @@ mod tests {
         assert!(!config.version.is_empty());
         assert!(!config.arch.is_empty());
         assert!(config.verify_checksum);
+    }
+
+    #[test]
+    fn test_default_config_uses_boot_asset_version() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original = std::env::var("ARCBOX_BOOT_ASSET_VERSION").ok();
+        std::env::remove_var("ARCBOX_BOOT_ASSET_VERSION");
+
+        let config = BootAssetConfig::default();
+        assert_eq!(config.version, BOOT_ASSET_VERSION.to_string());
+
+        restore_env(original);
+    }
+
+    #[test]
+    fn test_default_config_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original = std::env::var("ARCBOX_BOOT_ASSET_VERSION").ok();
+        std::env::set_var("ARCBOX_BOOT_ASSET_VERSION", "9.9.9");
+
+        let config = BootAssetConfig::default();
+        assert_eq!(config.version, "9.9.9");
+
+        restore_env(original);
     }
 
     #[test]
@@ -803,5 +834,12 @@ mod tests {
             phase: "test".to_string(),
         };
         assert_eq!(progress.percentage(), None);
+    }
+
+    fn restore_env(original: Option<String>) {
+        match original {
+            Some(value) => std::env::set_var("ARCBOX_BOOT_ASSET_VERSION", value),
+            None => std::env::remove_var("ARCBOX_BOOT_ASSET_VERSION"),
+        }
     }
 }
