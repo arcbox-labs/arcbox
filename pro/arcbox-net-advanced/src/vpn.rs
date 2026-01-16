@@ -125,9 +125,7 @@ impl VpnDetector {
     pub fn vpn_server(&mut self) -> Option<IpAddr> {
         self.refresh_if_needed();
 
-        self.interfaces
-            .iter()
-            .find_map(|i| i.peer_address)
+        self.interfaces.iter().find_map(|i| i.peer_address)
     }
 
     /// Forces a refresh of VPN detection.

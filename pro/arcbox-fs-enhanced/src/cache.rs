@@ -3,8 +3,8 @@
 //! Provides an LRU cache for file data with configurable size limits.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Cache entry for file data.
 #[derive(Debug, Clone)]
@@ -73,7 +73,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             max_size: 512 * 1024 * 1024, // 512MB
-            block_size: 64 * 1024,        // 64KB blocks
+            block_size: 64 * 1024,       // 64KB blocks
             write_through: true,
         }
     }
@@ -126,7 +126,10 @@ impl FileCache {
     /// Returns `Some(data)` if the requested data is in cache, `None` otherwise.
     pub fn read(&self, inode: u64, offset: u64, size: usize) -> Option<Vec<u8>> {
         let block_offset = self.align_offset(offset);
-        let key = CacheKey { inode, block_offset };
+        let key = CacheKey {
+            inode,
+            block_offset,
+        };
 
         let entries = match self.entries.read() {
             Ok(e) => e,
@@ -215,7 +218,10 @@ impl FileCache {
         }
 
         let block_offset = self.align_offset(offset);
-        let key = CacheKey { inode, block_offset };
+        let key = CacheKey {
+            inode,
+            block_offset,
+        };
 
         // Check if we need to evict entries.
         let new_size = data.len();
@@ -233,12 +239,14 @@ impl FileCache {
         if let Ok(mut entries) = self.entries.write() {
             // Remove old entry if exists.
             if let Some(old_entry) = entries.remove(&key) {
-                self.current_size.fetch_sub(old_entry.size as u64, Ordering::Relaxed);
+                self.current_size
+                    .fetch_sub(old_entry.size as u64, Ordering::Relaxed);
             }
 
             // Insert new entry.
             entries.insert(key, entry);
-            self.current_size.fetch_add(new_size as u64, Ordering::Relaxed);
+            self.current_size
+                .fetch_add(new_size as u64, Ordering::Relaxed);
         }
 
         // Update stats.
@@ -259,7 +267,8 @@ impl FileCache {
 
             for key in keys_to_remove {
                 if let Some(entry) = entries.remove(&key) {
-                    self.current_size.fetch_sub(entry.size as u64, Ordering::Relaxed);
+                    self.current_size
+                        .fetch_sub(entry.size as u64, Ordering::Relaxed);
                 }
             }
         }
@@ -273,11 +282,15 @@ impl FileCache {
     /// Invalidates a specific range in cache.
     pub fn invalidate_range(&self, inode: u64, offset: u64, _size: usize) {
         let block_offset = self.align_offset(offset);
-        let key = CacheKey { inode, block_offset };
+        let key = CacheKey {
+            inode,
+            block_offset,
+        };
 
         if let Ok(mut entries) = self.entries.write() {
             if let Some(entry) = entries.remove(&key) {
-                self.current_size.fetch_sub(entry.size as u64, Ordering::Relaxed);
+                self.current_size
+                    .fetch_sub(entry.size as u64, Ordering::Relaxed);
             }
         }
 
@@ -355,7 +368,8 @@ impl FileCache {
 
                 if let Some(key) = lru_key {
                     if let Some(entry) = entries.remove(&key) {
-                        self.current_size.fetch_sub(entry.size as u64, Ordering::Relaxed);
+                        self.current_size
+                            .fetch_sub(entry.size as u64, Ordering::Relaxed);
 
                         if let Ok(mut stats) = self.stats.write() {
                             stats.evictions += 1;

@@ -227,7 +227,8 @@ impl PerfMonitor {
         let (memory_used, memory_total, memory_available, memory_cached) = self.collect_memory();
 
         // Collect disk I/O rates.
-        let (disk_read_bps, disk_write_bps, disk_read_iops, disk_write_iops) = self.collect_disk_io();
+        let (disk_read_bps, disk_write_bps, disk_read_iops, disk_write_iops) =
+            self.collect_disk_io();
 
         // Collect network I/O rates.
         let (net_rx_bps, net_tx_bps, net_rx_pps, net_tx_pps) = self.collect_network_io();
@@ -378,7 +379,12 @@ impl PerfMonitor {
             .args(["-n", "hw.memsize"])
             .output()
             .ok()
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
             .unwrap_or(0);
 
         // Get memory stats from vm_stat.
@@ -537,7 +543,11 @@ impl PerfMonitor {
             let name = parts[2];
 
             // Only count physical disks (sda, nvme0n1, vda, etc.), skip partitions.
-            let is_physical_disk = (name.starts_with("sd") && !name.chars().last().map_or(false, |c| c.is_ascii_digit() && name.len() > 3))
+            let is_physical_disk = (name.starts_with("sd")
+                && !name
+                    .chars()
+                    .last()
+                    .map_or(false, |c| c.is_ascii_digit() && name.len() > 3))
                 || (name.starts_with("nvme") && name.ends_with("n1"))
                 || (name.starts_with("vd") && name.len() == 3)
                 || (name.starts_with("hd") && name.len() == 3);
@@ -564,13 +574,22 @@ impl PerfMonitor {
         let now = Instant::now();
         let mut io_state = self.io_state.write().unwrap();
 
-        let (read_bps, write_bps, read_iops, write_iops) = if let Some(last_update) = io_state.last_update {
+        let (read_bps, write_bps, read_iops, write_iops) = if let Some(last_update) =
+            io_state.last_update
+        {
             let elapsed_secs = last_update.elapsed().as_secs_f64();
             if elapsed_secs > 0.0 {
-                let read_bps = ((total_read_bytes.saturating_sub(io_state.prev_disk_read)) as f64 / elapsed_secs) as u64;
-                let write_bps = ((total_write_bytes.saturating_sub(io_state.prev_disk_write)) as f64 / elapsed_secs) as u64;
-                let read_iops = ((total_read_ops.saturating_sub(io_state.prev_disk_read_ops)) as f64 / elapsed_secs) as u64;
-                let write_iops = ((total_write_ops.saturating_sub(io_state.prev_disk_write_ops)) as f64 / elapsed_secs) as u64;
+                let read_bps = ((total_read_bytes.saturating_sub(io_state.prev_disk_read)) as f64
+                    / elapsed_secs) as u64;
+                let write_bps = ((total_write_bytes.saturating_sub(io_state.prev_disk_write))
+                    as f64
+                    / elapsed_secs) as u64;
+                let read_iops = ((total_read_ops.saturating_sub(io_state.prev_disk_read_ops))
+                    as f64
+                    / elapsed_secs) as u64;
+                let write_iops = ((total_write_ops.saturating_sub(io_state.prev_disk_write_ops))
+                    as f64
+                    / elapsed_secs) as u64;
                 (read_bps, write_bps, read_iops, write_iops)
             } else {
                 (0, 0, 0, 0)
@@ -612,9 +631,7 @@ impl PerfMonitor {
         use std::process::Command;
 
         // Use netstat -ib to get network interface statistics on macOS.
-        let output = Command::new("netstat")
-            .args(["-ib"])
-            .output();
+        let output = Command::new("netstat").args(["-ib"]).output();
 
         let mut total_rx_bytes: u64 = 0;
         let mut total_tx_bytes: u64 = 0;
@@ -633,8 +650,12 @@ impl PerfMonitor {
                 let iface = parts[0];
 
                 // Skip loopback and non-physical interfaces.
-                if iface == "lo0" || iface.starts_with("utun") || iface.starts_with("awdl")
-                   || iface.starts_with("llw") || iface.starts_with("bridge") {
+                if iface == "lo0"
+                    || iface.starts_with("utun")
+                    || iface.starts_with("awdl")
+                    || iface.starts_with("llw")
+                    || iface.starts_with("bridge")
+                {
                     continue;
                 }
 
@@ -661,10 +682,16 @@ impl PerfMonitor {
         let (rx_bps, tx_bps, rx_pps, tx_pps) = if let Some(last_update) = io_state.last_update {
             let elapsed_secs = last_update.elapsed().as_secs_f64();
             if elapsed_secs > 0.0 {
-                let rx_bps = ((total_rx_bytes.saturating_sub(io_state.prev_net_rx)) as f64 / elapsed_secs) as u64;
-                let tx_bps = ((total_tx_bytes.saturating_sub(io_state.prev_net_tx)) as f64 / elapsed_secs) as u64;
-                let rx_pps = ((total_rx_packets.saturating_sub(io_state.prev_net_rx_packets)) as f64 / elapsed_secs) as u64;
-                let tx_pps = ((total_tx_packets.saturating_sub(io_state.prev_net_tx_packets)) as f64 / elapsed_secs) as u64;
+                let rx_bps = ((total_rx_bytes.saturating_sub(io_state.prev_net_rx)) as f64
+                    / elapsed_secs) as u64;
+                let tx_bps = ((total_tx_bytes.saturating_sub(io_state.prev_net_tx)) as f64
+                    / elapsed_secs) as u64;
+                let rx_pps = ((total_rx_packets.saturating_sub(io_state.prev_net_rx_packets))
+                    as f64
+                    / elapsed_secs) as u64;
+                let tx_pps = ((total_tx_packets.saturating_sub(io_state.prev_net_tx_packets))
+                    as f64
+                    / elapsed_secs) as u64;
                 (rx_bps, tx_bps, rx_pps, tx_pps)
             } else {
                 (0, 0, 0, 0)
@@ -710,8 +737,12 @@ impl PerfMonitor {
             let iface = parts[0].trim_end_matches(':');
 
             // Skip loopback and virtual interfaces.
-            if iface == "lo" || iface.starts_with("veth") || iface.starts_with("docker")
-               || iface.starts_with("br-") || iface.starts_with("virbr") {
+            if iface == "lo"
+                || iface.starts_with("veth")
+                || iface.starts_with("docker")
+                || iface.starts_with("br-")
+                || iface.starts_with("virbr")
+            {
                 continue;
             }
 
@@ -734,10 +765,16 @@ impl PerfMonitor {
         let (rx_bps, tx_bps, rx_pps, tx_pps) = if let Some(last_update) = io_state.last_update {
             let elapsed_secs = last_update.elapsed().as_secs_f64();
             if elapsed_secs > 0.0 {
-                let rx_bps = ((total_rx_bytes.saturating_sub(io_state.prev_net_rx)) as f64 / elapsed_secs) as u64;
-                let tx_bps = ((total_tx_bytes.saturating_sub(io_state.prev_net_tx)) as f64 / elapsed_secs) as u64;
-                let rx_pps = ((total_rx_packets.saturating_sub(io_state.prev_net_rx_packets)) as f64 / elapsed_secs) as u64;
-                let tx_pps = ((total_tx_packets.saturating_sub(io_state.prev_net_tx_packets)) as f64 / elapsed_secs) as u64;
+                let rx_bps = ((total_rx_bytes.saturating_sub(io_state.prev_net_rx)) as f64
+                    / elapsed_secs) as u64;
+                let tx_bps = ((total_tx_bytes.saturating_sub(io_state.prev_net_tx)) as f64
+                    / elapsed_secs) as u64;
+                let rx_pps = ((total_rx_packets.saturating_sub(io_state.prev_net_rx_packets))
+                    as f64
+                    / elapsed_secs) as u64;
+                let tx_pps = ((total_tx_packets.saturating_sub(io_state.prev_net_tx_packets))
+                    as f64
+                    / elapsed_secs) as u64;
                 (rx_bps, tx_bps, rx_pps, tx_pps)
             } else {
                 (0, 0, 0, 0)
@@ -919,7 +956,9 @@ mod tests {
 
         // Basic sanity checks.
         assert!(metrics.cpu_percent >= 0.0 && metrics.cpu_percent <= 100.0);
-        assert!(metrics.memory_total > 0 || cfg!(not(any(target_os = "macos", target_os = "linux"))));
+        assert!(
+            metrics.memory_total > 0 || cfg!(not(any(target_os = "macos", target_os = "linux")))
+        );
     }
 
     #[test]

@@ -290,11 +290,7 @@ impl DnsResolver {
     /// Caches a DNS response.
     fn cache_response(&self, hostname: &str, record_type: RecordType, response: &DnsResponse) {
         // Determine TTL from response.
-        let ttl = response
-            .answers
-            .first()
-            .map(|r| r.ttl)
-            .unwrap_or(300);
+        let ttl = response.answers.first().map(|r| r.ttl).unwrap_or(300);
 
         let entry = CacheEntry {
             response: response.clone(),
@@ -573,7 +569,12 @@ fn parse_resource_record(data: &[u8], offset: usize) -> io::Result<(DnsRecord, u
 
     let rtype = u16::from_be_bytes([data[offset], data[offset + 1]]);
     let _rclass = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
-    let ttl = u32::from_be_bytes([data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7]]);
+    let ttl = u32::from_be_bytes([
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
+    ]);
     let rdlength = u16::from_be_bytes([data[offset + 8], data[offset + 9]]) as usize;
 
     offset += 10;
@@ -613,7 +614,8 @@ fn parse_resource_record(data: &[u8], offset: usize) -> io::Result<(DnsRecord, u
         }
         Some(RecordType::TXT) if !rdata.is_empty() => {
             let txt_len = rdata[0] as usize;
-            let txt = String::from_utf8_lossy(&rdata[1..1 + txt_len.min(rdata.len() - 1)]).to_string();
+            let txt =
+                String::from_utf8_lossy(&rdata[1..1 + txt_len.min(rdata.len() - 1)]).to_string();
             DnsRecordData::TXT(txt)
         }
         Some(RecordType::SRV) if rdlength >= 6 => {

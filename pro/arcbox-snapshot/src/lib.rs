@@ -301,11 +301,7 @@ impl SnapshotManager {
             snapshots.insert(snapshot_id.clone(), info.clone());
         }
 
-        tracing::info!(
-            "Created snapshot '{}' (size: {} bytes)",
-            name,
-            info.size
-        );
+        tracing::info!("Created snapshot '{}' (size: {} bytes)", name, info.size);
 
         Ok(info)
     }
@@ -489,9 +485,9 @@ impl SnapshotManager {
         }
 
         // Execute CRIU dump.
-        let output = cmd.output().map_err(|e| {
-            SnapshotError::CriuError(format!("Failed to execute CRIU: {}", e))
-        })?;
+        let output = cmd
+            .output()
+            .map_err(|e| SnapshotError::CriuError(format!("Failed to execute CRIU: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -580,9 +576,9 @@ impl SnapshotManager {
     ///
     /// Returns an error if the snapshot cannot be restored.
     pub async fn restore(&self, snapshot_id: &str) -> Result<(), SnapshotError> {
-        let info = self.get(snapshot_id).ok_or_else(|| {
-            SnapshotError::NotFound(snapshot_id.to_string())
-        })?;
+        let info = self
+            .get(snapshot_id)
+            .ok_or_else(|| SnapshotError::NotFound(snapshot_id.to_string()))?;
 
         if info.state != SnapshotState::Ready {
             return Err(SnapshotError::InvalidState(format!(
@@ -605,7 +601,8 @@ impl SnapshotManager {
                 self.restore_vm_snapshot(&snapshot_dir, &info).await?;
             }
             SnapshotTargetType::Container => {
-                self.restore_container_snapshot(&snapshot_dir, &info).await?;
+                self.restore_container_snapshot(&snapshot_dir, &info)
+                    .await?;
             }
         }
 
@@ -737,11 +734,7 @@ impl SnapshotManager {
     /// Gets a snapshot by ID.
     #[must_use]
     pub fn get(&self, snapshot_id: &str) -> Option<SnapshotInfo> {
-        self.snapshots
-            .read()
-            .ok()?
-            .get(snapshot_id)
-            .cloned()
+        self.snapshots.read().ok()?.get(snapshot_id).cloned()
     }
 
     /// Lists all snapshots.
@@ -788,9 +781,9 @@ impl SnapshotManager {
     /// Returns an error if the snapshot cannot be deleted.
     pub async fn delete(&self, snapshot_id: &str) -> Result<(), SnapshotError> {
         // Check if snapshot exists.
-        let info = self.get(snapshot_id).ok_or_else(|| {
-            SnapshotError::NotFound(snapshot_id.to_string())
-        })?;
+        let info = self
+            .get(snapshot_id)
+            .ok_or_else(|| SnapshotError::NotFound(snapshot_id.to_string()))?;
 
         // Check if any other snapshots depend on this one (as parent).
         {
