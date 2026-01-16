@@ -7,17 +7,21 @@ use crate::api::AppState;
 use crate::error::{DockerError, Result};
 use crate::types::*;
 use arcbox_container::config::ContainerConfig as CoreContainerConfig;
+use arcbox_core::event::Event;
 use arcbox_protocol::agent::LogEntry;
-use axum::body::Body;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use axum::Json;
+use axum::body::Body;
+use axum::body::to_bytes;
+use axum::extract::{OriginalUri, Path, Query, State};
+use axum::http::{HeaderMap, Request, StatusCode, Uri, header};
+use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::StreamExt;
-use serde::Deserialize;
-use serde::de::{self, Deserializer};
-use std::collections::HashMap;
+use hyper_util::rt::TokioIo;
+use serde::{Deserialize, Serialize};
+use serde::de::Deserializer;
+use std::collections::{HashMap, HashSet};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::wrappers::ReceiverStream;
 
 // ============================================================================
@@ -49,10 +53,7 @@ pub async fn list_containers(
 
     let summaries: Vec<ContainerSummary> = containers
         .iter()
-        .filter(|c| {
-            show_all
-                || c.state == arcbox_container::state::ContainerState::Running
-        })
+        .filter(|c| show_all || c.state == arcbox_container::state::ContainerState::Running)
         .map(|c| {
             // Extract ports from container config.
             let ports = c.config.as_ref().map_or(vec![], |cfg| {
@@ -230,6 +231,7 @@ pub async fn create_container(
         port_bindings,
         ..Default::default()
     };
+    let config_image = config.image.clone();
 
     // Create container using the default machine.
     let machine_name = state.runtime.default_machine_name();
@@ -238,6 +240,27 @@ pub async fn create_container(
         .create_container(machine_name, config)
         .await
         .map_err(|e| DockerError::Server(e.to_string()))?;
+
+    let (container_name, container_image, container_labels) = state
+        .runtime
+        .container_manager()
+        .get(&container_id)
+        .map(|c| {
+            let labels = c
+                .config
+                .as_ref()
+                .map(|cfg| cfg.labels.clone())
+                .unwrap_or_default();
+            (c.name.clone(), c.image.clone(), labels)
+        })
+        .unwrap_or_else(|| (container_id.to_string(), config_image, HashMap::new()));
+
+    state.runtime.event_bus().publish(Event::ContainerCreated {
+        id: container_id.to_string(),
+        name: container_name,
+        image: container_image,
+        labels: container_labels,
+    });
 
     Ok((
         StatusCode::CREATED,
@@ -291,7 +314,11 @@ pub async fn inspect_container(
             // Use entrypoint as path, cmd as args
             (
                 cfg.entrypoint.first().cloned().unwrap_or_default(),
-                cfg.entrypoint.iter().skip(1).cloned().collect::<Vec<_>>()
+                cfg.entrypoint
+                    .iter()
+                    .skip(1)
+                    .cloned()
+                    .collect::<Vec<_>>()
                     .into_iter()
                     .chain(cfg.cmd.iter().cloned())
                     .collect(),
@@ -420,6 +447,18 @@ pub async fn start_container(
         .await
         .map_err(|e| DockerError::Server(e.to_string()))?;
 
+    let labels = container
+        .config
+        .as_ref()
+        .map(|cfg| cfg.labels.clone())
+        .unwrap_or_default();
+    state.runtime.event_bus().publish(Event::ContainerStarted {
+        id: container_id.to_string(),
+        name: container.name.clone(),
+        image: container.image.clone(),
+        labels,
+    });
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -460,6 +499,45 @@ pub async fn stop_container(
         .await
         .map_err(|e| DockerError::Server(e.to_string()))?;
 
+    let (labels, image, exit_code) = state
+        .runtime
+        .container_manager()
+        .get(&container_id)
+        .map(|c| {
+            let labels = c
+                .config
+                .as_ref()
+                .map(|cfg| cfg.labels.clone())
+                .unwrap_or_default();
+            (labels, c.image.clone(), c.exit_code)
+        })
+        .unwrap_or_else(|| {
+            (
+                container
+                    .config
+                    .as_ref()
+                    .map(|cfg| cfg.labels.clone())
+                    .unwrap_or_default(),
+                container.image.clone(),
+                None,
+            )
+        });
+
+    state.runtime.event_bus().publish(Event::ContainerStopped {
+        id: container_id.to_string(),
+        name: container.name.clone(),
+        image: image.clone(),
+        labels: labels.clone(),
+        exit_code,
+    });
+    state.runtime.event_bus().publish(Event::ContainerDied {
+        id: container_id.to_string(),
+        name: container.name.clone(),
+        image,
+        labels,
+        exit_code,
+    });
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -493,6 +571,46 @@ pub async fn kill_container(
         .kill_container(&machine_name, &container_id, &signal)
         .await
         .map_err(|e| DockerError::Server(e.to_string()))?;
+
+    let (labels, image, exit_code) = state
+        .runtime
+        .container_manager()
+        .get(&container_id)
+        .map(|c| {
+            let labels = c
+                .config
+                .as_ref()
+                .map(|cfg| cfg.labels.clone())
+                .unwrap_or_default();
+            (labels, c.image.clone(), c.exit_code)
+        })
+        .unwrap_or_else(|| {
+            (
+                container
+                    .config
+                    .as_ref()
+                    .map(|cfg| cfg.labels.clone())
+                    .unwrap_or_default(),
+                container.image.clone(),
+                None,
+            )
+        });
+
+    state.runtime.event_bus().publish(Event::ContainerKilled {
+        id: container_id.to_string(),
+        name: container.name.clone(),
+        image: image.clone(),
+        labels: labels.clone(),
+        signal,
+        exit_code,
+    });
+    state.runtime.event_bus().publish(Event::ContainerDied {
+        id: container_id.to_string(),
+        name: container.name.clone(),
+        image,
+        labels,
+        exit_code,
+    });
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -539,11 +657,57 @@ pub async fn restart_container(
         .await
         .map_err(|e| DockerError::Server(e.to_string()))?;
 
+    let (labels, image, exit_code) = state
+        .runtime
+        .container_manager()
+        .get(&container_id)
+        .map(|c| {
+            let labels = c
+                .config
+                .as_ref()
+                .map(|cfg| cfg.labels.clone())
+                .unwrap_or_default();
+            (labels, c.image.clone(), c.exit_code)
+        })
+        .unwrap_or_else(|| {
+            (
+                container
+                    .config
+                    .as_ref()
+                    .map(|cfg| cfg.labels.clone())
+                    .unwrap_or_default(),
+                container.image.clone(),
+                None,
+            )
+        });
+
+    state.runtime.event_bus().publish(Event::ContainerStopped {
+        id: container_id.to_string(),
+        name: container.name.clone(),
+        image: image.clone(),
+        labels: labels.clone(),
+        exit_code,
+    });
+    state.runtime.event_bus().publish(Event::ContainerDied {
+        id: container_id.to_string(),
+        name: container.name.clone(),
+        image: image.clone(),
+        labels: labels.clone(),
+        exit_code,
+    });
+
     state
         .runtime
         .start_container(&machine_name, &container_id)
         .await
         .map_err(|e| DockerError::Server(e.to_string()))?;
+
+    state.runtime.event_bus().publish(Event::ContainerStarted {
+        id: container_id.to_string(),
+        name: container.name.clone(),
+        image,
+        labels,
+    });
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -602,6 +766,18 @@ pub async fn remove_container(
             })?;
     }
 
+    let labels = container
+        .config
+        .as_ref()
+        .map(|cfg| cfg.labels.clone())
+        .unwrap_or_default();
+    state.runtime.event_bus().publish(Event::ContainerRemoved {
+        id: container_id.to_string(),
+        name: container.name.clone(),
+        image: container.image.clone(),
+        labels,
+    });
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -616,33 +792,68 @@ pub async fn wait_container(
     let container_id = arcbox_container::state::ContainerId::from_string(&id);
 
     // Check if container exists and get its machine name.
-    let container = state.runtime.container_manager().get(&container_id)
+    let container = state
+        .runtime
+        .container_manager()
+        .get(&container_id)
         .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
 
-    let machine_name = container.machine_name.clone()
+    let machine_name = container
+        .machine_name
+        .clone()
         .ok_or_else(|| DockerError::Server("container has no machine assigned".to_string()))?;
+
+    let should_emit_die = container.state == arcbox_container::state::ContainerState::Running;
 
     // Connect to agent and wait for container to exit.
     #[cfg(target_os = "macos")]
     let exit_code = {
-        let mut agent = state.runtime.machine_manager().connect_agent(&machine_name)
+        let mut agent = state
+            .runtime
+            .machine_manager()
+            .connect_agent(&machine_name)
             .map_err(|e| DockerError::Server(format!("failed to connect to agent: {}", e)))?;
-        agent.wait_container(&id).await
+        agent
+            .wait_container(&id)
+            .await
             .map_err(|e| DockerError::Server(format!("wait failed: {}", e)))?
     };
 
     #[cfg(target_os = "linux")]
     let exit_code = {
-        let cid = state.runtime.machine_manager().get_cid(&machine_name)
+        let cid = state
+            .runtime
+            .machine_manager()
+            .get_cid(&machine_name)
             .ok_or_else(|| DockerError::Server("machine has no CID".to_string()))?;
         let agent = state.runtime.agent_pool().get(cid).await;
         let mut agent = agent.write().await;
-        agent.wait_container(&id).await
+        agent
+            .wait_container(&id)
+            .await
             .map_err(|e| DockerError::Server(format!("wait failed: {}", e)))?
     };
 
     // Update container state.
-    state.runtime.container_manager().notify_exit(&container_id, exit_code);
+    state
+        .runtime
+        .container_manager()
+        .notify_exit(&container_id, exit_code);
+
+    if should_emit_die {
+        let labels = container
+            .config
+            .as_ref()
+            .map(|cfg| cfg.labels.clone())
+            .unwrap_or_default();
+        state.runtime.event_bus().publish(Event::ContainerDied {
+            id: container_id.to_string(),
+            name: container.name.clone(),
+            image: container.image.clone(),
+            labels,
+            exit_code: Some(exit_code),
+        });
+    }
 
     Ok(Json(WaitResponse {
         status_code: i64::from(exit_code),
@@ -772,13 +983,7 @@ pub async fn container_logs(
     let tail: i64 = params
         .tail
         .as_ref()
-        .and_then(|t| {
-            if t == "all" {
-                Some(0)
-            } else {
-                t.parse().ok()
-            }
-        })
+        .and_then(|t| if t == "all" { Some(0) } else { t.parse().ok() })
         .unwrap_or(0);
 
     // Get machine name from container.
@@ -920,7 +1125,8 @@ async fn container_logs_stream(
         Err(e) => {
             tracing::warn!("Failed to get log stream from agent: {}", e);
             // Return empty streaming response.
-            let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Bytes, std::io::Error>>(1);
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<std::result::Result<Bytes, std::io::Error>>(1);
             drop(tx); // Close immediately.
             let body = Body::from_stream(ReceiverStream::new(rx));
 
@@ -964,6 +1170,814 @@ async fn container_logs_stream(
 }
 
 // ============================================================================
+// Events Handler
+// ============================================================================
+
+/// Events query parameters.
+#[derive(Debug, Deserialize)]
+pub struct EventsQuery {
+    /// Show events since this timestamp (Unix seconds or RFC3339).
+    pub since: Option<String>,
+    /// Show events until this timestamp (Unix seconds or RFC3339).
+    pub until: Option<String>,
+    /// Filters (JSON encoded).
+    pub filters: Option<String>,
+}
+
+#[derive(Default, Debug, Clone)]
+struct EventFilters {
+    fields: HashMap<String, HashSet<String>>,
+}
+
+impl EventFilters {
+    fn add(&mut self, key: &str, value: String) {
+        self.fields
+            .entry(key.to_string())
+            .or_default()
+            .insert(value);
+    }
+
+    fn get(&self, key: &str) -> Vec<String> {
+        self.fields
+            .get(key)
+            .map(|values| values.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.fields.contains_key(key)
+    }
+
+    fn exact_match(&self, key: &str, source: &str) -> bool {
+        let Some(values) = self.fields.get(key) else {
+            return true;
+        };
+        if values.is_empty() {
+            return true;
+        }
+        values.contains(source)
+    }
+
+    fn fuzzy_match(&self, key: &str, source: &str) -> bool {
+        if self.exact_match(key, source) {
+            return true;
+        }
+        let Some(values) = self.fields.get(key) else {
+            return true;
+        };
+        for prefix in values {
+            if source.starts_with(prefix) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn match_kv_list(&self, key: &str, attributes: &HashMap<String, String>) -> bool {
+        let Some(values) = self.fields.get(key) else {
+            return true;
+        };
+        if values.is_empty() {
+            return true;
+        }
+        if attributes.is_empty() {
+            return false;
+        }
+        for value in values {
+            let (attr_key, attr_value) = match value.split_once('=') {
+                Some((k, v)) => (k, Some(v)),
+                None => (value.as_str(), None),
+            };
+            let Some(found) = attributes.get(attr_key) else {
+                return false;
+            };
+            if let Some(expected) = attr_value {
+                if found != expected {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+#[derive(Serialize)]
+struct EventMessage {
+    #[serde(rename = "Type")]
+    event_type: String,
+    #[serde(rename = "Action")]
+    action: String,
+    #[serde(rename = "Actor")]
+    actor: EventActor,
+    #[serde(rename = "scope")]
+    scope: String,
+    #[serde(rename = "time")]
+    time: i64,
+    #[serde(rename = "timeNano")]
+    time_nano: i64,
+}
+
+#[derive(Serialize)]
+struct EventActor {
+    #[serde(rename = "ID")]
+    id: String,
+    #[serde(rename = "Attributes")]
+    attributes: HashMap<String, String>,
+}
+
+struct EventMapping {
+    event_type: &'static str,
+    action: &'static str,
+    actor_id: String,
+    attributes: HashMap<String, String>,
+    legacy_from: Option<String>,
+}
+
+/// Stream Docker-style events.
+pub async fn events(
+    State(state): State<AppState>,
+    Query(params): Query<EventsQuery>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> Result<Response> {
+    let filters = parse_event_filters(params.filters)?;
+    let since = parse_event_timestamp(params.since.as_deref())?;
+    let until = parse_event_timestamp(params.until.as_deref())?;
+    let api_version = api_version_from_uri(&uri).unwrap_or_else(|| crate::API_VERSION.to_string());
+    let include_legacy_fields = version_lt(&api_version, "1.52");
+    let skip_image_create = version_lt(&api_version, "1.46");
+    let content_type = negotiate_event_content_type(&headers);
+
+    if let Some(until) = until {
+        let now = chrono::Utc::now().timestamp();
+        if until < now {
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<std::result::Result<Bytes, std::io::Error>>(1);
+            drop(tx);
+            let body = Body::from_stream(ReceiverStream::new(rx));
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, content_type)
+                .body(body)
+                .unwrap());
+        }
+    }
+
+    let mut event_rx = state.runtime.event_bus().subscribe();
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<std::result::Result<Bytes, std::io::Error>>(64);
+
+    let scope = "local";
+    tokio::spawn(async move {
+        loop {
+            match event_rx.recv().await {
+                Ok(event) => {
+                    let now = chrono::Utc::now();
+                    let time = now.timestamp();
+                    if let Some(since) = since {
+                        if time < since {
+                            continue;
+                        }
+                    }
+                    if let Some(until) = until {
+                        if time > until {
+                            break;
+                        }
+                    }
+
+                    let mapping = match map_event(&event) {
+                        Some(mapping) => mapping,
+                        None => continue,
+                    };
+
+                    if skip_image_create
+                        && mapping.event_type == "image"
+                        && mapping.action == "create"
+                    {
+                        continue;
+                    }
+
+                    if !event_matches_filters(
+                        &filters,
+                        mapping.event_type,
+                        mapping.action,
+                        &mapping.actor_id,
+                        &mapping.attributes,
+                        scope,
+                    ) {
+                        continue;
+                    }
+
+                    let event_message = EventMessage {
+                        event_type: mapping.event_type.to_string(),
+                        action: mapping.action.to_string(),
+                        actor: EventActor {
+                            id: mapping.actor_id.clone(),
+                            attributes: mapping.attributes.clone(),
+                        },
+                        scope: scope.to_string(),
+                        time,
+                        time_nano: now.timestamp_nanos_opt().unwrap_or(time * 1_000_000_000),
+                    };
+                    let mut event_value = match serde_json::to_value(event_message) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            tracing::warn!("Failed to serialize event: {}", e);
+                            continue;
+                        }
+                    };
+
+                    if include_legacy_fields {
+                        if let serde_json::Value::Object(ref mut map) = event_value {
+                            if mapping.event_type == "container" {
+                                map.insert("id".to_string(), serde_json::Value::String(mapping.actor_id.clone()));
+                                map.insert(
+                                    "status".to_string(),
+                                    serde_json::Value::String(mapping.action.to_string()),
+                                );
+                                if let Some(from) = &mapping.legacy_from {
+                                    map.insert("from".to_string(), serde_json::Value::String(from.clone()));
+                                }
+                            } else if mapping.event_type == "image" {
+                                map.insert("id".to_string(), serde_json::Value::String(mapping.actor_id.clone()));
+                                map.insert(
+                                    "status".to_string(),
+                                    serde_json::Value::String(mapping.action.to_string()),
+                                );
+                            }
+                        }
+                    }
+
+                    let line = match encode_event_line(&event_value, content_type) {
+                        Ok(line) => line,
+                        Err(e) => {
+                            tracing::warn!("Failed to encode event: {}", e);
+                            continue;
+                        }
+                    };
+
+                    if tx.send(Ok(line)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    });
+
+    let body = Body::from_stream(ReceiverStream::new(rx));
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(body)
+        .unwrap())
+}
+
+fn parse_event_timestamp(value: Option<&str>) -> Result<Option<i64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if let Ok(ts) = trimmed.parse::<i64>() {
+        return Ok(Some(ts));
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(Some(dt.timestamp()));
+    }
+
+    Err(DockerError::BadRequest(format!(
+        "invalid timestamp: {trimmed}"
+    )))
+}
+
+fn parse_event_filters(filters: Option<String>) -> Result<EventFilters> {
+    let raw = match filters {
+        Some(raw) if !raw.trim().is_empty() => raw,
+        _ => return Ok(EventFilters::default()),
+    };
+
+    if let Ok(parsed) = serde_json::from_str::<HashMap<String, HashMap<String, bool>>>(&raw) {
+        let mut filters = EventFilters::default();
+        for (key, values) in parsed {
+            for value in values.keys() {
+                filters.add(&key, value.to_string());
+            }
+        }
+        return Ok(filters);
+    }
+
+    if let Ok(parsed) = serde_json::from_str::<HashMap<String, Vec<String>>>(&raw) {
+        let mut filters = EventFilters::default();
+        for (key, values) in parsed {
+            for value in values {
+                filters.add(&key, value);
+            }
+        }
+        return Ok(filters);
+    }
+
+    Err(DockerError::BadRequest(
+        "invalid filters parameter".to_string(),
+    ))
+}
+
+fn event_matches_filters(
+    filters: &EventFilters,
+    event_type: &str,
+    action: &str,
+    actor_id: &str,
+    attributes: &HashMap<String, String>,
+    scope: &str,
+) -> bool {
+    if !match_event_action(filters, action) {
+        return false;
+    }
+    if !filters.exact_match("type", event_type) {
+        return false;
+    }
+    if !filters.exact_match("scope", scope) {
+        return false;
+    }
+    if !fuzzy_match_name(filters, "daemon", actor_id, attributes.get("name")) {
+        return false;
+    }
+    if !fuzzy_match_name(filters, "container", actor_id, attributes.get("name")) {
+        return false;
+    }
+    if !fuzzy_match_name(filters, "plugin", actor_id, attributes.get("name")) {
+        return false;
+    }
+    if !fuzzy_match_name(filters, "volume", actor_id, attributes.get("name")) {
+        return false;
+    }
+    if !fuzzy_match_name(filters, "network", actor_id, attributes.get("name")) {
+        return false;
+    }
+    if !match_image(filters, event_type, actor_id, attributes) {
+        return false;
+    }
+    if !fuzzy_match_name(filters, "node", actor_id, attributes.get("name")) {
+        return false;
+    }
+    if !fuzzy_match_name(filters, "service", actor_id, attributes.get("name")) {
+        return false;
+    }
+    if !fuzzy_match_name(filters, "secret", actor_id, attributes.get("name")) {
+        return false;
+    }
+    if !fuzzy_match_name(filters, "config", actor_id, attributes.get("name")) {
+        return false;
+    }
+    if !fuzzy_match_name(filters, "machine", actor_id, attributes.get("name")) {
+        return false;
+    }
+    if !fuzzy_match_name(filters, "vm", actor_id, attributes.get("id")) {
+        return false;
+    }
+    if !filters.match_kv_list("label", attributes) {
+        return false;
+    }
+
+    true
+}
+
+fn match_event_action(filters: &EventFilters, action: &str) -> bool {
+    if filter_contains(filters, "event", &["health_status", "exec_create", "exec_start"]) {
+        return filters.fuzzy_match("event", action);
+    }
+    filters.exact_match("event", action)
+}
+
+fn filter_contains(filters: &EventFilters, key: &str, values: &[&str]) -> bool {
+    for value in filters.get(key) {
+        if values.iter().any(|candidate| candidate == &value) {
+            return true;
+        }
+    }
+    false
+}
+
+fn fuzzy_match_name(
+    filters: &EventFilters,
+    key: &str,
+    actor_id: &str,
+    name: Option<&String>,
+) -> bool {
+    if filters.fuzzy_match(key, actor_id) {
+        return true;
+    }
+    name.map(|value| filters.fuzzy_match(key, value))
+        .unwrap_or(false)
+}
+
+fn match_image(
+    filters: &EventFilters,
+    event_type: &str,
+    actor_id: &str,
+    attributes: &HashMap<String, String>,
+) -> bool {
+    let name_attr = if event_type == "image" { "name" } else { "image" };
+    let image_name = attributes.get(name_attr).map(|value| value.as_str()).unwrap_or("");
+    let stripped_id = strip_tag(actor_id);
+    let stripped_name = strip_tag(image_name);
+
+    filters.exact_match("image", actor_id)
+        || filters.exact_match("image", image_name)
+        || filters.exact_match("image", stripped_id.as_str())
+        || filters.exact_match("image", stripped_name.as_str())
+}
+
+fn strip_tag(image: &str) -> String {
+    let mut name = match image.split_once('@') {
+        Some((prefix, _)) => prefix.to_string(),
+        None => image.to_string(),
+    };
+
+    let last_slash = name.rfind('/');
+    if let Some(colon) = name.rfind(':') {
+        if last_slash.map_or(true, |slash| colon > slash) {
+            name.truncate(colon);
+        }
+    }
+
+    if let Some(stripped) = name.strip_prefix("docker.io/") {
+        name = stripped.to_string();
+        if let Some(stripped) = name.strip_prefix("library/") {
+            name = stripped.to_string();
+        }
+    }
+
+    name
+}
+
+fn normalize_container_name(name: &str) -> String {
+    name.trim_start_matches('/').to_string()
+}
+
+fn normalize_signal(signal: &str) -> String {
+    if !signal.is_empty() && signal.chars().all(|c| c.is_ascii_digit()) {
+        return signal.to_string();
+    }
+
+    let upper = signal.trim().trim_start_matches("SIG").to_uppercase();
+    let number = match upper.as_str() {
+        "HUP" => 1,
+        "INT" => 2,
+        "QUIT" => 3,
+        "ILL" => 4,
+        "TRAP" => 5,
+        "ABRT" => 6,
+        "BUS" => 7,
+        "FPE" => 8,
+        "KILL" => 9,
+        "USR1" => 10,
+        "SEGV" => 11,
+        "USR2" => 12,
+        "PIPE" => 13,
+        "ALRM" => 14,
+        "TERM" => 15,
+        "CHLD" => 17,
+        "CONT" => 18,
+        "STOP" => 19,
+        "TSTP" => 20,
+        "TTIN" => 21,
+        "TTOU" => 22,
+        "URG" => 23,
+        "XCPU" => 24,
+        "XFSZ" => 25,
+        "VTALRM" => 26,
+        "PROF" => 27,
+        "WINCH" => 28,
+        "IO" => 29,
+        "SYS" => 31,
+        _ => return signal.to_string(),
+    };
+    number.to_string()
+}
+
+const MEDIA_TYPE_JSON: &str = "application/json";
+const MEDIA_TYPE_JSON_LINES: &str = "application/jsonl";
+const MEDIA_TYPE_NDJSON: &str = "application/x-ndjson";
+const MEDIA_TYPE_JSON_SEQ: &str = "application/json-seq";
+const JSON_SEQ_RS: u8 = 0x1e;
+
+fn negotiate_event_content_type(headers: &HeaderMap) -> &'static str {
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+
+    for part in accept.split(',') {
+        let media = part.trim().split(';').next().unwrap_or("").trim();
+        match media {
+            MEDIA_TYPE_JSON_SEQ => return MEDIA_TYPE_JSON_SEQ,
+            MEDIA_TYPE_JSON_LINES => return MEDIA_TYPE_JSON_LINES,
+            MEDIA_TYPE_NDJSON => return MEDIA_TYPE_NDJSON,
+            MEDIA_TYPE_JSON => return MEDIA_TYPE_JSON,
+            _ => {}
+        }
+    }
+
+    MEDIA_TYPE_JSON
+}
+
+fn encode_event_line(
+    event: &serde_json::Value,
+    content_type: &str,
+) -> std::io::Result<Bytes> {
+    let mut payload = serde_json::to_vec(event)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    if content_type == MEDIA_TYPE_JSON_SEQ {
+        let mut buf = Vec::with_capacity(payload.len() + 2);
+        buf.push(JSON_SEQ_RS);
+        buf.append(&mut payload);
+        buf.push(b'\n');
+        return Ok(Bytes::from(buf));
+    }
+
+    payload.push(b'\n');
+    Ok(Bytes::from(payload))
+}
+
+fn api_version_from_uri(uri: &Uri) -> Option<String> {
+    let path = uri.path().trim_start_matches('/');
+    let mut segments = path.split('/');
+    let first = segments.next()?;
+    if let Some(version) = first.strip_prefix('v') {
+        if !version.is_empty() {
+            return Some(version.to_string());
+        }
+    }
+    None
+}
+
+fn version_lt(version: &str, other: &str) -> bool {
+    let Some(left) = parse_version(version) else {
+        return true;
+    };
+    let Some(right) = parse_version(other) else {
+        return false;
+    };
+    left < right
+}
+
+fn parse_version(version: &str) -> Option<(u64, u64)> {
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+fn merge_labels(
+    mut attributes: HashMap<String, String>,
+    labels: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    for (key, value) in labels {
+        attributes.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    attributes
+}
+
+fn map_event(event: &Event) -> Option<EventMapping> {
+    match event {
+        Event::ContainerCreated {
+            id,
+            name,
+            image,
+            labels,
+        } => {
+            let mut attributes = HashMap::new();
+            if !image.is_empty() {
+                attributes.insert("image".to_string(), image.clone());
+            }
+            attributes.insert("name".to_string(), normalize_container_name(name));
+            Some(EventMapping {
+                event_type: "container",
+                action: "create",
+                actor_id: id.clone(),
+                attributes: merge_labels(attributes, labels),
+                legacy_from: if image.is_empty() { None } else { Some(image.clone()) },
+            })
+        }
+        Event::ContainerStarted {
+            id,
+            name,
+            image,
+            labels,
+        } => {
+            let mut attributes = HashMap::new();
+            if !image.is_empty() {
+                attributes.insert("image".to_string(), image.clone());
+            }
+            attributes.insert("name".to_string(), normalize_container_name(name));
+            Some(EventMapping {
+                event_type: "container",
+                action: "start",
+                actor_id: id.clone(),
+                attributes: merge_labels(attributes, labels),
+                legacy_from: if image.is_empty() { None } else { Some(image.clone()) },
+            })
+        }
+        Event::ContainerStopped {
+            id,
+            name,
+            image,
+            labels,
+            exit_code: _,
+        } => {
+            let mut attributes = HashMap::new();
+            if !image.is_empty() {
+                attributes.insert("image".to_string(), image.clone());
+            }
+            attributes.insert("name".to_string(), normalize_container_name(name));
+            Some(EventMapping {
+                event_type: "container",
+                action: "stop",
+                actor_id: id.clone(),
+                attributes: merge_labels(attributes, labels),
+                legacy_from: if image.is_empty() { None } else { Some(image.clone()) },
+            })
+        }
+        Event::ContainerKilled {
+            id,
+            name,
+            image,
+            labels,
+            signal,
+            exit_code: _,
+        } => {
+            let mut attributes = HashMap::new();
+            if !image.is_empty() {
+                attributes.insert("image".to_string(), image.clone());
+            }
+            attributes.insert("name".to_string(), normalize_container_name(name));
+            attributes.insert("signal".to_string(), normalize_signal(signal));
+            Some(EventMapping {
+                event_type: "container",
+                action: "kill",
+                actor_id: id.clone(),
+                attributes: merge_labels(attributes, labels),
+                legacy_from: if image.is_empty() { None } else { Some(image.clone()) },
+            })
+        }
+        Event::ContainerDied {
+            id,
+            name,
+            image,
+            labels,
+            exit_code,
+        } => {
+            let mut attributes = HashMap::new();
+            if !image.is_empty() {
+                attributes.insert("image".to_string(), image.clone());
+            }
+            attributes.insert("name".to_string(), normalize_container_name(name));
+            if let Some(code) = exit_code {
+                attributes.insert("exitCode".to_string(), code.to_string());
+            }
+            Some(EventMapping {
+                event_type: "container",
+                action: "die",
+                actor_id: id.clone(),
+                attributes: merge_labels(attributes, labels),
+                legacy_from: if image.is_empty() { None } else { Some(image.clone()) },
+            })
+        }
+        Event::ContainerRemoved {
+            id,
+            name,
+            image,
+            labels,
+        } => {
+            let mut attributes = HashMap::new();
+            if !image.is_empty() {
+                attributes.insert("image".to_string(), image.clone());
+            }
+            attributes.insert("name".to_string(), normalize_container_name(name));
+            Some(EventMapping {
+                event_type: "container",
+                action: "destroy",
+                actor_id: id.clone(),
+                attributes: merge_labels(attributes, labels),
+                legacy_from: if image.is_empty() { None } else { Some(image.clone()) },
+            })
+        }
+        Event::ImagePulled { id, reference } => Some(EventMapping {
+            event_type: "image",
+            action: "pull",
+            actor_id: id.clone(),
+            attributes: HashMap::from([("name".to_string(), reference.clone())]),
+            legacy_from: None,
+        }),
+        Event::ImageRemoved { id, reference } => Some(EventMapping {
+            event_type: "image",
+            action: "delete",
+            actor_id: id.clone(),
+            attributes: HashMap::from([("name".to_string(), reference.clone())]),
+            legacy_from: None,
+        }),
+        Event::NetworkCreated {
+            id,
+            name,
+            driver,
+            labels: _,
+        } => Some(EventMapping {
+            event_type: "network",
+            action: "create",
+            actor_id: id.clone(),
+            attributes: HashMap::from([
+                ("name".to_string(), name.clone()),
+                ("type".to_string(), driver.clone()),
+            ]),
+            legacy_from: None,
+        }),
+        Event::NetworkRemoved {
+            id,
+            name,
+            driver,
+            labels: _,
+        } => Some(EventMapping {
+            event_type: "network",
+            action: "destroy",
+            actor_id: id.clone(),
+            attributes: HashMap::from([
+                ("name".to_string(), name.clone()),
+                ("type".to_string(), driver.clone()),
+            ]),
+            legacy_from: None,
+        }),
+        Event::VolumeCreated {
+            name,
+            driver,
+            labels: _,
+        } => Some(EventMapping {
+            event_type: "volume",
+            action: "create",
+            actor_id: name.clone(),
+            attributes: HashMap::from([("driver".to_string(), driver.clone())]),
+            legacy_from: None,
+        }),
+        Event::VolumeRemoved {
+            name,
+            driver,
+            labels: _,
+        } => Some(EventMapping {
+            event_type: "volume",
+            action: "destroy",
+            actor_id: name.clone(),
+            attributes: HashMap::from([("driver".to_string(), driver.clone())]),
+            legacy_from: None,
+        }),
+        Event::MachineCreated { name } => Some(EventMapping {
+            event_type: "machine",
+            action: "create",
+            actor_id: name.clone(),
+            attributes: HashMap::from([("name".to_string(), name.clone())]),
+            legacy_from: None,
+        }),
+        Event::MachineStarted { name } => Some(EventMapping {
+            event_type: "machine",
+            action: "start",
+            actor_id: name.clone(),
+            attributes: HashMap::from([("name".to_string(), name.clone())]),
+            legacy_from: None,
+        }),
+        Event::MachineStopped { name } => Some(EventMapping {
+            event_type: "machine",
+            action: "stop",
+            actor_id: name.clone(),
+            attributes: HashMap::from([("name".to_string(), name.clone())]),
+            legacy_from: None,
+        }),
+        Event::VmStarted { id } => Some(EventMapping {
+            event_type: "vm",
+            action: "start",
+            actor_id: id.clone(),
+            attributes: HashMap::from([("id".to_string(), id.clone())]),
+            legacy_from: None,
+        }),
+        Event::VmStopped { id } => Some(EventMapping {
+            event_type: "vm",
+            action: "stop",
+            actor_id: id.clone(),
+            attributes: HashMap::from([("id".to_string(), id.clone())]),
+            legacy_from: None,
+        }),
+    }
+}
+
+// ============================================================================
 // Attach Handler
 // ============================================================================
 
@@ -999,9 +2013,16 @@ pub async fn attach_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(params): Query<AttachContainerQuery>,
+    mut req: Request<Body>,
 ) -> Result<Response> {
-    tracing::debug!("attach_container: id={}, stdout={}, stderr={}, stream={}",
-                    id, params.stdout, params.stderr, params.stream);
+    tracing::debug!(
+        "attach_container: id={}, stdout={}, stderr={}, stream={}, logs={}",
+        id,
+        params.stdout,
+        params.stderr,
+        params.stream,
+        params.logs
+    );
 
     let container_id = arcbox_container::state::ContainerId::from_string(&id);
 
@@ -1016,6 +2037,17 @@ pub async fn attach_container(
         .machine_name
         .clone()
         .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
+    let is_tty = container
+        .config
+        .as_ref()
+        .and_then(|c| c.tty)
+        .unwrap_or(false);
+    let open_stdin = container
+        .config
+        .as_ref()
+        .and_then(|c| c.open_stdin)
+        .unwrap_or(false);
+    let attach_stdin = params.stdin && open_stdin;
 
     // Ensure VM is ready.
     state
@@ -1040,58 +2072,196 @@ pub async fn attach_container(
             })?;
         tracing::debug!("attach_container: container started");
     } else {
-        tracing::debug!("attach_container: container already in state {:?}, not starting", container_state);
+        tracing::debug!(
+            "attach_container: container already in state {:?}, not starting",
+            container_state
+        );
     }
 
-    // Wait for container to finish and get output.
-    tracing::debug!("attach_container: waiting for container to finish");
-    let exit_result = state
-        .runtime
-        .wait_container(&machine_name, &container_id.to_string())
-        .await;
+    // Optional: prepend existing logs when `logs=true`.
+    let initial_chunk = if params.logs {
+        match state
+            .runtime
+            .container_logs(
+                &machine_name,
+                &id,
+                false, // follow
+                params.stdout,
+                params.stderr,
+                0,
+                0,
+                false,
+                -1,
+            )
+            .await
+        {
+            Ok(entry) => {
+                let stream_type: u8 = if entry.stream == "stderr" { 2 } else { 1 };
+                let encoded = if is_tty {
+                    entry.data
+                } else {
+                    encode_docker_stream(stream_type, &entry.data)
+                };
+                if encoded.is_empty() {
+                    None
+                } else {
+                    Some(Bytes::from(encoded))
+                }
+            }
+            Err(e) => {
+                tracing::warn!("attach_container: failed to read initial logs: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    match &exit_result {
-        Ok(code) => tracing::debug!("attach_container: container exited with code {}", code),
-        Err(e) => tracing::error!("attach_container: wait_container failed: {}", e),
-    }
-
-    // Get logs after container finishes.
-    tracing::debug!("attach_container: getting logs");
-    let log_entry = state
+    // Establish attach session with agent.
+    let (mut output_stream, input_tx) = state
         .runtime
-        .container_logs(
+        .container_attach(
             &machine_name,
             &id,
-            false, // follow
+            None,
+            attach_stdin,
             params.stdout,
             params.stderr,
-            0,     // since
-            0,     // until
-            false, // timestamps
-            -1,    // tail (all)
+            0,
+            0,
         )
         .await
-        .unwrap_or_default();
+        .map_err(|e| DockerError::Server(format!("failed to attach: {}", e)))?;
 
-    // Encode in Docker multiplexed stream format.
-    let stream_type: u8 = if log_entry.stream == "stderr" { 2 } else { 1 };
-    let output = encode_docker_stream(stream_type, &log_entry.data);
+    // Prepare upgrade response and spawn bidirectional bridge.
+    let upgraded = hyper::upgrade::on(&mut req);
+    let response = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(axum::http::header::CONNECTION, "Upgrade")
+        .header(axum::http::header::UPGRADE, "tcp")
+        .body(Body::empty())
+        .unwrap();
 
-    // If there was an error waiting, still return what we have.
-    if let Err(e) = exit_result {
-        tracing::warn!("Error waiting for container: {}", e);
-    }
+    tokio::spawn(async move {
+        match upgraded.await {
+            Ok(upgraded) => {
+                let io = TokioIo::new(upgraded);
+                let (mut reader, mut writer) = tokio::io::split(io);
+                let input_tx = input_tx;
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(
-            axum::http::header::CONTENT_TYPE,
-            "application/vnd.docker.raw-stream",
-        )
-        .body(Body::from(output))
-        .unwrap())
+                // Writer: send container output to client.
+                let write_task = tokio::spawn(async move {
+                    if let Some(chunk) = initial_chunk {
+                        if writer.write_all(&chunk).await.is_err() {
+                            return;
+                        }
+                    }
+
+                    while let Some(item) = output_stream.next().await {
+                        match item {
+                            Ok(out) => {
+                                let stream_type: u8 = if out.stream == "stderr" { 2 } else { 1 };
+                                let data = if is_tty {
+                                    out.data
+                                } else {
+                                    encode_docker_stream(stream_type, &out.data)
+                                };
+                                if let Err(e) = writer.write_all(&data).await {
+                                    tracing::debug!("attach write error: {}", e);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("attach output stream error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    let _ = writer.shutdown().await;
+                });
+
+                // Reader: forward client input to agent.
+                let read_task = tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match reader.read(&mut buf).await {
+                            Ok(0) => {
+                                // Signal stdin close to agent so exec can terminate.
+                                tracing::debug!("exec attach reader: client EOF, sending stdin close");
+                                let _ = input_tx
+                                    .send(arcbox_protocol::agent::AttachInput {
+                                        data: Vec::new(),
+                                        resize: false,
+                                        width: 0,
+                                        height: 0,
+                                    })
+                                    .await;
+                                break;
+                            }
+                            Ok(n) => {
+                                tracing::debug!("exec attach reader: received {} bytes", n);
+                                let msg = arcbox_protocol::agent::AttachInput {
+                                    data: buf[..n].to_vec(),
+                                    resize: false,
+                                    width: 0,
+                                    height: 0,
+                                };
+                                if input_tx.send(msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!("attach read error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                });
+
+                let _ = tokio::join!(write_task, read_task);
+            }
+            Err(e) => {
+                tracing::warn!("upgrade to attach failed: {}", e);
+            }
+        }
+    });
+
+    Ok(response)
 }
 
+/// Concatenate a list of Bytes into one buffer.
+fn concat_bytes(chunks: &[Bytes]) -> Bytes {
+    if chunks.is_empty() {
+        return Bytes::new();
+    }
+    let total: usize = chunks.iter().map(|b| b.len()).sum();
+    let mut buf = Vec::with_capacity(total);
+    for chunk in chunks {
+        buf.extend_from_slice(chunk);
+    }
+    Bytes::from(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_docker_stream_formats_header() {
+        let data = b"abc";
+        let frame = encode_docker_stream(1, data);
+        assert_eq!(frame[0], 1);
+        assert_eq!(&frame[4..8], &(data.len() as u32).to_be_bytes());
+        assert_eq!(&frame[8..], data);
+    }
+
+    #[test]
+    fn concat_bytes_preserves_order() {
+        let chunks = vec![Bytes::from_static(b"foo"), Bytes::from_static(b"bar")];
+        let out = concat_bytes(&chunks);
+        assert_eq!(out, Bytes::from_static(b"foobar"));
+    }
+}
 // ============================================================================
 // Exec Handlers
 // ============================================================================
@@ -1102,11 +2272,16 @@ pub async fn exec_create(
     Path(id): Path<String>,
     Json(body): Json<ExecCreateRequest>,
 ) -> Result<(StatusCode, Json<ExecCreateResponse>)> {
-    use arcbox_container::{ExecConfig, ContainerId};
+    use arcbox_container::{ContainerId, ExecConfig};
 
     // Verify container exists.
     let container_id = ContainerId::from_string(&id);
-    if state.runtime.container_manager().get(&container_id).is_none() {
+    if state
+        .runtime
+        .container_manager()
+        .get(&container_id)
+        .is_none()
+    {
         return Err(DockerError::ContainerNotFound(id));
     }
 
@@ -1139,11 +2314,23 @@ pub async fn exec_create(
 pub async fn exec_start(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Json(_body): Json<ExecStartRequest>,
-) -> Result<impl IntoResponse> {
+    mut req: Request<Body>,
+) -> Result<Response> {
     use arcbox_container::ExecId;
 
     let exec_id = ExecId::from_string(&id);
+
+    // Parse body manually to keep request for upgrade.
+    let body_bytes = to_bytes(std::mem::take(req.body_mut()), 1024 * 1024)
+        .await
+        .map_err(|e| DockerError::BadRequest(format!("invalid exec start body: {}", e)))?;
+    let body: ExecStartRequest = if body_bytes.is_empty() {
+        ExecStartRequest::default()
+    } else {
+        serde_json::from_slice(&body_bytes).map_err(|e| {
+            DockerError::BadRequest(format!("failed to decode exec start body: {}", e))
+        })?
+    };
 
     // Get exec instance.
     let exec = state
@@ -1157,14 +2344,26 @@ pub async fn exec_start(
         .runtime
         .container_manager()
         .get(&exec.config.container_id)
-        .ok_or_else(|| {
-            DockerError::ContainerNotFound(exec.config.container_id.to_string())
-        })?;
+        .ok_or_else(|| DockerError::ContainerNotFound(exec.config.container_id.to_string()))?;
 
     let machine_name = container
         .machine_name
         .clone()
         .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
+
+    let detach = body.detach.unwrap_or(false);
+    let tty = body.tty.unwrap_or(exec.config.tty);
+    let (tty_width, tty_height) = body
+        .console_size
+        .clone()
+        .and_then(|v| {
+            if v.len() >= 2 {
+                Some((v[0], v[1]))
+            } else {
+                None
+            }
+        })
+        .unwrap_or((80, 24));
 
     // Ensure VM is ready before executing.
     state
@@ -1188,41 +2387,121 @@ pub async fn exec_start(
         })
         .collect();
 
-    // Execute through Runtime -> Agent.
-    let output = state
+    // Start exec process in guest (streaming ready).
+    state
         .runtime
-        .exec_container(
+        .exec_start_streaming(
             &machine_name,
+            &exec_id.to_string(),
             &exec.config.container_id.to_string(),
             exec.config.cmd.clone(),
             env,
-            exec.config.working_dir.clone().unwrap_or_default(),
-            exec.config.user.clone().unwrap_or_default(),
-            exec.config.tty,
+            exec.config.working_dir.clone(),
+            exec.config.user.clone(),
+            tty,
+            detach,
+            tty_width,
+            tty_height,
         )
         .await
-        .map_err(|e| DockerError::Server(e.to_string()))?;
+        .map_err(|e| DockerError::Server(format!("failed to start exec: {}", e)))?;
 
-    // Mark exec as started in ExecManager.
-    // Use default TTY size since the actual exec already completed via agent.
-    let _ = state
+    if detach {
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .unwrap());
+    }
+
+    // Attach to exec stream.
+    let (mut output_stream, input_tx) = state
         .runtime
-        .exec_manager()
-        .start(&exec_id, false, 80, 24)
-        .await;
+        .exec_attach(
+            &machine_name,
+            &exec_id.to_string(),
+            exec.config.attach_stdin,
+            exec.config.attach_stdout,
+            exec.config.attach_stderr,
+            tty_width,
+            tty_height,
+        )
+        .await
+        .map_err(|e| DockerError::Server(format!("failed to attach exec: {}", e)))?;
 
-    // Encode output in Docker stream format.
-    let stream_type: u8 = if exec.config.attach_stdout { 1 } else { 2 };
-    let encoded = encode_docker_stream(stream_type, &output.data);
+    let upgraded = hyper::upgrade::on(&mut req);
+    let response = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(axum::http::header::CONNECTION, "Upgrade")
+        .header(axum::http::header::UPGRADE, "tcp")
+        .body(Body::empty())
+        .unwrap();
 
-    Ok((
-        StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/vnd.docker.raw-stream",
-        )],
-        encoded,
-    ))
+    tokio::spawn(async move {
+        match upgraded.await {
+            Ok(upgraded) => {
+                let io = TokioIo::new(upgraded);
+                let (mut reader, mut writer) = tokio::io::split(io);
+                let input_tx = input_tx;
+
+                // Writer task: exec output to client.
+                let write_task = tokio::spawn(async move {
+                    while let Some(item) = output_stream.next().await {
+                        match item {
+                            Ok(out) => {
+                                let stream_type: u8 = if out.stream == "stderr" { 2 } else { 1 };
+                                let data = if tty {
+                                    out.data
+                                } else {
+                                    encode_docker_stream(stream_type, &out.data)
+                                };
+                                if let Err(e) = writer.write_all(&data).await {
+                                    tracing::debug!("exec attach write error: {}", e);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("exec output stream error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    let _ = writer.shutdown().await;
+                });
+
+                // Reader task: stdin to exec.
+                let read_task = tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match reader.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let msg = arcbox_protocol::agent::AttachInput {
+                                    data: buf[..n].to_vec(),
+                                    resize: false,
+                                    width: 0,
+                                    height: 0,
+                                };
+                                if input_tx.send(msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!("exec attach read error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                });
+
+                let _ = tokio::join!(write_task, read_task);
+            }
+            Err(e) => {
+                tracing::warn!("upgrade to exec attach failed: {}", e);
+            }
+        }
+    });
+
+    Ok(response)
 }
 
 /// Resize exec TTY.
@@ -1238,17 +2517,29 @@ pub async fn exec_resize(
 
     let exec_id = ExecId::from_string(&id);
 
-    state
+    let exec = state
         .runtime
         .exec_manager()
-        .resize(&exec_id, h, w)
+        .get(&exec_id)
+        .ok_or_else(|| DockerError::NotImplemented(format!("exec {id} not found")))?;
+
+    let container = state
+        .runtime
+        .container_manager()
+        .get(&exec.config.container_id)
+        .ok_or_else(|| DockerError::ContainerNotFound(exec.config.container_id.to_string()))?;
+
+    let machine_name = container
+        .machine_name
+        .clone()
+        .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
+
+    // Resize via agent.
+    state
+        .runtime
+        .exec_resize(&machine_name, &exec_id.to_string(), w, h)
         .await
-        .map_err(|e| match e {
-            arcbox_container::ContainerError::NotFound(_) => {
-                DockerError::NotImplemented(format!("exec {id} not found"))
-            }
-            e => DockerError::Server(e.to_string()),
-        })?;
+        .map_err(|e| DockerError::Server(e.to_string()))?;
 
     Ok(StatusCode::OK)
 }
@@ -1383,15 +2674,16 @@ pub async fn pull_image(
     State(state): State<AppState>,
     Query(params): Query<PullImageQuery>,
 ) -> Result<impl IntoResponse> {
-    use arcbox_image::{ImageRef, RegistryClient};
     use arcbox_image::pull::ImagePuller;
+    use arcbox_image::{ImageRef, RegistryClient};
 
     let image = params.from_image.unwrap_or_default();
     let tag = params.tag.unwrap_or_else(|| "latest".to_string());
 
     // Parse image reference.
-    let reference = ImageRef::parse(&format!("{image}:{tag}"))
-        .ok_or_else(|| DockerError::BadRequest(format!("invalid image reference: {image}:{tag}")))?;
+    let reference = ImageRef::parse(&format!("{image}:{tag}")).ok_or_else(|| {
+        DockerError::BadRequest(format!("invalid image reference: {image}:{tag}"))
+    })?;
 
     // Build NDJSON output.
     let mut output = String::new();
@@ -1409,8 +2701,13 @@ pub async fn pull_image(
 
     match puller.pull(&reference).await {
         Ok(image_id) => {
+            let image_id_full = if image_id.starts_with("sha256:") {
+                image_id.clone()
+            } else {
+                format!("sha256:{}", image_id)
+            };
             // Short ID for display.
-            let short_id = image_id.strip_prefix("sha256:").unwrap_or(&image_id);
+            let short_id = image_id_full.strip_prefix("sha256:").unwrap_or(&image_id_full);
             let short_id = &short_id[..12.min(short_id.len())];
 
             output.push_str(&format!(
@@ -1427,6 +2724,11 @@ pub async fn pull_image(
                 "{}\n",
                 serde_json::json!({"status": format!("Status: Downloaded newer image for {}:{}", image, tag)})
             ));
+
+            state.runtime.event_bus().publish(Event::ImagePulled {
+                id: image_id_full,
+                reference: reference.to_string(),
+            });
         }
         Err(e) => {
             output.push_str(&format!(
@@ -1472,6 +2774,7 @@ pub async fn remove_image(
         .ok_or_else(|| DockerError::ImageNotFound(id.clone()))?;
 
     let image_id = image.id.clone();
+    let image_id_full = format!("sha256:{}", image_id);
     let image_ref = image.reference.to_string();
 
     // Remove the image.
@@ -1481,6 +2784,11 @@ pub async fn remove_image(
         .remove(&reference)
         .map_err(|e| DockerError::Server(e.to_string()))?;
 
+    state.runtime.event_bus().publish(Event::ImageRemoved {
+        id: image_id_full.clone(),
+        reference: image_ref.clone(),
+    });
+
     Ok(Json(vec![
         ImageDeleteResponse {
             untagged: Some(image_ref),
@@ -1488,7 +2796,7 @@ pub async fn remove_image(
         },
         ImageDeleteResponse {
             untagged: None,
-            deleted: Some(format!("sha256:{}", image_id)),
+            deleted: Some(image_id_full),
         },
     ]))
 }
@@ -1510,8 +2818,9 @@ pub async fn tag_image(
     let source = ImageRef::parse(&id).ok_or_else(|| DockerError::ImageNotFound(id.clone()))?;
 
     // Build target reference.
-    let target = ImageRef::parse(&format!("{repo}:{tag}"))
-        .ok_or_else(|| DockerError::BadRequest(format!("invalid target reference: {repo}:{tag}")))?;
+    let target = ImageRef::parse(&format!("{repo}:{tag}")).ok_or_else(|| {
+        DockerError::BadRequest(format!("invalid target reference: {repo}:{tag}"))
+    })?;
 
     // Tag the image.
     state
@@ -1583,6 +2892,20 @@ pub async fn create_network(
         )
         .map_err(|e| DockerError::Server(e.to_string()))?;
 
+    let (driver, labels) = state
+        .runtime
+        .network_manager()
+        .get_network(&id)
+        .map(|network| (network.driver, network.labels))
+        .unwrap_or_else(|| (body.driver.unwrap_or_default(), HashMap::new()));
+
+    state.runtime.event_bus().publish(Event::NetworkCreated {
+        id: id.clone(),
+        name: body.name.clone(),
+        driver,
+        labels,
+    });
+
     Ok((
         StatusCode::CREATED,
         Json(NetworkCreateResponse { id, warning: None }),
@@ -1642,11 +2965,26 @@ pub async fn remove_network(
         ));
     }
 
+    let network = state
+        .runtime
+        .network_manager()
+        .get_network(&id)
+        .ok_or_else(|| DockerError::NetworkNotFound(id.clone()))?;
+    let network_id = network.id.clone();
+    let network_name = network.name.clone();
+
     state
         .runtime
         .network_manager()
         .remove_network(&id)
         .map_err(|_| DockerError::NetworkNotFound(id))?;
+
+    state.runtime.event_bus().publish(Event::NetworkRemoved {
+        id: network_id,
+        name: network_name,
+        driver: network.driver,
+        labels: network.labels,
+    });
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1709,6 +3047,12 @@ pub async fn create_volume(
         .create(options)
         .map_err(|e| DockerError::Server(e.to_string()))?;
 
+    state.runtime.event_bus().publish(Event::VolumeCreated {
+        name: volume.name.clone(),
+        driver: volume.driver.clone(),
+        labels: volume.labels.clone(),
+    });
+
     Ok((
         StatusCode::CREATED,
         Json(VolumeSummary {
@@ -1761,13 +3105,21 @@ pub async fn remove_volume(
         .write()
         .map_err(|_| DockerError::Server("lock poisoned".to_string()))?;
 
-    // Check if volume exists first.
-    if vm.get(&name).is_none() {
-        return Err(DockerError::VolumeNotFound(name));
-    }
+    let volume = vm
+        .get(&name)
+        .ok_or_else(|| DockerError::VolumeNotFound(name.clone()))?;
+    let volume_name = volume.name.clone();
+    let volume_driver = volume.driver.clone();
+    let volume_labels = volume.labels.clone();
 
     vm.remove(&name)
         .map_err(|e| DockerError::Server(e.to_string()))?;
+
+    state.runtime.event_bus().publish(Event::VolumeRemoved {
+        name: volume_name,
+        driver: volume_driver,
+        labels: volume_labels,
+    });
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1783,14 +3135,176 @@ pub async fn prune_volumes(
         .write()
         .map_err(|_| DockerError::Server("lock poisoned".to_string()))?;
 
-    let result = vm
-        .prune()
-        .map_err(|e| DockerError::Server(e.to_string()))?;
+    let result = vm.prune().map_err(|e| DockerError::Server(e.to_string()))?;
 
     Ok(Json(VolumePruneResponse {
         volumes_deleted: result.volumes_deleted,
         space_reclaimed: result.space_reclaimed,
     }))
+}
+
+#[cfg(test)]
+mod events_tests {
+    use super::{EventFilters, event_matches_filters, map_event, parse_event_filters};
+    use arcbox_core::event::Event;
+    use std::collections::HashMap;
+
+    #[test]
+    fn parse_filters_with_type_and_container() {
+        let raw = r#"{"type":{"container":true},"container":{"abc123":true},"event":{"start":true}}"#;
+        let filters = parse_event_filters(Some(raw.to_string())).unwrap();
+
+        assert!(filters.get("type").contains(&"container".to_string()));
+        assert!(filters.get("container").contains(&"abc123".to_string()));
+        assert!(filters.get("event").contains(&"start".to_string()));
+    }
+
+    #[test]
+    fn parse_filters_with_list_values() {
+        let raw = r#"{"type":["container"],"container":["abc123"],"event":["start"]}"#;
+        let filters = parse_event_filters(Some(raw.to_string())).unwrap();
+
+        assert!(filters.get("type").contains(&"container".to_string()));
+        assert!(filters.get("container").contains(&"abc123".to_string()));
+        assert!(filters.get("event").contains(&"start".to_string()));
+    }
+
+    #[test]
+    fn event_matches_respects_type_and_event_filters() {
+        let mut filters = EventFilters::default();
+        filters.add("type", "container".to_string());
+        filters.add("container", "abc123".to_string());
+        filters.add("event", "start".to_string());
+
+        let attributes = HashMap::from([("name".to_string(), "abc123".to_string())]);
+        assert!(event_matches_filters(
+            &filters,
+            "container",
+            "start",
+            "abc123",
+            &attributes,
+            "local"
+        ));
+        assert!(!event_matches_filters(
+            &filters,
+            "container",
+            "stop",
+            "abc123",
+            &attributes,
+            "local"
+        ));
+        assert!(!event_matches_filters(
+            &filters,
+            "image",
+            "pull",
+            "abc123",
+            &attributes,
+            "local"
+        ));
+    }
+
+    #[test]
+    fn event_filter_exec_start_uses_fuzzy_match() {
+        let mut filters = EventFilters::default();
+        filters.add("event", "exec_start".to_string());
+
+        let attributes = HashMap::new();
+        assert!(event_matches_filters(
+            &filters,
+            "container",
+            "exec_start: /bin/sh -c echo hello",
+            "abc123",
+            &attributes,
+            "local"
+        ));
+    }
+
+    #[test]
+    fn map_event_container_die_has_exit_code() {
+        let event = Event::ContainerDied {
+            id: "abc123".to_string(),
+            name: "/demo".to_string(),
+            image: "alpine:latest".to_string(),
+            labels: HashMap::new(),
+            exit_code: Some(42),
+        };
+
+        let mapping = map_event(&event).unwrap();
+        assert_eq!(mapping.event_type, "container");
+        assert_eq!(mapping.action, "die");
+        assert_eq!(mapping.actor_id, "abc123");
+        assert_eq!(
+            mapping.attributes.get("name"),
+            Some(&"demo".to_string())
+        );
+        assert_eq!(
+            mapping.attributes.get("image"),
+            Some(&"alpine:latest".to_string())
+        );
+        assert_eq!(
+            mapping.attributes.get("exitCode"),
+            Some(&"42".to_string())
+        );
+        assert_eq!(mapping.legacy_from.as_deref(), Some("alpine:latest"));
+    }
+
+    #[test]
+    fn map_event_container_kill_has_signal_only() {
+        let event = Event::ContainerKilled {
+            id: "abc123".to_string(),
+            name: "demo".to_string(),
+            image: "alpine:latest".to_string(),
+            labels: HashMap::new(),
+            signal: "SIGKILL".to_string(),
+            exit_code: Some(137),
+        };
+
+        let mapping = map_event(&event).unwrap();
+        assert_eq!(mapping.event_type, "container");
+        assert_eq!(mapping.action, "kill");
+        assert_eq!(
+            mapping.attributes.get("signal"),
+            Some(&"9".to_string())
+        );
+        assert!(mapping.attributes.get("exitCode").is_none());
+    }
+
+    #[test]
+    fn map_event_network_attributes_match_moby() {
+        let event = Event::NetworkCreated {
+            id: "net123".to_string(),
+            name: "demo".to_string(),
+            driver: "bridge".to_string(),
+            labels: HashMap::from([("env".to_string(), "dev".to_string())]),
+        };
+
+        let mapping = map_event(&event).unwrap();
+        assert_eq!(mapping.event_type, "network");
+        assert_eq!(mapping.action, "create");
+        assert_eq!(mapping.attributes.get("name"), Some(&"demo".to_string()));
+        assert_eq!(mapping.attributes.get("type"), Some(&"bridge".to_string()));
+        assert!(mapping.attributes.get("driver").is_none());
+        assert!(mapping.attributes.get("env").is_none());
+    }
+
+    #[test]
+    fn map_event_volume_attributes_match_moby() {
+        let event = Event::VolumeCreated {
+            name: "vol1".to_string(),
+            driver: "local".to_string(),
+            labels: HashMap::from([("env".to_string(), "dev".to_string())]),
+        };
+
+        let mapping = map_event(&event).unwrap();
+        assert_eq!(mapping.event_type, "volume");
+        assert_eq!(mapping.action, "create");
+        assert_eq!(
+            mapping.attributes.get("driver"),
+            Some(&"local".to_string())
+        );
+        assert!(mapping.attributes.get("name").is_none());
+        assert!(mapping.attributes.get("env").is_none());
+    }
 }
 
 // ============================================================================
