@@ -231,7 +231,11 @@ fn parse_log_line(line: &str, options: &LogWatchOptions) -> LogEntry {
             // Build output data with optional timestamp.
             let output_data = if options.timestamps {
                 let ts = chrono::DateTime::from_timestamp_nanos(entry.timestamp);
-                format!("{} {}", ts.format("%Y-%m-%dT%H:%M:%S%.9fZ"), String::from_utf8_lossy(&entry.data))
+                format!(
+                    "{} {}",
+                    ts.format("%Y-%m-%dT%H:%M:%S%.9fZ"),
+                    String::from_utf8_lossy(&entry.data)
+                )
             } else {
                 String::from_utf8_lossy(&entry.data).to_string()
             };
@@ -504,8 +508,7 @@ mod tests {
         assert_eq!(msg, "error");
 
         // With timestamp and stream
-        let (ts, stream, msg) =
-            parse_structured_line("2024-01-15T10:30:00+00:00 stdout: message");
+        let (ts, stream, msg) = parse_structured_line("2024-01-15T10:30:00+00:00 stdout: message");
         assert!(ts.is_some());
         assert_eq!(stream, Some("stdout".to_string()));
         assert_eq!(msg, "message");
@@ -514,7 +517,8 @@ mod tests {
     #[test]
     fn test_parse_docker_json_line() {
         // Standard Docker JSON format.
-        let line = r#"{"log":"hello world\n","stream":"stdout","time":"2024-01-15T10:30:00.123456789Z"}"#;
+        let line =
+            r#"{"log":"hello world\n","stream":"stdout","time":"2024-01-15T10:30:00.123456789Z"}"#;
         let entry = parse_docker_json_line(line).unwrap();
 
         assert_eq!(entry.stream, "stdout");
@@ -537,7 +541,10 @@ mod tests {
         let line = r#"{"log":"line with \"quotes\" and \\backslash\n","stream":"stdout","time":"2024-01-15T10:30:00Z"}"#;
         let entry = parse_docker_json_line(line).unwrap();
 
-        assert_eq!(String::from_utf8_lossy(&entry.data), "line with \"quotes\" and \\backslash\n");
+        assert_eq!(
+            String::from_utf8_lossy(&entry.data),
+            "line with \"quotes\" and \\backslash\n"
+        );
     }
 
     #[test]

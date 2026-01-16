@@ -21,14 +21,16 @@ use prost::Message;
 use std::io::Cursor;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use arcbox_protocol::agent::{
-    CreateContainerRequest, CreateContainerResponse, ExecOutput, ExecRequest,
-    ExecResizeRequest, ExecStartRequest, ExecStartResponse, ListContainersRequest,
-    ListContainersResponse, LogEntry, LogsRequest, PingRequest, PingResponse,
-    RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
-};
-use arcbox_protocol::container::{KillContainerRequest, WaitContainerRequest, WaitContainerResponse};
 use arcbox_protocol::Empty;
+use arcbox_protocol::agent::{
+    CreateContainerRequest, CreateContainerResponse, ExecOutput, ExecRequest, ExecResizeRequest,
+    ExecStartRequest, ExecStartResponse, ListContainersRequest, ListContainersResponse, LogEntry,
+    LogsRequest, PingRequest, PingResponse, RemoveContainerRequest, StartContainerRequest,
+    StopContainerRequest, SystemInfo,
+};
+use arcbox_protocol::container::{
+    KillContainerRequest, WaitContainerRequest, WaitContainerResponse,
+};
 
 /// Agent version string.
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -51,6 +53,8 @@ pub enum MessageType {
     LogsRequest = 0x0021,
     ExecStartRequest = 0x0022,
     ExecResizeRequest = 0x0023,
+    AttachRequest = 0x0024,
+    AttachInput = 0x0025,
 
     // Response types (0x1000 - 0x1FFF)
     PingResponse = 0x1001,
@@ -65,6 +69,7 @@ pub enum MessageType {
     ExecOutput = 0x1020,
     LogEntry = 0x1021,
     ExecStartResponse = 0x1022,
+    AttachOutput = 0x1023,
 
     // Special types
     Empty = 0x0000,
@@ -88,6 +93,8 @@ impl MessageType {
             0x0021 => Some(Self::LogsRequest),
             0x0022 => Some(Self::ExecStartRequest),
             0x0023 => Some(Self::ExecResizeRequest),
+            0x0024 => Some(Self::AttachRequest),
+            0x0025 => Some(Self::AttachInput),
             0x1001 => Some(Self::PingResponse),
             0x1002 => Some(Self::GetSystemInfoResponse),
             0x1010 => Some(Self::CreateContainerResponse),
@@ -100,6 +107,7 @@ impl MessageType {
             0x1020 => Some(Self::ExecOutput),
             0x1021 => Some(Self::LogEntry),
             0x1022 => Some(Self::ExecStartResponse),
+            0x1023 => Some(Self::AttachOutput),
             0x0000 => Some(Self::Empty),
             0xFFFF => Some(Self::Error),
             _ => None,
@@ -162,6 +170,8 @@ pub enum RpcRequest {
     Logs(LogsRequest),
     ExecStart(ExecStartRequest),
     ExecResize(ExecResizeRequest),
+    Attach(arcbox_protocol::agent::AttachRequest),
+    AttachInput(arcbox_protocol::agent::AttachInput),
 }
 
 /// RPC response envelope.
@@ -176,6 +186,7 @@ pub enum RpcResponse {
     ExecOutput(ExecOutput),
     LogEntry(LogEntry),
     ExecStart(ExecStartResponse),
+    AttachOutput(arcbox_protocol::agent::AttachOutput),
     Error(ErrorResponse),
 }
 
@@ -192,6 +203,7 @@ impl RpcResponse {
             Self::ExecOutput(_) => MessageType::ExecOutput,
             Self::LogEntry(_) => MessageType::LogEntry,
             Self::ExecStart(_) => MessageType::ExecStartResponse,
+            Self::AttachOutput(_) => MessageType::AttachOutput,
             Self::Error(_) => MessageType::Error,
         }
     }
@@ -208,6 +220,7 @@ impl RpcResponse {
             Self::ExecOutput(msg) => msg.encode_to_vec(),
             Self::LogEntry(msg) => msg.encode_to_vec(),
             Self::ExecStart(msg) => msg.encode_to_vec(),
+            Self::AttachOutput(msg) => msg.encode_to_vec(),
             Self::Error(err) => err.encode(),
         }
     }
@@ -329,6 +342,14 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
             let req = ExecResizeRequest::decode(payload)?;
             Ok(RpcRequest::ExecResize(req))
         }
+        MessageType::AttachRequest => {
+            let req = arcbox_protocol::agent::AttachRequest::decode(payload)?;
+            Ok(RpcRequest::Attach(req))
+        }
+        MessageType::AttachInput => {
+            let req = arcbox_protocol::agent::AttachInput::decode(payload)?;
+            Ok(RpcRequest::AttachInput(req))
+        }
         _ => anyhow::bail!("unexpected message type: {:?}", msg_type),
     }
 }
@@ -344,7 +365,10 @@ mod tests {
 
     #[test]
     fn test_message_type_from_u32_requests() {
-        assert_eq!(MessageType::from_u32(0x0001), Some(MessageType::PingRequest));
+        assert_eq!(
+            MessageType::from_u32(0x0001),
+            Some(MessageType::PingRequest)
+        );
         assert_eq!(
             MessageType::from_u32(0x0002),
             Some(MessageType::GetSystemInfoRequest)
@@ -373,6 +397,10 @@ mod tests {
             MessageType::from_u32(0x0020),
             Some(MessageType::ExecRequest)
         );
+        assert_eq!(
+            MessageType::from_u32(0x0024),
+            Some(MessageType::AttachRequest)
+        );
     }
 
     #[test]
@@ -394,6 +422,10 @@ mod tests {
             Some(MessageType::ListContainersResponse)
         );
         assert_eq!(MessageType::from_u32(0x1020), Some(MessageType::ExecOutput));
+        assert_eq!(
+            MessageType::from_u32(0x1023),
+            Some(MessageType::AttachOutput)
+        );
     }
 
     #[test]
@@ -407,6 +439,7 @@ mod tests {
         assert_eq!(MessageType::from_u32(0x9999), None);
         assert_eq!(MessageType::from_u32(0x0003), None);
         assert_eq!(MessageType::from_u32(0x1003), None);
+        assert_eq!(MessageType::from_u32(0x0026), None);
     }
 
     // =========================================================================
@@ -628,6 +661,34 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_request_attach() {
+        let req = arcbox_protocol::agent::AttachRequest {
+            container_id: "c1".to_string(),
+            attach_stdin: true,
+            attach_stdout: true,
+            attach_stderr: false,
+            tty_width: 120,
+            tty_height: 33,
+            exec_id: String::new(),
+        };
+        let payload = req.encode_to_vec();
+
+        let parsed = parse_request(MessageType::AttachRequest, &payload).unwrap();
+        match parsed {
+            RpcRequest::Attach(a) => {
+                assert_eq!(a.container_id, "c1");
+                assert!(a.attach_stdin);
+                assert!(a.attach_stdout);
+                assert!(!a.attach_stderr);
+                assert_eq!(a.tty_width, 120);
+                assert_eq!(a.tty_height, 33);
+                assert!(a.exec_id.is_empty());
+            }
+            _ => panic!("expected Attach request"),
+        }
+    }
+
+    #[test]
     fn test_parse_request_unexpected_type() {
         // Response types should not be parseable as requests
         let result = parse_request(MessageType::PingResponse, &[]);
@@ -673,6 +734,14 @@ mod tests {
             RpcResponse::Error(ErrorResponse::new(500, "error")).message_type(),
             MessageType::Error
         );
+        assert_eq!(
+            RpcResponse::AttachOutput(arcbox_protocol::agent::AttachOutput {
+                stream: "stdout".to_string(),
+                data: vec![1, 2, 3],
+            })
+            .message_type(),
+            MessageType::AttachOutput
+        );
     }
 
     #[test]
@@ -697,6 +766,19 @@ mod tests {
         // Empty message should decode successfully
         let decoded = Empty::decode(&payload[..]).unwrap();
         assert_eq!(decoded, Empty::default());
+    }
+
+    #[test]
+    fn test_rpc_response_encode_payload_attach_output() {
+        let response = RpcResponse::AttachOutput(arcbox_protocol::agent::AttachOutput {
+            stream: "stderr".to_string(),
+            data: vec![9, 8, 7],
+        });
+        let payload = response.encode_payload();
+
+        let decoded = arcbox_protocol::agent::AttachOutput::decode(&payload[..]).unwrap();
+        assert_eq!(decoded.stream, "stderr");
+        assert_eq!(decoded.data, vec![9, 8, 7]);
     }
 
     #[tokio::test]

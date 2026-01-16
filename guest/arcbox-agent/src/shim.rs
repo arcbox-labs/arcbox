@@ -39,6 +39,7 @@
 //! - [`ProcessShim`]: Main shim implementation managing I/O copying
 //! - [`BroadcastWriter`]: Tee writer for attach clients
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read as StdRead, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -50,7 +51,7 @@ use std::task::{Context, Poll};
 use bytes::{Bytes, BytesMut};
 use futures::ready;
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 // =============================================================================
@@ -304,10 +305,7 @@ pub struct JsonFileWriter {
 impl JsonFileWriter {
     /// Creates a new JSON file writer.
     pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
 
         Ok(Self {
             file: Mutex::new(BufWriter::new(file)),
@@ -334,8 +332,7 @@ impl JsonFileWriter {
     fn format_timestamp(nanos: i64) -> String {
         let secs = nanos / 1_000_000_000;
         let nsecs = (nanos % 1_000_000_000) as u32;
-        let dt = chrono::DateTime::from_timestamp(secs, nsecs)
-            .unwrap_or_else(chrono::Utc::now);
+        let dt = chrono::DateTime::from_timestamp(secs, nsecs).unwrap_or_else(chrono::Utc::now);
         dt.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string()
     }
 }
@@ -440,10 +437,7 @@ impl RotatingJsonFileWriter {
             fs::create_dir_all(parent)?;
         }
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         let size = file.metadata()?.len();
 
@@ -567,8 +561,7 @@ impl RotatingJsonFileWriter {
     fn format_timestamp(nanos: i64) -> String {
         let secs = nanos / 1_000_000_000;
         let nsecs = (nanos % 1_000_000_000) as u32;
-        let dt = chrono::DateTime::from_timestamp(secs, nsecs)
-            .unwrap_or_else(chrono::Utc::now);
+        let dt = chrono::DateTime::from_timestamp(secs, nsecs).unwrap_or_else(chrono::Utc::now);
         dt.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string()
     }
 }
@@ -618,8 +611,8 @@ impl LogWriter for RotatingJsonFileWriter {
 /// 2. Writes compressed data to .1.gz
 /// 3. Deletes the original .1 file on success
 fn compress_log_file(base_path: &Path) -> io::Result<()> {
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
 
     let source_path = format!("{}.1", base_path.display());
     let dest_path = format!("{}.1.gz", base_path.display());
@@ -653,6 +646,38 @@ fn compress_log_file(base_path: &Path) -> io::Result<()> {
 // Broadcast Writer
 // =============================================================================
 
+/// In-memory backlog to replay recent output to new subscribers.
+struct BroadcastBacklog {
+    entries: VecDeque<LogEntry>,
+    total_bytes: usize,
+}
+
+impl BroadcastBacklog {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            total_bytes: 0,
+        }
+    }
+
+    /// Push a new log entry and trim oldest data to respect limits.
+    fn push_and_trim(&mut self, entry: LogEntry) {
+        self.total_bytes += entry.data.len();
+        self.entries.push_back(entry);
+
+        while self.entries.len() > BROADCAST_BACKLOG_MAX_ENTRIES
+            || self.total_bytes > BROADCAST_BACKLOG_MAX_BYTES
+        {
+            if let Some(removed) = self.entries.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.data.len());
+            } else {
+                self.total_bytes = 0;
+                break;
+            }
+        }
+    }
+}
+
 /// Broadcast writer for attach clients.
 ///
 /// Allows multiple clients to subscribe to log output in real-time.
@@ -660,7 +685,12 @@ fn compress_log_file(base_path: &Path) -> io::Result<()> {
 pub struct BroadcastWriter {
     /// Active subscribers.
     subscribers: RwLock<Vec<mpsc::Sender<LogEntry>>>,
+    /// Recent output backlog for late subscribers.
+    backlog: RwLock<BroadcastBacklog>,
 }
+
+const BROADCAST_BACKLOG_MAX_ENTRIES: usize = 64;
+const BROADCAST_BACKLOG_MAX_BYTES: usize = 64 * 1024;
 
 impl BroadcastWriter {
     /// Creates a new broadcast writer.
@@ -668,6 +698,7 @@ impl BroadcastWriter {
     pub fn new() -> Self {
         Self {
             subscribers: RwLock::new(Vec::new()),
+            backlog: RwLock::new(BroadcastBacklog::new()),
         }
     }
 
@@ -676,7 +707,20 @@ impl BroadcastWriter {
     /// Returns a receiver that will receive log entries as they are written.
     pub async fn subscribe(&self) -> mpsc::Receiver<LogEntry> {
         let (tx, rx) = mpsc::channel(64);
-        self.subscribers.write().await.push(tx);
+
+        // Register subscriber first to receive new data arriving during replay.
+        self.subscribers.write().await.push(tx.clone());
+
+        // Replay buffered output so fast commands are not missed.
+        {
+            let backlog = self.backlog.read().await;
+            for entry in backlog.entries.iter() {
+                if tx.send(entry.clone()).await.is_err() {
+                    return rx;
+                }
+            }
+        }
+
         rx
     }
 
@@ -696,6 +740,11 @@ impl Default for BroadcastWriter {
 #[async_trait::async_trait]
 impl LogWriter for BroadcastWriter {
     async fn write(&self, entry: &LogEntry) -> io::Result<()> {
+        {
+            let mut backlog = self.backlog.write().await;
+            backlog.push_and_trim(entry.clone());
+        }
+
         let subs = self.subscribers.read().await;
         for tx in subs.iter() {
             // Best-effort send, don't block if a subscriber is slow
@@ -898,11 +947,7 @@ impl ProcessShim {
             tokio::spawn(async move {
                 if let Err(e) = read_source(source, tx, shutdown).await {
                     if e.kind() != io::ErrorKind::UnexpectedEof {
-                        tracing::error!(
-                            "Error reading from source for {}: {}",
-                            container_id,
-                            e
-                        );
+                        tracing::error!("Error reading from source for {}: {}", container_id, e);
                     }
                 }
             });
@@ -915,11 +960,7 @@ impl ProcessShim {
         while let Some(entry) = rx.recv().await {
             // Write to log file
             if let Err(e) = self.log_writer.write(&entry).await {
-                tracing::error!(
-                    "Error writing log for {}: {}",
-                    self.container_id,
-                    e
-                );
+                tracing::error!("Error writing log for {}: {}", self.container_id, e);
             }
 
             // Broadcast to attach clients
@@ -1294,7 +1335,11 @@ mod tests {
         // Write multiple entries
         for i in 0..5 {
             let entry = LogEntry {
-                stream: if i % 2 == 0 { StreamType::Stdout } else { StreamType::Stderr },
+                stream: if i % 2 == 0 {
+                    StreamType::Stdout
+                } else {
+                    StreamType::Stderr
+                },
                 data: Bytes::from(format!("line {}\n", i)),
                 timestamp: 1705315800_000000000 + i as i64 * 1_000_000_000,
                 partial: false,
@@ -1498,18 +1543,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_source_with_mock() {
-        let source = MockOutputSource::new(
-            StreamType::Stdout,
-            b"line 1\nline 2\nline 3\n".to_vec(),
-        );
+        let source =
+            MockOutputSource::new(StreamType::Stdout, b"line 1\nline 2\nline 3\n".to_vec());
 
         let (tx, mut rx) = mpsc::channel(16);
         let shutdown = CancellationToken::new();
 
         // Run read_source in a task
-        let handle = tokio::spawn(async move {
-            read_source(Box::new(source), tx, shutdown).await
-        });
+        let handle = tokio::spawn(async move { read_source(Box::new(source), tx, shutdown).await });
 
         // Collect entries
         let mut entries = Vec::new();
@@ -1533,17 +1574,13 @@ mod tests {
     #[tokio::test]
     async fn test_read_source_partial_line() {
         // Test data without trailing newline
-        let source = MockOutputSource::new(
-            StreamType::Stderr,
-            b"partial data without newline".to_vec(),
-        );
+        let source =
+            MockOutputSource::new(StreamType::Stderr, b"partial data without newline".to_vec());
 
         let (tx, mut rx) = mpsc::channel(16);
         let shutdown = CancellationToken::new();
 
-        let handle = tokio::spawn(async move {
-            read_source(Box::new(source), tx, shutdown).await
-        });
+        let handle = tokio::spawn(async move { read_source(Box::new(source), tx, shutdown).await });
 
         let mut entries = Vec::new();
         while let Some(entry) = rx.recv().await {
@@ -1581,9 +1618,10 @@ mod tests {
         let shutdown = CancellationToken::new();
         let shutdown_clone = shutdown.clone();
 
-        let handle = tokio::spawn(async move {
-            read_source(Box::new(BlockingSource), tx, shutdown_clone).await
-        });
+        let handle =
+            tokio::spawn(
+                async move { read_source(Box::new(BlockingSource), tx, shutdown_clone).await },
+            );
 
         // Give task time to start
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1592,10 +1630,7 @@ mod tests {
         shutdown.cancel();
 
         // Task should complete quickly
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            handle,
-        ).await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), handle).await;
 
         assert!(result.is_ok(), "Task should complete after shutdown");
     }
@@ -1824,7 +1859,10 @@ mod tests {
         // Test that RotatingJsonFileWriter uses the same escaping as JsonFileWriter.
         assert_eq!(RotatingJsonFileWriter::escape_json(b"hello"), "hello");
         assert_eq!(RotatingJsonFileWriter::escape_json(b"hello\n"), "hello\\n");
-        assert_eq!(RotatingJsonFileWriter::escape_json(b"say \"hi\""), "say \\\"hi\\\"");
+        assert_eq!(
+            RotatingJsonFileWriter::escape_json(b"say \"hi\""),
+            "say \\\"hi\\\""
+        );
     }
 
     #[test]

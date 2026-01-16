@@ -61,14 +61,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_exec_simple_command() {
-        let result = exec(
-            &["echo".to_string(), "hello".to_string()],
-            None,
-            &[],
-            None,
-        )
-        .await
-        .unwrap();
+        let result = exec(&["echo".to_string(), "hello".to_string()], None, &[], None)
+            .await
+            .unwrap();
 
         assert_eq!(result.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "hello");
@@ -122,7 +117,11 @@ mod tests {
     #[tokio::test]
     async fn test_exec_with_environment_variable() {
         let result = exec(
-            &["sh".to_string(), "-c".to_string(), "echo $TEST_VAR".to_string()],
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo $TEST_VAR".to_string(),
+            ],
             None,
             &[("TEST_VAR".to_string(), "hello_world".to_string())],
             None,
@@ -297,10 +296,7 @@ mod tests {
     #[tokio::test]
     async fn test_exec_unicode_output() {
         let result = exec(
-            &[
-                "echo".to_string(),
-                "你好世界 🌍".to_string(),
-            ],
+            &["echo".to_string(), "你好世界 🌍".to_string()],
             None,
             &[],
             None,

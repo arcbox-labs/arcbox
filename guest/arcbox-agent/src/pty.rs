@@ -4,8 +4,8 @@
 //! for interactive container sessions.
 
 use anyhow::{Context, Result};
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
-use nix::pty::{openpty, OpenptyResult, Winsize};
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::pty::{OpenptyResult, Winsize, openpty};
 use nix::sys::termios::{self, SetArg, Termios};
 use nix::unistd::{close, dup2, read, setsid, write};
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
@@ -16,7 +16,7 @@ pub struct Pty {
     /// Master side of the PTY (for the host to read/write).
     master: OwnedFd,
     /// Slave side of the PTY (for the child process).
-    slave: OwnedFd,
+    slave: Option<OwnedFd>,
     /// Original terminal settings (for restoration).
     /// Wrapped in Mutex for thread-safety (Termios contains RefCell).
     original_termios: Mutex<Option<Termios>>,
@@ -25,19 +25,18 @@ pub struct Pty {
 impl Pty {
     /// Opens a new PTY pair.
     pub fn open() -> Result<Self> {
-        let OpenptyResult { master, slave } = openpty(None, None)
-            .context("failed to open PTY")?;
+        let OpenptyResult { master, slave } = openpty(None, None).context("failed to open PTY")?;
 
         // Set master to non-blocking for async I/O
-        let flags = fcntl(master.as_raw_fd(), FcntlArg::F_GETFL)
-            .context("failed to get PTY flags")?;
+        let flags =
+            fcntl(master.as_raw_fd(), FcntlArg::F_GETFL).context("failed to get PTY flags")?;
         let new_flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
         fcntl(master.as_raw_fd(), FcntlArg::F_SETFL(new_flags))
             .context("failed to set PTY flags")?;
 
         Ok(Self {
             master,
-            slave,
+            slave: Some(slave),
             original_termios: Mutex::new(None),
         })
     }
@@ -51,19 +50,29 @@ impl Pty {
             ws_ypixel: 0,
         };
 
-        let OpenptyResult { master, slave } = openpty(Some(&winsize), None)
-            .context("failed to open PTY with size")?;
+        let OpenptyResult { master, slave } = match openpty(Some(&winsize), None) {
+            Ok(res) => res,
+            Err(err) => {
+                tracing::warn!(
+                    "openpty with size {}x{} failed ({}), falling back to default",
+                    cols,
+                    rows,
+                    err
+                );
+                openpty(None, None).context("failed to open PTY after fallback")?
+            }
+        };
 
         // Set master to non-blocking
-        let flags = fcntl(master.as_raw_fd(), FcntlArg::F_GETFL)
-            .context("failed to get PTY flags")?;
+        let flags =
+            fcntl(master.as_raw_fd(), FcntlArg::F_GETFL).context("failed to get PTY flags")?;
         let new_flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
         fcntl(master.as_raw_fd(), FcntlArg::F_SETFL(new_flags))
             .context("failed to set PTY flags")?;
 
         Ok(Self {
             master,
-            slave,
+            slave: Some(slave),
             original_termios: Mutex::new(None),
         })
     }
@@ -73,9 +82,9 @@ impl Pty {
         self.master.as_raw_fd()
     }
 
-    /// Returns the slave file descriptor.
+    /// Returns the slave file descriptor (or -1 if closed).
     pub fn slave_fd(&self) -> RawFd {
-        self.slave.as_raw_fd()
+        self.slave.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1)
     }
 
     /// Resizes the PTY window.
@@ -88,9 +97,7 @@ impl Pty {
         };
 
         // SAFETY: TIOCSWINSZ is a valid ioctl for PTY resize
-        let ret = unsafe {
-            libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &winsize)
-        };
+        let ret = unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &winsize) };
 
         if ret < 0 {
             anyhow::bail!("failed to resize PTY: {}", std::io::Error::last_os_error());
@@ -110,12 +117,13 @@ impl Pty {
         };
 
         // SAFETY: TIOCGWINSZ is a valid ioctl for getting PTY size
-        let ret = unsafe {
-            libc::ioctl(self.master.as_raw_fd(), libc::TIOCGWINSZ, &mut winsize)
-        };
+        let ret = unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCGWINSZ, &mut winsize) };
 
         if ret < 0 {
-            anyhow::bail!("failed to get PTY size: {}", std::io::Error::last_os_error());
+            anyhow::bail!(
+                "failed to get PTY size: {}",
+                std::io::Error::last_os_error()
+            );
         }
 
         Ok((winsize.ws_col, winsize.ws_row))
@@ -134,29 +142,31 @@ impl Pty {
 
         // Set the slave as the controlling terminal
         // SAFETY: TIOCSCTTY is a valid ioctl for setting controlling terminal
+        let slave_fd = self
+            .slave
+            .as_ref()
+            .context("PTY slave not available for child setup")?
+            .as_raw_fd();
+
         #[cfg(target_os = "linux")]
-        let ret = unsafe {
-            libc::ioctl(self.slave.as_raw_fd(), libc::TIOCSCTTY, 0)
-        };
+        let ret = unsafe { libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) };
         #[cfg(target_os = "macos")]
-        let ret = unsafe {
-            libc::ioctl(self.slave.as_raw_fd(), libc::TIOCSCTTY as libc::c_ulong, 0)
-        };
+        let ret = unsafe { libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) };
         if ret < 0 {
-            anyhow::bail!("failed to set controlling terminal: {}", std::io::Error::last_os_error());
+            anyhow::bail!(
+                "failed to set controlling terminal: {}",
+                std::io::Error::last_os_error()
+            );
         }
 
         // Duplicate slave to stdin, stdout, stderr
-        dup2(self.slave.as_raw_fd(), libc::STDIN_FILENO)
-            .context("failed to dup2 stdin")?;
-        dup2(self.slave.as_raw_fd(), libc::STDOUT_FILENO)
-            .context("failed to dup2 stdout")?;
-        dup2(self.slave.as_raw_fd(), libc::STDERR_FILENO)
-            .context("failed to dup2 stderr")?;
+        dup2(slave_fd, libc::STDIN_FILENO).context("failed to dup2 stdin")?;
+        dup2(slave_fd, libc::STDOUT_FILENO).context("failed to dup2 stdout")?;
+        dup2(slave_fd, libc::STDERR_FILENO).context("failed to dup2 stderr")?;
 
         // Close original fds if they're not 0, 1, or 2
-        if self.slave.as_raw_fd() > libc::STDERR_FILENO {
-            let _ = unsafe { libc::close(self.slave.as_raw_fd()) };
+        if slave_fd > libc::STDERR_FILENO {
+            let _ = unsafe { libc::close(slave_fd) };
         }
 
         Ok(())
@@ -164,19 +174,20 @@ impl Pty {
 
     /// Closes the slave side (should be done in parent after fork).
     pub fn close_slave(&mut self) -> Result<()> {
-        // The slave fd will be closed when the OwnedFd is dropped
-        // We create a new OwnedFd with an invalid fd to effectively close the old one
-        let slave_fd = self.slave.as_raw_fd();
-        if slave_fd >= 0 {
-            close(slave_fd).ok();
-        }
+        // Drop the slave fd so EOF can propagate to the master.
+        self.slave.take();
         Ok(())
     }
 
     /// Sets raw mode on the PTY slave.
     pub fn set_raw_mode(&self) -> Result<()> {
-        let mut termios = termios::tcgetattr(&self.slave)
-            .context("failed to get terminal attributes")?;
+        let slave = self
+            .slave
+            .as_ref()
+            .context("PTY slave not available for raw mode")?;
+
+        let mut termios =
+            termios::tcgetattr(slave).context("failed to get terminal attributes")?;
 
         // Save original settings
         if let Ok(mut guard) = self.original_termios.lock() {
@@ -186,7 +197,7 @@ impl Pty {
         // Set raw mode
         termios::cfmakeraw(&mut termios);
 
-        termios::tcsetattr(&self.slave, SetArg::TCSANOW, &termios)
+        termios::tcsetattr(slave, SetArg::TCSANOW, &termios)
             .context("failed to set raw mode")?;
 
         Ok(())
@@ -196,8 +207,10 @@ impl Pty {
     pub fn restore_termios(&self) -> Result<()> {
         if let Ok(guard) = self.original_termios.lock() {
             if let Some(ref original) = *guard {
-                termios::tcsetattr(&self.slave, SetArg::TCSANOW, original)
-                    .context("failed to restore terminal settings")?;
+                if let Some(slave) = self.slave.as_ref() {
+                    termios::tcsetattr(slave, SetArg::TCSANOW, original)
+                        .context("failed to restore terminal settings")?;
+                }
             }
         }
         Ok(())
@@ -205,8 +218,7 @@ impl Pty {
 
     /// Writes data to the PTY master (input to the child).
     pub fn write_input(&self, data: &[u8]) -> Result<usize> {
-        let n = write(&self.master, data)
-            .context("failed to write to PTY")?;
+        let n = write(&self.master, data).context("failed to write to PTY")?;
         Ok(n)
     }
 
@@ -272,6 +284,16 @@ impl PtyHandle {
     /// Gets a mutable reference to the inner PTY.
     pub fn pty_mut(&mut self) -> &mut Pty {
         &mut self.pty
+    }
+
+    /// Writes data to the PTY master (input to the child).
+    pub fn write_input(&self, data: &[u8]) -> Result<usize> {
+        self.pty.write_input(data)
+    }
+
+    /// Reads data from the PTY master (output from the child).
+    pub fn read_output(&self, buf: &mut [u8]) -> Result<usize> {
+        self.pty.read_output(buf)
     }
 }
 

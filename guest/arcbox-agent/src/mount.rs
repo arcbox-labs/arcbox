@@ -6,13 +6,8 @@ use anyhow::Result;
 
 /// Mount a filesystem.
 #[cfg(target_os = "linux")]
-pub fn mount_fs(
-    source: &str,
-    target: &str,
-    fstype: &str,
-    _options: &[String],
-) -> Result<()> {
-    use nix::mount::{mount, MsFlags};
+pub fn mount_fs(source: &str, target: &str, fstype: &str, _options: &[String]) -> Result<()> {
+    use nix::mount::{MsFlags, mount};
     use std::path::Path;
 
     tracing::info!("Mounting {} on {} (type: {})", source, target, fstype);
@@ -33,12 +28,7 @@ pub fn mount_fs(
 
 /// Mount a filesystem (stub for non-Linux platforms).
 #[cfg(not(target_os = "linux"))]
-pub fn mount_fs(
-    source: &str,
-    target: &str,
-    fstype: &str,
-    _options: &[String],
-) -> Result<()> {
+pub fn mount_fs(source: &str, target: &str, fstype: &str, _options: &[String]) -> Result<()> {
     tracing::warn!(
         "mount_fs is only supported on Linux (called with source={}, target={}, fstype={})",
         source,
