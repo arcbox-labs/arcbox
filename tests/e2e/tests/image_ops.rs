@@ -2,8 +2,8 @@
 //!
 //! Tests for image pull, list, inspect, and removal.
 
-use arcbox_e2e::{TestHarness, TestFixtures};
 use arcbox_e2e::fixtures::images;
+use arcbox_e2e::{TestFixtures, TestHarness};
 use std::time::Duration;
 
 /// Skip test if resources are not available.
@@ -31,7 +31,10 @@ async fn test_image_pull_alpine() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.start_daemon().await.expect("failed to start daemon");
+    harness
+        .start_daemon()
+        .await
+        .expect("failed to start daemon");
 
     // Pull alpine image
     let output = harness
@@ -66,7 +69,10 @@ async fn test_image_pull_with_tag() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.start_daemon().await.expect("failed to start daemon");
+    harness
+        .start_daemon()
+        .await
+        .expect("failed to start daemon");
 
     // Pull specific version
     let output = harness
@@ -89,7 +95,10 @@ async fn test_image_pull_progress() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.start_daemon().await.expect("failed to start daemon");
+    harness
+        .start_daemon()
+        .await
+        .expect("failed to start daemon");
 
     // Pull with progress output
     let output = harness
@@ -103,11 +112,7 @@ async fn test_image_pull_progress() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    assert!(
-        output.status.success(),
-        "Pull should succeed: {}",
-        combined
-    );
+    assert!(output.status.success(), "Pull should succeed: {}", combined);
 }
 
 #[tokio::test]
@@ -119,7 +124,10 @@ async fn test_image_pull_nonexistent() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.start_daemon().await.expect("failed to start daemon");
+    harness
+        .start_daemon()
+        .await
+        .expect("failed to start daemon");
 
     // Pull non-existent image
     let output = harness
@@ -145,7 +153,10 @@ async fn test_image_list_empty() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.start_daemon().await.expect("failed to start daemon");
+    harness
+        .start_daemon()
+        .await
+        .expect("failed to start daemon");
 
     // List images (should be empty initially)
     let output = harness
@@ -164,7 +175,10 @@ async fn test_image_list_after_pull() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.start_daemon().await.expect("failed to start daemon");
+    harness
+        .start_daemon()
+        .await
+        .expect("failed to start daemon");
 
     // Pull an image
     harness
@@ -196,7 +210,10 @@ async fn test_image_inspect() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.start_daemon().await.expect("failed to start daemon");
+    harness
+        .start_daemon()
+        .await
+        .expect("failed to start daemon");
 
     // Pull image first
     harness
@@ -233,7 +250,10 @@ async fn test_image_remove() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.start_daemon().await.expect("failed to start daemon");
+    harness
+        .start_daemon()
+        .await
+        .expect("failed to start daemon");
 
     // Pull image
     harness
@@ -241,7 +261,9 @@ async fn test_image_remove() {
         .expect("failed to pull");
 
     // Verify it exists
-    let list1 = harness.run_command_success(&["images"]).expect("failed to list");
+    let list1 = harness
+        .run_command_success(&["images"])
+        .expect("failed to list");
     assert!(list1.contains("busybox"), "Image should exist");
 
     // Remove image
@@ -256,7 +278,9 @@ async fn test_image_remove() {
     );
 
     // Verify it's gone
-    let list2 = harness.run_command_success(&["images"]).expect("failed to list");
+    let list2 = harness
+        .run_command_success(&["images"])
+        .expect("failed to list");
     assert!(!list2.contains("busybox"), "Image should be removed");
 }
 
@@ -269,7 +293,10 @@ async fn test_image_remove_in_use() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     // Pull image
     harness
@@ -319,7 +346,10 @@ async fn test_layer_extraction_on_container_create() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     // Pull image
     harness

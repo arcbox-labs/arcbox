@@ -11,13 +11,13 @@
 //! 4. **Container Lifecycle** - Test container create/start/stop/remove
 //! 5. **Full Workflow** - Test `arcbox run` equivalent flows
 
+pub mod agent;
+pub mod assertions;
+pub mod fixtures;
 pub mod harness;
 pub mod vm;
-pub mod agent;
-pub mod fixtures;
-pub mod assertions;
 
-pub use harness::{TestHarness, TestConfig};
-pub use vm::VmController;
 pub use agent::AgentClient;
 pub use fixtures::TestFixtures;
+pub use harness::{TestConfig, TestHarness};
+pub use vm::VmController;

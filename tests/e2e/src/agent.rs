@@ -80,7 +80,12 @@ impl<'a> AgentClient<'a> {
     }
 
     /// Creates a container.
-    pub fn create_container(&self, image: &str, name: Option<&str>, cmd: &[&str]) -> Result<String> {
+    pub fn create_container(
+        &self,
+        image: &str,
+        name: Option<&str>,
+        cmd: &[&str],
+    ) -> Result<String> {
         let mut args = vec!["create"];
 
         if let Some(n) = name {
@@ -230,9 +235,7 @@ impl<'a> AgentClient<'a> {
     /// Runs an arcbox command.
     fn run_arcbox(&self, args: &[&str]) -> Result<std::process::Output> {
         let mut cmd = Command::new(self.binary);
-        cmd.args(args)
-            .arg("--socket")
-            .arg(self.socket);
+        cmd.args(args).arg("--socket").arg(self.socket);
 
         cmd.output().context("failed to run arcbox command")
     }

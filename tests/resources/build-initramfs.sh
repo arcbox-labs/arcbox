@@ -113,6 +113,8 @@ cat > "$WORK_DIR/init" << 'INIT_EOF'
 /bin/busybox mount -t proc proc /proc
 /bin/busybox mount -t sysfs sysfs /sys
 /bin/busybox mount -t devtmpfs devtmpfs /dev
+/bin/busybox mkdir -p /dev/pts
+/bin/busybox mount -t devpts devpts /dev/pts
 
 # Set hostname
 /bin/busybox hostname arcbox-vm

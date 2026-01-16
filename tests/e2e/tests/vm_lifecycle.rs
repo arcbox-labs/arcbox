@@ -2,8 +2,8 @@
 //!
 //! Tests for VM creation, startup, shutdown, and agent connectivity.
 
-use arcbox_e2e::{TestConfig, TestHarness, TestFixtures, VmController};
 use arcbox_e2e::vm::MachineStatus;
+use arcbox_e2e::{TestConfig, TestFixtures, TestHarness, VmController};
 use std::time::Duration;
 
 /// Skip test if resources are not available.
@@ -32,13 +32,21 @@ async fn test_machine_create() {
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
     // Start daemon
-    harness.start_daemon().await.expect("failed to start daemon");
+    harness
+        .start_daemon()
+        .await
+        .expect("failed to start daemon");
 
     // Create machine
-    harness.create_machine().await.expect("failed to create machine");
+    harness
+        .create_machine()
+        .await
+        .expect("failed to create machine");
 
     // Verify machine exists
-    let output = harness.run_command(&["machine", "list"]).expect("failed to list machines");
+    let output = harness
+        .run_command(&["machine", "list"])
+        .expect("failed to list machines");
     assert!(output.status.success());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -63,8 +71,14 @@ async fn test_machine_create_with_custom_resources() {
 
     let mut harness = TestHarness::new(config).expect("failed to create harness");
 
-    harness.start_daemon().await.expect("failed to start daemon");
-    harness.create_machine().await.expect("failed to create machine");
+    harness
+        .start_daemon()
+        .await
+        .expect("failed to start daemon");
+    harness
+        .create_machine()
+        .await
+        .expect("failed to create machine");
 
     // Machine should be created with custom resources
     let output = harness
@@ -87,11 +101,20 @@ async fn test_machine_start_stop() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.start_daemon().await.expect("failed to start daemon");
-    harness.create_machine().await.expect("failed to create machine");
+    harness
+        .start_daemon()
+        .await
+        .expect("failed to start daemon");
+    harness
+        .create_machine()
+        .await
+        .expect("failed to create machine");
 
     // Start machine
-    harness.start_machine().await.expect("failed to start machine");
+    harness
+        .start_machine()
+        .await
+        .expect("failed to start machine");
 
     // Verify machine is running
     let socket = harness.socket_path();
@@ -107,7 +130,10 @@ async fn test_machine_start_stop() {
     );
 
     // Stop machine
-    harness.stop_machine().await.expect("failed to stop machine");
+    harness
+        .stop_machine()
+        .await
+        .expect("failed to stop machine");
 
     // Verify machine is stopped
     let status = vm.status().expect("failed to get status");
@@ -126,9 +152,18 @@ async fn test_machine_double_start() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.start_daemon().await.expect("failed to start daemon");
-    harness.create_machine().await.expect("failed to create machine");
-    harness.start_machine().await.expect("failed to start machine");
+    harness
+        .start_daemon()
+        .await
+        .expect("failed to start daemon");
+    harness
+        .create_machine()
+        .await
+        .expect("failed to create machine");
+    harness
+        .start_machine()
+        .await
+        .expect("failed to start machine");
 
     // Second start should be idempotent or return error
     let result = harness.start_machine().await;
@@ -156,7 +191,10 @@ async fn test_agent_ping() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup environment");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup environment");
 
     // Ping should succeed
     let output = harness
@@ -179,7 +217,10 @@ async fn test_agent_system_info() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup environment");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup environment");
 
     // Get system info
     let socket = harness.socket_path();
@@ -192,7 +233,10 @@ async fn test_agent_system_info() {
     let info = vm.get_system_info().expect("failed to get system info");
 
     // Verify we got reasonable info
-    assert!(!info.kernel_version.is_empty(), "Should have kernel version");
+    assert!(
+        !info.kernel_version.is_empty(),
+        "Should have kernel version"
+    );
     assert!(info.cpu_count > 0, "Should have CPUs");
     assert!(info.memory_total > 0, "Should have memory");
 }
@@ -206,7 +250,10 @@ async fn test_agent_ping_latency() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup environment");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup environment");
 
     use arcbox_e2e::AgentClient;
 
@@ -250,7 +297,10 @@ async fn test_machine_not_found() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.start_daemon().await.expect("failed to start daemon");
+    harness
+        .start_daemon()
+        .await
+        .expect("failed to start daemon");
 
     // Try to start non-existent machine
     let output = harness.run_command(&["machine", "start", "nonexistent"]);
@@ -279,8 +329,14 @@ async fn test_machine_stop_when_not_running() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.start_daemon().await.expect("failed to start daemon");
-    harness.create_machine().await.expect("failed to create machine");
+    harness
+        .start_daemon()
+        .await
+        .expect("failed to start daemon");
+    harness
+        .create_machine()
+        .await
+        .expect("failed to create machine");
 
     // Try to stop machine that's not running
     // This should either succeed (idempotent) or fail gracefully

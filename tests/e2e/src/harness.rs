@@ -9,8 +9,8 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -58,9 +58,12 @@ impl TestConfig {
     /// Creates a release build configuration.
     pub fn release() -> Self {
         let mut config = Self::default();
-        config.arcbox_binary = config.arcbox_binary
-            .parent().unwrap()
-            .parent().unwrap()
+        config.arcbox_binary = config
+            .arcbox_binary
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("release/arcbox");
         config
     }
@@ -178,10 +181,21 @@ impl TestHarness {
             .arg(&self.config.kernel_path)
             .arg("--initramfs")
             .arg(&self.config.initramfs_path)
-            .env("RUST_LOG", if self.config.verbose { "debug" } else { "warn" })
+            .env(
+                "RUST_LOG",
+                if self.config.verbose { "debug" } else { "warn" },
+            )
             .stdin(Stdio::null())
-            .stdout(if self.config.verbose { Stdio::inherit() } else { Stdio::null() })
-            .stderr(if self.config.verbose { Stdio::inherit() } else { Stdio::null() });
+            .stdout(if self.config.verbose {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .stderr(if self.config.verbose {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            });
 
         let child = cmd.spawn().context("failed to start daemon")?;
 
@@ -209,7 +223,7 @@ impl TestHarness {
             // Send SIGTERM
             #[cfg(unix)]
             {
-                use nix::sys::signal::{kill, Signal};
+                use nix::sys::signal::{Signal, kill};
                 use nix::unistd::Pid;
 
                 let pid = child.id();
@@ -339,9 +353,7 @@ impl TestHarness {
     /// Runs an arcbox command and returns its output.
     pub fn run_command(&self, args: &[&str]) -> Result<std::process::Output> {
         let mut cmd = Command::new(&self.config.arcbox_binary);
-        cmd.arg("--socket")
-            .arg(self.socket_path())
-            .args(args);
+        cmd.arg("--socket").arg(self.socket_path()).args(args);
 
         cmd.output().context("failed to run command")
     }
@@ -381,9 +393,10 @@ impl Drop for TestHarness {
                 self.data_dir.path().display()
             );
             // Leak the temp directory so it's not deleted
-            let _ = std::mem::ManuallyDrop::new(
-                std::mem::replace(&mut self.data_dir, TempDir::new().unwrap())
-            );
+            let _ = std::mem::ManuallyDrop::new(std::mem::replace(
+                &mut self.data_dir,
+                TempDir::new().unwrap(),
+            ));
             return;
         }
 

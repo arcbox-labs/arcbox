@@ -2,8 +2,8 @@
 //!
 //! Tests complete end-to-end workflows from start to finish.
 
-use arcbox_e2e::{TestConfig, TestHarness, TestFixtures};
 use arcbox_e2e::fixtures::images;
+use arcbox_e2e::{TestConfig, TestFixtures, TestHarness};
 use std::time::Duration;
 
 /// Skip test if resources are not available.
@@ -33,7 +33,10 @@ async fn test_workflow_simple_run() {
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
     // Setup: daemon + VM
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     // The full workflow: pull + create + start + wait
     let output = harness
@@ -72,7 +75,10 @@ async fn test_workflow_file_operations() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -111,7 +117,10 @@ async fn test_workflow_process_isolation() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -151,7 +160,10 @@ async fn test_workflow_multiple_containers() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -198,20 +210,16 @@ async fn test_workflow_multiple_containers() {
         .run_command_success(&["ps", "--machine", harness.machine_name()])
         .expect("failed to list");
 
-    assert!(
-        list.contains("worker1"),
-        "Should list worker1: {}",
-        list
-    );
-    assert!(
-        list.contains("worker2"),
-        "Should list worker2: {}",
-        list
-    );
+    assert!(list.contains("worker1"), "Should list worker1: {}", list);
+    assert!(list.contains("worker2"), "Should list worker2: {}", list);
 
     // Cleanup
-    harness.run_command(&["rm", "-f", "--machine", harness.machine_name(), "worker1"]).ok();
-    harness.run_command(&["rm", "-f", "--machine", harness.machine_name(), "worker2"]).ok();
+    harness
+        .run_command(&["rm", "-f", "--machine", harness.machine_name(), "worker1"])
+        .ok();
+    harness
+        .run_command(&["rm", "-f", "--machine", harness.machine_name(), "worker2"])
+        .ok();
 }
 
 // ============================================================================
@@ -227,7 +235,10 @@ async fn test_workflow_environment_variables() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -270,7 +281,10 @@ async fn test_workflow_working_directory() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -312,7 +326,10 @@ async fn test_workflow_volume_mount() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -369,7 +386,10 @@ async fn test_workflow_network_access() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -412,7 +432,10 @@ async fn test_workflow_memory_limit() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -458,7 +481,10 @@ async fn test_workflow_cleanup_on_error() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -504,7 +530,10 @@ async fn test_workflow_development_scenario() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -530,7 +559,12 @@ async fn test_workflow_development_scenario() {
 
     // Start container
     harness
-        .run_command_success(&["start", "--machine", harness.machine_name(), "dev-container"])
+        .run_command_success(&[
+            "start",
+            "--machine",
+            harness.machine_name(),
+            "dev-container",
+        ])
         .expect("failed to start");
 
     // Run multiple exec commands (simulating development)
@@ -606,7 +640,10 @@ async fn test_workflow_signal_handling() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -655,12 +692,7 @@ async fn test_workflow_signal_handling() {
 
     // Check logs for signal handling
     let logs = harness
-        .run_command(&[
-            "logs",
-            "--machine",
-            harness.machine_name(),
-            container_id,
-        ])
+        .run_command(&["logs", "--machine", harness.machine_name(), container_id])
         .expect("failed to get logs");
 
     let stdout = String::from_utf8_lossy(&logs.stdout);
@@ -668,7 +700,9 @@ async fn test_workflow_signal_handling() {
     // Should have received SIGTERM (if signal handling works)
 
     // Cleanup
-    harness.run_command(&["rm", "--machine", harness.machine_name(), container_id]).ok();
+    harness
+        .run_command(&["rm", "--machine", harness.machine_name(), container_id])
+        .ok();
 }
 
 // ============================================================================
@@ -684,7 +718,10 @@ async fn test_workflow_startup_time() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -729,7 +766,10 @@ async fn test_workflow_exec_latency() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -792,10 +832,7 @@ async fn test_workflow_exec_latency() {
         let min = latencies.iter().min().unwrap();
         let max = latencies.iter().max().unwrap();
 
-        println!(
-            "Exec latency: avg={:?}, min={:?}, max={:?}",
-            avg, min, max
-        );
+        println!("Exec latency: avg={:?}, min={:?}, max={:?}", avg, min, max);
 
         // Exec should be reasonably fast (< 500ms)
         assert!(
@@ -806,5 +843,13 @@ async fn test_workflow_exec_latency() {
     }
 
     // Cleanup
-    harness.run_command(&["rm", "-f", "--machine", harness.machine_name(), container_id]).ok();
+    harness
+        .run_command(&[
+            "rm",
+            "-f",
+            "--machine",
+            harness.machine_name(),
+            container_id,
+        ])
+        .ok();
 }

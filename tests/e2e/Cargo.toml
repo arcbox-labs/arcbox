@@ -33,6 +33,9 @@ nix = { version = "0.29", features = ["process", "signal"] }
 
 # HTTP client for Docker API testing
 reqwest = { version = "0.12", features = ["json"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["client", "http1", "tokio"] }
+http-body-util = "0.1"
 
 [dev-dependencies]
 test-log = { version = "0.2", features = ["trace"] }

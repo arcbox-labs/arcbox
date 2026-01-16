@@ -41,10 +41,7 @@ macro_rules! assert_failure {
         assert_eq!(
             $result.exit_code, $code,
             "Expected exit code {} but got {}: stdout={}, stderr={}",
-            $code,
-            $result.exit_code,
-            $result.stdout,
-            $result.stderr
+            $code, $result.exit_code, $result.stdout, $result.stderr
         )
     };
 }

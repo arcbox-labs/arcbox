@@ -2,8 +2,8 @@
 //!
 //! Tests for container create, start, stop, and remove operations.
 
-use arcbox_e2e::{TestHarness, TestFixtures};
-use arcbox_e2e::fixtures::{images, commands};
+use arcbox_e2e::fixtures::{commands, images};
+use arcbox_e2e::{TestFixtures, TestHarness};
 use std::time::Duration;
 
 /// Skip test if resources are not available.
@@ -31,7 +31,10 @@ async fn test_container_create() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     // Pull image first
     harness
@@ -80,7 +83,10 @@ async fn test_container_create_with_name() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -126,7 +132,10 @@ async fn test_container_start_stop() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -207,7 +216,10 @@ async fn test_container_restart() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -274,7 +286,10 @@ async fn test_container_remove() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -325,7 +340,10 @@ async fn test_container_remove_running() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -390,7 +408,10 @@ async fn test_container_exec() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -449,7 +470,10 @@ async fn test_container_exec_exit_code() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -503,7 +527,10 @@ async fn test_container_exec_with_env() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -565,7 +592,10 @@ async fn test_container_logs() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -588,17 +618,18 @@ async fn test_container_logs() {
 
     // Start and wait for completion
     harness
-        .run_command_success(&["start", "-a", "--machine", harness.machine_name(), container_id])
-        .expect("failed to start");
-
-    // Get logs
-    let output = harness
-        .run_command(&[
-            "logs",
+        .run_command_success(&[
+            "start",
+            "-a",
             "--machine",
             harness.machine_name(),
             container_id,
         ])
+        .expect("failed to start");
+
+    // Get logs
+    let output = harness
+        .run_command(&["logs", "--machine", harness.machine_name(), container_id])
         .expect("failed to get logs");
 
     assert!(output.status.success(), "Logs should succeed");
@@ -618,7 +649,10 @@ async fn test_container_logs_tail() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -640,7 +674,13 @@ async fn test_container_logs_tail() {
     let container_id = container_id.trim();
 
     harness
-        .run_command_success(&["start", "-a", "--machine", harness.machine_name(), container_id])
+        .run_command_success(&[
+            "start",
+            "-a",
+            "--machine",
+            harness.machine_name(),
+            container_id,
+        ])
         .expect("failed to start");
 
     // Get last 3 lines
@@ -660,11 +700,7 @@ async fn test_container_logs_tail() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
 
-    assert!(
-        lines.len() <= 3,
-        "Should have at most 3 lines: {}",
-        stdout
-    );
+    assert!(lines.len() <= 3, "Should have at most 3 lines: {}", stdout);
 }
 
 // ============================================================================
@@ -681,7 +717,10 @@ async fn test_container_stdout_capture() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -719,7 +758,10 @@ async fn test_container_stderr_capture() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -760,7 +802,10 @@ async fn test_container_stdout_stderr_both() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -806,7 +851,10 @@ async fn test_container_multiline_output_capture() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -827,9 +875,21 @@ async fn test_container_multiline_output_capture() {
     assert!(output.status.success(), "Run should succeed");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("line-one"), "Should have line-one: {}", stdout);
-    assert!(stdout.contains("line-two"), "Should have line-two: {}", stdout);
-    assert!(stdout.contains("line-three"), "Should have line-three: {}", stdout);
+    assert!(
+        stdout.contains("line-one"),
+        "Should have line-one: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("line-two"),
+        "Should have line-two: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("line-three"),
+        "Should have line-three: {}",
+        stdout
+    );
 }
 
 /// Test that container run preserves exit code.
@@ -842,7 +902,10 @@ async fn test_container_run_exit_code_propagation() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -850,14 +913,7 @@ async fn test_container_run_exit_code_propagation() {
 
     // Test exit code 0
     let output = harness
-        .run_command(&[
-            "run",
-            "--rm",
-            images::ALPINE,
-            "sh",
-            "-c",
-            "exit 0",
-        ])
+        .run_command(&["run", "--rm", images::ALPINE, "sh", "-c", "exit 0"])
         .expect("failed to run");
 
     assert_eq!(
@@ -868,14 +924,7 @@ async fn test_container_run_exit_code_propagation() {
 
     // Test exit code 1
     let output = harness
-        .run_command(&[
-            "run",
-            "--rm",
-            images::ALPINE,
-            "sh",
-            "-c",
-            "exit 1",
-        ])
+        .run_command(&["run", "--rm", images::ALPINE, "sh", "-c", "exit 1"])
         .expect("failed to run");
 
     assert_eq!(
@@ -886,14 +935,7 @@ async fn test_container_run_exit_code_propagation() {
 
     // Test exit code 42
     let output = harness
-        .run_command(&[
-            "run",
-            "--rm",
-            images::ALPINE,
-            "sh",
-            "-c",
-            "exit 42",
-        ])
+        .run_command(&["run", "--rm", images::ALPINE, "sh", "-c", "exit 42"])
         .expect("failed to run");
 
     assert_eq!(
@@ -916,7 +958,10 @@ async fn test_container_run() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -957,7 +1002,10 @@ async fn test_container_run_rm() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -997,7 +1045,10 @@ async fn test_container_run_detached() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -1039,7 +1090,13 @@ async fn test_container_run_detached() {
 
     // Cleanup
     harness
-        .run_command(&["rm", "-f", "--machine", harness.machine_name(), &container_id])
+        .run_command(&[
+            "rm",
+            "-f",
+            "--machine",
+            harness.machine_name(),
+            &container_id,
+        ])
         .ok();
 }
 
@@ -1056,7 +1113,10 @@ async fn test_container_exec_stopped() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     harness
         .run_command_success(&["pull", images::ALPINE])
@@ -1109,7 +1169,10 @@ async fn test_container_not_found() {
 
     let mut harness = TestHarness::with_defaults().expect("failed to create harness");
 
-    harness.setup_full_environment().await.expect("failed to setup");
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
 
     // Try to start non-existent container
     let output = harness
@@ -1127,6 +1190,176 @@ async fn test_container_not_found() {
     assert!(
         stderr.contains("not found") || stderr.contains("does not exist"),
         "Should have not found error: {}",
+        stderr
+    );
+}
+
+// ============================================================================
+// Auto-Pull Tests (Docker-like UX)
+// ============================================================================
+
+/// Test that `run` automatically pulls an image if not present locally.
+/// This is a key Docker-compatible UX feature.
+#[tokio::test]
+#[ignore = "requires VM resources and network"]
+async fn test_container_run_auto_pull() {
+    if skip_if_missing_resources() {
+        return;
+    }
+
+    let mut harness = TestHarness::with_defaults().expect("failed to create harness");
+
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
+
+    // Ensure busybox image is NOT present locally by attempting to remove it.
+    // Ignore errors if it doesn't exist.
+    let _ = harness.run_command(&["rmi", images::BUSYBOX]);
+
+    // Verify image is not present.
+    let list_before = harness
+        .run_command_success(&["images"])
+        .expect("failed to list images");
+    assert!(
+        !list_before.contains("busybox"),
+        "Image should not exist before test: {}",
+        list_before
+    );
+
+    // Run container WITHOUT pre-pulling - should auto-pull.
+    let output = harness
+        .run_command(&["run", "--rm", images::BUSYBOX, "echo", "auto-pull-works"])
+        .expect("failed to run");
+
+    assert!(
+        output.status.success(),
+        "Run with auto-pull should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("auto-pull-works"),
+        "Should capture output from auto-pulled image: {}",
+        stdout
+    );
+
+    // Image should now be present locally.
+    let list_after = harness
+        .run_command_success(&["images"])
+        .expect("failed to list images");
+    assert!(
+        list_after.contains("busybox"),
+        "Image should exist after auto-pull: {}",
+        list_after
+    );
+}
+
+/// Test that `create` automatically pulls an image if not present locally.
+#[tokio::test]
+#[ignore = "requires VM resources and network"]
+async fn test_container_create_auto_pull() {
+    if skip_if_missing_resources() {
+        return;
+    }
+
+    let mut harness = TestHarness::with_defaults().expect("failed to create harness");
+
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
+
+    // Use a specific tag to avoid conflicts with other tests.
+    let test_image = images::ALPINE_3_19;
+
+    // Ensure image is NOT present locally.
+    let _ = harness.run_command(&["rmi", test_image]);
+
+    // Verify image is not present.
+    let list_before = harness
+        .run_command_success(&["images"])
+        .expect("failed to list images");
+    assert!(
+        !list_before.contains("alpine") || !list_before.contains("3.19"),
+        "Image should not exist before test"
+    );
+
+    // Create container WITHOUT pre-pulling - should auto-pull.
+    let output = harness
+        .run_command(&[
+            "create",
+            "--machine",
+            harness.machine_name(),
+            test_image,
+            "/bin/sh",
+        ])
+        .expect("failed to create");
+
+    assert!(
+        output.status.success(),
+        "Create with auto-pull should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Should return container ID.
+    let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(!container_id.is_empty(), "Should return container ID");
+
+    // Image should now be present locally.
+    let list_after = harness
+        .run_command_success(&["images"])
+        .expect("failed to list images");
+    assert!(
+        list_after.contains("alpine"),
+        "Image should exist after auto-pull: {}",
+        list_after
+    );
+
+    // Cleanup.
+    let _ = harness.run_command(&["rm", "--machine", harness.machine_name(), &container_id]);
+}
+
+/// Test that auto-pull fails gracefully for non-existent images.
+#[tokio::test]
+#[ignore = "requires VM resources and network"]
+async fn test_container_run_auto_pull_nonexistent() {
+    if skip_if_missing_resources() {
+        return;
+    }
+
+    let mut harness = TestHarness::with_defaults().expect("failed to create harness");
+
+    harness
+        .setup_full_environment()
+        .await
+        .expect("failed to setup");
+
+    // Run with non-existent image - should fail with clear error.
+    let output = harness
+        .run_command(&[
+            "run",
+            "--rm",
+            "nonexistent-registry.invalid/fake-image:v999",
+            "echo",
+            "should-not-run",
+        ])
+        .expect("failed to run command");
+
+    assert!(
+        !output.status.success(),
+        "Run with non-existent image should fail"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not found")
+            || stderr.contains("pull failed")
+            || stderr.contains("error")
+            || stderr.contains("failed"),
+        "Should have meaningful error message: {}",
         stderr
     );
 }

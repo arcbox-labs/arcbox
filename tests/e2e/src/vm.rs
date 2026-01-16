@@ -183,13 +183,22 @@ fn extract_field(output: &str, field: &str) -> Option<String> {
 fn parse_memory(s: &str) -> Option<u64> {
     let s = s.trim();
     if s.ends_with("GB") || s.ends_with("G") {
-        let num: u64 = s.trim_end_matches(|c: char| !c.is_ascii_digit()).parse().ok()?;
+        let num: u64 = s
+            .trim_end_matches(|c: char| !c.is_ascii_digit())
+            .parse()
+            .ok()?;
         Some(num * 1024 * 1024 * 1024)
     } else if s.ends_with("MB") || s.ends_with("M") {
-        let num: u64 = s.trim_end_matches(|c: char| !c.is_ascii_digit()).parse().ok()?;
+        let num: u64 = s
+            .trim_end_matches(|c: char| !c.is_ascii_digit())
+            .parse()
+            .ok()?;
         Some(num * 1024 * 1024)
     } else if s.ends_with("KB") || s.ends_with("K") {
-        let num: u64 = s.trim_end_matches(|c: char| !c.is_ascii_digit()).parse().ok()?;
+        let num: u64 = s
+            .trim_end_matches(|c: char| !c.is_ascii_digit())
+            .parse()
+            .ok()?;
         Some(num * 1024)
     } else {
         s.parse().ok()
