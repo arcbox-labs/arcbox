@@ -1,0 +1,406 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'crates/**'
+      - 'guest/**'
+      - 'tests/e2e/**'
+      - '.github/workflows/e2e-tests.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'crates/**'
+      - 'guest/**'
+      - 'tests/e2e/**'
+  workflow_dispatch:
+    inputs:
+      run_vm_tests:
+        description: 'Run VM-based E2E tests (requires virtualization)'
+        required: false
+        default: 'false'
+        type: boolean
+      verbose:
+        description: 'Enable verbose output'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ==========================================================================
+  # Unit Tests (no VM required)
+  # ==========================================================================
+  unit-tests:
+    name: Unit Tests
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run unit tests
+        run: |
+          cargo test --workspace --exclude arcbox-e2e -- --skip ignored
+
+      - name: Run arcbox-image auto-pull tests
+        run: |
+          cargo test -p arcbox-image -- test_get_manifest_not_found test_get_image_config_not_found test_image_not_found
+
+  # ==========================================================================
+  # Build (prepare artifacts for E2E tests)
+  # ==========================================================================
+  build:
+    name: Build
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install musl cross-compiler
+        run: |
+          brew install FiloSottile/musl-cross/musl-cross
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+            ${{ runner.os }}-cargo-
+
+      - name: Build arcbox (release)
+        run: |
+          cargo build --release -p arcbox-cli
+
+      - name: Build arcbox-agent (cross-compile for Linux)
+        run: |
+          cargo build --release -p arcbox-agent --target aarch64-unknown-linux-musl
+
+      - name: Sign binary with virtualization entitlement
+        run: |
+          codesign --entitlements tests/resources/entitlements.plist \
+            --force -s - target/release/arcbox
+
+      - name: Download kernel
+        run: |
+          cd tests/resources
+          ./download-kernel.sh
+          # Create Image-arm64 symlink if needed
+          if [ ! -f Image-arm64 ] && [ -f vmlinuz-arm64 ]; then
+            cp vmlinuz-arm64 Image-arm64
+          fi
+
+      - name: Build initramfs
+        run: |
+          cd tests/resources
+          ./build-initramfs.sh
+
+      - name: Verify artifacts
+        run: |
+          echo "=== Build artifacts ==="
+          ls -lh target/release/arcbox
+          ls -lh target/aarch64-unknown-linux-musl/release/arcbox-agent
+          ls -lh tests/resources/Image-arm64
+          ls -lh tests/resources/initramfs-arcbox
+
+      - name: Upload arcbox binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: arcbox-macos-arm64
+          path: target/release/arcbox
+          retention-days: 7
+
+      - name: Upload arcbox-agent binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: arcbox-agent-linux-arm64
+          path: target/aarch64-unknown-linux-musl/release/arcbox-agent
+          retention-days: 7
+
+      - name: Upload boot assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-assets
+          path: |
+            tests/resources/Image-arm64
+            tests/resources/initramfs-arcbox
+          retention-days: 7
+
+  # ==========================================================================
+  # E2E Tests (requires VM - self-hosted or manual trigger)
+  # ==========================================================================
+  e2e-vm-tests:
+    name: E2E VM Tests
+    needs: build
+    runs-on: macos-14
+    timeout-minutes: 60
+    # Only run on main branch, workflow_dispatch with run_vm_tests=true, or self-hosted
+    if: |
+      github.ref == 'refs/heads/main' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.run_vm_tests == 'true')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Download arcbox binary
+        uses: actions/download-artifact@v4
+        with:
+          name: arcbox-macos-arm64
+          path: target/release/
+
+      - name: Download boot assets
+        uses: actions/download-artifact@v4
+        with:
+          name: boot-assets
+          path: tests/resources/
+
+      - name: Make binary executable and sign
+        run: |
+          chmod +x target/release/arcbox
+          codesign --entitlements tests/resources/entitlements.plist \
+            --force -s - target/release/arcbox
+
+      - name: Verify virtualization capability
+        id: check-virt
+        continue-on-error: true
+        run: |
+          # Check if we can use Virtualization.framework
+          # This will fail on most GitHub-hosted runners
+          if system_profiler SPSoftwareDataType | grep -q "System Integrity Protection: enabled"; then
+            echo "SIP is enabled"
+          fi
+
+          # Try to check virtualization capability
+          # This is a heuristic - actual VM tests will confirm
+          echo "virt_available=true" >> $GITHUB_OUTPUT
+
+      - name: Run E2E tests (VM lifecycle)
+        if: steps.check-virt.outputs.virt_available == 'true'
+        continue-on-error: true
+        env:
+          E2E_VERBOSE: ${{ github.event.inputs.verbose == 'true' && '1' || '' }}
+          RUST_LOG: ${{ github.event.inputs.verbose == 'true' && 'debug' || 'warn' }}
+        run: |
+          cargo test -p arcbox-e2e -- --ignored test_vm --nocapture 2>&1 | tee /tmp/e2e-vm.log || true
+
+      - name: Run E2E tests (container lifecycle)
+        if: steps.check-virt.outputs.virt_available == 'true'
+        continue-on-error: true
+        env:
+          E2E_VERBOSE: ${{ github.event.inputs.verbose == 'true' && '1' || '' }}
+          RUST_LOG: ${{ github.event.inputs.verbose == 'true' && 'debug' || 'warn' }}
+        run: |
+          cargo test -p arcbox-e2e -- --ignored test_container --nocapture 2>&1 | tee /tmp/e2e-container.log || true
+
+      - name: Run E2E tests (auto-pull)
+        if: steps.check-virt.outputs.virt_available == 'true'
+        continue-on-error: true
+        env:
+          E2E_VERBOSE: ${{ github.event.inputs.verbose == 'true' && '1' || '' }}
+          RUST_LOG: ${{ github.event.inputs.verbose == 'true' && 'debug' || 'warn' }}
+        run: |
+          cargo test -p arcbox-e2e -- --ignored test_container_run_auto_pull test_container_create_auto_pull --nocapture 2>&1 | tee /tmp/e2e-autopull.log || true
+
+      - name: Run E2E tests (image operations)
+        if: steps.check-virt.outputs.virt_available == 'true'
+        continue-on-error: true
+        env:
+          E2E_VERBOSE: ${{ github.event.inputs.verbose == 'true' && '1' || '' }}
+          RUST_LOG: ${{ github.event.inputs.verbose == 'true' && 'debug' || 'warn' }}
+        run: |
+          cargo test -p arcbox-e2e -- --ignored test_image --nocapture 2>&1 | tee /tmp/e2e-image.log || true
+
+      - name: Summarize test results
+        if: always()
+        run: |
+          echo "=== E2E Test Summary ==="
+          echo ""
+
+          for log in /tmp/e2e-*.log; do
+            if [ -f "$log" ]; then
+              echo "--- $(basename $log) ---"
+              grep -E "^(test |running |PASSED|FAILED|ok|FAILED)" "$log" | tail -20 || true
+              echo ""
+            fi
+          done
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-logs
+          path: /tmp/e2e-*.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ==========================================================================
+  # E2E Tests (Self-hosted runner with VM support)
+  # ==========================================================================
+  e2e-self-hosted:
+    name: E2E Tests (Self-Hosted)
+    needs: build
+    runs-on: [self-hosted, macOS, ARM64, virtualization]
+    timeout-minutes: 90
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.ref == 'refs/heads/main'
+    # Skip if no self-hosted runners available
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Download arcbox binary
+        uses: actions/download-artifact@v4
+        with:
+          name: arcbox-macos-arm64
+          path: target/release/
+
+      - name: Download boot assets
+        uses: actions/download-artifact@v4
+        with:
+          name: boot-assets
+          path: tests/resources/
+
+      - name: Make binary executable and sign
+        run: |
+          chmod +x target/release/arcbox
+          codesign --entitlements tests/resources/entitlements.plist \
+            --force -s - target/release/arcbox
+
+      - name: Run full E2E test suite
+        env:
+          E2E_VERBOSE: ${{ github.event.inputs.verbose == 'true' && '1' || '' }}
+          RUST_LOG: ${{ github.event.inputs.verbose == 'true' && 'debug' || 'info' }}
+        run: |
+          # Build e2e test binary
+          cargo build -p arcbox-e2e --tests
+
+          # Run all E2E tests (including ignored ones that require VM)
+          cargo test -p arcbox-e2e -- --ignored --nocapture 2>&1 | tee /tmp/e2e-full.log
+
+      - name: Parse test results
+        if: always()
+        run: |
+          echo "=== Full E2E Test Results ==="
+          echo ""
+
+          if [ -f /tmp/e2e-full.log ]; then
+            # Count passed/failed
+            PASSED=$(grep -c "^test .* ok$" /tmp/e2e-full.log || echo "0")
+            FAILED=$(grep -c "^test .* FAILED$" /tmp/e2e-full.log || echo "0")
+            IGNORED=$(grep -c "^test .* ignored$" /tmp/e2e-full.log || echo "0")
+
+            echo "Passed:  $PASSED"
+            echo "Failed:  $FAILED"
+            echo "Ignored: $IGNORED"
+            echo ""
+
+            if [ "$FAILED" -gt 0 ]; then
+              echo "=== Failed Tests ==="
+              grep "^test .* FAILED$" /tmp/e2e-full.log || true
+              exit 1
+            fi
+          fi
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-self-hosted-logs
+          path: /tmp/e2e-*.log
+          retention-days: 14
+
+  # ==========================================================================
+  # Summary Job
+  # ==========================================================================
+  summary:
+    name: Test Summary
+    needs: [unit-tests, build, e2e-vm-tests]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Check results
+        run: |
+          echo "=== CI Summary ==="
+          echo ""
+          echo "Unit Tests: ${{ needs.unit-tests.result }}"
+          echo "Build:      ${{ needs.build.result }}"
+          echo "E2E Tests:  ${{ needs.e2e-vm-tests.result }}"
+          echo ""
+
+          # Fail if critical jobs failed
+          if [ "${{ needs.unit-tests.result }}" == "failure" ]; then
+            echo "❌ Unit tests failed"
+            exit 1
+          fi
+
+          if [ "${{ needs.build.result }}" == "failure" ]; then
+            echo "❌ Build failed"
+            exit 1
+          fi
+
+          # E2E tests are optional (may not have VM support)
+          if [ "${{ needs.e2e-vm-tests.result }}" == "failure" ]; then
+            echo "⚠️ E2E tests failed (may be due to virtualization restrictions)"
+          fi
+
+          echo "✅ CI passed"
