@@ -463,13 +463,12 @@ impl VirtioFileSystemDeviceConfiguration {
         }
 
         unsafe {
-            let cls =
-                get_class("VZVirtioFileSystemDeviceConfiguration").ok_or_else(|| {
-                    VZError::Internal {
-                        code: -1,
-                        message: "VZVirtioFileSystemDeviceConfiguration class not found".into(),
-                    }
-                })?;
+            let cls = get_class("VZVirtioFileSystemDeviceConfiguration").ok_or_else(|| {
+                VZError::Internal {
+                    code: -1,
+                    message: "VZVirtioFileSystemDeviceConfiguration class not found".into(),
+                }
+            })?;
 
             // Validate tag using [VZVirtioFileSystemDeviceConfiguration validateTag:error:]
             let tag_ns = nsstring(tag);
@@ -481,8 +480,7 @@ impl VirtioFileSystemDeviceConfiguration {
                 objc2::runtime::Sel,
                 *mut AnyObject,
                 *mut *mut AnyObject,
-            ) -> Bool =
-                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
+            ) -> Bool = std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
 
             let valid = validate_fn(
                 cls as *const AnyClass as *const AnyObject,
@@ -527,7 +525,10 @@ impl VirtioFileSystemDeviceConfiguration {
                 });
             }
 
-            tracing::debug!("Created VirtioFileSystemDeviceConfiguration with tag '{}'", tag);
+            tracing::debug!(
+                "Created VirtioFileSystemDeviceConfiguration with tag '{}'",
+                tag
+            );
 
             Ok(Self {
                 inner: obj,
@@ -668,10 +669,11 @@ impl LinuxRosettaDirectoryShare {
         }
 
         unsafe {
-            let cls = get_class("VZLinuxRosettaDirectoryShare").ok_or_else(|| VZError::Internal {
-                code: -1,
-                message: "VZLinuxRosettaDirectoryShare class not found".into(),
-            })?;
+            let cls =
+                get_class("VZLinuxRosettaDirectoryShare").ok_or_else(|| VZError::Internal {
+                    code: -1,
+                    message: "VZLinuxRosettaDirectoryShare class not found".into(),
+                })?;
 
             let obj: *mut AnyObject = msg_send!(cls, new);
             if obj.is_null() {

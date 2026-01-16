@@ -247,7 +247,11 @@ impl TapBackend {
 
         // Extract device name
         let name = {
-            let len = ifr.ifr_name.iter().position(|&c| c == 0).unwrap_or(libc::IFNAMSIZ);
+            let len = ifr
+                .ifr_name
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(libc::IFNAMSIZ);
             let bytes: Vec<u8> = ifr.ifr_name[..len].iter().map(|&c| c as u8).collect();
             String::from_utf8_lossy(&bytes).into_owned()
         };
@@ -340,7 +344,11 @@ impl Drop for TapBackend {
 impl NetBackend for TapBackend {
     fn send(&mut self, packet: &NetPacket) -> std::io::Result<usize> {
         let ret = unsafe {
-            libc::write(self.fd, packet.data.as_ptr() as *const libc::c_void, packet.data.len())
+            libc::write(
+                self.fd,
+                packet.data.as_ptr() as *const libc::c_void,
+                packet.data.len(),
+            )
         };
 
         if ret < 0 {
@@ -351,9 +359,7 @@ impl NetBackend for TapBackend {
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let ret = unsafe {
-            libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-        };
+        let ret = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
 
         if ret < 0 {
             let err = std::io::Error::last_os_error();
@@ -404,9 +410,9 @@ impl SocketBackend {
         let socket = std::net::UdpSocket::bind(local_addr)?;
         socket.set_nonblocking(true)?;
 
-        let remote: std::net::SocketAddr = remote_addr.parse().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-        })?;
+        let remote: std::net::SocketAddr = remote_addr
+            .parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
         tracing::info!("Created socket backend: {} -> {}", local_addr, remote_addr);
 
@@ -657,9 +663,8 @@ impl VirtioNet {
             return Err(VirtioError::InvalidOperation("Packet too small".into()));
         }
 
-        let header = VirtioNetHeader::from_bytes(data).ok_or_else(|| {
-            VirtioError::InvalidOperation("Invalid header".into())
-        })?;
+        let header = VirtioNetHeader::from_bytes(data)
+            .ok_or_else(|| VirtioError::InvalidOperation("Invalid header".into()))?;
 
         let packet = NetPacket {
             header,
@@ -670,12 +675,12 @@ impl VirtioNet {
         self.tx_bytes += packet.data.len() as u64;
 
         if let Some(backend) = &self.backend {
-            let mut backend = backend.lock().map_err(|e| {
-                VirtioError::Io(format!("Failed to lock backend: {}", e))
-            })?;
-            backend.send(&packet).map_err(|e| {
-                VirtioError::Io(format!("Send failed: {}", e))
-            })?;
+            let mut backend = backend
+                .lock()
+                .map_err(|e| VirtioError::Io(format!("Failed to lock backend: {}", e)))?;
+            backend
+                .send(&packet)
+                .map_err(|e| VirtioError::Io(format!("Send failed: {}", e)))?;
         }
 
         tracing::trace!("Net TX: {} bytes", packet.data.len());
@@ -692,9 +697,10 @@ impl VirtioNet {
         let mut tx_data: Vec<(u16, Vec<u8>)> = Vec::new();
 
         {
-            let queue = self.tx_queue.as_mut().ok_or_else(|| {
-                VirtioError::NotReady("TX queue not ready".into())
-            })?;
+            let queue = self
+                .tx_queue
+                .as_mut()
+                .ok_or_else(|| VirtioError::NotReady("TX queue not ready".into()))?;
 
             while let Some((head_idx, chain)) = queue.pop_avail() {
                 let mut data = Vec::new();
@@ -736,15 +742,15 @@ impl VirtioNet {
     /// Returns an error if polling fails.
     pub fn poll_backend(&mut self) -> Result<()> {
         if let Some(backend) = &self.backend {
-            let mut backend = backend.lock().map_err(|e| {
-                VirtioError::Io(format!("Failed to lock backend: {}", e))
-            })?;
+            let mut backend = backend
+                .lock()
+                .map_err(|e| VirtioError::Io(format!("Failed to lock backend: {}", e)))?;
 
             while backend.has_data() {
                 let mut buf = vec![0u8; 65536];
-                let n = backend.recv(&mut buf).map_err(|e| {
-                    VirtioError::Io(format!("Recv failed: {}", e))
-                })?;
+                let n = backend
+                    .recv(&mut buf)
+                    .map_err(|e| VirtioError::Io(format!("Recv failed: {}", e)))?;
 
                 if n > 0 {
                     buf.truncate(n);

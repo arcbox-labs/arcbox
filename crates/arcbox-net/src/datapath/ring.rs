@@ -7,7 +7,7 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{next_power_of_two, CachePadded, DEFAULT_RING_CAPACITY};
+use super::{CachePadded, DEFAULT_RING_CAPACITY, next_power_of_two};
 
 /// Lock-free SPSC ring buffer.
 ///
@@ -190,7 +190,9 @@ impl<T> LockFreeRing<T> {
         }
 
         // Publish all writes at once
-        self.head.0.store(head.wrapping_add(count), Ordering::Release);
+        self.head
+            .0
+            .store(head.wrapping_add(count), Ordering::Release);
 
         count
     }
@@ -219,7 +221,9 @@ impl<T> LockFreeRing<T> {
         }
 
         // Publish all reads at once
-        self.tail.0.store(tail.wrapping_add(count), Ordering::Release);
+        self.tail
+            .0
+            .store(tail.wrapping_add(count), Ordering::Release);
 
         count
     }

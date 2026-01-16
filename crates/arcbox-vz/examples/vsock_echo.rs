@@ -25,9 +25,8 @@
 //! - Echo test passes
 
 use arcbox_vz::{
-    is_supported, EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader,
-    SerialPortConfiguration, SocketDeviceConfiguration, VirtualMachineConfiguration,
-    VirtualMachineState,
+    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, SerialPortConfiguration,
+    SocketDeviceConfiguration, VirtualMachineConfiguration, VirtualMachineState, is_supported,
 };
 use std::env;
 use std::time::Duration;
@@ -48,7 +47,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Usage: {} <kernel> <initrd>", args[0]);
         eprintln!();
         eprintln!("Example with PUI PUI Linux:");
-        eprintln!("  {} tests/resources/Image tests/resources/initramfs.cpio.gz", args[0]);
+        eprintln!(
+            "  {} tests/resources/Image tests/resources/initramfs.cpio.gz",
+            args[0]
+        );
         std::process::exit(1);
     }
 
@@ -113,9 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         while start.elapsed() < Duration::from_secs(5) {
             let mut buf = [0u8; 1024];
-            let n = unsafe {
-                libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-            };
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n > 0 {
                 let s = String::from_utf8_lossy(&buf[..n as usize]);
                 output.push_str(&s);

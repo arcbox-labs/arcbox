@@ -17,13 +17,13 @@
 
 use crate::error::{FsError, Result};
 use crate::fuse::{
-    FuseAccessIn, FuseAttr, FuseAttrOut, FuseCreateIn, FuseDirent, FuseEntryOut, FuseFallocateIn,
-    FuseFlushIn, FuseForgetIn, FuseFsyncIn, FuseGetxattrIn, FuseGetxattrOut, FuseInHeader,
-    FuseInitIn, FuseInitOut, FuseLinkIn, FuseLseekIn, FuseLseekOut, FuseMkdirIn, FuseMknodIn,
-    FuseOpenIn, FuseOpenOut, FuseOpcode, FuseOutHeader, FuseReadIn, FuseReleaseIn, FuseRenameIn,
-    FuseSetattrIn, FuseSetxattrIn, FuseStatfsOut, FuseWriteIn, FuseWriteOut,
     FATTR_ATIME, FATTR_GID, FATTR_MODE, FATTR_MTIME, FATTR_SIZE, FATTR_UID,
-    FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION,
+    FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FuseAccessIn, FuseAttr, FuseAttrOut,
+    FuseCreateIn, FuseDirent, FuseEntryOut, FuseFallocateIn, FuseFlushIn, FuseForgetIn,
+    FuseFsyncIn, FuseGetxattrIn, FuseGetxattrOut, FuseInHeader, FuseInitIn, FuseInitOut,
+    FuseLinkIn, FuseLseekIn, FuseLseekOut, FuseMkdirIn, FuseMknodIn, FuseOpcode, FuseOpenIn,
+    FuseOpenOut, FuseOutHeader, FuseReadIn, FuseReleaseIn, FuseRenameIn, FuseSetattrIn,
+    FuseSetxattrIn, FuseStatfsOut, FuseWriteIn, FuseWriteOut,
 };
 use crate::passthrough::PassthroughFs;
 
@@ -149,9 +149,8 @@ impl ResponseBuilder {
     }
 
     fn write_struct<T: Copy>(&mut self, value: &T) {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>())
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) };
         self.buffer.extend_from_slice(bytes);
     }
 }
@@ -394,7 +393,10 @@ impl FuseDispatcher {
             None
         };
 
-        match self.fs.setattr(ctx.nodeid, mode, uid, gid, size, atime, mtime) {
+        match self
+            .fs
+            .setattr(ctx.nodeid, mode, uid, gid, size, atime, mtime)
+        {
             Ok(attr) => {
                 let attr_out = FuseAttrOut {
                     attr_valid: self.config.attr_timeout,
@@ -430,7 +432,10 @@ impl FuseDispatcher {
         let mknod_in = unsafe { &*(body.as_ptr() as *const FuseMknodIn) };
         let name = self.parse_name(&body[size_of::<FuseMknodIn>()..]);
 
-        match self.fs.mknod(ctx.nodeid, name, mknod_in.mode, u64::from(mknod_in.rdev)) {
+        match self
+            .fs
+            .mknod(ctx.nodeid, name, mknod_in.mode, u64::from(mknod_in.rdev))
+        {
             Ok((inode, attr)) => {
                 let entry = self.make_entry_out(inode, &attr);
                 response.write_data(ctx.unique, &entry);
@@ -506,7 +511,10 @@ impl FuseDispatcher {
         let create_in = unsafe { &*(body.as_ptr() as *const FuseCreateIn) };
         let name = self.parse_name(&body[size_of::<FuseCreateIn>()..]);
 
-        match self.fs.create(ctx.nodeid, name, create_in.mode, create_in.flags) {
+        match self
+            .fs
+            .create(ctx.nodeid, name, create_in.mode, create_in.flags)
+        {
             Ok((inode, attr, handle)) => {
                 let entry = self.make_entry_out(inode, &attr);
                 let open_out = FuseOpenOut {
@@ -517,7 +525,9 @@ impl FuseDispatcher {
 
                 // Write entry followed by open response
                 response.buffer.clear();
-                let len = (FuseOutHeader::SIZE + size_of::<FuseEntryOut>() + size_of::<FuseOpenOut>()) as u32;
+                let len = (FuseOutHeader::SIZE
+                    + size_of::<FuseEntryOut>()
+                    + size_of::<FuseOpenOut>()) as u32;
                 let header = FuseOutHeader::success(ctx.unique, len);
                 response.write_struct(&header);
                 response.write_struct(&entry);
@@ -568,7 +578,10 @@ impl FuseDispatcher {
         let old_name = OsStr::from_bytes(parts[0]);
         let new_name = OsStr::from_bytes(parts[1].split(|&b| b == 0).next().unwrap_or(&[]));
 
-        match self.fs.rename(ctx.nodeid, old_name, rename_in.newdir, new_name, 0) {
+        match self
+            .fs
+            .rename(ctx.nodeid, old_name, rename_in.newdir, new_name, 0)
+        {
             Ok(()) => response.write_empty(ctx.unique),
             Err(e) => response.write_error(ctx.unique, e.to_errno()),
         }
@@ -622,7 +635,10 @@ impl FuseDispatcher {
         let write_in = unsafe { &*(body.as_ptr() as *const FuseWriteIn) };
         let data = &body[size_of::<FuseWriteIn>()..];
 
-        match self.fs.write(write_in.fh, write_in.offset, data, write_in.write_flags) {
+        match self
+            .fs
+            .write(write_in.fh, write_in.offset, data, write_in.write_flags)
+        {
             Ok(written) => {
                 let write_out = FuseWriteOut {
                     size: written,
@@ -685,7 +701,10 @@ impl FuseDispatcher {
 
         let lseek_in = unsafe { &*(body.as_ptr() as *const FuseLseekIn) };
 
-        match self.fs.lseek(lseek_in.fh, lseek_in.offset as i64, lseek_in.whence) {
+        match self
+            .fs
+            .lseek(lseek_in.fh, lseek_in.offset as i64, lseek_in.whence)
+        {
             Ok(offset) => {
                 let lseek_out = FuseLseekOut { offset };
                 response.write_data(ctx.unique, &lseek_out);
@@ -872,7 +891,12 @@ impl FuseDispatcher {
         }
     }
 
-    fn handle_removexattr(&self, ctx: &RequestContext, body: &[u8], response: &mut ResponseBuilder) {
+    fn handle_removexattr(
+        &self,
+        ctx: &RequestContext,
+        body: &[u8],
+        response: &mut ResponseBuilder,
+    ) {
         let name = self.parse_name(body);
 
         match self.fs.removexattr(ctx.nodeid, name) {
@@ -972,7 +996,10 @@ mod tests {
         };
 
         let header_bytes = unsafe {
-            std::slice::from_raw_parts(&header as *const FuseInHeader as *const u8, FuseInHeader::SIZE)
+            std::slice::from_raw_parts(
+                &header as *const FuseInHeader as *const u8,
+                FuseInHeader::SIZE,
+            )
         };
         header_bytes.to_vec()
     }
@@ -995,7 +1022,10 @@ mod tests {
 
         let mut request = make_header(FuseOpcode::Init, 0, size_of::<FuseInitIn>());
         let init_bytes = unsafe {
-            std::slice::from_raw_parts(&init_in as *const FuseInitIn as *const u8, size_of::<FuseInitIn>())
+            std::slice::from_raw_parts(
+                &init_in as *const FuseInitIn as *const u8,
+                size_of::<FuseInitIn>(),
+            )
         };
         request.extend_from_slice(init_bytes);
 
@@ -1003,7 +1033,11 @@ mod tests {
         let header = parse_response_header(&response);
 
         assert_eq!(header.error, 0);
-        assert!(dispatcher.initialized.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            dispatcher
+                .initialized
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     #[test]
@@ -1054,12 +1088,18 @@ mod tests {
         let (_temp, dispatcher) = setup_dispatcher();
 
         // Mkdir
-        let mkdir_in = FuseMkdirIn { mode: 0o755, umask: 0 };
+        let mkdir_in = FuseMkdirIn {
+            mode: 0o755,
+            umask: 0,
+        };
         let name = b"testdir\0";
 
         let mut request = make_header(FuseOpcode::Mkdir, 1, size_of::<FuseMkdirIn>() + name.len());
         let mkdir_bytes = unsafe {
-            std::slice::from_raw_parts(&mkdir_in as *const FuseMkdirIn as *const u8, size_of::<FuseMkdirIn>())
+            std::slice::from_raw_parts(
+                &mkdir_in as *const FuseMkdirIn as *const u8,
+                size_of::<FuseMkdirIn>(),
+            )
         };
         request.extend_from_slice(mkdir_bytes);
         request.extend_from_slice(name);
@@ -1105,7 +1145,10 @@ mod tests {
         };
         let mut request = make_header(FuseOpcode::Open, inode, size_of::<FuseOpenIn>());
         let open_bytes = unsafe {
-            std::slice::from_raw_parts(&open_in as *const FuseOpenIn as *const u8, size_of::<FuseOpenIn>())
+            std::slice::from_raw_parts(
+                &open_in as *const FuseOpenIn as *const u8,
+                size_of::<FuseOpenIn>(),
+            )
         };
         request.extend_from_slice(open_bytes);
 
@@ -1131,7 +1174,10 @@ mod tests {
         };
         let mut request = make_header(FuseOpcode::Read, inode, size_of::<FuseReadIn>());
         let read_bytes = unsafe {
-            std::slice::from_raw_parts(&read_in as *const FuseReadIn as *const u8, size_of::<FuseReadIn>())
+            std::slice::from_raw_parts(
+                &read_in as *const FuseReadIn as *const u8,
+                size_of::<FuseReadIn>(),
+            )
         };
         request.extend_from_slice(read_bytes);
 
@@ -1151,7 +1197,10 @@ mod tests {
         };
         let mut request = make_header(FuseOpcode::Release, inode, size_of::<FuseReleaseIn>());
         let release_bytes = unsafe {
-            std::slice::from_raw_parts(&release_in as *const FuseReleaseIn as *const u8, size_of::<FuseReleaseIn>())
+            std::slice::from_raw_parts(
+                &release_in as *const FuseReleaseIn as *const u8,
+                size_of::<FuseReleaseIn>(),
+            )
         };
         request.extend_from_slice(release_bytes);
 
@@ -1188,7 +1237,10 @@ mod tests {
         };
 
         let request = unsafe {
-            std::slice::from_raw_parts(&header as *const FuseInHeader as *const u8, FuseInHeader::SIZE)
+            std::slice::from_raw_parts(
+                &header as *const FuseInHeader as *const u8,
+                FuseInHeader::SIZE,
+            )
         };
 
         let result = dispatcher.dispatch(request);
@@ -1216,10 +1268,16 @@ mod tests {
         std::fs::write(temp.path().join("file2.txt"), "").unwrap();
 
         // Opendir
-        let open_in = FuseOpenIn { flags: 0, unused: 0 };
+        let open_in = FuseOpenIn {
+            flags: 0,
+            unused: 0,
+        };
         let mut request = make_header(FuseOpcode::Opendir, 1, size_of::<FuseOpenIn>());
         let open_bytes = unsafe {
-            std::slice::from_raw_parts(&open_in as *const FuseOpenIn as *const u8, size_of::<FuseOpenIn>())
+            std::slice::from_raw_parts(
+                &open_in as *const FuseOpenIn as *const u8,
+                size_of::<FuseOpenIn>(),
+            )
         };
         request.extend_from_slice(open_bytes);
 
@@ -1244,7 +1302,10 @@ mod tests {
         };
         let mut request = make_header(FuseOpcode::Readdir, 1, size_of::<FuseReadIn>());
         let read_bytes = unsafe {
-            std::slice::from_raw_parts(&read_in as *const FuseReadIn as *const u8, size_of::<FuseReadIn>())
+            std::slice::from_raw_parts(
+                &read_in as *const FuseReadIn as *const u8,
+                size_of::<FuseReadIn>(),
+            )
         };
         request.extend_from_slice(read_bytes);
 
@@ -1261,7 +1322,10 @@ mod tests {
         };
         let mut request = make_header(FuseOpcode::Releasedir, 1, size_of::<FuseReleaseIn>());
         let release_bytes = unsafe {
-            std::slice::from_raw_parts(&release_in as *const FuseReleaseIn as *const u8, size_of::<FuseReleaseIn>())
+            std::slice::from_raw_parts(
+                &release_in as *const FuseReleaseIn as *const u8,
+                size_of::<FuseReleaseIn>(),
+            )
         };
         request.extend_from_slice(release_bytes);
 

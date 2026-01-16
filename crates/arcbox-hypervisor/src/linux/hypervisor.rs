@@ -9,7 +9,7 @@ use crate::{
     types::{CpuArch, PlatformCapabilities},
 };
 
-use super::ffi::{self, KvmSystem, KVM_CAP_MAX_VCPUS, KVM_CAP_NR_MEMSLOTS};
+use super::ffi::{self, KVM_CAP_MAX_VCPUS, KVM_CAP_NR_MEMSLOTS, KvmSystem};
 use super::vm::KvmVm;
 
 /// Linux hypervisor implementation using KVM.

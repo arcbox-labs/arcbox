@@ -197,11 +197,7 @@ impl ZeroCopyPacket {
     /// - The memory is not modified while the packet is in use.
     #[inline]
     #[must_use]
-    pub const unsafe fn from_raw_parts(
-        data: *const u8,
-        len: u32,
-        desc_idx: u16,
-    ) -> Self {
+    pub const unsafe fn from_raw_parts(data: *const u8, len: u32, desc_idx: u16) -> Self {
         Self {
             data,
             len,
@@ -426,14 +422,10 @@ impl ZeroCopyPacket {
         if data.len() >= l4_offset + 4 {
             match self.metadata.protocol {
                 Protocol::Tcp | Protocol::Udp => {
-                    self.metadata.src_port = u16::from_be_bytes([
-                        data[l4_offset],
-                        data[l4_offset + 1],
-                    ]);
-                    self.metadata.dst_port = u16::from_be_bytes([
-                        data[l4_offset + 2],
-                        data[l4_offset + 3],
-                    ]);
+                    self.metadata.src_port =
+                        u16::from_be_bytes([data[l4_offset], data[l4_offset + 1]]);
+                    self.metadata.dst_port =
+                        u16::from_be_bytes([data[l4_offset + 2], data[l4_offset + 3]]);
 
                     // TCP flags
                     if self.metadata.protocol == Protocol::Tcp && data.len() >= l4_offset + 14 {
@@ -459,14 +451,10 @@ impl ZeroCopyPacket {
         if data.len() >= l4_offset + 4 {
             match self.metadata.protocol {
                 Protocol::Tcp | Protocol::Udp => {
-                    self.metadata.src_port = u16::from_be_bytes([
-                        data[l4_offset],
-                        data[l4_offset + 1],
-                    ]);
-                    self.metadata.dst_port = u16::from_be_bytes([
-                        data[l4_offset + 2],
-                        data[l4_offset + 3],
-                    ]);
+                    self.metadata.src_port =
+                        u16::from_be_bytes([data[l4_offset], data[l4_offset + 1]]);
+                    self.metadata.dst_port =
+                        u16::from_be_bytes([data[l4_offset + 2], data[l4_offset + 3]]);
 
                     // TCP flags
                     if self.metadata.protocol == Protocol::Tcp && data.len() >= l4_offset + 14 {

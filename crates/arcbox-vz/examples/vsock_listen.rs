@@ -26,9 +26,8 @@
 //! 4. Test connect to port 2222 (to verify vsock works)
 
 use arcbox_vz::{
-    is_supported, EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader,
-    SerialPortConfiguration, SocketDeviceConfiguration, VirtualMachineConfiguration,
-    VirtualMachineState,
+    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, SerialPortConfiguration,
+    SocketDeviceConfiguration, VirtualMachineConfiguration, VirtualMachineState, is_supported,
 };
 use std::env;
 use std::time::Duration;
@@ -116,9 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         while start.elapsed() < Duration::from_secs(5) {
             let mut buf = [0u8; 1024];
-            let n = unsafe {
-                libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-            };
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n > 0 {
                 let s = String::from_utf8_lossy(&buf[..n as usize]);
                 print!("{}", s);
@@ -145,11 +142,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match device.listen(5000) {
         Ok(mut listener) => {
-            println!("       SUCCESS! Listener created on port {}", listener.port());
+            println!(
+                "       SUCCESS! Listener created on port {}",
+                listener.port()
+            );
 
             // Wait for incoming connections (timeout after 3 seconds)
             println!("       Waiting for incoming connections (3 seconds)...");
-            println!("       (Note: PUI PUI Linux doesn't have a vsock client, so no connections expected)");
+            println!(
+                "       (Note: PUI PUI Linux doesn't have a vsock client, so no connections expected)"
+            );
 
             let timeout = tokio::time::timeout(Duration::from_secs(3), listener.accept()).await;
 

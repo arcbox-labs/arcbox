@@ -62,7 +62,8 @@ impl DarwinHypervisor {
         // Check Rosetta availability using arcbox-vz
         let rosetta = matches!(
             arcbox_vz::LinuxRosettaDirectoryShare::availability(),
-            arcbox_vz::RosettaAvailability::Supported | arcbox_vz::RosettaAvailability::NotInstalled
+            arcbox_vz::RosettaAvailability::Supported
+                | arcbox_vz::RosettaAvailability::NotInstalled
         );
 
         // Determine supported architectures

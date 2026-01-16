@@ -67,7 +67,11 @@ struct MmioAllocator {
 impl MmioAllocator {
     /// Creates a new MMIO allocator.
     fn new(base: u64, size: u64) -> Self {
-        Self { base, size, next: base }
+        Self {
+            base,
+            size,
+            next: base,
+        }
     }
 
     /// Allocates an MMIO region.
@@ -124,7 +128,10 @@ impl MemoryManager {
         self.total_ram = ram_size;
         self.initialized = true;
 
-        tracing::debug!("Memory manager initialized: RAM={}MB", ram_size / (1024 * 1024));
+        tracing::debug!(
+            "Memory manager initialized: RAM={}MB",
+            ram_size / (1024 * 1024)
+        );
         Ok(())
     }
 
@@ -146,9 +153,10 @@ impl MemoryManager {
     ///
     /// Returns an error if MMIO space is exhausted.
     pub fn allocate_mmio(&mut self, size: u64, name: &str) -> Result<u64> {
-        let addr = self.mmio_allocator.allocate(size).ok_or_else(|| {
-            VmmError::Memory("MMIO space exhausted".to_string())
-        })?;
+        let addr = self
+            .mmio_allocator
+            .allocate(size)
+            .ok_or_else(|| VmmError::Memory("MMIO space exhausted".to_string()))?;
 
         let region = MemoryRegionInfo {
             guest_addr: GuestAddress::new(addr),
@@ -160,7 +168,12 @@ impl MemoryManager {
 
         self.regions.insert(addr, region);
 
-        tracing::debug!("Allocated MMIO region '{}' at {:#x}, size={}", name, addr, size);
+        tracing::debug!(
+            "Allocated MMIO region '{}' at {:#x}, size={}",
+            name,
+            addr,
+            size
+        );
         Ok(addr)
     }
 
@@ -208,9 +221,7 @@ impl MemoryManager {
             .range(..=addr.raw())
             .next_back()
             .map(|(_, region)| region)
-            .filter(|region| {
-                addr.raw() < region.guest_addr.raw() + region.size
-            })
+            .filter(|region| addr.raw() < region.guest_addr.raw() + region.size)
     }
 
     /// Returns an iterator over all memory regions.

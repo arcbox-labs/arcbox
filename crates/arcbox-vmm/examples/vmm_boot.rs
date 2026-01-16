@@ -34,7 +34,11 @@ fn main() {
         memory_size: 512 * 1024 * 1024, // 512MB
         kernel_path: kernel_path.clone(),
         kernel_cmdline: "console=hvc0 earlycon root=/dev/ram0 rdinit=/bin/sh".to_string(),
-        initrd_path: if initrd_path.exists() { Some(initrd_path) } else { None },
+        initrd_path: if initrd_path.exists() {
+            Some(initrd_path)
+        } else {
+            None
+        },
         enable_rosetta: false,
         serial_console: true,
         virtio_console: true,
@@ -76,7 +80,12 @@ fn main() {
             // Run for a while
             for i in 0..15 {
                 std::thread::sleep(Duration::from_secs(1));
-                println!("[{}s] VMM state: {:?}, running: {}", i + 1, vmm.state(), vmm.is_running());
+                println!(
+                    "[{}s] VMM state: {:?}, running: {}",
+                    i + 1,
+                    vmm.state(),
+                    vmm.is_running()
+                );
             }
 
             println!();

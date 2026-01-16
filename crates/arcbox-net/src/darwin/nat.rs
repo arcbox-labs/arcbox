@@ -8,14 +8,13 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use crate::datapath::{
-    DatapathStats, LockFreeRing, PacketPool, DEFAULT_POOL_CAPACITY,
-    DEFAULT_RING_CAPACITY,
+    DEFAULT_POOL_CAPACITY, DEFAULT_RING_CAPACITY, DatapathStats, LockFreeRing, PacketPool,
 };
 use crate::error::{NetError, Result};
 use crate::nat::{IpAllocator, NatConfig};
 use crate::nat_engine::{NatDirection, NatEngine, NatEngineConfig, NatResult};
 
-use super::{generate_mac, DarwinNetEndpoint, DarwinNetMode};
+use super::{DarwinNetEndpoint, DarwinNetMode, generate_mac};
 
 /// macOS NAT network.
 ///
@@ -110,9 +109,10 @@ impl DarwinNatNetwork {
             )));
         }
 
-        let ip = self.ip_allocator.allocate().ok_or_else(|| {
-            NetError::AddressAllocation("no available IP addresses".to_string())
-        })?;
+        let ip = self
+            .ip_allocator
+            .allocate()
+            .ok_or_else(|| NetError::AddressAllocation("no available IP addresses".to_string()))?;
 
         let mac = generate_mac();
         let mut endpoint = DarwinNetEndpoint::new(id.to_string(), mac, DarwinNetMode::Nat);
@@ -129,9 +129,10 @@ impl DarwinNatNetwork {
     ///
     /// Returns an error if the endpoint doesn't exist.
     pub fn remove_endpoint(&mut self, id: &str) -> Result<()> {
-        let endpoint = self.endpoints.remove(id).ok_or_else(|| {
-            NetError::Config(format!("endpoint '{}' not found", id))
-        })?;
+        let endpoint = self
+            .endpoints
+            .remove(id)
+            .ok_or_else(|| NetError::Config(format!("endpoint '{}' not found", id)))?;
 
         if let Some(ip) = endpoint.ip {
             self.ip_allocator.release(ip);
@@ -377,7 +378,9 @@ impl DatapathPoller {
 
         // Process TX packets (Guest -> Host)
         let mut tx_batch = [0u32; 64];
-        let tx_count = network.tx_ring().dequeue_batch(&mut tx_batch[..self.batch_size]);
+        let tx_count = network
+            .tx_ring()
+            .dequeue_batch(&mut tx_batch[..self.batch_size]);
         if tx_count > 0 {
             work_done = true;
             network.stats().record_batch_size(tx_count);
@@ -402,7 +405,9 @@ impl DatapathPoller {
 
         // Process RX packets (Host -> Guest)
         let mut rx_batch = [0u32; 64];
-        let rx_count = network.rx_ring().dequeue_batch(&mut rx_batch[..self.batch_size]);
+        let rx_count = network
+            .rx_ring()
+            .dequeue_batch(&mut rx_batch[..self.batch_size]);
         if rx_count > 0 {
             work_done = true;
             network.stats().record_batch_size(rx_count);

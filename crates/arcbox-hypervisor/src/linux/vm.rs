@@ -233,9 +233,11 @@ impl KvmVm {
 
         // Set identity map address
         const IDENTITY_MAP_ADDR: u64 = 0xfffb_c000;
-        vm_fd.set_identity_map_addr(IDENTITY_MAP_ADDR).map_err(|e| {
-            HypervisorError::VmCreationFailed(format!("Failed to set identity map: {}", e))
-        })?;
+        vm_fd
+            .set_identity_map_addr(IDENTITY_MAP_ADDR)
+            .map_err(|e| {
+                HypervisorError::VmCreationFailed(format!("Failed to set identity map: {}", e))
+            })?;
 
         // Create in-kernel IRQ chip (APIC, IOAPIC, PIC)
         vm_fd.create_irqchip().map_err(|e| {
@@ -324,9 +326,10 @@ impl KvmVm {
         })?;
 
         {
-            let mut slots = self.memory_slots.write().map_err(|_| {
-                HypervisorError::SnapshotError("Lock poisoned".to_string())
-            })?;
+            let mut slots = self
+                .memory_slots
+                .write()
+                .map_err(|_| HypervisorError::SnapshotError("Lock poisoned".to_string()))?;
             slots.push(MemorySlotInfo {
                 slot,
                 guest_phys_addr: guest_addr.raw(),
@@ -364,9 +367,10 @@ impl KvmVm {
         })?;
 
         {
-            let mut slots = self.memory_slots.write().map_err(|_| {
-                HypervisorError::SnapshotError("Lock poisoned".to_string())
-            })?;
+            let mut slots = self
+                .memory_slots
+                .write()
+                .map_err(|_| HypervisorError::SnapshotError("Lock poisoned".to_string()))?;
             slots.retain(|entry| entry.slot != slot);
         }
 
@@ -390,9 +394,9 @@ impl KvmVm {
     /// * `gsi` - Global System Interrupt number
     /// * `level` - true to assert, false to deassert
     pub fn set_irq_line(&self, gsi: u32, level: bool) -> Result<(), HypervisorError> {
-        self.vm_fd.set_irq_line(gsi, level).map_err(|e| {
-            HypervisorError::DeviceError(format!("Failed to set IRQ line: {}", e))
-        })
+        self.vm_fd
+            .set_irq_line(gsi, level)
+            .map_err(|e| HypervisorError::DeviceError(format!("Failed to set IRQ line: {}", e)))
     }
 
     /// Triggers an edge-triggered interrupt.
@@ -419,16 +423,16 @@ impl KvmVm {
         gsi: u32,
         resample_fd: Option<RawFd>,
     ) -> Result<(), HypervisorError> {
-        self.vm_fd.register_irqfd(eventfd, gsi, resample_fd).map_err(|e| {
-            HypervisorError::DeviceError(format!("Failed to register IRQFD: {}", e))
-        })
+        self.vm_fd
+            .register_irqfd(eventfd, gsi, resample_fd)
+            .map_err(|e| HypervisorError::DeviceError(format!("Failed to register IRQFD: {}", e)))
     }
 
     /// Unregisters an eventfd for IRQ injection.
     pub fn unregister_irqfd(&self, eventfd: RawFd, gsi: u32) -> Result<(), HypervisorError> {
-        self.vm_fd.unregister_irqfd(eventfd, gsi).map_err(|e| {
-            HypervisorError::DeviceError(format!("Failed to unregister IRQFD: {}", e))
-        })
+        self.vm_fd
+            .unregister_irqfd(eventfd, gsi)
+            .map_err(|e| HypervisorError::DeviceError(format!("Failed to unregister IRQFD: {}", e)))
     }
 
     // ========================================================================
@@ -439,9 +443,10 @@ impl KvmVm {
     ///
     /// Returns the base address for the device.
     fn allocate_mmio_region(&self) -> Result<u64, HypervisorError> {
-        let devices = self.virtio_devices.read().map_err(|_| {
-            HypervisorError::DeviceError("Lock poisoned".to_string())
-        })?;
+        let devices = self
+            .virtio_devices
+            .read()
+            .map_err(|_| HypervisorError::DeviceError("Lock poisoned".to_string()))?;
 
         if devices.len() >= MAX_VIRTIO_DEVICES {
             return Err(HypervisorError::DeviceError(
@@ -502,18 +507,22 @@ impl KvmVm {
 
     /// Returns a copy of the attached VirtIO devices info.
     pub fn virtio_devices(&self) -> Result<Vec<VirtioDeviceInfo>, HypervisorError> {
-        let devices = self.virtio_devices.read().map_err(|_| {
-            HypervisorError::DeviceError("Lock poisoned".to_string())
-        })?;
+        let devices = self
+            .virtio_devices
+            .read()
+            .map_err(|_| HypervisorError::DeviceError("Lock poisoned".to_string()))?;
 
-        Ok(devices.iter().map(|d| VirtioDeviceInfo {
-            device_type: d.device_type.clone(),
-            mmio_base: d.mmio_base,
-            mmio_size: d.mmio_size,
-            irq: d.irq,
-            irq_fd: d.irq_fd,
-            notify_fd: d.notify_fd,
-        }).collect())
+        Ok(devices
+            .iter()
+            .map(|d| VirtioDeviceInfo {
+                device_type: d.device_type.clone(),
+                mmio_base: d.mmio_base,
+                mmio_size: d.mmio_size,
+                irq: d.irq,
+                irq_fd: d.irq_fd,
+                notify_fd: d.notify_fd,
+            })
+            .collect())
     }
 
     // ========================================================================
@@ -538,9 +547,10 @@ impl KvmVm {
             return Ok(());
         }
 
-        let slots = self.memory_slots.read().map_err(|_| {
-            HypervisorError::SnapshotError("Lock poisoned".to_string())
-        })?;
+        let slots = self
+            .memory_slots
+            .read()
+            .map_err(|_| HypervisorError::SnapshotError("Lock poisoned".to_string()))?;
 
         // Enable dirty logging for all memory slots.
         for slot in slots.iter() {
@@ -584,9 +594,10 @@ impl KvmVm {
             return Ok(());
         }
 
-        let slots = self.memory_slots.read().map_err(|_| {
-            HypervisorError::SnapshotError("Lock poisoned".to_string())
-        })?;
+        let slots = self
+            .memory_slots
+            .read()
+            .map_err(|_| HypervisorError::SnapshotError("Lock poisoned".to_string()))?;
 
         // Disable dirty logging for all memory slots.
         for slot in slots.iter() {
@@ -634,9 +645,10 @@ impl KvmVm {
             ));
         }
 
-        let slots = self.memory_slots.read().map_err(|_| {
-            HypervisorError::SnapshotError("Lock poisoned".to_string())
-        })?;
+        let slots = self
+            .memory_slots
+            .read()
+            .map_err(|_| HypervisorError::SnapshotError("Lock poisoned".to_string()))?;
 
         let mut dirty_pages = Vec::new();
 
@@ -653,11 +665,7 @@ impl KvmVm {
                 })?;
 
             // Parse the bitmap to extract dirty page addresses.
-            let pages = Self::parse_dirty_bitmap(
-                &bitmap,
-                slot.guest_phys_addr,
-                slot.size,
-            );
+            let pages = Self::parse_dirty_bitmap(&bitmap, slot.guest_phys_addr, slot.size);
 
             tracing::debug!(
                 "Slot {}: {} dirty pages out of {} total",
@@ -686,11 +694,7 @@ impl KvmVm {
     ///
     /// # Returns
     /// A vector of DirtyPageInfo for each dirty page.
-    fn parse_dirty_bitmap(
-        bitmap: &[u64],
-        base_addr: u64,
-        size: u64,
-    ) -> Vec<DirtyPageInfo> {
+    fn parse_dirty_bitmap(bitmap: &[u64], base_addr: u64, size: u64) -> Vec<DirtyPageInfo> {
         let mut pages = Vec::new();
         let num_pages = size / PAGE_SIZE;
 
@@ -739,10 +743,13 @@ impl VirtualMachine for KvmVm {
 
         // Check if already created
         {
-            let vcpus = self.vcpus.read().map_err(|_| HypervisorError::VcpuCreationFailed {
-                id,
-                reason: "Lock poisoned".to_string(),
-            })?;
+            let vcpus = self
+                .vcpus
+                .read()
+                .map_err(|_| HypervisorError::VcpuCreationFailed {
+                    id,
+                    reason: "Lock poisoned".to_string(),
+                })?;
 
             if vcpus.contains(&id) {
                 return Err(HypervisorError::VcpuCreationFailed {
@@ -753,22 +760,26 @@ impl VirtualMachine for KvmVm {
         }
 
         // Create vCPU via KVM
-        let vcpu_fd = self.vm_fd.create_vcpu(id, self.vcpu_mmap_size).map_err(|e| {
-            HypervisorError::VcpuCreationFailed {
+        let vcpu_fd = self
+            .vm_fd
+            .create_vcpu(id, self.vcpu_mmap_size)
+            .map_err(|e| HypervisorError::VcpuCreationFailed {
                 id,
                 reason: format!("KVM error: {}", e),
-            }
-        })?;
+            })?;
 
         // Create wrapper
         let vcpu = KvmVcpu::new(id, vcpu_fd)?;
 
         // Record creation
         {
-            let mut vcpus = self.vcpus.write().map_err(|_| HypervisorError::VcpuCreationFailed {
-                id,
-                reason: "Lock poisoned".to_string(),
-            })?;
+            let mut vcpus =
+                self.vcpus
+                    .write()
+                    .map_err(|_| HypervisorError::VcpuCreationFailed {
+                        id,
+                        reason: "Lock poisoned".to_string(),
+                    })?;
             vcpus.push(id);
         }
 
@@ -956,11 +967,7 @@ impl VirtualMachine for KvmVm {
 
             snapshots.push(DeviceSnapshot {
                 device_type: device.device_type.clone(),
-                name: format!(
-                    "{:?}-{}",
-                    device.device_type,
-                    snapshots.len()
-                ),
+                name: format!("{:?}-{}", device.device_type, snapshots.len()),
                 state: state_bytes,
             });
         }
@@ -1055,7 +1062,9 @@ impl Drop for KvmVm {
 
                 // Unregister IOEVENTFD.
                 let notify_addr = device.mmio_base + VIRTIO_MMIO_QUEUE_NOTIFY;
-                let _ = self.vm_fd.unregister_ioeventfd(notify_addr, 4, device.notify_fd);
+                let _ = self
+                    .vm_fd
+                    .unregister_ioeventfd(notify_addr, 4, device.notify_fd);
 
                 // Close eventfds.
                 unsafe {

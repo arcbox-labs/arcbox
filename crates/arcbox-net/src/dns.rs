@@ -18,8 +18,8 @@ pub const DNS_PORT: u16 = 53;
 
 /// Default upstream DNS servers.
 pub const DEFAULT_UPSTREAM: &[Ipv4Addr] = &[
-    Ipv4Addr::new(8, 8, 8, 8),      // Google DNS
-    Ipv4Addr::new(1, 1, 1, 1),      // Cloudflare DNS
+    Ipv4Addr::new(8, 8, 8, 8), // Google DNS
+    Ipv4Addr::new(1, 1, 1, 1), // Cloudflare DNS
 ];
 
 /// Default cache TTL.

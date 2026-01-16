@@ -17,8 +17,13 @@ pub fn nsstring(s: &str) -> *mut AnyObject {
         let alloc = msg_send!(cls, alloc);
 
         let sel = objc2::sel!(initWithBytes:length:encoding:);
-        let func: unsafe extern "C" fn(*mut AnyObject, objc2::runtime::Sel, *const u8, usize, u64) -> *mut AnyObject =
-            std::mem::transmute(super::runtime::objc_msgSend as *const c_void);
+        let func: unsafe extern "C" fn(
+            *mut AnyObject,
+            objc2::runtime::Sel,
+            *const u8,
+            usize,
+            u64,
+        ) -> *mut AnyObject = std::mem::transmute(super::runtime::objc_msgSend as *const c_void);
         func(alloc, sel, s.as_ptr(), s.len(), 4) // 4 = NSUTF8StringEncoding
     }
 }
@@ -109,8 +114,11 @@ pub fn nsarray_object_at_index(array: *mut AnyObject, index: usize) -> *mut AnyO
     }
     unsafe {
         let sel = objc2::sel!(objectAtIndex:);
-        let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel, usize) -> *mut AnyObject =
-            std::mem::transmute(super::runtime::objc_msgSend as *const c_void);
+        let func: unsafe extern "C" fn(
+            *const AnyObject,
+            objc2::runtime::Sel,
+            usize,
+        ) -> *mut AnyObject = std::mem::transmute(super::runtime::objc_msgSend as *const c_void);
         func(array as *const AnyObject, sel, index)
     }
 }
@@ -129,8 +137,12 @@ pub fn file_handle_for_fd(fd: i32) -> *mut AnyObject {
         let obj = msg_send!(cls, alloc);
 
         let sel = objc2::sel!(initWithFileDescriptor:closeOnDealloc:);
-        let func: unsafe extern "C" fn(*mut AnyObject, objc2::runtime::Sel, i32, bool) -> *mut AnyObject =
-            std::mem::transmute(super::runtime::objc_msgSend as *const c_void);
+        let func: unsafe extern "C" fn(
+            *mut AnyObject,
+            objc2::runtime::Sel,
+            i32,
+            bool,
+        ) -> *mut AnyObject = std::mem::transmute(super::runtime::objc_msgSend as *const c_void);
         func(obj, sel, fd, false)
     }
 }

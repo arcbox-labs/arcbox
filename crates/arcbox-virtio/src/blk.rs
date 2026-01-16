@@ -92,7 +92,11 @@ impl DirectIoBackend {
 
         let capacity = stat.st_size as u64 / 512;
 
-        tracing::info!("Opened {} with O_DIRECT, capacity={} sectors", path.display(), capacity);
+        tracing::info!(
+            "Opened {} with O_DIRECT, capacity={} sectors",
+            path.display(),
+            capacity
+        );
 
         Ok(Self {
             fd,
@@ -194,7 +198,11 @@ impl AsyncFileBackend {
         let metadata = file.metadata()?;
         let capacity = metadata.len() / 512;
 
-        tracing::info!("Created async file backend: {}, capacity={} sectors", path.display(), capacity);
+        tracing::info!(
+            "Created async file backend: {}, capacity={} sectors",
+            path.display(),
+            capacity
+        );
 
         Ok(Self {
             path,
@@ -296,22 +304,18 @@ impl MmapBackend {
             libc::PROT_READ | libc::PROT_WRITE
         };
 
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                prot,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), size, prot, libc::MAP_SHARED, fd, 0) };
 
         if ptr == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error());
         }
 
-        tracing::info!("Memory-mapped {} at {:p}, size={}", path.display(), ptr, size);
+        tracing::info!(
+            "Memory-mapped {} at {:p}, size={}",
+            path.display(),
+            ptr,
+            size
+        );
 
         Ok(Self {
             ptr: ptr as *mut u8,
@@ -643,13 +647,14 @@ impl VirtioBlock {
     }
 
     fn handle_read(&self, sector: u64, data: &mut [u8]) -> Result<usize> {
-        let file = self.file.as_ref().ok_or_else(|| {
-            VirtioError::NotReady("Block device not activated".into())
-        })?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| VirtioError::NotReady("Block device not activated".into()))?;
 
-        let mut file = file.write().map_err(|e| {
-            VirtioError::Io(format!("Failed to lock file: {}", e))
-        })?;
+        let mut file = file
+            .write()
+            .map_err(|e| VirtioError::Io(format!("Failed to lock file: {}", e)))?;
 
         let offset = sector * u64::from(self.config.blk_size);
         file.seek(SeekFrom::Start(offset))
@@ -668,13 +673,14 @@ impl VirtioBlock {
             return Err(VirtioError::InvalidOperation("Device is read-only".into()));
         }
 
-        let file = self.file.as_ref().ok_or_else(|| {
-            VirtioError::NotReady("Block device not activated".into())
-        })?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| VirtioError::NotReady("Block device not activated".into()))?;
 
-        let mut file = file.write().map_err(|e| {
-            VirtioError::Io(format!("Failed to lock file: {}", e))
-        })?;
+        let mut file = file
+            .write()
+            .map_err(|e| VirtioError::Io(format!("Failed to lock file: {}", e)))?;
 
         let offset = sector * u64::from(self.config.blk_size);
         file.seek(SeekFrom::Start(offset))
@@ -689,13 +695,14 @@ impl VirtioBlock {
     }
 
     fn handle_flush(&self) -> Result<usize> {
-        let file = self.file.as_ref().ok_or_else(|| {
-            VirtioError::NotReady("Block device not activated".into())
-        })?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| VirtioError::NotReady("Block device not activated".into()))?;
 
-        let file = file.write().map_err(|e| {
-            VirtioError::Io(format!("Failed to lock file: {}", e))
-        })?;
+        let file = file
+            .write()
+            .map_err(|e| VirtioError::Io(format!("Failed to lock file: {}", e)))?;
 
         file.sync_all()
             .map_err(|e| VirtioError::Io(format!("Flush failed: {}", e)))?;
@@ -794,12 +801,10 @@ impl VirtioBlock {
                 }
                 Ok((total_bytes, BlockStatus::Ok))
             }
-            BlockRequestType::Flush => {
-                match self.handle_flush() {
-                    Ok(_) => Ok((0, BlockStatus::Ok)),
-                    Err(_) => Ok((0, BlockStatus::IoErr)),
-                }
-            }
+            BlockRequestType::Flush => match self.handle_flush() {
+                Ok(_) => Ok((0, BlockStatus::Ok)),
+                Err(_) => Ok((0, BlockStatus::IoErr)),
+            },
             _ => Ok((0, BlockStatus::Unsupp)),
         }
     }
@@ -828,9 +833,9 @@ impl VirtioDevice for VirtioBlock {
         // offset 24: topology...
         let config_data = [
             self.config.capacity.to_le_bytes().as_slice(),
-            &(1u32 << 12).to_le_bytes(),  // size_max: 4KB
-            &128u32.to_le_bytes(),         // seg_max: 128 segments
-            &[0u8; 4],                     // geometry: not used
+            &(1u32 << 12).to_le_bytes(), // size_max: 4KB
+            &128u32.to_le_bytes(),       // seg_max: 128 segments
+            &[0u8; 4],                   // geometry: not used
             &self.config.blk_size.to_le_bytes(),
         ]
         .concat();
@@ -1148,11 +1153,26 @@ mod tests {
     #[test]
     fn test_all_request_types() {
         assert_eq!(BlockRequestType::try_from(0).unwrap(), BlockRequestType::In);
-        assert_eq!(BlockRequestType::try_from(1).unwrap(), BlockRequestType::Out);
-        assert_eq!(BlockRequestType::try_from(4).unwrap(), BlockRequestType::Flush);
-        assert_eq!(BlockRequestType::try_from(8).unwrap(), BlockRequestType::GetId);
-        assert_eq!(BlockRequestType::try_from(11).unwrap(), BlockRequestType::Discard);
-        assert_eq!(BlockRequestType::try_from(13).unwrap(), BlockRequestType::WriteZeroes);
+        assert_eq!(
+            BlockRequestType::try_from(1).unwrap(),
+            BlockRequestType::Out
+        );
+        assert_eq!(
+            BlockRequestType::try_from(4).unwrap(),
+            BlockRequestType::Flush
+        );
+        assert_eq!(
+            BlockRequestType::try_from(8).unwrap(),
+            BlockRequestType::GetId
+        );
+        assert_eq!(
+            BlockRequestType::try_from(11).unwrap(),
+            BlockRequestType::Discard
+        );
+        assert_eq!(
+            BlockRequestType::try_from(13).unwrap(),
+            BlockRequestType::WriteZeroes
+        );
     }
 
     #[test]

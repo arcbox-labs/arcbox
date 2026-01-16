@@ -60,8 +60,8 @@ use tokio::sync::RwLock;
 use crate::dns::DnsForwarder;
 use crate::error::{NetError, Result};
 use crate::mdns_protocol::{
-    build_announcement, build_goodbye, build_response, parse_query, DNS_TYPE_A, DNS_TYPE_ANY,
-    MDNS_MULTICAST_ADDR, MDNS_PORT,
+    DNS_TYPE_A, DNS_TYPE_ANY, MDNS_MULTICAST_ADDR, MDNS_PORT, build_announcement, build_goodbye,
+    build_response, parse_query,
 };
 
 /// Default mDNS TTL (2 minutes, per RFC 6762 recommendation for records that may change).
@@ -345,8 +345,7 @@ impl MdnsResponder {
     /// Checks if a domain is one we should respond to.
     fn is_our_domain(&self, domain: &str) -> bool {
         let lower = domain.to_lowercase();
-        lower.ends_with(&format!(".{}", self.config.domain))
-            || lower == self.config.domain
+        lower.ends_with(&format!(".{}", self.config.domain)) || lower == self.config.domain
     }
 
     /// Strips the domain suffix from a hostname.
@@ -460,10 +459,16 @@ mod tests {
         let test_domain = "nginx.arcbox.local";
 
         // Test domain suffix checking logic
-        assert!(test_domain.to_lowercase().ends_with(&format!(".{}", domain)));
-        assert!("NGINX.ARCBOX.LOCAL"
-            .to_lowercase()
-            .ends_with(&format!(".{}", domain)));
+        assert!(
+            test_domain
+                .to_lowercase()
+                .ends_with(&format!(".{}", domain))
+        );
+        assert!(
+            "NGINX.ARCBOX.LOCAL"
+                .to_lowercase()
+                .ends_with(&format!(".{}", domain))
+        );
     }
 
     #[test]

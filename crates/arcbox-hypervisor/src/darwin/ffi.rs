@@ -25,8 +25,9 @@ fn ensure_framework_loaded() {
         unsafe {
             // Load Virtualization.framework using dlopen
             let path = std::ffi::CString::new(
-                "/System/Library/Frameworks/Virtualization.framework/Virtualization"
-            ).unwrap();
+                "/System/Library/Frameworks/Virtualization.framework/Virtualization",
+            )
+            .unwrap();
             let handle = libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
             if handle.is_null() {
                 let err = libc::dlerror();
@@ -154,8 +155,13 @@ fn nsstring(s: &str) -> *mut AnyObject {
         let alloc = msg_send!(cls, alloc);
 
         let sel = sel!(initWithBytes:length:encoding:);
-        let func: unsafe extern "C" fn(*mut AnyObject, Sel, *const u8, usize, u64) -> *mut AnyObject =
-            std::mem::transmute(objc_msgSend as *const c_void);
+        let func: unsafe extern "C" fn(
+            *mut AnyObject,
+            Sel,
+            *const u8,
+            usize,
+            u64,
+        ) -> *mut AnyObject = std::mem::transmute(objc_msgSend as *const c_void);
         func(alloc, sel, s.as_ptr(), s.len(), 4) // 4 = NSUTF8StringEncoding
     }
 }
@@ -195,7 +201,9 @@ fn nsstring_to_string(obj: *mut AnyObject) -> String {
         if cstr.is_null() {
             String::new()
         } else {
-            std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned()
+            std::ffi::CStr::from_ptr(cstr)
+                .to_string_lossy()
+                .into_owned()
         }
     }
 }
@@ -205,8 +213,12 @@ fn nsarray(objects: &[*mut AnyObject]) -> *mut AnyObject {
     unsafe {
         let cls = get_class("NSArray").expect("NSArray class not found");
         let sel = sel!(arrayWithObjects:count:);
-        let func: unsafe extern "C" fn(*const AnyClass, Sel, *const *mut AnyObject, usize) -> *mut AnyObject =
-            std::mem::transmute(objc_msgSend as *const c_void);
+        let func: unsafe extern "C" fn(
+            *const AnyClass,
+            Sel,
+            *const *mut AnyObject,
+            usize,
+        ) -> *mut AnyObject = std::mem::transmute(objc_msgSend as *const c_void);
         func(cls, sel, objects.as_ptr(), objects.len())
     }
 }
@@ -664,24 +676,22 @@ impl VirtualMachine {
 
         static STOP_BLOCK_PTR: std::sync::OnceLock<BlockPtr> = std::sync::OnceLock::new();
 
-        let block_ptr = STOP_BLOCK_PTR.get_or_init(|| {
-            unsafe {
-                static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
-                    reserved: 0,
-                    size: 40,
-                };
+        let block_ptr = STOP_BLOCK_PTR.get_or_init(|| unsafe {
+            static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+                reserved: 0,
+                size: 40,
+            };
 
-                let stack_block = CompletionBlock {
-                    isa: _NSConcreteStackBlock,
-                    flags: 0,
-                    reserved: 0,
-                    invoke: stop_completion_handler,
-                    descriptor: &DESCRIPTOR,
-                };
+            let stack_block = CompletionBlock {
+                isa: _NSConcreteStackBlock,
+                flags: 0,
+                reserved: 0,
+                invoke: stop_completion_handler,
+                descriptor: &DESCRIPTOR,
+            };
 
-                let heap_block = _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
-                BlockPtr(heap_block)
-            }
+            let heap_block = _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
+            BlockPtr(heap_block)
         });
 
         unsafe {
@@ -776,7 +786,8 @@ impl VirtualMachine {
                 };
 
                 // _Block_copy moves the block to the heap and makes it permanent
-                let heap_block = _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
+                let heap_block =
+                    _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
                 BlockPtr(heap_block)
             }
         });
@@ -808,7 +819,10 @@ impl VirtualMachine {
             size: u64,
         }
 
-        unsafe extern "C" fn pause_completion_handler(_block: *const c_void, error: *mut AnyObject) {
+        unsafe extern "C" fn pause_completion_handler(
+            _block: *const c_void,
+            error: *mut AnyObject,
+        ) {
             unsafe {
                 if !error.is_null() {
                     let desc: *mut AnyObject = msg_send!(error, localizedDescription);
@@ -835,24 +849,22 @@ impl VirtualMachine {
 
         static PAUSE_BLOCK_PTR: std::sync::OnceLock<BlockPtr> = std::sync::OnceLock::new();
 
-        let block_ptr = PAUSE_BLOCK_PTR.get_or_init(|| {
-            unsafe {
-                static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
-                    reserved: 0,
-                    size: 40,
-                };
+        let block_ptr = PAUSE_BLOCK_PTR.get_or_init(|| unsafe {
+            static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+                reserved: 0,
+                size: 40,
+            };
 
-                let stack_block = CompletionBlock {
-                    isa: _NSConcreteStackBlock,
-                    flags: 0,
-                    reserved: 0,
-                    invoke: pause_completion_handler,
-                    descriptor: &DESCRIPTOR,
-                };
+            let stack_block = CompletionBlock {
+                isa: _NSConcreteStackBlock,
+                flags: 0,
+                reserved: 0,
+                invoke: pause_completion_handler,
+                descriptor: &DESCRIPTOR,
+            };
 
-                let heap_block = _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
-                BlockPtr(heap_block)
-            }
+            let heap_block = _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
+            BlockPtr(heap_block)
         });
 
         unsafe {
@@ -882,7 +894,10 @@ impl VirtualMachine {
             size: u64,
         }
 
-        unsafe extern "C" fn resume_completion_handler(_block: *const c_void, error: *mut AnyObject) {
+        unsafe extern "C" fn resume_completion_handler(
+            _block: *const c_void,
+            error: *mut AnyObject,
+        ) {
             unsafe {
                 if !error.is_null() {
                     let desc: *mut AnyObject = msg_send!(error, localizedDescription);
@@ -909,24 +924,22 @@ impl VirtualMachine {
 
         static RESUME_BLOCK_PTR: std::sync::OnceLock<BlockPtr> = std::sync::OnceLock::new();
 
-        let block_ptr = RESUME_BLOCK_PTR.get_or_init(|| {
-            unsafe {
-                static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
-                    reserved: 0,
-                    size: 40,
-                };
+        let block_ptr = RESUME_BLOCK_PTR.get_or_init(|| unsafe {
+            static DESCRIPTOR: BlockDescriptor = BlockDescriptor {
+                reserved: 0,
+                size: 40,
+            };
 
-                let stack_block = CompletionBlock {
-                    isa: _NSConcreteStackBlock,
-                    flags: 0,
-                    reserved: 0,
-                    invoke: resume_completion_handler,
-                    descriptor: &DESCRIPTOR,
-                };
+            let stack_block = CompletionBlock {
+                isa: _NSConcreteStackBlock,
+                flags: 0,
+                reserved: 0,
+                invoke: resume_completion_handler,
+                descriptor: &DESCRIPTOR,
+            };
 
-                let heap_block = _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
-                BlockPtr(heap_block)
-            }
+            let heap_block = _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
+            BlockPtr(heap_block)
         });
 
         unsafe {
@@ -955,8 +968,13 @@ pub fn create_disk_attachment(path: &str, read_only: bool) -> VZResult<*mut AnyO
 
         let sel = sel!(initWithURL:readOnly:error:);
         let alloc = msg_send!(cls, alloc);
-        let func: unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, Bool, *mut *mut AnyObject) -> *mut AnyObject =
-            std::mem::transmute(objc_msgSend as *const c_void);
+        let func: unsafe extern "C" fn(
+            *mut AnyObject,
+            Sel,
+            *mut AnyObject,
+            Bool,
+            *mut *mut AnyObject,
+        ) -> *mut AnyObject = std::mem::transmute(objc_msgSend as *const c_void);
         let obj = func(alloc, sel, url, Bool::new(read_only), &mut error);
 
         if obj.is_null() {
@@ -1114,8 +1132,12 @@ pub fn create_shared_directory(path: &str, read_only: bool) -> VZResult<*mut Any
         let alloc = msg_send!(cls, alloc);
 
         let sel = sel!(initWithURL:readOnly:);
-        let func: unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, Bool) -> *mut AnyObject =
-            std::mem::transmute(objc_msgSend as *const c_void);
+        let func: unsafe extern "C" fn(
+            *mut AnyObject,
+            Sel,
+            *mut AnyObject,
+            Bool,
+        ) -> *mut AnyObject = std::mem::transmute(objc_msgSend as *const c_void);
         let obj = func(alloc, sel, url, Bool::new(read_only));
 
         if obj.is_null() {
@@ -1238,7 +1260,8 @@ unsafe extern "C" {
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     fn CFRunLoopRun();
     fn CFRunLoopStop(rl: CFRunLoopRef);
-    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, returnAfterSourceHandled: bool) -> i32;
+    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, returnAfterSourceHandled: bool)
+    -> i32;
 }
 
 // kCFRunLoopDefaultMode is a CFStringRef constant
@@ -1268,9 +1291,13 @@ pub fn cf_run_loop_stop(rl: CFRunLoopRef) {
 
 /// Runs the run loop in default mode for up to the specified duration.
 /// Returns the result indicating why the run loop exited.
-pub fn cf_run_loop_run_in_mode(seconds: f64, return_after_source_handled: bool) -> CFRunLoopRunResult {
+pub fn cf_run_loop_run_in_mode(
+    seconds: f64,
+    return_after_source_handled: bool,
+) -> CFRunLoopRunResult {
     unsafe {
-        let result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, return_after_source_handled);
+        let result =
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, return_after_source_handled);
         match result {
             1 => CFRunLoopRunResult::Finished,
             2 => CFRunLoopRunResult::Stopped,
@@ -1327,7 +1354,11 @@ pub fn dispatch_sync_closure<F: FnMut()>(queue: *mut AnyObject, mut f: F) {
     // Use dispatch_sync_f instead of dispatch_sync with blocks
     // dispatch_sync_f takes a function pointer and context directly
     unsafe extern "C" {
-        fn dispatch_sync_f(queue: *mut AnyObject, context: *mut c_void, work: unsafe extern "C" fn(*mut c_void));
+        fn dispatch_sync_f(
+            queue: *mut AnyObject,
+            context: *mut c_void,
+            work: unsafe extern "C" fn(*mut c_void),
+        );
     }
 
     unsafe extern "C" fn trampoline<F: FnMut()>(context: *mut c_void) {
@@ -1461,12 +1492,11 @@ pub fn create_virtio_serial_port_configuration(
     attachment: *mut AnyObject,
 ) -> VZResult<*mut AnyObject> {
     unsafe {
-        let cls = get_class("VZVirtioConsoleDeviceSerialPortConfiguration").ok_or_else(|| {
-            VZError {
+        let cls =
+            get_class("VZVirtioConsoleDeviceSerialPortConfiguration").ok_or_else(|| VZError {
                 code: -1,
                 message: "VZVirtioConsoleDeviceSerialPortConfiguration class not found".into(),
-            }
-        })?;
+            })?;
         // Use new and then set attachment (inherited from VZSerialPortConfiguration)
         let port: *mut AnyObject = msg_send!(cls, new);
         if port.is_null() {
@@ -1502,9 +1532,7 @@ pub fn set_console_port_is_console(port: *mut AnyObject, is_console: bool) {
 /// Gets the ports array from a console device.
 /// Returns VZVirtioConsolePortConfigurationArray, not a standard NSArray.
 pub fn get_console_device_ports(device: *mut AnyObject) -> *mut AnyObject {
-    unsafe {
-        msg_send!(device, ports)
-    }
+    unsafe { msg_send!(device, ports) }
 }
 
 /// Sets maximum port count on the console ports array.
@@ -1657,8 +1685,11 @@ pub fn vsock_connect_to_port(
         connection: *mut AnyObject,
         error: *mut AnyObject,
     ) {
-        tracing::debug!("vsock_completion_handler called: connection={:?}, error={:?}",
-            connection, error);
+        tracing::debug!(
+            "vsock_completion_handler called: connection={:?}, error={:?}",
+            connection,
+            error
+        );
 
         let conn_result = unsafe {
             if !error.is_null() {
@@ -1868,11 +1899,7 @@ pub fn vm_first_socket_device(vm: *mut AnyObject) -> Option<*mut AnyObject> {
             std::mem::transmute(objc_msgSend as *const c_void);
         let device = func(devices as *const AnyObject, sel, 0usize);
 
-        if device.is_null() {
-            None
-        } else {
-            Some(device)
-        }
+        if device.is_null() { None } else { Some(device) }
     }
 }
 
@@ -1965,7 +1992,10 @@ mod tests {
     fn test_run_loop_until_immediate() {
         // Test immediate completion
         let result = run_loop_until(|| true, 1.0);
-        assert!(result, "run_loop_until should return true when predicate is immediately true");
+        assert!(
+            result,
+            "run_loop_until should return true when predicate is immediately true"
+        );
     }
 
     #[test]
@@ -1976,15 +2006,21 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(!result, "run_loop_until should return false on timeout");
-        assert!(elapsed.as_secs_f64() >= 0.1, "Should have waited at least 0.1 seconds");
-        assert!(elapsed.as_secs_f64() < 0.5, "Should not have waited too long");
+        assert!(
+            elapsed.as_secs_f64() >= 0.1,
+            "Should have waited at least 0.1 seconds"
+        );
+        assert!(
+            elapsed.as_secs_f64() < 0.5,
+            "Should not have waited too long"
+        );
     }
 
     #[test]
     fn test_run_loop_until_delayed() {
         // Test delayed completion
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let flag = Arc::new(AtomicBool::new(false));
         let flag_clone = flag.clone();
@@ -1996,7 +2032,10 @@ mod tests {
         });
 
         let result = run_loop_until(|| flag.load(Ordering::SeqCst), 1.0);
-        assert!(result, "run_loop_until should return true when predicate becomes true");
+        assert!(
+            result,
+            "run_loop_until should return true when predicate becomes true"
+        );
     }
 
     #[test]

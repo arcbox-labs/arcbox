@@ -41,8 +41,8 @@ pub mod net;
 pub mod queue;
 pub mod vsock;
 
-pub use error::{VirtioError, Result};
-pub use queue::{VirtQueue, Descriptor, AvailRing, UsedRing};
+pub use error::{Result, VirtioError};
+pub use queue::{AvailRing, Descriptor, UsedRing, VirtQueue};
 
 /// VirtIO device type IDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

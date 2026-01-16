@@ -26,8 +26,8 @@
 use crate::error::{Result, VirtioError};
 use crate::queue::VirtQueue;
 use crate::{VirtioDevice, VirtioDeviceId};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ============================================================================
 // FUSE Constants
@@ -352,8 +352,14 @@ impl FuseSession {
 
         // Response header (16 bytes)
         let unique = u64::from_le_bytes([
-            request[8], request[9], request[10], request[11],
-            request[12], request[13], request[14], request[15],
+            request[8],
+            request[9],
+            request[10],
+            request[11],
+            request[12],
+            request[13],
+            request[14],
+            request[15],
         ]);
         let len = 80u32;
         response.extend_from_slice(&len.to_le_bytes());
@@ -567,8 +573,14 @@ impl VirtioFs {
 
         // Parse unique ID for error responses
         let unique = u64::from_le_bytes([
-            request[8], request[9], request[10], request[11],
-            request[12], request[13], request[14], request[15],
+            request[8],
+            request[9],
+            request[10],
+            request[11],
+            request[12],
+            request[13],
+            request[14],
+            request[15],
         ]);
 
         match opcode {
@@ -625,10 +637,7 @@ impl VirtioFs {
         // This releases the borrow on self.request_queues
         let pending_requests = {
             let queue = self.request_queues.get_mut(queue_index).ok_or_else(|| {
-                VirtioError::NotReady(format!(
-                    "request queue {} not available",
-                    queue_index
-                ))
+                VirtioError::NotReady(format!("request queue {} not available", queue_index))
             })?;
 
             let mut requests = Vec::new();
@@ -1099,8 +1108,14 @@ mod tests {
         let resp_len = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
         let resp_error = i32::from_le_bytes([response[4], response[5], response[6], response[7]]);
         let resp_unique = u64::from_le_bytes([
-            response[8], response[9], response[10], response[11],
-            response[12], response[13], response[14], response[15],
+            response[8],
+            response[9],
+            response[10],
+            response[11],
+            response[12],
+            response[13],
+            response[14],
+            response[15],
         ]);
 
         assert_eq!(resp_len, 80);
@@ -1163,15 +1178,23 @@ mod tests {
             fn handle_request(&self, request: &[u8]) -> Result<Vec<u8>> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let unique = u64::from_le_bytes([
-                    request[8], request[9], request[10], request[11],
-                    request[12], request[13], request[14], request[15],
+                    request[8],
+                    request[9],
+                    request[10],
+                    request[11],
+                    request[12],
+                    request[13],
+                    request[14],
+                    request[15],
                 ]);
                 Ok(FuseResponse::new(unique, b"ok".to_vec()).into_data())
             }
         }
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(TestHandler { calls: Arc::clone(&calls) });
+        let handler = Arc::new(TestHandler {
+            calls: Arc::clone(&calls),
+        });
 
         let config = FsConfig {
             shared_dir: "/tmp".to_string(),
@@ -1198,24 +1221,28 @@ mod tests {
         let init_resp_offset = 128usize;
         memory[init_req_offset..init_req_offset + init_req.len()].copy_from_slice(&init_req);
 
-        queue.set_descriptor(
-            0,
-            crate::queue::Descriptor {
-                addr: init_req_offset as u64,
-                len: init_req.len() as u32,
-                flags: flags::NEXT,
-                next: 1,
-            },
-        ).unwrap();
-        queue.set_descriptor(
-            1,
-            crate::queue::Descriptor {
-                addr: init_resp_offset as u64,
-                len: 80,
-                flags: flags::WRITE,
-                next: 0,
-            },
-        ).unwrap();
+        queue
+            .set_descriptor(
+                0,
+                crate::queue::Descriptor {
+                    addr: init_req_offset as u64,
+                    len: init_req.len() as u32,
+                    flags: flags::NEXT,
+                    next: 1,
+                },
+            )
+            .unwrap();
+        queue
+            .set_descriptor(
+                1,
+                crate::queue::Descriptor {
+                    addr: init_resp_offset as u64,
+                    len: 80,
+                    flags: flags::WRITE,
+                    next: 0,
+                },
+            )
+            .unwrap();
 
         // Build a simple FUSE request that goes to the handler
         let mut other_req = vec![0u8; 40];
@@ -1227,24 +1254,28 @@ mod tests {
         let other_resp_offset = 512usize;
         memory[other_req_offset..other_req_offset + other_req.len()].copy_from_slice(&other_req);
 
-        queue.set_descriptor(
-            2,
-            crate::queue::Descriptor {
-                addr: other_req_offset as u64,
-                len: other_req.len() as u32,
-                flags: flags::NEXT,
-                next: 3,
-            },
-        ).unwrap();
-        queue.set_descriptor(
-            3,
-            crate::queue::Descriptor {
-                addr: other_resp_offset as u64,
-                len: 32,
-                flags: flags::WRITE,
-                next: 0,
-            },
-        ).unwrap();
+        queue
+            .set_descriptor(
+                2,
+                crate::queue::Descriptor {
+                    addr: other_req_offset as u64,
+                    len: other_req.len() as u32,
+                    flags: flags::NEXT,
+                    next: 3,
+                },
+            )
+            .unwrap();
+        queue
+            .set_descriptor(
+                3,
+                crate::queue::Descriptor {
+                    addr: other_resp_offset as u64,
+                    len: 32,
+                    flags: flags::WRITE,
+                    next: 0,
+                },
+            )
+            .unwrap();
 
         queue.add_avail(0).unwrap();
         queue.add_avail(2).unwrap();
@@ -1316,8 +1347,7 @@ mod tests {
         let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let error = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let unique = u64::from_le_bytes([
-            data[8], data[9], data[10], data[11],
-            data[12], data[13], data[14], data[15],
+            data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
         ]);
 
         assert_eq!(len, 20);
@@ -1336,8 +1366,7 @@ mod tests {
         let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let error = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let unique = u64::from_le_bytes([
-            data[8], data[9], data[10], data[11],
-            data[12], data[13], data[14], data[15],
+            data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
         ]);
 
         assert_eq!(len, 16);

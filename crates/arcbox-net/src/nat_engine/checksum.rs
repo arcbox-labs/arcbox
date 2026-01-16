@@ -64,11 +64,7 @@ pub fn incremental_checksum_update(old_checksum: u16, old_value: u16, new_value:
 ///
 /// Useful for IP address changes in NAT.
 #[inline]
-pub fn incremental_checksum_update_32(
-    old_checksum: u16,
-    old_value: u32,
-    new_value: u32,
-) -> u16 {
+pub fn incremental_checksum_update_32(old_checksum: u16, old_value: u32, new_value: u32) -> u16 {
     let old_hi = (old_value >> 16) as u16;
     let old_lo = old_value as u16;
     let new_hi = (new_value >> 16) as u16;
@@ -82,11 +78,7 @@ pub fn incremental_checksum_update_32(
 
 /// Updates checksum for IP address change.
 #[inline]
-pub fn update_checksum_for_ip(
-    old_checksum: u16,
-    old_ip: [u8; 4],
-    new_ip: [u8; 4],
-) -> u16 {
+pub fn update_checksum_for_ip(old_checksum: u16, old_ip: [u8; 4], new_ip: [u8; 4]) -> u16 {
     let old_val = u32::from_be_bytes(old_ip);
     let new_val = u32::from_be_bytes(new_ip);
     incremental_checksum_update_32(old_checksum, old_val, new_val)
@@ -94,11 +86,7 @@ pub fn update_checksum_for_ip(
 
 /// Updates checksum for port change.
 #[inline]
-pub fn update_checksum_for_port(
-    old_checksum: u16,
-    old_port: u16,
-    new_port: u16,
-) -> u16 {
+pub fn update_checksum_for_port(old_checksum: u16, old_port: u16, new_port: u16) -> u16 {
     incremental_checksum_update(old_checksum, old_port, new_port)
 }
 
@@ -129,11 +117,7 @@ pub fn ipv4_header_checksum(header: &[u8]) -> u16 {
 ///
 /// TCP checksum covers: pseudo-header + TCP header + data.
 #[inline]
-pub fn tcp_checksum(
-    src_ip: [u8; 4],
-    dst_ip: [u8; 4],
-    tcp_segment: &[u8],
-) -> u16 {
+pub fn tcp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], tcp_segment: &[u8]) -> u16 {
     let mut sum: u32 = 0;
 
     // Pseudo-header
@@ -154,11 +138,7 @@ pub fn tcp_checksum(
 ///
 /// UDP checksum covers: pseudo-header + UDP header + data.
 #[inline]
-pub fn udp_checksum(
-    src_ip: [u8; 4],
-    dst_ip: [u8; 4],
-    udp_datagram: &[u8],
-) -> u16 {
+pub fn udp_checksum(src_ip: [u8; 4], dst_ip: [u8; 4], udp_datagram: &[u8]) -> u16 {
     let mut sum: u32 = 0;
 
     // Pseudo-header
@@ -174,11 +154,7 @@ pub fn udp_checksum(
 
     let result = checksum_fold(sum);
     // UDP uses 0xFFFF for zero checksum
-    if result == 0 {
-        0xFFFF
-    } else {
-        result
-    }
+    if result == 0 { 0xFFFF } else { result }
 }
 
 /// SIMD-optimized checksum for ARM64 NEON.
@@ -413,22 +389,15 @@ mod tests {
     fn test_incremental_update_ip() {
         let data: [u8; 8] = [
             192, 168, 1, 100, // Old IP: 192.168.1.100
-            192, 168, 1, 1,   // Dest IP: 192.168.1.1
+            192, 168, 1, 1, // Dest IP: 192.168.1.1
         ];
         let original_checksum = checksum(&data);
 
         let new_ip = [10u8, 0, 0, 100]; // New IP: 10.0.0.100
-        let updated = update_checksum_for_ip(
-            original_checksum,
-            [192, 168, 1, 100],
-            new_ip,
-        );
+        let updated = update_checksum_for_ip(original_checksum, [192, 168, 1, 100], new_ip);
 
         // Verify
-        let new_data: [u8; 8] = [
-            10, 0, 0, 100,
-            192, 168, 1, 1,
-        ];
+        let new_data: [u8; 8] = [10, 0, 0, 100, 192, 168, 1, 1];
         let recalculated = checksum(&new_data);
 
         assert_eq!(updated, recalculated);

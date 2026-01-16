@@ -32,12 +32,11 @@ impl GenericPlatform {
     /// Creates a new generic platform configuration.
     pub fn new() -> VZResult<Self> {
         unsafe {
-            let cls = get_class("VZGenericPlatformConfiguration").ok_or_else(|| {
-                VZError::Internal {
+            let cls =
+                get_class("VZGenericPlatformConfiguration").ok_or_else(|| VZError::Internal {
                     code: -1,
                     message: "VZGenericPlatformConfiguration class not found".into(),
-                }
-            })?;
+                })?;
             let obj = msg_send!(cls, new);
 
             if obj.is_null() {

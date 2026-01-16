@@ -26,7 +26,7 @@ fn main() {
     {
         use arcbox_hypervisor::{
             config::VmConfig,
-            darwin::{is_supported, DarwinHypervisor},
+            darwin::{DarwinHypervisor, is_supported},
             traits::{Hypervisor, VirtualMachine},
             types::CpuArch,
         };
@@ -73,13 +73,31 @@ fn main() {
         let total_time = t0.elapsed();
 
         println!("Performance Results:");
-        println!("  Hypervisor init:  {:>8.2}ms", hypervisor_time.as_secs_f64() * 1000.0);
-        println!("  Config creation:  {:>8.2}ms", config_time.as_secs_f64() * 1000.0);
-        println!("  VM creation:      {:>8.2}ms", vm_create_time.as_secs_f64() * 1000.0);
-        println!("  Console setup:    {:>8.2}ms", console_time.as_secs_f64() * 1000.0);
-        println!("  VM start:         {:>8.2}ms", start_time.as_secs_f64() * 1000.0);
+        println!(
+            "  Hypervisor init:  {:>8.2}ms",
+            hypervisor_time.as_secs_f64() * 1000.0
+        );
+        println!(
+            "  Config creation:  {:>8.2}ms",
+            config_time.as_secs_f64() * 1000.0
+        );
+        println!(
+            "  VM creation:      {:>8.2}ms",
+            vm_create_time.as_secs_f64() * 1000.0
+        );
+        println!(
+            "  Console setup:    {:>8.2}ms",
+            console_time.as_secs_f64() * 1000.0
+        );
+        println!(
+            "  VM start:         {:>8.2}ms",
+            start_time.as_secs_f64() * 1000.0
+        );
         println!("  ────────────────────────────");
-        println!("  Total boot time:  {:>8.2}ms", total_time.as_secs_f64() * 1000.0);
+        println!(
+            "  Total boot time:  {:>8.2}ms",
+            total_time.as_secs_f64() * 1000.0
+        );
         println!();
 
         // Target comparison
@@ -87,18 +105,31 @@ fn main() {
         let boot_ms = total_time.as_secs_f64() * 1000.0;
         let target_ms = 1500.0; // 1.5s target
         if boot_ms <= target_ms {
-            println!("  ✓ Boot time {:.0}ms <= {:.0}ms target", boot_ms, target_ms);
+            println!(
+                "  ✓ Boot time {:.0}ms <= {:.0}ms target",
+                boot_ms, target_ms
+            );
         } else {
-            println!("  ✗ Boot time {:.0}ms > {:.0}ms target (need {:.0}ms improvement)",
-                boot_ms, target_ms, boot_ms - target_ms);
+            println!(
+                "  ✗ Boot time {:.0}ms > {:.0}ms target (need {:.0}ms improvement)",
+                boot_ms,
+                target_ms,
+                boot_ms - target_ms
+            );
         }
 
         let create_ms = vm_create_time.as_secs_f64() * 1000.0;
         let create_target = 500.0; // 500ms target
         if create_ms <= create_target {
-            println!("  ✓ VM creation {:.0}ms <= {:.0}ms target", create_ms, create_target);
+            println!(
+                "  ✓ VM creation {:.0}ms <= {:.0}ms target",
+                create_ms, create_target
+            );
         } else {
-            println!("  ✗ VM creation {:.0}ms > {:.0}ms target", create_ms, create_target);
+            println!(
+                "  ✗ VM creation {:.0}ms > {:.0}ms target",
+                create_ms, create_target
+            );
         }
 
         println!();

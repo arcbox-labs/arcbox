@@ -31,8 +31,14 @@ fn main() {
         eprintln!("  --virtiofs <path>  Enable VirtioFS sharing");
         eprintln!();
         eprintln!("Example:");
-        eprintln!("  {} tests/resources/Image-arm64 tests/resources/initramfs-arm64", args[0]);
-        eprintln!("  {} tests/resources/Image-arm64 tests/resources/initramfs-arm64 --disk test.img --net", args[0]);
+        eprintln!(
+            "  {} tests/resources/Image-arm64 tests/resources/initramfs-arm64",
+            args[0]
+        );
+        eprintln!(
+            "  {} tests/resources/Image-arm64 tests/resources/initramfs-arm64 --disk test.img --net",
+            args[0]
+        );
         std::process::exit(1);
     }
 
@@ -85,7 +91,7 @@ fn main() {
     {
         use arcbox_hypervisor::{
             config::VmConfig,
-            darwin::{is_supported, DarwinHypervisor},
+            darwin::{DarwinHypervisor, is_supported},
             traits::{Hypervisor, VirtualMachine},
             types::{CpuArch, VirtioDeviceConfig},
         };
@@ -102,14 +108,16 @@ fn main() {
 
         println!("Hypervisor capabilities:");
         println!("  Max vCPUs: {}", caps.max_vcpus);
-        println!("  Max memory: {} GB", caps.max_memory / (1024 * 1024 * 1024));
+        println!(
+            "  Max memory: {} GB",
+            caps.max_memory / (1024 * 1024 * 1024)
+        );
         println!("  Rosetta: {}", caps.rosetta);
         println!();
 
         // Create VM config
-        let cmdline = custom_cmdline.unwrap_or_else(|| {
-            "console=hvc0 loglevel=8 root=/dev/ram0 rdinit=/init".to_string()
-        });
+        let cmdline = custom_cmdline
+            .unwrap_or_else(|| "console=hvc0 loglevel=8 root=/dev/ram0 rdinit=/init".to_string());
         let config = VmConfig {
             vcpu_count: 2,
             memory_size: 512 * 1024 * 1024, // 512MB
@@ -128,8 +136,18 @@ fn main() {
         if let Some(ref disk) = disk_path {
             println!("  Disk: {}", disk);
         }
-        println!("  Network: {}", if enable_net { "enabled (NAT)" } else { "disabled" });
-        println!("  Vsock: {}", if enable_vsock { "enabled" } else { "disabled" });
+        println!(
+            "  Network: {}",
+            if enable_net {
+                "enabled (NAT)"
+            } else {
+                "disabled"
+            }
+        );
+        println!(
+            "  Vsock: {}",
+            if enable_vsock { "enabled" } else { "disabled" }
+        );
         if let Some(ref fs_path) = virtiofs_path {
             println!("  VirtioFS: {} -> arcbox", fs_path);
         } else {
@@ -229,7 +247,12 @@ fn main() {
                     }
 
                     if i % 2 == 1 {
-                        println!("[{}s] VM state: {:?}, running: {}", (i + 1) / 2, vm.state(), vm.is_running());
+                        println!(
+                            "[{}s] VM state: {:?}, running: {}",
+                            (i + 1) / 2,
+                            vm.state(),
+                            vm.is_running()
+                        );
                     }
                 }
 
@@ -243,7 +266,9 @@ fn main() {
                             Ok(fd) => {
                                 println!("  Vsock port {} connected! fd={}", port, fd);
                                 // Close the fd since we're just testing
-                                unsafe { libc::close(fd); }
+                                unsafe {
+                                    libc::close(fd);
+                                }
                                 break;
                             }
                             Err(e) => {
@@ -264,7 +289,9 @@ fn main() {
                 eprintln!("Failed to start VM: {}", e);
                 eprintln!();
                 eprintln!("Common issues:");
-                eprintln!("  1. Binary not signed with com.apple.security.virtualization entitlement");
+                eprintln!(
+                    "  1. Binary not signed with com.apple.security.virtualization entitlement"
+                );
                 eprintln!("  2. Kernel format not compatible (needs uncompressed ARM64 Image)");
                 eprintln!("  3. Insufficient memory or CPU count");
                 std::process::exit(1);

@@ -5,7 +5,7 @@ use crate::device::{
     SocketDeviceConfiguration, StorageDeviceConfiguration, VirtioFileSystemDeviceConfiguration,
 };
 use crate::error::{VZError, VZResult};
-use crate::ffi::{get_class, nsarray, release, DispatchQueue};
+use crate::ffi::{DispatchQueue, get_class, nsarray, release};
 use crate::vm::VirtualMachine;
 use crate::{msg_send, msg_send_bool, msg_send_u64, msg_send_void, msg_send_void_u64};
 use objc2::runtime::AnyObject;
@@ -152,7 +152,10 @@ impl VirtualMachineConfiguration {
     ///
     /// This allows sharing directories between the host and guest using
     /// the VirtIO file system protocol.
-    pub fn add_directory_share(&mut self, device: VirtioFileSystemDeviceConfiguration) -> &mut Self {
+    pub fn add_directory_share(
+        &mut self,
+        device: VirtioFileSystemDeviceConfiguration,
+    ) -> &mut Self {
         self.directory_sharing_devices.push(device.into_ptr());
         self
     }

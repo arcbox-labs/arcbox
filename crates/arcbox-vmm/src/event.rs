@@ -3,8 +3,8 @@
 //! This module provides the main event loop that coordinates vCPU execution,
 //! device I/O, and timers.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -105,9 +105,9 @@ impl EventLoop {
     ///
     /// Returns an error if the event cannot be posted.
     pub fn post_event(&self, event: VmmEvent) -> Result<()> {
-        self.event_tx.send(event).map_err(|e| {
-            VmmError::EventLoop(format!("failed to post event: {}", e))
-        })
+        self.event_tx
+            .send(event)
+            .map_err(|e| VmmError::EventLoop(format!("failed to post event: {}", e)))
     }
 
     /// Polls for the next event.

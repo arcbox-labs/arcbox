@@ -372,8 +372,7 @@ impl LinuxTap {
     ///
     /// Returns an error if the write fails.
     pub fn send_packet(&mut self, data: &[u8]) -> Result<usize> {
-        let ret =
-            unsafe { libc::write(self.fd.as_raw_fd(), data.as_ptr().cast(), data.len()) };
+        let ret = unsafe { libc::write(self.fd.as_raw_fd(), data.as_ptr().cast(), data.len()) };
 
         if ret < 0 {
             let err = io::Error::last_os_error();
@@ -394,13 +393,7 @@ impl LinuxTap {
     ///
     /// Returns an error if the read fails.
     pub fn recv_packet(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let ret = unsafe {
-            libc::read(
-                self.fd.as_raw_fd(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-            )
-        };
+        let ret = unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
 
         if ret < 0 {
             let err = io::Error::last_os_error();
@@ -431,8 +424,7 @@ impl LinuxTap {
 
 impl NetworkBackend for LinuxTap {
     fn send(&self, data: &[u8]) -> Result<usize> {
-        let ret =
-            unsafe { libc::write(self.fd.as_raw_fd(), data.as_ptr().cast(), data.len()) };
+        let ret = unsafe { libc::write(self.fd.as_raw_fd(), data.as_ptr().cast(), data.len()) };
 
         if ret < 0 {
             let err = io::Error::last_os_error();
@@ -446,13 +438,7 @@ impl NetworkBackend for LinuxTap {
     }
 
     fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-        let ret = unsafe {
-            libc::read(
-                self.fd.as_raw_fd(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-            )
-        };
+        let ret = unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
 
         if ret < 0 {
             let err = io::Error::last_os_error();

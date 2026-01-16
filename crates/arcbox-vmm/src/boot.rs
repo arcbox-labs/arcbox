@@ -148,24 +148,19 @@ impl KernelLoader {
     ///
     /// Returns an error if the file cannot be read.
     pub fn detect_kernel_type(path: &Path) -> Result<KernelType> {
-        let mut file = File::open(path).map_err(|e| {
-            VmmError::Config(format!("Cannot open kernel: {}", e))
-        })?;
+        let mut file =
+            File::open(path).map_err(|e| VmmError::Config(format!("Cannot open kernel: {}", e)))?;
 
         // Read enough to check all signatures (bzImage magic is at 0x202)
         let mut header = [0u8; 0x210];
-        let bytes_read = file.read(&mut header).map_err(|e| {
-            VmmError::Config(format!("Cannot read kernel header: {}", e))
-        })?;
+        let bytes_read = file
+            .read(&mut header)
+            .map_err(|e| VmmError::Config(format!("Cannot read kernel header: {}", e)))?;
 
         // Check for Linux bzImage (x86_64) - magic at offset 0x202
         if bytes_read >= 0x206 {
-            let magic = u32::from_le_bytes([
-                header[0x202],
-                header[0x203],
-                header[0x204],
-                header[0x205],
-            ]);
+            let magic =
+                u32::from_le_bytes([header[0x202], header[0x203], header[0x204], header[0x205]]);
             if magic == linux::BZIMAGE_MAGIC {
                 return Ok(KernelType::LinuxBzImage);
             }
@@ -276,9 +271,7 @@ impl KernelLoader {
     ///
     /// Returns an error if the kernel cannot be read.
     pub fn read_kernel(path: &Path) -> Result<Vec<u8>> {
-        std::fs::read(path).map_err(|e| {
-            VmmError::Config(format!("Cannot read kernel: {}", e))
-        })
+        std::fs::read(path).map_err(|e| VmmError::Config(format!("Cannot read kernel: {}", e)))
     }
 
     /// Reads the initrd into memory.
@@ -287,9 +280,7 @@ impl KernelLoader {
     ///
     /// Returns an error if the initrd cannot be read.
     pub fn read_initrd(path: &Path) -> Result<Vec<u8>> {
-        std::fs::read(path).map_err(|e| {
-            VmmError::Config(format!("Cannot read initrd: {}", e))
-        })
+        std::fs::read(path).map_err(|e| VmmError::Config(format!("Cannot read initrd: {}", e)))
     }
 }
 
@@ -335,10 +326,7 @@ pub mod x86_64 {
     }
 
     /// Creates the x86_64 boot parameters structure.
-    pub fn create_boot_params(
-        params: &BootParams,
-        memory_size: u64,
-    ) -> BootParamsStruct {
+    pub fn create_boot_params(params: &BootParams, memory_size: u64) -> BootParamsStruct {
         let mut boot_params = BootParamsStruct::default();
 
         // Create simple E820 map
@@ -461,8 +449,8 @@ mod tests {
 
     #[test]
     fn test_boot_params_creation() {
-        let params = BootParams::new("/path/to/kernel", "console=ttyS0")
-            .with_initrd("/path/to/initrd");
+        let params =
+            BootParams::new("/path/to/kernel", "console=ttyS0").with_initrd("/path/to/initrd");
 
         assert_eq!(params.kernel_path, "/path/to/kernel");
         assert_eq!(params.cmdline, "console=ttyS0");

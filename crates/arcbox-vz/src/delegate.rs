@@ -6,7 +6,7 @@
 use objc2::ffi::{objc_allocateClassPair, objc_registerClassPair};
 use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
 use std::collections::HashMap;
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{CString, c_char, c_void};
 use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -103,9 +103,7 @@ fn get_next_handle() -> ListenerHandle {
 }
 
 /// Registers a listener and returns a handle.
-pub fn register_listener(
-    sender: mpsc::UnboundedSender<IncomingConnection>,
-) -> ListenerHandle {
+pub fn register_listener(sender: mpsc::UnboundedSender<IncomingConnection>) -> ListenerHandle {
     let handle = get_next_handle();
     let mut registry = get_registry().lock().unwrap();
     registry.insert(handle, ListenerEntry { sender });
@@ -154,9 +152,7 @@ const HANDLE_IVAR: &[u8] = b"_listenerHandle\0";
 ///
 /// Returns an error if the delegate class cannot be created.
 pub fn get_delegate_class() -> Result<*const AnyClass, DelegateError> {
-    let result = DELEGATE_CLASS.get_or_init(|| {
-        ClassResult(unsafe { create_delegate_class() })
-    });
+    let result = DELEGATE_CLASS.get_or_init(|| ClassResult(unsafe { create_delegate_class() }));
     // Clone the result since we can't move out of OnceLock
     match &result.0 {
         Ok(ptr) => Ok(*ptr),
@@ -207,7 +203,8 @@ unsafe fn create_delegate_class() -> Result<*const AnyClass, DelegateError> {
 
         // Add the delegate method
         // selector: listener:shouldAcceptNewConnection:fromSocketDevice:
-        let sel_name = CString::new("listener:shouldAcceptNewConnection:fromSocketDevice:").unwrap();
+        let sel_name =
+            CString::new("listener:shouldAcceptNewConnection:fromSocketDevice:").unwrap();
         let sel = sel_registerName(sel_name.as_ptr());
 
         // Method signature: BOOL method(id self, SEL _cmd, id listener, id connection, id device)
@@ -249,11 +246,7 @@ unsafe extern "C" fn should_accept_connection(
 
         // Get the handle from instance variable
         let mut handle_ptr: *mut c_void = std::ptr::null_mut();
-        object_getInstanceVariable(
-            this,
-            HANDLE_IVAR.as_ptr() as *const c_char,
-            &mut handle_ptr,
-        );
+        object_getInstanceVariable(this, HANDLE_IVAR.as_ptr() as *const c_char, &mut handle_ptr);
         let handle = handle_ptr as ListenerHandle;
 
         if handle == 0 {
@@ -291,7 +284,10 @@ unsafe extern "C" fn should_accept_connection(
 
         tracing::debug!(
             "Incoming connection: fd={} (dup from {}), src_port={}, dst_port={}",
-            fd, original_fd, src_port, dst_port
+            fd,
+            original_fd,
+            src_port,
+            dst_port
         );
 
         // Send to channel
@@ -349,7 +345,11 @@ pub fn create_delegate_instance(handle: ListenerHandle) -> Result<*mut AnyObject
             handle as *mut c_void,
         );
 
-        tracing::debug!("Created delegate instance {:?} with handle {}", instance, handle);
+        tracing::debug!(
+            "Created delegate instance {:?} with handle {}",
+            instance,
+            handle
+        );
 
         Ok(instance)
     }

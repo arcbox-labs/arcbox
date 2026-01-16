@@ -76,8 +76,7 @@ pub const KVM_GET_CPUID2: nix::sys::ioctl::ioctl_num_type = kvm_iowr!(0x91, KvmC
 
 // ARM64-specific ioctls
 #[cfg(target_arch = "aarch64")]
-pub const KVM_ARM_PREFERRED_TARGET: nix::sys::ioctl::ioctl_num_type =
-    kvm_ior!(0xaf, KvmVcpuInit);
+pub const KVM_ARM_PREFERRED_TARGET: nix::sys::ioctl::ioctl_num_type = kvm_ior!(0xaf, KvmVcpuInit);
 #[cfg(target_arch = "aarch64")]
 pub const KVM_ARM_VCPU_INIT: nix::sys::ioctl::ioctl_num_type = kvm_iow!(0xae, KvmVcpuInit);
 #[cfg(target_arch = "aarch64")]
@@ -762,13 +761,8 @@ impl KvmVmFd {
     /// Sets the TSS address (x86 only).
     #[cfg(target_arch = "x86_64")]
     pub fn set_tss_addr(&self, addr: u64) -> KvmResult<()> {
-        let ret = unsafe {
-            libc::ioctl(
-                self.fd.as_raw_fd(),
-                KVM_SET_TSS_ADDR,
-                addr as libc::c_ulong,
-            )
-        };
+        let ret =
+            unsafe { libc::ioctl(self.fd.as_raw_fd(), KVM_SET_TSS_ADDR, addr as libc::c_ulong) };
         if ret < 0 {
             return Err(KvmError::from(std::io::Error::last_os_error()));
         }

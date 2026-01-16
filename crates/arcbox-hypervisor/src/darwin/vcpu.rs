@@ -9,8 +9,8 @@
 //! - Register access is not supported (Virtualization.framework doesn't expose this)
 //! - The actual vCPU execution is handled by `VZVirtualMachine.start()`
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use objc2::runtime::AnyObject;
@@ -793,20 +793,56 @@ mod tests {
     #[test]
     fn test_vz_state_from_i64() {
         // Test VZVirtualMachineState::from(i64) mapping
-        assert_eq!(VZVirtualMachineState::from(0), VZVirtualMachineState::Stopped);
-        assert_eq!(VZVirtualMachineState::from(1), VZVirtualMachineState::Running);
-        assert_eq!(VZVirtualMachineState::from(2), VZVirtualMachineState::Paused);
+        assert_eq!(
+            VZVirtualMachineState::from(0),
+            VZVirtualMachineState::Stopped
+        );
+        assert_eq!(
+            VZVirtualMachineState::from(1),
+            VZVirtualMachineState::Running
+        );
+        assert_eq!(
+            VZVirtualMachineState::from(2),
+            VZVirtualMachineState::Paused
+        );
         assert_eq!(VZVirtualMachineState::from(3), VZVirtualMachineState::Error);
-        assert_eq!(VZVirtualMachineState::from(4), VZVirtualMachineState::Starting);
-        assert_eq!(VZVirtualMachineState::from(5), VZVirtualMachineState::Pausing);
-        assert_eq!(VZVirtualMachineState::from(6), VZVirtualMachineState::Resuming);
-        assert_eq!(VZVirtualMachineState::from(7), VZVirtualMachineState::Stopping);
-        assert_eq!(VZVirtualMachineState::from(8), VZVirtualMachineState::Saving);
-        assert_eq!(VZVirtualMachineState::from(9), VZVirtualMachineState::Restoring);
+        assert_eq!(
+            VZVirtualMachineState::from(4),
+            VZVirtualMachineState::Starting
+        );
+        assert_eq!(
+            VZVirtualMachineState::from(5),
+            VZVirtualMachineState::Pausing
+        );
+        assert_eq!(
+            VZVirtualMachineState::from(6),
+            VZVirtualMachineState::Resuming
+        );
+        assert_eq!(
+            VZVirtualMachineState::from(7),
+            VZVirtualMachineState::Stopping
+        );
+        assert_eq!(
+            VZVirtualMachineState::from(8),
+            VZVirtualMachineState::Saving
+        );
+        assert_eq!(
+            VZVirtualMachineState::from(9),
+            VZVirtualMachineState::Restoring
+        );
 
         // Unknown values should map to Error
-        assert_eq!(VZVirtualMachineState::from(10), VZVirtualMachineState::Error);
-        assert_eq!(VZVirtualMachineState::from(-1), VZVirtualMachineState::Error);
-        assert_eq!(VZVirtualMachineState::from(100), VZVirtualMachineState::Error);
+        assert_eq!(
+            VZVirtualMachineState::from(10),
+            VZVirtualMachineState::Error
+        );
+        assert_eq!(
+            VZVirtualMachineState::from(-1),
+            VZVirtualMachineState::Error
+        );
+        assert_eq!(
+            VZVirtualMachineState::from(100),
+            VZVirtualMachineState::Error
+        );
     }
 }

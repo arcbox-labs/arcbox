@@ -192,12 +192,12 @@ impl Vmnet {
         let queue_label = CString::new("com.arcbox.vmnet").unwrap();
 
         // Safety: dispatch_queue_create is safe to call with valid parameters.
-        let queue = unsafe {
-            dispatch_queue_create(queue_label.as_ptr(), ptr::null())
-        };
+        let queue = unsafe { dispatch_queue_create(queue_label.as_ptr(), ptr::null()) };
 
         if queue.is_null() {
-            return Err(NetError::Config("failed to create dispatch queue".to_string()));
+            return Err(NetError::Config(
+                "failed to create dispatch queue".to_string(),
+            ));
         }
 
         // Build configuration dictionary.
@@ -206,7 +206,9 @@ impl Vmnet {
             let dict = create_vmnet_config_dict();
             if dict.is_null() {
                 dispatch_release(queue as *mut _);
-                return Err(NetError::Config("failed to create config dictionary".to_string()));
+                return Err(NetError::Config(
+                    "failed to create config dictionary".to_string(),
+                ));
             }
 
             // Set operating mode.
@@ -269,13 +271,17 @@ impl Vmnet {
                     // Set bridge interface.
                     if let Some(ref iface) = config.bridge_interface {
                         let iface_cf = cfstring_from_str(iface);
-                        CFDictionarySetValue(dict, vmnet_shared_interface_name_key as _, iface_cf as _);
+                        CFDictionarySetValue(
+                            dict,
+                            vmnet_shared_interface_name_key as _,
+                            iface_cf as _,
+                        );
                         CFRelease(iface_cf as _);
                     } else {
                         CFRelease(dict as _);
                         dispatch_release(queue as *mut _);
                         return Err(NetError::Config(
-                            "bridge mode requires interface name".to_string()
+                            "bridge mode requires interface name".to_string(),
                         ));
                     }
                 }
@@ -290,9 +296,7 @@ impl Vmnet {
         // A production implementation might use proper block support for async operation.
 
         // Safety: We're calling vmnet with valid configuration.
-        let interface = unsafe {
-            vmnet_start_interface(config_dict as _, queue, ptr::null())
-        };
+        let interface = unsafe { vmnet_start_interface(config_dict as _, queue, ptr::null()) };
 
         // Release the config dictionary.
         unsafe {
@@ -304,7 +308,7 @@ impl Vmnet {
                 dispatch_release(queue as *mut _);
             }
             return Err(NetError::Config(
-                "failed to start vmnet interface (requires root or entitlements)".to_string()
+                "failed to start vmnet interface (requires root or entitlements)".to_string(),
             ));
         }
 
@@ -392,9 +396,7 @@ impl Vmnet {
         let mut pktcnt: c_int = 1;
 
         // Safety: vmnet_read is safe when called with valid parameters.
-        let status = unsafe {
-            vmnet_read(self.interface, &mut packet, &mut pktcnt)
-        };
+        let status = unsafe { vmnet_read(self.interface, &mut packet, &mut pktcnt) };
 
         if !status.is_success() {
             if status == VmnetReturnT::BufferExhausted {
@@ -450,9 +452,7 @@ impl Vmnet {
         let mut pktcnt: c_int = 1;
 
         // Safety: vmnet_write is safe when called with valid parameters.
-        let status = unsafe {
-            vmnet_write(self.interface, &mut packet, &mut pktcnt)
-        };
+        let status = unsafe { vmnet_write(self.interface, &mut packet, &mut pktcnt) };
 
         if !status.is_success() {
             return Err(NetError::Io(std::io::Error::new(
@@ -608,7 +608,11 @@ mod tests {
     #[ignore]
     fn test_vmnet_create_shared() {
         let vmnet = Vmnet::new_shared();
-        assert!(vmnet.is_ok(), "Failed to create shared vmnet: {:?}", vmnet.err());
+        assert!(
+            vmnet.is_ok(),
+            "Failed to create shared vmnet: {:?}",
+            vmnet.err()
+        );
 
         let vmnet = vmnet.unwrap();
         assert!(vmnet.is_running());
@@ -620,7 +624,11 @@ mod tests {
     #[ignore]
     fn test_vmnet_create_host_only() {
         let vmnet = Vmnet::new_host_only();
-        assert!(vmnet.is_ok(), "Failed to create host-only vmnet: {:?}", vmnet.err());
+        assert!(
+            vmnet.is_ok(),
+            "Failed to create host-only vmnet: {:?}",
+            vmnet.err()
+        );
 
         let vmnet = vmnet.unwrap();
         assert!(vmnet.is_running());

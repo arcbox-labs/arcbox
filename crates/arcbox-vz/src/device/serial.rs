@@ -58,12 +58,14 @@ impl SerialPortConfiguration {
             let attachment = create_serial_port_attachment(read_handle, write_handle)?;
 
             // Create VirtIO console serial port configuration
-            let cls = get_class("VZVirtioConsoleDeviceSerialPortConfiguration").ok_or_else(
-                || VZError::Internal {
-                    code: -1,
-                    message: "VZVirtioConsoleDeviceSerialPortConfiguration class not found".into(),
-                },
-            )?;
+            let cls =
+                get_class("VZVirtioConsoleDeviceSerialPortConfiguration").ok_or_else(|| {
+                    VZError::Internal {
+                        code: -1,
+                        message: "VZVirtioConsoleDeviceSerialPortConfiguration class not found"
+                            .into(),
+                    }
+                })?;
 
             let port = msg_send!(cls, new);
             if port.is_null() {

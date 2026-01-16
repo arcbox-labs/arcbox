@@ -78,7 +78,10 @@ mod tests {
 
     #[test]
     fn test_buffer_too_small_error() {
-        let err = VirtioError::BufferTooSmall { needed: 1024, got: 512 };
+        let err = VirtioError::BufferTooSmall {
+            needed: 1024,
+            got: 512,
+        };
         let msg = err.to_string();
         assert!(msg.contains("1024"));
         assert!(msg.contains("512"));

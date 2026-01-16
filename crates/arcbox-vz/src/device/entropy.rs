@@ -18,11 +18,12 @@ impl EntropyDeviceConfiguration {
     /// Creates a new entropy device configuration.
     pub fn new() -> VZResult<Self> {
         unsafe {
-            let cls =
-                get_class("VZVirtioEntropyDeviceConfiguration").ok_or_else(|| VZError::Internal {
+            let cls = get_class("VZVirtioEntropyDeviceConfiguration").ok_or_else(|| {
+                VZError::Internal {
                     code: -1,
                     message: "VZVirtioEntropyDeviceConfiguration class not found".into(),
-                })?;
+                }
+            })?;
             let obj = msg_send!(cls, new);
 
             if obj.is_null() {

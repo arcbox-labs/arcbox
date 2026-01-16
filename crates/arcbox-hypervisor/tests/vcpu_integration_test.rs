@@ -3,14 +3,14 @@
 //! These tests verify the interaction between DarwinVm and DarwinVcpu,
 //! testing the managed execution model of Virtualization.framework.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::thread;
 
 #[cfg(target_os = "macos")]
 use arcbox_hypervisor::{
     config::VmConfig,
-    darwin::{is_supported, DarwinHypervisor},
+    darwin::{DarwinHypervisor, is_supported},
     traits::{Hypervisor, Vcpu, VirtualMachine},
     types::{CpuArch, VcpuExit},
 };
@@ -41,7 +41,9 @@ fn test_vcpu_creation_from_vm() {
 
     // Create multiple vCPUs
     for i in 0..4 {
-        let vcpu = vm.create_vcpu(i).expect(&format!("Failed to create vCPU {}", i));
+        let vcpu = vm
+            .create_vcpu(i)
+            .expect(&format!("Failed to create vCPU {}", i));
         assert_eq!(vcpu.id(), i);
     }
 
@@ -242,7 +244,10 @@ fn test_multiple_vcpu_run_independent() {
 
     // Create all vCPUs
     let mut vcpus: Vec<_> = (0..4)
-        .map(|i| vm.create_vcpu(i).expect(&format!("Failed to create vCPU {}", i)))
+        .map(|i| {
+            vm.create_vcpu(i)
+                .expect(&format!("Failed to create vCPU {}", i))
+        })
         .collect();
 
     // Call run() on each vCPU - should all return Halt immediately
@@ -319,7 +324,10 @@ fn test_multiple_vcpus_parallel_threads() {
 
     // Create vCPUs
     let vcpus: Vec<_> = (0..4)
-        .map(|i| vm.create_vcpu(i).expect(&format!("Failed to create vCPU {}", i)))
+        .map(|i| {
+            vm.create_vcpu(i)
+                .expect(&format!("Failed to create vCPU {}", i))
+        })
         .collect();
 
     // Run each vCPU in its own thread

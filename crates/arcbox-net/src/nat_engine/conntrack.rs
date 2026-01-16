@@ -455,7 +455,10 @@ impl ConnTrackTable {
             self.remove(&key);
         }
 
-        self.stats.expired.0.fetch_add(count as u64, Ordering::Relaxed);
+        self.stats
+            .expired
+            .0
+            .fetch_add(count as u64, Ordering::Relaxed);
         count
     }
 
@@ -558,13 +561,7 @@ mod tests {
 
     #[test]
     fn test_conntrack_table_create() {
-        let mut table = ConnTrackTable::new(
-            Ipv4Addr::new(10, 0, 0, 1),
-            49152,
-            65535,
-            256,
-            300,
-        );
+        let mut table = ConnTrackTable::new(Ipv4Addr::new(10, 0, 0, 1), 49152, 65535, 256, 300);
 
         let key = ConnTrackKey::new(
             Ipv4Addr::new(192, 168, 1, 100),
@@ -581,13 +578,7 @@ mod tests {
 
     #[test]
     fn test_conntrack_table_lookup() {
-        let mut table = ConnTrackTable::new(
-            Ipv4Addr::new(10, 0, 0, 1),
-            49152,
-            65535,
-            256,
-            300,
-        );
+        let mut table = ConnTrackTable::new(Ipv4Addr::new(10, 0, 0, 1), 49152, 65535, 256, 300);
 
         let key = ConnTrackKey::new(
             Ipv4Addr::new(192, 168, 1, 100),

@@ -47,8 +47,8 @@ pub use memory::{GuestAddress, MemoryRegion};
 pub use traits::{GuestMemory, Hypervisor, Vcpu, VirtualMachine};
 pub use types::{
     Arm64Registers, CpuArch, DeviceSnapshot, DirtyPageInfo, MemoryRegionSnapshot,
-    PlatformCapabilities, Registers, VcpuExit, VcpuSnapshot, VirtioDeviceConfig,
-    VirtioDeviceType, VmSnapshot,
+    PlatformCapabilities, Registers, VcpuExit, VcpuSnapshot, VirtioDeviceConfig, VirtioDeviceType,
+    VmSnapshot,
 };
 
 /// Creates the appropriate hypervisor for the current platform.

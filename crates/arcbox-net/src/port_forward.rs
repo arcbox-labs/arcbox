@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::error::{NetError, Result};
@@ -173,11 +173,7 @@ impl PortForwarder {
                     rule.guest_addr
                 );
 
-                tokio::spawn(tcp_forward_loop(
-                    listener,
-                    rule.guest_addr,
-                    shutdown_rx,
-                ))
+                tokio::spawn(tcp_forward_loop(listener, rule.guest_addr, shutdown_rx))
             }
             Protocol::Udp => {
                 let socket = UdpSocket::bind(rule.host_addr).await.map_err(|e| {

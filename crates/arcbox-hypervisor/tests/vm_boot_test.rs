@@ -12,7 +12,7 @@ use std::time::Duration;
 #[cfg(target_os = "macos")]
 use arcbox_hypervisor::{
     config::VmConfig,
-    darwin::{is_supported, DarwinHypervisor},
+    darwin::{DarwinHypervisor, is_supported},
     traits::{Hypervisor, VirtualMachine},
     types::CpuArch,
 };
@@ -69,7 +69,10 @@ fn test_vm_boot_with_kernel() {
 
     println!("Hypervisor capabilities:");
     println!("  Max vCPUs: {}", caps.max_vcpus);
-    println!("  Max memory: {} GB", caps.max_memory / (1024 * 1024 * 1024));
+    println!(
+        "  Max memory: {} GB",
+        caps.max_memory / (1024 * 1024 * 1024)
+    );
     println!("  Rosetta: {}", caps.rosetta);
 
     // Create VM config
@@ -78,7 +81,9 @@ fn test_vm_boot_with_kernel() {
         memory_size: 512 * 1024 * 1024, // 512MB
         arch: CpuArch::native(),
         kernel_path: Some(kernel_path.to_string_lossy().to_string()),
-        kernel_cmdline: Some("console=hvc0 earlycon=pl011,0x09000000 root=/dev/ram0 rdinit=/bin/sh".to_string()),
+        kernel_cmdline: Some(
+            "console=hvc0 earlycon=pl011,0x09000000 root=/dev/ram0 rdinit=/bin/sh".to_string(),
+        ),
         ..Default::default()
     };
 
@@ -101,9 +106,7 @@ fn test_vm_boot_with_kernel() {
     println!("Starting VM...");
 
     // Wrap in catch_unwind to handle any panics
-    let start_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        vm.start()
-    }));
+    let start_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm.start()));
 
     match start_result {
         Ok(Ok(())) => {
@@ -126,7 +129,9 @@ fn test_vm_boot_with_kernel() {
         }
         Ok(Err(e)) => {
             println!("Failed to start VM: {}", e);
-            println!("Note: This may fail if the kernel format is not compatible with Virtualization.framework");
+            println!(
+                "Note: This may fail if the kernel format is not compatible with Virtualization.framework"
+            );
             println!("Virtualization.framework requires uncompressed ARM64 Image format");
         }
         Err(panic) => {

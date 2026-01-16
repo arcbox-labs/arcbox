@@ -62,15 +62,13 @@ pub mod vm;
 // Re-exports for convenience
 pub use error::VZError;
 
-pub use configuration::{
-    GenericPlatform, LinuxBootLoader, Platform, VirtualMachineConfiguration,
-};
+pub use configuration::{GenericPlatform, LinuxBootLoader, Platform, VirtualMachineConfiguration};
 
 pub use device::{
-    DirectoryShare, EntropyDeviceConfiguration, LinuxRosettaDirectoryShare,
-    MultipleDirectoryShare, NetworkDeviceConfiguration, RosettaAvailability,
-    SerialPortConfiguration, SharedDirectory, SingleDirectoryShare, SocketDeviceConfiguration,
-    StorageDeviceConfiguration, VirtioFileSystemDeviceConfiguration,
+    DirectoryShare, EntropyDeviceConfiguration, LinuxRosettaDirectoryShare, MultipleDirectoryShare,
+    NetworkDeviceConfiguration, RosettaAvailability, SerialPortConfiguration, SharedDirectory,
+    SingleDirectoryShare, SocketDeviceConfiguration, StorageDeviceConfiguration,
+    VirtioFileSystemDeviceConfiguration,
 };
 
 pub use socket::{VirtioSocketConnection, VirtioSocketDevice, VirtioSocketListener};

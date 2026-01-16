@@ -4,9 +4,9 @@
 
 use std::net::Ipv4Addr;
 
+use super::NatEngineConfig;
 use super::checksum::{update_checksum_for_ip, update_checksum_for_nat};
 use super::conntrack::{ConnTrackKey, ConnTrackTable};
-use super::NatEngineConfig;
 
 /// NAT direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,11 +175,15 @@ impl NatEngine {
         // Safety: packet bounds have been validated above
         match direction {
             NatDirection::Outbound => unsafe {
-                self.translate_outbound(packet, ip_offset, l4_offset, src_ip, dst_ip, src_port, dst_port, protocol)
-            }
+                self.translate_outbound(
+                    packet, ip_offset, l4_offset, src_ip, dst_ip, src_port, dst_port, protocol,
+                )
+            },
             NatDirection::Inbound => unsafe {
-                self.translate_inbound(packet, ip_offset, l4_offset, src_ip, dst_ip, src_port, dst_port, protocol)
-            }
+                self.translate_inbound(
+                    packet, ip_offset, l4_offset, src_ip, dst_ip, src_port, dst_port, protocol,
+                )
+            },
         }
     }
 
@@ -230,7 +234,8 @@ impl NatEngine {
         };
 
         if checksum_offset + 2 <= packet.len() {
-            let old_l4_checksum = u16::from_be_bytes([packet[checksum_offset], packet[checksum_offset + 1]]);
+            let old_l4_checksum =
+                u16::from_be_bytes([packet[checksum_offset], packet[checksum_offset + 1]]);
 
             // Skip if UDP checksum is 0 (optional)
             if protocol != 17 || old_l4_checksum != 0 {
@@ -241,7 +246,8 @@ impl NatEngine {
                     new_ip_bytes,
                     nat_port,
                 );
-                packet[checksum_offset..checksum_offset + 2].copy_from_slice(&new_l4_checksum.to_be_bytes());
+                packet[checksum_offset..checksum_offset + 2]
+                    .copy_from_slice(&new_l4_checksum.to_be_bytes());
             }
         }
 
@@ -302,7 +308,8 @@ impl NatEngine {
         };
 
         if checksum_offset + 2 <= packet.len() {
-            let old_l4_checksum = u16::from_be_bytes([packet[checksum_offset], packet[checksum_offset + 1]]);
+            let old_l4_checksum =
+                u16::from_be_bytes([packet[checksum_offset], packet[checksum_offset + 1]]);
 
             if protocol != 17 || old_l4_checksum != 0 {
                 let new_l4_checksum = update_checksum_for_nat(
@@ -312,7 +319,8 @@ impl NatEngine {
                     new_ip_bytes,
                     orig_port,
                 );
-                packet[checksum_offset..checksum_offset + 2].copy_from_slice(&new_l4_checksum.to_be_bytes());
+                packet[checksum_offset..checksum_offset + 2]
+                    .copy_from_slice(&new_l4_checksum.to_be_bytes());
             }
         }
 
@@ -376,7 +384,7 @@ mod tests {
         packet[14] = 0x45; // Version 4, IHL 5 (20 bytes)
         packet[15] = 0x00; // DSCP/ECN
         packet[16] = 0x00; // Total length (high)
-        packet[17] = 40;   // Total length (low): 20 + 20
+        packet[17] = 40; // Total length (low): 20 + 20
         packet[23] = protocol;
         packet[26..30].copy_from_slice(&src_ip);
         packet[30..34].copy_from_slice(&dst_ip);
@@ -417,13 +425,7 @@ mod tests {
         engine.set_internal_network(Ipv4Addr::new(192, 168, 64, 0), 24);
 
         // Source is not in internal network
-        let mut packet = create_test_packet(
-            [8, 8, 4, 4],
-            [8, 8, 8, 8],
-            12345,
-            80,
-            6,
-        );
+        let mut packet = create_test_packet([8, 8, 4, 4], [8, 8, 8, 8], 12345, 80, 6);
 
         let result = unsafe { engine.translate(&mut packet, NatDirection::Outbound) };
         assert_eq!(result.unwrap(), NatResult::PassThrough);
@@ -438,26 +440,18 @@ mod tests {
         engine.set_internal_network(Ipv4Addr::new(192, 168, 64, 0), 24);
 
         // First create outbound connection
-        let mut outbound = create_test_packet(
-            [192, 168, 64, 100],
-            [8, 8, 8, 8],
-            12345,
-            80,
-            6,
-        );
-        unsafe { engine.translate(&mut outbound, NatDirection::Outbound).unwrap() };
+        let mut outbound = create_test_packet([192, 168, 64, 100], [8, 8, 8, 8], 12345, 80, 6);
+        unsafe {
+            engine
+                .translate(&mut outbound, NatDirection::Outbound)
+                .unwrap()
+        };
 
         // Get the NAT port
         let nat_port = u16::from_be_bytes([outbound[34], outbound[35]]);
 
         // Create inbound response
-        let mut inbound = create_test_packet(
-            [8, 8, 8, 8],
-            [10, 0, 0, 1],
-            80,
-            nat_port,
-            6,
-        );
+        let mut inbound = create_test_packet([8, 8, 8, 8], [10, 0, 0, 1], 80, nat_port, 6);
 
         let result = unsafe { engine.translate(&mut inbound, NatDirection::Inbound) };
         assert_eq!(result.unwrap(), NatResult::Translated);
@@ -471,13 +465,7 @@ mod tests {
         let mut engine = NatEngine::with_external_ip(Ipv4Addr::new(10, 0, 0, 1));
 
         // Inbound packet without existing connection
-        let mut packet = create_test_packet(
-            [8, 8, 8, 8],
-            [10, 0, 0, 1],
-            80,
-            54321,
-            6,
-        );
+        let mut packet = create_test_packet([8, 8, 8, 8], [10, 0, 0, 1], 80, 54321, 6);
 
         let result = unsafe { engine.translate(&mut packet, NatDirection::Inbound) };
         assert_eq!(result.unwrap(), NatResult::Dropped);

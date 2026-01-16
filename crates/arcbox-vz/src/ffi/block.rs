@@ -196,8 +196,7 @@ unsafe extern "C" fn vsock_block_invoke(
 
         let result = if !error.is_null() {
             // Get error description
-            let desc: *mut AnyObject =
-                crate::msg_send!(error, localizedDescription);
+            let desc: *mut AnyObject = crate::msg_send!(error, localizedDescription);
             let message = crate::ffi::nsstring_to_string(desc);
             tracing::debug!("vsock connection error: {}", message);
             Err(VsockConnectionError { message })
@@ -265,9 +264,7 @@ unsafe extern "C" fn vsock_block_invoke(
 ///
 /// The returned block must be used with Virtualization.framework's
 /// `connectToPort:completionHandler:` method.
-pub fn create_vsock_context_block(
-    sender: oneshot::Sender<VsockResult>,
-) -> *const c_void {
+pub fn create_vsock_context_block(sender: oneshot::Sender<VsockResult>) -> *const c_void {
     // Box the sender and get a raw pointer
     let sender_box = Box::new(sender);
     let sender_ptr = Box::into_raw(sender_box) as *mut c_void;

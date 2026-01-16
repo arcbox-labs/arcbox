@@ -328,11 +328,7 @@ impl KvmMemory {
         Ok(())
     }
 
-    fn get_dirty_log(
-        &self,
-        fd: RawFd,
-        slot: &MemorySlotInfo,
-    ) -> Result<Vec<u64>, HypervisorError> {
+    fn get_dirty_log(&self, fd: RawFd, slot: &MemorySlotInfo) -> Result<Vec<u64>, HypervisorError> {
         let num_pages = (slot.size + PAGE_SIZE - 1) / PAGE_SIZE;
         let bitmap_size = ((num_pages + 63) / 64) as usize;
         let mut bitmap: Vec<u64> = vec![0; bitmap_size];
@@ -431,8 +427,9 @@ impl KvmMemory {
 
     /// Writes a value to guest memory at the specified address.
     pub fn write_obj<T: Copy>(&self, addr: GuestAddress, val: &T) -> Result<(), HypervisorError> {
-        let bytes =
-            unsafe { std::slice::from_raw_parts(val as *const T as *const u8, std::mem::size_of::<T>()) };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(val as *const T as *const u8, std::mem::size_of::<T>())
+        };
         self.write(addr, bytes)
     }
 

@@ -6,8 +6,8 @@
 //! Note: Some tests require a valid kernel to run. They will be skipped
 //! if the kernel is not available.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use arcbox_hypervisor::{
     config::VmConfig,
-    darwin::{is_supported, DarwinHypervisor},
+    darwin::{DarwinHypervisor, is_supported},
     traits::{Hypervisor, Vcpu, VirtualMachine},
     types::{CpuArch, VcpuExit},
 };
@@ -159,7 +159,10 @@ fn test_vcpu_background_thread_pattern() {
 
     let (exit, elapsed) = handle.join().expect("vCPU thread panicked");
 
-    println!("vCPU run() completed in {:?} with exit: {:?}", elapsed, exit);
+    println!(
+        "vCPU run() completed in {:?} with exit: {:?}",
+        elapsed, exit
+    );
 
     assert!(matches!(exit, VcpuExit::Halt));
 
@@ -203,7 +206,10 @@ fn test_multiple_vcpus_workload_pattern() {
 
     // Create all vCPUs
     let vcpus: Vec<_> = (0..num_vcpus as u32)
-        .map(|i| vm.create_vcpu(i).expect(&format!("Failed to create vCPU {}", i)))
+        .map(|i| {
+            vm.create_vcpu(i)
+                .expect(&format!("Failed to create vCPU {}", i))
+        })
         .collect();
 
     // Spawn threads for each vCPU - simulating real VMM workload pattern
@@ -290,10 +296,7 @@ fn test_vcpu_vm_state_awareness() {
     let mut vcpu = vm.create_vcpu(0).expect("Failed to create vCPU");
 
     // VM state should still be Created (not started)
-    assert!(
-        !vm.is_running(),
-        "VM should not be running before start()"
-    );
+    assert!(!vm.is_running(), "VM should not be running before start()");
 
     // vCPU run should return immediately
     let exit = vcpu.run().expect("vCPU run failed");
@@ -522,7 +525,10 @@ fn test_vcpu_stress_create_destroy() {
     let hypervisor = DarwinHypervisor::new().expect("Failed to create hypervisor");
     let iterations = 10;
 
-    println!("Running {} iterations of VM/vCPU create/destroy", iterations);
+    println!(
+        "Running {} iterations of VM/vCPU create/destroy",
+        iterations
+    );
 
     for i in 0..iterations {
         let config = VmConfig {
@@ -555,7 +561,10 @@ fn test_vcpu_stress_create_destroy() {
         }
     }
 
-    println!("Stress test completed: {} iterations successful", iterations);
+    println!(
+        "Stress test completed: {} iterations successful",
+        iterations
+    );
 }
 
 /// Stress test: Rapid vCPU run() calls.

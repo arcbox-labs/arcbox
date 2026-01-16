@@ -812,7 +812,10 @@ impl NetlinkHandle {
             )));
         }
 
-        let len = buf.iter().position(|&c| c == 0).unwrap_or(libc::IF_NAMESIZE);
+        let len = buf
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(libc::IF_NAMESIZE);
         let name_bytes: Vec<u8> = buf[..len].iter().map(|&c| c as u8).collect();
         String::from_utf8(name_bytes).map_err(|e| NetError::Netlink(e.to_string()))
     }

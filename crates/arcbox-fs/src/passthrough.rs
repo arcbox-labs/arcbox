@@ -19,8 +19,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 // ============================================================================
@@ -296,9 +296,10 @@ impl PassthroughFs {
             return Ok(self.root.clone());
         }
 
-        let inodes = self.inodes.read().map_err(|_| {
-            FsError::Cache("failed to acquire inode lock".to_string())
-        })?;
+        let inodes = self
+            .inodes
+            .read()
+            .map_err(|_| FsError::Cache("failed to acquire inode lock".to_string()))?;
 
         let data = inodes.get(&inode).ok_or(FsError::InvalidHandle(inode))?;
         Ok(self.root.join(&data.path))
@@ -311,9 +312,10 @@ impl PassthroughFs {
             return Ok(self.root.join(name));
         }
 
-        let inodes = self.inodes.read().map_err(|_| {
-            FsError::Cache("failed to acquire inode lock".to_string())
-        })?;
+        let inodes = self
+            .inodes
+            .read()
+            .map_err(|_| FsError::Cache("failed to acquire inode lock".to_string()))?;
 
         let parent_data = inodes.get(&parent).ok_or(FsError::InvalidHandle(parent))?;
         Ok(self.root.join(&parent_data.path).join(name))
@@ -398,9 +400,10 @@ impl PassthroughFs {
 
         // Check if we already have this inode
         {
-            let inodes = self.inodes.read().map_err(|_| {
-                FsError::Cache("failed to acquire inode lock".to_string())
-            })?;
+            let inodes = self
+                .inodes
+                .read()
+                .map_err(|_| FsError::Cache("failed to acquire inode lock".to_string()))?;
             for (&ino, data) in inodes.iter() {
                 if data.path == relative {
                     data.inc_ref();
@@ -412,9 +415,10 @@ impl PassthroughFs {
         // Create new inode
         let inode = self.alloc_inode();
         {
-            let mut inodes = self.inodes.write().map_err(|_| {
-                FsError::Cache("failed to acquire inode lock".to_string())
-            })?;
+            let mut inodes = self
+                .inodes
+                .write()
+                .map_err(|_| FsError::Cache("failed to acquire inode lock".to_string()))?;
             inodes.insert(inode, InodeData::new(relative, file_type));
         }
 
@@ -536,7 +540,8 @@ impl PassthroughFs {
             let times = [atime_spec, mtime_spec];
             let path_cstr = std::ffi::CString::new(path.as_os_str().as_bytes())
                 .map_err(|_| FsError::InvalidPath("invalid path".to_string()))?;
-            let ret = unsafe { libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), 0) };
+            let ret =
+                unsafe { libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), 0) };
             if ret != 0 {
                 return Err(FsError::Io(std::io::Error::last_os_error()));
             }
@@ -591,18 +596,20 @@ impl PassthroughFs {
         let relative = self.relative_path(&path);
         let inode = self.alloc_inode();
         {
-            let mut inodes = self.inodes.write().map_err(|_| {
-                FsError::Cache("failed to acquire inode lock".to_string())
-            })?;
+            let mut inodes = self
+                .inodes
+                .write()
+                .map_err(|_| FsError::Cache("failed to acquire inode lock".to_string()))?;
             inodes.insert(inode, InodeData::new(relative, FileType::Regular));
         }
 
         // Create file handle
         let handle = self.alloc_handle();
         {
-            let mut handles = self.handles.write().map_err(|_| {
-                FsError::Cache("failed to acquire handle lock".to_string())
-            })?;
+            let mut handles = self
+                .handles
+                .write()
+                .map_err(|_| FsError::Cache("failed to acquire handle lock".to_string()))?;
             handles.insert(handle, HandleData { file, inode, flags });
         }
 
@@ -615,7 +622,12 @@ impl PassthroughFs {
     ///
     /// - [`FsError::Io`] if the directory cannot be created
     /// - [`FsError::InvalidHandle`] if the parent inode is invalid
-    pub fn mkdir(&self, parent: u64, name: &OsStr, mode: u32) -> Result<(u64, crate::fuse::FuseAttr)> {
+    pub fn mkdir(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+    ) -> Result<(u64, crate::fuse::FuseAttr)> {
         let path = self.get_path(parent, name)?;
 
         std::fs::create_dir(&path).map_err(FsError::Io)?;
@@ -629,9 +641,10 @@ impl PassthroughFs {
         let inode = self.alloc_inode();
 
         {
-            let mut inodes = self.inodes.write().map_err(|_| {
-                FsError::Cache("failed to acquire inode lock".to_string())
-            })?;
+            let mut inodes = self
+                .inodes
+                .write()
+                .map_err(|_| FsError::Cache("failed to acquire inode lock".to_string()))?;
             inodes.insert(inode, InodeData::new(relative, FileType::Directory));
         }
 
@@ -644,7 +657,12 @@ impl PassthroughFs {
     ///
     /// - [`FsError::Io`] if the symlink cannot be created
     /// - [`FsError::InvalidHandle`] if the parent inode is invalid
-    pub fn symlink(&self, parent: u64, name: &OsStr, target: &Path) -> Result<(u64, crate::fuse::FuseAttr)> {
+    pub fn symlink(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        target: &Path,
+    ) -> Result<(u64, crate::fuse::FuseAttr)> {
         let path = self.get_path(parent, name)?;
 
         std::os::unix::fs::symlink(target, &path).map_err(FsError::Io)?;
@@ -656,9 +674,10 @@ impl PassthroughFs {
         let inode = self.alloc_inode();
 
         {
-            let mut inodes = self.inodes.write().map_err(|_| {
-                FsError::Cache("failed to acquire inode lock".to_string())
-            })?;
+            let mut inodes = self
+                .inodes
+                .write()
+                .map_err(|_| FsError::Cache("failed to acquire inode lock".to_string()))?;
             inodes.insert(inode, InodeData::new(relative, FileType::Symlink));
         }
 
@@ -671,7 +690,12 @@ impl PassthroughFs {
     ///
     /// - [`FsError::Io`] if the link cannot be created
     /// - [`FsError::InvalidHandle`] if the source or parent inode is invalid
-    pub fn link(&self, inode: u64, new_parent: u64, new_name: &OsStr) -> Result<(u64, crate::fuse::FuseAttr)> {
+    pub fn link(
+        &self,
+        inode: u64,
+        new_parent: u64,
+        new_name: &OsStr,
+    ) -> Result<(u64, crate::fuse::FuseAttr)> {
         let source_path = self.inode_path(inode)?;
         let new_path = self.get_path(new_parent, new_name)?;
 
@@ -684,9 +708,10 @@ impl PassthroughFs {
 
         // Increment reference count
         {
-            let inodes = self.inodes.read().map_err(|_| {
-                FsError::Cache("failed to acquire inode lock".to_string())
-            })?;
+            let inodes = self
+                .inodes
+                .read()
+                .map_err(|_| FsError::Cache("failed to acquire inode lock".to_string()))?;
             if let Some(data) = inodes.get(&inode) {
                 data.inc_ref();
             }
@@ -702,12 +727,24 @@ impl PassthroughFs {
     /// - [`FsError::Io`] if the node cannot be created
     /// - [`FsError::InvalidHandle`] if the parent inode is invalid
     #[allow(clippy::cast_possible_truncation)]
-    pub fn mknod(&self, parent: u64, name: &OsStr, mode: u32, rdev: u64) -> Result<(u64, crate::fuse::FuseAttr)> {
+    pub fn mknod(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        rdev: u64,
+    ) -> Result<(u64, crate::fuse::FuseAttr)> {
         let path = self.get_path(parent, name)?;
         let path_cstr = std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|_| FsError::InvalidPath("invalid path".to_string()))?;
 
-        let ret = unsafe { libc::mknod(path_cstr.as_ptr(), mode as libc::mode_t, rdev as libc::dev_t) };
+        let ret = unsafe {
+            libc::mknod(
+                path_cstr.as_ptr(),
+                mode as libc::mode_t,
+                rdev as libc::dev_t,
+            )
+        };
         if ret != 0 {
             return Err(FsError::Io(std::io::Error::last_os_error()));
         }
@@ -720,9 +757,10 @@ impl PassthroughFs {
         let inode = self.alloc_inode();
 
         {
-            let mut inodes = self.inodes.write().map_err(|_| {
-                FsError::Cache("failed to acquire inode lock".to_string())
-            })?;
+            let mut inodes = self
+                .inodes
+                .write()
+                .map_err(|_| FsError::Cache("failed to acquire inode lock".to_string()))?;
             inodes.insert(inode, InodeData::new(relative, file_type));
         }
 
@@ -788,9 +826,10 @@ impl PassthroughFs {
         let new_relative = self.relative_path(&new_path);
 
         {
-            let mut inodes = self.inodes.write().map_err(|_| {
-                FsError::Cache("failed to acquire inode lock".to_string())
-            })?;
+            let mut inodes = self
+                .inodes
+                .write()
+                .map_err(|_| FsError::Cache("failed to acquire inode lock".to_string()))?;
             for data in inodes.values_mut() {
                 if data.path == old_relative {
                     data.path = new_relative.clone();
@@ -848,9 +887,10 @@ impl PassthroughFs {
         let handle = self.alloc_handle();
 
         {
-            let mut handles = self.handles.write().map_err(|_| {
-                FsError::Cache("failed to acquire handle lock".to_string())
-            })?;
+            let mut handles = self
+                .handles
+                .write()
+                .map_err(|_| FsError::Cache("failed to acquire handle lock".to_string()))?;
             handles.insert(handle, HandleData { file, inode, flags });
         }
 
@@ -864,13 +904,18 @@ impl PassthroughFs {
     /// - [`FsError::Io`] if read fails
     /// - [`FsError::InvalidHandle`] if the handle is invalid
     pub fn read(&self, handle: u64, offset: u64, size: u32) -> Result<Vec<u8>> {
-        let mut handles = self.handles.write().map_err(|_| {
-            FsError::Cache("failed to acquire handle lock".to_string())
-        })?;
+        let mut handles = self
+            .handles
+            .write()
+            .map_err(|_| FsError::Cache("failed to acquire handle lock".to_string()))?;
 
-        let data = handles.get_mut(&handle).ok_or(FsError::InvalidHandle(handle))?;
+        let data = handles
+            .get_mut(&handle)
+            .ok_or(FsError::InvalidHandle(handle))?;
 
-        data.file.seek(SeekFrom::Start(offset)).map_err(FsError::Io)?;
+        data.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(FsError::Io)?;
 
         let mut buf = vec![0u8; size as usize];
         let n = data.file.read(&mut buf).map_err(FsError::Io)?;
@@ -886,13 +931,19 @@ impl PassthroughFs {
     /// - [`FsError::Io`] if write fails
     /// - [`FsError::InvalidHandle`] if the handle is invalid
     pub fn write(&self, handle: u64, offset: u64, data: &[u8], _flags: u32) -> Result<u32> {
-        let mut handles = self.handles.write().map_err(|_| {
-            FsError::Cache("failed to acquire handle lock".to_string())
-        })?;
+        let mut handles = self
+            .handles
+            .write()
+            .map_err(|_| FsError::Cache("failed to acquire handle lock".to_string()))?;
 
-        let handle_data = handles.get_mut(&handle).ok_or(FsError::InvalidHandle(handle))?;
+        let handle_data = handles
+            .get_mut(&handle)
+            .ok_or(FsError::InvalidHandle(handle))?;
 
-        handle_data.file.seek(SeekFrom::Start(offset)).map_err(FsError::Io)?;
+        handle_data
+            .file
+            .seek(SeekFrom::Start(offset))
+            .map_err(FsError::Io)?;
         let n = handle_data.file.write(data).map_err(FsError::Io)?;
 
         #[allow(clippy::cast_possible_truncation)]
@@ -906,11 +957,14 @@ impl PassthroughFs {
     /// - [`FsError::Io`] if flush fails
     /// - [`FsError::InvalidHandle`] if the handle is invalid
     pub fn flush(&self, handle: u64) -> Result<()> {
-        let mut handles = self.handles.write().map_err(|_| {
-            FsError::Cache("failed to acquire handle lock".to_string())
-        })?;
+        let mut handles = self
+            .handles
+            .write()
+            .map_err(|_| FsError::Cache("failed to acquire handle lock".to_string()))?;
 
-        let data = handles.get_mut(&handle).ok_or(FsError::InvalidHandle(handle))?;
+        let data = handles
+            .get_mut(&handle)
+            .ok_or(FsError::InvalidHandle(handle))?;
         data.file.flush().map_err(FsError::Io)
     }
 
@@ -921,9 +975,10 @@ impl PassthroughFs {
     /// - [`FsError::Io`] if sync fails
     /// - [`FsError::InvalidHandle`] if the handle is invalid
     pub fn fsync(&self, handle: u64, datasync: bool) -> Result<()> {
-        let handles = self.handles.read().map_err(|_| {
-            FsError::Cache("failed to acquire handle lock".to_string())
-        })?;
+        let handles = self
+            .handles
+            .read()
+            .map_err(|_| FsError::Cache("failed to acquire handle lock".to_string()))?;
 
         let data = handles.get(&handle).ok_or(FsError::InvalidHandle(handle))?;
 
@@ -936,9 +991,10 @@ impl PassthroughFs {
 
     /// Releases (closes) a file handle.
     pub fn release(&self, handle: u64) -> Result<()> {
-        let mut handles = self.handles.write().map_err(|_| {
-            FsError::Cache("failed to acquire handle lock".to_string())
-        })?;
+        let mut handles = self
+            .handles
+            .write()
+            .map_err(|_| FsError::Cache("failed to acquire handle lock".to_string()))?;
 
         handles.remove(&handle);
         Ok(())
@@ -951,11 +1007,14 @@ impl PassthroughFs {
     /// - [`FsError::Io`] if seek fails
     /// - [`FsError::InvalidHandle`] if the handle is invalid
     pub fn lseek(&self, handle: u64, offset: i64, whence: u32) -> Result<u64> {
-        let mut handles = self.handles.write().map_err(|_| {
-            FsError::Cache("failed to acquire handle lock".to_string())
-        })?;
+        let mut handles = self
+            .handles
+            .write()
+            .map_err(|_| FsError::Cache("failed to acquire handle lock".to_string()))?;
 
-        let data = handles.get_mut(&handle).ok_or(FsError::InvalidHandle(handle))?;
+        let data = handles
+            .get_mut(&handle)
+            .ok_or(FsError::InvalidHandle(handle))?;
 
         let seek_from = match whence {
             0 => SeekFrom::Start(offset as u64), // SEEK_SET
@@ -975,17 +1034,16 @@ impl PassthroughFs {
     /// - [`FsError::InvalidHandle`] if the handle is invalid
     #[cfg(target_os = "linux")]
     pub fn fallocate(&self, handle: u64, mode: u32, offset: u64, length: u64) -> Result<()> {
-        let handles = self.handles.read().map_err(|_| {
-            FsError::Cache("failed to acquire handle lock".to_string())
-        })?;
+        let handles = self
+            .handles
+            .read()
+            .map_err(|_| FsError::Cache("failed to acquire handle lock".to_string()))?;
 
         let data = handles.get(&handle).ok_or(FsError::InvalidHandle(handle))?;
         let fd = data.file.as_raw_fd();
 
         #[allow(clippy::cast_possible_wrap)]
-        let ret = unsafe {
-            libc::fallocate(fd, mode as i32, offset as i64, length as i64)
-        };
+        let ret = unsafe { libc::fallocate(fd, mode as i32, offset as i64, length as i64) };
 
         if ret != 0 {
             Err(FsError::Io(std::io::Error::last_os_error()))
@@ -997,11 +1055,14 @@ impl PassthroughFs {
     #[cfg(target_os = "macos")]
     pub fn fallocate(&self, handle: u64, _mode: u32, offset: u64, length: u64) -> Result<()> {
         // macOS doesn't have fallocate, use ftruncate as fallback for simple cases
-        let mut handles = self.handles.write().map_err(|_| {
-            FsError::Cache("failed to acquire handle lock".to_string())
-        })?;
+        let mut handles = self
+            .handles
+            .write()
+            .map_err(|_| FsError::Cache("failed to acquire handle lock".to_string()))?;
 
-        let data = handles.get_mut(&handle).ok_or(FsError::InvalidHandle(handle))?;
+        let data = handles
+            .get_mut(&handle)
+            .ok_or(FsError::InvalidHandle(handle))?;
         let new_size = offset + length;
         data.file.set_len(new_size).map_err(FsError::Io)
     }
@@ -1052,9 +1113,10 @@ impl PassthroughFs {
             let entry_path = entry.path();
             let relative = self.relative_path(&entry_path);
             let entry_ino = {
-                let inodes = self.inodes.read().map_err(|_| {
-                    FsError::Cache("failed to acquire inode lock".to_string())
-                })?;
+                let inodes = self
+                    .inodes
+                    .read()
+                    .map_err(|_| FsError::Cache("failed to acquire inode lock".to_string()))?;
                 let mut found_ino = None;
                 for (&ino, data) in inodes.iter() {
                     if data.path == relative {
@@ -1070,9 +1132,10 @@ impl PassthroughFs {
             } else {
                 // Create new inode
                 let new_ino = self.alloc_inode();
-                let mut inodes = self.inodes.write().map_err(|_| {
-                    FsError::Cache("failed to acquire inode lock".to_string())
-                })?;
+                let mut inodes = self
+                    .inodes
+                    .write()
+                    .map_err(|_| FsError::Cache("failed to acquire inode lock".to_string()))?;
                 inodes.insert(new_ino, InodeData::new(relative, file_type));
                 new_ino
             };
@@ -1086,9 +1149,10 @@ impl PassthroughFs {
 
         let handle = self.alloc_handle();
         {
-            let mut dir_handles = self.dir_handles.write().map_err(|_| {
-                FsError::Cache("failed to acquire dir handle lock".to_string())
-            })?;
+            let mut dir_handles = self
+                .dir_handles
+                .write()
+                .map_err(|_| FsError::Cache("failed to acquire dir handle lock".to_string()))?;
             dir_handles.insert(handle, DirHandleData { inode, entries });
         }
 
@@ -1103,26 +1167,26 @@ impl PassthroughFs {
     ///
     /// - [`FsError::InvalidHandle`] if the handle is invalid
     pub fn readdir(&self, handle: u64, offset: u64) -> Result<Vec<DirEntry>> {
-        let dir_handles = self.dir_handles.read().map_err(|_| {
-            FsError::Cache("failed to acquire dir handle lock".to_string())
-        })?;
+        let dir_handles = self
+            .dir_handles
+            .read()
+            .map_err(|_| FsError::Cache("failed to acquire dir handle lock".to_string()))?;
 
-        let data = dir_handles.get(&handle).ok_or(FsError::InvalidHandle(handle))?;
+        let data = dir_handles
+            .get(&handle)
+            .ok_or(FsError::InvalidHandle(handle))?;
 
-        let entries: Vec<DirEntry> = data.entries
-            .iter()
-            .skip(offset as usize)
-            .cloned()
-            .collect();
+        let entries: Vec<DirEntry> = data.entries.iter().skip(offset as usize).cloned().collect();
 
         Ok(entries)
     }
 
     /// Releases (closes) a directory handle.
     pub fn releasedir(&self, handle: u64) -> Result<()> {
-        let mut dir_handles = self.dir_handles.write().map_err(|_| {
-            FsError::Cache("failed to acquire dir handle lock".to_string())
-        })?;
+        let mut dir_handles = self
+            .dir_handles
+            .write()
+            .map_err(|_| FsError::Cache("failed to acquire dir handle lock".to_string()))?;
 
         dir_handles.remove(&handle);
         Ok(())
@@ -1135,11 +1199,14 @@ impl PassthroughFs {
     /// - [`FsError::Io`] if sync fails
     /// - [`FsError::InvalidHandle`] if the handle is invalid
     pub fn fsyncdir(&self, handle: u64, _datasync: bool) -> Result<()> {
-        let dir_handles = self.dir_handles.read().map_err(|_| {
-            FsError::Cache("failed to acquire dir handle lock".to_string())
-        })?;
+        let dir_handles = self
+            .dir_handles
+            .read()
+            .map_err(|_| FsError::Cache("failed to acquire dir handle lock".to_string()))?;
 
-        let data = dir_handles.get(&handle).ok_or(FsError::InvalidHandle(handle))?;
+        let data = dir_handles
+            .get(&handle)
+            .ok_or(FsError::InvalidHandle(handle))?;
         let path = self.inode_path(data.inode)?;
 
         // Open directory and sync
@@ -1170,7 +1237,12 @@ impl PassthroughFs {
         if size == 0 {
             // Query size
             let ret = unsafe {
-                libc::getxattr(path_cstr.as_ptr(), name_cstr.as_ptr(), std::ptr::null_mut(), 0)
+                libc::getxattr(
+                    path_cstr.as_ptr(),
+                    name_cstr.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                )
             };
             if ret < 0 {
                 return Err(FsError::Io(std::io::Error::last_os_error()));
@@ -1204,7 +1276,14 @@ impl PassthroughFs {
 
         if size == 0 {
             let ret = unsafe {
-                libc::getxattr(path_cstr.as_ptr(), name_cstr.as_ptr(), std::ptr::null_mut(), 0, 0, 0)
+                libc::getxattr(
+                    path_cstr.as_ptr(),
+                    name_cstr.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                )
             };
             if ret < 0 {
                 return Err(FsError::Io(std::io::Error::last_os_error()));
@@ -1386,8 +1465,14 @@ impl std::fmt::Debug for PassthroughFs {
         f.debug_struct("PassthroughFs")
             .field("root", &self.root)
             .field("inodes", &self.inodes.read().map(|i| i.len()).unwrap_or(0))
-            .field("handles", &self.handles.read().map(|h| h.len()).unwrap_or(0))
-            .field("dir_handles", &self.dir_handles.read().map(|h| h.len()).unwrap_or(0))
+            .field(
+                "handles",
+                &self.handles.read().map(|h| h.len()).unwrap_or(0),
+            )
+            .field(
+                "dir_handles",
+                &self.dir_handles.read().map(|h| h.len()).unwrap_or(0),
+            )
             .finish()
     }
 }
@@ -1563,7 +1648,11 @@ mod tests {
 
         // Create hard link
         let (link_inode, attr) = fs
-            .link(orig_inode, PassthroughFs::ROOT_INODE, OsStr::new("hardlink.txt"))
+            .link(
+                orig_inode,
+                PassthroughFs::ROOT_INODE,
+                OsStr::new("hardlink.txt"),
+            )
             .unwrap();
 
         // Hard links share the same inode
@@ -1630,7 +1719,10 @@ mod tests {
         assert!(entries.len() >= 5);
 
         // Check for expected names
-        let names: Vec<_> = entries.iter().map(|e| e.name.to_string_lossy().to_string()).collect();
+        let names: Vec<_> = entries
+            .iter()
+            .map(|e| e.name.to_string_lossy().to_string())
+            .collect();
         assert!(names.contains(&".".to_string()));
         assert!(names.contains(&"..".to_string()));
         assert!(names.contains(&"file1.txt".to_string()));
@@ -1654,7 +1746,9 @@ mod tests {
             .unwrap();
 
         // Truncate to 5 bytes
-        let attr = fs.setattr(inode, None, None, None, Some(5), None, None).unwrap();
+        let attr = fs
+            .setattr(inode, None, None, None, Some(5), None, None)
+            .unwrap();
         assert_eq!(attr.size, 5);
 
         // Verify content
@@ -1674,7 +1768,9 @@ mod tests {
             .unwrap();
 
         // Change mode
-        let attr = fs.setattr(inode, Some(0o600), None, None, None, None, None).unwrap();
+        let attr = fs
+            .setattr(inode, Some(0o600), None, None, None, None, None)
+            .unwrap();
         assert_eq!(attr.mode & 0o777, 0o600);
     }
 
@@ -1854,7 +1950,11 @@ mod tests {
 
         // Create some initial files
         for i in 0..10 {
-            std::fs::write(temp.path().join(format!("file{i}.txt")), format!("content{i}")).unwrap();
+            std::fs::write(
+                temp.path().join(format!("file{i}.txt")),
+                format!("content{i}"),
+            )
+            .unwrap();
         }
 
         let mut handles = vec![];
@@ -1876,7 +1976,8 @@ mod tests {
             handles.push(thread::spawn(move || {
                 for j in 0..50 {
                     let name = format!("file{}.txt", (i + j) % 10);
-                    if let Ok((inode, _)) = fs.lookup(PassthroughFs::ROOT_INODE, OsStr::new(&name)) {
+                    if let Ok((inode, _)) = fs.lookup(PassthroughFs::ROOT_INODE, OsStr::new(&name))
+                    {
                         if let Ok(handle) = fs.open(inode, libc::O_RDONLY as u32) {
                             let _ = fs.read(handle, 0, 100);
                             let _ = fs.release(handle);

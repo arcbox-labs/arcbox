@@ -304,7 +304,11 @@ impl PacketPool {
             {
                 self.free_count.0.fetch_sub(1, Ordering::AcqRel);
                 // Safety: We have exclusive access via CAS success.
-                unsafe { (*self.buffers[head as usize].get()).refcount.store(1, Ordering::Release) };
+                unsafe {
+                    (*self.buffers[head as usize].get())
+                        .refcount
+                        .store(1, Ordering::Release)
+                };
                 return Some(head);
             }
             // CAS failed, retry
@@ -318,9 +322,9 @@ impl PacketPool {
     ///
     /// Returns an error if the pool is empty or data is too large.
     pub fn alloc_with_data(&self, data: &[u8]) -> Result<&mut PacketBuffer> {
-        let buffer = self.alloc().ok_or_else(|| {
-            NetError::PacketPool("pool exhausted".to_string())
-        })?;
+        let buffer = self
+            .alloc()
+            .ok_or_else(|| NetError::PacketPool("pool exhausted".to_string()))?;
         buffer.copy_from_slice(data)?;
         Ok(buffer)
     }

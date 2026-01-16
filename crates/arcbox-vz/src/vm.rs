@@ -2,8 +2,8 @@
 
 use crate::error::{VZError, VZResult};
 use crate::ffi::{
-    extract_nserror, nsstring_to_string, BlockPtr, DispatchQueue, SIMPLE_BLOCK_DESCRIPTOR,
-    _NSConcreteStackBlock, _Block_copy,
+    _Block_copy, _NSConcreteStackBlock, BlockPtr, DispatchQueue, SIMPLE_BLOCK_DESCRIPTOR,
+    extract_nserror, nsstring_to_string,
 };
 use crate::socket::VirtioSocketDevice;
 use crate::{msg_send, msg_send_bool, msg_send_i64};
@@ -436,10 +436,7 @@ impl VirtualMachine {
             for i in 0..count {
                 let device = crate::ffi::nsarray_object_at_index(devices, i);
                 if !device.is_null() {
-                    result.push(VirtioSocketDevice::from_raw(
-                        device,
-                        self.queue.as_ptr(),
-                    ));
+                    result.push(VirtioSocketDevice::from_raw(device, self.queue.as_ptr()));
                 }
             }
 

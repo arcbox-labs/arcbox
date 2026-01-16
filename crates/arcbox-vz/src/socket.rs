@@ -22,11 +22,11 @@
 //! ```
 
 use crate::delegate::{
-    create_delegate_instance, register_listener, unregister_listener, IncomingConnection,
-    ListenerHandle,
+    IncomingConnection, ListenerHandle, create_delegate_instance, register_listener,
+    unregister_listener,
 };
 use crate::error::{VZError, VZResult};
-use crate::ffi::block::{create_vsock_context_block, VsockResult, _Block_release};
+use crate::ffi::block::{_Block_release, VsockResult, create_vsock_context_block};
 use crate::ffi::get_class;
 use crate::msg_send;
 use objc2::runtime::AnyObject;
@@ -77,12 +77,8 @@ unsafe extern "C" fn connect_work(ctx: *mut c_void) {
 
         // Call [device connectToPort:port completionHandler:block]
         let sel = objc2::sel!(connectToPort:completionHandler:);
-        let func: unsafe extern "C" fn(
-            *mut AnyObject,
-            objc2::runtime::Sel,
-            u32,
-            *const c_void,
-        ) = std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
+        let func: unsafe extern "C" fn(*mut AnyObject, objc2::runtime::Sel, u32, *const c_void) =
+            std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
 
         func(context.device, sel, context.port, context.block);
 
@@ -183,10 +179,7 @@ impl VirtioSocketDevice {
         // CRITICAL: Must use dispatch_async, not dispatch_sync
         // The completion handler will be called on the same queue
         unsafe {
-            tracing::debug!(
-                "Dispatching connect to VM queue {:?}",
-                self.queue
-            );
+            tracing::debug!("Dispatching connect to VM queue {:?}", self.queue);
             dispatch_async_f(self.queue, context_ptr as *mut c_void, connect_work);
         }
 
@@ -275,12 +268,11 @@ impl VirtioSocketDevice {
 
         unsafe {
             // Create VZVirtioSocketListener object
-            let listener_cls = get_class("VZVirtioSocketListener").ok_or_else(|| {
-                VZError::Internal {
+            let listener_cls =
+                get_class("VZVirtioSocketListener").ok_or_else(|| VZError::Internal {
                     code: -1,
                     message: "VZVirtioSocketListener class not found".into(),
-                }
-            })?;
+                })?;
             let listener_obj: *mut AnyObject = msg_send!(listener_cls, new);
             if listener_obj.is_null() {
                 return Err(VZError::Internal {
@@ -308,7 +300,11 @@ impl VirtioSocketDevice {
             };
 
             // Set delegate on listener: [listener setDelegate:delegate]
-            tracing::debug!("Setting delegate {:?} on listener {:?}", delegate, listener_obj);
+            tracing::debug!(
+                "Setting delegate {:?} on listener {:?}",
+                delegate,
+                listener_obj
+            );
             let set_delegate_sel = objc2::sel!(setDelegate:);
             let set_delegate_fn: unsafe extern "C" fn(
                 *mut AnyObject,

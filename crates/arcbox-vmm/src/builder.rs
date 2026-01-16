@@ -11,12 +11,12 @@ use crate::irq::IrqChip;
 use crate::memory::MemoryManager;
 use crate::vmm::{Vmm, VmmConfig};
 
+use arcbox_virtio::VirtioDevice;
 use arcbox_virtio::blk::{BlockConfig, VirtioBlock};
 use arcbox_virtio::console::{ConsoleConfig, VirtioConsole};
-use arcbox_virtio::net::{NetConfig, VirtioNet};
 use arcbox_virtio::fs::{FsConfig, VirtioFs};
-use arcbox_virtio::vsock::{VsockConfig, VirtioVsock};
-use arcbox_virtio::VirtioDevice;
+use arcbox_virtio::net::{NetConfig, VirtioNet};
+use arcbox_virtio::vsock::{VirtioVsock, VsockConfig};
 
 /// Block device configuration for the builder.
 #[derive(Debug, Clone)]
@@ -224,17 +224,10 @@ impl VmBuilder {
 
     /// Adds a network device.
     #[must_use]
-    pub fn network_device(
-        mut self,
-        mac: Option<[u8; 6]>,
-        tap_name: Option<String>,
-    ) -> Self {
+    pub fn network_device(mut self, mac: Option<[u8; 6]>, tap_name: Option<String>) -> Self {
         let id = format!("eth{}", self.network_devices.len());
-        self.network_devices.push(NetworkDeviceConfig {
-            mac,
-            tap_name,
-            id,
-        });
+        self.network_devices
+            .push(NetworkDeviceConfig { mac, tap_name, id });
         self
     }
 

@@ -2,11 +2,15 @@
 //!
 //! These tests verify the interaction between different VirtIO components.
 
-use arcbox_virtio::blk::{BlockConfig, VirtioBlock, BlockRequestType, MmapBackend, AsyncBlockBackend};
-use arcbox_virtio::console::{ConsoleConfig, VirtioConsole, BufferConsole, ConsoleIo};
-use arcbox_virtio::net::{NetConfig, VirtioNet, LoopbackBackend, NetPacket, VirtioNetHeader, NetBackend};
-use arcbox_virtio::vsock::{VsockConfig, VirtioVsock, VsockAddr};
+use arcbox_virtio::blk::{
+    AsyncBlockBackend, BlockConfig, BlockRequestType, MmapBackend, VirtioBlock,
+};
+use arcbox_virtio::console::{BufferConsole, ConsoleConfig, ConsoleIo, VirtioConsole};
 use arcbox_virtio::fs::{FsConfig, VirtioFs};
+use arcbox_virtio::net::{
+    LoopbackBackend, NetBackend, NetConfig, NetPacket, VirtioNet, VirtioNetHeader,
+};
+use arcbox_virtio::vsock::{VirtioVsock, VsockAddr, VsockConfig};
 use arcbox_virtio::{VirtioDevice, VirtioDeviceId};
 
 // ============================================================================
@@ -213,7 +217,7 @@ fn test_network_packet_handling() {
         gso_type: VirtioNetHeader::GSO_NONE,
         hdr_len: 0,
         gso_size: 0,
-        csum_start: 14, // After Ethernet header
+        csum_start: 14,  // After Ethernet header
         csum_offset: 16, // TCP checksum offset
         num_buffers: 1,
     };
@@ -452,7 +456,9 @@ fn test_console_high_throughput() {
 
     // Write lots of data
     for _ in 0..1000 {
-        backend.write(b"Hello, VirtIO console! This is a test message.\n").unwrap();
+        backend
+            .write(b"Hello, VirtIO console! This is a test message.\n")
+            .unwrap();
     }
 
     // Just verify it doesn't panic

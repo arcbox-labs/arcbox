@@ -494,10 +494,9 @@ mod linux_impl {
             }
 
             // Allocate IP
-            let ip = self
-                .allocator
-                .allocate()
-                .ok_or_else(|| NetError::AddressAllocation("no IP addresses available".to_string()))?;
+            let ip = self.allocator.allocate().ok_or_else(|| {
+                NetError::AddressAllocation("no IP addresses available".to_string())
+            })?;
 
             // Create TAP device
             let tap_name = format!("tap-{}", name.chars().take(10).collect::<String>());

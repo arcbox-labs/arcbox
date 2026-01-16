@@ -309,7 +309,10 @@ impl LinuxBridge {
     /// Returns a list of attached interfaces.
     #[must_use]
     pub fn attached_interfaces(&self) -> Vec<&str> {
-        self.attached_interfaces.iter().map(|s| s.as_str()).collect()
+        self.attached_interfaces
+            .iter()
+            .map(|s| s.as_str())
+            .collect()
     }
 
     /// Checks if the bridge exists.

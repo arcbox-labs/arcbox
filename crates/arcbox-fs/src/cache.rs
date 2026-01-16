@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -264,7 +264,8 @@ impl NegativeCache {
     /// but can also be called manually for maintenance.
     pub fn evict_expired(&self) {
         let timeout = self.config.timeout;
-        self.entries.retain(|_, inserted_at| inserted_at.elapsed() < timeout);
+        self.entries
+            .retain(|_, inserted_at| inserted_at.elapsed() < timeout);
     }
 
     /// Returns current cache statistics.

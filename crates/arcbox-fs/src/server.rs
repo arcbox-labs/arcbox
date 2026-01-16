@@ -11,10 +11,10 @@ use std::sync::Arc;
 
 use arcbox_virtio::fs::{FuseRequestHandler, FuseSession};
 
+use crate::FsConfig;
 use crate::dispatcher::{DispatcherConfig, FuseDispatcher};
 use crate::error::{FsError, Result};
 use crate::passthrough::PassthroughFs;
-use crate::FsConfig;
 
 /// Filesystem server state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,9 +138,10 @@ impl FsServer {
     ///
     /// Returns an error if the request cannot be processed.
     pub fn handle_request(&self, request: &[u8]) -> Result<Vec<u8>> {
-        let dispatcher = self.dispatcher.as_ref().ok_or_else(|| {
-            FsError::Fuse("Server not started".to_string())
-        })?;
+        let dispatcher = self
+            .dispatcher
+            .as_ref()
+            .ok_or_else(|| FsError::Fuse("Server not started".to_string()))?;
 
         dispatcher.dispatch(request)
     }
@@ -164,12 +165,11 @@ impl FsServer {
 
 impl FuseRequestHandler for FsServer {
     fn handle_request(&self, request: &[u8]) -> arcbox_virtio::Result<Vec<u8>> {
-        self.handle_request(request).map_err(|e| {
-            arcbox_virtio::VirtioError::DeviceError {
+        self.handle_request(request)
+            .map_err(|e| arcbox_virtio::VirtioError::DeviceError {
                 device: "fs".to_string(),
                 message: e.to_string(),
-            }
-        })
+            })
     }
 
     fn on_init(&self, session: &FuseSession) {
@@ -221,7 +221,9 @@ mod tests {
 
     #[test]
     fn test_server_handle_request() {
-        use crate::fuse::{FuseInHeader, FuseInitIn, FuseOpcode, FUSE_KERNEL_VERSION, FUSE_KERNEL_MINOR_VERSION};
+        use crate::fuse::{
+            FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, FuseInHeader, FuseInitIn, FuseOpcode,
+        };
         use std::mem::size_of;
 
         let temp = TempDir::new().unwrap();

@@ -104,9 +104,17 @@ impl VirtioVsock {
             conn.state = ConnectionState::Connected;
         }
 
-        self.connections.write().unwrap().insert((src_port, dst_port), conn);
-        tracing::debug!("Vsock connect: {}:{} -> {}:{}",
-            self.config.guest_cid, src_port, Self::HOST_CID, dst_port);
+        self.connections
+            .write()
+            .unwrap()
+            .insert((src_port, dst_port), conn);
+        tracing::debug!(
+            "Vsock connect: {}:{} -> {}:{}",
+            self.config.guest_cid,
+            src_port,
+            Self::HOST_CID,
+            dst_port
+        );
 
         Ok(())
     }
@@ -156,7 +164,10 @@ impl VirtioVsock {
             backend.lock().unwrap().on_close(local)?;
         }
 
-        self.connections.write().unwrap().remove(&(src_port, dst_port));
+        self.connections
+            .write()
+            .unwrap()
+            .remove(&(src_port, dst_port));
         tracing::debug!("Vsock close: {}:{}", self.config.guest_cid, src_port);
 
         Ok(())
@@ -204,7 +215,10 @@ impl VirtioDevice for VirtioVsock {
             tracing::info!("Vsock: using loopback backend (no backend configured)");
             self.backend = Some(Arc::new(Mutex::new(LoopbackBackend::new())));
         }
-        tracing::info!("Vsock device activated, guest CID: {}", self.config.guest_cid);
+        tracing::info!(
+            "Vsock device activated, guest CID: {}",
+            self.config.guest_cid
+        );
         Ok(())
     }
 
@@ -543,7 +557,8 @@ impl TcpBackend {
         let listener = TcpListener::bind(format!("127.0.0.1:{}", tcp_port))
             .map_err(|e| VirtioError::Io(format!("Failed to bind: {}", e)))?;
 
-        listener.set_nonblocking(true)
+        listener
+            .set_nonblocking(true)
             .map_err(|e| VirtioError::Io(format!("Failed to set nonblocking: {}", e)))?;
 
         self.listeners.write().unwrap().insert(port, listener);
@@ -557,8 +572,9 @@ impl TcpBackend {
         if let Some(listener) = listeners.get(&port) {
             match listener.accept() {
                 Ok((stream, _addr)) => {
-                    stream.set_nonblocking(true)
-                        .map_err(|e| VirtioError::Io(format!("Failed to set nonblocking: {}", e)))?;
+                    stream.set_nonblocking(true).map_err(|e| {
+                        VirtioError::Io(format!("Failed to set nonblocking: {}", e))
+                    })?;
 
                     let local = VsockAddr::new(VirtioVsock::HOST_CID, port);
                     let remote = VsockAddr::new(self.guest_cid, port);
@@ -581,7 +597,8 @@ impl VsockBackend for TcpBackend {
         let stream = TcpStream::connect(format!("127.0.0.1:{}", tcp_port))
             .map_err(|e| VirtioError::Io(format!("Connect failed: {}", e)))?;
 
-        stream.set_nonblocking(true)
+        stream
+            .set_nonblocking(true)
             .map_err(|e| VirtioError::Io(format!("Failed to set nonblocking: {}", e)))?;
 
         self.connections.write().unwrap().insert(addr, stream);
@@ -591,7 +608,8 @@ impl VsockBackend for TcpBackend {
     fn on_send(&mut self, addr: VsockAddr, data: &[u8]) -> Result<usize> {
         let mut connections = self.connections.write().unwrap();
         if let Some(stream) = connections.get_mut(&addr) {
-            stream.write(data)
+            stream
+                .write(data)
                 .map_err(|e| VirtioError::Io(format!("Send failed: {}", e)))
         } else {
             Err(VirtioError::InvalidOperation("Connection not found".into()))
@@ -701,7 +719,9 @@ mod tests {
 
     #[test]
     fn test_vsock_read_config() {
-        let config = VsockConfig { guest_cid: 0x12345678 };
+        let config = VsockConfig {
+            guest_cid: 0x12345678,
+        };
         let vsock = VirtioVsock::new(config);
 
         let mut data = [0u8; 8];
@@ -713,7 +733,9 @@ mod tests {
 
     #[test]
     fn test_vsock_read_config_partial() {
-        let config = VsockConfig { guest_cid: 0xDEADBEEF };
+        let config = VsockConfig {
+            guest_cid: 0xDEADBEEF,
+        };
         let vsock = VirtioVsock::new(config);
 
         // Read only first 4 bytes
@@ -726,7 +748,9 @@ mod tests {
 
     #[test]
     fn test_vsock_read_config_offset() {
-        let config = VsockConfig { guest_cid: 0xAABBCCDD_11223344 };
+        let config = VsockConfig {
+            guest_cid: 0xAABBCCDD_11223344,
+        };
         let vsock = VirtioVsock::new(config);
 
         // Read from offset 4
@@ -870,20 +894,14 @@ mod tests {
 
     #[test]
     fn test_vsock_with_loopback_backend() {
-        let vsock = VirtioVsock::with_backend(
-            VsockConfig::default(),
-            LoopbackBackend::new(),
-        );
+        let vsock = VirtioVsock::with_backend(VsockConfig::default(), LoopbackBackend::new());
         assert_eq!(vsock.guest_cid(), 3);
         assert_eq!(vsock.connection_count(), 0);
     }
 
     #[test]
     fn test_vsock_connect_send_recv() {
-        let vsock = VirtioVsock::with_backend(
-            VsockConfig::default(),
-            LoopbackBackend::new(),
-        );
+        let vsock = VirtioVsock::with_backend(VsockConfig::default(), LoopbackBackend::new());
 
         // Connect
         vsock.handle_connect(1000, 80).unwrap();
@@ -907,10 +925,7 @@ mod tests {
 
     #[test]
     fn test_vsock_connection_state() {
-        let conn = VsockConnection::new(
-            VsockAddr::new(3, 1000),
-            VsockAddr::new(2, 80),
-        );
+        let conn = VsockConnection::new(VsockAddr::new(3, 1000), VsockAddr::new(2, 80));
         assert_eq!(conn.state, ConnectionState::Idle);
         assert_eq!(conn.tx_available(), 0);
         assert_eq!(conn.rx_available(), 0);
@@ -918,10 +933,7 @@ mod tests {
 
     #[test]
     fn test_vsock_connection_buffers() {
-        let mut conn = VsockConnection::new(
-            VsockAddr::new(3, 1000),
-            VsockAddr::new(2, 80),
-        );
+        let mut conn = VsockConnection::new(VsockAddr::new(3, 1000), VsockAddr::new(2, 80));
 
         // TX buffer
         conn.enqueue_tx(b"hello");

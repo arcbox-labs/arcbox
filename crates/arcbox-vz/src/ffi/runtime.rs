@@ -62,7 +62,10 @@ macro_rules! msg_send {
 macro_rules! msg_send_u64 {
     ($obj:expr, $sel:ident) => {{
         let sel = objc2::sel!($sel);
-        let func: unsafe extern "C" fn(*const objc2::runtime::AnyObject, objc2::runtime::Sel) -> u64 =
+        let func: unsafe extern "C" fn(
+            *const objc2::runtime::AnyObject,
+            objc2::runtime::Sel,
+        ) -> u64 =
             std::mem::transmute($crate::ffi::runtime::objc_msgSend as *const std::ffi::c_void);
         func($obj as *const _ as *const objc2::runtime::AnyObject, sel)
     }};
@@ -73,7 +76,10 @@ macro_rules! msg_send_u64 {
 macro_rules! msg_send_i64 {
     ($obj:expr, $sel:ident) => {{
         let sel = objc2::sel!($sel);
-        let func: unsafe extern "C" fn(*const objc2::runtime::AnyObject, objc2::runtime::Sel) -> i64 =
+        let func: unsafe extern "C" fn(
+            *const objc2::runtime::AnyObject,
+            objc2::runtime::Sel,
+        ) -> i64 =
             std::mem::transmute($crate::ffi::runtime::objc_msgSend as *const std::ffi::c_void);
         func($obj as *const _ as *const objc2::runtime::AnyObject, sel)
     }};
@@ -84,7 +90,10 @@ macro_rules! msg_send_i64 {
 macro_rules! msg_send_i32 {
     ($obj:expr, $sel:ident) => {{
         let sel = objc2::sel!($sel);
-        let func: unsafe extern "C" fn(*const objc2::runtime::AnyObject, objc2::runtime::Sel) -> i32 =
+        let func: unsafe extern "C" fn(
+            *const objc2::runtime::AnyObject,
+            objc2::runtime::Sel,
+        ) -> i32 =
             std::mem::transmute($crate::ffi::runtime::objc_msgSend as *const std::ffi::c_void);
         func($obj as *const _ as *const objc2::runtime::AnyObject, sel)
     }};

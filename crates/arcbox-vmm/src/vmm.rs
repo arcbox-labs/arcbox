@@ -5,8 +5,8 @@
 
 use std::any::Any;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::device::DeviceManager;
 #[cfg(target_os = "linux")]
@@ -17,18 +17,18 @@ use crate::irq::{Gsi, IrqChip, IrqTriggerCallback};
 use crate::memory::MemoryManager;
 use crate::vcpu::VcpuManager;
 
-use arcbox_hypervisor::VmConfig;
-#[cfg(target_os = "linux")]
-use arcbox_hypervisor::VirtioDeviceConfig;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use arcbox_hypervisor::GuestAddress;
+#[cfg(target_os = "linux")]
+use arcbox_hypervisor::VirtioDeviceConfig;
+use arcbox_hypervisor::VmConfig;
 #[cfg(target_os = "linux")]
 use arcbox_hypervisor::linux::VirtioDeviceInfo;
 
 #[cfg(target_arch = "aarch64")]
 use crate::boot::arm64;
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-use crate::fdt::{generate_fdt, FdtConfig};
+use crate::fdt::{FdtConfig, generate_fdt};
 
 /// Type-erased VM handle for managed execution mode.
 type ManagedVm = Box<dyn Any + Send + Sync>;
@@ -189,9 +189,7 @@ impl Vmm {
         }
 
         if config.memory_size < 64 * 1024 * 1024 {
-            return Err(VmmError::Config(
-                "memory_size must be >= 64MB".to_string(),
-            ));
+            return Err(VmmError::Config("memory_size must be >= 64MB".to_string()));
         }
 
         if !config.kernel_path.as_os_str().is_empty() && !config.kernel_path.exists() {
@@ -280,9 +278,9 @@ impl Vmm {
     /// Darwin-specific initialization using Virtualization.framework.
     #[cfg(target_os = "macos")]
     fn initialize_darwin(&mut self) -> Result<()> {
+        use arcbox_hypervisor::VirtioDeviceConfig;
         use arcbox_hypervisor::darwin::DarwinHypervisor;
         use arcbox_hypervisor::traits::{Hypervisor, VirtualMachine};
-        use arcbox_hypervisor::VirtioDeviceConfig;
 
         let hypervisor = DarwinHypervisor::new()?;
         tracing::debug!("Platform capabilities: {:?}", hypervisor.capabilities());
@@ -379,9 +377,9 @@ impl Vmm {
     /// Linux-specific initialization using KVM.
     #[cfg(target_os = "linux")]
     fn initialize_linux(&mut self) -> Result<()> {
-        use std::sync::Mutex;
         use arcbox_hypervisor::linux::KvmVm;
         use arcbox_hypervisor::traits::VirtualMachine;
+        use std::sync::Mutex;
 
         // Create hypervisor and VM
         let hypervisor = create_hypervisor()?;
@@ -772,9 +770,10 @@ impl Vmm {
             }
         }
 
-        let guest_cid = self.config.guest_cid.ok_or_else(|| {
-            VmmError::InvalidState("guest_cid not configured".to_string())
-        })?;
+        let guest_cid = self
+            .config
+            .guest_cid
+            .ok_or_else(|| VmmError::InvalidState("guest_cid not configured".to_string()))?;
 
         let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
         if fd < 0 {
@@ -868,11 +867,7 @@ impl Vmm {
     ///
     /// This processes exits from the hypervisor such as I/O, MMIO, and special
     /// instructions that require VMM intervention.
-    fn handle_vcpu_exit(
-        &mut self,
-        vcpu_id: u32,
-        exit: arcbox_hypervisor::VcpuExit,
-    ) -> Result<()> {
+    fn handle_vcpu_exit(&mut self, vcpu_id: u32, exit: arcbox_hypervisor::VcpuExit) -> Result<()> {
         use arcbox_hypervisor::VcpuExit;
 
         match exit {
@@ -883,8 +878,13 @@ impl Vmm {
             }
 
             VcpuExit::IoOut { port, size, data } => {
-                tracing::trace!("vCPU {} I/O out: port={:#x}, size={}, data={:#x}",
-                    vcpu_id, port, size, data);
+                tracing::trace!(
+                    "vCPU {} I/O out: port={:#x}, size={}, data={:#x}",
+                    vcpu_id,
+                    port,
+                    size,
+                    data
+                );
                 self.handle_io_out(port, size, data)?;
             }
 
@@ -896,7 +896,12 @@ impl Vmm {
             }
 
             VcpuExit::MmioRead { addr, size } => {
-                tracing::trace!("vCPU {} MMIO read: addr={:#x}, size={}", vcpu_id, addr, size);
+                tracing::trace!(
+                    "vCPU {} MMIO read: addr={:#x}, size={}",
+                    vcpu_id,
+                    addr,
+                    size
+                );
                 if let Some(ref device_manager) = self.device_manager {
                     match device_manager.handle_mmio_read(addr, size as usize) {
                         Ok(value) => {
@@ -911,8 +916,13 @@ impl Vmm {
             }
 
             VcpuExit::MmioWrite { addr, size, data } => {
-                tracing::trace!("vCPU {} MMIO write: addr={:#x}, size={}, data={:#x}",
-                    vcpu_id, addr, size, data);
+                tracing::trace!(
+                    "vCPU {} MMIO write: addr={:#x}, size={}, data={:#x}",
+                    vcpu_id,
+                    addr,
+                    size,
+                    data
+                );
                 if let Some(ref device_manager) = self.device_manager {
                     if let Err(e) = device_manager.handle_mmio_write(addr, size as usize, data) {
                         tracing::warn!("MMIO write failed at {:#x}: {}", addr, e);
@@ -1022,8 +1032,12 @@ impl Vmm {
             }
 
             _ => {
-                tracing::trace!("Unhandled I/O out: port={:#x}, size={}, data={:#x}",
-                    port, size, data);
+                tracing::trace!(
+                    "Unhandled I/O out: port={:#x}, size={}, data={:#x}",
+                    port,
+                    size,
+                    data
+                );
             }
         }
         Ok(())
@@ -1039,9 +1053,7 @@ impl Vmm {
             }
 
             // RTC (Real-Time Clock)
-            0x70 | 0x71 => {
-                0
-            }
+            0x70 | 0x71 => 0,
 
             // Keyboard controller status
             0x64 => {
@@ -1050,9 +1062,7 @@ impl Vmm {
             }
 
             // PIC
-            0x20 | 0x21 | 0xA0 | 0xA1 => {
-                0xFF
-            }
+            0x20 | 0x21 | 0xA0 | 0xA1 => 0xFF,
 
             _ => {
                 tracing::trace!("Unhandled I/O in: port={:#x}, size={}", port, size);
@@ -1085,11 +1095,19 @@ impl Vmm {
             4 => {
                 // Kick another vCPU
                 let target_vcpu = args[0] as u32;
-                tracing::trace!("vCPU {} hypercall: KICK_CPU target={}", vcpu_id, target_vcpu);
+                tracing::trace!(
+                    "vCPU {} hypercall: KICK_CPU target={}",
+                    vcpu_id,
+                    target_vcpu
+                );
             }
             _ => {
-                tracing::debug!("vCPU {} unhandled hypercall: nr={}, args={:?}",
-                    vcpu_id, nr, args);
+                tracing::debug!(
+                    "vCPU {} unhandled hypercall: nr={}, args={:?}",
+                    vcpu_id,
+                    nr,
+                    args
+                );
             }
         }
         Ok(())
@@ -1097,7 +1115,9 @@ impl Vmm {
 }
 
 #[cfg(target_os = "linux")]
-fn map_virtio_devices_to_fdt_entries(devices: &[arcbox_hypervisor::linux::VirtioDeviceInfo]) -> Vec<DeviceTreeEntry> {
+fn map_virtio_devices_to_fdt_entries(
+    devices: &[arcbox_hypervisor::linux::VirtioDeviceInfo],
+) -> Vec<DeviceTreeEntry> {
     devices
         .iter()
         .map(|device| DeviceTreeEntry {

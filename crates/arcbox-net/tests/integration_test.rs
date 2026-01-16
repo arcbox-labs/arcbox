@@ -8,10 +8,8 @@
 // ============================================================================
 
 mod datapath {
-    use arcbox_net::datapath::{
-        LockFreeRing, PacketPool, ZeroCopyPacket, DatapathStats,
-    };
     use arcbox_net::datapath::ring::MpmcRing;
+    use arcbox_net::datapath::{DatapathStats, LockFreeRing, PacketPool, ZeroCopyPacket};
 
     /// Test packet flow through pool and ring buffer.
     #[test]
@@ -84,15 +82,15 @@ mod datapath {
 
         // IP header (20 bytes at offset 14)
         packet_data[14] = 0x45; // IPv4, IHL=5
-        packet_data[23] = 6;    // Protocol: TCP
+        packet_data[23] = 6; // Protocol: TCP
 
         // IP addresses
         packet_data[26..30].copy_from_slice(&[192, 168, 1, 100]); // src
-        packet_data[30..34].copy_from_slice(&[10, 0, 0, 1]);      // dst
+        packet_data[30..34].copy_from_slice(&[10, 0, 0, 1]); // dst
 
         // TCP ports (at offset 34)
         packet_data[34..36].copy_from_slice(&8080u16.to_be_bytes()); // src port
-        packet_data[36..38].copy_from_slice(&80u16.to_be_bytes());   // dst port
+        packet_data[36..38].copy_from_slice(&80u16.to_be_bytes()); // dst port
 
         // Create zero-copy packet
         let packet = unsafe {
@@ -188,11 +186,10 @@ mod datapath {
 // ============================================================================
 
 mod nat_engine {
-    use arcbox_net::nat_engine::{
-        NatEngine, NatEngineConfig, NatDirection, NatResult,
-        incremental_checksum_update,
-    };
     use arcbox_net::nat_engine::checksum::incremental_checksum_update_32;
+    use arcbox_net::nat_engine::{
+        NatDirection, NatEngine, NatEngineConfig, NatResult, incremental_checksum_update,
+    };
     use std::net::Ipv4Addr;
 
     /// Helper to create a test packet.
@@ -267,9 +264,9 @@ mod nat_engine {
         engine.set_internal_network(Ipv4Addr::new(172, 16, 0, 0), 16);
 
         let destinations = [
-            ([1, 1, 1, 1], 53u16),      // DNS
-            ([8, 8, 8, 8], 53u16),      // DNS
-            ([93, 184, 216, 34], 80u16), // HTTP
+            ([1, 1, 1, 1], 53u16),        // DNS
+            ([8, 8, 8, 8], 53u16),        // DNS
+            ([93, 184, 216, 34], 80u16),  // HTTP
             ([93, 184, 216, 34], 443u16), // HTTPS
         ];
 
@@ -299,20 +296,18 @@ mod nat_engine {
     /// Test connection tracking expiration.
     #[test]
     fn test_connection_expiration() {
-        let config = NatEngineConfig::new(Ipv4Addr::new(192, 0, 2, 1))
-            .with_timeout(0); // Immediate expiration
+        let config = NatEngineConfig::new(Ipv4Addr::new(192, 0, 2, 1)).with_timeout(0); // Immediate expiration
 
         let mut engine = NatEngine::new(&config);
         engine.set_internal_network(Ipv4Addr::new(10, 10, 0, 0), 16);
 
         // Create a connection
-        let mut packet = create_tcp_packet(
-            [10, 10, 1, 1],
-            [8, 8, 8, 8],
-            12345,
-            53,
-        );
-        unsafe { engine.translate(&mut packet, NatDirection::Outbound).unwrap() };
+        let mut packet = create_tcp_packet([10, 10, 1, 1], [8, 8, 8, 8], 12345, 53);
+        unsafe {
+            engine
+                .translate(&mut packet, NatDirection::Outbound)
+                .unwrap()
+        };
 
         assert_eq!(engine.connection_count(), 1);
 
@@ -391,8 +386,8 @@ mod nat_engine {
 
         // Traffic from external source (not internal network)
         let mut packet = create_tcp_packet(
-            [8, 8, 8, 8],   // External source
-            [1, 1, 1, 1],   // External destination
+            [8, 8, 8, 8], // External source
+            [1, 1, 1, 1], // External destination
             12345,
             80,
         );
@@ -429,11 +424,11 @@ mod nat_engine {
 // ============================================================================
 
 mod stress {
-    use arcbox_net::datapath::{LockFreeRing, PacketPool};
     use arcbox_net::datapath::ring::MpmcRing;
+    use arcbox_net::datapath::{LockFreeRing, PacketPool};
     use std::sync::Arc;
-    use std::thread;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
 
     /// Stress test SPSC ring with high throughput.
     #[test]
@@ -594,7 +589,7 @@ mod stress {
 // ============================================================================
 
 mod error_handling {
-    use arcbox_net::nat_engine::{NatEngine, NatDirection, TranslateError};
+    use arcbox_net::nat_engine::{NatDirection, NatEngine, TranslateError};
     use std::net::Ipv4Addr;
 
     /// Test handling of malformed packets.
@@ -661,7 +656,7 @@ mod error_handling {
 // ============================================================================
 
 mod network_manager {
-    use arcbox_net::{NetworkManager, NetConfig, NetworkMode};
+    use arcbox_net::{NetConfig, NetworkManager, NetworkMode};
 
     #[test]
     fn test_network_manager_creation() {

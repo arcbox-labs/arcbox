@@ -151,10 +151,7 @@ mod tests {
 
     #[test]
     fn test_cache_padded_size() {
-        assert_eq!(
-            std::mem::size_of::<CachePadded<u64>>(),
-            CACHE_LINE_SIZE
-        );
+        assert_eq!(std::mem::size_of::<CachePadded<u64>>(), CACHE_LINE_SIZE);
     }
 
     #[test]

@@ -119,11 +119,7 @@ impl IrqChip {
     /// # Errors
     ///
     /// Returns an error if no IRQ is available.
-    pub fn allocate_irq_with_config(
-        &self,
-        gsi: Gsi,
-        trigger_mode: TriggerMode,
-    ) -> Result<Irq> {
+    pub fn allocate_irq_with_config(&self, gsi: Gsi, trigger_mode: TriggerMode) -> Result<Irq> {
         let irq = self.next_irq.fetch_add(1, Ordering::SeqCst);
         if irq >= MAX_IRQS {
             return Err(crate::error::VmmError::Irq("IRQ exhausted".to_string()));
@@ -193,7 +189,10 @@ impl IrqChip {
             );
             Ok(())
         } else {
-            Err(crate::error::VmmError::Irq(format!("IRQ {} not allocated", irq)))
+            Err(crate::error::VmmError::Irq(format!(
+                "IRQ {} not allocated",
+                irq
+            )))
         }
     }
 
@@ -526,7 +525,9 @@ mod tests {
         });
         chip.set_trigger_callback(Arc::new(callback));
 
-        let irq = chip.allocate_irq_with_config(3, TriggerMode::Level).unwrap();
+        let irq = chip
+            .allocate_irq_with_config(3, TriggerMode::Level)
+            .unwrap();
 
         // Assert
         chip.trigger_irq(irq).unwrap();
@@ -561,11 +562,14 @@ mod tests {
         // Insert config for legacy IRQ 5
         {
             let mut configs = chip.irq_configs.write().unwrap();
-            configs.insert(legacy_irq, super::IrqConfig {
-                gsi: 5,
-                trigger_mode: TriggerMode::Edge,
-                asserted: false,
-            });
+            configs.insert(
+                legacy_irq,
+                super::IrqConfig {
+                    gsi: 5,
+                    trigger_mode: TriggerMode::Edge,
+                    asserted: false,
+                },
+            );
         }
 
         // Mask legacy IRQ and try to trigger

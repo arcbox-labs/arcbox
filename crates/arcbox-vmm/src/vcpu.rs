@@ -81,7 +81,12 @@ impl ExitHandler for DeviceManagerExitHandler {
 
     fn handle_io_write(&self, port: u16, size: usize, data: u64) {
         // Handle common I/O ports
-        tracing::trace!("I/O write: port={:#x}, size={}, data={:#x}", port, size, data);
+        tracing::trace!(
+            "I/O write: port={:#x}, size={}, data={:#x}",
+            port,
+            size,
+            data
+        );
     }
 }
 
@@ -262,7 +267,10 @@ impl VcpuManager {
                                 } else {
                                     tracing::trace!(
                                         "vCPU {} I/O out: port={:#x}, size={}, data={:#x}",
-                                        id, port, size, data
+                                        id,
+                                        port,
+                                        size,
+                                        data
                                     );
                                 }
                             }
@@ -272,7 +280,9 @@ impl VcpuManager {
                                 } else {
                                     tracing::trace!(
                                         "vCPU {} I/O in: port={:#x}, size={}",
-                                        id, port, size
+                                        id,
+                                        port,
+                                        size
                                     );
                                     0xFF
                                 };
@@ -287,7 +297,9 @@ impl VcpuManager {
                                 } else {
                                     tracing::trace!(
                                         "vCPU {} MMIO read: addr={:#x}, size={}",
-                                        id, addr, size
+                                        id,
+                                        addr,
+                                        size
                                     );
                                     0
                                 };
@@ -302,7 +314,10 @@ impl VcpuManager {
                                 } else {
                                     tracing::trace!(
                                         "vCPU {} MMIO write: addr={:#x}, size={}, data={:#x}",
-                                        id, addr, size, data
+                                        id,
+                                        addr,
+                                        size,
+                                        data
                                     );
                                 }
                             }
@@ -331,9 +346,10 @@ impl VcpuManager {
         self.running.store(true, Ordering::SeqCst);
 
         for handle in &self.handles {
-            handle.cmd_tx.send(VcpuCommand::Run).map_err(|e| {
-                VmmError::Vcpu(format!("failed to send Run command: {}", e))
-            })?;
+            handle
+                .cmd_tx
+                .send(VcpuCommand::Run)
+                .map_err(|e| VmmError::Vcpu(format!("failed to send Run command: {}", e)))?;
         }
 
         tracing::info!("Started {} vCPUs", self.vcpu_count);
@@ -347,9 +363,10 @@ impl VcpuManager {
     /// Returns an error if vCPUs cannot be paused.
     pub fn pause(&mut self) -> Result<()> {
         for handle in &self.handles {
-            handle.cmd_tx.send(VcpuCommand::Pause).map_err(|e| {
-                VmmError::Vcpu(format!("failed to send Pause command: {}", e))
-            })?;
+            handle
+                .cmd_tx
+                .send(VcpuCommand::Pause)
+                .map_err(|e| VmmError::Vcpu(format!("failed to send Pause command: {}", e)))?;
         }
 
         tracing::info!("Paused {} vCPUs", self.vcpu_count);
@@ -363,9 +380,10 @@ impl VcpuManager {
     /// Returns an error if vCPUs cannot be resumed.
     pub fn resume(&mut self) -> Result<()> {
         for handle in &self.handles {
-            handle.cmd_tx.send(VcpuCommand::Resume).map_err(|e| {
-                VmmError::Vcpu(format!("failed to send Resume command: {}", e))
-            })?;
+            handle
+                .cmd_tx
+                .send(VcpuCommand::Resume)
+                .map_err(|e| VmmError::Vcpu(format!("failed to send Resume command: {}", e)))?;
         }
 
         tracing::info!("Resumed {} vCPUs", self.vcpu_count);

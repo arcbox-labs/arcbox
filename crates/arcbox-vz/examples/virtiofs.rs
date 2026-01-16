@@ -26,10 +26,10 @@
 //!    `mount -t virtiofs share /mnt`
 
 use arcbox_vz::{
-    is_supported, EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader,
-    LinuxRosettaDirectoryShare, RosettaAvailability, SerialPortConfiguration, SharedDirectory,
-    SingleDirectoryShare, SocketDeviceConfiguration, VirtioFileSystemDeviceConfiguration,
-    VirtualMachineConfiguration, VirtualMachineState,
+    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, LinuxRosettaDirectoryShare,
+    RosettaAvailability, SerialPortConfiguration, SharedDirectory, SingleDirectoryShare,
+    SocketDeviceConfiguration, VirtioFileSystemDeviceConfiguration, VirtualMachineConfiguration,
+    VirtualMachineState, is_supported,
 };
 use std::env;
 use std::time::Duration;

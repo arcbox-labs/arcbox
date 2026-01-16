@@ -7,9 +7,9 @@
 //! - VirtIO device implementations (`VirtioDevice`) from arcbox-virtio
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
-use arcbox_virtio::{VirtioDevice, VirtioDeviceId, DeviceStatus};
+use arcbox_virtio::{DeviceStatus, VirtioDevice, VirtioDeviceId};
 
 use crate::error::{Result, VmmError};
 use crate::irq::{Irq, IrqChip};
@@ -272,50 +272,44 @@ impl VirtioMmioState {
             }
             regs::QUEUE_DESC_LOW => {
                 if (self.queue_sel as usize) < 8 {
-                    self.queue_desc[self.queue_sel as usize] = (self.queue_desc
-                        [self.queue_sel as usize]
-                        & 0xFFFF_FFFF_0000_0000)
-                        | u64::from(value);
+                    self.queue_desc[self.queue_sel as usize] =
+                        (self.queue_desc[self.queue_sel as usize] & 0xFFFF_FFFF_0000_0000)
+                            | u64::from(value);
                 }
             }
             regs::QUEUE_DESC_HIGH => {
                 if (self.queue_sel as usize) < 8 {
-                    self.queue_desc[self.queue_sel as usize] = (self.queue_desc
-                        [self.queue_sel as usize]
-                        & 0x0000_0000_FFFF_FFFF)
-                        | (u64::from(value) << 32);
+                    self.queue_desc[self.queue_sel as usize] =
+                        (self.queue_desc[self.queue_sel as usize] & 0x0000_0000_FFFF_FFFF)
+                            | (u64::from(value) << 32);
                 }
             }
             regs::QUEUE_DRIVER_LOW => {
                 if (self.queue_sel as usize) < 8 {
-                    self.queue_driver[self.queue_sel as usize] = (self.queue_driver
-                        [self.queue_sel as usize]
-                        & 0xFFFF_FFFF_0000_0000)
-                        | u64::from(value);
+                    self.queue_driver[self.queue_sel as usize] =
+                        (self.queue_driver[self.queue_sel as usize] & 0xFFFF_FFFF_0000_0000)
+                            | u64::from(value);
                 }
             }
             regs::QUEUE_DRIVER_HIGH => {
                 if (self.queue_sel as usize) < 8 {
-                    self.queue_driver[self.queue_sel as usize] = (self.queue_driver
-                        [self.queue_sel as usize]
-                        & 0x0000_0000_FFFF_FFFF)
-                        | (u64::from(value) << 32);
+                    self.queue_driver[self.queue_sel as usize] =
+                        (self.queue_driver[self.queue_sel as usize] & 0x0000_0000_FFFF_FFFF)
+                            | (u64::from(value) << 32);
                 }
             }
             regs::QUEUE_DEVICE_LOW => {
                 if (self.queue_sel as usize) < 8 {
-                    self.queue_device[self.queue_sel as usize] = (self.queue_device
-                        [self.queue_sel as usize]
-                        & 0xFFFF_FFFF_0000_0000)
-                        | u64::from(value);
+                    self.queue_device[self.queue_sel as usize] =
+                        (self.queue_device[self.queue_sel as usize] & 0xFFFF_FFFF_0000_0000)
+                            | u64::from(value);
                 }
             }
             regs::QUEUE_DEVICE_HIGH => {
                 if (self.queue_sel as usize) < 8 {
-                    self.queue_device[self.queue_sel as usize] = (self.queue_device
-                        [self.queue_sel as usize]
-                        & 0x0000_0000_FFFF_FFFF)
-                        | (u64::from(value) << 32);
+                    self.queue_device[self.queue_sel as usize] =
+                        (self.queue_device[self.queue_sel as usize] & 0x0000_0000_FFFF_FFFF)
+                            | (u64::from(value) << 32);
                 }
             }
             _ => {
@@ -388,11 +382,14 @@ impl DeviceManager {
             irq: None,
         };
 
-        self.devices.insert(id, RegisteredDevice {
-            info,
-            mmio_state: None,
-            virtio_device: None,
-        });
+        self.devices.insert(
+            id,
+            RegisteredDevice {
+                info,
+                mmio_state: None,
+                virtio_device: None,
+            },
+        );
 
         Ok(id)
     }
@@ -430,14 +427,20 @@ impl DeviceManager {
             irq: Some(irq),
         };
 
-        let mmio_state = Arc::new(RwLock::new(VirtioMmioState::new(virtio_device_id, features)));
+        let mmio_state = Arc::new(RwLock::new(VirtioMmioState::new(
+            virtio_device_id,
+            features,
+        )));
 
         self.mmio_map.insert(mmio_base, id);
-        self.devices.insert(id, RegisteredDevice {
-            info,
-            mmio_state: Some(mmio_state),
-            virtio_device: None,
-        });
+        self.devices.insert(
+            id,
+            RegisteredDevice {
+                info,
+                mmio_state: Some(mmio_state),
+                virtio_device: None,
+            },
+        );
 
         tracing::info!(
             "Registered VirtIO device {} at MMIO {:#x}, IRQ {}",
@@ -485,15 +488,21 @@ impl DeviceManager {
             irq: Some(irq),
         };
 
-        let mmio_state = Arc::new(RwLock::new(VirtioMmioState::new(virtio_device_id, features)));
+        let mmio_state = Arc::new(RwLock::new(VirtioMmioState::new(
+            virtio_device_id,
+            features,
+        )));
         let virtio_device = Arc::new(Mutex::new(device));
 
         self.mmio_map.insert(mmio_base, id);
-        self.devices.insert(id, RegisteredDevice {
-            info,
-            mmio_state: Some(mmio_state),
-            virtio_device: Some(virtio_device),
-        });
+        self.devices.insert(
+            id,
+            RegisteredDevice {
+                info,
+                mmio_state: Some(mmio_state),
+                virtio_device: Some(virtio_device),
+            },
+        );
 
         tracing::info!(
             "Registered VirtIO device '{}' (type {:?}) at MMIO {:#x}, IRQ {}",
@@ -530,14 +539,15 @@ impl DeviceManager {
     ///
     /// Returns an error if the device doesn't exist or interrupt fails.
     pub fn trigger_interrupt(&self, id: DeviceId, reason: u32) -> Result<()> {
-        let device = self.devices.get(&id).ok_or_else(|| {
-            VmmError::Device(format!("Device {} not found", id.0))
-        })?;
+        let device = self
+            .devices
+            .get(&id)
+            .ok_or_else(|| VmmError::Device(format!("Device {} not found", id.0)))?;
 
         if let Some(state) = &device.mmio_state {
-            let mut state = state.write().map_err(|e| {
-                VmmError::Device(format!("Failed to lock device state: {}", e))
-            })?;
+            let mut state = state
+                .write()
+                .map_err(|e| VmmError::Device(format!("Failed to lock device state: {}", e)))?;
             state.trigger_interrupt(reason);
         }
 
@@ -563,21 +573,22 @@ impl DeviceManager {
     ///
     /// Returns an error if the read fails.
     pub fn handle_mmio_read(&self, addr: u64, size: usize) -> Result<u64> {
-        let device_id = self.find_by_mmio(addr).ok_or_else(|| {
-            VmmError::Device(format!("No device at MMIO address {:#x}", addr))
-        })?;
+        let device_id = self
+            .find_by_mmio(addr)
+            .ok_or_else(|| VmmError::Device(format!("No device at MMIO address {:#x}", addr)))?;
 
-        let device = self.devices.get(&device_id).ok_or_else(|| {
-            VmmError::Device(format!("Device {} not found", device_id.0))
-        })?;
+        let device = self
+            .devices
+            .get(&device_id)
+            .ok_or_else(|| VmmError::Device(format!("Device {} not found", device_id.0)))?;
 
         let base = device.info.mmio_base.unwrap_or(0);
         let offset = addr - base;
 
         if let Some(state) = &device.mmio_state {
-            let state = state.read().map_err(|e| {
-                VmmError::Device(format!("Failed to lock device state: {}", e))
-            })?;
+            let state = state
+                .read()
+                .map_err(|e| VmmError::Device(format!("Failed to lock device state: {}", e)))?;
 
             // Handle config space reads - forward to actual device
             if offset >= virtio_mmio::regs::CONFIG {
@@ -593,8 +604,7 @@ impl DeviceManager {
                         2 => u64::from(u16::from_le_bytes([data[0], data[1]])),
                         4 => u64::from(u32::from_le_bytes([data[0], data[1], data[2], data[3]])),
                         8 => u64::from_le_bytes([
-                            data[0], data[1], data[2], data[3],
-                            data[4], data[5], data[6], data[7],
+                            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                         ]),
                         _ => 0,
                     });
@@ -622,22 +632,23 @@ impl DeviceManager {
     ///
     /// Returns an error if the write fails.
     pub fn handle_mmio_write(&self, addr: u64, size: usize, value: u64) -> Result<()> {
-        let device_id = self.find_by_mmio(addr).ok_or_else(|| {
-            VmmError::Device(format!("No device at MMIO address {:#x}", addr))
-        })?;
+        let device_id = self
+            .find_by_mmio(addr)
+            .ok_or_else(|| VmmError::Device(format!("No device at MMIO address {:#x}", addr)))?;
 
-        let device = self.devices.get(&device_id).ok_or_else(|| {
-            VmmError::Device(format!("Device {} not found", device_id.0))
-        })?;
+        let device = self
+            .devices
+            .get(&device_id)
+            .ok_or_else(|| VmmError::Device(format!("Device {} not found", device_id.0)))?;
 
         let base = device.info.mmio_base.unwrap_or(0);
         let offset = addr - base;
 
         if let Some(state) = &device.mmio_state {
             let old_status = {
-                let s = state.read().map_err(|e| {
-                    VmmError::Device(format!("Failed to lock device state: {}", e))
-                })?;
+                let s = state
+                    .read()
+                    .map_err(|e| VmmError::Device(format!("Failed to lock device state: {}", e)))?;
                 s.status
             };
 
@@ -669,9 +680,9 @@ impl DeviceManager {
 
             // Write to MMIO state
             {
-                let mut state = state.write().map_err(|e| {
-                    VmmError::Device(format!("Failed to lock device state: {}", e))
-                })?;
+                let mut state = state
+                    .write()
+                    .map_err(|e| VmmError::Device(format!("Failed to lock device state: {}", e)))?;
                 state.write(offset, value32);
             }
 
@@ -800,7 +811,10 @@ mod tests {
     fn test_virtio_mmio_state() {
         let state = VirtioMmioState::new(2, 0x1234_5678);
 
-        assert_eq!(state.read(virtio_mmio::regs::MAGIC), virtio_mmio::MAGIC_VALUE);
+        assert_eq!(
+            state.read(virtio_mmio::regs::MAGIC),
+            virtio_mmio::MAGIC_VALUE
+        );
         assert_eq!(state.read(virtio_mmio::regs::VERSION), virtio_mmio::VERSION);
         assert_eq!(state.read(virtio_mmio::regs::DEVICE_ID), 2);
     }

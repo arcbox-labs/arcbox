@@ -395,10 +395,7 @@ impl NetworkManager {
         }
 
         // Then try by name.
-        networks
-            .values()
-            .find(|n| n.name == id_or_name)
-            .cloned()
+        networks.values().find(|n| n.name == id_or_name).cloned()
     }
 
     /// Lists all networks.
@@ -437,7 +434,10 @@ impl NetworkManager {
             return Ok(());
         }
 
-        Err(NetError::Config(format!("network {} not found", id_or_name)))
+        Err(NetError::Config(format!(
+            "network {} not found",
+            id_or_name
+        )))
     }
 }
 

@@ -150,13 +150,17 @@ impl DatapathStats {
     /// Records a new NAT connection.
     #[inline]
     pub fn record_nat_connection_created(&self) {
-        self.nat_connections_created.0.fetch_add(1, Ordering::Relaxed);
+        self.nat_connections_created
+            .0
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records an expired NAT connection.
     #[inline]
     pub fn record_nat_connection_expired(&self) {
-        self.nat_connections_expired.0.fetch_add(1, Ordering::Relaxed);
+        self.nat_connections_expired
+            .0
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records a poll iteration.
@@ -180,7 +184,9 @@ impl DatapathStats {
             (usize::BITS - (size - 1).leading_zeros()) as usize
         };
         let bucket = bucket.min(self.batch_histogram.len() - 1);
-        self.batch_histogram[bucket].0.fetch_add(1, Ordering::Relaxed);
+        self.batch_histogram[bucket]
+            .0
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Returns a snapshot of current statistics.
@@ -329,10 +335,18 @@ impl StatsSnapshot {
             rx_errors: self.rx_errors.saturating_sub(prev.rx_errors),
 
             nat_translations: self.nat_translations.saturating_sub(prev.nat_translations),
-            nat_fast_path_hits: self.nat_fast_path_hits.saturating_sub(prev.nat_fast_path_hits),
-            nat_slow_path_lookups: self.nat_slow_path_lookups.saturating_sub(prev.nat_slow_path_lookups),
-            nat_connections_created: self.nat_connections_created.saturating_sub(prev.nat_connections_created),
-            nat_connections_expired: self.nat_connections_expired.saturating_sub(prev.nat_connections_expired),
+            nat_fast_path_hits: self
+                .nat_fast_path_hits
+                .saturating_sub(prev.nat_fast_path_hits),
+            nat_slow_path_lookups: self
+                .nat_slow_path_lookups
+                .saturating_sub(prev.nat_slow_path_lookups),
+            nat_connections_created: self
+                .nat_connections_created
+                .saturating_sub(prev.nat_connections_created),
+            nat_connections_expired: self
+                .nat_connections_expired
+                .saturating_sub(prev.nat_connections_expired),
 
             poll_iterations: self.poll_iterations.saturating_sub(prev.poll_iterations),
             poll_work_done: self.poll_work_done.saturating_sub(prev.poll_work_done),
@@ -344,14 +358,28 @@ impl StatsSnapshot {
 impl std::fmt::Display for StatsSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Datapath Statistics:")?;
-        writeln!(f, "  TX: {} packets, {} bytes, {} dropped, {} errors",
-            self.tx_packets, self.tx_bytes, self.tx_dropped, self.tx_errors)?;
-        writeln!(f, "  RX: {} packets, {} bytes, {} dropped, {} errors",
-            self.rx_packets, self.rx_bytes, self.rx_dropped, self.rx_errors)?;
-        writeln!(f, "  NAT: {} translations ({:.1}% fast path)",
-            self.nat_translations, self.nat_hit_rate() * 100.0)?;
-        writeln!(f, "  Poll: {} iterations ({:.1}% efficient)",
-            self.poll_iterations, self.poll_efficiency() * 100.0)?;
+        writeln!(
+            f,
+            "  TX: {} packets, {} bytes, {} dropped, {} errors",
+            self.tx_packets, self.tx_bytes, self.tx_dropped, self.tx_errors
+        )?;
+        writeln!(
+            f,
+            "  RX: {} packets, {} bytes, {} dropped, {} errors",
+            self.rx_packets, self.rx_bytes, self.rx_dropped, self.rx_errors
+        )?;
+        writeln!(
+            f,
+            "  NAT: {} translations ({:.1}% fast path)",
+            self.nat_translations,
+            self.nat_hit_rate() * 100.0
+        )?;
+        writeln!(
+            f,
+            "  Poll: {} iterations ({:.1}% efficient)",
+            self.poll_iterations,
+            self.poll_efficiency() * 100.0
+        )?;
         Ok(())
     }
 }

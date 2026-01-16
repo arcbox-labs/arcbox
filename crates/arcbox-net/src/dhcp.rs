@@ -706,10 +706,7 @@ impl DhcpServer {
         if let Some(ip) = packet.requested_ip {
             self.allocator.allocate_specific(ip);
 
-            tracing::warn!(
-                "DHCPDECLINE: {} reported as in use",
-                ip
-            );
+            tracing::warn!("DHCPDECLINE: {} reported as in use", ip);
         }
 
         Ok(())

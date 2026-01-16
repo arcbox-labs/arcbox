@@ -209,7 +209,11 @@ impl PtyConsole {
                 .into_owned()
         };
 
-        tracing::info!("Created PTY console: master_fd={}, slave={}", master_fd, slave_path);
+        tracing::info!(
+            "Created PTY console: master_fd={}, slave={}",
+            master_fd,
+            slave_path
+        );
 
         Ok(Self {
             master_fd,
@@ -571,15 +575,13 @@ impl VirtioConsole {
 
         // Forward to I/O handler
         if let Some(io) = &self.io {
-            let mut io = io.lock().map_err(|e| {
-                VirtioError::Io(format!("Failed to lock I/O: {}", e))
-            })?;
-            io.write(data).map_err(|e| {
-                VirtioError::Io(format!("Write failed: {}", e))
-            })?;
-            io.flush().map_err(|e| {
-                VirtioError::Io(format!("Flush failed: {}", e))
-            })?;
+            let mut io = io
+                .lock()
+                .map_err(|e| VirtioError::Io(format!("Failed to lock I/O: {}", e)))?;
+            io.write(data)
+                .map_err(|e| VirtioError::Io(format!("Write failed: {}", e)))?;
+            io.flush()
+                .map_err(|e| VirtioError::Io(format!("Flush failed: {}", e)))?;
         }
 
         tracing::trace!("Console TX: {} bytes", data.len());
@@ -601,12 +603,12 @@ impl VirtioConsole {
 
         // Then try I/O handler
         if let Some(io) = &self.io {
-            let mut io = io.lock().map_err(|e| {
-                VirtioError::Io(format!("Failed to lock I/O: {}", e))
-            })?;
-            let n = io.read(buf).map_err(|e| {
-                VirtioError::Io(format!("Read failed: {}", e))
-            })?;
+            let mut io = io
+                .lock()
+                .map_err(|e| VirtioError::Io(format!("Failed to lock I/O: {}", e)))?;
+            let n = io
+                .read(buf)
+                .map_err(|e| VirtioError::Io(format!("Read failed: {}", e)))?;
             tracing::trace!("Console RX: {} bytes", n);
             return Ok(n);
         }
@@ -624,9 +626,10 @@ impl VirtioConsole {
         let mut tx_data: Vec<(u16, Vec<u8>)> = Vec::new();
 
         {
-            let queue = self.tx_queue.as_mut().ok_or_else(|| {
-                VirtioError::NotReady("TX queue not ready".into())
-            })?;
+            let queue = self
+                .tx_queue
+                .as_mut()
+                .ok_or_else(|| VirtioError::NotReady("TX queue not ready".into()))?;
 
             while let Some((head_idx, chain)) = queue.pop_avail() {
                 let mut data = Vec::new();
@@ -778,10 +781,7 @@ mod tests {
 
         assert_eq!(u16::from_le_bytes([data[0], data[1]]), 120); // cols
         assert_eq!(u16::from_le_bytes([data[2], data[3]]), 40); // rows
-        assert_eq!(
-            u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-            4
-        ); // max_ports
+        assert_eq!(u32::from_le_bytes([data[4], data[5], data[6], data[7]]), 4); // max_ports
     }
 
     #[test]
@@ -967,7 +967,10 @@ mod tests {
     #[test]
     fn test_socket_console_no_client() {
         let temp_dir = std::env::temp_dir();
-        let socket_path = temp_dir.join(format!("test_console_no_client_{}.sock", std::process::id()));
+        let socket_path = temp_dir.join(format!(
+            "test_console_no_client_{}.sock",
+            std::process::id()
+        ));
 
         let mut console = SocketConsole::new(&socket_path).unwrap();
 
@@ -999,7 +1002,8 @@ mod tests {
         use std::os::unix::net::UnixStream;
 
         let temp_dir = std::env::temp_dir();
-        let socket_path = temp_dir.join(format!("test_console_connect_{}.sock", std::process::id()));
+        let socket_path =
+            temp_dir.join(format!("test_console_connect_{}.sock", std::process::id()));
 
         let mut console = SocketConsole::new(&socket_path).unwrap();
 
@@ -1067,7 +1071,8 @@ mod tests {
     #[test]
     fn test_socket_console_cleanup() {
         let temp_dir = std::env::temp_dir();
-        let socket_path = temp_dir.join(format!("test_console_cleanup_{}.sock", std::process::id()));
+        let socket_path =
+            temp_dir.join(format!("test_console_cleanup_{}.sock", std::process::id()));
 
         {
             let _console = SocketConsole::new(&socket_path).unwrap();

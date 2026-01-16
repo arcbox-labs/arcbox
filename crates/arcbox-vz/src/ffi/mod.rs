@@ -25,22 +25,20 @@ static FRAMEWORK_INIT: Once = Once::new();
 
 /// Ensures Virtualization.framework is loaded.
 fn ensure_framework_loaded() {
-    FRAMEWORK_INIT.call_once(|| {
-        unsafe {
-            let path = std::ffi::CString::new(
-                "/System/Library/Frameworks/Virtualization.framework/Virtualization",
-            )
-            .unwrap();
-            let handle = libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
-            if handle.is_null() {
-                let err = libc::dlerror();
-                if !err.is_null() {
-                    let err_str = std::ffi::CStr::from_ptr(err).to_string_lossy();
-                    tracing::error!("Failed to load Virtualization.framework: {}", err_str);
-                }
-            } else {
-                tracing::debug!("Virtualization.framework loaded successfully");
+    FRAMEWORK_INIT.call_once(|| unsafe {
+        let path = std::ffi::CString::new(
+            "/System/Library/Frameworks/Virtualization.framework/Virtualization",
+        )
+        .unwrap();
+        let handle = libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+        if handle.is_null() {
+            let err = libc::dlerror();
+            if !err.is_null() {
+                let err_str = std::ffi::CStr::from_ptr(err).to_string_lossy();
+                tracing::error!("Failed to load Virtualization.framework: {}", err_str);
             }
+        } else {
+            tracing::debug!("Virtualization.framework loaded successfully");
         }
     });
 }

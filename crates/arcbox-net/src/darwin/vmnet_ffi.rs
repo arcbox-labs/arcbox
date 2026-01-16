@@ -256,16 +256,9 @@ unsafe extern "C" {
         value_callbacks: *const c_void,
     ) -> CFMutableDictionaryRef;
 
-    pub fn CFDictionarySetValue(
-        dict: CFMutableDictionaryRef,
-        key: CFTypeRef,
-        value: CFTypeRef,
-    );
+    pub fn CFDictionarySetValue(dict: CFMutableDictionaryRef, key: CFTypeRef, value: CFTypeRef);
 
-    pub fn CFDictionaryGetValue(
-        dict: CFDictionaryRef,
-        key: CFTypeRef,
-    ) -> CFTypeRef;
+    pub fn CFDictionaryGetValue(dict: CFDictionaryRef, key: CFTypeRef) -> CFTypeRef;
 
     pub fn CFRelease(cf: CFTypeRef);
     pub fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
@@ -290,31 +283,19 @@ unsafe extern "C" {
 
     pub fn CFUUIDCreate(allocator: CFAllocatorRef) -> CFUUIDRef;
 
-    pub fn CFUUIDCreateString(
-        allocator: CFAllocatorRef,
-        uuid: CFUUIDRef,
-    ) -> CFStringRef;
+    pub fn CFUUIDCreateString(allocator: CFAllocatorRef, uuid: CFUUIDRef) -> CFStringRef;
 }
 
 // Dispatch queue functions.
 #[link(name = "System")]
 unsafe extern "C" {
-    pub fn dispatch_queue_create(
-        label: *const c_char,
-        attr: *const c_void,
-    ) -> DispatchQueue;
+    pub fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> DispatchQueue;
 
     pub fn dispatch_release(object: *mut c_void);
 
-    pub fn dispatch_async(
-        queue: DispatchQueue,
-        block: *const c_void,
-    );
+    pub fn dispatch_async(queue: DispatchQueue, block: *const c_void);
 
-    pub fn dispatch_sync(
-        queue: DispatchQueue,
-        block: *const c_void,
-    );
+    pub fn dispatch_sync(queue: DispatchQueue, block: *const c_void);
 
     pub static _dispatch_queue_attr_concurrent: *const c_void;
 }
@@ -330,7 +311,13 @@ pub const K_CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
 #[must_use]
 pub unsafe fn cfstring_from_str(s: &str) -> CFStringRef {
     let cstr = std::ffi::CString::new(s).unwrap();
-    unsafe { CFStringCreateWithCString(kCFAllocatorDefault, cstr.as_ptr(), K_CF_STRING_ENCODING_UTF8) }
+    unsafe {
+        CFStringCreateWithCString(
+            kCFAllocatorDefault,
+            cstr.as_ptr(),
+            K_CF_STRING_ENCODING_UTF8,
+        )
+    }
 }
 
 /// Helper to create a CFNumber from an i64.
@@ -340,7 +327,13 @@ pub unsafe fn cfstring_from_str(s: &str) -> CFStringRef {
 /// The returned CFNumber must be released with CFRelease.
 #[must_use]
 pub unsafe fn cfnumber_from_i64(value: i64) -> CFNumberRef {
-    unsafe { CFNumberCreate(kCFAllocatorDefault, CFNumberType::SInt64, &value as *const _ as *const c_void) }
+    unsafe {
+        CFNumberCreate(
+            kCFAllocatorDefault,
+            CFNumberType::SInt64,
+            &value as *const _ as *const c_void,
+        )
+    }
 }
 
 /// Creates a mutable dictionary for vmnet configuration.

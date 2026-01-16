@@ -167,9 +167,8 @@ pub fn parse_mac(s: &str) -> Result<[u8; 6]> {
 
     let mut mac = [0u8; 6];
     for (i, part) in parts.iter().enumerate() {
-        mac[i] = u8::from_str_radix(part, 16).map_err(|_| {
-            crate::error::NetError::Config("invalid MAC address byte".to_string())
-        })?;
+        mac[i] = u8::from_str_radix(part, 16)
+            .map_err(|_| crate::error::NetError::Config("invalid MAC address byte".to_string()))?;
     }
 
     Ok(mac)

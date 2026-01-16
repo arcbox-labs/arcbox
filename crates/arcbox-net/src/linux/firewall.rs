@@ -216,9 +216,10 @@ impl LinuxFirewall {
             FirewallBackend::Nftables => "nft",
         };
 
-        let output = Command::new(cmd).arg("--version").output().map_err(|e| {
-            NetError::Firewall(format!("{} not available: {}", cmd, e))
-        })?;
+        let output = Command::new(cmd)
+            .arg("--version")
+            .output()
+            .map_err(|e| NetError::Firewall(format!("{} not available: {}", cmd, e)))?;
 
         if !output.status.success() {
             return Err(NetError::Firewall(format!("{} check failed", cmd)));
@@ -379,9 +380,8 @@ impl LinuxFirewall {
     ///
     /// Returns an error if the sysctl cannot be written.
     pub fn enable_ip_forward(&self) -> Result<()> {
-        std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").map_err(|e| {
-            NetError::Firewall(format!("failed to enable IP forwarding: {}", e))
-        })?;
+        std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")
+            .map_err(|e| NetError::Firewall(format!("failed to enable IP forwarding: {}", e)))?;
 
         tracing::debug!("IP forwarding enabled");
         Ok(())
@@ -393,9 +393,8 @@ impl LinuxFirewall {
     ///
     /// Returns an error if the sysctl cannot be written.
     pub fn disable_ip_forward(&self) -> Result<()> {
-        std::fs::write("/proc/sys/net/ipv4/ip_forward", "0").map_err(|e| {
-            NetError::Firewall(format!("failed to disable IP forwarding: {}", e))
-        })?;
+        std::fs::write("/proc/sys/net/ipv4/ip_forward", "0")
+            .map_err(|e| NetError::Firewall(format!("failed to disable IP forwarding: {}", e)))?;
 
         tracing::debug!("IP forwarding disabled");
         Ok(())
@@ -535,11 +534,23 @@ impl LinuxFirewall {
             if matches {
                 // Extract handle from the line.
                 if let Some(handle) = Self::extract_nft_handle(line) {
-                    tracing::debug!("Found matching rule with handle {}: {}", handle, line.trim());
+                    tracing::debug!(
+                        "Found matching rule with handle {}: {}",
+                        handle,
+                        line.trim()
+                    );
 
                     // Delete by handle.
                     let result = Command::new("nft")
-                        .args(["delete", "rule", "ip", "arcbox", chain, "handle", &handle.to_string()])
+                        .args([
+                            "delete",
+                            "rule",
+                            "ip",
+                            "arcbox",
+                            chain,
+                            "handle",
+                            &handle.to_string(),
+                        ])
                         .output();
 
                     match result {
@@ -642,7 +653,16 @@ impl LinuxFirewall {
             let dport = rule.host_port.to_string();
             let to_dest = format!("{}:{}", rule.guest_ip, rule.guest_port);
 
-            args.extend(&["-p", proto, "--dport", &dport, "-j", "DNAT", "--to-destination", &to_dest]);
+            args.extend(&[
+                "-p",
+                proto,
+                "--dport",
+                &dport,
+                "-j",
+                "DNAT",
+                "--to-destination",
+                &to_dest,
+            ]);
 
             self.run_iptables(&args)?;
         }
@@ -730,7 +750,16 @@ impl LinuxFirewall {
             let dport = rule.host_port.to_string();
             let to_dest = format!("{}:{}", rule.guest_ip, rule.guest_port);
 
-            args.extend(&["-p", proto, "--dport", &dport, "-j", "DNAT", "--to-destination", &to_dest]);
+            args.extend(&[
+                "-p",
+                proto,
+                "--dport",
+                &dport,
+                "-j",
+                "DNAT",
+                "--to-destination",
+                &to_dest,
+            ]);
 
             let _ = self.run_iptables(&args);
         }
@@ -751,8 +780,20 @@ impl LinuxFirewall {
 
                 // Allow established/related connections
                 self.run_iptables(&[
-                    "-t", "filter", "-A", &chain, "-i", out_if, "-o", in_if,
-                    "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT",
+                    "-t",
+                    "filter",
+                    "-A",
+                    &chain,
+                    "-i",
+                    out_if,
+                    "-o",
+                    in_if,
+                    "-m",
+                    "state",
+                    "--state",
+                    "RELATED,ESTABLISHED",
+                    "-j",
+                    "ACCEPT",
                 ])?;
 
                 // Allow new connections from internal to external
@@ -784,9 +825,10 @@ impl LinuxFirewall {
 
     /// Runs an iptables command.
     fn run_iptables(&self, args: &[&str]) -> Result<()> {
-        let output = Command::new("iptables").args(args).output().map_err(|e| {
-            NetError::Firewall(format!("failed to run iptables: {}", e))
-        })?;
+        let output = Command::new("iptables")
+            .args(args)
+            .output()
+            .map_err(|e| NetError::Firewall(format!("failed to run iptables: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -802,9 +844,10 @@ impl LinuxFirewall {
 
     /// Runs an nft command.
     fn run_nft(&self, args: &[&str]) -> Result<()> {
-        let output = Command::new("nft").args(args).output().map_err(|e| {
-            NetError::Firewall(format!("failed to run nft: {}", e))
-        })?;
+        let output = Command::new("nft")
+            .args(args)
+            .output()
+            .map_err(|e| NetError::Firewall(format!("failed to run nft: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

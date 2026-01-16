@@ -120,9 +120,10 @@ impl DarwinMemory {
     ///
     /// This is called when dirty tracking is enabled to establish a baseline.
     fn compute_all_checksums(&self) -> Result<HashMap<u64, u64>, HypervisorError> {
-        let regions = self.regions.read().map_err(|_| {
-            HypervisorError::MemoryError("Lock poisoned".to_string())
-        })?;
+        let regions = self
+            .regions
+            .read()
+            .map_err(|_| HypervisorError::MemoryError("Lock poisoned".to_string()))?;
 
         let mut checksums = HashMap::new();
         let page_size = PAGE_SIZE as usize;
@@ -135,17 +136,11 @@ impl DarwinMemory {
                 let guest_addr = region.guest_addr.raw() + page_offset as u64;
 
                 // Calculate actual bytes in this page (last page might be partial).
-                let bytes_in_page = std::cmp::min(
-                    page_size,
-                    region.size as usize - page_offset,
-                );
+                let bytes_in_page = std::cmp::min(page_size, region.size as usize - page_offset);
 
                 // Read page data and compute hash.
                 let page_data = unsafe {
-                    std::slice::from_raw_parts(
-                        region.host_addr.add(page_offset),
-                        bytes_in_page,
-                    )
+                    std::slice::from_raw_parts(region.host_addr.add(page_offset), bytes_in_page)
                 };
 
                 let hash = Self::hash_page(page_data);
@@ -153,10 +148,7 @@ impl DarwinMemory {
             }
         }
 
-        tracing::debug!(
-            "Computed checksums for {} pages",
-            checksums.len()
-        );
+        tracing::debug!("Computed checksums for {} pages", checksums.len());
 
         Ok(checksums)
     }
@@ -166,11 +158,7 @@ impl DarwinMemory {
     /// # Errors
     ///
     /// Returns an error if the region overlaps with existing regions.
-    pub fn add_region(
-        &self,
-        guest_addr: GuestAddress,
-        size: u64,
-    ) -> Result<(), HypervisorError> {
+    pub fn add_region(&self, guest_addr: GuestAddress, size: u64) -> Result<(), HypervisorError> {
         let host_addr = ffi::allocate_memory(size).map_err(|e| {
             HypervisorError::MemoryError(format!("Failed to allocate memory: {}", e))
         })?;
@@ -181,9 +169,10 @@ impl DarwinMemory {
             host_addr,
         };
 
-        let mut regions = self.regions.write().map_err(|_| {
-            HypervisorError::MemoryError("Lock poisoned".to_string())
-        })?;
+        let mut regions = self
+            .regions
+            .write()
+            .map_err(|_| HypervisorError::MemoryError("Lock poisoned".to_string()))?;
 
         // Check for overlaps
         let new_end = guest_addr.raw() + size;
@@ -211,9 +200,10 @@ impl DarwinMemory {
 
     /// Finds the region containing the given address.
     fn find_region(&self, addr: GuestAddress) -> Result<(*mut u8, u64), HypervisorError> {
-        let regions = self.regions.read().map_err(|_| {
-            HypervisorError::MemoryError("Lock poisoned".to_string())
-        })?;
+        let regions = self
+            .regions
+            .read()
+            .map_err(|_| HypervisorError::MemoryError("Lock poisoned".to_string()))?;
 
         for region in regions.iter() {
             if addr.raw() >= region.guest_addr.raw()
@@ -234,9 +224,10 @@ impl DarwinMemory {
 
     /// Returns an iterator over all memory regions.
     pub fn regions(&self) -> Result<Vec<MemoryRegion>, HypervisorError> {
-        let regions = self.regions.read().map_err(|_| {
-            HypervisorError::MemoryError("Lock poisoned".to_string())
-        })?;
+        let regions = self
+            .regions
+            .read()
+            .map_err(|_| HypervisorError::MemoryError("Lock poisoned".to_string()))?;
 
         Ok(regions
             .iter()
@@ -316,9 +307,10 @@ impl GuestMemory for DarwinMemory {
         let checksums = self.compute_all_checksums()?;
 
         // Store the checksums.
-        let mut stored = self.page_checksums.write().map_err(|_| {
-            HypervisorError::MemoryError("Lock poisoned".to_string())
-        })?;
+        let mut stored = self
+            .page_checksums
+            .write()
+            .map_err(|_| HypervisorError::MemoryError("Lock poisoned".to_string()))?;
         *stored = checksums;
 
         self.dirty_tracking_enabled
@@ -359,9 +351,10 @@ impl GuestMemory for DarwinMemory {
         let current_checksums = self.compute_all_checksums()?;
 
         // Compare with stored checksums to find dirty pages.
-        let stored_checksums = self.page_checksums.read().map_err(|_| {
-            HypervisorError::MemoryError("Lock poisoned".to_string())
-        })?;
+        let stored_checksums = self
+            .page_checksums
+            .read()
+            .map_err(|_| HypervisorError::MemoryError("Lock poisoned".to_string()))?;
 
         let mut dirty_pages = Vec::new();
 
@@ -388,9 +381,10 @@ impl GuestMemory for DarwinMemory {
         // Update stored checksums with current values.
         // This "clears" the dirty log for the next call.
         drop(stored_checksums);
-        let mut stored = self.page_checksums.write().map_err(|_| {
-            HypervisorError::MemoryError("Lock poisoned".to_string())
-        })?;
+        let mut stored = self
+            .page_checksums
+            .write()
+            .map_err(|_| HypervisorError::MemoryError("Lock poisoned".to_string()))?;
         *stored = current_checksums;
 
         Ok(dirty_pages)
@@ -405,9 +399,10 @@ impl GuestMemory for DarwinMemory {
             )));
         }
 
-        let regions = self.regions.read().map_err(|_| {
-            HypervisorError::MemoryError("Lock poisoned".to_string())
-        })?;
+        let regions = self
+            .regions
+            .read()
+            .map_err(|_| HypervisorError::MemoryError("Lock poisoned".to_string()))?;
 
         // Copy each region to the appropriate offset in the buffer.
         // Regions are assumed to be non-overlapping and cover guest physical addresses.
@@ -523,7 +518,11 @@ mod tests {
 
         // Get dirty pages immediately (should be empty since nothing changed).
         let dirty = memory.get_dirty_pages().unwrap();
-        assert!(dirty.is_empty(), "Expected no dirty pages, got {}", dirty.len());
+        assert!(
+            dirty.is_empty(),
+            "Expected no dirty pages, got {}",
+            dirty.len()
+        );
 
         // Disable tracking.
         memory.disable_dirty_tracking().unwrap();
@@ -551,7 +550,10 @@ mod tests {
 
         // Get dirty pages again (should be empty now since checksums were updated).
         let dirty2 = memory.get_dirty_pages().unwrap();
-        assert!(dirty2.is_empty(), "Expected no dirty pages after second call");
+        assert!(
+            dirty2.is_empty(),
+            "Expected no dirty pages after second call"
+        );
     }
 
     #[test]

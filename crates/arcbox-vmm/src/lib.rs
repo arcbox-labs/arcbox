@@ -69,7 +69,7 @@ pub mod vmm;
 
 pub use boot::{BootParams, KernelLoader, KernelType};
 pub use builder::{VmBuilder, VmInstance};
-pub use device::{DeviceId, DeviceInfo, DeviceManager, DeviceType, DeviceTreeEntry};
+pub use device::{DeviceId, DeviceInfo, DeviceManager, DeviceTreeEntry, DeviceType};
 pub use error::{Result, VmmError};
 pub use fdt::{FdtBuilder, FdtConfig};
 pub use vcpu::{DeviceManagerExitHandler, ExitHandler, VcpuManager};

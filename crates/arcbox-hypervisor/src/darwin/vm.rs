@@ -1,8 +1,8 @@
 //! Virtual machine implementation for macOS.
 
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use objc2::runtime::AnyObject;
@@ -116,15 +116,17 @@ impl DarwinVm {
         vz_config.set_memory_size(config.memory_size);
 
         // Set up generic platform for Linux VMs on Apple Silicon
-        let platform = ffi::create_generic_platform()
-            .map_err(|e| HypervisorError::VmCreationFailed(format!("Failed to create platform: {}", e)))?;
+        let platform = ffi::create_generic_platform().map_err(|e| {
+            HypervisorError::VmCreationFailed(format!("Failed to create platform: {}", e))
+        })?;
         vz_config.set_platform(platform);
         tracing::debug!("Set generic platform configuration");
 
         // Set up boot loader if kernel path is specified
         if let Some(ref kernel_path) = config.kernel_path {
-            let boot_loader = ffi::LinuxBootLoader::new(kernel_path)
-                .map_err(|e| HypervisorError::VmCreationFailed(format!("Failed to create boot loader: {}", e)))?;
+            let boot_loader = ffi::LinuxBootLoader::new(kernel_path).map_err(|e| {
+                HypervisorError::VmCreationFailed(format!("Failed to create boot loader: {}", e))
+            })?;
             tracing::debug!("Created boot loader for kernel: {}", kernel_path);
 
             if let Some(ref cmdline) = config.kernel_cmdline {
@@ -142,8 +144,9 @@ impl DarwinVm {
         }
 
         // Add entropy device for random number generation
-        let entropy = ffi::create_entropy_device()
-            .map_err(|e| HypervisorError::VmCreationFailed(format!("Failed to create entropy device: {}", e)))?;
+        let entropy = ffi::create_entropy_device().map_err(|e| {
+            HypervisorError::VmCreationFailed(format!("Failed to create entropy device: {}", e))
+        })?;
         vz_config.set_entropy_devices(&[entropy]);
         tracing::debug!("Entropy device configured");
 
@@ -207,8 +210,13 @@ impl DarwinVm {
             // write_to_vm = input_pipe[1] (we send input to VM)
             self.serial_fds = Some((output_pipe[0], input_pipe[1]));
 
-            tracing::info!("Created serial console pipes: input={}/{}, output={}/{}",
-                input_pipe[0], input_pipe[1], output_pipe[0], output_pipe[1]);
+            tracing::info!(
+                "Created serial console pipes: input={}/{}, output={}/{}",
+                input_pipe[0],
+                input_pipe[1],
+                output_pipe[0],
+                output_pipe[1]
+            );
 
             // Create serial port attachment
             // fileHandleForReading: VZ reads input to send to guest (from input_pipe[0])
@@ -233,9 +241,10 @@ impl DarwinVm {
 
     /// Finalizes configuration and creates the actual VZ VM.
     fn finalize_configuration(&mut self) -> Result<(), HypervisorError> {
-        let vz_config = self.vz_config.as_ref().ok_or_else(|| {
-            HypervisorError::VmCreationFailed("No VZ configuration".to_string())
-        })?;
+        let vz_config = self
+            .vz_config
+            .as_ref()
+            .ok_or_else(|| HypervisorError::VmCreationFailed("No VZ configuration".to_string()))?;
 
         // Set storage devices
         if !self.storage_devices.is_empty() {
@@ -272,7 +281,11 @@ impl DarwinVm {
     /// Waits for the VM to reach a specific state.
     ///
     /// This function polls the VM state directly (state property should be thread-safe to read).
-    fn wait_for_state(&self, target: ffi::VZVirtualMachineState, timeout: Duration) -> Result<(), HypervisorError> {
+    fn wait_for_state(
+        &self,
+        target: ffi::VZVirtualMachineState,
+        timeout: Duration,
+    ) -> Result<(), HypervisorError> {
         let start = std::time::Instant::now();
         let poll_interval = Duration::from_millis(100);
 
@@ -280,13 +293,20 @@ impl DarwinVm {
             if let Some(ref vm) = self.vz_vm {
                 // Read state directly - VZVirtualMachine.state should be thread-safe
                 let state = vm.state();
-                tracing::debug!("VM {} current state: {:?}, target: {:?}", self.id, state, target);
+                tracing::debug!(
+                    "VM {} current state: {:?}, target: {:?}",
+                    self.id,
+                    state,
+                    target
+                );
 
                 if state == target {
                     return Ok(());
                 }
                 if state == ffi::VZVirtualMachineState::Error {
-                    return Err(HypervisorError::VmError("VM entered error state".to_string()));
+                    return Err(HypervisorError::VmError(
+                        "VM entered error state".to_string(),
+                    ));
                 }
             }
 
@@ -298,7 +318,9 @@ impl DarwinVm {
                         target, state
                     )));
                 }
-                return Err(HypervisorError::Timeout("Timed out waiting for VM state".to_string()));
+                return Err(HypervisorError::Timeout(
+                    "Timed out waiting for VM state".to_string(),
+                ));
             }
 
             std::thread::sleep(poll_interval);
@@ -313,9 +335,9 @@ impl DarwinVm {
     /// This is a non-blocking read that returns whatever data is currently
     /// available in the PTY buffer.
     pub fn read_console_output(&self) -> Result<String, HypervisorError> {
-        let (read_fd, _) = self.serial_fds.ok_or_else(|| {
-            HypervisorError::DeviceError("Console not configured".to_string())
-        })?;
+        let (read_fd, _) = self
+            .serial_fds
+            .ok_or_else(|| HypervisorError::DeviceError("Console not configured".to_string()))?;
 
         tracing::debug!("read_console_output called, fd={}", read_fd);
 
@@ -335,7 +357,12 @@ impl DarwinVm {
                 revents: 0,
             };
             let poll_result = libc::poll(&mut pfd, 1, 0);
-            tracing::debug!("poll on fd {}: result={}, revents={:#x}", read_fd, poll_result, pfd.revents);
+            tracing::debug!(
+                "poll on fd {}: result={}, revents={:#x}",
+                read_fd,
+                poll_result,
+                pfd.revents
+            );
 
             // Set non-blocking mode for the read
             libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
@@ -385,9 +412,9 @@ impl DarwinVm {
     ///
     /// This sends data to the guest's serial console input.
     pub fn write_console_input(&self, input: &str) -> Result<usize, HypervisorError> {
-        let (master_fd, _) = self.serial_fds.ok_or_else(|| {
-            HypervisorError::DeviceError("Console not configured".to_string())
-        })?;
+        let (master_fd, _) = self
+            .serial_fds
+            .ok_or_else(|| HypervisorError::DeviceError("Console not configured".to_string()))?;
 
         unsafe {
             let bytes_written = libc::write(
@@ -412,8 +439,8 @@ impl DarwinVm {
     /// This can be used with tools like `screen` or `minicom` to connect
     /// to the VM's serial console interactively.
     pub fn console_path(&self) -> Option<String> {
-        self.serial_fds.map(|(master_fd, _)| {
-            unsafe {
+        self.serial_fds
+            .map(|(master_fd, _)| unsafe {
                 let slave_name = libc::ptsname(master_fd);
                 if !slave_name.is_null() {
                     std::ffi::CStr::from_ptr(slave_name)
@@ -422,8 +449,8 @@ impl DarwinVm {
                 } else {
                     String::new()
                 }
-            }
-        }).filter(|s| !s.is_empty())
+            })
+            .filter(|s| !s.is_empty())
     }
 
     /// Connects to a vsock port on the guest.
@@ -452,9 +479,10 @@ impl DarwinVm {
         }
 
         // Get the VZ VM's socket device
-        let vz_vm = self.vz_vm.as_ref().ok_or_else(|| {
-            HypervisorError::VmError("No VZ VM instance".to_string())
-        })?;
+        let vz_vm = self
+            .vz_vm
+            .as_ref()
+            .ok_or_else(|| HypervisorError::VmError("No VZ VM instance".to_string()))?;
 
         let socket_device = ffi::vm_first_socket_device(vz_vm.as_ptr()).ok_or_else(|| {
             HypervisorError::DeviceError("No vsock device configured".to_string())
@@ -463,9 +491,8 @@ impl DarwinVm {
         // Connect to the port
         tracing::debug!("Connecting to vsock port {} on VM {}", port, self.id);
 
-        let fd = ffi::vsock_connect_to_port(socket_device, self.dispatch_queue, port).map_err(|e| {
-            HypervisorError::DeviceError(format!("vsock connect failed: {}", e))
-        })?;
+        let fd = ffi::vsock_connect_to_port(socket_device, self.dispatch_queue, port)
+            .map_err(|e| HypervisorError::DeviceError(format!("vsock connect failed: {}", e)))?;
 
         tracing::debug!("Connected to vsock port {}, fd={}", port, fd);
 
@@ -551,11 +578,7 @@ impl DarwinVm {
         let mut irq_fd = self.vsock_irq_fd.write().unwrap();
         *irq_fd = Some(fd);
 
-        tracing::info!(
-            "IRQ signaling established for VM {}, fd={}",
-            self.id,
-            fd
-        );
+        tracing::info!("IRQ signaling established for VM {}, fd={}", self.id, fd);
 
         Ok(())
     }
@@ -584,9 +607,7 @@ impl DarwinVm {
             buf[1..5].copy_from_slice(&gsi.to_le_bytes());
             buf[5] = u8::from(level);
 
-            let written = unsafe {
-                libc::write(fd, buf.as_ptr() as *const libc::c_void, 6)
-            };
+            let written = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, 6) };
 
             if written == 6 {
                 tracing::trace!(
@@ -708,12 +729,13 @@ impl VirtualMachine for DarwinVm {
 
         // Check if already created
         {
-            let vcpus = self.vcpus.read().map_err(|_| {
-                HypervisorError::VcpuCreationFailed {
+            let vcpus = self
+                .vcpus
+                .read()
+                .map_err(|_| HypervisorError::VcpuCreationFailed {
                     id,
                     reason: "Lock poisoned".to_string(),
-                }
-            })?;
+                })?;
 
             if vcpus.contains(&id) {
                 return Err(HypervisorError::VcpuCreationFailed {
@@ -726,17 +748,21 @@ impl VirtualMachine for DarwinVm {
         // Create vCPU with VZ VM pointer for state queries.
         // On Virtualization.framework, vCPU execution is managed internally,
         // so the vCPU needs access to the VM's state for run() to work properly.
-        let vz_vm_ptr = self.vz_vm.as_ref().map_or(std::ptr::null_mut(), |vm| vm.as_ptr());
+        let vz_vm_ptr = self
+            .vz_vm
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |vm| vm.as_ptr());
         let vcpu = DarwinVcpu::new_managed(id, vz_vm_ptr);
 
         // Record creation
         {
-            let mut vcpus = self.vcpus.write().map_err(|_| {
-                HypervisorError::VcpuCreationFailed {
-                    id,
-                    reason: "Lock poisoned".to_string(),
-                }
-            })?;
+            let mut vcpus =
+                self.vcpus
+                    .write()
+                    .map_err(|_| HypervisorError::VcpuCreationFailed {
+                        id,
+                        reason: "Lock poisoned".to_string(),
+                    })?;
             vcpus.push(id);
         }
 
@@ -822,15 +848,14 @@ impl VirtualMachine for DarwinVm {
             }
             _ => {
                 // Other device types (Balloon, Gpu) not yet supported on Darwin
-                tracing::warn!("Device type {:?} not supported on Darwin", device.device_type);
+                tracing::warn!(
+                    "Device type {:?} not supported on Darwin",
+                    device.device_type
+                );
             }
         }
 
-        tracing::debug!(
-            "Added {:?} device to VM {}",
-            device.device_type,
-            self.id
-        );
+        tracing::debug!("Added {:?} device to VM {}", device.device_type, self.id);
 
         // Store device configuration for snapshot/restore
         self.device_configs.push(device);
@@ -873,7 +898,8 @@ impl VirtualMachine for DarwinVm {
             tracing::debug!("Waiting for VM {} to reach Running state...", self.id);
 
             // Wait for VM to reach Running state
-            match self.wait_for_state(ffi::VZVirtualMachineState::Running, Duration::from_secs(30)) {
+            match self.wait_for_state(ffi::VZVirtualMachineState::Running, Duration::from_secs(30))
+            {
                 Ok(()) => {
                     self.running.store(true, Ordering::SeqCst);
                     self.set_state(VmState::Running);
@@ -887,7 +913,11 @@ impl VirtualMachine for DarwinVm {
                     // Check actual VM state for better error message
                     if let Some(ref vz) = self.vz_vm {
                         let state = vz.state();
-                        tracing::error!("VM {} failed to start, current state: {:?}", self.id, state);
+                        tracing::error!(
+                            "VM {} failed to start, current state: {:?}",
+                            self.id,
+                            state
+                        );
                     }
                     self.set_state(VmState::Error);
                     Err(e)
@@ -969,7 +999,9 @@ impl VirtualMachine for DarwinVm {
                 });
 
                 // Wait for VM to reach Stopped state
-                match self.wait_for_state(ffi::VZVirtualMachineState::Stopped, Duration::from_secs(10)) {
+                match self
+                    .wait_for_state(ffi::VZVirtualMachineState::Stopped, Duration::from_secs(10))
+                {
                     Ok(()) => {
                         tracing::debug!("VM {} reached Stopped state", self.id);
                     }
@@ -979,7 +1011,10 @@ impl VirtualMachine for DarwinVm {
                     }
                 }
             } else {
-                tracing::warn!("VM {} cannot be stopped (canStop=false), forcing state change", self.id);
+                tracing::warn!(
+                    "VM {} cannot be stopped (canStop=false), forcing state change",
+                    self.id
+                );
             }
         }
 
@@ -1019,7 +1054,11 @@ impl VirtualMachine for DarwinVm {
             let name = match config.device_type {
                 VirtioDeviceType::Block => {
                     if let Some(ref path) = config.path {
-                        format!("block-{}-{}", idx, path.rsplit('/').next().unwrap_or("disk"))
+                        format!(
+                            "block-{}-{}",
+                            idx,
+                            path.rsplit('/').next().unwrap_or("disk")
+                        )
                     } else {
                         format!("block-{}", idx)
                     }
@@ -1081,7 +1120,9 @@ impl VirtualMachine for DarwinVm {
         for snapshot in snapshots {
             // Try to deserialize the stored configuration
             if !snapshot.state.is_empty() {
-                if let Ok(stored_config) = serde_json::from_slice::<VirtioDeviceConfig>(&snapshot.state) {
+                if let Ok(stored_config) =
+                    serde_json::from_slice::<VirtioDeviceConfig>(&snapshot.state)
+                {
                     // Find matching device in current configuration
                     let matches = self.device_configs.iter().any(|current| {
                         current.device_type == stored_config.device_type
@@ -1111,8 +1152,14 @@ impl VirtualMachine for DarwinVm {
         }
 
         // Verify device count by type
-        let snapshot_blocks = snapshots.iter().filter(|s| s.device_type == VirtioDeviceType::Block).count();
-        let snapshot_nets = snapshots.iter().filter(|s| s.device_type == VirtioDeviceType::Net).count();
+        let snapshot_blocks = snapshots
+            .iter()
+            .filter(|s| s.device_type == VirtioDeviceType::Block)
+            .count();
+        let snapshot_nets = snapshots
+            .iter()
+            .filter(|s| s.device_type == VirtioDeviceType::Net)
+            .count();
         let current_blocks = self.storage_devices.len();
         let current_nets = self.network_devices.len();
 
