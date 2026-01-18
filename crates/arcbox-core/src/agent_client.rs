@@ -562,9 +562,16 @@ impl AgentClient {
     ///
     /// # Architecture
     ///
-    /// This method creates a new vsock connection specifically for streaming,
-    /// following Docker's pattern where log streaming uses a dedicated channel.
-    /// This allows the main AgentClient to remain usable for other operations.
+    /// ## Linux
+    /// Creates a new AF_VSOCK connection specifically for streaming, following
+    /// Docker's pattern where log streaming uses a dedicated channel.
+    ///
+    /// ## macOS
+    /// On macOS, vsock connections must go through the hypervisor layer
+    /// (VZVirtioSocketDevice) rather than AF_VSOCK. This method cannot create
+    /// new connections internally. Instead, it takes ownership of the current
+    /// transport via `logs_stream_shared()`. Callers must ensure each logs_stream
+    /// call uses a fresh AgentClient obtained from `MachineManager::connect_agent()`.
     ///
     /// # Errors
     ///
@@ -581,10 +588,10 @@ impl AgentClient {
         // Connect the streaming transport.
         #[cfg(target_os = "macos")]
         {
-            // On macOS, we need to get a new fd from the hypervisor.
-            // For now, reuse the existing transport for the initial request,
-            // then hand off to a background task.
-            // TODO: Support creating new vsock connections on macOS.
+            // On macOS, vsock connections require hypervisor layer involvement.
+            // We take ownership of the existing transport for dedicated streaming.
+            // This is safe because Runtime creates a fresh AgentClient for each
+            // logs_stream call via MachineManager::connect_agent().
             return self.logs_stream_shared(req).await;
         }
 
@@ -700,8 +707,21 @@ impl AgentClient {
 
     /// Takes ownership of the transport and runs log streaming in a background task.
     ///
-    /// On macOS, each call to `connect_agent` creates a new AgentClient with its
-    /// own transport, so we can safely take ownership here.
+    /// # macOS-specific Implementation
+    ///
+    /// On macOS, vsock connections must go through the hypervisor layer
+    /// (Virtualization.framework's VZVirtioSocketDevice). Unlike Linux where we can
+    /// create new AF_VSOCK connections directly, macOS requires the hypervisor to
+    /// provide file descriptors.
+    ///
+    /// This method takes ownership of the existing transport for dedicated log
+    /// streaming. After calling this method, the AgentClient is marked as disconnected
+    /// and should not be reused.
+    ///
+    /// # Safety Contract
+    ///
+    /// Callers MUST use a fresh AgentClient obtained from `MachineManager::connect_agent()`
+    /// for each logs_stream call. The Runtime layer enforces this pattern.
     #[cfg(target_os = "macos")]
     async fn logs_stream_shared(
         &mut self,
@@ -730,13 +750,12 @@ impl AgentClient {
         let (tx, rx) = mpsc::channel(256);
         let cid = self.cid;
 
-        // Take ownership of the transport for the background task.
-        // This is safe on macOS because each logs_stream call uses a fresh AgentClient
-        // created by connect_agent, so the transport is not shared.
+        // Take ownership of the transport for dedicated streaming.
+        // See doc comment for safety contract.
         let addr = VsockAddr::new(self.cid, AGENT_PORT);
         let mut stream_transport =
             std::mem::replace(&mut self.transport, VsockTransport::new(addr));
-        self.connected = false; // Mark as disconnected since we took the transport
+        self.connected = false;
 
         // Spawn background task to continuously read log entries.
         tokio::spawn(async move {
@@ -868,6 +887,13 @@ impl AgentClient {
     /// Attaches to a running container for bidirectional I/O.
     ///
     /// Returns a stream of outputs and a sender for stdin/resize messages.
+    ///
+    /// # Ownership
+    ///
+    /// This method takes ownership of the transport for dedicated bidirectional
+    /// streaming. After calling this method, the AgentClient is marked as disconnected
+    /// and should not be reused. Callers should use a fresh AgentClient obtained
+    /// from `MachineManager::connect_agent()`.
     pub async fn attach_stream(
         &mut self,
         req: AttachRequest,
