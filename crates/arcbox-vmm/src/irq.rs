@@ -105,7 +105,7 @@ impl IrqChip {
     /// This should be called after the VM is created with a callback that
     /// invokes the hypervisor's interrupt injection mechanism.
     pub fn set_trigger_callback(&self, callback: Arc<IrqTriggerCallback>) {
-        let mut cb = self.trigger_callback.lock().unwrap();
+        let mut cb = self.trigger_callback.lock().unwrap_or_else(|e| e.into_inner());
         *cb = Some(callback);
         tracing::debug!("IRQ trigger callback registered");
     }
@@ -132,7 +132,7 @@ impl IrqChip {
         };
 
         {
-            let mut configs = self.irq_configs.write().unwrap();
+            let mut configs = self.irq_configs.write().unwrap_or_else(|e| e.into_inner());
             configs.insert(irq, config);
         }
 
@@ -166,7 +166,7 @@ impl IrqChip {
         };
 
         {
-            let mut configs = self.irq_configs.write().unwrap();
+            let mut configs = self.irq_configs.write().unwrap_or_else(|e| e.into_inner());
             configs.insert(irq, config);
         }
 
@@ -177,7 +177,7 @@ impl IrqChip {
 
     /// Configures an existing IRQ.
     pub fn configure_irq(&self, irq: Irq, gsi: Gsi, trigger_mode: TriggerMode) -> Result<()> {
-        let mut configs = self.irq_configs.write().unwrap();
+        let mut configs = self.irq_configs.write().unwrap_or_else(|e| e.into_inner());
         if let Some(config) = configs.get_mut(&irq) {
             config.gsi = gsi;
             config.trigger_mode = trigger_mode;
@@ -215,7 +215,7 @@ impl IrqChip {
         }
 
         // Get configuration
-        let configs = self.irq_configs.read().unwrap();
+        let configs = self.irq_configs.read().unwrap_or_else(|e| e.into_inner());
         let config = configs.get(&irq);
         let (gsi, trigger_mode) = match config {
             Some(c) => (c.gsi, c.trigger_mode),
@@ -242,7 +242,7 @@ impl IrqChip {
         tracing::trace!("Triggering IRQ {} -> GSI {}", irq, gsi);
 
         // Invoke the trigger callback
-        let callback = self.trigger_callback.lock().unwrap();
+        let callback = self.trigger_callback.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref cb) = *callback {
             match trigger_mode {
                 TriggerMode::Edge => {
@@ -258,7 +258,7 @@ impl IrqChip {
                     cb(gsi, true)?;
                     // Mark as asserted in config
                     drop(callback);
-                    let mut configs = self.irq_configs.write().unwrap();
+                    let mut configs = self.irq_configs.write().unwrap_or_else(|e| e.into_inner());
                     if let Some(c) = configs.get_mut(&irq) {
                         c.asserted = true;
                     }
@@ -280,7 +280,7 @@ impl IrqChip {
     /// For level-triggered IRQs, the device calls this when the interrupt
     /// condition is cleared (e.g., data read from FIFO).
     pub fn deassert_irq(&self, irq: Irq) -> Result<()> {
-        let configs = self.irq_configs.read().unwrap();
+        let configs = self.irq_configs.read().unwrap_or_else(|e| e.into_inner());
         let config = configs.get(&irq);
         let gsi = match config {
             Some(c) if c.trigger_mode == TriggerMode::Level => c.gsi,
@@ -295,13 +295,13 @@ impl IrqChip {
         drop(configs);
 
         // Invoke callback to deassert
-        let callback = self.trigger_callback.lock().unwrap();
+        let callback = self.trigger_callback.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref cb) = *callback {
             cb(gsi, false)?;
         }
 
         // Mark as deasserted
-        let mut configs = self.irq_configs.write().unwrap();
+        let mut configs = self.irq_configs.write().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = configs.get_mut(&irq) {
             c.asserted = false;
         }
@@ -362,14 +362,14 @@ impl IrqChip {
     /// Gets the GSI for an IRQ.
     #[must_use]
     pub fn get_gsi(&self, irq: Irq) -> Option<Gsi> {
-        let configs = self.irq_configs.read().unwrap();
+        let configs = self.irq_configs.read().unwrap_or_else(|e| e.into_inner());
         configs.get(&irq).map(|c| c.gsi)
     }
 
     /// Gets the trigger mode for an IRQ.
     #[must_use]
     pub fn get_trigger_mode(&self, irq: Irq) -> Option<TriggerMode> {
-        let configs = self.irq_configs.read().unwrap();
+        let configs = self.irq_configs.read().unwrap_or_else(|e| e.into_inner());
         configs.get(&irq).map(|c| c.trigger_mode)
     }
 
@@ -435,7 +435,7 @@ mod tests {
         let events_clone = Arc::clone(&events);
 
         let callback: IrqTriggerCallback = Box::new(move |gsi, level| {
-            events_clone.lock().unwrap().push((gsi, level));
+            events_clone.lock().unwrap_or_else(|e| e.into_inner()).push((gsi, level));
             Ok(())
         });
         chip.set_trigger_callback(Arc::new(callback));
@@ -443,7 +443,7 @@ mod tests {
         // Use a legacy IRQ to exercise pending tracking.
         let irq: Irq = 5;
         {
-            let mut configs = chip.irq_configs.write().unwrap();
+            let mut configs = chip.irq_configs.write().unwrap_or_else(|e| e.into_inner());
             configs.insert(
                 irq,
                 IrqConfig {
@@ -458,7 +458,7 @@ mod tests {
         chip.trigger_irq(irq).unwrap();
         assert!(!chip.is_pending(irq));
 
-        let recorded = events.lock().unwrap();
+        let recorded = events.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(recorded.as_slice(), &[(5, true), (5, false)]);
     }
 
@@ -520,7 +520,7 @@ mod tests {
         let levels_clone = Arc::clone(&levels);
 
         let callback: IrqTriggerCallback = Box::new(move |gsi, level| {
-            levels_clone.lock().unwrap().push((gsi, level));
+            levels_clone.lock().unwrap_or_else(|e| e.into_inner()).push((gsi, level));
             Ok(())
         });
         chip.set_trigger_callback(Arc::new(callback));
@@ -534,7 +534,7 @@ mod tests {
         // Deassert
         chip.deassert_irq(irq).unwrap();
 
-        let recorded = levels.lock().unwrap();
+        let recorded = levels.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(recorded.len(), 2);
         assert_eq!(recorded[0], (3, true)); // assert
         assert_eq!(recorded[1], (3, false)); // deassert
@@ -561,7 +561,7 @@ mod tests {
 
         // Insert config for legacy IRQ 5
         {
-            let mut configs = chip.irq_configs.write().unwrap();
+            let mut configs = chip.irq_configs.write().unwrap_or_else(|e| e.into_inner());
             configs.insert(
                 legacy_irq,
                 super::IrqConfig {
