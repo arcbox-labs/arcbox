@@ -356,6 +356,12 @@ mod linux {
             RpcRequest::WaitContainer(req) => {
                 RequestResult::Single(handle_wait_container(&req.id, state).await)
             }
+            RpcRequest::PauseContainer(req) => {
+                RequestResult::Single(handle_pause_container(&req.id, state).await)
+            }
+            RpcRequest::UnpauseContainer(req) => {
+                RequestResult::Single(handle_unpause_container(&req.id, state).await)
+            }
             RpcRequest::Exec(req) => RequestResult::Single(handle_exec(req, state).await),
             RpcRequest::Logs(req) => handle_logs(req, state).await,
             RpcRequest::ExecStart(req) => {
@@ -703,6 +709,46 @@ mod linux {
         }
     }
 
+    /// Handles a PauseContainer request.
+    ///
+    /// Pauses all processes in a container by sending SIGSTOP.
+    async fn handle_pause_container(id: &str, state: &Arc<RwLock<AgentState>>) -> RpcResponse {
+        tracing::info!("PauseContainer: id={}", id);
+
+        let runtime = {
+            let state = state.read().await;
+            Arc::clone(&state.runtime)
+        };
+        let mut runtime = runtime.lock().await;
+        match runtime.pause_container(id).await {
+            Ok(()) => RpcResponse::Empty,
+            Err(e) => {
+                tracing::error!("Failed to pause container {}: {}", id, e);
+                RpcResponse::Error(ErrorResponse::new(500, format!("failed to pause: {}", e)))
+            }
+        }
+    }
+
+    /// Handles an UnpauseContainer request.
+    ///
+    /// Resumes all processes in a paused container by sending SIGCONT.
+    async fn handle_unpause_container(id: &str, state: &Arc<RwLock<AgentState>>) -> RpcResponse {
+        tracing::info!("UnpauseContainer: id={}", id);
+
+        let runtime = {
+            let state = state.read().await;
+            Arc::clone(&state.runtime)
+        };
+        let mut runtime = runtime.lock().await;
+        match runtime.unpause_container(id).await {
+            Ok(()) => RpcResponse::Empty,
+            Err(e) => {
+                tracing::error!("Failed to unpause container {}: {}", id, e);
+                RpcResponse::Error(ErrorResponse::new(500, format!("failed to unpause: {}", e)))
+            }
+        }
+    }
+
     /// Handles a ListContainers request.
     async fn handle_list_containers(all: bool, state: &Arc<RwLock<AgentState>>) -> RpcResponse {
         tracing::debug!("ListContainers: all={}", all);
@@ -737,6 +783,13 @@ mod linux {
                     format!("Running (PID: {})", pid)
                 } else {
                     "Running".to_string()
+                }
+            }
+            ContainerState::Paused => {
+                if let Some(pid) = handle.pid {
+                    format!("Paused (PID: {})", pid)
+                } else {
+                    "Paused".to_string()
                 }
             }
             ContainerState::Stopped => {

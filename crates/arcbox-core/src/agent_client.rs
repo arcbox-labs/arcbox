@@ -12,7 +12,8 @@ use arcbox_protocol::agent::{
     PingResponse, RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
 };
 use arcbox_protocol::container::{
-    KillContainerRequest, WaitContainerRequest, WaitContainerResponse,
+    KillContainerRequest, PauseContainerRequest, UnpauseContainerRequest, WaitContainerRequest,
+    WaitContainerResponse,
 };
 use arcbox_transport::Transport;
 use arcbox_transport::vsock::{VsockAddr, VsockTransport};
@@ -41,6 +42,8 @@ enum MessageType {
     ListContainersRequest = 0x0014,
     KillContainerRequest = 0x0015,
     WaitContainerRequest = 0x0016,
+    PauseContainerRequest = 0x0017,
+    UnpauseContainerRequest = 0x0018,
     ExecRequest = 0x0020,
     LogsRequest = 0x0021,
     ExecStartRequest = 0x0022,
@@ -76,6 +79,8 @@ impl MessageType {
             0x0014 => Some(Self::ListContainersRequest),
             0x0015 => Some(Self::KillContainerRequest),
             0x0016 => Some(Self::WaitContainerRequest),
+            0x0017 => Some(Self::PauseContainerRequest),
+            0x0018 => Some(Self::UnpauseContainerRequest),
             0x0020 => Some(Self::ExecRequest),
             0x0021 => Some(Self::LogsRequest),
             0x0022 => Some(Self::ExecStartRequest),
@@ -401,6 +406,60 @@ impl AgentClient {
             .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))?;
 
         Ok(resp.status_code as i32)
+    }
+
+    /// Pauses a container in the guest VM.
+    ///
+    /// Sends SIGSTOP to suspend all processes in the container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container cannot be paused.
+    pub async fn pause_container(&mut self, id: &str) -> Result<()> {
+        let req = PauseContainerRequest {
+            id: id.to_string(),
+        };
+        let payload = req.encode_to_vec();
+
+        let (resp_type, _) = self
+            .rpc_call(MessageType::PauseContainerRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::EmptyResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: {}",
+                resp_type
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Unpauses a container in the guest VM.
+    ///
+    /// Sends SIGCONT to resume all processes in the container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container cannot be unpaused.
+    pub async fn unpause_container(&mut self, id: &str) -> Result<()> {
+        let req = UnpauseContainerRequest {
+            id: id.to_string(),
+        };
+        let payload = req.encode_to_vec();
+
+        let (resp_type, _) = self
+            .rpc_call(MessageType::UnpauseContainerRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::EmptyResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: {}",
+                resp_type
+            )));
+        }
+
+        Ok(())
     }
 
     /// Removes a container from the guest VM.
@@ -821,6 +880,11 @@ impl AgentClient {
         }
 
         let payload = req.encode_to_vec();
+        tracing::debug!(
+            "attach_stream: sending AttachRequest, container_id={}, exec_id={}",
+            req.container_id,
+            req.exec_id
+        );
 
         // Build message: length (4B BE) + type (4B BE) + payload
         let length = 4 + payload.len() as u32;
@@ -834,6 +898,7 @@ impl AgentClient {
             .send(buf.freeze())
             .await
             .map_err(|e| CoreError::Machine(format!("failed to send attach request: {}", e)))?;
+        tracing::debug!("attach_stream: AttachRequest sent successfully");
 
         // Take ownership of transport for streaming.
         let addr = VsockAddr::new(self.cid, AGENT_PORT);
@@ -851,15 +916,41 @@ impl AgentClient {
             let tx_out = tx_out.clone();
             tokio::spawn(async move {
                 let _cleanup = AttachStreamCleanup { cid };
+                tracing::debug!(cid = cid, "attach reader task started");
                 loop {
+                    tracing::debug!(cid = cid, "attach reader: waiting for response...");
+                    // Use a 90-second timeout to allow agent's 60-second broadcaster wait plus margin.
                     let response = {
                         let mut locked = transport.lock().await;
-                        locked.recv().await
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(90),
+                            locked.recv(),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                tracing::warn!(
+                                    cid = cid,
+                                    "attach reader: recv timed out after 90 seconds"
+                                );
+                                Err(arcbox_transport::error::TransportError::Io(
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "attach recv timed out",
+                                    ),
+                                ))
+                            }
+                        }
                     };
 
                     let data = match response {
-                        Ok(d) => d,
+                        Ok(d) => {
+                            tracing::debug!(cid = cid, "attach reader: received {} bytes", d.len());
+                            d
+                        }
                         Err(e) => {
+                            tracing::debug!(cid = cid, "attach reader: recv error: {}", e);
                             let _ = tx_out.send(Err(CoreError::Machine(e.to_string()))).await;
                             break;
                         }
@@ -877,6 +968,13 @@ impl AgentClient {
                     let resp_type = cursor.get_u32();
                     let resp_payload = data[8..].to_vec();
 
+                    tracing::debug!(
+                        cid = cid,
+                        "attach reader: received response type={}, payload_len={}",
+                        resp_type,
+                        resp_payload.len()
+                    );
+
                     if resp_type == MessageType::Error as u32 {
                         let error_msg = parse_error_response(&resp_payload)
                             .unwrap_or_else(|_| "unknown error".to_string());
@@ -886,6 +984,7 @@ impl AgentClient {
 
                     if resp_type == MessageType::EmptyResponse as u32 {
                         // End of stream
+                        tracing::debug!(cid = cid, "attach reader: received EmptyResponse, ending stream");
                         break;
                     }
 

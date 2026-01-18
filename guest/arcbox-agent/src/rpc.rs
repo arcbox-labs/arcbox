@@ -29,7 +29,8 @@ use arcbox_protocol::agent::{
     StopContainerRequest, SystemInfo,
 };
 use arcbox_protocol::container::{
-    KillContainerRequest, WaitContainerRequest, WaitContainerResponse,
+    KillContainerRequest, PauseContainerRequest, UnpauseContainerRequest, WaitContainerRequest,
+    WaitContainerResponse,
 };
 
 /// Agent version string.
@@ -49,6 +50,8 @@ pub enum MessageType {
     ListContainersRequest = 0x0014,
     KillContainerRequest = 0x0015,
     WaitContainerRequest = 0x0016,
+    PauseContainerRequest = 0x0017,
+    UnpauseContainerRequest = 0x0018,
     ExecRequest = 0x0020,
     LogsRequest = 0x0021,
     ExecStartRequest = 0x0022,
@@ -66,6 +69,8 @@ pub enum MessageType {
     ListContainersResponse = 0x1014,
     KillContainerResponse = 0x1015,
     WaitContainerResponse = 0x1016,
+    PauseContainerResponse = 0x1017,
+    UnpauseContainerResponse = 0x1018,
     ExecOutput = 0x1020,
     LogEntry = 0x1021,
     ExecStartResponse = 0x1022,
@@ -89,6 +94,8 @@ impl MessageType {
             0x0014 => Some(Self::ListContainersRequest),
             0x0015 => Some(Self::KillContainerRequest),
             0x0016 => Some(Self::WaitContainerRequest),
+            0x0017 => Some(Self::PauseContainerRequest),
+            0x0018 => Some(Self::UnpauseContainerRequest),
             0x0020 => Some(Self::ExecRequest),
             0x0021 => Some(Self::LogsRequest),
             0x0022 => Some(Self::ExecStartRequest),
@@ -104,6 +111,8 @@ impl MessageType {
             0x1014 => Some(Self::ListContainersResponse),
             0x1015 => Some(Self::KillContainerResponse),
             0x1016 => Some(Self::WaitContainerResponse),
+            0x1017 => Some(Self::PauseContainerResponse),
+            0x1018 => Some(Self::UnpauseContainerResponse),
             0x1020 => Some(Self::ExecOutput),
             0x1021 => Some(Self::LogEntry),
             0x1022 => Some(Self::ExecStartResponse),
@@ -166,6 +175,8 @@ pub enum RpcRequest {
     ListContainers(ListContainersRequest),
     KillContainer(KillContainerRequest),
     WaitContainer(WaitContainerRequest),
+    PauseContainer(PauseContainerRequest),
+    UnpauseContainer(UnpauseContainerRequest),
     Exec(ExecRequest),
     Logs(LogsRequest),
     ExecStart(ExecStartRequest),
@@ -325,6 +336,14 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
         MessageType::WaitContainerRequest => {
             let req = WaitContainerRequest::decode(payload)?;
             Ok(RpcRequest::WaitContainer(req))
+        }
+        MessageType::PauseContainerRequest => {
+            let req = PauseContainerRequest::decode(payload)?;
+            Ok(RpcRequest::PauseContainer(req))
+        }
+        MessageType::UnpauseContainerRequest => {
+            let req = UnpauseContainerRequest::decode(payload)?;
+            Ok(RpcRequest::UnpauseContainer(req))
         }
         MessageType::ExecRequest => {
             let req = ExecRequest::decode(payload)?;

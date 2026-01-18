@@ -395,3 +395,15 @@ message WaitContainerResponse {
     // Error message if any.
     string error = 2;
 }
+
+// Request to pause a container.
+message PauseContainerRequest {
+    // Container ID or name.
+    string id = 1;
+}
+
+// Request to unpause a container.
+message UnpauseContainerRequest {
+    // Container ID or name.
+    string id = 1;
+}

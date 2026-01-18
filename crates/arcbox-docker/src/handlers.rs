@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde::de::Deserializer;
 use std::collections::{HashMap, HashSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{Duration, Instant, sleep};
 use tokio_stream::wrappers::ReceiverStream;
 
 // ============================================================================
@@ -83,7 +84,7 @@ pub async fn list_containers(
                 size_rw: None,
                 size_root_fs: None,
                 labels: HashMap::new(),
-                state: c.state.to_string(),
+                state: docker_state_string(c.state),
                 status: format_container_status(c),
                 network_settings: None,
                 mounts: None,
@@ -98,6 +99,7 @@ pub async fn list_containers(
 fn format_container_status(c: &arcbox_container::state::Container) -> String {
     match c.state {
         arcbox_container::state::ContainerState::Created => "Created".to_string(),
+        arcbox_container::state::ContainerState::Starting => "Created".to_string(),
         arcbox_container::state::ContainerState::Running => {
             if let Some(started) = c.started_at {
                 let duration = chrono::Utc::now() - started;
@@ -114,6 +116,13 @@ fn format_container_status(c: &arcbox_container::state::Container) -> String {
                 "Exited".to_string()
             }
         }
+    }
+}
+
+fn docker_state_string(state: arcbox_container::state::ContainerState) -> String {
+    match state {
+        arcbox_container::state::ContainerState::Starting => "created".to_string(),
+        _ => state.to_string(),
     }
 }
 
@@ -289,7 +298,7 @@ pub async fn inspect_container(
 
     // Build state response with all available fields
     let state_response = ContainerState {
-        status: container.state.to_string().to_lowercase(),
+        status: docker_state_string(container.state),
         running: container.state == arcbox_container::state::ContainerState::Running,
         paused: container.state == arcbox_container::state::ContainerState::Paused,
         restarting: container.state == arcbox_container::state::ContainerState::Restarting,
@@ -441,23 +450,25 @@ pub async fn start_container(
         .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
 
     // Start through Runtime -> Agent.
-    state
+    let started = state
         .runtime
         .start_container(&machine_name, &container_id)
         .await
         .map_err(|e| DockerError::Server(e.to_string()))?;
 
-    let labels = container
-        .config
-        .as_ref()
-        .map(|cfg| cfg.labels.clone())
-        .unwrap_or_default();
-    state.runtime.event_bus().publish(Event::ContainerStarted {
-        id: container_id.to_string(),
-        name: container.name.clone(),
-        image: container.image.clone(),
-        labels,
-    });
+    if started {
+        let labels = container
+            .config
+            .as_ref()
+            .map(|cfg| cfg.labels.clone())
+            .unwrap_or_default();
+        state.runtime.event_bus().publish(Event::ContainerStarted {
+            id: container_id.to_string(),
+            name: container.name.clone(),
+            image: container.image.clone(),
+            labels,
+        });
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -696,18 +707,20 @@ pub async fn restart_container(
         exit_code,
     });
 
-    state
+    let started = state
         .runtime
         .start_container(&machine_name, &container_id)
         .await
         .map_err(|e| DockerError::Server(e.to_string()))?;
 
-    state.runtime.event_bus().publish(Event::ContainerStarted {
-        id: container_id.to_string(),
-        name: container.name.clone(),
-        image,
-        labels,
-    });
+    if started {
+        state.runtime.event_bus().publish(Event::ContainerStarted {
+            id: container_id.to_string(),
+            name: container.name.clone(),
+            image,
+            labels,
+        });
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -803,7 +816,11 @@ pub async fn wait_container(
         .clone()
         .ok_or_else(|| DockerError::Server("container has no machine assigned".to_string()))?;
 
-    let should_emit_die = container.state == arcbox_container::state::ContainerState::Running;
+    let should_emit_die = matches!(
+        container.state,
+        arcbox_container::state::ContainerState::Running
+            | arcbox_container::state::ContainerState::Starting
+    );
 
     // Connect to agent and wait for container to exit.
     #[cfg(target_os = "macos")]
@@ -2003,7 +2020,8 @@ pub struct AttachContainerQuery {
 
 /// Attach to a container.
 ///
-/// This endpoint starts the container (if not running) and streams its output.
+/// This endpoint streams container output. The agent waits for the process to
+/// appear and replays backlog so fast commands are not missed.
 /// For non-TTY containers, output is encoded in Docker multiplexed stream format.
 ///
 /// Docker CLI expects either:
@@ -2023,6 +2041,22 @@ pub async fn attach_container(
         params.stream,
         params.logs
     );
+    let upgrade_hdr = req
+        .headers()
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let connection_hdr = req
+        .headers()
+        .get(axum::http::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    tracing::debug!(
+        "attach_container: request headers upgrade='{}' connection='{}'",
+        upgrade_hdr,
+        connection_hdr
+    );
+    tracing::debug!("attach_container: http version={:?}", req.version());
 
     let container_id = arcbox_container::state::ContainerId::from_string(&id);
 
@@ -2056,26 +2090,21 @@ pub async fn attach_container(
         .await
         .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {}", e)))?;
 
-    // Start container if not running.
     let container_state = container.state;
     tracing::debug!("attach_container: container state = {:?}", container_state);
 
-    if container_state == arcbox_container::state::ContainerState::Created {
-        tracing::debug!("attach_container: starting container {}", id);
-        state
-            .runtime
-            .start_container(&machine_name, &container_id)
-            .await
-            .map_err(|e| {
-                tracing::error!("attach_container: failed to start container: {}", e);
-                DockerError::Server(e.to_string())
-            })?;
-        tracing::debug!("attach_container: container started");
-    } else {
-        tracing::debug!(
-            "attach_container: container already in state {:?}, not starting",
-            container_state
-        );
+    // Only reject if container is being removed or dead - these are terminal states.
+    // For Created/Starting, we'll wait inside the spawned task after returning 101.
+    // This allows Docker CLI to send the /start request concurrently.
+    if matches!(
+        container_state,
+        arcbox_container::state::ContainerState::Removing
+            | arcbox_container::state::ContainerState::Dead
+    ) {
+        return Err(DockerError::Server(format!(
+            "container {} is not running",
+            id
+        )));
     }
 
     // Optional: prepend existing logs when `logs=true`.
@@ -2117,37 +2146,86 @@ pub async fn attach_container(
         None
     };
 
-    // Establish attach session with agent.
-    let (mut output_stream, input_tx) = state
-        .runtime
-        .container_attach(
-            &machine_name,
-            &id,
-            None,
-            attach_stdin,
-            params.stdout,
-            params.stderr,
-            0,
-            0,
-        )
-        .await
-        .map_err(|e| DockerError::Server(format!("failed to attach: {}", e)))?;
-
     // Prepare upgrade response and spawn bidirectional bridge.
+    // Content-Type is required by Docker CLI to recognize the hijacked connection.
+    let content_type = if is_tty {
+        "application/vnd.docker.raw-stream"
+    } else {
+        "application/vnd.docker.multiplexed-stream"
+    };
+
     let upgraded = hyper::upgrade::on(&mut req);
     let response = Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(axum::http::header::CONTENT_TYPE, content_type)
         .header(axum::http::header::CONNECTION, "Upgrade")
         .header(axum::http::header::UPGRADE, "tcp")
         .body(Body::empty())
         .unwrap();
 
+    let state = state.clone();
+    let container_id = container_id.clone();
+    let id = id.clone();
+    let machine_name = machine_name.clone();
+    let attach_stdout = params.stdout;
+    let attach_stderr = params.stderr;
     tokio::spawn(async move {
         match upgraded.await {
             Ok(upgraded) => {
                 let io = TokioIo::new(upgraded);
                 let (mut reader, mut writer) = tokio::io::split(io);
-                let input_tx = input_tx;
+
+                // Wait for container to be ready (Running or Exited) if it's still starting.
+                // This is done inside the spawned task so the 101 response is sent first,
+                // allowing Docker CLI to send the /start request concurrently.
+                let container_state = match state
+                    .runtime
+                    .container_manager()
+                    .wait_for_running_or_exited(&container_id, std::time::Duration::from_secs(30))
+                    .await
+                {
+                    Ok(state) => {
+                        tracing::debug!("attach_container: container now in state {:?}", state);
+                        state
+                    }
+                    Err(e) => {
+                        tracing::warn!("attach_container: timeout waiting for container: {}", e);
+                        return;
+                    }
+                };
+
+                // For exited containers, we still proceed to attach to get any buffered output
+                // from the backlog. This is important for fast-exiting containers like `echo`.
+                if matches!(
+                    container_state,
+                    arcbox_container::state::ContainerState::Exited
+                        | arcbox_container::state::ContainerState::Dead
+                ) {
+                    tracing::debug!(
+                        "attach_container: container already exited, will try to get buffered output"
+                    );
+                }
+
+                let (mut output_stream, input_tx) = match state
+                    .runtime
+                    .container_attach(
+                        &machine_name,
+                        &id,
+                        None,
+                        attach_stdin,
+                        attach_stdout,
+                        attach_stderr,
+                        0,
+                        0,
+                    )
+                    .await
+                {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        tracing::warn!("attach_container: failed to attach: {}", e);
+                        return;
+                    }
+                };
 
                 // Writer: send container output to client.
                 let write_task = tokio::spawn(async move {
@@ -2319,6 +2397,22 @@ pub async fn exec_start(
     use arcbox_container::ExecId;
 
     let exec_id = ExecId::from_string(&id);
+    let upgrade_hdr = req
+        .headers()
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let connection_hdr = req
+        .headers()
+        .get(axum::http::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    tracing::debug!(
+        "exec_start: request headers upgrade='{}' connection='{}'",
+        upgrade_hdr,
+        connection_hdr
+    );
+    tracing::debug!("exec_start: http version={:?}", req.version());
 
     // Parse body manually to keep request for upgrade.
     let body_bytes = to_bytes(std::mem::take(req.body_mut()), 1024 * 1024)
@@ -3410,16 +3504,17 @@ pub async fn pause_container(
         )));
     }
 
-    // Update state to paused.
+    let machine_name = container
+        .machine_name
+        .clone()
+        .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
+
+    // Pause through Runtime -> Agent.
     state
         .runtime
-        .container_manager()
-        .update(&container.id, |c| {
-            c.state = arcbox_container::state::ContainerState::Paused;
-        })
+        .pause_container(&machine_name, &container.id)
+        .await
         .map_err(|e| DockerError::Server(e.to_string()))?;
-
-    // TODO: Send pause signal to agent when VM is running.
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3445,16 +3540,17 @@ pub async fn unpause_container(
         )));
     }
 
-    // Update state to running.
+    let machine_name = container
+        .machine_name
+        .clone()
+        .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
+
+    // Unpause through Runtime -> Agent.
     state
         .runtime
-        .container_manager()
-        .update(&container.id, |c| {
-            c.state = arcbox_container::state::ContainerState::Running;
-        })
+        .unpause_container(&machine_name, &container.id)
+        .await
         .map_err(|e| DockerError::Server(e.to_string()))?;
-
-    // TODO: Send unpause signal to agent when VM is running.
 
     Ok(StatusCode::NO_CONTENT)
 }

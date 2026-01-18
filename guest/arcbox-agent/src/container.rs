@@ -38,6 +38,8 @@ pub enum ContainerState {
     Created,
     /// Container is running.
     Running,
+    /// Container is paused (SIGSTOP sent to all processes).
+    Paused,
     /// Container has stopped.
     Stopped,
 }
@@ -48,6 +50,7 @@ impl ContainerState {
         match self {
             Self::Created => "created",
             Self::Running => "running",
+            Self::Paused => "paused",
             Self::Stopped => "stopped",
         }
     }
@@ -652,6 +655,80 @@ impl ContainerRuntime {
                 anyhow::bail!("failed to send signal: {}", std::io::Error::last_os_error());
             }
         }
+
+        Ok(())
+    }
+
+    /// Pauses a container by sending SIGSTOP to its main process.
+    ///
+    /// This suspends all processes in the container until unpause is called.
+    pub async fn pause_container(&mut self, id: &str) -> Result<()> {
+        let container = self.containers.get_mut(id).context("container not found")?;
+
+        if container.state != ContainerState::Running {
+            anyhow::bail!("container is not running");
+        }
+
+        let pid = container.pid.context("container has no PID")?;
+
+        tracing::info!("Pausing container {} (PID {})", id, pid);
+
+        #[cfg(target_os = "linux")]
+        {
+            use nix::sys::signal::{Signal, kill};
+            use nix::unistd::Pid;
+
+            let nix_pid = Pid::from_raw(pid as i32);
+            kill(nix_pid, Signal::SIGSTOP).context("failed to send SIGSTOP")?;
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let result = unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
+            if result != 0 {
+                anyhow::bail!("failed to send SIGSTOP: {}", std::io::Error::last_os_error());
+            }
+        }
+
+        container.state = ContainerState::Paused;
+        tracing::info!("Container {} paused", id);
+
+        Ok(())
+    }
+
+    /// Unpauses a container by sending SIGCONT to its main process.
+    ///
+    /// This resumes all processes in the container that were previously paused.
+    pub async fn unpause_container(&mut self, id: &str) -> Result<()> {
+        let container = self.containers.get_mut(id).context("container not found")?;
+
+        if container.state != ContainerState::Paused {
+            anyhow::bail!("container is not paused");
+        }
+
+        let pid = container.pid.context("container has no PID")?;
+
+        tracing::info!("Unpausing container {} (PID {})", id, pid);
+
+        #[cfg(target_os = "linux")]
+        {
+            use nix::sys::signal::{Signal, kill};
+            use nix::unistd::Pid;
+
+            let nix_pid = Pid::from_raw(pid as i32);
+            kill(nix_pid, Signal::SIGCONT).context("failed to send SIGCONT")?;
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let result = unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+            if result != 0 {
+                anyhow::bail!("failed to send SIGCONT: {}", std::io::Error::last_os_error());
+            }
+        }
+
+        container.state = ContainerState::Running;
+        tracing::info!("Container {} unpaused", id);
 
         Ok(())
     }

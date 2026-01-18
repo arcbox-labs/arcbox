@@ -519,28 +519,47 @@ impl Runtime {
         &self,
         machine_name: &str,
         container_id: &ContainerId,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
             .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+
+        let start_outcome = self.container_manager.begin_start(container_id)?;
+        let start_ticket = match start_outcome {
+            arcbox_container::StartOutcome::Started(ticket) => Some(ticket),
+            arcbox_container::StartOutcome::AlreadyRunning
+            | arcbox_container::StartOutcome::AlreadyStarting => {
+                return Ok(false);
+            }
+        };
 
         // Send start request to agent
         let container_id_str = container_id.to_string();
         #[cfg(target_os = "macos")]
         {
             let mut agent = self.machine_manager.connect_agent(machine_name)?;
-            agent.start_container(&container_id_str).await?;
+            if let Err(e) = agent.start_container(&container_id_str).await {
+                if let Some(ticket) = start_ticket {
+                    let _ = self.container_manager.fail_start(container_id, ticket);
+                }
+                return Err(e.into());
+            }
         }
         #[cfg(target_os = "linux")]
         {
             let agent = self.agent_pool.get(cid).await;
             let mut agent = agent.write().await;
-            agent.start_container(&container_id_str).await?;
+            if let Err(e) = agent.start_container(&container_id_str).await {
+                if let Some(ticket) = start_ticket {
+                    let _ = self.container_manager.fail_start(container_id, ticket);
+                }
+                return Err(e.into());
+            }
         }
 
         // Update local state after successful agent call
-        self.container_manager.start(container_id).await?;
+        self.container_manager.finish_start(container_id)?;
 
         // Start port forwarding if configured.
         self.start_port_forwarding(machine_name, container_id)
@@ -552,7 +571,7 @@ impl Runtime {
             machine_name
         );
 
-        Ok(())
+        Ok(true)
     }
 
     /// Gets the VM's IP address by executing a command in the guest.
@@ -1187,6 +1206,96 @@ impl Runtime {
             container_id,
             machine_name,
             signal
+        );
+
+        Ok(())
+    }
+
+    /// Pauses a container.
+    ///
+    /// Sends SIGSTOP to suspend all processes in the container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container cannot be paused.
+    pub async fn pause_container(
+        &self,
+        machine_name: &str,
+        container_id: &ContainerId,
+    ) -> Result<()> {
+        let cid = self
+            .machine_manager
+            .get_cid(machine_name)
+            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+
+        let container_id_str = container_id.to_string();
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut agent = self.machine_manager.connect_agent(machine_name)?;
+            agent.pause_container(&container_id_str).await?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let agent = self.agent_pool.get(cid).await;
+            let mut agent = agent.write().await;
+            agent.pause_container(&container_id_str).await?;
+        }
+
+        // Update local state after successful agent call.
+        self.container_manager.update(container_id, |c| {
+            c.state = arcbox_container::state::ContainerState::Paused;
+        })?;
+
+        tracing::info!(
+            "Paused container {} in machine '{}'",
+            container_id,
+            machine_name
+        );
+
+        Ok(())
+    }
+
+    /// Unpauses a container.
+    ///
+    /// Sends SIGCONT to resume all processes in the container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container cannot be unpaused.
+    pub async fn unpause_container(
+        &self,
+        machine_name: &str,
+        container_id: &ContainerId,
+    ) -> Result<()> {
+        let cid = self
+            .machine_manager
+            .get_cid(machine_name)
+            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+
+        let container_id_str = container_id.to_string();
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut agent = self.machine_manager.connect_agent(machine_name)?;
+            agent.unpause_container(&container_id_str).await?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let agent = self.agent_pool.get(cid).await;
+            let mut agent = agent.write().await;
+            agent.unpause_container(&container_id_str).await?;
+        }
+
+        // Update local state after successful agent call.
+        self.container_manager.update(container_id, |c| {
+            c.state = arcbox_container::state::ContainerState::Running;
+        })?;
+
+        tracing::info!(
+            "Unpaused container {} in machine '{}'",
+            container_id,
+            machine_name
         );
 
         Ok(())
