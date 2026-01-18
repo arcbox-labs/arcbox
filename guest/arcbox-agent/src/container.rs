@@ -11,7 +11,9 @@
 //! - Special mounts (/proc, /sys, /dev) for proper Linux operation
 
 use crate::pty::PtyHandle;
-use crate::shim::{BroadcastWriter, ProcessShim};
+use crate::shim::{
+    BroadcastWriter, ProcessShim, spawn_broadcast_only_from_pipes, spawn_broadcast_only_from_pty,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -101,7 +103,7 @@ pub struct ContainerHandle {
 /// Running process handle.
 pub(crate) struct ProcessHandle {
     /// The child process.
-    pub(crate) child: Child,
+    pub(crate) child: Option<Child>,
     /// Child stdin (non-TTY).
     pub(crate) stdin: Option<ChildStdin>,
     /// PTY handle (if TTY mode).
@@ -223,7 +225,7 @@ impl ContainerRuntime {
         let container = self.containers.get_mut(id).context("container not found")?;
 
         if container.state == ContainerState::Running {
-            anyhow::bail!("container is already running");
+            return Ok(());
         }
 
         if container.command.is_empty() {
@@ -391,11 +393,12 @@ impl ContainerRuntime {
                     }
                     Err(e) => {
                         tracing::warn!("Failed to create shim for {}: {}", id, e);
-                        (None, None)
+                        let broadcaster = spawn_broadcast_only_from_pty(pty_master_fd);
+                        (None, Some(broadcaster))
                     }
                 }
             } else {
-                (None, None)
+                (None, Some(Arc::new(BroadcastWriter::new())))
             }
         } else {
             // Non-TTY mode: use stdout/stderr pipes
@@ -421,11 +424,12 @@ impl ContainerRuntime {
                     }
                     Err(e) => {
                         tracing::warn!("Failed to create shim for {}: {}", id, e);
-                        (None, None)
+                        let broadcaster = spawn_broadcast_only_from_pipes(stdout_fd, stderr_fd);
+                        (None, Some(broadcaster))
                     }
                 }
             } else {
-                (None, None)
+                (None, Some(Arc::new(BroadcastWriter::new())))
             }
         };
 
@@ -433,7 +437,7 @@ impl ContainerRuntime {
         processes.insert(
             id.to_string(),
             Arc::new(Mutex::new(ProcessHandle {
-                child,
+                child: Some(child),
                 stdin: stdin_handle,
                 pty: pty_handle,
                 shim_shutdown,
@@ -488,52 +492,58 @@ impl ContainerRuntime {
         };
 
         if let Some(process_handle) = process_handle {
-            let mut process_handle = process_handle.lock().await;
-            let timeout = tokio::time::Duration::from_secs(timeout_secs.into());
-            let result = tokio::time::timeout(timeout, process_handle.child.wait()).await;
+            let child = {
+                let mut process_handle = process_handle.lock().await;
+                process_handle.child.take()
+            };
 
-            match result {
-                Ok(Ok(status)) => {
-                    container.exit_code = status.code();
-                    tracing::info!(
-                        "Container {} exited with code {:?}",
-                        id,
-                        container.exit_code
-                    );
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("Error waiting for container {}: {}", id, e);
-                }
-                Err(_) => {
-                    // Timeout - send SIGKILL
-                    tracing::warn!(
-                        "Container {} did not stop after {}s, sending SIGKILL",
-                        id,
-                        timeout_secs
-                    );
+            if let Some(mut child) = child {
+                let timeout = tokio::time::Duration::from_secs(timeout_secs.into());
+                let result = tokio::time::timeout(timeout, child.wait()).await;
 
-                    #[cfg(target_os = "linux")]
-                    {
-                        use nix::sys::signal::{Signal, kill};
-                        use nix::unistd::Pid;
-
-                        let nix_pid = Pid::from_raw(pid as i32);
-                        let _ = kill(nix_pid, Signal::SIGKILL);
+                match result {
+                    Ok(Ok(status)) => {
+                        container.exit_code = status.code();
+                        tracing::info!(
+                            "Container {} exited with code {:?}",
+                            id,
+                            container.exit_code
+                        );
                     }
+                    Ok(Err(e)) => {
+                        tracing::warn!("Error waiting for container {}: {}", id, e);
+                    }
+                    Err(_) => {
+                        // Timeout - send SIGKILL
+                        tracing::warn!(
+                            "Container {} did not stop after {}s, sending SIGKILL",
+                            id,
+                            timeout_secs
+                        );
 
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        unsafe {
-                            libc::kill(pid as i32, libc::SIGKILL);
+                        #[cfg(target_os = "linux")]
+                        {
+                            use nix::sys::signal::{Signal, kill};
+                            use nix::unistd::Pid;
+
+                            let nix_pid = Pid::from_raw(pid as i32);
+                            let _ = kill(nix_pid, Signal::SIGKILL);
                         }
-                    }
 
-                    // Wait briefly for SIGKILL to take effect
-                    let _ = tokio::time::timeout(
-                        tokio::time::Duration::from_secs(5),
-                        process_handle.child.wait(),
-                    )
-                    .await;
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            unsafe {
+                                libc::kill(pid as i32, libc::SIGKILL);
+                            }
+                        }
+
+                        // Wait briefly for SIGKILL to take effect
+                        let _ = tokio::time::timeout(
+                            tokio::time::Duration::from_secs(5),
+                            child.wait(),
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -541,10 +551,6 @@ impl ContainerRuntime {
         // Update state
         container.state = ContainerState::Stopped;
         container.pid = None;
-
-        // Remove from process map
-        let mut processes = self.processes.lock().await;
-        processes.remove(id);
 
         Ok(())
     }
@@ -564,6 +570,7 @@ impl ContainerRuntime {
 
         tracing::info!("Removing container {}", id);
         self.containers.remove(id);
+        self.remove_process_handle(id).await;
 
         Ok(())
     }
@@ -586,22 +593,23 @@ impl ContainerRuntime {
         };
 
         if let Some(process_handle) = process_handle {
-            let mut process_handle = process_handle.lock().await;
-            let status = process_handle.child.wait().await?;
-            let exit_code = status.code().unwrap_or(-1);
+            let child = {
+                let mut process_handle = process_handle.lock().await;
+                process_handle.child.take()
+            };
 
-            // Update container state
-            drop(process_handle); // Release process lock before updating state
-            if let Some(container) = self.containers.get_mut(id) {
-                container.state = ContainerState::Stopped;
-                container.exit_code = Some(exit_code);
-                container.pid = None;
+            if let Some(mut child) = child {
+                let status = child.wait().await?;
+                let exit_code = status.code().unwrap_or(-1);
+
+                if let Some(container) = self.containers.get_mut(id) {
+                    container.state = ContainerState::Stopped;
+                    container.exit_code = Some(exit_code);
+                    container.pid = None;
+                }
+
+                return Ok(exit_code);
             }
-
-            let mut processes = self.processes.lock().await;
-            processes.remove(id);
-
-            return Ok(exit_code);
         }
 
         anyhow::bail!("container process not found")
@@ -1771,10 +1779,12 @@ mod tests {
                 handle.stdin.is_some(),
                 "stdin should be kept open when open_stdin=true"
             );
-            if let Some(pid) = handle.child.id() {
-                let _ = handle.child.start_kill();
-                let _ = handle.child.wait().await;
-                tracing::debug!("Killed test process {}", pid);
+            if let Some(child) = handle.child.as_mut() {
+                if let Some(pid) = child.id() {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    tracing::debug!("Killed test process {}", pid);
+                }
             }
         }
     }

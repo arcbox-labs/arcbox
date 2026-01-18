@@ -20,6 +20,7 @@ mod linux {
     use std::sync::Arc;
 
     use anyhow::{Context, Result};
+    use bytes::Bytes;
     use prost::Message;
     use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
     use tokio::process::{Child, ChildStdin, Command};
@@ -34,7 +35,7 @@ mod linux {
         AGENT_VERSION, ErrorResponse, MessageType, RpcRequest, RpcResponse, parse_request,
         read_message, write_response,
     };
-    use crate::shim::{BroadcastWriter, ProcessShim, StreamType};
+    use crate::shim::{BroadcastWriter, LogEntry as ShimLogEntry, LogWriter, ProcessShim, StreamType};
 
     use arcbox_protocol::agent::{
         AttachInput, AttachOutput, AttachRequest, ContainerInfo, CreateContainerResponse,
@@ -141,6 +142,7 @@ mod linux {
                 match listener.accept().await {
                     Ok((stream, peer_addr)) => {
                         tracing::info!("Accepted connection from {:?}", peer_addr);
+                        eprintln!("[AGENT] Accepted connection from {:?}", peer_addr);
                         let state = Arc::clone(&self.state);
                         tokio::spawn(async move {
                             if let Err(e) = handle_connection(stream, state).await {
@@ -184,7 +186,9 @@ mod linux {
                 }
             };
 
-            tracing::debug!("Received message type {:?}", msg_type);
+            tracing::info!("Received message type {:?}, payload_len={}", msg_type, payload.len());
+            // Direct stderr output for debugging when console capture might fail
+            eprintln!("[AGENT] Received message type {:?}, payload_len={}", msg_type, payload.len());
 
             // Parse and handle the request
             let result = match parse_request(msg_type, &payload) {
@@ -252,6 +256,7 @@ mod linux {
                     }
                 }
                 RequestResult::Attach(mut session) => {
+                    tracing::info!("Entered Attach processing loop, tty={}, stdin={}", session.tty, session.attach_stdin);
                     // Apply initial resize if requested.
                     if let (true, Some((cols, rows))) = (session.tty, session.initial_size) {
                         match &session.process {
@@ -277,15 +282,20 @@ mod linux {
                             maybe_out = session.output_rx.recv() => {
                                 match maybe_out {
                                     Some(out) => {
+                                        tracing::info!("Attach: received output, stream={}, len={}", out.stream, out.data.len());
                                         let response = RpcResponse::AttachOutput(out);
                                         if let Err(e) = write_response(&mut stream, &response).await {
-                                            tracing::debug!("Client disconnected during attach output: {}", e);
+                                            tracing::warn!("Client disconnected during attach output: {}", e);
                                             break;
                                         }
+                                        tracing::info!("Attach: sent AttachOutput response");
                                     }
                                     None => {
                                         // Output stream ended; signal end of stream.
-                                        let _ = write_response(&mut stream, &RpcResponse::Empty).await;
+                                        tracing::info!("Attach: output stream ended, sending Empty response");
+                                        if let Err(e) = write_response(&mut stream, &RpcResponse::Empty).await {
+                                            tracing::warn!("Attach: failed to send Empty response: {}", e);
+                                        }
                                         break;
                                     }
                                 }
@@ -532,9 +542,60 @@ mod linux {
             let state = state.read().await;
             Arc::clone(&state.runtime)
         };
-        let mut runtime = runtime.lock().await;
-        match runtime.start_container(id).await {
-            Ok(()) => RpcResponse::Empty,
+        let start_result = {
+            let mut runtime = runtime.lock().await;
+            runtime.start_container(id).await
+        };
+        match start_result {
+            Ok(()) => {
+                let runtime = Arc::clone(&runtime);
+                let id = id.to_string();
+                tokio::spawn(async move {
+                    let process_handle = {
+                        let runtime = runtime.lock().await;
+                        runtime.get_process_handle(&id).await
+                    };
+
+                    let Some(process_handle) = process_handle else {
+                        tracing::warn!("Reaper: process handle missing for {}", id);
+                        return;
+                    };
+
+                    let child = {
+                        let mut handle = process_handle.lock().await;
+                        handle.child.take()
+                    };
+
+                    let Some(mut child) = child else {
+                        tracing::debug!("Reaper: child already taken for {}", id);
+                        return;
+                    };
+
+                    let exit_code = match child.wait().await {
+                        Ok(status) => status.code().unwrap_or(-1),
+                        Err(e) => {
+                            tracing::warn!("Reaper: wait failed for {}: {}", id, e);
+                            -1
+                        }
+                    };
+
+                    {
+                        let mut runtime = runtime.lock().await;
+                        runtime.mark_container_stopped(&id, exit_code);
+                    }
+
+                    {
+                        let mut handle = process_handle.lock().await;
+                        handle.stdin.take();
+                        handle.pty.take();
+                    }
+
+                    // Keep the process handle for late attach/log replay. It is removed on
+                    // container removal.
+                });
+
+                RpcResponse::Empty
+            }
             Err(e) => {
                 tracing::error!("Failed to start container {}: {}", id, e);
                 RpcResponse::Error(ErrorResponse::new(500, format!("failed to start: {}", e)))
@@ -618,64 +679,28 @@ mod linux {
             let state = state.read().await;
             Arc::clone(&state.runtime)
         };
-
-        let (container_state, exit_code, process_handle) = {
-            let runtime = runtime.lock().await;
-            let (state, code) = match runtime.get_container_state(id) {
-                Some(state) => state,
-                None => {
-                    return RpcResponse::Error(ErrorResponse::new(404, "container not found"));
+        loop {
+            let (container_state, exit_code) = {
+                let runtime = runtime.lock().await;
+                match runtime.get_container_state(id) {
+                    Some(state) => state,
+                    None => {
+                        return RpcResponse::Error(ErrorResponse::new(404, "container not found"));
+                    }
                 }
             };
-            let process_handle = if state == ContainerState::Running {
-                runtime.get_process_handle(id).await
-            } else {
-                None
-            };
-            (state, code, process_handle)
-        };
 
-        if container_state == ContainerState::Stopped {
-            let exit_code = exit_code.unwrap_or(-1);
-            tracing::info!("Container {} exited with code {}", id, exit_code);
-            return RpcResponse::WaitContainer(arcbox_protocol::container::WaitContainerResponse {
-                status_code: i64::from(exit_code),
-                error: String::new(),
-            });
-        }
-
-        let process_handle = match process_handle {
-            Some(handle) => handle,
-            None => {
-                return RpcResponse::Error(ErrorResponse::new(500, "container process not found"));
+            if container_state == ContainerState::Stopped {
+                let exit_code = exit_code.unwrap_or(-1);
+                tracing::info!("Container {} exited with code {}", id, exit_code);
+                return RpcResponse::WaitContainer(arcbox_protocol::container::WaitContainerResponse {
+                    status_code: i64::from(exit_code),
+                    error: String::new(),
+                });
             }
-        };
 
-        let exit_code = match process_handle.lock().await.child.wait().await {
-            Ok(status) => status.code().unwrap_or(-1),
-            Err(e) => {
-                tracing::error!("Failed to wait for container {}: {}", id, e);
-                return RpcResponse::Error(ErrorResponse::new(
-                    500,
-                    format!("failed to wait: {}", e),
-                ));
-            }
-        };
-
-        {
-            let mut runtime = runtime.lock().await;
-            runtime.mark_container_stopped(id, exit_code);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        {
-            let runtime = runtime.lock().await;
-            runtime.remove_process_handle(id).await;
-        }
-
-        tracing::info!("Container {} exited with code {}", id, exit_code);
-        RpcResponse::WaitContainer(arcbox_protocol::container::WaitContainerResponse {
-            status_code: i64::from(exit_code),
-            error: String::new(),
-        })
     }
 
     /// Handles a ListContainers request.
@@ -1255,6 +1280,7 @@ mod linux {
 
     /// Handles an Attach request (sets up bidirectional streaming).
     async fn handle_attach(req: AttachRequest, state: &Arc<RwLock<AgentState>>) -> RequestResult {
+        eprintln!("[AGENT] handle_attach: container_id={}, exec_id={}", req.container_id, req.exec_id);
         tracing::info!(
             "Attach: container_id={}, exec_id={}, stdin={}, stdout={}, stderr={}, size={}x{}",
             req.container_id,
@@ -1309,25 +1335,30 @@ mod linux {
                     broadcaster,
                 )
             } else {
-                // Validate container and gather metadata.
-                let (attach_stdin_allowed, is_tty, initial_size) = {
-                    let runtime = runtime.lock().await;
-                    let container = match runtime.get_container(&req.container_id) {
-                        Some(c) => c,
-                        None => {
-                            return RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
-                                404,
-                                format!("container not found: {}", req.container_id),
-                            )));
-                        }
-                    };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
 
-                    if container.state != ContainerState::Running {
-                        return RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
-                            400,
-                            "container is not running",
-                        )));
-                    }
+                let mut attach_stdin_allowed = false;
+                let mut is_tty = false;
+                let mut initial_size = None;
+                let mut process_handle = None;
+                let mut broadcaster = None;
+
+                loop {
+                    let (state, open_stdin, tty) = {
+                        let runtime = runtime.lock().await;
+                        let container = match runtime.get_container(&req.container_id) {
+                            Some(c) => c,
+                            None => {
+                                return RequestResult::Single(RpcResponse::Error(
+                                    ErrorResponse::new(
+                                        404,
+                                        format!("container not found: {}", req.container_id),
+                                    ),
+                                ));
+                            }
+                        };
+                        (container.state, container.open_stdin, container.tty)
+                    };
 
                     let resize = if req.tty_width > 0 && req.tty_height > 0 {
                         Some((req.tty_width as u16, req.tty_height as u16))
@@ -1335,31 +1366,103 @@ mod linux {
                         None
                     };
 
-                    (
-                        req.attach_stdin && container.open_stdin,
-                        container.tty,
-                        resize,
-                    )
-                };
+                    attach_stdin_allowed = req.attach_stdin && open_stdin;
+                    is_tty = tty;
+                    initial_size = resize;
 
-                // Get process handle.
-                let process_handle = {
-                    let runtime = runtime.lock().await;
-                    match runtime.get_process_handle(&req.container_id).await {
-                        Some(handle) => handle,
-                        None => {
-                            return RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
-                                500,
-                                "container process not found",
-                            )));
+                    let handle = {
+                        let runtime = runtime.lock().await;
+                        runtime.get_process_handle(&req.container_id).await
+                    };
+
+                    tracing::info!(
+                        "handle_attach: get_process_handle returned: {:?}",
+                        handle.is_some()
+                    );
+
+                    if let Some(handle) = handle {
+                        let handle_guard = handle.lock().await;
+                        let log_broadcaster = handle_guard.broadcaster.clone();
+                        tracing::info!(
+                            "handle_attach: broadcaster from handle: {:?}",
+                            log_broadcaster.is_some()
+                        );
+                        drop(handle_guard);
+
+                        if let Some(b) = log_broadcaster {
+                            process_handle = Some(handle);
+                            broadcaster = Some(b);
+                            tracing::info!("handle_attach: found broadcaster, breaking loop");
+                            break;
                         }
                     }
-                };
 
-                // Subscribe to broadcaster.
-                let broadcaster = {
-                    let runtime = runtime.lock().await;
-                    runtime.get_log_broadcaster(&req.container_id).await
+                    if state == ContainerState::Stopped {
+                        if let Some(b) = build_attach_backlog_broadcaster(
+                            &req.container_id,
+                            req.attach_stdout,
+                            req.attach_stderr,
+                        )
+                        .await
+                        {
+                            let handle = Arc::new(Mutex::new(crate::container::ProcessHandle {
+                                child: None,
+                                stdin: None,
+                                pty: None,
+                                shim_shutdown: None,
+                                broadcaster: Some(Arc::clone(&b)),
+                            }));
+                            process_handle = Some(handle);
+                            broadcaster = Some(b);
+                            attach_stdin_allowed = false;
+                            break;
+                        }
+                    }
+
+                    tracing::info!(
+                        "handle_attach: loop iteration, container_id={}, state={:?}, has_process_handle={}, has_broadcaster={}",
+                        req.container_id,
+                        state,
+                        process_handle.is_some(),
+                        broadcaster.is_some()
+                    );
+
+                    match state {
+                        ContainerState::Created => {
+                            if std::time::Instant::now() >= deadline {
+                                return RequestResult::Single(RpcResponse::Error(
+                                    ErrorResponse::new(400, "container is not running"),
+                                ));
+                            }
+                        }
+                        ContainerState::Running => {
+                            if std::time::Instant::now() >= deadline {
+                                return RequestResult::Single(RpcResponse::Error(
+                                    ErrorResponse::new(500, "log broadcaster unavailable"),
+                                ));
+                            }
+                        }
+                        ContainerState::Stopped => {
+                            if std::time::Instant::now() >= deadline {
+                                return RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
+                                    400,
+                                    "container is not running",
+                                )));
+                            }
+                        }
+                    }
+
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+
+                let process_handle = match process_handle {
+                    Some(handle) => handle,
+                    None => {
+                        return RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
+                            500,
+                            "container process not found",
+                        )));
+                    }
                 };
 
                 let broadcaster = match broadcaster {
@@ -1383,17 +1486,36 @@ mod linux {
 
         let include_stdout = req.attach_stdout;
         let include_stderr = req.attach_stderr;
+        tracing::info!(
+            "handle_attach: about to subscribe to broadcaster, container_id={}",
+            req.container_id
+        );
         let mut log_rx = broadcaster.subscribe().await;
+        tracing::info!(
+            "handle_attach: subscribed to broadcaster, container_id={}",
+            req.container_id
+        );
 
         // Channel for outgoing attach output.
         let (tx, rx) = mpsc::channel(64);
 
+        let container_id_for_log = req.container_id.clone();
         tokio::spawn(async move {
+            let mut entry_count = 0u32;
             while let Some(entry) = log_rx.recv().await {
+                entry_count += 1;
                 let stream_name = match entry.stream {
                     StreamType::Stderr => "stderr",
                     _ => "stdout",
                 };
+
+                tracing::debug!(
+                    "handle_attach: received entry #{} from broadcaster, stream={}, len={}, container_id={}",
+                    entry_count,
+                    stream_name,
+                    entry.data.len(),
+                    container_id_for_log
+                );
 
                 // Filter streams.
                 if stream_name == "stdout" && !include_stdout {
@@ -1409,9 +1531,18 @@ mod linux {
                 };
 
                 if tx.send(out).await.is_err() {
+                    tracing::debug!(
+                        "handle_attach: tx.send failed (receiver dropped), container_id={}",
+                        container_id_for_log
+                    );
                     break;
                 }
             }
+            tracing::debug!(
+                "handle_attach: log_rx ended, total entries={}, container_id={}",
+                entry_count,
+                container_id_for_log
+            );
         });
 
         RequestResult::Attach(AttachSession {
@@ -1421,6 +1552,53 @@ mod linux {
             tty: is_tty,
             initial_size,
         })
+    }
+
+    async fn build_attach_backlog_broadcaster(
+        container_id: &str,
+        stdout: bool,
+        stderr: bool,
+    ) -> Option<Arc<BroadcastWriter>> {
+        let log_path = format!("/var/log/containers/{}.log", container_id);
+        let log_data = match std::fs::read_to_string(&log_path) {
+            Ok(data) => data,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return None;
+                }
+                tracing::warn!(
+                    "Attach fallback: failed to read logs for {}: {}",
+                    container_id,
+                    e
+                );
+                return None;
+            }
+        };
+
+        let broadcaster = Arc::new(BroadcastWriter::new());
+        for line in log_data.lines() {
+            if let Some(parsed) = parse_docker_log_line(line, stdout, stderr) {
+                let stream = if parsed.stream == "stderr" {
+                    StreamType::Stderr
+                } else {
+                    StreamType::Stdout
+                };
+                let timestamp = parsed
+                    .timestamp
+                    .and_then(|ts| ts.timestamp_nanos_opt())
+                    .unwrap_or_else(|| Utc::now().timestamp_nanos_opt().unwrap_or(0));
+                let entry = ShimLogEntry {
+                    stream,
+                    data: Bytes::from(parsed.log),
+                    timestamp,
+                    partial: false,
+                };
+                let _ = broadcaster.write(&entry).await;
+            }
+        }
+
+        broadcaster.close().await;
+        Some(broadcaster)
     }
 
     /// Applies stdin and resize operations for an attach session.
