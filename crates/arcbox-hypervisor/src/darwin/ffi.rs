@@ -7,7 +7,7 @@
 
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::Once;
+use std::sync::{Mutex, Once, OnceLock};
 
 use objc2::ffi::{objc_getClass, objc_msgSend};
 use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
@@ -149,9 +149,14 @@ macro_rules! msg_send_void {
 // ============================================================================
 
 /// Creates an NSString from a Rust string.
+///
+/// Returns null if NSString class is not available (should never happen on a functional macOS).
 fn nsstring(s: &str) -> *mut AnyObject {
     unsafe {
-        let cls = get_class("NSString").expect("NSString class not found");
+        let Some(cls) = get_class("NSString") else {
+            tracing::error!("NSString class not found - this indicates a broken system");
+            return ptr::null_mut();
+        };
         let alloc = msg_send!(cls, alloc);
 
         let sel = sel!(initWithBytes:length:encoding:);
@@ -168,6 +173,8 @@ fn nsstring(s: &str) -> *mut AnyObject {
 
 /// Creates an NSURL from a file path.
 /// Converts relative paths to absolute paths to ensure correct URL creation.
+///
+/// Returns null if NSURL class is not available (should never happen on a functional macOS).
 fn nsurl_file_path(path: &str) -> *mut AnyObject {
     // Convert relative paths to absolute paths
     let abs_path = if std::path::Path::new(path).is_absolute() {
@@ -179,9 +186,18 @@ fn nsurl_file_path(path: &str) -> *mut AnyObject {
     };
 
     unsafe {
-        let cls = get_class("NSURL").expect("NSURL class not found");
+        let Some(cls) = get_class("NSURL") else {
+            tracing::error!("NSURL class not found - this indicates a broken system");
+            return ptr::null_mut();
+        };
         let path_str = nsstring(&abs_path);
+        if path_str.is_null() {
+            return ptr::null_mut();
+        }
         let url: *mut AnyObject = msg_send!(cls, fileURLWithPath: path_str);
+        if url.is_null() {
+            return ptr::null_mut();
+        }
         // Retain to prevent autorelease - caller is responsible for release
         let _: *mut AnyObject = msg_send!(url, retain);
         url
@@ -209,9 +225,14 @@ fn nsstring_to_string(obj: *mut AnyObject) -> String {
 }
 
 /// Creates an NSArray from raw pointers.
+///
+/// Returns null if NSArray class is not available (should never happen on a functional macOS).
 fn nsarray(objects: &[*mut AnyObject]) -> *mut AnyObject {
     unsafe {
-        let cls = get_class("NSArray").expect("NSArray class not found");
+        let Some(cls) = get_class("NSArray") else {
+            tracing::error!("NSArray class not found - this indicates a broken system");
+            return ptr::null_mut();
+        };
         let sel = sel!(arrayWithObjects:count:);
         let func: unsafe extern "C" fn(
             *const AnyClass,
@@ -1206,34 +1227,62 @@ pub fn is_supported() -> bool {
 }
 
 /// Gets the maximum supported CPU count.
+///
+/// Returns a safe default of 1 if the Virtualization.framework class is unavailable.
 pub fn max_cpu_count() -> u64 {
     unsafe {
-        let cls = get_class("VZVirtualMachineConfiguration").unwrap();
-        msg_send_u64!(cls, maximumAllowedCPUCount)
+        match get_class("VZVirtualMachineConfiguration") {
+            Some(cls) => msg_send_u64!(cls, maximumAllowedCPUCount),
+            None => {
+                tracing::warn!("VZVirtualMachineConfiguration class not found, using default max CPU count");
+                1
+            }
+        }
     }
 }
 
 /// Gets the minimum supported CPU count.
+///
+/// Returns a safe default of 1 if the Virtualization.framework class is unavailable.
 pub fn min_cpu_count() -> u64 {
     unsafe {
-        let cls = get_class("VZVirtualMachineConfiguration").unwrap();
-        msg_send_u64!(cls, minimumAllowedCPUCount)
+        match get_class("VZVirtualMachineConfiguration") {
+            Some(cls) => msg_send_u64!(cls, minimumAllowedCPUCount),
+            None => {
+                tracing::warn!("VZVirtualMachineConfiguration class not found, using default min CPU count");
+                1
+            }
+        }
     }
 }
 
 /// Gets the maximum supported memory size.
+///
+/// Returns a safe default of 1GB if the Virtualization.framework class is unavailable.
 pub fn max_memory_size() -> u64 {
     unsafe {
-        let cls = get_class("VZVirtualMachineConfiguration").unwrap();
-        msg_send_u64!(cls, maximumAllowedMemorySize)
+        match get_class("VZVirtualMachineConfiguration") {
+            Some(cls) => msg_send_u64!(cls, maximumAllowedMemorySize),
+            None => {
+                tracing::warn!("VZVirtualMachineConfiguration class not found, using default max memory size");
+                1024 * 1024 * 1024 // 1GB default
+            }
+        }
     }
 }
 
 /// Gets the minimum supported memory size.
+///
+/// Returns a safe default of 128MB if the Virtualization.framework class is unavailable.
 pub fn min_memory_size() -> u64 {
     unsafe {
-        let cls = get_class("VZVirtualMachineConfiguration").unwrap();
-        msg_send_u64!(cls, minimumAllowedMemorySize)
+        match get_class("VZVirtualMachineConfiguration") {
+            Some(cls) => msg_send_u64!(cls, minimumAllowedMemorySize),
+            None => {
+                tracing::warn!("VZVirtualMachineConfiguration class not found, using default min memory size");
+                128 * 1024 * 1024 // 128MB default
+            }
+        }
     }
 }
 
@@ -1379,9 +1428,14 @@ pub fn get_main_queue() -> *mut AnyObject {
 }
 
 /// Creates a dispatch queue for VM operations.
+///
+/// Returns null if the label contains a null byte (which is invalid for C strings).
 pub fn create_dispatch_queue(label: &str) -> *mut AnyObject {
     unsafe {
-        let label_cstr = std::ffi::CString::new(label).unwrap();
+        let Ok(label_cstr) = std::ffi::CString::new(label) else {
+            tracing::error!("Invalid dispatch queue label (contains null byte): {}", label);
+            return ptr::null_mut();
+        };
         let queue = dispatch_queue_create(
             label_cstr.as_ptr(),
             ptr::null(), // DISPATCH_QUEUE_SERIAL
@@ -1618,6 +1672,7 @@ pub struct VsockConnectionResult {
 static VSOCK_CONN_RESULT: std::sync::OnceLock<std::sync::Mutex<Option<VsockConnectionResult>>> =
     std::sync::OnceLock::new();
 static VSOCK_CONN_CONDVAR: std::sync::OnceLock<std::sync::Condvar> = std::sync::OnceLock::new();
+static VSOCK_CONNECT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// Connects to a port on a vsock device.
 ///
@@ -1654,13 +1709,20 @@ pub fn vsock_connect_to_port(
         });
     }
 
+    // Serialize vsock connections: the completion globals are not thread-safe.
+    // Use unwrap_or_else to handle poisoned mutex (recover by taking the inner value).
+    let _connect_guard = VSOCK_CONNECT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     // Initialize globals
     let result_mutex = VSOCK_CONN_RESULT.get_or_init(|| std::sync::Mutex::new(None));
     let _condvar = VSOCK_CONN_CONDVAR.get_or_init(|| std::sync::Condvar::new());
 
     // Clear previous result
     {
-        let mut guard = result_mutex.lock().unwrap();
+        let mut guard = result_mutex.lock().unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
 
@@ -1840,7 +1902,7 @@ pub fn vsock_connect_to_port(
             std::thread::sleep(std::time::Duration::from_millis(100));
 
             // Check if we have a result
-            let guard = result_mutex.lock().unwrap();
+            let guard = result_mutex.lock().unwrap_or_else(|e| e.into_inner());
             if guard.is_some() {
                 // Clean up context
                 drop(Box::from_raw(context_ptr));
