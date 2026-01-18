@@ -132,6 +132,9 @@ mod linux {
 
         /// Runs the agent, listening on vsock.
         pub async fn run(&self) -> Result<()> {
+            // Mount standard VirtioFS shares if not already mounted
+            crate::mount::mount_standard_shares();
+
             let addr = VsockAddr::new(VMADDR_CID_ANY, AGENT_PORT);
             let mut listener =
                 VsockListener::bind(addr).context("failed to bind vsock listener")?;

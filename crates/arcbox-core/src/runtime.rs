@@ -424,20 +424,25 @@ impl Runtime {
 
         // Convert volume mounts to protocol Mount type with path translation.
         // Host paths under data_dir are translated to /arcbox/... in guest.
-        let data_dir_str = self.config.data_dir.to_string_lossy();
+        // Host paths under home directory are translated to /host-home/... in guest.
+        let data_dir_str = self.config.data_dir.to_string_lossy().to_string();
+        let home_dir_str = dirs::home_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
         let mounts: Vec<Mount> = config
             .volumes
             .iter()
             .map(|v| {
                 // Translate host path to guest-accessible path.
-                // If source is under data_dir, map to /arcbox/...
-                let guest_source = if v.source.starts_with(data_dir_str.as_ref()) {
-                    v.source.replacen(data_dir_str.as_ref(), "/arcbox", 1)
+                // Priority: data_dir first, then home directory
+                let guest_source = if v.source.starts_with(&data_dir_str) {
+                    v.source.replacen(&data_dir_str, "/arcbox", 1)
+                } else if !home_dir_str.is_empty() && v.source.starts_with(&home_dir_str) {
+                    v.source.replacen(&home_dir_str, "/host-home", 1)
                 } else {
-                    // For paths outside data_dir, keep as-is.
-                    // TODO: Add VirtioFS share for home directory to support arbitrary paths.
+                    // For paths outside both data_dir and home, keep as-is.
                     tracing::warn!(
-                        "Volume source '{}' is outside data_dir, mount may fail",
+                        "Volume source '{}' is outside data_dir and home, mount may fail",
                         v.source
                     );
                     v.source.clone()

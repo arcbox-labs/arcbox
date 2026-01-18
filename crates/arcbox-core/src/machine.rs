@@ -234,12 +234,21 @@ impl MachineManager {
             return Err(CoreError::AlreadyExists(config.name));
         }
 
-        // Create shared directory for container rootfs via VirtioFS
-        // This shares data_dir (e.g., ~/.arcbox) with the guest at /arcbox
-        let shared_dirs = vec![SharedDirConfig::new(
+        // Create shared directories for container rootfs and home directory via VirtioFS
+        // - "arcbox" shares data_dir (e.g., ~/.local/share/arcbox) -> /arcbox in guest
+        // - "home" shares user home directory -> /host-home in guest
+        let mut shared_dirs = vec![SharedDirConfig::new(
             self.data_dir.to_string_lossy().to_string(),
             "arcbox",
         )];
+
+        // Add home directory share if available
+        if let Some(home_dir) = dirs::home_dir() {
+            shared_dirs.push(SharedDirConfig::new(
+                home_dir.to_string_lossy().to_string(),
+                "home",
+            ));
+        }
 
         // Create underlying VM
         let vm_config = VmConfig {

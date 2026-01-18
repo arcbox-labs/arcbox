@@ -57,3 +57,48 @@ pub fn unmount_fs(target: &str) -> Result<()> {
 pub fn mount_virtiofs(tag: &str, mountpoint: &str) -> Result<()> {
     mount_fs(tag, mountpoint, "virtiofs", &[])
 }
+
+/// Checks if a path is already mounted.
+#[cfg(target_os = "linux")]
+pub fn is_mounted(path: &str) -> bool {
+    use std::fs;
+    if let Ok(content) = fs::read_to_string("/proc/mounts") {
+        content.lines().any(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            parts.get(1).is_some_and(|&p| p == path)
+        })
+    } else {
+        false
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_mounted(_path: &str) -> bool {
+    false
+}
+
+/// Mount all standard VirtioFS shares if not already mounted.
+///
+/// This mounts:
+/// - "arcbox" tag -> /arcbox (data directory)
+/// - "home" tag -> /host-home (user home directory)
+pub fn mount_standard_shares() {
+    // Mount arcbox data directory
+    if !is_mounted("/arcbox") {
+        if let Err(e) = mount_virtiofs("arcbox", "/arcbox") {
+            tracing::warn!("Failed to mount arcbox share: {}", e);
+        } else {
+            tracing::info!("Mounted arcbox share at /arcbox");
+        }
+    }
+
+    // Mount home directory share
+    if !is_mounted("/host-home") {
+        if let Err(e) = mount_virtiofs("home", "/host-home") {
+            // This is expected to fail if the share isn't configured
+            tracing::debug!("Home share not available: {}", e);
+        } else {
+            tracing::info!("Mounted home share at /host-home");
+        }
+    }
+}
