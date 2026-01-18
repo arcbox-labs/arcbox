@@ -29,6 +29,7 @@ use arcbox_protocol::agent::{
     StopContainerRequest, SystemInfo,
 };
 use arcbox_protocol::container::{
+    ContainerStatsRequest, ContainerStatsResponse, ContainerTopRequest, ContainerTopResponse,
     KillContainerRequest, PauseContainerRequest, UnpauseContainerRequest, WaitContainerRequest,
     WaitContainerResponse,
 };
@@ -52,6 +53,8 @@ pub enum MessageType {
     WaitContainerRequest = 0x0016,
     PauseContainerRequest = 0x0017,
     UnpauseContainerRequest = 0x0018,
+    ContainerStatsRequest = 0x0019,
+    ContainerTopRequest = 0x001A,
     ExecRequest = 0x0020,
     LogsRequest = 0x0021,
     ExecStartRequest = 0x0022,
@@ -71,6 +74,8 @@ pub enum MessageType {
     WaitContainerResponse = 0x1016,
     PauseContainerResponse = 0x1017,
     UnpauseContainerResponse = 0x1018,
+    ContainerStatsResponse = 0x1019,
+    ContainerTopResponse = 0x101A,
     ExecOutput = 0x1020,
     LogEntry = 0x1021,
     ExecStartResponse = 0x1022,
@@ -96,6 +101,8 @@ impl MessageType {
             0x0016 => Some(Self::WaitContainerRequest),
             0x0017 => Some(Self::PauseContainerRequest),
             0x0018 => Some(Self::UnpauseContainerRequest),
+            0x0019 => Some(Self::ContainerStatsRequest),
+            0x001A => Some(Self::ContainerTopRequest),
             0x0020 => Some(Self::ExecRequest),
             0x0021 => Some(Self::LogsRequest),
             0x0022 => Some(Self::ExecStartRequest),
@@ -113,6 +120,8 @@ impl MessageType {
             0x1016 => Some(Self::WaitContainerResponse),
             0x1017 => Some(Self::PauseContainerResponse),
             0x1018 => Some(Self::UnpauseContainerResponse),
+            0x1019 => Some(Self::ContainerStatsResponse),
+            0x101A => Some(Self::ContainerTopResponse),
             0x1020 => Some(Self::ExecOutput),
             0x1021 => Some(Self::LogEntry),
             0x1022 => Some(Self::ExecStartResponse),
@@ -177,6 +186,8 @@ pub enum RpcRequest {
     WaitContainer(WaitContainerRequest),
     PauseContainer(PauseContainerRequest),
     UnpauseContainer(UnpauseContainerRequest),
+    ContainerStats(ContainerStatsRequest),
+    ContainerTop(ContainerTopRequest),
     Exec(ExecRequest),
     Logs(LogsRequest),
     ExecStart(ExecStartRequest),
@@ -194,6 +205,8 @@ pub enum RpcResponse {
     Empty,
     ListContainers(ListContainersResponse),
     WaitContainer(WaitContainerResponse),
+    ContainerStats(ContainerStatsResponse),
+    ContainerTop(ContainerTopResponse),
     ExecOutput(ExecOutput),
     LogEntry(LogEntry),
     ExecStart(ExecStartResponse),
@@ -211,6 +224,8 @@ impl RpcResponse {
             Self::Empty => MessageType::Empty,
             Self::ListContainers(_) => MessageType::ListContainersResponse,
             Self::WaitContainer(_) => MessageType::WaitContainerResponse,
+            Self::ContainerStats(_) => MessageType::ContainerStatsResponse,
+            Self::ContainerTop(_) => MessageType::ContainerTopResponse,
             Self::ExecOutput(_) => MessageType::ExecOutput,
             Self::LogEntry(_) => MessageType::LogEntry,
             Self::ExecStart(_) => MessageType::ExecStartResponse,
@@ -228,6 +243,8 @@ impl RpcResponse {
             Self::Empty => Empty::default().encode_to_vec(),
             Self::ListContainers(msg) => msg.encode_to_vec(),
             Self::WaitContainer(msg) => msg.encode_to_vec(),
+            Self::ContainerStats(msg) => msg.encode_to_vec(),
+            Self::ContainerTop(msg) => msg.encode_to_vec(),
             Self::ExecOutput(msg) => msg.encode_to_vec(),
             Self::LogEntry(msg) => msg.encode_to_vec(),
             Self::ExecStart(msg) => msg.encode_to_vec(),
@@ -344,6 +361,14 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
         MessageType::UnpauseContainerRequest => {
             let req = UnpauseContainerRequest::decode(payload)?;
             Ok(RpcRequest::UnpauseContainer(req))
+        }
+        MessageType::ContainerStatsRequest => {
+            let req = ContainerStatsRequest::decode(payload)?;
+            Ok(RpcRequest::ContainerStats(req))
+        }
+        MessageType::ContainerTopRequest => {
+            let req = ContainerTopRequest::decode(payload)?;
+            Ok(RpcRequest::ContainerTop(req))
         }
         MessageType::ExecRequest => {
             let req = ExecRequest::decode(payload)?;

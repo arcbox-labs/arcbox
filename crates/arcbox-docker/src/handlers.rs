@@ -3618,20 +3618,27 @@ pub async fn container_top(
         )));
     }
 
-    // TODO: Get actual process list from agent.
-    // For now, return a placeholder response.
+    let machine_name = container
+        .machine_name
+        .as_ref()
+        .ok_or_else(|| DockerError::Server("container has no machine".to_string()))?;
+
+    let ps_args = _params.get("ps_args").map_or("", String::as_str);
+
+    // Get process list from agent.
+    let top_response = state
+        .runtime
+        .container_top(machine_name, &container.id.to_string(), ps_args)
+        .await
+        .map_err(|e| DockerError::Server(e.to_string()))?;
+
     Ok(Json(ContainerTopResponse {
-        titles: vec![
-            "UID".to_string(),
-            "PID".to_string(),
-            "PPID".to_string(),
-            "C".to_string(),
-            "STIME".to_string(),
-            "TTY".to_string(),
-            "TIME".to_string(),
-            "CMD".to_string(),
-        ],
-        processes: vec![],
+        titles: top_response.titles,
+        processes: top_response
+            .processes
+            .into_iter()
+            .map(|p| p.values)
+            .collect(),
     }))
 }
 
@@ -3743,22 +3750,39 @@ pub async fn container_stats(
         )));
     }
 
-    // TODO: Get actual stats from agent.
-    // For now, return placeholder stats.
+    let machine_name = container
+        .machine_name
+        .as_ref()
+        .ok_or_else(|| DockerError::Server("container has no machine".to_string()))?;
+
     let now = chrono::Utc::now().to_rfc3339();
+
+    // Get actual stats from agent.
+    let agent_stats = state
+        .runtime
+        .container_stats(machine_name, &container.id.to_string())
+        .await
+        .map_err(|e| DockerError::Server(e.to_string()))?;
 
     Ok(Json(ContainerStatsResponse {
         id: container.id.to_string(),
         name: format!("/{}", container.name),
         read: now,
         cpu_stats: CpuStats {
-            online_cpus: num_cpus() as u32,
-            ..Default::default()
+            cpu_usage: CpuUsage {
+                total_usage: agent_stats.cpu_usage,
+                percpu_usage: vec![],
+                usage_in_kernelmode: 0,
+                usage_in_usermode: 0,
+            },
+            system_cpu_usage: agent_stats.system_cpu_usage,
+            online_cpus: agent_stats.online_cpus,
         },
         precpu_stats: CpuStats::default(),
         memory_stats: MemoryStats {
-            limit: total_memory() as u64,
-            ..Default::default()
+            usage: agent_stats.memory_usage,
+            max_usage: 0,
+            limit: agent_stats.memory_limit,
         },
         networks: HashMap::new(),
     }))

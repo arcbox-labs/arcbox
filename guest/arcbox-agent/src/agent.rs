@@ -362,6 +362,12 @@ mod linux {
             RpcRequest::UnpauseContainer(req) => {
                 RequestResult::Single(handle_unpause_container(&req.id, state).await)
             }
+            RpcRequest::ContainerStats(req) => {
+                RequestResult::Single(handle_container_stats(&req.id, state).await)
+            }
+            RpcRequest::ContainerTop(req) => {
+                RequestResult::Single(handle_container_top(&req.id, &req.ps_args, state).await)
+            }
             RpcRequest::Exec(req) => RequestResult::Single(handle_exec(req, state).await),
             RpcRequest::Logs(req) => handle_logs(req, state).await,
             RpcRequest::ExecStart(req) => {
@@ -745,6 +751,50 @@ mod linux {
             Err(e) => {
                 tracing::error!("Failed to unpause container {}: {}", id, e);
                 RpcResponse::Error(ErrorResponse::new(500, format!("failed to unpause: {}", e)))
+            }
+        }
+    }
+
+    /// Handles a ContainerStats request.
+    ///
+    /// Returns CPU, memory, and I/O statistics for a running container.
+    async fn handle_container_stats(id: &str, state: &Arc<RwLock<AgentState>>) -> RpcResponse {
+        tracing::debug!("ContainerStats: id={}", id);
+
+        let runtime = {
+            let state = state.read().await;
+            Arc::clone(&state.runtime)
+        };
+        let runtime = runtime.lock().await;
+        match runtime.container_stats(id).await {
+            Ok(stats) => RpcResponse::ContainerStats(stats),
+            Err(e) => {
+                tracing::error!("Failed to get container stats {}: {}", id, e);
+                RpcResponse::Error(ErrorResponse::new(500, format!("failed to get stats: {}", e)))
+            }
+        }
+    }
+
+    /// Handles a ContainerTop request.
+    ///
+    /// Returns process list for a running container.
+    async fn handle_container_top(
+        id: &str,
+        ps_args: &str,
+        state: &Arc<RwLock<AgentState>>,
+    ) -> RpcResponse {
+        tracing::debug!("ContainerTop: id={}, ps_args={}", id, ps_args);
+
+        let runtime = {
+            let state = state.read().await;
+            Arc::clone(&state.runtime)
+        };
+        let runtime = runtime.lock().await;
+        match runtime.container_top(id, ps_args).await {
+            Ok(top) => RpcResponse::ContainerTop(top),
+            Err(e) => {
+                tracing::error!("Failed to get container top {}: {}", id, e);
+                RpcResponse::Error(ErrorResponse::new(500, format!("failed to get top: {}", e)))
             }
         }
     }

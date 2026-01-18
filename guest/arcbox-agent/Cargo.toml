@@ -35,6 +35,7 @@ async-trait = { workspace = true }
 pin-project-lite = { workspace = true }
 tokio-util = "0.7"
 flate2 = "1"
+num_cpus = "1"
 
 # vsock is Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]

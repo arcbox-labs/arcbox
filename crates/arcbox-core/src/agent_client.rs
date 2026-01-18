@@ -12,6 +12,7 @@ use arcbox_protocol::agent::{
     PingResponse, RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
 };
 use arcbox_protocol::container::{
+    ContainerStatsRequest, ContainerStatsResponse, ContainerTopRequest, ContainerTopResponse,
     KillContainerRequest, PauseContainerRequest, UnpauseContainerRequest, WaitContainerRequest,
     WaitContainerResponse,
 };
@@ -44,6 +45,8 @@ enum MessageType {
     WaitContainerRequest = 0x0016,
     PauseContainerRequest = 0x0017,
     UnpauseContainerRequest = 0x0018,
+    ContainerStatsRequest = 0x0019,
+    ContainerTopRequest = 0x001A,
     ExecRequest = 0x0020,
     LogsRequest = 0x0021,
     ExecStartRequest = 0x0022,
@@ -57,6 +60,8 @@ enum MessageType {
     GetSystemInfoResponse = 0x1002,
     CreateContainerResponse = 0x1010,
     ListContainersResponse = 0x1014,
+    ContainerStatsResponse = 0x1019,
+    ContainerTopResponse = 0x101A,
     ExecOutput = 0x1020,
     LogEntry = 0x1021,
     ExecStartResponse = 0x1022,
@@ -81,6 +86,8 @@ impl MessageType {
             0x0016 => Some(Self::WaitContainerRequest),
             0x0017 => Some(Self::PauseContainerRequest),
             0x0018 => Some(Self::UnpauseContainerRequest),
+            0x0019 => Some(Self::ContainerStatsRequest),
+            0x001A => Some(Self::ContainerTopRequest),
             0x0020 => Some(Self::ExecRequest),
             0x0021 => Some(Self::LogsRequest),
             0x0022 => Some(Self::ExecStartRequest),
@@ -92,6 +99,8 @@ impl MessageType {
             0x1002 => Some(Self::GetSystemInfoResponse),
             0x1010 => Some(Self::CreateContainerResponse),
             0x1014 => Some(Self::ListContainersResponse),
+            0x1019 => Some(Self::ContainerStatsResponse),
+            0x101A => Some(Self::ContainerTopResponse),
             0x1020 => Some(Self::ExecOutput),
             0x1021 => Some(Self::LogEntry),
             0x1022 => Some(Self::ExecStartResponse),
@@ -460,6 +469,67 @@ impl AgentClient {
         }
 
         Ok(())
+    }
+
+    /// Gets container statistics from the guest VM.
+    ///
+    /// Returns CPU, memory, and I/O statistics for a running container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stats cannot be retrieved.
+    pub async fn container_stats(&mut self, id: &str) -> Result<ContainerStatsResponse> {
+        let req = ContainerStatsRequest {
+            id: id.to_string(),
+        };
+        let payload = req.encode_to_vec();
+
+        let (resp_type, resp_payload) = self
+            .rpc_call(MessageType::ContainerStatsRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::ContainerStatsResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: {}",
+                resp_type
+            )));
+        }
+
+        ContainerStatsResponse::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+    }
+
+    /// Gets the process list for a container in the guest VM.
+    ///
+    /// Returns process information similar to `docker top`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process list cannot be retrieved.
+    pub async fn container_top(
+        &mut self,
+        id: &str,
+        ps_args: &str,
+    ) -> Result<ContainerTopResponse> {
+        let req = ContainerTopRequest {
+            id: id.to_string(),
+            ps_args: ps_args.to_string(),
+        };
+        let payload = req.encode_to_vec();
+
+        let (resp_type, resp_payload) = self
+            .rpc_call(MessageType::ContainerTopRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::ContainerTopResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: {}",
+                resp_type
+            )));
+        }
+
+        ContainerTopResponse::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
     }
 
     /// Removes a container from the guest VM.

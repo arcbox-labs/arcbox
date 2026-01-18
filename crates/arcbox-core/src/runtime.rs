@@ -1301,6 +1301,63 @@ impl Runtime {
         Ok(())
     }
 
+    /// Gets container statistics (CPU, memory, I/O).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if stats cannot be retrieved.
+    pub async fn container_stats(
+        &self,
+        machine_name: &str,
+        container_id: &str,
+    ) -> Result<arcbox_protocol::container::ContainerStatsResponse> {
+        let _cid = self
+            .machine_manager
+            .get_cid(machine_name)
+            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut agent = self.machine_manager.connect_agent(machine_name)?;
+            agent.container_stats(container_id).await.map_err(Into::into)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let agent = self.agent_pool.get(_cid).await;
+            let mut agent = agent.write().await;
+            agent.container_stats(container_id).await.map_err(Into::into)
+        }
+    }
+
+    /// Gets the process list for a container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process list cannot be retrieved.
+    pub async fn container_top(
+        &self,
+        machine_name: &str,
+        container_id: &str,
+        ps_args: &str,
+    ) -> Result<arcbox_protocol::container::ContainerTopResponse> {
+        let _cid = self
+            .machine_manager
+            .get_cid(machine_name)
+            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut agent = self.machine_manager.connect_agent(machine_name)?;
+            agent.container_top(container_id, ps_args).await.map_err(Into::into)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let agent = self.agent_pool.get(_cid).await;
+            let mut agent = agent.write().await;
+            agent.container_top(container_id, ps_args).await.map_err(Into::into)
+        }
+    }
+
     // =========================================================================
     // Exec operations (coordinating ExecManager + Agent)
     // =========================================================================

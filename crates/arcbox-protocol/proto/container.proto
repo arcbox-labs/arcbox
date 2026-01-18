@@ -407,3 +407,55 @@ message UnpauseContainerRequest {
     // Container ID or name.
     string id = 1;
 }
+
+// Request for container stats.
+message ContainerStatsRequest {
+    // Container ID or name.
+    string id = 1;
+}
+
+// Container stats response.
+message ContainerStatsResponse {
+    // CPU usage in nanoseconds.
+    uint64 cpu_usage = 1;
+    // System CPU usage in nanoseconds.
+    uint64 system_cpu_usage = 2;
+    // Number of online CPUs.
+    uint32 online_cpus = 3;
+    // Memory usage in bytes.
+    uint64 memory_usage = 4;
+    // Memory limit in bytes.
+    uint64 memory_limit = 5;
+    // Network bytes received.
+    uint64 network_rx_bytes = 6;
+    // Network bytes transmitted.
+    uint64 network_tx_bytes = 7;
+    // Block I/O read bytes.
+    uint64 block_read_bytes = 8;
+    // Block I/O write bytes.
+    uint64 block_write_bytes = 9;
+    // Number of PIDs.
+    uint32 pids = 10;
+}
+
+// Request for container top (process list).
+message ContainerTopRequest {
+    // Container ID or name.
+    string id = 1;
+    // ps arguments (optional).
+    string ps_args = 2;
+}
+
+// Container top response.
+message ContainerTopResponse {
+    // Column titles.
+    repeated string titles = 1;
+    // Process rows (each row is a list of values).
+    repeated ProcessRow processes = 2;
+}
+
+// A single process row.
+message ProcessRow {
+    // Values for each column.
+    repeated string values = 1;
+}

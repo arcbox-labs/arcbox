@@ -733,6 +733,312 @@ impl ContainerRuntime {
         Ok(())
     }
 
+    /// Gets container statistics (CPU, memory, I/O).
+    ///
+    /// Returns stats for a running container by reading from /proc and cgroups.
+    pub async fn container_stats(
+        &self,
+        id: &str,
+    ) -> Result<arcbox_protocol::container::ContainerStatsResponse> {
+        let container = self.containers.get(id).context("container not found")?;
+
+        if container.state != ContainerState::Running {
+            anyhow::bail!("container is not running");
+        }
+
+        let pid = container.pid.context("container has no PID")?;
+
+        // Read stats from /proc/<pid>/stat and memory info
+        let stats = self.read_process_stats(pid).await?;
+
+        Ok(stats)
+    }
+
+    /// Reads process stats from /proc filesystem.
+    async fn read_process_stats(
+        &self,
+        pid: u32,
+    ) -> Result<arcbox_protocol::container::ContainerStatsResponse> {
+        use arcbox_protocol::container::ContainerStatsResponse;
+
+        // Read CPU times from /proc/<pid>/stat
+        let stat_path = format!("/proc/{}/stat", pid);
+        let stat_content = tokio::fs::read_to_string(&stat_path)
+            .await
+            .unwrap_or_default();
+
+        // Parse /proc/<pid>/stat - format: pid (comm) state ppid ...
+        // Fields 14 and 15 are utime and stime (in clock ticks)
+        let cpu_usage = if !stat_content.is_empty() {
+            // Find the closing paren to skip comm field (which may contain spaces/parens)
+            if let Some(close_paren) = stat_content.rfind(')') {
+                let fields: Vec<&str> = stat_content[close_paren + 2..].split_whitespace().collect();
+                if fields.len() >= 13 {
+                    // utime is field index 11 after the state field (which is index 0)
+                    // stime is field index 12
+                    let utime: u64 = fields[11].parse().unwrap_or(0);
+                    let stime: u64 = fields[12].parse().unwrap_or(0);
+                    // Convert clock ticks to nanoseconds (assuming 100 Hz clock)
+                    (utime + stime) * 10_000_000
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        // Read system CPU usage from /proc/stat
+        let system_stat = tokio::fs::read_to_string("/proc/stat")
+            .await
+            .unwrap_or_default();
+        let system_cpu_usage = if let Some(cpu_line) = system_stat.lines().next() {
+            let fields: Vec<&str> = cpu_line.split_whitespace().collect();
+            if fields.len() >= 5 && fields[0] == "cpu" {
+                let user: u64 = fields[1].parse().unwrap_or(0);
+                let nice: u64 = fields[2].parse().unwrap_or(0);
+                let system: u64 = fields[3].parse().unwrap_or(0);
+                let idle: u64 = fields[4].parse().unwrap_or(0);
+                (user + nice + system + idle) * 10_000_000
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        // Get number of online CPUs
+        let online_cpus = num_cpus::get() as u32;
+
+        // Read memory from /proc/<pid>/status
+        let status_path = format!("/proc/{}/status", pid);
+        let status_content = tokio::fs::read_to_string(&status_path)
+            .await
+            .unwrap_or_default();
+
+        let mut memory_usage = 0u64;
+        for line in status_content.lines() {
+            if line.starts_with("VmRSS:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    // VmRSS is in kB, convert to bytes
+                    memory_usage = parts[1].parse::<u64>().unwrap_or(0) * 1024;
+                }
+                break;
+            }
+        }
+
+        // Read total memory from /proc/meminfo
+        let meminfo = tokio::fs::read_to_string("/proc/meminfo")
+            .await
+            .unwrap_or_default();
+        let mut memory_limit = 0u64;
+        for line in meminfo.lines() {
+            if line.starts_with("MemTotal:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    memory_limit = parts[1].parse::<u64>().unwrap_or(0) * 1024;
+                }
+                break;
+            }
+        }
+
+        // Read I/O stats from /proc/<pid>/io
+        let io_path = format!("/proc/{}/io", pid);
+        let io_content = tokio::fs::read_to_string(&io_path)
+            .await
+            .unwrap_or_default();
+
+        let mut block_read_bytes = 0u64;
+        let mut block_write_bytes = 0u64;
+        for line in io_content.lines() {
+            if line.starts_with("read_bytes:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    block_read_bytes = parts[1].parse().unwrap_or(0);
+                }
+            } else if line.starts_with("write_bytes:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    block_write_bytes = parts[1].parse().unwrap_or(0);
+                }
+            }
+        }
+
+        // Count child processes
+        let children_path = format!("/proc/{}/task/{}/children", pid, pid);
+        let children = tokio::fs::read_to_string(&children_path)
+            .await
+            .unwrap_or_default();
+        let pids = children.split_whitespace().count() as u32 + 1; // +1 for the main process
+
+        Ok(ContainerStatsResponse {
+            cpu_usage,
+            system_cpu_usage,
+            online_cpus,
+            memory_usage,
+            memory_limit,
+            network_rx_bytes: 0, // TODO: implement network stats
+            network_tx_bytes: 0,
+            block_read_bytes,
+            block_write_bytes,
+            pids,
+        })
+    }
+
+    /// Gets the list of processes running in a container.
+    ///
+    /// Returns process information similar to `docker top`.
+    pub async fn container_top(
+        &self,
+        id: &str,
+        _ps_args: &str,
+    ) -> Result<arcbox_protocol::container::ContainerTopResponse> {
+        use arcbox_protocol::container::{ContainerTopResponse, ProcessRow};
+
+        let container = self.containers.get(id).context("container not found")?;
+
+        if container.state != ContainerState::Running {
+            anyhow::bail!("container is not running");
+        }
+
+        let pid = container.pid.context("container has no PID")?;
+
+        // Collect all processes in the container's process tree
+        let mut pids = vec![pid];
+        self.collect_child_pids(pid, &mut pids).await;
+
+        let mut processes = Vec::new();
+
+        for p in pids {
+            if let Ok(row) = self.read_process_info(p).await {
+                processes.push(row);
+            }
+        }
+
+        Ok(ContainerTopResponse {
+            titles: vec![
+                "UID".to_string(),
+                "PID".to_string(),
+                "PPID".to_string(),
+                "C".to_string(),
+                "STIME".to_string(),
+                "TTY".to_string(),
+                "TIME".to_string(),
+                "CMD".to_string(),
+            ],
+            processes,
+        })
+    }
+
+    /// Recursively collects all child PIDs.
+    async fn collect_child_pids(&self, pid: u32, pids: &mut Vec<u32>) {
+        let children_path = format!("/proc/{}/task/{}/children", pid, pid);
+        if let Ok(content) = tokio::fs::read_to_string(&children_path).await {
+            for child_str in content.split_whitespace() {
+                if let Ok(child_pid) = child_str.parse::<u32>() {
+                    pids.push(child_pid);
+                    // Recursively get children of this child
+                    Box::pin(self.collect_child_pids(child_pid, pids)).await;
+                }
+            }
+        }
+    }
+
+    /// Reads process info for a single PID.
+    async fn read_process_info(
+        &self,
+        pid: u32,
+    ) -> Result<arcbox_protocol::container::ProcessRow> {
+        use arcbox_protocol::container::ProcessRow;
+
+        // Read /proc/<pid>/stat for basic info
+        let stat_path = format!("/proc/{}/stat", pid);
+        let stat_content = tokio::fs::read_to_string(&stat_path).await?;
+
+        // Parse stat file
+        let (ppid, utime, stime) = if let Some(close_paren) = stat_content.rfind(')') {
+            let fields: Vec<&str> = stat_content[close_paren + 2..].split_whitespace().collect();
+            if fields.len() >= 13 {
+                let ppid: u32 = fields[1].parse().unwrap_or(0);
+                let utime: u64 = fields[11].parse().unwrap_or(0);
+                let stime: u64 = fields[12].parse().unwrap_or(0);
+                (ppid, utime, stime)
+            } else {
+                (0, 0, 0)
+            }
+        } else {
+            (0, 0, 0)
+        };
+
+        // CPU percentage (simplified)
+        let c = 0u32; // Would need delta calculation for accurate %
+
+        // Read /proc/<pid>/status for UID
+        let status_path = format!("/proc/{}/status", pid);
+        let status_content = tokio::fs::read_to_string(&status_path)
+            .await
+            .unwrap_or_default();
+
+        let mut uid = "0".to_string();
+        for line in status_content.lines() {
+            if line.starts_with("Uid:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    uid = parts[1].to_string();
+                }
+                break;
+            }
+        }
+
+        // Calculate CPU time
+        let total_time = (utime + stime) / 100; // Convert from jiffies to seconds
+        let time = format!(
+            "{:02}:{:02}:{:02}",
+            total_time / 3600,
+            (total_time % 3600) / 60,
+            total_time % 60
+        );
+
+        // Read command line
+        let cmdline_path = format!("/proc/{}/cmdline", pid);
+        let cmdline = tokio::fs::read_to_string(&cmdline_path)
+            .await
+            .unwrap_or_default()
+            .replace('\0', " ")
+            .trim()
+            .to_string();
+
+        // If cmdline is empty, use comm
+        let cmd = if cmdline.is_empty() {
+            let comm_path = format!("/proc/{}/comm", pid);
+            format!(
+                "[{}]",
+                tokio::fs::read_to_string(&comm_path)
+                    .await
+                    .unwrap_or_default()
+                    .trim()
+            )
+        } else {
+            cmdline
+        };
+
+        Ok(ProcessRow {
+            values: vec![
+                uid,
+                pid.to_string(),
+                ppid.to_string(),
+                c.to_string(),
+                "-".to_string(), // STIME - would need start time
+                "?".to_string(), // TTY
+                time,
+                cmd,
+            ],
+        })
+    }
+
     /// Resizes the TTY for a container.
     pub async fn resize_tty(&self, id: &str, cols: u16, rows: u16) -> Result<()> {
         tracing::debug!("ResizeTty for {}: {}x{}", id, cols, rows);
