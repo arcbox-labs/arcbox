@@ -61,10 +61,14 @@ struct MemorySlotInfo {
     flags: u32,
 }
 
-// Safety: The host_addr pointer points to mmap'd memory that is valid
+// SAFETY: The host_addr pointer points to mmap'd memory that is valid
 // for the lifetime of the KvmMemory instance.
 unsafe impl Send for MappedRegion {}
 unsafe impl Sync for MappedRegion {}
+
+// SAFETY: KvmMemory contains only atomic slot counter, a Vec of MappedRegions
+// (which are Send+Sync), and a KVM VM file descriptor. The VM fd is thread-safe
+// as KVM ioctls are designed to be called from multiple threads.
 unsafe impl Send for KvmMemory {}
 unsafe impl Sync for KvmMemory {}
 

@@ -39,4 +39,8 @@ pub enum ContainerError {
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Internal lock poisoned.
+    #[error("internal lock poisoned")]
+    LockPoisoned,
 }

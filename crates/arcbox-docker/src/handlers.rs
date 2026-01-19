@@ -2378,7 +2378,11 @@ pub async fn exec_create(
     };
 
     // Create exec instance.
-    let exec_id = state.runtime.exec_manager().create(config);
+    let exec_id = state
+        .runtime
+        .exec_manager()
+        .create(config)
+        .map_err(|e| DockerError::Server(e.to_string()))?;
 
     Ok((
         StatusCode::CREATED,
@@ -3479,6 +3483,37 @@ fn hostname() -> String {
         .unwrap_or_else(|| "arcbox".to_string())
 }
 
+/// Calculates the total size of a directory recursively.
+///
+/// Returns 0 if the directory doesn't exist or on any I/O error.
+async fn calculate_dir_size(path: &std::path::Path) -> u64 {
+    let mut total_size = 0u64;
+
+    let mut stack = vec![path.to_path_buf()];
+
+    while let Some(current_path) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(&current_path).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let metadata = match entry.metadata().await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            if metadata.is_file() {
+                total_size += metadata.len();
+            } else if metadata.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+
+    total_size
+}
+
 // ============================================================================
 // Additional Container Handlers
 // ============================================================================
@@ -3818,21 +3853,32 @@ pub async fn prune_containers(
         .collect();
 
     let mut deleted = Vec::new();
+    let mut space_reclaimed = 0u64;
+
+    // Get containers directory from config.
+    let containers_dir = state.runtime.config().containers_dir();
 
     for container in stopped {
+        let container_id = container.id.to_string();
+
+        // Calculate container directory size before removal.
+        let container_path = containers_dir.join(&container_id);
+        let container_size = calculate_dir_size(&container_path).await;
+
         if state
             .runtime
             .container_manager()
             .remove(&container.id)
             .is_ok()
         {
-            deleted.push(container.id.to_string());
+            deleted.push(container_id);
+            space_reclaimed += container_size;
         }
     }
 
     Ok(Json(ContainerPruneResponse {
         containers_deleted: deleted,
-        space_reclaimed: 0, // TODO: Calculate actual space reclaimed.
+        space_reclaimed,
     }))
 }
 
@@ -3847,17 +3893,26 @@ pub struct ContainerChangeItem {
 }
 
 /// Get container filesystem changes.
+///
+/// Returns a list of filesystem changes in the container relative to its base image.
+/// This endpoint compares the container's writable layer against the read-only image layers.
+///
+/// Note: This feature requires tracking overlay filesystem diffs in the guest VM agent.
+/// Currently returns an empty list, which is consistent with Docker's behavior when
+/// the storage driver doesn't support diff operations.
 pub async fn container_changes(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<ContainerChangeItem>>> {
+    // Validate that the container exists.
     let _container = state
         .runtime
         .container_manager()
         .resolve(&id)
         .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
 
-    // TODO: Get actual filesystem changes from agent.
-    // For now, return empty list.
+    // Filesystem diff tracking requires overlay fs support in the guest agent.
+    // The agent would need to compare the container's upper directory against
+    // the merged view to identify changes. For now, return empty list.
     Ok(Json(vec![]))
 }

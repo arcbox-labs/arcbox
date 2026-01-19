@@ -874,14 +874,18 @@ impl ContainerRuntime {
             .unwrap_or_default();
         let pids = children.split_whitespace().count() as u32 + 1; // +1 for the main process
 
+        // Read network stats from /proc/<pid>/net/dev
+        // This reads from the container's network namespace.
+        let (network_rx_bytes, network_tx_bytes) = self.read_network_stats(pid).await;
+
         Ok(ContainerStatsResponse {
             cpu_usage,
             system_cpu_usage,
             online_cpus,
             memory_usage,
             memory_limit,
-            network_rx_bytes: 0, // TODO: implement network stats
-            network_tx_bytes: 0,
+            network_rx_bytes,
+            network_tx_bytes,
             block_read_bytes,
             block_write_bytes,
             pids,
@@ -945,6 +949,63 @@ impl ContainerRuntime {
                 }
             }
         }
+    }
+
+    /// Reads network statistics from /proc/<pid>/net/dev.
+    ///
+    /// Returns (rx_bytes, tx_bytes) summed across all network interfaces
+    /// in the container's network namespace (excluding loopback).
+    async fn read_network_stats(&self, pid: u32) -> (u64, u64) {
+        let net_dev_path = format!("/proc/{}/net/dev", pid);
+        let content = match tokio::fs::read_to_string(&net_dev_path).await {
+            Ok(c) => c,
+            Err(_) => return (0, 0),
+        };
+
+        let mut total_rx_bytes = 0u64;
+        let mut total_tx_bytes = 0u64;
+
+        // /proc/net/dev format:
+        // Inter-|   Receive                                                |  Transmit
+        //  face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets ...
+        //     lo: 0       0    0    0    0     0          0         0        0       0    ...
+        //   eth0: 123456  789   0    0    0     0          0         0   234567    890    ...
+        //
+        // Fields after interface name:
+        // RX: bytes packets errs drop fifo frame compressed multicast (8 fields)
+        // TX: bytes packets errs drop fifo colls carrier compressed (8 fields)
+        for line in content.lines().skip(2) {
+            // Skip header lines
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            // Split on ':' to get interface name and stats
+            let parts: Vec<&str> = line.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+
+            let iface = parts[0].trim();
+            // Skip loopback interface
+            if iface == "lo" {
+                continue;
+            }
+
+            let stats: Vec<&str> = parts[1].split_whitespace().collect();
+            if stats.len() >= 9 {
+                // RX bytes is field 0, TX bytes is field 8
+                if let Ok(rx) = stats[0].parse::<u64>() {
+                    total_rx_bytes += rx;
+                }
+                if let Ok(tx) = stats[8].parse::<u64>() {
+                    total_tx_bytes += tx;
+                }
+            }
+        }
+
+        (total_rx_bytes, total_tx_bytes)
     }
 
     /// Reads process info for a single PID.

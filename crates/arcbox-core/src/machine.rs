@@ -309,11 +309,7 @@ impl MachineManager {
                 machine.state = MachineState::Running;
                 machine.cid = Some(cid);
 
-                tracing::info!(
-                    "Machine '{}' started with CID {}",
-                    name,
-                    machine.cid.unwrap()
-                );
+                tracing::info!("Machine '{}' started with CID {}", name, cid);
             }
         }
 

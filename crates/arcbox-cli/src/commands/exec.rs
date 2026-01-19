@@ -128,5 +128,7 @@ struct ExecStartRequest {
 struct ExecInspect {
     #[serde(default)]
     exit_code: i32,
+    /// Whether exec is still running (required for deserialization).
+    #[allow(dead_code)]
     running: bool,
 }

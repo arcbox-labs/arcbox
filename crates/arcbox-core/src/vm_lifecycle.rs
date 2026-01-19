@@ -455,8 +455,7 @@ impl VmLifecycleManager {
         let recovery = RecoveryPolicy::new(config.max_retries, BackoffStrategy::default());
 
         // Check if default machine already exists
-        let initial_state = if machine_manager.get(DEFAULT_MACHINE_NAME).is_some() {
-            let info = machine_manager.get(DEFAULT_MACHINE_NAME).unwrap();
+        let initial_state = if let Some(info) = machine_manager.get(DEFAULT_MACHINE_NAME) {
             VmLifecycleState::from(info.state)
         } else {
             VmLifecycleState::NotExist

@@ -195,15 +195,21 @@ impl ExecManager {
     }
 
     /// Creates a new exec instance.
-    #[must_use]
-    pub fn create(&self, config: ExecConfig) -> ExecId {
+    ///
+    /// # Errors
+    ///
+    /// Returns `ContainerError::LockPoisoned` if the internal lock is poisoned.
+    pub fn create(&self, config: ExecConfig) -> crate::error::Result<ExecId> {
         let exec = ExecInstance::new(config);
         let id = exec.id.clone();
 
-        let mut execs = self.execs.write().unwrap();
+        let mut execs = self
+            .execs
+            .write()
+            .map_err(|_| crate::error::ContainerError::LockPoisoned)?;
         execs.insert(id.to_string(), exec);
 
-        id
+        Ok(id)
     }
 
     /// Gets an exec instance by ID.
@@ -409,7 +415,7 @@ mod tests {
             ..Default::default()
         };
 
-        let id = manager.create(config);
+        let id = manager.create(config).unwrap();
         let exec = manager.get(&id).unwrap();
 
         assert_eq!(exec.config.cmd, vec!["ls", "-la"]);
@@ -426,7 +432,7 @@ mod tests {
             ..Default::default()
         };
 
-        let id = manager.create(config);
+        let id = manager.create(config).unwrap();
         // Default width/height for non-TTY mode.
         let result = manager.start(&id, false, 80, 24).await.unwrap();
 
@@ -445,7 +451,7 @@ mod tests {
             ..Default::default()
         };
 
-        let id = manager.create(config);
+        let id = manager.create(config).unwrap();
         // Without agent, detach mode still returns immediately with exit_code=0.
         let result = manager.start(&id, true, 80, 24).await.unwrap();
 
@@ -463,7 +469,7 @@ mod tests {
             ..Default::default()
         };
 
-        let id = manager.create(config);
+        let id = manager.create(config).unwrap();
 
         // Resize should fail because exec doesn't have TTY.
         let result = manager.resize(&id, 100, 40).await;
@@ -479,7 +485,7 @@ mod tests {
             ..Default::default()
         };
 
-        let id = manager.create(config);
+        let id = manager.create(config).unwrap();
 
         // Manually set running state.
         {
