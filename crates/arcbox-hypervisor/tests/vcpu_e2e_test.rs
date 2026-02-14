@@ -6,6 +6,10 @@
 //! Note: Some tests require a valid kernel to run. They will be skipped
 //! if the kernel is not available.
 
+#![allow(clippy::expect_fun_call)]
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::unnecessary_cast)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;

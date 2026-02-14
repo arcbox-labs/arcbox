@@ -3,6 +3,10 @@
 //! These tests verify the interaction between DarwinVm and DarwinVcpu,
 //! testing the managed execution model of Virtualization.framework.
 
+#![allow(clippy::expect_fun_call)]
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::unnecessary_cast)]
+
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;

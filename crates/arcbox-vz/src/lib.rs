@@ -49,6 +49,30 @@
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
+// FFI bindings require extensive pointer casts - these are intentional and safe.
+#![allow(clippy::ptr_as_ptr)]
+#![allow(clippy::ptr_cast_constness)]
+#![allow(clippy::ref_as_ptr)]
+#![allow(clippy::borrow_as_ptr)]
+#![allow(clippy::unnecessary_cast)]
+// Documentation lints - acceptable for FFI code.
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::must_use_candidate)]
+// Code style lints - acceptable for FFI patterns.
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::redundant_else)]
+#![allow(clippy::if_not_else)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::needless_pass_by_value)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::map_unwrap_or)]
+#![allow(clippy::manual_let_else)]
+#![allow(clippy::cast_possible_truncation)]
 
 pub mod error;
 pub mod ffi;

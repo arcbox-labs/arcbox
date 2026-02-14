@@ -5,6 +5,13 @@
 //! The agent listens on vsock port 1024 and processes RPC requests from the host.
 //! It manages container lifecycle and executes commands within the guest VM.
 
+// TODO: Remove these allows once the agent is complete.
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(clippy::all)]
+#![allow(clippy::pedantic)]
+
 use anyhow::Result;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 

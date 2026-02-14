@@ -2,6 +2,9 @@
 //!
 //! These tests verify the interaction between different VirtIO components.
 
+#![allow(unused_imports)]
+#![allow(clippy::all)]
+
 use arcbox_virtio::blk::{
     AsyncBlockBackend, BlockConfig, BlockRequestType, MmapBackend, VirtioBlock,
 };

@@ -23,6 +23,19 @@
 
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 #![allow(clippy::module_name_repetitions)]
+// Generated protobuf code has many clippy warnings that we cannot control.
+#![allow(clippy::derive_partial_eq_without_eq)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::redundant_closure_for_method_calls)]
+#![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::similar_names)]
+#![allow(clippy::struct_excessive_bools)]
+#![allow(clippy::zero_sized_map_values)]
 
 // Include generated protobuf code
 pub mod common {

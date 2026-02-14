@@ -28,6 +28,14 @@
 
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 #![allow(clippy::module_name_repetitions)]
+// Documentation and style lints.
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::wildcard_imports)]
+#![allow(clippy::cast_possible_truncation)]
 
 pub mod error;
 pub mod unix;

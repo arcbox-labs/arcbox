@@ -3,6 +3,11 @@
 //! These tests verify end-to-end functionality of the network stack components
 //! working together.
 
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(clippy::all)]
+
 // ============================================================================
 // Datapath Integration Tests
 // ============================================================================

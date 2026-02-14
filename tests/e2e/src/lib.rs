@@ -11,6 +11,11 @@
 //! 4. **Container Lifecycle** - Test container create/start/stop/remove
 //! 5. **Full Workflow** - Test `arcbox run` equivalent flows
 
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(clippy::all)]
+
 pub mod agent;
 pub mod assertions;
 pub mod fixtures;

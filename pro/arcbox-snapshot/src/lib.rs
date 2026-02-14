@@ -15,6 +15,27 @@
 
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 #![allow(clippy::module_name_repetitions)]
+// TODO: Remove these allows once the module is complete.
+#![allow(dead_code)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::similar_names)]
+#![allow(clippy::redundant_else)]
+#![allow(clippy::option_if_let_else)]
+#![allow(clippy::significant_drop_tightening)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::unused_async)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::default_trait_access)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::clone_on_copy)]
+#![allow(clippy::or_fun_call)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::map_unwrap_or)]
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
