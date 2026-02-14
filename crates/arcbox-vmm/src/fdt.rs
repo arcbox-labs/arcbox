@@ -349,7 +349,7 @@ pub fn generate_fdt(config: &FdtConfig) -> Result<Vec<u8>> {
     fdt.end_node();
 
     // VirtIO MMIO devices
-    for (i, device) in config.virtio_devices.iter().enumerate() {
+    for device in &config.virtio_devices {
         fdt.begin_node(&format!("virtio_mmio@{:x}", device.reg_base));
         fdt.property_string("compatible", &device.compatible);
         fdt.property_reg(device.reg_base, device.reg_size);

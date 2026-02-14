@@ -88,6 +88,11 @@ pub struct DarwinVm {
     /// we use vsock-based signaling as an alternative. The host sends IRQ signals
     /// through this connection, and the guest agent handles them.
     vsock_irq_fd: RwLock<Option<RawFd>>,
+    /// Whether a balloon device has been configured.
+    ///
+    /// The balloon device configuration is stored here during VM setup
+    /// and added to the VZ configuration in finalize_configuration().
+    balloon_configured: bool,
 }
 
 // Safety: The VZ handles are properly synchronized and only accessed
@@ -176,6 +181,7 @@ impl DarwinVm {
             serial_fds: None,
             device_configs: Vec::new(),
             vsock_irq_fd: RwLock::new(None),
+            balloon_configured: false,
         })
     }
 
@@ -260,6 +266,15 @@ impl DarwinVm {
         if let Some(serial_port) = self.serial_port {
             vz_config.set_serial_ports(&[serial_port]);
             tracing::debug!("Added serial port to configuration");
+        }
+
+        // Set balloon device if configured
+        if self.balloon_configured {
+            let balloon_config = ffi::create_balloon_device_config().map_err(|e| {
+                HypervisorError::DeviceError(format!("Failed to create balloon device: {}", e))
+            })?;
+            vz_config.set_memory_balloon_devices(&[balloon_config]);
+            tracing::debug!("Added memory balloon device to configuration");
         }
 
         // Validate configuration
@@ -701,6 +716,112 @@ impl DarwinVm {
         );
         Ok(())
     }
+
+    // ========================================================================
+    // Memory Balloon Interface
+    //
+    // The VirtIO balloon device allows the host to dynamically manage guest
+    // memory by "inflating" (reclaiming memory) or "deflating" (returning
+    // memory). This helps achieve the <150MB idle memory target.
+    // ========================================================================
+
+    /// Returns whether a balloon device is configured for this VM.
+    #[must_use]
+    pub fn has_balloon_device(&self) -> bool {
+        self.balloon_configured
+    }
+
+    /// Sets the target memory size for the balloon device.
+    ///
+    /// The balloon device will inflate or deflate to reach the target:
+    /// - **Smaller target**: Balloon inflates, reclaiming memory from guest
+    /// - **Larger target**: Balloon deflates, returning memory to guest
+    ///
+    /// # Arguments
+    /// * `target_bytes` - Target memory size in bytes. Should be between
+    ///   the minimum memory size and the VM's configured memory size.
+    ///
+    /// # Errors
+    /// Returns an error if the VM is not running or no balloon device is configured.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Reduce guest memory to 512MB
+    /// vm.set_balloon_target_memory(512 * 1024 * 1024)?;
+    /// ```
+    pub fn set_balloon_target_memory(&self, target_bytes: u64) -> Result<(), HypervisorError> {
+        // Check VM is running
+        let state = self.state();
+        if state != VmState::Running {
+            return Err(HypervisorError::InvalidState {
+                expected: "Running".to_string(),
+                actual: format!("{:?}", state),
+            });
+        }
+
+        // Check balloon is configured
+        if !self.balloon_configured {
+            return Err(HypervisorError::DeviceError(
+                "No balloon device configured".to_string(),
+            ));
+        }
+
+        // Get balloon device from running VM
+        let vz_vm = self
+            .vz_vm
+            .as_ref()
+            .ok_or_else(|| HypervisorError::VmError("No VZ VM instance".to_string()))?;
+
+        let balloon_device = ffi::vm_first_balloon_device(vz_vm.as_ptr()).ok_or_else(|| {
+            HypervisorError::DeviceError("Balloon device not found in running VM".to_string())
+        })?;
+
+        ffi::balloon_set_target_memory(balloon_device, target_bytes);
+
+        tracing::info!(
+            "VM {}: Set balloon target memory to {}MB",
+            self.id,
+            target_bytes / (1024 * 1024)
+        );
+
+        Ok(())
+    }
+
+    /// Gets the current target memory size from the balloon device.
+    ///
+    /// Returns the target memory size in bytes, or 0 if no balloon is configured
+    /// or the VM is not running.
+    #[must_use]
+    pub fn get_balloon_target_memory(&self) -> u64 {
+        // Check VM is running
+        if self.state() != VmState::Running {
+            return 0;
+        }
+
+        // Check balloon is configured
+        if !self.balloon_configured {
+            return 0;
+        }
+
+        // Get balloon device from running VM
+        let Some(ref vz_vm) = self.vz_vm else {
+            return 0;
+        };
+
+        let Some(balloon_device) = ffi::vm_first_balloon_device(vz_vm.as_ptr()) else {
+            return 0;
+        };
+
+        ffi::balloon_get_target_memory(balloon_device)
+    }
+
+    /// Returns the configured memory size for this VM.
+    ///
+    /// This is the maximum memory the guest can use when the balloon is fully deflated.
+    #[must_use]
+    pub fn configured_memory_size(&self) -> u64 {
+        self.config.memory_size
+    }
 }
 
 impl VirtualMachine for DarwinVm {
@@ -846,8 +967,13 @@ impl VirtualMachine for DarwinVm {
                 // Entropy device is already added in new()
                 tracing::debug!("Entropy device already configured");
             }
+            VirtioDeviceType::Balloon => {
+                // Mark balloon as configured; actual device is created in finalize_configuration()
+                self.balloon_configured = true;
+                tracing::debug!("Balloon device configured");
+            }
             _ => {
-                // Other device types (Balloon, Gpu) not yet supported on Darwin
+                // Other device types (Gpu) not yet supported on Darwin
                 tracing::warn!(
                     "Device type {:?} not supported on Darwin",
                     device.device_type

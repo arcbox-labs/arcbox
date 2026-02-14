@@ -46,6 +46,7 @@ fn main() {
         networking: false,
         vsock: false,
         guest_cid: None,
+        balloon: false,
     };
 
     println!("VMM Configuration:");

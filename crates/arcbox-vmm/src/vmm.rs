@@ -71,6 +71,12 @@ pub struct VmmConfig {
     pub vsock: bool,
     /// Guest CID for vsock connections (Linux).
     pub guest_cid: Option<u32>,
+    /// Enable memory balloon device.
+    ///
+    /// The balloon device allows dynamic memory management by inflating
+    /// (reclaiming memory from guest) or deflating (returning memory).
+    /// This helps achieve low idle memory usage.
+    pub balloon: bool,
 }
 
 impl Default for VmmConfig {
@@ -88,6 +94,7 @@ impl Default for VmmConfig {
             networking: true,
             vsock: true,
             guest_cid: None,
+            balloon: true, // Enable balloon by default for memory optimization
         }
     }
 }
@@ -320,6 +327,13 @@ impl Vmm {
             let vsock_config = VirtioDeviceConfig::vsock();
             vm.add_virtio_device(vsock_config)?;
             tracing::info!("Added vsock device");
+        }
+
+        // Add balloon device if enabled
+        if self.config.balloon {
+            let balloon_config = VirtioDeviceConfig::balloon();
+            vm.add_virtio_device(balloon_config)?;
+            tracing::info!("Added memory balloon device");
         }
 
         // Initialize memory manager
@@ -733,6 +747,94 @@ impl Vmm {
         }
 
         Ok(String::new())
+    }
+
+    // ========================================================================
+    // Memory Balloon Control
+    // ========================================================================
+
+    /// Sets the target memory size for the balloon device.
+    ///
+    /// The balloon device will inflate or deflate to reach the target:
+    /// - **Smaller target**: Balloon inflates, reclaiming memory from guest
+    /// - **Larger target**: Balloon deflates, returning memory to guest
+    ///
+    /// # Arguments
+    /// * `target_bytes` - Target memory size in bytes
+    ///
+    /// # Errors
+    /// Returns an error if the VM is not running or no balloon device is configured.
+    #[cfg(target_os = "macos")]
+    pub fn set_balloon_target(&self, target_bytes: u64) -> Result<()> {
+        use arcbox_hypervisor::darwin::DarwinVm;
+
+        if self.state != VmmState::Running {
+            return Err(VmmError::InvalidState(format!(
+                "cannot set balloon target: VMM is {:?}",
+                self.state
+            )));
+        }
+
+        if let Some(ref managed_vm) = self.managed_vm {
+            if let Some(vm) = managed_vm.downcast_ref::<DarwinVm>() {
+                return vm
+                    .set_balloon_target_memory(target_bytes)
+                    .map_err(VmmError::Hypervisor);
+            }
+        }
+
+        Err(VmmError::InvalidState(
+            "balloon not available in manual execution mode".to_string(),
+        ))
+    }
+
+    /// Gets the current target memory size from the balloon device.
+    ///
+    /// Returns the target memory size in bytes, or 0 if no balloon is configured
+    /// or the VM is not running.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn get_balloon_target(&self) -> u64 {
+        use arcbox_hypervisor::darwin::DarwinVm;
+
+        if self.state != VmmState::Running {
+            return 0;
+        }
+
+        if let Some(ref managed_vm) = self.managed_vm {
+            if let Some(vm) = managed_vm.downcast_ref::<DarwinVm>() {
+                return vm.get_balloon_target_memory();
+            }
+        }
+
+        0
+    }
+
+    /// Returns the configured memory size for this VM.
+    ///
+    /// This is the maximum memory the guest can use when the balloon is fully deflated.
+    #[must_use]
+    pub fn configured_memory(&self) -> u64 {
+        self.config.memory_size
+    }
+
+    /// Returns whether a balloon device is configured for this VM.
+    #[must_use]
+    pub fn has_balloon(&self) -> bool {
+        self.config.balloon
+    }
+
+    /// Gets balloon statistics.
+    ///
+    /// Returns current balloon stats including target, current, and configured memory sizes.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn get_balloon_stats(&self) -> arcbox_hypervisor::BalloonStats {
+        arcbox_hypervisor::BalloonStats {
+            target_bytes: self.get_balloon_target(),
+            current_bytes: 0, // macOS doesn't expose current balloon size
+            configured_bytes: self.config.memory_size,
+        }
     }
 
     /// Connects to a vsock port on the guest VM.

@@ -17,7 +17,7 @@
 
 use arcbox_vz::{
     EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, SocketDeviceConfiguration,
-    VZError, VirtualMachineConfiguration, is_supported,
+    VirtualMachineConfiguration, is_supported,
 };
 use std::env;
 use std::time::Duration;

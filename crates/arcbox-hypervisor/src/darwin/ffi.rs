@@ -1212,6 +1212,120 @@ pub fn create_fs_device(tag: &str, share: *mut AnyObject) -> VZResult<*mut AnyOb
 }
 
 // ============================================================================
+// Memory Balloon Device
+// ============================================================================
+
+/// Creates a VirtIO traditional memory balloon device configuration.
+///
+/// The balloon device allows the host to reclaim memory from the guest by
+/// "inflating" the balloon (reducing guest memory) or "deflating" it
+/// (returning memory to the guest).
+///
+/// On macOS, this creates a `VZVirtioTraditionalMemoryBalloonDeviceConfiguration`.
+pub fn create_balloon_device_config() -> VZResult<*mut AnyObject> {
+    unsafe {
+        let cls =
+            get_class("VZVirtioTraditionalMemoryBalloonDeviceConfiguration").ok_or_else(|| {
+                VZError {
+                    code: -1,
+                    message: "VZVirtioTraditionalMemoryBalloonDeviceConfiguration class not found"
+                        .into(),
+                }
+            })?;
+        let obj = msg_send!(cls, new);
+        if obj.is_null() {
+            return Err(VZError {
+                code: -1,
+                message: "Failed to create balloon device configuration".into(),
+            });
+        }
+        // Retain to prevent autorelease
+        let _: *mut AnyObject = msg_send!(obj, retain);
+        Ok(obj)
+    }
+}
+
+impl VmConfiguration {
+    /// Sets memory balloon devices.
+    ///
+    /// Typically only one balloon device is needed per VM.
+    pub fn set_memory_balloon_devices(&self, devices: &[*mut AnyObject]) {
+        unsafe {
+            let array = nsarray(devices);
+            msg_send_void!(self.inner, setMemoryBalloonDevices: array);
+        }
+    }
+}
+
+/// Gets the memory balloon devices from a running VM.
+///
+/// Returns an NSArray of `VZVirtioTraditionalMemoryBalloonDevice` objects.
+pub fn vm_memory_balloon_devices(vm: *mut AnyObject) -> *mut AnyObject {
+    if vm.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { msg_send!(vm, memoryBalloonDevices) }
+}
+
+/// Gets the first memory balloon device from a VM, if any.
+pub fn vm_first_balloon_device(vm: *mut AnyObject) -> Option<*mut AnyObject> {
+    let devices = vm_memory_balloon_devices(vm);
+    if devices.is_null() {
+        return None;
+    }
+
+    unsafe {
+        let count: usize = msg_send_u64!(devices, count) as usize;
+        if count == 0 {
+            return None;
+        }
+
+        // Use specific function for objectAtIndex: which takes NSUInteger
+        let sel = sel!(objectAtIndex:);
+        let func: unsafe extern "C" fn(*const AnyObject, Sel, usize) -> *mut AnyObject =
+            std::mem::transmute(objc_msgSend as *const c_void);
+        let device = func(devices as *const AnyObject, sel, 0usize);
+
+        if device.is_null() { None } else { Some(device) }
+    }
+}
+
+/// Sets the target virtual machine memory size on a balloon device.
+///
+/// The balloon device will inflate or deflate to reach the target memory size.
+/// A smaller target means the balloon inflates (reclaims memory from guest).
+/// A larger target means the balloon deflates (returns memory to guest).
+///
+/// # Arguments
+/// * `balloon_device` - The `VZVirtioTraditionalMemoryBalloonDevice` instance
+/// * `target_bytes` - Target memory size in bytes
+pub fn balloon_set_target_memory(balloon_device: *mut AnyObject, target_bytes: u64) {
+    if balloon_device.is_null() {
+        tracing::warn!("balloon_set_target_memory called with null device");
+        return;
+    }
+    unsafe {
+        msg_send_void_u64!(balloon_device, setTargetVirtualMachineMemorySize: target_bytes);
+    }
+    tracing::debug!(
+        "Set balloon target memory to {} bytes ({}MB)",
+        target_bytes,
+        target_bytes / (1024 * 1024)
+    );
+}
+
+/// Gets the target virtual machine memory size from a balloon device.
+///
+/// Returns the target memory size in bytes.
+pub fn balloon_get_target_memory(balloon_device: *mut AnyObject) -> u64 {
+    if balloon_device.is_null() {
+        tracing::warn!("balloon_get_target_memory called with null device");
+        return 0;
+    }
+    unsafe { msg_send_u64!(balloon_device, targetVirtualMachineMemorySize) }
+}
+
+// ============================================================================
 // System Queries
 // ============================================================================
 

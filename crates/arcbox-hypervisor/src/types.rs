@@ -228,6 +228,67 @@ pub enum VirtioDeviceType {
 }
 
 // ============================================================================
+// Memory Balloon Types
+// ============================================================================
+
+/// Memory balloon statistics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BalloonStats {
+    /// Target memory size in bytes.
+    ///
+    /// This is the memory size the balloon is trying to achieve.
+    pub target_bytes: u64,
+
+    /// Current balloon size in bytes.
+    ///
+    /// This is how much memory the balloon has currently claimed.
+    /// `actual_guest_memory = configured_memory - current_balloon_size`
+    pub current_bytes: u64,
+
+    /// Configured VM memory size in bytes.
+    ///
+    /// This is the maximum memory available to the guest when
+    /// the balloon is fully deflated.
+    pub configured_bytes: u64,
+}
+
+impl BalloonStats {
+    /// Returns the effective memory available to the guest in bytes.
+    ///
+    /// This is `configured_bytes - current_bytes`.
+    #[must_use]
+    pub fn effective_memory(&self) -> u64 {
+        self.configured_bytes.saturating_sub(self.current_bytes)
+    }
+
+    /// Returns the target memory as a percentage of configured memory.
+    #[must_use]
+    pub fn target_percent(&self) -> f64 {
+        if self.configured_bytes == 0 {
+            return 100.0;
+        }
+        (self.target_bytes as f64 / self.configured_bytes as f64) * 100.0
+    }
+}
+
+impl VirtioDeviceConfig {
+    /// Creates a new balloon device configuration.
+    ///
+    /// The balloon device allows dynamic memory management by inflating
+    /// (reclaiming memory from guest) or deflating (returning memory to guest).
+    #[must_use]
+    pub fn balloon() -> Self {
+        Self {
+            device_type: VirtioDeviceType::Balloon,
+            config: Vec::new(),
+            path: None,
+            read_only: false,
+            tag: None,
+        }
+    }
+}
+
+// ============================================================================
 // Snapshot Types
 // ============================================================================
 
