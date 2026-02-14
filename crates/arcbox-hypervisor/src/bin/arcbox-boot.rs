@@ -52,7 +52,8 @@ struct Args {
     memory: u64,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)

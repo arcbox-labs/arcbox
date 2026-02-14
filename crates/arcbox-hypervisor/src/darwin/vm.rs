@@ -462,7 +462,10 @@ impl DarwinVm {
             HypervisorError::DeviceError("No tokio runtime available for vsock connect".to_string())
         })?;
 
-        let connection = rt.block_on(socket_device.connect(port)).map_err(|e| {
+        // Use block_in_place to allow blocking in async context
+        let connection = tokio::task::block_in_place(|| {
+            rt.block_on(socket_device.connect(port))
+        }).map_err(|e| {
             HypervisorError::DeviceError(format!("vsock connect failed: {}", e))
         })?;
 
@@ -958,7 +961,10 @@ impl VirtualMachine for DarwinVm {
             })?;
 
             // Start the VM using arcbox-vz's async start
-            rt.block_on(vm.start()).map_err(|e| {
+            // Use block_in_place to allow blocking in async context
+            tokio::task::block_in_place(|| {
+                rt.block_on(vm.start())
+            }).map_err(|e| {
                 self.set_state(VmState::Error);
                 HypervisorError::VmError(format!("Failed to start VM: {}", e))
             })?;
@@ -1012,7 +1018,10 @@ impl VirtualMachine for DarwinVm {
             })?;
 
             // Pause using arcbox-vz's async pause
-            rt.block_on(vm.pause()).map_err(|e| {
+            // Use block_in_place to allow blocking in async context
+            tokio::task::block_in_place(|| {
+                rt.block_on(vm.pause())
+            }).map_err(|e| {
                 HypervisorError::VmError(format!("Failed to pause VM: {}", e))
             })?;
 
@@ -1041,7 +1050,10 @@ impl VirtualMachine for DarwinVm {
             })?;
 
             // Resume using arcbox-vz's async resume
-            rt.block_on(vm.resume()).map_err(|e| {
+            // Use block_in_place to allow blocking in async context
+            tokio::task::block_in_place(|| {
+                rt.block_on(vm.resume())
+            }).map_err(|e| {
                 HypervisorError::VmError(format!("Failed to resume VM: {}", e))
             })?;
 
@@ -1076,7 +1088,8 @@ impl VirtualMachine for DarwinVm {
 
                 if let Some(rt) = rt {
                     // Stop using arcbox-vz's async stop
-                    match rt.block_on(vm.stop()) {
+                    // Use block_in_place to allow blocking in async context
+                    match tokio::task::block_in_place(|| rt.block_on(vm.stop())) {
                         Ok(()) => {
                             tracing::debug!("VM {} stop completed", self.id);
                         }
