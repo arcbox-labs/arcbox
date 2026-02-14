@@ -1,8 +1,9 @@
 //! Virtual machine configuration.
 
 use crate::device::{
-    EntropyDeviceConfiguration, NetworkDeviceConfiguration, SerialPortConfiguration,
-    SocketDeviceConfiguration, StorageDeviceConfiguration, VirtioFileSystemDeviceConfiguration,
+    EntropyDeviceConfiguration, MemoryBalloonDeviceConfiguration, NetworkDeviceConfiguration,
+    SerialPortConfiguration, SocketDeviceConfiguration, StorageDeviceConfiguration,
+    VirtioFileSystemDeviceConfiguration,
 };
 use crate::error::{VZError, VZResult};
 use crate::ffi::{DispatchQueue, get_class, nsarray, release};
@@ -29,6 +30,7 @@ pub struct VirtualMachineConfiguration {
     socket_devices: Vec<*mut AnyObject>,
     entropy_devices: Vec<*mut AnyObject>,
     directory_sharing_devices: Vec<*mut AnyObject>,
+    memory_balloon_devices: Vec<*mut AnyObject>,
 }
 
 unsafe impl Send for VirtualMachineConfiguration {}
@@ -60,6 +62,7 @@ impl VirtualMachineConfiguration {
                 socket_devices: Vec::new(),
                 entropy_devices: Vec::new(),
                 directory_sharing_devices: Vec::new(),
+                memory_balloon_devices: Vec::new(),
             })
         }
     }
@@ -160,6 +163,20 @@ impl VirtualMachineConfiguration {
         self
     }
 
+    /// Adds a memory balloon device to the VM.
+    ///
+    /// The balloon device allows the host to reclaim memory from the guest
+    /// or return memory to it dynamically.
+    ///
+    /// Typically only one balloon device is needed per VM.
+    pub fn add_memory_balloon_device(
+        &mut self,
+        device: MemoryBalloonDeviceConfiguration,
+    ) -> &mut Self {
+        self.memory_balloon_devices.push(device.into_ptr());
+        self
+    }
+
     /// Validates the configuration.
     ///
     /// This is called automatically by `build()`, but can be called
@@ -242,6 +259,11 @@ impl VirtualMachineConfiguration {
             if !self.directory_sharing_devices.is_empty() {
                 let array = nsarray(&self.directory_sharing_devices);
                 msg_send_void!(self.inner, setDirectorySharingDevices: array);
+            }
+
+            if !self.memory_balloon_devices.is_empty() {
+                let array = nsarray(&self.memory_balloon_devices);
+                msg_send_void!(self.inner, setMemoryBalloonDevices: array);
             }
         }
     }

@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use arcbox_vz::VirtualMachineState;
 use objc2::runtime::AnyObject;
 
-use super::ffi::VZVirtualMachineState;
 use crate::{
     error::HypervisorError,
     traits::Vcpu,
@@ -81,7 +81,7 @@ impl DarwinVcpu {
     /// Queries the current VM state from Virtualization.framework.
     ///
     /// Returns `None` if no VZ VM pointer is available.
-    fn query_vm_state(&self) -> Option<VZVirtualMachineState> {
+    fn query_vm_state(&self) -> Option<VirtualMachineState> {
         if self.vz_vm.is_null() {
             return None;
         }
@@ -92,7 +92,7 @@ impl DarwinVcpu {
             let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel) -> i64 =
                 std::mem::transmute(objc2::ffi::objc_msgSend as *const std::ffi::c_void);
             let state = func(self.vz_vm as *const AnyObject, sel);
-            Some(VZVirtualMachineState::from(state))
+            Some(VirtualMachineState::from(state))
         }
     }
 
@@ -199,36 +199,36 @@ impl Vcpu for DarwinVcpu {
             };
 
             match state {
-                VZVirtualMachineState::Running => {
+                VirtualMachineState::Running => {
                     // VM is still running, continue waiting
                     std::thread::sleep(poll_interval);
                 }
-                VZVirtualMachineState::Stopped => {
+                VirtualMachineState::Stopped => {
                     tracing::debug!("vCPU {} detected VM stopped", self.id);
                     self.running.store(false, Ordering::SeqCst);
                     return Ok(VcpuExit::Shutdown);
                 }
-                VZVirtualMachineState::Paused => {
+                VirtualMachineState::Paused => {
                     tracing::debug!("vCPU {} detected VM paused", self.id);
                     self.running.store(false, Ordering::SeqCst);
                     return Ok(VcpuExit::Halt);
                 }
-                VZVirtualMachineState::Error => {
+                VirtualMachineState::Error => {
                     tracing::error!("vCPU {} detected VM error state", self.id);
                     self.running.store(false, Ordering::SeqCst);
                     return Err(HypervisorError::VcpuRunError(
                         "VM entered error state".to_string(),
                     ));
                 }
-                VZVirtualMachineState::Starting
-                | VZVirtualMachineState::Pausing
-                | VZVirtualMachineState::Resuming
-                | VZVirtualMachineState::Stopping => {
+                VirtualMachineState::Starting
+                | VirtualMachineState::Pausing
+                | VirtualMachineState::Resuming
+                | VirtualMachineState::Stopping => {
                     // Transitional states, wait for final state
                     tracing::trace!("vCPU {} VM in transitional state: {:?}", self.id, state);
                     std::thread::sleep(poll_interval);
                 }
-                VZVirtualMachineState::Saving | VZVirtualMachineState::Restoring => {
+                VirtualMachineState::Saving | VirtualMachineState::Restoring => {
                     // Snapshot operations (macOS 14+), wait for completion
                     tracing::trace!("vCPU {} VM performing snapshot operation", self.id);
                     std::thread::sleep(poll_interval);
@@ -792,57 +792,57 @@ mod tests {
 
     #[test]
     fn test_vz_state_from_i64() {
-        // Test VZVirtualMachineState::from(i64) mapping
+        // Test VirtualMachineState::from(i64) mapping
         assert_eq!(
-            VZVirtualMachineState::from(0),
-            VZVirtualMachineState::Stopped
+            VirtualMachineState::from(0),
+            VirtualMachineState::Stopped
         );
         assert_eq!(
-            VZVirtualMachineState::from(1),
-            VZVirtualMachineState::Running
+            VirtualMachineState::from(1),
+            VirtualMachineState::Running
         );
         assert_eq!(
-            VZVirtualMachineState::from(2),
-            VZVirtualMachineState::Paused
+            VirtualMachineState::from(2),
+            VirtualMachineState::Paused
         );
-        assert_eq!(VZVirtualMachineState::from(3), VZVirtualMachineState::Error);
+        assert_eq!(VirtualMachineState::from(3), VirtualMachineState::Error);
         assert_eq!(
-            VZVirtualMachineState::from(4),
-            VZVirtualMachineState::Starting
-        );
-        assert_eq!(
-            VZVirtualMachineState::from(5),
-            VZVirtualMachineState::Pausing
+            VirtualMachineState::from(4),
+            VirtualMachineState::Starting
         );
         assert_eq!(
-            VZVirtualMachineState::from(6),
-            VZVirtualMachineState::Resuming
+            VirtualMachineState::from(5),
+            VirtualMachineState::Pausing
         );
         assert_eq!(
-            VZVirtualMachineState::from(7),
-            VZVirtualMachineState::Stopping
+            VirtualMachineState::from(6),
+            VirtualMachineState::Resuming
         );
         assert_eq!(
-            VZVirtualMachineState::from(8),
-            VZVirtualMachineState::Saving
+            VirtualMachineState::from(7),
+            VirtualMachineState::Stopping
         );
         assert_eq!(
-            VZVirtualMachineState::from(9),
-            VZVirtualMachineState::Restoring
+            VirtualMachineState::from(8),
+            VirtualMachineState::Saving
+        );
+        assert_eq!(
+            VirtualMachineState::from(9),
+            VirtualMachineState::Restoring
         );
 
         // Unknown values should map to Error
         assert_eq!(
-            VZVirtualMachineState::from(10),
-            VZVirtualMachineState::Error
+            VirtualMachineState::from(10),
+            VirtualMachineState::Error
         );
         assert_eq!(
-            VZVirtualMachineState::from(-1),
-            VZVirtualMachineState::Error
+            VirtualMachineState::from(-1),
+            VirtualMachineState::Error
         );
         assert_eq!(
-            VZVirtualMachineState::from(100),
-            VZVirtualMachineState::Error
+            VirtualMachineState::from(100),
+            VirtualMachineState::Error
         );
     }
 }

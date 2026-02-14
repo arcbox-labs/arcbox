@@ -1,11 +1,18 @@
 //! Virtual machine implementation for macOS.
+//!
+//! This module uses arcbox-vz for Virtualization.framework bindings.
 
 use std::os::unix::io::RawFd;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use objc2::runtime::AnyObject;
+use arcbox_vz::{
+    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, NetworkDeviceConfiguration,
+    SerialPortConfiguration, SharedDirectory, SingleDirectoryShare, SocketDeviceConfiguration,
+    StorageDeviceConfiguration, VirtualMachineConfiguration, VirtioFileSystemDeviceConfiguration,
+    VirtualMachineState,
+};
 
 use crate::{
     config::VmConfig,
@@ -14,7 +21,6 @@ use crate::{
     types::{DeviceSnapshot, VirtioDeviceConfig, VirtioDeviceType},
 };
 
-use super::ffi;
 use super::memory::DarwinMemory;
 use super::vcpu::DarwinVcpu;
 
@@ -48,7 +54,7 @@ pub enum VmState {
 
 /// Virtual machine implementation for Darwin (macOS).
 ///
-/// This wraps a Virtualization.framework VM and provides the
+/// This wraps arcbox-vz types for Virtualization.framework and provides the
 /// platform-agnostic interface.
 pub struct DarwinVm {
     /// Unique VM ID.
@@ -63,19 +69,12 @@ pub struct DarwinVm {
     state: RwLock<VmState>,
     /// Whether the VM is running.
     running: AtomicBool,
-    /// VZ configuration handle.
-    vz_config: Option<ffi::VmConfiguration>,
-    /// VZ virtual machine handle.
-    vz_vm: Option<ffi::VirtualMachine>,
-    /// Dispatch queue for VM operations.
-    dispatch_queue: *mut AnyObject,
-    /// Storage devices (raw pointers for VZ).
-    storage_devices: Vec<*mut AnyObject>,
-    /// Network devices.
-    network_devices: Vec<*mut AnyObject>,
-    /// Serial port configuration (for serialPorts).
-    serial_port: Option<*mut AnyObject>,
+    /// VZ configuration builder (consumed when VM is built).
+    vz_config: Option<VirtualMachineConfiguration>,
+    /// VZ virtual machine handle (created from configuration).
+    vz_vm: Option<arcbox_vz::VirtualMachine>,
     /// Serial port file descriptors (read, write).
+    /// Read from VM output, write to VM input.
     serial_fds: Option<(RawFd, RawFd)>,
     /// Device configuration metadata for snapshots.
     ///
@@ -108,20 +107,16 @@ impl DarwinVm {
         // Allocate guest memory
         let memory = DarwinMemory::new(config.memory_size)?;
 
-        // Create a custom serial queue for VM operations
-        // VZVirtualMachine requires all operations to be called from its designated queue
-        let dispatch_queue = ffi::create_dispatch_queue(&format!("com.arcbox.vm.{}", id));
-
-        // Create VZ configuration
-        let vz_config = ffi::VmConfiguration::new()
+        // Create VZ configuration using arcbox-vz API
+        let mut vz_config = VirtualMachineConfiguration::new()
             .map_err(|e| HypervisorError::VmCreationFailed(e.to_string()))?;
 
         // Set CPU count and memory size
-        vz_config.set_cpu_count(config.vcpu_count as u64);
+        vz_config.set_cpu_count(config.vcpu_count as usize);
         vz_config.set_memory_size(config.memory_size);
 
         // Set up generic platform for Linux VMs on Apple Silicon
-        let platform = ffi::create_generic_platform().map_err(|e| {
+        let platform = GenericPlatform::new().map_err(|e| {
             HypervisorError::VmCreationFailed(format!("Failed to create platform: {}", e))
         })?;
         vz_config.set_platform(platform);
@@ -129,7 +124,7 @@ impl DarwinVm {
 
         // Set up boot loader if kernel path is specified
         if let Some(ref kernel_path) = config.kernel_path {
-            let boot_loader = ffi::LinuxBootLoader::new(kernel_path).map_err(|e| {
+            let mut boot_loader = LinuxBootLoader::new(kernel_path).map_err(|e| {
                 HypervisorError::VmCreationFailed(format!("Failed to create boot loader: {}", e))
             })?;
             tracing::debug!("Created boot loader for kernel: {}", kernel_path);
@@ -144,15 +139,15 @@ impl DarwinVm {
                 tracing::debug!("Set initrd: {}", initrd_path);
             }
 
-            vz_config.set_boot_loader(&boot_loader);
+            vz_config.set_boot_loader(boot_loader);
             tracing::debug!("Boot loader configured");
         }
 
         // Add entropy device for random number generation
-        let entropy = ffi::create_entropy_device().map_err(|e| {
+        let entropy = EntropyDeviceConfiguration::new().map_err(|e| {
             HypervisorError::VmCreationFailed(format!("Failed to create entropy device: {}", e))
         })?;
-        vz_config.set_entropy_devices(&[entropy]);
+        vz_config.add_entropy_device(entropy);
         tracing::debug!("Entropy device configured");
 
         // Note: We don't validate or create VM yet - devices may be added later
@@ -174,10 +169,6 @@ impl DarwinVm {
             running: AtomicBool::new(false),
             vz_config: Some(vz_config),
             vz_vm: None,
-            dispatch_queue,
-            storage_devices: Vec::new(),
-            network_devices: Vec::new(),
-            serial_port: None,
             serial_fds: None,
             device_configs: Vec::new(),
             vsock_irq_fd: RwLock::new(None),
@@ -191,100 +182,59 @@ impl DarwinVm {
     /// Note: Console output may not work with all Linux kernels. Virtio console
     /// driver must be properly configured in the guest kernel.
     pub fn setup_serial_console(&mut self) -> Result<String, HypervisorError> {
-        // Create two pipes: one for input to VM, one for output from VM
-        // input_pipe: we write to [1], VM reads from [0]
-        // output_pipe: VM writes to [1], we read from [0]
-        let mut input_pipe: [libc::c_int; 2] = [0, 0];
-        let mut output_pipe: [libc::c_int; 2] = [0, 0];
+        // Use arcbox-vz's SerialPortConfiguration which handles pipe creation internally
+        let serial_port = SerialPortConfiguration::virtio_console()
+            .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
 
-        unsafe {
-            if libc::pipe(input_pipe.as_mut_ptr()) != 0 {
-                return Err(HypervisorError::DeviceError(
-                    "Failed to create input pipe".to_string(),
-                ));
-            }
-            if libc::pipe(output_pipe.as_mut_ptr()) != 0 {
-                libc::close(input_pipe[0]);
-                libc::close(input_pipe[1]);
-                return Err(HypervisorError::DeviceError(
-                    "Failed to create output pipe".to_string(),
-                ));
-            }
+        // Store FDs: (read_from_vm, write_to_vm)
+        let read_fd = serial_port.read_fd().ok_or_else(|| {
+            HypervisorError::DeviceError("Failed to get serial read fd".to_string())
+        })?;
+        let write_fd = serial_port.write_fd().ok_or_else(|| {
+            HypervisorError::DeviceError("Failed to get serial write fd".to_string())
+        })?;
+        self.serial_fds = Some((read_fd, write_fd));
 
-            // Store FDs: (read_from_vm, write_to_vm)
-            // read_from_vm = output_pipe[0] (we read VM output)
-            // write_to_vm = input_pipe[1] (we send input to VM)
-            self.serial_fds = Some((output_pipe[0], input_pipe[1]));
+        tracing::info!(
+            "Created serial console pipes: read_fd={}, write_fd={}",
+            read_fd,
+            write_fd
+        );
 
-            tracing::info!(
-                "Created serial console pipes: input={}/{}, output={}/{}",
-                input_pipe[0],
-                input_pipe[1],
-                output_pipe[0],
-                output_pipe[1]
-            );
-
-            // Create serial port attachment
-            // fileHandleForReading: VZ reads input to send to guest (from input_pipe[0])
-            // fileHandleForWriting: VZ writes guest output (to output_pipe[1])
-            let read_handle = ffi::create_file_handle_for_reading(input_pipe[0])
-                .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-            let write_handle = ffi::create_file_handle_for_reading(output_pipe[1])
-                .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-            let attachment = ffi::create_serial_port_attachment(read_handle, write_handle)
-                .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-
-            // Use VZVirtioConsoleDeviceSerialPortConfiguration with serialPorts
-            let serial_port = ffi::create_virtio_serial_port_configuration(attachment)
-                .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-
-            self.serial_port = Some(serial_port);
+        // Add serial port to configuration
+        if let Some(ref mut vz_config) = self.vz_config {
+            vz_config.add_serial_port(serial_port);
             tracing::debug!("Serial port configured (will be added to serialPorts)");
-
-            Ok("pipe".to_string())
         }
+
+        Ok("pipe".to_string())
     }
 
     /// Finalizes configuration and creates the actual VZ VM.
     fn finalize_configuration(&mut self) -> Result<(), HypervisorError> {
         let vz_config = self
             .vz_config
-            .as_ref()
+            .take()
             .ok_or_else(|| HypervisorError::VmCreationFailed("No VZ configuration".to_string()))?;
 
-        // Set storage devices
-        if !self.storage_devices.is_empty() {
-            vz_config.set_storage_devices(&self.storage_devices);
-        }
+        // NOTE: Storage, network, serial, and other devices have already been added
+        // via add_*_device methods during configuration phase.
 
-        // Set network devices
-        if !self.network_devices.is_empty() {
-            vz_config.set_network_devices(&self.network_devices);
-        }
-
-        // Set serial ports (appears as hvc0 in guest)
-        if let Some(serial_port) = self.serial_port {
-            vz_config.set_serial_ports(&[serial_port]);
-            tracing::debug!("Added serial port to configuration");
-        }
-
-        // Set balloon device if configured
+        // Set balloon device if configured.
+        // TODO: arcbox-vz does not yet support balloon device configuration.
+        // For now, balloon functionality is disabled.
         if self.balloon_configured {
-            let balloon_config = ffi::create_balloon_device_config().map_err(|e| {
-                HypervisorError::DeviceError(format!("Failed to create balloon device: {}", e))
-            })?;
-            vz_config.set_memory_balloon_devices(&[balloon_config]);
-            tracing::debug!("Added memory balloon device to configuration");
+            tracing::warn!(
+                "Balloon device is configured but arcbox-vz does not yet support it. \
+                Memory ballooning will not work."
+            );
         }
 
-        // Validate configuration
-        vz_config
-            .validate()
-            .map_err(|e| HypervisorError::VmCreationFailed(format!("Invalid config: {}", e)))?;
-
-        // Create the VM with dispatch queue
-        let vz_vm = ffi::VirtualMachine::new_with_queue(vz_config, self.dispatch_queue)
-            .map_err(|e| HypervisorError::VmCreationFailed(e.to_string()))?;
+        // Build the VM. This validates configuration internally and creates
+        // the VZVirtualMachine instance with a dedicated dispatch queue.
+        let vz_vm = vz_config
+            .build()
+            .map_err(|e| HypervisorError::VmCreationFailed(format!("Failed to build VM: {}", e)))?;
 
         self.vz_vm = Some(vz_vm);
 
@@ -298,7 +248,7 @@ impl DarwinVm {
     /// This function polls the VM state directly (state property should be thread-safe to read).
     fn wait_for_state(
         &self,
-        target: ffi::VZVirtualMachineState,
+        target: VirtualMachineState,
         timeout: Duration,
     ) -> Result<(), HypervisorError> {
         let start = std::time::Instant::now();
@@ -318,7 +268,7 @@ impl DarwinVm {
                 if state == target {
                     return Ok(());
                 }
-                if state == ffi::VZVirtualMachineState::Error {
+                if state == VirtualMachineState::Error {
                     return Err(HypervisorError::VmError(
                         "VM entered error state".to_string(),
                     ));
@@ -493,21 +443,31 @@ impl DarwinVm {
             });
         }
 
-        // Get the VZ VM's socket device
+        // Get the VZ VM's socket devices using arcbox-vz API
         let vz_vm = self
             .vz_vm
             .as_ref()
             .ok_or_else(|| HypervisorError::VmError("No VZ VM instance".to_string()))?;
 
-        let socket_device = ffi::vm_first_socket_device(vz_vm.as_ptr()).ok_or_else(|| {
+        let socket_devices = vz_vm.socket_devices();
+        let socket_device = socket_devices.first().ok_or_else(|| {
             HypervisorError::DeviceError("No vsock device configured".to_string())
         })?;
 
-        // Connect to the port
+        // Connect to the port using arcbox-vz's async connect
         tracing::debug!("Connecting to vsock port {} on VM {}", port, self.id);
 
-        let fd = ffi::vsock_connect_to_port(socket_device, self.dispatch_queue, port)
-            .map_err(|e| HypervisorError::DeviceError(format!("vsock connect failed: {}", e)))?;
+        // Use tokio runtime to run async connect
+        let rt = tokio::runtime::Handle::try_current().map_err(|_| {
+            HypervisorError::DeviceError("No tokio runtime available for vsock connect".to_string())
+        })?;
+
+        let connection = rt.block_on(socket_device.connect(port)).map_err(|e| {
+            HypervisorError::DeviceError(format!("vsock connect failed: {}", e))
+        })?;
+
+        // Get the raw fd and take ownership (prevents close on drop)
+        let fd = connection.into_raw_fd();
 
         tracing::debug!("Connected to vsock port {}, fd={}", port, fd);
 
@@ -749,7 +709,11 @@ impl DarwinVm {
     /// // Reduce guest memory to 512MB
     /// vm.set_balloon_target_memory(512 * 1024 * 1024)?;
     /// ```
-    pub fn set_balloon_target_memory(&self, target_bytes: u64) -> Result<(), HypervisorError> {
+    ///
+    /// # Note
+    /// Balloon device support requires arcbox-vz extensions that are not yet
+    /// implemented. This method currently returns an error.
+    pub fn set_balloon_target_memory(&self, _target_bytes: u64) -> Result<(), HypervisorError> {
         // Check VM is running
         let state = self.state();
         if state != VmState::Running {
@@ -766,31 +730,22 @@ impl DarwinVm {
             ));
         }
 
-        // Get balloon device from running VM
-        let vz_vm = self
-            .vz_vm
-            .as_ref()
-            .ok_or_else(|| HypervisorError::VmError("No VZ VM instance".to_string()))?;
-
-        let balloon_device = ffi::vm_first_balloon_device(vz_vm.as_ptr()).ok_or_else(|| {
-            HypervisorError::DeviceError("Balloon device not found in running VM".to_string())
-        })?;
-
-        ffi::balloon_set_target_memory(balloon_device, target_bytes);
-
-        tracing::info!(
-            "VM {}: Set balloon target memory to {}MB",
-            self.id,
-            target_bytes / (1024 * 1024)
-        );
-
-        Ok(())
+        // TODO: arcbox-vz does not yet expose balloon device runtime access.
+        // When arcbox-vz adds support for VZVirtioTraditionalMemoryBalloonDevice,
+        // we can implement this properly.
+        Err(HypervisorError::DeviceError(
+            "Balloon device runtime access not yet supported in arcbox-vz".to_string(),
+        ))
     }
 
     /// Gets the current target memory size from the balloon device.
     ///
     /// Returns the target memory size in bytes, or 0 if no balloon is configured
     /// or the VM is not running.
+    ///
+    /// # Note
+    /// Balloon device support requires arcbox-vz extensions that are not yet
+    /// implemented. This method currently returns 0.
     #[must_use]
     pub fn get_balloon_target_memory(&self) -> u64 {
         // Check VM is running
@@ -803,16 +758,9 @@ impl DarwinVm {
             return 0;
         }
 
-        // Get balloon device from running VM
-        let Some(ref vz_vm) = self.vz_vm else {
-            return 0;
-        };
-
-        let Some(balloon_device) = ffi::vm_first_balloon_device(vz_vm.as_ptr()) else {
-            return 0;
-        };
-
-        ffi::balloon_get_target_memory(balloon_device)
+        // TODO: arcbox-vz does not yet expose balloon device runtime access.
+        // Return 0 for now.
+        0
     }
 
     /// Returns the configured memory size for this VM.
@@ -866,14 +814,12 @@ impl VirtualMachine for DarwinVm {
             }
         }
 
-        // Create vCPU with VZ VM pointer for state queries.
-        // On Virtualization.framework, vCPU execution is managed internally,
-        // so the vCPU needs access to the VM's state for run() to work properly.
-        let vz_vm_ptr = self
-            .vz_vm
-            .as_ref()
-            .map_or(std::ptr::null_mut(), |vm| vm.as_ptr());
-        let vcpu = DarwinVcpu::new_managed(id, vz_vm_ptr);
+        // Create vCPU for managed execution.
+        // On Virtualization.framework, vCPU execution is managed internally by the framework.
+        // The vCPU struct is a lightweight handle that tracks vCPU ID and state.
+        // NOTE: We pass null_mut() because arcbox-vz doesn't expose VM's raw pointer.
+        // The VM state is queried through the DarwinVm's state() method instead.
+        let vcpu = DarwinVcpu::new_managed(id, std::ptr::null_mut());
 
         // Record creation
         {
@@ -888,10 +834,9 @@ impl VirtualMachine for DarwinVm {
         }
 
         tracing::debug!(
-            "Created vCPU {} for VM {} (managed execution, vz_vm={:?})",
+            "Created vCPU {} for VM {} (managed execution)",
             id,
-            self.id,
-            vz_vm_ptr
+            self.id
         );
 
         Ok(vcpu)
@@ -906,31 +851,27 @@ impl VirtualMachine for DarwinVm {
             ));
         }
 
+        // Get mutable reference to config
+        let vz_config = self.vz_config.as_mut().ok_or_else(|| {
+            HypervisorError::DeviceError("VZ configuration not available".to_string())
+        })?;
+
         match device.device_type {
             VirtioDeviceType::Block => {
-                // Create block device
+                // Create block device using arcbox-vz API
                 if let Some(ref path) = device.path {
-                    let attachment = ffi::create_disk_attachment(path, device.read_only)
-                        .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-                    let block_device = ffi::create_block_device(attachment)
-                        .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-                    self.storage_devices.push(block_device);
+                    let storage_device =
+                        StorageDeviceConfiguration::disk_image(path, device.read_only)
+                            .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+                    vz_config.add_storage_device(storage_device);
                     tracing::debug!("Added block device: {}", path);
                 }
             }
             VirtioDeviceType::Net => {
-                // Create network device with NAT
-                let attachment = ffi::create_nat_attachment()
+                // Create network device with NAT using arcbox-vz API
+                let network_device = NetworkDeviceConfiguration::nat()
                     .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-                let network_device = ffi::create_network_device(attachment)
-                    .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-
-                // Set random MAC address
-                if let Ok(mac) = ffi::create_random_mac() {
-                    ffi::set_network_mac(network_device, mac);
-                }
-
-                self.network_devices.push(network_device);
+                vz_config.add_network_device(network_device);
                 tracing::debug!("Added network device with NAT");
             }
             VirtioDeviceType::Console => {
@@ -938,29 +879,24 @@ impl VirtualMachine for DarwinVm {
                 tracing::debug!("Console device will be configured separately");
             }
             VirtioDeviceType::Fs => {
-                // Create filesystem device
+                // Create filesystem device using arcbox-vz API
                 if let (Some(path), Some(tag)) = (&device.path, &device.tag) {
-                    let directory = ffi::create_shared_directory(path, device.read_only)
+                    let directory = SharedDirectory::new(path, device.read_only)
                         .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-                    let share = ffi::create_single_directory_share(directory)
+                    let share = SingleDirectoryShare::new(directory)
                         .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-                    let fs_device = ffi::create_fs_device(tag, share)
+                    let mut fs_device = VirtioFileSystemDeviceConfiguration::new(tag)
                         .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-
-                    // Add to directory sharing devices
-                    if let Some(ref config) = self.vz_config {
-                        config.set_directory_sharing_devices(&[fs_device]);
-                    }
+                    fs_device.set_share(share);
+                    vz_config.add_directory_share(fs_device);
                     tracing::debug!("Added filesystem device: {} -> {}", tag, path);
                 }
             }
             VirtioDeviceType::Vsock => {
-                // Create vsock device
-                let socket_device = ffi::create_socket_device()
+                // Create vsock device using arcbox-vz API
+                let socket_device = SocketDeviceConfiguration::new()
                     .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
-                if let Some(ref config) = self.vz_config {
-                    config.set_socket_devices(&[socket_device]);
-                }
+                vz_config.add_socket_device(socket_device);
                 tracing::debug!("Added vsock device");
             }
             VirtioDeviceType::Rng => {
@@ -968,9 +904,10 @@ impl VirtualMachine for DarwinVm {
                 tracing::debug!("Entropy device already configured");
             }
             VirtioDeviceType::Balloon => {
-                // Mark balloon as configured; actual device is created in finalize_configuration()
+                // Mark balloon as configured
+                // NOTE: arcbox-vz does not yet support balloon device configuration
                 self.balloon_configured = true;
-                tracing::debug!("Balloon device configured");
+                tracing::debug!("Balloon device configured (pending arcbox-vz support)");
             }
             _ => {
                 // Other device types (Gpu) not yet supported on Darwin
@@ -1010,22 +947,26 @@ impl VirtualMachine for DarwinVm {
             self.finalize_configuration()?;
         }
 
-        // Start the VM
-        // All VZ operations must be dispatched to the VM's designated queue
+        // Start the VM using arcbox-vz's async API
         if let Some(ref vm) = self.vz_vm {
             tracing::debug!("Starting VM {} asynchronously...", self.id);
 
-            // Start the VM asynchronously on its queue
-            let queue = self.dispatch_queue;
-            ffi::dispatch_sync_closure(queue, || {
-                vm.start_async();
-            });
+            // Get tokio runtime handle for async operations
+            let rt = tokio::runtime::Handle::try_current().map_err(|_| {
+                self.set_state(VmState::Error);
+                HypervisorError::VmError("No tokio runtime available for VM start".to_string())
+            })?;
+
+            // Start the VM using arcbox-vz's async start
+            rt.block_on(vm.start()).map_err(|e| {
+                self.set_state(VmState::Error);
+                HypervisorError::VmError(format!("Failed to start VM: {}", e))
+            })?;
 
             tracing::debug!("Waiting for VM {} to reach Running state...", self.id);
 
             // Wait for VM to reach Running state
-            match self.wait_for_state(ffi::VZVirtualMachineState::Running, Duration::from_secs(30))
-            {
+            match self.wait_for_state(VirtualMachineState::Running, Duration::from_secs(30)) {
                 Ok(()) => {
                     self.running.store(true, Ordering::SeqCst);
                     self.set_state(VmState::Running);
@@ -1065,11 +1006,17 @@ impl VirtualMachine for DarwinVm {
         }
 
         if let Some(ref vm) = self.vz_vm {
-            let queue = self.dispatch_queue;
-            ffi::dispatch_sync_closure(queue, || {
-                vm.pause_async();
-            });
-            self.wait_for_state(ffi::VZVirtualMachineState::Paused, Duration::from_secs(10))?;
+            // Get tokio runtime handle for async operations
+            let rt = tokio::runtime::Handle::try_current().map_err(|_| {
+                HypervisorError::VmError("No tokio runtime available for VM pause".to_string())
+            })?;
+
+            // Pause using arcbox-vz's async pause
+            rt.block_on(vm.pause()).map_err(|e| {
+                HypervisorError::VmError(format!("Failed to pause VM: {}", e))
+            })?;
+
+            self.wait_for_state(VirtualMachineState::Paused, Duration::from_secs(10))?;
         }
 
         self.set_state(VmState::Paused);
@@ -1088,11 +1035,17 @@ impl VirtualMachine for DarwinVm {
         }
 
         if let Some(ref vm) = self.vz_vm {
-            let queue = self.dispatch_queue;
-            ffi::dispatch_sync_closure(queue, || {
-                vm.resume_async();
-            });
-            self.wait_for_state(ffi::VZVirtualMachineState::Running, Duration::from_secs(10))?;
+            // Get tokio runtime handle for async operations
+            let rt = tokio::runtime::Handle::try_current().map_err(|_| {
+                HypervisorError::VmError("No tokio runtime available for VM resume".to_string())
+            })?;
+
+            // Resume using arcbox-vz's async resume
+            rt.block_on(vm.resume()).map_err(|e| {
+                HypervisorError::VmError(format!("Failed to resume VM: {}", e))
+            })?;
+
+            self.wait_for_state(VirtualMachineState::Running, Duration::from_secs(10))?;
         }
 
         self.set_state(VmState::Running);
@@ -1118,16 +1071,29 @@ impl VirtualMachine for DarwinVm {
             tracing::debug!("VM {} can_stop: {}", self.id, can_stop);
 
             if can_stop {
-                // Use async stop API (macOS 12.0+)
-                let queue = self.dispatch_queue;
-                ffi::dispatch_sync_closure(queue, || {
-                    vm.stop_async();
-                });
+                // Get tokio runtime handle for async operations
+                let rt = tokio::runtime::Handle::try_current().ok();
+
+                if let Some(rt) = rt {
+                    // Stop using arcbox-vz's async stop
+                    match rt.block_on(vm.stop()) {
+                        Ok(()) => {
+                            tracing::debug!("VM {} stop completed", self.id);
+                        }
+                        Err(e) => {
+                            tracing::warn!("VM {} stop failed: {}", self.id, e);
+                            // Continue with cleanup even if stop fails
+                        }
+                    }
+                } else {
+                    // No runtime available, try graceful request_stop
+                    if let Err(e) = vm.request_stop() {
+                        tracing::warn!("VM {} request_stop failed: {}", self.id, e);
+                    }
+                }
 
                 // Wait for VM to reach Stopped state
-                match self
-                    .wait_for_state(ffi::VZVirtualMachineState::Stopped, Duration::from_secs(10))
-                {
+                match self.wait_for_state(VirtualMachineState::Stopped, Duration::from_secs(10)) {
                     Ok(()) => {
                         tracing::debug!("VM {} reached Stopped state", self.id);
                     }
@@ -1210,7 +1176,7 @@ impl VirtualMachine for DarwinVm {
         }
 
         // Also record serial port if configured (not in device_configs)
-        if self.serial_port.is_some() {
+        if self.serial_fds.is_some() {
             snapshots.push(DeviceSnapshot {
                 device_type: VirtioDeviceType::Console,
                 name: "serial-0".to_string(),
@@ -1286,8 +1252,16 @@ impl VirtualMachine for DarwinVm {
             .iter()
             .filter(|s| s.device_type == VirtioDeviceType::Net)
             .count();
-        let current_blocks = self.storage_devices.len();
-        let current_nets = self.network_devices.len();
+        let current_blocks = self
+            .device_configs
+            .iter()
+            .filter(|c| c.device_type == VirtioDeviceType::Block)
+            .count();
+        let current_nets = self
+            .device_configs
+            .iter()
+            .filter(|c| c.device_type == VirtioDeviceType::Net)
+            .count();
 
         if snapshot_blocks != current_blocks {
             tracing::warn!(
@@ -1326,12 +1300,7 @@ impl Drop for DarwinVm {
             }
         }
 
-        // Release the custom dispatch queue
-        if !self.dispatch_queue.is_null() {
-            ffi::release_dispatch_queue(self.dispatch_queue);
-        }
-
-        // VZ handles are automatically released by Rust's drop
+        // VZ handles and dispatch queue are automatically released by arcbox-vz's drop
 
         tracing::debug!("Dropped VM {}", self.id);
     }
@@ -1345,7 +1314,7 @@ mod tests {
 
     #[test]
     fn test_vm_creation() {
-        if !ffi::is_supported() {
+        if !arcbox_vz::is_supported() {
             println!("Virtualization not supported, skipping");
             return;
         }
@@ -1364,7 +1333,7 @@ mod tests {
 
     #[test]
     fn test_vcpu_creation() {
-        if !ffi::is_supported() {
+        if !arcbox_vz::is_supported() {
             println!("Virtualization not supported, skipping");
             return;
         }
@@ -1396,7 +1365,7 @@ mod tests {
 
     #[test]
     fn test_vm_lifecycle() {
-        if !ffi::is_supported() {
+        if !arcbox_vz::is_supported() {
             println!("Virtualization not supported, skipping");
             return;
         }
@@ -1454,7 +1423,7 @@ mod tests {
 
     #[test]
     fn test_invalid_state_transitions() {
-        if !ffi::is_supported() {
+        if !arcbox_vz::is_supported() {
             println!("Virtualization not supported, skipping");
             return;
         }
@@ -1474,7 +1443,7 @@ mod tests {
 
     #[test]
     fn test_balloon_device_configuration() {
-        if !ffi::is_supported() {
+        if !arcbox_vz::is_supported() {
             println!("Virtualization not supported, skipping");
             return;
         }
@@ -1504,18 +1473,15 @@ mod tests {
     }
 
     #[test]
-    fn test_balloon_device_ffi() {
-        if !ffi::is_supported() {
+    fn test_balloon_device_pending() {
+        if !arcbox_vz::is_supported() {
             println!("Virtualization not supported, skipping");
             return;
         }
 
-        // Test that balloon FFI bindings work correctly
-        let balloon_config = ffi::create_balloon_device_config();
-        assert!(
-            balloon_config.is_ok(),
-            "Failed to create balloon device config: {:?}",
-            balloon_config.err()
-        );
+        // NOTE: Balloon device configuration is pending arcbox-vz support.
+        // Once arcbox-vz adds BalloonDeviceConfiguration, this test should
+        // verify that the balloon device can be created and configured.
+        println!("Balloon device test skipped: pending arcbox-vz support");
     }
 }

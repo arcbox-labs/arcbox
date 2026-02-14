@@ -6,11 +6,15 @@
 pub mod block;
 pub mod dispatch;
 pub mod foundation;
+pub mod memory;
+pub mod runloop;
 pub mod runtime;
 
 pub use block::*;
 pub use dispatch::*;
 pub use foundation::*;
+pub use memory::*;
+pub use runloop::*;
 pub use runtime::*;
 
 use crate::error::VZError;

@@ -11,12 +11,11 @@
 //!
 //! # Architecture
 //!
-//! - `DarwinHypervisor`: Uses `arcbox-vz` for capability detection
-//! - `DarwinVm`: Uses internal FFI for VM lifecycle (pending migration to arcbox-vz)
-//! - `DarwinMemory`: Internal memory management
+//! - `DarwinHypervisor`: Uses `arcbox-vz` for capability detection and VM creation
+//! - `DarwinVm`: Uses `arcbox-vz` for VM lifecycle management
+//! - `DarwinMemory`: Internal memory management with software dirty tracking
 //! - `DarwinVcpu`: Placeholder vCPU for managed execution model
 
-pub(crate) mod ffi;
 mod hypervisor;
 mod memory;
 mod vcpu;

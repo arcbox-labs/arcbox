@@ -2,8 +2,16 @@
 //!
 //! Virtualization.framework does not provide dirty page tracking like KVM does.
 //! This module implements a software-based alternative using page checksums.
+//!
+//! # Memory Allocation
+//!
+//! Guest memory is allocated using mmap directly, as this is a low-level
+//! operation not related to Virtualization.framework. The arcbox-vz crate
+//! does not expose memory allocation APIs since it focuses on VZ-specific
+//! functionality.
 
 use std::collections::HashMap;
+use std::ptr;
 use std::sync::RwLock;
 
 use crate::{
@@ -13,7 +21,48 @@ use crate::{
     types::DirtyPageInfo,
 };
 
-use super::ffi;
+// ============================================================================
+// Memory Allocation (using mmap directly)
+// ============================================================================
+
+/// Allocates guest memory using mmap.
+///
+/// This is a low-level operation that allocates anonymous memory pages
+/// for use as guest physical memory.
+fn allocate_memory(size: u64) -> Result<*mut u8, HypervisorError> {
+    unsafe {
+        let ptr = libc::mmap(
+            ptr::null_mut(),
+            size as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+
+        if ptr == libc::MAP_FAILED {
+            let errno = *libc::__error();
+            return Err(HypervisorError::MemoryError(format!(
+                "mmap failed: errno={}",
+                errno
+            )));
+        }
+
+        libc::memset(ptr, 0, size as usize);
+        tracing::debug!("Allocated {}MB of guest memory", size / (1024 * 1024));
+
+        Ok(ptr.cast::<u8>())
+    }
+}
+
+/// Frees guest memory previously allocated with `allocate_memory`.
+fn free_memory(ptr: *mut u8, size: u64) {
+    if !ptr.is_null() {
+        unsafe {
+            libc::munmap(ptr.cast(), size as usize);
+        }
+    }
+}
 
 /// Guest memory implementation for Darwin (macOS).
 ///
@@ -66,9 +115,7 @@ impl DarwinMemory {
     /// Returns an error if memory allocation fails.
     pub fn new(size: u64) -> Result<Self, HypervisorError> {
         // Allocate the main memory region at guest address 0
-        let host_addr = ffi::allocate_memory(size).map_err(|e| {
-            HypervisorError::MemoryError(format!("Failed to allocate memory: {}", e))
-        })?;
+        let host_addr = allocate_memory(size)?;
 
         let region = MappedRegion {
             guest_addr: GuestAddress::new(0),
@@ -159,9 +206,7 @@ impl DarwinMemory {
     ///
     /// Returns an error if the region overlaps with existing regions.
     pub fn add_region(&self, guest_addr: GuestAddress, size: u64) -> Result<(), HypervisorError> {
-        let host_addr = ffi::allocate_memory(size).map_err(|e| {
-            HypervisorError::MemoryError(format!("Failed to allocate memory: {}", e))
-        })?;
+        let host_addr = allocate_memory(size)?;
 
         let new_region = MappedRegion {
             guest_addr,
@@ -180,7 +225,7 @@ impl DarwinMemory {
             let existing_end = region.guest_addr.raw() + region.size;
             if guest_addr.raw() < existing_end && new_end > region.guest_addr.raw() {
                 // Free the allocated memory before returning error
-                ffi::free_memory(host_addr, size);
+                free_memory(host_addr, size);
                 return Err(HypervisorError::MemoryError(
                     "Region overlaps with existing region".to_string(),
                 ));
@@ -435,7 +480,7 @@ impl Drop for DarwinMemory {
     fn drop(&mut self) {
         if let Ok(regions) = self.regions.write() {
             for region in regions.iter() {
-                ffi::free_memory(region.host_addr, region.size);
+                free_memory(region.host_addr, region.size);
             }
         }
     }

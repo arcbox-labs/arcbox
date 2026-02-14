@@ -1,5 +1,6 @@
 //! Virtual machine runtime.
 
+use crate::device::{MemoryBalloonDevice, vm_memory_balloon_devices};
 use crate::error::{VZError, VZResult};
 use crate::ffi::{
     _Block_copy, _NSConcreteStackBlock, BlockPtr, DispatchQueue, SIMPLE_BLOCK_DESCRIPTOR,
@@ -442,6 +443,20 @@ impl VirtualMachine {
 
             result
         }
+    }
+
+    /// Returns the memory balloon devices configured on this VM.
+    ///
+    /// These can be used for dynamic memory management between host and guest.
+    pub fn memory_balloon_devices(&self) -> Vec<MemoryBalloonDevice> {
+        vm_memory_balloon_devices(self.inner)
+    }
+
+    /// Returns the first memory balloon device, if any.
+    ///
+    /// This is a convenience method for VMs with a single balloon device.
+    pub fn first_balloon_device(&self) -> Option<MemoryBalloonDevice> {
+        self.memory_balloon_devices().into_iter().next()
     }
 }
 

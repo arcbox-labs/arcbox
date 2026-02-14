@@ -89,7 +89,8 @@ pub use error::VZError;
 pub use configuration::{GenericPlatform, LinuxBootLoader, Platform, VirtualMachineConfiguration};
 
 pub use device::{
-    DirectoryShare, EntropyDeviceConfiguration, LinuxRosettaDirectoryShare, MultipleDirectoryShare,
+    DirectoryShare, EntropyDeviceConfiguration, LinuxRosettaDirectoryShare,
+    MemoryBalloonDevice, MemoryBalloonDeviceConfiguration, MultipleDirectoryShare,
     NetworkDeviceConfiguration, RosettaAvailability, SerialPortConfiguration, SharedDirectory,
     SingleDirectoryShare, SocketDeviceConfiguration, StorageDeviceConfiguration,
     VirtioFileSystemDeviceConfiguration,
