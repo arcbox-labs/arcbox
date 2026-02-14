@@ -1,5 +1,4 @@
 /target
-**/CLAUDE.md
 
 # macOS
 .DS_Store
@@ -10,3 +9,9 @@ tests/resources/Image-*
 tests/resources/vmlinuz-*
 tests/resources/initramfs-*
 tests/resources/modloop-*
+
+# Boot assets (generated)
+boot-assets/
+boot-assets-arm64-*.tar.gz*
+tests/resources/boot-assets-*
+tests/resources/boot-assets-arm64-*
