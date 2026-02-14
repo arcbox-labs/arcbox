@@ -1,14 +1,13 @@
 //! API server implementation.
 
 use crate::error::Result;
-use crate::generated::{
-    container_service_server::ContainerServiceServer, image_service_server::ImageServiceServer,
-    machine_service_server::MachineServiceServer, network_service_server::NetworkServiceServer,
-    system_service_server::SystemServiceServer,
-};
 use crate::grpc::{
     ContainerServiceImpl, ImageServiceImpl, MachineServiceImpl, NetworkServiceImpl,
     SystemServiceImpl,
+};
+use arcbox_grpc::{
+    ContainerServiceServer, ImageServiceServer, MachineServiceServer, NetworkServiceServer,
+    SystemServiceServer,
 };
 use arcbox_core::{Config, Runtime};
 use arcbox_docker::{DockerApiServer, ServerConfig as DockerConfig};

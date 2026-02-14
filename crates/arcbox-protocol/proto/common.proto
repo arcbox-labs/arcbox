@@ -9,7 +9,7 @@
 
 syntax = "proto3";
 
-package arcbox.common;
+package arcbox.v1;
 
 // Empty message for requests/responses that don't need data.
 message Empty {}

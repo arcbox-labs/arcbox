@@ -11,14 +11,17 @@ This file provides guidance to Claude Code when working with the arcbox-grpc cra
 ```
 arcbox-grpc/
 ├── src/lib.rs          # Re-exports clients/servers, includes tonic proto modules
-├── build.rs            # tonic-build configuration for proto compilation
-└── proto/
-    ├── common.proto    # Shared types (Empty, Timestamp)
-    ├── machine.proto   # VM management service
-    ├── container.proto # Container lifecycle service
-    ├── image.proto     # Image management service
-    └── agent.proto     # Guest agent service
+└── build.rs            # tonic-build configuration for proto compilation
+                        # (uses proto files from arcbox-protocol)
 ```
+
+Proto files are sourced from `../arcbox-protocol/proto/`:
+- `common.proto` - Shared types (Empty, Timestamp)
+- `machine.proto` - VM management service
+- `container.proto` - Container lifecycle service
+- `image.proto` - Image management service
+- `agent.proto` - Guest agent service
+- `api.proto` - Network, System, Volume services
 
 ### Service Definitions
 
@@ -31,16 +34,17 @@ arcbox-grpc/
 
 ### Relationship with arcbox-protocol
 
-- `arcbox-protocol`: Generates message types using `prost`
+- `arcbox-protocol`: Generates message types using `prost` from the unified `arcbox.v1` package
 - `arcbox-grpc`: Generates service clients/servers using `tonic-build`
-- The `extern_path` directive in build.rs maps proto packages to arcbox-protocol types
+- The `extern_path` directive in build.rs maps `.arcbox.v1` to `::arcbox_protocol::v1` types
+- Both crates share the same proto files located in `arcbox-protocol/proto/`
 
 ## Key Types
 
 ```rust
 // Client usage
 use arcbox_grpc::MachineServiceClient;
-use arcbox_protocol::machine::ListMachinesRequest;
+use arcbox_protocol::v1::ListMachinesRequest;
 use tonic::transport::Channel;
 
 let channel = /* connect to Unix socket */;
@@ -81,7 +85,7 @@ cargo clean -p arcbox-grpc && cargo build -p arcbox-grpc
 
 ## Notes
 
-- Proto files use `package arcbox.<service>` naming convention
+- Proto files use the unified `package arcbox.v1` namespace
 - Service methods follow REST-like naming (Create, List, Get, Update, Delete)
 - Streaming RPCs are used for long-running operations (Exec, Logs)
 - The crate re-exports `tonic` and `arcbox_protocol` for convenience

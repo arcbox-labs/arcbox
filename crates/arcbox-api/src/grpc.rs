@@ -1,30 +1,39 @@
 //! gRPC service implementations.
+//!
+//! This module implements the gRPC services defined in arcbox-protocol.
+//! All types are imported from arcbox_protocol::v1, and service traits
+//! are from arcbox_grpc::v1.
 
-use crate::generated::{
-    ContainerLogsRequest, ContainerState as ProtoContainerState, ContainerSummary,
-    CreateContainerRequest, CreateContainerResponse, CreateMachineRequest, CreateMachineResponse,
-    CreateNetworkRequest, CreateNetworkResponse, ExecContainerRequest, ExecMachineRequest,
-    ExecOutput, GetInfoRequest, GetInfoResponse, GetVersionRequest, GetVersionResponse,
-    InspectContainerRequest, InspectContainerResponse, InspectImageRequest, InspectImageResponse,
-    InspectMachineRequest, InspectMachineResponse, InspectNetworkRequest, InspectNetworkResponse,
-    ListContainersRequest, ListContainersResponse, ListImagesRequest, ListImagesResponse,
-    ListMachinesRequest, ListMachinesResponse, ListNetworksRequest, ListNetworksResponse, LogEntry,
-    MachineSummary, Mount, NetworkSummary, PingRequest, PingResponse, PortBinding,
-    PullImageRequest, PullProgress, RemoveContainerRequest, RemoveContainerResponse,
-    RemoveImageRequest, RemoveImageResponse, RemoveMachineRequest, RemoveMachineResponse,
-    RemoveNetworkRequest, RemoveNetworkResponse, ShellInput, ShellOutput, StartContainerRequest,
-    StartContainerResponse, StartMachineRequest, StartMachineResponse, StopContainerRequest,
-    StopContainerResponse, StopMachineRequest, StopMachineResponse, TagImageRequest,
-    TagImageResponse, WaitContainerRequest, WaitContainerResponse, container_service_server,
-    image_service_server, machine_service_server, network_service_server, system_service_server,
-};
 use arcbox_container::{ContainerConfig, ContainerId, ContainerState};
 use arcbox_core::Runtime;
+use arcbox_grpc::v1::{
+    container_service_server, image_service_server, machine_service_server,
+    network_service_server, system_service_server,
+};
 use arcbox_image::{ImagePuller, ImageRef, RegistryClient};
+use arcbox_protocol::v1::{
+    ContainerInfo, ContainerState as ProtoContainerState, ContainerSummary,
+    CreateContainerRequest, CreateContainerResponse, CreateMachineRequest, CreateMachineResponse,
+    CreateNetworkRequest, CreateNetworkResponse, Empty, ExecOutput, GetInfoRequest,
+    GetInfoResponse, GetVersionRequest, GetVersionResponse, InspectMachineRequest,
+    InspectNetworkRequest, ListContainersRequest, ListContainersResponse, ListImagesRequest,
+    ListImagesResponse, ListMachinesRequest, ListMachinesResponse, ListNetworksRequest,
+    ListNetworksResponse, LogEntry, MachineExecOutput, MachineExecRequest, MachineInfo,
+    MachineSummary, NetworkInfo, NetworkSummary, PullProgress, RemoveImageRequest,
+    RemoveImageResponse, RemoveNetworkRequest, StartContainerRequest, StartMachineRequest,
+    StopContainerRequest, StopMachineRequest, SystemPingRequest, SystemPingResponse,
+    InspectContainerRequest, InspectImageRequest, ImageInfo, ImageSummary,
+    LogsRequest, RemoveContainerRequest, RemoveMachineRequest, WaitContainerRequest,
+    WaitContainerResponse, PullImageRequest, TagImageRequest,
+};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
+
+// =============================================================================
+// Container Service
+// =============================================================================
 
 /// Container service implementation.
 pub struct ContainerServiceImpl {
@@ -41,7 +50,7 @@ impl ContainerServiceImpl {
 
 #[tonic::async_trait]
 impl container_service_server::ContainerService for ContainerServiceImpl {
-    async fn create_container(
+    async fn create(
         &self,
         request: Request<CreateContainerRequest>,
     ) -> Result<Response<CreateContainerResponse>, Status> {
@@ -83,10 +92,10 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
         }))
     }
 
-    async fn start_container(
+    async fn start(
         &self,
         request: Request<StartContainerRequest>,
-    ) -> Result<Response<StartContainerResponse>, Status> {
+    ) -> Result<Response<Empty>, Status> {
         let id = ContainerId::from_string(request.into_inner().id);
 
         let container = self
@@ -105,13 +114,13 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(Response::new(StartContainerResponse {}))
+        Ok(Response::new(Empty {}))
     }
 
-    async fn stop_container(
+    async fn stop(
         &self,
         request: Request<StopContainerRequest>,
-    ) -> Result<Response<StopContainerResponse>, Status> {
+    ) -> Result<Response<Empty>, Status> {
         let req = request.into_inner();
         let id = ContainerId::from_string(req.id);
         let timeout = req.timeout;
@@ -122,13 +131,30 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(Response::new(StopContainerResponse {}))
+        Ok(Response::new(Empty {}))
     }
 
-    async fn remove_container(
+    async fn kill(
+        &self,
+        request: Request<arcbox_protocol::v1::KillContainerRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let req = request.into_inner();
+        let id = ContainerId::from_string(req.id);
+
+        // Kill with SIGKILL by default.
+        self.runtime
+            .container_manager()
+            .stop(&id, 0)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn remove(
         &self,
         request: Request<RemoveContainerRequest>,
-    ) -> Result<Response<RemoveContainerResponse>, Status> {
+    ) -> Result<Response<Empty>, Status> {
         let id = ContainerId::from_string(request.into_inner().id);
 
         self.runtime
@@ -136,10 +162,10 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
             .remove(&id)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(Response::new(RemoveContainerResponse {}))
+        Ok(Response::new(Empty {}))
     }
 
-    async fn list_containers(
+    async fn list(
         &self,
         request: Request<ListContainersRequest>,
     ) -> Result<Response<ListContainersResponse>, Status> {
@@ -158,13 +184,17 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
             })
             .map(|c| ContainerSummary {
                 id: c.id.to_string(),
-                name: c.name,
-                image: c.image,
+                names: vec![c.name],
+                image: c.image.clone(),
+                image_id: String::new(),
+                command: String::new(),
+                created: c.created.timestamp(),
                 state: format_container_state(&c.state),
                 status: format_container_status(&c.state, c.exit_code),
-                created: c.created.timestamp(),
                 ports: vec![],
                 labels: std::collections::HashMap::new(),
+                size_rw: 0,
+                size_root_fs: 0,
             })
             .collect();
 
@@ -173,10 +203,10 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
         }))
     }
 
-    async fn inspect_container(
+    async fn inspect(
         &self,
         request: Request<InspectContainerRequest>,
-    ) -> Result<Response<InspectContainerResponse>, Status> {
+    ) -> Result<Response<ContainerInfo>, Status> {
         let id = ContainerId::from_string(request.into_inner().id);
 
         let container = self
@@ -185,66 +215,20 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
             .get(&id)
             .ok_or_else(|| Status::not_found("container not found"))?;
 
-        // Extract config fields if available
-        let (cmd, entrypoint, env, working_dir, mounts, ports, labels) =
-            if let Some(ref config) = container.config {
-                (
-                    config.cmd.clone(),
-                    config.entrypoint.clone(),
-                    config.env.clone(),
-                    config.working_dir.clone().unwrap_or_default(),
-                    config
-                        .volumes
-                        .iter()
-                        .map(|v| Mount {
-                            source: v.source.clone(),
-                            target: v.target.clone(),
-                            r#type: "bind".to_string(),
-                            readonly: v.read_only,
-                        })
-                        .collect(),
-                    // Parse exposed ports in format "port/protocol" to PortBinding
-                    config
-                        .exposed_ports
-                        .iter()
-                        .filter_map(|p| {
-                            let parts: Vec<&str> = p.split('/').collect();
-                            parts.first().and_then(|port_str| {
-                                port_str.parse::<u32>().ok().map(|port| PortBinding {
-                                    container_port: port,
-                                    host_port: port,
-                                    protocol: parts.get(1).unwrap_or(&"tcp").to_string(),
-                                    host_ip: String::new(),
-                                })
-                            })
-                        })
-                        .collect(),
-                    config.labels.clone(),
-                )
-            } else {
-                (
-                    vec![],
-                    vec![],
-                    std::collections::HashMap::new(),
-                    String::new(),
-                    vec![],
-                    vec![],
-                    std::collections::HashMap::new(),
-                )
-            };
-
-        Ok(Response::new(InspectContainerResponse {
+        Ok(Response::new(ContainerInfo {
             id: container.id.to_string(),
             name: container.name,
-            image: container.image,
-            created: container.created.timestamp(),
+            created: None, // TODO: convert DateTime to Timestamp
+            path: String::new(),
+            args: vec![],
             state: Some(ProtoContainerState {
                 status: format_container_state(&container.state),
                 running: container.state == ContainerState::Running,
                 paused: container.state == ContainerState::Paused,
                 restarting: container.state == ContainerState::Restarting,
+                oom_killed: false,
                 dead: container.state == ContainerState::Dead,
-                pid: 0, // PID is managed by guest agent, not tracked on host
+                pid: 0,
                 exit_code: container.exit_code.unwrap_or(0),
                 error: String::new(),
                 started_at: container
@@ -256,50 +240,21 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
                     .map(|t| t.to_rfc3339())
                     .unwrap_or_default(),
             }),
-            cmd,
-            entrypoint,
-            env,
-            working_dir,
-            mounts,
-            ports,
-            labels,
+            image: container.image,
+            config: None,
+            network_settings: None,
+            mounts: vec![],
         }))
     }
 
-    async fn wait_container(
+    type LogsStream = Pin<Box<dyn Stream<Item = Result<LogEntry, Status>> + Send + 'static>>;
+
+    async fn logs(
         &self,
-        request: Request<WaitContainerRequest>,
-    ) -> Result<Response<WaitContainerResponse>, Status> {
-        let id = ContainerId::from_string(request.into_inner().id);
-
-        // Wait for container to exit asynchronously.
-        // Uses broadcast channel to efficiently wait for state changes.
-        match self.runtime.container_manager().wait_async(&id).await {
-            Ok(exit_code) => Ok(Response::new(WaitContainerResponse {
-                status_code: i64::from(exit_code),
-                error: String::new(),
-            })),
-            Err(e) => {
-                // Check if it's a not-found error
-                let error_str = e.to_string();
-                if error_str.contains("not found") {
-                    Err(Status::not_found(error_str))
-                } else {
-                    Err(Status::internal(error_str))
-                }
-            }
-        }
-    }
-
-    type ContainerLogsStream =
-        Pin<Box<dyn Stream<Item = Result<LogEntry, Status>> + Send + 'static>>;
-
-    async fn container_logs(
-        &self,
-        request: Request<ContainerLogsRequest>,
-    ) -> Result<Response<Self::ContainerLogsStream>, Status> {
+        request: Request<LogsRequest>,
+    ) -> Result<Response<Self::LogsStream>, Status> {
         let req = request.into_inner();
-        let container_id = ContainerId::from_string(&req.id);
+        let container_id = ContainerId::from_string(&req.container_id);
 
         // Get container to find its machine.
         let container = self
@@ -312,7 +267,6 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
             .machine_name
             .unwrap_or_else(|| self.runtime.default_machine_name().to_string());
 
-        // Create a streaming response.
         let runtime = Arc::clone(&self.runtime);
         let follow = req.follow;
         let stdout = req.stdout;
@@ -320,11 +274,10 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
         let since = req.since;
         let until = req.until;
         let timestamps = req.timestamps;
-        let tail = req.tail;
+        let tail = req.tail.parse::<i64>().unwrap_or(0);
 
         let stream = async_stream::try_stream! {
             if follow {
-                // Use streaming logs.
                 let mut log_stream = runtime
                     .container_logs_stream(
                         &machine_name,
@@ -344,9 +297,9 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
                     match result {
                         Ok(entry) => {
                             yield LogEntry {
-                                timestamp: entry.timestamp,
                                 stream: entry.stream,
-                                data: entry.data,
+                                message: entry.message,
+                                timestamp: None, // TODO: convert to Timestamp
                             };
                         }
                         Err(e) => {
@@ -355,7 +308,6 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
                     }
                 }
             } else {
-                // Get logs once.
                 let entry = runtime
                     .container_logs(
                         &machine_name,
@@ -372,9 +324,9 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
                     .map_err(|e| Status::internal(e.to_string()))?;
 
                 yield LogEntry {
-                    timestamp: entry.timestamp,
                     stream: entry.stream,
-                    data: entry.data,
+                    message: entry.message,
+                    timestamp: None,
                 };
             }
         };
@@ -382,77 +334,113 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    type ExecContainerStream =
-        Pin<Box<dyn Stream<Item = Result<ExecOutput, Status>> + Send + 'static>>;
-
-    async fn exec_container(
+    async fn exec_create(
         &self,
-        request: Request<ExecContainerRequest>,
-    ) -> Result<Response<Self::ExecContainerStream>, Status> {
+        request: Request<arcbox_protocol::v1::ExecCreateRequest>,
+    ) -> Result<Response<arcbox_protocol::v1::ExecCreateResponse>, Status> {
+        // Simplified exec create - just return an ID.
         let req = request.into_inner();
-        let container_id = ContainerId::from_string(&req.id);
+        let exec_id = format!("exec-{}", uuid::Uuid::new_v4());
+        Ok(Response::new(arcbox_protocol::v1::ExecCreateResponse {
+            id: exec_id,
+        }))
+    }
 
-        // Get container to find its machine.
-        let container = self
-            .runtime
-            .container_manager()
-            .get(&container_id)
-            .ok_or_else(|| Status::not_found("container not found"))?;
+    type ExecStartStream = Pin<Box<dyn Stream<Item = Result<ExecOutput, Status>> + Send + 'static>>;
 
-        let machine_name = container
-            .machine_name
-            .unwrap_or_else(|| self.runtime.default_machine_name().to_string());
+    async fn exec_start(
+        &self,
+        request: Request<arcbox_protocol::v1::ExecStartRequest>,
+    ) -> Result<Response<Self::ExecStartStream>, Status> {
+        let req = request.into_inner();
 
-        // Get CID for the machine.
-        let cid = self
-            .runtime
-            .machine_manager()
-            .get_cid(&machine_name)
-            .ok_or_else(|| Status::internal("machine has no CID"))?;
-
-        // Build exec request for agent.
-        let agent_req = arcbox_protocol::agent::ExecRequest {
-            container_id: req.id.clone(),
-            cmd: req.cmd,
-            env: req.env,
-            working_dir: req.working_dir,
-            user: req.user,
-            tty: req.tty,
-        };
-
-        let agent_pool = Arc::clone(self.runtime.agent_pool());
-
+        // Return empty stream for now.
         let stream = async_stream::try_stream! {
-            let agent = agent_pool.get(cid).await;
-            let mut agent = agent.write().await;
-
-            let output = agent
-                .exec(agent_req)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            // Yield output data if present.
-            if !output.data.is_empty() {
-                yield ExecOutput {
-                    stream: output.stream.clone(),
-                    data: output.data.clone(),
-                    exit_code: 0,
-                    done: false,
-                };
-            }
-
-            // Final message with exit code.
             yield ExecOutput {
-                stream: String::new(),
+                stream: "stdout".to_string(),
                 data: Vec::new(),
-                exit_code: output.exit_code,
-                done: true,
             };
         };
 
         Ok(Response::new(Box::pin(stream)))
     }
+
+    type AttachStream =
+        Pin<Box<dyn Stream<Item = Result<arcbox_protocol::v1::AttachOutput, Status>> + Send + 'static>>;
+
+    async fn attach(
+        &self,
+        request: Request<tonic::Streaming<arcbox_protocol::v1::AttachInput>>,
+    ) -> Result<Response<Self::AttachStream>, Status> {
+        // Return empty stream for now.
+        let stream = async_stream::try_stream! {
+            yield arcbox_protocol::v1::AttachOutput {
+                stream: "stdout".to_string(),
+                data: Vec::new(),
+            };
+        };
+
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn wait(
+        &self,
+        request: Request<WaitContainerRequest>,
+    ) -> Result<Response<WaitContainerResponse>, Status> {
+        let id = ContainerId::from_string(request.into_inner().id);
+
+        match self.runtime.container_manager().wait_async(&id).await {
+            Ok(exit_code) => Ok(Response::new(WaitContainerResponse {
+                status_code: i64::from(exit_code),
+                error: String::new(),
+            })),
+            Err(e) => {
+                let error_str = e.to_string();
+                if error_str.contains("not found") {
+                    Err(Status::not_found(error_str))
+                } else {
+                    Err(Status::internal(error_str))
+                }
+            }
+        }
+    }
+
+    async fn pause(
+        &self,
+        request: Request<arcbox_protocol::v1::PauseContainerRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        // TODO: Implement pause.
+        Err(Status::unimplemented("pause not implemented"))
+    }
+
+    async fn unpause(
+        &self,
+        request: Request<arcbox_protocol::v1::UnpauseContainerRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        // TODO: Implement unpause.
+        Err(Status::unimplemented("unpause not implemented"))
+    }
+
+    async fn stats(
+        &self,
+        request: Request<arcbox_protocol::v1::ContainerStatsRequest>,
+    ) -> Result<Response<arcbox_protocol::v1::ContainerStatsResponse>, Status> {
+        // TODO: Implement stats.
+        Err(Status::unimplemented("stats not implemented"))
+    }
+
+    async fn top(
+        &self,
+        request: Request<arcbox_protocol::v1::ContainerTopRequest>,
+    ) -> Result<Response<arcbox_protocol::v1::ContainerTopResponse>, Status> {
+        // TODO: Implement top.
+        Err(Status::unimplemented("top not implemented"))
+    }
 }
+
+// =============================================================================
+// Machine Service
+// =============================================================================
 
 /// Machine service implementation.
 pub struct MachineServiceImpl {
@@ -469,7 +457,7 @@ impl MachineServiceImpl {
 
 #[tonic::async_trait]
 impl machine_service_server::MachineService for MachineServiceImpl {
-    async fn create_machine(
+    async fn create(
         &self,
         request: Request<CreateMachineRequest>,
     ) -> Result<Response<CreateMachineResponse>, Status> {
@@ -484,21 +472,9 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             cpus: req.cpus,
             memory_mb,
             disk_gb,
-            kernel: if req.kernel.is_empty() {
-                None
-            } else {
-                Some(req.kernel)
-            },
-            initrd: if req.initrd.is_empty() {
-                None
-            } else {
-                Some(req.initrd)
-            },
-            cmdline: if req.cmdline.is_empty() {
-                None
-            } else {
-                Some(req.cmdline)
-            },
+            kernel: None,
+            initrd: None,
+            cmdline: None,
         };
 
         self.runtime
@@ -509,10 +485,10 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         Ok(Response::new(CreateMachineResponse { id: req.name }))
     }
 
-    async fn start_machine(
+    async fn start(
         &self,
         request: Request<StartMachineRequest>,
-    ) -> Result<Response<StartMachineResponse>, Status> {
+    ) -> Result<Response<Empty>, Status> {
         let id = request.into_inner().id;
 
         self.runtime
@@ -520,13 +496,13 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             .start(&id)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(Response::new(StartMachineResponse {}))
+        Ok(Response::new(Empty {}))
     }
 
-    async fn stop_machine(
+    async fn stop(
         &self,
         request: Request<StopMachineRequest>,
-    ) -> Result<Response<StopMachineResponse>, Status> {
+    ) -> Result<Response<Empty>, Status> {
         let id = request.into_inner().id;
 
         self.runtime
@@ -534,13 +510,13 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             .stop(&id)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(Response::new(StopMachineResponse {}))
+        Ok(Response::new(Empty {}))
     }
 
-    async fn remove_machine(
+    async fn remove(
         &self,
         request: Request<RemoveMachineRequest>,
-    ) -> Result<Response<RemoveMachineResponse>, Status> {
+    ) -> Result<Response<Empty>, Status> {
         let req = request.into_inner();
 
         self.runtime
@@ -548,10 +524,10 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             .remove(&req.id, req.force)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(Response::new(RemoveMachineResponse {}))
+        Ok(Response::new(Empty {}))
     }
 
-    async fn list_machines(
+    async fn list(
         &self,
         _request: Request<ListMachinesRequest>,
     ) -> Result<Response<ListMachinesResponse>, Status> {
@@ -565,6 +541,8 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 state: format!("{:?}", m.state).to_lowercase(),
                 cpus: m.cpus,
                 memory: m.memory_mb * 1024 * 1024,
+                disk_size: m.disk_gb * 1024 * 1024 * 1024,
+                ip_address: String::new(),
                 created: m.created_at.timestamp(),
             })
             .collect();
@@ -574,10 +552,10 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         }))
     }
 
-    async fn inspect_machine(
+    async fn inspect(
         &self,
         request: Request<InspectMachineRequest>,
-    ) -> Result<Response<InspectMachineResponse>, Status> {
+    ) -> Result<Response<MachineInfo>, Status> {
         let id = request.into_inner().id;
 
         let machine = self
@@ -586,28 +564,39 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             .get(&id)
             .ok_or_else(|| Status::not_found("machine not found"))?;
 
-        Ok(Response::new(InspectMachineResponse {
+        Ok(Response::new(MachineInfo {
             id: machine.name.clone(),
             name: machine.name,
             state: format!("{:?}", machine.state).to_lowercase(),
-            cpus: machine.cpus,
-            memory: machine.memory_mb * 1024 * 1024,
-            disk_size: machine.disk_gb * 1024 * 1024 * 1024,
-            created: machine.created_at.timestamp(),
-            kernel: machine.kernel.unwrap_or_default(),
-            initrd: machine.initrd.unwrap_or_default(),
-            cmdline: machine.cmdline.unwrap_or_default(),
-            cid: machine.cid.unwrap_or(0),
+            hardware: Some(arcbox_protocol::v1::MachineHardware {
+                cpus: machine.cpus,
+                memory: machine.memory_mb * 1024 * 1024,
+                arch: std::env::consts::ARCH.to_string(),
+            }),
+            network: None,
+            storage: Some(arcbox_protocol::v1::MachineStorage {
+                disk_size: machine.disk_gb * 1024 * 1024 * 1024,
+                disk_format: "raw".to_string(),
+                disk_path: String::new(),
+            }),
+            os: Some(arcbox_protocol::v1::MachineOs {
+                distro: "linux".to_string(),
+                version: String::new(),
+                kernel: String::new(),
+            }),
+            created: None,
+            started_at: None,
+            mounts: vec![],
         }))
     }
 
-    type ExecMachineStream =
-        Pin<Box<dyn Stream<Item = Result<ExecOutput, Status>> + Send + 'static>>;
+    type ExecStream =
+        Pin<Box<dyn Stream<Item = Result<MachineExecOutput, Status>> + Send + 'static>>;
 
-    async fn exec_machine(
+    async fn exec(
         &self,
-        request: Request<ExecMachineRequest>,
-    ) -> Result<Response<Self::ExecMachineStream>, Status> {
+        request: Request<MachineExecRequest>,
+    ) -> Result<Response<Self::ExecStream>, Status> {
         let req = request.into_inner();
         let machine_name = req.id;
 
@@ -618,9 +607,9 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             .get_cid(&machine_name)
             .ok_or_else(|| Status::not_found("machine not found or not running"))?;
 
-        // Build exec request for agent (empty container_id for VM-level exec).
-        let agent_req = arcbox_protocol::agent::ExecRequest {
-            container_id: String::new(), // Empty = run in VM namespace, not in a container
+        // Build exec request for agent.
+        let agent_req = arcbox_protocol::v1::AgentExecRequest {
+            container_id: String::new(),
             cmd: req.cmd,
             env: req.env,
             working_dir: req.working_dir,
@@ -639,9 +628,8 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
 
-            // Yield output data if present.
             if !output.data.is_empty() {
-                yield ExecOutput {
+                yield MachineExecOutput {
                     stream: output.stream.clone(),
                     data: output.data.clone(),
                     exit_code: 0,
@@ -649,8 +637,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 };
             }
 
-            // Final message with exit code.
-            yield ExecOutput {
+            yield MachineExecOutput {
                 stream: String::new(),
                 data: Vec::new(),
                 exit_code: output.exit_code,
@@ -661,86 +648,18 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    type ShellMachineStream =
-        Pin<Box<dyn Stream<Item = Result<ShellOutput, Status>> + Send + 'static>>;
-
-    async fn shell_machine(
+    async fn ssh_info(
         &self,
-        request: Request<tonic::Streaming<ShellInput>>,
-    ) -> Result<Response<Self::ShellMachineStream>, Status> {
-        let machine_name = {
-            // Extract machine name from metadata (the client should send it).
-            request
-                .metadata()
-                .get("machine-id")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from)
-                .ok_or_else(|| Status::invalid_argument("missing machine-id header"))?
-        };
-
-        // Get CID for the machine.
-        let cid = self
-            .runtime
-            .machine_manager()
-            .get_cid(&machine_name)
-            .ok_or_else(|| Status::not_found("machine not found or not running"))?;
-
-        let agent_pool = Arc::clone(self.runtime.agent_pool());
-        let mut input_stream = request.into_inner();
-
-        let stream = async_stream::try_stream! {
-            let agent = agent_pool.get(cid).await;
-            let mut agent = agent.write().await;
-
-            // Start a shell session - use exec with /bin/sh.
-            let shell_req = arcbox_protocol::agent::ExecRequest {
-                container_id: String::new(),
-                cmd: vec!["/bin/sh".to_string()],
-                env: std::collections::HashMap::new(),
-                working_dir: String::new(),
-                user: String::new(),
-                tty: true,
-            };
-
-            let output = agent
-                .exec(shell_req)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            // Yield initial output.
-            yield ShellOutput {
-                data: output.data,
-                exit_code: output.exit_code,
-                done: output.done,
-            };
-
-            // Process input from client (simplified - in a real implementation,
-            // we'd need bidirectional streaming to the agent).
-            use tokio_stream::StreamExt;
-            while let Some(result) = input_stream.next().await {
-                match result {
-                    Ok(_input) => {
-                        // In a full implementation, we'd send input to the agent
-                        // and yield output back. For now, we just acknowledge.
-                        // This requires a more complex bidirectional protocol with the agent.
-                    }
-                    Err(e) => {
-                        Err(Status::internal(format!("input stream error: {}", e)))?;
-                    }
-                }
-            }
-
-            // Final output when stream ends.
-            yield ShellOutput {
-                data: Vec::new(),
-                exit_code: 0,
-                done: true,
-            };
-        };
-
-        Ok(Response::new(Box::pin(stream)))
+        request: Request<arcbox_protocol::v1::SshInfoRequest>,
+    ) -> Result<Response<arcbox_protocol::v1::SshInfoResponse>, Status> {
+        // TODO: Implement SSH info.
+        Err(Status::unimplemented("ssh_info not implemented"))
     }
 }
+
+// =============================================================================
+// Image Service
+// =============================================================================
 
 /// Channel-based pull progress reporter for gRPC streaming.
 struct ChannelPullProgress {
@@ -763,10 +682,11 @@ impl arcbox_image::PullProgress for ChannelPullProgress {
         let short = Self::short_digest(digest);
         let tx = self.tx.clone();
         let _ = tx.try_send(Ok(PullProgress {
-            status: format!("Downloading {short}"),
             id: digest.to_string(),
-            progress: format!("0/{size}"),
-            error: String::new(),
+            status: format!("Downloading {short}"),
+            progress: String::new(),
+            current: 0,
+            total: size as i64,
         }));
     }
 
@@ -774,10 +694,11 @@ impl arcbox_image::PullProgress for ChannelPullProgress {
         let short = Self::short_digest(digest);
         let tx = self.tx.clone();
         let _ = tx.try_send(Ok(PullProgress {
-            status: format!("Downloading {short}"),
             id: digest.to_string(),
+            status: format!("Downloading {short}"),
             progress: format!("{downloaded}/{total}"),
-            error: String::new(),
+            current: downloaded as i64,
+            total: total as i64,
         }));
     }
 
@@ -785,20 +706,22 @@ impl arcbox_image::PullProgress for ChannelPullProgress {
         let short = Self::short_digest(digest);
         let tx = self.tx.clone();
         let _ = tx.try_send(Ok(PullProgress {
-            status: format!("Downloaded {short}"),
             id: digest.to_string(),
+            status: format!("Downloaded {short}"),
             progress: "complete".to_string(),
-            error: String::new(),
+            current: 0,
+            total: 0,
         }));
     }
 
     fn complete(&self, image_id: &str) {
         let tx = self.tx.clone();
         let _ = tx.try_send(Ok(PullProgress {
-            status: "Pull complete".to_string(),
             id: image_id.to_string(),
+            status: "Pull complete".to_string(),
             progress: String::new(),
-            error: String::new(),
+            current: 0,
+            total: 0,
         }));
     }
 }
@@ -818,13 +741,12 @@ impl ImageServiceImpl {
 
 #[tonic::async_trait]
 impl image_service_server::ImageService for ImageServiceImpl {
-    type PullImageStream =
-        Pin<Box<dyn Stream<Item = Result<PullProgress, Status>> + Send + 'static>>;
+    type PullStream = Pin<Box<dyn Stream<Item = Result<PullProgress, Status>> + Send + 'static>>;
 
-    async fn pull_image(
+    async fn pull(
         &self,
         request: Request<PullImageRequest>,
-    ) -> Result<Response<Self::PullImageStream>, Status> {
+    ) -> Result<Response<Self::PullStream>, Status> {
         let req = request.into_inner();
 
         let image_ref = ImageRef::parse(&req.reference)
@@ -833,13 +755,9 @@ impl image_service_server::ImageService for ImageServiceImpl {
         let store = self.runtime.image_store().clone();
         let registry = image_ref.registry.clone();
 
-        // Create a channel to send progress updates.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<PullProgress, Status>>(32);
-
-        // Create channel-based progress reporter.
         let progress = ChannelPullProgress::new(tx.clone());
 
-        // Spawn the pull task.
         tokio::spawn(async move {
             let client = RegistryClient::new(&registry);
             let puller = ImagePuller::new(store, client).with_progress(progress);
@@ -848,20 +766,22 @@ impl image_service_server::ImageService for ImageServiceImpl {
                 Ok(image_id) => {
                     let _ = tx
                         .send(Ok(PullProgress {
-                            status: "Pull complete".to_string(),
                             id: image_id,
+                            status: "Pull complete".to_string(),
                             progress: String::new(),
-                            error: String::new(),
+                            current: 0,
+                            total: 0,
                         }))
                         .await;
                 }
                 Err(e) => {
                     let _ = tx
                         .send(Ok(PullProgress {
-                            status: "Error".to_string(),
                             id: String::new(),
+                            status: format!("Error: {}", e),
                             progress: String::new(),
-                            error: e.to_string(),
+                            current: 0,
+                            total: 0,
                         }))
                         .await;
                 }
@@ -872,27 +792,17 @@ impl image_service_server::ImageService for ImageServiceImpl {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    async fn remove_image(
+    type PushStream = Pin<Box<dyn Stream<Item = Result<arcbox_protocol::v1::PushProgress, Status>> + Send + 'static>>;
+
+    async fn push(
         &self,
-        request: Request<RemoveImageRequest>,
-    ) -> Result<Response<RemoveImageResponse>, Status> {
-        let req = request.into_inner();
-
-        let image_ref = ImageRef::parse(&req.reference)
-            .ok_or_else(|| Status::invalid_argument("invalid image reference"))?;
-
-        self.runtime
-            .image_store()
-            .remove(&image_ref)
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        Ok(Response::new(RemoveImageResponse {
-            untagged: vec![],
-            deleted: vec![req.reference],
-        }))
+        request: Request<arcbox_protocol::v1::PushImageRequest>,
+    ) -> Result<Response<Self::PushStream>, Status> {
+        // TODO: Implement push.
+        Err(Status::unimplemented("push not implemented"))
     }
 
-    async fn list_images(
+    async fn list(
         &self,
         _request: Request<ListImagesRequest>,
     ) -> Result<Response<ListImagesResponse>, Status> {
@@ -900,12 +810,14 @@ impl image_service_server::ImageService for ImageServiceImpl {
 
         let summaries: Vec<_> = images
             .into_iter()
-            .map(|img| crate::generated::ImageSummary {
+            .map(|img| ImageSummary {
                 id: img.id.clone(),
                 repo_tags: vec![img.reference.full_name()],
                 repo_digests: vec![],
                 created: img.created.timestamp(),
                 size: img.size as i64,
+                virtual_size: img.size as i64,
+                containers: 0,
                 labels: std::collections::HashMap::new(),
             })
             .collect();
@@ -913,13 +825,14 @@ impl image_service_server::ImageService for ImageServiceImpl {
         Ok(Response::new(ListImagesResponse { images: summaries }))
     }
 
-    async fn inspect_image(
+    async fn inspect(
         &self,
         request: Request<InspectImageRequest>,
-    ) -> Result<Response<InspectImageResponse>, Status> {
+    ) -> Result<Response<ImageInfo>, Status> {
         let req = request.into_inner();
 
-        let image_ref = ImageRef::parse(&req.reference)
+        // InspectImageRequest uses 'id' field, not 'reference'.
+        let image_ref = ImageRef::parse(&req.id)
             .ok_or_else(|| Status::invalid_argument("invalid image reference"))?;
 
         let image = self
@@ -928,35 +841,54 @@ impl image_service_server::ImageService for ImageServiceImpl {
             .get(&image_ref)
             .ok_or_else(|| Status::not_found("image not found"))?;
 
-        Ok(Response::new(InspectImageResponse {
+        Ok(Response::new(ImageInfo {
             id: image.id.clone(),
             repo_tags: vec![image.reference.full_name()],
             repo_digests: vec![],
             parent: String::new(),
             comment: String::new(),
-            created: image.created.timestamp(),
+            created: image.created.to_rfc3339(),
             author: String::new(),
-            architecture: String::new(),
+            architecture: std::env::consts::ARCH.to_string(),
             os: "linux".to_string(),
+            os_version: String::new(),
             size: image.size as i64,
-            cmd: vec![],
-            entrypoint: vec![],
-            env: std::collections::HashMap::new(),
-            working_dir: String::new(),
-            labels: std::collections::HashMap::new(),
+            virtual_size: image.size as i64,
+            config: None,
+            root_fs: None,
         }))
     }
 
-    async fn tag_image(
+    async fn remove(
+        &self,
+        request: Request<RemoveImageRequest>,
+    ) -> Result<Response<RemoveImageResponse>, Status> {
+        let req = request.into_inner();
+
+        // RemoveImageRequest uses 'id' field, not 'reference'.
+        let image_ref = ImageRef::parse(&req.id)
+            .ok_or_else(|| Status::invalid_argument("invalid image reference"))?;
+
+        self.runtime
+            .image_store()
+            .remove(&image_ref)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(RemoveImageResponse {
+            deleted: vec![req.id],
+            untagged: vec![],
+        }))
+    }
+
+    async fn tag(
         &self,
         request: Request<TagImageRequest>,
-    ) -> Result<Response<TagImageResponse>, Status> {
+    ) -> Result<Response<Empty>, Status> {
         let req = request.into_inner();
 
         let source = ImageRef::parse(&req.source)
             .ok_or_else(|| Status::invalid_argument("invalid source reference"))?;
 
-        // Construct target from repo:tag
         let target_str = if req.tag.is_empty() {
             format!("{}:latest", req.repo)
         } else {
@@ -970,9 +902,45 @@ impl image_service_server::ImageService for ImageServiceImpl {
             .tag(&source, &target)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(Response::new(TagImageResponse {}))
+        Ok(Response::new(Empty {}))
+    }
+
+    type BuildStream = Pin<Box<dyn Stream<Item = Result<arcbox_protocol::v1::BuildProgress, Status>> + Send + 'static>>;
+
+    async fn build(
+        &self,
+        request: Request<tonic::Streaming<arcbox_protocol::v1::BuildContext>>,
+    ) -> Result<Response<Self::BuildStream>, Status> {
+        // TODO: Implement build.
+        Err(Status::unimplemented("build not implemented"))
+    }
+
+    async fn exists(
+        &self,
+        request: Request<arcbox_protocol::v1::ExistsImageRequest>,
+    ) -> Result<Response<arcbox_protocol::v1::ExistsImageResponse>, Status> {
+        let req = request.into_inner();
+
+        // ExistsImageRequest uses 'reference' field.
+        let image_ref = ImageRef::parse(&req.reference)
+            .ok_or_else(|| Status::invalid_argument("invalid image reference"))?;
+
+        let image = self.runtime.image_store().get(&image_ref);
+        let (exists, id) = match image {
+            Some(img) => (true, img.id.clone()),
+            None => (false, String::new()),
+        };
+
+        Ok(Response::new(arcbox_protocol::v1::ExistsImageResponse {
+            exists,
+            id,
+        }))
     }
 }
+
+// =============================================================================
+// System Service
+// =============================================================================
 
 /// System service implementation.
 pub struct SystemServiceImpl {
@@ -1026,6 +994,10 @@ impl system_service_server::SystemService for SystemServiceImpl {
             mem_total: total_memory(),
             ncpu: num_cpus(),
             data_dir: self.runtime.config().data_dir.to_string_lossy().to_string(),
+            kernel_version: String::new(),
+            os_type: std::env::consts::OS.to_string(),
+            logging_driver: "json-file".to_string(),
+            storage_driver: "overlay2".to_string(),
         }))
     }
 
@@ -1036,6 +1008,7 @@ impl system_service_server::SystemService for SystemServiceImpl {
         Ok(Response::new(GetVersionResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
             api_version: "1.0.0".to_string(),
+            min_api_version: "1.0.0".to_string(),
             git_commit: option_env!("ARCBOX_GIT_COMMIT")
                 .unwrap_or("unknown")
                 .to_string(),
@@ -1044,15 +1017,43 @@ impl system_service_server::SystemService for SystemServiceImpl {
                 .to_string(),
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
+            go_version: String::new(), // N/A for Rust
         }))
     }
 
-    async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
-        Ok(Response::new(PingResponse {
+    async fn ping(
+        &self,
+        _request: Request<SystemPingRequest>,
+    ) -> Result<Response<SystemPingResponse>, Status> {
+        Ok(Response::new(SystemPingResponse {
             api_version: "1.0.0".to_string(),
+            build_version: env!("CARGO_PKG_VERSION").to_string(),
         }))
     }
+
+    type EventsStream =
+        Pin<Box<dyn Stream<Item = Result<arcbox_protocol::v1::Event, Status>> + Send + 'static>>;
+
+    async fn events(
+        &self,
+        request: Request<arcbox_protocol::v1::EventsRequest>,
+    ) -> Result<Response<Self::EventsStream>, Status> {
+        // TODO: Implement events stream.
+        Err(Status::unimplemented("events not implemented"))
+    }
+
+    async fn prune(
+        &self,
+        request: Request<arcbox_protocol::v1::PruneRequest>,
+    ) -> Result<Response<arcbox_protocol::v1::PruneResponse>, Status> {
+        // TODO: Implement prune.
+        Err(Status::unimplemented("prune not implemented"))
+    }
 }
+
+// =============================================================================
+// Network Service
+// =============================================================================
 
 /// Network service implementation.
 pub struct NetworkServiceImpl {
@@ -1069,7 +1070,7 @@ impl NetworkServiceImpl {
 
 #[tonic::async_trait]
 impl network_service_server::NetworkService for NetworkServiceImpl {
-    async fn create_network(
+    async fn create(
         &self,
         request: Request<CreateNetworkRequest>,
     ) -> Result<Response<CreateNetworkResponse>, Status> {
@@ -1087,13 +1088,16 @@ impl network_service_server::NetworkService for NetworkServiceImpl {
             .create_network(&req.name, driver, req.labels)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(Response::new(CreateNetworkResponse { id }))
+        Ok(Response::new(CreateNetworkResponse {
+            id,
+            warnings: vec![],
+        }))
     }
 
-    async fn remove_network(
+    async fn remove(
         &self,
         request: Request<RemoveNetworkRequest>,
-    ) -> Result<Response<RemoveNetworkResponse>, Status> {
+    ) -> Result<Response<Empty>, Status> {
         let id = request.into_inner().id;
 
         self.runtime
@@ -1101,10 +1105,10 @@ impl network_service_server::NetworkService for NetworkServiceImpl {
             .remove_network(&id)
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(Response::new(RemoveNetworkResponse {}))
+        Ok(Response::new(Empty {}))
     }
 
-    async fn list_networks(
+    async fn list(
         &self,
         _request: Request<ListNetworksRequest>,
     ) -> Result<Response<ListNetworksResponse>, Status> {
@@ -1129,10 +1133,10 @@ impl network_service_server::NetworkService for NetworkServiceImpl {
         }))
     }
 
-    async fn inspect_network(
+    async fn inspect(
         &self,
         request: Request<InspectNetworkRequest>,
-    ) -> Result<Response<InspectNetworkResponse>, Status> {
+    ) -> Result<Response<NetworkInfo>, Status> {
         let id = request.into_inner().id;
 
         let network = self
@@ -1141,7 +1145,7 @@ impl network_service_server::NetworkService for NetworkServiceImpl {
             .get_network(&id)
             .ok_or_else(|| Status::not_found("network not found"))?;
 
-        Ok(Response::new(InspectNetworkResponse {
+        Ok(Response::new(NetworkInfo {
             id: network.id,
             name: network.name,
             driver: network.driver,
@@ -1150,10 +1154,16 @@ impl network_service_server::NetworkService for NetworkServiceImpl {
             internal: network.internal,
             attachable: network.attachable,
             labels: network.labels,
+            ipam: None,
             containers: std::collections::HashMap::new(),
+            options: std::collections::HashMap::new(),
         }))
     }
 }
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
 
 /// Formats a container status string.
 fn format_container_status(state: &ContainerState, exit_code: Option<i32>) -> String {

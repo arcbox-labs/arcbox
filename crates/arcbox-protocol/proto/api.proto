@@ -1,0 +1,443 @@
+// ArcBox API service protocol definitions.
+//
+// This file contains API-specific services and types that are used by
+// arcbox CLI and other high-level clients communicating with the host daemon.
+//
+// Design sources:
+// - internal-docs/architecture/cli-api.md
+// - containerd API patterns
+
+syntax = "proto3";
+
+package arcbox.v1;
+
+import "common.proto";
+
+// =============================================================================
+// Network Service
+// =============================================================================
+
+// NetworkService manages Docker networks.
+service NetworkService {
+    // Creates a new network.
+    rpc Create(CreateNetworkRequest) returns (CreateNetworkResponse);
+
+    // Removes a network.
+    rpc Remove(RemoveNetworkRequest) returns (Empty);
+
+    // Lists networks.
+    rpc List(ListNetworksRequest) returns (ListNetworksResponse);
+
+    // Inspects a network.
+    rpc Inspect(InspectNetworkRequest) returns (NetworkInfo);
+}
+
+// Request to create a network.
+message CreateNetworkRequest {
+    // Network name.
+    string name = 1;
+    // Driver (e.g., "bridge", "host", "none").
+    string driver = 2;
+    // Internal network (not connected to external network).
+    bool internal = 3;
+    // Labels.
+    map<string, string> labels = 4;
+    // Enable IPv6.
+    bool enable_ipv6 = 5;
+    // IPAM configuration.
+    IpamConfig ipam = 6;
+}
+
+// IPAM configuration.
+message IpamConfig {
+    // Driver name.
+    string driver = 1;
+    // IPAM options.
+    map<string, string> options = 2;
+    // Subnet configurations.
+    repeated IpamSubnet subnets = 3;
+}
+
+// IPAM subnet configuration.
+message IpamSubnet {
+    // Subnet in CIDR format.
+    string subnet = 1;
+    // Gateway address.
+    string gateway = 2;
+    // IP range for allocation.
+    string ip_range = 3;
+}
+
+// Response to create network.
+message CreateNetworkResponse {
+    // Network ID.
+    string id = 1;
+    // Warning messages.
+    repeated string warnings = 2;
+}
+
+// Request to remove a network.
+message RemoveNetworkRequest {
+    // Network ID or name.
+    string id = 1;
+}
+
+// Request to list networks.
+message ListNetworksRequest {
+    // Filter by labels.
+    map<string, string> filters = 1;
+}
+
+// Response to list networks.
+message ListNetworksResponse {
+    // List of networks.
+    repeated NetworkSummary networks = 1;
+}
+
+// Summary information about a network.
+message NetworkSummary {
+    // Network ID.
+    string id = 1;
+    // Network name.
+    string name = 2;
+    // Driver.
+    string driver = 3;
+    // Scope (local, global).
+    string scope = 4;
+    // Created timestamp (RFC3339).
+    string created = 5;
+    // Internal network.
+    bool internal = 6;
+    // Attachable.
+    bool attachable = 7;
+    // Labels.
+    map<string, string> labels = 8;
+}
+
+// Request to inspect a network.
+message InspectNetworkRequest {
+    // Network ID or name.
+    string id = 1;
+    // Verbose output.
+    bool verbose = 2;
+}
+
+// Detailed network information.
+message NetworkInfo {
+    // Network ID.
+    string id = 1;
+    // Network name.
+    string name = 2;
+    // Driver.
+    string driver = 3;
+    // Scope.
+    string scope = 4;
+    // Created timestamp (RFC3339).
+    string created = 5;
+    // Internal network.
+    bool internal = 6;
+    // Attachable.
+    bool attachable = 7;
+    // Labels.
+    map<string, string> labels = 8;
+    // IPAM configuration.
+    IpamConfig ipam = 9;
+    // Connected containers.
+    map<string, NetworkContainer> containers = 10;
+    // Driver options.
+    map<string, string> options = 11;
+}
+
+// Container connected to a network.
+message NetworkContainer {
+    // Container name.
+    string name = 1;
+    // Container endpoint ID.
+    string endpoint_id = 2;
+    // IPv4 address.
+    string ipv4_address = 3;
+    // IPv6 address.
+    string ipv6_address = 4;
+    // MAC address.
+    string mac_address = 5;
+}
+
+// =============================================================================
+// System Service
+// =============================================================================
+
+// SystemService provides system-level operations.
+service SystemService {
+    // Gets system information.
+    rpc GetInfo(GetInfoRequest) returns (GetInfoResponse);
+
+    // Gets version information.
+    rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+
+    // Pings the server.
+    rpc Ping(SystemPingRequest) returns (SystemPingResponse);
+
+    // Gets system events.
+    rpc Events(EventsRequest) returns (stream Event);
+
+    // Prunes unused resources.
+    rpc Prune(PruneRequest) returns (PruneResponse);
+}
+
+// Request to get system info.
+message GetInfoRequest {}
+
+// Response to get system info.
+message GetInfoResponse {
+    // Number of containers.
+    int64 containers = 1;
+    // Running containers.
+    int64 containers_running = 2;
+    // Paused containers.
+    int64 containers_paused = 3;
+    // Stopped containers.
+    int64 containers_stopped = 4;
+    // Number of images.
+    int64 images = 5;
+    // Number of machines.
+    int64 machines = 6;
+    // Running machines.
+    int64 machines_running = 7;
+    // Server version.
+    string server_version = 8;
+    // Operating system.
+    string os = 9;
+    // Architecture.
+    string arch = 10;
+    // Total memory.
+    int64 mem_total = 11;
+    // Number of CPUs.
+    int32 ncpu = 12;
+    // Data directory.
+    string data_dir = 13;
+    // Kernel version.
+    string kernel_version = 14;
+    // Operating system type.
+    string os_type = 15;
+    // Logging driver.
+    string logging_driver = 16;
+    // Storage driver.
+    string storage_driver = 17;
+}
+
+// Request to get version.
+message GetVersionRequest {}
+
+// Response to get version.
+message GetVersionResponse {
+    // Version string.
+    string version = 1;
+    // API version.
+    string api_version = 2;
+    // Minimum API version.
+    string min_api_version = 3;
+    // Git commit.
+    string git_commit = 4;
+    // Build time.
+    string build_time = 5;
+    // OS.
+    string os = 6;
+    // Architecture.
+    string arch = 7;
+    // Go version (for compatibility).
+    string go_version = 8;
+}
+
+// Request to ping the server.
+message SystemPingRequest {}
+
+// Response to ping.
+message SystemPingResponse {
+    // API version.
+    string api_version = 1;
+    // Build version.
+    string build_version = 2;
+}
+
+// Request to get events.
+message EventsRequest {
+    // Only events since this timestamp (Unix seconds).
+    int64 since = 1;
+    // Only events until this timestamp (Unix seconds).
+    int64 until = 2;
+    // Filters.
+    map<string, string> filters = 3;
+}
+
+// System event.
+message Event {
+    // Event type (container, image, network, volume, daemon).
+    string type = 1;
+    // Action (create, start, stop, die, destroy, etc.).
+    string action = 2;
+    // Actor that generated the event.
+    EventActor actor = 3;
+    // Timestamp (Unix nanoseconds).
+    int64 time_nano = 4;
+}
+
+// Event actor.
+message EventActor {
+    // ID of the object.
+    string id = 1;
+    // Attributes.
+    map<string, string> attributes = 2;
+}
+
+// Request to prune resources.
+message PruneRequest {
+    // Types to prune: containers, images, networks, volumes, all.
+    repeated string types = 1;
+    // Remove all unused resources, not just dangling ones.
+    bool all = 2;
+    // Filters.
+    map<string, string> filters = 3;
+}
+
+// Response to prune.
+message PruneResponse {
+    // Space reclaimed in bytes.
+    uint64 space_reclaimed = 1;
+    // Deleted containers.
+    repeated string containers_deleted = 2;
+    // Deleted images.
+    repeated string images_deleted = 3;
+    // Deleted networks.
+    repeated string networks_deleted = 4;
+    // Deleted volumes.
+    repeated string volumes_deleted = 5;
+}
+
+// =============================================================================
+// Volume Service
+// =============================================================================
+
+// VolumeService manages Docker volumes.
+service VolumeService {
+    // Creates a volume.
+    rpc Create(CreateVolumeRequest) returns (CreateVolumeResponse);
+
+    // Removes a volume.
+    rpc Remove(RemoveVolumeRequest) returns (Empty);
+
+    // Lists volumes.
+    rpc List(ListVolumesRequest) returns (ListVolumesResponse);
+
+    // Inspects a volume.
+    rpc Inspect(InspectVolumeRequest) returns (VolumeInfo);
+}
+
+// Request to create a volume.
+message CreateVolumeRequest {
+    // Volume name.
+    string name = 1;
+    // Driver name.
+    string driver = 2;
+    // Driver options.
+    map<string, string> driver_opts = 3;
+    // Labels.
+    map<string, string> labels = 4;
+}
+
+// Response to create volume.
+message CreateVolumeResponse {
+    // Volume name.
+    string name = 1;
+    // Driver.
+    string driver = 2;
+    // Mountpoint.
+    string mountpoint = 3;
+}
+
+// Request to remove a volume.
+message RemoveVolumeRequest {
+    // Volume name.
+    string name = 1;
+    // Force removal.
+    bool force = 2;
+}
+
+// Request to list volumes.
+message ListVolumesRequest {
+    // Filters.
+    map<string, string> filters = 1;
+}
+
+// Response to list volumes.
+message ListVolumesResponse {
+    // List of volumes.
+    repeated VolumeInfo volumes = 1;
+    // Warnings.
+    repeated string warnings = 2;
+}
+
+// Request to inspect a volume.
+message InspectVolumeRequest {
+    // Volume name.
+    string name = 1;
+}
+
+// Volume information.
+message VolumeInfo {
+    // Volume name.
+    string name = 1;
+    // Driver.
+    string driver = 2;
+    // Mountpoint.
+    string mountpoint = 3;
+    // Created timestamp (RFC3339).
+    string created = 4;
+    // Status.
+    map<string, string> status = 5;
+    // Labels.
+    map<string, string> labels = 6;
+    // Scope (local, global).
+    string scope = 7;
+    // Driver options.
+    map<string, string> options = 8;
+    // Usage data.
+    VolumeUsage usage = 9;
+}
+
+// Volume usage data.
+message VolumeUsage {
+    // Size in bytes.
+    int64 size = 1;
+    // Reference count.
+    int64 ref_count = 2;
+}
+
+// =============================================================================
+// Shell/Interactive Session Types
+// =============================================================================
+
+// Shell input for interactive sessions.
+message ShellInput {
+    // Input data.
+    bytes data = 1;
+    // Resize terminal.
+    TerminalSize resize = 2;
+}
+
+// Shell output for interactive sessions.
+message ShellOutput {
+    // Output data.
+    bytes data = 1;
+    // Exit code (only set when done).
+    int32 exit_code = 2;
+    // Is this the final message.
+    bool done = 3;
+}
+
+// Terminal size.
+message TerminalSize {
+    // Terminal width.
+    uint32 width = 1;
+    // Terminal height.
+    uint32 height = 2;
+}

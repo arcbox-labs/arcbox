@@ -12,9 +12,11 @@ authors.workspace = true
 prost = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tonic = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }
+tonic-build = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

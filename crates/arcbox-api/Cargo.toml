@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 arcbox-core = { workspace = true }
 arcbox-protocol = { workspace = true }
+arcbox-grpc = { workspace = true }
 arcbox-docker = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -22,9 +23,7 @@ async-stream = { workspace = true }
 arcbox-container = { workspace = true }
 arcbox-image = { workspace = true }
 libc = { workspace = true }
-
-[build-dependencies]
-tonic-build = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -9,12 +9,15 @@
 //! - `ContainerService` - Container lifecycle management
 //! - `ImageService` - Container image management
 //! - `AgentService` - Guest agent communication
+//! - `NetworkService` - Network management (from api.proto)
+//! - `SystemService` - System operations (from api.proto)
+//! - `VolumeService` - Volume management (from api.proto)
 //!
 //! # Usage
 //!
 //! ```ignore
 //! use arcbox_grpc::MachineServiceClient;
-//! use arcbox_protocol::machine::ListMachinesRequest;
+//! use arcbox_protocol::v1::ListMachinesRequest;
 //! use tonic::transport::Channel;
 //!
 //! // Connect to daemon via Unix socket
@@ -35,34 +38,40 @@
 pub use arcbox_protocol;
 pub use tonic;
 
-/// Machine service (VM management)
-pub mod machine {
-    tonic::include_proto!("arcbox.machine");
+/// All gRPC services from the unified arcbox.v1 package.
+///
+/// This module contains tonic-generated client and server code for:
+/// - MachineService - VM management
+/// - ContainerService - Container lifecycle
+/// - ImageService - Image management
+/// - AgentService - Guest agent communication
+/// - NetworkService - Network management
+/// - SystemService - System operations
+/// - VolumeService - Volume management
+pub mod v1 {
+    tonic::include_proto!("arcbox.v1");
 }
 
-/// Container service (container lifecycle)
-pub mod container {
-    tonic::include_proto!("arcbox.container");
-}
+// =============================================================================
+// Client re-exports
+// =============================================================================
 
-/// Image service (container images)
-pub mod image {
-    tonic::include_proto!("arcbox.image");
-}
+pub use v1::agent_service_client::AgentServiceClient;
+pub use v1::container_service_client::ContainerServiceClient;
+pub use v1::image_service_client::ImageServiceClient;
+pub use v1::machine_service_client::MachineServiceClient;
+pub use v1::network_service_client::NetworkServiceClient;
+pub use v1::system_service_client::SystemServiceClient;
+pub use v1::volume_service_client::VolumeServiceClient;
 
-/// Agent service (guest agent)
-pub mod agent {
-    tonic::include_proto!("arcbox.agent");
-}
+// =============================================================================
+// Server re-exports
+// =============================================================================
 
-// Convenience re-exports for clients
-pub use agent::agent_service_client::AgentServiceClient;
-pub use container::container_service_client::ContainerServiceClient;
-pub use image::image_service_client::ImageServiceClient;
-pub use machine::machine_service_client::MachineServiceClient;
-
-// Convenience re-exports for servers
-pub use agent::agent_service_server::{AgentService, AgentServiceServer};
-pub use container::container_service_server::{ContainerService, ContainerServiceServer};
-pub use image::image_service_server::{ImageService, ImageServiceServer};
-pub use machine::machine_service_server::{MachineService, MachineServiceServer};
+pub use v1::agent_service_server::{AgentService, AgentServiceServer};
+pub use v1::container_service_server::{ContainerService, ContainerServiceServer};
+pub use v1::image_service_server::{ImageService, ImageServiceServer};
+pub use v1::machine_service_server::{MachineService, MachineServiceServer};
+pub use v1::network_service_server::{NetworkService, NetworkServiceServer};
+pub use v1::system_service_server::{SystemService, SystemServiceServer};
+pub use v1::volume_service_server::{VolumeService, VolumeServiceServer};

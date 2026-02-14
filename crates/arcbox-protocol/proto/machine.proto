@@ -9,7 +9,7 @@
 
 syntax = "proto3";
 
-package arcbox.machine;
+package arcbox.v1;
 
 import "common.proto";
 
@@ -19,13 +19,13 @@ service MachineService {
     rpc Create(CreateMachineRequest) returns (CreateMachineResponse);
 
     // Starts a stopped machine.
-    rpc Start(StartMachineRequest) returns (arcbox.common.Empty);
+    rpc Start(StartMachineRequest) returns (Empty);
 
     // Stops a running machine.
-    rpc Stop(StopMachineRequest) returns (arcbox.common.Empty);
+    rpc Stop(StopMachineRequest) returns (Empty);
 
     // Removes a machine.
-    rpc Remove(RemoveMachineRequest) returns (arcbox.common.Empty);
+    rpc Remove(RemoveMachineRequest) returns (Empty);
 
     // Lists machines.
     rpc List(ListMachinesRequest) returns (ListMachinesResponse);
@@ -157,9 +157,9 @@ message MachineInfo {
     // OS information.
     MachineOS os = 7;
     // Creation timestamp.
-    arcbox.common.Timestamp created = 8;
+    Timestamp created = 8;
     // Last start timestamp.
-    arcbox.common.Timestamp started_at = 9;
+    Timestamp started_at = 9;
     // Directory mounts.
     repeated DirectoryMount mounts = 10;
 }

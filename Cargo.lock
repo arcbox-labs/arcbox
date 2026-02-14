@@ -148,6 +148,7 @@ dependencies = [
  "arcbox-container",
  "arcbox-core",
  "arcbox-docker",
+ "arcbox-grpc",
  "arcbox-image",
  "arcbox-protocol",
  "async-stream",
@@ -157,8 +158,8 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tonic-build",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -450,6 +451,8 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]

@@ -1098,7 +1098,7 @@ pub async fn container_logs(
     let mut output = Vec::new();
     for entry in log_entries {
         let stream_type: u8 = if entry.stream == "stderr" { 2 } else { 1 };
-        output.extend_from_slice(&encode_docker_stream(stream_type, &entry.data));
+        output.extend_from_slice(&encode_docker_stream(stream_type, &entry.message));
     }
 
     Ok(Response::builder()
@@ -1163,7 +1163,7 @@ async fn container_logs_stream(
         match result {
             Ok(entry) => {
                 let stream_type: u8 = if entry.stream == "stderr" { 2 } else { 1 };
-                let encoded = encode_docker_stream(stream_type, &entry.data);
+                let encoded = encode_docker_stream(stream_type, &entry.message);
                 Ok::<_, std::io::Error>(Bytes::from(encoded))
             }
             Err(e) => {
@@ -2127,9 +2127,9 @@ pub async fn attach_container(
             Ok(entry) => {
                 let stream_type: u8 = if entry.stream == "stderr" { 2 } else { 1 };
                 let encoded = if is_tty {
-                    entry.data
+                    entry.message
                 } else {
-                    encode_docker_stream(stream_type, &entry.data)
+                    encode_docker_stream(stream_type, &entry.message)
                 };
                 if encoded.is_empty() {
                     None

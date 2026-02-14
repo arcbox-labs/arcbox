@@ -9,7 +9,7 @@
 
 syntax = "proto3";
 
-package arcbox.container;
+package arcbox.v1;
 
 import "common.proto";
 
@@ -19,16 +19,16 @@ service ContainerService {
     rpc Create(CreateContainerRequest) returns (CreateContainerResponse);
 
     // Starts a stopped container.
-    rpc Start(StartContainerRequest) returns (arcbox.common.Empty);
+    rpc Start(StartContainerRequest) returns (Empty);
 
     // Stops a running container.
-    rpc Stop(StopContainerRequest) returns (arcbox.common.Empty);
+    rpc Stop(StopContainerRequest) returns (Empty);
 
     // Kills a container with a signal.
-    rpc Kill(KillContainerRequest) returns (arcbox.common.Empty);
+    rpc Kill(KillContainerRequest) returns (Empty);
 
     // Removes a container.
-    rpc Remove(RemoveContainerRequest) returns (arcbox.common.Empty);
+    rpc Remove(RemoveContainerRequest) returns (Empty);
 
     // Lists containers.
     rpc List(ListContainersRequest) returns (ListContainersResponse);
@@ -50,6 +50,18 @@ service ContainerService {
 
     // Waits for a container to exit.
     rpc Wait(WaitContainerRequest) returns (WaitContainerResponse);
+
+    // Pauses a container.
+    rpc Pause(PauseContainerRequest) returns (Empty);
+
+    // Unpauses a container.
+    rpc Unpause(UnpauseContainerRequest) returns (Empty);
+
+    // Gets container stats.
+    rpc Stats(ContainerStatsRequest) returns (ContainerStatsResponse);
+
+    // Gets container processes (top).
+    rpc Top(ContainerTopRequest) returns (ContainerTopResponse);
 }
 
 // Request to create a container.
@@ -69,11 +81,11 @@ message CreateContainerRequest {
     // User to run as.
     string user = 7;
     // Mount specifications.
-    repeated arcbox.common.Mount mounts = 8;
+    repeated Mount mounts = 8;
     // Port bindings.
-    repeated arcbox.common.PortBinding ports = 9;
+    repeated PortBinding ports = 9;
     // Resource limits.
-    arcbox.common.ResourceLimits limits = 10;
+    ResourceLimits limits = 10;
     // Labels.
     map<string, string> labels = 11;
     // Hostname.
@@ -163,7 +175,7 @@ message ContainerSummary {
     // Status string.
     string status = 8;
     // Port bindings.
-    repeated arcbox.common.PortBinding ports = 9;
+    repeated PortBinding ports = 9;
     // Labels.
     map<string, string> labels = 10;
     // Size in bytes (rw layer).
@@ -187,7 +199,7 @@ message ContainerInfo {
     // Container name.
     string name = 2;
     // Creation timestamp.
-    arcbox.common.Timestamp created = 3;
+    Timestamp created = 3;
     // Path to container command.
     string path = 4;
     // Arguments to command.
@@ -307,7 +319,7 @@ message LogEntry {
     // Log message.
     bytes message = 2;
     // Timestamp.
-    arcbox.common.Timestamp timestamp = 3;
+    Timestamp timestamp = 3;
 }
 
 // Request to create an exec instance.

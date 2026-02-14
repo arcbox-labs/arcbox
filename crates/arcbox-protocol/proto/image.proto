@@ -9,7 +9,7 @@
 
 syntax = "proto3";
 
-package arcbox.image;
+package arcbox.v1;
 
 import "common.proto";
 
@@ -31,7 +31,7 @@ service ImageService {
     rpc Remove(RemoveImageRequest) returns (RemoveImageResponse);
 
     // Tags an image.
-    rpc Tag(TagImageRequest) returns (arcbox.common.Empty);
+    rpc Tag(TagImageRequest) returns (Empty);
 
     // Builds an image from a Dockerfile.
     rpc Build(stream BuildContext) returns (stream BuildProgress);
@@ -179,9 +179,9 @@ message ImageConfig {
     // Labels.
     map<string, string> labels = 8;
     // Exposed ports.
-    map<string, arcbox.common.Empty> exposed_ports = 9;
+    map<string, Empty> exposed_ports = 9;
     // Volumes.
-    map<string, arcbox.common.Empty> volumes = 10;
+    map<string, Empty> volumes = 10;
 }
 
 // Root filesystem information.

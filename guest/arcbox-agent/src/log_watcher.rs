@@ -11,6 +11,7 @@ use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
 use arcbox_protocol::agent::LogEntry;
+use arcbox_protocol::Timestamp;
 
 /// Default buffer size for reading log lines.
 const READ_BUFFER_SIZE: usize = 8192;
@@ -214,6 +215,14 @@ fn read_new_content(file: &mut std::fs::File, pos: &mut u64) -> Result<Vec<Strin
     Ok(lines)
 }
 
+/// Converts nanoseconds since Unix epoch to a protobuf Timestamp.
+fn nanos_to_timestamp(nanos: i64) -> Timestamp {
+    Timestamp {
+        seconds: nanos / 1_000_000_000,
+        nanos: (nanos % 1_000_000_000) as i32,
+    }
+}
+
 /// Parses a log line into a LogEntry.
 ///
 /// Supports two log formats:
@@ -227,23 +236,23 @@ fn parse_log_line(line: &str, options: &LogWatchOptions) -> LogEntry {
 
     // Try to parse Docker JSON format first.
     if line.starts_with('{') {
-        if let Some(entry) = parse_docker_json_line(line) {
-            // Build output data with optional timestamp.
-            let output_data = if options.timestamps {
-                let ts = chrono::DateTime::from_timestamp_nanos(entry.timestamp);
+        if let Some((stream, message, timestamp_nanos)) = parse_docker_json_line(line) {
+            // Build output message with optional timestamp.
+            let output_message = if options.timestamps {
+                let ts = chrono::DateTime::from_timestamp_nanos(timestamp_nanos);
                 format!(
                     "{} {}",
                     ts.format("%Y-%m-%dT%H:%M:%S%.9fZ"),
-                    String::from_utf8_lossy(&entry.data)
+                    String::from_utf8_lossy(&message)
                 )
             } else {
-                String::from_utf8_lossy(&entry.data).to_string()
+                String::from_utf8_lossy(&message).to_string()
             };
 
             return LogEntry {
-                stream: entry.stream,
-                data: output_data.into_bytes(),
-                timestamp: entry.timestamp,
+                stream,
+                message: output_message.into_bytes(),
+                timestamp: Some(nanos_to_timestamp(timestamp_nanos)),
             };
         }
     }
@@ -252,12 +261,12 @@ fn parse_log_line(line: &str, options: &LogWatchOptions) -> LogEntry {
     // Format: [timestamp] [stream]: message
     let (timestamp, stream, data) = parse_structured_line(line);
 
-    let final_timestamp = timestamp.unwrap_or(now);
+    let final_timestamp_nanos = timestamp.unwrap_or(now);
     let final_stream = stream.unwrap_or_else(|| "stdout".to_string());
 
-    // Build output data
-    let output_data = if options.timestamps {
-        let ts = chrono::DateTime::from_timestamp_nanos(final_timestamp);
+    // Build output message.
+    let output_message = if options.timestamps {
+        let ts = chrono::DateTime::from_timestamp_nanos(final_timestamp_nanos);
         format!("{} {}", ts.format("%Y-%m-%dT%H:%M:%S%.9fZ"), data)
     } else {
         data
@@ -265,15 +274,17 @@ fn parse_log_line(line: &str, options: &LogWatchOptions) -> LogEntry {
 
     LogEntry {
         stream: final_stream,
-        data: output_data.into_bytes(),
-        timestamp: final_timestamp,
+        message: output_message.into_bytes(),
+        timestamp: Some(nanos_to_timestamp(final_timestamp_nanos)),
     }
 }
 
 /// Parses a Docker JSON format log line.
 ///
 /// Format: `{"log":"message\n","stream":"stdout","time":"2024-01-01T00:00:00.123456789Z"}`
-fn parse_docker_json_line(line: &str) -> Option<LogEntry> {
+///
+/// Returns (stream, message, timestamp_nanos) tuple.
+fn parse_docker_json_line(line: &str) -> Option<(String, Vec<u8>, i64)> {
     // Manual parsing to avoid serde dependency overhead.
     // Extract "log" field.
     let log_start = line.find(r#""log":""#)? + 7;
@@ -289,16 +300,12 @@ fn parse_docker_json_line(line: &str) -> Option<LogEntry> {
     let time_start = line.find(r#""time":""#)? + 8;
     let time_end = find_json_string_end(line, time_start)?;
     let time_str = &line[time_start..time_end];
-    let timestamp = chrono::DateTime::parse_from_rfc3339(time_str)
+    let timestamp_nanos = chrono::DateTime::parse_from_rfc3339(time_str)
         .ok()?
         .timestamp_nanos_opt()
         .unwrap_or(0);
 
-    Some(LogEntry {
-        stream,
-        data: log_content.into_bytes(),
-        timestamp,
-    })
+    Some((stream, log_content.into_bytes(), timestamp_nanos))
 }
 
 /// Finds the end of a JSON string value (position of closing quote).
@@ -392,13 +399,14 @@ fn should_include_entry(entry: &LogEntry, options: &LogWatchOptions) -> bool {
         return false;
     }
 
-    // Time filters
-    let timestamp_secs = entry.timestamp / 1_000_000_000;
-    if options.since > 0 && timestamp_secs < options.since {
-        return false;
-    }
-    if options.until > 0 && timestamp_secs > options.until {
-        return false;
+    // Time filters - extract seconds from Timestamp if present.
+    if let Some(ref ts) = entry.timestamp {
+        if options.since > 0 && ts.seconds < options.since {
+            return false;
+        }
+        if options.until > 0 && ts.seconds > options.until {
+            return false;
+        }
     }
 
     true
@@ -414,7 +422,7 @@ mod tests {
         let entry = parse_log_line("hello world", &options);
 
         assert_eq!(entry.stream, "stdout");
-        assert_eq!(String::from_utf8_lossy(&entry.data), "hello world");
+        assert_eq!(String::from_utf8_lossy(&entry.message), "hello world");
     }
 
     #[test]
@@ -423,11 +431,11 @@ mod tests {
 
         let entry = parse_log_line("stderr: error message", &options);
         assert_eq!(entry.stream, "stderr");
-        assert_eq!(String::from_utf8_lossy(&entry.data), "error message");
+        assert_eq!(String::from_utf8_lossy(&entry.message), "error message");
 
         let entry = parse_log_line("stdout: info message", &options);
         assert_eq!(entry.stream, "stdout");
-        assert_eq!(String::from_utf8_lossy(&entry.data), "info message");
+        assert_eq!(String::from_utf8_lossy(&entry.message), "info message");
     }
 
     #[test]
@@ -436,9 +444,10 @@ mod tests {
         let entry = parse_log_line("2024-01-15T10:30:00Z stdout: test message", &options);
 
         assert_eq!(entry.stream, "stdout");
-        assert_eq!(String::from_utf8_lossy(&entry.data), "test message");
-        // Timestamp should be parsed
-        assert!(entry.timestamp > 0);
+        assert_eq!(String::from_utf8_lossy(&entry.message), "test message");
+        // Timestamp should be parsed.
+        assert!(entry.timestamp.is_some());
+        assert!(entry.timestamp.unwrap().seconds > 0);
     }
 
     #[test]
@@ -451,13 +460,13 @@ mod tests {
 
         let stdout_entry = LogEntry {
             stream: "stdout".to_string(),
-            data: vec![],
-            timestamp: 0,
+            message: vec![],
+            timestamp: Some(Timestamp { seconds: 0, nanos: 0 }),
         };
         let stderr_entry = LogEntry {
             stream: "stderr".to_string(),
-            data: vec![],
-            timestamp: 0,
+            message: vec![],
+            timestamp: Some(Timestamp { seconds: 0, nanos: 0 }),
         };
 
         assert!(should_include_entry(&stdout_entry, &options));
@@ -474,18 +483,18 @@ mod tests {
 
         let before = LogEntry {
             stream: "stdout".to_string(),
-            data: vec![],
-            timestamp: 500_000_000_000, // 500 seconds in nanos
+            message: vec![],
+            timestamp: Some(Timestamp { seconds: 500, nanos: 0 }),
         };
         let during = LogEntry {
             stream: "stdout".to_string(),
-            data: vec![],
-            timestamp: 1500_000_000_000, // 1500 seconds in nanos
+            message: vec![],
+            timestamp: Some(Timestamp { seconds: 1500, nanos: 0 }),
         };
         let after = LogEntry {
             stream: "stdout".to_string(),
-            data: vec![],
-            timestamp: 2500_000_000_000, // 2500 seconds in nanos
+            message: vec![],
+            timestamp: Some(Timestamp { seconds: 2500, nanos: 0 }),
         };
 
         assert!(!should_include_entry(&before, &options));
@@ -519,30 +528,30 @@ mod tests {
         // Standard Docker JSON format.
         let line =
             r#"{"log":"hello world\n","stream":"stdout","time":"2024-01-15T10:30:00.123456789Z"}"#;
-        let entry = parse_docker_json_line(line).unwrap();
+        let (stream, message, timestamp_nanos) = parse_docker_json_line(line).unwrap();
 
-        assert_eq!(entry.stream, "stdout");
-        assert_eq!(String::from_utf8_lossy(&entry.data), "hello world\n");
-        assert!(entry.timestamp > 0);
+        assert_eq!(stream, "stdout");
+        assert_eq!(String::from_utf8_lossy(&message), "hello world\n");
+        assert!(timestamp_nanos > 0);
     }
 
     #[test]
     fn test_parse_docker_json_line_stderr() {
         let line = r#"{"log":"error message\n","stream":"stderr","time":"2024-01-15T10:30:00Z"}"#;
-        let entry = parse_docker_json_line(line).unwrap();
+        let (stream, message, _) = parse_docker_json_line(line).unwrap();
 
-        assert_eq!(entry.stream, "stderr");
-        assert_eq!(String::from_utf8_lossy(&entry.data), "error message\n");
+        assert_eq!(stream, "stderr");
+        assert_eq!(String::from_utf8_lossy(&message), "error message\n");
     }
 
     #[test]
     fn test_parse_docker_json_line_with_escapes() {
         // Test JSON escape sequences.
         let line = r#"{"log":"line with \"quotes\" and \\backslash\n","stream":"stdout","time":"2024-01-15T10:30:00Z"}"#;
-        let entry = parse_docker_json_line(line).unwrap();
+        let (_, message, _) = parse_docker_json_line(line).unwrap();
 
         assert_eq!(
-            String::from_utf8_lossy(&entry.data),
+            String::from_utf8_lossy(&message),
             "line with \"quotes\" and \\backslash\n"
         );
     }
@@ -554,7 +563,7 @@ mod tests {
         let entry = parse_log_line(line, &options);
 
         assert_eq!(entry.stream, "stdout");
-        assert_eq!(String::from_utf8_lossy(&entry.data), "test message\n");
+        assert_eq!(String::from_utf8_lossy(&entry.message), "test message\n");
     }
 
     #[test]
