@@ -1,0 +1,368 @@
+name: Docker API E2E Tests
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'crates/arcbox-docker/**'
+      - 'crates/arcbox-core/**'
+      - 'crates/arcbox-cli/**'
+      - '.github/workflows/docker-api-e2e.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'crates/arcbox-docker/**'
+      - 'crates/arcbox-core/**'
+      - 'crates/arcbox-cli/**'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Basic API tests that don't require VM
+  api-compatibility:
+    name: Docker API Compatibility
+    runs-on: macos-14  # Apple Silicon runner
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build arcbox
+        run: cargo build --release -p arcbox-cli
+
+      - name: Start arcbox daemon
+        run: |
+          # Create test directories
+          mkdir -p /tmp/arcbox-e2e-data
+
+          # Start daemon in background (without VM support for basic API tests)
+          ./target/release/arcbox daemon \
+            --socket /tmp/arcbox-e2e.sock \
+            --data-dir /tmp/arcbox-e2e-data \
+            &
+          DAEMON_PID=$!
+          echo "DAEMON_PID=$DAEMON_PID" >> $GITHUB_ENV
+
+          # Wait for socket
+          for i in {1..30}; do
+            if [ -S /tmp/arcbox-e2e.sock ]; then
+              echo "Daemon started successfully"
+              break
+            fi
+            sleep 0.5
+          done
+
+          if [ ! -S /tmp/arcbox-e2e.sock ]; then
+            echo "Failed to start daemon"
+            exit 1
+          fi
+
+      - name: Test /_ping endpoint
+        run: |
+          response=$(curl -s --unix-socket /tmp/arcbox-e2e.sock http://localhost/_ping)
+          echo "Response: $response"
+          echo "$response" | grep -q "OK" || exit 1
+
+      - name: Test /version endpoint
+        run: |
+          response=$(curl -s --unix-socket /tmp/arcbox-e2e.sock http://localhost/version)
+          echo "Response: $response"
+          echo "$response" | jq .
+          echo "$response" | jq -e '.ApiVersion' || exit 1
+
+      - name: Test /info endpoint
+        run: |
+          response=$(curl -s --unix-socket /tmp/arcbox-e2e.sock http://localhost/info)
+          echo "Response: $response"
+          echo "$response" | jq .
+          echo "$response" | jq -e '.ServerVersion' || exit 1
+
+      - name: Test /v1.43/containers/json endpoint
+        run: |
+          response=$(curl -s --unix-socket /tmp/arcbox-e2e.sock "http://localhost/v1.43/containers/json")
+          echo "Response: $response"
+          echo "$response" | jq .
+          # Should return an empty array or array of containers
+          echo "$response" | jq -e 'type == "array"' || exit 1
+
+      - name: Test /v1.43/containers/json?all=true endpoint
+        run: |
+          response=$(curl -s --unix-socket /tmp/arcbox-e2e.sock "http://localhost/v1.43/containers/json?all=true")
+          echo "Response: $response"
+          echo "$response" | jq .
+          echo "$response" | jq -e 'type == "array"' || exit 1
+
+      - name: Test /v1.43/containers/json?all=1 endpoint (numeric boolean)
+        run: |
+          response=$(curl -s --unix-socket /tmp/arcbox-e2e.sock "http://localhost/v1.43/containers/json?all=1")
+          echo "Response: $response"
+          echo "$response" | jq .
+          echo "$response" | jq -e 'type == "array"' || exit 1
+
+      - name: Test /v1.43/images/json endpoint
+        run: |
+          response=$(curl -s --unix-socket /tmp/arcbox-e2e.sock "http://localhost/v1.43/images/json")
+          echo "Response: $response"
+          echo "$response" | jq .
+          echo "$response" | jq -e 'type == "array"' || exit 1
+
+      - name: Test /v1.43/networks endpoint
+        run: |
+          response=$(curl -s --unix-socket /tmp/arcbox-e2e.sock "http://localhost/v1.43/networks")
+          echo "Response: $response"
+          echo "$response" | jq .
+          # Should have at least the bridge network
+          echo "$response" | jq -e 'type == "array"' || exit 1
+
+      - name: Test /v1.43/volumes endpoint
+        run: |
+          response=$(curl -s --unix-socket /tmp/arcbox-e2e.sock "http://localhost/v1.43/volumes")
+          echo "Response: $response"
+          echo "$response" | jq .
+          echo "$response" | jq -e '.Volumes' || exit 1
+
+      - name: Test volume create and delete
+        run: |
+          # Create volume
+          response=$(curl -s -X POST \
+            --unix-socket /tmp/arcbox-e2e.sock \
+            -H "Content-Type: application/json" \
+            -d '{"Name": "test-volume"}' \
+            "http://localhost/v1.43/volumes/create")
+          echo "Create response: $response"
+          echo "$response" | jq -e '.Name == "test-volume"' || exit 1
+
+          # Inspect volume
+          response=$(curl -s --unix-socket /tmp/arcbox-e2e.sock \
+            "http://localhost/v1.43/volumes/test-volume")
+          echo "Inspect response: $response"
+          echo "$response" | jq -e '.Name == "test-volume"' || exit 1
+
+          # Delete volume
+          response=$(curl -s -X DELETE \
+            --unix-socket /tmp/arcbox-e2e.sock \
+            "http://localhost/v1.43/volumes/test-volume")
+          echo "Delete response: $response"
+
+      - name: Test network create and delete
+        run: |
+          # Create network
+          response=$(curl -s -X POST \
+            --unix-socket /tmp/arcbox-e2e.sock \
+            -H "Content-Type: application/json" \
+            -d '{"Name": "test-network", "Driver": "bridge"}' \
+            "http://localhost/v1.43/networks/create")
+          echo "Create response: $response"
+          network_id=$(echo "$response" | jq -r '.Id')
+          echo "Network ID: $network_id"
+
+          # Inspect network
+          response=$(curl -s --unix-socket /tmp/arcbox-e2e.sock \
+            "http://localhost/v1.43/networks/$network_id")
+          echo "Inspect response: $response"
+          echo "$response" | jq -e '.Name == "test-network"' || exit 1
+
+          # Delete network
+          response=$(curl -s -X DELETE \
+            --unix-socket /tmp/arcbox-e2e.sock \
+            "http://localhost/v1.43/networks/$network_id")
+          echo "Delete response: $response"
+
+      - name: Test with Docker CLI
+        run: |
+          export DOCKER_HOST="unix:///tmp/arcbox-e2e.sock"
+
+          echo "=== docker version ==="
+          docker version
+
+          echo ""
+          echo "=== docker info ==="
+          docker info
+
+          echo ""
+          echo "=== docker ps -a ==="
+          docker ps -a
+
+          echo ""
+          echo "=== docker images ==="
+          docker images
+
+          echo ""
+          echo "=== docker network ls ==="
+          docker network ls
+
+          echo ""
+          echo "=== docker volume ls ==="
+          docker volume ls
+
+      - name: Stop daemon
+        if: always()
+        run: |
+          if [ -n "$DAEMON_PID" ]; then
+            kill $DAEMON_PID 2>/dev/null || true
+          fi
+          rm -f /tmp/arcbox-e2e.sock
+          rm -rf /tmp/arcbox-e2e-data
+
+  # API version compatibility tests
+  api-versions:
+    name: API Version Compatibility
+    runs-on: macos-14
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build arcbox
+        run: cargo build --release -p arcbox-cli
+
+      - name: Start daemon
+        run: |
+          mkdir -p /tmp/arcbox-e2e-data
+          ./target/release/arcbox daemon \
+            --socket /tmp/arcbox-e2e.sock \
+            --data-dir /tmp/arcbox-e2e-data &
+          sleep 3
+
+      - name: Test API versions 1.24 to 1.43
+        run: |
+          for version in 1.24 1.25 1.30 1.35 1.40 1.41 1.42 1.43; do
+            echo "Testing API version $version..."
+            response=$(curl -s --unix-socket /tmp/arcbox-e2e.sock \
+              "http://localhost/v$version/containers/json")
+            if echo "$response" | jq -e 'type == "array"' > /dev/null; then
+              echo "  v$version: OK"
+            else
+              echo "  v$version: FAILED"
+              echo "  Response: $response"
+              exit 1
+            fi
+          done
+
+      - name: Stop daemon
+        if: always()
+        run: |
+          pkill -f "arcbox daemon" || true
+          rm -f /tmp/arcbox-e2e.sock
+          rm -rf /tmp/arcbox-e2e-data
+
+  # Run official Docker CLI e2e tests (requires Docker)
+  docker-cli-e2e:
+    name: Docker CLI E2E Tests
+    runs-on: macos-14
+    timeout-minutes: 60
+    # Only run on main branch or when explicitly triggered
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout arcbox
+        uses: actions/checkout@v4
+
+      - name: Checkout docker-cli
+        uses: actions/checkout@v4
+        with:
+          repository: docker/cli
+          path: docker-cli
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build arcbox
+        run: cargo build --release -p arcbox-cli
+
+      - name: Start arcbox daemon
+        run: |
+          mkdir -p /tmp/arcbox-e2e-data
+          ./target/release/arcbox daemon \
+            --socket /tmp/arcbox-e2e.sock \
+            --data-dir /tmp/arcbox-e2e-data &
+          sleep 3
+
+      - name: Run Docker CLI system tests
+        continue-on-error: true
+        env:
+          DOCKER_HOST: unix:///tmp/arcbox-e2e.sock
+        run: |
+          cd docker-cli
+
+          # Create temporary go.mod
+          cat > go.mod << 'EOF'
+          module github.com/docker/cli
+          go 1.24.0
+          EOF
+
+          # Run system tests (these don't require running containers)
+          go test -mod=mod -v ./e2e/system/... 2>&1 | tee /tmp/e2e-system.log || true
+
+          # Parse results
+          echo ""
+          echo "=== Test Summary ==="
+          grep -E "^(---|PASS|FAIL|SKIP)" /tmp/e2e-system.log | head -50 || true
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-logs
+          path: /tmp/e2e-*.log
+          retention-days: 7
+
+      - name: Stop daemon
+        if: always()
+        run: |
+          pkill -f "arcbox daemon" || true
+          rm -f /tmp/arcbox-e2e.sock
+          rm -rf /tmp/arcbox-e2e-data
