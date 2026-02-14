@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Virtualization.framework access (required for VMs on macOS) -->
+    <key>com.apple.security.virtualization</key>
+    <true/>
+
+    <!-- Hypervisor access (low-level VM control) -->
+    <key>com.apple.security.hypervisor</key>
+    <true/>
+
+    <!-- Network access for container networking -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <key>com.apple.security.network.server</key>
+    <true/>
+
+    <!-- Allow unsigned executable memory (for JIT in containers) -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+</dict>
+</plist>
