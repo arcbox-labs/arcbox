@@ -773,9 +773,12 @@ pub async fn remove_container(
             .runtime
             .container_manager()
             .remove(&container_id)
-            .map_err(|e| match e {
-                arcbox_container::ContainerError::NotFound(_) => DockerError::ContainerNotFound(id),
-                _ => DockerError::Server(e.to_string()),
+            .map_err(|e| {
+                if e.is_not_found() {
+                    DockerError::ContainerNotFound(id.clone())
+                } else {
+                    DockerError::Server(e.to_string())
+                }
             })?;
     }
 
@@ -2925,9 +2928,12 @@ pub async fn tag_image(
         .runtime
         .image_store()
         .tag(&source, &target)
-        .map_err(|e| match e {
-            arcbox_image::ImageError::NotFound(_) => DockerError::ImageNotFound(id),
-            e => DockerError::Server(e.to_string()),
+        .map_err(|e| {
+            if e.is_not_found() {
+                DockerError::ImageNotFound(id.clone())
+            } else {
+                DockerError::Server(e.to_string())
+            }
         })?;
 
     Ok(StatusCode::CREATED)

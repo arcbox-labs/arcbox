@@ -276,11 +276,11 @@ impl VmBuilder {
     pub fn build(self) -> Result<Vmm> {
         // Validate configuration
         if self.cpus == 0 {
-            return Err(VmmError::Config("cpus must be > 0".to_string()));
+            return Err(VmmError::config("cpus must be > 0".to_string()));
         }
 
         if self.memory_size < 64 * 1024 * 1024 {
-            return Err(VmmError::Config("memory must be >= 64MB".to_string()));
+            return Err(VmmError::config("memory must be >= 64MB".to_string()));
         }
 
         // Create VMM config

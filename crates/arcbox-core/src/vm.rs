@@ -204,10 +204,10 @@ impl VmManager {
 
         let entry = vms
             .get_mut(id)
-            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
 
         if matches!(entry.info.state, VmState::Running | VmState::Starting) {
-            return Err(CoreError::InvalidState(format!(
+            return Err(CoreError::invalid_state(format!(
                 "cannot set guest_cid while VM is {:?}",
                 entry.info.state
             )));
@@ -264,10 +264,10 @@ impl VmManager {
 
         let entry = vms
             .get_mut(id)
-            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
 
         if entry.info.state != VmState::Created && entry.info.state != VmState::Stopped {
-            return Err(CoreError::InvalidState(format!(
+            return Err(CoreError::invalid_state(format!(
                 "cannot start VM in state {:?}",
                 entry.info.state
             )));
@@ -301,10 +301,10 @@ impl VmManager {
 
         let entry = vms
             .get_mut(id)
-            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
 
         if entry.info.state != VmState::Running {
-            return Err(CoreError::InvalidState(format!(
+            return Err(CoreError::invalid_state(format!(
                 "cannot stop VM in state {:?}",
                 entry.info.state
             )));
@@ -337,7 +337,7 @@ impl VmManager {
 
         let entry = vms
             .get_mut(id)
-            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
 
         if let Some(ref mut vmm) = entry.vmm {
             vmm.pause().map_err(|e| CoreError::Vm(e.to_string()))?;
@@ -359,7 +359,7 @@ impl VmManager {
 
         let entry = vms
             .get_mut(id)
-            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
 
         if let Some(ref mut vmm) = entry.vmm {
             vmm.resume().map_err(|e| CoreError::Vm(e.to_string()))?;
@@ -396,10 +396,10 @@ impl VmManager {
 
         let entry = vms
             .get(id)
-            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
 
         if entry.info.state == VmState::Running {
-            return Err(CoreError::InvalidState(
+            return Err(CoreError::invalid_state(
                 "cannot remove running VM".to_string(),
             ));
         }
@@ -431,10 +431,10 @@ impl VmManager {
 
         let entry = vms
             .get(id)
-            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
 
         if entry.info.state != VmState::Running {
-            return Err(CoreError::InvalidState(format!(
+            return Err(CoreError::invalid_state(format!(
                 "cannot connect vsock: VM is {:?}",
                 entry.info.state
             )));
@@ -459,10 +459,10 @@ impl VmManager {
 
         let entry = vms
             .get(id)
-            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
 
         if entry.info.state != VmState::Running {
-            return Err(CoreError::InvalidState(format!(
+            return Err(CoreError::invalid_state(format!(
                 "cannot read console output: VM is {:?}",
                 entry.info.state
             )));
@@ -502,10 +502,10 @@ impl VmManager {
 
         let entry = vms
             .get(id)
-            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
 
         if entry.info.state != VmState::Running {
-            return Err(CoreError::InvalidState(format!(
+            return Err(CoreError::invalid_state(format!(
                 "cannot set balloon target: VM is {:?}",
                 entry.info.state
             )));
@@ -557,10 +557,10 @@ impl VmManager {
 
         let entry = vms
             .get(id)
-            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
 
         if entry.info.state != VmState::Running {
-            return Err(CoreError::InvalidState(format!(
+            return Err(CoreError::invalid_state(format!(
                 "cannot get balloon stats: VM is {:?}",
                 entry.info.state
             )));
@@ -591,7 +591,7 @@ impl VmManager {
             .map_err(|_| CoreError::Vm("lock poisoned".to_string()))?;
         let entry = vms
             .get(id)
-            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
         Ok(Self::build_vmm_config(entry))
     }
 }

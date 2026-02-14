@@ -278,13 +278,13 @@ impl DarwinVm {
             if start.elapsed() > timeout {
                 if let Some(ref vm) = self.vz_vm {
                     let state = vm.state();
-                    return Err(HypervisorError::Timeout(format!(
+                    return Err(HypervisorError::timeout(format!(
                         "Timed out waiting for VM state {:?}, current state: {:?}",
                         target, state
                     )));
                 }
-                return Err(HypervisorError::Timeout(
-                    "Timed out waiting for VM state".to_string(),
+                return Err(HypervisorError::timeout(
+                    "Timed out waiting for VM state",
                 ));
             }
 
@@ -437,7 +437,7 @@ impl DarwinVm {
         // Check VM is running
         let state = self.state();
         if state != VmState::Running {
-            return Err(HypervisorError::InvalidState {
+            return Err(HypervisorError::VmStateError {
                 expected: "Running".to_string(),
                 actual: format!("{:?}", state),
             });
@@ -717,7 +717,7 @@ impl DarwinVm {
         // Check VM is running
         let state = self.state();
         if state != VmState::Running {
-            return Err(HypervisorError::InvalidState {
+            return Err(HypervisorError::VmStateError {
                 expected: "Running".to_string(),
                 actual: format!("{:?}", state),
             });
@@ -929,7 +929,7 @@ impl VirtualMachine for DarwinVm {
     fn start(&mut self) -> Result<(), HypervisorError> {
         let state = self.state();
         if state != VmState::Created && state != VmState::Stopped {
-            return Err(HypervisorError::InvalidState {
+            return Err(HypervisorError::VmStateError {
                 expected: "Created or Stopped".to_string(),
                 actual: format!("{:?}", state),
             });
@@ -999,7 +999,7 @@ impl VirtualMachine for DarwinVm {
     fn pause(&mut self) -> Result<(), HypervisorError> {
         let state = self.state();
         if state != VmState::Running {
-            return Err(HypervisorError::InvalidState {
+            return Err(HypervisorError::VmStateError {
                 expected: "Running".to_string(),
                 actual: format!("{:?}", state),
             });
@@ -1028,7 +1028,7 @@ impl VirtualMachine for DarwinVm {
     fn resume(&mut self) -> Result<(), HypervisorError> {
         let state = self.state();
         if state != VmState::Paused {
-            return Err(HypervisorError::InvalidState {
+            return Err(HypervisorError::VmStateError {
                 expected: "Paused".to_string(),
                 actual: format!("{:?}", state),
             });
@@ -1057,7 +1057,7 @@ impl VirtualMachine for DarwinVm {
     fn stop(&mut self) -> Result<(), HypervisorError> {
         let state = self.state();
         if state != VmState::Running && state != VmState::Paused {
-            return Err(HypervisorError::InvalidState {
+            return Err(HypervisorError::VmStateError {
                 expected: "Running or Paused".to_string(),
                 actual: format!("{:?}", state),
             });

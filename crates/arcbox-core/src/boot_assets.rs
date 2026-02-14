@@ -255,7 +255,7 @@ impl BootAssetProvider {
 
         builder
             .build()
-            .map_err(|e| CoreError::Config(format!("failed to create HTTP client: {}", e)))
+            .map_err(|e| CoreError::config(format!("failed to create HTTP client: {}", e)))
     }
 
     /// Sets custom kernel path.
@@ -302,7 +302,7 @@ impl BootAssetProvider {
         // Check for custom paths first.
         let kernel = if let Some(ref k) = self.config.custom_kernel {
             if !k.exists() {
-                return Err(CoreError::Config(format!(
+                return Err(CoreError::config(format!(
                     "custom kernel not found: {}",
                     k.display()
                 )));
@@ -315,7 +315,7 @@ impl BootAssetProvider {
 
         let initramfs = if let Some(ref i) = self.config.custom_initramfs {
             if !i.exists() {
-                return Err(CoreError::Config(format!(
+                return Err(CoreError::config(format!(
                     "custom initramfs not found: {}",
                     i.display()
                 )));
@@ -349,7 +349,7 @@ impl BootAssetProvider {
         if kernel_path.exists() {
             Ok(kernel_path)
         } else {
-            Err(CoreError::Config(format!(
+            Err(CoreError::config(format!(
                 "kernel not found after download: {}",
                 kernel_path.display()
             )))
@@ -371,7 +371,7 @@ impl BootAssetProvider {
         if initramfs_path.exists() {
             Ok(initramfs_path)
         } else {
-            Err(CoreError::Config(format!(
+            Err(CoreError::config(format!(
                 "initramfs not found after download: {}",
                 initramfs_path.display()
             )))
@@ -385,7 +385,7 @@ impl BootAssetProvider {
         // Create cache directory.
         fs::create_dir_all(&cache_dir)
             .await
-            .map_err(|e| CoreError::Config(format!("failed to create cache directory: {}", e)))?;
+            .map_err(|e| CoreError::config(format!("failed to create cache directory: {}", e)))?;
 
         // Download checksum first (if verification enabled).
         let expected_checksum = if self.config.verify_checksum {
@@ -437,7 +437,7 @@ impl BootAssetProvider {
             if actual != expected {
                 // Remove corrupted file.
                 let _ = fs::remove_file(&bundle_path).await;
-                return Err(CoreError::Config(format!(
+                return Err(CoreError::config(format!(
                     "checksum mismatch: expected {}, got {}",
                     expected, actual
                 )));
@@ -496,10 +496,10 @@ impl BootAssetProvider {
             .get(url)
             .send()
             .await
-            .map_err(|e| CoreError::Config(format!("failed to download {}: {}", url, e)))?;
+            .map_err(|e| CoreError::config(format!("failed to download {}: {}", url, e)))?;
 
         if !response.status().is_success() {
-            return Err(CoreError::Config(format!(
+            return Err(CoreError::config(format!(
                 "download failed with status {}: {}",
                 response.status(),
                 url
@@ -513,17 +513,17 @@ impl BootAssetProvider {
         let temp_path = dest.with_extension("tmp");
         let mut file = tokio::fs::File::create(&temp_path)
             .await
-            .map_err(|e| CoreError::Config(format!("failed to create file: {}", e)))?;
+            .map_err(|e| CoreError::config(format!("failed to create file: {}", e)))?;
 
         // Stream download.
         let mut stream = response.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| CoreError::Config(format!("download error: {}", e)))?;
+            let chunk = chunk.map_err(|e| CoreError::config(format!("download error: {}", e)))?;
 
             file.write_all(&chunk)
                 .await
-                .map_err(|e| CoreError::Config(format!("write error: {}", e)))?;
+                .map_err(|e| CoreError::config(format!("write error: {}", e)))?;
 
             downloaded += chunk.len() as u64;
 
@@ -538,12 +538,12 @@ impl BootAssetProvider {
 
         file.flush()
             .await
-            .map_err(|e| CoreError::Config(format!("flush error: {}", e)))?;
+            .map_err(|e| CoreError::config(format!("flush error: {}", e)))?;
 
         // Rename to final path.
         fs::rename(&temp_path, dest)
             .await
-            .map_err(|e| CoreError::Config(format!("rename error: {}", e)))?;
+            .map_err(|e| CoreError::config(format!("rename error: {}", e)))?;
 
         tracing::debug!("Downloaded {} bytes to {}", downloaded, dest.display());
 
@@ -559,10 +559,10 @@ impl BootAssetProvider {
             .get(&url)
             .send()
             .await
-            .map_err(|e| CoreError::Config(format!("failed to download checksum: {}", e)))?;
+            .map_err(|e| CoreError::config(format!("failed to download checksum: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(CoreError::Config(format!(
+            return Err(CoreError::config(format!(
                 "checksum download failed with status {}",
                 response.status()
             )));
@@ -571,17 +571,17 @@ impl BootAssetProvider {
         let text = response
             .text()
             .await
-            .map_err(|e| CoreError::Config(format!("failed to read checksum: {}", e)))?;
+            .map_err(|e| CoreError::config(format!("failed to read checksum: {}", e)))?;
 
         // Parse checksum (format: "sha256sum  filename" or just "sha256sum").
         let checksum = text
             .split_whitespace()
             .next()
-            .ok_or_else(|| CoreError::Config("empty checksum file".to_string()))?
+            .ok_or_else(|| CoreError::config("empty checksum file".to_string()))?
             .to_lowercase();
 
         if checksum.len() != 64 {
-            return Err(CoreError::Config(format!(
+            return Err(CoreError::config(format!(
                 "invalid checksum length: {}",
                 checksum.len()
             )));
@@ -594,7 +594,7 @@ impl BootAssetProvider {
     async fn compute_file_checksum(&self, path: &Path) -> Result<String> {
         let data = fs::read(path)
             .await
-            .map_err(|e| CoreError::Config(format!("failed to read file for checksum: {}", e)))?;
+            .map_err(|e| CoreError::config(format!("failed to read file for checksum: {}", e)))?;
 
         let mut hasher = Sha256::new();
         hasher.update(&data);
@@ -611,19 +611,19 @@ impl BootAssetProvider {
         // Run extraction in blocking task.
         tokio::task::spawn_blocking(move || {
             let file = std::fs::File::open(&bundle_path)
-                .map_err(|e| CoreError::Config(format!("failed to open bundle: {}", e)))?;
+                .map_err(|e| CoreError::config(format!("failed to open bundle: {}", e)))?;
 
             let decoder = GzDecoder::new(file);
             let mut archive = Archive::new(decoder);
 
             archive
                 .unpack(&dest_dir)
-                .map_err(|e| CoreError::Config(format!("failed to extract bundle: {}", e)))?;
+                .map_err(|e| CoreError::config(format!("failed to extract bundle: {}", e)))?;
 
             Ok(())
         })
         .await
-        .map_err(|e| CoreError::Config(format!("extraction task failed: {}", e)))?
+        .map_err(|e| CoreError::config(format!("extraction task failed: {}", e)))?
     }
 
     /// Prefetches boot assets (downloads if not cached).
@@ -650,7 +650,7 @@ impl BootAssetProvider {
         if self.config.cache_dir.exists() {
             fs::remove_dir_all(&self.config.cache_dir)
                 .await
-                .map_err(|e| CoreError::Config(format!("failed to clear cache: {}", e)))?;
+                .map_err(|e| CoreError::config(format!("failed to clear cache: {}", e)))?;
         }
         Ok(())
     }
@@ -665,12 +665,12 @@ impl BootAssetProvider {
 
         let mut entries = fs::read_dir(&self.config.cache_dir)
             .await
-            .map_err(|e| CoreError::Config(format!("failed to read cache dir: {}", e)))?;
+            .map_err(|e| CoreError::config(format!("failed to read cache dir: {}", e)))?;
 
         while let Some(entry) = entries
             .next_entry()
             .await
-            .map_err(|e| CoreError::Config(format!("failed to read cache entry: {}", e)))?
+            .map_err(|e| CoreError::config(format!("failed to read cache entry: {}", e)))?
         {
             let path = entry.path();
             if path.is_dir() {

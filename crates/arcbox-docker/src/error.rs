@@ -1,5 +1,6 @@
 //! Error types for Docker API.
 
+use arcbox_error::CommonError;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
@@ -11,6 +12,10 @@ pub type Result<T> = std::result::Result<T, DockerError>;
 /// Errors that can occur in Docker API operations.
 #[derive(Debug, Error)]
 pub enum DockerError {
+    /// Common errors (I/O, timeout, etc.).
+    #[error(transparent)]
+    Common(#[from] CommonError),
+
     /// Container not found.
     #[error("No such container: {0}")]
     ContainerNotFound(String),
@@ -57,6 +62,7 @@ impl DockerError {
     #[must_use]
     pub fn status_code(&self) -> StatusCode {
         match self {
+            Self::Common(e) => Self::common_status_code(e),
             Self::ContainerNotFound(_)
             | Self::ImageNotFound(_)
             | Self::VolumeNotFound(_)
@@ -66,6 +72,27 @@ impl DockerError {
             Self::Server(_) | Self::Context(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
         }
+    }
+
+    /// Maps CommonError to HTTP status code.
+    fn common_status_code(err: &CommonError) -> StatusCode {
+        match err {
+            CommonError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            CommonError::Config(_) => StatusCode::BAD_REQUEST,
+            CommonError::NotFound(_) => StatusCode::NOT_FOUND,
+            CommonError::AlreadyExists(_) => StatusCode::CONFLICT,
+            CommonError::InvalidState(_) => StatusCode::BAD_REQUEST,
+            CommonError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            CommonError::PermissionDenied(_) => StatusCode::FORBIDDEN,
+            CommonError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+// Allow automatic conversion from std::io::Error to DockerError via CommonError.
+impl From<std::io::Error> for DockerError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Common(CommonError::from(err))
     }
 }
 

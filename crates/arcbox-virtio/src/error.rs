@@ -1,5 +1,6 @@
 //! Error types for VirtIO devices.
 
+use arcbox_error::CommonError;
 use thiserror::Error;
 
 /// Result type alias for VirtIO operations.
@@ -8,6 +9,10 @@ pub type Result<T> = std::result::Result<T, VirtioError>;
 /// Errors that can occur during VirtIO operations.
 #[derive(Debug, Error)]
 pub enum VirtioError {
+    /// Common error from arcbox-error.
+    #[error(transparent)]
+    Common(#[from] CommonError),
+
     /// Device not ready.
     #[error("device not ready: {0}")]
     NotReady(String),
@@ -24,13 +29,9 @@ pub enum VirtioError {
     #[error("buffer too small: need {needed}, got {got}")]
     BufferTooSmall { needed: usize, got: usize },
 
-    /// I/O error.
+    /// VirtIO I/O error (string message).
     #[error("I/O error: {0}")]
     Io(String),
-
-    /// Standard I/O error.
-    #[error("I/O error: {0}")]
-    IoError(#[from] std::io::Error),
 
     /// Memory error.
     #[error("memory error: {0}")]
@@ -51,6 +52,13 @@ pub enum VirtioError {
     /// Invalid operation.
     #[error("invalid operation: {0}")]
     InvalidOperation(String),
+}
+
+// Allow automatic conversion from std::io::Error to VirtioError via CommonError.
+impl From<std::io::Error> for VirtioError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Common(CommonError::from(err))
+    }
 }
 
 #[cfg(test)]

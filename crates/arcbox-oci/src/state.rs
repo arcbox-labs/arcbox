@@ -93,10 +93,13 @@ impl State {
     /// Returns an error if the transition is invalid.
     pub fn transition_to(&mut self, new_status: Status) -> Result<()> {
         if !self.status.can_transition_to(new_status) {
-            return Err(OciError::InvalidState {
-                expected: self.status.valid_transitions().join(", "),
-                actual: new_status.as_str().to_string(),
-            });
+            return Err(OciError::Common(arcbox_error::CommonError::invalid_state(
+                format!(
+                    "expected one of [{}], got {}",
+                    self.status.valid_transitions().join(", "),
+                    new_status.as_str()
+                ),
+            )));
         }
         self.status = new_status;
         Ok(())

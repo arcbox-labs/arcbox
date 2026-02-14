@@ -138,7 +138,7 @@ impl ContainerManager {
 
         let container = containers
             .get_mut(id)
-            .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+            .ok_or_else(|| ContainerError::not_found(id.to_string()))?;
 
         f(container);
         Ok(())
@@ -179,10 +179,10 @@ impl ContainerManager {
 
             let container = containers
                 .get(id)
-                .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+                .ok_or_else(|| ContainerError::not_found(id.to_string()))?;
 
             if container.state != ContainerState::Running {
-                return Err(ContainerError::InvalidState(format!(
+                return Err(ContainerError::invalid_state(format!(
                     "cannot stop from state {}",
                     container.state
                 )));
@@ -205,7 +205,7 @@ impl ContainerManager {
 
         let container = containers
             .get_mut(id)
-            .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+            .ok_or_else(|| ContainerError::not_found(id.to_string()))?;
 
         container.state = ContainerState::Exited;
         container.exit_code = Some(0);
@@ -228,10 +228,10 @@ impl ContainerManager {
 
             let container = containers
                 .get(id)
-                .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+                .ok_or_else(|| ContainerError::not_found(id.to_string()))?;
 
             if container.state != ContainerState::Running {
-                return Err(ContainerError::InvalidState(format!(
+                return Err(ContainerError::invalid_state(format!(
                     "cannot kill container in state {}",
                     container.state
                 )));
@@ -254,7 +254,7 @@ impl ContainerManager {
 
         let container = containers
             .get_mut(id)
-            .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+            .ok_or_else(|| ContainerError::not_found(id.to_string()))?;
 
         container.state = ContainerState::Exited;
         // SIGKILL (9) -> 137, SIGTERM (15) -> 143
@@ -287,13 +287,13 @@ impl ContainerManager {
 
             let container = containers
                 .get(id)
-                .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+                .ok_or_else(|| ContainerError::not_found(id.to_string()))?;
 
             container.state
         };
 
         if state == ContainerState::Starting {
-            return Err(ContainerError::InvalidState(
+            return Err(ContainerError::invalid_state(
                 "cannot restart while starting".to_string(),
             ));
         }
@@ -333,7 +333,7 @@ impl ContainerManager {
 
         let container = containers
             .get_mut(id)
-            .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+            .ok_or_else(|| ContainerError::not_found(id.to_string()))?;
 
         match container.state {
             ContainerState::Created | ContainerState::Exited => {
@@ -351,7 +351,7 @@ impl ContainerManager {
             }
             ContainerState::Running => Ok(StartOutcome::AlreadyRunning),
             ContainerState::Starting => Ok(StartOutcome::AlreadyStarting),
-            _ => Err(ContainerError::InvalidState(format!(
+            _ => Err(ContainerError::invalid_state(format!(
                 "cannot start from state {}",
                 container.state
             ))),
@@ -371,7 +371,7 @@ impl ContainerManager {
 
         let container = containers
             .get_mut(id)
-            .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+            .ok_or_else(|| ContainerError::not_found(id.to_string()))?;
 
         container.state = ContainerState::Running;
         container.started_at = Some(chrono::Utc::now());
@@ -397,7 +397,7 @@ impl ContainerManager {
 
         let container = containers
             .get_mut(id)
-            .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+            .ok_or_else(|| ContainerError::not_found(id.to_string()))?;
 
         container.state = ticket.prev_state;
         container.started_at = ticket.prev_started_at;
@@ -438,7 +438,7 @@ impl ContainerManager {
 
             let container = containers
                 .get(id)
-                .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+                .ok_or_else(|| ContainerError::not_found(id.to_string()))?;
 
             match container.state {
                 ContainerState::Exited | ContainerState::Dead => {
@@ -483,7 +483,7 @@ impl ContainerManager {
                         _ => {}
                     }
                 } else {
-                    return Err(ContainerError::NotFound(target_id.to_string()));
+                    return Err(ContainerError::not_found(target_id.to_string()));
                 }
             }
 
@@ -549,7 +549,7 @@ impl ContainerManager {
 
             let container = containers
                 .get(id)
-                .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+                .ok_or_else(|| ContainerError::not_found(id.to_string()))?;
 
             match container.state {
                 ContainerState::Running | ContainerState::Exited | ContainerState::Dead => {
@@ -578,7 +578,7 @@ impl ContainerManager {
                     _ => {}
                 }
             } else {
-                return Err(ContainerError::NotFound(target_id.to_string()));
+                return Err(ContainerError::not_found(target_id.to_string()));
             }
         }
 
@@ -645,10 +645,10 @@ impl ContainerManager {
 
         let container = containers
             .get(id)
-            .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+            .ok_or_else(|| ContainerError::not_found(id.to_string()))?;
 
         if matches!(container.state, ContainerState::Running | ContainerState::Starting) {
-            return Err(ContainerError::InvalidState(
+            return Err(ContainerError::invalid_state(
                 "cannot remove running container".to_string(),
             ));
         }

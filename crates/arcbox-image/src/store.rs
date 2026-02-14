@@ -181,7 +181,7 @@ impl ImageStore {
     pub fn get_blob(&self, digest: &str) -> Result<Vec<u8>> {
         let path = self.blob_path(digest);
         if !path.exists() {
-            return Err(ImageError::NotFound(format!("blob {digest}")));
+            return Err(ImageError::not_found(format!("blob {digest}")));
         }
         Ok(fs::read(&path)?)
     }
@@ -281,7 +281,7 @@ impl ImageStore {
                 .map_err(|_| ImageError::Storage("lock poisoned".to_string()))?;
             images
                 .remove(&reference.full_name())
-                .ok_or_else(|| ImageError::NotFound(reference.full_name()))?;
+                .ok_or_else(|| ImageError::not_found(reference.full_name()))?;
         }
 
         // Persist to disk.
@@ -298,7 +298,7 @@ impl ImageStore {
     pub fn tag(&self, source: &ImageRef, target: &ImageRef) -> Result<()> {
         let source_image = self
             .get(source)
-            .ok_or_else(|| ImageError::NotFound(source.full_name()))?;
+            .ok_or_else(|| ImageError::not_found(source.full_name()))?;
 
         let new_image = LocalImage {
             reference: target.clone(),

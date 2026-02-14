@@ -204,7 +204,7 @@ impl NetworkManager {
             let mut state = self
                 .state
                 .write()
-                .map_err(|_| NetError::Config("lock poisoned".to_string()))?;
+                .map_err(|_| NetError::config("lock poisoned".to_string()))?;
 
             if *state != NetworkState::Stopped {
                 return Ok(());
@@ -218,7 +218,7 @@ impl NetworkManager {
             let mut state = self
                 .state
                 .write()
-                .map_err(|_| NetError::Config("lock poisoned".to_string()))?;
+                .map_err(|_| NetError::config("lock poisoned".to_string()))?;
             *state = if result.is_ok() {
                 NetworkState::Running
             } else {
@@ -242,14 +242,14 @@ impl NetworkManager {
                 let mut ip_alloc = self
                     .ip_allocator
                     .write()
-                    .map_err(|_| NetError::Config("lock poisoned".to_string()))?;
+                    .map_err(|_| NetError::config("lock poisoned".to_string()))?;
                 *ip_alloc = Some(allocator);
 
                 tracing::info!("Network manager started in NAT mode");
             }
             NetworkMode::Bridge => {
                 if self.config.bridge.is_none() {
-                    return Err(NetError::Config(
+                    return Err(NetError::config(
                         "bridge mode requires bridge interface name".to_string(),
                     ));
                 }
@@ -268,7 +268,7 @@ impl NetworkManager {
                 let mut ip_alloc = self
                     .ip_allocator
                     .write()
-                    .map_err(|_| NetError::Config("lock poisoned".to_string()))?;
+                    .map_err(|_| NetError::config("lock poisoned".to_string()))?;
                 *ip_alloc = Some(allocator);
 
                 tracing::info!("Network manager started in host-only mode");
@@ -296,7 +296,7 @@ impl NetworkManager {
             let mut state = self
                 .state
                 .write()
-                .map_err(|_| NetError::Config("lock poisoned".to_string()))?;
+                .map_err(|_| NetError::config("lock poisoned".to_string()))?;
 
             if *state != NetworkState::Running {
                 return Ok(());
@@ -310,7 +310,7 @@ impl NetworkManager {
             let mut state = self
                 .state
                 .write()
-                .map_err(|_| NetError::Config("lock poisoned".to_string()))?;
+                .map_err(|_| NetError::config("lock poisoned".to_string()))?;
             *state = NetworkState::Stopped;
         }
 
@@ -386,7 +386,7 @@ impl NetworkManager {
         let mut networks = self
             .networks
             .write()
-            .map_err(|_| NetError::Config("lock poisoned".to_string()))?;
+            .map_err(|_| NetError::config("lock poisoned".to_string()))?;
         networks.insert(id.clone(), network);
 
         Ok(id)
@@ -424,7 +424,7 @@ impl NetworkManager {
         let mut networks = self
             .networks
             .write()
-            .map_err(|_| NetError::Config("lock poisoned".to_string()))?;
+            .map_err(|_| NetError::config("lock poisoned".to_string()))?;
 
         // Try by ID first.
         if networks.remove(id_or_name).is_some() {
@@ -442,7 +442,7 @@ impl NetworkManager {
             return Ok(());
         }
 
-        Err(NetError::Config(format!(
+        Err(NetError::config(format!(
             "network {} not found",
             id_or_name
         )))

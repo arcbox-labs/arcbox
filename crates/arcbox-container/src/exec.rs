@@ -249,10 +249,10 @@ impl ExecManager {
 
             let exec = execs
                 .get_mut(&id.to_string())
-                .ok_or_else(|| crate::ContainerError::NotFound(id.to_string()))?;
+                .ok_or_else(|| crate::ContainerError::not_found(id.to_string()))?;
 
             if exec.running {
-                return Err(crate::ContainerError::InvalidState(
+                return Err(crate::ContainerError::invalid_state(
                     "exec is already running".to_string(),
                 ));
             }
@@ -340,16 +340,16 @@ impl ExecManager {
 
             let exec = execs
                 .get(&id.to_string())
-                .ok_or_else(|| crate::ContainerError::NotFound(id.to_string()))?;
+                .ok_or_else(|| crate::ContainerError::not_found(id.to_string()))?;
 
             if !exec.config.tty {
-                return Err(crate::ContainerError::InvalidState(
+                return Err(crate::ContainerError::invalid_state(
                     "exec does not have a TTY".to_string(),
                 ));
             }
 
             if !exec.running {
-                return Err(crate::ContainerError::InvalidState(
+                return Err(crate::ContainerError::invalid_state(
                     "exec is not running".to_string(),
                 ));
             }

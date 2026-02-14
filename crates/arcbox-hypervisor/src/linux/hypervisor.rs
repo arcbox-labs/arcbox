@@ -152,13 +152,13 @@ impl KvmHypervisor {
     fn validate_config(&self, config: &VmConfig) -> Result<(), HypervisorError> {
         // Check vCPU count
         if config.vcpu_count == 0 {
-            return Err(HypervisorError::InvalidConfig(
+            return Err(HypervisorError::invalid_config(
                 "vCPU count must be > 0".to_string(),
             ));
         }
 
         if config.vcpu_count > self.capabilities.max_vcpus {
-            return Err(HypervisorError::InvalidConfig(format!(
+            return Err(HypervisorError::invalid_config(format!(
                 "vCPU count {} exceeds maximum {}",
                 config.vcpu_count, self.capabilities.max_vcpus
             )));
@@ -167,14 +167,14 @@ impl KvmHypervisor {
         // Check memory size
         const MIN_MEMORY: u64 = 16 * 1024 * 1024; // 16MB minimum
         if config.memory_size < MIN_MEMORY {
-            return Err(HypervisorError::InvalidConfig(format!(
+            return Err(HypervisorError::invalid_config(format!(
                 "Memory size {} is below minimum {}",
                 config.memory_size, MIN_MEMORY
             )));
         }
 
         if config.memory_size > self.capabilities.max_memory {
-            return Err(HypervisorError::InvalidConfig(format!(
+            return Err(HypervisorError::invalid_config(format!(
                 "Memory size {} exceeds maximum {}",
                 config.memory_size, self.capabilities.max_memory
             )));
@@ -182,7 +182,7 @@ impl KvmHypervisor {
 
         // Check architecture
         if !self.supports_arch(config.arch) {
-            return Err(HypervisorError::InvalidConfig(format!(
+            return Err(HypervisorError::invalid_config(format!(
                 "Architecture {:?} is not supported",
                 config.arch
             )));

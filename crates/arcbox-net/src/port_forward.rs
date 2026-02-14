@@ -161,7 +161,7 @@ impl PortForwarder {
         let handle = match rule.protocol {
             Protocol::Tcp => {
                 let listener = TcpListener::bind(rule.host_addr).await.map_err(|e| {
-                    NetError::Io(std::io::Error::new(
+                    NetError::io(std::io::Error::new(
                         e.kind(),
                         format!("failed to bind {}: {}", rule.host_addr, e),
                     ))
@@ -177,7 +177,7 @@ impl PortForwarder {
             }
             Protocol::Udp => {
                 let socket = UdpSocket::bind(rule.host_addr).await.map_err(|e| {
-                    NetError::Io(std::io::Error::new(
+                    NetError::io(std::io::Error::new(
                         e.kind(),
                         format!("failed to bind {}: {}", rule.host_addr, e),
                     ))

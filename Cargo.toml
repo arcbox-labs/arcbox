@@ -5,6 +5,9 @@ members = [
     # Core Layer (MIT OR Apache-2.0)
     # ============================================
 
+    # Common utilities
+    "crates/arcbox-error",
+
     # Low-level infrastructure
     "crates/arcbox-vz",
     "crates/arcbox-hypervisor",
@@ -138,6 +141,7 @@ nix = { version = "0.29", features = ["fs", "process", "socket", "ioctl", "mman"
 libc = "0.2"
 
 # Internal crates (Core layer)
+arcbox-error = { version = "0.0.1-alpha.1", path = "crates/arcbox-error" }
 arcbox-vz = { version = "0.0.1-alpha.1", path = "crates/arcbox-vz" }
 arcbox-hypervisor = { version = "0.0.1-alpha.1", path = "crates/arcbox-hypervisor" }
 arcbox-vmm = { version = "0.0.1-alpha.1", path = "crates/arcbox-vmm" }

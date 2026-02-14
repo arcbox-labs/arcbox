@@ -245,7 +245,7 @@ impl VolumeManager {
     pub fn remove(&mut self, name: &str) -> Result<()> {
         // Check if volume exists.
         if !self.volumes.contains_key(name) {
-            return Err(ContainerError::NotFound(format!("volume '{}'", name)));
+            return Err(ContainerError::not_found(format!("volume '{}'", name)));
         }
 
         // Check if volume is in use.
@@ -285,7 +285,7 @@ impl VolumeManager {
 
         // Check if volume exists.
         if !self.volumes.contains_key(name) {
-            return Err(ContainerError::NotFound(format!("volume '{}'", name)));
+            return Err(ContainerError::not_found(format!("volume '{}'", name)));
         }
 
         // Remove the volume directory.

@@ -103,7 +103,7 @@ impl DarwinNatNetwork {
     /// Returns an error if IP allocation fails or endpoint already exists.
     pub fn create_endpoint(&mut self, id: &str) -> Result<&DarwinNetEndpoint> {
         if self.endpoints.contains_key(id) {
-            return Err(NetError::Config(format!(
+            return Err(NetError::config(format!(
                 "endpoint '{}' already exists",
                 id
             )));
@@ -132,7 +132,7 @@ impl DarwinNatNetwork {
         let endpoint = self
             .endpoints
             .remove(id)
-            .ok_or_else(|| NetError::Config(format!("endpoint '{}' not found", id)))?;
+            .ok_or_else(|| NetError::config(format!("endpoint '{}' not found", id)))?;
 
         if let Some(ip) = endpoint.ip {
             self.ip_allocator.release(ip);
@@ -166,7 +166,7 @@ impl DarwinNatNetwork {
     /// Returns an error if the network is already running.
     pub fn start(&mut self) -> Result<()> {
         if self.running {
-            return Err(NetError::Config("network already running".to_string()));
+            return Err(NetError::config("network already running".to_string()));
         }
 
         // Set internal network in NAT engine

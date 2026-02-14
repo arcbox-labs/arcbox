@@ -1,0 +1,16 @@
+[package]
+name = "arcbox-error"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Common error types for ArcBox"
+
+[dependencies]
+thiserror.workspace = true
+
+[lints.clippy]
+pedantic = "warn"
+nursery = "warn"

@@ -13,6 +13,7 @@ arcbox-core = { workspace = true }
 arcbox-protocol = { workspace = true }
 arcbox-grpc = { workspace = true }
 arcbox-docker = { workspace = true }
+arcbox-error = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

@@ -165,13 +165,13 @@ mod linux {
         fn set_nonblocking(&self) -> Result<()> {
             let flags = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_GETFL) };
             if flags < 0 {
-                return Err(TransportError::Io(std::io::Error::last_os_error()));
+                return Err(TransportError::io(std::io::Error::last_os_error()));
             }
             let result = unsafe {
                 libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
             };
             if result < 0 {
-                return Err(TransportError::Io(std::io::Error::last_os_error()));
+                return Err(TransportError::io(std::io::Error::last_os_error()));
             }
             Ok(())
         }
@@ -198,7 +198,7 @@ mod linux {
                     tokio::task::yield_now().await;
                     continue;
                 }
-                return Err(TransportError::Io(err));
+                return Err(TransportError::io(err));
             }
         }
 
@@ -224,7 +224,7 @@ mod linux {
                     tokio::task::yield_now().await;
                     continue;
                 }
-                return Err(TransportError::Io(err));
+                return Err(TransportError::io(err));
             }
         }
     }
@@ -237,7 +237,7 @@ mod linux {
             SockFlag::SOCK_CLOEXEC,
             None,
         )
-        .map_err(|e| TransportError::Io(e.into()))?;
+        .map_err(|e| TransportError::io(e.into()))?;
         Ok(fd)
     }
 
@@ -281,13 +281,13 @@ mod linux {
 
         if result < 0 {
             let err = std::io::Error::last_os_error();
-            return Err(TransportError::Io(err));
+            return Err(TransportError::io(err));
         }
 
         let result = unsafe { libc::listen(fd.as_raw_fd(), 128) };
         if result < 0 {
             let err = std::io::Error::last_os_error();
-            return Err(TransportError::Io(err));
+            return Err(TransportError::io(err));
         }
 
         Ok(fd)
@@ -308,7 +308,7 @@ mod linux {
 
         if fd < 0 {
             let err = std::io::Error::last_os_error();
-            return Err(TransportError::Io(err));
+            return Err(TransportError::io(err));
         }
 
         let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -372,13 +372,13 @@ mod darwin {
         fn set_nonblocking(&self) -> Result<()> {
             let flags = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_GETFL) };
             if flags < 0 {
-                return Err(TransportError::Io(std::io::Error::last_os_error()));
+                return Err(TransportError::io(std::io::Error::last_os_error()));
             }
             let result = unsafe {
                 libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
             };
             if result < 0 {
-                return Err(TransportError::Io(std::io::Error::last_os_error()));
+                return Err(TransportError::io(std::io::Error::last_os_error()));
             }
             Ok(())
         }
@@ -406,7 +406,7 @@ mod darwin {
                     tokio::task::yield_now().await;
                     continue;
                 }
-                return Err(TransportError::Io(err));
+                return Err(TransportError::io(err));
             }
         }
 
@@ -432,7 +432,7 @@ mod darwin {
                     tokio::task::yield_now().await;
                     continue;
                 }
-                return Err(TransportError::Io(err));
+                return Err(TransportError::io(err));
             }
         }
     }
@@ -684,7 +684,7 @@ impl Transport for VsockTransport {
             let n = stream.read(&mut len_buf[read..]).await?;
             if n == 0 {
                 tracing::debug!("VsockTransport::recv: EOF while reading length prefix");
-                return Err(TransportError::Io(std::io::Error::new(
+                return Err(TransportError::io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "EOF while reading length prefix",
                 )));
@@ -707,7 +707,7 @@ impl Transport for VsockTransport {
                     read,
                     len
                 );
-                return Err(TransportError::Io(std::io::Error::new(
+                return Err(TransportError::io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "EOF while reading payload",
                 )));

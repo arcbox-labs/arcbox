@@ -1030,7 +1030,7 @@ impl AgentClient {
                                     cid = cid,
                                     "attach reader: recv timed out after 90 seconds"
                                 );
-                                Err(arcbox_transport::error::TransportError::Io(
+                                Err(arcbox_transport::error::TransportError::io(
                                     std::io::Error::new(
                                         std::io::ErrorKind::TimedOut,
                                         "attach recv timed out",

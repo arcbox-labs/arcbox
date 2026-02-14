@@ -1,5 +1,6 @@
 //! Error types for the core layer.
 
+use arcbox_error::CommonError;
 use thiserror::Error;
 
 /// Result type alias for core operations.
@@ -8,6 +9,10 @@ pub type Result<T> = std::result::Result<T, CoreError>;
 /// Errors that can occur in core operations.
 #[derive(Debug, Error)]
 pub enum CoreError {
+    /// Common errors (I/O, config, not found, etc.).
+    #[error(transparent)]
+    Common(#[from] CommonError),
+
     /// VM error.
     #[error("VM error: {0}")]
     Vm(String),
@@ -31,24 +36,37 @@ pub enum CoreError {
     /// Network error.
     #[error("network error: {0}")]
     Net(#[from] arcbox_net::NetError),
+}
 
-    /// Configuration error.
-    #[error("configuration error: {0}")]
-    Config(String),
+impl CoreError {
+    /// Creates a new configuration error.
+    #[must_use]
+    pub fn config(msg: impl Into<String>) -> Self {
+        Self::Common(CommonError::config(msg))
+    }
 
-    /// Not found.
-    #[error("not found: {0}")]
-    NotFound(String),
+    /// Creates a new not found error.
+    #[must_use]
+    pub fn not_found(resource: impl Into<String>) -> Self {
+        Self::Common(CommonError::not_found(resource))
+    }
 
-    /// Already exists.
-    #[error("already exists: {0}")]
-    AlreadyExists(String),
+    /// Creates a new already exists error.
+    #[must_use]
+    pub fn already_exists(resource: impl Into<String>) -> Self {
+        Self::Common(CommonError::already_exists(resource))
+    }
 
-    /// Invalid state.
-    #[error("invalid state: {0}")]
-    InvalidState(String),
+    /// Creates a new invalid state error.
+    #[must_use]
+    pub fn invalid_state(msg: impl Into<String>) -> Self {
+        Self::Common(CommonError::invalid_state(msg))
+    }
+}
 
-    /// I/O error.
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+// Allow automatic conversion from std::io::Error to CoreError via CommonError.
+impl From<std::io::Error> for CoreError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Common(CommonError::from(err))
+    }
 }

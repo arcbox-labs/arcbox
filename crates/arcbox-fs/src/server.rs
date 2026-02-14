@@ -85,7 +85,7 @@ impl FsServer {
 
         // Initialize passthrough filesystem
         let fs = PassthroughFs::new(&self.config.source)
-            .map_err(|e| FsError::NotFound(format!("Failed to initialize filesystem: {}", e)))?;
+            .map_err(|e| FsError::not_found(format!("Failed to initialize filesystem: {}", e)))?;
         let fs = Arc::new(fs);
 
         // Initialize dispatcher

@@ -14,6 +14,7 @@ arcbox-core = { workspace = true }
 arcbox-image = { workspace = true }
 arcbox-protocol = { workspace = true }
 arcbox-transport = { workspace = true }
+arcbox-error = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

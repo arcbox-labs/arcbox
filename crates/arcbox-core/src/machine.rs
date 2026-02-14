@@ -231,7 +231,7 @@ impl MachineManager {
             .map_err(|_| CoreError::Machine("lock poisoned".to_string()))?
             .contains_key(&config.name)
         {
-            return Err(CoreError::AlreadyExists(config.name));
+            return Err(CoreError::already_exists(config.name));
         }
 
         // Create shared directories for container rootfs and home directory via VirtioFS
@@ -328,7 +328,7 @@ impl MachineManager {
 
             let machine = machines
                 .get(name)
-                .ok_or_else(|| CoreError::NotFound(name.to_string()))?;
+                .ok_or_else(|| CoreError::not_found(name.to_string()))?;
 
             // Count running machines. CIDs 0, 1 are reserved, 2 is the host. We start from 3.
             let running_count = machines
@@ -369,10 +369,10 @@ impl MachineManager {
 
         let machine = machines
             .get(name)
-            .ok_or_else(|| CoreError::NotFound(name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
 
         if machine.state != MachineState::Running {
-            return Err(CoreError::InvalidState(format!(
+            return Err(CoreError::invalid_state(format!(
                 "machine '{}' is not running",
                 name
             )));
@@ -400,10 +400,10 @@ impl MachineManager {
 
         let machine = machines
             .get(name)
-            .ok_or_else(|| CoreError::NotFound(name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
 
         if machine.state != MachineState::Running {
-            return Err(CoreError::InvalidState(format!(
+            return Err(CoreError::invalid_state(format!(
                 "machine '{}' is not running",
                 name
             )));
@@ -427,10 +427,10 @@ impl MachineManager {
 
         let machine = machines
             .get(name)
-            .ok_or_else(|| CoreError::NotFound(name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
 
         if machine.state != MachineState::Running {
-            return Err(CoreError::InvalidState(format!(
+            return Err(CoreError::invalid_state(format!(
                 "machine '{}' is not running",
                 name
             )));
@@ -452,7 +452,7 @@ impl MachineManager {
 
         let machine = machines
             .get_mut(name)
-            .ok_or_else(|| CoreError::NotFound(name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
 
         // Stop underlying VM
         self.vm_manager.stop(&machine.vm_id)?;
@@ -492,11 +492,11 @@ impl MachineManager {
 
         let machine = machines
             .get(name)
-            .ok_or_else(|| CoreError::NotFound(name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
 
         // Check if machine is running
         if machine.state == MachineState::Running && !force {
-            return Err(CoreError::InvalidState(
+            return Err(CoreError::invalid_state(
                 "cannot remove running machine (use --force)".to_string(),
             ));
         }
@@ -516,7 +516,7 @@ impl MachineManager {
         let vm_id = machines
             .get(name)
             .map(|m| m.vm_id.clone())
-            .ok_or_else(|| CoreError::NotFound(name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
 
         // Remove from VM manager
         self.vm_manager.remove(&vm_id)?;

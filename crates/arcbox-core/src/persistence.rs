@@ -141,7 +141,7 @@ impl MachinePersistence {
     pub fn load(&self, name: &str) -> Result<PersistedMachine> {
         let path = self.config_path(name);
         let content = fs::read_to_string(&path)
-            .map_err(|e| CoreError::NotFound(format!("Machine config not found: {}", e)))?;
+            .map_err(|e| CoreError::not_found(format!("Machine config not found: {}", e)))?;
 
         toml::from_str(&content)
             .map_err(|e| CoreError::Machine(format!("Failed to parse config: {}", e)))

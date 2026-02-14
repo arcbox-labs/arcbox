@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+arcbox-error = { workspace = true }
 arcbox-hypervisor = { workspace = true }
 arcbox-virtio = { workspace = true }
 thiserror = { workspace = true }

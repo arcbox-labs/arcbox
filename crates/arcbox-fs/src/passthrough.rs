@@ -377,7 +377,7 @@ impl PassthroughFs {
         if let Some(ref cache) = self.negative_cache {
             if cache.contains(&path) {
                 tracing::trace!(path = %path.display(), "negative cache hit");
-                return Err(FsError::NotFound(path.display().to_string()));
+                return Err(FsError::not_found(path.display().to_string()));
             }
         }
 
@@ -390,9 +390,9 @@ impl PassthroughFs {
                     tracing::trace!(path = %path.display(), "adding to negative cache");
                     cache.insert(path.clone());
                 }
-                return Err(FsError::NotFound(path.display().to_string()));
+                return Err(FsError::not_found(path.display().to_string()));
             }
-            Err(e) => return Err(FsError::Io(e)),
+            Err(e) => return Err(FsError::io(e)),
         };
 
         let file_type = FileType::from_mode(metadata.mode());
@@ -465,7 +465,7 @@ impl PassthroughFs {
     /// - [`FsError::InvalidHandle`] if the inode is invalid
     pub fn getattr(&self, inode: u64) -> Result<crate::fuse::FuseAttr> {
         let path = self.inode_path(inode)?;
-        let metadata = std::fs::symlink_metadata(&path).map_err(FsError::Io)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(FsError::io)?;
         Ok(Self::metadata_to_attr(inode, &metadata))
     }
 
@@ -491,7 +491,7 @@ impl PassthroughFs {
         // Set mode
         if let Some(mode) = mode {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
-                .map_err(FsError::Io)?;
+                .map_err(FsError::io)?;
         }
 
         // Set owner
@@ -502,7 +502,7 @@ impl PassthroughFs {
                 .map_err(|_| FsError::InvalidPath("invalid path".to_string()))?;
             let ret = unsafe { libc::chown(path_cstr.as_ptr(), uid, gid) };
             if ret != 0 {
-                return Err(FsError::Io(std::io::Error::last_os_error()));
+                return Err(FsError::io(std::io::Error::last_os_error()));
             }
         }
 
@@ -511,8 +511,8 @@ impl PassthroughFs {
             let file = OpenOptions::new()
                 .write(true)
                 .open(&path)
-                .map_err(FsError::Io)?;
-            file.set_len(size).map_err(FsError::Io)?;
+                .map_err(FsError::io)?;
+            file.set_len(size).map_err(FsError::io)?;
         }
 
         // Set times
@@ -543,7 +543,7 @@ impl PassthroughFs {
             let ret =
                 unsafe { libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), 0) };
             if ret != 0 {
-                return Err(FsError::Io(std::io::Error::last_os_error()));
+                return Err(FsError::io(std::io::Error::last_os_error()));
             }
         }
 
@@ -558,7 +558,7 @@ impl PassthroughFs {
     /// - [`FsError::InvalidHandle`] if the inode is invalid
     pub fn readlink(&self, inode: u64) -> Result<PathBuf> {
         let path = self.inode_path(inode)?;
-        std::fs::read_link(&path).map_err(FsError::Io)
+        std::fs::read_link(&path).map_err(FsError::io)
     }
 
     // ========================================================================
@@ -586,8 +586,8 @@ impl PassthroughFs {
         opts.create(true);
         opts.mode(mode & 0o7777);
 
-        let file = opts.open(&path).map_err(FsError::Io)?;
-        let metadata = file.metadata().map_err(FsError::Io)?;
+        let file = opts.open(&path).map_err(FsError::io)?;
+        let metadata = file.metadata().map_err(FsError::io)?;
 
         // Invalidate negative cache
         self.invalidate_negative_cache(&path);
@@ -630,13 +630,13 @@ impl PassthroughFs {
     ) -> Result<(u64, crate::fuse::FuseAttr)> {
         let path = self.get_path(parent, name)?;
 
-        std::fs::create_dir(&path).map_err(FsError::Io)?;
+        std::fs::create_dir(&path).map_err(FsError::io)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode & 0o7777))
-            .map_err(FsError::Io)?;
+            .map_err(FsError::io)?;
 
         self.invalidate_negative_cache(&path);
 
-        let metadata = std::fs::symlink_metadata(&path).map_err(FsError::Io)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(FsError::io)?;
         let relative = self.relative_path(&path);
         let inode = self.alloc_inode();
 
@@ -665,11 +665,11 @@ impl PassthroughFs {
     ) -> Result<(u64, crate::fuse::FuseAttr)> {
         let path = self.get_path(parent, name)?;
 
-        std::os::unix::fs::symlink(target, &path).map_err(FsError::Io)?;
+        std::os::unix::fs::symlink(target, &path).map_err(FsError::io)?;
 
         self.invalidate_negative_cache(&path);
 
-        let metadata = std::fs::symlink_metadata(&path).map_err(FsError::Io)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(FsError::io)?;
         let relative = self.relative_path(&path);
         let inode = self.alloc_inode();
 
@@ -699,12 +699,12 @@ impl PassthroughFs {
         let source_path = self.inode_path(inode)?;
         let new_path = self.get_path(new_parent, new_name)?;
 
-        std::fs::hard_link(&source_path, &new_path).map_err(FsError::Io)?;
+        std::fs::hard_link(&source_path, &new_path).map_err(FsError::io)?;
 
         self.invalidate_negative_cache(&new_path);
 
         // Hard link shares the same inode
-        let metadata = std::fs::symlink_metadata(&new_path).map_err(FsError::Io)?;
+        let metadata = std::fs::symlink_metadata(&new_path).map_err(FsError::io)?;
 
         // Increment reference count
         {
@@ -746,12 +746,12 @@ impl PassthroughFs {
             )
         };
         if ret != 0 {
-            return Err(FsError::Io(std::io::Error::last_os_error()));
+            return Err(FsError::io(std::io::Error::last_os_error()));
         }
 
         self.invalidate_negative_cache(&path);
 
-        let metadata = std::fs::symlink_metadata(&path).map_err(FsError::Io)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(FsError::io)?;
         let file_type = FileType::from_mode(metadata.mode());
         let relative = self.relative_path(&path);
         let inode = self.alloc_inode();
@@ -779,7 +779,7 @@ impl PassthroughFs {
     /// - [`FsError::InvalidHandle`] if the parent inode is invalid
     pub fn unlink(&self, parent: u64, name: &OsStr) -> Result<()> {
         let path = self.get_path(parent, name)?;
-        std::fs::remove_file(&path).map_err(FsError::Io)?;
+        std::fs::remove_file(&path).map_err(FsError::io)?;
 
         // The old path should now return ENOENT, so we could add it to
         // negative cache, but since the file is gone, it's cleaner to
@@ -795,7 +795,7 @@ impl PassthroughFs {
     /// - [`FsError::InvalidHandle`] if the parent inode is invalid
     pub fn rmdir(&self, parent: u64, name: &OsStr) -> Result<()> {
         let path = self.get_path(parent, name)?;
-        std::fs::remove_dir(&path).map_err(FsError::Io)
+        std::fs::remove_dir(&path).map_err(FsError::io)
     }
 
     /// Renames a file or directory.
@@ -815,7 +815,7 @@ impl PassthroughFs {
         let old_path = self.get_path(parent, name)?;
         let new_path = self.get_path(new_parent, new_name)?;
 
-        std::fs::rename(&old_path, &new_path).map_err(FsError::Io)?;
+        std::fs::rename(&old_path, &new_path).map_err(FsError::io)?;
 
         // Invalidate both paths
         self.invalidate_negative_cache(&old_path);
@@ -883,7 +883,7 @@ impl PassthroughFs {
         let mut opts = OpenOptions::new();
         Self::apply_flags(&mut opts, flags);
 
-        let file = opts.open(&path).map_err(FsError::Io)?;
+        let file = opts.open(&path).map_err(FsError::io)?;
         let handle = self.alloc_handle();
 
         {
@@ -915,10 +915,10 @@ impl PassthroughFs {
 
         data.file
             .seek(SeekFrom::Start(offset))
-            .map_err(FsError::Io)?;
+            .map_err(FsError::io)?;
 
         let mut buf = vec![0u8; size as usize];
-        let n = data.file.read(&mut buf).map_err(FsError::Io)?;
+        let n = data.file.read(&mut buf).map_err(FsError::io)?;
         buf.truncate(n);
 
         Ok(buf)
@@ -943,8 +943,8 @@ impl PassthroughFs {
         handle_data
             .file
             .seek(SeekFrom::Start(offset))
-            .map_err(FsError::Io)?;
-        let n = handle_data.file.write(data).map_err(FsError::Io)?;
+            .map_err(FsError::io)?;
+        let n = handle_data.file.write(data).map_err(FsError::io)?;
 
         #[allow(clippy::cast_possible_truncation)]
         Ok(n as u32)
@@ -965,7 +965,7 @@ impl PassthroughFs {
         let data = handles
             .get_mut(&handle)
             .ok_or(FsError::InvalidHandle(handle))?;
-        data.file.flush().map_err(FsError::Io)
+        data.file.flush().map_err(FsError::io)
     }
 
     /// Syncs a file to disk.
@@ -983,9 +983,9 @@ impl PassthroughFs {
         let data = handles.get(&handle).ok_or(FsError::InvalidHandle(handle))?;
 
         if datasync {
-            data.file.sync_data().map_err(FsError::Io)
+            data.file.sync_data().map_err(FsError::io)
         } else {
-            data.file.sync_all().map_err(FsError::Io)
+            data.file.sync_all().map_err(FsError::io)
         }
     }
 
@@ -1023,7 +1023,7 @@ impl PassthroughFs {
             _ => return Err(FsError::InvalidPath("invalid whence".to_string())),
         };
 
-        data.file.seek(seek_from).map_err(FsError::Io)
+        data.file.seek(seek_from).map_err(FsError::io)
     }
 
     /// Allocates space for a file.
@@ -1046,7 +1046,7 @@ impl PassthroughFs {
         let ret = unsafe { libc::fallocate(fd, mode as i32, offset as i64, length as i64) };
 
         if ret != 0 {
-            Err(FsError::Io(std::io::Error::last_os_error()))
+            Err(FsError::io(std::io::Error::last_os_error()))
         } else {
             Ok(())
         }
@@ -1064,7 +1064,7 @@ impl PassthroughFs {
             .get_mut(&handle)
             .ok_or(FsError::InvalidHandle(handle))?;
         let new_size = offset + length;
-        data.file.set_len(new_size).map_err(FsError::Io)
+        data.file.set_len(new_size).map_err(FsError::io)
     }
 
     // ========================================================================
@@ -1104,9 +1104,9 @@ impl PassthroughFs {
         });
 
         // Read actual entries
-        for entry in std::fs::read_dir(&path).map_err(FsError::Io)? {
-            let entry = entry.map_err(FsError::Io)?;
-            let metadata = entry.metadata().map_err(FsError::Io)?;
+        for entry in std::fs::read_dir(&path).map_err(FsError::io)? {
+            let entry = entry.map_err(FsError::io)?;
+            let metadata = entry.metadata().map_err(FsError::io)?;
             let file_type = FileType::from_mode(metadata.mode());
 
             // Look up or create inode for this entry
@@ -1210,8 +1210,8 @@ impl PassthroughFs {
         let path = self.inode_path(data.inode)?;
 
         // Open directory and sync
-        let dir = File::open(&path).map_err(FsError::Io)?;
-        dir.sync_all().map_err(FsError::Io)
+        let dir = File::open(&path).map_err(FsError::io)?;
+        dir.sync_all().map_err(FsError::io)
     }
 
     // ========================================================================
@@ -1245,7 +1245,7 @@ impl PassthroughFs {
                 )
             };
             if ret < 0 {
-                return Err(FsError::Io(std::io::Error::last_os_error()));
+                return Err(FsError::io(std::io::Error::last_os_error()));
             }
             Ok(vec![0u8; ret as usize])
         } else {
@@ -1259,7 +1259,7 @@ impl PassthroughFs {
                 )
             };
             if ret < 0 {
-                return Err(FsError::Io(std::io::Error::last_os_error()));
+                return Err(FsError::io(std::io::Error::last_os_error()));
             }
             buf.truncate(ret as usize);
             Ok(buf)
@@ -1286,7 +1286,7 @@ impl PassthroughFs {
                 )
             };
             if ret < 0 {
-                return Err(FsError::Io(std::io::Error::last_os_error()));
+                return Err(FsError::io(std::io::Error::last_os_error()));
             }
             Ok(vec![0u8; ret as usize])
         } else {
@@ -1302,7 +1302,7 @@ impl PassthroughFs {
                 )
             };
             if ret < 0 {
-                return Err(FsError::Io(std::io::Error::last_os_error()));
+                return Err(FsError::io(std::io::Error::last_os_error()));
             }
             buf.truncate(ret as usize);
             Ok(buf)
@@ -1333,7 +1333,7 @@ impl PassthroughFs {
             )
         };
         if ret != 0 {
-            Err(FsError::Io(std::io::Error::last_os_error()))
+            Err(FsError::io(std::io::Error::last_os_error()))
         } else {
             Ok(())
         }
@@ -1358,7 +1358,7 @@ impl PassthroughFs {
             )
         };
         if ret != 0 {
-            Err(FsError::Io(std::io::Error::last_os_error()))
+            Err(FsError::io(std::io::Error::last_os_error()))
         } else {
             Ok(())
         }
@@ -1380,7 +1380,7 @@ impl PassthroughFs {
 
         let ret = unsafe { libc::removexattr(path_cstr.as_ptr(), name_cstr.as_ptr()) };
         if ret != 0 {
-            Err(FsError::Io(std::io::Error::last_os_error()))
+            Err(FsError::io(std::io::Error::last_os_error()))
         } else {
             Ok(())
         }
@@ -1396,7 +1396,7 @@ impl PassthroughFs {
 
         let ret = unsafe { libc::removexattr(path_cstr.as_ptr(), name_cstr.as_ptr(), 0) };
         if ret != 0 {
-            Err(FsError::Io(std::io::Error::last_os_error()))
+            Err(FsError::io(std::io::Error::last_os_error()))
         } else {
             Ok(())
         }
@@ -1418,7 +1418,7 @@ impl PassthroughFs {
         let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
         let ret = unsafe { libc::statfs(path_cstr.as_ptr(), &mut stat) };
         if ret != 0 {
-            return Err(FsError::Io(std::io::Error::last_os_error()));
+            return Err(FsError::io(std::io::Error::last_os_error()));
         }
 
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -1450,9 +1450,9 @@ impl PassthroughFs {
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EACCES) {
-                Err(FsError::PermissionDenied(path.display().to_string()))
+                Err(FsError::permission_denied(path.display().to_string()))
             } else {
-                Err(FsError::Io(err))
+                Err(FsError::io(err))
             }
         } else {
             Ok(())
@@ -1529,7 +1529,8 @@ mod tests {
         let (_temp, fs) = setup_test_fs();
 
         let result = fs.lookup(PassthroughFs::ROOT_INODE, OsStr::new("nonexistent.txt"));
-        assert!(matches!(result, Err(FsError::NotFound(_))));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().is_not_found());
     }
 
     #[test]
@@ -1547,7 +1548,8 @@ mod tests {
 
         // Second lookup - should hit cache
         let result = fs.lookup(PassthroughFs::ROOT_INODE, OsStr::new("missing.txt"));
-        assert!(matches!(result, Err(FsError::NotFound(_))));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().is_not_found());
     }
 
     #[test]
@@ -1608,7 +1610,8 @@ mod tests {
 
         // Lookup should fail
         let result = fs.lookup(PassthroughFs::ROOT_INODE, OsStr::new("testdir"));
-        assert!(matches!(result, Err(FsError::NotFound(_))));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().is_not_found());
     }
 
     #[test]

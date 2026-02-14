@@ -1,5 +1,6 @@
 //! Error types for the hypervisor crate.
 
+use arcbox_error::CommonError;
 use thiserror::Error;
 
 /// Result type alias for hypervisor operations.
@@ -8,6 +9,10 @@ pub type Result<T> = std::result::Result<T, HypervisorError>;
 /// Errors that can occur during hypervisor operations.
 #[derive(Debug, Error)]
 pub enum HypervisorError {
+    /// Common error from arcbox-error.
+    #[error(transparent)]
+    Common(#[from] CommonError),
+
     /// Platform not supported.
     #[error("platform not supported: {0}")]
     UnsupportedPlatform(String),
@@ -28,13 +33,9 @@ pub enum HypervisorError {
     #[error("memory error: {0}")]
     MemoryError(String),
 
-    /// Invalid configuration.
-    #[error("invalid configuration: {0}")]
-    InvalidConfig(String),
-
     /// VM not in expected state.
     #[error("VM state error: expected {expected}, got {actual}")]
-    InvalidState { expected: String, actual: String },
+    VmStateError { expected: String, actual: String },
 
     /// vCPU execution error.
     #[error("vCPU execution error: {0}")]
@@ -44,17 +45,9 @@ pub enum HypervisorError {
     #[error("device error: {0}")]
     DeviceError(String),
 
-    /// I/O error.
-    #[error("I/O error: {0}")]
-    IoError(#[from] std::io::Error),
-
     /// VM runtime error.
     #[error("VM error: {0}")]
     VmError(String),
-
-    /// Operation timed out.
-    #[error("timeout: {0}")]
-    Timeout(String),
 
     /// Snapshot error.
     #[error("snapshot error: {0}")]
@@ -73,4 +66,25 @@ pub enum HypervisorError {
     #[cfg(target_os = "linux")]
     #[error("KVM error: {0}")]
     KvmError(String),
+}
+
+impl HypervisorError {
+    /// Creates a timeout error via CommonError.
+    #[must_use]
+    pub fn timeout(msg: impl Into<String>) -> Self {
+        Self::Common(CommonError::timeout(msg))
+    }
+
+    /// Creates an invalid config error via CommonError.
+    #[must_use]
+    pub fn invalid_config(msg: impl Into<String>) -> Self {
+        Self::Common(CommonError::config(msg))
+    }
+}
+
+// Allow automatic conversion from std::io::Error to HypervisorError via CommonError.
+impl From<std::io::Error> for HypervisorError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Common(CommonError::from(err))
+    }
 }

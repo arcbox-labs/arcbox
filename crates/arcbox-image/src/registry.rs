@@ -170,7 +170,7 @@ impl RegistryClient {
 
         let status = response.status();
         if status == StatusCode::NOT_FOUND {
-            return Err(ImageError::NotFound(reference.full_name()));
+            return Err(ImageError::not_found(reference.full_name()));
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -265,7 +265,7 @@ impl RegistryClient {
 
         let status = response.status();
         if status == StatusCode::NOT_FOUND {
-            return Err(ImageError::NotFound(format!("blob {digest}")));
+            return Err(ImageError::not_found(format!("blob {digest}")));
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -313,7 +313,7 @@ impl RegistryClient {
 
         let status = response.status();
         if status == StatusCode::NOT_FOUND {
-            return Err(ImageError::NotFound(format!("blob {digest}")));
+            return Err(ImageError::not_found(format!("blob {digest}")));
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -370,7 +370,7 @@ impl RegistryClient {
 
         let status = response.status();
         if status == StatusCode::NOT_FOUND {
-            return Err(ImageError::NotFound(format!("blob {digest}")));
+            return Err(ImageError::not_found(format!("blob {digest}")));
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();

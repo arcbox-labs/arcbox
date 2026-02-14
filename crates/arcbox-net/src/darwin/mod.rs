@@ -160,7 +160,7 @@ pub fn format_mac(mac: &[u8; 6]) -> String {
 pub fn parse_mac(s: &str) -> Result<[u8; 6]> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 6 {
-        return Err(crate::error::NetError::Config(
+        return Err(crate::error::NetError::config(
             "invalid MAC address format".to_string(),
         ));
     }
@@ -168,7 +168,7 @@ pub fn parse_mac(s: &str) -> Result<[u8; 6]> {
     let mut mac = [0u8; 6];
     for (i, part) in parts.iter().enumerate() {
         mac[i] = u8::from_str_radix(part, 16)
-            .map_err(|_| crate::error::NetError::Config("invalid MAC address byte".to_string()))?;
+            .map_err(|_| crate::error::NetError::config("invalid MAC address byte".to_string()))?;
     }
 
     Ok(mac)

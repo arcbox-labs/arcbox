@@ -148,6 +148,7 @@ dependencies = [
  "arcbox-container",
  "arcbox-core",
  "arcbox-docker",
+ "arcbox-error",
  "arcbox-grpc",
  "arcbox-image",
  "arcbox-protocol",
@@ -200,6 +201,7 @@ dependencies = [
 name = "arcbox-container"
 version = "0.0.1-alpha.2"
 dependencies = [
+ "arcbox-error",
  "arcbox-image",
  "async-trait",
  "chrono",
@@ -217,6 +219,7 @@ name = "arcbox-core"
 version = "0.0.1-alpha.2"
 dependencies = [
  "arcbox-container",
+ "arcbox-error",
  "arcbox-fs",
  "arcbox-hypervisor",
  "arcbox-image",
@@ -253,6 +256,7 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "arcbox-container",
  "arcbox-core",
+ "arcbox-error",
  "arcbox-image",
  "arcbox-protocol",
  "arcbox-transport",
@@ -308,9 +312,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-error"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "arcbox-fs"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "arcbox-error",
  "arcbox-virtio",
  "bytes",
  "dashmap",
@@ -350,6 +362,7 @@ dependencies = [
 name = "arcbox-hypervisor"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "arcbox-error",
  "arcbox-vz",
  "block2",
  "clap",
@@ -368,6 +381,7 @@ dependencies = [
 name = "arcbox-image"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "arcbox-error",
  "bytes",
  "chrono",
  "dirs",
@@ -391,6 +405,7 @@ dependencies = [
 name = "arcbox-net"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "arcbox-error",
  "arcbox-virtio",
  "bytes",
  "chrono",
@@ -420,6 +435,7 @@ dependencies = [
 name = "arcbox-oci"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "arcbox-error",
  "chrono",
  "serde",
  "serde_json",
@@ -475,6 +491,7 @@ dependencies = [
 name = "arcbox-transport"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "arcbox-error",
  "arcbox-protocol",
  "async-trait",
  "bytes",
@@ -489,6 +506,7 @@ dependencies = [
 name = "arcbox-virtio"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "arcbox-error",
  "arcbox-hypervisor",
  "async-trait",
  "bytes",
@@ -503,6 +521,7 @@ dependencies = [
 name = "arcbox-vmm"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "arcbox-error",
  "arcbox-hypervisor",
  "arcbox-virtio",
  "bytes",

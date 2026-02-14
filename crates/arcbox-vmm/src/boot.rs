@@ -149,13 +149,13 @@ impl KernelLoader {
     /// Returns an error if the file cannot be read.
     pub fn detect_kernel_type(path: &Path) -> Result<KernelType> {
         let mut file =
-            File::open(path).map_err(|e| VmmError::Config(format!("Cannot open kernel: {}", e)))?;
+            File::open(path).map_err(|e| VmmError::config(format!("Cannot open kernel: {}", e)))?;
 
         // Read enough to check all signatures (bzImage magic is at 0x202)
         let mut header = [0u8; 0x210];
         let bytes_read = file
             .read(&mut header)
-            .map_err(|e| VmmError::Config(format!("Cannot read kernel header: {}", e)))?;
+            .map_err(|e| VmmError::config(format!("Cannot read kernel header: {}", e)))?;
 
         // Check for Linux bzImage (x86_64) - magic at offset 0x202
         if bytes_read >= 0x206 {
@@ -200,7 +200,7 @@ impl KernelLoader {
         );
 
         let file_size = std::fs::metadata(path)
-            .map_err(|e| VmmError::Config(format!("Cannot stat kernel: {}", e)))?
+            .map_err(|e| VmmError::config(format!("Cannot stat kernel: {}", e)))?
             .len();
 
         let mut params = BootParams::new(path.to_string_lossy(), cmdline);
@@ -243,7 +243,7 @@ impl KernelLoader {
     /// Returns an error if the initrd cannot be loaded.
     pub fn load_initrd(path: &Path, params: &mut BootParams) -> Result<()> {
         let file_size = std::fs::metadata(path)
-            .map_err(|e| VmmError::Config(format!("Cannot stat initrd: {}", e)))?
+            .map_err(|e| VmmError::config(format!("Cannot stat initrd: {}", e)))?
             .len();
 
         let load_addr = match params.kernel_type {
@@ -271,7 +271,7 @@ impl KernelLoader {
     ///
     /// Returns an error if the kernel cannot be read.
     pub fn read_kernel(path: &Path) -> Result<Vec<u8>> {
-        std::fs::read(path).map_err(|e| VmmError::Config(format!("Cannot read kernel: {}", e)))
+        std::fs::read(path).map_err(|e| VmmError::config(format!("Cannot read kernel: {}", e)))
     }
 
     /// Reads the initrd into memory.
@@ -280,7 +280,7 @@ impl KernelLoader {
     ///
     /// Returns an error if the initrd cannot be read.
     pub fn read_initrd(path: &Path) -> Result<Vec<u8>> {
-        std::fs::read(path).map_err(|e| VmmError::Config(format!("Cannot read initrd: {}", e)))
+        std::fs::read(path).map_err(|e| VmmError::config(format!("Cannot read initrd: {}", e)))
     }
 }
 

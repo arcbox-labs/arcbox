@@ -1,6 +1,8 @@
 //! Error types for OCI operations.
 
 use std::path::PathBuf;
+
+use arcbox_error::CommonError;
 use thiserror::Error;
 
 /// Result type alias for OCI operations.
@@ -9,6 +11,10 @@ pub type Result<T> = std::result::Result<T, OciError>;
 /// Errors that can occur during OCI operations.
 #[derive(Debug, Error)]
 pub enum OciError {
+    /// Common errors shared across ArcBox crates.
+    #[error(transparent)]
+    Common(#[from] CommonError),
+
     /// Invalid OCI version.
     #[error("invalid OCI version: {0}")]
     InvalidVersion(String),
@@ -33,10 +39,6 @@ pub enum OciError {
     #[error("invalid bundle structure: {0}")]
     InvalidBundle(String),
 
-    /// Invalid container state.
-    #[error("invalid container state: expected {expected}, got {actual}")]
-    InvalidState { expected: String, actual: String },
-
     /// Container not found.
     #[error("container not found: {0}")]
     ContainerNotFound(String),
@@ -56,8 +58,10 @@ pub enum OciError {
     /// JSON parsing error.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+}
 
-    /// I/O error.
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+impl From<std::io::Error> for OciError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Common(CommonError::from(err))
+    }
 }

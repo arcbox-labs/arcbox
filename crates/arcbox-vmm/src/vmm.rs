@@ -192,21 +192,21 @@ impl Vmm {
     pub fn new(config: VmmConfig) -> Result<Self> {
         // Validate configuration
         if config.vcpu_count == 0 {
-            return Err(VmmError::Config("vcpu_count must be > 0".to_string()));
+            return Err(VmmError::config("vcpu_count must be > 0".to_string()));
         }
 
         if config.memory_size < 64 * 1024 * 1024 {
-            return Err(VmmError::Config("memory_size must be >= 64MB".to_string()));
+            return Err(VmmError::config("memory_size must be >= 64MB".to_string()));
         }
 
         if !config.kernel_path.as_os_str().is_empty() && !config.kernel_path.exists() {
-            return Err(VmmError::Config(format!(
+            return Err(VmmError::config(format!(
                 "kernel not found: {}",
                 config.kernel_path.display()
             )));
         }
         if config.vsock && config.guest_cid.is_none() {
-            return Err(VmmError::Config(
+            return Err(VmmError::config(
                 "guest_cid must be set when vsock is enabled".to_string(),
             ));
         }
@@ -258,7 +258,7 @@ impl Vmm {
     /// Returns an error if initialization fails.
     pub fn initialize(&mut self) -> Result<()> {
         if self.state != VmmState::Created {
-            return Err(VmmError::InvalidState(format!(
+            return Err(VmmError::invalid_state(format!(
                 "cannot initialize from state {:?}",
                 self.state
             )));
@@ -513,7 +513,7 @@ impl Vmm {
         }
 
         if self.state != VmmState::Initializing && self.state != VmmState::Stopped {
-            return Err(VmmError::InvalidState(format!(
+            return Err(VmmError::invalid_state(format!(
                 "cannot start from state {:?}",
                 self.state
             )));
@@ -567,7 +567,7 @@ impl Vmm {
     /// Returns an error if the VMM cannot be paused.
     pub fn pause(&mut self) -> Result<()> {
         if self.state != VmmState::Running {
-            return Err(VmmError::InvalidState(format!(
+            return Err(VmmError::invalid_state(format!(
                 "cannot pause from state {:?}",
                 self.state
             )));
@@ -612,7 +612,7 @@ impl Vmm {
     /// Returns an error if the VMM cannot be resumed.
     pub fn resume(&mut self) -> Result<()> {
         if self.state != VmmState::Paused {
-            return Err(VmmError::InvalidState(format!(
+            return Err(VmmError::invalid_state(format!(
                 "cannot resume from state {:?}",
                 self.state
             )));
@@ -718,7 +718,7 @@ impl Vmm {
         use arcbox_hypervisor::darwin::DarwinVm;
 
         if self.state != VmmState::Running {
-            return Err(VmmError::InvalidState(format!(
+            return Err(VmmError::invalid_state(format!(
                 "cannot connect vsock: VMM is {:?}",
                 self.state
             )));
@@ -730,7 +730,7 @@ impl Vmm {
             }
         }
 
-        Err(VmmError::InvalidState(
+        Err(VmmError::invalid_state(
             "vsock not available in manual execution mode".to_string(),
         ))
     }
@@ -769,7 +769,7 @@ impl Vmm {
         use arcbox_hypervisor::darwin::DarwinVm;
 
         if self.state != VmmState::Running {
-            return Err(VmmError::InvalidState(format!(
+            return Err(VmmError::invalid_state(format!(
                 "cannot set balloon target: VMM is {:?}",
                 self.state
             )));
@@ -783,7 +783,7 @@ impl Vmm {
             }
         }
 
-        Err(VmmError::InvalidState(
+        Err(VmmError::invalid_state(
             "balloon not available in manual execution mode".to_string(),
         ))
     }
@@ -843,7 +843,7 @@ impl Vmm {
     #[cfg(target_os = "linux")]
     pub fn connect_vsock(&self, port: u32) -> Result<std::os::unix::io::RawFd> {
         if self.state != VmmState::Running {
-            return Err(VmmError::InvalidState(format!(
+            return Err(VmmError::invalid_state(format!(
                 "cannot connect vsock: VMM is {:?}",
                 self.state
             )));
@@ -875,7 +875,7 @@ impl Vmm {
         let guest_cid = self
             .config
             .guest_cid
-            .ok_or_else(|| VmmError::InvalidState("guest_cid not configured".to_string()))?;
+            .ok_or_else(|| VmmError::invalid_state("guest_cid not configured".to_string()))?;
 
         let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
         if fd < 0 {
@@ -1245,7 +1245,7 @@ fn build_fdt_config(
 
     if let Some(initrd) = &config.initrd_path {
         let size = std::fs::metadata(initrd)
-            .map_err(|e| VmmError::Config(format!("Cannot stat initrd: {}", e)))?
+            .map_err(|e| VmmError::config(format!("Cannot stat initrd: {}", e)))?
             .len();
         fdt_config.initrd_addr = Some(arm64::INITRD_LOAD_ADDR);
         fdt_config.initrd_size = Some(size);

@@ -1,5 +1,6 @@
 //! Error types for the network stack.
 
+use arcbox_error::CommonError;
 use thiserror::Error;
 
 /// Result type alias for network operations.
@@ -8,9 +9,9 @@ pub type Result<T> = std::result::Result<T, NetError>;
 /// Errors that can occur during network operations.
 #[derive(Debug, Error)]
 pub enum NetError {
-    /// I/O error.
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    /// Common errors shared across ArcBox crates.
+    #[error(transparent)]
+    Common(#[from] CommonError),
 
     /// Interface error.
     #[error("interface error: {0}")]
@@ -35,10 +36,6 @@ pub enum NetError {
     /// Backend error.
     #[error("backend error: {0}")]
     Backend(String),
-
-    /// Configuration error.
-    #[error("configuration error: {0}")]
-    Config(String),
 
     /// Netlink error (Linux only).
     #[error("netlink error: {0}")]
@@ -83,4 +80,24 @@ pub enum NetError {
     /// mDNS error.
     #[error("mDNS error: {0}")]
     Mdns(String),
+}
+
+impl From<std::io::Error> for NetError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Common(CommonError::from(err))
+    }
+}
+
+impl NetError {
+    /// Creates a configuration error.
+    #[must_use]
+    pub fn config(msg: impl Into<String>) -> Self {
+        Self::Common(CommonError::config(msg))
+    }
+
+    /// Creates an I/O error.
+    #[must_use]
+    pub fn io(err: std::io::Error) -> Self {
+        Self::Common(CommonError::from(err))
+    }
 }

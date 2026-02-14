@@ -363,10 +363,10 @@ impl Runtime {
         let machine = self
             .machine_manager
             .get(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         if machine.state != MachineState::Running {
-            return Err(CoreError::InvalidState(format!(
+            return Err(CoreError::invalid_state(format!(
                 "machine '{}' is not running",
                 machine_name
             )));
@@ -387,11 +387,14 @@ impl Runtime {
 
         // Extract image to create rootfs
         let image_ref = ImageRef::parse(&config.image).ok_or_else(|| {
-            CoreError::Config(format!("invalid image reference: {}", config.image))
+            CoreError::config(format!("invalid image reference: {}", config.image))
         })?;
 
         // Check if image exists locally, if not, pull it automatically (Docker-like UX).
-        if let Err(ImageError::NotFound(_)) = self.image_store.get_image_config(&image_ref) {
+        if let Err(e) = self.image_store.get_image_config(&image_ref) {
+            if !e.is_not_found() {
+                return Err(e.into());
+            }
             tracing::info!(
                 "Image {} not found locally, pulling from registry...",
                 config.image
@@ -528,7 +531,7 @@ impl Runtime {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         let start_outcome = self.container_manager.begin_start(container_id)?;
         let start_ticket = match start_outcome {
@@ -686,7 +689,7 @@ impl Runtime {
         let container = self
             .container_manager
             .get(container_id)
-            .ok_or_else(|| CoreError::NotFound(container_id.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(container_id.to_string()))?;
 
         let port_bindings = match &container.config {
             Some(cfg) if !cfg.port_bindings.is_empty() => &cfg.port_bindings,
@@ -756,7 +759,7 @@ impl Runtime {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         // Send stop request to agent first
         let container_id_str = container_id.to_string();
@@ -796,7 +799,7 @@ impl Runtime {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         let exit_code = {
             #[cfg(target_os = "macos")]
@@ -836,7 +839,7 @@ impl Runtime {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         // Send remove request to agent first
         let container_id_str = container_id.to_string();
@@ -880,7 +883,7 @@ impl Runtime {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         let response = {
             #[cfg(target_os = "macos")]
@@ -919,7 +922,7 @@ impl Runtime {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         let req = LogsRequest {
             container_id: container_id.to_string(),
@@ -970,7 +973,7 @@ impl Runtime {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         let req = LogsRequest {
             container_id: container_id.to_string(),
@@ -1020,7 +1023,7 @@ impl Runtime {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         let req = AttachRequest {
             container_id: container_id.to_string(),
@@ -1096,7 +1099,7 @@ impl Runtime {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         let req = arcbox_protocol::agent::ExecStartRequest {
             exec_id: exec_id.to_string(),
@@ -1139,7 +1142,7 @@ impl Runtime {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         let req = arcbox_protocol::agent::ExecResizeRequest {
             exec_id: exec_id.to_string(),
@@ -1176,7 +1179,7 @@ impl Runtime {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         // Send stop request to agent with 0 timeout (immediate kill).
         // Note: The agent protocol doesn't have a dedicated kill RPC,
@@ -1231,7 +1234,7 @@ impl Runtime {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         let container_id_str = container_id.to_string();
 
@@ -1276,7 +1279,7 @@ impl Runtime {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         let container_id_str = container_id.to_string();
 
@@ -1319,7 +1322,7 @@ impl Runtime {
         let _cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         #[cfg(target_os = "macos")]
         {
@@ -1348,7 +1351,7 @@ impl Runtime {
         let _cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         #[cfg(target_os = "macos")]
         {
@@ -1388,7 +1391,7 @@ impl Runtime {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         let req = arcbox_protocol::agent::ExecRequest {
             container_id: container_id.to_string(),
@@ -1440,7 +1443,7 @@ impl Runtime {
         let cid = self
             .machine_manager
             .get_cid(machine_name)
-            .ok_or_else(|| CoreError::NotFound(machine_name.to_string()))?;
+            .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
         // Empty container_id means execute in VM namespace.
         let req = arcbox_protocol::agent::ExecRequest {

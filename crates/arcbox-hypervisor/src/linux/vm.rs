@@ -864,7 +864,7 @@ impl VirtualMachine for KvmVm {
     fn start(&mut self) -> Result<(), HypervisorError> {
         let state = self.state();
         if state != VmState::Created && state != VmState::Stopped {
-            return Err(HypervisorError::InvalidState {
+            return Err(HypervisorError::VmStateError {
                 expected: "Created or Stopped".to_string(),
                 actual: format!("{:?}", state),
             });
@@ -884,7 +884,7 @@ impl VirtualMachine for KvmVm {
     fn pause(&mut self) -> Result<(), HypervisorError> {
         let state = self.state();
         if state != VmState::Running {
-            return Err(HypervisorError::InvalidState {
+            return Err(HypervisorError::VmStateError {
                 expected: "Running".to_string(),
                 actual: format!("{:?}", state),
             });
@@ -904,7 +904,7 @@ impl VirtualMachine for KvmVm {
     fn resume(&mut self) -> Result<(), HypervisorError> {
         let state = self.state();
         if state != VmState::Paused {
-            return Err(HypervisorError::InvalidState {
+            return Err(HypervisorError::VmStateError {
                 expected: "Paused".to_string(),
                 actual: format!("{:?}", state),
             });
@@ -920,7 +920,7 @@ impl VirtualMachine for KvmVm {
     fn stop(&mut self) -> Result<(), HypervisorError> {
         let state = self.state();
         if state != VmState::Running && state != VmState::Paused {
-            return Err(HypervisorError::InvalidState {
+            return Err(HypervisorError::VmStateError {
                 expected: "Running or Paused".to_string(),
                 actual: format!("{:?}", state),
             });

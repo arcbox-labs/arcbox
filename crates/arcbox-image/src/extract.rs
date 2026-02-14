@@ -397,7 +397,7 @@ impl ImageStore {
             .join(&reference.reference);
 
         if !ref_path.exists() {
-            return Err(ImageError::NotFound(format!(
+            return Err(ImageError::not_found(format!(
                 "manifest reference not found: {reference}"
             )));
         }
@@ -636,15 +636,15 @@ mod tests {
         let result = store.get_manifest(&reference);
 
         assert!(result.is_err());
-        match result.unwrap_err() {
-            ImageError::NotFound(msg) => {
-                assert!(
-                    msg.contains("manifest reference not found"),
-                    "Error should indicate manifest not found: {msg}"
-                );
-            }
-            err => panic!("Expected NotFound error, got: {err:?}"),
-        }
+        let err = result.unwrap_err();
+        assert!(
+            err.is_not_found(),
+            "Expected NotFound error, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("manifest reference not found"),
+            "Error should indicate manifest not found: {err}"
+        );
     }
 
     #[test]
@@ -657,12 +657,11 @@ mod tests {
 
         // Should return NotFound since the image hasn't been pulled.
         assert!(result.is_err());
-        match result.unwrap_err() {
-            ImageError::NotFound(_) => {
-                // Expected - image doesn't exist locally.
-            }
-            err => panic!("Expected NotFound error, got: {err:?}"),
-        }
+        let err = result.unwrap_err();
+        assert!(
+            err.is_not_found(),
+            "Expected NotFound error, got: {err:?}"
+        );
     }
 
     #[test]
@@ -676,9 +675,10 @@ mod tests {
         let result = store.get_image_config(&reference);
 
         // Verify this returns the exact error type that runtime uses to trigger auto-pull.
+        let err = result.unwrap_err();
         assert!(
-            matches!(result, Err(ImageError::NotFound(_))),
-            "Missing image should return ImageError::NotFound to trigger auto-pull"
+            err.is_not_found(),
+            "Missing image should return NotFound error to trigger auto-pull, got: {err:?}"
         );
     }
 }

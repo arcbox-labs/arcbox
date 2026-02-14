@@ -90,7 +90,7 @@ impl ApiServer {
         // Parse gRPC address
         let grpc_addr =
             self.config.grpc_addr.parse().map_err(|e| {
-                crate::error::ApiError::Config(format!("invalid gRPC address: {}", e))
+                crate::error::ApiError::config(format!("invalid gRPC address: {}", e))
             })?;
 
         tracing::info!("ArcBox API server starting");

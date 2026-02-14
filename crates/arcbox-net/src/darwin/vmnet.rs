@@ -195,7 +195,7 @@ impl Vmnet {
         let queue = unsafe { dispatch_queue_create(queue_label.as_ptr(), ptr::null()) };
 
         if queue.is_null() {
-            return Err(NetError::Config(
+            return Err(NetError::config(
                 "failed to create dispatch queue".to_string(),
             ));
         }
@@ -206,7 +206,7 @@ impl Vmnet {
             let dict = create_vmnet_config_dict();
             if dict.is_null() {
                 dispatch_release(queue as *mut _);
-                return Err(NetError::Config(
+                return Err(NetError::config(
                     "failed to create config dictionary".to_string(),
                 ));
             }
@@ -280,7 +280,7 @@ impl Vmnet {
                     } else {
                         CFRelease(dict as _);
                         dispatch_release(queue as *mut _);
-                        return Err(NetError::Config(
+                        return Err(NetError::config(
                             "bridge mode requires interface name".to_string(),
                         ));
                     }
@@ -307,7 +307,7 @@ impl Vmnet {
             unsafe {
                 dispatch_release(queue as *mut _);
             }
-            return Err(NetError::Config(
+            return Err(NetError::config(
                 "failed to start vmnet interface (requires root or entitlements)".to_string(),
             ));
         }
@@ -376,7 +376,7 @@ impl Vmnet {
     /// Returns an error if the read operation fails.
     pub fn read_packet(&self, buf: &mut [u8]) -> Result<usize> {
         if !self.is_running() {
-            return Err(NetError::Config("interface not running".to_string()));
+            return Err(NetError::config("interface not running".to_string()));
         }
 
         // Create iovec for the buffer.
@@ -403,7 +403,7 @@ impl Vmnet {
                 // No packets available.
                 return Ok(0);
             }
-            return Err(NetError::Io(std::io::Error::new(
+            return Err(NetError::io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 status.message(),
             )));
@@ -423,11 +423,11 @@ impl Vmnet {
     /// Returns an error if the write operation fails.
     pub fn write_packet(&self, data: &[u8]) -> Result<usize> {
         if !self.is_running() {
-            return Err(NetError::Config("interface not running".to_string()));
+            return Err(NetError::config("interface not running".to_string()));
         }
 
         if data.len() > self.max_packet_size {
-            return Err(NetError::Config(format!(
+            return Err(NetError::config(format!(
                 "packet too large: {} > {}",
                 data.len(),
                 self.max_packet_size
@@ -455,14 +455,14 @@ impl Vmnet {
         let status = unsafe { vmnet_write(self.interface, &mut packet, &mut pktcnt) };
 
         if !status.is_success() {
-            return Err(NetError::Io(std::io::Error::new(
+            return Err(NetError::io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 status.message(),
             )));
         }
 
         if pktcnt == 0 {
-            return Err(NetError::Io(std::io::Error::new(
+            return Err(NetError::io(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "no packets written",
             )));
