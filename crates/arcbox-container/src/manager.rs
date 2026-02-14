@@ -39,20 +39,45 @@ pub struct ContainerManager {
     /// Channel to notify waiters when a container exits.
     /// Sends (container_id, exit_code).
     exit_sender: broadcast::Sender<(ContainerId, i32)>,
+    /// Channel to notify waiters when container state changes.
+    /// Sends (container_id, new_state).
+    state_sender: broadcast::Sender<(ContainerId, ContainerState)>,
     /// Agent connection for communicating with guest VM.
     agent: Option<Arc<dyn AgentConnection>>,
+}
+
+/// Snapshot for rolling back a start transition.
+#[derive(Debug)]
+pub struct StartTicket {
+    prev_state: ContainerState,
+    prev_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    prev_finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    prev_exit_code: Option<i32>,
+}
+
+/// Result of a start transition attempt.
+#[derive(Debug)]
+pub enum StartOutcome {
+    /// Transitioned to Starting; caller should invoke the agent.
+    Started(StartTicket),
+    /// Container is already running.
+    AlreadyRunning,
+    /// Container start is already in progress.
+    AlreadyStarting,
 }
 
 impl ContainerManager {
     /// Creates a new container manager.
     #[must_use]
     pub fn new() -> Self {
-        // Create broadcast channel with reasonable capacity.
+        // Create broadcast channels with reasonable capacity.
         let (exit_sender, _) = broadcast::channel(256);
+        let (state_sender, _) = broadcast::channel(256);
 
         Self {
             containers: RwLock::new(HashMap::new()),
             exit_sender,
+            state_sender,
             agent: None,
         }
     }
@@ -61,10 +86,12 @@ impl ContainerManager {
     #[must_use]
     pub fn with_agent(agent: Arc<dyn AgentConnection>) -> Self {
         let (exit_sender, _) = broadcast::channel(256);
+        let (state_sender, _) = broadcast::channel(256);
 
         Self {
             containers: RwLock::new(HashMap::new()),
             exit_sender,
+            state_sender,
             agent: Some(agent),
         }
     }
@@ -123,47 +150,12 @@ impl ContainerManager {
     ///
     /// Returns an error if the container cannot be started.
     pub async fn start(&self, id: &ContainerId) -> Result<()> {
-        // First validate state (holding lock briefly).
-        {
-            let containers = self
-                .containers
-                .read()
-                .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
-
-            let container = containers
-                .get(id)
-                .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
-
-            if container.state != ContainerState::Created
-                && container.state != ContainerState::Exited
-            {
-                return Err(ContainerError::InvalidState(format!(
-                    "cannot start from state {}",
-                    container.state
-                )));
+        match self.begin_start(id)? {
+            StartOutcome::Started(_ticket) => {
+                self.finish_start(id)?;
             }
+            StartOutcome::AlreadyRunning | StartOutcome::AlreadyStarting => {}
         }
-
-        // Send start command to agent if connected.
-        if let Some(ref agent) = self.agent {
-            agent
-                .start_container(id.as_str())
-                .await
-                .map_err(|e| ContainerError::Runtime(format!("agent start failed: {}", e)))?;
-        }
-
-        // Update local state after successful agent call.
-        let mut containers = self
-            .containers
-            .write()
-            .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
-
-        let container = containers
-            .get_mut(id)
-            .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
-
-        container.state = ContainerState::Running;
-        container.started_at = Some(chrono::Utc::now());
         Ok(())
     }
 
@@ -286,8 +278,8 @@ impl ContainerManager {
     ///
     /// Returns an error if the container cannot be restarted.
     pub async fn restart(&self, id: &ContainerId, timeout: u32) -> Result<()> {
-        // Check if container is running (holding lock briefly).
-        let is_running = {
+        // Check current state (holding lock briefly).
+        let state = {
             let containers = self
                 .containers
                 .read()
@@ -297,11 +289,17 @@ impl ContainerManager {
                 .get(id)
                 .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
 
-            container.state == ContainerState::Running
+            container.state
         };
 
+        if state == ContainerState::Starting {
+            return Err(ContainerError::InvalidState(
+                "cannot restart while starting".to_string(),
+            ));
+        }
+
         // Stop if running (lock is released before await).
-        if is_running {
+        if state == ContainerState::Running {
             self.stop(id, timeout).await?;
         }
 
@@ -320,6 +318,92 @@ impl ContainerManager {
 
         // Start the container.
         self.start(id).await
+    }
+
+    /// Marks a container as starting, returning the previous state snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container is in an invalid state.
+    pub fn begin_start(&self, id: &ContainerId) -> Result<StartOutcome> {
+        let mut containers = self
+            .containers
+            .write()
+            .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
+
+        let container = containers
+            .get_mut(id)
+            .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+
+        match container.state {
+            ContainerState::Created | ContainerState::Exited => {
+                let ticket = StartTicket {
+                    prev_state: container.state,
+                    prev_started_at: container.started_at,
+                    prev_finished_at: container.finished_at,
+                    prev_exit_code: container.exit_code,
+                };
+                container.state = ContainerState::Starting;
+                container.started_at = None;
+                container.finished_at = None;
+                container.exit_code = None;
+                Ok(StartOutcome::Started(ticket))
+            }
+            ContainerState::Running => Ok(StartOutcome::AlreadyRunning),
+            ContainerState::Starting => Ok(StartOutcome::AlreadyStarting),
+            _ => Err(ContainerError::InvalidState(format!(
+                "cannot start from state {}",
+                container.state
+            ))),
+        }
+    }
+
+    /// Marks a container as running after a successful start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container is not found.
+    pub fn finish_start(&self, id: &ContainerId) -> Result<()> {
+        let mut containers = self
+            .containers
+            .write()
+            .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
+
+        let container = containers
+            .get_mut(id)
+            .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+
+        container.state = ContainerState::Running;
+        container.started_at = Some(chrono::Utc::now());
+        container.finished_at = None;
+        container.exit_code = None;
+
+        // Notify state change waiters.
+        let _ = self.state_sender.send((id.clone(), ContainerState::Running));
+
+        Ok(())
+    }
+
+    /// Restores container state if a start attempt fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container is not found.
+    pub fn fail_start(&self, id: &ContainerId, ticket: StartTicket) -> Result<()> {
+        let mut containers = self
+            .containers
+            .write()
+            .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
+
+        let container = containers
+            .get_mut(id)
+            .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+
+        container.state = ticket.prev_state;
+        container.started_at = ticket.prev_started_at;
+        container.finished_at = ticket.prev_finished_at;
+        container.exit_code = ticket.prev_exit_code;
+        Ok(())
     }
 
     /// Checks if a container has already exited and returns its exit code.
@@ -435,8 +519,117 @@ impl ContainerManager {
             }
         }
 
-        // Notify waiters (ignore if no one is listening).
+        // Notify state change waiters.
+        let _ = self.state_sender.send((id.clone(), ContainerState::Exited));
+        // Notify exit waiters (ignore if no one is listening).
         let _ = self.exit_sender.send((id.clone(), exit_code));
+    }
+
+    /// Waits for a container to reach Running or Exited state.
+    ///
+    /// This is useful for attach operations that need to wait for the container
+    /// to be ready before attaching to its streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container is not found or if waiting times out.
+    pub async fn wait_for_running_or_exited(
+        &self,
+        id: &ContainerId,
+        timeout: std::time::Duration,
+    ) -> Result<ContainerState> {
+        use tokio::time::timeout as tokio_timeout;
+
+        // First check current state.
+        {
+            let containers = self
+                .containers
+                .read()
+                .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
+
+            let container = containers
+                .get(id)
+                .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
+
+            match container.state {
+                ContainerState::Running | ContainerState::Exited | ContainerState::Dead => {
+                    return Ok(container.state);
+                }
+                _ => {}
+            }
+        }
+
+        // Subscribe to state changes before checking again to avoid race.
+        let mut receiver = self.state_sender.subscribe();
+        let target_id = id.clone();
+
+        // Check again after subscribing.
+        {
+            let containers = self
+                .containers
+                .read()
+                .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
+
+            if let Some(container) = containers.get(&target_id) {
+                match container.state {
+                    ContainerState::Running | ContainerState::Exited | ContainerState::Dead => {
+                        return Ok(container.state);
+                    }
+                    _ => {}
+                }
+            } else {
+                return Err(ContainerError::NotFound(target_id.to_string()));
+            }
+        }
+
+        // Wait for state change with timeout.
+        let wait_future = async {
+            loop {
+                match receiver.recv().await {
+                    Ok((changed_id, new_state)) => {
+                        if changed_id == target_id {
+                            match new_state {
+                                ContainerState::Running
+                                | ContainerState::Exited
+                                | ContainerState::Dead => {
+                                    return Ok(new_state);
+                                }
+                                _ => continue,
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Missed some messages, check current state.
+                        let containers = self.containers.read().map_err(|_| {
+                            ContainerError::Runtime("lock poisoned".to_string())
+                        })?;
+                        if let Some(container) = containers.get(&target_id) {
+                            match container.state {
+                                ContainerState::Running
+                                | ContainerState::Exited
+                                | ContainerState::Dead => {
+                                    return Ok(container.state);
+                                }
+                                _ => continue,
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err(ContainerError::Runtime(
+                            "state change channel closed".to_string(),
+                        ));
+                    }
+                }
+            }
+        };
+
+        match tokio_timeout(timeout, wait_future).await {
+            Ok(result) => result,
+            Err(_) => Err(ContainerError::Runtime(format!(
+                "timeout waiting for container {} to start",
+                id
+            ))),
+        }
     }
 
     /// Removes a container.
@@ -454,7 +647,7 @@ impl ContainerManager {
             .get(id)
             .ok_or_else(|| ContainerError::NotFound(id.to_string()))?;
 
-        if container.state == ContainerState::Running {
+        if matches!(container.state, ContainerState::Running | ContainerState::Starting) {
             return Err(ContainerError::InvalidState(
                 "cannot remove running container".to_string(),
             ));
@@ -523,5 +716,32 @@ impl ContainerManager {
 impl Default for ContainerManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn start_is_atomic_and_blocks_concurrent_start() {
+        let manager = ContainerManager::new();
+
+        let mut config = ContainerConfig::default();
+        config.image = "alpine".to_string();
+        let id = manager.create(config).unwrap();
+
+        let outcome = manager.begin_start(&id).unwrap();
+        assert!(matches!(outcome, StartOutcome::Started(_)));
+        let state = manager.get(&id).unwrap().state;
+        assert_eq!(state, ContainerState::Starting);
+
+        let second = manager.begin_start(&id).unwrap();
+        assert!(matches!(second, StartOutcome::AlreadyStarting));
+
+        manager.finish_start(&id).unwrap();
+        assert_eq!(
+            manager.get(&id).unwrap().state,
+            ContainerState::Running
+        );
     }
 }

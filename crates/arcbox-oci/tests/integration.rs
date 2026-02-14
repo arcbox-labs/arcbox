@@ -434,7 +434,7 @@ fn test_bundle_utilities() {
     for i in 1..=5 {
         let path = dir.path().join(format!("bundle-{i}"));
         BundleBuilder::new()
-            .hostname(&format!("container-{i}"))
+            .hostname(format!("container-{i}"))
             .build(&path)
             .unwrap();
     }

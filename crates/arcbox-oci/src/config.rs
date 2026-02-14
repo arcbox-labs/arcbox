@@ -1488,11 +1488,10 @@ mod tests {
     fn test_valid_oci_versions() {
         // Valid semver versions should pass.
         for version in ["1.0.0", "1.2.0", "2.0.0-rc1", "1.0.0-alpha+build"] {
-            let json = format!(r#"{{"ociVersion": "{}"}}"#, version);
+            let json = format!(r#"{{"ociVersion": "{version}"}}"#);
             assert!(
                 Spec::from_json(&json).is_ok(),
-                "Version {} should be valid",
-                version
+                "Version {version} should be valid"
             );
         }
     }

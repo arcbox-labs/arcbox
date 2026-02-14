@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn test_hook_context_new() {
         let state = State::new("test".to_string(), std::path::PathBuf::from("/bundle"));
-        let context = HookContext::new(state.clone(), std::path::PathBuf::from("/bundle"));
+        let context = HookContext::new(state, std::path::PathBuf::from("/bundle"));
 
         assert_eq!(context.state.id, "test");
         assert_eq!(context.bundle, std::path::PathBuf::from("/bundle"));

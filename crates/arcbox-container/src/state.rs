@@ -47,6 +47,8 @@ impl std::fmt::Display for ContainerId {
 pub enum ContainerState {
     /// Container created but not started.
     Created,
+    /// Container start requested but not yet running.
+    Starting,
     /// Container is running.
     Running,
     /// Container is paused.
@@ -65,6 +67,7 @@ impl std::fmt::Display for ContainerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Created => write!(f, "created"),
+            Self::Starting => write!(f, "starting"),
             Self::Running => write!(f, "running"),
             Self::Paused => write!(f, "paused"),
             Self::Restarting => write!(f, "restarting"),
