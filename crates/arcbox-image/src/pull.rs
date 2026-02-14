@@ -284,12 +284,14 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    #[allow(dead_code)]
     struct CountingProgress {
         layer_starts: AtomicU32,
         layer_completes: AtomicU32,
         complete_calls: AtomicU32,
     }
 
+    #[allow(dead_code)]
     impl CountingProgress {
         fn new() -> Self {
             Self {

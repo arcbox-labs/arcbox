@@ -183,9 +183,8 @@ impl RootfsBuilder {
                 continue;
             }
 
-            if file_name.starts_with(WHITEOUT_PREFIX) {
+            if let Some(target_name) = file_name.strip_prefix(WHITEOUT_PREFIX) {
                 // Whiteout file - mark target for deletion
-                let target_name = &file_name[WHITEOUT_PREFIX.len()..];
                 if let Some(parent) = path.parent() {
                     let target_path = parent.join(target_name);
                     let full_target = self.rootfs_path.join(&target_path);
@@ -244,23 +243,19 @@ impl RootfsBuilder {
                 }
                 tar::EntryType::Symlink => {
                     // Create symlink
-                    if let Ok(link_target) = entry.link_name() {
-                        if let Some(target) = link_target {
-                            // Remove existing file/symlink if present
-                            let _ = fs::remove_file(&dest_path);
-                            std::os::unix::fs::symlink(target, &dest_path)?;
-                        }
+                    if let Ok(Some(target)) = entry.link_name() {
+                        // Remove existing file/symlink if present
+                        let _ = fs::remove_file(&dest_path);
+                        std::os::unix::fs::symlink(target, &dest_path)?;
                     }
                 }
                 tar::EntryType::Link => {
                     // Create hard link
-                    if let Ok(link_target) = entry.link_name() {
-                        if let Some(target) = link_target {
-                            let link_src = self.rootfs_path.join(target.as_ref());
-                            if link_src.exists() {
-                                let _ = fs::remove_file(&dest_path);
-                                fs::hard_link(&link_src, &dest_path)?;
-                            }
+                    if let Ok(Some(target)) = entry.link_name() {
+                        let link_src = self.rootfs_path.join(target.as_ref());
+                        if link_src.exists() {
+                            let _ = fs::remove_file(&dest_path);
+                            fs::hard_link(&link_src, &dest_path)?;
                         }
                     }
                 }
@@ -283,6 +278,7 @@ impl RootfsBuilder {
     }
 
     /// Clears all content in a directory (for opaque whiteout).
+    #[allow(clippy::unused_self)]
     fn clear_directory(&self, dir: &Path) -> Result<()> {
         if !dir.exists() {
             return Ok(());
@@ -302,6 +298,7 @@ impl RootfsBuilder {
     }
 
     /// Checks if a file is gzip compressed.
+    #[allow(clippy::unused_self)]
     fn is_gzip(&self, path: &Path) -> Result<bool> {
         let mut file = File::open(path)?;
         let mut magic = [0u8; 2];
@@ -313,6 +310,11 @@ impl RootfsBuilder {
     }
 
     /// Finalizes the rootfs and returns the path.
+    ///
+    /// # Errors
+    ///
+    /// This function currently does not return errors, but returns `Result`
+    /// for future compatibility.
     pub fn finalize(self) -> Result<PathBuf> {
         info!(
             rootfs = %self.rootfs_path.display(),
@@ -325,6 +327,7 @@ impl RootfsBuilder {
 
 /// Type of whiteout entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum WhiteoutType {
     /// Regular whiteout (delete specific file).
     File,
@@ -395,8 +398,7 @@ impl ImageStore {
 
         if !ref_path.exists() {
             return Err(ImageError::NotFound(format!(
-                "manifest reference not found: {}",
-                reference
+                "manifest reference not found: {reference}"
             )));
         }
 
@@ -638,11 +640,10 @@ mod tests {
             ImageError::NotFound(msg) => {
                 assert!(
                     msg.contains("manifest reference not found"),
-                    "Error should indicate manifest not found: {}",
-                    msg
+                    "Error should indicate manifest not found: {msg}"
                 );
             }
-            err => panic!("Expected NotFound error, got: {:?}", err),
+            err => panic!("Expected NotFound error, got: {err:?}"),
         }
     }
 
@@ -660,7 +661,7 @@ mod tests {
             ImageError::NotFound(_) => {
                 // Expected - image doesn't exist locally.
             }
-            err => panic!("Expected NotFound error, got: {:?}", err),
+            err => panic!("Expected NotFound error, got: {err:?}"),
         }
     }
 
