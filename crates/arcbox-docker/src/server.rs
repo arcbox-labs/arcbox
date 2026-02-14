@@ -4,8 +4,8 @@ use crate::api::create_router;
 use crate::error::Result;
 use arcbox_core::Runtime;
 use hyper::body::Incoming;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder;
+use hyper::server::conn::http1;
+use hyper_util::rt::TokioIo;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixListener;
@@ -91,8 +91,9 @@ impl DockerApiServer {
                         tower_service.clone().call(request)
                     });
 
-                if let Err(err) = Builder::new(TokioExecutor::new())
-                    .serve_connection_with_upgrades(TokioIo::new(stream), hyper_service)
+                if let Err(err) = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), hyper_service)
+                    .with_upgrades()
                     .await
                 {
                     // Ignore normal connection shutdown errors (client closed connection)

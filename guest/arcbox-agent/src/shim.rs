@@ -46,6 +46,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
@@ -285,6 +286,20 @@ pub trait LogWriter: Send + Sync {
 
     /// Flushes pending writes.
     async fn flush(&self) -> io::Result<()>;
+}
+
+/// No-op log writer used when log files cannot be created.
+pub struct NullLogWriter;
+
+#[async_trait::async_trait]
+impl LogWriter for NullLogWriter {
+    async fn write(&self, _entry: &LogEntry) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -687,6 +702,8 @@ pub struct BroadcastWriter {
     subscribers: RwLock<Vec<mpsc::Sender<LogEntry>>>,
     /// Recent output backlog for late subscribers.
     backlog: RwLock<BroadcastBacklog>,
+    /// Whether the stream is closed.
+    closed: AtomicBool,
 }
 
 const BROADCAST_BACKLOG_MAX_ENTRIES: usize = 64;
@@ -699,6 +716,7 @@ impl BroadcastWriter {
         Self {
             subscribers: RwLock::new(Vec::new()),
             backlog: RwLock::new(BroadcastBacklog::new()),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -708,20 +726,46 @@ impl BroadcastWriter {
     pub async fn subscribe(&self) -> mpsc::Receiver<LogEntry> {
         let (tx, rx) = mpsc::channel(64);
 
-        // Register subscriber first to receive new data arriving during replay.
-        self.subscribers.write().await.push(tx.clone());
+        let closed = self.closed.load(Ordering::SeqCst);
+        tracing::info!(
+            "BroadcastWriter::subscribe: closed={}, will register={}",
+            closed,
+            !closed
+        );
+        if !closed {
+            // Register subscriber first to receive new data arriving during replay.
+            self.subscribers.write().await.push(tx.clone());
+        }
 
         // Replay buffered output so fast commands are not missed.
         {
             let backlog = self.backlog.read().await;
+            tracing::info!(
+                "BroadcastWriter::subscribe: replaying {} backlog entries, total_bytes={}",
+                backlog.entries.len(),
+                backlog.total_bytes
+            );
             for entry in backlog.entries.iter() {
                 if tx.send(entry.clone()).await.is_err() {
+                    tracing::debug!("BroadcastWriter::subscribe: send failed during replay");
                     return rx;
                 }
             }
         }
 
+        if closed {
+            tracing::debug!("BroadcastWriter::subscribe: dropping tx because closed");
+            drop(tx);
+        }
+
         rx
+    }
+
+    /// Closes all subscribers so attach sessions can end.
+    pub async fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        let mut subs = self.subscribers.write().await;
+        subs.clear();
     }
 
     /// Removes closed subscribers.
@@ -740,6 +784,10 @@ impl Default for BroadcastWriter {
 #[async_trait::async_trait]
 impl LogWriter for BroadcastWriter {
     async fn write(&self, entry: &LogEntry) -> io::Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
         {
             let mut backlog = self.backlog.write().await;
             backlog.push_and_trim(entry.clone());
@@ -856,7 +904,7 @@ pub struct ProcessShim {
     sources: Vec<Box<dyn OutputSource + Unpin>>,
 
     /// Log file writer.
-    log_writer: JsonFileWriter,
+    log_writer: Box<dyn LogWriter>,
 
     /// Broadcast writer for attach clients.
     broadcast: Arc<BroadcastWriter>,
@@ -893,11 +941,19 @@ impl ProcessShim {
 
     /// Internal constructor.
     fn new(container_id: String, sources: Vec<Box<dyn OutputSource + Unpin>>) -> io::Result<Self> {
-        // Ensure log directory exists
-        std::fs::create_dir_all(CONTAINER_LOG_DIR)?;
+        // Ensure log directory exists, but keep shims running even if logs are unavailable.
+        if let Err(e) = std::fs::create_dir_all(CONTAINER_LOG_DIR) {
+            tracing::warn!("Failed to create log dir {}: {}", CONTAINER_LOG_DIR, e);
+        }
 
         let log_path = format!("{}/{}.log", CONTAINER_LOG_DIR, container_id);
-        let log_writer = JsonFileWriter::new(&log_path)?;
+        let log_writer: Box<dyn LogWriter> = match JsonFileWriter::new(&log_path) {
+            Ok(writer) => Box::new(writer),
+            Err(e) => {
+                tracing::warn!("Failed to open log file {}: {}", log_path, e);
+                Box::new(NullLogWriter)
+            }
+        };
 
         Ok(Self {
             container_id,
@@ -957,7 +1013,17 @@ impl ProcessShim {
         drop(tx);
 
         // Process entries from all sources
+        let mut entry_count = 0u32;
         while let Some(entry) = rx.recv().await {
+            entry_count += 1;
+            tracing::info!(
+                "Shim: received entry #{} for {}, stream={:?}, len={}",
+                entry_count,
+                self.container_id,
+                entry.stream,
+                entry.data.len()
+            );
+
             // Write to log file
             if let Err(e) = self.log_writer.write(&entry).await {
                 tracing::error!("Error writing log for {}: {}", self.container_id, e);
@@ -966,13 +1032,102 @@ impl ProcessShim {
             // Broadcast to attach clients
             let _ = self.broadcast.write(&entry).await;
         }
+        tracing::info!(
+            "Shim: finished processing {} entries for {}",
+            entry_count,
+            self.container_id
+        );
 
         // Flush log file
         self.log_writer.flush().await?;
 
+        // Close broadcast stream so attach sessions can end.
+        self.broadcast.close().await;
+
         tracing::info!("Shim stopped for container {}", self.container_id);
         Ok(())
     }
+}
+
+/// Starts a broadcast-only shim for non-TTY pipes.
+pub fn spawn_broadcast_only_from_pipes(
+    stdout_fd: RawFd,
+    stderr_fd: RawFd,
+) -> Arc<BroadcastWriter> {
+    let broadcaster = Arc::new(BroadcastWriter::new());
+
+    let stdout_source = match PipeSource::new(stdout_fd, StreamType::Stdout) {
+        Ok(source) => source,
+        Err(e) => {
+            tracing::warn!("Broadcast-only shim: failed to wrap stdout fd: {}", e);
+            return broadcaster;
+        }
+    };
+    let stderr_source = match PipeSource::new(stderr_fd, StreamType::Stderr) {
+        Ok(source) => source,
+        Err(e) => {
+            tracing::warn!("Broadcast-only shim: failed to wrap stderr fd: {}", e);
+            return broadcaster;
+        }
+    };
+
+    let (tx, mut rx) = mpsc::channel::<LogEntry>(64);
+    let shutdown = CancellationToken::new();
+
+    let tx_stdout = tx.clone();
+    let shutdown_stdout = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = read_source(Box::new(stdout_source), tx_stdout, shutdown_stdout).await;
+    });
+
+    let tx_stderr = tx.clone();
+    let shutdown_stderr = shutdown.clone();
+    tokio::spawn(async move {
+        let _ = read_source(Box::new(stderr_source), tx_stderr, shutdown_stderr).await;
+    });
+
+    drop(tx);
+
+    let broadcaster_clone = Arc::clone(&broadcaster);
+    tokio::spawn(async move {
+        while let Some(entry) = rx.recv().await {
+            let _ = broadcaster_clone.write(&entry).await;
+        }
+        broadcaster_clone.close().await;
+    });
+
+    broadcaster
+}
+
+/// Starts a broadcast-only shim for TTY output.
+pub fn spawn_broadcast_only_from_pty(pty_master_fd: RawFd) -> Arc<BroadcastWriter> {
+    let broadcaster = Arc::new(BroadcastWriter::new());
+
+    let pty_source = match PtySource::new(pty_master_fd) {
+        Ok(source) => source,
+        Err(e) => {
+            tracing::warn!("Broadcast-only shim: failed to wrap pty fd: {}", e);
+            return broadcaster;
+        }
+    };
+
+    let (tx, mut rx) = mpsc::channel::<LogEntry>(64);
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+
+    tokio::spawn(async move {
+        let _ = read_source(Box::new(pty_source), tx, shutdown_clone).await;
+    });
+
+    let broadcaster_clone = Arc::clone(&broadcaster);
+    tokio::spawn(async move {
+        while let Some(entry) = rx.recv().await {
+            let _ = broadcaster_clone.write(&entry).await;
+        }
+        broadcaster_clone.close().await;
+    });
+
+    broadcaster
 }
 
 /// Reads from a source and sends entries to the channel.
@@ -982,8 +1137,10 @@ async fn read_source(
     shutdown: CancellationToken,
 ) -> io::Result<()> {
     let stream_type = source.stream_type();
+    tracing::info!("read_source: starting for stream {:?}", stream_type);
     let mut buf = BytesMut::with_capacity(READ_BUFFER_SIZE);
     let mut read_buf = [0u8; READ_BUFFER_SIZE];
+    let mut total_bytes_read = 0usize;
 
     loop {
         // Create a ReadBuf for this read
@@ -1000,9 +1157,16 @@ async fn read_source(
             result = poll_fn(|cx| Pin::new(&mut *source).poll_read(cx, &mut rb)) => {
                 result?;
                 let n = rb.filled().len();
+                total_bytes_read += n;
 
                 if n == 0 {
                     // EOF - send any remaining data
+                    tracing::info!(
+                        "read_source: EOF for stream {:?}, total_bytes_read={}, remaining_buf={}",
+                        stream_type,
+                        total_bytes_read,
+                        buf.len()
+                    );
                     if !buf.is_empty() {
                         let entry = LogEntry {
                             stream: stream_type,

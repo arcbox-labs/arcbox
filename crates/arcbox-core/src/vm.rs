@@ -117,6 +117,11 @@ pub struct VmConfig {
     pub vsock: bool,
     /// Guest CID for vsock connections (Linux).
     pub guest_cid: Option<u32>,
+    /// Enable memory balloon device.
+    ///
+    /// The balloon device allows dynamic memory management by inflating
+    /// (reclaiming memory from guest) or deflating (returning memory).
+    pub balloon: bool,
 }
 
 impl Default for VmConfig {
@@ -131,6 +136,7 @@ impl Default for VmConfig {
             networking: true,
             vsock: true,
             guest_cid: None,
+            balloon: true, // Enable balloon by default
         }
     }
 }
@@ -241,6 +247,7 @@ impl VmManager {
             networking: entry.config.networking,
             vsock: entry.config.vsock,
             guest_cid: entry.config.guest_cid,
+            balloon: entry.config.balloon,
         }
     }
 
@@ -468,6 +475,103 @@ impl VmManager {
 
         vmm.read_console_output()
             .map_err(|e| CoreError::Vm(format!("read console failed: {}", e)))
+    }
+
+    // ========================================================================
+    // Memory Balloon Control
+    // ========================================================================
+
+    /// Sets the target memory size for the balloon device on a running VM.
+    ///
+    /// The balloon device will inflate or deflate to reach the target:
+    /// - **Smaller target**: Balloon inflates, reclaiming memory from guest
+    /// - **Larger target**: Balloon deflates, returning memory to guest
+    ///
+    /// # Arguments
+    /// * `id` - The VM ID
+    /// * `target_bytes` - Target memory size in bytes
+    ///
+    /// # Errors
+    /// Returns an error if the VM is not found, not running, or balloon operation fails.
+    #[cfg(target_os = "macos")]
+    pub fn set_balloon_target(&self, id: &VmId, target_bytes: u64) -> Result<()> {
+        let vms = self
+            .vms
+            .read()
+            .map_err(|_| CoreError::Vm("lock poisoned".to_string()))?;
+
+        let entry = vms
+            .get(id)
+            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+
+        if entry.info.state != VmState::Running {
+            return Err(CoreError::InvalidState(format!(
+                "cannot set balloon target: VM is {:?}",
+                entry.info.state
+            )));
+        }
+
+        let vmm = entry
+            .vmm
+            .as_ref()
+            .ok_or_else(|| CoreError::Vm("VMM not initialized".to_string()))?;
+
+        vmm.set_balloon_target(target_bytes)
+            .map_err(|e| CoreError::Vm(format!("set balloon target failed: {}", e)))
+    }
+
+    /// Gets the current target memory size from the balloon device.
+    ///
+    /// Returns the target memory size in bytes, or 0 if no balloon is configured
+    /// or the VM is not running.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn get_balloon_target(&self, id: &VmId) -> u64 {
+        let Ok(vms) = self.vms.read() else {
+            return 0;
+        };
+
+        let Some(entry) = vms.get(id) else {
+            return 0;
+        };
+
+        if entry.info.state != VmState::Running {
+            return 0;
+        }
+
+        entry.vmm.as_ref().map_or(0, Vmm::get_balloon_target)
+    }
+
+    /// Gets balloon statistics for a VM.
+    ///
+    /// Returns current balloon stats including target, current, and configured memory sizes.
+    #[cfg(target_os = "macos")]
+    pub fn get_balloon_stats(
+        &self,
+        id: &VmId,
+    ) -> Result<arcbox_hypervisor::BalloonStats> {
+        let vms = self
+            .vms
+            .read()
+            .map_err(|_| CoreError::Vm("lock poisoned".to_string()))?;
+
+        let entry = vms
+            .get(id)
+            .ok_or_else(|| CoreError::NotFound(id.to_string()))?;
+
+        if entry.info.state != VmState::Running {
+            return Err(CoreError::InvalidState(format!(
+                "cannot get balloon stats: VM is {:?}",
+                entry.info.state
+            )));
+        }
+
+        let vmm = entry
+            .vmm
+            .as_ref()
+            .ok_or_else(|| CoreError::Vm("VMM not initialized".to_string()))?;
+
+        Ok(vmm.get_balloon_stats())
     }
 
     #[cfg(test)]

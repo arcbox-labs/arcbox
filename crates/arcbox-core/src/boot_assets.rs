@@ -745,7 +745,8 @@ mod tests {
     fn test_default_config_uses_boot_asset_version() {
         let _guard = ENV_LOCK.lock().unwrap();
         let original = std::env::var("ARCBOX_BOOT_ASSET_VERSION").ok();
-        std::env::remove_var("ARCBOX_BOOT_ASSET_VERSION");
+        // SAFETY: Test code running under ENV_LOCK mutex, single-threaded access.
+        unsafe { std::env::remove_var("ARCBOX_BOOT_ASSET_VERSION") };
 
         let config = BootAssetConfig::default();
         assert_eq!(config.version, BOOT_ASSET_VERSION.to_string());
@@ -757,7 +758,8 @@ mod tests {
     fn test_default_config_env_override() {
         let _guard = ENV_LOCK.lock().unwrap();
         let original = std::env::var("ARCBOX_BOOT_ASSET_VERSION").ok();
-        std::env::set_var("ARCBOX_BOOT_ASSET_VERSION", "9.9.9");
+        // SAFETY: Test code running under ENV_LOCK mutex, single-threaded access.
+        unsafe { std::env::set_var("ARCBOX_BOOT_ASSET_VERSION", "9.9.9") };
 
         let config = BootAssetConfig::default();
         assert_eq!(config.version, "9.9.9");
@@ -837,9 +839,13 @@ mod tests {
     }
 
     fn restore_env(original: Option<String>) {
-        match original {
-            Some(value) => std::env::set_var("ARCBOX_BOOT_ASSET_VERSION", value),
-            None => std::env::remove_var("ARCBOX_BOOT_ASSET_VERSION"),
+        // SAFETY: This is test code that runs single-threaded, so modifying
+        // environment variables is safe.
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var("ARCBOX_BOOT_ASSET_VERSION", value),
+                None => std::env::remove_var("ARCBOX_BOOT_ASSET_VERSION"),
+            }
         }
     }
 }

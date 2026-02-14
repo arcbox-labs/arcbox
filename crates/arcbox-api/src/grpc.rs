@@ -89,9 +89,19 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
     ) -> Result<Response<StartContainerResponse>, Status> {
         let id = ContainerId::from_string(request.into_inner().id);
 
-        self.runtime
+        let container = self
+            .runtime
             .container_manager()
-            .start(&id)
+            .get(&id)
+            .ok_or_else(|| Status::not_found("container not found"))?;
+
+        let machine_name = container
+            .machine_name
+            .clone()
+            .unwrap_or_else(|| self.runtime.default_machine_name().to_string());
+
+        self.runtime
+            .start_container(&machine_name, &id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -150,7 +160,7 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
                 id: c.id.to_string(),
                 name: c.name,
                 image: c.image,
-                state: c.state.to_string(),
+                state: format_container_state(&c.state),
                 status: format_container_status(&c.state, c.exit_code),
                 created: c.created.timestamp(),
                 ports: vec![],
@@ -229,7 +239,7 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
             image: container.image,
             created: container.created.timestamp(),
             state: Some(ProtoContainerState {
-                status: container.state.to_string(),
+                status: format_container_state(&container.state),
                 running: container.state == ContainerState::Running,
                 paused: container.state == ContainerState::Paused,
                 restarting: container.state == ContainerState::Restarting,
@@ -1149,6 +1159,7 @@ impl network_service_server::NetworkService for NetworkServiceImpl {
 fn format_container_status(state: &ContainerState, exit_code: Option<i32>) -> String {
     match state {
         ContainerState::Created => "Created".to_string(),
+        ContainerState::Starting => "Created".to_string(),
         ContainerState::Running => "Up".to_string(),
         ContainerState::Paused => "Paused".to_string(),
         ContainerState::Restarting => "Restarting".to_string(),
@@ -1157,6 +1168,13 @@ fn format_container_status(state: &ContainerState, exit_code: Option<i32>) -> St
         }
         ContainerState::Removing => "Removing".to_string(),
         ContainerState::Dead => "Dead".to_string(),
+    }
+}
+
+fn format_container_state(state: &ContainerState) -> String {
+    match state {
+        ContainerState::Starting => "created".to_string(),
+        _ => state.to_string(),
     }
 }
 

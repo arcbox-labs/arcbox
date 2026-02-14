@@ -681,9 +681,18 @@ impl Transport for VsockTransport {
         let mut len_buf = [0u8; 4];
         let mut read = 0;
         while read < 4 {
-            read += stream.read(&mut len_buf[read..]).await?;
+            let n = stream.read(&mut len_buf[read..]).await?;
+            if n == 0 {
+                tracing::debug!("VsockTransport::recv: EOF while reading length prefix");
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "EOF while reading length prefix",
+                )));
+            }
+            read += n;
         }
         let len = u32::from_be_bytes(len_buf) as usize;
+        tracing::debug!("VsockTransport::recv: message length={}", len);
 
         // Read data and return the full framed message (length + payload).
         let mut buf = Vec::with_capacity(4 + len);
@@ -691,7 +700,19 @@ impl Transport for VsockTransport {
         let mut payload = vec![0u8; len];
         read = 0;
         while read < len {
-            read += stream.read(&mut payload[read..]).await?;
+            let n = stream.read(&mut payload[read..]).await?;
+            if n == 0 {
+                tracing::debug!(
+                    "VsockTransport::recv: EOF while reading payload, read={}/{}",
+                    read,
+                    len
+                );
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "EOF while reading payload",
+                )));
+            }
+            read += n;
         }
 
         buf.extend_from_slice(&payload);
