@@ -1471,4 +1471,51 @@ mod tests {
         // Can't stop if not running
         assert!(vm.stop().is_err());
     }
+
+    #[test]
+    fn test_balloon_device_configuration() {
+        if !ffi::is_supported() {
+            println!("Virtualization not supported, skipping");
+            return;
+        }
+
+        let config = VmConfig {
+            vcpu_count: 1,
+            memory_size: 512 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        let mut vm = DarwinVm::new(config).unwrap();
+
+        // Initially no balloon device
+        assert!(!vm.has_balloon_device());
+
+        // Add balloon device
+        let balloon_config = VirtioDeviceConfig::balloon();
+        vm.add_virtio_device(balloon_config).unwrap();
+
+        // Now balloon should be configured
+        assert!(vm.has_balloon_device());
+        assert_eq!(vm.configured_memory_size(), 512 * 1024 * 1024);
+
+        // Before starting, balloon target memory should return 0
+        // (no running VM to query)
+        assert_eq!(vm.get_balloon_target_memory(), 0);
+    }
+
+    #[test]
+    fn test_balloon_device_ffi() {
+        if !ffi::is_supported() {
+            println!("Virtualization not supported, skipping");
+            return;
+        }
+
+        // Test that balloon FFI bindings work correctly
+        let balloon_config = ffi::create_balloon_device_config();
+        assert!(
+            balloon_config.is_ok(),
+            "Failed to create balloon device config: {:?}",
+            balloon_config.err()
+        );
+    }
 }

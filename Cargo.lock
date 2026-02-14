@@ -351,6 +351,7 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "arcbox-vz",
  "block2",
+ "clap",
  "libc",
  "nix 0.29.0",
  "objc2",

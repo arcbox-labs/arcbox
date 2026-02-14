@@ -1,18 +1,56 @@
-//! Example: Boot a Linux VM using Virtualization.framework
+//! Boot a Linux VM using Virtualization.framework
 //!
 //! Usage:
-//! 1. Build: cargo build --example boot_vm -p arcbox-hypervisor
-//! 2. Sign: codesign --entitlements tests/resources/entitlements.plist --force -s - target/debug/examples/boot_vm
-//! 3. Run: ./target/debug/examples/boot_vm <kernel_path> [initrd_path] [options]
-//!
-//! Options:
-//!   --disk <path>    Attach a block device
-//!   --net            Enable NAT networking
-//!   --vsock          Enable vsock device
-//!   --virtiofs <path>  Enable VirtioFS sharing (path to share)
+//! 1. Build: cargo build --bin arcbox-boot -p arcbox-hypervisor
+//! 2. Sign: codesign --entitlements tests/resources/entitlements.plist --force -s - target/debug/arcbox-boot
+//! 3. Run: arcbox-boot <kernel_path> [initrd_path] [options]
 
-use std::env;
+use clap::Parser;
+use std::path::PathBuf;
 use std::time::Duration;
+
+/// Boot a Linux VM using Virtualization.framework
+#[derive(Parser, Debug)]
+#[command(name = "arcbox-boot")]
+#[command(about = "Boot a Linux VM using ArcBox hypervisor")]
+#[command(version)]
+struct Args {
+    /// Path to the Linux kernel image
+    #[arg(value_name = "KERNEL")]
+    kernel: PathBuf,
+
+    /// Path to the initrd/initramfs image
+    #[arg(value_name = "INITRD")]
+    initrd: Option<PathBuf>,
+
+    /// Attach a block device
+    #[arg(long, value_name = "PATH")]
+    disk: Option<PathBuf>,
+
+    /// Enable NAT networking
+    #[arg(long)]
+    net: bool,
+
+    /// Enable vsock device
+    #[arg(long)]
+    vsock: bool,
+
+    /// Enable VirtioFS sharing (path to share)
+    #[arg(long, value_name = "PATH")]
+    virtiofs: Option<PathBuf>,
+
+    /// Custom kernel command line
+    #[arg(long, value_name = "CMDLINE")]
+    cmdline: Option<String>,
+
+    /// Number of vCPUs
+    #[arg(long, default_value = "2")]
+    vcpus: u32,
+
+    /// Memory size in MB
+    #[arg(long, default_value = "512")]
+    memory: u64,
+}
 
 fn main() {
     // Initialize tracing
@@ -20,78 +58,16 @@ fn main() {
         .with_max_level(tracing::Level::DEBUG)
         .init();
 
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <kernel_path> [initrd_path] [options]", args[0]);
-        eprintln!();
-        eprintln!("Options:");
-        eprintln!("  --disk <path>    Attach a block device");
-        eprintln!("  --net            Enable NAT networking");
-        eprintln!("  --vsock          Enable vsock device");
-        eprintln!("  --virtiofs <path>  Enable VirtioFS sharing");
-        eprintln!();
-        eprintln!("Example:");
-        eprintln!(
-            "  {} tests/resources/Image-arm64 tests/resources/initramfs-arm64",
-            args[0]
-        );
-        eprintln!(
-            "  {} tests/resources/Image-arm64 tests/resources/initramfs-arm64 --disk test.img --net",
-            args[0]
-        );
-        std::process::exit(1);
-    }
+    let args = Args::parse();
 
-    let kernel_path = &args[1];
-
-    // Parse optional arguments
-    let mut initrd_path = None;
-    let mut disk_path = None;
-    let mut enable_net = false;
-    let mut enable_vsock = false;
-    let mut virtiofs_path: Option<String> = None;
-    let mut custom_cmdline: Option<String> = None;
-    let mut i = 2;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--disk" if i + 1 < args.len() => {
-                disk_path = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--net" => {
-                enable_net = true;
-                i += 1;
-            }
-            "--vsock" => {
-                enable_vsock = true;
-                i += 1;
-            }
-            "--virtiofs" if i + 1 < args.len() => {
-                virtiofs_path = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--cmdline" if i + 1 < args.len() => {
-                custom_cmdline = Some(args[i + 1].clone());
-                i += 2;
-            }
-            _ if initrd_path.is_none() && !args[i].starts_with("--") => {
-                initrd_path = Some(args[i].clone());
-                i += 1;
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-
-    println!("=== ArcBox VM Boot Example ===");
+    println!("=== ArcBox VM Boot ===");
     println!();
 
     #[cfg(target_os = "macos")]
     {
         use arcbox_hypervisor::{
             config::VmConfig,
-            darwin::{DarwinHypervisor, is_supported},
+            darwin::{is_supported, DarwinHypervisor},
             traits::{Hypervisor, VirtualMachine},
             types::{CpuArch, VirtioDeviceConfig},
         };
@@ -116,29 +92,32 @@ fn main() {
         println!();
 
         // Create VM config
-        let cmdline = custom_cmdline
+        let cmdline = args
+            .cmdline
             .unwrap_or_else(|| "console=hvc0 loglevel=8 root=/dev/ram0 rdinit=/init".to_string());
+        let memory_bytes = args.memory * 1024 * 1024;
+
         let config = VmConfig {
-            vcpu_count: 2,
-            memory_size: 512 * 1024 * 1024, // 512MB
+            vcpu_count: args.vcpus,
+            memory_size: memory_bytes,
             arch: CpuArch::native(),
-            kernel_path: Some(kernel_path.clone()),
-            kernel_cmdline: Some(cmdline),
-            initrd_path,
+            kernel_path: Some(args.kernel.to_string_lossy().into_owned()),
+            kernel_cmdline: Some(cmdline.clone()),
+            initrd_path: args.initrd.map(|p| p.to_string_lossy().into_owned()),
             ..Default::default()
         };
 
         println!("VM Configuration:");
-        println!("  Kernel: {}", kernel_path);
+        println!("  Kernel: {}", args.kernel.display());
         if let Some(ref initrd) = config.initrd_path {
             println!("  Initrd: {}", initrd);
         }
-        if let Some(ref disk) = disk_path {
-            println!("  Disk: {}", disk);
+        if let Some(ref disk) = args.disk {
+            println!("  Disk: {}", disk.display());
         }
         println!(
             "  Network: {}",
-            if enable_net {
+            if args.net {
                 "enabled (NAT)"
             } else {
                 "disabled"
@@ -146,16 +125,16 @@ fn main() {
         );
         println!(
             "  Vsock: {}",
-            if enable_vsock { "enabled" } else { "disabled" }
+            if args.vsock { "enabled" } else { "disabled" }
         );
-        if let Some(ref fs_path) = virtiofs_path {
-            println!("  VirtioFS: {} -> arcbox", fs_path);
+        if let Some(ref fs_path) = args.virtiofs {
+            println!("  VirtioFS: {} -> arcbox", fs_path.display());
         } else {
             println!("  VirtioFS: disabled");
         }
         println!("  vCPUs: {}", config.vcpu_count);
-        println!("  Memory: {} MB", config.memory_size / (1024 * 1024));
-        println!("  Cmdline: {:?}", config.kernel_cmdline);
+        println!("  Memory: {} MB", args.memory);
+        println!("  Cmdline: {:?}", cmdline);
         println!();
 
         // Create VM
@@ -164,9 +143,9 @@ fn main() {
         println!("VM created: ID={}", vm.id());
 
         // Add block device if specified
-        if let Some(ref disk) = disk_path {
-            println!("Adding block device: {}", disk);
-            let block_config = VirtioDeviceConfig::block(disk, false);
+        if let Some(ref disk) = args.disk {
+            println!("Adding block device: {}", disk.display());
+            let block_config = VirtioDeviceConfig::block(disk.to_string_lossy().into_owned(), false);
             match vm.add_virtio_device(block_config) {
                 Ok(()) => println!("Block device added successfully"),
                 Err(e) => eprintln!("Warning: Failed to add block device: {}", e),
@@ -174,7 +153,7 @@ fn main() {
         }
 
         // Add network device if requested
-        if enable_net {
+        if args.net {
             println!("Adding network device (NAT)...");
             let net_config = VirtioDeviceConfig::network();
             match vm.add_virtio_device(net_config) {
@@ -184,7 +163,7 @@ fn main() {
         }
 
         // Add vsock device if requested
-        if enable_vsock {
+        if args.vsock {
             println!("Adding vsock device...");
             let vsock_config = VirtioDeviceConfig::vsock();
             match vm.add_virtio_device(vsock_config) {
@@ -194,9 +173,9 @@ fn main() {
         }
 
         // Add VirtioFS device if requested
-        if let Some(ref fs_path) = virtiofs_path {
-            println!("Adding VirtioFS device: {} -> arcbox", fs_path);
-            let fs_config = VirtioDeviceConfig::filesystem(fs_path, "arcbox", false);
+        if let Some(ref fs_path) = args.virtiofs {
+            println!("Adding VirtioFS device: {} -> arcbox", fs_path.display());
+            let fs_config = VirtioDeviceConfig::filesystem(fs_path.to_string_lossy().into_owned(), "arcbox", false);
             match vm.add_virtio_device(fs_config) {
                 Ok(()) => println!("VirtioFS device added successfully"),
                 Err(e) => eprintln!("Warning: Failed to add VirtioFS device: {}", e),
@@ -257,7 +236,7 @@ fn main() {
                 }
 
                 // Test vsock connection if enabled
-                if enable_vsock {
+                if args.vsock {
                     println!();
                     // Try multiple ports: 2222 (PUI PUI socat), 1024 (arcbox-agent)
                     for port in [2222u32, 1024] {
@@ -301,7 +280,8 @@ fn main() {
 
     #[cfg(not(target_os = "macos"))]
     {
-        eprintln!("This example only works on macOS");
+        let _ = args; // Suppress unused warning
+        eprintln!("This binary only works on macOS");
         std::process::exit(1);
     }
 }
