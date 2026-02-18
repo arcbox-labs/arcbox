@@ -19,7 +19,7 @@ use arcbox_protocol::v1::{
     InspectNetworkRequest, ListContainersRequest, ListContainersResponse, ListImagesRequest,
     ListImagesResponse, ListMachinesRequest, ListMachinesResponse, ListNetworksRequest,
     ListNetworksResponse, LogEntry, MachineExecOutput, MachineExecRequest, MachineInfo,
-    MachineSummary, NetworkInfo, NetworkSummary, PullProgress, RemoveImageRequest,
+    MachineNetwork, MachineSummary, NetworkInfo, NetworkSummary, PullProgress, RemoveImageRequest,
     RemoveImageResponse, RemoveNetworkRequest, StartContainerRequest, StartMachineRequest,
     StopContainerRequest, StopMachineRequest, SystemPingRequest, SystemPingResponse,
     InspectContainerRequest, InspectImageRequest, ImageInfo, ImageSummary,
@@ -475,11 +475,22 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             kernel: None,
             initrd: None,
             cmdline: None,
+            distro: if req.distro.is_empty() {
+                None
+            } else {
+                Some(req.distro)
+            },
+            distro_version: if req.version.is_empty() {
+                None
+            } else {
+                Some(req.version)
+            },
         };
 
         self.runtime
             .machine_manager()
             .create(config)
+            .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(CreateMachineResponse { id: req.name }))
@@ -494,6 +505,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         self.runtime
             .machine_manager()
             .start(&id)
+            .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(Empty {}))
@@ -542,7 +554,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 cpus: m.cpus,
                 memory: m.memory_mb * 1024 * 1024,
                 disk_size: m.disk_gb * 1024 * 1024 * 1024,
-                ip_address: String::new(),
+                ip_address: m.ip_address.unwrap_or_default(),
                 created: m.created_at.timestamp(),
             })
             .collect();
@@ -573,16 +585,21 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 memory: machine.memory_mb * 1024 * 1024,
                 arch: std::env::consts::ARCH.to_string(),
             }),
-            network: None,
+            network: Some(MachineNetwork {
+                ip_address: machine.ip_address.clone().unwrap_or_default(),
+                gateway: String::new(),
+                mac_address: String::new(),
+                dns_servers: vec![],
+            }),
             storage: Some(arcbox_protocol::v1::MachineStorage {
                 disk_size: machine.disk_gb * 1024 * 1024 * 1024,
                 disk_format: "raw".to_string(),
                 disk_path: String::new(),
             }),
             os: Some(arcbox_protocol::v1::MachineOs {
-                distro: "linux".to_string(),
-                version: String::new(),
-                kernel: String::new(),
+                distro: machine.distro.clone().unwrap_or_else(|| "linux".to_string()),
+                version: machine.distro_version.clone().unwrap_or_default(),
+                kernel: machine.kernel.clone().unwrap_or_default(),
             }),
             created: None,
             started_at: None,

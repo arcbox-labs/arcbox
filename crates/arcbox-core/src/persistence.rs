@@ -29,6 +29,21 @@ pub struct PersistedMachine {
     /// Kernel command line.
     #[serde(default)]
     pub cmdline: Option<String>,
+    /// Distribution name.
+    #[serde(default)]
+    pub distro: Option<String>,
+    /// Distribution version.
+    #[serde(default)]
+    pub distro_version: Option<String>,
+    /// Path to the disk image.
+    #[serde(default)]
+    pub disk_path: Option<String>,
+    /// Path to the SSH private key.
+    #[serde(default)]
+    pub ssh_key_path: Option<String>,
+    /// Last known IP address.
+    #[serde(default)]
+    pub ip_address: Option<String>,
     /// Last known state.
     pub state: PersistedState,
     /// VM ID (for correlation).
@@ -83,6 +98,11 @@ impl From<&MachineInfo> for PersistedMachine {
             kernel: info.kernel.clone(),
             initrd: info.initrd.clone(),
             cmdline: info.cmdline.clone(),
+            distro: info.distro.clone(),
+            distro_version: info.distro_version.clone(),
+            disk_path: info.disk_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            ssh_key_path: info.ssh_key_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            ip_address: info.ip_address.clone(),
             state: info.state.into(),
             vm_id: info.vm_id.to_string(),
             created_at: info.created_at,
@@ -199,6 +219,23 @@ impl MachinePersistence {
 
         Ok(())
     }
+
+    /// Updates the IP address of a persisted machine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the IP cannot be updated.
+    pub fn update_ip(&self, name: &str, ip: Option<&str>) -> Result<()> {
+        let mut machine = self.load(name)?;
+        machine.ip_address = ip.map(ToString::to_string);
+
+        let content = toml::to_string_pretty(&machine)
+            .map_err(|e| CoreError::Machine(format!("Failed to serialize config: {}", e)))?;
+
+        fs::write(self.config_path(name), content)?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +260,11 @@ mod tests {
             kernel: Some("/path/to/kernel".to_string()),
             initrd: Some("/path/to/initrd".to_string()),
             cmdline: Some("console=ttyS0".to_string()),
+            distro: None,
+            distro_version: None,
+            disk_path: None,
+            ssh_key_path: None,
+            ip_address: None,
             cid: None,
             created_at,
         };
@@ -257,6 +299,11 @@ mod tests {
                 kernel: None,
                 initrd: None,
                 cmdline: None,
+                distro: None,
+                distro_version: None,
+                disk_path: None,
+                ssh_key_path: None,
+                ip_address: None,
                 cid: None,
                 created_at: Utc::now(),
             };
@@ -285,6 +332,11 @@ mod tests {
             kernel: None,
             initrd: None,
             cmdline: None,
+            distro: None,
+            distro_version: None,
+            disk_path: None,
+            ssh_key_path: None,
+            ip_address: None,
             cid: None,
             created_at: Utc::now(),
         };

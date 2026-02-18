@@ -16,6 +16,7 @@ use anyhow::Result;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod agent;
+mod machine_init;
 
 // These modules contain the core logic. They are always compiled for testing,
 // but only used at runtime on Linux where vsock is available.
@@ -30,8 +31,18 @@ mod shim;
 #[cfg(target_os = "linux")]
 mod mount;
 
+// DNS module manages /etc/hosts for container name resolution.
+mod dns;
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Machine provisioning should only run in initramfs as PID 1.
+    // After switch_root, distro service managers also start arcbox-agent but
+    // those processes must run the RPC server directly.
+    if machine_init::is_machine_mode() && std::process::id() == 1 {
+        machine_init::run(); // Never returns.
+    }
+
     // Initialize logging
     tracing_subscriber::registry()
         .with(
