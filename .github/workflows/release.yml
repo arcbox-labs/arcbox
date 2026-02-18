@@ -40,7 +40,7 @@ jobs:
           echo "Building version: $VERSION"
 
       - name: Setup Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           targets: aarch64-unknown-linux-musl
