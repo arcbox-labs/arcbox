@@ -120,6 +120,26 @@ fn parse_vsock_endpoint_port(endpoint: &str) -> Option<u32> {
     endpoint.strip_prefix("vsock:")?.parse::<u32>().ok()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::parse_vsock_endpoint_port;
+
+    #[test]
+    fn test_parse_vsock_endpoint_port_ok() {
+        assert_eq!(parse_vsock_endpoint_port("vsock:2375"), Some(2375));
+    }
+
+    #[test]
+    fn test_parse_vsock_endpoint_port_invalid() {
+        assert_eq!(
+            parse_vsock_endpoint_port("unix:///var/run/docker.sock"),
+            None
+        );
+        assert_eq!(parse_vsock_endpoint_port("vsock:not-a-number"), None);
+        assert_eq!(parse_vsock_endpoint_port("2375"), None);
+    }
+}
+
 #[async_trait]
 impl ContainerBackend for GuestDockerBackend {
     fn mode(&self) -> ContainerBackendMode {
