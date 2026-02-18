@@ -194,6 +194,11 @@ async fn execute_start(args: StartArgs) -> Result<()> {
         .context("Failed to start machine")?;
 
     println!("Machine '{}' started", args.name);
+    if let Some(machine) = runtime.machine_manager().get(&args.name) {
+        if let Some(ip) = machine.ip_address {
+            println!("IP:      {}", ip);
+        }
+    }
 
     Ok(())
 }
@@ -296,6 +301,23 @@ async fn execute_status(args: StatusArgs) -> Result<()> {
     println!("Memory:  {} MB", machine.memory_mb);
     println!("Disk:    {} GB", machine.disk_gb);
     println!("VM ID:   {}", machine.vm_id);
+    if let Some(ip) = &machine.ip_address {
+        println!("IP:      {}", ip);
+    }
+
+    if machine.state == MachineState::Running {
+        if let Ok(mut agent) = runtime.get_agent(&args.name) {
+            if let Ok(status) = agent.get_runtime_status().await {
+                println!("Runtime:");
+                println!("  Docker:     {}", status.docker_ready);
+                println!("  Containerd: {}", status.containerd_ready);
+                println!("  Endpoint:   {}", status.endpoint);
+                if !status.detail.is_empty() {
+                    println!("  Detail:     {}", status.detail);
+                }
+            }
+        }
+    }
 
     Ok(())
 }
