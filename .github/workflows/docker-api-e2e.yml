@@ -195,6 +195,10 @@ jobs:
             "http://localhost/v1.43/networks/$network_id")
           echo "Delete response: $response"
 
+      - name: Install Docker CLI
+        run: |
+          brew install docker
+
       - name: Test with Docker CLI
         run: |
           export DOCKER_HOST="unix:///tmp/arcbox-e2e.sock"
