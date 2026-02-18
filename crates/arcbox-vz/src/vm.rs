@@ -126,16 +126,19 @@ impl VirtualMachine {
     /// the Running state.
     pub async fn start(&self) -> VZResult<()> {
         let (tx, rx) = oneshot::channel::<VZResult<()>>();
-        let tx = Arc::new(Mutex::new(Some(tx)));
+        static RESULT_TX: OnceLock<Arc<Mutex<Option<oneshot::Sender<VZResult<()>>>>>> =
+            OnceLock::new();
+        let result_tx = RESULT_TX.get_or_init(|| Arc::new(Mutex::new(None))).clone();
+        {
+            let mut guard = result_tx.lock().map_err(|_| VZError::Internal {
+                code: -1,
+                message: "failed to lock start completion sender".into(),
+            })?;
+            *guard = Some(tx);
+        }
 
         // Create completion block
         static START_BLOCK: OnceLock<BlockPtr> = OnceLock::new();
-
-        static RESULT_TX: OnceLock<Arc<Mutex<Option<oneshot::Sender<VZResult<()>>>>>> =
-            OnceLock::new();
-
-        // Store the sender (this is a simplification - real impl would use proper context)
-        let _ = RESULT_TX.set(tx);
 
         let block_ptr = START_BLOCK.get_or_init(|| unsafe {
             #[repr(C)]
