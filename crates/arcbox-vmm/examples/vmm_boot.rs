@@ -47,6 +47,7 @@ fn main() {
         vsock: false,
         guest_cid: None,
         balloon: false,
+        block_devices: Vec::new(),
     };
 
     println!("VMM Configuration:");
