@@ -26,6 +26,7 @@
 use crate::error::{CoreError, Result};
 use flate2::read::GzDecoder;
 use futures_util::StreamExt;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -39,11 +40,11 @@ use tokio::io::AsyncWriteExt;
 
 /// Default boot asset version.
 /// This is pinned to a known-good kernel/initramfs bundle.
-pub const BOOT_ASSET_VERSION: &str = "0.0.1-alpha.2";
+pub const BOOT_ASSET_VERSION: &str = "0.0.1-alpha.3";
 
 /// Base URL for boot asset downloads.
 /// Assets are hosted on GitHub Releases.
-const DEFAULT_CDN_BASE_URL: &str = "https://github.com/arcboxd/boot-assets/releases/download";
+const DEFAULT_CDN_BASE_URL: &str = "https://github.com/arcbox-labs/boot-assets/releases/download";
 
 /// Asset bundle filename pattern.
 /// Format: boot-assets-{arch}-v{version}.tar.gz
@@ -54,6 +55,9 @@ const KERNEL_FILENAME: &str = "kernel";
 
 /// Initramfs filename inside the bundle.
 const INITRAMFS_FILENAME: &str = "initramfs.cpio.gz";
+
+/// Manifest filename inside the bundle.
+const MANIFEST_FILENAME: &str = "manifest.json";
 
 /// Checksum filename suffix.
 const CHECKSUM_SUFFIX: &str = ".sha256";
@@ -179,6 +183,8 @@ pub struct BootAssets {
     pub cmdline: String,
     /// Asset version.
     pub version: String,
+    /// Parsed manifest metadata (if present in cache bundle).
+    pub manifest: Option<BootAssetManifest>,
 }
 
 impl BootAssets {
@@ -188,6 +194,33 @@ impl BootAssets {
     pub fn default_cmdline() -> String {
         "console=hvc0 rdinit=/init quiet".to_string()
     }
+}
+
+/// Boot asset manifest metadata.
+///
+/// This file is generated in the boot-assets release pipeline and bundled
+/// alongside kernel/initramfs as `manifest.json`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BootAssetManifest {
+    /// Manifest schema version.
+    #[serde(default)]
+    pub schema_version: u32,
+    /// Boot asset version (must match configured version).
+    pub asset_version: String,
+    /// Target architecture (must match configured arch).
+    pub arch: String,
+    /// Kernel git commit used to build this asset.
+    #[serde(default)]
+    pub kernel_commit: Option<String>,
+    /// arcbox-agent git commit used to build initramfs.
+    #[serde(default)]
+    pub agent_commit: Option<String>,
+    /// Build timestamp in UTC (RFC3339 expected).
+    #[serde(default)]
+    pub built_at: Option<String>,
+    /// Recommended kernel cmdline for this boot asset.
+    #[serde(default)]
+    pub kernel_cmdline: Option<String>,
 }
 
 // =============================================================================
@@ -299,6 +332,9 @@ impl BootAssetProvider {
         &self,
         progress: Option<ProgressCallback>,
     ) -> Result<BootAssets> {
+        let using_custom_paths =
+            self.config.custom_kernel.is_some() || self.config.custom_initramfs.is_some();
+
         // Check for custom paths first.
         let kernel = if let Some(ref k) = self.config.custom_kernel {
             if !k.exists() {
@@ -326,11 +362,23 @@ impl BootAssetProvider {
             self.get_initramfs_path(&progress).await?
         };
 
+        let manifest = if using_custom_paths {
+            None
+        } else {
+            Some(self.read_cached_manifest_required().await?)
+        };
+
+        let cmdline = manifest
+            .as_ref()
+            .and_then(|m| m.kernel_cmdline.clone())
+            .unwrap_or_else(BootAssets::default_cmdline);
+
         Ok(BootAssets {
             kernel,
             initramfs,
-            cmdline: BootAssets::default_cmdline(),
+            cmdline,
             version: self.config.version.clone(),
+            manifest,
         })
     }
 
@@ -397,13 +445,7 @@ impl BootAssetProvider {
                 });
             }
 
-            match self.download_checksum().await {
-                Ok(checksum) => Some(checksum),
-                Err(e) => {
-                    tracing::warn!("Failed to download checksum, skipping verification: {}", e);
-                    None
-                }
-            }
+            Some(self.download_checksum().await?)
         } else {
             None
         };
@@ -456,6 +498,7 @@ impl BootAssetProvider {
         }
 
         self.extract_bundle(&bundle_path, &cache_dir).await?;
+        self.validate_extracted_assets(&cache_dir).await?;
 
         // Clean up bundle file.
         let _ = fs::remove_file(&bundle_path).await;
@@ -626,6 +669,102 @@ impl BootAssetProvider {
         .map_err(|e| CoreError::config(format!("extraction task failed: {}", e)))?
     }
 
+    /// Validates required files after extraction.
+    async fn validate_extracted_assets(&self, cache_dir: &Path) -> Result<()> {
+        let kernel_path = cache_dir.join(KERNEL_FILENAME);
+        if !kernel_path.exists() {
+            return Err(CoreError::config(format!(
+                "boot bundle missing required file: {}",
+                kernel_path.display()
+            )));
+        }
+
+        let initramfs_path = cache_dir.join(INITRAMFS_FILENAME);
+        if !initramfs_path.exists() {
+            return Err(CoreError::config(format!(
+                "boot bundle missing required file: {}",
+                initramfs_path.display()
+            )));
+        }
+
+        let manifest = self.require_manifest_from_dir(cache_dir).await?;
+        tracing::info!(
+            "Boot asset manifest loaded: version={}, arch={}, kernel_commit={}, agent_commit={}",
+            manifest.asset_version,
+            manifest.arch,
+            manifest.kernel_commit.as_deref().unwrap_or("unknown"),
+            manifest.agent_commit.as_deref().unwrap_or("unknown"),
+        );
+
+        Ok(())
+    }
+
+    fn validate_manifest(&self, manifest: &BootAssetManifest) -> Result<()> {
+        if manifest.asset_version != self.config.version {
+            return Err(CoreError::config(format!(
+                "boot manifest version mismatch: expected {}, got {}",
+                self.config.version, manifest.asset_version
+            )));
+        }
+
+        if manifest.arch != self.config.arch {
+            return Err(CoreError::config(format!(
+                "boot manifest arch mismatch: expected {}, got {}",
+                self.config.arch, manifest.arch
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn read_manifest_from_dir(&self, dir: &Path) -> Result<Option<BootAssetManifest>> {
+        let manifest_path = dir.join(MANIFEST_FILENAME);
+        if !manifest_path.exists() {
+            return Ok(None);
+        }
+
+        let bytes = fs::read(&manifest_path).await.map_err(|e| {
+            CoreError::config(format!(
+                "failed to read boot manifest {}: {}",
+                manifest_path.display(),
+                e
+            ))
+        })?;
+
+        let manifest: BootAssetManifest = serde_json::from_slice(&bytes).map_err(|e| {
+            CoreError::config(format!(
+                "failed to parse boot manifest {}: {}",
+                manifest_path.display(),
+                e
+            ))
+        })?;
+
+        self.validate_manifest(&manifest)?;
+        Ok(Some(manifest))
+    }
+
+    async fn require_manifest_from_dir(&self, dir: &Path) -> Result<BootAssetManifest> {
+        let manifest_path = dir.join(MANIFEST_FILENAME);
+        self.read_manifest_from_dir(dir).await?.ok_or_else(|| {
+            CoreError::config(format!(
+                "boot manifest required but missing: {}",
+                manifest_path.display()
+            ))
+        })
+    }
+
+    /// Reads cached manifest for the configured asset version.
+    pub async fn read_cached_manifest(&self) -> Result<Option<BootAssetManifest>> {
+        self.read_manifest_from_dir(&self.config.version_cache_dir())
+            .await
+    }
+
+    /// Reads cached manifest and requires it to exist.
+    pub async fn read_cached_manifest_required(&self) -> Result<BootAssetManifest> {
+        self.require_manifest_from_dir(&self.config.version_cache_dir())
+            .await
+    }
+
     /// Prefetches boot assets (downloads if not cached).
     ///
     /// This can be called during daemon startup to reduce first-use latency.
@@ -642,7 +781,9 @@ impl BootAssetProvider {
     /// Checks if boot assets are cached.
     pub fn is_cached(&self) -> bool {
         let cache_dir = self.config.version_cache_dir();
-        cache_dir.join(KERNEL_FILENAME).exists() && cache_dir.join(INITRAMFS_FILENAME).exists()
+        cache_dir.join(KERNEL_FILENAME).exists()
+            && cache_dir.join(INITRAMFS_FILENAME).exists()
+            && cache_dir.join(MANIFEST_FILENAME).exists()
     }
 
     /// Clears the boot asset cache.
@@ -727,6 +868,7 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -836,6 +978,114 @@ mod tests {
             phase: "test".to_string(),
         };
         assert_eq!(progress.percentage(), None);
+    }
+
+    #[tokio::test]
+    async fn test_read_cached_manifest_ok() {
+        let temp = tempdir().unwrap();
+        let cache_dir = temp.path().to_path_buf();
+        let version = "1.0.0".to_string();
+        let version_dir = cache_dir.join(&version);
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(
+            version_dir.join(MANIFEST_FILENAME),
+            r#"{
+  "schema_version": 1,
+  "asset_version": "1.0.0",
+  "arch": "arm64",
+  "kernel_commit": "abc123",
+  "agent_commit": "def456",
+  "built_at": "2026-02-17T00:00:00Z",
+  "kernel_cmdline": "console=hvc0 rdinit=/init quiet"
+}"#,
+        )
+        .unwrap();
+
+        let config = BootAssetConfig {
+            cache_dir,
+            version,
+            arch: "arm64".to_string(),
+            ..Default::default()
+        };
+        let provider = BootAssetProvider::with_config(config);
+
+        let manifest = provider.read_cached_manifest().await.unwrap().unwrap();
+        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.asset_version, "1.0.0");
+        assert_eq!(manifest.arch, "arm64");
+        assert_eq!(
+            manifest.kernel_cmdline.as_deref(),
+            Some("console=hvc0 rdinit=/init quiet")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_cached_manifest_version_mismatch() {
+        let temp = tempdir().unwrap();
+        let cache_dir = temp.path().to_path_buf();
+        let version = "1.0.0".to_string();
+        let version_dir = cache_dir.join(&version);
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(
+            version_dir.join(MANIFEST_FILENAME),
+            r#"{
+  "schema_version": 1,
+  "asset_version": "2.0.0",
+  "arch": "arm64"
+}"#,
+        )
+        .unwrap();
+
+        let config = BootAssetConfig {
+            cache_dir,
+            version,
+            arch: "arm64".to_string(),
+            ..Default::default()
+        };
+        let provider = BootAssetProvider::with_config(config);
+
+        let err = provider.read_cached_manifest().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("manifest version mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_read_cached_manifest_missing_is_none() {
+        let temp = tempdir().unwrap();
+        let cache_dir = temp.path().to_path_buf();
+        let version = "1.0.0".to_string();
+        std::fs::create_dir_all(cache_dir.join(&version)).unwrap();
+
+        let config = BootAssetConfig {
+            cache_dir,
+            version,
+            arch: "arm64".to_string(),
+            ..Default::default()
+        };
+        let provider = BootAssetProvider::with_config(config);
+
+        let manifest = provider.read_cached_manifest().await.unwrap();
+        assert!(manifest.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_cached_manifest_required_missing_errors() {
+        let temp = tempdir().unwrap();
+        let cache_dir = temp.path().to_path_buf();
+        let version = "1.0.0".to_string();
+        std::fs::create_dir_all(cache_dir.join(&version)).unwrap();
+
+        let config = BootAssetConfig {
+            cache_dir,
+            version,
+            arch: "arm64".to_string(),
+            ..Default::default()
+        };
+        let provider = BootAssetProvider::with_config(config);
+
+        let err = provider.read_cached_manifest_required().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("boot manifest required but missing"));
     }
 
     fn restore_env(original: Option<String>) {

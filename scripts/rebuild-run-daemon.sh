@@ -4,8 +4,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 PROFILE="${PROFILE:-debug}"
-KERNEL="${KERNEL:-$ROOT/tests/resources/Image-arm64}"
-INITRAMFS="${INITRAMFS:-$ROOT/tests/resources/initramfs-arcbox}"
+DEFAULT_KERNEL="$ROOT/boot-assets/dev/kernel"
+DEFAULT_INITRAMFS="$ROOT/boot-assets/dev/initramfs.cpio.gz"
+KERNEL="${KERNEL:-$DEFAULT_KERNEL}"
+INITRAMFS="${INITRAMFS:-$DEFAULT_INITRAMFS}"
 SOCKET="${SOCKET:-/tmp/arcbox.sock}"
 GRPC_SOCKET="${GRPC_SOCKET:-/tmp/arcbox-grpc.sock}"
 DATA_DIR="${DATA_DIR:-/tmp/arcbox-data}"
@@ -22,9 +24,19 @@ else
   BIN="$ROOT/target/debug/arcbox"
 fi
 
-cargo build -p arcbox-agent --target aarch64-unknown-linux-musl --release
+if [[ "$KERNEL" == "$DEFAULT_KERNEL" && "$INITRAMFS" == "$DEFAULT_INITRAMFS" ]]; then
+  "$ROOT/scripts/setup-dev-boot-assets.sh"
+fi
 
-"$ROOT/tests/resources/build-initramfs.sh"
+if [[ ! -f "$KERNEL" ]]; then
+  echo "Kernel not found: $KERNEL" >&2
+  exit 1
+fi
+
+if [[ ! -f "$INITRAMFS" ]]; then
+  echo "Initramfs not found: $INITRAMFS" >&2
+  exit 1
+fi
 
 if [[ "$SIGN" == "1" ]]; then
   codesign --force --options runtime \

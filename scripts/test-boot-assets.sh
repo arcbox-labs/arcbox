@@ -7,7 +7,24 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 TEST_DIR="/tmp/arcbox-boot-test-$$"
-BOOT_ASSETS_VERSION="0.0.1-alpha.2"
+BOOT_ASSETS_VERSION_DEFAULT="$(awk -F '\"' '/pub const BOOT_ASSET_VERSION/ {print $2; exit}' "$PROJECT_DIR/crates/arcbox-core/src/boot_assets.rs")"
+if [[ -z "$BOOT_ASSETS_VERSION_DEFAULT" ]]; then
+    echo "Failed to resolve BOOT_ASSET_VERSION from crates/arcbox-core/src/boot_assets.rs" >&2
+    exit 1
+fi
+BOOT_ASSETS_VERSION="${ARCBOX_BOOT_ASSET_VERSION:-$BOOT_ASSETS_VERSION_DEFAULT}"
+TEST_LABEL="arcbox.e2e.run=$$"
+
+# Test result tracking
+RESULT_VM_BOOT="SKIP"
+RESULT_VSOCK="SKIP"
+RESULT_AGENT="SKIP"
+RESULT_CONTAINER_CREATE="SKIP"
+RESULT_CONTAINER_RUN="SKIP"
+RESULT_BACKGROUND_CONTAINER="SKIP"
+RESULT_DOCKER_LOGS="SKIP"
+RESULT_DOCKER_EXEC="SKIP"
+RESULT_STOP_RM="SKIP"
 
 # Colors
 RED='\033[0;31m'
@@ -21,12 +38,23 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 cleanup() {
     log_info "Cleaning up..."
+    # Remove any test containers created in this run.
+    local ids
+    ids=$(DOCKER_HOST="unix://$TEST_DIR/docker.sock" docker ps -aq --filter "label=$TEST_LABEL" 2>/dev/null || true)
+    if [[ -n "$ids" ]]; then
+        DOCKER_HOST="unix://$TEST_DIR/docker.sock" docker rm -f $ids >/dev/null 2>&1 || true
+    fi
     pkill -f "arcbox.*daemon.*$TEST_DIR" 2>/dev/null || true
     if [[ -n "${KEEP_TEST_DIR:-}" ]]; then
         log_warn "KEEP_TEST_DIR set, preserving: $TEST_DIR"
     else
         rm -rf "$TEST_DIR"
     fi
+}
+
+# Helper: run docker commands against the test socket
+dkr() {
+    DOCKER_HOST="unix://$TEST_DIR/docker.sock" docker "$@"
 }
 
 trap cleanup EXIT
@@ -74,6 +102,7 @@ setup_test_env() {
 start_daemon() {
     log_info "Starting daemon..."
 
+    ARCBOX_BOOT_ASSET_VERSION="$BOOT_ASSETS_VERSION" \
     "$PROJECT_DIR/target/release/arcbox" daemon \
         --data-dir "$TEST_DIR" \
         --socket "$TEST_DIR/docker.sock" \
@@ -118,6 +147,189 @@ wait_for_agent() {
     return 1
 }
 
+# --- Container lifecycle test functions (Phase 1.2 / 1.4) ---
+
+# Test: docker run alpine echo hello
+test_container_run() {
+    log_info "[test] Container run: docker run alpine echo hello"
+    local cid
+    cid=$(DOCKER_HOST="unix://$TEST_DIR/docker.sock" timeout 30 docker create --label "$TEST_LABEL" alpine echo hello) || {
+        log_error "docker create failed"
+        return 1
+    }
+    cid="${cid%%$'\n'*}"
+
+    if ! DOCKER_HOST="unix://$TEST_DIR/docker.sock" timeout 30 docker start "$cid" >/dev/null; then
+        log_error "docker start failed"
+        dkr rm -f "$cid" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if ! DOCKER_HOST="unix://$TEST_DIR/docker.sock" timeout 30 docker wait "$cid" >/dev/null; then
+        log_error "docker wait failed"
+        dkr rm -f "$cid" >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    local output
+    output=$(DOCKER_HOST="unix://$TEST_DIR/docker.sock" timeout 10 docker logs "$cid" 2>&1) || {
+        log_error "docker logs failed after wait: $output"
+        dkr rm -f "$cid" >/dev/null 2>&1 || true
+        return 1
+    }
+
+    dkr rm -f "$cid" >/dev/null 2>&1 || true
+
+    if echo "$output" | grep -q "hello"; then
+        log_info "container run: OK"
+        return 0
+    else
+        log_error "Expected 'hello' in output, got: $output"
+        return 1
+    fi
+}
+
+# Test: background container visible in docker ps
+test_background_container() {
+    log_info "[test] Background container: docker run -d + docker ps"
+
+    local cid
+    cid=$(DOCKER_HOST="unix://$TEST_DIR/docker.sock" timeout 30 docker run -d --label "$TEST_LABEL" alpine sleep 300) || {
+        log_error "docker run -d failed"
+        return 1
+    }
+    cid="${cid%%$'\n'*}"
+    log_info "Started background container: ${cid:0:12}"
+
+    sleep 2
+
+    local running
+    running=$(DOCKER_HOST="unix://$TEST_DIR/docker.sock" timeout 10 docker inspect -f '{{.State.Running}}' "$cid" 2>&1) || {
+        log_error "docker inspect failed: $running"
+        dkr rm -f "$cid" >/dev/null 2>&1 || true
+        return 1
+    }
+
+    if [[ "$running" == "true" ]]; then
+        log_info "background container is running: OK"
+        dkr stop "$cid" >/dev/null 2>&1 || true
+        dkr rm -f "$cid" >/dev/null 2>&1 || true
+        return 0
+    else
+        log_error "Container is not running (inspect output: $running)"
+        dkr rm -f "$cid" >/dev/null 2>&1 || true
+        return 1
+    fi
+}
+
+# Test: docker logs
+test_docker_logs() {
+    log_info "[test] Docker logs: verify container output"
+
+    local cid
+    cid=$(DOCKER_HOST="unix://$TEST_DIR/docker.sock" timeout 30 docker run -d --label "$TEST_LABEL" alpine sh -c "echo 'log-output-test'; sleep 10") || {
+        log_error "docker run -d for log test failed"
+        return 1
+    }
+    cid="${cid%%$'\n'*}"
+    log_info "Started log-test container: ${cid:0:12}"
+
+    local found=0
+    local logs_output
+    # Retry briefly to avoid race between container start and log flush.
+    for _ in {1..10}; do
+        logs_output=$(DOCKER_HOST="unix://$TEST_DIR/docker.sock" timeout 10 docker logs "$cid" 2>&1) || {
+            log_error "docker logs failed: $logs_output"
+            dkr rm -f "$cid" >/dev/null 2>&1 || true
+            return 1
+        }
+        if echo "$logs_output" | grep -q "log-output-test"; then
+            found=1
+            break
+        fi
+        sleep 1
+    done
+
+    dkr rm -f "$cid" >/dev/null 2>&1 || true
+
+    if [[ $found -eq 1 ]]; then
+        log_info "docker logs contains expected output: OK"
+        return 0
+    else
+        log_error "Expected 'log-output-test' in logs, got: $logs_output"
+        return 1
+    fi
+}
+
+# Test: docker exec
+test_docker_exec() {
+    log_info "[test] Docker exec: run command in running container"
+
+    local cid
+    cid=$(DOCKER_HOST="unix://$TEST_DIR/docker.sock" timeout 30 docker run -d --label "$TEST_LABEL" alpine sleep 300) || {
+        log_error "docker run -d for exec test failed"
+        return 1
+    }
+    cid="${cid%%$'\n'*}"
+    log_info "Started exec-test container: ${cid:0:12}"
+
+    sleep 2
+
+    local exec_output
+    exec_output=$(DOCKER_HOST="unix://$TEST_DIR/docker.sock" timeout 10 docker exec "$cid" ls / 2>&1) || {
+        log_error "docker exec failed: $exec_output"
+        dkr rm -f "$cid" >/dev/null 2>&1 || true
+        return 1
+    }
+
+    dkr rm -f "$cid" >/dev/null 2>&1 || true
+
+    if echo "$exec_output" | grep -qE "(bin|etc|usr)"; then
+        log_info "docker exec ls / succeeded: OK"
+        return 0
+    else
+        log_error "docker exec ls / returned unexpected output: $exec_output"
+        return 1
+    fi
+}
+
+# Test: docker stop + docker rm
+test_stop_rm() {
+    log_info "[test] Stop/rm: graceful stop and remove"
+
+    local cid
+    cid=$(DOCKER_HOST="unix://$TEST_DIR/docker.sock" timeout 30 docker run -d --label "$TEST_LABEL" alpine sleep 300) || {
+        log_error "docker run -d for stop test failed"
+        return 1
+    }
+    cid="${cid%%$'\n'*}"
+    log_info "Started stop-test container: ${cid:0:12}"
+
+    sleep 2
+
+    if ! DOCKER_HOST="unix://$TEST_DIR/docker.sock" timeout 15 docker stop "$cid" >/dev/null 2>&1; then
+        log_error "docker stop failed"
+        dkr rm -f "$cid" >/dev/null 2>&1 || true
+        return 1
+    fi
+    log_info "docker stop: OK"
+
+    if ! DOCKER_HOST="unix://$TEST_DIR/docker.sock" timeout 10 docker rm "$cid" >/dev/null 2>&1; then
+        log_error "docker rm failed"
+        dkr rm -f "$cid" >/dev/null 2>&1 || true
+        return 1
+    fi
+    log_info "docker rm: OK"
+
+    if dkr inspect "$cid" >/dev/null 2>&1; then
+        log_error "Container still exists after rm: $cid"
+        return 1
+    fi
+
+    log_info "Container fully removed: OK"
+    return 0
+}
+
 # Print summary
 print_summary() {
     echo ""
@@ -132,23 +344,42 @@ print_summary() {
     echo "Initramfs:  $(ls -lh "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/initramfs.cpio.gz" | awk '{print $5}')"
     echo ""
 
-    if grep -q "Agent is ready" "$TEST_DIR/daemon.log" 2>/dev/null; then
-        echo -e "VM Boot:        ${GREEN}PASS${NC}"
-        echo -e "vsock:          ${GREEN}PASS${NC}"
-        echo -e "Agent:          ${GREEN}PASS${NC}"
-    else
-        echo -e "VM Boot:        ${RED}FAIL${NC}"
-    fi
+    local pass=0
+    local fail=0
+    local skip=0
+    local total=0
 
-    if grep -q "Created container" "$TEST_DIR/daemon.log" 2>/dev/null; then
-        echo -e "Container:      ${GREEN}PASS${NC}"
-    else
-        echo -e "Container:      ${YELLOW}SKIP${NC}"
-    fi
+    for result_var in \
+        "VM Boot:$RESULT_VM_BOOT" \
+        "vsock:$RESULT_VSOCK" \
+        "Agent:$RESULT_AGENT" \
+        "Container Create:$RESULT_CONTAINER_CREATE" \
+        "Container Run:$RESULT_CONTAINER_RUN" \
+        "Background Container:$RESULT_BACKGROUND_CONTAINER" \
+        "Docker Logs:$RESULT_DOCKER_LOGS" \
+        "Docker Exec:$RESULT_DOCKER_EXEC" \
+        "Stop/Rm:$RESULT_STOP_RM"; do
+
+        local label="${result_var%%:*}"
+        local status="${result_var##*:}"
+        ((total++))
+
+        case "$status" in
+            PASS) echo -e "  $(printf '%-22s' "$label") ${GREEN}PASS${NC}"; ((pass++)) ;;
+            FAIL) echo -e "  $(printf '%-22s' "$label") ${RED}FAIL${NC}"; ((fail++)) ;;
+            SKIP) echo -e "  $(printf '%-22s' "$label") ${YELLOW}SKIP${NC}"; ((skip++)) ;;
+        esac
+    done
 
     echo ""
+    echo -e "Results: ${GREEN}${pass} passed${NC}, ${RED}${fail} failed${NC}, ${YELLOW}${skip} skipped${NC} / ${total} total"
     echo "Log: $TEST_DIR/daemon.log"
     echo "=========================================="
+
+    if [[ $fail -gt 0 ]]; then
+        return 1
+    fi
+    return 0
 }
 
 # Main
@@ -174,23 +405,75 @@ main() {
 
     # Start docker create in background - this triggers VM creation
     log_info "Creating container (triggers VM boot)..."
-    DOCKER_HOST="unix://$TEST_DIR/docker.sock" docker create alpine echo "test" \
-        > "$TEST_DIR/container_id" 2>&1 &
+    DOCKER_HOST="unix://$TEST_DIR/docker.sock" docker create --label "$TEST_LABEL" alpine echo "test" \
+        > "$TEST_DIR/container_id" 2> "$TEST_DIR/container_create.err" &
     CREATE_PID=$!
 
     # Wait for agent to connect
     if wait_for_agent; then
+        RESULT_VM_BOOT="PASS"
+        RESULT_VSOCK="PASS"
+        RESULT_AGENT="PASS"
+
         # Wait for create to complete
         if wait $CREATE_PID; then
             local cid
             cid=$(cat "$TEST_DIR/container_id" 2>/dev/null)
             log_info "container create: OK (ID: ${cid:0:12})"
+            RESULT_CONTAINER_CREATE="PASS"
         else
             log_warn "container create: FAILED"
+            RESULT_CONTAINER_CREATE="FAIL"
         fi
     else
+        RESULT_VM_BOOT="FAIL"
+        RESULT_VSOCK="FAIL"
+        RESULT_AGENT="FAIL"
         # Kill create if agent failed
         kill $CREATE_PID 2>/dev/null || true
+        print_summary
+        exit 1
+    fi
+
+    # --- Phase 1.2 / 1.4: Container lifecycle tests ---
+
+    echo ""
+    log_info "=== Container Lifecycle Tests (Phase 1.2 / 1.4) ==="
+    echo ""
+
+    # Test 1: docker run alpine echo hello
+    if test_container_run; then
+        RESULT_CONTAINER_RUN="PASS"
+    else
+        RESULT_CONTAINER_RUN="FAIL"
+    fi
+
+    # Test 2: background container + docker ps
+    if test_background_container; then
+        RESULT_BACKGROUND_CONTAINER="PASS"
+    else
+        RESULT_BACKGROUND_CONTAINER="FAIL"
+    fi
+
+    # Test 3: docker logs
+    if test_docker_logs; then
+        RESULT_DOCKER_LOGS="PASS"
+    else
+        RESULT_DOCKER_LOGS="FAIL"
+    fi
+
+    # Test 4: docker exec
+    if test_docker_exec; then
+        RESULT_DOCKER_EXEC="PASS"
+    else
+        RESULT_DOCKER_EXEC="FAIL"
+    fi
+
+    # Test 5: docker stop + docker rm
+    if test_stop_rm; then
+        RESULT_STOP_RM="PASS"
+    else
+        RESULT_STOP_RM="FAIL"
     fi
 
     print_summary
