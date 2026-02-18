@@ -9,7 +9,9 @@ use arcbox_protocol::agent::{
     AttachInput, AttachOutput, AttachRequest, CreateContainerRequest, CreateContainerResponse,
     ExecOutput, ExecRequest, ExecResizeRequest, ExecStartRequest, ExecStartResponse,
     ListContainersRequest, ListContainersResponse, LogEntry, LogsRequest, PingRequest,
-    PingResponse, RemoveContainerRequest, StartContainerRequest, StopContainerRequest, SystemInfo,
+    PingResponse, RemoveContainerRequest, RuntimeEnsureRequest, RuntimeEnsureResponse,
+    RuntimeStatusRequest, RuntimeStatusResponse, StartContainerRequest, StopContainerRequest,
+    SystemInfo,
 };
 use arcbox_protocol::container::{
     ContainerStatsRequest, ContainerStatsResponse, ContainerTopRequest, ContainerTopResponse,
@@ -36,6 +38,8 @@ enum MessageType {
     // Request types
     PingRequest = 0x0001,
     GetSystemInfoRequest = 0x0002,
+    EnsureRuntimeRequest = 0x0003,
+    RuntimeStatusRequest = 0x0004,
     CreateContainerRequest = 0x0010,
     StartContainerRequest = 0x0011,
     StopContainerRequest = 0x0012,
@@ -58,6 +62,8 @@ enum MessageType {
     PingResponse = 0x1001,
     WaitContainerResponse = 0x1016,
     GetSystemInfoResponse = 0x1002,
+    EnsureRuntimeResponse = 0x1003,
+    RuntimeStatusResponse = 0x1004,
     CreateContainerResponse = 0x1010,
     ListContainersResponse = 0x1014,
     ContainerStatsResponse = 0x1019,
@@ -77,6 +83,8 @@ impl MessageType {
         match value {
             0x0001 => Some(Self::PingRequest),
             0x0002 => Some(Self::GetSystemInfoRequest),
+            0x0003 => Some(Self::EnsureRuntimeRequest),
+            0x0004 => Some(Self::RuntimeStatusRequest),
             0x0010 => Some(Self::CreateContainerRequest),
             0x0011 => Some(Self::StartContainerRequest),
             0x0012 => Some(Self::StopContainerRequest),
@@ -97,6 +105,8 @@ impl MessageType {
             0x1001 => Some(Self::PingResponse),
             0x1016 => Some(Self::WaitContainerResponse),
             0x1002 => Some(Self::GetSystemInfoResponse),
+            0x1003 => Some(Self::EnsureRuntimeResponse),
+            0x1004 => Some(Self::RuntimeStatusResponse),
             0x1010 => Some(Self::CreateContainerResponse),
             0x1014 => Some(Self::ListContainersResponse),
             0x1019 => Some(Self::ContainerStatsResponse),
@@ -287,6 +297,52 @@ impl AgentClient {
             .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
     }
 
+    /// Ensures guest runtime services are ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn ensure_runtime(&mut self, start_if_needed: bool) -> Result<RuntimeEnsureResponse> {
+        let req = RuntimeEnsureRequest { start_if_needed };
+        let payload = req.encode_to_vec();
+        let (resp_type, resp_payload) = self
+            .rpc_call(MessageType::EnsureRuntimeRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::EnsureRuntimeResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: {}",
+                resp_type
+            )));
+        }
+
+        RuntimeEnsureResponse::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+    }
+
+    /// Gets guest runtime status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn get_runtime_status(&mut self) -> Result<RuntimeStatusResponse> {
+        let req = RuntimeStatusRequest {};
+        let payload = req.encode_to_vec();
+        let (resp_type, resp_payload) = self
+            .rpc_call(MessageType::RuntimeStatusRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::RuntimeStatusResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: {}",
+                resp_type
+            )));
+        }
+
+        RuntimeStatusResponse::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+    }
+
     /// Creates a container in the guest VM.
     ///
     /// # Errors
@@ -425,9 +481,7 @@ impl AgentClient {
     ///
     /// Returns an error if the container cannot be paused.
     pub async fn pause_container(&mut self, id: &str) -> Result<()> {
-        let req = PauseContainerRequest {
-            id: id.to_string(),
-        };
+        let req = PauseContainerRequest { id: id.to_string() };
         let payload = req.encode_to_vec();
 
         let (resp_type, _) = self
@@ -452,9 +506,7 @@ impl AgentClient {
     ///
     /// Returns an error if the container cannot be unpaused.
     pub async fn unpause_container(&mut self, id: &str) -> Result<()> {
-        let req = UnpauseContainerRequest {
-            id: id.to_string(),
-        };
+        let req = UnpauseContainerRequest { id: id.to_string() };
         let payload = req.encode_to_vec();
 
         let (resp_type, _) = self
@@ -479,9 +531,7 @@ impl AgentClient {
     ///
     /// Returns an error if the stats cannot be retrieved.
     pub async fn container_stats(&mut self, id: &str) -> Result<ContainerStatsResponse> {
-        let req = ContainerStatsRequest {
-            id: id.to_string(),
-        };
+        let req = ContainerStatsRequest { id: id.to_string() };
         let payload = req.encode_to_vec();
 
         let (resp_type, resp_payload) = self
@@ -506,11 +556,7 @@ impl AgentClient {
     /// # Errors
     ///
     /// Returns an error if the process list cannot be retrieved.
-    pub async fn container_top(
-        &mut self,
-        id: &str,
-        ps_args: &str,
-    ) -> Result<ContainerTopResponse> {
+    pub async fn container_top(&mut self, id: &str, ps_args: &str) -> Result<ContainerTopResponse> {
         let req = ContainerTopRequest {
             id: id.to_string(),
             ps_args: ps_args.to_string(),
@@ -1080,7 +1126,10 @@ impl AgentClient {
 
                     if resp_type == MessageType::EmptyResponse as u32 {
                         // End of stream
-                        tracing::debug!(cid = cid, "attach reader: received EmptyResponse, ending stream");
+                        tracing::debug!(
+                            cid = cid,
+                            "attach reader: received EmptyResponse, ending stream"
+                        );
                         break;
                     }
 

@@ -1423,6 +1423,56 @@ pub struct SystemInfo {
     /// Uptime in seconds.
     #[prost(uint64, tag = "10")]
     pub uptime: u64,
+    /// Guest IP addresses (excluding loopback).
+    #[prost(string, repeated, tag = "11")]
+    pub ip_addresses: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Request to ensure runtime services are available.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RuntimeEnsureRequest {
+    /// Whether to attempt starting services when not ready.
+    #[prost(bool, tag = "1")]
+    pub start_if_needed: bool,
+}
+/// Response from runtime ensure operation.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RuntimeEnsureResponse {
+    /// Whether runtime is ready for Docker API requests.
+    #[prost(bool, tag = "1")]
+    pub ready: bool,
+    /// Runtime endpoint exposed to host proxy.
+    #[prost(string, tag = "2")]
+    pub endpoint: ::prost::alloc::string::String,
+    /// Additional status detail.
+    #[prost(string, tag = "3")]
+    pub message: ::prost::alloc::string::String,
+}
+/// Request for runtime status.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct RuntimeStatusRequest {}
+/// Runtime status report.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RuntimeStatusResponse {
+    /// Whether containerd socket is reachable.
+    #[prost(bool, tag = "1")]
+    pub containerd_ready: bool,
+    /// Whether Docker socket is reachable.
+    #[prost(bool, tag = "2")]
+    pub docker_ready: bool,
+    /// Runtime endpoint exposed to host proxy.
+    #[prost(string, tag = "3")]
+    pub endpoint: ::prost::alloc::string::String,
+    /// Human-readable detail for diagnostics.
+    #[prost(string, tag = "4")]
+    pub detail: ::prost::alloc::string::String,
 }
 /// Request to create a container (forwarded to containerd).
 #[derive(serde::Serialize, serde::Deserialize)]

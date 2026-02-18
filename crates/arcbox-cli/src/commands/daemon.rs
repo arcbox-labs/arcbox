@@ -12,9 +12,9 @@ use arcbox_api::{
     container_service_server::ContainerServiceServer, image_service_server::ImageServiceServer,
     machine_service_server::MachineServiceServer, system_service_server::SystemServiceServer,
 };
-use arcbox_core::{Config, Runtime};
+use arcbox_core::{Config, ContainerBackendMode, ContainerProvisionMode, Runtime};
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
@@ -53,6 +53,50 @@ pub struct DaemonArgs {
     /// Automatically enable Docker CLI integration.
     #[arg(long)]
     pub docker_integration: bool,
+
+    /// Container backend mode.
+    #[arg(long, value_enum)]
+    pub container_backend: Option<ContainerBackendArg>,
+
+    /// Guest runtime provisioning mode.
+    #[arg(long, value_enum)]
+    pub container_provision: Option<ContainerProvisionArg>,
+
+    /// Guest dockerd API vsock port.
+    #[arg(long)]
+    pub guest_docker_vsock_port: Option<u32>,
+}
+
+/// CLI argument values for container backend mode.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ContainerBackendArg {
+    NativeControlPlane,
+    GuestDocker,
+}
+
+impl From<ContainerBackendArg> for ContainerBackendMode {
+    fn from(value: ContainerBackendArg) -> Self {
+        match value {
+            ContainerBackendArg::NativeControlPlane => Self::NativeControlPlane,
+            ContainerBackendArg::GuestDocker => Self::GuestDocker,
+        }
+    }
+}
+
+/// CLI argument values for provisioning mode.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ContainerProvisionArg {
+    BundledAssets,
+    DistroEngine,
+}
+
+impl From<ContainerProvisionArg> for ContainerProvisionMode {
+    fn from(value: ContainerProvisionArg) -> Self {
+        match value {
+            ContainerProvisionArg::BundledAssets => Self::BundledAssets,
+            ContainerProvisionArg::DistroEngine => Self::DistroEngine,
+        }
+    }
 }
 
 /// Executes the daemon command.
@@ -73,10 +117,22 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
         .unwrap_or_else(|| data_dir.join("arcbox.sock"));
 
     // Create configuration.
-    let config = Config {
+    let mut config = Config {
         data_dir: data_dir.clone(),
         ..Default::default()
     };
+    if let Some(mode) = args.container_backend {
+        config.container.backend = mode.into();
+    }
+    if let Some(mode) = args.container_provision {
+        config.container.provision = mode.into();
+    }
+    if let Some(port) = args.guest_docker_vsock_port {
+        config.container.guest_docker_vsock_port = port;
+    }
+    let selected_backend = config.container.backend;
+    let selected_provision = config.container.provision;
+    let selected_guest_docker_port = config.container.guest_docker_vsock_port;
 
     // Build VM lifecycle config with custom kernel/initramfs if provided.
     let mut vm_lifecycle_config = arcbox_core::VmLifecycleConfig::default();
@@ -97,7 +153,13 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
         .await
         .context("Failed to initialize runtime")?;
 
-    info!(data_dir = %data_dir.display(), "Runtime initialized");
+    info!(
+        data_dir = %data_dir.display(),
+        backend = ?selected_backend,
+        provision = ?selected_provision,
+        guest_docker_vsock_port = selected_guest_docker_port,
+        "Runtime initialized"
+    );
 
     // Configure Docker API server.
     let server_config = ServerConfig {

@@ -2,6 +2,7 @@
 
 use crate::agent_client::AgentPool;
 use crate::config::Config;
+use crate::container_backend::{DynContainerBackend, create_backend};
 use crate::error::{CoreError, Result};
 use crate::event::EventBus;
 use crate::machine::{MachineManager, MachineState};
@@ -43,6 +44,8 @@ pub struct Runtime {
     machine_manager: Arc<MachineManager>,
     /// VM lifecycle manager (automatic VM management).
     vm_lifecycle: Arc<VmLifecycleManager>,
+    /// Selected container backend implementation.
+    container_backend: DynContainerBackend,
     /// Container manager.
     container_manager: Arc<ContainerManager>,
     /// Image store.
@@ -92,6 +95,12 @@ impl Runtime {
             config.data_dir.clone(),
             vm_lifecycle_config,
         ));
+        let container_backend = create_backend(
+            &config.container,
+            Arc::clone(&vm_lifecycle),
+            Arc::clone(&machine_manager),
+            DEFAULT_MACHINE_NAME,
+        );
 
         let container_manager = Arc::new(ContainerManager::new());
         let image_store = Arc::new(ImageStore::new(config.data_dir.join("images"))?);
@@ -108,6 +117,7 @@ impl Runtime {
             vm_manager,
             machine_manager,
             vm_lifecycle,
+            container_backend,
             container_manager,
             image_store,
             volume_manager,
@@ -184,6 +194,12 @@ impl Runtime {
         &self.vm_lifecycle
     }
 
+    /// Returns the selected container backend implementation.
+    #[must_use]
+    pub fn container_backend(&self) -> &DynContainerBackend {
+        &self.container_backend
+    }
+
     /// Ensures the default VM is running and ready for container operations.
     ///
     /// This is the main entry point for automatic VM lifecycle management.
@@ -196,7 +212,7 @@ impl Runtime {
     ///
     /// Returns an error if the VM cannot be started or becomes unhealthy.
     pub async fn ensure_vm_ready(&self) -> Result<u32> {
-        self.vm_lifecycle.ensure_ready().await
+        self.container_backend.ensure_ready().await
     }
 
     /// Returns the default machine name used for automatic VM lifecycle.
@@ -236,7 +252,10 @@ impl Runtime {
         tokio::fs::create_dir_all(self.config.data_dir.join("images")).await?;
         tokio::fs::create_dir_all(self.config.data_dir.join("volumes")).await?;
 
-        tracing::info!("ArcBox runtime initialized");
+        tracing::info!(
+            backend = self.container_backend.name(),
+            "ArcBox runtime initialized"
+        );
         Ok(())
     }
 
@@ -1327,13 +1346,19 @@ impl Runtime {
         #[cfg(target_os = "macos")]
         {
             let mut agent = self.machine_manager.connect_agent(machine_name)?;
-            agent.container_stats(container_id).await.map_err(Into::into)
+            agent
+                .container_stats(container_id)
+                .await
+                .map_err(Into::into)
         }
         #[cfg(target_os = "linux")]
         {
             let agent = self.agent_pool.get(_cid).await;
             let mut agent = agent.write().await;
-            agent.container_stats(container_id).await.map_err(Into::into)
+            agent
+                .container_stats(container_id)
+                .await
+                .map_err(Into::into)
         }
     }
 
@@ -1356,13 +1381,19 @@ impl Runtime {
         #[cfg(target_os = "macos")]
         {
             let mut agent = self.machine_manager.connect_agent(machine_name)?;
-            agent.container_top(container_id, ps_args).await.map_err(Into::into)
+            agent
+                .container_top(container_id, ps_args)
+                .await
+                .map_err(Into::into)
         }
         #[cfg(target_os = "linux")]
         {
             let agent = self.agent_pool.get(_cid).await;
             let mut agent = agent.write().await;
-            agent.container_top(container_id, ps_args).await.map_err(Into::into)
+            agent
+                .container_top(container_id, ps_args)
+                .await
+                .map_err(Into::into)
         }
     }
 

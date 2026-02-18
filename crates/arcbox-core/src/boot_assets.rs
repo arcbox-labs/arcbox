@@ -221,6 +221,24 @@ pub struct BootAssetManifest {
     /// Recommended kernel cmdline for this boot asset.
     #[serde(default)]
     pub kernel_cmdline: Option<String>,
+    /// Runtime binary metadata bundled in this boot asset.
+    #[serde(default)]
+    pub runtime_assets: Vec<RuntimeAssetManifestEntry>,
+}
+
+/// Runtime artifact metadata in boot manifest.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuntimeAssetManifestEntry {
+    /// Runtime component name (for example: dockerd, containerd, youki).
+    pub name: String,
+    /// Relative path inside boot asset bundle.
+    pub path: String,
+    /// Optional component version.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Optional sha256 checksum for this file.
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 // =============================================================================
@@ -275,9 +293,7 @@ impl BootAssetProvider {
 
     /// Creates a new boot asset provider with custom configuration.
     pub fn with_config(config: BootAssetConfig) -> Self {
-        Self {
-            config,
-        }
+        Self { config }
     }
 
     fn build_http_client(&self) -> Result<reqwest::Client> {
@@ -702,14 +718,18 @@ impl BootAssetProvider {
     fn validate_manifest(&self, manifest: &BootAssetManifest) -> Result<()> {
         if manifest.asset_version != self.config.version {
             return Err(CoreError::config(format!(
-                "boot manifest version mismatch: expected {}, got {}",
+                "boot manifest version mismatch: expected '{}', got '{}'. \
+                 Run 'arcbox boot prefetch --force' to re-download the correct version, \
+                 or set ARCBOX_BOOT_ASSET_VERSION to match your cached assets.",
                 self.config.version, manifest.asset_version
             )));
         }
 
         if manifest.arch != self.config.arch {
             return Err(CoreError::config(format!(
-                "boot manifest arch mismatch: expected {}, got {}",
+                "boot manifest arch mismatch: expected '{}', got '{}'. \
+                 The cached boot assets were built for a different architecture. \
+                 Run 'arcbox boot prefetch --force' to download assets for this platform.",
                 self.config.arch, manifest.arch
             )));
         }
@@ -747,7 +767,9 @@ impl BootAssetProvider {
         let manifest_path = dir.join(MANIFEST_FILENAME);
         self.read_manifest_from_dir(dir).await?.ok_or_else(|| {
             CoreError::config(format!(
-                "boot manifest required but missing: {}",
+                "boot manifest required but missing: {}. \
+                 Boot assets without a manifest are not supported. \
+                 Run 'arcbox boot prefetch --force' to re-download a valid asset bundle.",
                 manifest_path.display()
             ))
         })
@@ -868,8 +890,8 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::sync::Mutex;
+    use tempfile::tempdir;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -996,7 +1018,15 @@ mod tests {
   "kernel_commit": "abc123",
   "agent_commit": "def456",
   "built_at": "2026-02-17T00:00:00Z",
-  "kernel_cmdline": "console=hvc0 rdinit=/init quiet"
+  "kernel_cmdline": "console=hvc0 rdinit=/init quiet",
+  "runtime_assets": [
+    {
+      "name": "dockerd",
+      "path": "runtime/bin/dockerd",
+      "version": "28.0.0",
+      "sha256": "deadbeef"
+    }
+  ]
 }"#,
         )
         .unwrap();
@@ -1016,6 +1046,17 @@ mod tests {
         assert_eq!(
             manifest.kernel_cmdline.as_deref(),
             Some("console=hvc0 rdinit=/init quiet")
+        );
+        assert_eq!(manifest.runtime_assets.len(), 1);
+        assert_eq!(manifest.runtime_assets[0].name, "dockerd");
+        assert_eq!(manifest.runtime_assets[0].path, "runtime/bin/dockerd");
+        assert_eq!(
+            manifest.runtime_assets[0].version.as_deref(),
+            Some("28.0.0")
+        );
+        assert_eq!(
+            manifest.runtime_assets[0].sha256.as_deref(),
+            Some("deadbeef")
         );
     }
 
@@ -1086,6 +1127,68 @@ mod tests {
         let err = provider.read_cached_manifest_required().await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("boot manifest required but missing"));
+    }
+
+    #[tokio::test]
+    async fn test_read_cached_manifest_arch_mismatch() {
+        let temp = tempdir().unwrap();
+        let cache_dir = temp.path().to_path_buf();
+        let version = "1.0.0".to_string();
+        let version_dir = cache_dir.join(&version);
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(
+            version_dir.join(MANIFEST_FILENAME),
+            r#"{
+  "schema_version": 1,
+  "asset_version": "1.0.0",
+  "arch": "x86_64"
+}"#,
+        )
+        .unwrap();
+
+        let config = BootAssetConfig {
+            cache_dir,
+            version,
+            arch: "arm64".to_string(),
+            ..Default::default()
+        };
+        let provider = BootAssetProvider::with_config(config);
+
+        let err = provider.read_cached_manifest().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("manifest arch mismatch"));
+    }
+
+    #[test]
+    fn test_is_cached_requires_all_files() {
+        let temp = tempdir().unwrap();
+        let cache_dir = temp.path().to_path_buf();
+        let version = "1.0.0".to_string();
+        let version_dir = cache_dir.join(&version);
+        std::fs::create_dir_all(&version_dir).unwrap();
+
+        let config = BootAssetConfig {
+            cache_dir: cache_dir.clone(),
+            version: version.clone(),
+            arch: "arm64".to_string(),
+            ..Default::default()
+        };
+        let provider = BootAssetProvider::with_config(config);
+
+        // No files: not cached.
+        assert!(!provider.is_cached());
+
+        // Only kernel: not cached.
+        std::fs::write(version_dir.join(KERNEL_FILENAME), b"kernel").unwrap();
+        assert!(!provider.is_cached());
+
+        // Kernel + initramfs but no manifest: not cached.
+        std::fs::write(version_dir.join(INITRAMFS_FILENAME), b"initramfs").unwrap();
+        assert!(!provider.is_cached());
+
+        // All three files: cached.
+        std::fs::write(version_dir.join(MANIFEST_FILENAME), b"{}").unwrap();
+        assert!(provider.is_cached());
     }
 
     fn restore_env(original: Option<String>) {

@@ -100,8 +100,14 @@ impl From<&MachineInfo> for PersistedMachine {
             cmdline: info.cmdline.clone(),
             distro: info.distro.clone(),
             distro_version: info.distro_version.clone(),
-            disk_path: info.disk_path.as_ref().map(|p| p.to_string_lossy().to_string()),
-            ssh_key_path: info.ssh_key_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            disk_path: info
+                .disk_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            ssh_key_path: info
+                .ssh_key_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
             ip_address: info.ip_address.clone(),
             state: info.state.into(),
             vm_id: info.vm_id.to_string(),

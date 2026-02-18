@@ -33,8 +33,8 @@ use crate::event::{Event, EventBus};
 use crate::machine::{MachineConfig, MachineInfo, MachineManager, MachineState};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -59,6 +59,13 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 
 /// Maximum retry attempts for recovery.
 const DEFAULT_MAX_RETRIES: u32 = 3;
+
+/// Minimum balloon target in MB when VM is idle.
+/// Below this, the guest may become unstable.
+const IDLE_BALLOON_TARGET_MB: u64 = 128;
+
+/// Delay before shrinking balloon after entering idle state.
+const BALLOON_SHRINK_DELAY_SECS: u64 = 10;
 
 // =============================================================================
 // VM Lifecycle State
@@ -431,6 +438,10 @@ pub struct VmLifecycleManager {
     data_dir: PathBuf,
     /// Mutex for serializing state transitions.
     transition_lock: Mutex<()>,
+    /// Timestamp of last activity (epoch millis, for idle detection).
+    last_activity_ms: AtomicU64,
+    /// Whether balloon is currently shrunk for idle state.
+    balloon_shrunk: std::sync::atomic::AtomicBool,
 }
 
 impl VmLifecycleManager {
@@ -461,6 +472,11 @@ impl VmLifecycleManager {
             VmLifecycleState::NotExist
         };
 
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
         Self {
             machine_manager,
             event_bus,
@@ -471,6 +487,8 @@ impl VmLifecycleManager {
             config,
             data_dir,
             transition_lock: Mutex::new(()),
+            last_activity_ms: AtomicU64::new(now_ms),
+            balloon_shrunk: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -525,9 +543,13 @@ impl VmLifecycleManager {
 
         // If already running, just return CID
         if current_state.is_ready() {
-            // Record activity to exit idle state
+            // Record activity timestamp.
+            self.record_activity();
+
+            // Exit idle state and restore balloon if shrunk.
             if current_state == VmLifecycleState::Idle {
                 *self.state.write().await = VmLifecycleState::Running;
+                self.restore_balloon();
             }
 
             return self.get_cid().await;
@@ -583,7 +605,7 @@ impl VmLifecycleManager {
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
-            match self.machine_manager.start(DEFAULT_MACHINE_NAME) {
+            match self.machine_manager.start(DEFAULT_MACHINE_NAME).await {
                 Ok(()) => {
                     tracing::info!("Default VM started successfully");
                     *self.state.write().await = VmLifecycleState::Running;
@@ -637,6 +659,8 @@ impl VmLifecycleManager {
                 .cmdline
                 .clone()
                 .or(Some(assets.cmdline)),
+            distro: None,
+            distro_version: None,
         };
 
         tracing::info!(
@@ -646,7 +670,7 @@ impl VmLifecycleManager {
             config.kernel.as_deref().unwrap_or("default")
         );
 
-        self.machine_manager.create(config)?;
+        self.machine_manager.create(config).await?;
 
         Ok(())
     }
@@ -685,6 +709,32 @@ impl VmLifecycleManager {
                         Ok(_response) => {
                             tracing::info!("Agent is ready");
                             self.health_monitor.record_success();
+                            #[cfg(target_os = "macos")]
+                            if std::env::var("ARCBOX_ENABLE_CONSOLE").as_deref() == Ok("1") {
+                                let machine_manager = Arc::clone(&self.machine_manager);
+                                tokio::spawn(async move {
+                                    loop {
+                                        match machine_manager
+                                            .read_console_output(DEFAULT_MACHINE_NAME)
+                                        {
+                                            Ok(output) => {
+                                                let trimmed = output.trim_matches('\0');
+                                                if !trimmed.is_empty() {
+                                                    tracing::info!(
+                                                        "Guest console (runtime): {}",
+                                                        trimmed.trim_end()
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::debug!("Console read loop stopped: {}", e);
+                                                break;
+                                            }
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(200)).await;
+                                    }
+                                });
+                            }
                             return Ok(());
                         }
                         Err(e) => {
@@ -701,6 +751,125 @@ impl VmLifecycleManager {
         }
 
         Err(CoreError::Vm("timeout waiting for agent".to_string()))
+    }
+
+    // =========================================================================
+    // Activity tracking & balloon control (Phase 2.1)
+    // =========================================================================
+
+    /// Records activity, updating the last-activity timestamp.
+    fn record_activity(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.last_activity_ms.store(now_ms, Ordering::Relaxed);
+    }
+
+    /// Returns seconds since last activity.
+    fn idle_seconds(&self) -> u64 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let last = self.last_activity_ms.load(Ordering::Relaxed);
+        now_ms.saturating_sub(last) / 1000
+    }
+
+    /// Shrinks the balloon to reclaim guest memory during idle.
+    ///
+    /// Sets the balloon target to `IDLE_BALLOON_TARGET_MB` so the guest
+    /// returns memory to the host, reducing idle footprint.
+    #[cfg(target_os = "macos")]
+    fn shrink_balloon(&self) {
+        if self.balloon_shrunk.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let target_bytes = IDLE_BALLOON_TARGET_MB * 1024 * 1024;
+        if let Some(info) = self.machine_manager.get(DEFAULT_MACHINE_NAME) {
+            match self
+                .machine_manager
+                .vm_manager()
+                .set_balloon_target(&info.vm_id, target_bytes)
+            {
+                Ok(()) => {
+                    self.balloon_shrunk.store(true, Ordering::Relaxed);
+                    tracing::info!("Balloon shrunk to {}MB for idle VM", IDLE_BALLOON_TARGET_MB);
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to shrink balloon: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Restores the balloon to the full configured memory size.
+    ///
+    /// Called when the VM exits idle state (new container activity).
+    #[cfg(target_os = "macos")]
+    fn restore_balloon(&self) {
+        if !self.balloon_shrunk.load(Ordering::Relaxed) {
+            return;
+        }
+
+        if let Some(info) = self.machine_manager.get(DEFAULT_MACHINE_NAME) {
+            let full_bytes = info.memory_mb * 1024 * 1024;
+            match self
+                .machine_manager
+                .vm_manager()
+                .set_balloon_target(&info.vm_id, full_bytes)
+            {
+                Ok(()) => {
+                    self.balloon_shrunk.store(false, Ordering::Relaxed);
+                    tracing::info!("Balloon restored to {}MB", info.memory_mb);
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to restore balloon: {}", e);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn shrink_balloon(&self) {}
+
+    #[cfg(not(target_os = "macos"))]
+    fn restore_balloon(&self) {}
+
+    /// Starts the idle monitor background task.
+    ///
+    /// This task periodically checks if the VM has been idle for longer than
+    /// `idle_timeout` and transitions to Idle state, shrinking the balloon.
+    pub fn start_idle_monitor(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        let idle_timeout = this.config.idle_timeout;
+        let shutdown = this.health_monitor.shutdown_token();
+
+        tokio::spawn(async move {
+            let check_interval = Duration::from_secs(BALLOON_SHRINK_DELAY_SECS);
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(check_interval) => {}
+                }
+
+                let state = *this.state.read().await;
+                if state != VmLifecycleState::Running {
+                    continue;
+                }
+
+                let idle_secs = this.idle_seconds();
+                if idle_secs >= idle_timeout.as_secs() {
+                    *this.state.write().await = VmLifecycleState::Idle;
+                    this.shrink_balloon();
+                    tracing::info!("VM entered idle state after {}s of inactivity", idle_secs);
+                    this.event_bus.publish(Event::MachineStopped {
+                        name: DEFAULT_MACHINE_NAME.to_string(),
+                    });
+                }
+            }
+        });
     }
 
     /// Gracefully stops the VM.

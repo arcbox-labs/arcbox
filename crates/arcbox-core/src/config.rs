@@ -27,6 +27,11 @@
 //! [docker]
 //! socket_path = "~/.arcbox/docker.sock"
 //!
+//! [container]
+//! backend = "guest_docker"
+//! provision = "bundled_assets"
+//! guest_docker_vsock_port = 2375
+//!
 //! [logging]
 //! level = "info"
 //! ```
@@ -52,6 +57,8 @@ pub struct Config {
     pub network: NetworkConfig,
     /// Docker API configuration.
     pub docker: DockerConfig,
+    /// Container runtime backend configuration.
+    pub container: ContainerRuntimeConfig,
     /// Logging configuration.
     pub logging: LoggingConfig,
     /// Storage configuration.
@@ -66,6 +73,7 @@ impl Default for Config {
             machine: MachineDefaults::default(),
             network: NetworkConfig::default(),
             docker: DockerConfig::default(),
+            container: ContainerRuntimeConfig::default(),
             logging: LoggingConfig::default(),
             storage: StorageConfig::default(),
         }
@@ -228,6 +236,51 @@ impl Default for DockerConfig {
     }
 }
 
+/// Container runtime backend mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerBackendMode {
+    /// Existing host control-plane + guest agent runtime path.
+    NativeControlPlane,
+    /// Guest VM Docker Engine path (dockerd/containerd/youki).
+    GuestDocker,
+}
+
+/// Guest Docker runtime provisioning mode.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerProvisionMode {
+    /// Runtime assets bundled with boot-assets release.
+    BundledAssets,
+    /// Runtime installed from distro packages inside guest.
+    DistroEngine,
+}
+
+/// Container runtime configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContainerRuntimeConfig {
+    /// Container backend selector.
+    pub backend: ContainerBackendMode,
+    /// Guest runtime provisioning mode.
+    pub provision: ContainerProvisionMode,
+    /// Guest dockerd API vsock port.
+    pub guest_docker_vsock_port: u32,
+    /// Backend startup timeout in milliseconds.
+    pub startup_timeout_ms: u64,
+}
+
+impl Default for ContainerRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            backend: ContainerBackendMode::GuestDocker,
+            provision: ContainerProvisionMode::BundledAssets,
+            guest_docker_vsock_port: 2375,
+            startup_timeout_ms: 20_000,
+        }
+    }
+}
+
 fn default_docker_socket_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -304,6 +357,12 @@ mod tests {
         assert_eq!(config.vm.memory_mb, 4096);
         assert_eq!(config.machine.disk_gb, 50);
         assert!(config.docker.enabled);
+        assert_eq!(config.container.backend, ContainerBackendMode::GuestDocker);
+        assert_eq!(
+            config.container.provision,
+            ContainerProvisionMode::BundledAssets
+        );
+        assert_eq!(config.container.guest_docker_vsock_port, 2375);
     }
 
     #[test]

@@ -161,11 +161,14 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
         kernel: args.kernel.clone(),
         initrd: args.initrd.clone(),
         cmdline: args.cmdline.clone(),
+        distro: None,
+        distro_version: None,
     };
 
     runtime
         .machine_manager()
         .create(config)
+        .await
         .context("Failed to create machine")?;
 
     println!("Machine '{}' created successfully", args.name);
@@ -187,6 +190,7 @@ async fn execute_start(args: StartArgs) -> Result<()> {
     runtime
         .machine_manager()
         .start(&args.name)
+        .await
         .context("Failed to start machine")?;
 
     println!("Machine '{}' started", args.name);

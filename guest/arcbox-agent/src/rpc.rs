@@ -25,7 +25,8 @@ use arcbox_protocol::Empty;
 use arcbox_protocol::agent::{
     CreateContainerRequest, CreateContainerResponse, ExecOutput, ExecRequest, ExecResizeRequest,
     ExecStartRequest, ExecStartResponse, ListContainersRequest, ListContainersResponse, LogEntry,
-    LogsRequest, PingRequest, PingResponse, RemoveContainerRequest, StartContainerRequest,
+    LogsRequest, PingRequest, PingResponse, RemoveContainerRequest, RuntimeEnsureRequest,
+    RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, StartContainerRequest,
     StopContainerRequest, SystemInfo,
 };
 use arcbox_protocol::container::{
@@ -44,6 +45,8 @@ pub enum MessageType {
     // Request types (0x0000 - 0x0FFF)
     PingRequest = 0x0001,
     GetSystemInfoRequest = 0x0002,
+    EnsureRuntimeRequest = 0x0003,
+    RuntimeStatusRequest = 0x0004,
     CreateContainerRequest = 0x0010,
     StartContainerRequest = 0x0011,
     StopContainerRequest = 0x0012,
@@ -65,6 +68,8 @@ pub enum MessageType {
     // Response types (0x1000 - 0x1FFF)
     PingResponse = 0x1001,
     GetSystemInfoResponse = 0x1002,
+    EnsureRuntimeResponse = 0x1003,
+    RuntimeStatusResponse = 0x1004,
     CreateContainerResponse = 0x1010,
     StartContainerResponse = 0x1011,
     StopContainerResponse = 0x1012,
@@ -92,6 +97,8 @@ impl MessageType {
         match value {
             0x0001 => Some(Self::PingRequest),
             0x0002 => Some(Self::GetSystemInfoRequest),
+            0x0003 => Some(Self::EnsureRuntimeRequest),
+            0x0004 => Some(Self::RuntimeStatusRequest),
             0x0010 => Some(Self::CreateContainerRequest),
             0x0011 => Some(Self::StartContainerRequest),
             0x0012 => Some(Self::StopContainerRequest),
@@ -111,6 +118,8 @@ impl MessageType {
             0x0025 => Some(Self::AttachInput),
             0x1001 => Some(Self::PingResponse),
             0x1002 => Some(Self::GetSystemInfoResponse),
+            0x1003 => Some(Self::EnsureRuntimeResponse),
+            0x1004 => Some(Self::RuntimeStatusResponse),
             0x1010 => Some(Self::CreateContainerResponse),
             0x1011 => Some(Self::StartContainerResponse),
             0x1012 => Some(Self::StopContainerResponse),
@@ -177,6 +186,8 @@ impl ErrorResponse {
 pub enum RpcRequest {
     Ping(PingRequest),
     GetSystemInfo,
+    EnsureRuntime(RuntimeEnsureRequest),
+    RuntimeStatus(RuntimeStatusRequest),
     CreateContainer(CreateContainerRequest),
     StartContainer(StartContainerRequest),
     StopContainer(StopContainerRequest),
@@ -201,6 +212,8 @@ pub enum RpcRequest {
 pub enum RpcResponse {
     Ping(PingResponse),
     SystemInfo(SystemInfo),
+    RuntimeEnsure(RuntimeEnsureResponse),
+    RuntimeStatus(RuntimeStatusResponse),
     CreateContainer(CreateContainerResponse),
     Empty,
     ListContainers(ListContainersResponse),
@@ -220,6 +233,8 @@ impl RpcResponse {
         match self {
             Self::Ping(_) => MessageType::PingResponse,
             Self::SystemInfo(_) => MessageType::GetSystemInfoResponse,
+            Self::RuntimeEnsure(_) => MessageType::EnsureRuntimeResponse,
+            Self::RuntimeStatus(_) => MessageType::RuntimeStatusResponse,
             Self::CreateContainer(_) => MessageType::CreateContainerResponse,
             Self::Empty => MessageType::Empty,
             Self::ListContainers(_) => MessageType::ListContainersResponse,
@@ -239,6 +254,8 @@ impl RpcResponse {
         match self {
             Self::Ping(msg) => msg.encode_to_vec(),
             Self::SystemInfo(msg) => msg.encode_to_vec(),
+            Self::RuntimeEnsure(msg) => msg.encode_to_vec(),
+            Self::RuntimeStatus(msg) => msg.encode_to_vec(),
             Self::CreateContainer(msg) => msg.encode_to_vec(),
             Self::Empty => Empty::default().encode_to_vec(),
             Self::ListContainers(msg) => msg.encode_to_vec(),
@@ -326,6 +343,14 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
             Ok(RpcRequest::Ping(req))
         }
         MessageType::GetSystemInfoRequest => Ok(RpcRequest::GetSystemInfo),
+        MessageType::EnsureRuntimeRequest => {
+            let req = RuntimeEnsureRequest::decode(payload)?;
+            Ok(RpcRequest::EnsureRuntime(req))
+        }
+        MessageType::RuntimeStatusRequest => {
+            let req = RuntimeStatusRequest::decode(payload)?;
+            Ok(RpcRequest::RuntimeStatus(req))
+        }
         MessageType::CreateContainerRequest => {
             let req = CreateContainerRequest::decode(payload)?;
             Ok(RpcRequest::CreateContainer(req))
@@ -418,6 +443,14 @@ mod tests {
             Some(MessageType::GetSystemInfoRequest)
         );
         assert_eq!(
+            MessageType::from_u32(0x0003),
+            Some(MessageType::EnsureRuntimeRequest)
+        );
+        assert_eq!(
+            MessageType::from_u32(0x0004),
+            Some(MessageType::RuntimeStatusRequest)
+        );
+        assert_eq!(
             MessageType::from_u32(0x0010),
             Some(MessageType::CreateContainerRequest)
         );
@@ -458,6 +491,14 @@ mod tests {
             Some(MessageType::GetSystemInfoResponse)
         );
         assert_eq!(
+            MessageType::from_u32(0x1003),
+            Some(MessageType::EnsureRuntimeResponse)
+        );
+        assert_eq!(
+            MessageType::from_u32(0x1004),
+            Some(MessageType::RuntimeStatusResponse)
+        );
+        assert_eq!(
             MessageType::from_u32(0x1010),
             Some(MessageType::CreateContainerResponse)
         );
@@ -481,8 +522,8 @@ mod tests {
     #[test]
     fn test_message_type_from_u32_invalid() {
         assert_eq!(MessageType::from_u32(0x9999), None);
-        assert_eq!(MessageType::from_u32(0x0003), None);
-        assert_eq!(MessageType::from_u32(0x1003), None);
+        assert_eq!(MessageType::from_u32(0x0005), None);
+        assert_eq!(MessageType::from_u32(0x1005), None);
         assert_eq!(MessageType::from_u32(0x0026), None);
     }
 

@@ -135,10 +135,7 @@ fn mount_fs(source: &str, target: &str, fstype: &str, options: &str) {
         }
         Err(e) => {
             // Fall back to mount(2) syscall if busybox is not available.
-            eprintln!(
-                "[arcbox-init] busybox mount failed ({}), trying syscall",
-                e
-            );
+            eprintln!("[arcbox-init] busybox mount failed ({}), trying syscall", e);
             #[cfg(target_os = "linux")]
             {
                 use nix::mount::{MsFlags, mount};
@@ -148,9 +145,7 @@ fn mount_fs(source: &str, target: &str, fstype: &str, options: &str) {
                 } else {
                     Some(options)
                 };
-                if let Err(e) =
-                    mount(Some(source), target, Some(fstype), flags, opts)
-                {
+                if let Err(e) = mount(Some(source), target, Some(fstype), flags, opts) {
                     eprintln!(
                         "[arcbox-init] Warning: mount syscall {} -> {} failed: {}",
                         source, target, e
@@ -181,7 +176,10 @@ fn first_boot_provision() -> bool {
     // Extract rootfs tarball.
     let tarball_path = Path::new(MNT_SETUP).join("rootfs.tar.gz");
     if tarball_path.exists() {
-        eprintln!("[arcbox-init] Extracting rootfs from {}...", tarball_path.display());
+        eprintln!(
+            "[arcbox-init] Extracting rootfs from {}...",
+            tarball_path.display()
+        );
         extract_tarball(&tarball_path, MNT_ROOT);
     } else {
         eprintln!("[arcbox-init] Warning: rootfs.tar.gz not found in setup share");
@@ -344,7 +342,9 @@ fn enable_sshd(root: &Path, distro: &str) {
 fn install_agent() -> bool {
     let src = Path::new("/sbin/arcbox-agent");
     if !src.exists() {
-        eprintln!("[arcbox-init] Warning: /sbin/arcbox-agent not found in initramfs, skipping agent install");
+        eprintln!(
+            "[arcbox-init] Warning: /sbin/arcbox-agent not found in initramfs, skipping agent install"
+        );
         return false;
     }
 
@@ -354,7 +354,10 @@ fn install_agent() -> bool {
     }
 
     if let Err(e) = fs::copy(src, &dest) {
-        eprintln!("[arcbox-init] Warning: failed to copy agent to rootfs: {}", e);
+        eprintln!(
+            "[arcbox-init] Warning: failed to copy agent to rootfs: {}",
+            e
+        );
         return false;
     }
 
@@ -385,10 +388,15 @@ fn install_agent_openrc(root: &Path) {
 name="arcbox-agent"
 description="ArcBox guest agent"
 command="/usr/local/bin/arcbox-agent"
+command_args=""
 command_background="yes"
 pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/arcbox-agent.log"
 error_log="/var/log/arcbox-agent.log"
+
+# Can be overridden in /etc/conf.d/arcbox-agent
+: "${ARCBOX_GUEST_DOCKER_VSOCK_PORT:=2375}"
+export ARCBOX_GUEST_DOCKER_VSOCK_PORT
 
 depend() {
     need net
@@ -403,15 +411,11 @@ depend() {
     }
 
     // Enable at default runlevel.
-    let runlevel_dir = root.join("etc/runlevels/default");
-    fs::create_dir_all(&runlevel_dir).ok();
-    let link = runlevel_dir.join("arcbox-agent");
-    if !link.exists() {
-        #[cfg(unix)]
-        {
-            let _ = std::os::unix::fs::symlink("/etc/init.d/arcbox-agent", &link);
-        }
-    }
+    enable_openrc_service(root, "arcbox-agent");
+
+    // If runtime services exist in rootfs, enable them too.
+    enable_openrc_service(root, "containerd");
+    enable_openrc_service(root, "docker");
     eprintln!("[arcbox-init] Installed arcbox-agent OpenRC service.");
 }
 
@@ -427,6 +431,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=ARCBOX_GUEST_DOCKER_VSOCK_PORT=2375
+EnvironmentFile=-/etc/default/arcbox-agent
 ExecStart=/usr/local/bin/arcbox-agent
 Restart=always
 RestartSec=2
@@ -439,19 +445,74 @@ WantedBy=multi-user.target
     let _ = fs::write(unit_dir.join("arcbox-agent.service"), unit);
 
     // Enable the service.
-    let wants_dir = root.join("etc/systemd/system/multi-user.target.wants");
-    fs::create_dir_all(&wants_dir).ok();
-    let link = wants_dir.join("arcbox-agent.service");
-    if !link.exists() {
-        #[cfg(unix)]
-        {
-            let _ = std::os::unix::fs::symlink(
-                "/etc/systemd/system/arcbox-agent.service",
-                &link,
+    enable_systemd_service(root, "arcbox-agent.service");
+
+    // If runtime services exist in rootfs, enable them too.
+    enable_systemd_service(root, "containerd.service");
+    enable_systemd_service(root, "docker.service");
+    eprintln!("[arcbox-init] Installed arcbox-agent systemd service.");
+}
+
+fn enable_openrc_service(root: &Path, service: &str) {
+    let init_script = root.join("etc/init.d").join(service);
+    if !init_script.exists() {
+        return;
+    }
+
+    let runlevel_dir = root.join("etc/runlevels/default");
+    fs::create_dir_all(&runlevel_dir).ok();
+    let link = runlevel_dir.join(service);
+    if link.exists() {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        let target = format!("/etc/init.d/{}", service);
+        if let Err(e) = std::os::unix::fs::symlink(target, &link) {
+            eprintln!(
+                "[arcbox-init] Warning: failed to enable OpenRC service {}: {}",
+                service, e
             );
+        } else {
+            eprintln!("[arcbox-init] Enabled OpenRC service {}.", service);
         }
     }
-    eprintln!("[arcbox-init] Installed arcbox-agent systemd service.");
+}
+
+fn enable_systemd_service(root: &Path, service: &str) {
+    let service_in_etc = root.join("etc/systemd/system").join(service);
+    let service_in_lib = root.join("lib/systemd/system").join(service);
+    let service_in_usr_lib = root.join("usr/lib/systemd/system").join(service);
+
+    let target = if service_in_etc.exists() {
+        format!("/etc/systemd/system/{}", service)
+    } else if service_in_lib.exists() {
+        format!("/lib/systemd/system/{}", service)
+    } else if service_in_usr_lib.exists() {
+        format!("/usr/lib/systemd/system/{}", service)
+    } else {
+        return;
+    };
+
+    let wants_dir = root.join("etc/systemd/system/multi-user.target.wants");
+    fs::create_dir_all(&wants_dir).ok();
+    let link = wants_dir.join(service);
+    if link.exists() {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        if let Err(e) = std::os::unix::fs::symlink(target, &link) {
+            eprintln!(
+                "[arcbox-init] Warning: failed to enable systemd service {}: {}",
+                service, e
+            );
+        } else {
+            eprintln!("[arcbox-init] Enabled systemd service {}.", service);
+        }
+    }
 }
 
 /// Performs switch_root to the real rootfs and exec /sbin/init.

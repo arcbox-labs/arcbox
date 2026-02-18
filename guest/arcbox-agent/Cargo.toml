@@ -35,6 +35,7 @@ async-trait = { workspace = true }
 pin-project-lite = { workspace = true }
 tokio-util = "0.7"
 flate2 = "1"
+tar = "0.4"
 num_cpus = "1"
 
 # vsock is Linux-only
@@ -46,6 +47,10 @@ tempfile = "3"
 
 [features]
 default = []
+engine-native = []
+engine-docker-supervisor = []
+provision-bundled = []
+provision-distro = []
 
 # When building for the guest VM (Linux), vsock is fully functional.
 # On macOS host, we provide stubs for development/testing.

@@ -34,6 +34,7 @@ flate2 = "1"
 tar = "0.4"
 futures-util = "0.3"
 serde = { workspace = true }
+serde_json = { workspace = true }
 figment = { workspace = true }
 uuid = { workspace = true }
 dirs = { workspace = true }
@@ -45,3 +46,7 @@ tempfile = "3"
 
 [features]
 default = []
+backend-native = []
+backend-guest-docker = []
+provision-bundled = []
+provision-distro = []

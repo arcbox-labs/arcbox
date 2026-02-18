@@ -3,13 +3,9 @@
 //! A "machine" is a high-level abstraction over a VM that provides
 //! a Linux environment for running containers.
 
-use crate::boot_assets::BootAssetProvider;
-use crate::disk::{self, DiskManager};
-use crate::distro::DistroRegistry;
 use crate::error::{CoreError, Result};
 use crate::persistence::MachinePersistence;
-use crate::ssh::SshKeyManager;
-use crate::vm::{BlockDeviceConfig, SharedDirConfig, VmConfig, VmId, VmManager};
+use crate::vm::{SharedDirConfig, VmConfig, VmId, VmManager};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -34,15 +30,12 @@ pub enum MachineState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::boot_assets::{BootAssetConfig, BootAssetProvider};
     use tempfile::tempdir;
 
-    /// Creates a test MachineManager with a mock boot asset provider.
+    /// Creates a test MachineManager.
     fn test_machine_manager(data_dir: &std::path::Path) -> MachineManager {
         let vm_manager = VmManager::new();
-        let boot_config = BootAssetConfig::with_cache_dir(data_dir.join("boot"));
-        let boot_assets = Arc::new(BootAssetProvider::with_config(boot_config));
-        MachineManager::new(vm_manager, data_dir.to_path_buf(), boot_assets)
+        MachineManager::new(vm_manager, data_dir.to_path_buf())
     }
 
     #[tokio::test]
@@ -101,6 +94,27 @@ mod tests {
         // Should still have the first CID (not overwritten).
         let machine = machine_manager.get("test-idempotent").unwrap();
         assert_eq!(machine.cid, Some(10));
+    }
+
+    #[test]
+    fn test_select_routable_ip_prefers_ipv4() {
+        let ips = vec![
+            "::1".to_string(),
+            "fe80::1".to_string(),
+            "2001:db8::10".to_string(),
+            "192.168.64.2".to_string(),
+        ];
+        assert_eq!(select_routable_ip(&ips), Some("192.168.64.2".to_string()));
+    }
+
+    #[test]
+    fn test_select_routable_ip_falls_back_to_global_ipv6() {
+        let ips = vec![
+            "::1".to_string(),
+            "fe80::2".to_string(),
+            "2001:db8::42".to_string(),
+        ];
+        assert_eq!(select_routable_ip(&ips), Some("2001:db8::42".to_string()));
     }
 }
 
@@ -189,23 +203,14 @@ pub struct MachineManager {
     data_dir: PathBuf,
     /// Machine-specific directory (data_dir/machines/).
     machines_dir: PathBuf,
-    /// Distribution rootfs registry.
-    distro_registry: DistroRegistry,
-    /// Boot asset provider (shared kernel/initramfs).
-    boot_assets: Arc<BootAssetProvider>,
 }
 
 impl MachineManager {
     /// Creates a new machine manager.
     #[must_use]
-    pub fn new(
-        vm_manager: VmManager,
-        data_dir: PathBuf,
-        boot_assets: Arc<BootAssetProvider>,
-    ) -> Self {
+    pub fn new(vm_manager: VmManager, data_dir: PathBuf) -> Self {
         let machines_dir = data_dir.join("machines");
         let persistence = MachinePersistence::new(&machines_dir);
-        let distro_registry = DistroRegistry::new(data_dir.join("distros"));
 
         // Create the default shared directory config for VirtioFS
         // This shares the data_dir (e.g., ~/.arcbox) with the guest at /arcbox
@@ -218,33 +223,13 @@ impl MachineManager {
         let mut machines = HashMap::new();
         for persisted in persistence.load_all() {
             // Reconstruct VmConfig from persisted data.
-            // For machine VMs with a distro, set up block devices and shared dirs.
-            let (block_devices, vm_shared_dirs) = if persisted.distro.is_some() {
-                let machine_dir = machines_dir.join(&persisted.name);
-                let mut bds = Vec::new();
-                if let Some(ref dp) = persisted.disk_path {
-                    bds.push(BlockDeviceConfig {
-                        path: dp.clone(),
-                        read_only: false,
-                    });
-                }
-                let sds = vec![SharedDirConfig::new(
-                    machine_dir.to_string_lossy().to_string(),
-                    "arcbox-setup",
-                )];
-                (bds, sds)
-            } else {
-                (Vec::new(), shared_dirs.clone())
-            };
-
             let vm_config = VmConfig {
                 cpus: persisted.cpus,
                 memory_mb: persisted.memory_mb,
                 kernel: persisted.kernel.clone(),
                 initrd: persisted.initrd.clone(),
                 cmdline: persisted.cmdline.clone(),
-                shared_dirs: vm_shared_dirs,
-                block_devices,
+                shared_dirs: shared_dirs.clone(),
                 ..Default::default()
             };
 
@@ -280,8 +265,6 @@ impl MachineManager {
             persistence,
             data_dir,
             machines_dir,
-            distro_registry,
-            boot_assets,
         }
     }
 
@@ -314,44 +297,26 @@ impl MachineManager {
         let machine_dir = self.machines_dir.join(&config.name);
         std::fs::create_dir_all(&machine_dir)?;
 
-        // Set up machine based on whether distro is specified.
-        let (disk_path, ssh_key_path, kernel, initrd, cmdline, block_devices, shared_dirs) =
-            if let Some(ref distro_name) = config.distro {
-                // Full machine VM with distro rootfs.
-                self.setup_machine_vm(&config, &machine_dir, distro_name)
-                    .await?
-            } else {
-                // Lightweight container VM (existing behavior).
-                let mut shared_dirs = vec![SharedDirConfig::new(
-                    self.data_dir.to_string_lossy().to_string(),
-                    "arcbox",
-                )];
-                if let Some(home_dir) = dirs::home_dir() {
-                    shared_dirs.push(SharedDirConfig::new(
-                        home_dir.to_string_lossy().to_string(),
-                        "home",
-                    ));
-                }
-                (
-                    None,
-                    None,
-                    config.kernel.clone(),
-                    config.initrd.clone(),
-                    config.cmdline.clone(),
-                    Vec::new(),
-                    shared_dirs,
-                )
-            };
+        // Set up shared directories for VirtioFS.
+        let mut shared_dirs = vec![SharedDirConfig::new(
+            self.data_dir.to_string_lossy().to_string(),
+            "arcbox",
+        )];
+        if let Some(home_dir) = dirs::home_dir() {
+            shared_dirs.push(SharedDirConfig::new(
+                home_dir.to_string_lossy().to_string(),
+                "home",
+            ));
+        }
 
         // Create underlying VM
         let vm_config = VmConfig {
             cpus: config.cpus,
             memory_mb: config.memory_mb,
-            kernel,
-            initrd,
-            cmdline,
+            kernel: config.kernel.clone(),
+            initrd: config.initrd.clone(),
+            cmdline: config.cmdline.clone(),
             shared_dirs,
-            block_devices,
             ..Default::default()
         };
         let vm_id = self.vm_manager.create(vm_config)?;
@@ -369,8 +334,8 @@ impl MachineManager {
             cmdline: config.cmdline,
             distro: config.distro,
             distro_version: config.distro_version,
-            disk_path,
-            ssh_key_path,
+            disk_path: None,
+            ssh_key_path: None,
             ip_address: None,
             created_at: Utc::now(),
         };
@@ -384,102 +349,6 @@ impl MachineManager {
             .insert(config.name.clone(), info);
 
         Ok(config.name)
-    }
-
-    /// Sets up a full machine VM with distro rootfs, disk image, and SSH keys.
-    async fn setup_machine_vm(
-        &self,
-        config: &MachineConfig,
-        machine_dir: &std::path::Path,
-        distro_name: &str,
-    ) -> Result<(
-        Option<PathBuf>,
-        Option<PathBuf>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Vec<BlockDeviceConfig>,
-        Vec<SharedDirConfig>,
-    )> {
-        // 1. Resolve distro info.
-        let distro_info = self
-            .distro_registry
-            .resolve(distro_name, config.distro_version.as_deref())?;
-
-        tracing::info!(
-            "Setting up machine VM: distro={} {}, disk={}GB",
-            distro_info.distro,
-            distro_info.version,
-            config.disk_gb
-        );
-
-        // 2. Download rootfs tarball (cached).
-        let tarball_path = self.distro_registry.ensure_rootfs(&distro_info).await?;
-
-        // 3. Generate SSH key pair.
-        let (private_key_path, public_key) = SshKeyManager::generate(machine_dir).await?;
-
-        // 4. Create ext4 disk image.
-        let disk_path = machine_dir.join(disk::DISK_IMAGE_FILENAME);
-        DiskManager::create_image(&disk_path, config.disk_gb).await?;
-
-        // 5. Create setup.json for first-boot provisioning.
-        let setup_data = serde_json::json!({
-            "hostname": config.name,
-            "ssh_pubkey": public_key,
-            "distro": distro_name,
-            "distro_version": distro_info.version,
-        });
-        std::fs::write(
-            machine_dir.join("setup.json"),
-            serde_json::to_string_pretty(&setup_data)
-                .map_err(|e| CoreError::Machine(format!("Failed to serialize setup.json: {}", e)))?,
-        )?;
-
-        // 6. Symlink rootfs tarball into machine dir for VirtioFS access.
-        let local_tarball = machine_dir.join("rootfs.tar.gz");
-        if !local_tarball.exists() {
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&tarball_path, &local_tarball)?;
-            #[cfg(not(unix))]
-            std::fs::copy(&tarball_path, &local_tarball)?;
-        }
-
-        // 7. Get shared boot assets (kernel + initramfs).
-        let assets = self.boot_assets.get_assets().await?;
-
-        let kernel = Some(assets.kernel.to_string_lossy().to_string());
-        let initrd = Some(assets.initramfs.to_string_lossy().to_string());
-        let base_cmdline = assets
-            .manifest
-            .as_ref()
-            .and_then(|m| m.kernel_cmdline.as_deref())
-            .unwrap_or("console=hvc0 rdinit=/init quiet");
-        let cmdline = Some(format!(
-            "{} arcbox.mode=machine arcbox.setup_tag=arcbox-setup",
-            base_cmdline
-        ));
-
-        // 8. Build block device and shared dir configs.
-        let block_devices = vec![BlockDeviceConfig {
-            path: disk_path.to_string_lossy().to_string(),
-            read_only: false,
-        }];
-
-        let shared_dirs = vec![SharedDirConfig::new(
-            machine_dir.to_string_lossy().to_string(),
-            "arcbox-setup",
-        )];
-
-        Ok((
-            Some(disk_path),
-            Some(private_key_path),
-            kernel,
-            initrd,
-            cmdline,
-            block_devices,
-            shared_dirs,
-        ))
     }
 
     /// Starts a machine.
@@ -556,68 +425,62 @@ impl MachineManager {
 
             // Try to connect and ping.
             match self.connect_agent(name) {
-                Ok(mut agent) => {
-                    match agent.ping().await {
-                        Ok(resp) => {
-                            tracing::info!(
-                                "Machine '{}' agent ready (version: {}, attempt {})",
-                                name,
-                                resp.version,
-                                attempt
-                            );
+                Ok(mut agent) => match agent.ping().await {
+                    Ok(resp) => {
+                        tracing::debug!(
+                            "Machine '{}' agent reachable (version: {}, attempt {})",
+                            name,
+                            resp.version,
+                            attempt
+                        );
 
-                            // Agent is up — query system info for IP.
-                            match agent.get_system_info().await {
-                                Ok(info) => {
-                                    let selected_ip = info
-                                        .ip_addresses
-                                        .iter()
-                                        .filter_map(|ip| ip.parse::<IpAddr>().ok())
-                                        .filter(|ip| !ip.is_loopback())
-                                        .max_by_key(|ip| usize::from(ip.is_ipv4()))
-                                        .map(|ip| ip.to_string());
-
-                                    if let Some(ip) = selected_ip {
-                                        tracing::info!(
-                                            "Machine '{}' IP: {}",
-                                            name,
-                                            ip
-                                        );
-                                        // Store IP in memory and persist.
-                                        if let Ok(mut machines) = self.machines.write() {
-                                            if let Some(machine) = machines.get_mut(name) {
-                                                machine.ip_address = Some(ip.clone());
-                                            }
+                        match agent.get_system_info().await {
+                            Ok(info) => {
+                                if let Some(ip) = select_routable_ip(&info.ip_addresses) {
+                                    {
+                                        let mut machines = self.machines.write().map_err(|_| {
+                                            CoreError::Machine("lock poisoned".to_string())
+                                        })?;
+                                        if let Some(machine) = machines.get_mut(name) {
+                                            machine.ip_address = Some(ip.clone());
                                         }
-                                        let _ = self.persistence.update_ip(name, Some(&ip));
-                                        return Ok(());
-                                    } else {
-                                        tracing::debug!(
-                                            "Machine '{}' agent is up but no routable IP yet (attempt {})",
-                                            name,
-                                            attempt
-                                        );
                                     }
-                                }
-                                Err(e) => {
-                                    tracing::debug!(
-                                        "Machine '{}' agent ready but failed to get system info: {}",
+                                    let _ = self.persistence.update_ip(name, Some(&ip));
+
+                                    tracing::info!(
+                                        "Machine '{}' ready with IP {} (attempt {})",
                                         name,
-                                        e
+                                        ip,
+                                        attempt
                                     );
+                                    return Ok(());
                                 }
+
+                                tracing::trace!(
+                                    "Machine '{}' system info has no routable IP yet (attempt {})",
+                                    name,
+                                    attempt
+                                );
+                            }
+                            Err(e) => {
+                                tracing::trace!(
+                                    "Machine '{}' get_system_info attempt {} failed: {}",
+                                    name,
+                                    attempt,
+                                    e
+                                );
                             }
                         }
-                        Err(e) => {
-                            tracing::trace!(
-                                "Machine '{}' ping attempt {} failed: {}",
-                                name,
-                                attempt,
-                                e
-                            );
-                        }
                     }
-                }
+                    Err(e) => {
+                        tracing::trace!(
+                            "Machine '{}' ping attempt {} failed: {}",
+                            name,
+                            attempt,
+                            e
+                        );
+                    }
+                },
                 Err(e) => {
                     tracing::trace!(
                         "Machine '{}' connect attempt {} failed: {}",
@@ -686,7 +549,19 @@ impl MachineManager {
     #[cfg(target_os = "macos")]
     pub fn connect_agent(&self, name: &str) -> Result<crate::agent_client::AgentClient> {
         use crate::agent_client::{AGENT_PORT, AgentClient};
+        let cid = self
+            .get_cid(name)
+            .ok_or_else(|| CoreError::Machine("CID not assigned".to_string()))?;
+        let fd = self.connect_vsock_port(name, AGENT_PORT)?;
 
+        AgentClient::from_fd(cid, fd)
+    }
+
+    /// Connects to a vsock port on a running machine (macOS).
+    ///
+    /// This is a generic helper used by agent and guest runtime proxy paths.
+    #[cfg(target_os = "macos")]
+    pub fn connect_vsock_port(&self, name: &str, port: u32) -> Result<std::os::unix::io::RawFd> {
         let machines = self
             .machines
             .read()
@@ -703,14 +578,7 @@ impl MachineManager {
             )));
         }
 
-        let cid = machine
-            .cid
-            .ok_or_else(|| CoreError::Machine("CID not assigned".to_string()))?;
-
-        // Connect to the agent via vsock through the VM
-        let fd = self.vm_manager.connect_vsock(&machine.vm_id, AGENT_PORT)?;
-
-        AgentClient::from_fd(cid, fd)
+        self.vm_manager.connect_vsock(&machine.vm_id, port)
     }
 
     /// Connects to the agent on a running machine (Linux).
@@ -740,6 +608,28 @@ impl MachineManager {
 
         // On Linux, AgentClient connects directly via AF_VSOCK
         Ok(AgentClient::new(cid))
+    }
+
+    /// Connects to a vsock port on a running machine (Linux).
+    #[cfg(target_os = "linux")]
+    pub fn connect_vsock_port(&self, name: &str, port: u32) -> Result<std::os::unix::io::RawFd> {
+        let machines = self
+            .machines
+            .read()
+            .map_err(|_| CoreError::Machine("lock poisoned".to_string()))?;
+
+        let machine = machines
+            .get(name)
+            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+
+        if machine.state != MachineState::Running {
+            return Err(CoreError::invalid_state(format!(
+                "machine '{}' is not running",
+                name
+            )));
+        }
+
+        self.vm_manager.connect_vsock(&machine.vm_id, port)
     }
 
     /// Reads serial console output for a running machine (macOS only).
@@ -837,21 +727,16 @@ impl MachineManager {
                 .map_err(|_| CoreError::Machine("lock poisoned".to_string()))?;
         }
 
-        // Get VM ID and disk path before removing from map.
-        let (vm_id, disk_path) = {
+        // Get VM ID before removing from map.
+        let vm_id = {
             let m = machines
                 .get(name)
                 .ok_or_else(|| CoreError::not_found(name.to_string()))?;
-            (m.vm_id.clone(), m.disk_path.clone())
+            m.vm_id.clone()
         };
 
         // Remove from VM manager
         self.vm_manager.remove(&vm_id)?;
-
-        // Clean up disk image.
-        if let Some(ref dp) = disk_path {
-            let _ = DiskManager::remove(dp);
-        }
 
         // Remove from machines map
         machines.remove(name);
@@ -903,4 +788,31 @@ impl MachineManager {
         tracing::debug!("Registered mock machine '{}' with CID {}", name, cid);
         Ok(())
     }
+}
+
+fn select_routable_ip(ips: &[String]) -> Option<String> {
+    let mut ipv6_candidate = None;
+
+    for ip in ips {
+        let Ok(addr) = ip.parse::<IpAddr>() else {
+            continue;
+        };
+        if addr.is_loopback() || addr.is_multicast() || addr.is_unspecified() {
+            continue;
+        }
+
+        match addr {
+            IpAddr::V4(v4) => return Some(v4.to_string()),
+            IpAddr::V6(v6) => {
+                if v6.is_unicast_link_local() {
+                    continue;
+                }
+                if ipv6_candidate.is_none() {
+                    ipv6_candidate = Some(v6.to_string());
+                }
+            }
+        }
+    }
+
+    ipv6_candidate
 }

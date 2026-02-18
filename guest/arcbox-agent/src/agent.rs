@@ -17,16 +17,19 @@ mod linux {
     use std::collections::HashMap;
     use std::net::IpAddr;
     use std::os::unix::io::AsRawFd;
+    use std::path::Path;
     use std::process::Stdio;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use anyhow::{Context, Result};
     use bytes::Bytes;
     use prost::Message;
     use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+    use tokio::net::UnixStream;
     use tokio::process::{Child, ChildStdin, Command};
     use tokio::sync::{Mutex, RwLock, mpsc};
-    use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
+    use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener, VsockStream};
 
     use super::AGENT_PORT;
     use crate::container::{
@@ -46,9 +49,28 @@ mod linux {
     use arcbox_protocol::agent::{
         AttachInput, AttachOutput, AttachRequest, ContainerInfo, CreateContainerResponse,
         ExecOutput, ExecStartResponse, ListContainersResponse, LogEntry, LogsRequest, PingResponse,
+        RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
         SystemInfo,
     };
     use chrono::{DateTime, Utc};
+
+    /// Default guest-side raw Docker API proxy port on vsock.
+    const DOCKER_API_VSOCK_PORT_DEFAULT: u32 = 2375;
+    /// Docker Unix socket path in guest.
+    const DOCKER_API_UNIX_SOCKET: &str = "/var/run/docker.sock";
+    /// Containerd socket candidates.
+    const CONTAINERD_SOCKET_CANDIDATES: [&str; 2] = [
+        "/run/containerd/containerd.sock",
+        "/var/run/containerd/containerd.sock",
+    ];
+
+    fn docker_api_vsock_port() -> u32 {
+        std::env::var("ARCBOX_GUEST_DOCKER_VSOCK_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|port| *port > 0)
+            .unwrap_or(DOCKER_API_VSOCK_PORT_DEFAULT)
+    }
 
     /// Agent state shared across connections.
     pub struct AgentState {
@@ -148,6 +170,13 @@ mod linux {
             // Mount standard VirtioFS shares if not already mounted
             crate::mount::mount_standard_shares();
 
+            // Start guest-side Docker API proxy (vsock -> unix socket).
+            tokio::spawn(async {
+                if let Err(e) = run_docker_api_proxy().await {
+                    tracing::warn!("Docker API proxy exited: {}", e);
+                }
+            });
+
             let addr = VsockAddr::new(VMADDR_CID_ANY, AGENT_PORT);
             let mut listener =
                 VsockListener::bind(addr).context("failed to bind vsock listener")?;
@@ -172,6 +201,41 @@ mod linux {
                 }
             }
         }
+    }
+
+    async fn run_docker_api_proxy() -> Result<()> {
+        let port = docker_api_vsock_port();
+        let addr = VsockAddr::new(VMADDR_CID_ANY, port);
+        let mut listener =
+            VsockListener::bind(addr).context("failed to bind docker api vsock listener")?;
+        tracing::info!("Docker API proxy listening on vsock port {}", port);
+
+        loop {
+            match listener.accept().await {
+                Ok((stream, peer_addr)) => {
+                    tracing::debug!("Docker API proxy accepted connection from {:?}", peer_addr);
+                    tokio::spawn(async move {
+                        if let Err(e) = proxy_docker_api_connection(stream).await {
+                            tracing::debug!("Docker API proxy connection ended: {}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("Docker API proxy accept failed: {}", e);
+                }
+            }
+        }
+    }
+
+    async fn proxy_docker_api_connection(mut vsock_stream: VsockStream) -> Result<()> {
+        let mut unix_stream = UnixStream::connect(DOCKER_API_UNIX_SOCKET)
+            .await
+            .context("failed to connect guest docker unix socket")?;
+
+        let _ = tokio::io::copy_bidirectional(&mut vsock_stream, &mut unix_stream)
+            .await
+            .context("docker api proxy copy failed")?;
+        Ok(())
     }
 
     impl Default for Agent {
@@ -363,6 +427,12 @@ mod linux {
         match request {
             RpcRequest::Ping(req) => RequestResult::Single(handle_ping(req)),
             RpcRequest::GetSystemInfo => RequestResult::Single(handle_get_system_info().await),
+            RpcRequest::EnsureRuntime(req) => {
+                RequestResult::Single(handle_ensure_runtime(req).await)
+            }
+            RpcRequest::RuntimeStatus(req) => {
+                RequestResult::Single(handle_runtime_status(req).await)
+            }
             RpcRequest::CreateContainer(req) => {
                 RequestResult::Single(handle_create_container(req, state).await)
             }
@@ -432,6 +502,134 @@ mod linux {
     async fn handle_get_system_info() -> RpcResponse {
         let info = collect_system_info();
         RpcResponse::SystemInfo(info)
+    }
+
+    async fn handle_ensure_runtime(req: RuntimeEnsureRequest) -> RpcResponse {
+        let mut notes = Vec::new();
+        if req.start_if_needed {
+            let note = try_start_runtime_services().await;
+            if !note.is_empty() {
+                notes.push(note);
+            }
+        }
+
+        let mut status = collect_runtime_status().await;
+        for _ in 0..20 {
+            if status.docker_ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            status = collect_runtime_status().await;
+        }
+
+        let mut message = status.detail.clone();
+        if !notes.is_empty() {
+            message = format!("{}; {}", notes.join("; "), status.detail);
+        }
+
+        RpcResponse::RuntimeEnsure(RuntimeEnsureResponse {
+            ready: status.docker_ready,
+            endpoint: status.endpoint,
+            message,
+        })
+    }
+
+    async fn handle_runtime_status(_req: RuntimeStatusRequest) -> RpcResponse {
+        RpcResponse::RuntimeStatus(collect_runtime_status().await)
+    }
+
+    async fn collect_runtime_status() -> RuntimeStatusResponse {
+        let containerd_ready = probe_first_ready_socket(&CONTAINERD_SOCKET_CANDIDATES).await;
+        let docker_ready = probe_unix_socket(DOCKER_API_UNIX_SOCKET).await;
+
+        let detail = if docker_ready {
+            "docker socket ready".to_string()
+        } else if Path::new(DOCKER_API_UNIX_SOCKET).exists() {
+            format!(
+                "docker socket exists but not reachable: {}",
+                DOCKER_API_UNIX_SOCKET
+            )
+        } else {
+            format!("docker socket missing: {}", DOCKER_API_UNIX_SOCKET)
+        };
+
+        RuntimeStatusResponse {
+            containerd_ready,
+            docker_ready,
+            endpoint: format!("vsock:{}", docker_api_vsock_port()),
+            detail,
+        }
+    }
+
+    async fn probe_first_ready_socket(paths: &[&str]) -> bool {
+        for path in paths {
+            if probe_unix_socket(path).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn probe_unix_socket(path: &str) -> bool {
+        if !Path::new(path).exists() {
+            return false;
+        }
+        match tokio::time::timeout(Duration::from_millis(300), UnixStream::connect(path)).await {
+            Ok(Ok(_stream)) => true,
+            Ok(Err(_)) | Err(_) => false,
+        }
+    }
+
+    async fn try_start_runtime_services() -> String {
+        let mut notes = Vec::new();
+
+        if Path::new("/run/systemd/system").exists() {
+            for service in ["containerd.service", "docker.service"] {
+                match Command::new("systemctl")
+                    .args(["start", service])
+                    .status()
+                    .await
+                {
+                    Ok(status) if status.success() => {
+                        notes.push(format!("started {}", service));
+                    }
+                    Ok(status) => {
+                        notes.push(format!(
+                            "systemctl start {} failed(exit={})",
+                            service,
+                            status.code().unwrap_or(-1)
+                        ));
+                    }
+                    Err(e) => {
+                        notes.push(format!("systemctl start {} error({})", service, e));
+                    }
+                }
+            }
+        } else {
+            for service in ["containerd", "docker"] {
+                match Command::new("rc-service")
+                    .args([service, "start"])
+                    .status()
+                    .await
+                {
+                    Ok(status) if status.success() => {
+                        notes.push(format!("started {}", service));
+                    }
+                    Ok(status) => {
+                        notes.push(format!(
+                            "rc-service {} start failed(exit={})",
+                            service,
+                            status.code().unwrap_or(-1)
+                        ));
+                    }
+                    Err(e) => {
+                        notes.push(format!("rc-service {} start error({})", service, e));
+                    }
+                }
+            }
+        }
+
+        notes.join("; ")
     }
 
     /// Collects system information from the guest.

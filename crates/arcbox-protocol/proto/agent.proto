@@ -21,6 +21,12 @@ service AgentService {
     // Gets system information.
     rpc GetSystemInfo(Empty) returns (SystemInfo);
 
+    // Ensures guest runtime stack (containerd/dockerd) is ready.
+    rpc EnsureRuntime(RuntimeEnsureRequest) returns (RuntimeEnsureResponse);
+
+    // Gets guest runtime stack status.
+    rpc GetRuntimeStatus(RuntimeStatusRequest) returns (RuntimeStatusResponse);
+
     // Creates a container.
     rpc CreateContainer(AgentCreateContainerRequest) returns (AgentCreateContainerResponse);
 
@@ -97,6 +103,39 @@ message SystemInfo {
     string hostname = 9;
     // Uptime in seconds.
     uint64 uptime = 10;
+    // Guest IP addresses (excluding loopback).
+    repeated string ip_addresses = 11;
+}
+
+// Request to ensure runtime services are available.
+message RuntimeEnsureRequest {
+    // Whether to attempt starting services when not ready.
+    bool start_if_needed = 1;
+}
+
+// Response from runtime ensure operation.
+message RuntimeEnsureResponse {
+    // Whether runtime is ready for Docker API requests.
+    bool ready = 1;
+    // Runtime endpoint exposed to host proxy.
+    string endpoint = 2;
+    // Additional status detail.
+    string message = 3;
+}
+
+// Request for runtime status.
+message RuntimeStatusRequest {}
+
+// Runtime status report.
+message RuntimeStatusResponse {
+    // Whether containerd socket is reachable.
+    bool containerd_ready = 1;
+    // Whether Docker socket is reachable.
+    bool docker_ready = 2;
+    // Runtime endpoint exposed to host proxy.
+    string endpoint = 3;
+    // Human-readable detail for diagnostics.
+    string detail = 4;
 }
 
 // Request to create a container (forwarded to containerd).
