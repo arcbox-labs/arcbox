@@ -394,10 +394,6 @@ pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/arcbox-agent.log"
 error_log="/var/log/arcbox-agent.log"
 
-# Can be overridden in /etc/conf.d/arcbox-agent
-: "${ARCBOX_GUEST_DOCKER_VSOCK_PORT:=2375}"
-export ARCBOX_GUEST_DOCKER_VSOCK_PORT
-
 depend() {
     need net
     after firewall
@@ -431,7 +427,6 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=ARCBOX_GUEST_DOCKER_VSOCK_PORT=2375
 EnvironmentFile=-/etc/default/arcbox-agent
 ExecStart=/usr/local/bin/arcbox-agent
 Restart=always

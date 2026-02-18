@@ -79,8 +79,16 @@ impl Runtime {
     /// Returns an error if the image store cannot be created.
     pub fn with_vm_lifecycle_config(
         config: Config,
-        vm_lifecycle_config: VmLifecycleConfig,
+        mut vm_lifecycle_config: VmLifecycleConfig,
     ) -> Result<Self> {
+        if matches!(
+            config.container.backend,
+            crate::config::ContainerBackendMode::GuestDocker
+        ) {
+            vm_lifecycle_config.guest_docker_vsock_port =
+                Some(config.container.guest_docker_vsock_port);
+        }
+
         let event_bus = EventBus::new();
         let vm_manager = Arc::new(VmManager::new());
         let machine_manager = Arc::new(MachineManager::new(

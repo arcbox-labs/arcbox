@@ -65,11 +65,27 @@ mod linux {
     ];
 
     fn docker_api_vsock_port() -> u32 {
-        std::env::var("ARCBOX_GUEST_DOCKER_VSOCK_PORT")
+        if let Some(port) = std::env::var("ARCBOX_GUEST_DOCKER_VSOCK_PORT")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|port| *port > 0)
-            .unwrap_or(DOCKER_API_VSOCK_PORT_DEFAULT)
+        {
+            return port;
+        }
+
+        if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
+            for token in cmdline.split_whitespace() {
+                if let Some(raw) = token.strip_prefix("arcbox.guest_docker_vsock_port=") {
+                    if let Ok(port) = raw.parse::<u32>() {
+                        if port > 0 {
+                            return port;
+                        }
+                    }
+                }
+            }
+        }
+
+        DOCKER_API_VSOCK_PORT_DEFAULT
     }
 
     /// Agent state shared across connections.

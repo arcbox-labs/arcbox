@@ -193,6 +193,8 @@ pub struct VmLifecycleConfig {
     /// Skip VM check (for testing only).
     /// When true, `ensure_ready()` returns immediately with a mock CID.
     pub skip_vm_check: bool,
+    /// Guest docker API vsock port propagated via kernel cmdline.
+    pub guest_docker_vsock_port: Option<u32>,
 }
 
 impl Default for VmLifecycleConfig {
@@ -206,6 +208,7 @@ impl Default for VmLifecycleConfig {
             max_retries: DEFAULT_MAX_RETRIES,
             default_vm: DefaultVmConfig::default(),
             skip_vm_check: false,
+            guest_docker_vsock_port: None,
         }
     }
 }
@@ -645,6 +648,22 @@ impl VmLifecycleManager {
     async fn create_default_machine(&self) -> Result<()> {
         // Get boot assets
         let assets = self.boot_assets.get_assets().await?;
+        let mut cmdline = self
+            .config
+            .default_vm
+            .cmdline
+            .clone()
+            .unwrap_or(assets.cmdline);
+        if let Some(port) = self.config.guest_docker_vsock_port {
+            let key = "arcbox.guest_docker_vsock_port=";
+            if !cmdline
+                .split_whitespace()
+                .any(|token| token.starts_with(key))
+            {
+                cmdline.push(' ');
+                cmdline.push_str(&format!("{key}{port}"));
+            }
+        }
 
         let config = MachineConfig {
             name: DEFAULT_MACHINE_NAME.to_string(),
@@ -653,12 +672,7 @@ impl VmLifecycleManager {
             disk_gb: self.config.default_vm.disk_gb,
             kernel: Some(assets.kernel.to_string_lossy().to_string()),
             initrd: Some(assets.initramfs.to_string_lossy().to_string()),
-            cmdline: self
-                .config
-                .default_vm
-                .cmdline
-                .clone()
-                .or(Some(assets.cmdline)),
+            cmdline: Some(cmdline),
             distro: None,
             distro_version: None,
         };
