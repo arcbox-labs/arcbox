@@ -553,7 +553,8 @@ fn manual_switch_root(new_root: &str) -> ! {
     let _ = fs::create_dir_all(format!("{}/oldroot", new_root));
 
     // pivot_root.
-    if let Err(e) = nix::unistd::pivot_root(new_root, &format!("{}/oldroot", new_root)) {
+    let put_old = format!("{}/oldroot", new_root);
+    if let Err(e) = nix::unistd::pivot_root(new_root, put_old.as_str()) {
         eprintln!("[arcbox-init] pivot_root failed: {}", e);
     }
 
