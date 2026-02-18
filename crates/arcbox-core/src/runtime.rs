@@ -260,6 +260,46 @@ impl Runtime {
         tokio::fs::create_dir_all(self.config.data_dir.join("images")).await?;
         tokio::fs::create_dir_all(self.config.data_dir.join("volumes")).await?;
 
+        if matches!(
+            self.config.container.backend,
+            crate::config::ContainerBackendMode::GuestDocker
+        ) && matches!(
+            self.config.container.provision,
+            crate::config::ContainerProvisionMode::BundledAssets
+        ) {
+            const REQUIRED_RUNTIME_ASSETS: [&str; 3] = ["dockerd", "containerd", "youki"];
+            match self.vm_lifecycle.boot_assets().read_cached_manifest().await {
+                Ok(Some(manifest)) => {
+                    let names: std::collections::HashSet<&str> = manifest
+                        .runtime_assets
+                        .iter()
+                        .map(|item| item.name.as_str())
+                        .collect();
+                    let missing: Vec<&str> = REQUIRED_RUNTIME_ASSETS
+                        .into_iter()
+                        .filter(|name| !names.contains(name))
+                        .collect();
+                    if !missing.is_empty() {
+                        tracing::warn!(
+                            missing = ?missing,
+                            "boot manifest runtime_assets missing expected entries for guest docker mode"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "boot manifest missing in cache; runtime asset metadata unavailable"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to inspect boot manifest runtime assets during init: {}",
+                        e
+                    );
+                }
+            }
+        }
+
         tracing::info!(
             backend = self.container_backend.name(),
             "ArcBox runtime initialized"
