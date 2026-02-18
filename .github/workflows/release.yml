@@ -45,6 +45,10 @@ jobs:
           toolchain: stable
           targets: aarch64-unknown-linux-musl
 
+      - name: Install Protobuf compiler
+        run: |
+          brew install protobuf
+
       - name: Install musl cross-compiler
         run: |
           brew install FiloSottile/musl-cross/musl-cross

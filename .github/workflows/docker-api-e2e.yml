@@ -36,6 +36,10 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Install Protobuf compiler
+        run: |
+          brew install protobuf
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -240,6 +244,10 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Protobuf compiler
+        run: |
+          brew install protobuf
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -305,6 +313,10 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Protobuf compiler
+        run: |
+          brew install protobuf
 
       - name: Setup Go
         uses: actions/setup-go@v5
