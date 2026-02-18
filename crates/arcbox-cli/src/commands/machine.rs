@@ -1,12 +1,22 @@
 //! Machine management commands.
 
 use anyhow::{Context, Result};
-use arcbox_core::machine::{MachineConfig, MachineState};
+use arcbox_core::machine::MachineState;
 use arcbox_core::{Config, Runtime};
+use arcbox_grpc::v1::machine_service_client::MachineServiceClient;
+use arcbox_protocol::v1::{
+    CreateMachineRequest, DirectoryMount, InspectMachineRequest, ListMachinesRequest,
+    MachineAgentRequest, RemoveMachineRequest, StartMachineRequest, StopMachineRequest,
+};
 use clap::{Args, Subcommand};
+use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::OnceLock;
+use tokio::net::UnixStream;
+use tonic::transport::{Channel, Endpoint};
+use tower::service_fn;
 
 /// Global runtime instance.
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -17,6 +27,81 @@ fn get_runtime() -> &'static Runtime {
         let config = Config::load().unwrap_or_default();
         Runtime::new(config).expect("failed to initialize runtime")
     })
+}
+
+fn resolve_grpc_socket_path() -> PathBuf {
+    if let Ok(path) = std::env::var("ARCBOX_GRPC_SOCKET") {
+        return PathBuf::from(path);
+    }
+
+    if let Ok(path) = std::env::var("ARCBOX_SOCKET") {
+        let docker_socket = PathBuf::from(path);
+        if let Some(parent) = docker_socket.parent() {
+            let preferred = parent.join("arcbox-grpc.sock");
+            if preferred.exists() {
+                return preferred;
+            }
+
+            let legacy = parent.join("arcbox.sock");
+            if legacy.exists() {
+                return legacy;
+            }
+
+            return preferred;
+        }
+    }
+
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".arcbox")
+        .join("arcbox.sock")
+}
+
+async fn machine_client() -> Result<MachineServiceClient<Channel>> {
+    let socket_path = resolve_grpc_socket_path();
+    let socket_for_connector = socket_path.clone();
+
+    let channel = Endpoint::from_static("http://[::]:50051")
+        .connect_with_connector(service_fn(move |_| {
+            let socket_for_connector = socket_for_connector.clone();
+            async move {
+                let stream = UnixStream::connect(socket_for_connector).await?;
+                Ok::<_, std::io::Error>(TokioIo::new(stream))
+            }
+        }))
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to connect to ArcBox gRPC daemon at {}",
+                socket_path.display()
+            )
+        })?;
+
+    Ok(MachineServiceClient::new(channel))
+}
+
+fn parse_mount(mount: &str) -> Result<DirectoryMount> {
+    let mut parts = mount.splitn(2, ':');
+    let host = parts.next().unwrap_or_default().trim();
+    let guest = parts.next().unwrap_or_default().trim();
+
+    if host.is_empty() || guest.is_empty() {
+        anyhow::bail!("Invalid mount '{}', expected host_path:guest_path", mount);
+    }
+
+    Ok(DirectoryMount {
+        host_path: host.to_string(),
+        guest_path: guest.to_string(),
+        readonly: false,
+    })
+}
+
+fn title_case_state(state: &str) -> String {
+    let mut chars = state.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
 }
 
 /// Machine subcommands.
@@ -36,6 +121,12 @@ pub enum MachineCommands {
     List(ListArgs),
     /// Show machine status
     Status(StatusArgs),
+    /// Inspect machine details
+    Inspect(InspectArgs),
+    /// Ping machine agent
+    Ping(PingArgs),
+    /// Show guest system info
+    Info(InfoArgs),
     /// SSH into a machine
     Ssh(SshArgs),
     /// Execute a command in a machine
@@ -56,8 +147,8 @@ pub struct CreateArgs {
     #[arg(long, default_value = "50")]
     pub disk: u64,
     /// Distribution (ubuntu, alpine, etc.)
-    #[arg(long, default_value = "ubuntu")]
-    pub distro: String,
+    #[arg(long)]
+    pub distro: Option<String>,
     /// Distribution version
     #[arg(long, name = "distro-version")]
     pub distro_version: Option<String>,
@@ -119,6 +210,24 @@ pub struct StatusArgs {
 }
 
 #[derive(Args)]
+pub struct InspectArgs {
+    /// Machine name
+    pub name: String,
+}
+
+#[derive(Args)]
+pub struct PingArgs {
+    /// Machine name
+    pub name: String,
+}
+
+#[derive(Args)]
+pub struct InfoArgs {
+    /// Machine name
+    pub name: String,
+}
+
+#[derive(Args)]
 pub struct SshArgs {
     /// Machine name
     pub name: String,
@@ -145,29 +254,37 @@ pub async fn execute(cmd: MachineCommands) -> Result<()> {
         MachineCommands::Remove(args) => execute_remove(args).await,
         MachineCommands::List(args) => execute_list(args).await,
         MachineCommands::Status(args) => execute_status(args).await,
+        MachineCommands::Inspect(args) => execute_inspect(args).await,
+        MachineCommands::Ping(args) => execute_ping(args).await,
+        MachineCommands::Info(args) => execute_info(args).await,
         MachineCommands::Ssh(args) => execute_ssh(args).await,
         MachineCommands::Exec(args) => execute_exec(args).await,
     }
 }
 
 async fn execute_create(args: CreateArgs) -> Result<()> {
-    let runtime = get_runtime();
+    let mut client = machine_client().await?;
+    let mounts = args
+        .mount
+        .iter()
+        .map(|m| parse_mount(m))
+        .collect::<Result<Vec<_>>>()?;
 
-    let config = MachineConfig {
-        name: args.name.clone(),
-        cpus: args.cpus,
-        memory_mb: args.memory,
-        disk_gb: args.disk,
-        kernel: args.kernel.clone(),
-        initrd: args.initrd.clone(),
-        cmdline: args.cmdline.clone(),
-        distro: None,
-        distro_version: None,
-    };
-
-    runtime
-        .machine_manager()
-        .create(config)
+    client
+        .create(tonic::Request::new(CreateMachineRequest {
+            name: args.name.clone(),
+            cpus: args.cpus,
+            memory: args.memory.saturating_mul(1024_u64 * 1024),
+            disk_size: args.disk.saturating_mul(1024_u64 * 1024 * 1024),
+            distro: args.distro.clone().unwrap_or_default(),
+            version: args.distro_version.clone().unwrap_or_default(),
+            arch: std::env::consts::ARCH.to_string(),
+            mounts,
+            ssh_public_key: String::new(),
+            kernel: args.kernel.clone().unwrap_or_default(),
+            initrd: args.initrd.clone().unwrap_or_default(),
+            cmdline: args.cmdline.clone().unwrap_or_default(),
+        }))
         .await
         .context("Failed to create machine")?;
 
@@ -183,20 +300,49 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
 }
 
 async fn execute_start(args: StartArgs) -> Result<()> {
-    let runtime = get_runtime();
+    let mut client = machine_client().await?;
 
     println!("Starting machine '{}'...", args.name);
 
-    runtime
-        .machine_manager()
-        .start(&args.name)
+    client
+        .start(tonic::Request::new(StartMachineRequest {
+            id: args.name.clone(),
+        }))
         .await
         .context("Failed to start machine")?;
 
+    const MAX_AGENT_WAIT_ATTEMPTS: u32 = 20;
+    let mut delay = std::time::Duration::from_millis(200);
+    for attempt in 1..=MAX_AGENT_WAIT_ATTEMPTS {
+        match client
+            .ping(tonic::Request::new(MachineAgentRequest {
+                id: args.name.clone(),
+            }))
+            .await
+        {
+            Ok(_) => break,
+            Err(e) => {
+                if attempt == MAX_AGENT_WAIT_ATTEMPTS {
+                    return Err(anyhow::Error::new(e))
+                        .context("Failed to wait for machine agent readiness");
+                }
+                tokio::time::sleep(delay).await;
+                delay = std::cmp::min(delay.saturating_mul(2), std::time::Duration::from_secs(2));
+            }
+        }
+    }
+
     println!("Machine '{}' started", args.name);
-    if let Some(machine) = runtime.machine_manager().get(&args.name) {
-        if let Some(ip) = machine.ip_address {
-            println!("IP:      {}", ip);
+    if let Ok(resp) = client
+        .inspect(tonic::Request::new(InspectMachineRequest {
+            id: args.name.clone(),
+        }))
+        .await
+    {
+        if let Some(network) = resp.into_inner().network {
+            if !network.ip_address.is_empty() {
+                println!("IP:      {}", network.ip_address);
+            }
         }
     }
 
@@ -204,13 +350,16 @@ async fn execute_start(args: StartArgs) -> Result<()> {
 }
 
 async fn execute_stop(args: StopArgs) -> Result<()> {
-    let runtime = get_runtime();
+    let mut client = machine_client().await?;
 
     println!("Stopping machine '{}'...", args.name);
 
-    runtime
-        .machine_manager()
-        .stop(&args.name)
+    client
+        .stop(tonic::Request::new(StopMachineRequest {
+            id: args.name.clone(),
+            force: args.force,
+        }))
+        .await
         .context("Failed to stop machine")?;
 
     println!("Machine '{}' stopped", args.name);
@@ -219,11 +368,15 @@ async fn execute_stop(args: StopArgs) -> Result<()> {
 }
 
 async fn execute_remove(args: RemoveArgs) -> Result<()> {
-    let runtime = get_runtime();
+    let mut client = machine_client().await?;
 
-    runtime
-        .machine_manager()
-        .remove(&args.name, args.force)
+    client
+        .remove(tonic::Request::new(RemoveMachineRequest {
+            id: args.name.clone(),
+            force: args.force,
+            volumes: args.volumes,
+        }))
+        .await
         .context("Failed to remove machine")?;
 
     println!("Machine '{}' removed", args.name);
@@ -232,8 +385,13 @@ async fn execute_remove(args: RemoveArgs) -> Result<()> {
 }
 
 async fn execute_list(args: ListArgs) -> Result<()> {
-    let runtime = get_runtime();
-    let machines = runtime.machine_manager().list();
+    let mut client = machine_client().await?;
+    let machines = client
+        .list(tonic::Request::new(ListMachinesRequest { all: args.all }))
+        .await
+        .context("Failed to list machines")?
+        .into_inner()
+        .machines;
 
     if args.quiet {
         for machine in &machines {
@@ -258,21 +416,13 @@ async fn execute_list(args: ListArgs) -> Result<()> {
 
     // Print machines
     for machine in &machines {
-        let state_str = match machine.state {
-            MachineState::Created => "Created",
-            MachineState::Starting => "Starting",
-            MachineState::Running => "Running",
-            MachineState::Stopping => "Stopping",
-            MachineState::Stopped => "Stopped",
-        };
-
         println!(
             "{:<20} {:<12} {:<6} {:<12} {:<10}",
             machine.name,
-            state_str,
+            title_case_state(&machine.state),
             machine.cpus,
-            format!("{} MB", machine.memory_mb),
-            format!("{} GB", machine.disk_gb),
+            format!("{} MB", machine.memory / (1024 * 1024)),
+            format!("{} GB", machine.disk_size / (1024 * 1024 * 1024)),
         );
     }
 
@@ -280,43 +430,117 @@ async fn execute_list(args: ListArgs) -> Result<()> {
 }
 
 async fn execute_status(args: StatusArgs) -> Result<()> {
-    let runtime = get_runtime();
+    let mut client = machine_client().await?;
+    let machine = client
+        .inspect(tonic::Request::new(InspectMachineRequest {
+            id: args.name.clone(),
+        }))
+        .await
+        .context("Failed to get machine status")?
+        .into_inner();
 
-    let machine = runtime
-        .machine_manager()
-        .get(&args.name)
-        .ok_or_else(|| anyhow::anyhow!("Machine '{}' not found", args.name))?;
-
-    let state_str = match machine.state {
-        MachineState::Created => "Created",
-        MachineState::Starting => "Starting",
-        MachineState::Running => "Running",
-        MachineState::Stopping => "Stopping",
-        MachineState::Stopped => "Stopped",
-    };
+    let cpus = machine.hardware.as_ref().map_or(0, |h| h.cpus);
+    let memory_mb = machine
+        .hardware
+        .as_ref()
+        .map_or(0, |h| h.memory / (1024 * 1024));
+    let disk_gb = machine
+        .storage
+        .as_ref()
+        .map_or(0, |s| s.disk_size / (1024 * 1024 * 1024));
+    let ip_address = machine
+        .network
+        .as_ref()
+        .map(|n| n.ip_address.as_str())
+        .filter(|ip| !ip.is_empty())
+        .unwrap_or("-");
 
     println!("Machine: {}", machine.name);
-    println!("State:   {}", state_str);
-    println!("CPUs:    {}", machine.cpus);
-    println!("Memory:  {} MB", machine.memory_mb);
-    println!("Disk:    {} GB", machine.disk_gb);
-    println!("VM ID:   {}", machine.vm_id);
-    if let Some(ip) = &machine.ip_address {
-        println!("IP:      {}", ip);
-    }
+    println!("State:   {}", title_case_state(&machine.state));
+    println!("CPUs:    {}", cpus);
+    println!("Memory:  {} MB", memory_mb);
+    println!("Disk:    {} GB", disk_gb);
+    println!("VM ID:   {}", machine.id);
+    println!("IP:      {}", ip_address);
 
-    if machine.state == MachineState::Running {
-        if let Ok(mut agent) = runtime.get_agent(&args.name) {
-            if let Ok(status) = agent.get_runtime_status().await {
-                println!("Runtime:");
-                println!("  Docker:     {}", status.docker_ready);
-                println!("  Containerd: {}", status.containerd_ready);
-                println!("  Endpoint:   {}", status.endpoint);
-                if !status.detail.is_empty() {
-                    println!("  Detail:     {}", status.detail);
-                }
-            }
-        }
+    Ok(())
+}
+
+async fn execute_inspect(args: InspectArgs) -> Result<()> {
+    let mut client = machine_client().await?;
+    let machine = client
+        .inspect(tonic::Request::new(InspectMachineRequest {
+            id: args.name.clone(),
+        }))
+        .await
+        .context("Failed to inspect machine")?
+        .into_inner();
+
+    let payload = serde_json::json!({
+        "id": machine.id,
+        "name": machine.name,
+        "state": machine.state,
+        "cpus": machine.hardware.as_ref().map_or(0, |h| h.cpus),
+        "memory_mb": machine.hardware.as_ref().map_or(0, |h| h.memory / (1024 * 1024)),
+        "disk_gb": machine.storage.as_ref().map_or(0, |s| s.disk_size / (1024 * 1024 * 1024)),
+        "ip_address": machine.network.as_ref().map(|n| n.ip_address.clone()).filter(|ip| !ip.is_empty()),
+        "kernel": machine.os.as_ref().map_or(String::new(), |os| os.kernel.clone()),
+        "distro": machine.os.as_ref().map_or(String::new(), |os| os.distro.clone()),
+        "distro_version": machine.os.as_ref().map_or(String::new(), |os| os.version.clone()),
+    });
+
+    println!(
+        "{}",
+        serde_json::to_string(&payload).context("Failed to serialize machine info")?
+    );
+
+    Ok(())
+}
+
+async fn execute_ping(args: PingArgs) -> Result<()> {
+    let mut client = machine_client().await?;
+    let started = std::time::Instant::now();
+    let response = client
+        .ping(tonic::Request::new(MachineAgentRequest {
+            id: args.name.clone(),
+        }))
+        .await
+        .context("Failed to ping agent")?
+        .into_inner();
+    let elapsed = started.elapsed();
+
+    println!(
+        "pong: {} (version: {}, latency: {} ms)",
+        response.message,
+        response.version,
+        elapsed.as_millis()
+    );
+    Ok(())
+}
+
+async fn execute_info(args: InfoArgs) -> Result<()> {
+    let mut client = machine_client().await?;
+    let info = client
+        .get_system_info(tonic::Request::new(MachineAgentRequest {
+            id: args.name.clone(),
+        }))
+        .await
+        .context("Failed to get system info")?
+        .into_inner();
+
+    let total_mb = info.total_memory / 1024 / 1024;
+    let available_mb = info.available_memory / 1024 / 1024;
+
+    println!("Kernel: {}", info.kernel_version);
+    println!("OS: {} {}", info.os_name, info.os_version);
+    println!("Arch: {}", info.arch);
+    println!("Hostname: {}", info.hostname);
+    println!("CPUs: {}", info.cpu_count);
+    println!("Memory: {} MB", total_mb);
+    println!("Memory Available: {} MB", available_mb);
+    println!("Uptime: {} s", info.uptime);
+    if !info.ip_addresses.is_empty() {
+        println!("IP Addresses: {}", info.ip_addresses.join(", "));
     }
 
     Ok(())

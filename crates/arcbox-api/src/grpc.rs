@@ -18,12 +18,13 @@ use arcbox_protocol::v1::{
     GetVersionResponse, ImageInfo, ImageSummary, InspectContainerRequest, InspectImageRequest,
     InspectMachineRequest, InspectNetworkRequest, ListContainersRequest, ListContainersResponse,
     ListImagesRequest, ListImagesResponse, ListMachinesRequest, ListMachinesResponse,
-    ListNetworksRequest, ListNetworksResponse, LogEntry, LogsRequest, MachineExecOutput,
-    MachineExecRequest, MachineInfo, MachineNetwork, MachineSummary, NetworkInfo, NetworkSummary,
-    PullImageRequest, PullProgress, RemoveContainerRequest, RemoveImageRequest,
-    RemoveImageResponse, RemoveMachineRequest, RemoveNetworkRequest, StartContainerRequest,
-    StartMachineRequest, StopContainerRequest, StopMachineRequest, SystemPingRequest,
-    SystemPingResponse, TagImageRequest, WaitContainerRequest, WaitContainerResponse,
+    ListNetworksRequest, ListNetworksResponse, LogEntry, LogsRequest, MachineAgentRequest,
+    MachineExecOutput, MachineExecRequest, MachineInfo, MachineNetwork, MachinePingResponse,
+    MachineSummary, MachineSystemInfo, NetworkInfo, NetworkSummary, PullImageRequest,
+    PullProgress, RemoveContainerRequest, RemoveImageRequest, RemoveImageResponse,
+    RemoveMachineRequest, RemoveNetworkRequest, StartContainerRequest, StartMachineRequest,
+    StopContainerRequest, StopMachineRequest, SystemPingRequest, SystemPingResponse,
+    TagImageRequest, WaitContainerRequest, WaitContainerResponse,
 };
 use std::pin::Pin;
 use std::sync::Arc;
@@ -472,9 +473,21 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             cpus: req.cpus,
             memory_mb,
             disk_gb,
-            kernel: None,
-            initrd: None,
-            cmdline: None,
+            kernel: if req.kernel.is_empty() {
+                None
+            } else {
+                Some(req.kernel)
+            },
+            initrd: if req.initrd.is_empty() {
+                None
+            } else {
+                Some(req.initrd)
+            },
+            cmdline: if req.cmdline.is_empty() {
+                None
+            } else {
+                Some(req.cmdline)
+            },
             distro: if req.distro.is_empty() {
                 None
             } else {
@@ -604,6 +617,57 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             created: None,
             started_at: None,
             mounts: vec![],
+        }))
+    }
+
+    async fn ping(
+        &self,
+        request: Request<MachineAgentRequest>,
+    ) -> Result<Response<MachinePingResponse>, Status> {
+        let id = request.into_inner().id;
+
+        let mut agent = self
+            .runtime
+            .get_agent(&id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let response = agent
+            .ping()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(MachinePingResponse {
+            message: response.message,
+            version: response.version,
+        }))
+    }
+
+    async fn get_system_info(
+        &self,
+        request: Request<MachineAgentRequest>,
+    ) -> Result<Response<MachineSystemInfo>, Status> {
+        let id = request.into_inner().id;
+
+        let mut agent = self
+            .runtime
+            .get_agent(&id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let info = agent
+            .get_system_info()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(MachineSystemInfo {
+            kernel_version: info.kernel_version,
+            os_name: info.os_name,
+            os_version: info.os_version,
+            arch: info.arch,
+            total_memory: info.total_memory,
+            available_memory: info.available_memory,
+            cpu_count: info.cpu_count,
+            load_average: info.load_average,
+            hostname: info.hostname,
+            uptime: info.uptime,
+            ip_addresses: info.ip_addresses,
         }))
     }
 

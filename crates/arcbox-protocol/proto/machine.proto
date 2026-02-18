@@ -33,6 +33,12 @@ service MachineService {
     // Inspects a machine.
     rpc Inspect(InspectMachineRequest) returns (MachineInfo);
 
+    // Pings the guest agent for a machine.
+    rpc Ping(MachineAgentRequest) returns (MachinePingResponse);
+
+    // Gets guest system information for a machine.
+    rpc GetSystemInfo(MachineAgentRequest) returns (MachineSystemInfo);
+
     // Executes a command in a machine.
     rpc Exec(MachineExecRequest) returns (stream MachineExecOutput);
 
@@ -60,6 +66,52 @@ message CreateMachineRequest {
     repeated DirectoryMount mounts = 8;
     // SSH public key.
     string ssh_public_key = 9;
+    // Kernel image path.
+    string kernel = 10;
+    // Initrd/initramfs path.
+    string initrd = 11;
+    // Kernel command line.
+    string cmdline = 12;
+}
+
+// Request that targets a machine's guest agent.
+message MachineAgentRequest {
+    // Machine ID or name.
+    string id = 1;
+}
+
+// Ping response from machine guest agent.
+message MachinePingResponse {
+    // Response payload.
+    string message = 1;
+    // Agent version.
+    string version = 2;
+}
+
+// System information reported by machine guest agent.
+message MachineSystemInfo {
+    // Kernel version.
+    string kernel_version = 1;
+    // OS name.
+    string os_name = 2;
+    // OS version.
+    string os_version = 3;
+    // Architecture.
+    string arch = 4;
+    // Total memory in bytes.
+    uint64 total_memory = 5;
+    // Available memory in bytes.
+    uint64 available_memory = 6;
+    // Number of CPUs.
+    uint32 cpu_count = 7;
+    // Load average (1, 5, 15 minutes).
+    repeated double load_average = 8;
+    // Hostname.
+    string hostname = 9;
+    // Uptime in seconds.
+    uint64 uptime = 10;
+    // Guest IP addresses (excluding loopback).
+    repeated string ip_addresses = 11;
 }
 
 // Directory mount configuration.

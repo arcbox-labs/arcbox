@@ -118,6 +118,75 @@ pub struct CreateMachineRequest {
     /// SSH public key.
     #[prost(string, tag = "9")]
     pub ssh_public_key: ::prost::alloc::string::String,
+    /// Kernel image path.
+    #[prost(string, tag = "10")]
+    pub kernel: ::prost::alloc::string::String,
+    /// Initrd/initramfs path.
+    #[prost(string, tag = "11")]
+    pub initrd: ::prost::alloc::string::String,
+    /// Kernel command line.
+    #[prost(string, tag = "12")]
+    pub cmdline: ::prost::alloc::string::String,
+}
+/// Request that targets a machine's guest agent.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineAgentRequest {
+    /// Machine ID or name.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+}
+/// Ping response from machine guest agent.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachinePingResponse {
+    /// Response payload.
+    #[prost(string, tag = "1")]
+    pub message: ::prost::alloc::string::String,
+    /// Agent version.
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+}
+/// System information reported by machine guest agent.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineSystemInfo {
+    /// Kernel version.
+    #[prost(string, tag = "1")]
+    pub kernel_version: ::prost::alloc::string::String,
+    /// OS name.
+    #[prost(string, tag = "2")]
+    pub os_name: ::prost::alloc::string::String,
+    /// OS version.
+    #[prost(string, tag = "3")]
+    pub os_version: ::prost::alloc::string::String,
+    /// Architecture.
+    #[prost(string, tag = "4")]
+    pub arch: ::prost::alloc::string::String,
+    /// Total memory in bytes.
+    #[prost(uint64, tag = "5")]
+    pub total_memory: u64,
+    /// Available memory in bytes.
+    #[prost(uint64, tag = "6")]
+    pub available_memory: u64,
+    /// Number of CPUs.
+    #[prost(uint32, tag = "7")]
+    pub cpu_count: u32,
+    /// Load average (1, 5, 15 minutes).
+    #[prost(double, repeated, tag = "8")]
+    pub load_average: ::prost::alloc::vec::Vec<f64>,
+    /// Hostname.
+    #[prost(string, tag = "9")]
+    pub hostname: ::prost::alloc::string::String,
+    /// Uptime in seconds.
+    #[prost(uint64, tag = "10")]
+    pub uptime: u64,
+    /// Guest IP addresses (excluding loopback).
+    #[prost(string, repeated, tag = "11")]
+    pub ip_addresses: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Directory mount configuration.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -354,8 +423,10 @@ pub struct MachineExecRequest {
     pub user: ::prost::alloc::string::String,
     /// Environment variables.
     #[prost(map = "string, string", tag = "5")]
-    pub env:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub env: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Allocate TTY.
     #[prost(bool, tag = "6")]
     pub tty: bool,
@@ -427,8 +498,10 @@ pub struct CreateContainerRequest {
     pub entrypoint: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// Environment variables.
     #[prost(map = "string, string", tag = "5")]
-    pub env:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub env: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Working directory.
     #[prost(string, tag = "6")]
     pub working_dir: ::prost::alloc::string::String,
@@ -446,8 +519,10 @@ pub struct CreateContainerRequest {
     pub limits: ::core::option::Option<ResourceLimits>,
     /// Labels.
     #[prost(map = "string, string", tag = "11")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Hostname.
     #[prost(string, tag = "12")]
     pub hostname: ::prost::alloc::string::String,
@@ -582,8 +657,10 @@ pub struct ContainerSummary {
     pub ports: ::prost::alloc::vec::Vec<PortBinding>,
     /// Labels.
     #[prost(map = "string, string", tag = "10")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Size in bytes (rw layer).
     #[prost(int64, tag = "11")]
     pub size_rw: i64,
@@ -709,8 +786,10 @@ pub struct ContainerConfig {
     pub image: ::prost::alloc::string::String,
     /// Labels.
     #[prost(map = "string, string", tag = "9")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// TTY allocation.
     #[prost(bool, tag = "10")]
     pub tty: bool,
@@ -1145,8 +1224,10 @@ pub struct ImageSummary {
     pub containers: i64,
     /// Labels.
     #[prost(map = "string, string", tag = "8")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Request to inspect an image.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1233,11 +1314,16 @@ pub struct ImageConfig {
     pub working_dir: ::prost::alloc::string::String,
     /// Labels.
     #[prost(map = "string, string", tag = "8")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Exposed ports.
     #[prost(map = "string, message", tag = "9")]
-    pub exposed_ports: ::std::collections::HashMap<::prost::alloc::string::String, Empty>,
+    pub exposed_ports: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        Empty,
+    >,
     /// Volumes.
     #[prost(map = "string, message", tag = "10")]
     pub volumes: ::std::collections::HashMap<::prost::alloc::string::String, Empty>,
@@ -1476,8 +1562,10 @@ pub struct AgentCreateContainerRequest {
     pub entrypoint: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// Environment variables.
     #[prost(map = "string, string", tag = "5")]
-    pub env:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub env: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Working directory.
     #[prost(string, tag = "6")]
     pub working_dir: ::prost::alloc::string::String,
@@ -1643,8 +1731,10 @@ pub struct AgentExecRequest {
     pub cmd: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// Environment variables.
     #[prost(map = "string, string", tag = "3")]
-    pub env:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub env: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Working directory.
     #[prost(string, tag = "4")]
     pub working_dir: ::prost::alloc::string::String,
@@ -1689,8 +1779,10 @@ pub struct AgentExecStartRequest {
     pub cmd: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// Environment variables.
     #[prost(map = "string, string", tag = "4")]
-    pub env:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub env: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Working directory.
     #[prost(string, tag = "5")]
     pub working_dir: ::prost::alloc::string::String,
@@ -1951,8 +2043,10 @@ pub struct CreateNetworkRequest {
     pub internal: bool,
     /// Labels.
     #[prost(map = "string, string", tag = "4")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Enable IPv6.
     #[prost(bool, tag = "5")]
     pub enable_ipv6: bool,
@@ -1970,8 +2064,10 @@ pub struct IpamConfig {
     pub driver: ::prost::alloc::string::String,
     /// IPAM options.
     #[prost(map = "string, string", tag = "2")]
-    pub options:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub options: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Subnet configurations.
     #[prost(message, repeated, tag = "3")]
     pub subnets: ::prost::alloc::vec::Vec<IpamSubnet>,
@@ -2019,8 +2115,10 @@ pub struct RemoveNetworkRequest {
 pub struct ListNetworksRequest {
     /// Filter by labels.
     #[prost(map = "string, string", tag = "1")]
-    pub filters:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub filters: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Response to list networks.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2059,8 +2157,10 @@ pub struct NetworkSummary {
     pub attachable: bool,
     /// Labels.
     #[prost(map = "string, string", tag = "8")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Request to inspect a network.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2102,18 +2202,25 @@ pub struct NetworkInfo {
     pub attachable: bool,
     /// Labels.
     #[prost(map = "string, string", tag = "8")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// IPAM configuration.
     #[prost(message, optional, tag = "9")]
     pub ipam: ::core::option::Option<IpamConfig>,
     /// Connected containers.
     #[prost(map = "string, message", tag = "10")]
-    pub containers: ::std::collections::HashMap<::prost::alloc::string::String, NetworkContainer>,
+    pub containers: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        NetworkContainer,
+    >,
     /// Driver options.
     #[prost(map = "string, string", tag = "11")]
-    pub options:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub options: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Container connected to a network.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2263,8 +2370,10 @@ pub struct EventsRequest {
     pub until: i64,
     /// Filters.
     #[prost(map = "string, string", tag = "3")]
-    pub filters:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub filters: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// System event.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2294,8 +2403,10 @@ pub struct EventActor {
     pub id: ::prost::alloc::string::String,
     /// Attributes.
     #[prost(map = "string, string", tag = "2")]
-    pub attributes:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub attributes: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Request to prune resources.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2310,8 +2421,10 @@ pub struct PruneRequest {
     pub all: bool,
     /// Filters.
     #[prost(map = "string, string", tag = "3")]
-    pub filters:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub filters: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Response to prune.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2347,12 +2460,16 @@ pub struct CreateVolumeRequest {
     pub driver: ::prost::alloc::string::String,
     /// Driver options.
     #[prost(map = "string, string", tag = "3")]
-    pub driver_opts:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub driver_opts: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Labels.
     #[prost(map = "string, string", tag = "4")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Response to create volume.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2388,8 +2505,10 @@ pub struct RemoveVolumeRequest {
 pub struct ListVolumesRequest {
     /// Filters.
     #[prost(map = "string, string", tag = "1")]
-    pub filters:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub filters: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Response to list volumes.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2431,19 +2550,25 @@ pub struct VolumeInfo {
     pub created: ::prost::alloc::string::String,
     /// Status.
     #[prost(map = "string, string", tag = "5")]
-    pub status:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub status: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Labels.
     #[prost(map = "string, string", tag = "6")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Scope (local, global).
     #[prost(string, tag = "7")]
     pub scope: ::prost::alloc::string::String,
     /// Driver options.
     #[prost(map = "string, string", tag = "8")]
-    pub options:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub options: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Usage data.
     #[prost(message, optional, tag = "9")]
     pub usage: ::core::option::Option<VolumeUsage>,
