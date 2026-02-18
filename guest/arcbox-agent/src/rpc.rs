@@ -706,6 +706,30 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_request_ensure_runtime() {
+        let req = RuntimeEnsureRequest {
+            start_if_needed: true,
+        };
+        let payload = req.encode_to_vec();
+        let parsed = parse_request(MessageType::EnsureRuntimeRequest, &payload).unwrap();
+        match parsed {
+            RpcRequest::EnsureRuntime(r) => assert!(r.start_if_needed),
+            _ => panic!("expected EnsureRuntime request"),
+        }
+    }
+
+    #[test]
+    fn test_parse_request_runtime_status() {
+        let req = RuntimeStatusRequest {};
+        let payload = req.encode_to_vec();
+        let parsed = parse_request(MessageType::RuntimeStatusRequest, &payload).unwrap();
+        match parsed {
+            RpcRequest::RuntimeStatus(_) => {}
+            _ => panic!("expected RuntimeStatus request"),
+        }
+    }
+
+    #[test]
     fn test_parse_request_create_container() {
         let req = CreateContainerRequest {
             name: "test-container".to_string(),
@@ -801,6 +825,14 @@ mod tests {
         assert_eq!(
             RpcResponse::SystemInfo(SystemInfo::default()).message_type(),
             MessageType::GetSystemInfoResponse
+        );
+        assert_eq!(
+            RpcResponse::RuntimeEnsure(RuntimeEnsureResponse::default()).message_type(),
+            MessageType::EnsureRuntimeResponse
+        );
+        assert_eq!(
+            RpcResponse::RuntimeStatus(RuntimeStatusResponse::default()).message_type(),
+            MessageType::RuntimeStatusResponse
         );
         assert_eq!(
             RpcResponse::CreateContainer(CreateContainerResponse::default()).message_type(),
