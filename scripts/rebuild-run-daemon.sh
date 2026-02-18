@@ -11,6 +11,9 @@ INITRAMFS="${INITRAMFS:-$DEFAULT_INITRAMFS}"
 SOCKET="${SOCKET:-/tmp/arcbox.sock}"
 GRPC_SOCKET="${GRPC_SOCKET:-/tmp/arcbox-grpc.sock}"
 DATA_DIR="${DATA_DIR:-/tmp/arcbox-data}"
+CONTAINER_BACKEND="${CONTAINER_BACKEND:-guest-docker}"
+CONTAINER_PROVISION="${CONTAINER_PROVISION:-bundled-assets}"
+GUEST_DOCKER_VSOCK_PORT="${GUEST_DOCKER_VSOCK_PORT:-2375}"
 SIGN="${SIGN:-1}"
 ENTITLEMENTS="${ENTITLEMENTS:-$ROOT/tests/resources/entitlements.plist}"
 
@@ -53,4 +56,7 @@ exec "$BIN" daemon \
   --grpc-socket "$GRPC_SOCKET" \
   --data-dir "$DATA_DIR" \
   --kernel "$KERNEL" \
-  --initramfs "$INITRAMFS"
+  --initramfs "$INITRAMFS" \
+  --container-backend "$CONTAINER_BACKEND" \
+  --container-provision "$CONTAINER_PROVISION" \
+  --guest-docker-vsock-port "$GUEST_DOCKER_VSOCK_PORT"

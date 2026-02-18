@@ -14,6 +14,7 @@ if [[ -z "$BOOT_ASSETS_VERSION_DEFAULT" ]]; then
 fi
 BOOT_ASSETS_VERSION="${ARCBOX_BOOT_ASSET_VERSION:-$BOOT_ASSETS_VERSION_DEFAULT}"
 TEST_LABEL="arcbox.e2e.run=$$"
+GUEST_DOCKER_VSOCK_PORT="${ARCBOX_GUEST_DOCKER_VSOCK_PORT:-2375}"
 
 # Test result tracking
 RESULT_VM_BOOT="SKIP"
@@ -106,6 +107,9 @@ start_daemon() {
     "$PROJECT_DIR/target/release/arcbox" daemon \
         --data-dir "$TEST_DIR" \
         --socket "$TEST_DIR/docker.sock" \
+        --container-backend guest-docker \
+        --container-provision bundled-assets \
+        --guest-docker-vsock-port "$GUEST_DOCKER_VSOCK_PORT" \
         > "$TEST_DIR/daemon.log" 2>&1 &
 
     DAEMON_PID=$!

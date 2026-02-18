@@ -2,14 +2,14 @@ name: Docker API E2E Tests
 
 on:
   push:
-    branches: [main, develop]
+    branches: [master, develop]
     paths:
       - 'crates/arcbox-docker/**'
       - 'crates/arcbox-core/**'
       - 'crates/arcbox-cli/**'
       - '.github/workflows/docker-api-e2e.yml'
   pull_request:
-    branches: [main, develop]
+    branches: [master, develop]
     paths:
       - 'crates/arcbox-docker/**'
       - 'crates/arcbox-core/**'
@@ -61,6 +61,7 @@ jobs:
           ./target/release/arcbox daemon \
             --socket /tmp/arcbox-e2e.sock \
             --data-dir /tmp/arcbox-e2e-data \
+            --container-backend native-control-plane \
             &
           DAEMON_PID=$!
           echo "DAEMON_PID=$DAEMON_PID" >> $GITHUB_ENV
@@ -258,7 +259,8 @@ jobs:
           mkdir -p /tmp/arcbox-e2e-data
           ./target/release/arcbox daemon \
             --socket /tmp/arcbox-e2e.sock \
-            --data-dir /tmp/arcbox-e2e-data &
+            --data-dir /tmp/arcbox-e2e-data \
+            --container-backend native-control-plane &
           sleep 3
 
       - name: Test API versions 1.24 to 1.43
@@ -288,8 +290,8 @@ jobs:
     name: Docker CLI E2E Tests
     runs-on: macos-14
     timeout-minutes: 60
-    # Only run on main branch or when explicitly triggered
-    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    # Only run on master branch or when explicitly triggered
+    if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout arcbox
@@ -328,7 +330,8 @@ jobs:
           mkdir -p /tmp/arcbox-e2e-data
           ./target/release/arcbox daemon \
             --socket /tmp/arcbox-e2e.sock \
-            --data-dir /tmp/arcbox-e2e-data &
+            --data-dir /tmp/arcbox-e2e-data \
+            --container-backend native-control-plane &
           sleep 3
 
       - name: Run Docker CLI system tests
