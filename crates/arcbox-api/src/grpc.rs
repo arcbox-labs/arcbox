@@ -7,24 +7,23 @@
 use arcbox_container::{ContainerConfig, ContainerId, ContainerState};
 use arcbox_core::Runtime;
 use arcbox_grpc::v1::{
-    container_service_server, image_service_server, machine_service_server,
-    network_service_server, system_service_server,
+    container_service_server, image_service_server, machine_service_server, network_service_server,
+    system_service_server,
 };
 use arcbox_image::{ImagePuller, ImageRef, RegistryClient};
 use arcbox_protocol::v1::{
-    ContainerInfo, ContainerState as ProtoContainerState, ContainerSummary,
-    CreateContainerRequest, CreateContainerResponse, CreateMachineRequest, CreateMachineResponse,
-    CreateNetworkRequest, CreateNetworkResponse, Empty, ExecOutput, GetInfoRequest,
-    GetInfoResponse, GetVersionRequest, GetVersionResponse, InspectMachineRequest,
-    InspectNetworkRequest, ListContainersRequest, ListContainersResponse, ListImagesRequest,
-    ListImagesResponse, ListMachinesRequest, ListMachinesResponse, ListNetworksRequest,
-    ListNetworksResponse, LogEntry, MachineExecOutput, MachineExecRequest, MachineInfo,
-    MachineNetwork, MachineSummary, NetworkInfo, NetworkSummary, PullProgress, RemoveImageRequest,
-    RemoveImageResponse, RemoveNetworkRequest, StartContainerRequest, StartMachineRequest,
-    StopContainerRequest, StopMachineRequest, SystemPingRequest, SystemPingResponse,
-    InspectContainerRequest, InspectImageRequest, ImageInfo, ImageSummary,
-    LogsRequest, RemoveContainerRequest, RemoveMachineRequest, WaitContainerRequest,
-    WaitContainerResponse, PullImageRequest, TagImageRequest,
+    ContainerInfo, ContainerState as ProtoContainerState, ContainerSummary, CreateContainerRequest,
+    CreateContainerResponse, CreateMachineRequest, CreateMachineResponse, CreateNetworkRequest,
+    CreateNetworkResponse, Empty, ExecOutput, GetInfoRequest, GetInfoResponse, GetVersionRequest,
+    GetVersionResponse, ImageInfo, ImageSummary, InspectContainerRequest, InspectImageRequest,
+    InspectMachineRequest, InspectNetworkRequest, ListContainersRequest, ListContainersResponse,
+    ListImagesRequest, ListImagesResponse, ListMachinesRequest, ListMachinesResponse,
+    ListNetworksRequest, ListNetworksResponse, LogEntry, LogsRequest, MachineExecOutput,
+    MachineExecRequest, MachineInfo, MachineNetwork, MachineSummary, NetworkInfo, NetworkSummary,
+    PullImageRequest, PullProgress, RemoveContainerRequest, RemoveImageRequest,
+    RemoveImageResponse, RemoveMachineRequest, RemoveNetworkRequest, StartContainerRequest,
+    StartMachineRequest, StopContainerRequest, StopMachineRequest, SystemPingRequest,
+    SystemPingResponse, TagImageRequest, WaitContainerRequest, WaitContainerResponse,
 };
 use std::pin::Pin;
 use std::sync::Arc;
@@ -365,8 +364,9 @@ impl container_service_server::ContainerService for ContainerServiceImpl {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    type AttachStream =
-        Pin<Box<dyn Stream<Item = Result<arcbox_protocol::v1::AttachOutput, Status>> + Send + 'static>>;
+    type AttachStream = Pin<
+        Box<dyn Stream<Item = Result<arcbox_protocol::v1::AttachOutput, Status>> + Send + 'static>,
+    >;
 
     async fn attach(
         &self,
@@ -511,10 +511,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         Ok(Response::new(Empty {}))
     }
 
-    async fn stop(
-        &self,
-        request: Request<StopMachineRequest>,
-    ) -> Result<Response<Empty>, Status> {
+    async fn stop(&self, request: Request<StopMachineRequest>) -> Result<Response<Empty>, Status> {
         let id = request.into_inner().id;
 
         self.runtime
@@ -597,7 +594,10 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 disk_path: String::new(),
             }),
             os: Some(arcbox_protocol::v1::MachineOs {
-                distro: machine.distro.clone().unwrap_or_else(|| "linux".to_string()),
+                distro: machine
+                    .distro
+                    .clone()
+                    .unwrap_or_else(|| "linux".to_string()),
                 version: machine.distro_version.clone().unwrap_or_default(),
                 kernel: machine.kernel.clone().unwrap_or_default(),
             }),
@@ -809,7 +809,9 @@ impl image_service_server::ImageService for ImageServiceImpl {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    type PushStream = Pin<Box<dyn Stream<Item = Result<arcbox_protocol::v1::PushProgress, Status>> + Send + 'static>>;
+    type PushStream = Pin<
+        Box<dyn Stream<Item = Result<arcbox_protocol::v1::PushProgress, Status>> + Send + 'static>,
+    >;
 
     async fn push(
         &self,
@@ -897,10 +899,7 @@ impl image_service_server::ImageService for ImageServiceImpl {
         }))
     }
 
-    async fn tag(
-        &self,
-        request: Request<TagImageRequest>,
-    ) -> Result<Response<Empty>, Status> {
+    async fn tag(&self, request: Request<TagImageRequest>) -> Result<Response<Empty>, Status> {
         let req = request.into_inner();
 
         let source = ImageRef::parse(&req.source)
@@ -922,7 +921,9 @@ impl image_service_server::ImageService for ImageServiceImpl {
         Ok(Response::new(Empty {}))
     }
 
-    type BuildStream = Pin<Box<dyn Stream<Item = Result<arcbox_protocol::v1::BuildProgress, Status>> + Send + 'static>>;
+    type BuildStream = Pin<
+        Box<dyn Stream<Item = Result<arcbox_protocol::v1::BuildProgress, Status>> + Send + 'static>,
+    >;
 
     async fn build(
         &self,

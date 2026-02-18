@@ -40,10 +40,12 @@
 //! ```
 
 pub mod nat;
+pub mod tun;
 pub mod vmnet;
 pub mod vmnet_ffi;
 
 pub use nat::DarwinNatNetwork;
+pub use tun::DarwinTun;
 pub use vmnet::{Vmnet, VmnetConfig, VmnetMode};
 
 use std::net::Ipv4Addr;

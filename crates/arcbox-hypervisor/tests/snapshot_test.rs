@@ -22,8 +22,8 @@ use arcbox_hypervisor::{
     memory::GuestAddress,
     traits::{GuestMemory, Hypervisor, Vcpu, VirtualMachine},
     types::{
-        CpuArch, DeviceSnapshot, MemoryRegionSnapshot, Registers, VcpuSnapshot,
-        VirtioDeviceConfig, VirtioDeviceType, VmSnapshot,
+        CpuArch, DeviceSnapshot, MemoryRegionSnapshot, Registers, VcpuSnapshot, VirtioDeviceConfig,
+        VirtioDeviceType, VmSnapshot,
     },
 };
 
@@ -84,8 +84,14 @@ fn test_vm_snapshot_basic() {
     // Verify register values in snapshots
     #[cfg(target_arch = "x86_64")]
     {
-        let regs0_snap = snap0.x86_regs.as_ref().expect("Missing x86 regs in snapshot 0");
-        let regs1_snap = snap1.x86_regs.as_ref().expect("Missing x86 regs in snapshot 1");
+        let regs0_snap = snap0
+            .x86_regs
+            .as_ref()
+            .expect("Missing x86 regs in snapshot 0");
+        let regs1_snap = snap1
+            .x86_regs
+            .as_ref()
+            .expect("Missing x86 regs in snapshot 1");
 
         assert_eq!(regs0_snap.rax, 0xAAAA_BBBB_CCCC_DDDD);
         assert_eq!(regs0_snap.rip, 0x0000_1000);
@@ -95,8 +101,14 @@ fn test_vm_snapshot_basic() {
 
     #[cfg(target_arch = "aarch64")]
     {
-        let arm0 = snap0.arm64_regs.as_ref().expect("Missing ARM64 regs in snapshot 0");
-        let arm1 = snap1.arm64_regs.as_ref().expect("Missing ARM64 regs in snapshot 1");
+        let arm0 = snap0
+            .arm64_regs
+            .as_ref()
+            .expect("Missing ARM64 regs in snapshot 0");
+        let arm1 = snap1
+            .arm64_regs
+            .as_ref()
+            .expect("Missing ARM64 regs in snapshot 1");
 
         // On ARM64, rax/rip are mapped to x[0]/pc
         assert_eq!(arm0.x[0], 0xAAAA_BBBB_CCCC_DDDD);
@@ -173,7 +185,10 @@ fn test_vm_snapshot_with_devices() {
     // Verify each device has a name
     for device in &device_snapshots {
         assert!(!device.name.is_empty(), "Device name should not be empty");
-        println!("Device snapshot: {:?} - {}", device.device_type, device.name);
+        println!(
+            "Device snapshot: {:?} - {}",
+            device.device_type, device.name
+        );
     }
 
     println!("VM snapshot with devices test passed");
@@ -209,7 +224,8 @@ fn test_vm_restore_from_snapshot() {
     initial_regs.rbx = 0x1234_5678_9ABC_DEF0;
     initial_regs.rip = 0x0000_FFFF_0000_1000;
     initial_regs.rsp = 0x7FFF_FFFF_FFFF_F000;
-    vcpu.set_regs(&initial_regs).expect("Failed to set initial regs");
+    vcpu.set_regs(&initial_regs)
+        .expect("Failed to set initial regs");
 
     // Take snapshot
     let snapshot = vcpu.snapshot().expect("Failed to create snapshot");
@@ -221,7 +237,8 @@ fn test_vm_restore_from_snapshot() {
     let mut modified_regs = Registers::default();
     modified_regs.rax = 0x0000_0000_0000_0000;
     modified_regs.rip = 0x0000_0000_0000_0000;
-    vcpu.set_regs(&modified_regs).expect("Failed to modify regs");
+    vcpu.set_regs(&modified_regs)
+        .expect("Failed to modify regs");
 
     // Verify modification took effect
     let current_regs = vcpu.get_regs().expect("Failed to get current regs");
@@ -229,7 +246,8 @@ fn test_vm_restore_from_snapshot() {
     assert_eq!(current_regs.rip, 0);
 
     // Restore from snapshot
-    vcpu.restore(&snapshot).expect("Failed to restore from snapshot");
+    vcpu.restore(&snapshot)
+        .expect("Failed to restore from snapshot");
 
     // Verify state is restored
     let restored_regs = vcpu.get_regs().expect("Failed to get restored regs");
@@ -284,7 +302,10 @@ fn test_vm_restore_vcpu_id_mismatch() {
 
     // Try to restore vCPU 0's snapshot to vCPU 1 - should fail
     let result = vcpu1.restore(&snapshot0);
-    assert!(result.is_err(), "Restore with mismatched vCPU ID should fail");
+    assert!(
+        result.is_err(),
+        "Restore with mismatched vCPU ID should fail"
+    );
 
     println!("vCPU ID mismatch detection test passed");
 }
@@ -376,8 +397,7 @@ fn test_snapshot_serialization() {
     assert!(json.contains("\"total_memory\": 335544320")); // 320 * 1024 * 1024
 
     // Deserialize back
-    let restored: VmSnapshot =
-        serde_json::from_str(&json).expect("Failed to deserialize snapshot");
+    let restored: VmSnapshot = serde_json::from_str(&json).expect("Failed to deserialize snapshot");
 
     // Verify structure
     assert_eq!(restored.version, 1);
@@ -512,8 +532,7 @@ fn test_incremental_snapshot() {
     );
 
     // Serialize both and verify structure
-    let base_json =
-        serde_json::to_string_pretty(&base_snapshot).expect("Failed to serialize base");
+    let base_json = serde_json::to_string_pretty(&base_snapshot).expect("Failed to serialize base");
     let incr_json =
         serde_json::to_string_pretty(&incremental_snapshot).expect("Failed to serialize incr");
 
@@ -527,10 +546,7 @@ fn test_incremental_snapshot() {
         serde_json::from_str(&incr_json).expect("Failed to deserialize incr");
 
     assert!(restored_base.parent_id.is_none());
-    assert_eq!(
-        restored_incr.parent_id,
-        Some(base_snapshot_id)
-    );
+    assert_eq!(restored_incr.parent_id, Some(base_snapshot_id));
 
     // Verify the incremental snapshot has updated values
     let incr_regs = restored_incr.vcpus[0]
@@ -661,18 +677,19 @@ fn test_device_restore_validation() {
     assert!(result.is_ok(), "Device restore validation should succeed");
 
     // Create a mismatched snapshot (has block device that doesn't exist)
-    let mismatched_snapshots = vec![
-        DeviceSnapshot {
-            device_type: VirtioDeviceType::Block,
-            name: "block-0".to_string(),
-            state: serde_json::to_vec(&VirtioDeviceConfig::block("/nonexistent", false)).unwrap(),
-        },
-    ];
+    let mismatched_snapshots = vec![DeviceSnapshot {
+        device_type: VirtioDeviceType::Block,
+        name: "block-0".to_string(),
+        state: serde_json::to_vec(&VirtioDeviceConfig::block("/nonexistent", false)).unwrap(),
+    }];
 
     // This should succeed (Darwin logs warnings but doesn't fail)
     // because actual device state restoration is not supported
     let result = vm.restore_devices(&mismatched_snapshots);
-    assert!(result.is_ok(), "Device restore should succeed (with warnings)");
+    assert!(
+        result.is_ok(),
+        "Device restore should succeed (with warnings)"
+    );
 
     println!("Device restore validation test passed");
 }

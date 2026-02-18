@@ -130,6 +130,7 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "thiserror",
  "tokio",
@@ -238,6 +239,7 @@ dependencies = [
  "prost",
  "reqwest",
  "serde",
+ "serde_json",
  "sha2",
  "tar",
  "tempfile",
@@ -270,6 +272,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -366,6 +369,7 @@ dependencies = [
  "arcbox-vz",
  "block2",
  "clap",
+ "ctrlc",
  "libc",
  "nix 0.29.0",
  "objc2",
@@ -523,6 +527,7 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "arcbox-error",
  "arcbox-hypervisor",
+ "arcbox-net",
  "arcbox-virtio",
  "bytes",
  "futures",
@@ -922,6 +927,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctrlc"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73736a89c4aff73035ba2ed2e565061954da00d4970fc9ac25dcc85a2a20d790"
+dependencies = [
+ "dispatch2",
+ "nix 0.30.1",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "dashmap"
 version = "6.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -970,6 +986,18 @@ dependencies = [
  "option-ext",
  "redox_users",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "dispatch2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89a09f22a6c6069a18470eb92d2298acf25463f14256d24778e1230d789a2aec"
+dependencies = [
+ "bitflags 2.10.0",
+ "block2",
+ "libc",
+ "objc2",
 ]
 
 [[package]]
@@ -1911,6 +1939,18 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "memoffset",
+]
+
+[[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags 2.10.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]

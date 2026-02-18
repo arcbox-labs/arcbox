@@ -1,5 +1,9 @@
 #!/bin/bash
-# Build a minimal initramfs with arcbox-agent
+# Build a minimal initramfs with arcbox-agent for LOCAL DEVELOPMENT AND TESTING ONLY.
+#
+# NOTE: This script is NOT used in production boot flow.
+# Production initramfs (with arcbox-agent) is built and released from the
+# arcbox-labs/boot-assets repository. See PLAN.md for details.
 #
 # This creates an initramfs that:
 # 1. Uses Alpine Linux's base initramfs
@@ -93,12 +97,27 @@ else
     echo "  Warning: fuse modules not found in modloop"
 fi
 
+# Copy virtio_net module (needed for guest networking)
+echo "Adding virtio_net kernel module..."
+VIRTIO_NET_SRC="$MODLOOP_EXTRACT/modules/$KERNEL_VERSION/kernel/drivers/net/virtio_net.ko"
+mkdir -p "$WORK_DIR/lib/modules/$KERNEL_VERSION/kernel/drivers/net"
+if [ -f "$VIRTIO_NET_SRC" ]; then
+    cp "$VIRTIO_NET_SRC" "$WORK_DIR/lib/modules/$KERNEL_VERSION/kernel/drivers/net/" 2>/dev/null || true
+    echo "  Copied virtio_net module"
+elif [ -f "${VIRTIO_NET_SRC}.gz" ]; then
+    cp "${VIRTIO_NET_SRC}.gz" "$WORK_DIR/lib/modules/$KERNEL_VERSION/kernel/drivers/net/" 2>/dev/null || true
+    echo "  Copied virtio_net module (compressed)"
+else
+    echo "  Warning: virtio_net module not found in modloop"
+fi
+
 # Update modules.dep for the new modules
 echo "kernel/net/vmw_vsock/vsock.ko:" >> "$WORK_DIR/lib/modules/$KERNEL_VERSION/modules.dep"
 echo "kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko: kernel/net/vmw_vsock/vsock.ko" >> "$WORK_DIR/lib/modules/$KERNEL_VERSION/modules.dep"
 echo "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko: kernel/net/vmw_vsock/vmw_vsock_virtio_transport_common.ko" >> "$WORK_DIR/lib/modules/$KERNEL_VERSION/modules.dep"
 echo "kernel/fs/fuse/fuse.ko:" >> "$WORK_DIR/lib/modules/$KERNEL_VERSION/modules.dep"
 echo "kernel/fs/fuse/virtiofs.ko: kernel/fs/fuse/fuse.ko" >> "$WORK_DIR/lib/modules/$KERNEL_VERSION/modules.dep"
+echo "kernel/drivers/net/virtio_net.ko:" >> "$WORK_DIR/lib/modules/$KERNEL_VERSION/modules.dep"
 
 # Cleanup modloop extract
 rm -rf "$MODLOOP_EXTRACT"
@@ -173,12 +192,40 @@ echo "Loaded modules:"
 /bin/busybox cat /proc/modules | /bin/busybox head -10
 echo ""
 
+# Network setup
+echo "Setting up network..."
+/sbin/modprobe virtio_net 2>/dev/null && echo "  Loaded: virtio_net" || echo "  Failed: virtio_net"
+
+# Wait for the network interface to appear
+/bin/busybox sleep 1
+
+# Configure eth0 with static IP matching the host utun peer address
+if /bin/busybox ip addr add 192.168.64.2/24 dev eth0 2>/dev/null && \
+   /bin/busybox ip link set eth0 up && \
+   /bin/busybox ip route add default via 192.168.64.1; then
+    echo "  Network configured: 192.168.64.2/24 via 192.168.64.1"
+else
+    echo "  Network configuration FAILED"
+fi
+
+# DNS configuration
+echo "nameserver 192.168.64.1" > /etc/resolv.conf
+
+# host.docker.internal support
+echo "192.168.64.1 host.docker.internal" >> /etc/hosts
+
+# Log network IP for host-side detection
+/bin/busybox mkdir -p /var/log
+echo "192.168.64.2" > /var/log/network.log
+echo ""
+
 # Start arcbox-agent in foreground with debug output
 echo "Starting arcbox-agent on vsock port 1024..."
 echo "=================================="
 
-# Run agent - it will print tracing output
-exec /sbin/arcbox-agent
+# Persist agent logs to host-mounted share for debugging.
+echo "Agent logs: /arcbox/agent.log"
+exec /sbin/arcbox-agent >> /arcbox/agent.log 2>&1
 INIT_EOF
 chmod 755 "$WORK_DIR/init"
 

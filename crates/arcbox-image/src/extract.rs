@@ -637,10 +637,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            err.is_not_found(),
-            "Expected NotFound error, got: {err:?}"
-        );
+        assert!(err.is_not_found(), "Expected NotFound error, got: {err:?}");
         assert!(
             err.to_string().contains("manifest reference not found"),
             "Error should indicate manifest not found: {err}"
@@ -658,10 +655,7 @@ mod tests {
         // Should return NotFound since the image hasn't been pulled.
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            err.is_not_found(),
-            "Expected NotFound error, got: {err:?}"
-        );
+        assert!(err.is_not_found(), "Expected NotFound error, got: {err:?}");
     }
 
     #[test]

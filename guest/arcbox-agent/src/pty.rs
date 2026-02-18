@@ -186,8 +186,7 @@ impl Pty {
             .as_ref()
             .context("PTY slave not available for raw mode")?;
 
-        let mut termios =
-            termios::tcgetattr(slave).context("failed to get terminal attributes")?;
+        let mut termios = termios::tcgetattr(slave).context("failed to get terminal attributes")?;
 
         // Save original settings
         if let Ok(mut guard) = self.original_termios.lock() {
@@ -197,8 +196,7 @@ impl Pty {
         // Set raw mode
         termios::cfmakeraw(&mut termios);
 
-        termios::tcsetattr(slave, SetArg::TCSANOW, &termios)
-            .context("failed to set raw mode")?;
+        termios::tcsetattr(slave, SetArg::TCSANOW, &termios).context("failed to set raw mode")?;
 
         Ok(())
     }

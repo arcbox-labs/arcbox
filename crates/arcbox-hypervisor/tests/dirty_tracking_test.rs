@@ -14,7 +14,7 @@
 use std::time::Instant;
 
 use arcbox_hypervisor::{
-    darwin::{is_supported, DarwinMemory},
+    darwin::{DarwinMemory, is_supported},
     memory::{GuestAddress, PAGE_SIZE},
     traits::GuestMemory,
 };
@@ -309,7 +309,10 @@ fn test_dirty_tracking_performance() {
     ];
 
     println!("\nDirty tracking performance (FNV-1a checksum):");
-    println!("{:>10} {:>12} {:>12} {:>15}", "Size", "Enable (ms)", "Check (ms)", "Pages/ms");
+    println!(
+        "{:>10} {:>12} {:>12} {:>15}",
+        "Size", "Enable (ms)", "Check (ms)", "Pages/ms"
+    );
     println!("{}", "-".repeat(55));
 
     for (size, label) in test_sizes {
@@ -329,10 +332,7 @@ fn test_dirty_tracking_performance() {
         let check_time = start.elapsed();
 
         // Should be empty since nothing was written
-        assert!(
-            dirty.is_empty(),
-            "Expected no dirty pages for clean memory"
-        );
+        assert!(dirty.is_empty(), "Expected no dirty pages for clean memory");
 
         let enable_ms = enable_time.as_secs_f64() * 1000.0;
         let check_ms = check_time.as_secs_f64() * 1000.0;
@@ -372,8 +372,14 @@ fn test_dirty_tracking_performance_with_writes() {
         .enable_dirty_tracking()
         .expect("Failed to enable dirty tracking");
 
-    println!("\nDirty tracking with writes (16MB memory, {} pages):", num_pages);
-    println!("{:>15} {:>12} {:>15}", "Dirty pages", "Check (ms)", "Pages/ms");
+    println!(
+        "\nDirty tracking with writes (16MB memory, {} pages):",
+        num_pages
+    );
+    println!(
+        "{:>15} {:>12} {:>15}",
+        "Dirty pages", "Check (ms)", "Pages/ms"
+    );
     println!("{}", "-".repeat(45));
 
     // Test with different amounts of dirty pages

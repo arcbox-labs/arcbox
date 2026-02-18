@@ -7,8 +7,8 @@
 
 use clap::Parser;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Boot a Linux VM using Virtualization.framework
@@ -87,7 +87,7 @@ async fn main() {
 fn run_macos(args: Args) {
     use arcbox_hypervisor::{
         config::VmConfig,
-        darwin::{is_supported, DarwinHypervisor, DarwinVm},
+        darwin::{DarwinHypervisor, DarwinVm, is_supported},
         traits::{Hypervisor, VirtualMachine},
         types::{CpuArch, VirtioDeviceConfig},
     };
@@ -124,7 +124,10 @@ fn run_macos(args: Args) {
         arch: CpuArch::native(),
         kernel_path: Some(args.kernel.to_string_lossy().into_owned()),
         kernel_cmdline: Some(cmdline.clone()),
-        initrd_path: args.initrd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        initrd_path: args
+            .initrd
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
         ..Default::default()
     };
 
@@ -138,7 +141,11 @@ fn run_macos(args: Args) {
     }
     println!(
         "  Network: {}",
-        if args.net { "enabled (NAT)" } else { "disabled" }
+        if args.net {
+            "enabled (NAT)"
+        } else {
+            "disabled"
+        }
     );
     println!(
         "  Vsock: {}",
@@ -193,11 +200,8 @@ fn run_macos(args: Args) {
     // Add VirtioFS device if requested
     if let Some(ref fs_path) = args.virtiofs {
         println!("Adding VirtioFS device: {} -> arcbox", fs_path.display());
-        let fs_config = VirtioDeviceConfig::filesystem(
-            fs_path.to_string_lossy().into_owned(),
-            "arcbox",
-            false,
-        );
+        let fs_config =
+            VirtioDeviceConfig::filesystem(fs_path.to_string_lossy().into_owned(), "arcbox", false);
         match vm.add_virtio_device(fs_config) {
             Ok(()) => println!("VirtioFS device added successfully"),
             Err(e) => eprintln!("Warning: Failed to add VirtioFS device: {}", e),

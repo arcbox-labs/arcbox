@@ -234,7 +234,10 @@ async fn docker_exec_hijack_roundtrip(socket: &Path, exec_id: &str) -> Result<Ve
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(b"hello-from-e2e".len()).any(|w| w == b"hello-from-e2e") {
+        if buf
+            .windows(b"hello-from-e2e".len())
+            .any(|w| w == b"hello-from-e2e")
+        {
             break;
         }
     }

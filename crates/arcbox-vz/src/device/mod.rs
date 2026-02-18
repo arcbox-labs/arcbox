@@ -11,8 +11,8 @@ mod serial;
 mod socket;
 mod storage;
 
-pub use balloon::{MemoryBalloonDevice, MemoryBalloonDeviceConfiguration};
 pub(crate) use balloon::vm_memory_balloon_devices;
+pub use balloon::{MemoryBalloonDevice, MemoryBalloonDeviceConfiguration};
 pub use entropy::EntropyDeviceConfiguration;
 pub use filesystem::{
     DirectoryShare, LinuxRosettaDirectoryShare, MultipleDirectoryShare, RosettaAvailability,

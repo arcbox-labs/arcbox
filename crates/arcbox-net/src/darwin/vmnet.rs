@@ -403,10 +403,7 @@ impl Vmnet {
                 // No packets available.
                 return Ok(0);
             }
-            return Err(NetError::io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                status.message(),
-            )));
+            return Err(NetError::io(std::io::Error::other(status.message())));
         }
 
         if pktcnt == 0 {
@@ -455,10 +452,7 @@ impl Vmnet {
         let status = unsafe { vmnet_write(self.interface, &mut packet, &mut pktcnt) };
 
         if !status.is_success() {
-            return Err(NetError::io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                status.message(),
-            )));
+            return Err(NetError::io(std::io::Error::other(status.message())));
         }
 
         if pktcnt == 0 {

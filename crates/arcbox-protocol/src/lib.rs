@@ -86,10 +86,10 @@ pub mod container {
         ContainerStatsRequest, ContainerStatsResponse, ContainerSummary, ContainerTopRequest,
         ContainerTopResponse, CreateContainerRequest, CreateContainerResponse, ExecCreateRequest,
         ExecCreateResponse, ExecOutput, ExecStartRequest, InspectContainerRequest,
-        KillContainerRequest, ListContainersRequest, ListContainersResponse, LogEntry,
-        LogsRequest, MountPoint, NetworkSettings, PauseContainerRequest, ProcessRow,
-        RemoveContainerRequest, StartContainerRequest, StopContainerRequest,
-        UnpauseContainerRequest, WaitContainerRequest, WaitContainerResponse,
+        KillContainerRequest, ListContainersRequest, ListContainersResponse, LogEntry, LogsRequest,
+        MountPoint, NetworkSettings, PauseContainerRequest, ProcessRow, RemoveContainerRequest,
+        StartContainerRequest, StopContainerRequest, UnpauseContainerRequest, WaitContainerRequest,
+        WaitContainerResponse,
     };
 }
 
@@ -159,9 +159,9 @@ pub mod agent {
 pub mod api {
     // Network service types
     pub use super::v1::{
-        CreateNetworkRequest, CreateNetworkResponse, InspectNetworkRequest, IpamConfig,
-        IpamSubnet, ListNetworksRequest, ListNetworksResponse, NetworkContainer, NetworkInfo,
-        NetworkSummary, RemoveNetworkRequest,
+        CreateNetworkRequest, CreateNetworkResponse, InspectNetworkRequest, IpamConfig, IpamSubnet,
+        ListNetworksRequest, ListNetworksResponse, NetworkContainer, NetworkInfo, NetworkSummary,
+        RemoveNetworkRequest,
     };
 
     // System service types
@@ -200,9 +200,9 @@ pub use v1::{
     AttachInput, AttachOutput, ContainerConfig, ContainerInfo, ContainerState,
     ContainerStatsRequest, ContainerStatsResponse, ContainerSummary, ContainerTopRequest,
     ContainerTopResponse, CreateContainerRequest, CreateContainerResponse, ExecCreateRequest,
-    ExecCreateResponse, ExecOutput, ExecStartRequest, InspectContainerRequest, KillContainerRequest,
-    ListContainersRequest, ListContainersResponse, LogEntry, LogsRequest, MountPoint,
-    NetworkSettings, PauseContainerRequest, ProcessRow, RemoveContainerRequest,
+    ExecCreateResponse, ExecOutput, ExecStartRequest, InspectContainerRequest,
+    KillContainerRequest, ListContainersRequest, ListContainersResponse, LogEntry, LogsRequest,
+    MountPoint, NetworkSettings, PauseContainerRequest, ProcessRow, RemoveContainerRequest,
     StartContainerRequest, StopContainerRequest, UnpauseContainerRequest, WaitContainerRequest,
     WaitContainerResponse,
 };

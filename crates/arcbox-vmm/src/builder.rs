@@ -306,6 +306,14 @@ impl VmBuilder {
             vsock: self.vsock_config.is_some(),
             guest_cid: self.vsock_config.as_ref().map(|cfg| cfg.guest_cid as u32),
             balloon: true, // Enable balloon by default for memory optimization
+            block_devices: self
+                .block_devices
+                .iter()
+                .map(|cfg| crate::vmm::BlockDeviceConfig {
+                    path: cfg.path.clone(),
+                    read_only: cfg.read_only,
+                })
+                .collect(),
         };
 
         tracing::info!(

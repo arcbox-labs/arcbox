@@ -148,7 +148,7 @@ impl DarwinNatNetwork {
     }
 
     /// Returns all endpoints.
-    #[must_use]
+    #[must_use = "returns an iterator over endpoints without modifying the NAT engine"]
     pub fn endpoints(&self) -> impl Iterator<Item = &DarwinNetEndpoint> {
         self.endpoints.values()
     }

@@ -11,14 +11,11 @@
 //! - Special mounts (/proc, /sys, /dev) for proper Linux operation
 
 use crate::pty::PtyHandle;
-use crate::shim::{
-    BroadcastWriter, ProcessShim, spawn_broadcast_only_from_pipes, spawn_broadcast_only_from_pty,
-};
+use crate::shim::{BroadcastWriter, ProcessShim, spawn_broadcast_only_from_pty};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 #[cfg(target_os = "linux")]
 use std::path::Path;
@@ -198,6 +195,9 @@ impl ContainerRuntime {
             container.state = ContainerState::Stopped;
             container.exit_code = Some(exit_code);
             container.pid = None;
+
+            // Remove container name from /etc/hosts.
+            crate::dns::remove_container_dns(&container.name);
         }
     }
 
@@ -228,7 +228,10 @@ impl ContainerRuntime {
         let container = self.containers.get_mut(id).context("container not found")?;
 
         if container.state == ContainerState::Running {
-            return Ok(());
+            anyhow::bail!("container is already running");
+        }
+        if container.state == ContainerState::Paused {
+            anyhow::bail!("container is paused (unpause before restart)");
         }
 
         if container.command.is_empty() {
@@ -408,12 +411,7 @@ impl ContainerRuntime {
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
             if let (Some(stdout), Some(stderr)) = (stdout, stderr) {
-                let stdout_fd = stdout.as_raw_fd();
-                let stderr_fd = stderr.as_raw_fd();
-                // Prevent the ChildStdout/ChildStderr from closing the fds
-                std::mem::forget(stdout);
-                std::mem::forget(stderr);
-                match ProcessShim::with_pipes(id.to_string(), stdout_fd, stderr_fd) {
+                match ProcessShim::with_child_pipes(id.to_string(), stdout, stderr) {
                     Ok(shim) => {
                         let shutdown = shim.shutdown_token();
                         let broadcaster = shim.broadcaster();
@@ -427,8 +425,7 @@ impl ContainerRuntime {
                     }
                     Err(e) => {
                         tracing::warn!("Failed to create shim for {}: {}", id, e);
-                        let broadcaster = spawn_broadcast_only_from_pipes(stdout_fd, stderr_fd);
-                        (None, Some(broadcaster))
+                        (None, Some(Arc::new(BroadcastWriter::new())))
                     }
                 }
             } else {
@@ -448,6 +445,12 @@ impl ContainerRuntime {
             })),
         );
 
+        // Register container name in /etc/hosts for inter-container DNS resolution.
+        let container = self.containers.get(id);
+        if let Some(container) = container {
+            crate::dns::add_container_dns(&container.name);
+        }
+
         Ok(())
     }
 
@@ -455,11 +458,12 @@ impl ContainerRuntime {
     pub async fn stop_container(&mut self, id: &str, timeout_secs: u32) -> Result<()> {
         let container = self.containers.get_mut(id).context("container not found")?;
 
-        if container.state != ContainerState::Running {
+        if container.state != ContainerState::Running && container.state != ContainerState::Paused {
             anyhow::bail!("container is not running");
         }
 
         let pid = container.pid.context("container has no PID")?;
+        let was_paused = container.state == ContainerState::Paused;
 
         tracing::info!(
             "Stopping container {} (PID {}) with timeout {}s",
@@ -467,6 +471,29 @@ impl ContainerRuntime {
             pid,
             timeout_secs
         );
+
+        // Resume first when paused so SIGTERM can take effect immediately.
+        if was_paused {
+            tracing::info!("Container {} is paused, sending SIGCONT before stop", id);
+            #[cfg(target_os = "linux")]
+            {
+                use nix::sys::signal::{Signal, kill};
+                use nix::unistd::Pid;
+
+                let nix_pid = Pid::from_raw(pid as i32);
+                if let Err(e) = kill(nix_pid, Signal::SIGCONT) {
+                    tracing::warn!("Failed to send SIGCONT to {}: {}", pid, e);
+                }
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                // On non-Linux, use libc directly
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGCONT);
+                }
+            }
+        }
 
         // Send SIGTERM first
         #[cfg(target_os = "linux")]
@@ -541,11 +568,9 @@ impl ContainerRuntime {
                         }
 
                         // Wait briefly for SIGKILL to take effect
-                        let _ = tokio::time::timeout(
-                            tokio::time::Duration::from_secs(5),
-                            child.wait(),
-                        )
-                        .await;
+                        let _ =
+                            tokio::time::timeout(tokio::time::Duration::from_secs(5), child.wait())
+                                .await;
                     }
                 }
             }
@@ -555,6 +580,9 @@ impl ContainerRuntime {
         container.state = ContainerState::Stopped;
         container.pid = None;
 
+        // Remove container name from /etc/hosts.
+        crate::dns::remove_container_dns(&container.name);
+
         Ok(())
     }
 
@@ -562,16 +590,22 @@ impl ContainerRuntime {
     pub async fn remove_container(&mut self, id: &str, force: bool) -> Result<()> {
         let container = self.containers.get(id).context("container not found")?;
 
-        if container.state == ContainerState::Running {
+        if container.state == ContainerState::Running || container.state == ContainerState::Paused {
             if force {
                 // Force stop first
                 self.stop_container(id, 10).await?;
             } else {
-                anyhow::bail!("cannot remove running container (use force=true)");
+                anyhow::bail!("cannot remove active container (use force=true)");
             }
         }
 
         tracing::info!("Removing container {}", id);
+
+        // Ensure DNS entry is cleaned up (idempotent if already removed by stop).
+        if let Some(container) = self.containers.get(id) {
+            crate::dns::remove_container_dns(&container.name);
+        }
+
         self.containers.remove(id);
         self.remove_process_handle(id).await;
 
@@ -586,7 +620,7 @@ impl ContainerRuntime {
             return Ok(container.exit_code.unwrap_or(-1));
         }
 
-        if container.state != ContainerState::Running {
+        if container.state != ContainerState::Running && container.state != ContainerState::Paused {
             anyhow::bail!("container is not running");
         }
 
@@ -622,7 +656,7 @@ impl ContainerRuntime {
     pub async fn signal_container(&mut self, id: &str, signal: &str) -> Result<()> {
         let container = self.containers.get(id).context("container not found")?;
 
-        if container.state != ContainerState::Running {
+        if container.state != ContainerState::Running && container.state != ContainerState::Paused {
             anyhow::bail!("container is not running");
         }
 
@@ -686,7 +720,10 @@ impl ContainerRuntime {
         {
             let result = unsafe { libc::kill(pid as i32, libc::SIGSTOP) };
             if result != 0 {
-                anyhow::bail!("failed to send SIGSTOP: {}", std::io::Error::last_os_error());
+                anyhow::bail!(
+                    "failed to send SIGSTOP: {}",
+                    std::io::Error::last_os_error()
+                );
             }
         }
 
@@ -723,7 +760,10 @@ impl ContainerRuntime {
         {
             let result = unsafe { libc::kill(pid as i32, libc::SIGCONT) };
             if result != 0 {
-                anyhow::bail!("failed to send SIGCONT: {}", std::io::Error::last_os_error());
+                anyhow::bail!(
+                    "failed to send SIGCONT: {}",
+                    std::io::Error::last_os_error()
+                );
             }
         }
 
@@ -772,7 +812,8 @@ impl ContainerRuntime {
         let cpu_usage = if !stat_content.is_empty() {
             // Find the closing paren to skip comm field (which may contain spaces/parens)
             if let Some(close_paren) = stat_content.rfind(')') {
-                let fields: Vec<&str> = stat_content[close_paren + 2..].split_whitespace().collect();
+                let fields: Vec<&str> =
+                    stat_content[close_paren + 2..].split_whitespace().collect();
                 if fields.len() >= 13 {
                     // utime is field index 11 after the state field (which is index 0)
                     // stime is field index 12
@@ -1009,10 +1050,7 @@ impl ContainerRuntime {
     }
 
     /// Reads process info for a single PID.
-    async fn read_process_info(
-        &self,
-        pid: u32,
-    ) -> Result<arcbox_protocol::container::ProcessRow> {
+    async fn read_process_info(&self, pid: u32) -> Result<arcbox_protocol::container::ProcessRow> {
         use arcbox_protocol::container::ProcessRow;
 
         // Read /proc/<pid>/stat for basic info
@@ -1734,6 +1772,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_start_paused_container() {
+        let mut runtime = ContainerRuntime::new();
+
+        let mut container =
+            create_test_container("paused-start", vec!["sleep".to_string(), "60".to_string()]);
+        container.state = ContainerState::Paused;
+        runtime.add_container(container);
+
+        let result = runtime.start_container("paused-start").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("paused"));
+    }
+
+    #[tokio::test]
     async fn test_start_container_with_no_command() {
         let mut runtime = ContainerRuntime::new();
 
@@ -1833,6 +1885,29 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("not running"));
     }
 
+    #[tokio::test]
+    async fn test_stop_paused_container() {
+        let mut runtime = ContainerRuntime::new();
+
+        let container = create_test_container(
+            "stop-paused-test",
+            vec!["sleep".to_string(), "60".to_string()],
+        );
+        runtime.add_container(container);
+
+        runtime.start_container("stop-paused-test").await.unwrap();
+        runtime.pause_container("stop-paused-test").await.unwrap();
+
+        let container = runtime.get_container("stop-paused-test").unwrap();
+        assert_eq!(container.state, ContainerState::Paused);
+
+        runtime.stop_container("stop-paused-test", 5).await.unwrap();
+
+        let container = runtime.get_container("stop-paused-test").unwrap();
+        assert_eq!(container.state, ContainerState::Stopped);
+        assert!(container.pid.is_none());
+    }
+
     // =========================================================================
     // Remove Container Tests
     // =========================================================================
@@ -1869,10 +1944,42 @@ mod tests {
         // Try to remove without force
         let result = runtime.remove_container("force-remove", false).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("running"));
+        assert!(result.unwrap_err().to_string().contains("active"));
 
         // Clean up
         let _ = runtime.stop_container("force-remove", 1).await;
+    }
+
+    #[tokio::test]
+    async fn test_remove_paused_container_without_force() {
+        let mut runtime = ContainerRuntime::new();
+
+        let container = create_test_container(
+            "paused-remove-no-force",
+            vec!["sleep".to_string(), "60".to_string()],
+        );
+        runtime.add_container(container);
+
+        runtime
+            .start_container("paused-remove-no-force")
+            .await
+            .unwrap();
+        runtime
+            .pause_container("paused-remove-no-force")
+            .await
+            .unwrap();
+
+        let result = runtime
+            .remove_container("paused-remove-no-force", false)
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("active"));
+
+        // Clean up
+        runtime
+            .remove_container("paused-remove-no-force", true)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1892,6 +1999,33 @@ mod tests {
             .unwrap();
 
         assert!(runtime.get_container("force-remove").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remove_paused_container_with_force() {
+        let mut runtime = ContainerRuntime::new();
+
+        let container = create_test_container(
+            "paused-remove-force",
+            vec!["sleep".to_string(), "60".to_string()],
+        );
+        runtime.add_container(container);
+
+        runtime
+            .start_container("paused-remove-force")
+            .await
+            .unwrap();
+        runtime
+            .pause_container("paused-remove-force")
+            .await
+            .unwrap();
+
+        runtime
+            .remove_container("paused-remove-force", true)
+            .await
+            .unwrap();
+
+        assert!(runtime.get_container("paused-remove-force").is_none());
     }
 
     #[tokio::test]

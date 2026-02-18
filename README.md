@@ -2,195 +2,168 @@
 
 # ArcBox
 
-**A high-performance container and VM runtime written in pure Rust**
+**A fast, lightweight container runtime for macOS -- built from scratch in Rust.**
 
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org)
 [![Status](https://img.shields.io/badge/status-alpha-red.svg)](#status)
 
-[Features](#features) • [Installation](#installation) • [Quick Start](#quick-start) • [Architecture](#architecture) • [Contributing](#contributing)
-
 </div>
 
 ---
 
-## Overview
+> **Alpha software.** ArcBox is under active development. Expect rough edges,
+> missing features, and breaking changes. We publish early so you can try it,
+> break it, and help shape it.
 
-ArcBox is a next-generation container and virtual machine runtime built from the ground up in Rust, designed for maximum performance on macOS and Linux. Our goal is to deliver the fastest container experience possible—faster cold boots, lower memory usage, and native-speed file I/O.
-
-## Performance Goals
-
-| Metric | ArcBox Target | Comparison |
-|--------|---------------|------------|
-| Cold boot | **< 1.5s** | ~2s typical |
-| Warm boot | **< 500ms** | ~1s typical |
-| Idle memory | **< 150MB** | ~200MB typical |
-| Idle CPU | **< 0.05%** | ~0.1% typical |
-| File I/O | **> 90%** native | 75-95% typical |
-| Network | **> 50 Gbps** | ~45 Gbps typical |
-
-## Features
-
-- **Pure Rust** — Memory-safe, no data races, zero-cost abstractions
-- **Native virtualization** — Leverages Virtualization.framework (macOS) and KVM (Linux)
-- **Custom VirtioFS** — Purpose-built filesystem with smart caching and prefetching
-- **High-performance networking** — Custom network stack with zero-copy I/O
-- **Docker compatible** — Drop-in replacement via Docker Engine API v1.43
-
-## Status
-
-> **Alpha** — Under active development. APIs may change.
-
-ArcBox is currently in early alpha. Core virtualization, VirtioFS, and basic container operations are functional on macOS (Apple Silicon). We welcome contributors who want to push the boundaries of container performance.
-
-## Platform Support
-
-| Platform | Status |
-|----------|--------|
-| macOS (Apple Silicon) | 🟢 Primary target |
-| macOS (Intel) | 🟡 In progress |
-| Linux (x86_64/ARM64) | 🟡 Planned |
-
-## Installation
-
-### From Source
+## Quick Start
 
 ```bash
-# Clone the repository
+# 1. Install ArcBox
+curl -sSL https://install.arcbox.dev | sh
+
+# 2. Start the daemon
+arcbox start
+
+# 3. Point Docker CLI at ArcBox
+arcbox docker enable
+
+# 4. Run a container
+docker run -d -p 8080:80 nginx
+
+# 5. Verify
+curl http://localhost:8080
+```
+
+To switch back to Docker Desktop at any time:
+
+```bash
+arcbox docker disable
+```
+
+## Requirements
+
+- macOS 13 (Ventura) or later
+- Apple Silicon (M1/M2/M3/M4) -- Intel support is in progress
+- Docker CLI installed (ArcBox replaces the Docker engine, not the CLI)
+- ~500 MB disk space (runtime + boot assets)
+
+## What Works Today
+
+ArcBox can already serve as a drop-in Docker engine for common workflows:
+
+- **Container lifecycle** -- `docker run`, `stop`, `rm`, `logs`, `exec`, `inspect`
+- **Image management** -- pull from Docker Hub and OCI registries (ARM64)
+- **Port forwarding** -- `-p 8080:80` maps host ports into containers
+- **Volume mounts** -- `-v /host/path:/container/path` and named volumes
+- **Container networking** -- containers can reach the internet and resolve DNS
+- **Inter-container DNS** -- containers on the same network resolve each other by name
+- **Docker Compose** -- basic `docker-compose up/down` for multi-container projects
+- **Docker context switching** -- `arcbox docker enable/disable` to toggle between ArcBox and Docker Desktop
+- **40+ Docker API endpoints** -- compatible with Docker Engine API v1.43
+
+## Known Limitations
+
+ArcBox is alpha software. The following features are not yet available:
+
+| Feature | Status |
+|---------|--------|
+| `docker build` | Not implemented -- use `docker buildx` with a remote builder or pre-built images |
+| x86/amd64 image support (Rosetta) | Not yet -- only ARM64 images work |
+| Docker plugins / extensions | Not supported |
+| Linux host | macOS only for now |
+| GUI | CLI only -- a desktop app is planned |
+
+Other things to be aware of:
+
+- Cold boot takes a few seconds on first launch. Subsequent container starts are faster.
+- Some advanced Docker API features (swarm, secrets, configs) are not implemented.
+- Error messages may be less polished than Docker Desktop.
+- If you hit a bug, please [open an issue](https://github.com/arcboxd/arcbox/issues).
+
+## Performance
+
+ArcBox uses Apple's Virtualization.framework with a custom VirtIO stack, zero-copy
+networking, and a purpose-built VirtioFS implementation. Our targets for the
+stable release (these are goals, not guarantees at this stage):
+
+| Metric | ArcBox Target | Docker Desktop (typical) |
+|--------|---------------|--------------------------|
+| Cold boot | < 2s | 5-10s |
+| Idle memory | < 150 MB | 1-2 GB |
+| Idle CPU | < 0.1% | 0.5-3% |
+| File I/O (vs native) | > 90% | 50-70% (with VirtioFS) |
+
+Current alpha performance varies. We are focused on correctness first, then
+optimization.
+
+## Building from Source
+
+If you prefer to build ArcBox yourself:
+
+```bash
+# Clone
 git clone https://github.com/arcboxd/arcbox.git
 cd arcbox
 
 # Build
 cargo build --release
 
+# Sign (required for macOS virtualization)
+codesign --entitlements tests/resources/entitlements.plist --force -s - \
+    target/release/arcbox
+
 # Run
 ./target/release/arcbox --help
 ```
 
-### Requirements
+### Build Requirements
 
-- Rust 1.85+ (Edition 2024)
-- macOS 13+ or Linux with KVM support
-- Xcode Command Line Tools (macOS)
+- Rust 1.85+ (install via [rustup](https://rustup.rs))
+- Xcode Command Line Tools (`xcode-select --install`)
+- musl cross-compiler for guest agent (optional):
+  ```bash
+  brew install FiloSottile/musl-cross/musl-cross
+  rustup target add aarch64-unknown-linux-musl
+  ```
 
-## Quick Start
-
-```bash
-# Start the daemon
-arcbox daemon
-
-# Run a container (Docker-compatible)
-docker run -it alpine sh
-
-# Or use the native CLI
-arcbox run alpine
-```
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       arcbox-cli / arcbox-api                   │
-├─────────────────────────────────────────────────────────────────┤
-│                          arcbox-core                            │
-├──────────────────┬──────────────────┬───────────────────────────┤
-│    arcbox-fs     │    arcbox-net    │    arcbox-container       │
-├──────────────────┴──────────────────┴───────────────────────────┤
-│                         arcbox-virtio                           │
-├─────────────────────────────────────────────────────────────────┤
-│                          arcbox-vmm                             │
-├─────────────────────────────────────────────────────────────────┤
-│                       arcbox-hypervisor                         │
-├────────────────────────────┬────────────────────────────────────┤
-│  Virtualization.framework  │               KVM                  │
-│         (macOS)            │             (Linux)                │
-└────────────────────────────┴────────────────────────────────────┘
-```
-
-### Crate Overview
-
-| Crate | Description |
-|-------|-------------|
-| `arcbox-hypervisor` | Cross-platform virtualization abstraction |
-| `arcbox-vmm` | Virtual machine monitor (vCPU, memory, devices) |
-| `arcbox-virtio` | VirtIO device implementations |
-| `arcbox-fs` | High-performance VirtioFS with caching |
-| `arcbox-net` | Custom network stack |
-| `arcbox-container` | Container lifecycle management |
-| `arcbox-docker` | Docker Engine API compatibility |
-
-## Development
+## Uninstall
 
 ```bash
-# Build
-cargo build
+# Stop the daemon
+arcbox stop
 
-# Run tests
-cargo test
+# Restore Docker Desktop as default
+arcbox docker disable
 
-# Run with logging
-RUST_LOG=debug cargo run --bin arcbox
+# Remove ArcBox files
+rm -rf ~/.arcbox
+rm /usr/local/bin/arcbox
 
-# Lint
-cargo clippy -- -D warnings
-
-# Format
-cargo fmt
-```
-
-### Guest Agent Cross-Compilation
-
-```bash
-# Install musl toolchain (macOS)
-brew install FiloSottile/musl-cross/musl-cross
-
-# Add target
-rustup target add aarch64-unknown-linux-musl
-
-# Build guest agent
-cargo build -p arcbox-agent --target aarch64-unknown-linux-musl --release
-```
-
-### macOS Signing
-
-VM operations require entitlement signing:
-
-```bash
-codesign --entitlements tests/resources/entitlements.plist --force -s - <binary>
+# Remove the launchd service (if installed)
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/dev.arcbox.daemon.plist
+rm ~/Library/LaunchAgents/dev.arcbox.daemon.plist
 ```
 
 ## Contributing
 
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
+We welcome contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-### Development Guidelines
-
-- Use `clippy` with pedantic lints
-- All `unsafe` code requires justification and audit
-- Comments must be in English
-- Platform-specific code should be abstracted via traits
+- Use `cargo clippy -- -D warnings` before submitting
+- All code comments must be in English
+- `unsafe` code requires a `// SAFETY:` justification
 
 ## License
 
-ArcBox uses a multi-license structure:
+- **Core** (`crates/`) -- [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)
+- **Pro** (`pro/`) -- [BSL-1.1](LICENSE-BSL-1.1) (converts to MIT after 4 years)
 
-- **Core** (`crates/`) — [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)
-- **Pro** (`pro/`) — [BSL-1.1](LICENSE-BSL-1.1) (converts to MIT after 4 years)
-
-See [LICENSE](LICENSE) for details.
-
-## Acknowledgments
-
-ArcBox builds on the shoulders of giants:
-- The Rust community and ecosystem
-- Apple's Virtualization.framework
-- The Linux KVM project
-- The OCI and Docker communities
+See [LICENSE](LICENSE) for the full text.
 
 ---
 
 <div align="center">
 
-**[Website](https://arcbox.dev)** • **[Documentation](https://docs.arcbox.dev)** • **[Discord](https://discord.gg/arcbox)**
+**[Website](https://arcbox.dev)** -- **[Documentation](https://docs.arcbox.dev)** -- **[Discord](https://discord.gg/arcbox)**
 
 </div>

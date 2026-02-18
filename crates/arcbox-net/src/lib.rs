@@ -36,16 +36,14 @@
 //! └─────────────────────────────────────────────────┘
 //! ```
 
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
+#![warn(clippy::all)]
 #![allow(clippy::module_name_repetitions)]
-// Network code involves many low-level operations and bit manipulations.
+// Network code has many low-level structures and datapath components
+// not yet connected to the VirtIO layer. Allow dead_code at crate level
+// until the integration is complete (Phase 2.2).
 #![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-#![allow(clippy::all)]
-#![allow(clippy::pedantic)]
-#![allow(clippy::nursery)]
+// Pedantic/nursery lints: enable incrementally as the crate stabilizes.
+#![allow(unused_imports, unused_variables, unused_mut)]
 
 pub mod backend;
 pub mod datapath;
@@ -55,6 +53,7 @@ pub mod error;
 pub mod mdns;
 pub mod mdns_protocol;
 pub mod nat;
+pub mod nat_backend;
 pub mod nat_engine;
 pub mod port_forward;
 

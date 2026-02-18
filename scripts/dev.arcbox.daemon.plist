@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ArcBox daemon - launchd user agent
+
+  Install:
+    cp scripts/dev.arcbox.daemon.plist ~/Library/LaunchAgents/dev.arcbox.daemon.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.arcbox.daemon.plist
+
+  Uninstall:
+    launchctl bootout gui/$(id -u)/dev.arcbox.daemon
+    rm ~/Library/LaunchAgents/dev.arcbox.daemon.plist
+
+  View logs:
+    tail -f ~/Library/Logs/arcbox/daemon.stderr.log
+
+  Restart:
+    launchctl kickstart -k gui/$(id -u)/dev.arcbox.daemon
+-->
+<plist version="1.0">
+<dict>
+    <!-- Unique identifier for this agent -->
+    <key>Label</key>
+    <string>dev.arcbox.daemon</string>
+
+    <!-- Command to run: arcbox daemon in foreground with Docker integration -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/arcbox</string>
+        <string>daemon</string>
+        <string>--foreground</string>
+        <string>--docker-integration</string>
+    </array>
+
+    <!-- Start automatically on user login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      KeepAlive: restart the daemon if it exits with a non-zero code.
+      SuccessfulExit=false means launchd restarts only on failure (non-zero exit).
+      A clean shutdown (exit 0) will NOT trigger a restart.
+    -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Log files -->
+    <key>StandardOutPath</key>
+    <string>Library/Logs/arcbox/daemon.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>Library/Logs/arcbox/daemon.stderr.log</string>
+
+    <!--
+      Environment: ensure PATH includes common binary locations
+      and HOME is set for ~/.arcbox resolution.
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Mark as background process for macOS resource scheduling -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- Minimum interval between restarts (seconds) to avoid rapid restart loops -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+</dict>
+</plist>

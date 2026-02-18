@@ -105,7 +105,10 @@ impl IrqChip {
     /// This should be called after the VM is created with a callback that
     /// invokes the hypervisor's interrupt injection mechanism.
     pub fn set_trigger_callback(&self, callback: Arc<IrqTriggerCallback>) {
-        let mut cb = self.trigger_callback.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cb = self
+            .trigger_callback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *cb = Some(callback);
         tracing::debug!("IRQ trigger callback registered");
     }
@@ -242,7 +245,10 @@ impl IrqChip {
         tracing::trace!("Triggering IRQ {} -> GSI {}", irq, gsi);
 
         // Invoke the trigger callback
-        let callback = self.trigger_callback.lock().unwrap_or_else(|e| e.into_inner());
+        let callback = self
+            .trigger_callback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(ref cb) = *callback {
             match trigger_mode {
                 TriggerMode::Edge => {
@@ -295,7 +301,10 @@ impl IrqChip {
         drop(configs);
 
         // Invoke callback to deassert
-        let callback = self.trigger_callback.lock().unwrap_or_else(|e| e.into_inner());
+        let callback = self
+            .trigger_callback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(ref cb) = *callback {
             cb(gsi, false)?;
         }
@@ -435,7 +444,10 @@ mod tests {
         let events_clone = Arc::clone(&events);
 
         let callback: IrqTriggerCallback = Box::new(move |gsi, level| {
-            events_clone.lock().unwrap_or_else(|e| e.into_inner()).push((gsi, level));
+            events_clone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((gsi, level));
             Ok(())
         });
         chip.set_trigger_callback(Arc::new(callback));
@@ -520,7 +532,10 @@ mod tests {
         let levels_clone = Arc::clone(&levels);
 
         let callback: IrqTriggerCallback = Box::new(move |gsi, level| {
-            levels_clone.lock().unwrap_or_else(|e| e.into_inner()).push((gsi, level));
+            levels_clone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((gsi, level));
             Ok(())
         });
         chip.set_trigger_callback(Arc::new(callback));

@@ -793,56 +793,20 @@ mod tests {
     #[test]
     fn test_vz_state_from_i64() {
         // Test VirtualMachineState::from(i64) mapping
-        assert_eq!(
-            VirtualMachineState::from(0),
-            VirtualMachineState::Stopped
-        );
-        assert_eq!(
-            VirtualMachineState::from(1),
-            VirtualMachineState::Running
-        );
-        assert_eq!(
-            VirtualMachineState::from(2),
-            VirtualMachineState::Paused
-        );
+        assert_eq!(VirtualMachineState::from(0), VirtualMachineState::Stopped);
+        assert_eq!(VirtualMachineState::from(1), VirtualMachineState::Running);
+        assert_eq!(VirtualMachineState::from(2), VirtualMachineState::Paused);
         assert_eq!(VirtualMachineState::from(3), VirtualMachineState::Error);
-        assert_eq!(
-            VirtualMachineState::from(4),
-            VirtualMachineState::Starting
-        );
-        assert_eq!(
-            VirtualMachineState::from(5),
-            VirtualMachineState::Pausing
-        );
-        assert_eq!(
-            VirtualMachineState::from(6),
-            VirtualMachineState::Resuming
-        );
-        assert_eq!(
-            VirtualMachineState::from(7),
-            VirtualMachineState::Stopping
-        );
-        assert_eq!(
-            VirtualMachineState::from(8),
-            VirtualMachineState::Saving
-        );
-        assert_eq!(
-            VirtualMachineState::from(9),
-            VirtualMachineState::Restoring
-        );
+        assert_eq!(VirtualMachineState::from(4), VirtualMachineState::Starting);
+        assert_eq!(VirtualMachineState::from(5), VirtualMachineState::Pausing);
+        assert_eq!(VirtualMachineState::from(6), VirtualMachineState::Resuming);
+        assert_eq!(VirtualMachineState::from(7), VirtualMachineState::Stopping);
+        assert_eq!(VirtualMachineState::from(8), VirtualMachineState::Saving);
+        assert_eq!(VirtualMachineState::from(9), VirtualMachineState::Restoring);
 
         // Unknown values should map to Error
-        assert_eq!(
-            VirtualMachineState::from(10),
-            VirtualMachineState::Error
-        );
-        assert_eq!(
-            VirtualMachineState::from(-1),
-            VirtualMachineState::Error
-        );
-        assert_eq!(
-            VirtualMachineState::from(100),
-            VirtualMachineState::Error
-        );
+        assert_eq!(VirtualMachineState::from(10), VirtualMachineState::Error);
+        assert_eq!(VirtualMachineState::from(-1), VirtualMachineState::Error);
+        assert_eq!(VirtualMachineState::from(100), VirtualMachineState::Error);
     }
 }

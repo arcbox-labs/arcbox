@@ -102,6 +102,7 @@ async fn status(data_dir: PathBuf) -> anyhow::Result<()> {
 
     let config = BootAssetConfig::with_cache_dir(data_dir.clone());
     let provider = BootAssetProvider::with_config(config.clone());
+    let version_dir = config.version_cache_dir();
 
     println!("Boot Asset Status");
     println!("=================");
@@ -112,10 +113,8 @@ async fn status(data_dir: PathBuf) -> anyhow::Result<()> {
     println!();
 
     if provider.is_cached() {
-        println!("Status: ✓ Cached");
+        println!("Status: ✓ Cached and valid");
 
-        // Show file paths.
-        let version_dir = config.version_cache_dir();
         let kernel = version_dir.join("kernel");
         let initramfs = version_dir.join("initramfs.cpio.gz");
 
@@ -132,9 +131,71 @@ async fn status(data_dir: PathBuf) -> anyhow::Result<()> {
                 meta.len()
             );
         }
+
+        // Manifest is required for cached assets to be considered valid.
+        // `is_cached()` already ensures the file exists; validate its contents.
+        match provider.read_cached_manifest_required().await {
+            Ok(manifest) => {
+                println!(
+                    "  Manifest:  ✓ {}",
+                    version_dir.join("manifest.json").display()
+                );
+                println!("  Schema:    {}", manifest.schema_version);
+                println!(
+                    "  Build At:  {}",
+                    manifest.built_at.as_deref().unwrap_or("unknown")
+                );
+                println!(
+                    "  Kernel SHA: {}",
+                    manifest.kernel_commit.as_deref().unwrap_or("unknown")
+                );
+                println!(
+                    "  Agent SHA:  {}",
+                    manifest.agent_commit.as_deref().unwrap_or("unknown")
+                );
+            }
+            Err(e) => {
+                println!("  Manifest:  ✗ INVALID");
+                println!("  Error:     {}", e);
+                println!();
+                println!("Boot will FAIL with the current assets.");
+                println!("Run 'arcbox boot prefetch --force' to re-download.");
+            }
+        }
     } else {
-        println!("Status: ✗ Not cached");
+        // Determine what is missing for a more helpful diagnostic.
+        let kernel_exists = version_dir.join("kernel").exists();
+        let initramfs_exists = version_dir.join("initramfs.cpio.gz").exists();
+        let manifest_exists = version_dir.join("manifest.json").exists();
+
+        if !kernel_exists && !initramfs_exists && !manifest_exists {
+            println!("Status: ✗ Not cached");
+        } else {
+            println!("Status: ✗ Incomplete");
+            println!(
+                "  Kernel:    {}",
+                if kernel_exists { "✓" } else { "✗ missing" }
+            );
+            println!(
+                "  Initramfs: {}",
+                if initramfs_exists {
+                    "✓"
+                } else {
+                    "✗ missing"
+                }
+            );
+            println!(
+                "  Manifest:  {}",
+                if manifest_exists {
+                    "✓"
+                } else {
+                    "✗ missing (required)"
+                }
+            );
+        }
+
         println!();
+        println!("Boot will FAIL without valid cached assets.");
         println!("Run 'arcbox boot prefetch' to download boot assets.");
     }
 

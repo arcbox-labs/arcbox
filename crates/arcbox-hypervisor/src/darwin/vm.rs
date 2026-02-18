@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use arcbox_vz::{
-    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, NetworkDeviceConfiguration,
-    SerialPortConfiguration, SharedDirectory, SingleDirectoryShare, SocketDeviceConfiguration,
-    StorageDeviceConfiguration, VirtualMachineConfiguration, VirtioFileSystemDeviceConfiguration,
-    VirtualMachineState,
+    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, MemoryBalloonDeviceConfiguration,
+    NetworkDeviceConfiguration, SerialPortConfiguration, SharedDirectory, SingleDirectoryShare,
+    SocketDeviceConfiguration, StorageDeviceConfiguration, VirtioFileSystemDeviceConfiguration,
+    VirtualMachineConfiguration, VirtualMachineState,
 };
 
 use crate::{
@@ -212,7 +212,7 @@ impl DarwinVm {
 
     /// Finalizes configuration and creates the actual VZ VM.
     fn finalize_configuration(&mut self) -> Result<(), HypervisorError> {
-        let vz_config = self
+        let mut vz_config = self
             .vz_config
             .take()
             .ok_or_else(|| HypervisorError::VmCreationFailed("No VZ configuration".to_string()))?;
@@ -220,14 +220,16 @@ impl DarwinVm {
         // NOTE: Storage, network, serial, and other devices have already been added
         // via add_*_device methods during configuration phase.
 
-        // Set balloon device if configured.
-        // TODO: arcbox-vz does not yet support balloon device configuration.
-        // For now, balloon functionality is disabled.
+        // Add balloon device if configured.
         if self.balloon_configured {
-            tracing::warn!(
-                "Balloon device is configured but arcbox-vz does not yet support it. \
-                Memory ballooning will not work."
-            );
+            let balloon = MemoryBalloonDeviceConfiguration::new().map_err(|e| {
+                HypervisorError::DeviceError(format!(
+                    "Failed to create balloon device configuration: {}",
+                    e
+                ))
+            })?;
+            vz_config.add_memory_balloon_device(balloon);
+            tracing::debug!("Balloon device configured for VM {}", self.id);
         }
 
         // Build the VM. This validates configuration internally and creates
@@ -245,18 +247,20 @@ impl DarwinVm {
 
     /// Waits for the VM to reach a specific state.
     ///
-    /// This function polls the VM state directly (state property should be thread-safe to read).
+    /// Uses progressive backoff: starts with short spins then yields, avoiding
+    /// the overhead of a fixed 100ms poll interval for fast transitions.
     fn wait_for_state(
         &self,
         target: VirtualMachineState,
         timeout: Duration,
     ) -> Result<(), HypervisorError> {
         let start = std::time::Instant::now();
-        let poll_interval = Duration::from_millis(100);
+        // Start with short intervals for fast state transitions, then back off.
+        let mut poll_interval = Duration::from_millis(1);
+        let max_interval = Duration::from_millis(50);
 
         loop {
             if let Some(ref vm) = self.vz_vm {
-                // Read state directly - VZVirtualMachine.state should be thread-safe
                 let state = vm.state();
                 tracing::debug!(
                     "VM {} current state: {:?}, target: {:?}",
@@ -283,12 +287,12 @@ impl DarwinVm {
                         target, state
                     )));
                 }
-                return Err(HypervisorError::timeout(
-                    "Timed out waiting for VM state",
-                ));
+                return Err(HypervisorError::timeout("Timed out waiting for VM state"));
             }
 
             std::thread::sleep(poll_interval);
+            // Progressive backoff: 1ms → 2ms → 4ms → ... → 50ms cap.
+            poll_interval = (poll_interval * 2).min(max_interval);
         }
     }
 
@@ -463,9 +467,8 @@ impl DarwinVm {
         })?;
 
         // Use block_in_place to allow blocking in async context
-        let connection = tokio::task::block_in_place(|| {
-            rt.block_on(socket_device.connect(port))
-        }).map_err(|e| {
+        let connection = tokio::task::block_in_place(|| rt.block_on(socket_device.connect(port)))
+            .map_err(|e| {
             HypervisorError::DeviceError(format!("vsock connect failed: {}", e))
         })?;
 
@@ -706,18 +709,7 @@ impl DarwinVm {
     ///
     /// # Errors
     /// Returns an error if the VM is not running or no balloon device is configured.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Reduce guest memory to 512MB
-    /// vm.set_balloon_target_memory(512 * 1024 * 1024)?;
-    /// ```
-    ///
-    /// # Note
-    /// Balloon device support requires arcbox-vz extensions that are not yet
-    /// implemented. This method currently returns an error.
-    pub fn set_balloon_target_memory(&self, _target_bytes: u64) -> Result<(), HypervisorError> {
-        // Check VM is running
+    pub fn set_balloon_target_memory(&self, target_bytes: u64) -> Result<(), HypervisorError> {
         let state = self.state();
         if state != VmState::Running {
             return Err(HypervisorError::VmStateError {
@@ -726,44 +718,46 @@ impl DarwinVm {
             });
         }
 
-        // Check balloon is configured
         if !self.balloon_configured {
             return Err(HypervisorError::DeviceError(
                 "No balloon device configured".to_string(),
             ));
         }
 
-        // TODO: arcbox-vz does not yet expose balloon device runtime access.
-        // When arcbox-vz adds support for VZVirtioTraditionalMemoryBalloonDevice,
-        // we can implement this properly.
-        Err(HypervisorError::DeviceError(
-            "Balloon device runtime access not yet supported in arcbox-vz".to_string(),
-        ))
+        let vz_vm = self
+            .vz_vm
+            .as_ref()
+            .ok_or_else(|| HypervisorError::DeviceError("VM not finalized".to_string()))?;
+
+        let balloon = vz_vm.first_balloon_device().ok_or_else(|| {
+            HypervisorError::DeviceError("No balloon device found on running VM".to_string())
+        })?;
+
+        balloon.set_target_memory_size(target_bytes);
+        tracing::debug!(
+            "VM {}: set balloon target memory to {} bytes ({}MB)",
+            self.id,
+            target_bytes,
+            target_bytes / (1024 * 1024)
+        );
+
+        Ok(())
     }
 
     /// Gets the current target memory size from the balloon device.
     ///
     /// Returns the target memory size in bytes, or 0 if no balloon is configured
     /// or the VM is not running.
-    ///
-    /// # Note
-    /// Balloon device support requires arcbox-vz extensions that are not yet
-    /// implemented. This method currently returns 0.
     #[must_use]
     pub fn get_balloon_target_memory(&self) -> u64 {
-        // Check VM is running
-        if self.state() != VmState::Running {
+        if self.state() != VmState::Running || !self.balloon_configured {
             return 0;
         }
 
-        // Check balloon is configured
-        if !self.balloon_configured {
-            return 0;
-        }
-
-        // TODO: arcbox-vz does not yet expose balloon device runtime access.
-        // Return 0 for now.
-        0
+        self.vz_vm
+            .as_ref()
+            .and_then(|vm| vm.first_balloon_device())
+            .map_or(0, |balloon| balloon.target_memory_size())
     }
 
     /// Returns the configured memory size for this VM.
@@ -836,11 +830,7 @@ impl VirtualMachine for DarwinVm {
             vcpus.push(id);
         }
 
-        tracing::debug!(
-            "Created vCPU {} for VM {} (managed execution)",
-            id,
-            self.id
-        );
+        tracing::debug!("Created vCPU {} for VM {} (managed execution)", id, self.id);
 
         Ok(vcpu)
     }
@@ -962,9 +952,7 @@ impl VirtualMachine for DarwinVm {
 
             // Start the VM using arcbox-vz's async start
             // Use block_in_place to allow blocking in async context
-            tokio::task::block_in_place(|| {
-                rt.block_on(vm.start())
-            }).map_err(|e| {
+            tokio::task::block_in_place(|| rt.block_on(vm.start())).map_err(|e| {
                 self.set_state(VmState::Error);
                 HypervisorError::VmError(format!("Failed to start VM: {}", e))
             })?;
@@ -1019,11 +1007,8 @@ impl VirtualMachine for DarwinVm {
 
             // Pause using arcbox-vz's async pause
             // Use block_in_place to allow blocking in async context
-            tokio::task::block_in_place(|| {
-                rt.block_on(vm.pause())
-            }).map_err(|e| {
-                HypervisorError::VmError(format!("Failed to pause VM: {}", e))
-            })?;
+            tokio::task::block_in_place(|| rt.block_on(vm.pause()))
+                .map_err(|e| HypervisorError::VmError(format!("Failed to pause VM: {}", e)))?;
 
             self.wait_for_state(VirtualMachineState::Paused, Duration::from_secs(10))?;
         }
@@ -1051,11 +1036,8 @@ impl VirtualMachine for DarwinVm {
 
             // Resume using arcbox-vz's async resume
             // Use block_in_place to allow blocking in async context
-            tokio::task::block_in_place(|| {
-                rt.block_on(vm.resume())
-            }).map_err(|e| {
-                HypervisorError::VmError(format!("Failed to resume VM: {}", e))
-            })?;
+            tokio::task::block_in_place(|| rt.block_on(vm.resume()))
+                .map_err(|e| HypervisorError::VmError(format!("Failed to resume VM: {}", e)))?;
 
             self.wait_for_state(VirtualMachineState::Running, Duration::from_secs(10))?;
         }

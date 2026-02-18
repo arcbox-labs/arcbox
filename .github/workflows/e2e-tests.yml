@@ -2,14 +2,14 @@ name: E2E Tests
 
 on:
   push:
-    branches: [main, develop]
+    branches: [master, develop]
     paths:
       - 'crates/**'
       - 'guest/**'
       - 'tests/e2e/**'
       - '.github/workflows/e2e-tests.yml'
   pull_request:
-    branches: [main, develop]
+    branches: [master, develop]
     paths:
       - 'crates/**'
       - 'guest/**'
@@ -172,9 +172,9 @@ jobs:
     needs: build
     runs-on: macos-14
     timeout-minutes: 60
-    # Only run on main branch, workflow_dispatch with run_vm_tests=true, or self-hosted
+    # Only run on master branch, workflow_dispatch with run_vm_tests=true, or self-hosted
     if: |
-      github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/master' ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.run_vm_tests == 'true')
 
     steps:
@@ -296,7 +296,7 @@ jobs:
     timeout-minutes: 90
     if: |
       github.event_name == 'workflow_dispatch' ||
-      github.ref == 'refs/heads/main'
+      github.ref == 'refs/heads/master'
     # Skip if no self-hosted runners available
     continue-on-error: true
 

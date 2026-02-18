@@ -161,7 +161,11 @@ async fn test_docker_context_cli_smoke() -> Result<()> {
 
     wait_for_socket(&socket_path, Duration::from_secs(15)).await?;
 
-    run_arcbox_success(fixtures.arcbox_binary().as_path(), home, &["docker", "enable"])?;
+    run_arcbox_success(
+        fixtures.arcbox_binary().as_path(),
+        home,
+        &["docker", "enable"],
+    )?;
 
     let context = run_docker_success(home, &["context", "show"])?;
     assert_eq!(context.trim(), "arcbox", "unexpected docker context");
@@ -196,7 +200,9 @@ async fn test_docker_context_cli_smoke() -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let events_child = events_cmd.spawn().context("failed to start docker events")?;
+    let events_child = events_cmd
+        .spawn()
+        .context("failed to start docker events")?;
     sleep(Duration::from_millis(200)).await;
 
     let run_output = run_docker_success(home, &["run", "--rm", images::ALPINE, "echo", "ok"])?;
@@ -221,16 +227,10 @@ async fn test_docker_context_cli_smoke() -> Result<()> {
     wait_for_log(home, &run_name, "log-ok", Duration::from_secs(10)).await?;
 
     let exec_output = run_docker_success(home, &["exec", &run_name, "echo", "exec-ok"])?;
-    assert!(
-        exec_output.contains("exec-ok"),
-        "unexpected exec output"
-    );
+    assert!(exec_output.contains("exec-ok"), "unexpected exec output");
 
     let logs_output = run_docker_success(home, &["logs", &run_name])?;
-    assert!(
-        logs_output.contains("log-ok"),
-        "unexpected logs output"
-    );
+    assert!(logs_output.contains("log-ok"), "unexpected logs output");
 
     let network_name = format!("arcbox-e2e-net-{}", uuid::Uuid::new_v4().simple());
     let volume_name = format!("arcbox-e2e-vol-{}", uuid::Uuid::new_v4().simple());
@@ -258,8 +258,8 @@ async fn test_docker_context_cli_smoke() -> Result<()> {
         if trimmed.is_empty() {
             continue;
         }
-        let value: serde_json::Value = serde_json::from_str(trimmed)
-            .context("failed to parse docker event json")?;
+        let value: serde_json::Value =
+            serde_json::from_str(trimmed).context("failed to parse docker event json")?;
         if let Some(event_type) = value.get("Type").and_then(|v| v.as_str()) {
             types.insert(event_type.to_string());
         }
@@ -285,12 +285,7 @@ async fn test_docker_context_cli_smoke() -> Result<()> {
     Ok(())
 }
 
-async fn wait_for_log(
-    home: &Path,
-    container: &str,
-    needle: &str,
-    timeout: Duration,
-) -> Result<()> {
+async fn wait_for_log(home: &Path, container: &str, needle: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         let output = run_docker_success(home, &["logs", container])?;

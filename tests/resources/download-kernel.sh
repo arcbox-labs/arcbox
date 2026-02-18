@@ -1,6 +1,10 @@
 #!/bin/bash
-# Downloads a minimal ARM64 Linux kernel for testing
-# Uses Alpine Linux's kernel as it's small and fast to boot
+# Downloads a minimal ARM64 Linux kernel for LOCAL DEVELOPMENT AND TESTING ONLY.
+# Uses Alpine Linux's kernel as it's small and fast to boot.
+#
+# NOTE: This script is NOT used in production boot flow.
+# Production boot assets are built and released from the arcbox-labs/boot-assets
+# repository and consumed via `arcbox boot prefetch`. See PLAN.md for details.
 
 set -e
 

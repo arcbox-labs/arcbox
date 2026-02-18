@@ -188,6 +188,7 @@ impl NatEngine {
     }
 
     /// Translates an outbound packet (SNAT).
+    #[allow(clippy::too_many_arguments)]
     unsafe fn translate_outbound(
         &mut self,
         packet: &mut [u8],
@@ -258,6 +259,7 @@ impl NatEngine {
     }
 
     /// Translates an inbound packet (reverse NAT).
+    #[allow(clippy::too_many_arguments)]
     unsafe fn translate_inbound(
         &mut self,
         packet: &mut [u8],

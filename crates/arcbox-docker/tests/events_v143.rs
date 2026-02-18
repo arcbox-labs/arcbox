@@ -1,11 +1,11 @@
+use arcbox_core::Runtime;
 use arcbox_core::config::Config;
 use arcbox_core::event::Event;
-use arcbox_core::Runtime;
-use arcbox_docker::api::AppState;
-use arcbox_docker::handlers::{events, EventsQuery};
 use arcbox_docker::DockerError;
+use arcbox_docker::api::AppState;
+use arcbox_docker::handlers::{EventsQuery, events};
 use axum::extract::{OriginalUri, Query, State};
-use axum::http::{header, HeaderMap, Uri};
+use axum::http::{HeaderMap, Uri, header};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -71,7 +71,10 @@ async fn events_v143_response_matches_schema_and_legacy_fields() {
 
     let value: serde_json::Value = serde_json::from_slice(&chunk).expect("json parse");
 
-    assert_eq!(value.get("Type").and_then(|v| v.as_str()), Some("container"));
+    assert_eq!(
+        value.get("Type").and_then(|v| v.as_str()),
+        Some("container")
+    );
     assert_eq!(value.get("Action").and_then(|v| v.as_str()), Some("start"));
     assert_eq!(value.get("scope").and_then(|v| v.as_str()), Some("local"));
     assert!(value.get("time").and_then(|v| v.as_i64()).is_some());

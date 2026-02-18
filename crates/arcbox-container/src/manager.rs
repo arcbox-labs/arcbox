@@ -379,7 +379,9 @@ impl ContainerManager {
         container.exit_code = None;
 
         // Notify state change waiters.
-        let _ = self.state_sender.send((id.clone(), ContainerState::Running));
+        let _ = self
+            .state_sender
+            .send((id.clone(), ContainerState::Running));
 
         Ok(())
     }
@@ -600,9 +602,10 @@ impl ContainerManager {
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // Missed some messages, check current state.
-                        let containers = self.containers.read().map_err(|_| {
-                            ContainerError::Runtime("lock poisoned".to_string())
-                        })?;
+                        let containers = self
+                            .containers
+                            .read()
+                            .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
                         if let Some(container) = containers.get(&target_id) {
                             match container.state {
                                 ContainerState::Running
@@ -647,7 +650,10 @@ impl ContainerManager {
             .get(id)
             .ok_or_else(|| ContainerError::not_found(id.to_string()))?;
 
-        if matches!(container.state, ContainerState::Running | ContainerState::Starting) {
+        if matches!(
+            container.state,
+            ContainerState::Running | ContainerState::Starting
+        ) {
             return Err(ContainerError::invalid_state(
                 "cannot remove running container".to_string(),
             ));
@@ -739,9 +745,6 @@ mod tests {
         assert!(matches!(second, StartOutcome::AlreadyStarting));
 
         manager.finish_start(&id).unwrap();
-        assert_eq!(
-            manager.get(&id).unwrap().state,
-            ContainerState::Running
-        );
+        assert_eq!(manager.get(&id).unwrap().state, ContainerState::Running);
     }
 }

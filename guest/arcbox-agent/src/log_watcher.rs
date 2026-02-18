@@ -10,8 +10,8 @@ use anyhow::{Context, Result};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
-use arcbox_protocol::agent::LogEntry;
 use arcbox_protocol::Timestamp;
+use arcbox_protocol::agent::LogEntry;
 
 /// Default buffer size for reading log lines.
 const READ_BUFFER_SIZE: usize = 8192;
@@ -461,12 +461,18 @@ mod tests {
         let stdout_entry = LogEntry {
             stream: "stdout".to_string(),
             message: vec![],
-            timestamp: Some(Timestamp { seconds: 0, nanos: 0 }),
+            timestamp: Some(Timestamp {
+                seconds: 0,
+                nanos: 0,
+            }),
         };
         let stderr_entry = LogEntry {
             stream: "stderr".to_string(),
             message: vec![],
-            timestamp: Some(Timestamp { seconds: 0, nanos: 0 }),
+            timestamp: Some(Timestamp {
+                seconds: 0,
+                nanos: 0,
+            }),
         };
 
         assert!(should_include_entry(&stdout_entry, &options));
@@ -484,17 +490,26 @@ mod tests {
         let before = LogEntry {
             stream: "stdout".to_string(),
             message: vec![],
-            timestamp: Some(Timestamp { seconds: 500, nanos: 0 }),
+            timestamp: Some(Timestamp {
+                seconds: 500,
+                nanos: 0,
+            }),
         };
         let during = LogEntry {
             stream: "stdout".to_string(),
             message: vec![],
-            timestamp: Some(Timestamp { seconds: 1500, nanos: 0 }),
+            timestamp: Some(Timestamp {
+                seconds: 1500,
+                nanos: 0,
+            }),
         };
         let after = LogEntry {
             stream: "stdout".to_string(),
             message: vec![],
-            timestamp: Some(Timestamp { seconds: 2500, nanos: 0 }),
+            timestamp: Some(Timestamp {
+                seconds: 2500,
+                nanos: 0,
+            }),
         };
 
         assert!(!should_include_entry(&before, &options));

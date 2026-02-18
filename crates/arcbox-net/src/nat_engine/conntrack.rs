@@ -12,10 +12,11 @@ use hashbrown::HashMap;
 use crate::datapath::CachePadded;
 
 /// Connection state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ConnState {
     /// New connection (SYN seen).
+    #[default]
     New = 0,
     /// Connection established.
     Established = 1,
@@ -25,12 +26,6 @@ pub enum ConnState {
     Closing = 3,
     /// Connection timed out.
     TimedOut = 4,
-}
-
-impl Default for ConnState {
-    fn default() -> Self {
-        Self::New
-    }
 }
 
 /// Connection tracking key (5-tuple).

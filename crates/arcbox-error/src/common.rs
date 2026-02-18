@@ -167,29 +167,20 @@ mod tests {
     #[test]
     fn test_invalid_state_error() {
         let err = CommonError::invalid_state("container is not running");
-        assert_eq!(
-            err.to_string(),
-            "invalid state: container is not running"
-        );
+        assert_eq!(err.to_string(), "invalid state: container is not running");
     }
 
     #[test]
     fn test_timeout_error() {
         let err = CommonError::timeout("connection timed out after 30s");
         assert!(err.is_timeout());
-        assert_eq!(
-            err.to_string(),
-            "timeout: connection timed out after 30s"
-        );
+        assert_eq!(err.to_string(), "timeout: connection timed out after 30s");
     }
 
     #[test]
     fn test_permission_denied_error() {
         let err = CommonError::permission_denied("/var/run/docker.sock");
-        assert_eq!(
-            err.to_string(),
-            "permission denied: /var/run/docker.sock"
-        );
+        assert_eq!(err.to_string(), "permission denied: /var/run/docker.sock");
     }
 
     #[test]

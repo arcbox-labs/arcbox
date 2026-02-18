@@ -18,8 +18,8 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::StreamExt;
 use hyper_util::rt::TokioIo;
-use serde::{Deserialize, Serialize};
 use serde::de::Deserializer;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{Duration, Instant, sleep};
@@ -163,30 +163,56 @@ pub async fn create_container(
         .collect();
 
     // Parse volume binds from host_config into VolumeMount structs.
-    // Format: /host/path:/container/path[:ro|rw]
-    let volumes = body
-        .host_config
-        .as_ref()
-        .and_then(|hc| hc.binds.as_ref())
-        .map(|binds| {
-            binds
-                .iter()
-                .filter_map(|bind| {
-                    let parts: Vec<&str> = bind.split(':').collect();
-                    if parts.len() >= 2 {
-                        let read_only = parts.get(2).is_some_and(|&opt| opt == "ro");
-                        Some(arcbox_container::config::VolumeMount {
-                            source: parts[0].to_string(),
-                            target: parts[1].to_string(),
-                            read_only,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // Format: /host/path:/container/path[:ro|rw]   (bind mount)
+    //     or: volume_name:/container/path[:ro|rw]   (named volume)
+    // Named volumes (source without leading '/') are resolved via VolumeManager.
+    let volumes =
+        body.host_config
+            .as_ref()
+            .and_then(|hc| hc.binds.as_ref())
+            .map(|binds| {
+                binds
+                    .iter()
+                    .filter_map(|bind| {
+                        let parts: Vec<&str> = bind.split(':').collect();
+                        if parts.len() >= 2 {
+                            let read_only = parts.get(2).is_some_and(|&opt| opt == "ro");
+                            let source = parts[0].to_string();
+
+                            // If source doesn't start with '/', treat as named volume.
+                            let resolved_source = if source.starts_with('/') {
+                                source
+                            } else {
+                                match state.runtime.volume_manager().write().ok().and_then(
+                                    |mut vm| {
+                                        vm.get_or_create(&source)
+                                            .ok()
+                                            .map(|v| v.mountpoint.display().to_string())
+                                    },
+                                ) {
+                                    Some(path) => path,
+                                    None => {
+                                        tracing::warn!(
+                                            "Failed to resolve named volume '{}', skipping bind",
+                                            source
+                                        );
+                                        return None;
+                                    }
+                                }
+                            };
+
+                            Some(arcbox_container::config::VolumeMount {
+                                source: resolved_source,
+                                target: parts[1].to_string(),
+                                read_only,
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
     // Parse port bindings from host_config.
     // Docker format: {"80/tcp": [{"HostIp": "", "HostPort": "8080"}]}
@@ -1065,11 +1091,43 @@ pub async fn container_logs(
             )
             .await;
 
-        if let Ok(entry) = stdout_entry {
-            log_entries.push(entry);
+        match stdout_entry {
+            Ok(entry) => {
+                tracing::debug!(
+                    container_id = %container_id,
+                    stream = "stdout",
+                    message_len = entry.message.len(),
+                    "container logs stdout entry received"
+                );
+                log_entries.push(entry);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    container_id = %container_id,
+                    stream = "stdout",
+                    error = %e,
+                    "container logs stdout request failed"
+                );
+            }
         }
-        if let Ok(entry) = stderr_entry {
-            log_entries.push(entry);
+        match stderr_entry {
+            Ok(entry) => {
+                tracing::debug!(
+                    container_id = %container_id,
+                    stream = "stderr",
+                    message_len = entry.message.len(),
+                    "container logs stderr entry received"
+                );
+                log_entries.push(entry);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    container_id = %container_id,
+                    stream = "stderr",
+                    error = %e,
+                    "container logs stderr request failed"
+                );
+            }
         }
     } else {
         let log_entry = state
@@ -1087,8 +1145,23 @@ pub async fn container_logs(
             )
             .await;
 
-        if let Ok(entry) = log_entry {
-            log_entries.push(entry);
+        match log_entry {
+            Ok(entry) => {
+                tracing::debug!(
+                    container_id = %container_id,
+                    stream = if params.stdout { "stdout" } else { "stderr" },
+                    message_len = entry.message.len(),
+                    "container logs entry received"
+                );
+                log_entries.push(entry);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    container_id = %container_id,
+                    error = %e,
+                    "container logs request failed"
+                );
+            }
         }
     }
 
@@ -1344,8 +1417,7 @@ pub async fn events(
     }
 
     let mut event_rx = state.runtime.event_bus().subscribe();
-    let (tx, rx) =
-        tokio::sync::mpsc::channel::<std::result::Result<Bytes, std::io::Error>>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Bytes, std::io::Error>>(64);
 
     let scope = "local";
     tokio::spawn(async move {
@@ -1410,16 +1482,25 @@ pub async fn events(
                     if include_legacy_fields {
                         if let serde_json::Value::Object(ref mut map) = event_value {
                             if mapping.event_type == "container" {
-                                map.insert("id".to_string(), serde_json::Value::String(mapping.actor_id.clone()));
+                                map.insert(
+                                    "id".to_string(),
+                                    serde_json::Value::String(mapping.actor_id.clone()),
+                                );
                                 map.insert(
                                     "status".to_string(),
                                     serde_json::Value::String(mapping.action.to_string()),
                                 );
                                 if let Some(from) = &mapping.legacy_from {
-                                    map.insert("from".to_string(), serde_json::Value::String(from.clone()));
+                                    map.insert(
+                                        "from".to_string(),
+                                        serde_json::Value::String(from.clone()),
+                                    );
                                 }
                             } else if mapping.event_type == "image" {
-                                map.insert("id".to_string(), serde_json::Value::String(mapping.actor_id.clone()));
+                                map.insert(
+                                    "id".to_string(),
+                                    serde_json::Value::String(mapping.actor_id.clone()),
+                                );
                                 map.insert(
                                     "status".to_string(),
                                     serde_json::Value::String(mapping.action.to_string()),
@@ -1572,7 +1653,11 @@ fn event_matches_filters(
 }
 
 fn match_event_action(filters: &EventFilters, action: &str) -> bool {
-    if filter_contains(filters, "event", &["health_status", "exec_create", "exec_start"]) {
+    if filter_contains(
+        filters,
+        "event",
+        &["health_status", "exec_create", "exec_start"],
+    ) {
         return filters.fuzzy_match("event", action);
     }
     filters.exact_match("event", action)
@@ -1606,8 +1691,15 @@ fn match_image(
     actor_id: &str,
     attributes: &HashMap<String, String>,
 ) -> bool {
-    let name_attr = if event_type == "image" { "name" } else { "image" };
-    let image_name = attributes.get(name_attr).map(|value| value.as_str()).unwrap_or("");
+    let name_attr = if event_type == "image" {
+        "name"
+    } else {
+        "image"
+    };
+    let image_name = attributes
+        .get(name_attr)
+        .map(|value| value.as_str())
+        .unwrap_or("");
     let stripped_id = strip_tag(actor_id);
     let stripped_name = strip_tag(image_name);
 
@@ -1711,10 +1803,7 @@ fn negotiate_event_content_type(headers: &HeaderMap) -> &'static str {
     MEDIA_TYPE_JSON
 }
 
-fn encode_event_line(
-    event: &serde_json::Value,
-    content_type: &str,
-) -> std::io::Result<Bytes> {
+fn encode_event_line(event: &serde_json::Value, content_type: &str) -> std::io::Result<Bytes> {
     let mut payload = serde_json::to_vec(event)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
@@ -1764,7 +1853,9 @@ fn merge_labels(
     labels: &HashMap<String, String>,
 ) -> HashMap<String, String> {
     for (key, value) in labels {
-        attributes.entry(key.clone()).or_insert_with(|| value.clone());
+        attributes
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
     }
     attributes
 }
@@ -1787,7 +1878,11 @@ fn map_event(event: &Event) -> Option<EventMapping> {
                 action: "create",
                 actor_id: id.clone(),
                 attributes: merge_labels(attributes, labels),
-                legacy_from: if image.is_empty() { None } else { Some(image.clone()) },
+                legacy_from: if image.is_empty() {
+                    None
+                } else {
+                    Some(image.clone())
+                },
             })
         }
         Event::ContainerStarted {
@@ -1806,7 +1901,11 @@ fn map_event(event: &Event) -> Option<EventMapping> {
                 action: "start",
                 actor_id: id.clone(),
                 attributes: merge_labels(attributes, labels),
-                legacy_from: if image.is_empty() { None } else { Some(image.clone()) },
+                legacy_from: if image.is_empty() {
+                    None
+                } else {
+                    Some(image.clone())
+                },
             })
         }
         Event::ContainerStopped {
@@ -1826,7 +1925,11 @@ fn map_event(event: &Event) -> Option<EventMapping> {
                 action: "stop",
                 actor_id: id.clone(),
                 attributes: merge_labels(attributes, labels),
-                legacy_from: if image.is_empty() { None } else { Some(image.clone()) },
+                legacy_from: if image.is_empty() {
+                    None
+                } else {
+                    Some(image.clone())
+                },
             })
         }
         Event::ContainerKilled {
@@ -1848,7 +1951,11 @@ fn map_event(event: &Event) -> Option<EventMapping> {
                 action: "kill",
                 actor_id: id.clone(),
                 attributes: merge_labels(attributes, labels),
-                legacy_from: if image.is_empty() { None } else { Some(image.clone()) },
+                legacy_from: if image.is_empty() {
+                    None
+                } else {
+                    Some(image.clone())
+                },
             })
         }
         Event::ContainerDied {
@@ -1871,7 +1978,11 @@ fn map_event(event: &Event) -> Option<EventMapping> {
                 action: "die",
                 actor_id: id.clone(),
                 attributes: merge_labels(attributes, labels),
-                legacy_from: if image.is_empty() { None } else { Some(image.clone()) },
+                legacy_from: if image.is_empty() {
+                    None
+                } else {
+                    Some(image.clone())
+                },
             })
         }
         Event::ContainerRemoved {
@@ -1890,7 +2001,11 @@ fn map_event(event: &Event) -> Option<EventMapping> {
                 action: "destroy",
                 actor_id: id.clone(),
                 attributes: merge_labels(attributes, labels),
-                legacy_from: if image.is_empty() { None } else { Some(image.clone()) },
+                legacy_from: if image.is_empty() {
+                    None
+                } else {
+                    Some(image.clone())
+                },
             })
         }
         Event::ImagePulled { id, reference } => Some(EventMapping {
@@ -2268,7 +2383,9 @@ pub async fn attach_container(
                         match reader.read(&mut buf).await {
                             Ok(0) => {
                                 // Signal stdin close to agent so exec can terminate.
-                                tracing::debug!("exec attach reader: client EOF, sending stdin close");
+                                tracing::debug!(
+                                    "exec attach reader: client EOF, sending stdin close"
+                                );
                                 let _ = input_tx
                                     .send(arcbox_protocol::agent::AttachInput {
                                         data: Vec::new(),
@@ -2505,7 +2622,10 @@ pub async fn exec_start(
             tty_height,
         )
         .await
-        .map_err(|e| DockerError::Server(format!("failed to start exec: {}", e)))?;
+        .map_err(|e| {
+            tracing::warn!(exec_id = %exec_id, error = %e, "failed to start exec in runtime");
+            DockerError::Server(format!("failed to start exec: {}", e))
+        })?;
 
     if detach {
         return Ok(Response::builder()
@@ -2527,7 +2647,10 @@ pub async fn exec_start(
             tty_height,
         )
         .await
-        .map_err(|e| DockerError::Server(format!("failed to attach exec: {}", e)))?;
+        .map_err(|e| {
+            tracing::warn!(exec_id = %exec_id, error = %e, "failed to attach exec in runtime");
+            DockerError::Server(format!("failed to attach exec: {}", e))
+        })?;
 
     let upgraded = hyper::upgrade::on(&mut req);
     let response = Response::builder()
@@ -2808,7 +2931,9 @@ pub async fn pull_image(
                 format!("sha256:{}", image_id)
             };
             // Short ID for display.
-            let short_id = image_id_full.strip_prefix("sha256:").unwrap_or(&image_id_full);
+            let short_id = image_id_full
+                .strip_prefix("sha256:")
+                .unwrap_or(&image_id_full);
             let short_id = &short_id[..12.min(short_id.len())];
 
             output.push_str(&format!(
@@ -3255,7 +3380,8 @@ mod events_tests {
 
     #[test]
     fn parse_filters_with_type_and_container() {
-        let raw = r#"{"type":{"container":true},"container":{"abc123":true},"event":{"start":true}}"#;
+        let raw =
+            r#"{"type":{"container":true},"container":{"abc123":true},"event":{"start":true}}"#;
         let filters = parse_event_filters(Some(raw.to_string())).unwrap();
 
         assert!(filters.get("type").contains(&"container".to_string()));
@@ -3337,18 +3463,12 @@ mod events_tests {
         assert_eq!(mapping.event_type, "container");
         assert_eq!(mapping.action, "die");
         assert_eq!(mapping.actor_id, "abc123");
-        assert_eq!(
-            mapping.attributes.get("name"),
-            Some(&"demo".to_string())
-        );
+        assert_eq!(mapping.attributes.get("name"), Some(&"demo".to_string()));
         assert_eq!(
             mapping.attributes.get("image"),
             Some(&"alpine:latest".to_string())
         );
-        assert_eq!(
-            mapping.attributes.get("exitCode"),
-            Some(&"42".to_string())
-        );
+        assert_eq!(mapping.attributes.get("exitCode"), Some(&"42".to_string()));
         assert_eq!(mapping.legacy_from.as_deref(), Some("alpine:latest"));
     }
 
@@ -3366,10 +3486,7 @@ mod events_tests {
         let mapping = map_event(&event).unwrap();
         assert_eq!(mapping.event_type, "container");
         assert_eq!(mapping.action, "kill");
-        assert_eq!(
-            mapping.attributes.get("signal"),
-            Some(&"9".to_string())
-        );
+        assert_eq!(mapping.attributes.get("signal"), Some(&"9".to_string()));
         assert!(mapping.attributes.get("exitCode").is_none());
     }
 
@@ -3402,10 +3519,7 @@ mod events_tests {
         let mapping = map_event(&event).unwrap();
         assert_eq!(mapping.event_type, "volume");
         assert_eq!(mapping.action, "create");
-        assert_eq!(
-            mapping.attributes.get("driver"),
-            Some(&"local".to_string())
-        );
+        assert_eq!(mapping.attributes.get("driver"), Some(&"local".to_string()));
         assert!(mapping.attributes.get("name").is_none());
         assert!(mapping.attributes.get("env").is_none());
     }

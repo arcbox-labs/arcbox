@@ -28,14 +28,12 @@ impl MemoryBalloonDeviceConfiguration {
     /// Creates a new memory balloon device configuration.
     pub fn new() -> VZResult<Self> {
         unsafe {
-            let cls =
-                get_class("VZVirtioTraditionalMemoryBalloonDeviceConfiguration").ok_or_else(
-                    || VZError::Internal {
-                        code: -1,
-                        message: "VZVirtioTraditionalMemoryBalloonDeviceConfiguration not found"
-                            .into(),
-                    },
-                )?;
+            let cls = get_class("VZVirtioTraditionalMemoryBalloonDeviceConfiguration").ok_or_else(
+                || VZError::Internal {
+                    code: -1,
+                    message: "VZVirtioTraditionalMemoryBalloonDeviceConfiguration not found".into(),
+                },
+            )?;
             let obj = msg_send!(cls, new);
 
             if obj.is_null() {
@@ -177,4 +175,3 @@ pub(crate) fn vm_memory_balloon_devices(vm_ptr: *mut AnyObject) -> Vec<MemoryBal
         result
     }
 }
-

@@ -48,11 +48,8 @@ unsafe extern "C" {
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     fn CFRunLoopRun();
     fn CFRunLoopStop(rl: CFRunLoopRef);
-    fn CFRunLoopRunInMode(
-        mode: *const c_void,
-        seconds: f64,
-        returnAfterSourceHandled: bool,
-    ) -> i32;
+    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, returnAfterSourceHandled: bool)
+    -> i32;
 
     // kCFRunLoopDefaultMode is a CFStringRef constant
     static kCFRunLoopDefaultMode: *const c_void;
@@ -93,7 +90,10 @@ pub fn cf_run_loop_run() {
 /// # Arguments
 ///
 /// * `rl` - The run loop to stop
-pub fn cf_run_loop_stop(rl: CFRunLoopRef) {
+/// # Safety
+///
+/// The caller must ensure `rl` is a valid `CFRunLoopRef`.
+pub unsafe fn cf_run_loop_stop(rl: CFRunLoopRef) {
     unsafe { CFRunLoopStop(rl) }
 }
 
@@ -112,7 +112,8 @@ pub fn cf_run_loop_run_in_mode(
     return_after_source_handled: bool,
 ) -> CFRunLoopRunResult {
     unsafe {
-        let result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, return_after_source_handled);
+        let result =
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, return_after_source_handled);
         CFRunLoopRunResult::from(result)
     }
 }

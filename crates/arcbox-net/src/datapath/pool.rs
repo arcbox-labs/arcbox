@@ -254,6 +254,7 @@ impl PacketPool {
     /// Allocates a buffer from the pool.
     ///
     /// Returns `None` if the pool is empty.
+    #[allow(clippy::mut_from_ref)]
     pub fn alloc(&self) -> Option<&mut PacketBuffer> {
         loop {
             let head = self.free_head.0.load(Ordering::Acquire);
@@ -391,6 +392,7 @@ impl PacketPool {
     ///
     /// The caller must ensure the buffer is allocated and have exclusive access.
     #[must_use]
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn get_mut(&self, idx: u32) -> &mut PacketBuffer {
         debug_assert!((idx as usize) < self.capacity);
         // Safety: caller guarantees exclusive access per function contract.

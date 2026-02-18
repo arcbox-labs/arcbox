@@ -39,7 +39,7 @@ fn main() {
     {
         use arcbox_hypervisor::{
             config::VmConfig,
-            darwin::{is_supported, DarwinHypervisor},
+            darwin::{DarwinHypervisor, is_supported},
             traits::{Hypervisor, VirtualMachine},
             types::CpuArch,
         };
@@ -54,7 +54,11 @@ fn main() {
 
         for iteration in 0..args.iterations {
             if args.iterations > 1 {
-                println!("--- Iteration {} of {} ---\n", iteration + 1, args.iterations);
+                println!(
+                    "--- Iteration {} of {} ---\n",
+                    iteration + 1,
+                    args.iterations
+                );
             }
 
             // Measure hypervisor creation

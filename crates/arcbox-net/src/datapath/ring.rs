@@ -215,9 +215,9 @@ impl<T> LockFreeRing<T> {
         }
 
         // Read items
-        for i in 0..count {
+        for (i, slot) in out[..count].iter_mut().enumerate() {
             let idx = (tail + i) & self.mask;
-            out[i] = unsafe { (*self.buffer[idx].get()).assume_init_read() };
+            *slot = unsafe { (*self.buffer[idx].get()).assume_init_read() };
         }
 
         // Publish all reads at once

@@ -52,6 +52,7 @@ use std::task::{Context, Poll};
 use bytes::{Bytes, BytesMut};
 use futures::ready;
 use tokio::io::{AsyncRead, ReadBuf};
+use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -272,6 +273,48 @@ impl OutputSource for PipeSource {
 }
 
 // =============================================================================
+// Tokio Pipe Source
+// =============================================================================
+
+/// Output source wrapping Tokio child stdio pipes.
+pub struct TokioPipeSource<R>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    /// Stream type (stdout or stderr).
+    stream: StreamType,
+    /// Tokio-managed reader.
+    inner: R,
+}
+
+impl<R> TokioPipeSource<R>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    /// Creates a new Tokio pipe source.
+    pub fn new(inner: R, stream: StreamType) -> Self {
+        Self { stream, inner }
+    }
+}
+
+impl<R> OutputSource for TokioPipeSource<R>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    fn stream_type(&self) -> StreamType {
+        self.stream
+    }
+
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+// =============================================================================
 // Log Writer Trait
 // =============================================================================
 
@@ -366,6 +409,8 @@ impl LogWriter for JsonFileWriter {
 
         let mut file = self.file.lock().await;
         writeln!(file, "{}", line)?;
+        // Keep `docker logs` responsive for running containers.
+        file.flush()?;
         Ok(())
     }
 
@@ -605,6 +650,8 @@ impl LogWriter for RotatingJsonFileWriter {
         {
             let mut file = self.file.lock().await;
             writeln!(file, "{}", line)?;
+            // Keep `docker logs` responsive for running containers.
+            file.flush()?;
         }
 
         // Update size counter.
@@ -939,6 +986,22 @@ impl ProcessShim {
         )
     }
 
+    /// Creates a shim for a non-TTY mode container using Tokio child pipes.
+    ///
+    /// This avoids re-registering file descriptors that Tokio already owns.
+    pub fn with_child_pipes(
+        container_id: String,
+        stdout: ChildStdout,
+        stderr: ChildStderr,
+    ) -> io::Result<Self> {
+        let stdout_source = TokioPipeSource::new(stdout, StreamType::Stdout);
+        let stderr_source = TokioPipeSource::new(stderr, StreamType::Stderr);
+        Self::new(
+            container_id,
+            vec![Box::new(stdout_source), Box::new(stderr_source)],
+        )
+    }
+
     /// Internal constructor.
     fn new(container_id: String, sources: Vec<Box<dyn OutputSource + Unpin>>) -> io::Result<Self> {
         // Ensure log directory exists, but keep shims running even if logs are unavailable.
@@ -1050,10 +1113,7 @@ impl ProcessShim {
 }
 
 /// Starts a broadcast-only shim for non-TTY pipes.
-pub fn spawn_broadcast_only_from_pipes(
-    stdout_fd: RawFd,
-    stderr_fd: RawFd,
-) -> Arc<BroadcastWriter> {
+pub fn spawn_broadcast_only_from_pipes(stdout_fd: RawFd, stderr_fd: RawFd) -> Arc<BroadcastWriter> {
     let broadcaster = Arc::new(BroadcastWriter::new());
 
     let stdout_source = match PipeSource::new(stdout_fd, StreamType::Stdout) {
