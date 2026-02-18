@@ -687,6 +687,15 @@ impl VmLifecycleManager {
             .cmdline
             .clone()
             .unwrap_or(assets.cmdline);
+        let boot_version_key = "arcbox.boot_asset_version=";
+        if !cmdline
+            .split_whitespace()
+            .any(|token| token.starts_with(boot_version_key))
+        {
+            cmdline.push(' ');
+            cmdline.push_str(boot_version_key);
+            cmdline.push_str(&assets.version);
+        }
         if let Some(port) = self.config.guest_docker_vsock_port {
             let key = "arcbox.guest_docker_vsock_port=";
             if !cmdline

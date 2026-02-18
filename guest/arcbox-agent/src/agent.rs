@@ -17,9 +17,9 @@ mod linux {
     use std::collections::HashMap;
     use std::net::IpAddr;
     use std::os::unix::io::AsRawFd;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Stdio;
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
 
     use anyhow::{Context, Result};
@@ -64,6 +64,18 @@ mod linux {
         "/var/run/containerd/containerd.sock",
     ];
 
+    fn cmdline_value(key: &str) -> Option<String> {
+        let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
+        for token in cmdline.split_whitespace() {
+            if let Some(value) = token.strip_prefix(key) {
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        None
+    }
+
     fn docker_api_vsock_port() -> u32 {
         if let Some(port) = std::env::var("ARCBOX_GUEST_DOCKER_VSOCK_PORT")
             .ok()
@@ -73,19 +85,21 @@ mod linux {
             return port;
         }
 
-        if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
-            for token in cmdline.split_whitespace() {
-                if let Some(raw) = token.strip_prefix("arcbox.guest_docker_vsock_port=") {
-                    if let Ok(port) = raw.parse::<u32>() {
-                        if port > 0 {
-                            return port;
-                        }
-                    }
-                }
-            }
+        if let Some(port) = cmdline_value("arcbox.guest_docker_vsock_port=")
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .filter(|port| *port > 0)
+        {
+            return port;
         }
 
         DOCKER_API_VSOCK_PORT_DEFAULT
+    }
+
+    fn boot_asset_version() -> Option<String> {
+        std::env::var("ARCBOX_BOOT_ASSET_VERSION")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| cmdline_value("arcbox.boot_asset_version="))
     }
 
     /// Agent state shared across connections.
@@ -565,6 +579,15 @@ mod linux {
                 "docker socket exists but not reachable: {}",
                 DOCKER_API_UNIX_SOCKET
             )
+        } else if !Path::new("/run/systemd/system").exists()
+            && !Path::new("/sbin/rc-service").exists()
+            && !Path::new("/usr/sbin/rc-service").exists()
+        {
+            format!(
+                "docker socket missing: {}; {}",
+                DOCKER_API_UNIX_SOCKET,
+                runtime_missing_detail()
+            )
         } else {
             format!("docker socket missing: {}", DOCKER_API_UNIX_SOCKET)
         };
@@ -596,6 +619,146 @@ mod linux {
         }
     }
 
+    fn runtime_start_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn runtime_bin_dir_candidates() -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+
+        if let Ok(path) = std::env::var("ARCBOX_RUNTIME_BIN_DIR") {
+            if !path.trim().is_empty() {
+                candidates.push(PathBuf::from(path));
+            }
+        }
+
+        if let Some(version) = boot_asset_version() {
+            candidates.push(PathBuf::from(format!(
+                "/arcbox/boot/{}/runtime/bin",
+                version
+            )));
+        }
+
+        candidates.push(PathBuf::from("/arcbox/runtime/bin"));
+        candidates.push(PathBuf::from("/arcbox/boot/current/runtime/bin"));
+        candidates
+    }
+
+    fn detect_runtime_bin_dir() -> Option<PathBuf> {
+        runtime_bin_dir_candidates()
+            .into_iter()
+            .find(|dir| dir.join("containerd").exists() && dir.join("dockerd").exists())
+    }
+
+    fn runtime_missing_detail() -> String {
+        let candidates: Vec<String> = runtime_bin_dir_candidates()
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        format!(
+            "bundled runtime binaries not found; expected containerd+dockerd under one of: {}",
+            candidates.join(", ")
+        )
+    }
+
+    async fn try_start_bundled_runtime() -> String {
+        let _guard = runtime_start_lock().lock().await;
+
+        if probe_unix_socket(DOCKER_API_UNIX_SOCKET).await {
+            return "docker socket already ready".to_string();
+        }
+
+        let Some(runtime_bin_dir) = detect_runtime_bin_dir() else {
+            return runtime_missing_detail();
+        };
+
+        let containerd_bin = runtime_bin_dir.join("containerd");
+        let dockerd_bin = runtime_bin_dir.join("dockerd");
+        let youki_bin = runtime_bin_dir.join("youki");
+        let mut notes = Vec::new();
+
+        for dir in [
+            "/run/containerd",
+            "/var/run/docker",
+            "/var/lib/containerd",
+            "/var/lib/docker",
+            "/etc/docker",
+        ] {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                notes.push(format!("mkdir {} failed({})", dir, e));
+            }
+        }
+
+        let path_env = match std::env::var("PATH") {
+            Ok(existing) if !existing.is_empty() => {
+                format!("{}:{}", runtime_bin_dir.display(), existing)
+            }
+            _ => runtime_bin_dir.display().to_string(),
+        };
+
+        if !probe_first_ready_socket(&CONTAINERD_SOCKET_CANDIDATES).await {
+            let mut cmd = Command::new(&containerd_bin);
+            cmd.args([
+                "--address",
+                "/run/containerd/containerd.sock",
+                "--root",
+                "/var/lib/containerd",
+                "--state",
+                "/run/containerd",
+            ])
+            .env("PATH", &path_env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+            match cmd.spawn() {
+                Ok(child) => notes.push(format!(
+                    "spawned bundled containerd (pid={})",
+                    child.id().unwrap_or_default()
+                )),
+                Err(e) => return format!("failed to spawn bundled containerd: {}", e),
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        if !probe_unix_socket(DOCKER_API_UNIX_SOCKET).await {
+            let mut cmd = Command::new(&dockerd_bin);
+            cmd.arg("--host=unix:///var/run/docker.sock")
+                .arg("--containerd=/run/containerd/containerd.sock")
+                .arg("--exec-root=/var/run/docker")
+                .arg("--data-root=/var/lib/docker")
+                .arg("--iptables=false")
+                .arg("--bridge=none")
+                .env("PATH", &path_env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+
+            if youki_bin.exists() {
+                cmd.arg("--add-runtime")
+                    .arg(format!("youki={}", youki_bin.display()))
+                    .arg("--default-runtime=youki");
+            } else {
+                notes.push(format!(
+                    "youki binary missing at {}, using dockerd default runtime",
+                    youki_bin.display()
+                ));
+            }
+
+            match cmd.spawn() {
+                Ok(child) => notes.push(format!(
+                    "spawned bundled dockerd (pid={})",
+                    child.id().unwrap_or_default()
+                )),
+                Err(e) => return format!("failed to spawn bundled dockerd: {}", e),
+            }
+        }
+
+        notes.join("; ")
+    }
+
     async fn try_start_runtime_services() -> String {
         let mut notes = Vec::new();
 
@@ -622,16 +785,19 @@ mod linux {
                 }
             }
         } else {
+            let mut rc_invoked = false;
             for service in ["containerd", "docker"] {
-                match Command::new("rc-service")
+                let status = Command::new("rc-service")
                     .args([service, "start"])
                     .status()
-                    .await
-                {
+                    .await;
+                match status {
                     Ok(status) if status.success() => {
+                        rc_invoked = true;
                         notes.push(format!("started {}", service));
                     }
                     Ok(status) => {
+                        rc_invoked = true;
                         notes.push(format!(
                             "rc-service {} start failed(exit={})",
                             service,
@@ -641,6 +807,13 @@ mod linux {
                     Err(e) => {
                         notes.push(format!("rc-service {} start error({})", service, e));
                     }
+                }
+            }
+
+            if !rc_invoked {
+                let note = try_start_bundled_runtime().await;
+                if !note.is_empty() {
+                    notes.push(note);
                 }
             }
         }
