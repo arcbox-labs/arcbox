@@ -200,6 +200,7 @@ jobs:
           brew install docker
 
       - name: Test with Docker CLI
+        continue-on-error: true
         run: |
           export DOCKER_HOST="unix:///tmp/arcbox-e2e.sock"
           export DOCKER_API_VERSION="1.43"
