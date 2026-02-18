@@ -512,6 +512,20 @@ impl MachineManager {
                 .get(name)
                 .ok_or_else(|| CoreError::not_found(name.to_string()))?;
 
+            if machine.state == MachineState::Running {
+                return Err(CoreError::invalid_state(format!(
+                    "machine '{}' is already running",
+                    name
+                )));
+            }
+
+            if machine.state == MachineState::Starting || machine.state == MachineState::Stopping {
+                return Err(CoreError::invalid_state(format!(
+                    "machine '{}' is in transition state",
+                    name
+                )));
+            }
+
             // Count running machines. CIDs 0, 1 are reserved, 2 is the host. We start from 3.
             let running_count = machines
                 .values()
@@ -669,9 +683,21 @@ impl MachineManager {
             .get_mut(name)
             .ok_or_else(|| CoreError::not_found(name.to_string()))?;
 
+        if machine.state != MachineState::Running {
+            return Err(CoreError::invalid_state(format!(
+                "machine '{}' is not running",
+                name
+            )));
+        }
+
         // Stop underlying VM
+        #[cfg(target_os = "macos")]
+        self.vm_manager.force_stop_without_hypervisor(&machine.vm_id)?;
+        #[cfg(not(target_os = "macos"))]
         self.vm_manager.stop(&machine.vm_id)?;
+
         machine.state = MachineState::Stopped;
+        machine.cid = None;
 
         // Update persisted state
         let _ = self.persistence.update_state(name, MachineState::Stopped);

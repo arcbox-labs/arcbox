@@ -334,6 +334,41 @@ impl VmManager {
         Ok(())
     }
 
+    /// Marks a running VM as stopped without invoking hypervisor stop.
+    ///
+    /// This is a macOS fallback for environments where explicit VF stop can
+    /// terminate the daemon process unexpectedly.
+    #[cfg(target_os = "macos")]
+    pub fn force_stop_without_hypervisor(&self, id: &VmId) -> Result<()> {
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|_| CoreError::Vm("lock poisoned".to_string()))?;
+
+        let entry = vms
+            .get_mut(id)
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+
+        if entry.info.state != VmState::Running {
+            return Err(CoreError::invalid_state(format!(
+                "cannot force stop VM in state {:?}",
+                entry.info.state
+            )));
+        }
+
+        entry.info.state = VmState::Stopping;
+
+        if let Some(vmm) = entry.vmm.take() {
+            // Intentionally leak the VMM object to avoid triggering a crashy
+            // shutdown path in some macOS Virtualization.framework setups.
+            std::mem::forget(vmm);
+        }
+
+        entry.info.state = VmState::Stopped;
+        tracing::warn!("Force-stopped VM {} without hypervisor stop", id);
+        Ok(())
+    }
+
     /// Pauses a VM.
     ///
     /// # Errors

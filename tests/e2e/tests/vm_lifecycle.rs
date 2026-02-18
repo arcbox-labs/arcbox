@@ -195,6 +195,14 @@ async fn test_agent_ping() {
         .setup_full_environment()
         .await
         .expect("failed to setup environment");
+    harness
+        .create_machine()
+        .await
+        .expect("failed to create machine");
+    harness
+        .start_machine()
+        .await
+        .expect("failed to start machine");
 
     // Ping should succeed
     let output = harness
@@ -221,6 +229,14 @@ async fn test_agent_system_info() {
         .setup_full_environment()
         .await
         .expect("failed to setup environment");
+    harness
+        .create_machine()
+        .await
+        .expect("failed to create machine");
+    harness
+        .start_machine()
+        .await
+        .expect("failed to start machine");
 
     // Get system info
     let socket = harness.socket_path();
@@ -254,6 +270,14 @@ async fn test_agent_ping_latency() {
         .setup_full_environment()
         .await
         .expect("failed to setup environment");
+    harness
+        .create_machine()
+        .await
+        .expect("failed to create machine");
+    harness
+        .start_machine()
+        .await
+        .expect("failed to start machine");
 
     use arcbox_e2e::AgentClient;
 
