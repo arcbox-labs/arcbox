@@ -31,6 +31,7 @@ use crate::boot_assets::{BootAssetConfig, BootAssetProvider, BootAssets};
 use crate::error::{CoreError, Result};
 use crate::event::{Event, EventBus};
 use crate::machine::{MachineConfig, MachineInfo, MachineManager, MachineState};
+use arcbox_error::CommonError;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -583,9 +584,16 @@ impl VmLifecycleManager {
     /// Starts the default VM.
     async fn start_default_vm(&self, timeout: Duration) -> Result<()> {
         let current_state = *self.state.read().await;
+        let machine_exists = self.machine_manager.get(DEFAULT_MACHINE_NAME).is_some();
 
-        // Create VM if not exists
-        if current_state == VmLifecycleState::NotExist {
+        // Recreate if state says "not exist" or machine record is missing.
+        if current_state == VmLifecycleState::NotExist || !machine_exists {
+            if current_state != VmLifecycleState::NotExist && !machine_exists {
+                tracing::warn!(
+                    state = current_state.as_str(),
+                    "default machine missing while lifecycle state indicates existing VM; recreating"
+                );
+            }
             *self.state.write().await = VmLifecycleState::Creating;
 
             match self.create_default_machine().await {
@@ -618,10 +626,35 @@ impl VmLifecycleManager {
                     return Ok(());
                 }
                 Err(e) => {
+                    if is_not_found_error(&e) {
+                        tracing::warn!(
+                            "default machine disappeared before start; recreating and retrying"
+                        );
+                        *self.state.write().await = VmLifecycleState::Creating;
+                        match self.create_default_machine().await {
+                            Ok(()) => {
+                                *self.state.write().await = VmLifecycleState::Created;
+                                self.event_bus.publish(Event::MachineCreated {
+                                    name: DEFAULT_MACHINE_NAME.to_string(),
+                                });
+                                continue;
+                            }
+                            Err(create_err) => {
+                                *self.state.write().await = VmLifecycleState::Failed;
+                                return Err(create_err);
+                            }
+                        }
+                    }
+
                     tracing::warn!("Failed to start VM: {}", e);
 
-                    // Check if we should retry
-                    match self.recovery.handle_failure(&e.to_string()) {
+                    // Check if we should retry.
+                    // Avoid wrapping "VM error: ..." multiple times when propagating.
+                    let recovery_error = match &e {
+                        CoreError::Vm(msg) => msg.as_str(),
+                        _ => &e.to_string(),
+                    };
+                    match self.recovery.handle_failure(recovery_error) {
                         RecoveryAction::RetryAfter(delay) => {
                             if tokio::time::Instant::now() + delay > deadline {
                                 *self.state.write().await = VmLifecycleState::Failed;
@@ -962,6 +995,10 @@ impl VmLifecycleManager {
     pub fn default_machine_info(&self) -> Option<MachineInfo> {
         self.machine_manager.get(DEFAULT_MACHINE_NAME)
     }
+}
+
+fn is_not_found_error(err: &CoreError) -> bool {
+    matches!(err, CoreError::Common(CommonError::NotFound(_)))
 }
 
 // =============================================================================

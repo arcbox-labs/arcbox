@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{UnixListener, UnixStream};
 use tower::Service;
 use tower_http::trace::TraceLayer;
@@ -270,27 +270,58 @@ async fn proxy_guest_docker_connection(
     guest_port: u32,
     mut client_stream: UnixStream,
 ) -> Result<()> {
-    runtime
-        .ensure_vm_ready()
-        .await
-        .map_err(|e| DockerError::Server(format!("failed to ensure vm ready: {}", e)))?;
+    if let Err(e) = runtime.ensure_vm_ready().await {
+        let message = format!("failed to ensure vm ready: {}", e);
+        write_proxy_http_error(&mut client_stream, 503, &message).await;
+        return Err(DockerError::Server(message));
+    }
 
     let machine_name = runtime.default_machine_name();
-    let guest_fd = runtime
+    let guest_fd = match runtime
         .machine_manager()
         .connect_vsock_port(machine_name, guest_port)
-        .map_err(|e| {
-            DockerError::Server(format!(
+    {
+        Ok(fd) => fd,
+        Err(e) => {
+            let message = format!(
                 "failed to connect guest docker endpoint on vsock port {}: {}",
                 guest_port, e
-            ))
-        })?;
+            );
+            write_proxy_http_error(&mut client_stream, 502, &message).await;
+            return Err(DockerError::Server(message));
+        }
+    };
 
-    let mut guest_stream = RawFdStream::from_raw_fd(guest_fd)
-        .map_err(|e| DockerError::Server(format!("failed to create guest stream: {}", e)))?;
+    let mut guest_stream = match RawFdStream::from_raw_fd(guest_fd) {
+        Ok(stream) => stream,
+        Err(e) => {
+            let message = format!("failed to create guest stream: {}", e);
+            write_proxy_http_error(&mut client_stream, 502, &message).await;
+            return Err(DockerError::Server(message));
+        }
+    };
 
     let _ = tokio::io::copy_bidirectional(&mut client_stream, &mut guest_stream).await?;
     Ok(())
+}
+
+async fn write_proxy_http_error(stream: &mut UnixStream, status: u16, message: &str) {
+    let reason = match status {
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Internal Server Error",
+    };
+    let body = format!("{}\n", message.replace('\n', " "));
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        reason,
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.flush().await;
+    let _ = stream.shutdown().await;
 }
 
 fn is_disconnect_error(err: &DockerError) -> bool {

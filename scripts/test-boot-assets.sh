@@ -64,13 +64,17 @@ trap cleanup EXIT
 check_prerequisites() {
     log_info "Checking prerequisites..."
 
-    # Check for arcbox binary
-    if [[ ! -f "$PROJECT_DIR/target/release/arcbox" ]]; then
-        log_error "arcbox binary not found. Run: cargo build --release"
-        exit 1
+    if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
+        log_info "Building latest arcbox release binary..."
+        (cd "$PROJECT_DIR" && cargo build --release -p arcbox-cli)
     fi
 
     # Check for entitlements
+    if [[ ! -f "$PROJECT_DIR/target/release/arcbox" ]]; then
+        log_error "arcbox binary not found at target/release/arcbox"
+        exit 1
+    fi
+
     if ! codesign -d --entitlements :- "$PROJECT_DIR/target/release/arcbox" 2>/dev/null | grep -q "com.apple.security.virtualization"; then
         log_warn "Binary not signed with virtualization entitlement. Signing..."
         codesign --entitlements "$PROJECT_DIR/tests/resources/entitlements.plist" --force -s - "$PROJECT_DIR/target/release/arcbox"
@@ -87,13 +91,23 @@ setup_test_env() {
 
     # Use development boot assets
     local dev_boot_dir="$PROJECT_DIR/boot-assets/dev"
+    local dev_kernel="$dev_boot_dir/kernel"
+    local dev_initramfs="$dev_boot_dir/initramfs.cpio.gz"
+    local dev_manifest="$dev_boot_dir/manifest.json"
 
-    if [[ -f "$dev_boot_dir/kernel" ]] && [[ -f "$dev_boot_dir/initramfs.cpio.gz" ]]; then
-        cp "$dev_boot_dir/kernel" "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/"
-        cp "$dev_boot_dir/initramfs.cpio.gz" "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/"
+    if [[ ! -f "$dev_kernel" ]] || [[ ! -f "$dev_initramfs" ]] || [[ ! -f "$dev_manifest" ]]; then
+        log_warn "Development boot assets incomplete, refreshing..."
+        (cd "$PROJECT_DIR" && ./scripts/setup-dev-boot-assets.sh)
+    fi
+
+    if [[ -f "$dev_kernel" ]] && [[ -f "$dev_initramfs" ]] && [[ -f "$dev_manifest" ]]; then
+        cp "$dev_kernel" "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/"
+        cp "$dev_initramfs" "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/"
+        cp "$dev_manifest" "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/"
         log_info "Using development boot assets from $dev_boot_dir"
     else
-        log_error "Development boot assets not found at $dev_boot_dir"
+        log_error "Development boot assets not found or incomplete at $dev_boot_dir"
+        log_error "Required files: kernel, initramfs.cpio.gz, manifest.json"
         log_error "Run: ./scripts/setup-dev-boot-assets.sh"
         exit 1
     fi

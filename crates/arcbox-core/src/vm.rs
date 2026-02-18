@@ -248,6 +248,7 @@ impl VmManager {
             vsock: entry.config.vsock,
             guest_cid: entry.config.guest_cid,
             balloon: entry.config.balloon,
+            block_devices: Vec::new(),
         }
     }
 
@@ -277,9 +278,18 @@ impl VmManager {
 
         let vmm_config = Self::build_vmm_config(entry);
 
-        // Create and start VMM
-        let mut vmm = Vmm::new(vmm_config).map_err(|e| CoreError::Vm(e.to_string()))?;
-        vmm.start().map_err(|e| CoreError::Vm(e.to_string()))?;
+        // Create and start VMM. On failure, roll back state so retries can proceed.
+        let mut vmm = match Vmm::new(vmm_config) {
+            Ok(vmm) => vmm,
+            Err(e) => {
+                entry.info.state = VmState::Created;
+                return Err(CoreError::Vm(e.to_string()));
+            }
+        };
+        if let Err(e) = vmm.start() {
+            entry.info.state = VmState::Created;
+            return Err(CoreError::Vm(e.to_string()));
+        }
 
         entry.vmm = Some(vmm);
         entry.info.state = VmState::Running;
@@ -546,10 +556,7 @@ impl VmManager {
     ///
     /// Returns current balloon stats including target, current, and configured memory sizes.
     #[cfg(target_os = "macos")]
-    pub fn get_balloon_stats(
-        &self,
-        id: &VmId,
-    ) -> Result<arcbox_hypervisor::BalloonStats> {
+    pub fn get_balloon_stats(&self, id: &VmId) -> Result<arcbox_hypervisor::BalloonStats> {
         let vms = self
             .vms
             .read()
@@ -621,6 +628,16 @@ mod tests {
         let vm_id = manager.create(config).unwrap();
         let vmm_config = manager.build_vmm_config_for_test(&vm_id).unwrap();
         assert_eq!(vmm_config.guest_cid, Some(9));
+    }
+
+    #[test]
+    fn test_start_failure_rolls_back_to_created() {
+        let manager = VmManager::new();
+        let vm_id = manager.create(VmConfig::default()).unwrap();
+
+        let _ = manager.start(&vm_id);
+        let info = manager.get(&vm_id).expect("vm should still exist");
+        assert_eq!(info.state, VmState::Created);
     }
 }
 

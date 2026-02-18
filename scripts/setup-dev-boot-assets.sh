@@ -15,7 +15,13 @@ if [[ -z "$BOOT_ASSET_VERSION_DEFAULT" ]]; then
     exit 1
 fi
 BOOT_ASSET_VERSION="${ARCBOX_BOOT_ASSET_VERSION:-$BOOT_ASSET_VERSION_DEFAULT}"
-USER_BOOT_DIR="$HOME/.arcbox/boot/$BOOT_ASSET_VERSION"
+if [[ "$OSTYPE" == darwin* ]]; then
+    DEFAULT_DATA_DIR="$HOME/Library/Application Support/arcbox"
+else
+    DEFAULT_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/arcbox"
+fi
+DATA_DIR="${ARCBOX_DATA_DIR:-$DEFAULT_DATA_DIR}"
+USER_BOOT_DIR="$DATA_DIR/boot/$BOOT_ASSET_VERSION"
 BOOT_SOURCE="${ARCBOX_DEV_BOOT_SOURCE:-release}"
 
 # Colors
@@ -55,8 +61,11 @@ setup_from_kernel_repo() {
 }
 
 check_dev_assets() {
-    if [[ -f "$DEV_BOOT_DIR/kernel" ]] && [[ -f "$DEV_BOOT_DIR/initramfs.cpio.gz" ]]; then
-        return 0
+    if [[ -f "$DEV_BOOT_DIR/kernel" ]] && [[ -f "$DEV_BOOT_DIR/initramfs.cpio.gz" ]] && [[ -f "$DEV_BOOT_DIR/manifest.json" ]]; then
+        if grep -Eq "\"asset_version\"[[:space:]]*:[[:space:]]*\"$BOOT_ASSET_VERSION\"" "$DEV_BOOT_DIR/manifest.json"; then
+            return 0
+        fi
+        log_warn "Dev manifest version does not match expected $BOOT_ASSET_VERSION, refreshing..."
     fi
     return 1
 }
@@ -93,7 +102,9 @@ setup_from_user_cache() {
         cp "$USER_BOOT_DIR/manifest.json" "$DEV_BOOT_DIR/manifest.json"
         log_info "Copied manifest.json"
     else
-        log_warn "manifest.json not found in user cache"
+        log_error "manifest.json not found in user cache"
+        log_error "Run: arcbox boot prefetch --force"
+        return 1
     fi
 
     return 0
