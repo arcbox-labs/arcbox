@@ -79,9 +79,7 @@ async fn execute_install() -> Result<()> {
             println!("All *.{domain} queries will be routed to the ArcBox DNS server.");
             Ok(())
         }
-        Err(macos_resolver::ResolverError::Io(ref e))
-            if e.kind() == std::io::ErrorKind::PermissionDenied =>
-        {
+        Err(ref e) if e.is_permission_denied() => {
             eprintln!("Error: permission denied writing to /etc/resolver/");
             eprintln!();
             eprintln!("Run with sudo:");
@@ -102,9 +100,7 @@ async fn execute_uninstall() -> Result<()> {
             println!("Removed DNS resolver: /etc/resolver/{domain}");
             Ok(())
         }
-        Err(macos_resolver::ResolverError::Io(ref e))
-            if e.kind() == std::io::ErrorKind::PermissionDenied =>
-        {
+        Err(ref e) if e.is_permission_denied() => {
             eprintln!("Error: permission denied removing /etc/resolver/{domain}");
             eprintln!();
             eprintln!("Run with sudo:");
