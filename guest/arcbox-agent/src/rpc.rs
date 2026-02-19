@@ -273,8 +273,19 @@ impl RpcResponse {
 
 /// Reads a single RPC message from the stream.
 ///
-/// Returns the message type and payload bytes.
-pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(MessageType, Vec<u8>)> {
+/// Wire format V2:
+/// ```text
+/// +----------------+----------------+------------------+----------------+
+/// | Length (4B BE) | Type (4B BE)   | TraceLen (2B BE) | TraceID bytes  | Payload
+/// +----------------+----------------+------------------+----------------+
+/// ```
+/// Length = sizeof(Type) + sizeof(TraceLen) + TraceLen + PayloadLen
+///        = 4 + 2 + TraceLen + PayloadLen
+///
+/// Returns (message_type, trace_id, payload).
+pub async fn read_message<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<(MessageType, String, Vec<u8>)> {
     // Read header: 4 bytes length + 4 bytes type
     let mut header = [0u8; 8];
     reader
@@ -288,10 +299,44 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Messa
     let msg_type =
         MessageType::from_u32(msg_type_raw).context("unknown message type: {msg_type_raw}")?;
 
-    // Length includes the type field (4 bytes), so payload is length - 4
-    let payload_len = length.saturating_sub(4);
+    // Remaining bytes = length - 4 (type already consumed from length).
+    let remaining = length.saturating_sub(4);
 
-    // Read payload
+    if remaining < 2 {
+        // Minimal frame: just a 2-byte trace_len of 0, no payload.
+        // Read whatever remains.
+        let mut tail = vec![0u8; remaining];
+        if remaining > 0 {
+            reader
+                .read_exact(&mut tail)
+                .await
+                .context("failed to read remaining")?;
+        }
+        return Ok((msg_type, String::new(), tail));
+    }
+
+    // Read trace_len (2 bytes BE).
+    let mut trace_len_buf = [0u8; 2];
+    reader
+        .read_exact(&mut trace_len_buf)
+        .await
+        .context("failed to read trace length")?;
+    let trace_len = u16::from_be_bytes(trace_len_buf) as usize;
+
+    // Read trace_id bytes.
+    let trace_id = if trace_len > 0 {
+        let mut trace_buf = vec![0u8; trace_len];
+        reader
+            .read_exact(&mut trace_buf)
+            .await
+            .context("failed to read trace id")?;
+        String::from_utf8(trace_buf).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    // Payload = remaining - 2 (trace_len field) - trace_len.
+    let payload_len = remaining.saturating_sub(2 + trace_len);
     let mut payload = vec![0u8; payload_len];
     if payload_len > 0 {
         reader
@@ -300,21 +345,31 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Messa
             .context("failed to read message payload")?;
     }
 
-    Ok((msg_type, payload))
+    Ok((msg_type, trace_id, payload))
 }
 
 /// Writes a single RPC message to the stream.
+///
+/// Wire format V2 (see `read_message` for layout).
 pub async fn write_message<W: AsyncWrite + Unpin>(
     writer: &mut W,
     msg_type: MessageType,
+    trace_id: &str,
     payload: &[u8],
 ) -> Result<()> {
-    // Length = type (4 bytes) + payload
-    let length = 4 + payload.len() as u32;
+    let trace_bytes = trace_id.as_bytes();
+    let trace_len = trace_bytes.len().min(u16::MAX as usize);
 
-    let mut buf = BytesMut::with_capacity(8 + payload.len());
-    buf.put_u32(length);
+    // Length = type(4) + trace_len_field(2) + trace_bytes + payload
+    let length = 4 + 2 + trace_len + payload.len();
+
+    let mut buf = BytesMut::with_capacity(8 + 2 + trace_len + payload.len());
+    buf.put_u32(length as u32);
     buf.put_u32(msg_type as u32);
+    buf.put_u16(trace_len as u16);
+    if trace_len > 0 {
+        buf.extend_from_slice(&trace_bytes[..trace_len]);
+    }
     buf.extend_from_slice(payload);
 
     writer
@@ -326,13 +381,14 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Writes an RPC response to the stream.
+/// Writes an RPC response to the stream with a trace ID.
 pub async fn write_response<W: AsyncWrite + Unpin>(
     writer: &mut W,
     response: &RpcResponse,
+    trace_id: &str,
 ) -> Result<()> {
     let payload = response.encode_payload();
-    write_message(writer, response.message_type(), &payload).await
+    write_message(writer, response.message_type(), trace_id, &payload).await
 }
 
 /// Parses an RPC request from message type and payload.
@@ -591,28 +647,59 @@ mod tests {
         let ping = PingRequest {
             message: "hello".to_string(),
         };
-        write_message(&mut buf, MessageType::PingRequest, &ping.encode_to_vec())
-            .await
-            .unwrap();
+        write_message(
+            &mut buf,
+            MessageType::PingRequest,
+            "",
+            &ping.encode_to_vec(),
+        )
+        .await
+        .unwrap();
 
         let mut cursor = Cursor::new(&buf);
-        let (msg_type, payload) = read_message(&mut cursor).await.unwrap();
+        let (msg_type, trace_id, payload) = read_message(&mut cursor).await.unwrap();
 
         assert_eq!(msg_type, MessageType::PingRequest);
+        assert!(trace_id.is_empty());
         let decoded = PingRequest::decode(&payload[..]).unwrap();
         assert_eq!(decoded.message, "hello");
+    }
+
+    #[tokio::test]
+    async fn test_message_roundtrip_with_trace_id() {
+        let mut buf = Vec::new();
+
+        let ping = PingRequest {
+            message: "traced".to_string(),
+        };
+        write_message(
+            &mut buf,
+            MessageType::PingRequest,
+            "abc-123-trace",
+            &ping.encode_to_vec(),
+        )
+        .await
+        .unwrap();
+
+        let mut cursor = Cursor::new(&buf);
+        let (msg_type, trace_id, payload) = read_message(&mut cursor).await.unwrap();
+
+        assert_eq!(msg_type, MessageType::PingRequest);
+        assert_eq!(trace_id, "abc-123-trace");
+        let decoded = PingRequest::decode(&payload[..]).unwrap();
+        assert_eq!(decoded.message, "traced");
     }
 
     #[tokio::test]
     async fn test_message_roundtrip_empty_payload() {
         let mut buf = Vec::new();
 
-        write_message(&mut buf, MessageType::GetSystemInfoRequest, &[])
+        write_message(&mut buf, MessageType::GetSystemInfoRequest, "", &[])
             .await
             .unwrap();
 
         let mut cursor = Cursor::new(&buf);
-        let (msg_type, payload) = read_message(&mut cursor).await.unwrap();
+        let (msg_type, _trace_id, payload) = read_message(&mut cursor).await.unwrap();
 
         assert_eq!(msg_type, MessageType::GetSystemInfoRequest);
         assert!(payload.is_empty());
@@ -624,12 +711,12 @@ mod tests {
 
         // Create a large payload (64KB)
         let large_payload = vec![0xABu8; 65536];
-        write_message(&mut buf, MessageType::ExecOutput, &large_payload)
+        write_message(&mut buf, MessageType::ExecOutput, "", &large_payload)
             .await
             .unwrap();
 
         let mut cursor = Cursor::new(&buf);
-        let (msg_type, payload) = read_message(&mut cursor).await.unwrap();
+        let (msg_type, _trace_id, payload) = read_message(&mut cursor).await.unwrap();
 
         assert_eq!(msg_type, MessageType::ExecOutput);
         assert_eq!(payload.len(), 65536);
@@ -648,23 +735,35 @@ mod tests {
             message: "second".to_string(),
         };
 
-        write_message(&mut buf, MessageType::PingRequest, &ping1.encode_to_vec())
-            .await
-            .unwrap();
-        write_message(&mut buf, MessageType::PingRequest, &ping2.encode_to_vec())
-            .await
-            .unwrap();
+        write_message(
+            &mut buf,
+            MessageType::PingRequest,
+            "t1",
+            &ping1.encode_to_vec(),
+        )
+        .await
+        .unwrap();
+        write_message(
+            &mut buf,
+            MessageType::PingRequest,
+            "t2",
+            &ping2.encode_to_vec(),
+        )
+        .await
+        .unwrap();
 
         // Read them back
         let mut cursor = Cursor::new(&buf);
 
-        let (msg_type1, payload1) = read_message(&mut cursor).await.unwrap();
+        let (msg_type1, trace1, payload1) = read_message(&mut cursor).await.unwrap();
         assert_eq!(msg_type1, MessageType::PingRequest);
+        assert_eq!(trace1, "t1");
         let decoded1 = PingRequest::decode(&payload1[..]).unwrap();
         assert_eq!(decoded1.message, "first");
 
-        let (msg_type2, payload2) = read_message(&mut cursor).await.unwrap();
+        let (msg_type2, trace2, payload2) = read_message(&mut cursor).await.unwrap();
         assert_eq!(msg_type2, MessageType::PingRequest);
+        assert_eq!(trace2, "t2");
         let decoded2 = PingRequest::decode(&payload2[..]).unwrap();
         assert_eq!(decoded2.message, "second");
     }
@@ -907,11 +1006,11 @@ mod tests {
             version: "0.1.0".to_string(),
         });
 
-        write_response(&mut buf, &response).await.unwrap();
+        write_response(&mut buf, &response, "").await.unwrap();
 
         // Read it back
         let mut cursor = Cursor::new(&buf);
-        let (msg_type, payload) = read_message(&mut cursor).await.unwrap();
+        let (msg_type, _trace_id, payload) = read_message(&mut cursor).await.unwrap();
 
         assert_eq!(msg_type, MessageType::PingResponse);
         let decoded = PingResponse::decode(&payload[..]).unwrap();
