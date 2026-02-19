@@ -4,9 +4,10 @@
 //! See: https://docs.docker.com/engine/api/v1.43/
 
 use crate::handlers;
+use crate::trace::trace_id_middleware;
 use arcbox_core::Runtime;
 use axum::{
-    Router,
+    Router, middleware,
     routing::{delete, get, post},
 };
 use std::sync::Arc;
@@ -93,6 +94,7 @@ pub fn create_router(runtime: Arc<Runtime>) -> Router {
         .nest("/v1.26", versioned_router())
         .nest("/v1.25", versioned_router())
         .nest("/v1.24", versioned_router())
+        .layer(middleware::from_fn(trace_id_middleware))
         .with_state(state)
 }
 

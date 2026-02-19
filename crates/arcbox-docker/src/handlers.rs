@@ -45,10 +45,59 @@ pub struct ListContainersQuery {
 }
 
 /// List containers.
+///
+/// When the guest Docker backend is active and the VM is running, this
+/// proxies the request to guest dockerd (SSOT) instead of reading from
+/// the host-side speculative state.
 pub async fn list_containers(
     State(state): State<AppState>,
     Query(query): Query<ListContainersQuery>,
-) -> Result<Json<Vec<ContainerSummary>>> {
+) -> Result<Response> {
+    // Proxy to guest Docker when available (SSOT).
+    if state.runtime.is_guest_docker() && state.runtime.vm_lifecycle().is_running().await {
+        let mut path = "/v1.43/containers/json".to_string();
+        let mut params = Vec::new();
+        if query.all {
+            params.push("all=true".to_string());
+        }
+        if let Some(limit) = query.limit {
+            params.push(format!("limit={}", limit));
+        }
+        if query.size {
+            params.push("size=true".to_string());
+        }
+        if let Some(ref filters) = query.filters {
+            // Percent-encode the JSON filter value for the query string.
+            let encoded: String = filters
+                .bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                        String::from(b as char)
+                    }
+                    _ => format!("%{:02X}", b),
+                })
+                .collect();
+            params.push(format!("filters={}", encoded));
+        }
+        if !params.is_empty() {
+            path = format!("{}?{}", path, params.join("&"));
+        }
+
+        let (upstream_status, body) = state
+            .runtime
+            .guest_docker_get(&path)
+            .await
+            .map_err(|e| DockerError::Server(e.to_string()))?;
+
+        return Ok((
+            StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::BAD_GATEWAY),
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response());
+    }
+
+    // Fallback: read from local state (VM not running or native backend).
     let containers = state.runtime.container_manager().list();
     let show_all = query.all;
 
@@ -92,7 +141,7 @@ pub async fn list_containers(
         })
         .collect();
 
-    Ok(Json(summaries))
+    Ok(Json(summaries).into_response())
 }
 
 /// Formats container status string.
@@ -318,17 +367,35 @@ pub async fn create_container(
 }
 
 /// Inspect container.
+///
+/// Proxies to guest Docker (SSOT) when available; falls back to local state.
 pub async fn inspect_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(_params): Query<HashMap<String, String>>,
-) -> Result<Json<ContainerInspectResponse>> {
-    // Use resolve() to support both ID and name lookups.
-    let container = state
-        .runtime
-        .container_manager()
-        .resolve(&id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+) -> Result<Response> {
+    // Proxy to guest Docker when available (SSOT).
+    if state.runtime.is_guest_docker() && state.runtime.vm_lifecycle().is_running().await {
+        // Container IDs are hex-safe; names may need encoding but
+        // Docker CLI always sends the ID for inspect.
+        let path = format!("/v1.43/containers/{}/json", id);
+        match state.runtime.guest_docker_get(&path).await {
+            Ok((upstream_status, body)) => {
+                return Ok((
+                    StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+                    .into_response());
+            }
+            Err(e) => {
+                // Guest unreachable; fall through to local state.
+                tracing::warn!("guest docker inspect failed, using local state: {}", e);
+            }
+        }
+    }
+
+    let container = resolve_container(&state, &id)?;
 
     // Extract configuration from container
     let container_config = container.config.as_ref();
@@ -457,7 +524,8 @@ pub async fn inspect_container(
         host_config: HostConfig::default(),
         network_settings: NetworkSettings::default(),
         mounts,
-    }))
+    })
+    .into_response())
 }
 
 /// Start container.
@@ -768,6 +836,22 @@ pub async fn remove_container(
     let container = resolve_container(&state, &id)?;
     let container_id = container.id.clone();
 
+    // Docker returns 409 Conflict when trying to remove a running container
+    // without the force flag.
+    if !params.force
+        && matches!(
+            container.state,
+            arcbox_container::state::ContainerState::Running
+                | arcbox_container::state::ContainerState::Paused
+                | arcbox_container::state::ContainerState::Restarting
+        )
+    {
+        return Err(DockerError::Conflict(format!(
+            "cannot remove running container {}; stop the container before removing or force remove",
+            id
+        )));
+    }
+
     let machine_name = container
         .machine_name
         .clone()
@@ -783,17 +867,34 @@ pub async fn remove_container(
             .map_err(|e| DockerError::Server(e.to_string()))?;
     } else {
         // VM not running, just remove from local state.
-        state
+        let result = if params.force {
+            state
+                .runtime
+                .container_manager()
+                .remove_force(&container_id)
+        } else {
+            state.runtime.container_manager().remove(&container_id)
+        };
+        result.map_err(|e| {
+            if e.is_not_found() {
+                DockerError::ContainerNotFound(id.clone())
+            } else {
+                DockerError::Server(e.to_string())
+            }
+        })?;
+
+        // Clean up container rootfs on disk.
+        if let Err(e) = state
             .runtime
-            .container_manager()
-            .remove(&container_id)
-            .map_err(|e| {
-                if e.is_not_found() {
-                    DockerError::ContainerNotFound(id.clone())
-                } else {
-                    DockerError::Server(e.to_string())
-                }
-            })?;
+            .image_store()
+            .remove_container_rootfs(&container_id.to_string())
+        {
+            tracing::warn!(
+                "Failed to clean up rootfs for container {}: {}",
+                container_id,
+                e
+            );
+        }
     }
 
     let labels = container
@@ -818,89 +919,202 @@ pub struct WaitContainerQuery {
     pub condition: Option<String>,
 }
 
-/// Wait for container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitCondition {
+    NotRunning,
+    NextExit,
+    Removed,
+}
+
+fn parse_wait_condition(condition: Option<&str>) -> Result<WaitCondition> {
+    match condition.unwrap_or("not-running") {
+        "" | "not-running" => Ok(WaitCondition::NotRunning),
+        "next-exit" => Ok(WaitCondition::NextExit),
+        "removed" => Ok(WaitCondition::Removed),
+        other => Err(DockerError::InvalidParameter(format!(
+            "invalid wait condition '{}': must be one of not-running, next-exit, removed",
+            other
+        ))),
+    }
+}
+
+fn is_active_for_not_running(state: arcbox_container::state::ContainerState) -> bool {
+    matches!(
+        state,
+        arcbox_container::state::ContainerState::Running
+            | arcbox_container::state::ContainerState::Starting
+            | arcbox_container::state::ContainerState::Restarting
+            | arcbox_container::state::ContainerState::Paused
+    )
+}
+
+fn is_active_for_next_exit(state: arcbox_container::state::ContainerState) -> bool {
+    matches!(
+        state,
+        arcbox_container::state::ContainerState::Running
+            | arcbox_container::state::ContainerState::Paused
+            | arcbox_container::state::ContainerState::Restarting
+    )
+}
+
+async fn wait_for_current_exit(
+    state: &AppState,
+    machine_name: &str,
+    container_id: &arcbox_container::state::ContainerId,
+    container_id_string: &str,
+    exit_rx: &mut tokio::sync::broadcast::Receiver<(arcbox_container::state::ContainerId, i32)>,
+) -> Result<i32> {
+    if state.runtime.vm_lifecycle().is_running().await {
+        #[cfg(target_os = "macos")]
+        {
+            return match state.runtime.machine_manager().connect_agent(machine_name) {
+                Ok(mut agent) => agent
+                    .wait_container(container_id_string)
+                    .await
+                    .map_err(|e| DockerError::Server(format!("wait failed: {}", e))),
+                Err(_) => wait_exit_broadcast(exit_rx, container_id).await,
+            };
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            return match state.runtime.machine_manager().get_cid(machine_name) {
+                Some(cid) => {
+                    let agent = state.runtime.agent_pool().get(cid).await;
+                    let mut agent = agent.write().await;
+                    agent
+                        .wait_container(container_id_string)
+                        .await
+                        .map_err(|e| DockerError::Server(format!("wait failed: {}", e)))
+                }
+                None => wait_exit_broadcast(exit_rx, container_id).await,
+            };
+        }
+    }
+
+    wait_exit_broadcast(exit_rx, container_id).await
+}
+
+async fn wait_until_next_exit(
+    state: &AppState,
+    machine_name: &str,
+    container_id: &arcbox_container::state::ContainerId,
+    container_id_string: &str,
+    state_rx: &mut tokio::sync::broadcast::Receiver<(
+        arcbox_container::state::ContainerId,
+        arcbox_container::state::ContainerState,
+    )>,
+    exit_rx: &mut tokio::sync::broadcast::Receiver<(arcbox_container::state::ContainerId, i32)>,
+) -> Result<i32> {
+    // Docker condition=next-exit waits for a future exit event.
+    // If the container is currently not active, first wait for a running-like
+    // state transition, then wait for that active instance to exit.
+    loop {
+        let current = state
+            .runtime
+            .container_manager()
+            .get(container_id)
+            .ok_or_else(|| DockerError::ContainerNotFound(container_id.to_string()))?;
+
+        if is_active_for_next_exit(current.state) {
+            break;
+        }
+
+        match state_rx.recv().await {
+            Ok((changed_id, new_state))
+                if &changed_id == container_id && is_active_for_next_exit(new_state) =>
+            {
+                break;
+            }
+            Ok(_) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                return Err(DockerError::Server(
+                    "state notification channel closed".to_string(),
+                ));
+            }
+        }
+    }
+
+    wait_for_current_exit(
+        state,
+        machine_name,
+        container_id,
+        container_id_string,
+        exit_rx,
+    )
+    .await
+}
+
+/// Wait for container to stop.
 ///
-/// Blocks until the container exits and returns the exit code.
+/// Implements Docker API `POST /containers/{id}/wait` with three conditions:
+/// - `not-running` (default): returns immediately if the container is not
+///   running; blocks while it is running/starting/paused/restarting.
+/// - `next-exit`: waits for a future exit event. If currently not active,
+///   it first waits until the container enters a running-like state.
+/// - `removed`: not yet implemented (returns 501).
 pub async fn wait_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(params): Query<WaitContainerQuery>,
 ) -> Result<Json<WaitResponse>> {
-    // Check if container exists and get its machine name.
     let container = resolve_container(&state, &id)?;
     let container_id = container.id.clone();
     let container_id_string = container_id.to_string();
-
     let machine_name = container
         .machine_name
         .clone()
-        .ok_or_else(|| DockerError::Server("container has no machine assigned".to_string()))?;
+        .unwrap_or_else(|| state.runtime.default_machine_name().to_string());
 
-    let condition = params.condition.as_deref().unwrap_or("not-running");
+    let condition_raw = params.condition.as_deref().unwrap_or("not-running");
     tracing::debug!(
         "wait_container: id={}, condition={}, state={:?}",
         container_id_string,
-        condition,
+        condition_raw,
         container.state
     );
-    if condition == "removed" {
-        return Err(DockerError::NotImplemented(
-            "wait condition=removed is not supported".to_string(),
-        ));
-    }
-    let should_wait = match condition {
-        // Docker CLI `run -d` can issue `wait(next-exit)` before `start`.
-        // For created/starting containers we must return immediately to avoid deadlock.
-        "next-exit" => matches!(
-            container.state,
-            arcbox_container::state::ContainerState::Running
-                | arcbox_container::state::ContainerState::Restarting
-                | arcbox_container::state::ContainerState::Paused
-        ),
-        // Default behavior: wait while container is active.
-        _ => matches!(
-            container.state,
-            arcbox_container::state::ContainerState::Running
-                | arcbox_container::state::ContainerState::Starting
-                | arcbox_container::state::ContainerState::Restarting
-                | arcbox_container::state::ContainerState::Paused
-        ),
-    };
-    if !should_wait {
-        return Ok(Json(WaitResponse {
-            status_code: i64::from(container.exit_code.unwrap_or(0)),
-            error: None,
-        }));
-    }
-    let should_emit_die = true;
 
-    // Connect to agent and wait for container to exit.
-    #[cfg(target_os = "macos")]
-    let exit_code = {
-        let mut agent = state
-            .runtime
-            .machine_manager()
-            .connect_agent(&machine_name)
-            .map_err(|e| DockerError::Server(format!("failed to connect to agent: {}", e)))?;
-        agent
-            .wait_container(&container_id_string)
-            .await
-            .map_err(|e| DockerError::Server(format!("wait failed: {}", e)))?
-    };
+    // Subscribe to exit events BEFORE checking state so that an exit happening
+    // between the state check and the subscribe call is never lost.
+    let mut exit_rx = state.runtime.container_manager().subscribe_exit();
+    let mut state_rx = state.runtime.container_manager().subscribe_state();
 
-    #[cfg(target_os = "linux")]
-    let exit_code = {
-        let cid = state
-            .runtime
-            .machine_manager()
-            .get_cid(&machine_name)
-            .ok_or_else(|| DockerError::Server("machine has no CID".to_string()))?;
-        let agent = state.runtime.agent_pool().get(cid).await;
-        let mut agent = agent.write().await;
-        agent
-            .wait_container(&container_id_string)
-            .await
-            .map_err(|e| DockerError::Server(format!("wait failed: {}", e)))?
+    let condition = parse_wait_condition(params.condition.as_deref())?;
+    let exit_code = match condition {
+        WaitCondition::Removed => {
+            return Err(DockerError::NotImplemented(
+                "wait condition=removed is not supported".to_string(),
+            ));
+        }
+        WaitCondition::NotRunning => {
+            if !is_active_for_not_running(container.state) {
+                return Ok(Json(WaitResponse {
+                    status_code: i64::from(container.exit_code.unwrap_or(0)),
+                    error: None,
+                }));
+            }
+
+            wait_for_current_exit(
+                &state,
+                &machine_name,
+                &container_id,
+                &container_id_string,
+                &mut exit_rx,
+            )
+            .await?
+        }
+        WaitCondition::NextExit => {
+            wait_until_next_exit(
+                &state,
+                &machine_name,
+                &container_id,
+                &container_id_string,
+                &mut state_rx,
+                &mut exit_rx,
+            )
+            .await?
+        }
     };
 
     // Update container state.
@@ -909,25 +1123,42 @@ pub async fn wait_container(
         .container_manager()
         .notify_exit(&container_id, exit_code);
 
-    if should_emit_die {
-        let labels = container
-            .config
-            .as_ref()
-            .map(|cfg| cfg.labels.clone())
-            .unwrap_or_default();
-        state.runtime.event_bus().publish(Event::ContainerDied {
-            id: container_id.to_string(),
-            name: container.name.clone(),
-            image: container.image.clone(),
-            labels,
-            exit_code: Some(exit_code),
-        });
-    }
+    let labels = container
+        .config
+        .as_ref()
+        .map(|cfg| cfg.labels.clone())
+        .unwrap_or_default();
+    state.runtime.event_bus().publish(Event::ContainerDied {
+        id: container_id.to_string(),
+        name: container.name.clone(),
+        image: container.image.clone(),
+        labels,
+        exit_code: Some(exit_code),
+    });
 
     Ok(Json(WaitResponse {
         status_code: i64::from(exit_code),
         error: None,
     }))
+}
+
+/// Waits for a specific container's exit event on the broadcast channel.
+async fn wait_exit_broadcast(
+    rx: &mut tokio::sync::broadcast::Receiver<(arcbox_container::state::ContainerId, i32)>,
+    target: &arcbox_container::state::ContainerId,
+) -> Result<i32> {
+    loop {
+        match rx.recv().await {
+            Ok((id, code)) if &id == target => return Ok(code),
+            Ok(_) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                return Err(DockerError::Server(
+                    "exit notification channel closed".to_string(),
+                ));
+            }
+        }
+    }
 }
 
 /// Container logs query parameters.
@@ -1042,12 +1273,7 @@ pub async fn container_logs(
     Query(params): Query<LogsQuery>,
 ) -> Result<Response> {
     // Verify container exists and get machine name.
-    // Use resolve() to support both ID and name lookups.
-    let container = state
-        .runtime
-        .container_manager()
-        .resolve(&id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+    let container = resolve_container(&state, &id)?;
 
     // Log query parameters for debugging.
     tracing::debug!(
@@ -2489,6 +2715,39 @@ mod tests {
         let out = concat_bytes(&chunks);
         assert_eq!(out, Bytes::from_static(b"foobar"));
     }
+
+    #[test]
+    fn parse_wait_condition_defaults_to_not_running() {
+        assert_eq!(
+            parse_wait_condition(None).unwrap(),
+            WaitCondition::NotRunning
+        );
+        assert_eq!(
+            parse_wait_condition(Some("")).unwrap(),
+            WaitCondition::NotRunning
+        );
+    }
+
+    #[test]
+    fn parse_wait_condition_rejects_unknown_value() {
+        let err = parse_wait_condition(Some("invalid")).unwrap_err();
+        assert!(matches!(err, DockerError::InvalidParameter(_)));
+    }
+
+    #[test]
+    fn next_exit_active_states_match_docker_expectation() {
+        use arcbox_container::state::ContainerState;
+
+        assert!(is_active_for_next_exit(ContainerState::Running));
+        assert!(is_active_for_next_exit(ContainerState::Paused));
+        assert!(is_active_for_next_exit(ContainerState::Restarting));
+
+        assert!(!is_active_for_next_exit(ContainerState::Created));
+        assert!(!is_active_for_next_exit(ContainerState::Starting));
+        assert!(!is_active_for_next_exit(ContainerState::Exited));
+        assert!(!is_active_for_next_exit(ContainerState::Dead));
+        assert!(!is_active_for_next_exit(ContainerState::Removing));
+    }
 }
 // ============================================================================
 // Exec Handlers
@@ -2579,7 +2838,7 @@ pub async fn exec_start(
         .runtime
         .exec_manager()
         .get(&exec_id)
-        .ok_or_else(|| DockerError::NotImplemented(format!("exec {id} not found")))?;
+        .ok_or_else(|| DockerError::ExecNotFound(id.clone()))?;
 
     // Get container to find its machine.
     let container = state
@@ -2608,8 +2867,8 @@ pub async fn exec_start(
         .unwrap_or((80, 24));
 
     if container.state != arcbox_container::state::ContainerState::Running {
-        return Err(DockerError::BadRequest(format!(
-            "container is not running: {}",
+        return Err(DockerError::Conflict(format!(
+            "container {} is not running",
             exec.config.container_id
         )));
     }
@@ -2689,15 +2948,19 @@ pub async fn exec_start(
             .exec_manager()
             .notify_exit(&exec_id, output.exit_code);
 
-        let body = if tty {
-            output.data
+        let (content_type, body) = if tty {
+            ("application/vnd.docker.raw-stream", output.data)
         } else {
             let stream_type: u8 = if output.stream == "stderr" { 2 } else { 1 };
-            encode_docker_stream(stream_type, &output.data)
+            (
+                "application/vnd.docker.multiplexed-stream",
+                encode_docker_stream(stream_type, &output.data),
+            )
         };
 
         return Ok(Response::builder()
             .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
             .body(Body::from(body))
             .unwrap());
     }
@@ -2842,7 +3105,7 @@ pub async fn exec_resize(
         .runtime
         .exec_manager()
         .get(&exec_id)
-        .ok_or_else(|| DockerError::NotImplemented(format!("exec {id} not found")))?;
+        .ok_or_else(|| DockerError::ExecNotFound(id.clone()))?;
 
     let container = state
         .runtime
@@ -2878,7 +3141,7 @@ pub async fn exec_inspect(
         .runtime
         .exec_manager()
         .get(&exec_id)
-        .ok_or_else(|| DockerError::NotImplemented(format!("exec {id} not found")))?;
+        .ok_or_else(|| DockerError::ExecNotFound(id.clone()))?;
 
     Ok(Json(ExecInspectResponse {
         can_remove: !exec.running,
@@ -3742,11 +4005,7 @@ pub async fn pause_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode> {
-    let container = state
-        .runtime
-        .container_manager()
-        .resolve(&id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+    let container = resolve_container(&state, &id)?;
 
     // Check if container is running.
     if container.state != arcbox_container::state::ContainerState::Running {
@@ -3778,11 +4037,7 @@ pub async fn unpause_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode> {
-    let container = state
-        .runtime
-        .container_manager()
-        .resolve(&id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+    let container = resolve_container(&state, &id)?;
 
     // Check if container is paused.
     if container.state != arcbox_container::state::ContainerState::Paused {
@@ -3820,11 +4075,7 @@ pub async fn rename_container(
     Path(id): Path<String>,
     Query(query): Query<RenameContainerQuery>,
 ) -> Result<StatusCode> {
-    let container = state
-        .runtime
-        .container_manager()
-        .resolve(&id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+    let container = resolve_container(&state, &id)?;
 
     // Update container name.
     state
@@ -3856,11 +4107,7 @@ pub async fn container_top(
     Path(id): Path<String>,
     Query(_params): Query<HashMap<String, String>>,
 ) -> Result<Json<ContainerTopResponse>> {
-    let container = state
-        .runtime
-        .container_manager()
-        .resolve(&id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+    let container = resolve_container(&state, &id)?;
 
     // Check if container is running.
     if container.state != arcbox_container::state::ContainerState::Running {
@@ -3988,11 +4235,7 @@ pub async fn container_stats(
     Path(id): Path<String>,
     Query(_query): Query<ContainerStatsQuery>,
 ) -> Result<Json<ContainerStatsResponse>> {
-    let container = state
-        .runtime
-        .container_manager()
-        .resolve(&id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+    let container = resolve_container(&state, &id)?;
 
     // Check if container is running (stats only available for running containers).
     if container.state != arcbox_container::state::ContainerState::Running {
@@ -4122,11 +4365,7 @@ pub async fn container_changes(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<ContainerChangeItem>>> {
     // Validate that the container exists.
-    let _container = state
-        .runtime
-        .container_manager()
-        .resolve(&id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+    let _container = resolve_container(&state, &id)?;
 
     // Filesystem diff tracking requires overlay fs support in the guest agent.
     // The agent would need to compare the container's upper directory against

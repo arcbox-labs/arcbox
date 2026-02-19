@@ -32,6 +32,10 @@ pub enum DockerError {
     #[error("No such network: {0}")]
     NetworkNotFound(String),
 
+    /// Exec instance not found.
+    #[error("No such exec instance: {0}")]
+    ExecNotFound(String),
+
     /// Invalid parameter.
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
@@ -66,7 +70,8 @@ impl DockerError {
             Self::ContainerNotFound(_)
             | Self::ImageNotFound(_)
             | Self::VolumeNotFound(_)
-            | Self::NetworkNotFound(_) => StatusCode::NOT_FOUND,
+            | Self::NetworkNotFound(_)
+            | Self::ExecNotFound(_) => StatusCode::NOT_FOUND,
             Self::InvalidParameter(_) | Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Server(_) | Self::Context(_) => StatusCode::INTERNAL_SERVER_ERROR,

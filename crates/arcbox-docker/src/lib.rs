@@ -51,6 +51,7 @@ pub mod context;
 pub mod error;
 pub mod handlers;
 pub mod server;
+pub mod trace;
 pub mod types;
 
 pub use context::{ContextStatus, DockerContextManager};
