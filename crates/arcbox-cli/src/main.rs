@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
         Commands::Dns(cmd) => commands::dns::execute(cmd).await,
         Commands::Daemon(args) => commands::daemon::execute(args).await,
         Commands::Info => execute_info().await,
+        Commands::Diagnose => commands::diagnose::execute().await,
         Commands::Version => commands::version::execute().await,
     }
 }

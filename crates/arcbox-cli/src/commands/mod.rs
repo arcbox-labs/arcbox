@@ -14,6 +14,7 @@ use std::path::PathBuf;
 pub mod boot;
 pub mod create;
 pub mod daemon;
+pub mod diagnose;
 pub mod dns;
 pub mod docker;
 pub mod exec;
@@ -131,6 +132,9 @@ pub enum Commands {
 
     /// Display system-wide information
     Info,
+
+    /// Run system diagnostics
+    Diagnose,
 
     /// Show version information
     Version,
