@@ -435,22 +435,7 @@ impl Runtime {
             .await
             .map_err(|e| CoreError::Machine(format!("failed to read from guest docker: {}", e)))?;
 
-        // Parse HTTP status code from the status line ("HTTP/1.1 200 OK\r\n").
-        let status_line_end = buf.windows(2).position(|w| w == b"\r\n").unwrap_or(0);
-        let status_code = std::str::from_utf8(&buf[..status_line_end])
-            .ok()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|code| code.parse::<u16>().ok())
-            .unwrap_or(502);
-
-        // Split headers from body at the first \r\n\r\n boundary.
-        let body_start = buf
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .map(|pos| pos + 4)
-            .unwrap_or(0);
-
-        Ok((status_code, bytes::Bytes::from(buf[body_start..].to_vec())))
+        Ok(parse_http_status_and_body(&buf))
     }
 
     /// Ensures the default VM is running and ready for container operations.
@@ -1854,10 +1839,30 @@ impl Runtime {
     }
 }
 
+fn parse_http_status_and_body(buf: &[u8]) -> (u16, bytes::Bytes) {
+    // Parse HTTP status code from the status line ("HTTP/1.1 200 OK\r\n").
+    let status_line_end = buf.windows(2).position(|w| w == b"\r\n").unwrap_or(0);
+    let status_code = std::str::from_utf8(&buf[..status_line_end])
+        .ok()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(502);
+
+    // Split headers from body at the first \r\n\r\n boundary.
+    let body_start = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| pos + 4)
+        .unwrap_or(0);
+
+    (status_code, bytes::Bytes::from(buf[body_start..].to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::validate_bundled_runtime_manifest;
+    use super::{parse_http_status_and_body, validate_bundled_runtime_manifest};
     use crate::boot_assets::{BootAssetManifest, RuntimeAssetManifestEntry};
+    use bytes::Bytes;
     use sha2::{Digest, Sha256};
 
     fn runtime_entry(name: &str, content: &[u8]) -> RuntimeAssetManifestEntry {
@@ -1931,5 +1936,21 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_parse_http_status_and_body_success() {
+        let raw = b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"message\":\"not found\"}";
+        let (status, body) = parse_http_status_and_body(raw);
+        assert_eq!(status, 404);
+        assert_eq!(body, Bytes::from_static(b"{\"message\":\"not found\"}"));
+    }
+
+    #[test]
+    fn test_parse_http_status_and_body_invalid_status_falls_back_to_502() {
+        let raw = b"not-a-valid-http-response\r\n\r\npayload";
+        let (status, body) = parse_http_status_and_body(raw);
+        assert_eq!(status, 502);
+        assert_eq!(body, Bytes::from_static(b"payload"));
     }
 }

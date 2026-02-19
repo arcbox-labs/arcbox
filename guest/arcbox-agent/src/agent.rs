@@ -3190,6 +3190,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ensure_runtime_no_lost_wakeup_when_driver_finishes_fast() {
+        // Repeat to make the regression deterministic enough: this used to
+        // hang intermittently when notify happened before waiter registered.
+        for _ in 0..50 {
+            let guard = Arc::new(RuntimeGuard::new());
+            let entered_start_fn = Arc::new(tokio::sync::Notify::new());
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+            let guard_driver = Arc::clone(&guard);
+            let entered_start_fn_driver = Arc::clone(&entered_start_fn);
+            let driver = tokio::spawn(async move {
+                ensure_runtime::ensure_runtime(
+                    &guard_driver,
+                    true,
+                    async move {
+                        entered_start_fn_driver.notify_waiters();
+                        let _ = release_rx.await;
+                        make_ready_response()
+                    },
+                    async { unreachable!() },
+                )
+                .await
+            });
+
+            // Ensure state has transitioned to Starting before spawning waiter.
+            entered_start_fn.notified().await;
+
+            let guard_waiter = Arc::clone(&guard);
+            let waiter = tokio::spawn(async move {
+                ensure_runtime::ensure_runtime(
+                    &guard_waiter,
+                    true,
+                    async { panic!("waiter should never run start_fn") },
+                    async { unreachable!() },
+                )
+                .await
+            });
+
+            // Give waiter a chance to enter wait path, then let driver finish.
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            let _ = release_tx.send(());
+
+            let driver_resp = tokio::time::timeout(std::time::Duration::from_millis(500), driver)
+                .await
+                .expect("driver timed out")
+                .expect("driver task failed");
+            let waiter_resp = tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
+                .await
+                .expect("waiter timed out")
+                .expect("waiter task failed");
+
+            assert!(driver_resp.ready);
+            assert_eq!(driver_resp.status, STATUS_STARTED);
+            assert!(waiter_resp.ready);
+            assert_eq!(waiter_resp.status, STATUS_REUSED);
+        }
+    }
+
+    #[tokio::test]
     async fn test_ensure_runtime_state_machine_transitions() {
         let guard = RuntimeGuard::new();
 
