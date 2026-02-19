@@ -1826,7 +1826,9 @@ dependencies = [
 
 [[package]]
 name = "macos-resolver"
-version = "0.1.0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6795e57816b6f58f4420f761c3fffc151f48f4f9f374e1cacfcb281301a46a89"
 dependencies = [
  "libc",
  "thiserror",
