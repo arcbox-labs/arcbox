@@ -22,6 +22,15 @@ OUTPUT="${SCRIPT_DIR}/initramfs-arcbox"
 echo "=== Building ArcBox Initramfs ==="
 
 # Check dependencies
+REQUIRED_CMDS=(curl gunzip cpio unsquashfs gzip)
+for cmd in "${REQUIRED_CMDS[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "Error: required command '$cmd' not found"
+        echo "Install dependencies and retry (macOS example: brew install cpio squashfs)"
+        exit 1
+    fi
+done
+
 if [ ! -f "$AGENT_BIN" ]; then
     echo "Error: Agent binary not found at $AGENT_BIN"
     echo "Build it with: cargo build -p arcbox-agent --target aarch64-unknown-linux-musl --release"
@@ -60,7 +69,7 @@ chmod 755 "$WORK_DIR/sbin/arcbox-agent"
 echo "Adding vsock kernel modules..."
 MODLOOP_EXTRACT="/tmp/modloop-extract-$$"
 rm -rf "$MODLOOP_EXTRACT"
-unsquashfs -f -d "$MODLOOP_EXTRACT" "$MODLOOP" >/dev/null 2>&1
+unsquashfs -f -d "$MODLOOP_EXTRACT" "$MODLOOP" >/dev/null
 
 # Find the kernel version in the initramfs
 KERNEL_VERSION=$(ls "$WORK_DIR/lib/modules/" 2>/dev/null | head -1)
