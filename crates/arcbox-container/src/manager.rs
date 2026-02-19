@@ -508,6 +508,24 @@ impl ContainerManager {
         }
     }
 
+    /// Returns a receiver for exit events.
+    ///
+    /// Each message carries `(container_id, exit_code)`.
+    /// Subscribe **before** checking current state to avoid race conditions.
+    #[must_use]
+    pub fn subscribe_exit(&self) -> broadcast::Receiver<(ContainerId, i32)> {
+        self.exit_sender.subscribe()
+    }
+
+    /// Returns a receiver for container state change events.
+    ///
+    /// Each message carries `(container_id, new_state)`.
+    /// Subscribe **before** checking current state to avoid race conditions.
+    #[must_use]
+    pub fn subscribe_state(&self) -> broadcast::Receiver<(ContainerId, ContainerState)> {
+        self.state_sender.subscribe()
+    }
+
     /// Notifies waiters that a container has exited.
     ///
     /// This should be called when the container state changes to Exited or Dead.
@@ -665,6 +683,11 @@ impl ContainerManager {
 
     /// Force removes a container regardless of state.
     ///
+    /// If the container is running or starting, it is first transitioned to
+    /// Exited with exit code 137 (SIGKILL) and all waiters are notified,
+    /// preventing dangling `docker wait` calls and ensuring no dirty state
+    /// is left behind.
+    ///
     /// # Errors
     ///
     /// Returns an error if the container is not found.
@@ -674,11 +697,35 @@ impl ContainerManager {
             .write()
             .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
 
-        if !containers.contains_key(id) {
-            return Err(ContainerError::not_found(id.to_string()));
+        let container = containers
+            .get_mut(id)
+            .ok_or_else(|| ContainerError::not_found(id.to_string()))?;
+
+        // If the container was still active, transition to Exited before
+        // removal so that broadcast subscribers see a clean exit event.
+        let was_active = matches!(
+            container.state,
+            ContainerState::Running | ContainerState::Starting | ContainerState::Paused
+        );
+
+        if was_active {
+            container.state = ContainerState::Exited;
+            container.exit_code = Some(137); // SIGKILL
+            container.finished_at = Some(chrono::Utc::now());
         }
 
+        // Remove the entry from the map (drop the Container).
         containers.remove(id);
+
+        // Release the write lock before broadcasting so subscribers
+        // that read-lock the map won't deadlock.
+        drop(containers);
+
+        if was_active {
+            let _ = self.state_sender.send((id.clone(), ContainerState::Exited));
+            let _ = self.exit_sender.send((id.clone(), 137));
+        }
+
         Ok(())
     }
 
@@ -765,5 +812,77 @@ mod tests {
 
         manager.finish_start(&id).unwrap();
         assert_eq!(manager.get(&id).unwrap().state, ContainerState::Running);
+    }
+
+    #[test]
+    fn force_remove_running_container_notifies_waiters() {
+        let manager = ContainerManager::new();
+
+        let mut config = ContainerConfig::default();
+        config.image = "alpine".to_string();
+        config.name = Some("mycontainer".to_string());
+        let id = manager.create(config).unwrap();
+
+        // Transition to Running.
+        manager.begin_start(&id).unwrap();
+        manager.finish_start(&id).unwrap();
+        assert_eq!(manager.get(&id).unwrap().state, ContainerState::Running);
+
+        // Subscribe to exit events before force removing.
+        let mut exit_rx = manager.subscribe_exit();
+
+        manager.remove_force(&id).unwrap();
+
+        // Container should be gone from the map.
+        assert!(manager.get(&id).is_none());
+
+        // Exit notification should have been sent with SIGKILL exit code.
+        let (exited_id, exit_code) = exit_rx.try_recv().unwrap();
+        assert_eq!(exited_id, id);
+        assert_eq!(exit_code, 137);
+    }
+
+    #[test]
+    fn force_remove_exited_container_no_extra_notification() {
+        let manager = ContainerManager::new();
+
+        let mut config = ContainerConfig::default();
+        config.image = "alpine".to_string();
+        let id = manager.create(config).unwrap();
+
+        // Transition to Exited.
+        manager.begin_start(&id).unwrap();
+        manager.finish_start(&id).unwrap();
+        manager.notify_exit(&id, 0);
+
+        let mut exit_rx = manager.subscribe_exit();
+
+        // Force remove should NOT send extra exit notification.
+        manager.remove_force(&id).unwrap();
+        assert!(manager.get(&id).is_none());
+
+        // No new notification (only the one from notify_exit above, which
+        // was sent before we subscribed).
+        assert!(exit_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn force_remove_then_recreate_same_name() {
+        let manager = ContainerManager::new();
+
+        let mut config = ContainerConfig::default();
+        config.image = "alpine".to_string();
+        config.name = Some("reusable".to_string());
+        let id1 = manager.create(config.clone()).unwrap();
+
+        // Run and force remove.
+        manager.begin_start(&id1).unwrap();
+        manager.finish_start(&id1).unwrap();
+        manager.remove_force(&id1).unwrap();
+
+        // Create a new container with the same name.
+        let id2 = manager.create(config).unwrap();
+        assert!(manager.get(&id2).is_some());
+        assert_eq!(manager.get(&id2).unwrap().name, "reusable");
     }
 }
