@@ -52,6 +52,20 @@ jobs:
       - name: Install musl cross-compiler
         run: |
           brew install FiloSottile/musl-cross/musl-cross
+          mkdir -p "$HOME/.local/bin"
+
+          if command -v aarch64-unknown-linux-musl-gcc >/dev/null 2>&1; then
+            echo "Found linker: $(command -v aarch64-unknown-linux-musl-gcc)"
+          elif command -v aarch64-linux-musl-gcc >/dev/null 2>&1; then
+            ln -sf "$(command -v aarch64-linux-musl-gcc)" \
+              "$HOME/.local/bin/aarch64-unknown-linux-musl-gcc"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            echo "Created linker shim: $HOME/.local/bin/aarch64-unknown-linux-musl-gcc"
+          else
+            echo "Missing musl linker binary after install"
+            ls -1 /opt/homebrew/bin/*musl*gcc || true
+            exit 1
+          fi
 
       - name: Cache cargo
         uses: actions/cache@v4
