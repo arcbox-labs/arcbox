@@ -22,7 +22,7 @@ jobs:
   build-macos-arm64:
     name: Build macOS ARM64
     runs-on: macos-14
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -46,18 +46,38 @@ jobs:
           targets: aarch64-unknown-linux-musl
 
       - name: Install Protobuf compiler
+        timeout-minutes: 5
         run: |
           brew install protobuf
 
       - name: Install initramfs build tools
+        timeout-minutes: 5
         run: |
           brew install squashfs
 
-      - name: Install musl cross-compiler
-        run: |
-          brew install FiloSottile/musl-cross/musl-cross
-          mkdir -p "$HOME/.local/bin"
+      # MLT-041: Cache musl-cross to avoid repeated source builds.
+      - name: Cache musl-cross toolchain
+        id: cache-musl
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/homebrew/Cellar/musl-cross
+            /opt/homebrew/bin/aarch64-linux-musl-*
+            /opt/homebrew/opt/musl-cross
+          key: ${{ runner.os }}-musl-cross-v1
 
+      - name: Install musl cross-compiler
+        timeout-minutes: 30
+        run: |
+          if ! command -v aarch64-linux-musl-gcc >/dev/null 2>&1; then
+            echo "::group::Installing musl-cross from source (this takes a while)"
+            brew install FiloSottile/musl-cross/musl-cross
+            echo "::endgroup::"
+          else
+            echo "musl-cross already available (from cache)"
+          fi
+
+          mkdir -p "$HOME/.local/bin"
           if command -v aarch64-unknown-linux-musl-gcc >/dev/null 2>&1; then
             echo "Found linker: $(command -v aarch64-unknown-linux-musl-gcc)"
           elif command -v aarch64-linux-musl-gcc >/dev/null 2>&1; then
@@ -66,8 +86,8 @@ jobs:
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
             echo "Created linker shim: $HOME/.local/bin/aarch64-unknown-linux-musl-gcc"
           else
-            echo "Missing musl linker binary after install"
-            ls -1 /opt/homebrew/bin/*musl*gcc || true
+            echo "::error::Missing musl linker binary after install"
+            ls -1 /opt/homebrew/bin/*musl*gcc 2>/dev/null || echo "No musl-gcc binaries found"
             exit 1
           fi
 
@@ -86,10 +106,12 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build arcbox (release)
+        timeout-minutes: 15
         run: |
           cargo build --release -p arcbox-cli
 
       - name: Build arcbox-agent (cross-compile for Linux ARM64)
+        timeout-minutes: 15
         run: |
           cargo build --release -p arcbox-agent --target aarch64-unknown-linux-musl
 

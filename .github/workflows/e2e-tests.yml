@@ -50,6 +50,7 @@ jobs:
           toolchain: stable
 
       - name: Install Protobuf compiler
+        timeout-minutes: 5
         run: |
           brew install protobuf
 
@@ -67,20 +68,25 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run unit tests
+        timeout-minutes: 20
         run: |
           cargo test --workspace --exclude arcbox-e2e -- --skip ignored
 
       - name: Run arcbox-image auto-pull tests
+        timeout-minutes: 5
         run: |
           cargo test -p arcbox-image -- test_get_manifest_not_found test_get_image_config_not_found test_image_not_found
 
   # ==========================================================================
   # Build (prepare artifacts for E2E tests)
+  #
+  # MLT-041: musl toolchain cached separately, step-level timeouts,
+  #          build steps split for better failure diagnostics.
   # ==========================================================================
   build:
     name: Build
     runs-on: macos-14
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -93,18 +99,39 @@ jobs:
           targets: aarch64-unknown-linux-musl
 
       - name: Install Protobuf compiler
+        timeout-minutes: 5
         run: |
           brew install protobuf
 
       - name: Install initramfs build tools
+        timeout-minutes: 5
         run: |
           brew install squashfs
 
-      - name: Install musl cross-compiler
-        run: |
-          brew install FiloSottile/musl-cross/musl-cross
-          mkdir -p "$HOME/.local/bin"
+      # MLT-041: Cache musl-cross toolchain to avoid repeated Homebrew builds.
+      # The musl-cross formula compiles from source and is the slowest step.
+      - name: Cache musl-cross toolchain
+        id: cache-musl
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/homebrew/Cellar/musl-cross
+            /opt/homebrew/bin/aarch64-linux-musl-*
+            /opt/homebrew/opt/musl-cross
+          key: ${{ runner.os }}-musl-cross-v1
 
+      - name: Install musl cross-compiler
+        timeout-minutes: 30
+        run: |
+          if ! command -v aarch64-linux-musl-gcc >/dev/null 2>&1; then
+            echo "::group::Installing musl-cross from source (this takes a while)"
+            brew install FiloSottile/musl-cross/musl-cross
+            echo "::endgroup::"
+          else
+            echo "musl-cross already available (from cache)"
+          fi
+
+          mkdir -p "$HOME/.local/bin"
           if command -v aarch64-unknown-linux-musl-gcc >/dev/null 2>&1; then
             echo "Found linker: $(command -v aarch64-unknown-linux-musl-gcc)"
           elif command -v aarch64-linux-musl-gcc >/dev/null 2>&1; then
@@ -113,8 +140,8 @@ jobs:
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
             echo "Created linker shim: $HOME/.local/bin/aarch64-unknown-linux-musl-gcc"
           else
-            echo "Missing musl linker binary after install"
-            ls -1 /opt/homebrew/bin/*musl*gcc || true
+            echo "::error::Missing musl linker binary after install"
+            ls -1 /opt/homebrew/bin/*musl*gcc 2>/dev/null || echo "No musl-gcc binaries found"
             exit 1
           fi
 
@@ -133,10 +160,13 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build arcbox (release)
+        timeout-minutes: 15
         run: |
           cargo build --release -p arcbox-cli
 
+      # MLT-041: Separate step for cross-compilation with its own timeout.
       - name: Build arcbox-agent (cross-compile for Linux)
+        timeout-minutes: 15
         run: |
           cargo build --release -p arcbox-agent --target aarch64-unknown-linux-musl
 
@@ -146,15 +176,16 @@ jobs:
             --force -s - target/release/arcbox
 
       - name: Download kernel
+        timeout-minutes: 5
         run: |
           cd tests/resources
           ./download-kernel.sh
-          # Create Image-arm64 symlink if needed
           if [ ! -f Image-arm64 ] && [ -f vmlinuz-arm64 ]; then
             cp vmlinuz-arm64 Image-arm64
           fi
 
       - name: Build initramfs
+        timeout-minutes: 5
         run: |
           cd tests/resources
           ./build-initramfs.sh
@@ -190,15 +221,33 @@ jobs:
             tests/resources/initramfs-arcbox
           retention-days: 7
 
+      # MLT-041: Step summary for build timing visibility.
+      - name: Build summary
+        if: always()
+        run: |
+          echo "### Build Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Artifact | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          for f in target/release/arcbox target/aarch64-unknown-linux-musl/release/arcbox-agent tests/resources/Image-arm64 tests/resources/initramfs-arcbox; do
+            if [ -f "$f" ]; then
+              SIZE=$(ls -lh "$f" | awk '{print $5}')
+              echo "| \`$(basename $f)\` | OK ($SIZE) |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| \`$(basename $f)\` | **MISSING** |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
   # ==========================================================================
-  # E2E Tests (requires VM - self-hosted or manual trigger)
+  # E2E VM Tests with Matrix (MLT-040)
+  #
+  # Runs smoke tests for each backend x distro combination.
   # ==========================================================================
   e2e-vm-tests:
     name: E2E VM Tests
     needs: build
     runs-on: macos-14
     timeout-minutes: 60
-    # Only run on master branch, workflow_dispatch with run_vm_tests=true, or self-hosted
     if: |
       github.ref == 'refs/heads/master' ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.run_vm_tests == 'true')
@@ -211,6 +260,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Protobuf compiler
+        timeout-minutes: 5
         run: |
           brew install protobuf
 
@@ -247,65 +297,119 @@ jobs:
         id: check-virt
         continue-on-error: true
         run: |
-          # Check if we can use Virtualization.framework
-          # This will fail on most GitHub-hosted runners
           if system_profiler SPSoftwareDataType | grep -q "System Integrity Protection: enabled"; then
             echo "SIP is enabled"
           fi
-
-          # Try to check virtualization capability
-          # This is a heuristic - actual VM tests will confirm
           echo "virt_available=true" >> $GITHUB_OUTPUT
 
+      # MLT-040: Smoke matrix tests (backend x distro).
+      - name: Run smoke matrix tests (native_control_plane x alpine)
+        if: steps.check-virt.outputs.virt_available == 'true'
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          ARCBOX_TEST_BACKEND: native-control-plane
+          E2E_VERBOSE: ${{ github.event.inputs.verbose == 'true' && '1' || '' }}
+          RUST_LOG: ${{ github.event.inputs.verbose == 'true' && 'debug' || 'warn' }}
+        run: |
+          cargo test -p arcbox-e2e --test smoke_matrix -- --ignored test_smoke_native_alpine test_lifecycle_native_alpine --nocapture 2>&1 | tee /tmp/e2e-smoke-native-alpine.log
+      - name: Run smoke matrix tests (native_control_plane x ubuntu)
+        if: steps.check-virt.outputs.virt_available == 'true'
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          ARCBOX_TEST_BACKEND: native-control-plane
+          E2E_VERBOSE: ${{ github.event.inputs.verbose == 'true' && '1' || '' }}
+          RUST_LOG: ${{ github.event.inputs.verbose == 'true' && 'debug' || 'warn' }}
+        run: |
+          cargo test -p arcbox-e2e --test smoke_matrix -- --ignored test_smoke_native_ubuntu test_lifecycle_native_ubuntu --nocapture 2>&1 | tee /tmp/e2e-smoke-native-ubuntu.log
+      - name: Run smoke matrix tests (guest_docker x alpine)
+        if: steps.check-virt.outputs.virt_available == 'true'
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          ARCBOX_TEST_BACKEND: guest-docker
+          E2E_VERBOSE: ${{ github.event.inputs.verbose == 'true' && '1' || '' }}
+          RUST_LOG: ${{ github.event.inputs.verbose == 'true' && 'debug' || 'warn' }}
+        run: |
+          cargo test -p arcbox-e2e --test smoke_matrix -- --ignored test_smoke_guest_docker_alpine test_lifecycle_guest_docker_alpine --nocapture 2>&1 | tee /tmp/e2e-smoke-guest-docker-alpine.log
+      - name: Run smoke matrix tests (guest_docker x ubuntu)
+        if: steps.check-virt.outputs.virt_available == 'true'
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          ARCBOX_TEST_BACKEND: guest-docker
+          E2E_VERBOSE: ${{ github.event.inputs.verbose == 'true' && '1' || '' }}
+          RUST_LOG: ${{ github.event.inputs.verbose == 'true' && 'debug' || 'warn' }}
+        run: |
+          cargo test -p arcbox-e2e --test smoke_matrix -- --ignored test_smoke_guest_docker_ubuntu test_lifecycle_guest_docker_ubuntu --nocapture 2>&1 | tee /tmp/e2e-smoke-guest-docker-ubuntu.log
+      # Existing E2E suites (run on default backend).
       - name: Run E2E tests (VM lifecycle)
         if: steps.check-virt.outputs.virt_available == 'true'
         continue-on-error: true
+        timeout-minutes: 10
         env:
           E2E_VERBOSE: ${{ github.event.inputs.verbose == 'true' && '1' || '' }}
           RUST_LOG: ${{ github.event.inputs.verbose == 'true' && 'debug' || 'warn' }}
         run: |
-          cargo test -p arcbox-e2e -- --ignored test_vm --nocapture 2>&1 | tee /tmp/e2e-vm.log || true
-
+          cargo test -p arcbox-e2e -- --ignored test_vm --nocapture 2>&1 | tee /tmp/e2e-vm.log
       - name: Run E2E tests (container lifecycle)
         if: steps.check-virt.outputs.virt_available == 'true'
         continue-on-error: true
+        timeout-minutes: 15
         env:
           E2E_VERBOSE: ${{ github.event.inputs.verbose == 'true' && '1' || '' }}
           RUST_LOG: ${{ github.event.inputs.verbose == 'true' && 'debug' || 'warn' }}
         run: |
-          cargo test -p arcbox-e2e -- --ignored test_container --nocapture 2>&1 | tee /tmp/e2e-container.log || true
-
-      - name: Run E2E tests (auto-pull)
-        if: steps.check-virt.outputs.virt_available == 'true'
-        continue-on-error: true
-        env:
-          E2E_VERBOSE: ${{ github.event.inputs.verbose == 'true' && '1' || '' }}
-          RUST_LOG: ${{ github.event.inputs.verbose == 'true' && 'debug' || 'warn' }}
-        run: |
-          cargo test -p arcbox-e2e -- --ignored test_container_run_auto_pull test_container_create_auto_pull --nocapture 2>&1 | tee /tmp/e2e-autopull.log || true
-
+          cargo test -p arcbox-e2e -- --ignored test_container --nocapture 2>&1 | tee /tmp/e2e-container.log
       - name: Run E2E tests (image operations)
         if: steps.check-virt.outputs.virt_available == 'true'
         continue-on-error: true
+        timeout-minutes: 10
         env:
           E2E_VERBOSE: ${{ github.event.inputs.verbose == 'true' && '1' || '' }}
           RUST_LOG: ${{ github.event.inputs.verbose == 'true' && 'debug' || 'warn' }}
         run: |
-          cargo test -p arcbox-e2e -- --ignored test_image --nocapture 2>&1 | tee /tmp/e2e-image.log || true
-
+          cargo test -p arcbox-e2e -- --ignored test_image --nocapture 2>&1 | tee /tmp/e2e-image.log
+      # MLT-041: Structured test summary for quick failure diagnosis.
       - name: Summarize test results
         if: always()
         run: |
-          echo "=== E2E Test Summary ==="
-          echo ""
+          echo "### E2E Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Suite | Passed | Failed |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|--------|--------|" >> "$GITHUB_STEP_SUMMARY"
 
           for log in /tmp/e2e-*.log; do
             if [ -f "$log" ]; then
-              echo "--- $(basename $log) ---"
-              grep -E "^(test |running |PASSED|FAILED|ok|FAILED)" "$log" | tail -20 || true
-              echo ""
+              SUITE=$(basename "$log" .log | sed 's/^e2e-//')
+              PASSED=$(grep -c " \.\.\. ok$" "$log" 2>/dev/null || echo "0")
+              FAILED=$(grep -c " \.\.\. FAILED$" "$log" 2>/dev/null || echo "0")
+              if [ "$FAILED" -gt 0 ]; then
+                echo "| $SUITE | $PASSED | **$FAILED** |" >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "| $SUITE | $PASSED | $FAILED |" >> "$GITHUB_STEP_SUMMARY"
+              fi
             fi
           done
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Print failed tests to summary.
+          HAS_FAILURES=false
+          for log in /tmp/e2e-*.log; do
+            if [ -f "$log" ] && grep -q "FAILED" "$log"; then
+              HAS_FAILURES=true
+              echo "#### Failed tests in $(basename "$log")" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              grep "FAILED" "$log" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          if [ "$HAS_FAILURES" = false ]; then
+            echo "> All executed tests passed." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload test logs
         if: always()
@@ -323,11 +427,10 @@ jobs:
     name: E2E Tests (Self-Hosted)
     needs: build
     runs-on: [self-hosted, macOS, ARM64, virtualization]
-    timeout-minutes: 90
+    timeout-minutes: 60
     if: |
       github.event_name == 'workflow_dispatch' &&
       github.event.inputs.run_vm_tests == 'true'
-    # Manual only; avoids blocking push CI when no self-hosted runners are online
     continue-on-error: true
 
     steps:
@@ -338,6 +441,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Protobuf compiler
+        timeout-minutes: 5
         run: |
           brew install protobuf
 
@@ -359,40 +463,47 @@ jobs:
           codesign --entitlements tests/resources/entitlements.plist \
             --force -s - target/release/arcbox
 
-      - name: Run full E2E test suite
+      # MLT-040: Run smoke matrix first, then full suite.
+      - name: Run smoke matrix (all combinations)
+        timeout-minutes: 20
         env:
           E2E_VERBOSE: ${{ github.event.inputs.verbose == 'true' && '1' || '' }}
           RUST_LOG: ${{ github.event.inputs.verbose == 'true' && 'debug' || 'info' }}
         run: |
-          # Build e2e test binary
           cargo build -p arcbox-e2e --tests
+          cargo test -p arcbox-e2e --test smoke_matrix -- --ignored --nocapture 2>&1 | tee /tmp/e2e-smoke-matrix.log
 
-          # Run all E2E tests (including ignored ones that require VM)
+      - name: Run full E2E test suite
+        timeout-minutes: 30
+        env:
+          E2E_VERBOSE: ${{ github.event.inputs.verbose == 'true' && '1' || '' }}
+          RUST_LOG: ${{ github.event.inputs.verbose == 'true' && 'debug' || 'info' }}
+        run: |
           cargo test -p arcbox-e2e -- --ignored --nocapture 2>&1 | tee /tmp/e2e-full.log
 
       - name: Parse test results
         if: always()
         run: |
-          echo "=== Full E2E Test Results ==="
-          echo ""
+          echo "### Self-Hosted E2E Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
 
-          if [ -f /tmp/e2e-full.log ]; then
-            # Count passed/failed
-            PASSED=$(grep -c "^test .* ok$" /tmp/e2e-full.log || echo "0")
-            FAILED=$(grep -c "^test .* FAILED$" /tmp/e2e-full.log || echo "0")
-            IGNORED=$(grep -c "^test .* ignored$" /tmp/e2e-full.log || echo "0")
+          for log in /tmp/e2e-smoke-matrix.log /tmp/e2e-full.log; do
+            if [ -f "$log" ]; then
+              SUITE=$(basename "$log" .log)
+              PASSED=$(grep -c " \.\.\. ok$" "$log" 2>/dev/null || echo "0")
+              FAILED=$(grep -c " \.\.\. FAILED$" "$log" 2>/dev/null || echo "0")
+              IGNORED=$(grep -c " \.\.\. ignored$" "$log" 2>/dev/null || echo "0")
 
-            echo "Passed:  $PASSED"
-            echo "Failed:  $FAILED"
-            echo "Ignored: $IGNORED"
-            echo ""
+              echo "**$SUITE**: $PASSED passed, $FAILED failed, $IGNORED ignored" >> "$GITHUB_STEP_SUMMARY"
 
-            if [ "$FAILED" -gt 0 ]; then
-              echo "=== Failed Tests ==="
-              grep "^test .* FAILED$" /tmp/e2e-full.log || true
-              exit 1
+              if [ "$FAILED" -gt 0 ]; then
+                echo '```' >> "$GITHUB_STEP_SUMMARY"
+                grep "FAILED" "$log" >> "$GITHUB_STEP_SUMMARY"
+                echo '```' >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
             fi
-          fi
+          done
 
       - name: Upload test logs
         if: always()
@@ -423,18 +534,19 @@ jobs:
 
           # Fail if critical jobs failed
           if [ "${{ needs.unit-tests.result }}" == "failure" ]; then
-            echo "❌ Unit tests failed"
+            echo "Unit tests failed"
             exit 1
           fi
 
           if [ "${{ needs.build.result }}" == "failure" ]; then
-            echo "❌ Build failed"
+            echo "Build failed"
             exit 1
           fi
 
-          # E2E tests are optional (may not have VM support)
+          # E2E tests gate the pipeline when they ran.
           if [ "${{ needs.e2e-vm-tests.result }}" == "failure" ]; then
-            echo "⚠️ E2E tests failed (may be due to virtualization restrictions)"
+            echo "::error::E2E tests failed"
+            exit 1
           fi
 
-          echo "✅ CI passed"
+          echo "CI passed"
