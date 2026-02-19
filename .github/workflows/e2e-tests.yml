@@ -304,6 +304,7 @@ jobs:
 
       # MLT-040: Smoke matrix tests (backend x distro).
       - name: Run smoke matrix tests (native_control_plane x alpine)
+        id: smoke_native_alpine
         if: steps.check-virt.outputs.virt_available == 'true'
         continue-on-error: true
         timeout-minutes: 10
@@ -314,6 +315,7 @@ jobs:
         run: |
           cargo test -p arcbox-e2e --test smoke_matrix -- --ignored test_smoke_native_alpine test_lifecycle_native_alpine --nocapture 2>&1 | tee /tmp/e2e-smoke-native-alpine.log
       - name: Run smoke matrix tests (native_control_plane x ubuntu)
+        id: smoke_native_ubuntu
         if: steps.check-virt.outputs.virt_available == 'true'
         continue-on-error: true
         timeout-minutes: 10
@@ -324,6 +326,7 @@ jobs:
         run: |
           cargo test -p arcbox-e2e --test smoke_matrix -- --ignored test_smoke_native_ubuntu test_lifecycle_native_ubuntu --nocapture 2>&1 | tee /tmp/e2e-smoke-native-ubuntu.log
       - name: Run smoke matrix tests (guest_docker x alpine)
+        id: smoke_guest_alpine
         if: steps.check-virt.outputs.virt_available == 'true'
         continue-on-error: true
         timeout-minutes: 10
@@ -334,6 +337,7 @@ jobs:
         run: |
           cargo test -p arcbox-e2e --test smoke_matrix -- --ignored test_smoke_guest_docker_alpine test_lifecycle_guest_docker_alpine --nocapture 2>&1 | tee /tmp/e2e-smoke-guest-docker-alpine.log
       - name: Run smoke matrix tests (guest_docker x ubuntu)
+        id: smoke_guest_ubuntu
         if: steps.check-virt.outputs.virt_available == 'true'
         continue-on-error: true
         timeout-minutes: 10
@@ -409,6 +413,35 @@ jobs:
 
           if [ "$HAS_FAILURES" = false ]; then
             echo "> All executed tests passed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Enforce smoke matrix on master
+        if: always() && github.ref == 'refs/heads/master' && steps.check-virt.outputs.virt_available == 'true'
+        run: |
+          FAILED=0
+
+          if [ "${{ steps.smoke_native_alpine.outcome }}" != "success" ]; then
+            echo "::error::native_control_plane x alpine failed"
+            FAILED=1
+          fi
+
+          if [ "${{ steps.smoke_native_ubuntu.outcome }}" != "success" ]; then
+            echo "::error::native_control_plane x ubuntu failed"
+            FAILED=1
+          fi
+
+          if [ "${{ steps.smoke_guest_alpine.outcome }}" != "success" ]; then
+            echo "::error::guest_docker x alpine failed"
+            FAILED=1
+          fi
+
+          if [ "${{ steps.smoke_guest_ubuntu.outcome }}" != "success" ]; then
+            echo "::error::guest_docker x ubuntu failed"
+            FAILED=1
+          fi
+
+          if [ "$FAILED" -ne 0 ]; then
+            exit 1
           fi
 
       - name: Upload test logs
