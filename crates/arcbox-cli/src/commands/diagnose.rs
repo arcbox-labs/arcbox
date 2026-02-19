@@ -3,8 +3,18 @@
 //! Outputs runtime readiness, boot assets validation, and key socket status.
 
 use anyhow::Result;
-use arcbox_core::{BootAssetProvider, Config, Runtime, boot_assets::BOOT_ASSET_VERSION};
+use arcbox_core::{
+    BootAssetProvider, Config, DefaultVmConfig, Runtime, boot_assets::BOOT_ASSET_VERSION,
+    machine::MachineInfo,
+};
 use std::path::Path;
+
+#[derive(Default)]
+struct RuntimeReadiness {
+    daemon_running: bool,
+    runtime_default_vm: Option<DefaultVmConfig>,
+    default_machine: Option<MachineInfo>,
+}
 
 /// Executes the diagnose command.
 pub async fn execute() -> Result<()> {
@@ -28,7 +38,7 @@ pub async fn execute() -> Result<()> {
 
     // 4. Runtime readiness
     println!("--- Runtime ---");
-    check_runtime_readiness(&config).await;
+    let runtime_readiness = check_runtime_readiness(&config).await;
     println!();
 
     // 5. Data directories
@@ -41,12 +51,7 @@ pub async fn execute() -> Result<()> {
     println!();
 
     // 6. Configuration summary
-    println!("--- Configuration ---");
-    println!("  Container backend: {:?}", config.container.backend);
-    println!("  Provision mode:    {:?}", config.container.provision);
-    println!("  VM CPUs:           {}", config.vm.cpus);
-    println!("  VM Memory:         {} MB", config.vm.memory_mb);
-    println!("  Network subnet:    {}", config.network.subnet);
+    print_configuration_summary(&config, &runtime_readiness);
 
     Ok(())
 }
@@ -134,7 +139,56 @@ async fn check_boot_assets(config: &Config) {
     }
 }
 
-async fn check_runtime_readiness(config: &Config) {
+fn print_configuration_summary(config: &Config, runtime: &RuntimeReadiness) {
+    println!("--- Configuration ---");
+    println!("  Container backend: {:?}", config.container.backend);
+    println!("  Provision mode:    {:?}", config.container.provision);
+
+    if let Some(info) = runtime.default_machine.as_ref() {
+        println!("  VM CPUs:           {} (running machine)", info.cpus);
+        println!("  VM Memory:         {} MB (running machine)", info.memory_mb);
+        if let Some(kernel) = info.kernel.as_deref() {
+            println!("  VM Kernel:         {} (running machine)", kernel);
+        }
+        if let Some(initrd) = info.initrd.as_deref() {
+            println!("  VM Initramfs:      {} (running machine)", initrd);
+        }
+    } else if let Some(default_vm) = runtime.runtime_default_vm.as_ref() {
+        println!("  VM CPUs:           {} (runtime default)", default_vm.cpus);
+        println!(
+            "  VM Memory:         {} MB (runtime default)",
+            default_vm.memory_mb
+        );
+        if let Some(kernel) = default_vm.kernel.as_ref() {
+            println!("  VM Kernel:         {} (runtime default)", kernel.display());
+        }
+        if let Some(initramfs) = default_vm.initramfs.as_ref() {
+            println!(
+                "  VM Initramfs:      {} (runtime default)",
+                initramfs.display()
+            );
+        }
+        if runtime.daemon_running {
+            println!("  VM Config Source:  local runtime defaults");
+        }
+    } else {
+        println!("  VM CPUs:           {} (config)", config.vm.cpus);
+        println!("  VM Memory:         {} MB (config)", config.vm.memory_mb);
+        if let Some(kernel) = config.vm.kernel_path.as_ref() {
+            println!("  VM Kernel:         {} (config)", kernel.display());
+        }
+        if let Some(initramfs) = config.vm.initrd_path.as_ref() {
+            println!("  VM Initramfs:      {} (config)", initramfs.display());
+        }
+        if runtime.daemon_running {
+            println!("  VM Config Source:  local config (runtime unavailable)");
+        }
+    }
+
+    println!("  Network subnet:    {}", config.network.subnet);
+}
+
+async fn check_runtime_readiness(config: &Config) -> RuntimeReadiness {
     // Check daemon connectivity.
     let daemon = arcbox_cli::client::DaemonClient::new();
     let daemon_running = daemon.is_running().await;
@@ -151,13 +205,14 @@ async fn check_runtime_readiness(config: &Config) {
     if !daemon_running {
         println!("  VM state:         unknown (daemon not running)");
         println!("  Health:           unknown (daemon not running)");
-        return;
+        return RuntimeReadiness::default();
     }
 
     // Try to instantiate Runtime to check VM lifecycle state.
     match Runtime::new(config.clone()) {
         Ok(runtime) => {
             let vm_lifecycle = runtime.vm_lifecycle();
+            let runtime_default_vm = Some(vm_lifecycle.default_vm_config());
 
             let state = vm_lifecycle.state().await;
             println!("  VM state:         {}", state.as_str());
@@ -168,12 +223,19 @@ async fn check_runtime_readiness(config: &Config) {
                 if healthy { "healthy" } else { "UNHEALTHY" }
             );
 
-            if let Some(info) = vm_lifecycle.default_machine_info() {
+            let default_machine = vm_lifecycle.default_machine_info();
+            if let Some(info) = default_machine.as_ref() {
                 println!("  Machine name:     {}", info.name);
                 println!("  Machine CPUs:     {}", info.cpus);
                 println!("  Machine memory:   {} MB", info.memory_mb);
                 if let Some(cid) = info.cid {
                     println!("  Machine CID:      {}", cid);
+                }
+                if let Some(kernel) = info.kernel.as_deref() {
+                    println!("  Machine kernel:   {}", kernel);
+                }
+                if let Some(initrd) = info.initrd.as_deref() {
+                    println!("  Machine initrd:   {}", initrd);
                 }
             } else {
                 println!("  Default machine:  not created");
@@ -194,9 +256,20 @@ async fn check_runtime_readiness(config: &Config) {
             let images: Vec<arcbox_cli::client::ImageSummary> =
                 daemon.get("/v1.43/images/json").await.unwrap_or_default();
             println!("  Images:           {}", images.len());
+
+            RuntimeReadiness {
+                daemon_running: true,
+                runtime_default_vm,
+                default_machine,
+            }
         }
         Err(e) => {
             println!("  Runtime init:     ERROR - {}", e);
+            RuntimeReadiness {
+                daemon_running: true,
+                runtime_default_vm: None,
+                default_machine: None,
+            }
         }
     }
 }

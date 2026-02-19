@@ -584,10 +584,33 @@ impl VmLifecycleManager {
     /// Starts the default VM.
     async fn start_default_vm(&self, timeout: Duration) -> Result<()> {
         let current_state = *self.state.read().await;
-        let machine_exists = self.machine_manager.get(DEFAULT_MACHINE_NAME).is_some();
+        let existing_machine = self.machine_manager.get(DEFAULT_MACHINE_NAME);
+        let machine_exists = existing_machine.is_some();
 
-        // Recreate if state says "not exist" or machine record is missing.
-        if current_state == VmLifecycleState::NotExist || !machine_exists {
+        // Detect stale persisted machine whose cpus/memory no longer matches
+        // the current default_vm config (e.g. after a config change).
+        let config_drifted = existing_machine
+            .as_ref()
+            .is_some_and(|m| {
+                m.cpus != self.config.default_vm.cpus
+                    || m.memory_mb != self.config.default_vm.memory_mb
+            });
+
+        if config_drifted {
+            let m = existing_machine.as_ref().unwrap();
+            tracing::warn!(
+                persisted_cpus = m.cpus,
+                persisted_memory = m.memory_mb,
+                desired_cpus = self.config.default_vm.cpus,
+                desired_memory = self.config.default_vm.memory_mb,
+                "default machine config drifted from desired defaults; recreating"
+            );
+            let _ = self.machine_manager.remove(DEFAULT_MACHINE_NAME, true);
+        }
+
+        // Recreate if state says "not exist", machine record is missing, or
+        // the persisted config drifted from desired defaults.
+        if current_state == VmLifecycleState::NotExist || !machine_exists || config_drifted {
             if current_state != VmLifecycleState::NotExist && !machine_exists {
                 tracing::warn!(
                     state = current_state.as_str(),
@@ -993,6 +1016,12 @@ impl VmLifecycleManager {
     /// Returns the boot asset provider.
     pub fn boot_assets(&self) -> &Arc<BootAssetProvider> {
         &self.boot_assets
+    }
+
+    /// Returns the resolved default VM configuration used by lifecycle.
+    #[must_use]
+    pub fn default_vm_config(&self) -> DefaultVmConfig {
+        self.config.default_vm.clone()
     }
 
     /// Returns the health monitor.

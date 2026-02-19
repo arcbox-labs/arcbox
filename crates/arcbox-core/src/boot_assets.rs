@@ -28,7 +28,7 @@ use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use tar::Archive;
 use tokio::fs;
@@ -40,11 +40,11 @@ use tokio::io::AsyncWriteExt;
 
 /// Default boot asset version.
 /// This is pinned to a known-good kernel/initramfs bundle.
-pub const BOOT_ASSET_VERSION: &str = "0.0.1-alpha.10";
+pub const BOOT_ASSET_VERSION: &str = "0.0.1-alpha.12";
 
 /// Base URL for boot asset downloads.
-/// Assets are hosted on GitHub Releases.
-const DEFAULT_CDN_BASE_URL: &str = "https://github.com/arcbox-labs/boot-assets/releases/download";
+/// Assets are hosted on Cloudflare R2 via custom domain.
+const DEFAULT_CDN_BASE_URL: &str = "https://dl.arcbox.dev/boot-assets";
 
 /// Asset bundle filename pattern.
 /// Format: boot-assets-{arch}-v{version}.tar.gz
@@ -101,9 +101,9 @@ impl Default for BootAssetConfig {
             "unknown"
         };
 
-        let cache_dir = dirs::data_dir()
+        let cache_dir = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("arcbox")
+            .join(".arcbox")
             .join("boot");
 
         Self {
@@ -298,7 +298,6 @@ impl BootAssetProvider {
 
     fn build_http_client(&self) -> Result<reqwest::Client> {
         let builder = reqwest::Client::builder()
-            .no_proxy()
             .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
             .user_agent(format!("arcbox/{}", BOOT_ASSET_VERSION));
 
@@ -360,7 +359,9 @@ impl BootAssetProvider {
                 )));
             }
             tracing::debug!("Using custom kernel: {}", k.display());
-            k.clone()
+            // Decompress ZBOOT into cache dir so we never modify the user's
+            // original file (it may be read-only or a build artifact).
+            ensure_kernel_decompressed_to_cache(k, &self.config.version_cache_dir()).await?
         } else {
             self.get_kernel_path(&progress).await?
         };
@@ -404,6 +405,7 @@ impl BootAssetProvider {
 
         if kernel_path.exists() {
             tracing::debug!("Using cached kernel: {}", kernel_path.display());
+            ensure_kernel_decompressed(&kernel_path).await?;
             return Ok(kernel_path);
         }
 
@@ -514,6 +516,7 @@ impl BootAssetProvider {
         }
 
         self.extract_bundle(&bundle_path, &cache_dir).await?;
+        ensure_kernel_decompressed(&cache_dir.join(KERNEL_FILENAME)).await?;
         self.validate_extracted_assets(&cache_dir).await?;
 
         // Clean up bundle file.
@@ -849,6 +852,150 @@ impl BootAssetProvider {
 
         Ok(versions)
     }
+}
+
+// =============================================================================
+// ZBOOT Decompression
+// =============================================================================
+
+/// EFI ZBOOT magic identifier at offset 4..8 in the PE/COFF header.
+const ZBOOT_MAGIC: &[u8; 4] = b"zimg";
+
+/// ARM64 Linux kernel magic at offset 56 in the raw Image header.
+const ARM64_MAGIC: &[u8; 4] = b"ARMd";
+
+/// Minimum header size needed to detect ZBOOT format.
+const ZBOOT_HEADER_SIZE: usize = 64;
+
+/// Ensures the kernel file at `path` is a raw Image, decompressing in-place
+/// if it is an EFI ZBOOT compressed kernel.
+///
+/// This operation is idempotent: if the file is already a raw Image it
+/// returns immediately without modification.
+///
+/// Use this only for cache-owned files. For user-provided paths, use
+/// [`ensure_kernel_decompressed_to_cache`] instead.
+async fn ensure_kernel_decompressed(path: &Path) -> Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        if let Some(raw) = detect_and_decompress_zboot(&path)? {
+            atomic_write_file(&path, &raw)?;
+            tracing::info!("Kernel decompressed in-place: {} bytes", raw.len());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| CoreError::config(format!("kernel decompression task failed: {e}")))?
+}
+
+/// Decompresses a ZBOOT kernel into the cache directory, leaving the
+/// user-provided source file untouched. Returns the path to use — either
+/// the original (if already raw) or the cached decompressed copy.
+async fn ensure_kernel_decompressed_to_cache(
+    source: &Path,
+    cache_dir: &Path,
+) -> Result<PathBuf> {
+    let source = source.to_path_buf();
+    let cache_dir = cache_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        match detect_and_decompress_zboot(&source)? {
+            None => {
+                // Already a raw Image — use as-is.
+                Ok(source)
+            }
+            Some(raw) => {
+                // Write decompressed kernel into cache dir.
+                std::fs::create_dir_all(&cache_dir).map_err(|e| {
+                    CoreError::config(format!("failed to create cache dir: {e}"))
+                })?;
+                let cached_path = cache_dir.join("kernel-custom-decompressed");
+                atomic_write_file(&cached_path, &raw)?;
+                tracing::info!(
+                    "Custom kernel decompressed to cache: {} → {} ({} bytes)",
+                    source.display(),
+                    cached_path.display(),
+                    raw.len()
+                );
+                Ok(cached_path)
+            }
+        }
+    })
+    .await
+    .map_err(|e| CoreError::config(format!("kernel decompression task failed: {e}")))?
+}
+
+/// Detects EFI ZBOOT format and decompresses the gzip payload if present.
+///
+/// Returns `Ok(Some(raw_image))` if the file was ZBOOT and was decompressed,
+/// `Ok(None)` if the file is already a raw Image (idempotent passthrough).
+fn detect_and_decompress_zboot(path: &Path) -> Result<Option<Vec<u8>>> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| CoreError::config(format!("failed to open kernel: {e}")))?;
+
+    // Read header to check format.
+    let mut header = [0u8; ZBOOT_HEADER_SIZE];
+    let n = file
+        .read(&mut header)
+        .map_err(|e| CoreError::config(format!("failed to read kernel header: {e}")))?;
+
+    if n < ZBOOT_HEADER_SIZE {
+        return Ok(None);
+    }
+
+    if header[4..8] != *ZBOOT_MAGIC {
+        return Ok(None);
+    }
+
+    tracing::info!("Detected EFI ZBOOT kernel: {}", path.display());
+
+    // Parse payload offset and size (u32 LE at offsets 8 and 12).
+    let payload_offset = u32::from_le_bytes(header[8..12].try_into().unwrap()) as u64;
+    let payload_size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+
+    let file_len = file
+        .metadata()
+        .map_err(|e| CoreError::config(format!("failed to stat kernel: {e}")))?
+        .len();
+
+    if payload_offset + payload_size as u64 > file_len {
+        return Err(CoreError::config(format!(
+            "ZBOOT payload range ({payload_offset}..{}) exceeds file size ({file_len})",
+            payload_offset + payload_size as u64
+        )));
+    }
+
+    file.seek(SeekFrom::Start(payload_offset))
+        .map_err(|e| CoreError::config(format!("failed to seek to ZBOOT payload: {e}")))?;
+
+    let mut compressed = vec![0u8; payload_size];
+    file.read_exact(&mut compressed)
+        .map_err(|e| CoreError::config(format!("failed to read ZBOOT payload: {e}")))?;
+
+    drop(file);
+
+    let mut decoder = GzDecoder::new(&compressed[..]);
+    let mut raw_image = Vec::new();
+    decoder
+        .read_to_end(&mut raw_image)
+        .map_err(|e| CoreError::config(format!("failed to decompress ZBOOT kernel: {e}")))?;
+
+    if raw_image.len() < 60 || raw_image[56..60] != *ARM64_MAGIC {
+        return Err(CoreError::config(
+            "decompressed kernel missing ARM64 magic (expected 'ARMd' at offset 56)".to_string(),
+        ));
+    }
+
+    Ok(Some(raw_image))
+}
+
+/// Atomically writes `data` to `path` via a `.tmp` sibling + rename.
+fn atomic_write_file(path: &Path, data: &[u8]) -> Result<()> {
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, data)
+        .map_err(|e| CoreError::config(format!("failed to write decompressed kernel: {e}")))?;
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| CoreError::config(format!("failed to rename decompressed kernel: {e}")))?;
+    Ok(())
 }
 
 // =============================================================================
@@ -1200,5 +1347,109 @@ mod tests {
                 None => std::env::remove_var("ARCBOX_BOOT_ASSET_VERSION"),
             }
         }
+    }
+
+    /// Builds a minimal EFI ZBOOT kernel file for testing.
+    ///
+    /// Layout:
+    /// - bytes 0..4: PE stub ("MZ\0\0")
+    /// - bytes 4..8: ZBOOT magic ("zimg")
+    /// - bytes 8..12: payload_offset (u32 LE)
+    /// - bytes 12..16: payload_size (u32 LE)
+    /// - bytes 16..payload_offset: padding
+    /// - bytes payload_offset..: gzip-compressed raw Image
+    fn build_zboot_kernel(raw_image: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Compress the raw image with gzip.
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(raw_image).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let payload_offset: u32 = 64; // Place payload after a 64-byte header.
+        let payload_size: u32 = compressed.len() as u32;
+
+        let mut buf = vec![0u8; payload_offset as usize + compressed.len()];
+        // PE stub.
+        buf[0] = b'M';
+        buf[1] = b'Z';
+        // ZBOOT magic.
+        buf[4..8].copy_from_slice(b"zimg");
+        // Payload offset.
+        buf[8..12].copy_from_slice(&payload_offset.to_le_bytes());
+        // Payload size.
+        buf[12..16].copy_from_slice(&payload_size.to_le_bytes());
+        // Compressed payload.
+        buf[payload_offset as usize..].copy_from_slice(&compressed);
+
+        buf
+    }
+
+    /// Builds a minimal raw ARM64 kernel Image for testing.
+    ///
+    /// Places the ARM64 magic "ARMd" at offset 56.
+    fn build_raw_arm64_image() -> Vec<u8> {
+        let mut img = vec![0u8; 256];
+        img[56..60].copy_from_slice(b"ARMd");
+        img
+    }
+
+    #[tokio::test]
+    async fn test_ensure_kernel_decompressed_zboot() {
+        let temp = tempdir().unwrap();
+        let kernel_path = temp.path().join("kernel");
+
+        let raw_image = build_raw_arm64_image();
+        let zboot = build_zboot_kernel(&raw_image);
+
+        // Write ZBOOT kernel.
+        std::fs::write(&kernel_path, &zboot).unwrap();
+        assert_ne!(std::fs::read(&kernel_path).unwrap(), raw_image);
+
+        // Decompress.
+        ensure_kernel_decompressed(&kernel_path).await.unwrap();
+
+        // After decompression, file should be the raw image.
+        let result = std::fs::read(&kernel_path).unwrap();
+        assert_eq!(result, raw_image);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_kernel_decompressed_raw_passthrough() {
+        let temp = tempdir().unwrap();
+        let kernel_path = temp.path().join("kernel");
+
+        let raw_image = build_raw_arm64_image();
+        std::fs::write(&kernel_path, &raw_image).unwrap();
+
+        // Should be a no-op for already-raw kernel.
+        ensure_kernel_decompressed(&kernel_path).await.unwrap();
+
+        let result = std::fs::read(&kernel_path).unwrap();
+        assert_eq!(result, raw_image);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_kernel_decompressed_corrupt_offset() {
+        let temp = tempdir().unwrap();
+        let kernel_path = temp.path().join("kernel");
+
+        // Build a ZBOOT header with payload_offset pointing beyond the file.
+        let mut buf = vec![0u8; 64];
+        buf[0] = b'M';
+        buf[1] = b'Z';
+        buf[4..8].copy_from_slice(b"zimg");
+        // Payload offset far beyond file size.
+        buf[8..12].copy_from_slice(&9999u32.to_le_bytes());
+        buf[12..16].copy_from_slice(&100u32.to_le_bytes());
+
+        std::fs::write(&kernel_path, &buf).unwrap();
+
+        let result = ensure_kernel_decompressed(&kernel_path).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("exceeds file size"), "got: {msg}");
     }
 }

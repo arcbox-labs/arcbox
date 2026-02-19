@@ -136,6 +136,18 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
 
     // Build VM lifecycle config with custom kernel/initramfs if provided.
     let mut vm_lifecycle_config = arcbox_core::VmLifecycleConfig::default();
+
+    // Propagate config.vm to VM lifecycle defaults.
+    vm_lifecycle_config.default_vm.cpus = config.vm.cpus;
+    vm_lifecycle_config.default_vm.memory_mb = config.vm.memory_mb;
+    if let Some(ref kernel) = config.vm.kernel_path {
+        vm_lifecycle_config.default_vm.kernel = Some(kernel.clone());
+    }
+    if let Some(ref initrd) = config.vm.initrd_path {
+        vm_lifecycle_config.default_vm.initramfs = Some(initrd.clone());
+    }
+
+    // CLI args override config file values.
     if let Some(kernel) = args.kernel {
         vm_lifecycle_config.default_vm.kernel = Some(kernel);
     }

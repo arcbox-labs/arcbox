@@ -10,7 +10,7 @@
 //!
 //! ```toml
 //! # ArcBox configuration file
-//! data_dir = "~/.local/share/arcbox"
+//! data_dir = "~/.arcbox"
 //!
 //! [vm]
 //! cpus = 4
@@ -330,9 +330,9 @@ impl Default for StorageConfig {
 }
 
 fn default_data_dir() -> PathBuf {
-    dirs::data_local_dir()
+    dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/var/lib"))
-        .join("arcbox")
+        .join(".arcbox")
 }
 
 fn user_config_path() -> PathBuf {

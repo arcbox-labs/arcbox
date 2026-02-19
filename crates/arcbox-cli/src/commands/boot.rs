@@ -35,11 +35,9 @@ pub struct PrefetchArgs {
 
 /// Execute boot commands.
 pub async fn execute(command: BootCommands) -> anyhow::Result<()> {
-    // Get default data directory.
-    let data_dir = dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("arcbox")
-        .join("boot");
+    // Use Config::load() so the cache directory is consistent with daemon.
+    let config = arcbox_core::Config::load().unwrap_or_default();
+    let data_dir = config.data_dir.join("boot");
 
     match command {
         BootCommands::Prefetch(args) => prefetch(data_dir, args).await,

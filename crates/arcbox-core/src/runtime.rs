@@ -235,7 +235,20 @@ impl Runtime {
     ///
     /// Returns an error if the image store cannot be created.
     pub fn new(config: Config) -> Result<Self> {
-        Self::with_vm_lifecycle_config(config, VmLifecycleConfig::default())
+        let mut vm_lifecycle_config = VmLifecycleConfig::default();
+
+        // Propagate config.vm defaults into VM lifecycle so every entry
+        // point (daemon, machine, diagnose, API server) uses the same values.
+        vm_lifecycle_config.default_vm.cpus = config.vm.cpus;
+        vm_lifecycle_config.default_vm.memory_mb = config.vm.memory_mb;
+        if let Some(ref kernel) = config.vm.kernel_path {
+            vm_lifecycle_config.default_vm.kernel = Some(kernel.clone());
+        }
+        if let Some(ref initrd) = config.vm.initrd_path {
+            vm_lifecycle_config.default_vm.initramfs = Some(initrd.clone());
+        }
+
+        Self::with_vm_lifecycle_config(config, vm_lifecycle_config)
     }
 
     /// Creates a new runtime with custom VM lifecycle configuration.
@@ -1860,10 +1873,12 @@ fn parse_http_status_and_body(buf: &[u8]) -> (u16, bytes::Bytes) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_http_status_and_body, validate_bundled_runtime_manifest};
+    use super::{Runtime, parse_http_status_and_body, validate_bundled_runtime_manifest};
     use crate::boot_assets::{BootAssetManifest, RuntimeAssetManifestEntry};
+    use crate::config::Config;
     use bytes::Bytes;
     use sha2::{Digest, Sha256};
+    use std::path::PathBuf;
 
     fn runtime_entry(name: &str, content: &[u8]) -> RuntimeAssetManifestEntry {
         RuntimeAssetManifestEntry {
@@ -1952,5 +1967,31 @@ mod tests {
         let (status, body) = parse_http_status_and_body(raw);
         assert_eq!(status, 502);
         assert_eq!(body, Bytes::from_static(b"payload"));
+    }
+
+    #[test]
+    fn test_runtime_new_propagates_config_vm_defaults() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let mut config = Config::default();
+        config.data_dir = temp_dir.path().to_path_buf();
+        config.vm.cpus = 6;
+        config.vm.memory_mb = 3072;
+        config.vm.kernel_path = Some(PathBuf::from("/tmp/arcbox-test-kernel"));
+        config.vm.initrd_path = Some(PathBuf::from("/tmp/arcbox-test-initramfs"));
+
+        let runtime = Runtime::new(config).expect("runtime init should succeed");
+        let default_vm = runtime.vm_lifecycle().default_vm_config();
+
+        assert_eq!(default_vm.cpus, 6);
+        assert_eq!(default_vm.memory_mb, 3072);
+        assert_eq!(
+            default_vm.kernel,
+            Some(PathBuf::from("/tmp/arcbox-test-kernel"))
+        );
+        assert_eq!(
+            default_vm.initramfs,
+            Some(PathBuf::from("/tmp/arcbox-test-initramfs"))
+        );
     }
 }
