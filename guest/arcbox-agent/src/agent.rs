@@ -382,6 +382,11 @@ mod linux {
             // Mount standard VirtioFS shares if not already mounted
             crate::mount::mount_standard_shares();
 
+            // Best-effort: ensure guest vsock modules are available before we
+            // attempt to bind listeners. This is especially important when the
+            // agent is started by distro init systems after switch_root.
+            ensure_vsock_modules_loaded().await;
+
             // Start guest-side Docker API proxy (vsock -> unix socket).
             tokio::spawn(async {
                 if let Err(e) = run_docker_api_proxy().await {
@@ -389,9 +394,8 @@ mod linux {
                 }
             });
 
-            let addr = VsockAddr::new(VMADDR_CID_ANY, AGENT_PORT);
             let mut listener =
-                VsockListener::bind(addr).context("failed to bind vsock listener")?;
+                bind_vsock_listener_with_retry(AGENT_PORT, "agent rpc listener").await?;
 
             tracing::info!("Agent listening on vsock port {}", AGENT_PORT);
 
@@ -415,11 +419,62 @@ mod linux {
         }
     }
 
+    async fn ensure_vsock_modules_loaded() {
+        for module in [
+            "vsock",
+            "vmw_vsock_virtio_transport_common",
+            "vmw_vsock_virtio_transport",
+        ] {
+            match Command::new("modprobe").arg(module).status().await {
+                Ok(status) if status.success() => {
+                    tracing::debug!(module, "loaded kernel module");
+                }
+                Ok(status) => {
+                    tracing::debug!(
+                        module,
+                        exit_code = status.code().unwrap_or(-1),
+                        "modprobe exited non-zero"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(module, error = %e, "modprobe unavailable/failed");
+                }
+            }
+        }
+    }
+
+    async fn bind_vsock_listener_with_retry(port: u32, component: &str) -> Result<VsockListener> {
+        const INITIAL_DELAY_MS: u64 = 120;
+        const MAX_DELAY_MS: u64 = 2_000;
+
+        let mut delay_ms = INITIAL_DELAY_MS;
+
+        loop {
+            let addr = VsockAddr::new(VMADDR_CID_ANY, port);
+            match VsockListener::bind(addr) {
+                Ok(listener) => {
+                    tracing::info!(port, component, "vsock listener bound");
+                    return Ok(listener);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        port,
+                        component,
+                        retry_delay_ms = delay_ms,
+                        error = %e,
+                        "failed to bind vsock listener, retrying"
+                    );
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            delay_ms = (delay_ms * 3 / 2).min(MAX_DELAY_MS);
+        }
+    }
+
     async fn run_docker_api_proxy() -> Result<()> {
         let port = docker_api_vsock_port();
-        let addr = VsockAddr::new(VMADDR_CID_ANY, port);
-        let mut listener =
-            VsockListener::bind(addr).context("failed to bind docker api vsock listener")?;
+        let mut listener = bind_vsock_listener_with_retry(port, "docker api proxy").await?;
         tracing::info!("Docker API proxy listening on vsock port {}", port);
 
         loop {
