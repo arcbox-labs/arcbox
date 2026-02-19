@@ -56,3 +56,15 @@ path = "tests/container_lifecycle.rs"
 [[test]]
 name = "full_workflow"
 path = "tests/full_workflow.rs"
+
+[[test]]
+name = "smoke_matrix"
+path = "tests/smoke_matrix.rs"
+
+[[test]]
+name = "docker_compat"
+path = "tests/docker_compat.rs"
+
+[[test]]
+name = "docker_context"
+path = "tests/docker_context.rs"

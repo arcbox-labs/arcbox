@@ -31,6 +31,8 @@ pub struct TestConfig {
     pub timeout: Duration,
     /// Enable verbose logging.
     pub verbose: bool,
+    /// Container backend mode (CLI arg value).
+    pub container_backend: String,
 }
 
 impl Default for TestConfig {
@@ -50,6 +52,8 @@ impl Default for TestConfig {
             memory_mb: 1024,
             timeout: Duration::from_secs(60),
             verbose: std::env::var("E2E_VERBOSE").is_ok(),
+            container_backend: std::env::var("ARCBOX_TEST_BACKEND")
+                .unwrap_or_else(|_| "native-control-plane".to_string()),
         }
     }
 }
@@ -65,6 +69,13 @@ impl TestConfig {
             .parent()
             .unwrap()
             .join("release/arcbox");
+        config
+    }
+
+    /// Creates a configuration for a specific backend.
+    pub fn with_backend(backend: &crate::fixtures::TestBackend) -> Self {
+        let mut config = Self::default();
+        config.container_backend = backend.cli_value().to_string();
         config
     }
 
@@ -182,7 +193,7 @@ impl TestHarness {
             .arg("--initramfs")
             .arg(&self.config.initramfs_path)
             .arg("--container-backend")
-            .arg("native-control-plane")
+            .arg(&self.config.container_backend)
             .env(
                 "RUST_LOG",
                 if self.config.verbose { "debug" } else { "warn" },

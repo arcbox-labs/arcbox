@@ -23,6 +23,6 @@ pub mod harness;
 pub mod vm;
 
 pub use agent::AgentClient;
-pub use fixtures::TestFixtures;
+pub use fixtures::{TestBackend, TestDistro, TestFixtures};
 pub use harness::{TestConfig, TestHarness};
 pub use vm::VmController;

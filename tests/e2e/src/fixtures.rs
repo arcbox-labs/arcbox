@@ -115,6 +115,50 @@ pub mod images {
     pub const BUSYBOX: &str = "quay.io/prometheus/busybox:latest";
     /// Debian slim.
     pub const DEBIAN_SLIM: &str = "debian:bookworm-slim";
+    /// Ubuntu (for matrix testing).
+    pub const UBUNTU: &str = "ubuntu:24.04";
+}
+
+/// Container backend modes for E2E matrix testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestBackend {
+    /// Host control-plane + guest agent.
+    NativeControlPlane,
+    /// Guest VM Docker Engine (dockerd/containerd).
+    GuestDocker,
+}
+
+impl TestBackend {
+    /// Returns the CLI argument value for `--container-backend`.
+    pub fn cli_value(&self) -> &'static str {
+        match self {
+            Self::NativeControlPlane => "native-control-plane",
+            Self::GuestDocker => "guest-docker",
+        }
+    }
+}
+
+/// Container distro for E2E matrix testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestDistro {
+    Alpine,
+    Ubuntu,
+}
+
+impl TestDistro {
+    /// Returns the image reference for this distro.
+    pub fn image(&self) -> &'static str {
+        match self {
+            Self::Alpine => images::ALPINE,
+            Self::Ubuntu => images::UBUNTU,
+        }
+    }
+
+    /// Returns the `echo` command suitable for this distro.
+    pub fn echo_cmd(&self) -> &'static [&'static str] {
+        // Both Alpine and Ubuntu support basic echo.
+        &["echo", "ok"]
+    }
 }
 
 /// Common test commands.
