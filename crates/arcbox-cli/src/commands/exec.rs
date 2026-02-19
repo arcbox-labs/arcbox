@@ -1,9 +1,10 @@
 //! Exec command implementation.
 
 use anyhow::Result;
-use arcbox_cli::client::{self, ExecCreateRequest, ExecCreateResponse};
+use arcbox_cli::client::{self, DaemonClient, ExecCreateRequest, ExecCreateResponse};
 use arcbox_cli::terminal::InteractiveSession;
 use clap::Args;
+use tokio::time::{Duration, sleep};
 
 /// Arguments for the exec command.
 #[derive(Args)]
@@ -65,11 +66,11 @@ pub async fn execute(args: ExecArgs) -> Result<()> {
     let exec_id = create_response.id;
 
     // Start exec instance
-    let start_path = format!("/v1.43/exec/{}/start", exec_id);
     let start_request = ExecStartRequest {
         detach: args.detach,
         tty: args.tty,
     };
+    let start_path = format!("/v1.43/exec/{}/start", exec_id);
 
     if args.detach {
         // Detached mode: just start and return
@@ -84,16 +85,15 @@ pub async fn execute(args: ExecArgs) -> Result<()> {
         let session = InteractiveSession::new(reader, writer, args.tty);
         session.run().await?;
 
-        // Get exec inspect to get exit code
-        let inspect_path = format!("/v1.43/exec/{}/json", exec_id);
-        if let Ok(inspect) = daemon.get::<ExecInspect>(&inspect_path).await {
-            if inspect.exit_code != 0 {
-                std::process::exit(inspect.exit_code);
-            }
+        // Wait for exec completion and preserve exit code.
+        let inspect = wait_exec_exit(&daemon, &exec_id).await?;
+        if inspect.exit_code != 0 {
+            std::process::exit(inspect.exit_code);
         }
     } else {
-        // Non-interactive attached mode: use post_raw which returns the response body
+        // Non-interactive mode uses regular HTTP response body.
         let output = daemon.post_raw(&start_path, Some(&start_request)).await?;
+        let output = decode_exec_output(&output, args.tty);
 
         // Print output
         if !output.is_empty() {
@@ -102,12 +102,10 @@ pub async fn execute(args: ExecArgs) -> Result<()> {
             }
         }
 
-        // Get exec inspect to get exit code
-        let inspect_path = format!("/v1.43/exec/{}/json", exec_id);
-        if let Ok(inspect) = daemon.get::<ExecInspect>(&inspect_path).await {
-            if inspect.exit_code != 0 {
-                std::process::exit(inspect.exit_code);
-            }
+        // Wait for exec completion and preserve exit code.
+        let inspect = wait_exec_exit(&daemon, &exec_id).await?;
+        if inspect.exit_code != 0 {
+            std::process::exit(inspect.exit_code);
         }
     }
 
@@ -131,4 +129,50 @@ struct ExecInspect {
     /// Whether exec is still running (required for deserialization).
     #[allow(dead_code)]
     running: bool,
+}
+
+async fn wait_exec_exit(daemon: &DaemonClient, exec_id: &str) -> Result<ExecInspect> {
+    let inspect_path = format!("/v1.43/exec/{}/json", exec_id);
+    let mut last = daemon.get::<ExecInspect>(&inspect_path).await?;
+    if !last.running {
+        return Ok(last);
+    }
+
+    for _ in 0..50 {
+        sleep(Duration::from_millis(100)).await;
+        last = daemon.get::<ExecInspect>(&inspect_path).await?;
+        if !last.running {
+            return Ok(last);
+        }
+    }
+
+    Ok(last)
+}
+
+fn decode_exec_output(data: &[u8], tty: bool) -> Vec<u8> {
+    if tty || data.is_empty() {
+        return data.to_vec();
+    }
+
+    let mut output = Vec::with_capacity(data.len());
+    let mut offset = 0;
+
+    while offset + 8 <= data.len() {
+        let size = u32::from_be_bytes([
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]) as usize;
+
+        let end = offset + 8 + size;
+        if end > data.len() {
+            break;
+        }
+
+        output.extend_from_slice(&data[offset + 8..end]);
+        offset = end;
+    }
+
+    if offset == 0 { data.to_vec() } else { output }
 }

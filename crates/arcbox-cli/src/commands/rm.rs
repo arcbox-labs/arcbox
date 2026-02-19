@@ -27,6 +27,7 @@ pub struct RmArgs {
 /// Executes the rm command.
 pub async fn execute(args: RmArgs) -> Result<()> {
     let daemon = client::get_client().await?;
+    let mut errors = Vec::new();
 
     for container in &args.containers {
         let path = format!(
@@ -40,8 +41,13 @@ pub async fn execute(args: RmArgs) -> Result<()> {
             }
             Err(e) => {
                 eprintln!("Error removing {}: {}", container, e);
+                errors.push(format!("{}: {}", container, e));
             }
         }
+    }
+
+    if !errors.is_empty() {
+        anyhow::bail!("failed to remove container(s): {}", errors.join("; "));
     }
 
     Ok(())

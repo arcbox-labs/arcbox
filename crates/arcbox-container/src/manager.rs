@@ -663,6 +663,25 @@ impl ContainerManager {
         Ok(())
     }
 
+    /// Force removes a container regardless of state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container is not found.
+    pub fn remove_force(&self, id: &ContainerId) -> Result<()> {
+        let mut containers = self
+            .containers
+            .write()
+            .map_err(|_| ContainerError::Runtime("lock poisoned".to_string()))?;
+
+        if !containers.contains_key(id) {
+            return Err(ContainerError::not_found(id.to_string()));
+        }
+
+        containers.remove(id);
+        Ok(())
+    }
+
     /// Gets container information.
     #[must_use]
     pub fn get(&self, id: &ContainerId) -> Option<Container> {

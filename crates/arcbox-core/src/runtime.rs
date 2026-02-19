@@ -37,6 +37,87 @@ use tokio_stream::wrappers::ReceiverStream;
 const DEFAULT_GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 2);
 const REQUIRED_RUNTIME_ASSETS: [&str; 3] = ["dockerd", "containerd", "youki"];
 
+fn ensure_container_network_files(rootfs: &Path) -> Result<()> {
+    let etc_dir = rootfs.join("etc");
+    std::fs::create_dir_all(&etc_dir).map_err(|e| {
+        CoreError::config(format!(
+            "failed to create container etc directory '{}': {}",
+            etc_dir.display(),
+            e
+        ))
+    })?;
+
+    let resolv_conf = etc_dir.join("resolv.conf");
+    if !resolv_conf.exists() {
+        std::fs::write(&resolv_conf, "nameserver 1.1.1.1\nnameserver 8.8.8.8\n").map_err(|e| {
+            CoreError::config(format!(
+                "failed to write container resolv.conf '{}': {}",
+                resolv_conf.display(),
+                e
+            ))
+        })?;
+    }
+
+    Ok(())
+}
+
+fn ensure_container_working_dir(rootfs: &Path, working_dir: &str) -> Result<()> {
+    if working_dir.is_empty() {
+        return Ok(());
+    }
+
+    let relative = if let Ok(stripped) = Path::new(working_dir).strip_prefix("/") {
+        stripped
+    } else {
+        Path::new(working_dir)
+    };
+    let host_workdir = rootfs.join(relative);
+    if let Ok(meta) = std::fs::symlink_metadata(&host_workdir) {
+        if meta.file_type().is_symlink() {
+            if let Ok(target) = std::fs::read_link(&host_workdir) {
+                let target_path = if target.is_absolute() {
+                    let target_relative = target
+                        .strip_prefix("/")
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or(target.clone());
+                    rootfs.join(target_relative)
+                } else {
+                    host_workdir
+                        .parent()
+                        .unwrap_or(rootfs)
+                        .join(target.as_path())
+                };
+                std::fs::create_dir_all(&target_path).map_err(|e| {
+                    CoreError::config(format!(
+                        "failed to create container symlinked working directory '{}': {}",
+                        target_path.display(),
+                        e
+                    ))
+                })?;
+                return Ok(());
+            }
+        }
+    }
+
+    std::fs::create_dir_all(&host_workdir).map_err(|e| {
+        CoreError::config(format!(
+            "failed to create container working directory '{}': {}",
+            host_workdir.display(),
+            e
+        ))
+    })?;
+
+    Ok(())
+}
+
+fn shell_quote(input: &str) -> String {
+    if input.is_empty() {
+        return "''".to_string();
+    }
+    let escaped = input.replace('\'', "'\"'\"'");
+    format!("'{}'", escaped)
+}
+
 fn validate_bundled_runtime_manifest(manifest: &BootAssetManifest, cache_dir: &Path) -> Result<()> {
     let mut missing = Vec::new();
 
@@ -537,11 +618,24 @@ impl Runtime {
         // Get image config for default entrypoint/cmd
         let image_config = self.image_store.get_image_config(&image_ref)?;
         let image_container_config = &image_config.config;
+        let container_working_dir = config
+            .working_dir
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                image_container_config
+                    .working_dir
+                    .clone()
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| "/".to_string());
 
         // Prepare container rootfs by extracting image layers
         let host_rootfs = self
             .image_store
             .prepare_container_rootfs(&container_id.to_string(), &image_ref)?;
+        ensure_container_network_files(&host_rootfs)?;
+        ensure_container_working_dir(&host_rootfs, &container_working_dir)?;
 
         tracing::info!(
             "Prepared rootfs for container {}: {}",
@@ -602,21 +696,62 @@ impl Runtime {
         } else {
             config.cmd.clone()
         };
+        let mut env = HashMap::new();
+        if let Some(image_env) = &image_container_config.env {
+            for item in image_env {
+                if let Some((key, value)) = item.split_once('=') {
+                    env.insert(key.to_string(), value.to_string());
+                } else {
+                    env.insert(item.clone(), String::new());
+                }
+            }
+        }
+        env.extend(config.env.clone());
+        if !env.contains_key("PATH") {
+            env.insert(
+                "PATH".to_string(),
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+            );
+        }
+
+        let mut request_entrypoint = entrypoint;
+        let mut request_cmd = cmd;
+        let mut request_working_dir = container_working_dir;
+        if request_working_dir != "/" {
+            let mut full_cmd = request_entrypoint.clone();
+            full_cmd.extend(request_cmd.clone());
+            if !full_cmd.is_empty() {
+                let quoted_cmd = full_cmd
+                    .iter()
+                    .map(|part| shell_quote(part))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let quoted_workdir = shell_quote(&request_working_dir);
+                let script = format!(
+                    "mkdir -p {wd} && cd {wd} && exec {cmd}",
+                    wd = quoted_workdir,
+                    cmd = quoted_cmd
+                );
+                request_entrypoint = vec!["/bin/sh".to_string(), "-c".to_string()];
+                request_cmd = vec![script];
+                request_working_dir = "/".to_string();
+            }
+        }
 
         tracing::debug!(
             "Container {} entrypoint={:?}, cmd={:?}",
             container_id,
-            entrypoint,
-            cmd
+            request_entrypoint,
+            request_cmd
         );
 
         let req = CreateContainerRequest {
             name: config.name.clone().unwrap_or_default(),
             image: config.image.clone(),
-            cmd,
-            entrypoint,
-            env: config.env.clone(),
-            working_dir: config.working_dir.clone().unwrap_or_default(),
+            cmd: request_cmd,
+            entrypoint: request_entrypoint,
+            env,
+            working_dir: request_working_dir,
             user: config.user.clone().unwrap_or_default(),
             mounts,
             tty: config.tty.unwrap_or(false),
@@ -988,7 +1123,11 @@ impl Runtime {
         self.stop_port_forwarding(container_id).await;
 
         // Update local state
-        self.container_manager.remove(container_id)?;
+        if force {
+            self.container_manager.remove_force(container_id)?;
+        } else {
+            self.container_manager.remove(container_id)?;
+        }
 
         tracing::info!(
             "Removed container {} from machine '{}'",

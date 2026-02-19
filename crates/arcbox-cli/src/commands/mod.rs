@@ -12,14 +12,18 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 pub mod boot;
+pub mod create;
 pub mod daemon;
+pub mod dns;
 pub mod docker;
 pub mod exec;
+pub mod image;
 pub mod images;
 pub mod logs;
 pub mod machine;
 pub mod ps;
 pub mod pull;
+pub mod restart;
 pub mod rm;
 pub mod run;
 pub mod start;
@@ -69,11 +73,17 @@ pub enum Commands {
     /// Run a command in a new container
     Run(run::RunArgs),
 
+    /// Create a new container
+    Create(create::CreateArgs),
+
     /// Start one or more stopped containers
     Start(start::StartArgs),
 
     /// Stop one or more running containers
     Stop(stop::StopArgs),
+
+    /// Restart one or more containers
+    Restart(restart::RestartArgs),
 
     /// List containers
     Ps(ps::PsArgs),
@@ -89,6 +99,10 @@ pub enum Commands {
 
     /// List images
     Images(images::ImagesArgs),
+
+    /// Manage images
+    #[command(subcommand)]
+    Image(image::ImageCommands),
 
     /// Pull an image from a registry
     Pull(pull::PullArgs),
@@ -107,6 +121,10 @@ pub enum Commands {
     /// Manage boot assets (kernel/initramfs)
     #[command(subcommand)]
     Boot(boot::BootCommands),
+
+    /// Manage DNS resolver for *.arcbox.local
+    #[command(subcommand)]
+    Dns(dns::DnsCommands),
 
     /// Start the ArcBox daemon
     Daemon(daemon::DaemonArgs),

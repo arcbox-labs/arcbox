@@ -97,7 +97,11 @@ async fn test_workflow_file_operations() {
         ])
         .expect("failed to run");
 
-    assert!(output.status.success(), "Should succeed");
+    assert!(
+        output.status.success(),
+        "Should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -139,7 +143,11 @@ async fn test_workflow_process_isolation() {
         ])
         .expect("failed to run");
 
-    assert!(output.status.success(), "Should succeed");
+    assert!(
+        output.status.success(),
+        "Should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     // In isolated namespace, there should be very few processes
@@ -261,7 +269,11 @@ async fn test_workflow_environment_variables() {
         ])
         .expect("failed to run");
 
-    assert!(output.status.success(), "Should succeed");
+    assert!(
+        output.status.success(),
+        "Should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("FOO=bar"), "Should have FOO: {}", stdout);
@@ -303,7 +315,11 @@ async fn test_workflow_working_directory() {
         ])
         .expect("failed to run");
 
-    assert!(output.status.success(), "Should succeed");
+    assert!(
+        output.status.success(),
+        "Should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(

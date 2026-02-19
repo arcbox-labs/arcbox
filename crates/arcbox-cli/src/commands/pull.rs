@@ -21,6 +21,10 @@ pub struct PullArgs {
     /// Suppress progress output
     #[arg(short, long)]
     pub quiet: bool,
+
+    /// Show progress output (docker-compatible flag; currently informational)
+    #[arg(long)]
+    pub progress: bool,
 }
 
 /// Executes the pull command.

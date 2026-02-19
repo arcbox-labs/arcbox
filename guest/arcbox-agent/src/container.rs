@@ -361,10 +361,13 @@ impl ContainerRuntime {
 
         // Spawn the process
         tracing::info!("Spawning process: {:?}", command);
-        let mut child = cmd.spawn().with_context(|| {
-            format!(
-                "failed to spawn container process (cmd={:?}, rootfs={:?}, workdir={})",
-                command, rootfs, working_dir
+        let mut child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!(
+                "failed to spawn container process (cmd={:?}, rootfs={:?}, workdir={}): {}",
+                command,
+                rootfs,
+                working_dir,
+                e
             )
         })?;
         let pid = child.id();
@@ -1302,8 +1305,16 @@ pub(crate) unsafe fn setup_container_rootfs(
     // Chroot into the rootfs
     // SAFETY: chroot is a valid syscall with a proper C string
     if unsafe { libc::chroot(rootfs_c.as_ptr()) } < 0 {
-        return Err(std::io::Error::last_os_error());
+        let err = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(
+            err.kind(),
+            format!("chroot({}) failed: {}", rootfs, err),
+        ));
     }
+
+    // Docker creates working directories on-demand for `-w/--workdir`.
+    // Ensure it exists inside the chroot before attempting chdir.
+    let _ = std::fs::create_dir_all(working_dir);
 
     // Change to the specified working directory
     let workdir_c = CString::new(working_dir).map_err(|_| {
@@ -1311,7 +1322,11 @@ pub(crate) unsafe fn setup_container_rootfs(
     })?;
     // SAFETY: chdir is a valid syscall with a proper C string
     if unsafe { libc::chdir(workdir_c.as_ptr()) } < 0 {
-        return Err(std::io::Error::last_os_error());
+        let err = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(
+            err.kind(),
+            format!("chdir({}) failed: {}", working_dir, err),
+        ));
     }
 
     Ok(())
@@ -1524,9 +1539,17 @@ pub(crate) unsafe fn setup_container_rootfs(
     // SAFETY: rootfs_c is a valid CString
     unsafe {
         if libc::chroot(rootfs_c.as_ptr()) < 0 {
-            return Err(std::io::Error::last_os_error());
+            let err = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(
+                err.kind(),
+                format!("chroot({}) failed: {}", _rootfs, err),
+            ));
         }
     }
+
+    // Docker creates working directories on-demand for `-w/--workdir`.
+    // Ensure it exists inside the chroot before attempting chdir.
+    let _ = std::fs::create_dir_all(working_dir);
 
     // Change to the specified working directory
     let workdir_c = CString::new(working_dir).map_err(|_| {
@@ -1535,7 +1558,11 @@ pub(crate) unsafe fn setup_container_rootfs(
     // SAFETY: workdir_c is a valid CString
     unsafe {
         if libc::chdir(workdir_c.as_ptr()) < 0 {
-            return Err(std::io::Error::last_os_error());
+            let err = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(
+                err.kind(),
+                format!("chdir({}) failed: {}", working_dir, err),
+            ));
         }
     }
 

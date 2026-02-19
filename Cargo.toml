@@ -140,6 +140,9 @@ nix = { version = "0.29", features = ["fs", "process", "socket", "ioctl", "mman"
 # libc
 libc = "0.2"
 
+# External crates
+macos-resolver = { path = "../external-crates/macos-resolver" }
+
 # Internal crates (Core layer)
 arcbox-error = { version = "0.0.1-alpha.1", path = "crates/arcbox-error" }
 arcbox-vz = { version = "0.0.1-alpha.1", path = "crates/arcbox-vz" }

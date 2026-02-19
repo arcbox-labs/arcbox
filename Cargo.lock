@@ -185,6 +185,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "macos-resolver",
  "predicates",
  "serde",
  "serde_json",
@@ -1821,6 +1822,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08ab2867e3eeeca90e844d1940eab391c9dc5228783db2ed999acbc0a9ed375a"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "macos-resolver"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

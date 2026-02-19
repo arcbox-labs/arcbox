@@ -188,7 +188,7 @@ impl DaemonClient {
 
         // Spawn connection handler
         tokio::spawn(async move {
-            if let Err(e) = conn.await {
+            if let Err(e) = conn.with_upgrades().await {
                 tracing::debug!("Upgrade connection closed: {}", e);
             }
         });
@@ -234,25 +234,52 @@ impl DaemonClient {
                 .context("failed to read response")?
                 .to_bytes();
             let error_msg = String::from_utf8_lossy(&body);
-            anyhow::bail!("daemon returned error {}: {}", status, error_msg);
+            anyhow::bail!(
+                "daemon returned error {} ({}): {}",
+                status,
+                status_reason_lower(status),
+                error_msg
+            );
         }
 
-        // Create a duplex stream for bidirectional communication.
-        // We use a pair of channels to bridge between the HTTP body and our stream.
-        let (client_duplex, server_duplex) = tokio::io::duplex(4096);
+        if status == hyper::StatusCode::SWITCHING_PROTOCOLS {
+            // 101 upgrade path: bridge client duplex <-> upgraded raw socket.
+            let upgraded = hyper::upgrade::on(response)
+                .await
+                .context("failed to upgrade connection")?;
+            let io = TokioIo::new(upgraded);
 
-        // Spawn a task to forward data from HTTP response body to client
+            let (client_duplex, bridge_duplex) = tokio::io::duplex(64 * 1024);
+            let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge_duplex);
+            let (mut io_read, mut io_write) = tokio::io::split(io);
+
+            tokio::spawn(async move {
+                use tokio::io::{AsyncWriteExt, copy};
+                let _ = copy(&mut bridge_read, &mut io_write).await;
+                let _ = io_write.shutdown().await;
+            });
+
+            tokio::spawn(async move {
+                use tokio::io::{AsyncWriteExt, copy};
+                let _ = copy(&mut io_read, &mut bridge_write).await;
+                let _ = bridge_write.shutdown().await;
+            });
+
+            return Ok(client_duplex);
+        }
+
+        // 200 non-upgrade path: forward response body to duplex read side.
+        let (client_duplex, bridge_duplex) = tokio::io::duplex(4096);
         let mut body = response.into_body();
-        let (mut server_read, mut server_write) = tokio::io::split(server_duplex);
+        let (_bridge_read, mut bridge_write) = tokio::io::split(bridge_duplex);
 
-        // Forward response body to client read side
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             while let Some(frame) = body.frame().await {
                 match frame {
                     Ok(f) => {
                         if let Some(data) = f.data_ref() {
-                            if server_write.write_all(data).await.is_err() {
+                            if bridge_write.write_all(data).await.is_err() {
                                 break;
                             }
                         }
@@ -260,6 +287,7 @@ impl DaemonClient {
                     Err(_) => break,
                 }
             }
+            let _ = bridge_write.shutdown().await;
         });
 
         Ok(client_duplex)
@@ -332,7 +360,11 @@ impl DaemonClient {
 
         let status = response.status();
         if !status.is_success() {
-            anyhow::bail!("daemon returned error {}", status);
+            anyhow::bail!(
+                "daemon returned error {} ({})",
+                status,
+                status_reason_lower(status)
+            );
         }
 
         // Stream response body with cancellation support
@@ -482,7 +514,12 @@ impl DaemonClient {
         // Check status
         if !status.is_success() {
             let error_msg = String::from_utf8_lossy(&body);
-            anyhow::bail!("daemon returned error {}: {}", status, error_msg);
+            anyhow::bail!(
+                "daemon returned error {} ({}): {}",
+                status,
+                status_reason_lower(status),
+                error_msg
+            );
         }
 
         Ok(body)
@@ -679,6 +716,13 @@ pub fn relative_time(timestamp: i64) -> String {
     } else {
         format!("{} days ago", diff / 86400)
     }
+}
+
+fn status_reason_lower(status: hyper::StatusCode) -> String {
+    status
+        .canonical_reason()
+        .unwrap_or("unknown")
+        .to_ascii_lowercase()
 }
 
 /// Extracts a single log frame from a buffer.

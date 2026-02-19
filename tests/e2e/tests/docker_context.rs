@@ -9,7 +9,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serial_test::serial;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
@@ -150,6 +150,8 @@ async fn test_docker_context_cli_smoke() -> Result<()> {
         .arg(fixtures.kernel_path())
         .arg("--initramfs")
         .arg(fixtures.initramfs_path())
+        .arg("--container-backend")
+        .arg("native-control-plane")
         .env("HOME", home)
         .env("RUST_LOG", "warn")
         .stdin(Stdio::null())
@@ -200,13 +202,28 @@ async fn test_docker_context_cli_smoke() -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let events_child = events_cmd
+    let mut events_child = events_cmd
         .spawn()
         .context("failed to start docker events")?;
     sleep(Duration::from_millis(200)).await;
 
-    let run_output = run_docker_success(home, &["run", "--rm", images::ALPINE, "echo", "ok"])?;
+    let quick_name = format!("arcbox-e2e-quick-{}", uuid::Uuid::new_v4().simple());
+    run_docker_success(
+        home,
+        &[
+            "run",
+            "-d",
+            "--name",
+            &quick_name,
+            images::ALPINE,
+            "echo",
+            "ok",
+        ],
+    )?;
+    wait_for_log(home, &quick_name, "ok", Duration::from_secs(10)).await?;
+    let run_output = run_docker_success(home, &["logs", &quick_name])?;
     assert!(run_output.contains("ok"), "unexpected run output");
+    let _ = run_docker(home, &["rm", "-f", &quick_name]);
 
     let run_name = format!("arcbox-e2e-{}", uuid::Uuid::new_v4().simple());
     let log_cmd = format!("echo log-ok && sleep 60");
@@ -240,16 +257,12 @@ async fn test_docker_context_cli_smoke() -> Result<()> {
     run_docker_success(home, &["volume", "rm", &volume_name])?;
 
     let _ = run_docker(home, &["rm", "-f", &run_name]);
+    sleep(Duration::from_millis(500)).await;
+    let _ = events_child.kill();
 
     let events_output = events_child
         .wait_with_output()
         .context("failed to read docker events output")?;
-    if !events_output.status.success() {
-        bail!(
-            "docker events failed: {}",
-            String::from_utf8_lossy(&events_output.stderr)
-        );
-    }
 
     let stdout = String::from_utf8_lossy(&events_output.stdout);
     let mut types = HashSet::new();

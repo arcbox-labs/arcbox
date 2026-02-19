@@ -181,6 +181,8 @@ impl TestHarness {
             .arg(&self.config.kernel_path)
             .arg("--initramfs")
             .arg(&self.config.initramfs_path)
+            .arg("--container-backend")
+            .arg("native-control-plane")
             .env(
                 "RUST_LOG",
                 if self.config.verbose { "debug" } else { "warn" },
@@ -352,10 +354,8 @@ impl TestHarness {
 
     /// Runs an arcbox command and returns its output.
     pub fn run_command(&self, args: &[&str]) -> Result<std::process::Output> {
-        let mut cmd = Command::new(&self.config.arcbox_binary);
-        cmd.arg("--socket").arg(self.socket_path()).args(args);
-
-        cmd.output().context("failed to run command")
+        let normalized = self.normalize_legacy_args(args);
+        self.exec_arcbox_args(&normalized)
     }
 
     /// Runs an arcbox command and asserts it succeeds.
@@ -382,6 +382,29 @@ impl TestHarness {
         // VM is auto-started by daemon when first container operation is performed.
         // We can optionally wait for it to be ready here by doing a simple operation.
         Ok(())
+    }
+
+    fn normalize_legacy_args(&self, args: &[&str]) -> Vec<String> {
+        let mut normalized = Vec::with_capacity(args.len());
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "--machine" {
+                i += 1;
+                if i < args.len() {
+                    i += 1;
+                }
+                continue;
+            }
+            normalized.push(args[i].to_string());
+            i += 1;
+        }
+        normalized
+    }
+
+    fn exec_arcbox_args(&self, args: &[String]) -> Result<std::process::Output> {
+        let mut cmd = Command::new(&self.config.arcbox_binary);
+        cmd.arg("--socket").arg(self.socket_path()).args(args);
+        cmd.output().context("failed to run command")
     }
 }
 

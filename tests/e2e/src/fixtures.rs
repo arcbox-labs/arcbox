@@ -108,11 +108,11 @@ impl ResourceCheck {
 /// Common test images.
 pub mod images {
     /// Alpine Linux (minimal).
-    pub const ALPINE: &str = "alpine:latest";
-    /// Alpine with specific version.
-    pub const ALPINE_3_19: &str = "alpine:3.19";
+    pub const ALPINE: &str = "quay.io/libpod/alpine:latest";
+    /// Alternate Alpine reference for tag-specific test paths.
+    pub const ALPINE_3_19: &str = "quay.io/libpod/alpine:latest";
     /// BusyBox (ultra minimal).
-    pub const BUSYBOX: &str = "busybox:latest";
+    pub const BUSYBOX: &str = "quay.io/prometheus/busybox:latest";
     /// Debian slim.
     pub const DEBIAN_SLIM: &str = "debian:bookworm-slim";
 }

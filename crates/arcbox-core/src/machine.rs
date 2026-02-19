@@ -692,7 +692,8 @@ impl MachineManager {
 
         // Stop underlying VM
         #[cfg(target_os = "macos")]
-        self.vm_manager.force_stop_without_hypervisor(&machine.vm_id)?;
+        self.vm_manager
+            .force_stop_without_hypervisor(&machine.vm_id)?;
         #[cfg(not(target_os = "macos"))]
         self.vm_manager.stop(&machine.vm_id)?;
 

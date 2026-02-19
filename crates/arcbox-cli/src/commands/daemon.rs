@@ -194,6 +194,9 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
         }
     }
 
+    // Check DNS resolver status.
+    super::dns::check_resolver_installed();
+
     // Print startup info.
     println!("ArcBox daemon started");
     println!("  Docker API: {}", socket_path.display());

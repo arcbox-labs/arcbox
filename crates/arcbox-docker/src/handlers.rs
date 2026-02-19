@@ -126,6 +126,17 @@ fn docker_state_string(state: arcbox_container::state::ContainerState) -> String
     }
 }
 
+fn resolve_container(
+    state: &AppState,
+    id_or_name: &str,
+) -> Result<arcbox_container::state::Container> {
+    state
+        .runtime
+        .container_manager()
+        .resolve(id_or_name)
+        .ok_or_else(|| DockerError::ContainerNotFound(id_or_name.to_string()))
+}
+
 /// Create container query parameters.
 #[derive(Debug, Deserialize)]
 pub struct CreateContainerQuery {
@@ -461,14 +472,9 @@ pub async fn start_container(
         .await
         .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {}", e)))?;
 
-    let container_id = arcbox_container::state::ContainerId::from_string(&id);
-
     // Get container to find its machine, or use default.
-    let container = state
-        .runtime
-        .container_manager()
-        .get(&container_id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+    let container = resolve_container(&state, &id)?;
+    let container_id = container.id.clone();
 
     let machine_name = container
         .machine_name
@@ -514,15 +520,11 @@ pub async fn stop_container(
     Path(id): Path<String>,
     Query(params): Query<StopContainerQuery>,
 ) -> Result<StatusCode> {
-    let container_id = arcbox_container::state::ContainerId::from_string(&id);
     let timeout = params.t.unwrap_or(10); // Default 10 seconds timeout
 
     // Get container to find its machine.
-    let container = state
-        .runtime
-        .container_manager()
-        .get(&container_id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+    let container = resolve_container(&state, &id)?;
+    let container_id = container.id.clone();
 
     let machine_name = container
         .machine_name
@@ -588,14 +590,9 @@ pub async fn kill_container(
         .get("signal")
         .cloned()
         .unwrap_or_else(|| "SIGKILL".to_string());
-    let container_id = arcbox_container::state::ContainerId::from_string(&id);
-
     // Get container to find its machine.
-    let container = state
-        .runtime
-        .container_manager()
-        .get(&container_id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+    let container = resolve_container(&state, &id)?;
+    let container_id = container.id.clone();
 
     let machine_name = container
         .machine_name
@@ -672,15 +669,11 @@ pub async fn restart_container(
         .await
         .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {}", e)))?;
 
-    let container_id = arcbox_container::state::ContainerId::from_string(&id);
     let timeout = params.t.unwrap_or(10);
 
     // Get container to find its machine.
-    let container = state
-        .runtime
-        .container_manager()
-        .get(&container_id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+    let container = resolve_container(&state, &id)?;
+    let container_id = container.id.clone();
 
     let machine_name = container
         .machine_name
@@ -771,14 +764,9 @@ pub async fn remove_container(
     Path(id): Path<String>,
     Query(params): Query<RemoveContainerQuery>,
 ) -> Result<StatusCode> {
-    let container_id = arcbox_container::state::ContainerId::from_string(&id);
-
     // Get container to find its machine.
-    let container = state
-        .runtime
-        .container_manager()
-        .get(&container_id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+    let container = resolve_container(&state, &id)?;
+    let container_id = container.id.clone();
 
     let machine_name = container
         .machine_name
@@ -823,33 +811,68 @@ pub async fn remove_container(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Wait for container query parameters.
+#[derive(Debug, Deserialize)]
+pub struct WaitContainerQuery {
+    /// Wait condition.
+    pub condition: Option<String>,
+}
+
 /// Wait for container.
 ///
 /// Blocks until the container exits and returns the exit code.
 pub async fn wait_container(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(_params): Query<HashMap<String, String>>,
+    Query(params): Query<WaitContainerQuery>,
 ) -> Result<Json<WaitResponse>> {
-    let container_id = arcbox_container::state::ContainerId::from_string(&id);
-
     // Check if container exists and get its machine name.
-    let container = state
-        .runtime
-        .container_manager()
-        .get(&container_id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+    let container = resolve_container(&state, &id)?;
+    let container_id = container.id.clone();
+    let container_id_string = container_id.to_string();
 
     let machine_name = container
         .machine_name
         .clone()
         .ok_or_else(|| DockerError::Server("container has no machine assigned".to_string()))?;
 
-    let should_emit_die = matches!(
-        container.state,
-        arcbox_container::state::ContainerState::Running
-            | arcbox_container::state::ContainerState::Starting
+    let condition = params.condition.as_deref().unwrap_or("not-running");
+    tracing::debug!(
+        "wait_container: id={}, condition={}, state={:?}",
+        container_id_string,
+        condition,
+        container.state
     );
+    if condition == "removed" {
+        return Err(DockerError::NotImplemented(
+            "wait condition=removed is not supported".to_string(),
+        ));
+    }
+    let should_wait = match condition {
+        // Docker CLI `run -d` can issue `wait(next-exit)` before `start`.
+        // For created/starting containers we must return immediately to avoid deadlock.
+        "next-exit" => matches!(
+            container.state,
+            arcbox_container::state::ContainerState::Running
+                | arcbox_container::state::ContainerState::Restarting
+                | arcbox_container::state::ContainerState::Paused
+        ),
+        // Default behavior: wait while container is active.
+        _ => matches!(
+            container.state,
+            arcbox_container::state::ContainerState::Running
+                | arcbox_container::state::ContainerState::Starting
+                | arcbox_container::state::ContainerState::Restarting
+                | arcbox_container::state::ContainerState::Paused
+        ),
+    };
+    if !should_wait {
+        return Ok(Json(WaitResponse {
+            status_code: i64::from(container.exit_code.unwrap_or(0)),
+            error: None,
+        }));
+    }
+    let should_emit_die = true;
 
     // Connect to agent and wait for container to exit.
     #[cfg(target_os = "macos")]
@@ -860,7 +883,7 @@ pub async fn wait_container(
             .connect_agent(&machine_name)
             .map_err(|e| DockerError::Server(format!("failed to connect to agent: {}", e)))?;
         agent
-            .wait_container(&id)
+            .wait_container(&container_id_string)
             .await
             .map_err(|e| DockerError::Server(format!("wait failed: {}", e)))?
     };
@@ -875,7 +898,7 @@ pub async fn wait_container(
         let agent = state.runtime.agent_pool().get(cid).await;
         let mut agent = agent.write().await;
         agent
-            .wait_container(&id)
+            .wait_container(&container_id_string)
             .await
             .map_err(|e| DockerError::Server(format!("wait failed: {}", e)))?
     };
@@ -991,6 +1014,17 @@ fn encode_docker_stream(stream_type: u8, data: &[u8]) -> Vec<u8> {
     output.extend_from_slice(&(data.len() as u32).to_be_bytes());
     output.extend_from_slice(data);
     output
+}
+
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\"'\"'"))
+}
+
+fn shell_join(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Get container logs.
@@ -2176,14 +2210,10 @@ pub async fn attach_container(
     );
     tracing::debug!("attach_container: http version={:?}", req.version());
 
-    let container_id = arcbox_container::state::ContainerId::from_string(&id);
-
     // Check if container exists.
-    let container = state
-        .runtime
-        .container_manager()
-        .get(&container_id)
-        .ok_or_else(|| DockerError::ContainerNotFound(id.clone()))?;
+    let container = resolve_container(&state, &id)?;
+    let container_id = container.id.clone();
+    let container_id_string = container_id.to_string();
 
     let machine_name = container
         .machine_name
@@ -2231,7 +2261,7 @@ pub async fn attach_container(
             .runtime
             .container_logs(
                 &machine_name,
-                &id,
+                &container_id_string,
                 false, // follow
                 params.stdout,
                 params.stderr,
@@ -2283,7 +2313,7 @@ pub async fn attach_container(
 
     let state = state.clone();
     let container_id = container_id.clone();
-    let id = id.clone();
+    let container_id_string = container_id_string.clone();
     let machine_name = machine_name.clone();
     let attach_stdout = params.stdout;
     let attach_stderr = params.stderr;
@@ -2328,7 +2358,7 @@ pub async fn attach_container(
                     .runtime
                     .container_attach(
                         &machine_name,
-                        &id,
+                        &container_id_string,
                         None,
                         attach_stdin,
                         attach_stdout,
@@ -2473,15 +2503,7 @@ pub async fn exec_create(
     use arcbox_container::{ContainerId, ExecConfig};
 
     // Verify container exists.
-    let container_id = ContainerId::from_string(&id);
-    if state
-        .runtime
-        .container_manager()
-        .get(&container_id)
-        .is_none()
-    {
-        return Err(DockerError::ContainerNotFound(id));
-    }
+    let container_id = resolve_container(&state, &id)?.id;
 
     // Build exec config.
     let config = ExecConfig {
@@ -2537,6 +2559,8 @@ pub async fn exec_start(
         connection_hdr
     );
     tracing::debug!("exec_start: http version={:?}", req.version());
+    let wants_upgrade =
+        !upgrade_hdr.is_empty() || connection_hdr.to_ascii_lowercase().contains("upgrade");
 
     // Parse body manually to keep request for upgrade.
     let body_bytes = to_bytes(std::mem::take(req.body_mut()), 1024 * 1024)
@@ -2583,6 +2607,13 @@ pub async fn exec_start(
         })
         .unwrap_or((80, 24));
 
+    if container.state != arcbox_container::state::ContainerState::Running {
+        return Err(DockerError::BadRequest(format!(
+            "container is not running: {}",
+            exec.config.container_id
+        )));
+    }
+
     // Ensure VM is ready before executing.
     state
         .runtime
@@ -2604,6 +2635,72 @@ pub async fn exec_start(
             }
         })
         .collect();
+
+    // Non-upgrade exec path (CLI non-interactive mode): run synchronously and
+    // return output in body, then store exit code for /exec/{id}/json.
+    if !detach && !wants_upgrade {
+        let mut cmd = exec.config.cmd.clone();
+        if let Some(first) = cmd.first_mut() {
+            if !first.contains('/') {
+                *first = format!("/bin/{}", first);
+            }
+        }
+
+        let run_exec = |cmd: Vec<String>| async {
+            state
+                .runtime
+                .exec_container(
+                    &machine_name,
+                    &exec.config.container_id.to_string(),
+                    cmd,
+                    env.clone(),
+                    exec.config.working_dir.clone().unwrap_or_default(),
+                    exec.config.user.clone().unwrap_or_default(),
+                    tty,
+                )
+                .await
+        };
+
+        let output = match run_exec(cmd).await {
+            Ok(output) => output,
+            Err(e) => {
+                let err = e.to_string();
+                if err.contains("No such file or directory") && !exec.config.cmd.is_empty() {
+                    // Fallback for minimal images where /bin/<cmd> symlinks are missing.
+                    let shell_cmd = vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        shell_join(&exec.config.cmd),
+                    ];
+                    run_exec(shell_cmd).await.map_err(|inner| {
+                        DockerError::Server(format!("failed to execute command: {}", inner))
+                    })?
+                } else {
+                    return Err(DockerError::Server(format!(
+                        "failed to execute command: {}",
+                        err
+                    )));
+                }
+            }
+        };
+
+        state
+            .runtime
+            .exec_manager()
+            .notify_exit(&exec_id, output.exit_code);
+
+        let body = if tty {
+            output.data
+        } else {
+            let stream_type: u8 = if output.stream == "stderr" { 2 } else { 1 };
+            encode_docker_stream(stream_type, &output.data)
+        };
+
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(body))
+            .unwrap());
+    }
 
     // Start exec process in guest (streaming ready).
     state

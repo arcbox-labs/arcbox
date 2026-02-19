@@ -1,6 +1,7 @@
 //! Images command implementation.
 
 use anyhow::Result;
+use arcbox_cli::client::{DaemonClient, ImageSummary};
 use arcbox_image::{ImageRef, ImageStore};
 use clap::Args;
 
@@ -46,6 +47,76 @@ pub struct RmiArgs {
 
 /// Executes the images command.
 pub async fn execute(args: ImagesArgs) -> Result<()> {
+    let daemon = DaemonClient::new();
+    if daemon.is_running().await {
+        return execute_via_daemon(&daemon, &args).await;
+    }
+
+    execute_direct(&args)
+}
+
+async fn execute_via_daemon(daemon: &DaemonClient, args: &ImagesArgs) -> Result<()> {
+    let path = if args.all {
+        "/v1.43/images/json?all=true"
+    } else {
+        "/v1.43/images/json"
+    };
+
+    let images: Vec<ImageSummary> = daemon.get(path).await?;
+
+    if args.quiet {
+        for image in &images {
+            let id = if args.no_trunc {
+                image.id.clone()
+            } else {
+                short_id(&image.id)
+            };
+            println!("{id}");
+        }
+        return Ok(());
+    }
+
+    if args.digests {
+        println!(
+            "{:<30} {:<15} {:<71} {:<15} {:<10}",
+            "REPOSITORY", "TAG", "DIGEST", "CREATED", "SIZE"
+        );
+    } else {
+        println!(
+            "{:<30} {:<15} {:<15} {:<15} {:<10}",
+            "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"
+        );
+    }
+
+    for image in &images {
+        let (repo, tag) = parse_repo_tag(
+            image
+                .repo_tags
+                .first()
+                .map(std::string::String::as_str)
+                .unwrap_or("<none>:<none>"),
+        );
+
+        let id_or_digest = if args.digests || args.no_trunc {
+            image.id.clone()
+        } else {
+            short_id(&image.id)
+        };
+
+        let created = format_duration_ago_ts(image.created);
+        let size = format_size(image.size.max(0) as u64);
+
+        if args.digests {
+            println!("{repo:<30} {tag:<15} {id_or_digest:<71} {created:<15} {size:<10}");
+        } else {
+            println!("{repo:<30} {tag:<15} {id_or_digest:<15} {created:<15} {size:<10}");
+        }
+    }
+
+    Ok(())
+}
+
+fn execute_direct(args: &ImagesArgs) -> Result<()> {
     let store = ImageStore::open_default()?;
     let images = store.list();
 
@@ -109,6 +180,44 @@ pub async fn execute(args: ImagesArgs) -> Result<()> {
 
 /// Executes the rmi command.
 pub async fn execute_rmi(args: RmiArgs) -> Result<()> {
+    let daemon = DaemonClient::new();
+    if daemon.is_running().await {
+        return execute_rmi_via_daemon(&daemon, &args).await;
+    }
+
+    execute_rmi_direct(&args)
+}
+
+async fn execute_rmi_via_daemon(daemon: &DaemonClient, args: &RmiArgs) -> Result<()> {
+    let mut errors = Vec::new();
+
+    for image_name in &args.images {
+        let encoded = url_encode_image_ref(image_name);
+        let path = format!(
+            "/v1.43/images/{}?force={}&noprune={}",
+            encoded, args.force, args.no_prune
+        );
+
+        match daemon.delete(&path).await {
+            Ok(()) => println!("Untagged: {}", image_name),
+            Err(e) => {
+                if args.force {
+                    tracing::warn!("Error removing {}: {}", image_name, e);
+                } else {
+                    errors.push(format!("{}: {}", image_name, e));
+                }
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        anyhow::bail!("failed to remove image(s): {}", errors.join("; "));
+    }
+
+    Ok(())
+}
+
+fn execute_rmi_direct(args: &RmiArgs) -> Result<()> {
     let store = ImageStore::open_default()?;
 
     for image_name in &args.images {
@@ -138,6 +247,13 @@ fn short_id(digest: &str) -> String {
     s[..12.min(s.len())].to_string()
 }
 
+fn parse_repo_tag(repo_tag: &str) -> (String, String) {
+    if let Some((repo, tag)) = repo_tag.rsplit_once(':') {
+        return (repo.to_string(), tag.to_string());
+    }
+    (repo_tag.to_string(), "<none>".to_string())
+}
+
 /// Formats a timestamp as a human-readable duration (e.g., "2 hours ago").
 fn format_duration_ago(time: chrono::DateTime<chrono::Utc>) -> String {
     let now = chrono::Utc::now();
@@ -163,6 +279,14 @@ fn format_duration_ago(time: chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
+fn format_duration_ago_ts(timestamp: i64) -> String {
+    if let Some(time) = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0) {
+        format_duration_ago(time)
+    } else {
+        "unknown".to_string()
+    }
+}
+
 /// Formats a size in bytes as a human-readable string.
 fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
@@ -178,4 +302,11 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{}B", bytes)
     }
+}
+
+fn url_encode_image_ref(image: &str) -> String {
+    image
+        .replace('%', "%25")
+        .replace('/', "%2F")
+        .replace(':', "%3A")
 }
