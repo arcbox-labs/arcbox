@@ -51,6 +51,7 @@ pub mod event;
 pub mod machine;
 pub mod persistence;
 pub mod runtime;
+pub mod trace;
 pub mod vm;
 pub mod vm_lifecycle;
 

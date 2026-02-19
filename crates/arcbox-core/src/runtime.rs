@@ -374,6 +374,85 @@ impl Runtime {
         &self.container_backend
     }
 
+    /// Returns true when the active backend delegates to guest Docker.
+    #[must_use]
+    pub fn is_guest_docker(&self) -> bool {
+        self.container_backend.mode() == crate::config::ContainerBackendMode::GuestDocker
+    }
+
+    /// Returns the configured guest Docker vsock port.
+    #[must_use]
+    pub fn guest_docker_vsock_port(&self) -> u32 {
+        self.config.container.guest_docker_vsock_port
+    }
+
+    /// Sends an HTTP GET request to the guest Docker daemon via vsock and
+    /// returns the raw response body bytes.
+    ///
+    /// This is used by Docker API handlers to proxy read-only queries
+    /// (list, inspect) directly to the guest Docker, making it the single
+    /// source of truth for container runtime state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the VM is not running or the request fails.
+    /// Returns `(http_status_code, body)` so callers can propagate the
+    /// upstream status faithfully (e.g. 404 for missing containers).
+    pub async fn guest_docker_get(&self, path: &str) -> Result<(u16, bytes::Bytes)> {
+        use std::os::fd::FromRawFd;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let port = self.config.container.guest_docker_vsock_port;
+        let fd = self
+            .machine_manager
+            .connect_vsock_port(DEFAULT_MACHINE_NAME, port)?;
+
+        // Wrap the raw fd into an async TcpStream-like handle.
+        // SAFETY: fd is a valid, newly-opened vsock file descriptor.
+        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        std_stream.set_nonblocking(true).map_err(|e| {
+            CoreError::Machine(format!("failed to set vsock fd non-blocking: {}", e))
+        })?;
+        let stream = tokio::net::TcpStream::from_std(std_stream)
+            .map_err(|e| CoreError::Machine(format!("failed to wrap vsock fd: {}", e)))?;
+
+        let (mut reader, mut writer) = tokio::io::split(stream);
+
+        // Send a minimal HTTP/1.1 GET request.
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            path
+        );
+        writer
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|e| CoreError::Machine(format!("failed to write to guest docker: {}", e)))?;
+
+        // Read the full response.
+        let mut buf = Vec::with_capacity(8192);
+        reader
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| CoreError::Machine(format!("failed to read from guest docker: {}", e)))?;
+
+        // Parse HTTP status code from the status line ("HTTP/1.1 200 OK\r\n").
+        let status_line_end = buf.windows(2).position(|w| w == b"\r\n").unwrap_or(0);
+        let status_code = std::str::from_utf8(&buf[..status_line_end])
+            .ok()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(502);
+
+        // Split headers from body at the first \r\n\r\n boundary.
+        let body_start = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|pos| pos + 4)
+            .unwrap_or(0);
+
+        Ok((status_code, bytes::Bytes::from(buf[body_start..].to_vec())))
+    }
+
     /// Ensures the default VM is running and ready for container operations.
     ///
     /// This is the main entry point for automatic VM lifecycle management.
@@ -1091,6 +1170,12 @@ impl Runtime {
 
     /// Removes a container from a machine.
     ///
+    /// When `force` is true and the container is running, the container is
+    /// killed via the agent before removal. This ensures:
+    /// - The guest-side process is terminated cleanly.
+    /// - Host-side state transitions to Exited so waiters are unblocked.
+    /// - Port forwarding and rootfs are cleaned up.
+    ///
     /// # Errors
     ///
     /// Returns an error if the container cannot be removed.
@@ -1105,7 +1190,7 @@ impl Runtime {
             .get_cid(machine_name)
             .ok_or_else(|| CoreError::not_found(machine_name.to_string()))?;
 
-        // Send remove request to agent first
+        // Send remove request to agent.
         let container_id_str = container_id.to_string();
         #[cfg(target_os = "macos")]
         {
@@ -1122,11 +1207,21 @@ impl Runtime {
         // Stop port forwarding if any.
         self.stop_port_forwarding(container_id).await;
 
-        // Update local state
+        // Update local state. remove_force handles the Exited transition
+        // and waiter notification for active containers.
         if force {
             self.container_manager.remove_force(container_id)?;
         } else {
             self.container_manager.remove(container_id)?;
+        }
+
+        // Clean up container rootfs so the same name/ID can be reused.
+        if let Err(e) = self.image_store.remove_container_rootfs(&container_id_str) {
+            tracing::warn!(
+                "Failed to clean up rootfs for container {}: {}",
+                container_id,
+                e
+            );
         }
 
         tracing::info!(

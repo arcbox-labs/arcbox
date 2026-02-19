@@ -207,22 +207,93 @@ impl AgentClient {
         Ok(())
     }
 
+    /// Builds a V2 wire message with an optional trace_id.
+    ///
+    /// Wire format V2:
+    /// ```text
+    /// +----------------+----------------+------------------+----------------+
+    /// | Length (4B BE) | Type (4B BE)   | TraceLen (2B BE) | TraceID bytes  | Payload
+    /// +----------------+----------------+------------------+----------------+
+    /// ```
+    fn build_message(msg_type: MessageType, trace_id: &str, payload: &[u8]) -> Bytes {
+        let trace_bytes = trace_id.as_bytes();
+        let trace_len = trace_bytes.len().min(u16::MAX as usize);
+        // Length = type(4) + trace_len_field(2) + trace_bytes + payload
+        let length = 4 + 2 + trace_len + payload.len();
+        let mut buf = BytesMut::with_capacity(4 + length);
+        buf.put_u32(length as u32);
+        buf.put_u32(msg_type as u32);
+        buf.put_u16(trace_len as u16);
+        if trace_len > 0 {
+            buf.extend_from_slice(&trace_bytes[..trace_len]);
+        }
+        buf.extend_from_slice(payload);
+        buf.freeze()
+    }
+
+    /// Parses a V2 wire response. Returns (resp_type, trace_id, payload).
+    fn parse_response(response: &[u8]) -> Result<(u32, String, Vec<u8>)> {
+        if response.len() < 8 {
+            return Err(CoreError::Machine("response too short".to_string()));
+        }
+        let mut cursor = std::io::Cursor::new(response);
+        let length = cursor.get_u32() as usize;
+        let resp_type = cursor.get_u32();
+
+        let remaining = length.saturating_sub(4);
+        let offset = 8usize; // Past length + type
+
+        if remaining < 2 || response.len() < offset + 2 {
+            // No trace_len field; treat the rest as payload.
+            return Ok((resp_type, String::new(), response[offset..].to_vec()));
+        }
+
+        let trace_len = u16::from_be_bytes([response[offset], response[offset + 1]]) as usize;
+        let trace_start = offset + 2;
+        let trace_end = trace_start + trace_len;
+        let payload_start = trace_end;
+
+        if response.len() < trace_end {
+            return Ok((resp_type, String::new(), response[trace_start..].to_vec()));
+        }
+
+        let trace_id =
+            String::from_utf8(response[trace_start..trace_end].to_vec()).unwrap_or_default();
+        let payload = if response.len() > payload_start {
+            response[payload_start..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        Ok((resp_type, trace_id, payload))
+    }
+
     /// Sends an RPC request and receives a response.
+    ///
+    /// Automatically picks up the trace ID from task-local storage (set by
+    /// the Docker API trace middleware) so callers don't need to thread it
+    /// through manually.
     async fn rpc_call(&mut self, msg_type: MessageType, payload: &[u8]) -> Result<(u32, Vec<u8>)> {
+        let trace_id = crate::trace::current_trace_id();
+        self.rpc_call_traced(msg_type, &trace_id, payload).await
+    }
+
+    /// Sends an RPC request with a trace_id and receives a response.
+    async fn rpc_call_traced(
+        &mut self,
+        msg_type: MessageType,
+        trace_id: &str,
+        payload: &[u8],
+    ) -> Result<(u32, Vec<u8>)> {
         if !self.connected {
             self.connect().await?;
         }
 
-        // Build message: length (4B BE) + type (4B BE) + payload
-        let length = 4 + payload.len() as u32;
-        let mut buf = BytesMut::with_capacity(8 + payload.len());
-        buf.put_u32(length);
-        buf.put_u32(msg_type as u32);
-        buf.extend_from_slice(payload);
+        let buf = Self::build_message(msg_type, trace_id, payload);
 
         // Send request
         self.transport
-            .send(buf.freeze())
+            .send(buf)
             .await
             .map_err(|e| CoreError::Machine(format!("failed to send request: {}", e)))?;
 
@@ -233,15 +304,7 @@ impl AgentClient {
             .await
             .map_err(|e| CoreError::Machine(format!("failed to receive response: {}", e)))?;
 
-        // Parse response: length (4B BE) + type (4B BE) + payload
-        if response.len() < 8 {
-            return Err(CoreError::Machine("response too short".to_string()));
-        }
-
-        let mut cursor = std::io::Cursor::new(&response[..]);
-        let _length = cursor.get_u32();
-        let resp_type = cursor.get_u32();
-        let payload = response[8..].to_vec();
+        let (resp_type, _resp_trace, payload) = Self::parse_response(&response)?;
 
         // Check for error response
         if resp_type == MessageType::Error as u32 {
@@ -720,16 +783,12 @@ impl AgentClient {
 
         let payload = req.encode_to_vec();
 
-        // Build message: length (4B BE) + type (4B BE) + payload
-        let length = 4 + payload.len() as u32;
-        let mut buf = BytesMut::with_capacity(8 + payload.len());
-        buf.put_u32(length);
-        buf.put_u32(MessageType::LogsRequest as u32);
-        buf.extend_from_slice(&payload);
+        // Build V2 wire message.
+        let buf = Self::build_message(MessageType::LogsRequest, "", &payload);
 
         // Send request on the dedicated stream transport.
         stream_transport
-            .send(buf.freeze())
+            .send(buf)
             .await
             .map_err(|e| CoreError::Machine(format!("failed to send request: {}", e)))?;
 
@@ -765,15 +824,14 @@ impl AgentClient {
                     }
                 };
 
-                if response.len() < 8 {
-                    tracing::warn!(cid = cid, "log stream received short response");
-                    continue;
-                }
-
-                let mut cursor = std::io::Cursor::new(&response[..]);
-                let _length = cursor.get_u32();
-                let resp_type = cursor.get_u32();
-                let resp_payload = response[8..].to_vec();
+                let (resp_type, _trace_id, resp_payload) =
+                    match AgentClient::parse_response(&response) {
+                        Ok(parsed) => parsed,
+                        Err(_) => {
+                            tracing::warn!(cid = cid, "log stream received unparseable response");
+                            continue;
+                        }
+                    };
 
                 // Check for error response.
                 if resp_type == MessageType::Error as u32 {
@@ -849,16 +907,12 @@ impl AgentClient {
 
         let payload = req.encode_to_vec();
 
-        // Build message: length (4B BE) + type (4B BE) + payload
-        let length = 4 + payload.len() as u32;
-        let mut buf = BytesMut::with_capacity(8 + payload.len());
-        buf.put_u32(length);
-        buf.put_u32(MessageType::LogsRequest as u32);
-        buf.extend_from_slice(&payload);
+        // Build V2 wire message.
+        let buf = Self::build_message(MessageType::LogsRequest, "", &payload);
 
         // Send request.
         self.transport
-            .send(buf.freeze())
+            .send(buf)
             .await
             .map_err(|e| CoreError::Machine(format!("failed to send request: {}", e)))?;
 
@@ -899,15 +953,14 @@ impl AgentClient {
                     }
                 };
 
-                if response.len() < 8 {
-                    tracing::warn!(cid = cid, "log stream received short response");
-                    continue;
-                }
-
-                let mut cursor = std::io::Cursor::new(&response[..]);
-                let _length = cursor.get_u32();
-                let resp_type = cursor.get_u32();
-                let resp_payload = response[8..].to_vec();
+                let (resp_type, _trace_id, resp_payload) =
+                    match AgentClient::parse_response(&response) {
+                        Ok(parsed) => parsed,
+                        Err(_) => {
+                            tracing::warn!(cid = cid, "log stream received unparseable response");
+                            continue;
+                        }
+                    };
 
                 // Check for error response.
                 if resp_type == MessageType::Error as u32 {
@@ -1028,16 +1081,12 @@ impl AgentClient {
             req.exec_id
         );
 
-        // Build message: length (4B BE) + type (4B BE) + payload
-        let length = 4 + payload.len() as u32;
-        let mut buf = BytesMut::with_capacity(8 + payload.len());
-        buf.put_u32(length);
-        buf.put_u32(MessageType::AttachRequest as u32);
-        buf.extend_from_slice(&payload);
+        // Build V2 wire message.
+        let buf = Self::build_message(MessageType::AttachRequest, "", &payload);
 
         // Send request.
         self.transport
-            .send(buf.freeze())
+            .send(buf)
             .await
             .map_err(|e| CoreError::Machine(format!("failed to send attach request: {}", e)))?;
         tracing::debug!("attach_stream: AttachRequest sent successfully");
@@ -1098,17 +1147,18 @@ impl AgentClient {
                         }
                     };
 
-                    if data.len() < 8 {
-                        let _ = tx_out
-                            .send(Err(CoreError::Machine("short attach response".to_string())))
-                            .await;
-                        break;
-                    }
-
-                    let mut cursor = std::io::Cursor::new(&data[..]);
-                    let _length = cursor.get_u32();
-                    let resp_type = cursor.get_u32();
-                    let resp_payload = data[8..].to_vec();
+                    let (resp_type, _trace_id, resp_payload) =
+                        match AgentClient::parse_response(&data) {
+                            Ok(parsed) => parsed,
+                            Err(_) => {
+                                let _ = tx_out
+                                    .send(Err(CoreError::Machine(
+                                        "unparseable attach response".to_string(),
+                                    )))
+                                    .await;
+                                break;
+                            }
+                        };
 
                     tracing::debug!(
                         cid = cid,
@@ -1162,15 +1212,11 @@ impl AgentClient {
             tokio::spawn(async move {
                 while let Some(input) = rx_in.recv().await {
                     let payload = input.encode_to_vec();
-                    let length = 4 + payload.len() as u32;
-                    let mut buf = BytesMut::with_capacity(8 + payload.len());
-                    buf.put_u32(length);
-                    buf.put_u32(MessageType::AttachInput as u32);
-                    buf.extend_from_slice(&payload);
+                    let buf = AgentClient::build_message(MessageType::AttachInput, "", &payload);
 
                     let send_result = {
                         let mut locked = transport.lock().await;
-                        locked.send(buf.freeze()).await
+                        locked.send(buf).await
                     };
 
                     if let Err(e) = send_result {
