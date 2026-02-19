@@ -40,25 +40,25 @@ impl GuestDockerBackend {
         let timeout = Duration::from_millis(self.config.startup_timeout_ms);
         let deadline = Instant::now() + timeout;
         let mut delay_ms = INITIAL_DELAY_MS;
-        let mut start_requested = false;
         let mut last_status_detail: Option<String> = None;
 
         loop {
+            let mut docker_ready = false;
+
             if let Ok(mut agent) = self.machine_manager.connect_agent(self.machine_name) {
-                if !start_requested {
-                    match agent.ensure_runtime(true).await {
-                        Ok(resp) => {
-                            start_requested = true;
-                            tracing::debug!(
-                                ready = resp.ready,
-                                endpoint = resp.endpoint,
-                                message = resp.message,
-                                "requested guest runtime ensure"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::trace!("failed to request guest runtime ensure: {}", e);
-                        }
+                match agent.ensure_runtime(true).await {
+                    Ok(resp) => {
+                        last_status_detail = Some(resp.message.clone());
+                        tracing::debug!(
+                            ready = resp.ready,
+                            endpoint = resp.endpoint,
+                            message = resp.message,
+                            status = resp.status,
+                            "requested guest runtime ensure"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::trace!("failed to request guest runtime ensure: {}", e);
                     }
                 }
 
@@ -66,6 +66,7 @@ impl GuestDockerBackend {
                     Ok(status) => {
                         last_status_detail = Some(status.detail.clone());
                         if status.docker_ready {
+                            docker_ready = true;
                             if let Some(endpoint_port) = parse_vsock_endpoint_port(&status.endpoint)
                             {
                                 if endpoint_port != port {
@@ -83,32 +84,47 @@ impl GuestDockerBackend {
                 }
             }
 
-            match self
-                .machine_manager
-                .connect_vsock_port(self.machine_name, port)
-            {
-                Ok(fd) => {
-                    let _owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-                    tracing::debug!(port, "guest docker endpoint is ready");
-                    return Ok(());
-                }
-                Err(e) => {
-                    if Instant::now() >= deadline {
-                        return Err(CoreError::Machine(format!(
-                            "guest docker endpoint on vsock port {} not ready within {}ms: {}",
-                            port,
-                            self.config.startup_timeout_ms,
-                            last_status_detail.unwrap_or_else(|| e.to_string())
-                        )));
+            if docker_ready {
+                match self
+                    .machine_manager
+                    .connect_vsock_port(self.machine_name, port)
+                {
+                    Ok(fd) => {
+                        let _owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+                        tracing::debug!(port, "guest docker endpoint is ready");
+                        return Ok(());
                     }
-                    tracing::trace!(
-                        port,
-                        retry_delay_ms = delay_ms,
-                        "guest docker endpoint not ready yet: {}",
-                        e
-                    );
+                    Err(e) => {
+                        if Instant::now() >= deadline {
+                            return Err(CoreError::Machine(format!(
+                                "guest docker endpoint on vsock port {} not ready within {}ms: {}",
+                                port,
+                                self.config.startup_timeout_ms,
+                                last_status_detail.unwrap_or_else(|| e.to_string())
+                            )));
+                        }
+                        tracing::trace!(
+                            port,
+                            retry_delay_ms = delay_ms,
+                            "guest docker endpoint not reachable yet: {}",
+                            e
+                        );
+                    }
                 }
-            }
+            } else if Instant::now() >= deadline {
+                return Err(CoreError::Machine(format!(
+                    "guest docker endpoint on vsock port {} not ready within {}ms: {}",
+                    port,
+                    self.config.startup_timeout_ms,
+                    last_status_detail.unwrap_or_else(|| "runtime status unavailable".to_string())
+                )));
+            } else {
+                tracing::trace!(
+                    port,
+                    retry_delay_ms = delay_ms,
+                    "guest runtime not ready yet"
+                );
+                }
 
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             delay_ms = (delay_ms * 3 / 2).min(MAX_DELAY_MS);

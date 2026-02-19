@@ -1066,8 +1066,10 @@ mod linux {
 
     async fn try_start_runtime_services() -> String {
         let mut notes = Vec::new();
+        let mut all_service_starts_succeeded = false;
 
         if Path::new("/run/systemd/system").exists() {
+            all_service_starts_succeeded = true;
             for service in ["containerd.service", "docker.service"] {
                 match Command::new("systemctl")
                     .args(["start", service])
@@ -1078,6 +1080,7 @@ mod linux {
                         notes.push(format!("started {}", service));
                     }
                     Ok(status) => {
+                        all_service_starts_succeeded = false;
                         notes.push(format!(
                             "systemctl start {} failed(exit={})",
                             service,
@@ -1085,12 +1088,16 @@ mod linux {
                         ));
                     }
                     Err(e) => {
+                        all_service_starts_succeeded = false;
                         notes.push(format!("systemctl start {} error({})", service, e));
                     }
                 }
             }
-        } else {
-            let mut rc_invoked = false;
+        } else if Path::new("/sbin/rc-service").exists()
+            || Path::new("/usr/sbin/rc-service").exists()
+            || Path::new("/bin/rc-service").exists()
+        {
+            all_service_starts_succeeded = true;
             for service in ["containerd", "docker"] {
                 let status = Command::new("rc-service")
                     .args([service, "start"])
@@ -1098,11 +1105,10 @@ mod linux {
                     .await;
                 match status {
                     Ok(status) if status.success() => {
-                        rc_invoked = true;
                         notes.push(format!("started {}", service));
                     }
                     Ok(status) => {
-                        rc_invoked = true;
+                        all_service_starts_succeeded = false;
                         notes.push(format!(
                             "rc-service {} start failed(exit={})",
                             service,
@@ -1110,16 +1116,19 @@ mod linux {
                         ));
                     }
                     Err(e) => {
+                        all_service_starts_succeeded = false;
                         notes.push(format!("rc-service {} start error({})", service, e));
                     }
                 }
             }
+        } else {
+            notes.push("no init service manager found, using bundled runtime".to_string());
+        }
 
-            if !rc_invoked {
-                let note = try_start_bundled_runtime().await;
-                if !note.is_empty() {
-                    notes.push(note);
-                }
+        if !all_service_starts_succeeded {
+            let note = try_start_bundled_runtime().await;
+            if !note.is_empty() {
+                notes.push(note);
             }
         }
 
