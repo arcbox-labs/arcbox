@@ -56,3 +56,70 @@ pub async fn trace_id_middleware(mut request: Request, next: Next) -> Response {
 
     response
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use axum::middleware;
+    use axum::routing::get;
+    use axum::{Router, response::IntoResponse};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    async fn echo_current_trace_id() -> impl IntoResponse {
+        arcbox_core::trace::current_trace_id()
+    }
+
+    #[tokio::test]
+    async fn trace_header_is_reused_and_propagated() {
+        let app = Router::new()
+            .route("/", get(echo_current_trace_id))
+            .layer(middleware::from_fn(trace_id_middleware));
+
+        let req = HttpRequest::builder()
+            .uri("/")
+            .header(TRACE_ID_HEADER, "trace-from-client")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        let header_value = resp
+            .headers()
+            .get(TRACE_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_trace = String::from_utf8_lossy(&body).to_string();
+
+        assert_eq!(header_value, "trace-from-client");
+        assert_eq!(body_trace, "trace-from-client");
+    }
+
+    #[tokio::test]
+    async fn trace_header_is_generated_when_missing() {
+        let app = Router::new()
+            .route("/", get(echo_current_trace_id))
+            .layer(middleware::from_fn(trace_id_middleware));
+
+        let req = HttpRequest::builder()
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        let header_value = resp
+            .headers()
+            .get(TRACE_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_trace = String::from_utf8_lossy(&body).to_string();
+
+        assert!(!header_value.is_empty());
+        assert_eq!(body_trace, header_value);
+    }
+}
