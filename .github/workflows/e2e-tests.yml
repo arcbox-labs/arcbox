@@ -325,9 +325,9 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64, virtualization]
     timeout-minutes: 90
     if: |
-      github.event_name == 'workflow_dispatch' ||
-      github.ref == 'refs/heads/master'
-    # Skip if no self-hosted runners available
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.run_vm_tests == 'true'
+    # Manual only; avoids blocking push CI when no self-hosted runners are online
     continue-on-error: true
 
     steps:
