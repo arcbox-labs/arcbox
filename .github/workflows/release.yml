@@ -22,7 +22,7 @@ jobs:
   build-macos-arm64:
     name: Build macOS ARM64
     runs-on: macos-14
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
