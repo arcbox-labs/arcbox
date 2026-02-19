@@ -208,7 +208,19 @@ impl VirtioSocketDevice {
                         })
                     }
                     Err(e) => {
-                        tracing::warn!("Vsock connection failed: {}", e.message);
+                        if is_transient_connect_error(&e.message) {
+                            tracing::debug!(
+                                port,
+                                error = %e.message,
+                                "Vsock connection not ready yet"
+                            );
+                        } else {
+                            tracing::warn!(
+                                port,
+                                error = %e.message,
+                                "Vsock connection failed"
+                            );
+                        }
                         Err(VZError::ConnectionFailed(e.message))
                     }
                 }
@@ -408,6 +420,14 @@ impl VirtioSocketDevice {
             set_listener_fn(self.inner, set_listener_sel, std::ptr::null_mut(), port);
         }
     }
+}
+
+fn is_transient_connect_error(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    msg.contains("connection reset")
+        || msg.contains("connection refused")
+        || msg.contains("connection aborted")
+        || msg.contains("broken pipe")
 }
 
 // ============================================================================
