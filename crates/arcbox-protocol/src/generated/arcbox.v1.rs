@@ -1502,6 +1502,9 @@ pub struct RuntimeEnsureResponse {
     /// Additional status detail.
     #[prost(string, tag = "3")]
     pub message: ::prost::alloc::string::String,
+    /// Outcome of this ensure call: "started", "reused", or "failed".
+    #[prost(string, tag = "4")]
+    pub status: ::prost::alloc::string::String,
 }
 /// Request for runtime status.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1524,6 +1527,24 @@ pub struct RuntimeStatusResponse {
     pub endpoint: ::prost::alloc::string::String,
     /// Human-readable detail for diagnostics.
     #[prost(string, tag = "4")]
+    pub detail: ::prost::alloc::string::String,
+    /// Per-service status entries for fine-grained observability.
+    #[prost(message, repeated, tag = "5")]
+    pub services: ::prost::alloc::vec::Vec<ServiceStatus>,
+}
+/// Individual service status within the guest runtime stack.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ServiceStatus {
+    /// Service name (e.g. "containerd", "dockerd", "youki").
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Service status: "ready", "not_ready", or "error".
+    #[prost(string, tag = "2")]
+    pub status: ::prost::alloc::string::String,
+    /// Human-readable detail for diagnostics (error message, socket path, etc.).
+    #[prost(string, tag = "3")]
     pub detail: ::prost::alloc::string::String,
 }
 /// Request to create a container (forwarded to containerd).

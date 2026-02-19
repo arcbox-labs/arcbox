@@ -121,6 +121,8 @@ message RuntimeEnsureResponse {
     string endpoint = 2;
     // Additional status detail.
     string message = 3;
+    // Outcome of this ensure call: "started", "reused", or "failed".
+    string status = 4;
 }
 
 // Request for runtime status.
@@ -136,6 +138,18 @@ message RuntimeStatusResponse {
     string endpoint = 3;
     // Human-readable detail for diagnostics.
     string detail = 4;
+    // Per-service status entries for fine-grained observability.
+    repeated ServiceStatus services = 5;
+}
+
+// Individual service status within the guest runtime stack.
+message ServiceStatus {
+    // Service name (e.g. "containerd", "dockerd", "youki").
+    string name = 1;
+    // Service status: "ready", "not_ready", or "error".
+    string status = 2;
+    // Human-readable detail for diagnostics (error message, socket path, etc.).
+    string detail = 3;
 }
 
 // Request to create a container (forwarded to containerd).
