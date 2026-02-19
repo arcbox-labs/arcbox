@@ -2,7 +2,7 @@
 //!
 //! These tests verify the Docker Engine API compatibility layer works correctly.
 
-use arcbox_core::{Config, Runtime, VmLifecycleConfig};
+use arcbox_core::{Config, ContainerBackendMode, Runtime, VmLifecycleConfig};
 use arcbox_docker::api::create_router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -15,10 +15,14 @@ use tower::ServiceExt;
 /// Uses skip_vm_check=true to avoid needing actual VM boot assets.
 async fn create_test_runtime() -> (Arc<Runtime>, TempDir) {
     let tmp_dir = TempDir::new().expect("Failed to create temp dir");
-    let config = Config {
+    let mut config = Config {
         data_dir: tmp_dir.path().to_path_buf(),
         ..Default::default()
     };
+    // API handler tests validate HTTP contract, not guest-docker provisioning.
+    // Keep them on native backend to avoid boot-assets network dependency.
+    config.container.backend = ContainerBackendMode::NativeControlPlane;
+
     let vm_lifecycle_config = VmLifecycleConfig {
         skip_vm_check: true,
         ..Default::default()
