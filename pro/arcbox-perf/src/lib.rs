@@ -317,7 +317,8 @@ impl PerfMonitor {
                     if parts.len() >= 7 {
                         let user: f64 = parts[2].trim_end_matches('%').parse().unwrap_or(0.0);
                         let sys: f64 = parts[4].trim_end_matches('%').parse().unwrap_or(0.0);
-                        return (user + sys, vec![user + sys]);
+                        let cpu_percent = normalize_cpu_percent(user + sys);
+                        return (cpu_percent, vec![cpu_percent]);
                     }
                 }
             }
@@ -349,7 +350,9 @@ impl PerfMonitor {
                     let total_diff = times.total.saturating_sub(prev.total);
                     let idle_diff = times.idle.saturating_sub(prev.idle);
                     if total_diff > 0 {
-                        cpu_percent = 100.0 * (1.0 - (idle_diff as f64 / total_diff as f64));
+                        cpu_percent = normalize_cpu_percent(
+                            100.0 * (1.0 - (idle_diff as f64 / total_diff as f64)),
+                        );
                     }
                 }
 
@@ -915,6 +918,14 @@ impl PerfMonitor {
 impl Default for PerfMonitor {
     fn default() -> Self {
         Self::new(1000)
+    }
+}
+
+fn normalize_cpu_percent(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 100.0)
+    } else {
+        0.0
     }
 }
 
