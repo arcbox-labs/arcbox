@@ -588,21 +588,28 @@ impl VmLifecycleManager {
         let machine_exists = existing_machine.is_some();
 
         // Detect stale persisted machine whose cpus/memory no longer matches
-        // the current default_vm config (e.g. after a config change).
-        let config_drifted = existing_machine
-            .as_ref()
-            .is_some_and(|m| {
-                m.cpus != self.config.default_vm.cpus
-                    || m.memory_mb != self.config.default_vm.memory_mb
-            });
+        // the current default_vm config, or whose kernel path references an
+        // outdated boot asset version.
+        let boot_version = &self.boot_assets.config().version;
+        let config_drifted = existing_machine.as_ref().is_some_and(|m| {
+            let hw_changed = m.cpus != self.config.default_vm.cpus
+                || m.memory_mb != self.config.default_vm.memory_mb;
+            let kernel_stale = m
+                .kernel
+                .as_ref()
+                .is_some_and(|k| !k.contains(boot_version));
+            hw_changed || kernel_stale
+        });
 
         if config_drifted {
             let m = existing_machine.as_ref().unwrap();
             tracing::warn!(
                 persisted_cpus = m.cpus,
                 persisted_memory = m.memory_mb,
+                persisted_kernel = m.kernel.as_deref().unwrap_or("none"),
                 desired_cpus = self.config.default_vm.cpus,
                 desired_memory = self.config.default_vm.memory_mb,
+                boot_version = %boot_version,
                 "default machine config drifted from desired defaults; recreating"
             );
             let _ = self.machine_manager.remove(DEFAULT_MACHINE_NAME, true);
@@ -710,6 +717,19 @@ impl VmLifecycleManager {
             .cmdline
             .clone()
             .unwrap_or(assets.cmdline);
+
+        // Strip "quiet" so kernel boot messages are visible on the serial console.
+        cmdline = cmdline
+            .split_whitespace()
+            .filter(|t| *t != "quiet")
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Ensure earlycon is present for early boot diagnostics via virtio console.
+        if !cmdline.split_whitespace().any(|t| t.starts_with("earlycon")) {
+            cmdline.push_str(" earlycon");
+        }
+
         let boot_version_key = "arcbox.boot_asset_version=";
         if !cmdline
             .split_whitespace()
@@ -763,20 +783,18 @@ impl VmLifecycleManager {
 
         while tokio::time::Instant::now() < deadline {
             #[cfg(target_os = "macos")]
-            if std::env::var("ARCBOX_ENABLE_CONSOLE").as_deref() == Ok("1") {
-                match self
-                    .machine_manager
-                    .read_console_output(DEFAULT_MACHINE_NAME)
-                {
-                    Ok(output) => {
-                        let trimmed = output.trim_matches('\0');
-                        if !trimmed.is_empty() {
-                            tracing::info!("Guest console: {}", trimmed.trim_end());
-                        }
+            match self
+                .machine_manager
+                .read_console_output(DEFAULT_MACHINE_NAME)
+            {
+                Ok(output) => {
+                    let trimmed = output.trim_matches('\0');
+                    if !trimmed.is_empty() {
+                        tracing::info!("Guest console: {}", trimmed.trim_end());
                     }
-                    Err(e) => {
-                        tracing::debug!("Console read failed: {}", e);
-                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Console read failed: {}", e);
                 }
             }
 
@@ -789,7 +807,7 @@ impl VmLifecycleManager {
                             tracing::info!("Agent is ready");
                             self.health_monitor.record_success();
                             #[cfg(target_os = "macos")]
-                            if std::env::var("ARCBOX_ENABLE_CONSOLE").as_deref() == Ok("1") {
+                            {
                                 let machine_manager = Arc::clone(&self.machine_manager);
                                 tokio::spawn(async move {
                                     loop {
@@ -806,7 +824,10 @@ impl VmLifecycleManager {
                                                 }
                                             }
                                             Err(e) => {
-                                                tracing::debug!("Console read loop stopped: {}", e);
+                                                tracing::debug!(
+                                                    "Console read loop stopped: {}",
+                                                    e
+                                                );
                                                 break;
                                             }
                                         }

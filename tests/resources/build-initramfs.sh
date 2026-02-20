@@ -142,7 +142,18 @@ cat > "$WORK_DIR/init" << 'INIT_EOF'
 /bin/busybox mount -t sysfs sysfs /sys
 /bin/busybox mount -t devtmpfs devtmpfs /dev
 /bin/busybox mkdir -p /dev/pts
-/bin/busybox mount -t devpts devpts /dev/pts
+/bin/busybox mount -t devpts -o gid=5,mode=0620,noexec,nosuid devpts /dev/pts
+/bin/busybox mkdir -p /dev/shm
+/bin/busybox mount -t tmpfs -o nodev,nosuid,noexec shm /dev/shm
+
+# Mount cgroup2 unified hierarchy (required by dockerd/containerd)
+/bin/busybox mkdir -p /sys/fs/cgroup
+/bin/busybox mount -t cgroup2 cgroup2 /sys/fs/cgroup
+
+# Writable tmpfs for /tmp and /run
+/bin/busybox mount -t tmpfs tmpfs /tmp
+/bin/busybox mount -t tmpfs tmpfs /run
+/bin/busybox mkdir -p /run/containerd /var/run /var/log /var/lib
 
 # Set hostname
 /bin/busybox hostname arcbox-vm
@@ -161,6 +172,7 @@ echo ""
 echo "Loading fuse/virtiofs modules..."
 /sbin/modprobe fuse 2>/dev/null && echo "  Loaded: fuse" || echo "  Failed: fuse"
 /sbin/modprobe virtiofs 2>/dev/null && echo "  Loaded: virtiofs" || echo "  Failed: virtiofs"
+/sbin/modprobe overlay 2>/dev/null && echo "  Loaded: overlay" || echo "  Failed: overlay"
 echo ""
 
 # Mount VirtioFS share for host data (/arcbox)
@@ -206,26 +218,64 @@ echo "Setting up network..."
 /sbin/modprobe virtio_net 2>/dev/null && echo "  Loaded: virtio_net" || echo "  Failed: virtio_net"
 
 # Wait for the network interface to appear
-/bin/busybox sleep 1
+RETRY=0
+while [ ! -e /sys/class/net/eth0 ] && [ $RETRY -lt 5 ]; do
+    /bin/busybox sleep 0.2
+    RETRY=$((RETRY + 1))
+done
 
-# Configure eth0 with static IP matching the host utun peer address
-if /bin/busybox ip addr add 192.168.64.2/24 dev eth0 2>/dev/null && \
-   /bin/busybox ip link set eth0 up && \
-   /bin/busybox ip route add default via 192.168.64.1; then
-    echo "  Network configured: 192.168.64.2/24 via 192.168.64.1"
+if [ ! -e /sys/class/net/eth0 ]; then
+    echo "  ERROR: eth0 not found after loading virtio_net"
+    /bin/busybox ip link show
 else
-    echo "  Network configuration FAILED"
+    echo "  eth0 device found"
+    
+    # Bring up eth0
+    /bin/busybox ip link set eth0 up 2>/dev/null || echo "  WARNING: Failed to bring up eth0"
+    
+    # Setup udhcpc with a custom script to handle DHCP response
+    mkdir -p /usr/share/udhcpc
+    cat > /usr/share/udhcpc/default.script <<'UDHCP_EOF'
+#!/bin/sh
+case "$1" in
+    bound|renew)
+        /bin/busybox ip addr add "$ip/24" dev "$interface" 2>/dev/null
+        if [ -n "$router" ]; then
+            /bin/busybox ip route add default via "$router" 2>/dev/null
+        fi
+        # Dynamic DNS from DHCP server
+        {
+            for ns in $dns; do
+                echo "nameserver $ns"
+            done
+        } > /etc/resolv.conf
+        echo "DHCP: $interface got $ip from $server_name"
+        ;;
+    deconfig)
+        /bin/busybox ip addr flush dev "$interface" 2>/dev/null
+        ;;
+esac
+EOF
+    chmod +x /usr/share/udhcpc/default.script
+    
+    # Run udhcpc with timeout
+    if /bin/busybox timeout 5 /sbin/udhcpc -i eth0 -t 5 -n 2>/dev/null; then
+        echo "  DHCP: success"
+        /bin/busybox cat /etc/resolv.conf | /bin/busybox head -3
+    else
+        echo "  DHCP: timeout or failed, trying fallback static config"
+        /bin/busybox ip addr add 192.168.64.2/24 dev eth0 2>/dev/null || true
+        /bin/busybox ip route add default via 192.168.64.1 2>/dev/null || true
+        echo "nameserver 192.168.64.1" > /etc/resolv.conf
+    fi
 fi
-
-# DNS configuration
-echo "nameserver 192.168.64.1" > /etc/resolv.conf
 
 # host.docker.internal support
 echo "192.168.64.1 host.docker.internal" >> /etc/hosts
 
 # Log network IP for host-side detection
 /bin/busybox mkdir -p /var/log
-echo "192.168.64.2" > /var/log/network.log
+/bin/busybox ip addr show dev eth0 2>/dev/null | /bin/busybox grep "inet " | /bin/busybox awk '{print $2}' | /bin/busybox cut -d/ -f1 > /var/log/network.log 2>/dev/null || true
 echo ""
 
 # Start arcbox-agent in foreground with debug output

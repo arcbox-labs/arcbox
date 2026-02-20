@@ -1022,6 +1022,100 @@ mod linux {
         )
     }
 
+    /// Ensures the guest environment has the prerequisites that dockerd/containerd
+    /// need: cgroup2, overlayfs, devpts, /dev/shm, /tmp, /run.
+    fn ensure_runtime_prerequisites() -> Vec<String> {
+        let mut notes = Vec::new();
+
+        // Mount cgroup2 unified hierarchy (required by dockerd).
+        if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+            if let Err(e) = std::fs::create_dir_all("/sys/fs/cgroup") {
+                notes.push(format!("mkdir /sys/fs/cgroup failed({})", e));
+            } else {
+                let rc = std::process::Command::new("mount")
+                    .args(["-t", "cgroup2", "cgroup2", "/sys/fs/cgroup"])
+                    .status();
+                match rc {
+                    Ok(s) if s.success() => notes.push("mounted cgroup2".to_string()),
+                    Ok(s) => notes.push(format!("mount cgroup2 exit={}", s.code().unwrap_or(-1))),
+                    Err(e) => notes.push(format!("mount cgroup2 failed({})", e)),
+                }
+            }
+        }
+
+        // Mount devpts if missing (needed for PTY allocation).
+        if !Path::new("/dev/pts/ptmx").exists() {
+            let _ = std::fs::create_dir_all("/dev/pts");
+            let _ = std::process::Command::new("mount")
+                .args([
+                    "-t",
+                    "devpts",
+                    "-o",
+                    "gid=5,mode=0620,noexec,nosuid",
+                    "devpts",
+                    "/dev/pts",
+                ])
+                .status();
+        }
+
+        // Mount /dev/shm if missing.
+        if !Path::new("/dev/shm").exists() {
+            let _ = std::fs::create_dir_all("/dev/shm");
+            let _ = std::process::Command::new("mount")
+                .args(["-t", "tmpfs", "-o", "nodev,nosuid,noexec", "shm", "/dev/shm"])
+                .status();
+        }
+
+        // Ensure /tmp and /run exist as writable tmpfs.
+        for dir in ["/tmp", "/run"] {
+            if !Path::new(dir).exists() || std::fs::metadata(dir).is_ok_and(|m| m.permissions().readonly()) {
+                let _ = std::fs::create_dir_all(dir);
+                let _ = std::process::Command::new("mount")
+                    .args(["-t", "tmpfs", "tmpfs", dir])
+                    .status();
+            }
+        }
+
+        // Load overlay module (needed for Docker's overlay2 storage driver).
+        if !Path::new("/sys/module/overlay").exists() {
+            let rc = std::process::Command::new("modprobe")
+                .arg("overlay")
+                .status();
+            match rc {
+                Ok(s) if s.success() => notes.push("loaded overlay module".to_string()),
+                _ => {
+                    // Fallback: try insmod with kernel version path.
+                    if let Ok(uname) = std::process::Command::new("uname").arg("-r").output() {
+                        let kver = String::from_utf8_lossy(&uname.stdout).trim().to_string();
+                        let ko = format!("/lib/modules/{}/kernel/fs/overlayfs/overlay.ko", kver);
+                        if Path::new(&ko).exists() {
+                            let _ = std::process::Command::new("insmod").arg(&ko).status();
+                            notes.push(format!("insmod overlay from {}", ko));
+                        } else {
+                            notes.push("overlay module not found".to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        notes
+    }
+
+    /// Redirects daemon stdout/stderr to a log file under /var/log/ so crashes
+    /// are diagnosable.  Returns the opened file (or falls back to Stdio::null).
+    fn daemon_log_file(name: &str) -> Stdio {
+        let log_path = format!("/var/log/{}.log", name);
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            Ok(f) => f.into(),
+            Err(_) => Stdio::null(),
+        }
+    }
+
     async fn try_start_bundled_runtime() -> String {
         let _guard = runtime_start_lock().lock().await;
 
@@ -1038,12 +1132,16 @@ mod linux {
         let youki_bin = runtime_bin_dir.join("youki");
         let mut notes = Vec::new();
 
+        // Ensure kernel/filesystem prerequisites before spawning daemons.
+        notes.extend(ensure_runtime_prerequisites());
+
         for dir in [
             "/run/containerd",
             "/var/run/docker",
             "/var/lib/containerd",
             "/var/lib/docker",
             "/etc/docker",
+            "/var/log",
         ] {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 notes.push(format!("mkdir {} failed({})", dir, e));
@@ -1069,8 +1167,8 @@ mod linux {
             ])
             .env("PATH", &path_env)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(daemon_log_file("containerd"))
+            .stderr(daemon_log_file("containerd"));
 
             match cmd.spawn() {
                 Ok(child) => notes.push(format!(
@@ -1093,8 +1191,8 @@ mod linux {
                 .arg("--bridge=none")
                 .env("PATH", &path_env)
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
+                .stdout(daemon_log_file("dockerd"))
+                .stderr(daemon_log_file("dockerd"));
 
             if youki_bin.exists() {
                 cmd.arg("--add-runtime")

@@ -932,7 +932,8 @@ impl VirtualMachine for DarwinVm {
 
         // Finalize configuration if VM hasn't been created yet
         if self.vz_vm.is_none() {
-            if std::env::var("ARCBOX_ENABLE_CONSOLE").as_deref() == Ok("1") {
+            // Enable serial console for boot diagnostics unless already configured.
+            if self.serial_fds.is_none() {
                 if let Err(err) = self.setup_serial_console() {
                     tracing::warn!("Failed to set up serial console: {}", err);
                 }
