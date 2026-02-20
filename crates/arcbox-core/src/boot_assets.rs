@@ -380,7 +380,11 @@ impl BootAssetProvider {
         };
 
         let manifest = if using_custom_paths {
-            None
+            // Custom kernel/initramfs paths are used for local development.
+            // Still try to load the cached manifest so the bundled runtime
+            // validation in runtime.rs (which reads runtime_assets) continues
+            // to work. If no cached manifest exists, silently fall back to None.
+            self.read_cached_manifest().await.ok().flatten()
         } else {
             Some(self.read_cached_manifest_required().await?)
         };
