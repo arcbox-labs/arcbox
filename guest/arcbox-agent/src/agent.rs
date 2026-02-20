@@ -1212,6 +1212,11 @@ mod linux {
                 "/var/lib/containerd",
                 "--state",
                 "/run/containerd",
+                // Disable the CRI plugin: it requires a loopback-bound streaming
+                // server (127.0.0.1:0) that is unnecessary for Docker usage and
+                // would cause containerd to exit with a fatal error if the
+                // loopback interface is not available.
+                "--disable-plugin=io.containerd.grpc.v1.cri",
             ])
             .env("PATH", &path_env)
             .stdin(Stdio::null())
