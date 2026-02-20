@@ -1204,19 +1204,30 @@ mod linux {
         };
 
         if !probe_first_ready_socket(&CONTAINERD_SOCKET_CANDIDATES).await {
+            // Write a minimal containerd config that disables the CRI plugin.
+            // CRI (Kubernetes Container Runtime Interface) is not needed for
+            // Docker-based container usage. The containerd CLI does not support
+            // a --disable-plugin flag (v1.7); the only way to disable plugins is
+            // via the TOML config file.
+            let containerd_config = "/etc/containerd/config.toml";
+            if let Err(e) = std::fs::create_dir_all("/etc/containerd") {
+                notes.push(format!("mkdir /etc/containerd failed({})", e));
+            }
+            let config_toml = "version = 2\ndisabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n";
+            if let Err(e) = std::fs::write(containerd_config, config_toml) {
+                notes.push(format!("write containerd config failed({})", e));
+            }
+
             let mut cmd = Command::new(&containerd_bin);
             cmd.args([
+                "--config",
+                containerd_config,
                 "--address",
                 "/run/containerd/containerd.sock",
                 "--root",
                 "/var/lib/containerd",
                 "--state",
                 "/run/containerd",
-                // Disable the CRI plugin: it requires a loopback-bound streaming
-                // server (127.0.0.1:0) that is unnecessary for Docker usage and
-                // would cause containerd to exit with a fatal error if the
-                // loopback interface is not available.
-                "--disable-plugin=io.containerd.grpc.v1.cri",
             ])
             .env("PATH", &path_env)
             .stdin(Stdio::null())
