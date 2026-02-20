@@ -128,7 +128,16 @@ jobs:
             cp vmlinuz-arm64 Image-arm64
           fi
 
+      - name: Checkout boot-assets
+        uses: actions/checkout@v4
+        with:
+          repository: arcbox-labs/boot-assets
+          path: boot-assets
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build initramfs
+        env:
+          BOOT_ASSETS_DIR: ${{ github.workspace }}/boot-assets
         run: |
           cd tests/resources
           ./build-initramfs.sh
