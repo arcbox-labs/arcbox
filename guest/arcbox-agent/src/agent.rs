@@ -1081,6 +1081,14 @@ mod linux {
             }
         }
 
+        // Enable IPv4 forwarding so Docker can route traffic between docker0 and eth0.
+        // VZ framework NAT masquerades all VM traffic, so no guest-side masquerade rule needed.
+        if let Err(e) = std::fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n") {
+            notes.push(format!("ip_forward failed({})", e));
+        } else {
+            notes.push("enabled ip_forward".to_string());
+        }
+
         // Load overlay module (needed for Docker's overlay2 storage driver).
         if !Path::new("/sys/module/overlay").exists() {
             let rc = std::process::Command::new("/sbin/modprobe")
@@ -1183,11 +1191,16 @@ mod linux {
             }
         }
 
-        let path_env = match std::env::var("PATH") {
-            Ok(existing) if !existing.is_empty() => {
-                format!("{}:{}", runtime_bin_dir.display(), existing)
+        // Alpine initramfs does not export PATH. Always include standard search
+        // paths so containerd/dockerd can invoke modprobe, mount, etc.
+        let path_env = {
+            let standard = "/usr/sbin:/usr/bin:/sbin:/bin";
+            match std::env::var("PATH") {
+                Ok(existing) if !existing.is_empty() => {
+                    format!("{}:{}:{}", runtime_bin_dir.display(), existing, standard)
+                }
+                _ => format!("{}:{}", runtime_bin_dir.display(), standard),
             }
-            _ => runtime_bin_dir.display().to_string(),
         };
 
         if !probe_first_ready_socket(&CONTAINERD_SOCKET_CANDIDATES).await {
@@ -1228,7 +1241,6 @@ mod linux {
                 .arg("--exec-root=/var/run/docker")
                 .arg("--data-root=/var/lib/docker")
                 .arg("--iptables=false")
-                .arg("--bridge=none")
                 .env("PATH", &path_env)
                 .stdin(Stdio::null())
                 .stdout(daemon_log_file("dockerd"))
