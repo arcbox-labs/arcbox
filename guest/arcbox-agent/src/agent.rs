@@ -1112,6 +1112,21 @@ mod linux {
             }
         }
 
+        // Sync system clock via NTP before spawning containerd/dockerd.
+        // The VM guest clock starts at epoch (1970-01-01) because VZ framework's
+        // virtualised RTC is not automatically read by the Alpine kernel on boot.
+        // Without a correct clock, TLS certificate verification fails with
+        // "x509: certificate is not yet valid".
+        // busybox ntpd -q performs a one-shot adjustment and exits.
+        let ntp = std::process::Command::new(busybox)
+            .args(["ntpd", "-q", "-n", "-p", "pool.ntp.org"])
+            .status();
+        match ntp {
+            Ok(s) if s.success() => notes.push("ntp synced".to_string()),
+            Ok(s) => notes.push(format!("ntp exit={}", s.code().unwrap_or(-1))),
+            Err(e) => notes.push(format!("ntp failed({})", e)),
+        }
+
         notes
     }
 
