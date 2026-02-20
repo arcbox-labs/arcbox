@@ -1228,11 +1228,33 @@ mod linux {
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(400)).await;
-
-        // Check containerd socket after waiting.
-        let containerd_ok = probe_first_ready_socket(&CONTAINERD_SOCKET_CANDIDATES).await;
-        tracing::info!(containerd_ready = containerd_ok, "containerd socket check after 400ms");
+        // Poll for containerd socket readiness before spawning dockerd.
+        // containerd may take several seconds to initialise its gRPC socket,
+        // especially on first boot when it has to set up its state directories.
+        // We wait up to 8 s in 200 ms increments; failing to detect it is not
+        // fatal — dockerd will retry on its own, but logging it helps debugging.
+        {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+            let mut containerd_ok = false;
+            while tokio::time::Instant::now() < deadline {
+                if probe_first_ready_socket(&CONTAINERD_SOCKET_CANDIDATES).await {
+                    containerd_ok = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            let elapsed_ms = (tokio::time::Instant::now()
+                .duration_since(deadline - Duration::from_secs(8)))
+            .as_millis();
+            tracing::info!(
+                containerd_ready = containerd_ok,
+                elapsed_ms,
+                "containerd socket poll complete"
+            );
+            if !containerd_ok {
+                notes.push("containerd socket not ready after 8s".to_string());
+            }
+        }
 
         if !probe_unix_socket(DOCKER_API_UNIX_SOCKET).await {
             let mut cmd = Command::new(&dockerd_bin);
