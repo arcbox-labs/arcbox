@@ -1299,15 +1299,21 @@ mod linux {
                 .stdout(daemon_log_file("dockerd"))
                 .stderr(daemon_log_file("dockerd"));
 
-            if youki_bin.exists() {
+            // Use bundled runc as the default OCI runtime.
+            // youki (a Rust OCI runtime) is also bundled but fails in the Alpine
+            // initramfs environment, possibly due to missing kernel features
+            // (seccomp, user namespaces) or cgroup configuration.
+            // runc is the reference OCI runtime and works reliably.
+            // The runtime binary directory is already prepended to PATH via
+            // path_env, so dockerd can locate runc without an explicit path.
+            let runc_bin = runtime_bin_dir.join("runc");
+            if runc_bin.exists() {
+                // Register bundled runc under the default name so dockerd uses it.
                 cmd.arg("--add-runtime")
-                    .arg(format!("youki={}", youki_bin.display()))
-                    .arg("--default-runtime=youki");
+                    .arg(format!("runc={}", runc_bin.display()));
+                notes.push("using bundled runc as OCI runtime".to_string());
             } else {
-                notes.push(format!(
-                    "youki binary missing at {}, using dockerd default runtime",
-                    youki_bin.display()
-                ));
+                notes.push("runc binary missing, dockerd will search PATH".to_string());
             }
 
             match cmd.spawn() {
