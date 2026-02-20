@@ -1027,13 +1027,17 @@ mod linux {
     fn ensure_runtime_prerequisites() -> Vec<String> {
         let mut notes = Vec::new();
 
+        // Alpine initramfs does not set PATH, so bare command names may not be
+        // found. Use /bin/busybox <applet> which is always present in Alpine.
+        let busybox = "/bin/busybox";
+
         // Mount cgroup2 unified hierarchy (required by dockerd).
         if !Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
             if let Err(e) = std::fs::create_dir_all("/sys/fs/cgroup") {
                 notes.push(format!("mkdir /sys/fs/cgroup failed({})", e));
             } else {
-                let rc = std::process::Command::new("mount")
-                    .args(["-t", "cgroup2", "cgroup2", "/sys/fs/cgroup"])
+                let rc = std::process::Command::new(busybox)
+                    .args(["mount", "-t", "cgroup2", "cgroup2", "/sys/fs/cgroup"])
                     .status();
                 match rc {
                     Ok(s) if s.success() => notes.push("mounted cgroup2".to_string()),
@@ -1046,8 +1050,9 @@ mod linux {
         // Mount devpts if missing (needed for PTY allocation).
         if !Path::new("/dev/pts/ptmx").exists() {
             let _ = std::fs::create_dir_all("/dev/pts");
-            let _ = std::process::Command::new("mount")
+            let _ = std::process::Command::new(busybox)
                 .args([
+                    "mount",
                     "-t",
                     "devpts",
                     "-o",
@@ -1061,8 +1066,8 @@ mod linux {
         // Mount /dev/shm if missing.
         if !Path::new("/dev/shm").exists() {
             let _ = std::fs::create_dir_all("/dev/shm");
-            let _ = std::process::Command::new("mount")
-                .args(["-t", "tmpfs", "-o", "nodev,nosuid,noexec", "shm", "/dev/shm"])
+            let _ = std::process::Command::new(busybox)
+                .args(["mount", "-t", "tmpfs", "-o", "nodev,nosuid,noexec", "shm", "/dev/shm"])
                 .status();
         }
 
@@ -1070,26 +1075,26 @@ mod linux {
         for dir in ["/tmp", "/run"] {
             if !Path::new(dir).exists() || std::fs::metadata(dir).is_ok_and(|m| m.permissions().readonly()) {
                 let _ = std::fs::create_dir_all(dir);
-                let _ = std::process::Command::new("mount")
-                    .args(["-t", "tmpfs", "tmpfs", dir])
+                let _ = std::process::Command::new(busybox)
+                    .args(["mount", "-t", "tmpfs", "tmpfs", dir])
                     .status();
             }
         }
 
         // Load overlay module (needed for Docker's overlay2 storage driver).
         if !Path::new("/sys/module/overlay").exists() {
-            let rc = std::process::Command::new("modprobe")
+            let rc = std::process::Command::new("/sbin/modprobe")
                 .arg("overlay")
                 .status();
             match rc {
                 Ok(s) if s.success() => notes.push("loaded overlay module".to_string()),
                 _ => {
                     // Fallback: try insmod with kernel version path.
-                    if let Ok(uname) = std::process::Command::new("uname").arg("-r").output() {
+                    if let Ok(uname) = std::process::Command::new(busybox).arg("uname").arg("-r").output() {
                         let kver = String::from_utf8_lossy(&uname.stdout).trim().to_string();
                         let ko = format!("/lib/modules/{}/kernel/fs/overlayfs/overlay.ko", kver);
                         if Path::new(&ko).exists() {
-                            let _ = std::process::Command::new("insmod").arg(&ko).status();
+                            let _ = std::process::Command::new(busybox).args(["insmod", &ko]).status();
                             notes.push(format!("insmod overlay from {}", ko));
                         } else {
                             notes.push("overlay module not found".to_string());
@@ -1102,17 +1107,38 @@ mod linux {
         notes
     }
 
-    /// Redirects daemon stdout/stderr to a log file under /var/log/ so crashes
-    /// are diagnosable.  Returns the opened file (or falls back to Stdio::null).
+    /// Redirects daemon stdout/stderr to a log file so crashes are diagnosable.
+    ///
+    /// Prefers `/arcbox/` (VirtioFS mount, visible from host as `~/.arcbox/`)
+    /// so that logs survive guest restarts and are accessible without exec.
+    /// Falls back to `/var/log/` (guest tmpfs) if VirtioFS is not mounted.
     fn daemon_log_file(name: &str) -> Stdio {
-        let log_path = format!("/var/log/{}.log", name);
+        let arcbox_path = format!("/arcbox/{}.log", name);
+        let var_log_path = format!("/var/log/{}.log", name);
+
+        let log_path = if Path::new("/arcbox").exists() {
+            &arcbox_path
+        } else {
+            &var_log_path
+        };
+
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&log_path)
+            .open(log_path)
         {
             Ok(f) => f.into(),
-            Err(_) => Stdio::null(),
+            Err(_) => {
+                // Fallback to /var/log/ if /arcbox/ write fails.
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&var_log_path)
+                {
+                    Ok(f) => f.into(),
+                    Err(_) => Stdio::null(),
+                }
+            }
         }
     }
 
@@ -1127,13 +1153,22 @@ mod linux {
             return runtime_missing_detail();
         };
 
+        tracing::info!(
+            runtime_bin_dir = %runtime_bin_dir.display(),
+            "starting bundled runtime"
+        );
+
         let containerd_bin = runtime_bin_dir.join("containerd");
         let dockerd_bin = runtime_bin_dir.join("dockerd");
         let youki_bin = runtime_bin_dir.join("youki");
         let mut notes = Vec::new();
 
         // Ensure kernel/filesystem prerequisites before spawning daemons.
-        notes.extend(ensure_runtime_prerequisites());
+        let prereq_notes = ensure_runtime_prerequisites();
+        if !prereq_notes.is_empty() {
+            tracing::info!(prerequisites = %prereq_notes.join("; "), "runtime prerequisites");
+        }
+        notes.extend(prereq_notes);
 
         for dir in [
             "/run/containerd",
@@ -1171,15 +1206,20 @@ mod linux {
             .stderr(daemon_log_file("containerd"));
 
             match cmd.spawn() {
-                Ok(child) => notes.push(format!(
-                    "spawned bundled containerd (pid={})",
-                    child.id().unwrap_or_default()
-                )),
+                Ok(child) => {
+                    let pid = child.id().unwrap_or_default();
+                    tracing::info!(pid, "spawned bundled containerd");
+                    notes.push(format!("spawned bundled containerd (pid={})", pid));
+                }
                 Err(e) => return format!("failed to spawn bundled containerd: {}", e),
             }
         }
 
         tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // Check containerd socket after waiting.
+        let containerd_ok = probe_first_ready_socket(&CONTAINERD_SOCKET_CANDIDATES).await;
+        tracing::info!(containerd_ready = containerd_ok, "containerd socket check after 400ms");
 
         if !probe_unix_socket(DOCKER_API_UNIX_SOCKET).await {
             let mut cmd = Command::new(&dockerd_bin);
@@ -1206,10 +1246,11 @@ mod linux {
             }
 
             match cmd.spawn() {
-                Ok(child) => notes.push(format!(
-                    "spawned bundled dockerd (pid={})",
-                    child.id().unwrap_or_default()
-                )),
+                Ok(child) => {
+                    let pid = child.id().unwrap_or_default();
+                    tracing::info!(pid, "spawned bundled dockerd");
+                    notes.push(format!("spawned bundled dockerd (pid={})", pid));
+                }
                 Err(e) => return format!("failed to spawn bundled dockerd: {}", e),
             }
         }
