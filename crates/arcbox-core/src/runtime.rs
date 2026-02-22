@@ -1912,6 +1912,7 @@ mod tests {
                 runtime_entry("containerd", b"containerd-bin"),
                 runtime_entry("youki", b"youki-bin"),
             ],
+            rootfs_squashfs_sha256: None,
         };
 
         let result = validate_bundled_runtime_manifest(&manifest, temp_dir.path());
@@ -1942,6 +1943,7 @@ mod tests {
                 runtime_entry("dockerd", b"dockerd-bin"),
                 runtime_entry("containerd", b"containerd-bin"),
             ],
+            rootfs_squashfs_sha256: None,
         };
 
         let err = validate_bundled_runtime_manifest(&manifest, temp_dir.path()).unwrap_err();

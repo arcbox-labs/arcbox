@@ -40,7 +40,7 @@ use tokio::io::AsyncWriteExt;
 
 /// Default boot asset version.
 /// This is pinned to a known-good kernel/initramfs bundle.
-pub const BOOT_ASSET_VERSION: &str = "0.0.1-alpha.24";
+pub const BOOT_ASSET_VERSION: &str = "0.0.1-alpha.25";
 
 /// Base URL for boot asset downloads.
 /// Assets are hosted on Cloudflare R2 via custom domain.
@@ -58,6 +58,11 @@ const INITRAMFS_FILENAME: &str = "initramfs.cpio.gz";
 
 /// Manifest filename inside the bundle.
 const MANIFEST_FILENAME: &str = "manifest.json";
+
+/// Rootfs squashfs filename inside the bundle.
+/// Introduced in schema_version 2 (squashfs rootfs architecture).
+/// Stage 1 initramfs mounts this image as the guest OS root filesystem.
+const ROOTFS_SQUASHFS_FILENAME: &str = "rootfs.squashfs";
 
 /// Checksum filename suffix.
 const CHECKSUM_SUFFIX: &str = ".sha256";
@@ -224,6 +229,11 @@ pub struct BootAssetManifest {
     /// Runtime binary metadata bundled in this boot asset.
     #[serde(default)]
     pub runtime_assets: Vec<RuntimeAssetManifestEntry>,
+    /// SHA256 of rootfs.squashfs (present in schema_version >= 2).
+    /// The squashfs image is the Stage 2 root filesystem; Stage 1 initramfs
+    /// mounts it via a tmpfs overlay so that pivot_root works for containers.
+    #[serde(default)]
+    pub rootfs_squashfs_sha256: Option<String>,
 }
 
 /// Runtime artifact metadata in boot manifest.
@@ -718,6 +728,20 @@ impl BootAssetProvider {
             manifest.kernel_commit.as_deref().unwrap_or("unknown"),
             manifest.agent_commit.as_deref().unwrap_or("unknown"),
         );
+
+        // schema_version 2 adds rootfs.squashfs (squashfs rootfs architecture).
+        // Validate its presence so the guest VM can successfully switch_root.
+        if manifest.schema_version >= 2 {
+            let squashfs_path = cache_dir.join(ROOTFS_SQUASHFS_FILENAME);
+            if !squashfs_path.exists() {
+                return Err(CoreError::config(format!(
+                    "boot bundle (schema_version={}) missing required file: {}. \
+                     Run 'arcbox boot prefetch --force' to re-download the asset bundle.",
+                    manifest.schema_version,
+                    squashfs_path.display()
+                )));
+            }
+        }
 
         Ok(())
     }
