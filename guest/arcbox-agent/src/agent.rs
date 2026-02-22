@@ -1293,7 +1293,6 @@ mod linux {
                 .arg("--containerd=/run/containerd/containerd.sock")
                 .arg("--exec-root=/var/run/docker")
                 .arg("--data-root=/var/lib/docker")
-                .arg("--iptables=false")
                 .env("PATH", &path_env)
                 .stdin(Stdio::null())
                 .stdout(daemon_log_file("dockerd"))
