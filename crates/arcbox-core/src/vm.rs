@@ -96,6 +96,15 @@ impl SharedDirConfig {
     }
 }
 
+/// Block device configuration for the VM.
+#[derive(Debug, Clone)]
+pub struct BlockDeviceConfig {
+    /// Path to the disk image file on the host.
+    pub path: String,
+    /// Whether the block device is read-only.
+    pub read_only: bool,
+}
+
 /// VM configuration.
 #[derive(Debug, Clone)]
 pub struct VmConfig {
@@ -111,6 +120,8 @@ pub struct VmConfig {
     pub cmdline: Option<String>,
     /// Shared directories for VirtioFS.
     pub shared_dirs: Vec<SharedDirConfig>,
+    /// Block devices (for example, rootfs ext4 image).
+    pub block_devices: Vec<BlockDeviceConfig>,
     /// Enable networking.
     pub networking: bool,
     /// Enable vsock.
@@ -133,6 +144,7 @@ impl Default for VmConfig {
             initrd: None,
             cmdline: None,
             shared_dirs: Vec::new(),
+            block_devices: Vec::new(),
             networking: true,
             vsock: true,
             guest_cid: None,
@@ -248,7 +260,15 @@ impl VmManager {
             vsock: entry.config.vsock,
             guest_cid: entry.config.guest_cid,
             balloon: entry.config.balloon,
-            block_devices: Vec::new(),
+            block_devices: entry
+                .config
+                .block_devices
+                .iter()
+                .map(|bd| arcbox_vmm::vmm::BlockDeviceConfig {
+                    path: PathBuf::from(&bd.path),
+                    read_only: bd.read_only,
+                })
+                .collect(),
         }
     }
 

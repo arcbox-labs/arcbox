@@ -172,6 +172,8 @@ pub struct MachineConfig {
     pub initrd: Option<String>,
     /// Kernel command line.
     pub cmdline: Option<String>,
+    /// Block devices (for example, rootfs ext4 image).
+    pub block_devices: Vec<crate::vm::BlockDeviceConfig>,
     /// Distribution name (e.g., "alpine", "ubuntu").
     pub distro: Option<String>,
     /// Distribution version (e.g., "3.21", "24.04").
@@ -188,6 +190,7 @@ impl Default for MachineConfig {
             kernel: None,
             initrd: None,
             cmdline: None,
+            block_devices: Vec::new(),
             distro: None,
             distro_version: None,
         }
@@ -317,6 +320,7 @@ impl MachineManager {
             initrd: config.initrd.clone(),
             cmdline: config.cmdline.clone(),
             shared_dirs,
+            block_devices: config.block_devices.clone(),
             ..Default::default()
         };
         let vm_id = self.vm_manager.create(vm_config)?;

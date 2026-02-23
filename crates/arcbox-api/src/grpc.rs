@@ -498,6 +498,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             } else {
                 Some(req.version)
             },
+            block_devices: Vec::new(),
         };
 
         self.runtime

@@ -1,12 +1,12 @@
 //! Boot asset management for VM startup.
 //!
 //! This module handles automatic downloading, verification, and caching
-//! of kernel and initramfs files required for VM boot.
+//! of kernel/initramfs/rootfs/modloop files required for VM boot.
 //!
 //! ## Asset Sources
 //!
 //! Boot assets can be obtained from:
-//! 1. **CDN/GitHub Releases** - Pre-built optimized kernel + initramfs
+//! 1. **CDN/GitHub Releases** - Pre-built optimized boot bundle
 //! 2. **Local cache** - Previously downloaded assets
 //! 3. **Custom paths** - User-provided kernel/initramfs
 //!
@@ -16,10 +16,11 @@
 //! ```text
 //! ~/.arcbox/boot/
 //! ├── v0.1.0/
-//! │   ├── kernel-arm64
-//! │   ├── kernel-arm64.sha256
-//! │   ├── initramfs-arm64.cpio.gz
-//! │   └── initramfs-arm64.sha256
+//! │   ├── kernel
+//! │   ├── initramfs.cpio.gz
+//! │   ├── rootfs.squashfs
+//! │   ├── modloop
+//! │   └── manifest.json
 //! └── current -> v0.1.0/
 //! ```
 
@@ -40,7 +41,7 @@ use tokio::io::AsyncWriteExt;
 
 /// Default boot asset version.
 /// This is pinned to a known-good kernel/initramfs bundle.
-pub const BOOT_ASSET_VERSION: &str = "0.0.1-alpha.30";
+pub const BOOT_ASSET_VERSION: &str = "0.0.1-alpha.36";
 
 /// Base URL for boot asset downloads.
 /// Assets are hosted on Cloudflare R2 via custom domain.
@@ -63,6 +64,18 @@ const MANIFEST_FILENAME: &str = "manifest.json";
 /// Introduced in schema_version 2 (squashfs rootfs architecture).
 /// Stage 1 initramfs mounts this image as the guest OS root filesystem.
 const ROOTFS_SQUASHFS_FILENAME: &str = "rootfs.squashfs";
+
+/// Rootfs ext4 image filename inside the bundle.
+/// Introduced in schema_version 4 (Alpine rootfs + OpenRC architecture).
+/// The VMM attaches this as a VirtIO block device; initramfs mounts it at
+/// /dev/vda and switch_roots to standard Alpine OpenRC init.
+const ROOTFS_EXT4_FILENAME: &str = "rootfs.ext4";
+
+/// Alpine modloop filename inside the bundle.
+/// Introduced in schema_version 3.
+/// Stage 1 initramfs loop-mounts this squashfs and bind-mounts its modules
+/// tree into Stage 2 so modprobe works normally after switch_root.
+const MODLOOP_FILENAME: &str = "modloop";
 
 /// Checksum filename suffix.
 const CHECKSUM_SUFFIX: &str = ".sha256";
@@ -184,6 +197,10 @@ pub struct BootAssets {
     pub kernel: PathBuf,
     /// Path to initramfs.
     pub initramfs: PathBuf,
+    /// Path to rootfs ext4 image (schema_version >= 4, DistroEngine mode).
+    /// When present, the VMM attaches this as a VirtIO block device at /dev/vda
+    /// and the initramfs mounts it directly (no squashfs+overlay).
+    pub rootfs_image: Option<PathBuf>,
     /// Kernel command line.
     pub cmdline: String,
     /// Asset version.
@@ -234,6 +251,14 @@ pub struct BootAssetManifest {
     /// mounts it via a tmpfs overlay so that pivot_root works for containers.
     #[serde(default)]
     pub rootfs_squashfs_sha256: Option<String>,
+    /// SHA256 of modloop (present in schema_version >= 3).
+    #[serde(default)]
+    pub modloop_sha256: Option<String>,
+    /// SHA256 of rootfs.ext4 (present in schema_version >= 4).
+    /// The ext4 image is attached as a VirtIO block device; Alpine OpenRC
+    /// handles all init instead of a custom two-stage init.
+    #[serde(default)]
+    pub rootfs_ext4_sha256: Option<String>,
 }
 
 /// Runtime artifact metadata in boot manifest.
@@ -404,9 +429,20 @@ impl BootAssetProvider {
             .and_then(|m| m.kernel_cmdline.clone())
             .unwrap_or_else(BootAssets::default_cmdline);
 
+        // Check for rootfs.ext4 (schema_version >= 4, DistroEngine mode).
+        let rootfs_image = {
+            let ext4_path = self.config.version_cache_dir().join(ROOTFS_EXT4_FILENAME);
+            if ext4_path.exists() {
+                Some(ext4_path)
+            } else {
+                None
+            }
+        };
+
         Ok(BootAssets {
             kernel,
             initramfs,
+            rootfs_image,
             cmdline,
             version: self.config.version.clone(),
             manifest,
@@ -739,6 +775,35 @@ impl BootAssetProvider {
                      Run 'arcbox boot prefetch --force' to re-download the asset bundle.",
                     manifest.schema_version,
                     squashfs_path.display()
+                )));
+            }
+        }
+
+        // schema_version 3 adds modloop (Alpine kernel modules squashfs).
+        // Stage 1 mounts this inside /newroot so Stage 2 has /lib/modules.
+        if manifest.schema_version >= 3 && manifest.schema_version < 4 {
+            let modloop_path = cache_dir.join(MODLOOP_FILENAME);
+            if !modloop_path.exists() {
+                return Err(CoreError::config(format!(
+                    "boot bundle (schema_version={}) missing required file: {}. \
+                     Run 'arcbox boot prefetch --force' to re-download the asset bundle.",
+                    manifest.schema_version,
+                    modloop_path.display()
+                )));
+            }
+        }
+
+        // schema_version 4 adds rootfs.ext4 (Alpine rootfs + OpenRC).
+        // The VMM attaches this as a VirtIO block device; initramfs mounts
+        // /dev/vda and switch_roots to /sbin/init (OpenRC).
+        if manifest.schema_version >= 4 {
+            let ext4_path = cache_dir.join(ROOTFS_EXT4_FILENAME);
+            if !ext4_path.exists() {
+                return Err(CoreError::config(format!(
+                    "boot bundle (schema_version={}) missing required file: {}. \
+                     Run 'arcbox boot prefetch --force' to re-download the asset bundle.",
+                    manifest.schema_version,
+                    ext4_path.display()
                 )));
             }
         }

@@ -1913,6 +1913,8 @@ mod tests {
                 runtime_entry("youki", b"youki-bin"),
             ],
             rootfs_squashfs_sha256: None,
+            modloop_sha256: None,
+            rootfs_ext4_sha256: None,
         };
 
         let result = validate_bundled_runtime_manifest(&manifest, temp_dir.path());
@@ -1944,6 +1946,8 @@ mod tests {
                 runtime_entry("containerd", b"containerd-bin"),
             ],
             rootfs_squashfs_sha256: None,
+            modloop_sha256: None,
+            rootfs_ext4_sha256: None,
         };
 
         let err = validate_bundled_runtime_manifest(&manifest, temp_dir.path()).unwrap_err();

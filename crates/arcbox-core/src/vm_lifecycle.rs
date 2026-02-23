@@ -718,6 +718,20 @@ impl VmLifecycleManager {
             .clone()
             .unwrap_or(assets.cmdline);
 
+        // When rootfs.ext4 is present (schema_version >= 4), the initramfs
+        // mounts /dev/vda directly and switch_roots to /sbin/init (OpenRC).
+        // Override cmdline to use block device root instead of rdinit.
+        let has_rootfs_image = assets.rootfs_image.is_some();
+        if has_rootfs_image {
+            // Replace rdinit=/init with root=/dev/vda rw for block device boot.
+            let tokens: Vec<&str> = cmdline
+                .split_whitespace()
+                .filter(|t| !t.starts_with("rdinit=") && !t.starts_with("root="))
+                .collect();
+            cmdline = tokens.join(" ");
+            cmdline.push_str(" root=/dev/vda rw");
+        }
+
         // Strip "quiet" so kernel boot messages are visible on the serial console.
         cmdline = cmdline
             .split_whitespace()
@@ -750,6 +764,20 @@ impl VmLifecycleManager {
             }
         }
 
+        // Attach rootfs.ext4 as a block device when available.
+        let block_devices = if let Some(ref rootfs_path) = assets.rootfs_image {
+            tracing::info!(
+                "Using ext4 rootfs block device: {}",
+                rootfs_path.display()
+            );
+            vec![crate::vm::BlockDeviceConfig {
+                path: rootfs_path.to_string_lossy().to_string(),
+                read_only: false,
+            }]
+        } else {
+            Vec::new()
+        };
+
         let config = MachineConfig {
             name: DEFAULT_MACHINE_NAME.to_string(),
             cpus: self.config.default_vm.cpus,
@@ -758,6 +786,7 @@ impl VmLifecycleManager {
             kernel: Some(assets.kernel.to_string_lossy().to_string()),
             initrd: Some(assets.initramfs.to_string_lossy().to_string()),
             cmdline: Some(cmdline),
+            block_devices,
             distro: None,
             distro_version: None,
         };
