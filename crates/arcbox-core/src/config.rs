@@ -276,7 +276,7 @@ impl Default for ContainerRuntimeConfig {
             backend: ContainerBackendMode::GuestDocker,
             provision: ContainerProvisionMode::BundledAssets,
             guest_docker_vsock_port: 2375,
-            startup_timeout_ms: 20_000,
+            startup_timeout_ms: 60_000,
         }
     }
 }

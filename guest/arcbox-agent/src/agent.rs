@@ -792,13 +792,15 @@ mod linux {
             notes.push(note);
         }
 
-        // Poll until docker socket is ready (up to ~6 seconds).
+        // Poll until docker socket is ready (up to ~30 seconds).
+        // dockerd on first boot may need significant time to initialise its
+        // overlay2 storage and connect to containerd.
         let mut status = collect_runtime_status().await;
-        for _ in 0..20 {
+        for _ in 0..60 {
             if status.docker_ready {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
             status = collect_runtime_status().await;
         }
 
