@@ -10,11 +10,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Each crate has its own `CLAUDE.md` with detailed guidance:
 
-| Layer | Crates |
-|-------|--------|
-| **Core** | `crates/arcbox-hypervisor`, `arcbox-vmm`, `arcbox-virtio`, `arcbox-fs`, `arcbox-net`, `arcbox-core`, `arcbox-container`, `arcbox-image`, `arcbox-docker`, `arcbox-api`, `arcbox-cli`, `arcbox-protocol`, `arcbox-transport`, `arcbox-oci`, `arcbox-grpc`, `arcbox-vz` |
-| **Pro** | `pro/arcbox-fs-enhanced`, `arcbox-net-advanced`, `arcbox-snapshot`, `arcbox-perf` |
-| **Guest** | `guest/arcbox-agent` |
+| Layer | Directory | Crates |
+|-------|-----------|--------|
+| **L0: Common** | `common/` | `arcbox-error` |
+| **L1-2: Hypervisor** | `hypervisor/` | `arcbox-vz`, `arcbox-hypervisor`, `arcbox-vmm`, `arcbox-virtio` |
+| **L3: Services** | `services/` | `arcbox-fs`, `arcbox-net`, `arcbox-container`, `arcbox-image`, `arcbox-oci` |
+| **L4: Communication** | `comm/` | `arcbox-protocol`, `arcbox-grpc`, `arcbox-transport` |
+| **L5-6: Application** | `app/` | `arcbox-core`, `arcbox-api`, `arcbox-docker`, `arcbox-cli`, `arcbox` |
+| **Pro** | `pro/` | `arcbox-fs-enhanced`, `arcbox-net-advanced`, `arcbox-snapshot`, `arcbox-perf` |
+| **Guest** | `guest/` | `arcbox-agent` |
 
 When working on a specific crate, read its `CLAUDE.md` for crate-specific patterns and types.
 
@@ -31,36 +35,47 @@ ArcBox is a high-performance container and virtual machine runtime implemented p
 ## Repository Structure
 
 ```
-arcbox/                          # This repository
-├── crates/                      # Core layer (MIT OR Apache-2.0)
-│   ├── arcbox-hypervisor/       # Virtualization abstraction
-│   ├── arcbox-vmm/              # Virtual machine monitor
-│   ├── arcbox-virtio/           # VirtIO devices
-│   ├── arcbox-fs/               # Base filesystem
-│   ├── arcbox-net/              # Base network stack
-│   ├── arcbox-container/        # Container management
-│   ├── arcbox-image/            # Image management
-│   ├── arcbox-oci/              # OCI spec implementation
-│   ├── arcbox-protocol/         # ttrpc protocol
-│   ├── arcbox-transport/        # Transport layer
-│   ├── arcbox-docker/           # Docker REST API
-│   ├── arcbox-core/             # Core coordination
-│   ├── arcbox-api/              # gRPC API
-│   └── arcbox-cli/              # Command-line tool
+arcbox/                              # This repository
+├── common/                          # L0: Foundation (MIT OR Apache-2.0)
+│   └── arcbox-error/                # Unified error types
 │
-├── guest/                       # Guest components (MIT OR Apache-2.0)
-│   └── arcbox-agent/            # In-VM agent (requires cross-compilation)
+├── hypervisor/                      # L1-2: Virtualization (MIT OR Apache-2.0)
+│   ├── arcbox-vz/                   # macOS Virtualization.framework bindings
+│   ├── arcbox-hypervisor/           # Cross-platform virtualization abstraction
+│   ├── arcbox-vmm/                  # Virtual machine monitor
+│   └── arcbox-virtio/               # VirtIO devices (blk/net/console/fs/vsock)
 │
-├── pro/                         # Pro layer (BSL-1.1)
-│   ├── arcbox-fs-enhanced/      # Smart caching/prefetch
-│   ├── arcbox-net-advanced/     # VPN-aware/advanced DNS
-│   ├── arcbox-snapshot/         # Snapshot/restore
-│   └── arcbox-perf/             # Performance monitoring
+├── services/                        # L3: Domain services (MIT OR Apache-2.0)
+│   ├── arcbox-fs/                   # VirtioFS filesystem
+│   ├── arcbox-net/                  # Network stack (NAT/DHCP/DNS)
+│   ├── arcbox-container/            # Container state management
+│   ├── arcbox-image/                # OCI image management
+│   └── arcbox-oci/                  # OCI runtime spec
 │
-└── tests/resources/             # Test resources
-    ├── entitlements.plist       # macOS signing entitlements
-    ├── download-kernel.sh       # Download test kernel
-    └── build-initramfs.sh       # Build initramfs
+├── comm/                            # L4: Communication (MIT OR Apache-2.0)
+│   ├── arcbox-protocol/             # Protobuf message definitions
+│   ├── arcbox-grpc/                 # gRPC services (tonic)
+│   └── arcbox-transport/            # Transport layer (vsock/unix socket)
+│
+├── app/                             # L5-6: Application (MIT OR Apache-2.0)
+│   ├── arcbox-core/                 # Core orchestration (Runtime singleton)
+│   ├── arcbox-api/                  # API server (gRPC + Docker)
+│   ├── arcbox-docker/               # Docker Engine API v1.43 compat
+│   ├── arcbox-cli/                  # Command-line tool
+│   └── arcbox/                      # Facade crate (re-exports)
+│
+├── guest/                           # Guest components (MIT OR Apache-2.0)
+│   └── arcbox-agent/                # In-VM agent (cross-compiled)
+│
+├── pro/                             # Pro layer (BSL-1.1)
+│   ├── arcbox-fs-enhanced/          # Smart caching/prefetch
+│   ├── arcbox-net-advanced/         # VPN-aware/advanced DNS
+│   ├── arcbox-snapshot/             # Snapshot/restore
+│   └── arcbox-perf/                 # Performance monitoring
+│
+└── tests/                           # Test infrastructure
+    ├── e2e/                         # End-to-end tests
+    └── resources/                   # Test resources
 ```
 
 ## Design Goals and Requirements

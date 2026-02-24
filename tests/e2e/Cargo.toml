@@ -7,11 +7,11 @@ description = "End-to-end integration tests for ArcBox"
 
 [dependencies]
 # ArcBox crates
-arcbox-core = { path = "../../crates/arcbox-core" }
-arcbox-image = { path = "../../crates/arcbox-image" }
-arcbox-container = { path = "../../crates/arcbox-container" }
-arcbox-protocol = { path = "../../crates/arcbox-protocol" }
-arcbox-vmm = { path = "../../crates/arcbox-vmm" }
+arcbox-core = { path = "../../app/arcbox-core" }
+arcbox-image = { path = "../../services/arcbox-image" }
+arcbox-container = { path = "../../services/arcbox-container" }
+arcbox-protocol = { path = "../../comm/arcbox-protocol" }
+arcbox-vmm = { path = "../../hypervisor/arcbox-vmm" }
 
 # Async runtime
 tokio = { version = "1", features = ["full", "test-util"] }

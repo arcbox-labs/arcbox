@@ -2,40 +2,46 @@
 resolver = "2"
 members = [
     # ============================================
-    # Core Layer (MIT OR Apache-2.0)
+    # L0: Common (MIT OR Apache-2.0)
     # ============================================
+    "common/arcbox-error",
 
-    # Common utilities
-    "crates/arcbox-error",
+    # ============================================
+    # L1-2: Hypervisor (MIT OR Apache-2.0)
+    # ============================================
+    "hypervisor/arcbox-vz",
+    "hypervisor/arcbox-hypervisor",
+    "hypervisor/arcbox-vmm",
+    "hypervisor/arcbox-virtio",
 
-    # Low-level infrastructure
-    "crates/arcbox-vz",
-    "crates/arcbox-hypervisor",
-    "crates/arcbox-vmm",
-    "crates/arcbox-virtio",
+    # ============================================
+    # L3: Services (MIT OR Apache-2.0)
+    # ============================================
+    "services/arcbox-fs",
+    "services/arcbox-net",
+    "services/arcbox-container",
+    "services/arcbox-image",
+    "services/arcbox-oci",
 
-    # Services
-    "crates/arcbox-fs",
-    "crates/arcbox-net",
-    "crates/arcbox-container",
-    "crates/arcbox-image",
-    "crates/arcbox-oci",
+    # ============================================
+    # L4: Communication (MIT OR Apache-2.0)
+    # ============================================
+    "comm/arcbox-protocol",
+    "comm/arcbox-grpc",
+    "comm/arcbox-transport",
 
-    # Communication (see architecture/cli-api.md)
-    "crates/arcbox-protocol",
-    "crates/arcbox-grpc",
-    "crates/arcbox-transport",
-    "crates/arcbox-docker",
+    # ============================================
+    # L5-6: Application (MIT OR Apache-2.0)
+    # ============================================
+    "app/arcbox-core",
+    "app/arcbox-api",
+    "app/arcbox-docker",
+    "app/arcbox-cli",
+    "app/arcbox",
 
-    # Core and interfaces
-    "crates/arcbox-core",
-    "crates/arcbox-api",
-    "crates/arcbox-cli",
-
-    # Facade crate
-    "crates/arcbox",
-
-    # Guest components
+    # ============================================
+    # Guest Components (MIT OR Apache-2.0)
+    # ============================================
     "guest/arcbox-agent",
 
     # ============================================
@@ -150,25 +156,25 @@ libc = "0.2"
 macos-resolver = "0.2.0"
 
 # Internal crates (Core layer)
-arcbox-error = { version = "0.0.1-alpha.1", path = "crates/arcbox-error" }
-arcbox-vz = { version = "0.0.1-alpha.1", path = "crates/arcbox-vz" }
-arcbox-hypervisor = { version = "0.0.1-alpha.1", path = "crates/arcbox-hypervisor" }
-arcbox-vmm = { version = "0.0.1-alpha.1", path = "crates/arcbox-vmm" }
-arcbox-virtio = { version = "0.0.1-alpha.1", path = "crates/arcbox-virtio" }
-arcbox-fs = { version = "0.0.1-alpha.1", path = "crates/arcbox-fs" }
-arcbox-net = { version = "0.0.1-alpha.1", path = "crates/arcbox-net" }
-arcbox-container = { version = "0.0.1-alpha.2", path = "crates/arcbox-container" }
-arcbox-image = { version = "0.0.1-alpha.1", path = "crates/arcbox-image" }
-arcbox-oci = { version = "0.0.1-alpha.1", path = "crates/arcbox-oci" }
-arcbox-protocol = { version = "0.0.1-alpha.1", path = "crates/arcbox-protocol" }
-arcbox-grpc = { version = "0.0.1-alpha.1", path = "crates/arcbox-grpc" }
-arcbox-transport = { version = "0.0.1-alpha.1", path = "crates/arcbox-transport" }
-arcbox-docker = { version = "0.0.1-alpha.1", path = "crates/arcbox-docker" }
-arcbox-core = { version = "0.0.1-alpha.2", path = "crates/arcbox-core" }
-arcbox-api = { version = "0.0.1-alpha.1", path = "crates/arcbox-api" }
-arcbox-cli = { version = "0.0.1-alpha.1", path = "crates/arcbox-cli" }
+arcbox-error = { version = "0.0.1-alpha.1", path = "common/arcbox-error" }
+arcbox-vz = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-vz" }
+arcbox-hypervisor = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-hypervisor" }
+arcbox-vmm = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-vmm" }
+arcbox-virtio = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-virtio" }
+arcbox-fs = { version = "0.0.1-alpha.1", path = "services/arcbox-fs" }
+arcbox-net = { version = "0.0.1-alpha.1", path = "services/arcbox-net" }
+arcbox-container = { version = "0.0.1-alpha.2", path = "services/arcbox-container" }
+arcbox-image = { version = "0.0.1-alpha.1", path = "services/arcbox-image" }
+arcbox-oci = { version = "0.0.1-alpha.1", path = "services/arcbox-oci" }
+arcbox-protocol = { version = "0.0.1-alpha.1", path = "comm/arcbox-protocol" }
+arcbox-grpc = { version = "0.0.1-alpha.1", path = "comm/arcbox-grpc" }
+arcbox-transport = { version = "0.0.1-alpha.1", path = "comm/arcbox-transport" }
+arcbox-docker = { version = "0.0.1-alpha.1", path = "app/arcbox-docker" }
+arcbox-core = { version = "0.0.1-alpha.2", path = "app/arcbox-core" }
+arcbox-api = { version = "0.0.1-alpha.1", path = "app/arcbox-api" }
+arcbox-cli = { version = "0.0.1-alpha.1", path = "app/arcbox-cli" }
 arcbox-agent = { version = "0.0.1-alpha.1", path = "guest/arcbox-agent" }
-arcbox = { version = "0.0.1-alpha.1", path = "crates/arcbox" }
+arcbox = { version = "0.0.1-alpha.1", path = "app/arcbox" }
 
 # Internal crates (Pro layer)
 arcbox-fs-enhanced = { version = "0.0.1-alpha.1", path = "pro/arcbox-fs-enhanced" }
