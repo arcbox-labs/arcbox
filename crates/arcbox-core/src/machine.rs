@@ -215,12 +215,21 @@ impl MachineManager {
         let machines_dir = data_dir.join("machines");
         let persistence = MachinePersistence::new(&machines_dir);
 
-        // Create the default shared directory config for VirtioFS
-        // This shares the data_dir (e.g., ~/.arcbox) with the guest at /arcbox
-        let shared_dirs = vec![SharedDirConfig::new(
+        // Create the default shared directory config for VirtioFS.
+        // "arcbox" shares the data_dir; "users" shares /Users for transparent paths.
+        let mut shared_dirs = vec![SharedDirConfig::new(
             data_dir.to_string_lossy().to_string(),
             "arcbox",
         )];
+        let users_dir = std::path::Path::new("/Users");
+        if users_dir.is_dir() {
+            shared_dirs.push(SharedDirConfig::new("/Users", "users"));
+        } else if let Some(home_dir) = dirs::home_dir() {
+            shared_dirs.push(SharedDirConfig::new(
+                home_dir.to_string_lossy().to_string(),
+                "home",
+            ));
+        }
 
         // Load persisted machines
         let mut machines = HashMap::new();
@@ -301,11 +310,18 @@ impl MachineManager {
         std::fs::create_dir_all(&machine_dir)?;
 
         // Set up shared directories for VirtioFS.
+        // "arcbox" tag provides internal data (boot assets, logs, runtime).
+        // "users" tag shares /Users so macOS paths work transparently in guest
+        // (e.g. `docker run -v /Users/foo/project:/app` just works).
         let mut shared_dirs = vec![SharedDirConfig::new(
             self.data_dir.to_string_lossy().to_string(),
             "arcbox",
         )];
-        if let Some(home_dir) = dirs::home_dir() {
+        let users_dir = std::path::Path::new("/Users");
+        if users_dir.is_dir() {
+            shared_dirs.push(SharedDirConfig::new("/Users", "users"));
+        } else if let Some(home_dir) = dirs::home_dir() {
+            // Fallback for non-standard macOS layouts.
             shared_dirs.push(SharedDirConfig::new(
                 home_dir.to_string_lossy().to_string(),
                 "home",

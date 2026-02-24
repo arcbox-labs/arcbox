@@ -41,7 +41,7 @@ use tokio::io::AsyncWriteExt;
 
 /// Default boot asset version.
 /// This is pinned to a known-good kernel/initramfs bundle.
-pub const BOOT_ASSET_VERSION: &str = "0.0.1-alpha.40";
+pub const BOOT_ASSET_VERSION: &str = "0.1.1";
 
 /// Base URL for boot asset downloads.
 /// Assets are hosted on Cloudflare R2 via custom domain.

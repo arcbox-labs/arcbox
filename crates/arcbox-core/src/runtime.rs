@@ -727,25 +727,24 @@ impl Runtime {
 
         // Convert volume mounts to protocol Mount type with path translation.
         // Host paths under data_dir are translated to /arcbox/... in guest.
-        // Host paths under home directory are translated to /host-home/... in guest.
+        // Host paths under /Users are passed through unchanged (VirtioFS "users"
+        // share mounts /Users at the same path in guest).
         let data_dir_str = self.config.data_dir.to_string_lossy().to_string();
-        let home_dir_str = dirs::home_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
         let mounts: Vec<Mount> = config
             .volumes
             .iter()
             .map(|v| {
                 // Translate host path to guest-accessible path.
-                // Priority: data_dir first, then home directory
+                // Priority: data_dir → /arcbox, /Users paths pass through as-is.
                 let guest_source = if v.source.starts_with(&data_dir_str) {
                     v.source.replacen(&data_dir_str, "/arcbox", 1)
-                } else if !home_dir_str.is_empty() && v.source.starts_with(&home_dir_str) {
-                    v.source.replacen(&home_dir_str, "/host-home", 1)
+                } else if v.source.starts_with("/Users/") {
+                    // /Users is mounted at /Users in guest via VirtioFS.
+                    v.source.clone()
                 } else {
-                    // For paths outside both data_dir and home, keep as-is.
+                    // For paths outside data_dir and /Users, keep as-is.
                     tracing::warn!(
-                        "Volume source '{}' is outside data_dir and home, mount may fail",
+                        "Volume source '{}' is outside /Users, mount may fail in guest",
                         v.source
                     );
                     v.source.clone()

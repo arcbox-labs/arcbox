@@ -13,6 +13,7 @@ KERNEL_DIR="${SCRIPT_DIR}"
 KERNEL_VERSION="6.6.63-0-lts"
 KERNEL_URL="https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/netboot/vmlinuz-lts"
 INITRAMFS_URL="https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/netboot/initramfs-lts"
+MODLOOP_URL="https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/netboot/modloop-lts"
 
 echo "Downloading ARM64 Linux kernel for testing..."
 
@@ -34,7 +35,17 @@ else
     echo "Initramfs already exists at ${KERNEL_DIR}/initramfs-arm64"
 fi
 
+# Download modloop (full kernel module set)
+if [ ! -f "${KERNEL_DIR}/modloop-lts" ]; then
+    echo "Downloading modloop..."
+    curl -L -o "${KERNEL_DIR}/modloop-lts" "${MODLOOP_URL}"
+    echo "Modloop downloaded to ${KERNEL_DIR}/modloop-lts"
+else
+    echo "Modloop already exists at ${KERNEL_DIR}/modloop-lts"
+fi
+
 echo "Done! Test resources ready."
 echo ""
 echo "Kernel: ${KERNEL_DIR}/vmlinuz-arm64"
 echo "Initramfs: ${KERNEL_DIR}/initramfs-arm64"
+echo "Modloop: ${KERNEL_DIR}/modloop-lts"

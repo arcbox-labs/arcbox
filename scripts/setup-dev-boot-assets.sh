@@ -42,26 +42,35 @@ setup_from_kernel_repo() {
         return 1
     fi
 
-    if [[ ! -f "$KERNEL_OUTPUT_DIR/kernel-arm64" ]] || [[ ! -f "$KERNEL_OUTPUT_DIR/initramfs-arm64.cpio.gz" ]]; then
+    if [[ ! -f "$KERNEL_OUTPUT_DIR/kernel-arm64" ]] \
+        || [[ ! -f "$KERNEL_OUTPUT_DIR/initramfs-arm64.cpio.gz" ]] \
+        || [[ ! -f "$KERNEL_OUTPUT_DIR/rootfs.squashfs" ]] \
+        || [[ ! -f "$KERNEL_OUTPUT_DIR/modloop" ]]; then
         log_warn "arcbox-kernel output incomplete: $KERNEL_OUTPUT_DIR"
-        log_warn "Expected: kernel-arm64 + initramfs-arm64.cpio.gz"
+        log_warn "Expected: kernel-arm64 + initramfs-arm64.cpio.gz + rootfs.squashfs + modloop"
         return 1
     fi
 
     mkdir -p "$DEV_BOOT_DIR"
     cp "$KERNEL_OUTPUT_DIR/kernel-arm64" "$DEV_BOOT_DIR/kernel"
     cp "$KERNEL_OUTPUT_DIR/initramfs-arm64.cpio.gz" "$DEV_BOOT_DIR/initramfs.cpio.gz"
+    cp "$KERNEL_OUTPUT_DIR/rootfs.squashfs" "$DEV_BOOT_DIR/rootfs.squashfs"
+    cp "$KERNEL_OUTPUT_DIR/modloop" "$DEV_BOOT_DIR/modloop"
     if [[ -f "$KERNEL_OUTPUT_DIR/manifest.json" ]]; then
         cp "$KERNEL_OUTPUT_DIR/manifest.json" "$DEV_BOOT_DIR/manifest.json"
         log_info "Copied manifest.json from arcbox-kernel output"
     fi
 
-    log_info "Copied kernel/initramfs from arcbox-kernel output"
+    log_info "Copied kernel/initramfs/rootfs/modloop from arcbox-kernel output"
     return 0
 }
 
 check_dev_assets() {
-    if [[ -f "$DEV_BOOT_DIR/kernel" ]] && [[ -f "$DEV_BOOT_DIR/initramfs.cpio.gz" ]] && [[ -f "$DEV_BOOT_DIR/manifest.json" ]]; then
+    if [[ -f "$DEV_BOOT_DIR/kernel" ]] \
+        && [[ -f "$DEV_BOOT_DIR/initramfs.cpio.gz" ]] \
+        && [[ -f "$DEV_BOOT_DIR/rootfs.squashfs" ]] \
+        && [[ -f "$DEV_BOOT_DIR/modloop" ]] \
+        && [[ -f "$DEV_BOOT_DIR/manifest.json" ]]; then
         if grep -Eq "\"asset_version\"[[:space:]]*:[[:space:]]*\"$BOOT_ASSET_VERSION\"" "$DEV_BOOT_DIR/manifest.json"; then
             return 0
         fi
@@ -98,6 +107,22 @@ setup_from_user_cache() {
         return 1
     fi
 
+    if [[ -f "$USER_BOOT_DIR/rootfs.squashfs" ]]; then
+        cp "$USER_BOOT_DIR/rootfs.squashfs" "$DEV_BOOT_DIR/"
+        log_info "Copied rootfs.squashfs"
+    else
+        log_error "rootfs.squashfs not found in user cache"
+        return 1
+    fi
+
+    if [[ -f "$USER_BOOT_DIR/modloop" ]]; then
+        cp "$USER_BOOT_DIR/modloop" "$DEV_BOOT_DIR/"
+        log_info "Copied modloop"
+    else
+        log_error "modloop not found in user cache"
+        return 1
+    fi
+
     if [[ -f "$USER_BOOT_DIR/manifest.json" ]]; then
         cp "$USER_BOOT_DIR/manifest.json" "$DEV_BOOT_DIR/manifest.json"
         log_info "Copied manifest.json"
@@ -129,6 +154,16 @@ print_info() {
         local initramfs_size
         initramfs_size=$(ls -lh "$DEV_BOOT_DIR/initramfs.cpio.gz" | awk '{print $5}')
         echo "Initramfs:  $initramfs_size"
+    fi
+    if [[ -f "$DEV_BOOT_DIR/rootfs.squashfs" ]]; then
+        local rootfs_size
+        rootfs_size=$(ls -lh "$DEV_BOOT_DIR/rootfs.squashfs" | awk '{print $5}')
+        echo "Rootfs:     $rootfs_size"
+    fi
+    if [[ -f "$DEV_BOOT_DIR/modloop" ]]; then
+        local modloop_size
+        modloop_size=$(ls -lh "$DEV_BOOT_DIR/modloop" | awk '{print $5}')
+        echo "Modloop:    $modloop_size"
     fi
     if [[ -f "$DEV_BOOT_DIR/manifest.json" ]]; then
         echo "Manifest:   $(ls -lh "$DEV_BOOT_DIR/manifest.json" | awk '{print $5}')"

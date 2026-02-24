@@ -93,21 +93,25 @@ setup_test_env() {
     local dev_boot_dir="$PROJECT_DIR/boot-assets/dev"
     local dev_kernel="$dev_boot_dir/kernel"
     local dev_initramfs="$dev_boot_dir/initramfs.cpio.gz"
+    local dev_rootfs="$dev_boot_dir/rootfs.squashfs"
+    local dev_modloop="$dev_boot_dir/modloop"
     local dev_manifest="$dev_boot_dir/manifest.json"
 
-    if [[ ! -f "$dev_kernel" ]] || [[ ! -f "$dev_initramfs" ]] || [[ ! -f "$dev_manifest" ]]; then
+    if [[ ! -f "$dev_kernel" ]] || [[ ! -f "$dev_initramfs" ]] || [[ ! -f "$dev_rootfs" ]] || [[ ! -f "$dev_modloop" ]] || [[ ! -f "$dev_manifest" ]]; then
         log_warn "Development boot assets incomplete, refreshing..."
         (cd "$PROJECT_DIR" && ./scripts/setup-dev-boot-assets.sh)
     fi
 
-    if [[ -f "$dev_kernel" ]] && [[ -f "$dev_initramfs" ]] && [[ -f "$dev_manifest" ]]; then
+    if [[ -f "$dev_kernel" ]] && [[ -f "$dev_initramfs" ]] && [[ -f "$dev_rootfs" ]] && [[ -f "$dev_modloop" ]] && [[ -f "$dev_manifest" ]]; then
         cp "$dev_kernel" "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/"
         cp "$dev_initramfs" "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/"
+        cp "$dev_rootfs" "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/"
+        cp "$dev_modloop" "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/"
         cp "$dev_manifest" "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/"
         log_info "Using development boot assets from $dev_boot_dir"
     else
         log_error "Development boot assets not found or incomplete at $dev_boot_dir"
-        log_error "Required files: kernel, initramfs.cpio.gz, manifest.json"
+        log_error "Required files: kernel, initramfs.cpio.gz, rootfs.squashfs, modloop, manifest.json"
         log_error "Run: ./scripts/setup-dev-boot-assets.sh"
         exit 1
     fi
@@ -360,6 +364,8 @@ print_summary() {
 
     echo "Kernel:     $kernel_version"
     echo "Initramfs:  $(ls -lh "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/initramfs.cpio.gz" | awk '{print $5}')"
+    echo "Rootfs:     $(ls -lh "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/rootfs.squashfs" | awk '{print $5}')"
+    echo "Modloop:    $(ls -lh "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/modloop" | awk '{print $5}')"
     echo ""
 
     local pass=0

@@ -81,7 +81,8 @@ pub fn is_mounted(_path: &str) -> bool {
 ///
 /// This mounts:
 /// - "arcbox" tag -> /arcbox (data directory)
-/// - "home" tag -> /host-home (user home directory)
+/// - "users" tag -> /Users (macOS /Users, bind-mounted to original path)
+/// - "home" tag -> /host-home (legacy fallback)
 pub fn mount_standard_shares() {
     // Mount arcbox data directory
     if !is_mounted("/arcbox") {
@@ -92,13 +93,22 @@ pub fn mount_standard_shares() {
         }
     }
 
-    // Mount home directory share
-    if !is_mounted("/host-home") {
-        if let Err(e) = mount_virtiofs("home", "/host-home") {
-            // This is expected to fail if the share isn't configured
-            tracing::debug!("Home share not available: {}", e);
+    // Mount /Users share for transparent macOS path support.
+    // This allows `docker run -v /Users/foo/project:/app` to work directly
+    // because /Users exists in the guest at the same path as on the host.
+    if !is_mounted("/Users") {
+        if let Err(e) = mount_virtiofs("users", "/Users") {
+            tracing::debug!("Users share not available, trying legacy home share: {}", e);
+            // Fallback to legacy "home" share at /host-home.
+            if !is_mounted("/host-home") {
+                if let Err(e) = mount_virtiofs("home", "/host-home") {
+                    tracing::debug!("Home share not available: {}", e);
+                } else {
+                    tracing::info!("Mounted home share at /host-home (legacy)");
+                }
+            }
         } else {
-            tracing::info!("Mounted home share at /host-home");
+            tracing::info!("Mounted users share at /Users");
         }
     }
 }
