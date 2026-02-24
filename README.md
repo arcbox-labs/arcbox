@@ -121,11 +121,26 @@ codesign --entitlements tests/resources/entitlements.plist --force -s - \
 
 - Rust 1.85+ (install via [rustup](https://rustup.rs))
 - Xcode Command Line Tools (`xcode-select --install`)
-- musl cross-compiler for guest agent (optional):
-  ```bash
-  brew install FiloSottile/musl-cross/musl-cross
-  rustup target add aarch64-unknown-linux-musl
-  ```
+
+### Guest Agent
+
+The guest VM expects the `arcbox-agent` binary at `~/.arcbox/bin/arcbox-agent`,
+served into the VM via VirtioFS. Without it, the VM boots but no agent listens
+on vsock and all container operations will fail.
+
+```bash
+# Install musl cross-compiler (macOS)
+brew install FiloSottile/musl-cross/musl-cross
+rustup target add aarch64-unknown-linux-musl
+
+# Cross-compile the agent for Linux ARM64
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc \
+  cargo build -p arcbox-agent --target aarch64-unknown-linux-musl --release
+
+# Install into the path the guest VM expects
+mkdir -p ~/.arcbox/bin
+cp target/aarch64-unknown-linux-musl/release/arcbox-agent ~/.arcbox/bin/
+```
 
 ## Uninstall
 
