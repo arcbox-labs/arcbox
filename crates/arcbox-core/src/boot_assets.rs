@@ -41,7 +41,7 @@ use tokio::io::AsyncWriteExt;
 
 /// Default boot asset version.
 /// This is pinned to a known-good kernel/initramfs bundle.
-pub const BOOT_ASSET_VERSION: &str = "0.0.1-alpha.39";
+pub const BOOT_ASSET_VERSION: &str = "0.0.1-alpha.40";
 
 /// Base URL for boot asset downloads.
 /// Assets are hosted on Cloudflare R2 via custom domain.
@@ -765,9 +765,9 @@ impl BootAssetProvider {
             manifest.agent_commit.as_deref().unwrap_or("unknown"),
         );
 
-        // schema_version 2 adds rootfs.squashfs (squashfs rootfs architecture).
-        // Validate its presence so the guest VM can successfully switch_root.
-        if manifest.schema_version >= 2 {
+        // schema_version 2-3 use rootfs.squashfs (squashfs rootfs architecture).
+        // schema_version 4+ replaced squashfs with ext4 block device rootfs.
+        if manifest.schema_version >= 2 && manifest.schema_version < 4 {
             let squashfs_path = cache_dir.join(ROOTFS_SQUASHFS_FILENAME);
             if !squashfs_path.exists() {
                 return Err(CoreError::config(format!(
