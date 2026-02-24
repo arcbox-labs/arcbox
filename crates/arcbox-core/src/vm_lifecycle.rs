@@ -798,6 +798,15 @@ impl VmLifecycleManager {
             config.kernel.as_deref().unwrap_or("default")
         );
 
+        // Write host wall-clock time to the VirtioFS share so the guest can
+        // set its system clock before TLS-dependent services (dockerd, chronyd)
+        // start.  The ARM generic timer only provides monotonic time; without
+        // this the guest boots with clock at epoch (1970).
+        if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            let ts_path = self.data_dir.join(".host_time");
+            let _ = tokio::fs::write(&ts_path, now.as_secs().to_string()).await;
+        }
+
         self.machine_manager.create(config).await?;
 
         Ok(())
