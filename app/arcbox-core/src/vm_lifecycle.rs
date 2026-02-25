@@ -730,6 +730,15 @@ impl VmLifecycleManager {
                 .collect();
             cmdline = tokens.join(" ");
             cmdline.push_str(" root=/dev/vda rw");
+
+            // The guest agent gates its machine-init path (mount /dev/vda,
+            // switch_root to OpenRC) on this token.
+            if !cmdline
+                .split_whitespace()
+                .any(|t| t == "arcbox.mode=machine")
+            {
+                cmdline.push_str(" arcbox.mode=machine");
+            }
         }
 
         // Strip "quiet" so kernel boot messages are visible on the serial console.
