@@ -1,0 +1,24 @@
+[package]
+name        = "vmm-core"
+version.workspace   = true
+edition.workspace   = true
+authors.workspace   = true
+license.workspace   = true
+repository.workspace = true
+
+[dependencies]
+fc-sdk.workspace       = true
+tokio.workspace        = true
+thiserror.workspace    = true
+anyhow.workspace       = true
+serde.workspace        = true
+serde_json.workspace   = true
+uuid.workspace         = true
+tracing.workspace      = true
+nix.workspace          = true
+libc.workspace         = true
+chrono.workspace       = true
+toml.workspace         = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

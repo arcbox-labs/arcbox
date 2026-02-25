@@ -1,0 +1,182 @@
+// VMM-specific gRPC extension service.
+//
+// Provides snapshot management, live updates, and metrics that are beyond
+// the scope of the arcbox.v1.MachineService interface.
+
+syntax = "proto3";
+
+package vmm.v1;
+
+// =============================================================================
+// VmmService
+// =============================================================================
+
+// VmmService exposes Firecracker-specific operations.
+service VmmService {
+    // Pause a running VM.
+    rpc Pause(PauseVmRequest) returns (Empty);
+
+    // Resume a paused VM.
+    rpc Resume(ResumeVmRequest) returns (Empty);
+
+    // Create a full or diff snapshot.
+    rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+
+    // List snapshots for a VM.
+    rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+
+    // Restore a VM from a snapshot.
+    rpc RestoreSnapshot(RestoreSnapshotRequest) returns (RestoreSnapshotResponse);
+
+    // Delete a snapshot.
+    rpc DeleteSnapshot(DeleteSnapshotRequest) returns (Empty);
+
+    // Get VM metrics (balloon, instance info).
+    rpc GetMetrics(GetMetricsRequest) returns (VmMetrics);
+
+    // Adjust memory balloon target.
+    rpc UpdateBalloon(UpdateBalloonRequest) returns (Empty);
+
+    // Update hotplug memory size.
+    rpc UpdateMemory(UpdateMemoryRequest) returns (Empty);
+}
+
+// =============================================================================
+// Common
+// =============================================================================
+
+// Empty response / request.
+message Empty {}
+
+// =============================================================================
+// Pause / Resume
+// =============================================================================
+
+// Request to pause a VM.
+message PauseVmRequest {
+    // VM ID.
+    string id = 1;
+}
+
+// Request to resume a VM.
+message ResumeVmRequest {
+    // VM ID.
+    string id = 1;
+}
+
+// =============================================================================
+// Snapshots
+// =============================================================================
+
+// Request to create a snapshot.
+message CreateSnapshotRequest {
+    // VM ID.
+    string id = 1;
+    // Optional human-readable label.
+    string name = 2;
+    // Snapshot type: "full" or "diff".
+    string snapshot_type = 3;
+}
+
+// Response for CreateSnapshot.
+message CreateSnapshotResponse {
+    // Snapshot ID.
+    string snapshot_id = 1;
+    // Snapshot directory path on host.
+    string snapshot_dir = 2;
+    // Creation timestamp (RFC3339).
+    string created_at = 3;
+}
+
+// Request to list snapshots for a VM.
+message ListSnapshotsRequest {
+    // VM ID.
+    string id = 1;
+}
+
+// Response for ListSnapshots.
+message ListSnapshotsResponse {
+    repeated SnapshotSummary snapshots = 1;
+}
+
+// Summary of a single snapshot.
+message SnapshotSummary {
+    // Snapshot ID.
+    string id = 1;
+    // VM ID.
+    string vm_id = 2;
+    // Optional label.
+    string name = 3;
+    // "full" or "diff".
+    string snapshot_type = 4;
+    // vmstate file path.
+    string vmstate_path = 5;
+    // Memory file path (empty for diff snapshots without full mem).
+    string mem_path = 6;
+    // Creation timestamp (RFC3339).
+    string created_at = 7;
+}
+
+// Request to restore a VM from a snapshot.
+message RestoreSnapshotRequest {
+    // Name to assign the restored VM.
+    string name = 1;
+    // Path to snapshot directory.
+    string snapshot_dir = 2;
+    // Whether to assign a fresh TAP interface.
+    bool network_override = 3;
+}
+
+// Response for RestoreSnapshot.
+message RestoreSnapshotResponse {
+    // ID of the newly-restored VM.
+    string id = 1;
+}
+
+// Request to delete a snapshot.
+message DeleteSnapshotRequest {
+    // VM ID.
+    string vm_id = 1;
+    // Snapshot ID.
+    string snapshot_id = 2;
+}
+
+// =============================================================================
+// Metrics
+// =============================================================================
+
+// Request VM metrics.
+message GetMetricsRequest {
+    // VM ID.
+    string id = 1;
+}
+
+// VM metrics response.
+message VmMetrics {
+    // VM ID.
+    string vm_id = 1;
+    // Balloon target in MiB (-1 if no balloon device).
+    int64 balloon_target_mib = 2;
+    // Actual balloon size in MiB (-1 if unknown).
+    int64 balloon_actual_mib = 3;
+}
+
+// =============================================================================
+// Live Updates
+// =============================================================================
+
+// Request to update balloon target.
+message UpdateBalloonRequest {
+    // VM ID.
+    string id = 1;
+    // New target size in MiB.
+    int64 amount_mib = 2;
+}
+
+// Request to update hotplug memory size.
+message UpdateMemoryRequest {
+    // VM ID.
+    string id = 1;
+    // Requested size in MiB.
+    int64 size_mib = 2;
+}
