@@ -44,6 +44,10 @@ ArcBox is a high-performance container and virtual machine runtime in Rust, targ
 - If a request appears to conflict with these guidelines, double-check intent with the user before proceeding.
 - When project conventions or processes change, this file (`CLAUDE.md`/`AGENTS.md`) must be updated promptly. All changes to this file require human approval.
 
+## Testing
+
+- Tests are expected for code changes. Only test meaningful logic (branching, transformations, error handling). Don't test code that can only break if the language, runtime, or a dependency breaks.
+
 ## Change Discipline
 
 - Commit messages: `type(scope): summary` (e.g. `fix(net): correct checksum on fragmented packets`). Do not add Co-Authored-By lines.
