@@ -1,4 +1,4 @@
-# CLAUDE.md
+# Repository Guidelines for Coding Agents
 
 ## Project Overview
 
@@ -42,6 +42,7 @@ ArcBox is a high-performance container and virtual machine runtime in Rust, targ
 - Prefer refactoring over layered, patchy fixes. Code changes must be coherent, not duct-taped on.
 - No hacky workarounds. If a workaround is truly unavoidable, pause and get user approval first.
 - If a request appears to conflict with these guidelines, double-check intent with the user before proceeding.
+- When project conventions or processes change, this file (`CLAUDE.md`/`AGENTS.md`) must be updated promptly. All changes to this file require human approval.
 
 ## Change Discipline
 
