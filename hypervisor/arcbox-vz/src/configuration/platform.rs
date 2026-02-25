@@ -2,8 +2,8 @@
 
 use crate::error::{VZError, VZResult};
 use crate::ffi::{get_class, release};
-use crate::msg_send;
-use objc2::runtime::AnyObject;
+use crate::{msg_send, msg_send_bool, msg_send_void_bool};
+use objc2::runtime::{AnyObject, Bool};
 
 // ============================================================================
 // Platform Trait
@@ -50,6 +50,41 @@ impl GenericPlatform {
             let _: *mut AnyObject = msg_send!(obj, retain);
 
             Ok(Self { inner: obj })
+        }
+    }
+
+    /// Returns whether the hardware supports nested virtualization.
+    ///
+    /// Requires macOS 15+ and Apple M3 or later. On older systems, the
+    /// selector does not exist and this returns `false`.
+    pub fn is_nested_virt_supported() -> bool {
+        let Some(cls) = get_class("VZGenericPlatformConfiguration") else {
+            return false;
+        };
+        // `isNestedVirtualizationSupported` is a *class* method.
+        // `AnyClass::responds_to` checks instance methods, so use
+        // `class_method` which queries the metaclass instead.
+        let sel = objc2::sel!(isNestedVirtualizationSupported);
+        if cls.class_method(sel).is_none() {
+            return false;
+        }
+        unsafe { msg_send_bool!(cls, isNestedVirtualizationSupported).as_bool() }
+    }
+
+    /// Enables or disables nested virtualization for this platform config.
+    ///
+    /// Only has effect when [`Self::is_nested_virt_supported()`] returns `true`.
+    pub fn set_nested_virt_enabled(&self, enabled: bool) {
+        // Guard: the setter selector only exists on macOS 15+.
+        let sel = objc2::sel!(setNestedVirtualizationEnabled:);
+        if !unsafe { &*(self.inner as *const AnyObject) }
+            .class()
+            .responds_to(sel)
+        {
+            return;
+        }
+        unsafe {
+            msg_send_void_bool!(self.inner, setNestedVirtualizationEnabled: Bool::new(enabled));
         }
     }
 }

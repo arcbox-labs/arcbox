@@ -45,10 +45,11 @@ impl DarwinHypervisor {
         let capabilities = Self::detect_capabilities();
 
         tracing::info!(
-            "Darwin hypervisor initialized: max_vcpus={}, max_memory={}GB, rosetta={}",
+            "Darwin hypervisor initialized: max_vcpus={}, max_memory={}GB, rosetta={}, nested_virt={}",
             capabilities.max_vcpus,
             capabilities.max_memory / (1024 * 1024 * 1024),
-            capabilities.rosetta
+            capabilities.rosetta,
+            capabilities.nested_virt
         );
 
         Ok(Self { capabilities })
@@ -79,7 +80,7 @@ impl DarwinHypervisor {
             supported_archs,
             max_vcpus: max_vcpus as u32,
             max_memory,
-            nested_virt: false, // macOS doesn't support nested virtualization
+            nested_virt: arcbox_vz::GenericPlatform::is_nested_virt_supported(),
             rosetta,
         }
     }

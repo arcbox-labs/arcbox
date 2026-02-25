@@ -127,6 +127,17 @@ macro_rules! msg_send_bool {
     }};
 }
 
+/// Sends a message with void return and a Bool argument.
+#[macro_export]
+macro_rules! msg_send_void_bool {
+    ($obj:expr, $sel:ident : $arg:expr) => {{
+        let sel = objc2::sel!($sel:);
+        let func: unsafe extern "C" fn(*const objc2::runtime::AnyObject, objc2::runtime::Sel, objc2::runtime::Bool) =
+            std::mem::transmute($crate::ffi::runtime::objc_msgSend as *const std::ffi::c_void);
+        func($obj as *const _ as *const objc2::runtime::AnyObject, sel, $arg)
+    }};
+}
+
 /// Sends a message with void return.
 #[macro_export]
 macro_rules! msg_send_void {
@@ -145,4 +156,5 @@ pub use msg_send_i32;
 pub use msg_send_i64;
 pub use msg_send_u64;
 pub use msg_send_void;
+pub use msg_send_void_bool;
 pub use msg_send_void_u64;
