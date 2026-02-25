@@ -518,6 +518,46 @@ impl Runtime {
             })?;
             let cache_dir = self.vm_lifecycle.boot_assets().config().version_cache_dir();
             validate_bundled_runtime_manifest(manifest, &cache_dir)?;
+
+            // Ensure the guest agent binary is available at data_dir/bin/arcbox-agent.
+            // The OpenRC service inside the guest mounts data_dir via VirtioFS at /arcbox
+            // and expects the agent at /arcbox/bin/arcbox-agent.
+            let agent_src = cache_dir.join("bin/arcbox-agent");
+            if agent_src.exists() {
+                let bin_dir = self.config.data_dir.join("bin");
+                tokio::fs::create_dir_all(&bin_dir).await?;
+                let agent_dst = bin_dir.join("arcbox-agent");
+                let needs_copy = if agent_dst.exists() {
+                    let src_meta = tokio::fs::metadata(&agent_src).await?;
+                    let dst_meta = tokio::fs::metadata(&agent_dst).await?;
+                    src_meta.len() != dst_meta.len()
+                } else {
+                    true
+                };
+                if needs_copy {
+                    tokio::fs::copy(&agent_src, &agent_dst).await.map_err(|e| {
+                        CoreError::config(format!(
+                            "failed to install agent binary to {}: {}",
+                            agent_dst.display(),
+                            e
+                        ))
+                    })?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        tokio::fs::set_permissions(
+                            &agent_dst,
+                            std::fs::Permissions::from_mode(0o755),
+                        )
+                        .await?;
+                    }
+                    tracing::info!(
+                        src = %agent_src.display(),
+                        dst = %agent_dst.display(),
+                        "Installed guest agent binary"
+                    );
+                }
+            }
         }
 
         tracing::info!(
