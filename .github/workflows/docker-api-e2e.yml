@@ -4,16 +4,16 @@ on:
   push:
     branches: [master, develop]
     paths:
-      - 'crates/arcbox-docker/**'
-      - 'crates/arcbox-core/**'
-      - 'crates/arcbox-cli/**'
+      - 'app/arcbox-docker/**'
+      - 'app/arcbox-core/**'
+      - 'app/arcbox-cli/**'
       - '.github/workflows/docker-api-e2e.yml'
   pull_request:
     branches: [master, develop]
     paths:
-      - 'crates/arcbox-docker/**'
-      - 'crates/arcbox-core/**'
-      - 'crates/arcbox-cli/**'
+      - 'app/arcbox-docker/**'
+      - 'app/arcbox-core/**'
+      - 'app/arcbox-cli/**'
   workflow_dispatch:
 
 env:
