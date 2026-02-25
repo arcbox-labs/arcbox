@@ -7,9 +7,9 @@ use tonic::{Request, Response, Status};
 use vmm_core::VmmManager;
 
 use crate::proto::arcbox::{
-    system_service_server::SystemService, Event, EventsRequest, GetInfoRequest, GetInfoResponse,
-    GetVersionRequest, GetVersionResponse, PruneRequest, PruneResponse, SystemPingRequest,
-    SystemPingResponse,
+    Event, EventsRequest, GetInfoRequest, GetInfoResponse, GetVersionRequest, GetVersionResponse,
+    PruneRequest, PruneResponse, SystemPingRequest, SystemPingResponse,
+    system_service_server::SystemService,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");

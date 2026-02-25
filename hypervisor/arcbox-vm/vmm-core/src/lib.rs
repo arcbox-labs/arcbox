@@ -1,4 +1,7 @@
 //! `vmm-core` — multi-VM orchestration, state, networking, and snapshots.
+// fc_sdk::Error is 144 bytes due to external library constraints; boxing every call
+// site would add noise without runtime benefit since these are never in hot paths.
+#![allow(clippy::result_large_err)]
 //!
 //! This crate is the heart of the Firecracker VMM daemon. It exposes:
 //!
@@ -18,8 +21,10 @@ pub mod snapshot;
 pub mod store;
 
 pub use config::{
-    DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, RestoreSpec, SnapshotRequest,
-    SnapshotType, VmSpec, VmmConfig,
+    BalloonSpec, CacheType, CpuTemplateSpec, DefaultVmConfig, DriveSpec, FirecrackerConfig,
+    GrpcConfig, HugePagesSpec, IoEngine, JailerConfig, MemoryHotplugSpec, MmdsSpec,
+    MmdsVersionSpec, NetworkConfig, RateLimitSpec, RestoreSpec, SnapshotRequest, SnapshotType,
+    TokenBucketSpec, VmSpec, VmmConfig, VsockSpec,
 };
 pub use error::{Result, VmmError};
 pub use instance::{VmId, VmInfo, VmInstance, VmMetrics, VmState, VmSummary};

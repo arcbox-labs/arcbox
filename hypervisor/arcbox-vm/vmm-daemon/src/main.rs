@@ -43,7 +43,10 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    info!(version = env!("CARGO_PKG_VERSION"), "firecracker-vmm daemon starting");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "firecracker-vmm daemon starting"
+    );
 
     // Load configuration.
     let mut config = if std::path::Path::new(&args.config).exists() {
@@ -69,9 +72,7 @@ async fn main() -> Result<()> {
     let tcp_addr = config.grpc.tcp_addr.clone();
 
     // Build the manager.
-    let manager = Arc::new(
-        VmmManager::new(config).context("failed to initialise VmmManager")?,
-    );
+    let manager = Arc::new(VmmManager::new(config).context("failed to initialise VmmManager")?);
 
     // Install signal handlers for graceful shutdown.
     let shutdown = install_signal_handler();
