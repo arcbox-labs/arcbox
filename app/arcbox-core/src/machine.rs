@@ -141,6 +141,8 @@ pub struct MachineInfo {
     pub initrd: Option<String>,
     /// Kernel command line.
     pub cmdline: Option<String>,
+    /// Block devices (e.g., rootfs ext4 image).
+    pub block_devices: Vec<crate::vm::BlockDeviceConfig>,
     /// Distribution name (e.g., "alpine", "ubuntu").
     pub distro: Option<String>,
     /// Distribution version (e.g., "3.21", "24.04").
@@ -242,6 +244,7 @@ impl MachineManager {
                 initrd: persisted.initrd.clone(),
                 cmdline: persisted.cmdline.clone(),
                 shared_dirs: shared_dirs.clone(),
+                block_devices: persisted.block_devices.clone(),
                 ..Default::default()
             };
 
@@ -258,6 +261,7 @@ impl MachineManager {
                     kernel: persisted.kernel.clone(),
                     initrd: persisted.initrd.clone(),
                     cmdline: persisted.cmdline,
+                    block_devices: persisted.block_devices.clone(),
                     distro: persisted.distro.clone(),
                     distro_version: persisted.distro_version.clone(),
                     disk_path: persisted.disk_path.clone().map(PathBuf::from),
@@ -352,6 +356,7 @@ impl MachineManager {
             kernel: config.kernel,
             initrd: config.initrd,
             cmdline: config.cmdline,
+            block_devices: config.block_devices,
             distro: config.distro,
             distro_version: config.distro_version,
             disk_path: None,
@@ -823,6 +828,7 @@ impl MachineManager {
             kernel: None,
             initrd: None,
             cmdline: None,
+            block_devices: Vec::new(),
             distro: None,
             distro_version: None,
             disk_path: None,

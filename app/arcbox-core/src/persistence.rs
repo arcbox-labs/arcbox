@@ -29,6 +29,9 @@ pub struct PersistedMachine {
     /// Kernel command line.
     #[serde(default)]
     pub cmdline: Option<String>,
+    /// Block devices (e.g., rootfs ext4 image).
+    #[serde(default)]
+    pub block_devices: Vec<crate::vm::BlockDeviceConfig>,
     /// Distribution name.
     #[serde(default)]
     pub distro: Option<String>,
@@ -98,6 +101,7 @@ impl From<&MachineInfo> for PersistedMachine {
             kernel: info.kernel.clone(),
             initrd: info.initrd.clone(),
             cmdline: info.cmdline.clone(),
+            block_devices: info.block_devices.clone(),
             distro: info.distro.clone(),
             distro_version: info.distro_version.clone(),
             disk_path: info
@@ -266,6 +270,7 @@ mod tests {
             kernel: Some("/path/to/kernel".to_string()),
             initrd: Some("/path/to/initrd".to_string()),
             cmdline: Some("console=ttyS0".to_string()),
+            block_devices: Vec::new(),
             distro: None,
             distro_version: None,
             disk_path: None,
@@ -305,6 +310,7 @@ mod tests {
                 kernel: None,
                 initrd: None,
                 cmdline: None,
+                block_devices: Vec::new(),
                 distro: None,
                 distro_version: None,
                 disk_path: None,
@@ -338,6 +344,7 @@ mod tests {
             kernel: None,
             initrd: None,
             cmdline: None,
+            block_devices: Vec::new(),
             distro: None,
             distro_version: None,
             disk_path: None,

@@ -97,7 +97,7 @@ impl SharedDirConfig {
 }
 
 /// Block device configuration for the VM.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BlockDeviceConfig {
     /// Path to the disk image file on the host.
     pub path: String,
