@@ -682,13 +682,6 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         let req = request.into_inner();
         let machine_name = req.id;
 
-        // Get CID for the machine.
-        let cid = self
-            .runtime
-            .machine_manager()
-            .get_cid(&machine_name)
-            .ok_or_else(|| Status::not_found("machine not found or not running"))?;
-
         // Build exec request for agent.
         let agent_req = arcbox_protocol::v1::AgentExecRequest {
             container_id: String::new(),
@@ -699,12 +692,12 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             tty: req.tty,
         };
 
-        let agent_pool = Arc::clone(self.runtime.agent_pool());
+        let mut agent = self
+            .runtime
+            .get_agent(&machine_name)
+            .map_err(|e| Status::internal(format!("machine error: {e}")))?;
 
         let stream = async_stream::try_stream! {
-            let agent = agent_pool.get(cid).await;
-            let mut agent = agent.write().await;
-
             let output = agent
                 .exec(agent_req)
                 .await

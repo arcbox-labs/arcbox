@@ -1,33 +1,20 @@
 //! Machine management commands.
 
 use anyhow::{Context, Result};
-use arcbox_core::machine::MachineState;
-use arcbox_core::{Config, Runtime};
 use arcbox_grpc::v1::machine_service_client::MachineServiceClient;
 use arcbox_protocol::v1::{
     CreateMachineRequest, DirectoryMount, InspectMachineRequest, ListMachinesRequest,
-    MachineAgentRequest, RemoveMachineRequest, StartMachineRequest, StopMachineRequest,
+    MachineAgentRequest, MachineExecRequest, RemoveMachineRequest, StartMachineRequest,
+    StopMachineRequest,
 };
 use clap::{Args, Subcommand};
 use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
-
-/// Global runtime instance.
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-
-/// Gets or initializes the global runtime.
-fn get_runtime() -> &'static Runtime {
-    RUNTIME.get_or_init(|| {
-        let config = Config::load().unwrap_or_default();
-        Runtime::new(config).expect("failed to initialize runtime")
-    })
-}
 
 fn resolve_grpc_socket_path() -> PathBuf {
     if let Ok(path) = std::env::var("ARCBOX_GRPC_SOCKET") {
@@ -547,119 +534,70 @@ async fn execute_info(args: InfoArgs) -> Result<()> {
 }
 
 async fn execute_ssh(args: SshArgs) -> Result<()> {
-    let runtime = get_runtime();
-
-    // Check machine exists and is running
-    let machine = runtime
-        .machine_manager()
-        .get(&args.name)
-        .ok_or_else(|| anyhow::anyhow!("Machine '{}' not found", args.name))?;
-
-    if machine.state != MachineState::Running {
-        anyhow::bail!("Machine '{}' is not running", args.name);
-    }
-
-    // Determine command to execute
     let (cmd, tty) = if args.command.is_empty() {
-        // Interactive mode: launch default shell
         (vec!["/bin/sh".to_string(), "-l".to_string()], true)
     } else {
-        // Execute provided command
         (args.command.clone(), false)
     };
 
-    // Execute command in the VM via agent
-    let output = runtime
-        .exec_machine(
-            &args.name,
-            cmd.clone(),
-            HashMap::new(),
-            String::new(),
-            String::new(),
-            tty,
-        )
-        .await
-        .context("Failed to execute command in machine")?;
-
-    // Print output based on stream type
-    if !output.data.is_empty() {
-        match output.stream.as_str() {
-            "stderr" => {
-                std::io::stderr()
-                    .write_all(&output.data)
-                    .context("Failed to write stderr")?;
-            }
-            _ => {
-                // Default to stdout for "stdout" or empty stream
-                std::io::stdout()
-                    .write_all(&output.data)
-                    .context("Failed to write stdout")?;
-            }
-        }
-    }
-
-    // Exit with the command's exit code
-    if output.exit_code != 0 {
-        std::process::exit(output.exit_code);
-    }
-
-    Ok(())
+    exec_via_grpc(&args.name, cmd, HashMap::new(), tty).await
 }
 
 async fn execute_exec(args: ExecArgs) -> Result<()> {
-    let runtime = get_runtime();
+    exec_via_grpc(&args.name, args.command, HashMap::new(), false).await
+}
 
-    // Check machine exists and is running
-    let machine = runtime
-        .machine_manager()
-        .get(&args.name)
-        .ok_or_else(|| anyhow::anyhow!("Machine '{}' not found", args.name))?;
-
-    if machine.state != MachineState::Running {
-        anyhow::bail!("Machine '{}' is not running", args.name);
-    }
-
-    // Execute command in the VM via agent (non-TTY mode for exec)
-    let output = runtime
-        .exec_machine(
-            &args.name,
-            args.command.clone(),
-            HashMap::new(),
-            String::new(),
-            String::new(),
-            false, // Non-interactive exec
-        )
+/// Runs a command in a machine via the daemon's gRPC Exec RPC.
+async fn exec_via_grpc(
+    name: &str,
+    cmd: Vec<String>,
+    env: HashMap<String, String>,
+    tty: bool,
+) -> Result<()> {
+    let mut client = machine_client().await?;
+    let mut stream = client
+        .exec(tonic::Request::new(MachineExecRequest {
+            id: name.to_string(),
+            cmd,
+            working_dir: String::new(),
+            user: String::new(),
+            env,
+            tty,
+        }))
         .await
-        .context("Failed to execute command in machine")?;
+        .context("Failed to execute command in machine")?
+        .into_inner();
 
-    // Print output based on stream type
-    if !output.data.is_empty() {
-        match output.stream.as_str() {
-            "stderr" => {
-                std::io::stderr()
-                    .write_all(&output.data)
-                    .context("Failed to write stderr")?;
+    let mut exit_code = 0i32;
+    while let Some(output) = stream.message().await.context("Failed to read exec output")? {
+        if !output.data.is_empty() {
+            match output.stream.as_str() {
+                "stderr" => {
+                    std::io::stderr()
+                        .write_all(&output.data)
+                        .context("Failed to write stderr")?;
+                }
+                _ => {
+                    std::io::stdout()
+                        .write_all(&output.data)
+                        .context("Failed to write stdout")?;
+                }
             }
-            _ => {
-                // Default to stdout for "stdout" or empty stream
-                std::io::stdout()
-                    .write_all(&output.data)
-                    .context("Failed to write stdout")?;
-            }
+        }
+        if output.done {
+            exit_code = output.exit_code;
         }
     }
 
-    // Exit with the command's exit code
-    if output.exit_code != 0 {
-        std::process::exit(output.exit_code);
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use arcbox_core::machine::MachineState;
 
     #[test]
     fn test_machine_state_display() {
