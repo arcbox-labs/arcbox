@@ -79,7 +79,9 @@ impl VmStore {
             if entry.path().is_dir() {
                 match self.load_record_from_dir(&entry.path()) {
                     Ok(r) => records.push(r),
-                    Err(e) => tracing::warn!(path = %entry.path().display(), error = %e, "skipping corrupt VM record"),
+                    Err(e) => {
+                        tracing::warn!(path = %entry.path().display(), error = %e, "skipping corrupt VM record")
+                    }
                 }
             }
         }
@@ -113,8 +115,7 @@ impl VmStore {
     }
 
     fn load_record_from_dir(&self, dir: &std::path::Path) -> Result<VmRecord> {
-        let json =
-            std::fs::read_to_string(dir.join("meta.json")).map_err(VmmError::Io)?;
+        let json = std::fs::read_to_string(dir.join("meta.json")).map_err(VmmError::Io)?;
         let record = serde_json::from_str(&json)?;
         Ok(record)
     }

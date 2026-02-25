@@ -25,6 +25,7 @@ pub struct NetworkAllocation {
 /// Shared manager for TAP interfaces and guest IP addresses.
 pub struct NetworkManager {
     /// Bridge interface name.
+    #[allow(dead_code)]
     bridge: String,
     /// Base IP from which the pool starts (host-octet 2 onwards).
     base: Ipv4Addr,

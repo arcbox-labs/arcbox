@@ -5,16 +5,13 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
 use vmm_grpc::proto::arcbox::{
-    machine_service_client::MachineServiceClient,
-    system_service_client::SystemServiceClient,
-    CreateMachineRequest, InspectMachineRequest, ListMachinesRequest,
-    RemoveMachineRequest, StartMachineRequest, StopMachineRequest,
-    SshInfoRequest, SystemPingRequest,
+    CreateMachineRequest, InspectMachineRequest, ListMachinesRequest, RemoveMachineRequest,
+    SshInfoRequest, StartMachineRequest, StopMachineRequest, SystemPingRequest,
+    machine_service_client::MachineServiceClient, system_service_client::SystemServiceClient,
 };
 use vmm_grpc::proto::vmm::{
-    vmm_service_client::VmmServiceClient,
-    CreateSnapshotRequest, DeleteSnapshotRequest, GetMetricsRequest,
-    ListSnapshotsRequest, PauseVmRequest, RestoreSnapshotRequest, ResumeVmRequest,
+    CreateSnapshotRequest, DeleteSnapshotRequest, GetMetricsRequest, ListSnapshotsRequest,
+    PauseVmRequest, RestoreSnapshotRequest, ResumeVmRequest, vmm_service_client::VmmServiceClient,
 };
 
 /// vmm — firecracker-vmm management CLI
@@ -152,14 +149,17 @@ enum SnapshotCmd {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter("warn")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("warn").init();
 
     let channel = connect_uds(&cli.socket).await?;
 
     match cli.command {
-        Cmd::Create { name, cpus, memory, kernel } => {
+        Cmd::Create {
+            name,
+            cpus,
+            memory,
+            kernel,
+        } => {
             let mut client = MachineServiceClient::new(channel);
             let resp = client
                 .create(CreateMachineRequest {
@@ -195,7 +195,11 @@ async fn main() -> Result<()> {
         Cmd::Remove { id, force } => {
             let mut client = MachineServiceClient::new(channel);
             client
-                .remove(RemoveMachineRequest { id, force, volumes: false })
+                .remove(RemoveMachineRequest {
+                    id,
+                    force,
+                    volumes: false,
+                })
                 .await
                 .context("remove VM")?;
             println!("VM removed");
@@ -211,13 +215,20 @@ async fn main() -> Result<()> {
             if machines.is_empty() {
                 println!("No VMs found.");
             } else {
-                println!("{:<36}  {:<20}  {:<10}  {:>6}  {:>8}  {}",
-                    "ID", "NAME", "STATE", "CPUS", "MEM(MiB)", "IP");
+                println!(
+                    "{:<36}  {:<20}  {:<10}  {:>6}  {:>8}  IP",
+                    "ID", "NAME", "STATE", "CPUS", "MEM(MiB)"
+                );
                 for m in machines {
-                    println!("{:<36}  {:<20}  {:<10}  {:>6}  {:>8}  {}",
-                        m.id, m.name, m.state, m.cpus,
+                    println!(
+                        "{:<36}  {:<20}  {:<10}  {:>6}  {:>8}  {}",
+                        m.id,
+                        m.name,
+                        m.state,
+                        m.cpus,
                         m.memory / (1024 * 1024),
-                        m.ip_address);
+                        m.ip_address
+                    );
                 }
             }
         }
@@ -278,10 +289,7 @@ async fn main() -> Result<()> {
 
         Cmd::Ping => {
             let mut client = SystemServiceClient::new(channel);
-            let resp = client
-                .ping(SystemPingRequest {})
-                .await
-                .context("ping")?;
+            let resp = client.ping(SystemPingRequest {}).await.context("ping")?;
             let r = resp.into_inner();
             println!("OK  api={} build={}", r.api_version, r.build_version);
         }
@@ -330,14 +338,21 @@ async fn run_snapshot(channel: Channel, cmd: SnapshotCmd) -> Result<()> {
             if snaps.is_empty() {
                 println!("No snapshots found.");
             } else {
-                println!("{:<36}  {:<20}  {:<8}  {}", "ID", "NAME", "TYPE", "CREATED");
+                println!("{:<36}  {:<20}  {:<8}  CREATED", "ID", "NAME", "TYPE");
                 for s in snaps {
-                    println!("{:<36}  {:<20}  {:<8}  {}", s.id, s.name, s.snapshot_type, s.created_at);
+                    println!(
+                        "{:<36}  {:<20}  {:<8}  {}",
+                        s.id, s.name, s.snapshot_type, s.created_at
+                    );
                 }
             }
         }
 
-        SnapshotCmd::Restore { name, snapshot_dir, network_override } => {
+        SnapshotCmd::Restore {
+            name,
+            snapshot_dir,
+            network_override,
+        } => {
             let resp = client
                 .restore_snapshot(RestoreSnapshotRequest {
                     name,

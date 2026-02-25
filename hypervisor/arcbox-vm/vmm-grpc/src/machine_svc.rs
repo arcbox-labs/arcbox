@@ -4,14 +4,14 @@ use tonic::{Request, Response, Status};
 
 use vmm_core::{VmmManager, config::VmSpec};
 
-use crate::proto::arcbox::{
-    machine_service_server::MachineService, CreateMachineRequest, CreateMachineResponse,
-    InspectMachineRequest, ListMachinesRequest, ListMachinesResponse, MachineAgentRequest,
-    MachineExecOutput, MachineExecRequest, MachineInfo, MachineHardware, MachineNetwork,
-    MachineStorage, MachinePingResponse, MachineSystemInfo, MachineSummary, RemoveMachineRequest,
-    SshInfoRequest, SshInfoResponse, StartMachineRequest, StopMachineRequest,
-};
 use crate::proto::arcbox::Empty;
+use crate::proto::arcbox::{
+    CreateMachineRequest, CreateMachineResponse, InspectMachineRequest, ListMachinesRequest,
+    ListMachinesResponse, MachineAgentRequest, MachineExecOutput, MachineExecRequest,
+    MachineHardware, MachineInfo, MachineNetwork, MachinePingResponse, MachineStorage,
+    MachineSummary, MachineSystemInfo, RemoveMachineRequest, SshInfoRequest, SshInfoResponse,
+    StartMachineRequest, StopMachineRequest, machine_service_server::MachineService,
+};
 
 /// Implementation of `arcbox.v1.MachineService` backed by [`VmmManager`].
 pub struct MachineServiceImpl {
@@ -34,23 +34,15 @@ impl MachineService for MachineServiceImpl {
         let req = request.into_inner();
         let spec = VmSpec {
             name: req.name.clone(),
-            vcpus: if req.cpus > 0 { req.cpus as u64 } else { 1 },
+            vcpus: if req.cpus > 0 { req.cpus as u64 } else { 0 },
             memory_mib: if req.memory > 0 {
                 req.memory / (1024 * 1024)
             } else {
-                512
+                0
             },
-            kernel: if req.kernel.is_empty() {
-                self.manager_config_kernel()
-            } else {
-                req.kernel.clone()
-            },
+            kernel: req.kernel.clone(),
             rootfs: String::new(), // Provisioned via distro/version resolution (future)
-            boot_args: if req.cmdline.is_empty() {
-                "console=ttyS0 reboot=k panic=1 pci=off".into()
-            } else {
-                req.cmdline.clone()
-            },
+            boot_args: req.cmdline.clone(),
             disk_size: if req.disk_size > 0 {
                 Some(req.disk_size)
             } else {
@@ -61,6 +53,7 @@ impl MachineService for MachineServiceImpl {
             } else {
                 Some(req.ssh_public_key)
             },
+            ..Default::default()
         };
 
         let id = self
@@ -86,10 +79,7 @@ impl MachineService for MachineServiceImpl {
     }
 
     /// Stop a running VM.
-    async fn stop(
-        &self,
-        request: Request<StopMachineRequest>,
-    ) -> Result<Response<Empty>, Status> {
+    async fn stop(&self, request: Request<StopMachineRequest>) -> Result<Response<Empty>, Status> {
         let req = request.into_inner();
         self.manager
             .stop_vm(&req.id, req.force)
@@ -164,9 +154,7 @@ impl MachineService for MachineServiceImpl {
                 ip_address: net.map(|n| n.ip_address.to_string()).unwrap_or_default(),
                 gateway: net.map(|n| n.gateway.to_string()).unwrap_or_default(),
                 mac_address: net.map(|n| n.mac_address.clone()).unwrap_or_default(),
-                dns_servers: net
-                    .map(|n| n.dns_servers.clone())
-                    .unwrap_or_default(),
+                dns_servers: net.map(|n| n.dns_servers.clone()).unwrap_or_default(),
             }),
             storage: Some(MachineStorage {
                 disk_size: info.spec.disk_size.unwrap_or(0),
@@ -230,13 +218,5 @@ impl MachineService for MachineServiceImpl {
             identity_file: String::new(),
             command: format!("ssh root@{ip}"),
         }))
-    }
-
-}
-
-impl MachineServiceImpl {
-    fn manager_config_kernel(&self) -> String {
-        // Fall back to empty string so VmmManager uses its configured default.
-        String::new()
     }
 }

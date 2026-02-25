@@ -8,8 +8,7 @@ use vmm_core::VmmManager;
 
 use crate::machine_svc::MachineServiceImpl;
 use crate::proto::arcbox::{
-    machine_service_server::MachineServiceServer,
-    system_service_server::SystemServiceServer,
+    machine_service_server::MachineServiceServer, system_service_server::SystemServiceServer,
 };
 use crate::proto::vmm::vmm_service_server::VmmServiceServer;
 use crate::system_svc::SystemServiceImpl;
