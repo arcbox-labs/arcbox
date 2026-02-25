@@ -64,6 +64,7 @@ ArcBox is a high-performance container and virtual machine runtime in Rust, targ
 - Virtualization.framework requires entitlement signing: `codesign --entitlements tests/resources/entitlements.plist --force -s - <binary>`
 - Without signing, you get "Virtualization not available" errors
 - Requires Xcode Command Line Tools
+- Some tasks require a running daemon. Start it in a background terminal: `arcbox daemon -f`
 
 ## Guest Agent Cross-Compilation
 
