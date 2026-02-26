@@ -34,6 +34,7 @@ ArcBox is a high-performance container and virtual machine runtime in Rust, targ
 
 ## Code Standards
 
+- Run `cargo clippy` and `cargo fmt` before committing. All code must pass both with zero warnings.
 - All comments in English
 - `unsafe` blocks require `// SAFETY:` comments
 - Use `thiserror` for crate-specific errors, `anyhow` in CLI/API layers
