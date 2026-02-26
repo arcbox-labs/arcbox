@@ -204,15 +204,12 @@ name = "arcbox-container"
 version = "0.0.1-alpha.2"
 dependencies = [
  "arcbox-error",
- "arcbox-image",
  "async-trait",
  "chrono",
  "serde",
- "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -220,7 +217,6 @@ dependencies = [
 name = "arcbox-core"
 version = "0.0.1-alpha.2"
 dependencies = [
- "arcbox-container",
  "arcbox-error",
  "arcbox-fs",
  "arcbox-hypervisor",

@@ -21,10 +21,6 @@ pub enum CoreError {
     #[error("machine error: {0}")]
     Machine(String),
 
-    /// Container error.
-    #[error("container error: {0}")]
-    Container(#[from] arcbox_container::ContainerError),
-
     /// Image error.
     #[error("image error: {0}")]
     Image(#[from] arcbox_image::ImageError),
