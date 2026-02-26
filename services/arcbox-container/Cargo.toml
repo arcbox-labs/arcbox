@@ -10,13 +10,10 @@ authors.workspace = true
 
 [dependencies]
 arcbox-error = { workspace = true }
-arcbox-image = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 
