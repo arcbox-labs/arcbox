@@ -8,7 +8,7 @@ use crate::error::{DockerError, Result};
 use arcbox_core::Runtime;
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
-use axum::http::{header, HeaderMap, Method, Response, StatusCode, Uri};
+use axum::http::{HeaderMap, Method, Request, Response, StatusCode, Uri, header};
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::client::conn::http1;
@@ -217,6 +217,64 @@ pub async fn proxy_to_guest(
     Ok(Response::from_parts(parts, Body::new(incoming)))
 }
 
+/// Forward an HTTP request to guest dockerd without buffering the request body.
+///
+/// This is used by pass-through proxy paths so large uploads and streamed
+/// payloads are relayed directly instead of being collected in memory.
+pub async fn proxy_to_guest_stream(
+    runtime: &Runtime,
+    original_uri: &Uri,
+    req: Request<Body>,
+) -> Result<Response<Body>> {
+    let io = connect_guest(runtime).await?;
+
+    let (mut sender, conn) = http1::Builder::new()
+        .handshake(io)
+        .await
+        .map_err(|e| DockerError::Server(format!("guest docker handshake failed: {}", e)))?;
+
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            let msg = e.to_string().to_lowercase();
+            if !msg.contains("canceled") && !msg.contains("incomplete") {
+                tracing::debug!("guest docker connection ended: {}", e);
+            }
+        }
+    });
+
+    let path_and_query = original_uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let method = req.method().clone();
+    let content_type = req.headers().get(header::CONTENT_TYPE).cloned();
+    let body = req.into_body();
+
+    let mut guest_req = hyper::Request::builder()
+        .method(method)
+        .uri(path_and_query)
+        .body(body)
+        .map_err(|e| DockerError::Server(format!("failed to build guest request: {}", e)))?;
+
+    if let Some(ct) = content_type {
+        guest_req.headers_mut().insert(header::CONTENT_TYPE, ct);
+    }
+    guest_req
+        .headers_mut()
+        .insert(header::HOST, "localhost".parse().unwrap());
+    guest_req
+        .headers_mut()
+        .insert(header::CONNECTION, "close".parse().unwrap());
+
+    let response = sender
+        .send_request(guest_req)
+        .await
+        .map_err(|e| DockerError::Server(format!("guest docker request failed: {}", e)))?;
+
+    let (parts, incoming) = response.into_parts();
+    Ok(Response::from_parts(parts, Body::new(incoming)))
+}
+
 /// Forward an HTTP request with upgrade support to guest dockerd.
 ///
 /// Used for attach and exec endpoints that use HTTP upgrade (101 Switching
@@ -244,20 +302,16 @@ pub async fn proxy_with_upgrade(
         }
     });
 
-    // Buffer the client request body (small for exec/attach).
-    let body_bytes = axum::body::to_bytes(std::mem::take(client_req.body_mut()), 10 * 1024 * 1024)
-        .await
-        .map_err(|e| DockerError::Server(format!("failed to read request body: {}", e)))?;
-
     let path_and_query = original_uri
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
+    let req_body = std::mem::take(client_req.body_mut());
 
     let mut guest_req = hyper::Request::builder()
         .method(client_req.method())
         .uri(path_and_query)
-        .body(Full::new(body_bytes))
+        .body(req_body)
         .map_err(|e| DockerError::Server(format!("failed to build guest request: {}", e)))?;
 
     // Forward all headers except Host.
@@ -355,17 +409,7 @@ pub async fn proxy_fallback(
         return proxy_with_upgrade(&state.runtime, req, &uri).await;
     }
 
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-    let method = req.method().clone();
-    let headers = req.headers().clone();
-    let body = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
-        .await
-        .map_err(|e| DockerError::Server(e.to_string()))?;
-
-    proxy_to_guest(&state.runtime, method, path_and_query, &headers, body).await
+    proxy_to_guest_stream(&state.runtime, &uri, req).await
 }
 
 // =============================================================================

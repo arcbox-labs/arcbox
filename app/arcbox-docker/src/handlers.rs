@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tokio_stream::wrappers::ReceiverStream;
 
+const HOOK_BUFFER_LIMIT_BYTES: usize = 10 * 1024 * 1024;
+
 // ============================================================================
 // Proxy helpers
 // ============================================================================
@@ -31,16 +33,7 @@ async fn proxy(state: &AppState, uri: &Uri, req: Request<Body>) -> Result<Respon
         .ensure_vm_ready()
         .await
         .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {}", e)))?;
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-    let method = req.method().clone();
-    let headers = req.headers().clone();
-    let body = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
-        .await
-        .map_err(|e| DockerError::Server(e.to_string()))?;
-    proxy::proxy_to_guest(&state.runtime, method, path_and_query, &headers, body).await
+    proxy::proxy_to_guest_stream(&state.runtime, uri, req).await
 }
 
 /// Fetch container name, image, and labels from guest dockerd.
@@ -63,7 +56,7 @@ async fn fetch_container_metadata(
     if resp.status() != StatusCode::OK {
         return (container_id.to_string(), String::new(), HashMap::new());
     }
-    let Ok(body) = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024).await else {
+    let Ok(body) = axum::body::to_bytes(resp.into_body(), HOOK_BUFFER_LIMIT_BYTES).await else {
         return (container_id.to_string(), String::new(), HashMap::new());
     };
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
@@ -215,51 +208,36 @@ pub async fn create_container(
         .await
         .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {}", e)))?;
 
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/containers/create");
-    let headers = req.headers().clone();
-    let body = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
-        .await
-        .map_err(|e| DockerError::Server(e.to_string()))?;
-
-    let response = proxy::proxy_to_guest(
-        &state.runtime,
-        Method::POST,
-        path_and_query,
-        &headers,
-        body.clone(),
-    )
-    .await?;
+    let response = proxy::proxy_to_guest_stream(&state.runtime, &uri, req).await?;
 
     // Post-hook: publish event if creation succeeded.
     if response.status() == StatusCode::CREATED {
         // Read the response body to get container ID, then re-wrap it.
         let (parts, resp_body) = response.into_parts();
-        let resp_bytes = axum::body::to_bytes(resp_body, 10 * 1024 * 1024)
+        let resp_bytes = axum::body::to_bytes(resp_body, HOOK_BUFFER_LIMIT_BYTES)
             .await
             .map_err(|e| DockerError::Server(e.to_string()))?;
 
         if let Some(id) = extract_container_id(&resp_bytes) {
-            // Parse the request body to get image name for the event.
-            let image = serde_json::from_slice::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|v| v.get("Image").and_then(|i| i.as_str()).map(String::from))
-                .unwrap_or_default();
-            let name = uri
+            let (meta_name, image, labels) = fetch_container_metadata(&state, &id).await;
+            let fallback_name = uri
                 .query()
                 .and_then(|q| {
                     q.split('&')
                         .find_map(|p| p.strip_prefix("name=").map(String::from))
                 })
                 .unwrap_or_else(|| id.chars().take(12).collect());
+            let name = if meta_name == id {
+                fallback_name
+            } else {
+                meta_name
+            };
 
             state.runtime.event_bus().publish(Event::ContainerCreated {
                 id: id.clone(),
                 name,
                 image,
-                labels: HashMap::new(),
+                labels,
             });
         }
 
@@ -292,7 +270,7 @@ pub async fn start_container(
         {
             if inspect_resp.status() == StatusCode::OK {
                 if let Ok(body) =
-                    axum::body::to_bytes(inspect_resp.into_body(), 10 * 1024 * 1024).await
+                    axum::body::to_bytes(inspect_resp.into_body(), HOOK_BUFFER_LIMIT_BYTES).await
                 {
                     // Set up port forwarding.
                     let bindings = proxy::parse_port_bindings(&body);
@@ -450,7 +428,7 @@ pub async fn restart_container(
         {
             if inspect_resp.status() == StatusCode::OK {
                 if let Ok(body) =
-                    axum::body::to_bytes(inspect_resp.into_body(), 10 * 1024 * 1024).await
+                    axum::body::to_bytes(inspect_resp.into_body(), HOOK_BUFFER_LIMIT_BYTES).await
                 {
                     let bindings = proxy::parse_port_bindings(&body);
                     if !bindings.is_empty() {
@@ -589,16 +567,7 @@ pub async fn exec_start(
     if wants_upgrade {
         proxy::proxy_with_upgrade(&state.runtime, req, &uri).await
     } else {
-        let path_and_query = uri
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-        let method = req.method().clone();
-        let headers = req.headers().clone();
-        let body = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
-            .await
-            .map_err(|e| DockerError::Server(e.to_string()))?;
-        proxy::proxy_to_guest(&state.runtime, method, path_and_query, &headers, body).await
+        proxy::proxy_to_guest_stream(&state.runtime, &uri, req).await
     }
 }
 
