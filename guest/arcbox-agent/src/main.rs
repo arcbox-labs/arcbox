@@ -18,14 +18,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod agent;
 mod machine_init;
 
-// These modules contain the core logic. They are always compiled for testing,
-// but only used at runtime on Linux where vsock is available.
-mod container;
-mod exec;
-mod log_watcher;
-mod pty;
 mod rpc;
-mod shim;
 
 // Mount module uses Linux-specific syscalls (mount/umount).
 #[cfg(target_os = "linux")]

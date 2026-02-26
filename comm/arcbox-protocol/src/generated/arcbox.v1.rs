@@ -423,8 +423,10 @@ pub struct MachineExecRequest {
     pub user: ::prost::alloc::string::String,
     /// Environment variables.
     #[prost(map = "string, string", tag = "5")]
-    pub env:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub env: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Allocate TTY.
     #[prost(bool, tag = "6")]
     pub tty: bool,
@@ -496,8 +498,10 @@ pub struct CreateContainerRequest {
     pub entrypoint: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// Environment variables.
     #[prost(map = "string, string", tag = "5")]
-    pub env:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub env: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Working directory.
     #[prost(string, tag = "6")]
     pub working_dir: ::prost::alloc::string::String,
@@ -515,8 +519,10 @@ pub struct CreateContainerRequest {
     pub limits: ::core::option::Option<ResourceLimits>,
     /// Labels.
     #[prost(map = "string, string", tag = "11")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Hostname.
     #[prost(string, tag = "12")]
     pub hostname: ::prost::alloc::string::String,
@@ -651,8 +657,10 @@ pub struct ContainerSummary {
     pub ports: ::prost::alloc::vec::Vec<PortBinding>,
     /// Labels.
     #[prost(map = "string, string", tag = "10")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Size in bytes (rw layer).
     #[prost(int64, tag = "11")]
     pub size_rw: i64,
@@ -778,8 +786,10 @@ pub struct ContainerConfig {
     pub image: ::prost::alloc::string::String,
     /// Labels.
     #[prost(map = "string, string", tag = "9")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// TTY allocation.
     #[prost(bool, tag = "10")]
     pub tty: bool,
@@ -1214,8 +1224,10 @@ pub struct ImageSummary {
     pub containers: i64,
     /// Labels.
     #[prost(map = "string, string", tag = "8")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Request to inspect an image.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1302,11 +1314,16 @@ pub struct ImageConfig {
     pub working_dir: ::prost::alloc::string::String,
     /// Labels.
     #[prost(map = "string, string", tag = "8")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Exposed ports.
     #[prost(map = "string, message", tag = "9")]
-    pub exposed_ports: ::std::collections::HashMap<::prost::alloc::string::String, Empty>,
+    pub exposed_ports: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        Empty,
+    >,
     /// Volumes.
     #[prost(map = "string, message", tag = "10")]
     pub volumes: ::std::collections::HashMap<::prost::alloc::string::String, Empty>,
@@ -1568,484 +1585,6 @@ pub struct ServiceStatus {
     #[prost(string, tag = "3")]
     pub detail: ::prost::alloc::string::String,
 }
-/// Request to create a container (forwarded to containerd).
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentCreateContainerRequest {
-    /// Container name.
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// Image reference.
-    #[prost(string, tag = "2")]
-    pub image: ::prost::alloc::string::String,
-    /// Command to run.
-    #[prost(string, repeated, tag = "3")]
-    pub cmd: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Entrypoint.
-    #[prost(string, repeated, tag = "4")]
-    pub entrypoint: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Environment variables.
-    #[prost(map = "string, string", tag = "5")]
-    pub env:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// Working directory.
-    #[prost(string, tag = "6")]
-    pub working_dir: ::prost::alloc::string::String,
-    /// User.
-    #[prost(string, tag = "7")]
-    pub user: ::prost::alloc::string::String,
-    /// Mounts.
-    #[prost(message, repeated, tag = "8")]
-    pub mounts: ::prost::alloc::vec::Vec<Mount>,
-    /// TTY allocation.
-    #[prost(bool, tag = "9")]
-    pub tty: bool,
-    /// Keep stdin open.
-    #[prost(bool, tag = "10")]
-    pub open_stdin: bool,
-    /// Root filesystem path (extracted OCI image).
-    /// When set, the container will be chrooted into this directory.
-    #[prost(string, tag = "11")]
-    pub rootfs: ::prost::alloc::string::String,
-    /// Optional container ID to keep host/guest IDs in sync.
-    #[prost(string, tag = "12")]
-    pub id: ::prost::alloc::string::String,
-}
-/// Response to create container.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentCreateContainerResponse {
-    /// Container ID.
-    #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
-}
-/// Request to start a container.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentStartContainerRequest {
-    /// Container ID.
-    #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
-}
-/// Request to stop a container.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentStopContainerRequest {
-    /// Container ID.
-    #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
-    /// Timeout in seconds.
-    #[prost(uint32, tag = "2")]
-    pub timeout: u32,
-}
-/// Request to remove a container.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentRemoveContainerRequest {
-    /// Container ID.
-    #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
-    /// Force removal.
-    #[prost(bool, tag = "2")]
-    pub force: bool,
-}
-/// Request to list containers.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct AgentListContainersRequest {
-    /// Show all containers.
-    #[prost(bool, tag = "1")]
-    pub all: bool,
-}
-/// Response to list containers.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentListContainersResponse {
-    /// List of containers.
-    #[prost(message, repeated, tag = "1")]
-    pub containers: ::prost::alloc::vec::Vec<AgentContainerInfo>,
-}
-/// Container information.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentContainerInfo {
-    /// Container ID.
-    #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
-    /// Container name.
-    #[prost(string, tag = "2")]
-    pub name: ::prost::alloc::string::String,
-    /// Image reference.
-    #[prost(string, tag = "3")]
-    pub image: ::prost::alloc::string::String,
-    /// State.
-    #[prost(string, tag = "4")]
-    pub state: ::prost::alloc::string::String,
-    /// Status.
-    #[prost(string, tag = "5")]
-    pub status: ::prost::alloc::string::String,
-    /// Creation time.
-    #[prost(int64, tag = "6")]
-    pub created: i64,
-}
-/// Request to read a file.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ReadFileRequest {
-    /// File path.
-    #[prost(string, tag = "1")]
-    pub path: ::prost::alloc::string::String,
-    /// Offset in bytes.
-    #[prost(int64, tag = "2")]
-    pub offset: i64,
-    /// Maximum bytes to read (0 = all).
-    #[prost(int64, tag = "3")]
-    pub limit: i64,
-}
-/// File chunk for streaming file operations.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct FileChunk {
-    /// File path (only in first chunk for writes).
-    #[prost(string, tag = "1")]
-    pub path: ::prost::alloc::string::String,
-    /// File data.
-    #[prost(bytes = "vec", tag = "2")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
-    /// Offset in file.
-    #[prost(int64, tag = "3")]
-    pub offset: i64,
-    /// Is this the last chunk.
-    #[prost(bool, tag = "4")]
-    pub eof: bool,
-    /// File mode (only for writes, in first chunk).
-    #[prost(uint32, tag = "5")]
-    pub mode: u32,
-}
-/// Response to write file.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct WriteFileResponse {
-    /// Bytes written.
-    #[prost(int64, tag = "1")]
-    pub bytes_written: i64,
-}
-/// Request to execute a command.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentExecRequest {
-    /// Container ID (empty for host).
-    #[prost(string, tag = "1")]
-    pub container_id: ::prost::alloc::string::String,
-    /// Command to execute.
-    #[prost(string, repeated, tag = "2")]
-    pub cmd: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Environment variables.
-    #[prost(map = "string, string", tag = "3")]
-    pub env:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// Working directory.
-    #[prost(string, tag = "4")]
-    pub working_dir: ::prost::alloc::string::String,
-    /// User to run as.
-    #[prost(string, tag = "5")]
-    pub user: ::prost::alloc::string::String,
-    /// Allocate TTY.
-    #[prost(bool, tag = "6")]
-    pub tty: bool,
-}
-/// Exec output.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentExecOutput {
-    /// Stream type: stdout, stderr.
-    #[prost(string, tag = "1")]
-    pub stream: ::prost::alloc::string::String,
-    /// Output data.
-    #[prost(bytes = "vec", tag = "2")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
-    /// Exit code (only set when done).
-    #[prost(int32, tag = "3")]
-    pub exit_code: i32,
-    /// Is this the final message.
-    #[prost(bool, tag = "4")]
-    pub done: bool,
-}
-/// Request to start an exec instance with full options.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentExecStartRequest {
-    /// Exec ID.
-    #[prost(string, tag = "1")]
-    pub exec_id: ::prost::alloc::string::String,
-    /// Container ID.
-    #[prost(string, tag = "2")]
-    pub container_id: ::prost::alloc::string::String,
-    /// Command to execute.
-    #[prost(string, repeated, tag = "3")]
-    pub cmd: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Environment variables.
-    #[prost(map = "string, string", tag = "4")]
-    pub env:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// Working directory.
-    #[prost(string, tag = "5")]
-    pub working_dir: ::prost::alloc::string::String,
-    /// User to run as.
-    #[prost(string, tag = "6")]
-    pub user: ::prost::alloc::string::String,
-    /// Allocate TTY.
-    #[prost(bool, tag = "7")]
-    pub tty: bool,
-    /// Detach mode (run in background).
-    #[prost(bool, tag = "8")]
-    pub detach: bool,
-    /// Initial terminal width.
-    #[prost(uint32, tag = "9")]
-    pub tty_width: u32,
-    /// Initial terminal height.
-    #[prost(uint32, tag = "10")]
-    pub tty_height: u32,
-}
-/// Exec start response.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct AgentExecStartResponse {
-    /// Process ID in guest.
-    #[prost(uint32, tag = "1")]
-    pub pid: u32,
-}
-/// Request to resize exec TTY.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentExecResizeRequest {
-    /// Exec ID.
-    #[prost(string, tag = "1")]
-    pub exec_id: ::prost::alloc::string::String,
-    /// New terminal width.
-    #[prost(uint32, tag = "2")]
-    pub width: u32,
-    /// New terminal height.
-    #[prost(uint32, tag = "3")]
-    pub height: u32,
-}
-/// Attach request for container interactive session.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentAttachRequest {
-    /// Container ID to attach to.
-    #[prost(string, tag = "1")]
-    pub container_id: ::prost::alloc::string::String,
-    /// Attach stdin.
-    #[prost(bool, tag = "2")]
-    pub attach_stdin: bool,
-    /// Attach stdout.
-    #[prost(bool, tag = "3")]
-    pub attach_stdout: bool,
-    /// Attach stderr.
-    #[prost(bool, tag = "4")]
-    pub attach_stderr: bool,
-    /// Terminal width for TTY containers.
-    #[prost(uint32, tag = "5")]
-    pub tty_width: u32,
-    /// Terminal height for TTY containers.
-    #[prost(uint32, tag = "6")]
-    pub tty_height: u32,
-    /// Exec session ID when attaching to an exec.
-    #[prost(string, tag = "7")]
-    pub exec_id: ::prost::alloc::string::String,
-}
-/// Attach input for stdin/resizes.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentAttachInput {
-    /// Raw input data for the container.
-    #[prost(bytes = "vec", tag = "1")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
-    /// Resize flag.
-    #[prost(bool, tag = "2")]
-    pub resize: bool,
-    /// New terminal width (when resize=true).
-    #[prost(uint32, tag = "3")]
-    pub width: u32,
-    /// New terminal height (when resize=true).
-    #[prost(uint32, tag = "4")]
-    pub height: u32,
-}
-/// Attach output for stdout/stderr.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentAttachOutput {
-    /// Stream name: stdout/stderr.
-    #[prost(string, tag = "1")]
-    pub stream: ::prost::alloc::string::String,
-    /// Output data chunk.
-    #[prost(bytes = "vec", tag = "2")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
-}
-/// Request for container stats.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentStatsRequest {
-    /// Container ID.
-    #[prost(string, tag = "1")]
-    pub container_id: ::prost::alloc::string::String,
-    /// Stream updates.
-    #[prost(bool, tag = "2")]
-    pub stream: bool,
-}
-/// Container statistics.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentContainerStats {
-    /// Container ID.
-    #[prost(string, tag = "1")]
-    pub container_id: ::prost::alloc::string::String,
-    /// CPU usage.
-    #[prost(message, optional, tag = "2")]
-    pub cpu: ::core::option::Option<AgentCpuStats>,
-    /// Memory usage.
-    #[prost(message, optional, tag = "3")]
-    pub memory: ::core::option::Option<AgentMemoryStats>,
-    /// Network I/O.
-    #[prost(message, optional, tag = "4")]
-    pub network: ::core::option::Option<AgentNetworkStats>,
-    /// Block I/O.
-    #[prost(message, optional, tag = "5")]
-    pub block: ::core::option::Option<AgentBlockStats>,
-    /// Timestamp.
-    #[prost(message, optional, tag = "6")]
-    pub timestamp: ::core::option::Option<Timestamp>,
-}
-/// CPU statistics.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct AgentCpuStats {
-    /// CPU usage in nanoseconds.
-    #[prost(uint64, tag = "1")]
-    pub usage_ns: u64,
-    /// System CPU usage in nanoseconds.
-    #[prost(uint64, tag = "2")]
-    pub system_ns: u64,
-    /// CPU usage percentage.
-    #[prost(double, tag = "3")]
-    pub usage_percent: f64,
-}
-/// Memory statistics.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct AgentMemoryStats {
-    /// Memory usage in bytes.
-    #[prost(uint64, tag = "1")]
-    pub usage: u64,
-    /// Memory limit in bytes.
-    #[prost(uint64, tag = "2")]
-    pub limit: u64,
-    /// Memory usage percentage.
-    #[prost(double, tag = "3")]
-    pub usage_percent: f64,
-    /// Cache in bytes.
-    #[prost(uint64, tag = "4")]
-    pub cache: u64,
-}
-/// Network statistics.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct AgentNetworkStats {
-    /// Bytes received.
-    #[prost(uint64, tag = "1")]
-    pub rx_bytes: u64,
-    /// Bytes transmitted.
-    #[prost(uint64, tag = "2")]
-    pub tx_bytes: u64,
-    /// Packets received.
-    #[prost(uint64, tag = "3")]
-    pub rx_packets: u64,
-    /// Packets transmitted.
-    #[prost(uint64, tag = "4")]
-    pub tx_packets: u64,
-}
-/// Block I/O statistics.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
-pub struct AgentBlockStats {
-    /// Bytes read.
-    #[prost(uint64, tag = "1")]
-    pub read_bytes: u64,
-    /// Bytes written.
-    #[prost(uint64, tag = "2")]
-    pub write_bytes: u64,
-}
-/// Request for container logs.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentLogsRequest {
-    /// Container ID.
-    #[prost(string, tag = "1")]
-    pub container_id: ::prost::alloc::string::String,
-    /// Follow logs (stream new entries).
-    #[prost(bool, tag = "2")]
-    pub follow: bool,
-    /// Include stdout.
-    #[prost(bool, tag = "3")]
-    pub stdout: bool,
-    /// Include stderr.
-    #[prost(bool, tag = "4")]
-    pub stderr: bool,
-    /// Only entries since this timestamp (Unix seconds, 0 = all).
-    #[prost(int64, tag = "5")]
-    pub since: i64,
-    /// Only entries until this timestamp (Unix seconds, 0 = now).
-    #[prost(int64, tag = "6")]
-    pub until: i64,
-    /// Include timestamps in output.
-    #[prost(bool, tag = "7")]
-    pub timestamps: bool,
-    /// Tail N lines (0 = all).
-    #[prost(int64, tag = "8")]
-    pub tail: i64,
-}
-/// Log entry.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct AgentLogEntry {
-    /// Stream type: "stdout" or "stderr".
-    #[prost(string, tag = "1")]
-    pub stream: ::prost::alloc::string::String,
-    /// Log data.
-    #[prost(bytes = "vec", tag = "2")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
-    /// Timestamp (Unix nanoseconds).
-    #[prost(int64, tag = "3")]
-    pub timestamp: i64,
-}
 /// Request to create a network.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2062,8 +1601,10 @@ pub struct CreateNetworkRequest {
     pub internal: bool,
     /// Labels.
     #[prost(map = "string, string", tag = "4")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Enable IPv6.
     #[prost(bool, tag = "5")]
     pub enable_ipv6: bool,
@@ -2081,8 +1622,10 @@ pub struct IpamConfig {
     pub driver: ::prost::alloc::string::String,
     /// IPAM options.
     #[prost(map = "string, string", tag = "2")]
-    pub options:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub options: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Subnet configurations.
     #[prost(message, repeated, tag = "3")]
     pub subnets: ::prost::alloc::vec::Vec<IpamSubnet>,
@@ -2130,8 +1673,10 @@ pub struct RemoveNetworkRequest {
 pub struct ListNetworksRequest {
     /// Filter by labels.
     #[prost(map = "string, string", tag = "1")]
-    pub filters:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub filters: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Response to list networks.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2170,8 +1715,10 @@ pub struct NetworkSummary {
     pub attachable: bool,
     /// Labels.
     #[prost(map = "string, string", tag = "8")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Request to inspect a network.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2213,18 +1760,25 @@ pub struct NetworkInfo {
     pub attachable: bool,
     /// Labels.
     #[prost(map = "string, string", tag = "8")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// IPAM configuration.
     #[prost(message, optional, tag = "9")]
     pub ipam: ::core::option::Option<IpamConfig>,
     /// Connected containers.
     #[prost(map = "string, message", tag = "10")]
-    pub containers: ::std::collections::HashMap<::prost::alloc::string::String, NetworkContainer>,
+    pub containers: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        NetworkContainer,
+    >,
     /// Driver options.
     #[prost(map = "string, string", tag = "11")]
-    pub options:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub options: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Container connected to a network.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2374,8 +1928,10 @@ pub struct EventsRequest {
     pub until: i64,
     /// Filters.
     #[prost(map = "string, string", tag = "3")]
-    pub filters:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub filters: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// System event.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2405,8 +1961,10 @@ pub struct EventActor {
     pub id: ::prost::alloc::string::String,
     /// Attributes.
     #[prost(map = "string, string", tag = "2")]
-    pub attributes:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub attributes: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Request to prune resources.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2421,8 +1979,10 @@ pub struct PruneRequest {
     pub all: bool,
     /// Filters.
     #[prost(map = "string, string", tag = "3")]
-    pub filters:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub filters: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Response to prune.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2458,12 +2018,16 @@ pub struct CreateVolumeRequest {
     pub driver: ::prost::alloc::string::String,
     /// Driver options.
     #[prost(map = "string, string", tag = "3")]
-    pub driver_opts:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub driver_opts: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Labels.
     #[prost(map = "string, string", tag = "4")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Response to create volume.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2499,8 +2063,10 @@ pub struct RemoveVolumeRequest {
 pub struct ListVolumesRequest {
     /// Filters.
     #[prost(map = "string, string", tag = "1")]
-    pub filters:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub filters: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// Response to list volumes.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2542,19 +2108,25 @@ pub struct VolumeInfo {
     pub created: ::prost::alloc::string::String,
     /// Status.
     #[prost(map = "string, string", tag = "5")]
-    pub status:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub status: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Labels.
     #[prost(map = "string, string", tag = "6")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub labels: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Scope (local, global).
     #[prost(string, tag = "7")]
     pub scope: ::prost::alloc::string::String,
     /// Driver options.
     #[prost(map = "string, string", tag = "8")]
-    pub options:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    pub options: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
     /// Usage data.
     #[prost(message, optional, tag = "9")]
     pub usage: ::core::option::Option<VolumeUsage>,

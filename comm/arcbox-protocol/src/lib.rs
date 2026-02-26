@@ -110,48 +110,14 @@ pub mod image {
 /// Re-exports all agent-related types for backward compatibility.
 pub mod agent {
     pub use super::v1::{
-        AgentAttachInput, AgentAttachOutput, AgentAttachRequest, AgentBlockStats,
-        AgentContainerInfo, AgentContainerStats, AgentCpuStats, AgentCreateContainerRequest,
-        AgentCreateContainerResponse, AgentExecOutput, AgentExecRequest, AgentExecResizeRequest,
-        AgentExecStartRequest, AgentExecStartResponse, AgentListContainersRequest,
-        AgentListContainersResponse, AgentLogEntry, AgentLogsRequest, AgentMemoryStats,
-        AgentNetworkStats, AgentPingRequest, AgentPingResponse, AgentRemoveContainerRequest,
-        AgentStartContainerRequest, AgentStatsRequest, AgentStopContainerRequest, FileChunk,
-        PortBindingsChanged, PortBindingsRemoved, ReadFileRequest, RuntimeEnsureRequest,
-        RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, ServiceStatus,
-        SystemInfo, WriteFileResponse,
+        AgentPingRequest, AgentPingResponse, PortBindingsChanged, PortBindingsRemoved,
+        RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
+        ServiceStatus, SystemInfo,
     };
 
-    // Re-export container types that are commonly used in agent context.
-    pub use super::v1::LogEntry;
-
-    // Note: `ContainerInfo` in agent context refers to `AgentContainerInfo`
-    // (the simplified container info returned by agent). The full `ContainerInfo`
-    // from container.proto is re-exported at the crate level.
-    pub type ContainerInfo = super::v1::AgentContainerInfo;
-
     // Backward compatibility type aliases (short names without Agent prefix).
-    pub type AttachInput = super::v1::AgentAttachInput;
-    pub type AttachOutput = super::v1::AgentAttachOutput;
-    pub type AttachRequest = super::v1::AgentAttachRequest;
-    pub type ContainerStats = super::v1::AgentContainerStats;
-    pub type CpuStats = super::v1::AgentCpuStats;
-    pub type MemoryStats = super::v1::AgentMemoryStats;
-    pub type ExecRequest = super::v1::AgentExecRequest;
-    pub type ExecOutput = super::v1::AgentExecOutput;
-    pub type ExecResizeRequest = super::v1::AgentExecResizeRequest;
-    pub type ExecStartRequest = super::v1::AgentExecStartRequest;
-    pub type ExecStartResponse = super::v1::AgentExecStartResponse;
     pub type PingRequest = super::v1::AgentPingRequest;
     pub type PingResponse = super::v1::AgentPingResponse;
-    pub type CreateContainerRequest = super::v1::AgentCreateContainerRequest;
-    pub type CreateContainerResponse = super::v1::AgentCreateContainerResponse;
-    pub type StartContainerRequest = super::v1::AgentStartContainerRequest;
-    pub type StopContainerRequest = super::v1::AgentStopContainerRequest;
-    pub type RemoveContainerRequest = super::v1::AgentRemoveContainerRequest;
-    pub type ListContainersRequest = super::v1::AgentListContainersRequest;
-    pub type ListContainersResponse = super::v1::AgentListContainersResponse;
-    pub type LogsRequest = super::v1::AgentLogsRequest;
 }
 
 /// API types (from api.proto).
@@ -218,15 +184,9 @@ pub use v1::{
 
 // Agent types
 pub use v1::{
-    AgentAttachInput, AgentAttachOutput, AgentAttachRequest, AgentBlockStats, AgentContainerInfo,
-    AgentContainerStats, AgentCpuStats, AgentCreateContainerRequest, AgentCreateContainerResponse,
-    AgentExecOutput, AgentExecRequest, AgentExecResizeRequest, AgentExecStartRequest,
-    AgentExecStartResponse, AgentListContainersRequest, AgentListContainersResponse, AgentLogEntry,
-    AgentLogsRequest, AgentMemoryStats, AgentNetworkStats, AgentPingRequest, AgentPingResponse,
-    AgentRemoveContainerRequest, AgentStartContainerRequest, AgentStatsRequest,
-    AgentStopContainerRequest, FileChunk, PortBindingsChanged, PortBindingsRemoved,
-    ReadFileRequest, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
-    RuntimeStatusResponse, ServiceStatus, SystemInfo, WriteFileResponse,
+    AgentPingRequest, AgentPingResponse, PortBindingsChanged, PortBindingsRemoved,
+    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
+    ServiceStatus, SystemInfo,
 };
 
 // API types - Network
@@ -254,18 +214,6 @@ pub use v1::{ShellInput, ShellOutput, TerminalSize};
 // =============================================================================
 // Backward compatibility type aliases at crate level
 // =============================================================================
-
-/// Backward compatibility: Container stats from agent.
-pub type ContainerStats = AgentContainerStats;
-
-/// Backward compatibility: CPU stats from agent.
-pub type CpuStats = AgentCpuStats;
-
-/// Backward compatibility: Memory stats from agent.
-pub type MemoryStats = AgentMemoryStats;
-
-/// Backward compatibility: Exec request (alias for AgentExecRequest).
-pub type ExecRequest = AgentExecRequest;
 
 /// Backward compatibility: Ping request (alias for AgentPingRequest).
 pub type PingRequest = AgentPingRequest;
