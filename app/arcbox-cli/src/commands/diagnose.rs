@@ -146,7 +146,10 @@ fn print_configuration_summary(config: &Config, runtime: &RuntimeReadiness) {
 
     if let Some(info) = runtime.default_machine.as_ref() {
         println!("  VM CPUs:           {} (running machine)", info.cpus);
-        println!("  VM Memory:         {} MB (running machine)", info.memory_mb);
+        println!(
+            "  VM Memory:         {} MB (running machine)",
+            info.memory_mb
+        );
         if let Some(kernel) = info.kernel.as_deref() {
             println!("  VM Kernel:         {} (running machine)", kernel);
         }
@@ -160,7 +163,10 @@ fn print_configuration_summary(config: &Config, runtime: &RuntimeReadiness) {
             default_vm.memory_mb
         );
         if let Some(kernel) = default_vm.kernel.as_ref() {
-            println!("  VM Kernel:         {} (runtime default)", kernel.display());
+            println!(
+                "  VM Kernel:         {} (runtime default)",
+                kernel.display()
+            );
         }
         if let Some(initramfs) = default_vm.initramfs.as_ref() {
             println!(

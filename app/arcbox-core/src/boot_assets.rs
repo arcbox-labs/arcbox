@@ -984,10 +984,7 @@ async fn ensure_kernel_decompressed(path: &Path) -> Result<()> {
 /// Decompresses a ZBOOT kernel into the cache directory, leaving the
 /// user-provided source file untouched. Returns the path to use — either
 /// the original (if already raw) or the cached decompressed copy.
-async fn ensure_kernel_decompressed_to_cache(
-    source: &Path,
-    cache_dir: &Path,
-) -> Result<PathBuf> {
+async fn ensure_kernel_decompressed_to_cache(source: &Path, cache_dir: &Path) -> Result<PathBuf> {
     let source = source.to_path_buf();
     let cache_dir = cache_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -998,9 +995,8 @@ async fn ensure_kernel_decompressed_to_cache(
             }
             Some(raw) => {
                 // Write decompressed kernel into cache dir.
-                std::fs::create_dir_all(&cache_dir).map_err(|e| {
-                    CoreError::config(format!("failed to create cache dir: {e}"))
-                })?;
+                std::fs::create_dir_all(&cache_dir)
+                    .map_err(|e| CoreError::config(format!("failed to create cache dir: {e}")))?;
                 let cached_path = cache_dir.join("kernel-custom-decompressed");
                 atomic_write_file(&cached_path, &raw)?;
                 tracing::info!(
@@ -1452,8 +1448,8 @@ mod tests {
     /// - bytes 16..payload_offset: padding
     /// - bytes payload_offset..: gzip-compressed raw Image
     fn build_zboot_kernel(raw_image: &[u8]) -> Vec<u8> {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         // Compress the raw image with gzip.

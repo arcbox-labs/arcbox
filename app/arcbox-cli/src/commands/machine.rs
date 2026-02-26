@@ -569,7 +569,11 @@ async fn exec_via_grpc(
         .into_inner();
 
     let mut exit_code = 0i32;
-    while let Some(output) = stream.message().await.context("Failed to read exec output")? {
+    while let Some(output) = stream
+        .message()
+        .await
+        .context("Failed to read exec output")?
+    {
         if !output.data.is_empty() {
             match output.stream.as_str() {
                 "stderr" => {

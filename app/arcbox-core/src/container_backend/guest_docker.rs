@@ -124,7 +124,7 @@ impl GuestDockerBackend {
                     retry_delay_ms = delay_ms,
                     "guest runtime not ready yet"
                 );
-                }
+            }
 
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             delay_ms = (delay_ms * 3 / 2).min(MAX_DELAY_MS);

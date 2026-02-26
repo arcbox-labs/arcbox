@@ -7,10 +7,10 @@
 use arcbox_core::Runtime;
 use arcbox_grpc::v1::machine_service_server;
 use arcbox_protocol::v1::{
-    CreateMachineRequest, CreateMachineResponse, Empty, InspectMachineRequest,
-    ListMachinesRequest, ListMachinesResponse, MachineAgentRequest, MachineExecOutput,
-    MachineExecRequest, MachineInfo, MachineNetwork, MachinePingResponse, MachineSummary,
-    MachineSystemInfo, RemoveMachineRequest, StartMachineRequest, StopMachineRequest,
+    CreateMachineRequest, CreateMachineResponse, Empty, InspectMachineRequest, ListMachinesRequest,
+    ListMachinesResponse, MachineAgentRequest, MachineExecOutput, MachineExecRequest, MachineInfo,
+    MachineNetwork, MachinePingResponse, MachineSummary, MachineSystemInfo, RemoveMachineRequest,
+    StartMachineRequest, StopMachineRequest,
 };
 use std::pin::Pin;
 use std::sync::Arc;
@@ -309,4 +309,3 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         Err(Status::unimplemented("ssh_info not implemented"))
     }
 }
-

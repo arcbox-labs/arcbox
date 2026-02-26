@@ -7,10 +7,7 @@
 //! - Image management
 
 use anyhow::{Context, Result};
-use arcbox_api::{
-    MachineServiceImpl,
-    machine_service_server::MachineServiceServer,
-};
+use arcbox_api::{MachineServiceImpl, machine_service_server::MachineServiceServer};
 use arcbox_core::{Config, ContainerProvisionMode, Runtime};
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
 use clap::{Args, ValueEnum};
