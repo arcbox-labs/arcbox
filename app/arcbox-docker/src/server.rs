@@ -2,18 +2,15 @@
 
 use crate::api::create_router;
 use crate::error::{DockerError, Result};
+use crate::proxy::RawFdStream;
 use arcbox_core::{ContainerBackendMode, Runtime};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, ready};
-use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tower::Service;
 use tower_http::trace::TraceLayer;
@@ -44,120 +41,6 @@ fn default_socket_path() -> PathBuf {
 pub struct DockerApiServer {
     config: ServerConfig,
     runtime: Arc<Runtime>,
-}
-
-struct RawFdWrapper(OwnedFd);
-
-impl AsRawFd for RawFdWrapper {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
-    }
-}
-
-struct RawFdStream {
-    inner: AsyncFd<RawFdWrapper>,
-}
-
-impl RawFdStream {
-    fn from_raw_fd(fd: RawFd) -> io::Result<Self> {
-        if fd < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid file descriptor",
-            ));
-        }
-
-        Self::set_nonblocking(fd)?;
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        let inner = AsyncFd::new(RawFdWrapper(owned))?;
-        Ok(Self { inner })
-    }
-
-    fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-        if result < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-}
-
-impl AsyncRead for RawFdStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        loop {
-            let mut guard = ready!(self.inner.poll_read_ready(cx))?;
-            match guard.try_io(|inner| {
-                let fd = inner.get_ref().as_raw_fd();
-                let slice = buf.initialize_unfilled();
-                let n = unsafe { libc::read(fd, slice.as_mut_ptr().cast(), slice.len()) };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
-                }
-            }) {
-                Ok(Ok(n)) => {
-                    buf.advance(n);
-                    return Poll::Ready(Ok(()));
-                }
-                Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Ok(Err(e)) => return Poll::Ready(Err(e)),
-                Err(_would_block) => continue,
-            }
-        }
-    }
-}
-
-impl AsyncWrite for RawFdStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        loop {
-            let mut guard = ready!(self.inner.poll_write_ready(cx))?;
-            match guard.try_io(|inner| {
-                let fd = inner.get_ref().as_raw_fd();
-                let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
-                }
-            }) {
-                Ok(Ok(n)) => return Poll::Ready(Ok(n)),
-                Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Ok(Err(e)) => return Poll::Ready(Err(e)),
-                Err(_would_block) => continue,
-            }
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let fd = self.inner.get_ref().as_raw_fd();
-        let result = unsafe { libc::shutdown(fd, libc::SHUT_WR) };
-        if result == 0 {
-            return Poll::Ready(Ok(()));
-        }
-
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ENOTCONN) {
-            return Poll::Ready(Ok(()));
-        }
-        Poll::Ready(Err(err))
-    }
 }
 
 impl DockerApiServer {

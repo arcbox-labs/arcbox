@@ -4,6 +4,7 @@
 //! See: https://docs.docker.com/engine/api/v1.43/
 
 use crate::handlers;
+use crate::proxy;
 use crate::trace::trace_id_middleware;
 use arcbox_core::Runtime;
 use axum::{
@@ -94,6 +95,7 @@ pub fn create_router(runtime: Arc<Runtime>) -> Router {
         .nest("/v1.26", versioned_router())
         .nest("/v1.25", versioned_router())
         .nest("/v1.24", versioned_router())
+        .fallback(proxy::proxy_fallback)
         .layer(middleware::from_fn(trace_id_middleware))
         .with_state(state)
 }
