@@ -1125,6 +1125,72 @@ impl Runtime {
         }
     }
 
+    /// Starts port forwarding for a container from externally-provided bindings.
+    ///
+    /// Used by the smart proxy layer which parses port bindings from the guest
+    /// Docker inspect response rather than from local container state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the guest IP cannot be discovered or listeners fail.
+    pub async fn start_port_forwarding_for(
+        &self,
+        machine_name: &str,
+        container_id: &str,
+        bindings: &[(String, u16, u16, String)], // (host_ip, host_port, container_port, protocol)
+    ) -> Result<()> {
+        if bindings.is_empty() {
+            return Ok(());
+        }
+
+        let guest_ip = self.get_guest_ip(machine_name).await?;
+        let mut forwarder = PortForwarder::new();
+
+        for (host_ip_str, host_port, container_port, protocol) in bindings {
+            let host_ip: Ipv4Addr =
+                if host_ip_str.is_empty() || host_ip_str == "0.0.0.0" {
+                    Ipv4Addr::UNSPECIFIED
+                } else {
+                    host_ip_str.parse().unwrap_or(Ipv4Addr::UNSPECIFIED)
+                };
+
+            let host_addr = SocketAddr::V4(SocketAddrV4::new(host_ip, *host_port));
+            let guest_addr = SocketAddr::V4(SocketAddrV4::new(guest_ip, *container_port));
+
+            let rule = match protocol.to_lowercase().as_str() {
+                "udp" => PortForwardRule::udp(host_addr, guest_addr),
+                _ => PortForwardRule::tcp(host_addr, guest_addr),
+            };
+
+            forwarder.add_rule(rule);
+            tracing::info!(
+                "Port forward rule added: {} -> {} ({})",
+                host_addr,
+                guest_addr,
+                protocol
+            );
+        }
+
+        forwarder.start().await?;
+
+        let mut forwarders = self.port_forwarders.write().await;
+        forwarders.insert(container_id.to_string(), forwarder);
+
+        Ok(())
+    }
+
+    /// Stops port forwarding for a container by its string ID.
+    ///
+    /// Used by the smart proxy layer which operates on raw container ID strings
+    /// rather than typed `ContainerId` values.
+    pub async fn stop_port_forwarding_by_id(&self, container_id: &str) {
+        let mut forwarders = self.port_forwarders.write().await;
+        if let Some(mut forwarder) = forwarders.remove(container_id) {
+            forwarder.stop().await;
+            tracing::debug!("Stopped port forwarding for container {}", container_id);
+        }
+    }
+
     /// Stops a container in a machine.
     ///
     /// # Errors
