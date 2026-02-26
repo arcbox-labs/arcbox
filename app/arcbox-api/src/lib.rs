@@ -41,15 +41,8 @@ pub mod grpc;
 pub mod server;
 
 // Re-export gRPC service types from arcbox-grpc for convenience.
-pub use arcbox_grpc::v1::{
-    container_service_client, container_service_server, image_service_client, image_service_server,
-    machine_service_client, machine_service_server, network_service_client, network_service_server,
-    system_service_client, system_service_server,
-};
+pub use arcbox_grpc::v1::{machine_service_client, machine_service_server};
 
 pub use error::{ApiError, Result};
-pub use grpc::{
-    ContainerServiceImpl, ImageServiceImpl, MachineServiceImpl, NetworkServiceImpl,
-    SystemServiceImpl,
-};
+pub use grpc::MachineServiceImpl;
 pub use server::{ApiServer, ApiServerConfig};

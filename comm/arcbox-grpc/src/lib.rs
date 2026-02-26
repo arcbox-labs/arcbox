@@ -6,11 +6,7 @@
 //! # Services
 //!
 //! - `MachineService` - Virtual machine management
-//! - `ContainerService` - Container lifecycle management
-//! - `ImageService` - Container image management
 //! - `AgentService` - Guest agent communication
-//! - `NetworkService` - Network management (from api.proto)
-//! - `SystemService` - System operations (from api.proto)
 //! - `VolumeService` - Volume management (from api.proto)
 //!
 //! # Usage
@@ -42,11 +38,7 @@ pub use tonic;
 ///
 /// This module contains tonic-generated client and server code for:
 /// - MachineService - VM management
-/// - ContainerService - Container lifecycle
-/// - ImageService - Image management
 /// - AgentService - Guest agent communication
-/// - NetworkService - Network management
-/// - SystemService - System operations
 /// - VolumeService - Volume management
 pub mod v1 {
     tonic::include_proto!("arcbox.v1");
@@ -57,11 +49,7 @@ pub mod v1 {
 // =============================================================================
 
 pub use v1::agent_service_client::AgentServiceClient;
-pub use v1::container_service_client::ContainerServiceClient;
-pub use v1::image_service_client::ImageServiceClient;
 pub use v1::machine_service_client::MachineServiceClient;
-pub use v1::network_service_client::NetworkServiceClient;
-pub use v1::system_service_client::SystemServiceClient;
 pub use v1::volume_service_client::VolumeServiceClient;
 
 // =============================================================================
@@ -69,9 +57,5 @@ pub use v1::volume_service_client::VolumeServiceClient;
 // =============================================================================
 
 pub use v1::agent_service_server::{AgentService, AgentServiceServer};
-pub use v1::container_service_server::{ContainerService, ContainerServiceServer};
-pub use v1::image_service_server::{ImageService, ImageServiceServer};
 pub use v1::machine_service_server::{MachineService, MachineServiceServer};
-pub use v1::network_service_server::{NetworkService, NetworkServiceServer};
-pub use v1::system_service_server::{SystemService, SystemServiceServer};
 pub use v1::volume_service_server::{VolumeService, VolumeServiceServer};

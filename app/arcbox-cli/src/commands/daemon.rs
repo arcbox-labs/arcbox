@@ -8,9 +8,8 @@
 
 use anyhow::{Context, Result};
 use arcbox_api::{
-    ContainerServiceImpl, ImageServiceImpl, MachineServiceImpl, SystemServiceImpl,
-    container_service_server::ContainerServiceServer, image_service_server::ImageServiceServer,
-    machine_service_server::MachineServiceServer, system_service_server::SystemServiceServer,
+    MachineServiceImpl,
+    machine_service_server::MachineServiceServer,
 };
 use arcbox_core::{Config, ContainerBackendMode, ContainerProvisionMode, Runtime};
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
@@ -268,18 +267,12 @@ async fn start_grpc_server(
     info!(socket = %socket_path.display(), "gRPC server listening");
 
     // Create gRPC services.
-    let container_service = ContainerServiceImpl::new(Arc::clone(&runtime));
     let machine_service = MachineServiceImpl::new(Arc::clone(&runtime));
-    let image_service = ImageServiceImpl::new(Arc::clone(&runtime));
-    let system_service = SystemServiceImpl::new(Arc::clone(&runtime));
 
     // Build and run gRPC server.
     let handle = tokio::spawn(async move {
         let result = Server::builder()
-            .add_service(ContainerServiceServer::new(container_service))
             .add_service(MachineServiceServer::new(machine_service))
-            .add_service(ImageServiceServer::new(image_service))
-            .add_service(SystemServiceServer::new(system_service))
             .serve_with_incoming(incoming)
             .await;
 

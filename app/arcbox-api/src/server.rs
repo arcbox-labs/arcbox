@@ -1,16 +1,10 @@
 //! API server implementation.
 
 use crate::error::Result;
-use crate::grpc::{
-    ContainerServiceImpl, ImageServiceImpl, MachineServiceImpl, NetworkServiceImpl,
-    SystemServiceImpl,
-};
+use crate::grpc::MachineServiceImpl;
 use arcbox_core::{Config, Runtime};
 use arcbox_docker::{DockerApiServer, ServerConfig as DockerConfig};
-use arcbox_grpc::{
-    ContainerServiceServer, ImageServiceServer, MachineServiceServer, NetworkServiceServer,
-    SystemServiceServer,
-};
+use arcbox_grpc::MachineServiceServer;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tonic::transport::Server;
@@ -81,11 +75,7 @@ impl ApiServer {
         });
 
         // Create gRPC services
-        let container_service = ContainerServiceImpl::new(Arc::clone(&self.runtime));
         let machine_service = MachineServiceImpl::new(Arc::clone(&self.runtime));
-        let image_service = ImageServiceImpl::new(Arc::clone(&self.runtime));
-        let network_service = NetworkServiceImpl::new(Arc::clone(&self.runtime));
-        let system_service = SystemServiceImpl::new(Arc::clone(&self.runtime));
 
         // Parse gRPC address
         let grpc_addr =
@@ -99,11 +89,7 @@ impl ApiServer {
 
         // Build gRPC server
         let grpc_server = Server::builder()
-            .add_service(ContainerServiceServer::new(container_service))
             .add_service(MachineServiceServer::new(machine_service))
-            .add_service(ImageServiceServer::new(image_service))
-            .add_service(NetworkServiceServer::new(network_service))
-            .add_service(SystemServiceServer::new(system_service))
             .serve_with_shutdown(grpc_addr, async {
                 tokio::signal::ctrl_c()
                     .await
