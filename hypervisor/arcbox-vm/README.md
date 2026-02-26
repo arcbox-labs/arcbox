@@ -1,10 +1,9 @@
 # firecracker-vmm
 
-A production-grade VM Manager built on top of
+A production-grade sandbox manager built on top of
 [`fc-sdk`](../firecracker-client) that orchestrates multiple
 [Firecracker](https://firecracker-microvm.github.io/) microVMs and exposes
-a [gRPC](https://grpc.io/) interface compatible with the
-[arcbox-protocol](../arcbox/comm/arcbox-protocol/proto).
+a self-contained [gRPC](https://grpc.io/) interface (`sandbox.v1`).
 
 ---
 
@@ -20,19 +19,20 @@ a [gRPC](https://grpc.io/) interface compatible with the
             │         vmm-grpc             │
             │  tonic gRPC server           │
             │  ┌──────────────────────┐    │
-            │  │  MachineService      │    │  ◄── arcbox.v1 proto
-            │  │  SystemService       │    │
+            │  │  SandboxService      │    │  ◄── sandbox.v1 proto
+            │  │  SandboxSnapshot     │    │
+            │  │  Service             │    │
             │  └──────────┬───────────┘    │
             └─────────────┼────────────────┘
                           │
             ┌─────────────▼────────────────┐
             │         vmm-core             │
-            │  VmmManager                  │
+            │  SandboxManager              │
             │  ┌────────────────────────┐  │
-            │  │  VmInstance registry   │  │
+            │  │  SandboxInstance       │  │
+            │  │  registry              │  │
             │  │  (Arc<RwLock<...>>)    │  │
             │  └────────────────────────┘  │
-            │  VmStore  (disk persistence) │
             │  NetworkManager (TAP / IP)   │
             │  SnapshotCatalog             │
             └─────────────┬────────────────┘
@@ -52,7 +52,7 @@ a [gRPC](https://grpc.io/) interface compatible with the
 
 | Crate | Type | Purpose |
 |-------|------|---------|
-| `vmm-core` | lib | Multi-VM orchestration, state, networking, snapshots |
+| `vmm-core` | lib | Sandbox orchestration, state, networking, snapshots |
 | `vmm-grpc` | lib | gRPC server + service implementations |
 | `vmm-daemon` | bin | Daemon entrypoint |
 | `vmm-cli` | bin | Management CLI (gRPC client) |
@@ -61,48 +61,92 @@ a [gRPC](https://grpc.io/) interface compatible with the
 
 ## Features
 
-### VM Lifecycle
-- **Create** — provision kernel + rootfs, allocate TAP, configure and boot Firecracker
-- **Start / Stop** — resume or gracefully halt (Ctrl+Alt+Del) or force-kill
-- **Remove** — stop, release TAP, clean up socket and store entry
-- **List / Inspect** — live registry with full hardware/network/OS detail
+### Sandbox Lifecycle
+- **Create** — provision kernel + rootfs, allocate TAP, configure and boot Firecracker; returns immediately (async boot)
+- **Stop** — graceful halt with configurable timeout, then force-kill
+- **Remove** — stop, release TAP, clean up all resources
+- **List / Inspect** — live in-memory registry with full hardware/network detail
+- **Events** — streaming sandbox lifecycle events (filtered by ID or action)
 
-### Process Options (daemon-level)
-- Direct mode or Jailer sandbox
-- Configurable log level, seccomp filter, API payload limits
-- Custom socket timeout
+### Checkpoint / Restore
+- **Checkpoint** — pause VM, write vmstate + memory snapshot, resume
+- **Restore** — boot a new sandbox from an existing checkpoint
+- **List / Delete** — manage checkpoints on disk
+
+### Process Options
+- Direct Firecracker mode or Jailer sandbox
+- Configurable per-sandbox resources (vCPUs, memory)
+- Auto-destroy TTL per sandbox
 
 ### gRPC Interface
 - Unix socket transport (default: `/run/firecracker-vmm/vmm.sock`)
-- Optional TCP transport
-- Protocol-compatible with `arcbox.v1.MachineService`
+- Optional TCP transport (e.g. `127.0.0.1:9090`)
+- Self-contained `sandbox.v1` proto — no external proto dependencies
 
 ---
 
 ## gRPC Services
 
-### `arcbox.v1.MachineService`
+### `sandbox.v1.SandboxService`
+
+| RPC | Description |
+|-----|-------------|
+| `Create` | Boot a new sandbox (returns immediately; VM boots async) |
+| `Run` | Execute a workload in a sandbox *(future: vsock guest agent)* |
+| `Exec` | Attach to a running workload *(future: vsock guest agent)* |
+| `Stop` | Stop a running sandbox gracefully |
+| `Remove` | Delete sandbox and release all resources |
+| `Inspect` | Full sandbox detail (hardware, network, state) |
+| `List` | List sandboxes with optional state filter |
+| `Events` | Stream sandbox lifecycle events |
+
+### `sandbox.v1.SandboxSnapshotService`
+
+| RPC | Description |
+|-----|-------------|
+| `Checkpoint` | Pause, snapshot, and resume a sandbox |
+| `Restore` | Boot a new sandbox from a checkpoint |
+| `ListSnapshots` | List checkpoints (optionally filtered by sandbox ID) |
+| `DeleteSnapshot` | Remove a checkpoint and its on-disk data |
+
+---
+
+## Sandbox State Machine
 
 ```
-Create       → boot a new VM (uses daemon defaults for unset params)
-Start        → start a stopped VM
-Stop         → stop a running VM (graceful or force)
-Remove       → delete a VM and release all resources
-List         → list VMs (running only, or all with flag)
-Inspect      → full VM detail (hardware, network, storage)
-Ping         → guest agent health check (future: vsock)
-GetSystemInfo→ guest OS info (future: vsock)
-Exec         → run command in guest (future: vsock)
-SSHInfo      → SSH connection details
-```
+            create()
+               │
+               ▼
+          ┌─────────┐
+          │ starting│ (VM booting in background)
+          └────┬────┘
+               │  boot success
+               ▼
+          ┌─────────┐
+          │  ready  │ (VM running, awaiting workload)
+          └────┬────┘
+               │  run()
+               ▼
+          ┌─────────┐
+          │ running │ (workload executing)
+          └────┬────┘
+               │  workload exits
+               ▼
+          ┌─────────┐ ◄── workload exits (returns to ready)
+          │  ready  │
+          └────┬────┘
+               │  stop()
+               ▼
+         ┌──────────┐
+         │ stopping │
+         └────┬─────┘
+              │
+              ▼
+         ┌─────────┐
+         │ stopped │
+         └─────────┘
 
-### `arcbox.v1.SystemService`
-
-```
-GetInfo      → daemon stats (VM counts, host info)
-GetVersion   → daemon version
-Ping         → liveness probe
-Events       → stream VM lifecycle events
+  boot failure → failed
 ```
 
 ---
@@ -115,12 +159,17 @@ Events       → stream VM lifecycle events
 │   └── vmlinux               # default kernel
 ├── images/
 │   └── ubuntu-22.04.ext4     # default rootfs
-└── vms/
-    └── {vm-id}/
-        ├── meta.json         # VmSpec + state + timestamps
-        ├── firecracker.sock  # API socket (while running)
-        ├── firecracker.log
-        └── firecracker.metrics
+├── sandboxes/
+│   └── {sandbox-id}/
+│       ├── firecracker.sock  # Firecracker API socket (while running)
+│       ├── firecracker.log
+│       └── firecracker.metrics
+└── snapshots/
+    └── {sandbox-id}/
+        └── {snapshot-id}/
+            ├── vmstate       # Firecracker VM state file
+            ├── mem           # memory file (full snapshots)
+            └── meta.json     # snapshot metadata
 ```
 
 ---
@@ -142,12 +191,12 @@ no_seccomp                = false
 # mmds_size_limit           = 51200
 # socket_timeout_secs       = 5
 
-# Jailer sandbox (remove this section to run without jailer)
+# Jailer sandbox (omit this section to run without jailer)
 # [firecracker.jailer]
 # binary          = "/usr/bin/jailer"
 # uid             = 1000
 # gid             = 1000
-# chroot_base_dir = "/srv/jailer"       # default: /srv/jailer
+# chroot_base_dir = "/srv/jailer"
 # netns           = "/var/run/netns/myns"
 # new_pid_ns      = false
 # cgroup_version  = "2"
@@ -162,7 +211,7 @@ dns      = ["1.1.1.1", "8.8.8.8"]
 
 [grpc]
 unix_socket = "/run/firecracker-vmm/vmm.sock"
-tcp_addr    = ""
+tcp_addr    = ""                        # empty = disabled
 
 [defaults]
 vcpus      = 1
@@ -172,32 +221,49 @@ rootfs     = "/var/lib/firecracker-vmm/images/ubuntu-22.04.ext4"
 boot_args  = "console=ttyS0 reboot=k panic=1 pci=off"
 ```
 
-> **Breaking change from earlier versions:** The `jailer` field under
-> `[firecracker]` was previously a plain string (`jailer = ""`). It is now
-> an optional TOML table (`[firecracker.jailer]`). Remove the old
-> `jailer = ""` line from existing configs; the jailer is disabled by default
-> when the section is absent.
-
 ---
 
-## Quick Start (planned CLI)
+## Quick Start
 
 ```bash
 # Start daemon
 vmm-daemon --config /etc/firecracker-vmm/config.toml
 
-# Create a VM (uses daemon defaults)
-vmm create --name my-vm --cpus 2 --memory 1024
+# Create a sandbox (returns immediately; VM boots async)
+vmm create --vcpus 2 --memory 1024
 
-# List VMs
+# Create with explicit kernel/rootfs
+vmm create --kernel /path/to/vmlinux --rootfs /path/to/root.ext4
+
+# Create with labels and 5-minute auto-destroy TTL
+vmm create --label env=dev --label owner=alice --ttl 300
+
+# List sandboxes
 vmm list
 
-# Inspect a VM
-vmm inspect my-vm
+# Filter by state
+vmm list --state ready
+
+# Inspect a sandbox
+vmm inspect <sandbox-id>
+
+# Watch live events
+vmm events
+
+# Watch events for a specific sandbox
+vmm events --id <sandbox-id>
 
 # Stop and remove
-vmm stop my-vm
-vmm remove my-vm
+vmm stop <sandbox-id>
+vmm remove <sandbox-id>
+vmm remove --force <sandbox-id>
+
+# Checkpoint management
+vmm snapshot create <sandbox-id> --name my-checkpoint
+vmm snapshot list
+vmm snapshot list --sandbox-id <sandbox-id>
+vmm snapshot restore <snapshot-id> --ttl 600
+vmm snapshot delete <snapshot-id>
 ```
 
 ---
@@ -207,7 +273,7 @@ vmm remove my-vm
 ### Prerequisites
 
 - Rust 1.82+ (edition 2024)
-- `firecracker` binary in PATH (or set `[firecracker].binary` in config)
+- `firecracker` binary (set `[firecracker].binary` in config or add to PATH)
 - Linux with `CAP_NET_ADMIN` for TAP interface creation
 - `protoc` for proto codegen
 
@@ -233,19 +299,6 @@ cargo test --test e2e -- --ignored
 cargo clippy --workspace -- -D warnings
 cargo fmt --check
 ```
-
----
-
-## Relation to ArcBox
-
-`firecracker-vmm` is designed to be the Linux/x86_64 VM backend for ArcBox,
-providing the same `MachineService` gRPC interface that ArcBox's orchestration
-layer consumes — the same interface currently implemented against
-Virtualization.framework on macOS.
-
-On Linux, `arcbox-daemon` can connect to `firecracker-vmm` via the Unix socket
-and route all `MachineService` RPCs through it without changes to the upper
-layers.
 
 ---
 

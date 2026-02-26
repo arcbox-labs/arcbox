@@ -4,45 +4,48 @@ use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::info;
 
-use vmm_core::VmmManager;
+use vmm_core::SandboxManager;
 
-use crate::machine_svc::MachineServiceImpl;
-use crate::proto::arcbox::{
-    machine_service_server::MachineServiceServer, system_service_server::SystemServiceServer,
+use crate::proto::sandbox::{
+    sandbox_service_server::SandboxServiceServer,
+    sandbox_snapshot_service_server::SandboxSnapshotServiceServer,
 };
-use crate::system_svc::SystemServiceImpl;
+use crate::sandbox_svc::{SandboxServiceImpl, SandboxSnapshotServiceImpl};
 
 /// Start the gRPC server.
 ///
-/// Listens on `unix_socket` (required) and optionally on `tcp_addr` if non-empty.
+/// Listens on `unix_socket` (required) and optionally on `tcp_addr` if
+/// non-empty.
 pub async fn serve(
-    manager: Arc<VmmManager>,
+    manager: Arc<SandboxManager>,
     unix_socket: &str,
     tcp_addr: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let machine_svc = MachineServiceServer::new(MachineServiceImpl::new(Arc::clone(&manager)));
-    let system_svc = SystemServiceServer::new(SystemServiceImpl::new(Arc::clone(&manager)));
+    let sandbox_svc =
+        SandboxServiceServer::new(SandboxServiceImpl::new(Arc::clone(&manager)));
+    let snapshot_svc =
+        SandboxSnapshotServiceServer::new(SandboxSnapshotServiceImpl::new(Arc::clone(&manager)));
 
-    // Ensure parent directory for the unix socket exists.
+    // Ensure the parent directory for the Unix socket exists.
     if let Some(parent) = Path::new(unix_socket).parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Remove stale socket if present.
+    // Remove a stale socket file if present.
     if Path::new(unix_socket).exists() {
         std::fs::remove_file(unix_socket)?;
     }
 
     let uds_path = unix_socket.to_owned();
     let uds_server = {
-        let machine_svc = machine_svc.clone();
-        let system_svc = system_svc.clone();
+        let sandbox_svc = sandbox_svc.clone();
+        let snapshot_svc = snapshot_svc.clone();
         async move {
             info!(socket = %uds_path, "gRPC listening on Unix socket");
             let uds = tokio::net::UnixListener::bind(&uds_path)?;
             let incoming = tokio_stream::wrappers::UnixListenerStream::new(uds);
             Server::builder()
-                .add_service(machine_svc)
-                .add_service(system_svc)
+                .add_service(sandbox_svc)
+                .add_service(snapshot_svc)
                 .serve_with_incoming(incoming)
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
@@ -56,11 +59,13 @@ pub async fn serve(
         let tcp_server = async move {
             let addr = tcp_addr_str
                 .parse()
-                .map_err(|e: std::net::AddrParseError| Box::new(e) as Box<dyn std::error::Error>)?;
+                .map_err(|e: std::net::AddrParseError| {
+                    Box::new(e) as Box<dyn std::error::Error>
+                })?;
             info!(addr = %tcp_addr_str, "gRPC also listening on TCP");
             Server::builder()
-                .add_service(machine_svc)
-                .add_service(system_svc)
+                .add_service(sandbox_svc)
+                .add_service(snapshot_svc)
                 .serve(addr)
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
