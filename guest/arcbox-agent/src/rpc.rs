@@ -25,9 +25,9 @@ use arcbox_protocol::Empty;
 use arcbox_protocol::agent::{
     CreateContainerRequest, CreateContainerResponse, ExecOutput, ExecRequest, ExecResizeRequest,
     ExecStartRequest, ExecStartResponse, ListContainersRequest, ListContainersResponse, LogEntry,
-    LogsRequest, PingRequest, PingResponse, RemoveContainerRequest, RuntimeEnsureRequest,
-    RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, StartContainerRequest,
-    StopContainerRequest, SystemInfo,
+    LogsRequest, PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved,
+    RemoveContainerRequest, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
+    RuntimeStatusResponse, StartContainerRequest, StopContainerRequest, SystemInfo,
 };
 use arcbox_protocol::container::{
     ContainerStatsRequest, ContainerStatsResponse, ContainerTopRequest, ContainerTopResponse,
@@ -85,6 +85,8 @@ pub enum MessageType {
     LogEntry = 0x1021,
     ExecStartResponse = 0x1022,
     AttachOutput = 0x1023,
+    PortBindingsChanged = 0x1030,
+    PortBindingsRemoved = 0x1031,
 
     // Special types
     Empty = 0x0000,
@@ -135,6 +137,8 @@ impl MessageType {
             0x1021 => Some(Self::LogEntry),
             0x1022 => Some(Self::ExecStartResponse),
             0x1023 => Some(Self::AttachOutput),
+            0x1030 => Some(Self::PortBindingsChanged),
+            0x1031 => Some(Self::PortBindingsRemoved),
             0x0000 => Some(Self::Empty),
             0xFFFF => Some(Self::Error),
             _ => None,
@@ -224,6 +228,8 @@ pub enum RpcResponse {
     LogEntry(LogEntry),
     ExecStart(ExecStartResponse),
     AttachOutput(arcbox_protocol::agent::AttachOutput),
+    PortBindingsChanged(PortBindingsChanged),
+    PortBindingsRemoved(PortBindingsRemoved),
     Error(ErrorResponse),
 }
 
@@ -245,6 +251,8 @@ impl RpcResponse {
             Self::LogEntry(_) => MessageType::LogEntry,
             Self::ExecStart(_) => MessageType::ExecStartResponse,
             Self::AttachOutput(_) => MessageType::AttachOutput,
+            Self::PortBindingsChanged(_) => MessageType::PortBindingsChanged,
+            Self::PortBindingsRemoved(_) => MessageType::PortBindingsRemoved,
             Self::Error(_) => MessageType::Error,
         }
     }
@@ -266,6 +274,8 @@ impl RpcResponse {
             Self::LogEntry(msg) => msg.encode_to_vec(),
             Self::ExecStart(msg) => msg.encode_to_vec(),
             Self::AttachOutput(msg) => msg.encode_to_vec(),
+            Self::PortBindingsChanged(msg) => msg.encode_to_vec(),
+            Self::PortBindingsRemoved(msg) => msg.encode_to_vec(),
             Self::Error(err) => err.encode(),
         }
     }

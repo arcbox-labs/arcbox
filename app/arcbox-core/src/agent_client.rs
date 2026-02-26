@@ -9,9 +9,9 @@ use arcbox_protocol::agent::{
     AttachInput, AttachOutput, AttachRequest, CreateContainerRequest, CreateContainerResponse,
     ExecOutput, ExecRequest, ExecResizeRequest, ExecStartRequest, ExecStartResponse,
     ListContainersRequest, ListContainersResponse, LogEntry, LogsRequest, PingRequest,
-    PingResponse, RemoveContainerRequest, RuntimeEnsureRequest, RuntimeEnsureResponse,
-    RuntimeStatusRequest, RuntimeStatusResponse, StartContainerRequest, StopContainerRequest,
-    SystemInfo,
+    PingResponse, PortBindingsChanged, PortBindingsRemoved, RemoveContainerRequest,
+    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
+    StartContainerRequest, StopContainerRequest, SystemInfo,
 };
 use arcbox_protocol::container::{
     ContainerStatsRequest, ContainerStatsResponse, ContainerTopRequest, ContainerTopResponse,
@@ -72,6 +72,8 @@ enum MessageType {
     LogEntry = 0x1021,
     ExecStartResponse = 0x1022,
     AttachOutput = 0x1023,
+    PortBindingsChanged = 0x1030,
+    PortBindingsRemoved = 0x1031,
 
     // Special types
     EmptyResponse = 0x0000,
@@ -115,6 +117,8 @@ impl MessageType {
             0x1021 => Some(Self::LogEntry),
             0x1022 => Some(Self::ExecStartResponse),
             0x1023 => Some(Self::AttachOutput),
+            0x1030 => Some(Self::PortBindingsChanged),
+            0x1031 => Some(Self::PortBindingsRemoved),
             0x0000 => Some(Self::EmptyResponse),
             0xFFFF => Some(Self::Error),
             _ => None,

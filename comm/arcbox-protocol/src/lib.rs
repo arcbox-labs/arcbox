@@ -117,8 +117,9 @@ pub mod agent {
         AgentListContainersResponse, AgentLogEntry, AgentLogsRequest, AgentMemoryStats,
         AgentNetworkStats, AgentPingRequest, AgentPingResponse, AgentRemoveContainerRequest,
         AgentStartContainerRequest, AgentStatsRequest, AgentStopContainerRequest, FileChunk,
-        ReadFileRequest, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
-        RuntimeStatusResponse, ServiceStatus, SystemInfo, WriteFileResponse,
+        PortBindingsChanged, PortBindingsRemoved, ReadFileRequest, RuntimeEnsureRequest,
+        RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, ServiceStatus,
+        SystemInfo, WriteFileResponse,
     };
 
     // Re-export container types that are commonly used in agent context.
@@ -223,9 +224,9 @@ pub use v1::{
     AgentExecStartResponse, AgentListContainersRequest, AgentListContainersResponse, AgentLogEntry,
     AgentLogsRequest, AgentMemoryStats, AgentNetworkStats, AgentPingRequest, AgentPingResponse,
     AgentRemoveContainerRequest, AgentStartContainerRequest, AgentStatsRequest,
-    AgentStopContainerRequest, FileChunk, ReadFileRequest, RuntimeEnsureRequest,
-    RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, ServiceStatus, SystemInfo,
-    WriteFileResponse,
+    AgentStopContainerRequest, FileChunk, PortBindingsChanged, PortBindingsRemoved,
+    ReadFileRequest, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
+    RuntimeStatusResponse, ServiceStatus, SystemInfo, WriteFileResponse,
 };
 
 // API types - Network

@@ -142,6 +142,20 @@ message RuntimeStatusResponse {
     repeated ServiceStatus services = 5;
 }
 
+// Notification that a container's published port bindings changed.
+message PortBindingsChanged {
+    // Container ID.
+    string container_id = 1;
+    // Current published bindings from dockerd inspect output.
+    repeated PortBinding bindings = 2;
+}
+
+// Notification that a container no longer has active published ports.
+message PortBindingsRemoved {
+    // Container ID.
+    string container_id = 1;
+}
+
 // Individual service status within the guest runtime stack.
 message ServiceStatus {
     // Service name (e.g. "containerd", "dockerd", "youki").
