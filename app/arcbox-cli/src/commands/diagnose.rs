@@ -141,7 +141,7 @@ async fn check_boot_assets(config: &Config) {
 
 fn print_configuration_summary(config: &Config, runtime: &RuntimeReadiness) {
     println!("--- Configuration ---");
-    println!("  Container backend: {:?}", config.container.backend);
+    println!("  Container provision: {:?}", config.container.provision);
     println!("  Provision mode:    {:?}", config.container.provision);
 
     if let Some(info) = runtime.default_machine.as_ref() {

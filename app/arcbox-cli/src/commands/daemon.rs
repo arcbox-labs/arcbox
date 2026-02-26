@@ -11,7 +11,7 @@ use arcbox_api::{
     MachineServiceImpl,
     machine_service_server::MachineServiceServer,
 };
-use arcbox_core::{Config, ContainerBackendMode, ContainerProvisionMode, Runtime};
+use arcbox_core::{Config, ContainerProvisionMode, Runtime};
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
 use clap::{Args, ValueEnum};
 use std::path::PathBuf;
@@ -53,10 +53,6 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub docker_integration: bool,
 
-    /// Container backend mode.
-    #[arg(long, value_enum)]
-    pub container_backend: Option<ContainerBackendArg>,
-
     /// Guest runtime provisioning mode.
     #[arg(long, value_enum)]
     pub container_provision: Option<ContainerProvisionArg>,
@@ -64,22 +60,6 @@ pub struct DaemonArgs {
     /// Guest dockerd API vsock port.
     #[arg(long)]
     pub guest_docker_vsock_port: Option<u32>,
-}
-
-/// CLI argument values for container backend mode.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum ContainerBackendArg {
-    NativeControlPlane,
-    GuestDocker,
-}
-
-impl From<ContainerBackendArg> for ContainerBackendMode {
-    fn from(value: ContainerBackendArg) -> Self {
-        match value {
-            ContainerBackendArg::NativeControlPlane => Self::NativeControlPlane,
-            ContainerBackendArg::GuestDocker => Self::GuestDocker,
-        }
-    }
 }
 
 /// CLI argument values for provisioning mode.
@@ -120,16 +100,12 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
         data_dir: data_dir.clone(),
         ..Default::default()
     };
-    if let Some(mode) = args.container_backend {
-        config.container.backend = mode.into();
-    }
     if let Some(mode) = args.container_provision {
         config.container.provision = mode.into();
     }
     if let Some(port) = args.guest_docker_vsock_port {
         config.container.guest_docker_vsock_port = port;
     }
-    let selected_backend = config.container.backend;
     let selected_provision = config.container.provision;
     let selected_guest_docker_port = config.container.guest_docker_vsock_port;
 
@@ -166,7 +142,6 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
 
     info!(
         data_dir = %data_dir.display(),
-        backend = ?selected_backend,
         provision = ?selected_provision,
         guest_docker_vsock_port = selected_guest_docker_port,
         "Runtime initialized"

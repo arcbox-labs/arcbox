@@ -260,13 +260,8 @@ impl Runtime {
         config: Config,
         mut vm_lifecycle_config: VmLifecycleConfig,
     ) -> Result<Self> {
-        if matches!(
-            config.container.backend,
-            crate::config::ContainerBackendMode::GuestDocker
-        ) {
-            vm_lifecycle_config.guest_docker_vsock_port =
-                Some(config.container.guest_docker_vsock_port);
-        }
+        vm_lifecycle_config.guest_docker_vsock_port =
+            Some(config.container.guest_docker_vsock_port);
 
         let event_bus = EventBus::new();
         let vm_manager = Arc::new(VmManager::new());
@@ -387,68 +382,10 @@ impl Runtime {
         &self.container_backend
     }
 
-    /// Returns true when the active backend delegates to guest Docker.
-    #[must_use]
-    pub fn is_guest_docker(&self) -> bool {
-        self.container_backend.mode() == crate::config::ContainerBackendMode::GuestDocker
-    }
-
     /// Returns the configured guest Docker vsock port.
     #[must_use]
     pub fn guest_docker_vsock_port(&self) -> u32 {
         self.config.container.guest_docker_vsock_port
-    }
-
-    /// Sends an HTTP GET request to the guest Docker daemon via vsock and
-    /// returns the raw response body bytes.
-    ///
-    /// This is used by Docker API handlers to proxy read-only queries
-    /// (list, inspect) directly to the guest Docker, making it the single
-    /// source of truth for container runtime state.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the VM is not running or the request fails.
-    /// Returns `(http_status_code, body)` so callers can propagate the
-    /// upstream status faithfully (e.g. 404 for missing containers).
-    pub async fn guest_docker_get(&self, path: &str) -> Result<(u16, bytes::Bytes)> {
-        use std::os::fd::FromRawFd;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let port = self.config.container.guest_docker_vsock_port;
-        let fd = self
-            .machine_manager
-            .connect_vsock_port(DEFAULT_MACHINE_NAME, port)?;
-
-        // Wrap the raw fd into an async TcpStream-like handle.
-        // SAFETY: fd is a valid, newly-opened vsock file descriptor.
-        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-        std_stream.set_nonblocking(true).map_err(|e| {
-            CoreError::Machine(format!("failed to set vsock fd non-blocking: {}", e))
-        })?;
-        let stream = tokio::net::TcpStream::from_std(std_stream)
-            .map_err(|e| CoreError::Machine(format!("failed to wrap vsock fd: {}", e)))?;
-
-        let (mut reader, mut writer) = tokio::io::split(stream);
-
-        // Send a minimal HTTP/1.1 GET request.
-        let request = format!(
-            "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-            path
-        );
-        writer
-            .write_all(request.as_bytes())
-            .await
-            .map_err(|e| CoreError::Machine(format!("failed to write to guest docker: {}", e)))?;
-
-        // Read the full response.
-        let mut buf = Vec::with_capacity(8192);
-        reader
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| CoreError::Machine(format!("failed to read from guest docker: {}", e)))?;
-
-        Ok(parse_http_status_and_body(&buf))
     }
 
     /// Ensures the default VM is running and ready for container operations.
@@ -504,9 +441,6 @@ impl Runtime {
         tokio::fs::create_dir_all(self.config.data_dir.join("volumes")).await?;
 
         if matches!(
-            self.config.container.backend,
-            crate::config::ContainerBackendMode::GuestDocker
-        ) && matches!(
             self.config.container.provision,
             crate::config::ContainerProvisionMode::BundledAssets
         ) {
@@ -1957,28 +1891,9 @@ impl Runtime {
     }
 }
 
-fn parse_http_status_and_body(buf: &[u8]) -> (u16, bytes::Bytes) {
-    // Parse HTTP status code from the status line ("HTTP/1.1 200 OK\r\n").
-    let status_line_end = buf.windows(2).position(|w| w == b"\r\n").unwrap_or(0);
-    let status_code = std::str::from_utf8(&buf[..status_line_end])
-        .ok()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse::<u16>().ok())
-        .unwrap_or(502);
-
-    // Split headers from body at the first \r\n\r\n boundary.
-    let body_start = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|pos| pos + 4)
-        .unwrap_or(0);
-
-    (status_code, bytes::Bytes::from(buf[body_start..].to_vec()))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Runtime, parse_http_status_and_body, validate_bundled_runtime_manifest};
+    use super::{Runtime, validate_bundled_runtime_manifest};
     use crate::boot_assets::{BootAssetManifest, RuntimeAssetManifestEntry};
     use crate::config::Config;
     use bytes::Bytes;
@@ -2062,22 +1977,6 @@ mod tests {
             "unexpected error: {}",
             err
         );
-    }
-
-    #[test]
-    fn test_parse_http_status_and_body_success() {
-        let raw = b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"message\":\"not found\"}";
-        let (status, body) = parse_http_status_and_body(raw);
-        assert_eq!(status, 404);
-        assert_eq!(body, Bytes::from_static(b"{\"message\":\"not found\"}"));
-    }
-
-    #[test]
-    fn test_parse_http_status_and_body_invalid_status_falls_back_to_502() {
-        let raw = b"not-a-valid-http-response\r\n\r\npayload";
-        let (status, body) = parse_http_status_and_body(raw);
-        assert_eq!(status, 502);
-        assert_eq!(body, Bytes::from_static(b"payload"));
     }
 
     #[test]

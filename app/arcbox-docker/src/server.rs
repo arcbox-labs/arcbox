@@ -2,16 +2,13 @@
 
 use crate::api::create_router;
 use crate::error::{DockerError, Result};
-use crate::proxy::RawFdStream;
-use arcbox_core::{ContainerBackendMode, Runtime};
+use arcbox_core::Runtime;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixListener;
 use tower::Service;
 use tower_http::trace::TraceLayer;
 
@@ -77,20 +74,15 @@ impl DockerApiServer {
             "Docker API server listening on {}",
             self.config.socket_path.display()
         );
-        match self.runtime.config().container.backend {
-            ContainerBackendMode::NativeControlPlane => self.run_native_http(listener).await,
-            ContainerBackendMode::GuestDocker => {
-                let port = self.runtime.config().container.guest_docker_vsock_port;
-                self.run_guest_docker_proxy(listener, port).await
-            }
-        }
+        tracing::info!("Docker API backend: smart proxy to guest dockerd");
+
+        self.run_native_http(listener).await
     }
 }
 
 impl DockerApiServer {
     async fn run_native_http(&self, listener: UnixListener) -> Result<()> {
         let app = create_router(Arc::clone(&self.runtime)).layer(TraceLayer::new_for_http());
-        tracing::info!("Docker API backend: native control plane");
 
         loop {
             let (stream, _) = listener
@@ -121,96 +113,4 @@ impl DockerApiServer {
             });
         }
     }
-
-    async fn run_guest_docker_proxy(&self, listener: UnixListener, guest_port: u32) -> Result<()> {
-        tracing::info!(
-            guest_docker_vsock_port = guest_port,
-            "Docker API backend: guest docker proxy"
-        );
-
-        loop {
-            let (client_stream, _) = listener
-                .accept()
-                .await
-                .map_err(|e| DockerError::Server(e.to_string()))?;
-            let runtime = Arc::clone(&self.runtime);
-
-            tokio::spawn(async move {
-                if let Err(err) =
-                    proxy_guest_docker_connection(runtime, guest_port, client_stream).await
-                {
-                    if !is_disconnect_error(&err) {
-                        tracing::warn!("Guest docker proxy connection failed: {}", err);
-                    }
-                }
-            });
-        }
-    }
-}
-
-async fn proxy_guest_docker_connection(
-    runtime: Arc<Runtime>,
-    guest_port: u32,
-    mut client_stream: UnixStream,
-) -> Result<()> {
-    if let Err(e) = runtime.ensure_vm_ready().await {
-        let message = format!("failed to ensure vm ready: {}", e);
-        write_proxy_http_error(&mut client_stream, 503, &message).await;
-        return Err(DockerError::Server(message));
-    }
-
-    let machine_name = runtime.default_machine_name();
-    let guest_fd = match runtime
-        .machine_manager()
-        .connect_vsock_port(machine_name, guest_port)
-    {
-        Ok(fd) => fd,
-        Err(e) => {
-            let message = format!(
-                "failed to connect guest docker endpoint on vsock port {}: {}",
-                guest_port, e
-            );
-            write_proxy_http_error(&mut client_stream, 502, &message).await;
-            return Err(DockerError::Server(message));
-        }
-    };
-
-    let mut guest_stream = match RawFdStream::from_raw_fd(guest_fd) {
-        Ok(stream) => stream,
-        Err(e) => {
-            let message = format!("failed to create guest stream: {}", e);
-            write_proxy_http_error(&mut client_stream, 502, &message).await;
-            return Err(DockerError::Server(message));
-        }
-    };
-
-    let _ = tokio::io::copy_bidirectional(&mut client_stream, &mut guest_stream).await?;
-    Ok(())
-}
-
-async fn write_proxy_http_error(stream: &mut UnixStream, status: u16, message: &str) {
-    let reason = match status {
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "Internal Server Error",
-    };
-    let body = format!("{}\n", message.replace('\n', " "));
-    let response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        status,
-        reason,
-        body.len(),
-        body
-    );
-    let _ = stream.write_all(response.as_bytes()).await;
-    let _ = stream.flush().await;
-    let _ = stream.shutdown().await;
-}
-
-fn is_disconnect_error(err: &DockerError) -> bool {
-    let msg = err.to_string().to_lowercase();
-    msg.contains("broken pipe")
-        || msg.contains("connection reset")
-        || msg.contains("connection aborted")
-        || msg.contains("unexpected eof")
 }

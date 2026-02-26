@@ -1,5 +1,5 @@
 use super::ContainerBackend;
-use crate::config::{ContainerBackendMode, ContainerRuntimeConfig};
+use crate::config::ContainerRuntimeConfig;
 use crate::error::{CoreError, Result};
 use crate::machine::MachineManager;
 use crate::vm_lifecycle::VmLifecycleManager;
@@ -158,10 +158,6 @@ mod tests {
 
 #[async_trait]
 impl ContainerBackend for GuestDockerBackend {
-    fn mode(&self) -> ContainerBackendMode {
-        ContainerBackendMode::GuestDocker
-    }
-
     fn name(&self) -> &'static str {
         "guest_docker"
     }

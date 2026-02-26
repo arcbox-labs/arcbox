@@ -236,16 +236,6 @@ impl Default for DockerConfig {
     }
 }
 
-/// Container runtime backend mode.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ContainerBackendMode {
-    /// Existing host control-plane + guest agent runtime path.
-    NativeControlPlane,
-    /// Guest VM Docker Engine path (dockerd/containerd/youki).
-    GuestDocker,
-}
-
 /// Guest Docker runtime provisioning mode.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -260,8 +250,6 @@ pub enum ContainerProvisionMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContainerRuntimeConfig {
-    /// Container backend selector.
-    pub backend: ContainerBackendMode,
     /// Guest runtime provisioning mode.
     pub provision: ContainerProvisionMode,
     /// Guest dockerd API vsock port.
@@ -273,7 +261,6 @@ pub struct ContainerRuntimeConfig {
 impl Default for ContainerRuntimeConfig {
     fn default() -> Self {
         Self {
-            backend: ContainerBackendMode::GuestDocker,
             provision: ContainerProvisionMode::BundledAssets,
             guest_docker_vsock_port: 2375,
             startup_timeout_ms: 60_000,
@@ -357,7 +344,6 @@ mod tests {
         assert_eq!(config.vm.memory_mb, 4096);
         assert_eq!(config.machine.disk_gb, 50);
         assert!(config.docker.enabled);
-        assert_eq!(config.container.backend, ContainerBackendMode::GuestDocker);
         assert_eq!(
             config.container.provision,
             ContainerProvisionMode::BundledAssets
