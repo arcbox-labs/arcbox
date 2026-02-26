@@ -1,9 +1,7 @@
 //! Pull command implementation.
 
-use std::sync::Arc;
-
 use anyhow::Result;
-use arcbox_image::{ImageRef, ImageStore, RegistryClient, pull::ConsoleProgress};
+use arcbox_image::ImageRef;
 use clap::Args;
 
 use crate::client::DaemonClient;
@@ -43,8 +41,7 @@ pub async fn execute(args: PullArgs) -> Result<()> {
         return execute_via_daemon(&daemon, &reference, args.quiet).await;
     }
 
-    // Fall back to direct pull when daemon is not running.
-    execute_direct(&reference, args.quiet).await
+    anyhow::bail!("daemon is not running; start it with `arcbox daemon`")
 }
 
 /// Executes pull via daemon API.
@@ -105,39 +102,6 @@ async fn execute_via_daemon(
         }
     } else if !quiet {
         println!("Successfully pulled {}", reference);
-    }
-
-    Ok(())
-}
-
-/// Executes pull directly (when daemon is not running).
-async fn execute_direct(reference: &ImageRef, quiet: bool) -> Result<()> {
-    // Open image store.
-    let store = Arc::new(ImageStore::open_default()?);
-
-    // Create registry client.
-    let client = RegistryClient::new(&reference.registry);
-
-    // Create puller.
-    let puller = arcbox_image::pull::ImagePuller::new(store, client);
-
-    // Pull with or without progress.
-    let image_id = if quiet {
-        puller.pull(reference).await?
-    } else {
-        puller
-            .with_progress(ConsoleProgress)
-            .pull(reference)
-            .await?
-    };
-
-    // Print result.
-    let short_id = short_digest(&image_id);
-    if !quiet {
-        println!("Successfully pulled {}", reference);
-        println!("Image ID: {short_id}");
-    } else {
-        println!("{short_id}");
     }
 
     Ok(())

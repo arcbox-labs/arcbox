@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use arcbox_cli::client::{DaemonClient, ImageSummary};
-use arcbox_image::{ImageRef, ImageStore};
 use clap::Args;
 
 /// Arguments for the images command.
@@ -52,7 +51,7 @@ pub async fn execute(args: ImagesArgs) -> Result<()> {
         return execute_via_daemon(&daemon, &args).await;
     }
 
-    execute_direct(&args)
+    anyhow::bail!("daemon is not running; start it with `arcbox daemon`")
 }
 
 async fn execute_via_daemon(daemon: &DaemonClient, args: &ImagesArgs) -> Result<()> {
@@ -116,68 +115,6 @@ async fn execute_via_daemon(daemon: &DaemonClient, args: &ImagesArgs) -> Result<
     Ok(())
 }
 
-fn execute_direct(args: &ImagesArgs) -> Result<()> {
-    let store = ImageStore::open_default()?;
-    let images = store.list();
-
-    if args.quiet {
-        for image in &images {
-            let id = if args.no_trunc {
-                image.id.clone()
-            } else {
-                short_id(&image.id)
-            };
-            println!("{id}");
-        }
-    } else {
-        // Print header.
-        if args.digests {
-            println!(
-                "{:<30} {:<15} {:<71} {:<15} {:<10}",
-                "REPOSITORY", "TAG", "DIGEST", "CREATED", "SIZE"
-            );
-        } else {
-            println!(
-                "{:<30} {:<15} {:<15} {:<15} {:<10}",
-                "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"
-            );
-        }
-
-        for image in &images {
-            let repo = format!(
-                "{}/{}",
-                image.reference.registry, image.reference.repository
-            );
-            // Simplify Docker Hub display.
-            let repo = repo
-                .strip_prefix("docker.io/library/")
-                .unwrap_or(&repo)
-                .to_string();
-
-            let tag = &image.reference.reference;
-
-            let id_or_digest = if args.digests {
-                image.id.clone()
-            } else if args.no_trunc {
-                image.id.clone()
-            } else {
-                short_id(&image.id)
-            };
-
-            let created = format_duration_ago(image.created);
-            let size = format_size(image.size);
-
-            if args.digests {
-                println!("{repo:<30} {tag:<15} {id_or_digest:<71} {created:<15} {size:<10}");
-            } else {
-                println!("{repo:<30} {tag:<15} {id_or_digest:<15} {created:<15} {size:<10}");
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Executes the rmi command.
 pub async fn execute_rmi(args: RmiArgs) -> Result<()> {
     let daemon = DaemonClient::new();
@@ -185,7 +122,7 @@ pub async fn execute_rmi(args: RmiArgs) -> Result<()> {
         return execute_rmi_via_daemon(&daemon, &args).await;
     }
 
-    execute_rmi_direct(&args)
+    anyhow::bail!("daemon is not running; start it with `arcbox daemon`")
 }
 
 async fn execute_rmi_via_daemon(daemon: &DaemonClient, args: &RmiArgs) -> Result<()> {
@@ -212,30 +149,6 @@ async fn execute_rmi_via_daemon(daemon: &DaemonClient, args: &RmiArgs) -> Result
 
     if !errors.is_empty() {
         anyhow::bail!("failed to remove image(s): {}", errors.join("; "));
-    }
-
-    Ok(())
-}
-
-fn execute_rmi_direct(args: &RmiArgs) -> Result<()> {
-    let store = ImageStore::open_default()?;
-
-    for image_name in &args.images {
-        let reference = ImageRef::parse(image_name)
-            .ok_or_else(|| anyhow::anyhow!("invalid image reference: {}", image_name))?;
-
-        match store.remove(&reference) {
-            Ok(()) => {
-                println!("Untagged: {}", reference);
-            }
-            Err(e) => {
-                if args.force {
-                    tracing::warn!("Error removing {}: {}", image_name, e);
-                } else {
-                    return Err(e.into());
-                }
-            }
-        }
     }
 
     Ok(())
