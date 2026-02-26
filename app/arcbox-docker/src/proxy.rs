@@ -17,7 +17,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -336,10 +336,7 @@ pub async fn proxy_with_upgrade(
     }
 
     // Preserve content-type from guest's 101 (raw-stream vs multiplexed-stream).
-    let content_type = guest_response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .cloned();
+    let content_type = guest_response.headers().get(header::CONTENT_TYPE).cloned();
 
     // Prepare both upgrade futures BEFORE returning the 101 to the client.
     let client_upgrade = hyper::upgrade::on(&mut client_req);

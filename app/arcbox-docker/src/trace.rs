@@ -104,10 +104,7 @@ mod tests {
             .route("/", get(echo_current_trace_id))
             .layer(middleware::from_fn(trace_id_middleware));
 
-        let req = HttpRequest::builder()
-            .uri("/")
-            .body(Body::empty())
-            .unwrap();
+        let req = HttpRequest::builder().uri("/").body(Body::empty()).unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
         let header_value = resp
