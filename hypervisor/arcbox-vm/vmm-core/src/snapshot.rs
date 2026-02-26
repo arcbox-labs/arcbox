@@ -143,6 +143,53 @@ impl SnapshotCatalog {
         Ok(dir)
     }
 
+    /// Find a snapshot by ID alone, searching across all owner directories.
+    pub fn find_by_id(&self, snapshot_id: &str) -> Result<SnapshotMeta> {
+        if !self.root.exists() {
+            return Err(VmmError::Snapshot(format!(
+                "snapshot {snapshot_id} not found"
+            )));
+        }
+        for entry in std::fs::read_dir(&self.root).map_err(VmmError::Io)? {
+            let entry = entry.map_err(VmmError::Io)?;
+            if entry.path().is_dir() {
+                let snap_path = entry.path().join(snapshot_id);
+                if snap_path.is_dir() {
+                    if let Ok(meta) = self.read_meta(&snap_path) {
+                        return Ok(meta);
+                    }
+                }
+            }
+        }
+        Err(VmmError::Snapshot(format!(
+            "snapshot {snapshot_id} not found"
+        )))
+    }
+
+    /// List all snapshots across every owner directory, sorted by creation time.
+    pub fn list_all(&self) -> Result<Vec<SnapshotInfo>> {
+        if !self.root.exists() {
+            return Ok(vec![]);
+        }
+        let mut all: Vec<SnapshotInfo> = vec![];
+        for entry in std::fs::read_dir(&self.root).map_err(VmmError::Io)? {
+            let entry = entry.map_err(VmmError::Io)?;
+            if entry.path().is_dir() {
+                let owner_id = entry.file_name().to_string_lossy().into_owned();
+                let mut infos = self.list(&owner_id)?;
+                all.append(&mut infos);
+            }
+        }
+        all.sort_by_key(|s| s.created_at);
+        Ok(all)
+    }
+
+    /// Delete a snapshot knowing only its ID (searches across all owner directories).
+    pub fn delete_by_id(&self, snapshot_id: &str) -> Result<()> {
+        let meta = self.find_by_id(snapshot_id)?;
+        self.delete(&meta.vm_id, snapshot_id)
+    }
+
     // -------------------------------------------------------------------------
     // Private helpers
     // -------------------------------------------------------------------------

@@ -1,34 +1,37 @@
-//! `vmm-core` — multi-VM orchestration, state, networking, and snapshots.
-// fc_sdk::Error is 144 bytes due to external library constraints; boxing every call
-// site would add noise without runtime benefit since these are never in hot paths.
+//! `vmm-core` — sandbox orchestration, state, networking, and checkpoints.
+// fc_sdk::Error is 144 bytes due to external library constraints; boxing every
+// call site would add noise without runtime benefit since these are never in
+// hot paths.
 #![allow(clippy::result_large_err)]
 //!
-//! This crate is the heart of the Firecracker VMM daemon. It exposes:
+//! This crate is the heart of the Firecracker VMM daemon.  It exposes:
 //!
-//! - [`VmmManager`] — top-level orchestrator
-//! - [`VmInstance`] / [`VmState`] — per-VM runtime state
-//! - [`VmStore`] — disk persistence
+//! - [`SandboxManager`] — top-level sandbox orchestrator
+//! - [`SandboxInstance`] / [`SandboxState`] — per-sandbox runtime state
 //! - [`NetworkManager`] — TAP lifecycle & IP allocation
-//! - [`SnapshotCatalog`] — snapshot tracking
-//! - [`VmmConfig`] / [`VmSpec`] — configuration types
+//! - [`SnapshotCatalog`] — checkpoint tracking
+//! - [`VmmConfig`] / [`SandboxSpec`] — configuration types
 
 pub mod config;
 pub mod error;
-pub mod instance;
-pub mod manager;
 pub mod network;
+pub mod sandbox;
 pub mod snapshot;
 pub mod store;
 
-pub use config::{
-    BalloonSpec, CacheType, CpuTemplateSpec, DefaultVmConfig, DriveSpec, FirecrackerConfig,
-    GrpcConfig, HugePagesSpec, IoEngine, JailerConfig, MemoryHotplugSpec, MmdsSpec,
-    MmdsVersionSpec, NetworkConfig, RateLimitSpec, RestoreSpec, SnapshotRequest, SnapshotType,
-    TokenBucketSpec, VmSpec, VmmConfig, VsockSpec,
-};
+// Keep the general VM manager available for internal tooling.
+pub mod instance;
+pub mod manager;
+
+pub use config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, VmmConfig};
 pub use error::{Result, VmmError};
-pub use instance::{VmId, VmInfo, VmInstance, VmMetrics, VmState, VmSummary};
-pub use manager::VmmManager;
 pub use network::{NetworkAllocation, NetworkManager};
+pub use sandbox::{
+    CheckpointInfo, CheckpointSummary, RestoreSandboxSpec, SandboxEvent, SandboxId,
+    SandboxInfo, SandboxManager, SandboxMountSpec, SandboxNetworkInfo, SandboxNetworkSpec,
+    SandboxSpec, SandboxState, SandboxSummary,
+};
 pub use snapshot::{SnapshotCatalog, SnapshotInfo};
-pub use store::VmStore;
+
+// Re-export VmState for system_svc compatibility (internal use only).
+pub use instance::VmState;

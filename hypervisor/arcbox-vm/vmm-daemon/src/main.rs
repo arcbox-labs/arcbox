@@ -4,9 +4,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::{error, info};
 
-use vmm_core::{VmmConfig, VmmManager};
+use vmm_core::{SandboxManager, VmmConfig};
 
-/// firecracker-vmm daemon — Firecracker microVM manager with gRPC interface.
+/// firecracker-vmm daemon — Firecracker sandbox manager with gRPC interface.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        "firecracker-vmm daemon starting"
+        "firecracker-vmm sandbox daemon starting"
     );
 
     // Load configuration.
@@ -71,8 +71,10 @@ async fn main() -> Result<()> {
     let unix_socket = config.grpc.unix_socket.clone();
     let tcp_addr = config.grpc.tcp_addr.clone();
 
-    // Build the manager.
-    let manager = Arc::new(VmmManager::new(config).context("failed to initialise VmmManager")?);
+    // Build the sandbox manager.
+    let manager = Arc::new(
+        SandboxManager::new(config).context("failed to initialise SandboxManager")?,
+    );
 
     // Install signal handlers for graceful shutdown.
     let shutdown = install_signal_handler();
@@ -90,7 +92,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    info!("firecracker-vmm daemon stopped");
+    info!("firecracker-vmm sandbox daemon stopped");
     Ok(())
 }
 

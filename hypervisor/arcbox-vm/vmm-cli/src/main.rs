@@ -4,17 +4,15 @@ use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
-use vmm_grpc::proto::arcbox::{
-    CreateMachineRequest, InspectMachineRequest, ListMachinesRequest, RemoveMachineRequest,
-    SshInfoRequest, StartMachineRequest, StopMachineRequest, SystemPingRequest,
-    machine_service_client::MachineServiceClient, system_service_client::SystemServiceClient,
-};
-use vmm_grpc::proto::vmm::{
-    CreateSnapshotRequest, DeleteSnapshotRequest, GetMetricsRequest, ListSnapshotsRequest,
-    PauseVmRequest, RestoreSnapshotRequest, ResumeVmRequest, vmm_service_client::VmmServiceClient,
+use vmm_grpc::proto::sandbox::{
+    CheckpointRequest, CreateSandboxRequest, DeleteSnapshotRequest, InspectSandboxRequest,
+    ListSandboxesRequest, ListSnapshotsRequest, RemoveSandboxRequest, ResourceLimits,
+    RestoreRequest, SandboxEventsRequest, StopSandboxRequest,
+    sandbox_service_client::SandboxServiceClient,
+    sandbox_snapshot_service_client::SandboxSnapshotServiceClient,
 };
 
-/// vmm — firecracker-vmm management CLI
+/// vmm — firecracker-vmm sandbox management CLI
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Cli {
@@ -33,113 +31,109 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Create and boot a new VM.
+    /// Create a sandbox (returns immediately; VM boots asynchronously).
     Create {
-        /// VM name (must be unique).
-        name: String,
-        /// Number of vCPUs.
-        #[arg(short, long, default_value_t = 1)]
-        cpus: u32,
-        /// Memory in MiB.
-        #[arg(short, long, default_value_t = 512)]
+        /// Caller-supplied sandbox ID (auto-generated when omitted).
+        #[arg(long, default_value = "")]
+        id: String,
+        /// Number of vCPUs (0 = daemon default).
+        #[arg(long, default_value_t = 0)]
+        vcpus: u32,
+        /// Memory in MiB (0 = daemon default).
+        #[arg(long, default_value_t = 0)]
         memory: u64,
-        /// Kernel image path (uses daemon config default when omitted).
+        /// Kernel image path (daemon default when omitted).
         #[arg(long, default_value = "")]
         kernel: String,
+        /// Root filesystem image path (daemon default when omitted).
+        #[arg(long, default_value = "")]
+        rootfs: String,
+        /// Auto-destroy TTL in seconds (0 = no limit).
+        #[arg(long, default_value_t = 0)]
+        ttl: u32,
+        /// Labels in key=value format (repeatable).
+        #[arg(long = "label")]
+        labels: Vec<String>,
     },
-    /// Start a stopped VM.
-    Start {
-        /// VM ID or name.
-        id: String,
-    },
-    /// Stop a running VM.
+
+    /// Stop a sandbox gracefully.
     Stop {
-        /// VM ID or name.
+        /// Sandbox ID.
         id: String,
-        /// Force-kill instead of graceful shutdown.
-        #[arg(short, long)]
-        force: bool,
+        /// Seconds to wait before force-killing (0 = daemon default of 30 s).
+        #[arg(long, default_value_t = 0)]
+        timeout: u32,
     },
-    /// Remove a VM.
+
+    /// Forcibly remove a sandbox and release all resources.
     Remove {
-        /// VM ID or name.
+        /// Sandbox ID.
         id: String,
-        /// Force removal.
+        /// Force removal even if sandbox is running.
         #[arg(short, long)]
         force: bool,
     },
-    /// List VMs.
+
+    /// List sandboxes.
     List {
-        /// Show all VMs (including stopped).
-        #[arg(short, long)]
-        all: bool,
+        /// Filter by state (starting|ready|running|stopping|stopped|failed).
+        #[arg(long, default_value = "")]
+        state: String,
     },
-    /// Inspect a VM (detailed JSON output).
+
+    /// Show detailed information about a sandbox.
     Inspect {
-        /// VM ID or name.
+        /// Sandbox ID.
         id: String,
     },
-    /// Print SSH connection info for a VM.
-    SshInfo {
-        /// VM ID or name.
+
+    /// Subscribe to sandbox lifecycle events (streams until Ctrl-C).
+    Events {
+        /// Filter by sandbox ID (empty = all sandboxes).
+        #[arg(long, default_value = "")]
         id: String,
+        /// Filter by action (empty = all actions).
+        #[arg(long, default_value = "")]
+        action: String,
     },
-    /// Pause a running VM.
-    Pause {
-        /// VM ID or name.
-        id: String,
-    },
-    /// Resume a paused VM.
-    Resume {
-        /// VM ID or name.
-        id: String,
-    },
-    /// Snapshot management.
+
+    /// Checkpoint and restore management.
     #[command(subcommand)]
     Snapshot(SnapshotCmd),
-    /// Show VM metrics.
-    Metrics {
-        /// VM ID or name.
-        id: String,
-    },
-    /// Check daemon liveness.
-    Ping,
-    /// Show daemon version.
-    Version,
 }
 
 #[derive(Subcommand, Debug)]
 enum SnapshotCmd {
-    /// Create a snapshot.
+    /// Checkpoint a sandbox into a reusable snapshot.
     Create {
-        /// VM ID.
-        id: String,
-        /// Optional label.
-        #[arg(long)]
-        name: Option<String>,
-        /// Snapshot type: full or diff.
-        #[arg(long, default_value = "full")]
-        r#type: String,
-    },
-    /// List snapshots for a VM.
-    List {
-        /// VM ID.
-        id: String,
-    },
-    /// Restore a VM from a snapshot.
-    Restore {
-        /// Name for the restored VM.
+        /// Sandbox ID to checkpoint.
+        sandbox_id: String,
+        /// Human-readable label for the snapshot.
+        #[arg(long, default_value = "")]
         name: String,
-        /// Snapshot directory path.
-        snapshot_dir: String,
-        /// Assign a fresh network interface.
+    },
+    /// Restore a new sandbox from a checkpoint.
+    Restore {
+        /// Snapshot ID.
+        snapshot_id: String,
+        /// ID to assign to the restored sandbox (auto-generated when omitted).
+        #[arg(long, default_value = "")]
+        id: String,
+        /// Assign a fresh TAP interface and IP to the restored sandbox.
         #[arg(long)]
         network_override: bool,
+        /// Auto-destroy TTL in seconds (0 = no limit).
+        #[arg(long, default_value_t = 0)]
+        ttl: u32,
     },
-    /// Delete a snapshot.
+    /// List checkpoints.
+    List {
+        /// Filter by sandbox ID (empty = all).
+        #[arg(long, default_value = "")]
+        sandbox_id: String,
+    },
+    /// Delete a checkpoint and its on-disk data.
     Delete {
-        /// VM ID.
-        vm_id: String,
         /// Snapshot ID.
         snapshot_id: String,
     },
@@ -148,231 +142,225 @@ enum SnapshotCmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-
     tracing_subscriber::fmt().with_env_filter("warn").init();
 
     let channel = connect_uds(&cli.socket).await?;
 
     match cli.command {
         Cmd::Create {
-            name,
-            cpus,
+            id,
+            vcpus,
             memory,
             kernel,
+            rootfs,
+            ttl,
+            labels,
         } => {
-            let mut client = MachineServiceClient::new(channel);
+            let mut client = SandboxServiceClient::new(channel);
+            let label_map = parse_labels(&labels)?;
             let resp = client
-                .create(CreateMachineRequest {
-                    name: name.clone(),
-                    cpus,
-                    memory: memory * 1024 * 1024,
+                .create(CreateSandboxRequest {
+                    id,
+                    limits: Some(ResourceLimits {
+                        vcpus,
+                        memory_mib: memory,
+                    }),
                     kernel,
+                    rootfs,
+                    ttl_seconds: ttl,
+                    labels: label_map,
                     ..Default::default()
                 })
                 .await
-                .context("create VM")?;
-            println!("Created VM: {}", resp.into_inner().id);
+                .context("create sandbox")?;
+            let r = resp.into_inner();
+            println!("Sandbox ID:  {}", r.id);
+            println!("IP address:  {}", r.ip_address);
+            println!("State:       {} (poll `vmm inspect` or watch `vmm events`)", r.state);
         }
 
-        Cmd::Start { id } => {
-            let mut client = MachineServiceClient::new(channel);
+        Cmd::Stop { id, timeout } => {
+            let mut client = SandboxServiceClient::new(channel);
             client
-                .start(StartMachineRequest { id })
+                .stop(StopSandboxRequest {
+                    id,
+                    timeout_seconds: timeout,
+                })
                 .await
-                .context("start VM")?;
-            println!("VM started");
-        }
-
-        Cmd::Stop { id, force } => {
-            let mut client = MachineServiceClient::new(channel);
-            client
-                .stop(StopMachineRequest { id, force })
-                .await
-                .context("stop VM")?;
-            println!("VM stopped");
+                .context("stop sandbox")?;
+            println!("Sandbox stopped.");
         }
 
         Cmd::Remove { id, force } => {
-            let mut client = MachineServiceClient::new(channel);
+            let mut client = SandboxServiceClient::new(channel);
             client
-                .remove(RemoveMachineRequest {
-                    id,
-                    force,
-                    volumes: false,
-                })
+                .remove(RemoveSandboxRequest { id, force })
                 .await
-                .context("remove VM")?;
-            println!("VM removed");
+                .context("remove sandbox")?;
+            println!("Sandbox removed.");
         }
 
-        Cmd::List { all } => {
-            let mut client = MachineServiceClient::new(channel);
+        Cmd::List { state } => {
+            let mut client = SandboxServiceClient::new(channel);
             let resp = client
-                .list(ListMachinesRequest { all })
+                .list(ListSandboxesRequest {
+                    state,
+                    ..Default::default()
+                })
                 .await
-                .context("list VMs")?;
-            let machines = resp.into_inner().machines;
-            if machines.is_empty() {
-                println!("No VMs found.");
+                .context("list sandboxes")?;
+            let sandboxes = resp.into_inner().sandboxes;
+            if sandboxes.is_empty() {
+                println!("No sandboxes found.");
             } else {
-                println!(
-                    "{:<36}  {:<20}  {:<10}  {:>6}  {:>8}  IP",
-                    "ID", "NAME", "STATE", "CPUS", "MEM(MiB)"
-                );
-                for m in machines {
-                    println!(
-                        "{:<36}  {:<20}  {:<10}  {:>6}  {:>8}  {}",
-                        m.id,
-                        m.name,
-                        m.state,
-                        m.cpus,
-                        m.memory / (1024 * 1024),
-                        m.ip_address
-                    );
+                println!("{:<36}  {:<10}  IP", "ID", "STATE");
+                for s in sandboxes {
+                    println!("{:<36}  {:<10}  {}", s.id, s.state, s.ip_address);
                 }
             }
         }
 
         Cmd::Inspect { id } => {
-            let mut client = MachineServiceClient::new(channel);
+            let mut client = SandboxServiceClient::new(channel);
             let resp = client
-                .inspect(InspectMachineRequest { id })
+                .inspect(InspectSandboxRequest { id })
                 .await
-                .context("inspect VM")?;
-            println!("{:#?}", resp.into_inner());
+                .context("inspect sandbox")?;
+            let s = resp.into_inner();
+            let limits = s.limits.unwrap_or_default();
+            let net = s.network.unwrap_or_default();
+            println!("ID:           {}", s.id);
+            println!("State:        {}", s.state);
+            println!("vCPUs:        {}", limits.vcpus);
+            println!("Memory (MiB): {}", limits.memory_mib);
+            println!("IP address:   {}", net.ip_address);
+            println!("Gateway:      {}", net.gateway);
+            println!("TAP:          {}", net.tap_name);
+            if !s.error.is_empty() {
+                println!("Error:        {}", s.error);
+            }
         }
 
-        Cmd::SshInfo { id } => {
-            let mut client = MachineServiceClient::new(channel);
-            let resp = client
-                .ssh_info(SshInfoRequest { id })
+        Cmd::Events { id, action } => {
+            let mut client = SandboxServiceClient::new(channel);
+            let mut stream = client
+                .events(SandboxEventsRequest { id, action })
                 .await
-                .context("SSH info")?;
-            let info = resp.into_inner();
-            println!("Host:    {}", info.host);
-            println!("Port:    {}", info.port);
-            println!("User:    {}", info.user);
-            println!("Command: {}", info.command);
-        }
-
-        Cmd::Pause { id } => {
-            let mut client = VmmServiceClient::new(channel);
-            client
-                .pause(PauseVmRequest { id })
-                .await
-                .context("pause VM")?;
-            println!("VM paused");
-        }
-
-        Cmd::Resume { id } => {
-            let mut client = VmmServiceClient::new(channel);
-            client
-                .resume(ResumeVmRequest { id })
-                .await
-                .context("resume VM")?;
-            println!("VM resumed");
+                .context("subscribe events")?
+                .into_inner();
+            println!("Listening for events (Ctrl-C to stop)…");
+            loop {
+                match stream.message().await {
+                    Ok(Some(ev)) => println!(
+                        "  ts={}  sandbox={}  action={}  attrs={:?}",
+                        ev.timestamp, ev.sandbox_id, ev.action, ev.attributes
+                    ),
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("stream error: {e}");
+                        break;
+                    }
+                }
+            }
         }
 
         Cmd::Snapshot(snap_cmd) => run_snapshot(channel, snap_cmd).await?,
-
-        Cmd::Metrics { id } => {
-            let mut client = VmmServiceClient::new(channel);
-            let resp = client
-                .get_metrics(GetMetricsRequest { id })
-                .await
-                .context("get metrics")?;
-            let m = resp.into_inner();
-            println!("VM ID:               {}", m.vm_id);
-            println!("Balloon target (MiB): {}", m.balloon_target_mib);
-            println!("Balloon actual (MiB): {}", m.balloon_actual_mib);
-        }
-
-        Cmd::Ping => {
-            let mut client = SystemServiceClient::new(channel);
-            let resp = client.ping(SystemPingRequest {}).await.context("ping")?;
-            let r = resp.into_inner();
-            println!("OK  api={} build={}", r.api_version, r.build_version);
-        }
-
-        Cmd::Version => {
-            let mut client = SystemServiceClient::new(channel);
-            let resp = client
-                .get_version(vmm_grpc::proto::arcbox::GetVersionRequest {})
-                .await
-                .context("get version")?;
-            let v = resp.into_inner();
-            println!("Version:   {}", v.version);
-            println!("API:       {}", v.api_version);
-            println!("OS/Arch:   {}/{}", v.os, v.arch);
-            println!("Commit:    {}", v.git_commit);
-        }
     }
 
     Ok(())
 }
 
 async fn run_snapshot(channel: Channel, cmd: SnapshotCmd) -> Result<()> {
-    let mut client = VmmServiceClient::new(channel);
     match cmd {
-        SnapshotCmd::Create { id, name, r#type } => {
+        SnapshotCmd::Create { sandbox_id, name } => {
+            let mut client = SandboxSnapshotServiceClient::new(channel);
             let resp = client
-                .create_snapshot(CreateSnapshotRequest {
-                    id,
-                    name: name.unwrap_or_default(),
-                    snapshot_type: r#type,
+                .checkpoint(CheckpointRequest {
+                    sandbox_id,
+                    name,
+                    labels: Default::default(),
                 })
                 .await
-                .context("create snapshot")?;
-            let s = resp.into_inner();
-            println!("Snapshot ID:  {}", s.snapshot_id);
-            println!("Directory:    {}", s.snapshot_dir);
-            println!("Created at:   {}", s.created_at);
+                .context("checkpoint sandbox")?;
+            let r = resp.into_inner();
+            println!("Snapshot ID:  {}", r.snapshot_id);
+            println!("Directory:    {}", r.snapshot_dir);
+            println!("Created at:   {}", r.created_at);
         }
 
-        SnapshotCmd::List { id } => {
+        SnapshotCmd::Restore {
+            snapshot_id,
+            id,
+            network_override,
+            ttl,
+        } => {
+            let mut client = SandboxSnapshotServiceClient::new(channel);
             let resp = client
-                .list_snapshots(ListSnapshotsRequest { id })
+                .restore(RestoreRequest {
+                    id,
+                    snapshot_id,
+                    network_override,
+                    ttl_seconds: ttl,
+                    labels: Default::default(),
+                })
+                .await
+                .context("restore sandbox")?;
+            let r = resp.into_inner();
+            println!("Restored sandbox ID: {}", r.id);
+            println!("IP address:          {}", r.ip_address);
+        }
+
+        SnapshotCmd::List { sandbox_id } => {
+            let mut client = SandboxSnapshotServiceClient::new(channel);
+            let resp = client
+                .list_snapshots(ListSnapshotsRequest {
+                    sandbox_id,
+                    labels: Default::default(),
+                })
                 .await
                 .context("list snapshots")?;
             let snaps = resp.into_inner().snapshots;
             if snaps.is_empty() {
                 println!("No snapshots found.");
             } else {
-                println!("{:<36}  {:<20}  {:<8}  CREATED", "ID", "NAME", "TYPE");
+                println!(
+                    "{:<36}  {:<36}  {:<20}  CREATED",
+                    "ID", "SANDBOX_ID", "NAME"
+                );
                 for s in snaps {
                     println!(
-                        "{:<36}  {:<20}  {:<8}  {}",
-                        s.id, s.name, s.snapshot_type, s.created_at
+                        "{:<36}  {:<36}  {:<20}  {}",
+                        s.id, s.sandbox_id, s.name, s.created_at
                     );
                 }
             }
         }
 
-        SnapshotCmd::Restore {
-            name,
-            snapshot_dir,
-            network_override,
-        } => {
-            let resp = client
-                .restore_snapshot(RestoreSnapshotRequest {
-                    name,
-                    snapshot_dir,
-                    network_override,
-                })
-                .await
-                .context("restore snapshot")?;
-            println!("Restored VM: {}", resp.into_inner().id);
-        }
-
-        SnapshotCmd::Delete { vm_id, snapshot_id } => {
+        SnapshotCmd::Delete { snapshot_id } => {
+            let mut client = SandboxSnapshotServiceClient::new(channel);
             client
-                .delete_snapshot(DeleteSnapshotRequest { vm_id, snapshot_id })
+                .delete_snapshot(DeleteSnapshotRequest { snapshot_id })
                 .await
                 .context("delete snapshot")?;
-            println!("Snapshot deleted");
+            println!("Snapshot deleted.");
         }
     }
     Ok(())
+}
+
+/// Parse `"key=value"` label strings into a `HashMap`.
+fn parse_labels(
+    labels: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    labels
+        .iter()
+        .map(|l| {
+            let (k, v) = l
+                .split_once('=')
+                .with_context(|| format!("label must be key=value, got: {l}"))?;
+            Ok((k.to_owned(), v.to_owned()))
+        })
+        .collect()
 }
 
 /// Connect to the daemon via a Unix domain socket.
