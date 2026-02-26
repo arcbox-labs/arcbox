@@ -255,50 +255,11 @@ impl machine_service_server::MachineService for MachineServiceImpl {
 
     async fn exec(
         &self,
-        request: Request<MachineExecRequest>,
+        _request: Request<MachineExecRequest>,
     ) -> Result<Response<Self::ExecStream>, Status> {
-        let req = request.into_inner();
-        let machine_name = req.id;
-
-        // Build exec request for agent.
-        let agent_req = arcbox_protocol::v1::AgentExecRequest {
-            container_id: String::new(),
-            cmd: req.cmd,
-            env: req.env,
-            working_dir: req.working_dir,
-            user: req.user,
-            tty: req.tty,
-        };
-
-        let mut agent = self
-            .runtime
-            .get_agent(&machine_name)
-            .map_err(|e| Status::internal(format!("machine error: {e}")))?;
-
-        let stream = async_stream::try_stream! {
-            let output = agent
-                .exec(agent_req)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-            if !output.data.is_empty() {
-                yield MachineExecOutput {
-                    stream: output.stream.clone(),
-                    data: output.data.clone(),
-                    exit_code: 0,
-                    done: false,
-                };
-            }
-
-            yield MachineExecOutput {
-                stream: String::new(),
-                data: Vec::new(),
-                exit_code: output.exit_code,
-                done: true,
-            };
-        };
-
-        Ok(Response::new(Box::pin(stream)))
+        Err(Status::unimplemented(
+            "machine exec is no longer supported by guest agent RPC",
+        ))
     }
 
     async fn ssh_info(

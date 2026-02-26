@@ -6,19 +6,18 @@
 //!
 //! - [`VmManager`]: Virtual machine lifecycle
 //! - [`MachineManager`]: Linux machine management
-//! - [`ContainerManager`]: Container orchestration
 //!
 //! ## Architecture
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────┐
 //! │                  arcbox-core                    │
-//! │  ┌─────────────┐ ┌─────────────┐ ┌───────────┐│
-//! │  │  VmManager  │ │MachineManager│ │Container  ││
-//! │  │             │ │             │ │ Manager   ││
-//! │  └──────┬──────┘ └──────┬──────┘ └─────┬─────┘│
-//! │         │               │               │      │
-//! │         └───────────────┼───────────────┘      │
+//! │  ┌─────────────┐ ┌─────────────┐              │
+//! │  │  VmManager  │ │MachineManager│              │
+//! │  │             │ │             │              │
+//! │  └──────┬──────┘ └──────┬──────┘              │
+//! │         │               │                      │
+//! │         └───────────────┘                      │
 //! │                         ▼                      │
 //! │              ┌─────────────────┐              │
 //! │              │    EventBus     │              │
@@ -26,8 +25,8 @@
 //! └─────────────────────────────────────────────────┘
 //!                        │
 //!           ┌────────────┼────────────┐
-//!           ▼            ▼            ▼
-//!      arcbox-vmm   arcbox-fs   arcbox-container
+//!           ▼            ▼
+//!      arcbox-vmm   arcbox-fs
 //! ```
 
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
@@ -55,7 +54,7 @@ pub mod trace;
 pub mod vm;
 pub mod vm_lifecycle;
 
-pub use agent_client::{AgentClient, AgentClientWrapper, AgentPool};
+pub use agent_client::AgentClient;
 pub use boot_assets::{
     BootAssetConfig, BootAssetManifest, BootAssetProvider, BootAssets, DownloadProgress,
 };
