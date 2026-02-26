@@ -109,6 +109,7 @@ async fn test_info() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_list_containers_empty() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -337,6 +338,7 @@ async fn test_inspect_container() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_container_not_found() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -355,6 +357,7 @@ async fn test_container_not_found() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_wait_container_invalid_condition_returns_bad_request() {
     let (runtime, _tmp) = create_test_runtime().await;
 
@@ -389,6 +392,7 @@ async fn test_wait_container_invalid_condition_returns_bad_request() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_wait_container_not_running_returns_cached_exit_code() {
     let (runtime, _tmp) = create_test_runtime().await;
 
@@ -420,6 +424,7 @@ async fn test_wait_container_not_running_returns_cached_exit_code() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_wait_container_next_exit_waits_for_future_exit() {
     let (runtime, _tmp) = create_test_runtime().await;
 
@@ -565,6 +570,7 @@ async fn test_exec_create() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_list_networks() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -591,6 +597,7 @@ async fn test_list_networks() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_create_network() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -624,6 +631,7 @@ async fn test_create_network() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_list_volumes() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -648,6 +656,7 @@ async fn test_list_volumes() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_create_volume() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -678,6 +687,7 @@ async fn test_create_volume() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_volume_lifecycle() {
     let (runtime, _tmp) = create_test_runtime().await;
 
@@ -750,6 +760,7 @@ async fn test_volume_lifecycle() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_list_images() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -817,6 +828,7 @@ async fn test_older_api_version() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_prune_containers() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -843,6 +855,7 @@ async fn test_prune_containers() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_pause_container_not_found() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -862,6 +875,7 @@ async fn test_pause_container_not_found() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_unpause_container_not_found() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -881,6 +895,7 @@ async fn test_unpause_container_not_found() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_rename_container_not_found() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -900,6 +915,7 @@ async fn test_rename_container_not_found() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_container_top_not_found() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -918,6 +934,7 @@ async fn test_container_top_not_found() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_container_stats_not_found() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -936,6 +953,7 @@ async fn test_container_stats_not_found() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_container_changes_not_found() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
