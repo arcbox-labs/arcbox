@@ -1,9 +1,8 @@
 //! Request handlers for Docker API endpoints.
 //!
 //! Most handlers forward requests to guest dockerd via the smart proxy.
-//! Host-only handlers (ping, version, info, events) respond from host state.
-//! Lifecycle handlers (start, stop, kill, remove) add post-hooks for port
-//! forwarding and event publishing.
+//! Host-only handlers (ping, version, info) respond from host state.
+//! Docker events and lifecycle endpoints are proxied directly to guest dockerd.
 
 use crate::api::AppState;
 use crate::error::{DockerError, Result};
@@ -66,7 +65,7 @@ pub use container::{
     prune_containers, remove_container, rename_container, restart_container, start_container,
     stop_container, unpause_container, wait_container,
 };
-pub use events::{EventsQuery, events};
+pub use events::events;
 pub use exec::{exec_create, exec_inspect, exec_resize, exec_start};
 pub use image::{inspect_image, list_images, pull_image, remove_image, tag_image};
 pub use network::{create_network, inspect_network, list_networks, remove_network};
