@@ -515,30 +515,12 @@ impl Runtime {
     pub async fn shutdown(&self) -> Result<()> {
         tracing::info!("ArcBox runtime shutting down");
 
-        // 1. Stop all running containers.
-        let containers = self.container_manager.list();
-        for container in containers {
-            if container.state == arcbox_container::ContainerState::Running {
-                tracing::debug!("Stopping container {}", container.id);
-                if let Some(machine_name) = &container.machine_name {
-                    // Try to stop via agent (with timeout).
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        self.stop_container(machine_name, &container.id, 5),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {
-                            tracing::info!("Container {} stopped", container.id);
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!("Failed to stop container {}: {}", container.id, e);
-                        }
-                        Err(_) => {
-                            tracing::warn!("Timeout stopping container {}", container.id);
-                        }
-                    }
-                }
+        // 1. Stop all active host port forwarders.
+        {
+            let mut forwarders = self.port_forwarders.write().await;
+            for (container_id, mut forwarder) in forwarders.drain() {
+                tracing::debug!("Stopping port forwarder for container {}", container_id);
+                forwarder.stop().await;
             }
         }
 
@@ -581,6 +563,13 @@ impl Runtime {
     /// Returns an error if shutdown fails.
     pub async fn shutdown_force(&self) -> Result<()> {
         tracing::warn!("ArcBox runtime force shutdown");
+
+        {
+            let mut forwarders = self.port_forwarders.write().await;
+            for (_, mut forwarder) in forwarders.drain() {
+                forwarder.stop().await;
+            }
+        }
 
         // Force stop VM lifecycle manager (immediate VM termination).
         if let Err(e) = self.vm_lifecycle.force_stop().await {
@@ -1081,12 +1070,11 @@ impl Runtime {
         let mut forwarder = PortForwarder::new();
 
         for (host_ip_str, host_port, container_port, protocol) in bindings {
-            let host_ip: Ipv4Addr =
-                if host_ip_str.is_empty() || host_ip_str == "0.0.0.0" {
-                    Ipv4Addr::UNSPECIFIED
-                } else {
-                    host_ip_str.parse().unwrap_or(Ipv4Addr::UNSPECIFIED)
-                };
+            let host_ip: Ipv4Addr = if host_ip_str.is_empty() || host_ip_str == "0.0.0.0" {
+                Ipv4Addr::UNSPECIFIED
+            } else {
+                host_ip_str.parse().unwrap_or(Ipv4Addr::UNSPECIFIED)
+            };
 
             let host_addr = SocketAddr::V4(SocketAddrV4::new(host_ip, *host_port));
             let guest_addr = SocketAddr::V4(SocketAddrV4::new(guest_ip, *container_port));

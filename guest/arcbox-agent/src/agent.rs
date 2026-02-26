@@ -196,6 +196,7 @@ pub(crate) mod ensure_runtime {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::HashMap;
+    use std::io::{Read as _, Seek as _, SeekFrom};
     use std::net::IpAddr;
     use std::os::unix::io::AsRawFd;
     use std::path::{Path, PathBuf};
@@ -245,6 +246,12 @@ mod linux {
         "/run/containerd/containerd.sock",
         "/var/run/containerd/containerd.sock",
     ];
+    /// Kernel cmdline key for guest docker data block device.
+    const DOCKER_DATA_DEVICE_CMDLINE_KEY: &str = "arcbox.docker_data_device=";
+    /// Default docker data block device when cmdline is missing.
+    const DOCKER_DATA_DEVICE_DEFAULT: &str = "/dev/vdb";
+    /// Mount point for dockerd persistent state.
+    const DOCKER_DATA_MOUNT_POINT: &str = "/var/lib/docker";
 
     fn cmdline_value(key: &str) -> Option<String> {
         let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
@@ -282,6 +289,110 @@ mod linux {
             .ok()
             .filter(|v| !v.is_empty())
             .or_else(|| cmdline_value("arcbox.boot_asset_version="))
+    }
+
+    fn docker_data_device() -> String {
+        cmdline_value(DOCKER_DATA_DEVICE_CMDLINE_KEY)
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| DOCKER_DATA_DEVICE_DEFAULT.to_string())
+    }
+
+    fn has_ext4_superblock(device: &str) -> bool {
+        let mut file = match std::fs::File::open(device) {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        if file.seek(SeekFrom::Start(1024 + 56)).is_err() {
+            return false;
+        }
+        let mut magic = [0_u8; 2];
+        if file.read_exact(&mut magic).is_err() {
+            return false;
+        }
+        magic == [0x53, 0xEF]
+    }
+
+    fn format_ext4_if_needed(device: &str) -> String {
+        if has_ext4_superblock(device) {
+            return "docker data device already formatted as ext4".to_string();
+        }
+
+        let mkfs_candidates = [
+            ("/sbin/mkfs.ext4", vec!["-F", device]),
+            ("/usr/sbin/mkfs.ext4", vec!["-F", device]),
+            ("/sbin/mke2fs", vec!["-F", "-t", "ext4", device]),
+            ("/usr/sbin/mke2fs", vec!["-F", "-t", "ext4", device]),
+            ("/bin/busybox", vec!["mke2fs", "-F", "-t", "ext4", device]),
+        ];
+
+        for (binary, args) in mkfs_candidates {
+            if !Path::new(binary).exists() {
+                continue;
+            }
+            match std::process::Command::new(binary).args(&args).status() {
+                Ok(status) if status.success() => {
+                    return format!("formatted {} as ext4 via {}", device, binary);
+                }
+                Ok(status) => {
+                    tracing::warn!(
+                        binary,
+                        exit_code = status.code().unwrap_or_default(),
+                        device,
+                        "failed to format docker data device"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(binary, device, error = %e, "failed to execute formatter");
+                }
+            }
+        }
+
+        format!(
+            "failed to format docker data device {}; mkfs.ext4/mke2fs unavailable",
+            device
+        )
+    }
+
+    fn ensure_docker_data_mount() -> String {
+        if crate::mount::is_mounted(DOCKER_DATA_MOUNT_POINT) {
+            return format!("docker data already mounted at {}", DOCKER_DATA_MOUNT_POINT);
+        }
+
+        if let Err(e) = std::fs::create_dir_all(DOCKER_DATA_MOUNT_POINT) {
+            return format!("failed to create {}: {}", DOCKER_DATA_MOUNT_POINT, e);
+        }
+
+        let device = docker_data_device();
+        if !Path::new(&device).exists() {
+            return format!("docker data device missing: {}", device);
+        }
+
+        match crate::mount::mount_fs(&device, DOCKER_DATA_MOUNT_POINT, "ext4", &[]) {
+            Ok(()) => format!(
+                "mounted docker data {} -> {}",
+                device, DOCKER_DATA_MOUNT_POINT
+            ),
+            Err(initial_mount_err) => {
+                if has_ext4_superblock(&device) {
+                    return format!(
+                        "failed to mount docker data {} -> {}: {}",
+                        device, DOCKER_DATA_MOUNT_POINT, initial_mount_err
+                    );
+                }
+
+                let format_note = format_ext4_if_needed(&device);
+                match crate::mount::mount_fs(&device, DOCKER_DATA_MOUNT_POINT, "ext4", &[]) {
+                    Ok(()) => format!(
+                        "mounted docker data {} -> {} ({})",
+                        device, DOCKER_DATA_MOUNT_POINT, format_note
+                    ),
+                    Err(e) => format!(
+                        "failed to mount docker data {} -> {}: {} ({})",
+                        device, DOCKER_DATA_MOUNT_POINT, e, format_note
+                    ),
+                }
+            }
+        }
     }
 
     /// Agent state shared across connections.
@@ -1069,13 +1180,23 @@ mod linux {
         if !Path::new("/dev/shm").exists() {
             let _ = std::fs::create_dir_all("/dev/shm");
             let _ = std::process::Command::new(busybox)
-                .args(["mount", "-t", "tmpfs", "-o", "nodev,nosuid,noexec", "shm", "/dev/shm"])
+                .args([
+                    "mount",
+                    "-t",
+                    "tmpfs",
+                    "-o",
+                    "nodev,nosuid,noexec",
+                    "shm",
+                    "/dev/shm",
+                ])
                 .status();
         }
 
         // Ensure /tmp and /run exist as writable tmpfs.
         for dir in ["/tmp", "/run"] {
-            if !Path::new(dir).exists() || std::fs::metadata(dir).is_ok_and(|m| m.permissions().readonly()) {
+            if !Path::new(dir).exists()
+                || std::fs::metadata(dir).is_ok_and(|m| m.permissions().readonly())
+            {
                 let _ = std::fs::create_dir_all(dir);
                 let _ = std::process::Command::new(busybox)
                     .args(["mount", "-t", "tmpfs", "tmpfs", dir])
@@ -1100,11 +1221,17 @@ mod linux {
                 Ok(s) if s.success() => notes.push("loaded overlay module".to_string()),
                 _ => {
                     // Fallback: try insmod with kernel version path.
-                    if let Ok(uname) = std::process::Command::new(busybox).arg("uname").arg("-r").output() {
+                    if let Ok(uname) = std::process::Command::new(busybox)
+                        .arg("uname")
+                        .arg("-r")
+                        .output()
+                    {
                         let kver = String::from_utf8_lossy(&uname.stdout).trim().to_string();
                         let ko = format!("/lib/modules/{}/kernel/fs/overlayfs/overlay.ko", kver);
                         if Path::new(&ko).exists() {
-                            let _ = std::process::Command::new(busybox).args(["insmod", &ko]).status();
+                            let _ = std::process::Command::new(busybox)
+                                .args(["insmod", &ko])
+                                .status();
                             notes.push(format!("insmod overlay from {}", ko));
                         } else {
                             notes.push("overlay module not found".to_string());
@@ -1194,6 +1321,7 @@ mod linux {
             tracing::info!(prerequisites = %prereq_notes.join("; "), "runtime prerequisites");
         }
         notes.extend(prereq_notes);
+        notes.push(ensure_docker_data_mount());
 
         for dir in [
             "/run/containerd",

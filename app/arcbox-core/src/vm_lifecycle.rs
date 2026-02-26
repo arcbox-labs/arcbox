@@ -32,6 +32,9 @@ use crate::error::{CoreError, Result};
 use crate::event::{Event, EventBus};
 use crate::machine::{MachineConfig, MachineInfo, MachineManager, MachineState};
 use arcbox_error::CommonError;
+use std::fs::OpenOptions;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -67,6 +70,13 @@ const IDLE_BALLOON_TARGET_MB: u64 = 128;
 
 /// Delay before shrinking balloon after entering idle state.
 const BALLOON_SHRINK_DELAY_SECS: u64 = 10;
+
+/// Persistent guest dockerd data image name.
+const DOCKER_DATA_IMAGE_NAME: &str = "docker.img";
+/// Persistent guest dockerd data image size (64 GiB sparse file).
+const DOCKER_DATA_IMAGE_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Kernel cmdline key for guest docker data device.
+const DOCKER_DATA_DEVICE_CMDLINE_KEY: &str = "arcbox.docker_data_device=";
 
 // =============================================================================
 // VM Lifecycle State
@@ -449,6 +459,72 @@ pub struct VmLifecycleManager {
 }
 
 impl VmLifecycleManager {
+    fn virtio_block_device_path(index: usize) -> Result<String> {
+        if index >= 26 {
+            return Err(CoreError::config(format!(
+                "too many block devices configured: {}",
+                index
+            )));
+        }
+        Ok(format!("/dev/vd{}", (b'a' + index as u8) as char))
+    }
+
+    fn ensure_sparse_block_image(path: &std::path::Path, size_bytes: u64) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                CoreError::config(format!(
+                    "failed to create block image directory '{}': {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
+        }
+
+        let file_exists = path.exists();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| {
+                CoreError::config(format!(
+                    "failed to open block image '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+
+        let current_len = file.metadata().map_err(|e| {
+            CoreError::config(format!(
+                "failed to stat block image '{}': {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+        if current_len.len() < size_bytes {
+            file.set_len(size_bytes).map_err(|e| {
+                CoreError::config(format!(
+                    "failed to resize block image '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+            let _ = file.seek(SeekFrom::Start(size_bytes.saturating_sub(1)));
+        }
+
+        if !file_exists {
+            tracing::info!(
+                path = %path.display(),
+                size_bytes,
+                "created persistent docker data image"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Creates a new VM lifecycle manager.
     pub fn new(
         machine_manager: Arc<MachineManager>,
@@ -594,10 +670,7 @@ impl VmLifecycleManager {
         let config_drifted = existing_machine.as_ref().is_some_and(|m| {
             let hw_changed = m.cpus != self.config.default_vm.cpus
                 || m.memory_mb != self.config.default_vm.memory_mb;
-            let kernel_stale = m
-                .kernel
-                .as_ref()
-                .is_some_and(|k| !k.contains(boot_version));
+            let kernel_stale = m.kernel.as_ref().is_some_and(|k| !k.contains(boot_version));
             hw_changed || kernel_stale
         });
 
@@ -749,7 +822,10 @@ impl VmLifecycleManager {
             .join(" ");
 
         // Ensure earlycon is present for early boot diagnostics via virtio console.
-        if !cmdline.split_whitespace().any(|t| t.starts_with("earlycon")) {
+        if !cmdline
+            .split_whitespace()
+            .any(|t| t.starts_with("earlycon"))
+        {
             cmdline.push_str(" earlycon");
         }
 
@@ -774,11 +850,8 @@ impl VmLifecycleManager {
         }
 
         // Attach rootfs.ext4 as a block device when available.
-        let block_devices = if let Some(ref rootfs_path) = assets.rootfs_image {
-            tracing::info!(
-                "Using ext4 rootfs block device: {}",
-                rootfs_path.display()
-            );
+        let mut block_devices = if let Some(ref rootfs_path) = assets.rootfs_image {
+            tracing::info!("Using ext4 rootfs block device: {}", rootfs_path.display());
             vec![crate::vm::BlockDeviceConfig {
                 path: rootfs_path.to_string_lossy().to_string(),
                 read_only: false,
@@ -786,6 +859,25 @@ impl VmLifecycleManager {
         } else {
             Vec::new()
         };
+
+        // Attach persistent Docker data disk (ext4 in guest at /var/lib/docker).
+        let docker_data_image = self.data_dir.join(DOCKER_DATA_IMAGE_NAME);
+        Self::ensure_sparse_block_image(&docker_data_image, DOCKER_DATA_IMAGE_SIZE_BYTES)?;
+
+        let docker_data_guest_device = Self::virtio_block_device_path(block_devices.len())?;
+        if !cmdline
+            .split_whitespace()
+            .any(|token| token.starts_with(DOCKER_DATA_DEVICE_CMDLINE_KEY))
+        {
+            cmdline.push(' ');
+            cmdline.push_str(DOCKER_DATA_DEVICE_CMDLINE_KEY);
+            cmdline.push_str(&docker_data_guest_device);
+        }
+
+        block_devices.push(crate::vm::BlockDeviceConfig {
+            path: docker_data_image.to_string_lossy().to_string(),
+            read_only: false,
+        });
 
         let config = MachineConfig {
             name: DEFAULT_MACHINE_NAME.to_string(),
@@ -871,10 +963,7 @@ impl VmLifecycleManager {
                                                 }
                                             }
                                             Err(e) => {
-                                                tracing::debug!(
-                                                    "Console read loop stopped: {}",
-                                                    e
-                                                );
+                                                tracing::debug!("Console read loop stopped: {}", e);
                                                 break;
                                             }
                                         }
