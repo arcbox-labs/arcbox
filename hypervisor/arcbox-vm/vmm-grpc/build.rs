@@ -9,15 +9,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .canonicalize()
         .expect("arcbox proto dir not found; expected at ../../arcbox/comm/arcbox-protocol/proto");
 
-    // Compile vmm.v1 extension protos.
-    tonic_build::configure()
-        .build_server(true)
-        .build_client(true)
-        .compile_protos(
-            &[manifest.join("proto/vmm.proto")],
-            &[manifest.join("proto")],
-        )?;
-
     // Compile arcbox.v1 protos (MachineService + SystemService).
     tonic_build::configure()
         .build_server(true)

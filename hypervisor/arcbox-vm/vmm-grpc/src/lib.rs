@@ -1,17 +1,11 @@
 //! `vmm-grpc` — tonic gRPC server and service implementations.
 //!
-//! Exposes three services:
+//! Exposes two services:
 //! - `arcbox.v1.MachineService` — VM CRUD + lifecycle (arcbox-protocol compatible)
 //! - `arcbox.v1.SystemService`  — system info, version, liveness, events
-//! - `vmm.v1.VmmService`        — pause/resume, snapshots, metrics, live updates
 
 // Generated protobuf/tonic code.
 pub mod proto {
-    /// `vmm.v1` extensions.
-    pub mod vmm {
-        tonic::include_proto!("vmm.v1");
-    }
-
     /// `arcbox.v1` — machine, system, and common types.
     pub mod arcbox {
         tonic::include_proto!("arcbox.v1");
@@ -21,7 +15,6 @@ pub mod proto {
 pub mod machine_svc;
 pub mod server;
 pub mod system_svc;
-pub mod vmm_svc;
 
 pub use server::serve;
 

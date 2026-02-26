@@ -22,7 +22,6 @@ a [gRPC](https://grpc.io/) interface compatible with the
             │  ┌──────────────────────┐    │
             │  │  MachineService      │    │  ◄── arcbox.v1 proto
             │  │  SystemService       │    │
-            │  │  VmmService          │    │  ◄── vmm.v1 proto (extensions)
             │  └──────────┬───────────┘    │
             └─────────────┼────────────────┘
                           │
@@ -68,32 +67,6 @@ a [gRPC](https://grpc.io/) interface compatible with the
 - **Remove** — stop, release TAP, clean up socket and store entry
 - **List / Inspect** — live registry with full hardware/network/OS detail
 
-### Full Device Support (via `VmmService.CreateVm`)
-- Machine: vCPU, memory, SMT, huge pages, CPU templates, dirty-page tracking
-- Root drive: read-only, IO engine (sync/async), cache mode, rate limiter, partuuid
-- Extra drives: multiple additional block devices with per-drive settings
-- Network: per-interface TX/RX rate limiters
-- Balloon: amount, deflate-on-OOM, stats interval, free-page hinting/reporting
-- Vsock: host↔guest virtio-vsock (guest CID configurable)
-- Entropy: virtio-rng device
-- Serial: redirect console output to host file
-- Memory hotplug: virtio-mem with configurable total/slot/block sizes
-- MMDS: metadata service with V1/V2 API, custom IP, IMDS compat mode
-
-### Snapshots
-- Full snapshots (memory + VM state)
-- Diff snapshots (dirty pages only, requires `track_dirty_pages`)
-- Snapshot catalog per VM with metadata
-- Restore from any catalog entry
-
-### Live Updates (post-boot)
-- Balloon target size adjustment
-- Balloon statistics polling interval
-- Memory hotplug size update
-- Drive hot-swap (path + rate limiter)
-- Network interface rate limiter update
-- Metrics flush to disk
-
 ### Process Options (daemon-level)
 - Direct mode or Jailer sandbox
 - Configurable log level, seccomp filter, API payload limits
@@ -103,28 +76,25 @@ a [gRPC](https://grpc.io/) interface compatible with the
 - Unix socket transport (default: `/run/firecracker-vmm/vmm.sock`)
 - Optional TCP transport
 - Protocol-compatible with `arcbox.v1.MachineService`
-- VMM-specific extensions via `vmm.v1.VmmService`
 
 ---
 
 ## gRPC Services
 
-### `arcbox.v1.MachineService` (arcbox-protocol compatible)
+### `arcbox.v1.MachineService`
 
 ```
-Create       → boot a new VM (basic params; uses daemon defaults)
+Create       → boot a new VM (uses daemon defaults for unset params)
 Start        → start a stopped VM
-Stop         → stop a running VM
-Remove       → delete a VM
-List         → list all VMs
-Inspect      → full VM detail
+Stop         → stop a running VM (graceful or force)
+Remove       → delete a VM and release all resources
+List         → list VMs (running only, or all with flag)
+Inspect      → full VM detail (hardware, network, storage)
 Ping         → guest agent health check (future: vsock)
 GetSystemInfo→ guest OS info (future: vsock)
 Exec         → run command in guest (future: vsock)
 SSHInfo      → SSH connection details
 ```
-
-> For full parameter control use `VmmService.CreateVm` instead.
 
 ### `arcbox.v1.SystemService`
 
@@ -133,25 +103,6 @@ GetInfo      → daemon stats (VM counts, host info)
 GetVersion   → daemon version
 Ping         → liveness probe
 Events       → stream VM lifecycle events
-```
-
-### `vmm.v1.VmmService` (VMM-specific extensions)
-
-```
-CreateVm                 → create VM with full Firecracker parameter set
-Pause                    → pause a running VM
-Resume                   → resume a paused VM
-CreateSnapshot           → create full or diff snapshot
-ListSnapshots            → list snapshot catalog for a VM
-RestoreSnapshot          → restore VM from snapshot
-DeleteSnapshot           → remove snapshot from catalog
-GetMetrics               → balloon stats
-UpdateBalloon            → adjust memory balloon target
-UpdateBalloonStatsInterval → update balloon statistics polling interval
-UpdateMemory             → hotplug memory size change
-UpdateDrive              → hot-swap drive path / update rate limiter
-UpdateNetworkInterface   → update NIC TX/RX rate limiters
-FlushMetrics             → flush metrics to disk immediately
 ```
 
 ---
@@ -164,19 +115,12 @@ FlushMetrics             → flush metrics to disk immediately
 │   └── vmlinux               # default kernel
 ├── images/
 │   └── ubuntu-22.04.ext4     # default rootfs
-├── vms/
-│   └── {vm-id}/
-│       ├── meta.json         # VmSpec + state + timestamps
-│       ├── firecracker.sock  # API socket (while running)
-│       ├── vsock.sock        # vsock UDS (if vsock enabled)
-│       ├── firecracker.log
-│       └── firecracker.metrics
-└── snapshots/
+└── vms/
     └── {vm-id}/
-        └── {snapshot-id}/
-            ├── vmstate
-            ├── mem           # full snapshots only
-            └── meta.json
+        ├── meta.json         # VmSpec + state + timestamps
+        ├── firecracker.sock  # API socket (while running)
+        ├── firecracker.log
+        └── firecracker.metrics
 ```
 
 ---
@@ -242,7 +186,7 @@ boot_args  = "console=ttyS0 reboot=k panic=1 pci=off"
 # Start daemon
 vmm-daemon --config /etc/firecracker-vmm/config.toml
 
-# Create a VM (basic — uses daemon defaults)
+# Create a VM (uses daemon defaults)
 vmm create --name my-vm --cpus 2 --memory 1024
 
 # List VMs
@@ -250,9 +194,6 @@ vmm list
 
 # Inspect a VM
 vmm inspect my-vm
-
-# Snapshot
-vmm snapshot create my-vm --name before-upgrade
 
 # Stop and remove
 vmm stop my-vm
@@ -304,8 +245,7 @@ Virtualization.framework on macOS.
 
 On Linux, `arcbox-daemon` can connect to `firecracker-vmm` via the Unix socket
 and route all `MachineService` RPCs through it without changes to the upper
-layers. For Firecracker-specific features (snapshots, balloon, hotplug), use
-the `vmm.v1.VmmService` extensions directly.
+layers.
 
 ---
 

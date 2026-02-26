@@ -10,9 +10,7 @@ use crate::machine_svc::MachineServiceImpl;
 use crate::proto::arcbox::{
     machine_service_server::MachineServiceServer, system_service_server::SystemServiceServer,
 };
-use crate::proto::vmm::vmm_service_server::VmmServiceServer;
 use crate::system_svc::SystemServiceImpl;
-use crate::vmm_svc::VmmServiceImpl;
 
 /// Start the gRPC server.
 ///
@@ -24,7 +22,6 @@ pub async fn serve(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let machine_svc = MachineServiceServer::new(MachineServiceImpl::new(Arc::clone(&manager)));
     let system_svc = SystemServiceServer::new(SystemServiceImpl::new(Arc::clone(&manager)));
-    let vmm_svc = VmmServiceServer::new(VmmServiceImpl::new(Arc::clone(&manager)));
 
     // Ensure parent directory for the unix socket exists.
     if let Some(parent) = Path::new(unix_socket).parent() {
@@ -39,7 +36,6 @@ pub async fn serve(
     let uds_server = {
         let machine_svc = machine_svc.clone();
         let system_svc = system_svc.clone();
-        let vmm_svc = vmm_svc.clone();
         async move {
             info!(socket = %uds_path, "gRPC listening on Unix socket");
             let uds = tokio::net::UnixListener::bind(&uds_path)?;
@@ -47,7 +43,6 @@ pub async fn serve(
             Server::builder()
                 .add_service(machine_svc)
                 .add_service(system_svc)
-                .add_service(vmm_svc)
                 .serve_with_incoming(incoming)
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
@@ -66,7 +61,6 @@ pub async fn serve(
             Server::builder()
                 .add_service(machine_svc)
                 .add_service(system_svc)
-                .add_service(vmm_svc)
                 .serve(addr)
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
