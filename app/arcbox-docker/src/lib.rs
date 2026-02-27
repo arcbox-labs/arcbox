@@ -7,12 +7,19 @@
 //!
 //! ## Compatibility
 //!
-//! Implements Docker Engine API v1.43, supporting:
+//! Host routing supports Docker Engine API compatibility paths `v1.24..v1.43`
+//! (plus unversioned endpoints). Request handling is split between local
+//! ArcBox handlers and pass-through proxying to guest `dockerd`.
+//!
+//! Supported operation groups include:
 //!
 //! - Container operations (create, start, stop, remove, logs, exec)
 //! - Image operations (pull, push, list, remove)
 //! - Volume operations
 //! - Network operations (basic)
+//!
+//! `/version` and related system metadata responses are sourced from guest
+//! `dockerd`.
 //!
 //! ## Architecture
 //!

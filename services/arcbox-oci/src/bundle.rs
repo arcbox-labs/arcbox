@@ -374,7 +374,7 @@ pub mod utils {
             )));
         }
 
-        // For now, just create the directory. Actual copy would be more complex.
+        // Ensure destination rootfs directory exists before recursive copy.
         std::fs::create_dir_all(&dest)?;
 
         // Copy directory contents (basic implementation).

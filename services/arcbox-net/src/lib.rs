@@ -257,10 +257,9 @@ impl NetworkManager {
 
     /// Stops the network manager.
     ///
-    /// This cleans up all network resources:
-    /// - Releases allocated IP addresses
-    /// - Stops port forwarding
-    /// - Removes user-created networks
+    /// Current stop behavior:
+    /// - Clears the in-memory IP allocator state
+    /// - Transitions manager state back to `Stopped`
     ///
     /// # Errors
     ///

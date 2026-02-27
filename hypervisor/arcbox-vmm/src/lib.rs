@@ -6,10 +6,11 @@
 //! abstraction layer:
 //!
 //! - [`VmBuilder`]: Fluent API for VM configuration
+//! - [`Vmm`]: VM lifecycle/state and device orchestration
 //! - [`VcpuManager`]: Manages vCPU threads and execution
 //! - [`MemoryManager`]: Memory allocation and mapping
 //! - [`DeviceManager`]: Device registration and I/O handling
-//! - [`EventLoop`]: Main VMM event loop
+//! - [`KernelLoader`] and [`FdtBuilder`]: Boot image and device-tree setup
 //!
 //! ## Architecture
 //!
@@ -17,10 +18,10 @@
 //! ┌─────────────────────────────────────────────────┐
 //! │                    VMM                           │
 //! │  ┌────────────┐ ┌────────────┐ ┌────────────┐  │
-//! │  │VcpuManager │ │MemoryManager│ │DeviceManager│  │
+//! │  │VcpuManager │ │MemoryManager│ │DeviceManager│ │
 //! │  └────────────┘ └────────────┘ └────────────┘  │
 //! │  ┌────────────┐ ┌────────────┐ ┌────────────┐  │
-//! │  │ EventLoop  │ │  IrqChip   │ │   Boot     │  │
+//! │  │    Boot    │ │    FDT     │ │    IRQ     │  │
 //! │  └────────────┘ └────────────┘ └────────────┘  │
 //! └─────────────────────────────────────────────────┘
 //!                      │

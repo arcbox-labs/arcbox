@@ -4,7 +4,7 @@ Docker REST API compatibility layer for ArcBox.
 
 ## Overview
 
-This crate provides a Docker-compatible API server that allows existing Docker CLI tools to work with ArcBox seamlessly. It implements Docker Engine API v1.43, enabling transparent use of Docker commands with ArcBox as the backend.
+This crate provides a Docker-compatible API server that allows existing Docker CLI tools to work with ArcBox seamlessly. It acts as a host-side compatibility and proxy layer: some endpoints are handled by ArcBox handlers while pass-through requests are forwarded to guest `dockerd`.
 
 ## Features
 
@@ -41,8 +41,8 @@ docker CLI ──► Unix Socket ──► arcbox-docker ──► arcbox-core
 
 ## API Version
 
-- **Current**: Docker Engine API v1.43 (Docker 24.0)
-- **Minimum Supported**: v1.24
+- **Host route compatibility:** `/v1.24` through `/v1.43` plus unversioned routes
+- **Version payload source:** `/version` and related system metadata are reported by guest `dockerd`
 
 ## License
 

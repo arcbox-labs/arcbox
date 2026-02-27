@@ -8,7 +8,7 @@
 //!
 //! - **Transparent**: Users only run `docker run`, VM is invisible
 //! - **Lazy**: VM starts on first container command, not daemon startup
-//! - **Fast**: Cold start <1.5s, warm <50ms
+//! - **Fast**: Cold start <1.5s, warm <500ms
 //! - **Resilient**: Auto-recovery from crashes
 //!
 //! ## Architecture

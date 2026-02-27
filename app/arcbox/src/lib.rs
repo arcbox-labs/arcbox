@@ -5,24 +5,19 @@
 //!
 //! # Architecture
 //!
-//! ArcBox is organized into several layers:
+//! This crate currently re-exports selected ArcBox foundational crates:
 //!
 //! - **Hypervisor**: Platform abstraction for virtualization (macOS/Linux)
-//! - **VMM**: Virtual machine monitor managing VM lifecycle
 //! - **VirtIO**: Virtual device implementations (block, net, fs, console)
-//! - **Container**: OCI-compatible container runtime
-//! - **Core**: High-level orchestration and management
+//! - **Protocol**: Protobuf message and service definitions
 //!
 //! # Example
 //!
 //! ```ignore
-//! use arcbox::prelude::*;
+//! use arcbox::{protocol, version};
 //!
-//! // Create a container runtime
-//! let runtime = Runtime::new()?;
-//!
-//! // Run a container
-//! runtime.run("alpine:latest", &["echo", "hello"])?;
+//! let _ = protocol::v1::Empty {};
+//! println!("arcbox facade version: {}", version());
 //! ```
 
 // Re-export core crates (available in this version)

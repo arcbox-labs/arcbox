@@ -42,7 +42,7 @@ Guest: mount -t virtiofs arcbox /mnt/arcbox
 ## Usage
 
 ```rust
-use arcbox_fs::{FsConfig, PassthroughFs, FuseDispatcher};
+use arcbox_fs::{FsConfig, FuseDispatcher, PassthroughConfig, PassthroughFs};
 
 let config = FsConfig {
     tag: "arcbox".to_string(),
