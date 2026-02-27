@@ -11,7 +11,7 @@ repository = "https://github.com/arcbox-labs/arcbox"
 
 [workspace.dependencies]
 vmm-core = { path = "vmm-core" }
-fc-sdk    = { path = "../firecracker-client/fc-sdk" }
+fc-sdk    = { path = "../../comm/fc-sdk" }
 
 tonic            = { version = "0.12", features = ["transport"] }
 tonic-build      = "0.12"
