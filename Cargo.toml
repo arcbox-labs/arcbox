@@ -50,11 +50,6 @@ members = [
     "pro/arcbox-net-advanced",
     "pro/arcbox-snapshot",
     "pro/arcbox-perf",
-
-    # ============================================
-    # Test Infrastructure
-    # ============================================
-    "tests/e2e",
 ]
 
 # ============================================
