@@ -1,21 +1,8 @@
 name: Docker API E2E Tests
 
 on:
-  push:
-    branches: [master, develop]
-    paths:
-      - 'app/arcbox-docker/**'
-      - 'app/arcbox-core/**'
-      - 'app/arcbox-cli/**'
-      - 'tests/**'
-      - '.github/workflows/docker-api-e2e.yml'
-  pull_request:
-    branches: [master, develop]
-    paths:
-      - 'app/arcbox-docker/**'
-      - 'app/arcbox-core/**'
-      - 'app/arcbox-cli/**'
-      - 'tests/**'
+  # Disabled: GitHub Actions macos runners lack Virtualization.framework.
+  # Re-enable when a self-hosted Apple Silicon runner is available.
   workflow_dispatch:
 
 env:
