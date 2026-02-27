@@ -152,7 +152,7 @@ async fn execute_stop(args: &DaemonArgs) -> Result<()> {
     send_sigterm(pid)?;
     println!("Stopping ArcBox daemon (PID {pid})...");
 
-    let timeout_window = Duration::from_secs(30);
+    let timeout_window = Duration::from_secs(40);
     let deadline = Instant::now() + timeout_window;
     loop {
         let process_exited = !process_is_running(pid);
