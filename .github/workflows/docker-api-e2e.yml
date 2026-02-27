@@ -13,7 +13,7 @@ jobs:
   # Basic API tests that don't require VM
   api-compatibility:
     name: Docker API Compatibility
-    runs-on: macos-14  # Apple Silicon runner
+    runs-on: macos-26  # Apple Silicon runner
     timeout-minutes: 30
 
     steps:
@@ -228,7 +228,7 @@ jobs:
   # API version compatibility tests
   api-versions:
     name: API Version Compatibility
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: 15
 
     steps:

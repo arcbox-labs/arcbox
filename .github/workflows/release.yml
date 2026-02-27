@@ -21,7 +21,7 @@ jobs:
   # ==========================================================================
   build-macos-arm64:
     name: Build macOS ARM64
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: 60
 
     steps:

@@ -13,7 +13,7 @@ env:
 jobs:
   ci:
     name: Build, Lint, and Test
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: 60
 
     steps:
@@ -53,5 +53,10 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --exclude arcbox-agent
 
+      - name: Code sign arcbox CLI
+        run: |
+          codesign --entitlements tests/resources/entitlements.plist --force -s - \
+            target/debug/arcbox
+
       - name: Smoke test arcbox CLI
-        run: cargo run -p arcbox-cli --bin arcbox -- --help
+        run: ./target/debug/arcbox --help
