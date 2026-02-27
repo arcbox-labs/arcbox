@@ -9,7 +9,7 @@ pub type Result<T> = std::result::Result<T, FsError>;
 /// Errors that can occur during filesystem operations.
 #[derive(Debug, Error)]
 pub enum FsError {
-    /// Common errors shared across ArcBox crates.
+    /// Common errors shared across `ArcBox` crates.
     #[error(transparent)]
     Common(#[from] CommonError),
 

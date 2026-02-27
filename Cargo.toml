@@ -176,7 +176,6 @@ arcbox-snapshot = { version = "0.0.1-alpha.1", path = "pro/arcbox-snapshot" }
 arcbox-perf = { version = "0.0.1-alpha.1", path = "pro/arcbox-perf" }
 
 # Test infrastructure
-arcbox-e2e = { version = "0.0.1-alpha.1", path = "tests/e2e" }
 tempfile = "3"
 
 [profile.release]

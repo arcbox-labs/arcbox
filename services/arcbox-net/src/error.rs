@@ -9,7 +9,7 @@ pub type Result<T> = std::result::Result<T, NetError>;
 /// Errors that can occur during network operations.
 #[derive(Debug, Error)]
 pub enum NetError {
-    /// Common errors shared across ArcBox crates.
+    /// Common errors shared across `ArcBox` crates.
     #[error(transparent)]
     Common(#[from] CommonError),
 

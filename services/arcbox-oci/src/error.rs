@@ -11,7 +11,7 @@ pub type Result<T> = std::result::Result<T, OciError>;
 /// Errors that can occur during OCI operations.
 #[derive(Debug, Error)]
 pub enum OciError {
-    /// Common errors shared across ArcBox crates.
+    /// Common errors shared across `ArcBox` crates.
     #[error(transparent)]
     Common(#[from] CommonError),
 

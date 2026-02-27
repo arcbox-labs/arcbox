@@ -9,7 +9,7 @@ pub type Result<T> = std::result::Result<T, TransportError>;
 /// Errors that can occur during transport operations.
 #[derive(Debug, Error)]
 pub enum TransportError {
-    /// Common errors shared across ArcBox crates.
+    /// Common errors shared across `ArcBox` crates.
     #[error(transparent)]
     Common(#[from] CommonError),
 

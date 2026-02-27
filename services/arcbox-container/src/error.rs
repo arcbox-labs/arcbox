@@ -9,7 +9,7 @@ pub type Result<T> = std::result::Result<T, ContainerError>;
 /// Errors that can occur during container operations.
 #[derive(Debug, Error)]
 pub enum ContainerError {
-    /// Common errors shared across ArcBox crates.
+    /// Common errors shared across `ArcBox` crates.
     #[error(transparent)]
     Common(#[from] CommonError),
 
