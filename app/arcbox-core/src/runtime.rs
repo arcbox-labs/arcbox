@@ -290,7 +290,7 @@ impl Runtime {
         self.machine_manager.connect_vsock_port(machine_name, port)
     }
 
-    /// Initializes the runtime.
+    /// Initializes the runtime and eagerly starts the default VM.
     ///
     /// # Errors
     ///
@@ -354,6 +354,8 @@ impl Runtime {
                 }
             }
         }
+
+        self.ensure_vm_ready().await?;
 
         tracing::info!(
             backend = self.container_backend.name(),

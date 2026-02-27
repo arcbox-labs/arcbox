@@ -7,7 +7,7 @@
 //! ## Design Goals
 //!
 //! - **Transparent**: Users only run `docker run`, VM is invisible
-//! - **Lazy**: VM starts on first container command, not daemon startup
+//! - **Eager**: Default VM boots during runtime initialization
 //! - **Fast**: Cold start <1.5s, warm <500ms
 //! - **Resilient**: Auto-recovery from crashes
 //!
@@ -187,8 +187,6 @@ pub enum VmEvent {
 /// VM lifecycle configuration.
 #[derive(Debug, Clone)]
 pub struct VmLifecycleConfig {
-    /// Enable auto-start on first container command.
-    pub auto_start: bool,
     /// Enable auto-stop after idle timeout.
     pub auto_stop: bool,
     /// Idle timeout before entering idle state.
@@ -211,7 +209,6 @@ pub struct VmLifecycleConfig {
 impl Default for VmLifecycleConfig {
     fn default() -> Self {
         Self {
-            auto_start: true,
             auto_stop: true,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             startup_timeout: Duration::from_secs(DEFAULT_STARTUP_TIMEOUT_SECS),
@@ -1255,7 +1252,6 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = VmLifecycleConfig::default();
-        assert!(config.auto_start);
         assert!(config.auto_stop);
         assert_eq!(config.max_retries, DEFAULT_MAX_RETRIES);
     }
