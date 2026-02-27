@@ -205,10 +205,21 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
         .await
         .context("Failed to shutdown runtime")?;
 
+    let socket_path_clone = socket_path.clone();
+
     // Disable Docker integration if it was enabled.
     if args.docker_integration {
         if let Ok(ctx_manager) = DockerContextManager::new(socket_path) {
             let _ = ctx_manager.disable();
+        }
+    }
+
+    // Clean up socket files.
+    for path in [&socket_path_clone, &grpc_socket] {
+        if let Err(e) = std::fs::remove_file(path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Failed to remove socket {}: {}", path.display(), e);
+            }
         }
     }
 
