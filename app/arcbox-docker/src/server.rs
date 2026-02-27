@@ -106,6 +106,8 @@ impl DockerApiServer {
                     if !err_str.contains("shutting down")
                         && !err_str.contains("connection reset")
                         && !err_str.contains("broken pipe")
+                        && !err_str.contains("connection closed")
+                        && !err_str.contains("incomplete")
                     {
                         tracing::error!("Error serving connection: {}", err);
                     }

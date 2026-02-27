@@ -310,8 +310,9 @@ pub async fn proxy_with_upgrade(
         .map_err(|e| DockerError::Server(format!("guest docker handshake failed: {e}")))?;
 
     // The connection task must keep running for the upgrade to work.
+    // `.with_upgrades()` is required so hyper::upgrade::on(response) works.
     tokio::spawn(async move {
-        if let Err(e) = conn.await {
+        if let Err(e) = conn.with_upgrades().await {
             let msg = e.to_string().to_lowercase();
             if !msg.contains("canceled") && !msg.contains("incomplete") {
                 tracing::debug!("guest docker upgrade connection ended: {}", e);
