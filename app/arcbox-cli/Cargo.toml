@@ -34,6 +34,7 @@ dirs = { workspace = true }
 crossterm = { workspace = true }
 macos-resolver = { workspace = true }
 libc.workspace = true
+humantime = "2.3.0"
 
 [features]
 default = []

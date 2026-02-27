@@ -4,16 +4,21 @@
 //! - start in background (default)
 //! - run in foreground (`-f`)
 //! - stop a running daemon (`arcbox daemon stop`)
+//! - inspect daemon status (`arcbox daemon status`)
 
+use super::machine::UnixConnector;
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
+use humantime::format_duration;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+use tokio::time::{Instant, sleep, timeout};
+use tonic::transport::Endpoint;
 use tracing::warn;
 
 /// Arguments for the daemon command.
@@ -64,6 +69,7 @@ pub struct DaemonArgs {
 #[derive(Debug, Clone, ValueEnum)]
 pub enum DaemonAction {
     Stop,
+    Status,
 }
 
 /// CLI argument values for provisioning mode.
@@ -84,15 +90,12 @@ impl ContainerProvisionArg {
 
 /// Executes the daemon command.
 pub async fn execute(args: DaemonArgs) -> Result<()> {
-    if let Some(DaemonAction::Stop) = args.action {
-        return execute_stop(&args);
+    match args.action {
+        Some(DaemonAction::Stop) => execute_stop(&args).await,
+        Some(DaemonAction::Status) => execute_status(&args).await,
+        None if args.foreground => exec_foreground(&args),
+        None => spawn_background(&args),
     }
-
-    if args.foreground {
-        return exec_foreground(&args);
-    }
-
-    spawn_background(&args)
 }
 
 fn exec_foreground(args: &DaemonArgs) -> Result<()> {
@@ -126,9 +129,13 @@ fn exec_foreground(args: &DaemonArgs) -> Result<()> {
     }
 }
 
-fn execute_stop(args: &DaemonArgs) -> Result<()> {
+async fn execute_stop(args: &DaemonArgs) -> Result<()> {
     let data_dir = resolve_data_dir(args.data_dir.as_ref());
     let pid_file = data_dir.join("daemon.pid");
+    let grpc_socket = args
+        .grpc_socket
+        .clone()
+        .unwrap_or_else(|| data_dir.join("arcbox.sock"));
 
     let Some(pid) = read_pid_file(&pid_file)? else {
         println!("Daemon is not running");
@@ -144,18 +151,99 @@ fn execute_stop(args: &DaemonArgs) -> Result<()> {
     send_sigterm(pid)?;
     println!("Stopping ArcBox daemon (PID {pid})...");
 
-    for _ in 0..50 {
-        if !process_is_running(pid) {
+    let timeout_window = Duration::from_secs(30);
+    let deadline = Instant::now() + timeout_window;
+    loop {
+        let process_exited = !process_is_running(pid);
+        let grpc_socket_removed = !grpc_socket.exists();
+        if process_exited && grpc_socket_removed {
             println!("ArcBox daemon stopped");
             let _ = std::fs::remove_file(&pid_file);
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(100));
+
+        if Instant::now() >= deadline {
+            bail!(
+                "ArcBox daemon (PID {pid}) did not fully stop within {}s (process_running={}, grpc_socket_present={})",
+                timeout_window.as_secs(),
+                !process_exited,
+                !grpc_socket_removed,
+            );
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn execute_status(args: &DaemonArgs) -> Result<()> {
+    let data_dir = resolve_data_dir(args.data_dir.as_ref());
+    let pid_file = data_dir.join("daemon.pid");
+    let docker_socket = args
+        .socket
+        .clone()
+        .unwrap_or_else(|| data_dir.join("docker.sock"));
+    let grpc_socket = args
+        .grpc_socket
+        .clone()
+        .unwrap_or_else(|| data_dir.join("arcbox.sock"));
+
+    let mut pid = read_pid_file(&pid_file)?;
+    if let Some(value) = pid {
+        if !process_is_running(value) {
+            let _ = std::fs::remove_file(&pid_file);
+            pid = None;
+        }
     }
 
-    println!("ArcBox daemon (PID {pid}) is still running after 5s");
-    println!("Try: kill -9 {pid}");
+    let running = pid.is_some();
+    let status = if running { "running" } else { "not running" };
+    let uptime = if running {
+        pid_file_uptime(&pid_file)
+            .map(|duration| format_duration(duration).to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    } else {
+        "n/a".to_string()
+    };
+    let grpc_responsive = if running {
+        grpc_daemon_is_responsive(&grpc_socket).await
+    } else {
+        false
+    };
+
+    println!("ArcBox daemon status: {status}");
+    println!(
+        "PID: {}",
+        pid.map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    );
+    println!("Docker socket: {}", docker_socket.display());
+    println!("gRPC socket: {}", grpc_socket.display());
+    println!("Uptime: {uptime}");
+    println!(
+        "gRPC responsive: {}",
+        if grpc_responsive { "yes" } else { "no" }
+    );
     Ok(())
+}
+
+async fn grpc_daemon_is_responsive(socket_path: &Path) -> bool {
+    if !socket_path.exists() {
+        return false;
+    }
+
+    let endpoint =
+        Endpoint::from_static("http://[::]:50051").connect_timeout(Duration::from_secs(1));
+    let connect_future =
+        endpoint.connect_with_connector(UnixConnector::new(socket_path.to_path_buf()));
+    matches!(
+        timeout(Duration::from_secs(2), connect_future).await,
+        Ok(Ok(_))
+    )
+}
+
+fn pid_file_uptime(pid_file: &Path) -> Option<Duration> {
+    let modified_at = std::fs::metadata(pid_file).ok()?.modified().ok()?;
+    SystemTime::now().duration_since(modified_at).ok()
 }
 
 fn spawn_background(args: &DaemonArgs) -> Result<()> {

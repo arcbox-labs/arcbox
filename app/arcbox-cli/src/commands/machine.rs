@@ -8,6 +8,7 @@ use arcbox_protocol::v1::{
     StopMachineRequest,
 };
 use clap::{Args, Subcommand};
+use humantime::format_duration;
 use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
 use std::future::Future;
@@ -67,7 +68,7 @@ pub(crate) struct UnixConnector {
     socket_path: PathBuf,
 }
 
-pub(crate) impl UnixConnector {
+impl UnixConnector {
     pub(crate) fn new(socket_path: PathBuf) -> Self {
         Self { socket_path }
     }
@@ -560,7 +561,10 @@ async fn execute_info(args: InfoArgs) -> Result<()> {
     println!("CPUs: {}", info.cpu_count);
     println!("Memory: {} MB", total_mb);
     println!("Memory Available: {} MB", available_mb);
-    println!("Uptime: {} s", info.uptime);
+    println!(
+        "Uptime: {}",
+        format_duration(std::time::Duration::from_secs(info.uptime))
+    );
     if !info.ip_addresses.is_empty() {
         println!("IP Addresses: {}", info.ip_addresses.join(", "));
     }
