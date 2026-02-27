@@ -1,52 +1,49 @@
-
 # firecracker-vmm
 
-A production-grade sandbox manager built on top of
+A production-grade sandbox management library built on top of
 [`fc-sdk`](../firecracker-client) that orchestrates multiple
-[Firecracker](https://firecracker-microvm.github.io/) microVMs and exposes
-a self-contained [gRPC](https://grpc.io/) interface (`sandbox.v1`).
+[Firecracker](https://firecracker-microvm.github.io/) microVMs.
+
+Exposes a `SandboxManager` API and optional gRPC service implementations
+(`sandbox.v1`) for embedding into a larger daemon.
 
 ---
 
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                        vmm-daemon                              │
-│   (CLI args · config · signal handling · tokio runtime)        │
-└───────────────────────────┬────────────────────────────────────┘
-                            │
-            ┌───────────────▼──────────────┐
-            │         vmm-grpc             │
-            │  tonic gRPC server           │
-            │  ┌──────────────────────┐    │
-            │  │  SandboxService      │    │  ◄── sandbox.v1 proto
-            │  │  SandboxSnapshot     │    │
-            │  │  Service             │    │
-            │  └──────────┬───────────┘    │
-            └─────────────┼────────────────┘
-                          │
-            ┌─────────────▼────────────────┐
-            │         vmm-core             │
-            │  SandboxManager              │
-            │  ┌────────────────────────┐  │
-            │  │  SandboxInstance       │  │
-            │  │  registry              │  │
-            │  │  (Arc<RwLock<...>>)    │  │
-            │  └────────────────────────┘  │
-            │  NetworkManager (TAP / IP)   │
-            │  SnapshotCatalog             │
-            └─────────────┬────────────────┘
-                          │
-            ┌─────────────▼────────────────┐
-            │           fc-sdk             │
-            │  VmBuilder / VmProcess / Vm  │
-            └─────────────┬────────────────┘
-                          │
-            ┌─────────────▼────────────────┐
-            │  Firecracker process (unix   │
-            │  socket per VM)              │
-            └──────────────────────────────┘
+            ┌─────────────────────────────┐
+            │  your daemon / arcbox-vmm   │
+            │  (owns runtime + transport) │
+            └──────────────┬──────────────┘
+                           │
+            ┌──────────────▼──────────────┐
+            │          vmm-grpc           │
+            │  SandboxServiceImpl         │  ◄── sandbox.v1 proto
+            │  SandboxSnapshotServiceImpl │
+            └──────────────┬──────────────┘
+                           │
+            ┌──────────────▼──────────────┐
+            │          vmm-core           │
+            │  SandboxManager             │
+            │  ┌─────────────────────┐   │
+            │  │  SandboxInstance    │   │
+            │  │  registry           │   │
+            │  │  (Arc<RwLock<...>>) │   │
+            │  └─────────────────────┘   │
+            │  NetworkManager (TAP / IP) │
+            │  SnapshotCatalog           │
+            └──────────────┬──────────────┘
+                           │
+            ┌──────────────▼──────────────┐
+            │           fc-sdk            │
+            │  VmBuilder / VmProcess / Vm │
+            └──────────────┬──────────────┘
+                           │
+            ┌──────────────▼──────────────┐
+            │  Firecracker process        │
+            │  (unix socket per VM)       │
+            └─────────────────────────────┘
 ```
 
 ### Crates
@@ -54,10 +51,10 @@ a self-contained [gRPC](https://grpc.io/) interface (`sandbox.v1`).
 | Crate | Type | Purpose |
 |-------|------|---------|
 | `vmm-core` | lib | Sandbox orchestration, state, networking, snapshots |
-| `vmm-grpc` | lib | gRPC server + service implementations |
-| `vmm-daemon` | bin | Daemon entrypoint |
-| `vmm-cli` | bin | Management CLI (gRPC client) |
+| `vmm-grpc` | lib | gRPC service implementations (`sandbox.v1`) |
 | `vmm-guest-agent` | bin | In-guest agent — receives `Run`/`Exec` commands over vsock |
+
+There is no standalone daemon or CLI binary. The gRPC server and direct API usage are demonstrated via the examples described below.
 
 ---
 
@@ -85,11 +82,6 @@ a self-contained [gRPC](https://grpc.io/) interface (`sandbox.v1`).
 - **Jailer mode** — Firecracker runs under the Firecracker jailer (`pivot_root` + uid/gid drop + seccomp); kernel and rootfs are staged into the chroot at boot and cleaned up on removal; snapshot and restore also stage files through the chroot (see [Jailer Mode Internals](#jailer-mode-internals))
 - Configurable per-sandbox resources (vCPUs, memory)
 - Auto-destroy TTL per sandbox
-
-### gRPC Interface
-- Unix socket transport (default: `/run/firecracker-vmm/vmm.sock`)
-- Optional TCP transport (e.g. `127.0.0.1:9090`)
-- Self-contained `sandbox.v1` proto — no external proto dependencies
 
 ---
 
@@ -159,6 +151,89 @@ a self-contained [gRPC](https://grpc.io/) interface (`sandbox.v1`).
 
 ---
 
+## Usage
+
+Both crates are designed to be embedded — there is no standalone daemon or CLI
+binary.  The examples below show the two main integration patterns.
+
+### Direct API (`vmm-core`)
+
+```rust
+use std::sync::Arc;
+use vmm_core::{SandboxManager, SandboxSpec, VmmConfig};
+
+let manager = Arc::new(SandboxManager::new(VmmConfig::default())?);
+
+let (id, ip) = manager.create_sandbox(SandboxSpec {
+    vcpus: 1,
+    memory_mib: 512,
+    ..Default::default()
+}).await?;
+```
+
+### Embedding the gRPC services (`vmm-grpc`)
+
+```rust
+use std::sync::Arc;
+use vmm_core::{SandboxManager, VmmConfig};
+use vmm_grpc::{SandboxServiceImpl, SandboxSnapshotServiceImpl};
+use vmm_grpc::proto::sandbox::{
+    sandbox_service_server::SandboxServiceServer,
+    sandbox_snapshot_service_server::SandboxSnapshotServiceServer,
+};
+use tonic::transport::Server;
+
+let manager = Arc::new(SandboxManager::new(VmmConfig::default())?);
+
+Server::builder()
+    .add_service(SandboxServiceServer::new(
+        SandboxServiceImpl::new(Arc::clone(&manager))
+    ))
+    .add_service(SandboxSnapshotServiceServer::new(
+        SandboxSnapshotServiceImpl::new(Arc::clone(&manager))
+    ))
+    // add your own services here
+    .serve_with_incoming(incoming)
+    .await?;
+```
+
+---
+
+## Examples
+
+### `sandbox_lifecycle` — Direct API walkthrough
+
+[`vmm-core/examples/sandbox_lifecycle.rs`](vmm-core/examples/sandbox_lifecycle.rs)
+
+Demonstrates the full `SandboxManager` API without the gRPC layer:
+
+1. **Create** a sandbox (1 vCPU, 512 MiB)
+2. **Poll** until state transitions to `Ready`
+3. **Inspect** hardware and network details
+4. **List** all live sandboxes
+5. **Checkpoint** (pause → snapshot → resume)
+6. **Remove** the original sandbox
+7. **Restore** a new sandbox from the checkpoint
+8. **Cleanup** the restored sandbox
+
+```bash
+cargo run --example sandbox_lifecycle
+```
+
+### `serve` — Embedded gRPC server
+
+[`vmm-grpc/examples/serve.rs`](vmm-grpc/examples/serve.rs)
+
+Shows how to wire `SandboxServiceImpl` and `SandboxSnapshotServiceImpl` into a
+tonic server listening on a Unix socket.  This is the reference for embedding
+the sandbox services into a larger daemon (e.g. arcbox-vmm).
+
+```bash
+cargo run --example serve -- --unix-socket /tmp/vmm-test.sock
+```
+
+---
+
 ## Data Layout
 
 ### Direct mode
@@ -185,9 +260,8 @@ a self-contained [gRPC](https://grpc.io/) interface (`sandbox.v1`).
 
 ### Jailer mode
 
-Firecracker runs inside a chroot created by the jailer.  The daemon stages
-kernel and rootfs into the chroot before boot and removes the directory on
-sandbox removal.
+Firecracker runs inside a chroot created by the jailer.  Files are staged
+into the chroot before boot and removed on sandbox removal.
 
 ```
 {chroot_base_dir}/             # default: /srv/jailer
@@ -209,7 +283,7 @@ sandbox removal.
 ### Create flow
 
 ```
-vmm create
+SandboxManager::create_sandbox()
     │
     ├─ 1. NetworkManager.allocate()
     │      create TAP, assign IP, attach to bridge
@@ -236,7 +310,7 @@ vmm create
 ### Checkpoint flow
 
 ```
-vmm snapshot create <id>
+SandboxManager::checkpoint_sandbox()
     │
     ├─ 1. fc-sdk Vm.pause()
     │
@@ -260,7 +334,7 @@ vmm snapshot create <id>
 ### Restore flow
 
 ```
-vmm snapshot restore <snapshot-id> --network-override
+SandboxManager::restore_sandbox()
     │
     ├─ 1. NetworkManager.allocate()  (new TAP + IP for restored sandbox)
     │
@@ -300,7 +374,7 @@ vmm snapshot restore <snapshot-id> --network-override
 
 ## Configuration
 
-Default location: `/etc/firecracker-vmm/config.toml`
+`VmmConfig` can be loaded from a TOML file or constructed programmatically.
 
 ```toml
 [firecracker]
@@ -311,9 +385,6 @@ data_dir = "/var/lib/firecracker-vmm"
 log_level                 = "Warning"   # Error | Warning | Info | Debug | Trace
 no_seccomp                = false
 # seccomp_filter          = "/etc/fc-seccomp.bpf"
-# http_api_max_payload_size = 51200
-# mmds_size_limit           = 51200
-# socket_timeout_secs       = 5
 
 # Jailer sandbox (omit this section to run without jailer)
 # [firecracker.jailer]
@@ -333,61 +404,12 @@ cidr     = "172.20.0.0/16"
 gateway  = "172.20.0.1"
 dns      = ["1.1.1.1", "8.8.8.8"]
 
-[grpc]
-unix_socket = "/run/firecracker-vmm/vmm.sock"
-tcp_addr    = ""                        # empty = disabled
-
 [defaults]
 vcpus      = 1
 memory_mib = 512
 kernel     = "/var/lib/firecracker-vmm/kernels/vmlinux"
 rootfs     = "/var/lib/firecracker-vmm/images/ubuntu-22.04.ext4"
 boot_args  = "console=ttyS0 reboot=k panic=1 pci=off"
-```
-
----
-
-## Quick Start
-
-```bash
-# Start daemon
-vmm-daemon --config /etc/firecracker-vmm/config.toml
-
-# Create a sandbox (returns immediately; VM boots async)
-vmm create --vcpus 2 --memory 1024
-
-# Create with explicit kernel/rootfs
-vmm create --kernel /path/to/vmlinux --rootfs /path/to/root.ext4
-
-# Create with labels and 5-minute auto-destroy TTL
-vmm create --label env=dev --label owner=alice --ttl 300
-
-# List sandboxes
-vmm list
-
-# Filter by state
-vmm list --state ready
-
-# Inspect a sandbox
-vmm inspect <sandbox-id>
-
-# Watch live events
-vmm events
-
-# Watch events for a specific sandbox
-vmm events --id <sandbox-id>
-
-# Stop and remove
-vmm stop <sandbox-id>
-vmm remove <sandbox-id>
-vmm remove --force <sandbox-id>
-
-# Checkpoint management
-vmm snapshot create <sandbox-id> --name my-checkpoint
-vmm snapshot list
-vmm snapshot list --sandbox-id <sandbox-id>
-vmm snapshot restore <snapshot-id> --ttl 600
-vmm snapshot delete <snapshot-id>
 ```
 
 ---
@@ -418,11 +440,8 @@ rustup target add x86_64-unknown-linux-musl
 brew install FiloSottile/musl-cross/musl-cross   # macOS
 
 cargo build --target x86_64-unknown-linux-musl --release
-# output: target/x86_64-unknown-linux-musl/release/{vmm-daemon,vmm,vmm-guest-agent}
+# output: target/x86_64-unknown-linux-musl/release/vmm-guest-agent
 ```
-
-The resulting binaries are statically linked (no glibc dependency) and run
-on any Linux x86\_64 host.
 
 ### Test
 
@@ -430,8 +449,9 @@ on any Linux x86\_64 host.
 # Unit + integration (no Firecracker required)
 cargo test --workspace
 
-# e2e (requires firecracker binary + CAP_NET_ADMIN)
-cargo test --test e2e -- --ignored
+# Run examples (requires firecracker binary + CAP_NET_ADMIN)
+cargo run --example sandbox_lifecycle        # vmm-core: direct API
+cargo run --example serve                    # vmm-grpc: embedded gRPC server
 ```
 
 ### Lint
