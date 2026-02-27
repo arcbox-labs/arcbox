@@ -64,7 +64,7 @@ pub enum DockerError {
 impl DockerError {
     /// Returns the HTTP status code for this error.
     #[must_use]
-    pub fn status_code(&self) -> StatusCode {
+    pub const fn status_code(&self) -> StatusCode {
         match self {
             Self::Common(e) => Self::common_status_code(e),
             Self::ContainerNotFound(_)
@@ -79,17 +79,15 @@ impl DockerError {
         }
     }
 
-    /// Maps CommonError to HTTP status code.
-    fn common_status_code(err: &CommonError) -> StatusCode {
+    /// Maps `CommonError` to HTTP status code.
+    const fn common_status_code(err: &CommonError) -> StatusCode {
         match err {
-            CommonError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            CommonError::Config(_) => StatusCode::BAD_REQUEST,
+            CommonError::Config(_) | CommonError::InvalidState(_) => StatusCode::BAD_REQUEST,
             CommonError::NotFound(_) => StatusCode::NOT_FOUND,
             CommonError::AlreadyExists(_) => StatusCode::CONFLICT,
-            CommonError::InvalidState(_) => StatusCode::BAD_REQUEST,
             CommonError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             CommonError::PermissionDenied(_) => StatusCode::FORBIDDEN,
-            CommonError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            CommonError::Io(_) | CommonError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }

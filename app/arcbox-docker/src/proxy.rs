@@ -8,7 +8,7 @@ use crate::error::{DockerError, Result};
 use arcbox_core::Runtime;
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
-use axum::http::{HeaderMap, Method, Request, Response, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::client::conn::http1;
@@ -16,7 +16,6 @@ use hyper_util::rt::TokioIo;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -83,6 +82,8 @@ impl AsyncRead for RawFdStream {
                 if n < 0 {
                     Err(io::Error::last_os_error())
                 } else {
+                    // n >= 0 is enforced above.
+                    #[allow(clippy::cast_sign_loss)]
                     Ok(n as usize)
                 }
             }) {
@@ -90,9 +91,9 @@ impl AsyncRead for RawFdStream {
                     buf.advance(n);
                     return Poll::Ready(Ok(()));
                 }
-                Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {}
                 Ok(Err(e)) => return Poll::Ready(Err(e)),
-                Err(_would_block) => continue,
+                Err(_would_block) => {}
             }
         }
     }
@@ -113,13 +114,15 @@ impl AsyncWrite for RawFdStream {
                 if n < 0 {
                     Err(io::Error::last_os_error())
                 } else {
+                    // n >= 0 is enforced above.
+                    #[allow(clippy::cast_sign_loss)]
                     Ok(n as usize)
                 }
             }) {
                 Ok(Ok(n)) => return Poll::Ready(Ok(n)),
-                Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {}
                 Ok(Err(e)) => return Poll::Ready(Err(e)),
-                Err(_would_block) => continue,
+                Err(_would_block) => {}
             }
         }
     }
@@ -149,15 +152,15 @@ impl AsyncWrite for RawFdStream {
 // =============================================================================
 
 /// Opens a vsock connection to guest dockerd.
-async fn connect_guest(runtime: &Runtime) -> Result<TokioIo<RawFdStream>> {
+fn connect_guest(runtime: &Runtime) -> Result<TokioIo<RawFdStream>> {
     let port = runtime.guest_docker_vsock_port();
     let machine_name = runtime.default_machine_name();
     let fd = runtime
         .machine_manager()
         .connect_vsock_port(machine_name, port)
-        .map_err(|e| DockerError::Server(format!("failed to connect to guest docker: {}", e)))?;
+        .map_err(|e| DockerError::Server(format!("failed to connect to guest docker: {e}")))?;
     let stream = RawFdStream::from_raw_fd(fd)
-        .map_err(|e| DockerError::Server(format!("failed to create guest stream: {}", e)))?;
+        .map_err(|e| DockerError::Server(format!("failed to create guest stream: {e}")))?;
     Ok(TokioIo::new(stream))
 }
 
@@ -170,6 +173,11 @@ async fn connect_guest(runtime: &Runtime) -> Result<TokioIo<RawFdStream>> {
 /// Opens a new HTTP/1.1 connection over vsock for each request. The response
 /// body is streamed lazily, so this works for both fixed-length and chunked
 /// (streaming) responses like logs and events.
+///
+/// # Errors
+///
+/// Returns an error if guest connection, handshake, request forwarding,
+/// or response mapping fails.
 pub async fn proxy_to_guest(
     runtime: &Runtime,
     method: Method,
@@ -177,12 +185,12 @@ pub async fn proxy_to_guest(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>> {
-    let io = connect_guest(runtime).await?;
+    let io = connect_guest(runtime)?;
 
     let (mut sender, conn) = http1::Builder::new()
         .handshake(io)
         .await
-        .map_err(|e| DockerError::Server(format!("guest docker handshake failed: {}", e)))?;
+        .map_err(|e| DockerError::Server(format!("guest docker handshake failed: {e}")))?;
 
     tokio::spawn(async move {
         if let Err(e) = conn.await {
@@ -197,21 +205,21 @@ pub async fn proxy_to_guest(
         .method(method)
         .uri(path_and_query)
         .body(Full::new(body))
-        .map_err(|e| DockerError::Server(format!("failed to build guest request: {}", e)))?;
+        .map_err(|e| DockerError::Server(format!("failed to build guest request: {e}")))?;
 
     // Forward content-type so the guest dockerd can parse JSON bodies.
     if let Some(ct) = headers.get(header::CONTENT_TYPE) {
         req.headers_mut().insert(header::CONTENT_TYPE, ct.clone());
     }
     req.headers_mut()
-        .insert(header::HOST, "localhost".parse().unwrap());
+        .insert(header::HOST, HeaderValue::from_static("localhost"));
     req.headers_mut()
-        .insert(header::CONNECTION, "close".parse().unwrap());
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
 
     let response = sender
         .send_request(req)
         .await
-        .map_err(|e| DockerError::Server(format!("guest docker request failed: {}", e)))?;
+        .map_err(|e| DockerError::Server(format!("guest docker request failed: {e}")))?;
 
     let (parts, incoming) = response.into_parts();
     Ok(Response::from_parts(parts, Body::new(incoming)))
@@ -221,17 +229,22 @@ pub async fn proxy_to_guest(
 ///
 /// This is used by pass-through proxy paths so large uploads and streamed
 /// payloads are relayed directly instead of being collected in memory.
+///
+/// # Errors
+///
+/// Returns an error if guest connection, handshake, request forwarding,
+/// or response mapping fails.
 pub async fn proxy_to_guest_stream(
     runtime: &Runtime,
     original_uri: &Uri,
     req: Request<Body>,
 ) -> Result<Response<Body>> {
-    let io = connect_guest(runtime).await?;
+    let io = connect_guest(runtime)?;
 
     let (mut sender, conn) = http1::Builder::new()
         .handshake(io)
         .await
-        .map_err(|e| DockerError::Server(format!("guest docker handshake failed: {}", e)))?;
+        .map_err(|e| DockerError::Server(format!("guest docker handshake failed: {e}")))?;
 
     tokio::spawn(async move {
         if let Err(e) = conn.await {
@@ -244,8 +257,7 @@ pub async fn proxy_to_guest_stream(
 
     let path_and_query = original_uri
         .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+        .map_or("/", hyper::http::uri::PathAndQuery::as_str);
     let method = req.method().clone();
     let content_type = req.headers().get(header::CONTENT_TYPE).cloned();
     let body = req.into_body();
@@ -254,22 +266,22 @@ pub async fn proxy_to_guest_stream(
         .method(method)
         .uri(path_and_query)
         .body(body)
-        .map_err(|e| DockerError::Server(format!("failed to build guest request: {}", e)))?;
+        .map_err(|e| DockerError::Server(format!("failed to build guest request: {e}")))?;
 
     if let Some(ct) = content_type {
         guest_req.headers_mut().insert(header::CONTENT_TYPE, ct);
     }
     guest_req
         .headers_mut()
-        .insert(header::HOST, "localhost".parse().unwrap());
+        .insert(header::HOST, HeaderValue::from_static("localhost"));
     guest_req
         .headers_mut()
-        .insert(header::CONNECTION, "close".parse().unwrap());
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
 
     let response = sender
         .send_request(guest_req)
         .await
-        .map_err(|e| DockerError::Server(format!("guest docker request failed: {}", e)))?;
+        .map_err(|e| DockerError::Server(format!("guest docker request failed: {e}")))?;
 
     let (parts, incoming) = response.into_parts();
     Ok(Response::from_parts(parts, Body::new(incoming)))
@@ -280,17 +292,22 @@ pub async fn proxy_to_guest_stream(
 /// Used for attach and exec endpoints that use HTTP upgrade (101 Switching
 /// Protocols) for bidirectional streaming. After the upgrade, client and
 /// guest streams are bridged via `copy_bidirectional`.
+///
+/// # Errors
+///
+/// Returns an error if guest connection, handshake, request forwarding,
+/// or response construction fails.
 pub async fn proxy_with_upgrade(
     runtime: &Runtime,
     mut client_req: axum::http::Request<Body>,
     original_uri: &Uri,
 ) -> Result<Response<Body>> {
-    let io = connect_guest(runtime).await?;
+    let io = connect_guest(runtime)?;
 
     let (mut sender, conn) = http1::Builder::new()
         .handshake(io)
         .await
-        .map_err(|e| DockerError::Server(format!("guest docker handshake failed: {}", e)))?;
+        .map_err(|e| DockerError::Server(format!("guest docker handshake failed: {e}")))?;
 
     // The connection task must keep running for the upgrade to work.
     tokio::spawn(async move {
@@ -304,15 +321,14 @@ pub async fn proxy_with_upgrade(
 
     let path_and_query = original_uri
         .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+        .map_or("/", hyper::http::uri::PathAndQuery::as_str);
     let req_body = std::mem::take(client_req.body_mut());
 
     let mut guest_req = hyper::Request::builder()
         .method(client_req.method())
         .uri(path_and_query)
         .body(req_body)
-        .map_err(|e| DockerError::Server(format!("failed to build guest request: {}", e)))?;
+        .map_err(|e| DockerError::Server(format!("failed to build guest request: {e}")))?;
 
     // Forward all headers except Host.
     for (key, value) in client_req.headers() {
@@ -322,12 +338,12 @@ pub async fn proxy_with_upgrade(
     }
     guest_req
         .headers_mut()
-        .insert(header::HOST, "localhost".parse().unwrap());
+        .insert(header::HOST, HeaderValue::from_static("localhost"));
 
     let guest_response = sender
         .send_request(guest_req)
         .await
-        .map_err(|e| DockerError::Server(format!("guest docker request failed: {}", e)))?;
+        .map_err(|e| DockerError::Server(format!("guest docker request failed: {e}")))?;
 
     if guest_response.status() != StatusCode::SWITCHING_PROTOCOLS {
         // Guest didn't upgrade — return its response as-is.
@@ -351,7 +367,9 @@ pub async fn proxy_with_upgrade(
         builder = builder.header(header::CONTENT_TYPE, ct);
     }
 
-    let response = builder.body(Body::empty()).unwrap();
+    let response = builder
+        .body(Body::empty())
+        .map_err(|e| DockerError::Server(format!("failed to build upgrade response: {e}")))?;
 
     // Bridge upgraded connections in background.
     tokio::spawn(async move {
@@ -383,6 +401,10 @@ pub async fn proxy_with_upgrade(
 ///
 /// Ensures forward compatibility with newer Docker API versions — any endpoint
 /// we don't explicitly handle gets forwarded transparently.
+///
+/// # Errors
+///
+/// Returns an error if VM readiness fails or guest proxying fails.
 pub async fn proxy_fallback(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -392,7 +414,7 @@ pub async fn proxy_fallback(
         .runtime
         .ensure_vm_ready()
         .await
-        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {}", e)))?;
+        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {e}")))?;
 
     // Detect upgrade requests (attach, exec).
     let wants_upgrade = req.headers().get(header::UPGRADE).is_some()
@@ -400,7 +422,7 @@ pub async fn proxy_fallback(
             .headers()
             .get(header::CONNECTION)
             .and_then(|v| v.to_str().ok())
-            .map_or(false, |v| v.to_ascii_lowercase().contains("upgrade"));
+            .is_some_and(|v| v.to_ascii_lowercase().contains("upgrade"));
 
     if wants_upgrade {
         return proxy_with_upgrade(&state.runtime, req, &uri).await;
@@ -426,6 +448,7 @@ pub struct PortBindingInfo {
 ///
 /// Extracts `NetworkSettings.Ports` and `HostConfig.PortBindings` into a flat
 /// list of `PortBindingInfo` structs suitable for port forwarding setup.
+#[must_use]
 pub fn parse_port_bindings(inspect_json: &[u8]) -> Vec<PortBindingInfo> {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(inspect_json) else {
         return vec![];
@@ -444,22 +467,20 @@ pub fn parse_port_bindings(inspect_json: &[u8]) -> Vec<PortBindingInfo> {
 
     for (container_port_proto, host_bindings) in ports {
         // Parse "80/tcp" or "53/udp"
-        let (container_port, protocol) = match container_port_proto.split_once('/') {
-            Some((port_str, proto)) => {
+        let (container_port, protocol) =
+            if let Some((port_str, proto)) = container_port_proto.split_once('/') {
                 let port: u16 = match port_str.parse() {
                     Ok(p) => p,
                     Err(_) => continue,
                 };
                 (port, proto.to_string())
-            }
-            None => {
+            } else {
                 let port: u16 = match container_port_proto.parse() {
                     Ok(p) => p,
                     Err(_) => continue,
                 };
                 (port, "tcp".to_string())
-            }
-        };
+            };
 
         let Some(bindings_arr) = host_bindings.as_array() else {
             continue;

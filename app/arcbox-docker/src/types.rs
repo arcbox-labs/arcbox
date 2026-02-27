@@ -1,7 +1,7 @@
 //! Docker API types.
 //!
 //! Types defined according to Docker Engine API v1.43 specification.
-//! See: https://docs.docker.com/engine/api/v1.43/
+//! See: <https://docs.docker.com/engine/api/v1.43>/
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -140,6 +140,7 @@ pub struct ContainerCreateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attach_stderr: Option<bool>,
     /// Exposed ports.
+    #[allow(clippy::zero_sized_map_values)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exposed_ports: Option<HashMap<String, HashMap<(), ()>>>,
     /// TTY allocation.
@@ -160,6 +161,7 @@ pub struct ContainerCreateRequest {
     /// Image name.
     pub image: String,
     /// Volumes.
+    #[allow(clippy::zero_sized_map_values)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volumes: Option<HashMap<String, HashMap<(), ()>>>,
     /// Working directory.
@@ -308,6 +310,7 @@ pub struct ContainerInspectResponse {
 }
 
 /// Container state.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ContainerState {
@@ -470,6 +473,7 @@ pub struct ExecStartRequest {
 }
 
 /// Exec inspect response.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ExecInspectResponse {
@@ -589,6 +593,7 @@ pub struct ImageDeleteResponse {
 // ============================================================================
 
 /// Network summary.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct NetworkSummary {

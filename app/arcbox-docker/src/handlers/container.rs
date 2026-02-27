@@ -25,6 +25,10 @@ crate::handlers::proxy_handler!(restart_container);
 crate::handlers::proxy_handler!(remove_container);
 
 /// Attach to a container.
+///
+/// # Errors
+///
+/// Returns an error if upgrade proxying to guest dockerd fails.
 pub async fn attach_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,

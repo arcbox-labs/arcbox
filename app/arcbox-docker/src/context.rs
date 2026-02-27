@@ -108,7 +108,7 @@ impl DockerContextManager {
 
     /// Creates a new context manager with a custom Docker config directory.
     #[must_use]
-    pub fn with_config_dir(socket_path: PathBuf, docker_config_dir: PathBuf) -> Self {
+    pub const fn with_config_dir(socket_path: PathBuf, docker_config_dir: PathBuf) -> Self {
         Self {
             socket_path,
             docker_config_dir,
@@ -134,12 +134,20 @@ impl DockerContextManager {
     }
 
     /// Checks if `ArcBox` is the current default context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Docker config cannot be read or parsed.
     pub fn is_default(&self) -> Result<bool> {
         let config = self.read_docker_config()?;
         Ok(config.current_context.as_deref() == Some(ARCBOX_CONTEXT_NAME))
     }
 
     /// Gets the current default context name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Docker config cannot be read or parsed.
     pub fn current_context(&self) -> Result<Option<String>> {
         let config = self.read_docker_config()?;
         Ok(config.current_context)
@@ -258,15 +266,16 @@ impl DockerContextManager {
         let mut config = self.read_docker_config()?;
 
         // Restore previous context (or clear if there was none).
-        config.current_context = previous.clone();
+        config.current_context.clone_from(&previous);
         self.write_docker_config(&config)?;
 
         // Clean up saved previous context.
         let _ = fs::remove_file(self.previous_context_path());
 
-        match previous {
-            Some(name) => info!("Restored default Docker context to '{name}'"),
-            None => info!("Cleared default Docker context"),
+        if let Some(name) = previous {
+            info!("Restored default Docker context to '{name}'");
+        } else {
+            info!("Cleared default Docker context");
         }
 
         Ok(())

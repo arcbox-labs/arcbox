@@ -34,11 +34,10 @@ pub async fn trace_id_middleware(mut request: Request, next: Next) -> Response {
         .get(TRACE_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), String::from);
 
     // Record in tracing for structured logs.
-    tracing::Span::current().record("trace_id", &trace_id.as_str());
+    tracing::Span::current().record("trace_id", trace_id.as_str());
     tracing::debug!(trace_id = %trace_id, method = %request.method(), uri = %request.uri(), "request");
 
     // Store in request extensions so handlers can access it.

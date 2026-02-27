@@ -11,6 +11,10 @@ crate::handlers::proxy_handler!(exec_resize);
 crate::handlers::proxy_handler!(exec_inspect);
 
 /// Start exec instance (proxy + upgrade for interactive mode).
+///
+/// # Errors
+///
+/// Returns an error if upgrade proxying or request proxying fails.
 pub async fn exec_start(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,

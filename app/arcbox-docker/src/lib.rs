@@ -1,9 +1,9 @@
 //! # arcbox-docker
 //!
-//! Docker REST API compatibility layer for ArcBox.
+//! Docker REST API compatibility layer for `ArcBox`.
 //!
 //! This crate provides a Docker-compatible API server that allows existing
-//! Docker CLI tools to work with ArcBox seamlessly.
+//! Docker CLI tools to work with `ArcBox` seamlessly.
 //!
 //! ## Compatibility
 //!
@@ -37,14 +37,6 @@
 
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 #![allow(clippy::module_name_repetitions)]
-// Docker API compatibility layer has many fields matching Docker spec.
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-#![allow(clippy::all)]
-#![allow(clippy::pedantic)]
-#![allow(clippy::nursery)]
 
 pub mod api;
 pub mod context;
@@ -53,6 +45,8 @@ pub mod handlers;
 pub mod proxy;
 pub mod server;
 pub mod trace;
+// Docker API compatibility layer contains many spec fields only serialized/deserialized.
+#[allow(dead_code)]
 pub mod types;
 
 pub use context::{ContextStatus, DockerContextManager};

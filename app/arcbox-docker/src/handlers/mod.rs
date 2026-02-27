@@ -11,10 +11,13 @@ use axum::body::Body;
 use axum::http::{Request, Uri};
 use axum::response::Response;
 
-pub(crate) const HOOK_BUFFER_LIMIT_BYTES: usize = 10 * 1024 * 1024;
-
 macro_rules! proxy_handler {
     ($name:ident) => {
+        /// Forwards the request to guest dockerd.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if VM readiness fails or proxying to guest dockerd fails.
         pub async fn $name(
             axum::extract::State(state): axum::extract::State<crate::api::AppState>,
             axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
@@ -33,7 +36,7 @@ pub(crate) async fn proxy(state: &AppState, uri: &Uri, req: Request<Body>) -> Re
         .runtime
         .ensure_vm_ready()
         .await
-        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {}", e)))?;
+        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {e}")))?;
     proxy::proxy_to_guest_stream(&state.runtime, uri, req).await
 }
 
@@ -47,7 +50,7 @@ pub(crate) async fn proxy_upgrade(
         .runtime
         .ensure_vm_ready()
         .await
-        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {}", e)))?;
+        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {e}")))?;
     proxy::proxy_with_upgrade(&state.runtime, req, uri).await
 }
 

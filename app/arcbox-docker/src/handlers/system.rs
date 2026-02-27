@@ -47,14 +47,14 @@ pub async fn ping() -> &'static str {
 
 fn num_cpus() -> i64 {
     std::thread::available_parallelism()
-        .map(|n| n.get() as i64)
+        .map(|n| i64::try_from(n.get()).unwrap_or(i64::MAX))
         .unwrap_or(1)
 }
 
 fn total_memory() -> i64 {
     use sysinfo::System;
     let sys = System::new_all();
-    sys.total_memory() as i64
+    i64::try_from(sys.total_memory()).unwrap_or(i64::MAX)
 }
 
 fn hostname() -> String {

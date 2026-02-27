@@ -43,7 +43,7 @@ pub struct DockerApiServer {
 impl DockerApiServer {
     /// Creates a new Docker API server.
     #[must_use]
-    pub fn new(config: ServerConfig, runtime: Arc<Runtime>) -> Self {
+    pub const fn new(config: ServerConfig, runtime: Arc<Runtime>) -> Self {
         Self { config, runtime }
     }
 

@@ -1,7 +1,7 @@
 //! Docker API router.
 //!
 //! Implements Docker Engine API v1.43 routing.
-//! See: https://docs.docker.com/engine/api/v1.43/
+//! See: <https://docs.docker.com/engine/api/v1.43>/
 
 use crate::handlers;
 use crate::proxy;
@@ -16,12 +16,11 @@ use std::sync::Arc;
 /// Application state shared with handlers.
 #[derive(Clone)]
 pub struct AppState {
-    /// ArcBox runtime.
+    /// `ArcBox` runtime.
     pub runtime: Arc<Runtime>,
 }
 
 /// Creates the Docker API router with all endpoints.
-#[must_use]
 pub fn create_router(runtime: Arc<Runtime>) -> Router {
     let state = AppState { runtime };
 
