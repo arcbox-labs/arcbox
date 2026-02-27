@@ -48,6 +48,13 @@ arcbox docker disable
 - Docker CLI installed (ArcBox replaces the Docker engine, not the CLI)
 - ~500 MB disk space (runtime + boot assets)
 
+## Architecture
+
+ArcBox ships as two binaries:
+
+- `arcbox`: thin CLI for machine management, daemon lifecycle, boot assets, Docker integration, and DNS helpers
+- `arcbox-daemon`: long-running daemon process that owns runtime state and serves Docker API + gRPC
+
 ## What Works Today
 
 ArcBox can already serve as a drop-in Docker engine for common workflows:
@@ -107,14 +114,17 @@ git clone https://github.com/arcboxd/arcbox.git
 cd arcbox
 
 # Build
-cargo build --release
+cargo build --release -p arcbox-cli -p arcbox-daemon
 
 # Sign (required for macOS virtualization)
 codesign --entitlements tests/resources/entitlements.plist --force -s - \
     target/release/arcbox
+codesign --entitlements tests/resources/entitlements.plist --force -s - \
+    target/release/arcbox-daemon
 
 # Run
 ./target/release/arcbox --help
+./target/release/arcbox-daemon --help
 ```
 
 ### Build Requirements
@@ -139,6 +149,7 @@ arcbox docker disable
 # Remove ArcBox files
 rm -rf ~/.arcbox
 rm /usr/local/bin/arcbox
+rm /usr/local/bin/arcbox-daemon
 
 # Remove the launchd service (if installed)
 launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/dev.arcbox.daemon.plist
