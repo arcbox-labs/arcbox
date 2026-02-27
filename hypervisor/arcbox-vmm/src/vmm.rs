@@ -7,6 +7,7 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::device::DeviceManager;
 #[cfg(target_os = "linux")]
@@ -834,6 +835,34 @@ impl Vmm {
             }
         }
         Ok(())
+    }
+
+    /// Requests graceful guest shutdown via ACPI and waits for it to stop.
+    ///
+    /// Returns `Ok(true)` if the VM stopped, `Ok(false)` on timeout or when
+    /// graceful stop is unavailable.
+    #[cfg(target_os = "macos")]
+    pub fn request_stop(&self, timeout: Duration) -> Result<bool> {
+        use arcbox_hypervisor::darwin::DarwinVm;
+
+        if self.state != VmmState::Running {
+            return Ok(false);
+        }
+
+        let vm = self
+            .managed_vm
+            .as_ref()
+            .and_then(|managed_vm| managed_vm.downcast_ref::<DarwinVm>())
+            .ok_or_else(|| VmmError::invalid_state("no managed DarwinVm".to_string()))?;
+
+        vm.request_stop_and_wait(timeout)
+            .map_err(VmmError::Hypervisor)
+    }
+
+    /// Requests graceful stop on non-macOS platforms.
+    #[cfg(not(target_os = "macos"))]
+    pub fn request_stop(&self, _timeout: Duration) -> Result<bool> {
+        Ok(false)
     }
 
     /// Connects to a vsock port on the guest VM.

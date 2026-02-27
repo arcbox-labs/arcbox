@@ -300,6 +300,38 @@ impl DarwinVm {
         }
     }
 
+    /// Sends ACPI power button to guest and waits for shutdown.
+    ///
+    /// Returns `Ok(true)` if the VM reached `Stopped`, `Ok(false)` if graceful
+    /// shutdown is unsupported or did not complete within `timeout`.
+    pub fn request_stop_and_wait(&self, timeout: Duration) -> Result<bool, HypervisorError> {
+        let vm = self
+            .vz_vm
+            .as_ref()
+            .ok_or_else(|| HypervisorError::VmError("No VZ VM instance".to_string()))?;
+
+        if !vm.can_request_stop() {
+            tracing::debug!("VM {} cannot request graceful stop", self.id);
+            return Ok(false);
+        }
+
+        vm.request_stop()
+            .map_err(|e| HypervisorError::VmError(format!("Failed to request VM stop: {}", e)))?;
+
+        match self.wait_for_state(VirtualMachineState::Stopped, timeout) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                tracing::warn!(
+                    "VM {} did not stop gracefully within {:?}: {}",
+                    self.id,
+                    timeout,
+                    e
+                );
+                Ok(false)
+            }
+        }
+    }
+
     /// Reads available console output from the PTY.
     ///
     /// Returns the output as a String. Returns an empty string if no output
