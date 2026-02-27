@@ -36,6 +36,7 @@ members = [
     "app/arcbox-api",
     "app/arcbox-docker",
     "app/arcbox-cli",
+    "app/arcbox-daemon",
     "app/arcbox",
 
     # ============================================

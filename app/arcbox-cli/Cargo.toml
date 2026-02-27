@@ -17,7 +17,6 @@ name = "arcbox"
 path = "src/main.rs"
 
 [dependencies]
-arcbox-api = { workspace = true }
 arcbox-core = { workspace = true }
 arcbox-docker = { workspace = true }
 arcbox-grpc = { workspace = true }
@@ -25,7 +24,6 @@ arcbox-protocol = { workspace = true }
 tonic = { workspace = true }
 tower = "0.5"
 hyper-util = "0.1"
-tokio-stream = { version = "0.1", features = ["net"] }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -172,14 +172,3 @@ fn is_dns_port_reachable(port: u16) -> bool {
     let mut buf = [0u8; 512];
     socket.recv_from(&mut buf).is_ok()
 }
-
-/// Checks whether the DNS resolver is installed and prints a hint if not.
-///
-/// Called from daemon startup to remind users to install the resolver.
-pub fn check_resolver_installed() {
-    let resolver = FileResolver::new(PREFIX);
-    let domain = dns_domain();
-    if !resolver.is_registered(&domain) {
-        println!("Hint: Run 'sudo arcbox dns install' to enable *.{domain} DNS resolution.");
-    }
-}

@@ -166,7 +166,6 @@ name = "arcbox-cli"
 version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
- "arcbox-api",
  "arcbox-core",
  "arcbox-docker",
  "arcbox-grpc",
@@ -182,7 +181,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-stream",
  "tonic",
  "tower 0.5.3",
  "tracing",
@@ -236,6 +234,25 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "arcbox-daemon"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "anyhow",
+ "arcbox-api",
+ "arcbox-core",
+ "arcbox-docker",
+ "clap",
+ "dirs",
+ "libc",
+ "macos-resolver",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

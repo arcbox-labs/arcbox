@@ -1,0 +1,28 @@
+[package]
+name = "arcbox-daemon"
+description = "ArcBox daemon process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "arcbox-daemon"
+path = "src/main.rs"
+
+[dependencies]
+arcbox-api = { workspace = true }
+arcbox-core = { workspace = true }
+arcbox-docker = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+dirs = { workspace = true }
+macos-resolver = { workspace = true }
+libc = { workspace = true }

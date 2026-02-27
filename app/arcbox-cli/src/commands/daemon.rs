@@ -1,27 +1,20 @@
 //! Daemon command implementation.
 //!
-//! Starts the ArcBox daemon which provides:
-//! - Docker-compatible REST API on a Unix socket
-//! - gRPC API on a Unix socket (for desktop/GUI clients)
-//! - VM and container lifecycle management
-//! - Image management
+//! This command controls the lifecycle of the `arcbox-daemon` binary:
+//! - start in background (default)
+//! - run in foreground (`--foreground`)
+//! - stop a running daemon (`arcbox daemon stop`)
 
 use anyhow::{Context, Result, bail};
-use arcbox_api::{MachineServiceImpl, machine_service_server::MachineServiceServer};
-use arcbox_core::{Config, ContainerProvisionMode, Runtime};
-use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
 use clap::{Args, ValueEnum};
 use std::ffi::OsString;
 use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UnixListener;
-use tokio::signal;
-use tokio_stream::wrappers::UnixListenerStream;
-use tonic::transport::Server;
-use tracing::{info, warn};
+use tracing::warn;
 
 /// Arguments for the daemon command.
 #[derive(Debug, Args)]
@@ -80,11 +73,11 @@ pub enum ContainerProvisionArg {
     DistroEngine,
 }
 
-impl From<ContainerProvisionArg> for ContainerProvisionMode {
-    fn from(value: ContainerProvisionArg) -> Self {
-        match value {
-            ContainerProvisionArg::BundledAssets => Self::BundledAssets,
-            ContainerProvisionArg::DistroEngine => Self::DistroEngine,
+impl ContainerProvisionArg {
+    fn as_arg_value(self) -> &'static str {
+        match self {
+            Self::BundledAssets => "bundled-assets",
+            Self::DistroEngine => "distro-engine",
         }
     }
 }
@@ -95,164 +88,42 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
         return execute_stop(&args);
     }
 
-    if !args.foreground {
-        return spawn_background(&args);
+    if args.foreground {
+        return exec_foreground(&args);
     }
 
-    info!("Starting ArcBox daemon...");
+    spawn_background(&args)
+}
 
-    // Determine data directory.
-    let data_dir = resolve_data_dir(args.data_dir.as_ref());
-    let pid_file = data_dir.join("daemon.pid");
-    std::fs::create_dir_all(&data_dir).context("Failed to create data directory")?;
-    std::fs::write(&pid_file, format!("{}\n", std::process::id()))
-        .context("Failed to write daemon PID file")?;
-    let socket_path = args.socket.unwrap_or_else(|| data_dir.join("docker.sock"));
+fn exec_foreground(args: &DaemonArgs) -> Result<()> {
+    let daemon_binary = resolve_daemon_binary()?;
+    let daemon_args = build_daemon_args(args, true);
 
-    // Determine gRPC socket path (defaults to same directory as data_dir).
-    let grpc_socket = args
-        .grpc_socket
-        .unwrap_or_else(|| data_dir.join("arcbox.sock"));
-
-    // Create configuration.
-    let mut config = Config {
-        data_dir: data_dir.clone(),
-        ..Default::default()
-    };
-    if let Some(mode) = args.container_provision {
-        config.container.provision = mode.into();
-    }
-    if let Some(port) = args.guest_docker_vsock_port {
-        config.container.guest_docker_vsock_port = port;
-    }
-    let selected_provision = config.container.provision;
-    let selected_guest_docker_port = config.container.guest_docker_vsock_port;
-
-    // Build VM lifecycle config with custom kernel/initramfs if provided.
-    let mut vm_lifecycle_config = arcbox_core::VmLifecycleConfig::default();
-
-    // Propagate config.vm to VM lifecycle defaults.
-    vm_lifecycle_config.default_vm.cpus = config.vm.cpus;
-    vm_lifecycle_config.default_vm.memory_mb = config.vm.memory_mb;
-    if let Some(ref kernel) = config.vm.kernel_path {
-        vm_lifecycle_config.default_vm.kernel = Some(kernel.clone());
-    }
-    if let Some(ref initrd) = config.vm.initrd_path {
-        vm_lifecycle_config.default_vm.initramfs = Some(initrd.clone());
+    #[cfg(unix)]
+    {
+        let err = Command::new(&daemon_binary).args(&daemon_args).exec();
+        Err(anyhow::Error::from(err)).with_context(|| {
+            format!(
+                "Failed to exec daemon binary at {}",
+                daemon_binary.display()
+            )
+        })
     }
 
-    // CLI args override config file values.
-    if let Some(kernel) = args.kernel {
-        vm_lifecycle_config.default_vm.kernel = Some(kernel);
-    }
-    if let Some(initramfs) = args.initramfs {
-        vm_lifecycle_config.default_vm.initramfs = Some(initramfs);
-    }
-
-    // Initialize runtime with custom VM lifecycle config.
-    let runtime = Arc::new(
-        Runtime::with_vm_lifecycle_config(config, vm_lifecycle_config)
-            .context("Failed to create runtime")?,
-    );
-    runtime
-        .init()
-        .await
-        .context("Failed to initialize runtime")?;
-
-    info!(
-        data_dir = %data_dir.display(),
-        provision = ?selected_provision,
-        guest_docker_vsock_port = selected_guest_docker_port,
-        "Runtime initialized"
-    );
-
-    // Configure Docker API server.
-    let server_config = ServerConfig {
-        socket_path: socket_path.clone(),
-    };
-
-    let docker_server = DockerApiServer::new(server_config, Arc::clone(&runtime));
-
-    // Start Docker API server in background.
-    let docker_handle = tokio::spawn(async move {
-        if let Err(e) = docker_server.run().await {
-            tracing::error!("Docker API server error: {}", e);
-        }
-    });
-
-    // Start gRPC server on Unix socket.
-    let grpc_handle = start_grpc_server(Arc::clone(&runtime), grpc_socket.clone()).await?;
-
-    // Enable Docker CLI integration if requested.
-    if args.docker_integration {
-        match DockerContextManager::new(socket_path.clone()) {
-            Ok(ctx_manager) => {
-                if let Err(e) = ctx_manager.enable() {
-                    warn!("Failed to enable Docker integration: {}", e);
-                } else {
-                    info!("Docker CLI integration enabled");
-                }
-            }
-            Err(e) => {
-                warn!("Failed to create Docker context manager: {}", e);
-            }
+    #[cfg(not(unix))]
+    {
+        let status = Command::new(&daemon_binary)
+            .args(&daemon_args)
+            .status()
+            .with_context(|| {
+                format!("Failed to run daemon binary at {}", daemon_binary.display())
+            })?;
+        if status.success() {
+            Ok(())
+        } else {
+            bail!("Daemon exited with status {}", status);
         }
     }
-
-    // Check DNS resolver status.
-    super::dns::check_resolver_installed();
-
-    // Print startup info.
-    println!("ArcBox daemon started");
-    println!("  Docker API: {}", socket_path.display());
-    println!("  gRPC API:   {}", grpc_socket.display());
-    println!("  Data:       {}", data_dir.display());
-    println!();
-    println!("Use 'arcbox docker enable' to configure Docker CLI integration.");
-    println!("Press Ctrl+C to stop.");
-
-    // Wait for shutdown signal.
-    shutdown_signal().await;
-    info!("Shutdown signal received");
-
-    // Cleanup.
-    info!("Shutting down...");
-
-    // Abort server tasks.
-    docker_handle.abort();
-    grpc_handle.abort();
-
-    runtime
-        .shutdown()
-        .await
-        .context("Failed to shutdown runtime")?;
-
-    let socket_path_clone = socket_path.clone();
-
-    // Disable Docker integration if it was enabled.
-    if args.docker_integration {
-        if let Ok(ctx_manager) = DockerContextManager::new(socket_path) {
-            let _ = ctx_manager.disable();
-        }
-    }
-
-    // Clean up socket files.
-    for path in [&socket_path_clone, &grpc_socket] {
-        if let Err(e) = std::fs::remove_file(path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!("Failed to remove socket {}: {}", path.display(), e);
-            }
-        }
-    }
-
-    if let Err(e) = std::fs::remove_file(&pid_file) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            warn!("Failed to remove PID file {}: {}", pid_file.display(), e);
-        }
-    }
-
-    info!("ArcBox daemon stopped");
-    Ok(())
 }
 
 fn execute_stop(args: &DaemonArgs) -> Result<()> {
@@ -305,6 +176,9 @@ fn spawn_background(args: &DaemonArgs) -> Result<()> {
         let _ = std::fs::remove_file(&pid_file);
     }
 
+    let daemon_binary = resolve_daemon_binary()?;
+    let daemon_args = build_daemon_args(args, true);
+
     let stdout_log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -316,17 +190,18 @@ fn spawn_background(args: &DaemonArgs) -> Result<()> {
         .open(&stderr_path)
         .context("Failed to open daemon stderr log file")?;
 
-    let mut child_args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    child_args.push(OsString::from("--foreground"));
-
-    let current_exe = std::env::current_exe().context("Failed to resolve current executable")?;
-    let child = Command::new(current_exe)
-        .args(child_args)
+    let child = Command::new(&daemon_binary)
+        .args(&daemon_args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_log))
         .stderr(Stdio::from(stderr_log))
         .spawn()
-        .context("Failed to launch ArcBox daemon in background")?;
+        .with_context(|| {
+            format!(
+                "Failed to launch ArcBox daemon binary at {}",
+                daemon_binary.display()
+            )
+        })?;
 
     std::fs::write(&pid_file, format!("{}\n", child.id()))
         .context("Failed to write daemon PID file")?;
@@ -336,6 +211,71 @@ fn spawn_background(args: &DaemonArgs) -> Result<()> {
     println!("  Stdout:   {}", stdout_path.display());
     println!("  Stderr:   {}", stderr_path.display());
     Ok(())
+}
+
+fn resolve_daemon_binary() -> Result<PathBuf> {
+    let current_exe = std::env::current_exe().context("Failed to resolve current executable")?;
+
+    if let Some(parent) = current_exe.parent() {
+        let sibling = parent.join("arcbox-daemon");
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+    }
+
+    if let Some(path) = find_in_path("arcbox-daemon") {
+        return Ok(path);
+    }
+
+    bail!("Failed to locate `arcbox-daemon` next to `arcbox` or in PATH");
+}
+
+fn find_in_path(binary: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|entry| entry.join(binary))
+        .find(|candidate| candidate.is_file())
+}
+
+fn build_daemon_args(args: &DaemonArgs, foreground: bool) -> Vec<OsString> {
+    let mut daemon_args = Vec::new();
+
+    if let Some(socket) = &args.socket {
+        daemon_args.push(OsString::from("--socket"));
+        daemon_args.push(socket.as_os_str().to_os_string());
+    }
+    if let Some(grpc_socket) = &args.grpc_socket {
+        daemon_args.push(OsString::from("--grpc-socket"));
+        daemon_args.push(grpc_socket.as_os_str().to_os_string());
+    }
+    if let Some(data_dir) = &args.data_dir {
+        daemon_args.push(OsString::from("--data-dir"));
+        daemon_args.push(data_dir.as_os_str().to_os_string());
+    }
+    if let Some(kernel) = &args.kernel {
+        daemon_args.push(OsString::from("--kernel"));
+        daemon_args.push(kernel.as_os_str().to_os_string());
+    }
+    if let Some(initramfs) = &args.initramfs {
+        daemon_args.push(OsString::from("--initramfs"));
+        daemon_args.push(initramfs.as_os_str().to_os_string());
+    }
+    if args.docker_integration {
+        daemon_args.push(OsString::from("--docker-integration"));
+    }
+    if let Some(mode) = args.container_provision {
+        daemon_args.push(OsString::from("--container-provision"));
+        daemon_args.push(OsString::from(mode.as_arg_value()));
+    }
+    if let Some(port) = args.guest_docker_vsock_port {
+        daemon_args.push(OsString::from("--guest-docker-vsock-port"));
+        daemon_args.push(OsString::from(port.to_string()));
+    }
+    if foreground {
+        daemon_args.push(OsString::from("--foreground"));
+    }
+
+    daemon_args
 }
 
 fn resolve_data_dir(data_dir: Option<&PathBuf>) -> PathBuf {
@@ -425,70 +365,5 @@ mod tests {
         let pid = read_pid_file(&pid_file).expect("read_pid_file should succeed");
         assert_eq!(pid, None);
         assert!(!pid_file.exists());
-    }
-}
-
-/// Starts the gRPC server on a Unix socket.
-async fn start_grpc_server(
-    runtime: Arc<Runtime>,
-    socket_path: PathBuf,
-) -> Result<tokio::task::JoinHandle<()>> {
-    // Remove existing socket file.
-    let _ = std::fs::remove_file(&socket_path);
-
-    // Create parent directory if needed.
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).context("Failed to create socket directory")?;
-    }
-
-    // Bind Unix socket.
-    let listener = UnixListener::bind(&socket_path).context(format!(
-        "Failed to bind gRPC socket: {}",
-        socket_path.display()
-    ))?;
-    let incoming = UnixListenerStream::new(listener);
-
-    info!(socket = %socket_path.display(), "gRPC server listening");
-
-    // Create gRPC services.
-    let machine_service = MachineServiceImpl::new(Arc::clone(&runtime));
-
-    // Build and run gRPC server.
-    let handle = tokio::spawn(async move {
-        let result = Server::builder()
-            .add_service(MachineServiceServer::new(machine_service))
-            .serve_with_incoming(incoming)
-            .await;
-
-        if let Err(e) = result {
-            tracing::error!("gRPC server error: {}", e);
-        }
-    });
-
-    Ok(handle)
-}
-
-/// Waits for a shutdown signal (Ctrl+C or SIGTERM).
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
     }
 }
