@@ -31,7 +31,7 @@ arcbox-hypervisor / arcbox-vz (platform virtualization)
 - Uses Apple's Virtualization.framework (not KVM)
 - **All VM-related binaries require code signing:**
   ```bash
-  codesign --entitlements tests/resources/entitlements.plist --force -s - <binary>
+  codesign --entitlements tests/resources/entitlements.plist --force -s - arcbox-daemon
   ```
   Required for: examples, tests touching hypervisor. See [entitlements.plist](tests/resources/entitlements.plist)
 - `mode_t` types (e.g., `libc::S_IFMT`) are `u16` (Linux: `u32`). Use `u32::from()` for cross-platform compatibility

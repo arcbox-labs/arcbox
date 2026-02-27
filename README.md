@@ -116,9 +116,7 @@ cd arcbox
 # Build
 cargo build --release -p arcbox-cli -p arcbox-daemon
 
-# Sign (required for macOS virtualization)
-codesign --entitlements tests/resources/entitlements.plist --force -s - \
-    target/release/arcbox
+# Sign daemon (required for macOS virtualization)
 codesign --entitlements tests/resources/entitlements.plist --force -s - \
     target/release/arcbox-daemon
 

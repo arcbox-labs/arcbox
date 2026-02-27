@@ -70,14 +70,14 @@ check_prerequisites() {
     fi
 
     # Check for entitlements
-    if [[ ! -f "$PROJECT_DIR/target/release/arcbox" ]]; then
-        log_error "arcbox binary not found at target/release/arcbox"
+    if [[ ! -f "$PROJECT_DIR/target/release/arcbox-daemon" ]]; then
+        log_error "arcbox-daemon binary not found at target/release/arcbox-daemon"
         exit 1
     fi
 
-    if ! codesign -d --entitlements :- "$PROJECT_DIR/target/release/arcbox" 2>/dev/null | grep -q "com.apple.security.virtualization"; then
+    if ! codesign -d --entitlements :- "$PROJECT_DIR/target/release/arcbox-daemon" 2>/dev/null | grep -q "com.apple.security.virtualization"; then
         log_warn "Binary not signed with virtualization entitlement. Signing..."
-        codesign --entitlements "$PROJECT_DIR/tests/resources/entitlements.plist" --force -s - "$PROJECT_DIR/target/release/arcbox"
+        codesign --entitlements "$PROJECT_DIR/tests/resources/entitlements.plist" --force -s - "$PROJECT_DIR/target/release/arcbox-daemon"
     fi
 
     log_info "Prerequisites OK"
@@ -122,10 +122,9 @@ start_daemon() {
     log_info "Starting daemon..."
 
     ARCBOX_BOOT_ASSET_VERSION="$BOOT_ASSETS_VERSION" \
-    "$PROJECT_DIR/target/release/arcbox" daemon \
+    "$PROJECT_DIR/target/release/arcbox-daemon" \
         --data-dir "$TEST_DIR" \
         --socket "$TEST_DIR/docker.sock" \
-        --container-backend guest-docker \
         --container-provision bundled-assets \
         --guest-docker-vsock-port "$GUEST_DOCKER_VSOCK_PORT" \
         > "$TEST_DIR/daemon.log" 2>&1 &

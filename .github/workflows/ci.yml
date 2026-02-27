@@ -53,10 +53,8 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --exclude arcbox-agent
 
-      - name: Code sign arcbox binaries
+      - name: Code sign arcbox-daemon
         run: |
-          codesign --entitlements tests/resources/entitlements.plist --force -s - \
-            target/debug/arcbox
           codesign --entitlements tests/resources/entitlements.plist --force -s - \
             target/debug/arcbox-daemon
 

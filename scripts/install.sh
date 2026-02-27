@@ -164,7 +164,6 @@ download_and_install() {
 </dict>
 </plist>
 PLIST
-    codesign --entitlements "$entitlements" --force -s - "$arcbox_binary" 2>/dev/null || warn "Codesign failed for arcbox. VM features may not work without the virtualization entitlement."
     codesign --entitlements "$entitlements" --force -s - "$daemon_binary" 2>/dev/null || warn "Codesign failed for arcbox-daemon. VM features may not work without the virtualization entitlement."
 
     # Install binaries

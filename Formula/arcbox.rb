@@ -25,6 +25,7 @@ class Arcbox < Formula
 
   def install
     bin.install "arcbox"
+    bin.install "arcbox-daemon"
 
     # Write entitlements plist for codesigning.
     entitlements = buildpath / "entitlements.plist"
@@ -42,7 +43,7 @@ class Arcbox < Formula
     # Codesign with virtualization entitlement.
     system "codesign", "--entitlements", entitlements,
                        "--force", "-s", "-",
-                       bin / "arcbox"
+                       bin / "arcbox-daemon"
 
     # Create data and log directories.
     (var / "arcbox").mkpath
@@ -56,7 +57,7 @@ class Arcbox < Formula
 
   # launchd service for the ArcBox daemon.
   service do
-    run [opt_bin / "arcbox", "daemon", "--foreground", "--docker-integration"]
+    run [opt_bin / "arcbox-daemon", "--docker-integration"]
     keep_alive successful_exit: false
     log_path var / "log" / "arcbox" / "daemon.stdout.log"
     error_log_path var / "log" / "arcbox" / "daemon.stderr.log"

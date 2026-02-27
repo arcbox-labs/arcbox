@@ -80,10 +80,8 @@ jobs:
         run: |
           cargo build --release --locked -p arcbox-cli -p arcbox-daemon
 
-      - name: Codesign binaries with virtualization entitlement
+      - name: Codesign arcbox-daemon with virtualization entitlement
         run: |
-          codesign --entitlements tests/resources/entitlements.plist \
-            --force -s - target/release/arcbox
           codesign --entitlements tests/resources/entitlements.plist \
             --force -s - target/release/arcbox-daemon
 
@@ -204,8 +202,7 @@ jobs:
             tar xzf ${{ needs.build-macos-arm64.outputs.tarball }}
             cd arcbox-darwin-arm64-${{ needs.build-macos-arm64.outputs.version }}
 
-            # Re-sign binaries with virtualization entitlement
-            codesign --entitlements entitlements.plist --force -s - arcbox
+            # Re-sign daemon with virtualization entitlement
             codesign --entitlements entitlements.plist --force -s - arcbox-daemon
 
             # Install binaries
