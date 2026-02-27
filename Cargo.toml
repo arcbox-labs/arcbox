@@ -20,7 +20,6 @@ members = [
     "services/arcbox-fs",
     "services/arcbox-net",
     "services/arcbox-container",
-    "services/arcbox-image",
     "services/arcbox-oci",
 
     # ============================================
@@ -164,7 +163,6 @@ arcbox-virtio = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-virtio" }
 arcbox-fs = { version = "0.0.1-alpha.1", path = "services/arcbox-fs" }
 arcbox-net = { version = "0.0.1-alpha.1", path = "services/arcbox-net" }
 arcbox-container = { version = "0.0.1-alpha.2", path = "services/arcbox-container" }
-arcbox-image = { version = "0.0.1-alpha.1", path = "services/arcbox-image" }
 arcbox-oci = { version = "0.0.1-alpha.1", path = "services/arcbox-oci" }
 arcbox-protocol = { version = "0.0.1-alpha.1", path = "comm/arcbox-protocol" }
 arcbox-grpc = { version = "0.0.1-alpha.1", path = "comm/arcbox-grpc" }

@@ -15,7 +15,7 @@ ArcBox is a pure-Rust, high-performance container and VM runtime targeting macOS
 ```
 arcbox-cli / arcbox-docker API → arcbox-core (Runtime singleton)
     ↓
-arcbox-fs / arcbox-net / arcbox-container / arcbox-image
+arcbox-fs / arcbox-net / arcbox-container
     ↓
 arcbox-virtio (VirtIO devices) → arcbox-vmm (VM Monitor)
     ↓

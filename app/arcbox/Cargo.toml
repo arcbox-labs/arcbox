@@ -14,7 +14,6 @@ categories = ["virtualization", "development-tools"]
 # Re-export core crates (temporarily commented for initial publish)
 arcbox-hypervisor = { workspace = true }
 arcbox-virtio = { workspace = true }
-arcbox-image = { workspace = true }
 arcbox-protocol = { workspace = true }
 # TODO: uncomment after publishing these crates
 # arcbox-vmm = { workspace = true }

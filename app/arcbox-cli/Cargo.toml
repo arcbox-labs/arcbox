@@ -21,7 +21,6 @@ arcbox-api = { workspace = true }
 arcbox-core = { workspace = true }
 arcbox-docker = { workspace = true }
 arcbox-grpc = { workspace = true }
-arcbox-image = { workspace = true }
 arcbox-protocol = { workspace = true }
 arcbox-transport = { workspace = true }
 tonic = { workspace = true }

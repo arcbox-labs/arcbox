@@ -14,7 +14,6 @@ arcbox-vmm = { workspace = true }
 arcbox-virtio = { workspace = true }
 arcbox-fs = { workspace = true }
 arcbox-net = { workspace = true }
-arcbox-image = { workspace = true }
 arcbox-protocol = { workspace = true }
 arcbox-transport = { workspace = true }
 arcbox-error = { workspace = true }

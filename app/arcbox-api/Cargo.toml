@@ -21,7 +21,6 @@ tonic = { workspace = true }
 prost = { workspace = true }
 tokio-stream = { workspace = true }
 async-stream = { workspace = true }
-arcbox-image = { workspace = true }
 libc = { workspace = true }
 uuid = { workspace = true }
 

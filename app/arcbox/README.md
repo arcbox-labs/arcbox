@@ -29,7 +29,6 @@ ArcBox is organized into several layers:
 |--------|--------------|-------------|
 | `hypervisor` | arcbox-hypervisor | Virtualization abstraction |
 | `virtio` | arcbox-virtio | VirtIO device implementations |
-| `image` | arcbox-image | Container image management |
 | `protocol` | arcbox-protocol | Protobuf message types |
 
 ## Usage

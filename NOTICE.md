@@ -4922,7 +4922,6 @@ Used by:
 - [arcbox-fs 0.0.1-alpha.1](https://github.com/AprilNEA/arcbox)
 - [arcbox-grpc 0.0.1-alpha.1](https://github.com/AprilNEA/arcbox)
 - [arcbox-hypervisor 0.0.1-alpha.1](https://github.com/AprilNEA/arcbox)
-- [arcbox-image 0.0.1-alpha.1](https://github.com/AprilNEA/arcbox)
 - [arcbox-net 0.0.1-alpha.1](https://github.com/AprilNEA/arcbox)
 - [arcbox-oci 0.0.1-alpha.1](https://github.com/AprilNEA/arcbox)
 - [arcbox-protocol 0.0.1-alpha.1](https://github.com/AprilNEA/arcbox)
@@ -6604,5 +6603,4 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 </details>
 
 ---
-
 
