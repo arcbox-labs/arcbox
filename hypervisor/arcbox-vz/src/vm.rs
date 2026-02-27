@@ -117,7 +117,8 @@ impl VirtualMachine {
 
     /// Returns whether a stop can be requested.
     pub fn can_request_stop(&self) -> bool {
-        unsafe { msg_send_bool!(self.inner, canRequestStop).as_bool() }
+        self.queue
+            .sync(|| unsafe { msg_send_bool!(self.inner, canRequestStop).as_bool() })
     }
 
     /// Starts the virtual machine.
@@ -413,7 +414,7 @@ impl VirtualMachine {
             });
         }
 
-        unsafe {
+        self.queue.sync(|| unsafe {
             let mut error: *mut AnyObject = std::ptr::null_mut();
             let result = msg_send_bool!(self.inner, requestStopWithError: &mut error);
             if result.as_bool() {
@@ -421,7 +422,7 @@ impl VirtualMachine {
             } else {
                 Err(extract_nserror(error))
             }
-        }
+        })
     }
 
     /// Returns the socket devices configured on this VM.
