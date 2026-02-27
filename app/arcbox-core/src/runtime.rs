@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Component, Path};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock as TokioRwLock;
 
 /// Default guest VM IP address in NAT network.
@@ -382,7 +383,35 @@ impl Runtime {
         for machine in machines {
             if machine.state == MachineState::Running && machine.name != DEFAULT_MACHINE_NAME {
                 tracing::debug!("Stopping machine {}", machine.name);
-                match self.machine_manager.stop(&machine.name) {
+                let stopped_gracefully = match self
+                    .machine_manager
+                    .graceful_stop(&machine.name, Duration::from_secs(3))
+                {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        tracing::warn!(
+                            "Graceful stop timed out for machine {}, forcing stop",
+                            machine.name
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Graceful stop failed for machine {}: {}, forcing stop",
+                            machine.name,
+                            e
+                        );
+                        false
+                    }
+                };
+
+                let stop_result = if stopped_gracefully {
+                    Ok(())
+                } else {
+                    self.machine_manager.stop(&machine.name)
+                };
+
+                match stop_result {
                     Ok(()) => {
                         tracing::info!("Machine {} stopped", machine.name);
                     }

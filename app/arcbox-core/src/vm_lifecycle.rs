@@ -1127,8 +1127,30 @@ impl VmLifecycleManager {
         // Stop health monitor
         self.health_monitor.stop();
 
-        // Stop the machine
-        match self.machine_manager.stop(DEFAULT_MACHINE_NAME) {
+        // Stop the machine (graceful first, then force-stop fallback).
+        let stop_result = match self
+            .machine_manager
+            .graceful_stop(DEFAULT_MACHINE_NAME, Duration::from_secs(5))
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                tracing::warn!(
+                    "Graceful stop timed out for '{}', falling back to force stop",
+                    DEFAULT_MACHINE_NAME
+                );
+                self.machine_manager.stop(DEFAULT_MACHINE_NAME)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Graceful stop failed for '{}': {}, falling back to force stop",
+                    DEFAULT_MACHINE_NAME,
+                    e
+                );
+                self.machine_manager.stop(DEFAULT_MACHINE_NAME)
+            }
+        };
+
+        match stop_result {
             Ok(()) => {
                 *self.state.write().await = VmLifecycleState::Stopped;
                 tracing::info!("Default VM stopped");
