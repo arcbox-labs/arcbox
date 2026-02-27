@@ -1,4 +1,4 @@
-# firecracker-vmm
+# arcbox-vm
 
 A production-grade sandbox management library built on top of
 [`fc-sdk`](../fc-sdk) that orchestrates multiple
