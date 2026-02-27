@@ -23,14 +23,12 @@ tower-http = { workspace = true }
 hyper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-hostname = { workspace = true }
 hyper-util = { version = "0.1", features = ["tokio"] }
 uuid = { workspace = true }
 chrono = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
 dirs = { workspace = true }
-sysinfo = "0.32"
 tokio-stream = "0.1"
 futures = { workspace = true }
 libc = { workspace = true }

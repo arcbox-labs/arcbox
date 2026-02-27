@@ -36,6 +36,7 @@ async fn create_test_runtime() -> (Arc<Runtime>, TempDir) {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_ping() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -54,6 +55,7 @@ async fn test_ping() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_version() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -80,6 +82,7 @@ async fn test_version() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_info() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -671,6 +674,7 @@ async fn test_list_images() {
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_versioned_api() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
@@ -689,6 +693,7 @@ async fn test_versioned_api() {
 }
 
 #[tokio::test]
+#[ignore = "requires running daemon with guest dockerd"]
 async fn test_older_api_version() {
     let (runtime, _tmp) = create_test_runtime().await;
     let app = create_router(runtime);
