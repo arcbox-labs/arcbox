@@ -1,7 +1,6 @@
 //! Pull command implementation.
 
 use anyhow::Result;
-use arcbox_image::ImageRef;
 use clap::Args;
 
 use crate::client::DaemonClient;
@@ -111,4 +110,64 @@ async fn execute_via_daemon(
 fn short_digest(digest: &str) -> &str {
     let s = digest.strip_prefix("sha256:").unwrap_or(digest);
     &s[..12.min(s.len())]
+}
+
+/// Image reference (e.g., "docker.io/library/nginx:latest").
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+struct ImageRef {
+    /// Registry (e.g., "docker.io").
+    registry: String,
+    /// Repository (e.g., "library/nginx").
+    repository: String,
+    /// Tag or digest.
+    reference: String,
+}
+
+impl ImageRef {
+    /// Parses an image reference string.
+    #[must_use]
+    fn parse(s: &str) -> Option<Self> {
+        // Simple parser, real implementation would be more robust.
+        let (registry, rest) = if s.contains('/') && s.split('/').next()?.contains('.') {
+            let idx = s.find('/')?;
+            (&s[..idx], &s[idx + 1..])
+        } else {
+            ("docker.io", s)
+        };
+
+        let (repository, reference) = if rest.contains(':') {
+            let idx = rest.rfind(':')?;
+            (&rest[..idx], &rest[idx + 1..])
+        } else if rest.contains('@') {
+            let idx = rest.find('@')?;
+            (&rest[..idx], &rest[idx + 1..])
+        } else {
+            (rest, "latest")
+        };
+
+        // Add library/ prefix for Docker Hub.
+        let repository = if registry == "docker.io" && !repository.contains('/') {
+            format!("library/{repository}")
+        } else {
+            repository.to_string()
+        };
+
+        Some(Self {
+            registry: registry.to_string(),
+            repository,
+            reference: reference.to_string(),
+        })
+    }
+
+    /// Returns the full image name.
+    #[must_use]
+    fn full_name(&self) -> String {
+        format!("{}/{}:{}", self.registry, self.repository, self.reference)
+    }
+}
+
+impl std::fmt::Display for ImageRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.full_name())
+    }
 }

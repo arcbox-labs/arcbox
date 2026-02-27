@@ -27,7 +27,6 @@
 
 // Re-export core crates (available in this version)
 pub use arcbox_hypervisor as hypervisor;
-pub use arcbox_image as image;
 pub use arcbox_protocol as protocol;
 pub use arcbox_virtio as virtio;
 

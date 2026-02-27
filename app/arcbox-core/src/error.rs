@@ -21,10 +21,6 @@ pub enum CoreError {
     #[error("machine error: {0}")]
     Machine(String),
 
-    /// Image error.
-    #[error("image error: {0}")]
-    Image(#[from] arcbox_image::ImageError),
-
     /// Filesystem error.
     #[error("filesystem error: {0}")]
     Fs(#[from] arcbox_fs::FsError),
