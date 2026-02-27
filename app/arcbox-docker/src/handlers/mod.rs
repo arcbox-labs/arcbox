@@ -1,7 +1,7 @@
 //! Request handlers for Docker API endpoints.
 //!
 //! Most handlers forward requests to guest dockerd via the smart proxy.
-//! Host-only handlers (ping, version, info) respond from host state.
+//! System handlers (ping, version, info) also proxy directly to guest dockerd.
 //! Docker events and lifecycle endpoints are proxied directly to guest dockerd.
 
 use crate::api::AppState;

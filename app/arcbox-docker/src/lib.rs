@@ -52,9 +52,3 @@ pub mod types;
 pub use context::{ContextStatus, DockerContextManager};
 pub use error::{DockerError, Result};
 pub use server::{DockerApiServer, ServerConfig};
-
-/// Docker API version.
-pub const API_VERSION: &str = "1.43";
-
-/// Minimum supported API version.
-pub const MIN_API_VERSION: &str = "1.24";
