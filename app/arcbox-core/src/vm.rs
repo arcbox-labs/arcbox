@@ -389,7 +389,12 @@ impl VmManager {
 
         match stop_result {
             Ok(true) => {
-                entry.vmm = None;
+                if let Some(vmm) = entry.vmm.take() {
+                    // The guest has already halted via ACPI, but Vmm::Drop
+                    // would call the hypervisor stop path which can crash on
+                    // macOS. Leak the handle just like force_stop_without_hypervisor.
+                    std::mem::forget(vmm);
+                }
                 entry.info.state = VmState::Stopped;
                 tracing::info!("Gracefully stopped VM {}", id);
                 Ok(true)
