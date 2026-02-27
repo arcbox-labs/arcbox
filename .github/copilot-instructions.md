@@ -6,29 +6,29 @@ ArcBox is a pure-Rust, high-performance container and VM runtime targeting macOS
 
 **Three-tier structure:**
 
-- **Core layer** (`crates/`): MIT/Apache-2.0 licensed foundation
+- **Core layer** (`common/`, `hypervisor/`, `services/`, `comm/`, `app/`): MIT/Apache-2.0 licensed foundation
 - **Pro layer** (`pro/`): BSL-1.1 licensed enhanced features (smart caching, snapshots, advanced networking)
 - **Guest components** (`guest/arcbox-agent`): Runs inside VMs, cross-compiled to Linux ARM64/x86_64
 
 **Key layers (bottom-up):**
 
-```
-arcbox-cli / arcbox-docker API → arcbox-core (Runtime singleton)
+```text
+arcbox-cli / arcbox-docker API -> arcbox-core (Runtime)
     ↓
 arcbox-fs / arcbox-net / arcbox-container
     ↓
-arcbox-virtio (VirtIO devices) → arcbox-vmm (VM Monitor)
+arcbox-virtio (VirtIO devices) -> arcbox-vmm (VM monitor)
     ↓
-arcbox-hypervisor (platform abstraction: macOS Virtualization.framework / Linux KVM)
+arcbox-hypervisor / arcbox-vz (platform virtualization)
 ```
 
-**Communication:** Host ↔ Guest via vsock + ttrpc (`arcbox-protocol`). Docker API compatibility via `arcbox-docker` (Axum REST server).
+**Communication:** Host <-> Guest via vsock and ArcBox protocol crates (`arcbox-protocol`, `arcbox-grpc`, `arcbox-transport`). Docker API compatibility is provided by `arcbox-docker` (Axum REST server + guest dockerd proxy).
 
 ## Critical Platform Differences
 
 **macOS specifics:**
 
-- Uses Virtualization.framework via Objective-C FFI (`objc2` crate in `crates/arcbox-hypervisor/src/darwin/ffi.rs`)
+- Uses Apple's Virtualization.framework (not KVM)
 - **All VM-related binaries require code signing:**
   ```bash
   codesign --entitlements tests/resources/entitlements.plist --force -s - <binary>
@@ -44,7 +44,7 @@ arcbox-hypervisor (platform abstraction: macOS Virtualization.framework / Linux 
 
 ```bash
 cargo build -p <crate>           # Dev build specific crate
-cargo build --release            # Full optimized build (uses LTO)
+cargo build --release            # Full optimized build
 ```
 
 **Testing:**
@@ -66,23 +66,6 @@ rustup target add aarch64-unknown-linux-musl
 cargo build -p arcbox-agent --target aarch64-unknown-linux-musl --release
 ```
 
-**Running VM examples:**
-
-```bash
-cd tests/resources
-./download-kernel.sh              # Get test kernel
-./build-initramfs.sh              # Build initramfs with agent
-
-# Build and sign example:
-cargo build --example boot_vm -p arcbox-hypervisor
-codesign --entitlements tests/resources/entitlements.plist --force -s - \
-    target/debug/examples/boot_vm
-
-# Run:
-./target/debug/examples/boot_vm tests/resources/Image-arm64 \
-    tests/resources/initramfs-arcbox --vsock --net
-```
-
 ## Project Conventions
 
 **Comments and commits:**
@@ -99,7 +82,7 @@ codesign --entitlements tests/resources/entitlements.plist --force -s - \
 **Async:**
 
 - Tokio runtime everywhere (`tokio::main`, `tokio::spawn`)
-- Performance-critical paths use async I/O
+- Performance-critical paths use async I/O where appropriate
 
 **Unsafe usage:**
 
@@ -118,49 +101,43 @@ codesign --entitlements tests/resources/entitlements.plist --force -s - \
 
 **Implementation patterns:**
 
-1. **Zero-copy everywhere:** `arcbox-net` uses `ZeroCopyPacket` with raw guest memory pointers
-2. **Lock-free:** `LockFreeRing<T>` SPSC queue in `arcbox-net/src/datapath/ring.rs`
-3. **Cache-aligned:** Hot structures use `#[repr(C, align(64))]` + `CachePadded<T>` wrapper
-4. **Batch operations:** Process multiple virtqueue descriptors per iteration
-5. **Negative caching:** `arcbox-fs` caches "file not found" results (see `crates/arcbox-fs/src/cache.rs`)
-
-**NAT Engine** (`arcbox-net/src/nat_engine/`):
-
-- Connection tracking with 256-entry fast-path cache
-- Incremental checksum updates (RFC 1624) - no full recalculations
-- In-place packet modification for SNAT/DNAT
+1. **Zero-copy datapath:** `arcbox-net` packet-path code avoids unnecessary copies
+2. **Lock-free where it matters:** SPSC queue in `services/arcbox-net/src/datapath/ring.rs`
+3. **Cache alignment:** use `#[repr(C, align(64))]` for hot structures
+4. **Batch operations:** avoid per-descriptor overhead in VirtIO queues
+5. **Negative caching:** `arcbox-fs` caches missing lookups (see `services/arcbox-fs/src/cache.rs`)
 
 ## Key Files & Patterns
 
-**Runtime singleton** (`crates/arcbox-core/src/runtime.rs`):
+**Runtime singleton** (`app/arcbox-core/src/runtime.rs`):
 
-- Central orchestrator holding `VmManager`, `MachineManager`, `ContainerManager`, `ImageStore`, etc.
-- All managers are `Arc<>`-wrapped for sharing across async tasks
+- Central orchestrator wiring `MachineManager`, `VmLifecycleManager`, container backend, networking, and port-forward state
+- Shared managers/state are held behind `Arc` for async task coordination
 
-**VirtIO device pattern** (`crates/arcbox-virtio/src/*.rs`):
+**VirtIO device pattern** (`hypervisor/arcbox-virtio/src/*.rs`):
 
 - `pop_avail()` to get descriptor chains from guest
 - Process I/O (zero-copy where possible)
 - `push_used()` to return completed descriptors
 
-**Filesystem passthrough** (`crates/arcbox-fs/src/passthrough.rs`):
+**Filesystem passthrough** (`services/arcbox-fs/src/passthrough.rs`):
 
-- Maps guest paths → host paths via `InodeData` table
-- Platform-specific syscalls (`#[cfg(target_os = "...")]` branches common)
-- Uses `NegativeCache` to avoid repeated stat calls on missing paths
+- Maps guest paths -> host paths via inode/path tables
+- Uses platform-specific syscall branches (`#[cfg(target_os = "...")]`)
+- Uses negative caching to avoid repeated misses
 
-**Hypervisor abstraction** (`crates/arcbox-hypervisor/src/traits.rs`):
+**Hypervisor abstraction** (`hypervisor/arcbox-hypervisor/src/traits.rs`):
 
 - Core traits: `Hypervisor`, `VirtualMachine`, `Vcpu`, `GuestMemory`
-- Platform impls in `darwin/` (Virtualization.framework) and `linux/` (KVM)
+- Platform implementations in `darwin/` (Virtualization.framework) and `linux/` (KVM)
 
 ## Common Pitfalls
 
-1. **Forgetting to codesign** → "Virtualization not available" errors on macOS
-2. **Using `libc::S_IFMT` directly** → Works on Linux, fails on macOS (cast to `u32` first)
-3. **Not batching virtqueue operations** → Excessive VM exits hurt performance
-4. **Ignoring cache alignment** → False sharing between CPU cores
-5. **Using `Arc<Mutex<T>>` in hot paths** → Prefer lock-free or `Arc<RwLock<T>>`
+1. **Forgetting to codesign** -> "Virtualization not available" errors on macOS
+2. **Using `libc::S_IFMT` directly** -> Works on Linux, fails on macOS (cast to `u32` first)
+3. **Not batching virtqueue operations** -> Excessive VM exits hurt performance
+4. **Ignoring cache alignment** -> False sharing between CPU cores
+5. **Using `Arc<Mutex<T>>` in hot paths** -> Prefer lock-free or `Arc<RwLock<T>>`
 
 ## Debugging & Logging
 
@@ -174,21 +151,18 @@ RUST_BACKTRACE=1                      # Enable backtraces
 
 **Test resources:**
 
-- Kernel images: `tests/resources/Image-arm64`, `Image-microvm`
-- Build scripts: `download-kernel.sh`, `build-initramfs.sh`
-- Initramfs contains `arcbox-agent` + busybox
+- Kernel images and initramfs live under `tests/resources/`
+- Build scripts for assets are in `tests/resources/` and `scripts/`
 
 ## Documentation References
 
-- Main CLAUDE.md: Project overview, architecture, commands
-- `crates/arcbox-hypervisor/CLAUDE.md`: FFI patterns, platform backends
-- `crates/arcbox-net/CLAUDE.md`: Zero-copy datapath, NAT engine details
-- `crates/arcbox-virtio/CLAUDE.md`: VirtIO device implementations
-- `internal-docs/parallel-development-plan.md`: Development streams (VM lifecycle, image pull, guest agent, integration)
+- Main [CLAUDE.md](../CLAUDE.md): project overview, architecture, commands
+- Crate-level READMEs in `app/`, `hypervisor/`, `services/`, `comm/`
+- Boot assets ownership and boundaries: [docs/boot-assets.md](../docs/boot-assets.md)
 
 ## Licensing & Structure
 
-- Core (`crates/`) + Guest: **MIT OR Apache-2.0** - permissive
+- Core (`common/`, `hypervisor/`, `services/`, `comm/`, `app/`) + Guest: **MIT OR Apache-2.0**
 - Pro (`pro/`): **BSL-1.1** - production use requires license after 4 years
 - Enterprise (separate repos): Proprietary (desktop app, SSO, K8s integration)
-- When adding files to `crates/` or `guest/`, include dual-license header
+- When adding files to core directories or `guest/`, include dual-license headers

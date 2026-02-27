@@ -147,7 +147,7 @@ rm ~/Library/LaunchAgents/dev.arcbox.daemon.plist
 
 ## Contributing
 
-We welcome contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+We welcome contributions. See [CLAUDE.md](CLAUDE.md) for current contribution and repository guidelines.
 
 - Use `cargo clippy -- -D warnings` before submitting
 - All code comments must be in English
@@ -155,7 +155,7 @@ We welcome contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
-- **Core** (`crates/`) -- [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)
+- **Core** (`common/`, `hypervisor/`, `services/`, `comm/`, `app/`) -- [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)
 - **Pro** (`pro/`) -- [BSL-1.1](LICENSE-BSL-1.1) (converts to MIT after 4 years)
 
 See [LICENSE](LICENSE) for the full text.

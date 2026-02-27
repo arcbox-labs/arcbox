@@ -11,11 +11,11 @@ Boot asset **build and release** are being migrated to the dedicated repository:
 ## Responsibilities In This Repository
 
 1. Download, verify, and cache boot assets at runtime:
-   `crates/arcbox-core/src/boot_assets.rs`
+   `app/arcbox-core/src/boot_assets.rs`
 2. Wire boot assets into VM lifecycle:
-   `crates/arcbox-core/src/vm_lifecycle.rs`
+   `app/arcbox-core/src/vm_lifecycle.rs`
 3. Provide CLI operations (`prefetch/status/list/clear`):
-   `crates/arcbox-cli/src/commands/boot.rs`
+   `app/arcbox-cli/src/commands/boot.rs`
 4. Development and integration tests:
    `scripts/setup-dev-boot-assets.sh`, `scripts/test-boot-assets.sh`
 
