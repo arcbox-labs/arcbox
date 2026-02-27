@@ -181,6 +181,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "macos-resolver",
  "predicates",
  "serde",

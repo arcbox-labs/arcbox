@@ -6,13 +6,17 @@
 //! - VM and container lifecycle management
 //! - Image management
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use arcbox_api::{MachineServiceImpl, machine_service_server::MachineServiceServer};
 use arcbox_core::{Config, ContainerProvisionMode, Runtime};
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
 use clap::{Args, ValueEnum};
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::UnixListener;
 use tokio::signal;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -22,6 +26,10 @@ use tracing::{info, warn};
 /// Arguments for the daemon command.
 #[derive(Debug, Args)]
 pub struct DaemonArgs {
+    /// Optional daemon action.
+    #[arg(value_name = "ACTION")]
+    pub action: Option<DaemonAction>,
+
     /// Unix socket path for Docker API (default: ~/.arcbox/docker.sock).
     #[arg(long)]
     pub socket: Option<PathBuf>,
@@ -43,7 +51,7 @@ pub struct DaemonArgs {
     pub initramfs: Option<PathBuf>,
 
     /// Run in foreground (don't daemonize).
-    #[arg(long, short = 'f', default_value = "true")]
+    #[arg(long, short = 'f')]
     pub foreground: bool,
 
     /// Automatically enable Docker CLI integration.
@@ -57,6 +65,12 @@ pub struct DaemonArgs {
     /// Guest dockerd API vsock port.
     #[arg(long)]
     pub guest_docker_vsock_port: Option<u32>,
+}
+
+/// Daemon actions.
+#[derive(Debug, Clone, ValueEnum)]
+pub enum DaemonAction {
+    Stop,
 }
 
 /// CLI argument values for provisioning mode.
@@ -77,14 +91,22 @@ impl From<ContainerProvisionArg> for ContainerProvisionMode {
 
 /// Executes the daemon command.
 pub async fn execute(args: DaemonArgs) -> Result<()> {
+    if let Some(DaemonAction::Stop) = args.action {
+        return execute_stop(&args);
+    }
+
+    if !args.foreground {
+        return spawn_background(&args);
+    }
+
     info!("Starting ArcBox daemon...");
 
     // Determine data directory.
-    let data_dir = args.data_dir.unwrap_or_else(|| {
-        dirs::home_dir()
-            .map(|h| h.join(".arcbox"))
-            .unwrap_or_else(|| PathBuf::from("/var/lib/arcbox"))
-    });
+    let data_dir = resolve_data_dir(args.data_dir.as_ref());
+    let pid_file = data_dir.join("daemon.pid");
+    std::fs::create_dir_all(&data_dir).context("Failed to create data directory")?;
+    std::fs::write(&pid_file, format!("{}\n", std::process::id()))
+        .context("Failed to write daemon PID file")?;
     let socket_path = args.socket.unwrap_or_else(|| data_dir.join("docker.sock"));
 
     // Determine gRPC socket path (defaults to same directory as data_dir).
@@ -223,8 +245,187 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
         }
     }
 
+    if let Err(e) = std::fs::remove_file(&pid_file) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!("Failed to remove PID file {}: {}", pid_file.display(), e);
+        }
+    }
+
     info!("ArcBox daemon stopped");
     Ok(())
+}
+
+fn execute_stop(args: &DaemonArgs) -> Result<()> {
+    let data_dir = resolve_data_dir(args.data_dir.as_ref());
+    let pid_file = data_dir.join("daemon.pid");
+
+    let Some(pid) = read_pid_file(&pid_file)? else {
+        println!("Daemon is not running");
+        return Ok(());
+    };
+
+    if !process_is_running(pid) {
+        let _ = std::fs::remove_file(&pid_file);
+        println!("Daemon is not running");
+        return Ok(());
+    }
+
+    send_sigterm(pid)?;
+    println!("Stopping ArcBox daemon (PID {pid})...");
+
+    for _ in 0..50 {
+        if !process_is_running(pid) {
+            println!("ArcBox daemon stopped");
+            let _ = std::fs::remove_file(&pid_file);
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    println!("ArcBox daemon (PID {pid}) is still running after 5s");
+    println!("Try: kill -9 {pid}");
+    Ok(())
+}
+
+fn spawn_background(args: &DaemonArgs) -> Result<()> {
+    let data_dir = resolve_data_dir(args.data_dir.as_ref());
+    let logs_dir = data_dir.join("logs");
+    let pid_file = data_dir.join("daemon.pid");
+    let stdout_path = logs_dir.join("daemon.stdout.log");
+    let stderr_path = logs_dir.join("daemon.stderr.log");
+
+    std::fs::create_dir_all(&logs_dir).context("Failed to create daemon log directory")?;
+
+    if let Some(pid) = read_pid_file(&pid_file)? {
+        if process_is_running(pid) {
+            bail!("Daemon already running (PID {pid})");
+        }
+
+        warn!("Removing stale daemon PID file for PID {}", pid);
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    let stdout_log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stdout_path)
+        .context("Failed to open daemon stdout log file")?;
+    let stderr_log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_path)
+        .context("Failed to open daemon stderr log file")?;
+
+    let mut child_args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    child_args.push(OsString::from("--foreground"));
+
+    let current_exe = std::env::current_exe().context("Failed to resolve current executable")?;
+    let child = Command::new(current_exe)
+        .args(child_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_log))
+        .stderr(Stdio::from(stderr_log))
+        .spawn()
+        .context("Failed to launch ArcBox daemon in background")?;
+
+    std::fs::write(&pid_file, format!("{}\n", child.id()))
+        .context("Failed to write daemon PID file")?;
+
+    println!("ArcBox daemon started (PID {})", child.id());
+    println!("  PID file: {}", pid_file.display());
+    println!("  Stdout:   {}", stdout_path.display());
+    println!("  Stderr:   {}", stderr_path.display());
+    Ok(())
+}
+
+fn resolve_data_dir(data_dir: Option<&PathBuf>) -> PathBuf {
+    data_dir.cloned().unwrap_or_else(|| {
+        dirs::home_dir()
+            .map(|home| home.join(".arcbox"))
+            .unwrap_or_else(|| PathBuf::from("/var/lib/arcbox"))
+    })
+}
+
+fn read_pid_file(pid_file: &Path) -> Result<Option<i32>> {
+    if !pid_file.exists() {
+        return Ok(None);
+    }
+
+    let pid_text = std::fs::read_to_string(pid_file)
+        .with_context(|| format!("Failed to read daemon PID file from {}", pid_file.display()))?;
+
+    match pid_text.trim().parse::<i32>() {
+        Ok(pid) if pid > 0 => Ok(Some(pid)),
+        _ => {
+            warn!("Invalid daemon PID file, removing {}", pid_file.display());
+            let _ = std::fs::remove_file(pid_file);
+            Ok(None)
+        }
+    }
+}
+
+fn process_is_running(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+
+    // SAFETY: libc::kill is called with a validated positive PID and signal 0,
+    // which performs existence/permission checks without sending a signal.
+    let result = unsafe { libc::kill(pid, 0) };
+    if result == 0 {
+        return true;
+    }
+
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn send_sigterm(pid: i32) -> Result<()> {
+    // SAFETY: libc::kill is called with a validated positive PID and SIGTERM
+    // to request graceful daemon shutdown.
+    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    Err(std::io::Error::last_os_error())
+        .with_context(|| format!("Failed to send SIGTERM to daemon process {pid}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_pid_file;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn read_pid_file_returns_none_when_missing() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let pid_file = dir.path().join("daemon.pid");
+        let pid = read_pid_file(&pid_file).expect("read_pid_file should succeed");
+        assert_eq!(pid, None);
+    }
+
+    #[test]
+    fn read_pid_file_parses_valid_pid() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let pid_file = dir.path().join("daemon.pid");
+        fs::write(&pid_file, "12345\n").expect("failed to write pid file");
+
+        let pid = read_pid_file(&pid_file).expect("read_pid_file should succeed");
+        assert_eq!(pid, Some(12345));
+        assert!(pid_file.exists());
+    }
+
+    #[test]
+    fn read_pid_file_removes_invalid_content() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let pid_file = dir.path().join("daemon.pid");
+        fs::write(&pid_file, "not-a-pid").expect("failed to write pid file");
+
+        let pid = read_pid_file(&pid_file).expect("read_pid_file should succeed");
+        assert_eq!(pid, None);
+        assert!(!pid_file.exists());
+    }
 }
 
 /// Starts the gRPC server on a Unix socket.
