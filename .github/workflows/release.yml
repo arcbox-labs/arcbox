@@ -22,7 +22,11 @@ jobs:
   build-macos-arm64:
     name: Build macOS ARM64
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      tarball: ${{ steps.tarball.outputs.tarball }}
 
     steps:
       - name: Checkout
@@ -37,59 +41,25 @@ jobs:
             VERSION="${GITHUB_REF#refs/tags/}"
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # Detect pre-release (alpha, beta, rc)
+          if echo "$VERSION" | grep -qE '(alpha|beta|rc)'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
           echo "Building version: $VERSION"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          targets: aarch64-unknown-linux-musl
 
       - name: Install Protobuf compiler
         timeout-minutes: 5
         run: |
           brew install protobuf
-
-      - name: Install initramfs build tools
-        timeout-minutes: 5
-        run: |
-          brew install squashfs
-
-      # MLT-041: Cache musl-cross to avoid repeated source builds.
-      - name: Cache musl-cross toolchain
-        id: cache-musl
-        uses: actions/cache@v4
-        with:
-          path: |
-            /opt/homebrew/Cellar/musl-cross
-            /opt/homebrew/bin/aarch64-linux-musl-*
-            /opt/homebrew/opt/musl-cross
-          key: ${{ runner.os }}-musl-cross-v1
-
-      - name: Install musl cross-compiler
-        timeout-minutes: 30
-        run: |
-          if ! command -v aarch64-linux-musl-gcc >/dev/null 2>&1; then
-            echo "::group::Installing musl-cross from source (this takes a while)"
-            brew install FiloSottile/musl-cross/musl-cross
-            echo "::endgroup::"
-          else
-            echo "musl-cross already available (from cache)"
-          fi
-
-          mkdir -p "$HOME/.local/bin"
-          if command -v aarch64-unknown-linux-musl-gcc >/dev/null 2>&1; then
-            echo "Found linker: $(command -v aarch64-unknown-linux-musl-gcc)"
-          elif command -v aarch64-linux-musl-gcc >/dev/null 2>&1; then
-            ln -sf "$(command -v aarch64-linux-musl-gcc)" \
-              "$HOME/.local/bin/aarch64-unknown-linux-musl-gcc"
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-            echo "Created linker shim: $HOME/.local/bin/aarch64-unknown-linux-musl-gcc"
-          else
-            echo "::error::Missing musl linker binary after install"
-            ls -1 /opt/homebrew/bin/*musl*gcc 2>/dev/null || echo "No musl-gcc binaries found"
-            exit 1
-          fi
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -108,49 +78,18 @@ jobs:
       - name: Build arcbox (release)
         timeout-minutes: 15
         run: |
-          cargo build --release -p arcbox-cli
-
-      - name: Build arcbox-agent (cross-compile for Linux ARM64)
-        timeout-minutes: 15
-        run: |
-          cargo build --release -p arcbox-agent --target aarch64-unknown-linux-musl
+          cargo build --release --locked -p arcbox-cli
 
       - name: Codesign binary with virtualization entitlement
         run: |
           codesign --entitlements tests/resources/entitlements.plist \
             --force -s - target/release/arcbox
 
-      - name: Download kernel
-        run: |
-          cd tests/resources
-          ./download-kernel.sh
-          if [ ! -f Image-arm64 ] && [ -f vmlinuz-arm64 ]; then
-            cp vmlinuz-arm64 Image-arm64
-          fi
-
-      - name: Checkout boot-assets
-        uses: actions/checkout@v4
-        with:
-          repository: arcbox-labs/boot-assets
-          path: boot-assets
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build initramfs
-        env:
-          BOOT_ASSETS_DIR: ${{ github.workspace }}/boot-assets
-        run: |
-          cd tests/resources
-          ./build-initramfs.sh
-
       - name: Verify artifacts
         run: |
           echo "=== Build artifacts ==="
           ls -lh target/release/arcbox
-          ls -lh target/aarch64-unknown-linux-musl/release/arcbox-agent
-          ls -lh tests/resources/Image-arm64
-          ls -lh tests/resources/initramfs-arcbox
           file target/release/arcbox
-          file target/aarch64-unknown-linux-musl/release/arcbox-agent
 
       - name: Create tarball
         id: tarball
@@ -159,21 +98,16 @@ jobs:
           TARBALL_NAME="arcbox-darwin-arm64-${VERSION}.tar.gz"
           STAGING="arcbox-darwin-arm64-${VERSION}"
 
-          mkdir -p "$STAGING/boot"
+          mkdir -p "$STAGING"
 
-          # Binary
+          # CLI binary
           cp target/release/arcbox "$STAGING/"
-
-          # Boot assets
-          cp tests/resources/Image-arm64 "$STAGING/boot/"
-          cp tests/resources/initramfs-arcbox "$STAGING/boot/"
 
           # Entitlements (needed for codesigning after install)
           cp tests/resources/entitlements.plist "$STAGING/"
 
           tar czf "$TARBALL_NAME" "$STAGING"
           echo "tarball=$TARBALL_NAME" >> "$GITHUB_OUTPUT"
-          echo "staging=$STAGING" >> "$GITHUB_OUTPUT"
 
           echo "=== Tarball contents ==="
           tar tzf "$TARBALL_NAME"
@@ -207,26 +141,6 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Determine version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.tag }}"
-          else
-            VERSION="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-          # Detect pre-release (alpha, beta, rc)
-          if echo "$VERSION" | grep -qE '(alpha|beta|rc)'; then
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -255,9 +169,9 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: ArcBox ${{ steps.version.outputs.version }}
-          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
+          tag_name: ${{ needs.build-macos-arm64.outputs.version }}
+          name: ArcBox ${{ needs.build-macos-arm64.outputs.version }}
+          prerelease: ${{ needs.build-macos-arm64.outputs.prerelease == 'true' }}
           generate_release_notes: true
           files: |
             release-assets/*.tar.gz
@@ -266,21 +180,33 @@ jobs:
           body: |
             ## Installation
 
-            ### macOS (Apple Silicon)
+            ### Recommended (install script)
 
             ```bash
-            # Download and extract
-            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/arcbox-darwin-arm64-${{ steps.version.outputs.version }}.tar.gz
-            tar xzf arcbox-darwin-arm64-${{ steps.version.outputs.version }}.tar.gz
-            cd arcbox-darwin-arm64-${{ steps.version.outputs.version }}
+            curl -fsSL https://get.arcbox.dev | bash
+            ```
 
-            # Codesign (required for virtualization)
+            ### Homebrew
+
+            ```bash
+            brew install --formula https://raw.githubusercontent.com/${{ github.repository }}/${{ needs.build-macos-arm64.outputs.version }}/Formula/arcbox.rb
+            ```
+
+            ### Manual tarball install (macOS Apple Silicon)
+
+            ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ needs.build-macos-arm64.outputs.version }}/${{ needs.build-macos-arm64.outputs.tarball }}
+            tar xzf ${{ needs.build-macos-arm64.outputs.tarball }}
+            cd arcbox-darwin-arm64-${{ needs.build-macos-arm64.outputs.version }}
+
+            # Re-sign binary with virtualization entitlement
             codesign --entitlements entitlements.plist --force -s - arcbox
 
-            # Install
+            # Install CLI
             sudo cp arcbox /usr/local/bin/
-            sudo mkdir -p /usr/local/share/arcbox/boot
-            sudo cp boot/* /usr/local/share/arcbox/boot/
+
+            # Download runtime boot assets
+            arcbox boot prefetch
             ```
 
             ### Verify checksums
