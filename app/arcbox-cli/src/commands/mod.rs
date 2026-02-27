@@ -3,8 +3,6 @@
 //! This module contains all the command handlers for the ArcBox CLI.
 //! Commands are organized into:
 //!
-//! - Container operations (run, start, stop, ps, logs, exec, rm)
-//! - Image operations (images, pull, rmi)
 //! - Machine operations (machine subcommands)
 //! - System operations (version, info)
 
@@ -12,23 +10,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 pub mod boot;
-pub mod create;
 pub mod daemon;
-pub mod diagnose;
 pub mod dns;
 pub mod docker;
-pub mod exec;
-pub mod image;
-pub mod images;
-pub mod logs;
 pub mod machine;
-pub mod ps;
-pub mod pull;
-pub mod restart;
-pub mod rm;
-pub mod run;
-pub mod start;
-pub mod stop;
 pub mod version;
 
 /// ArcBox - High-performance container and VM runtime
@@ -71,46 +56,6 @@ pub enum OutputFormat {
 /// Available commands
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Run a command in a new container
-    Run(run::RunArgs),
-
-    /// Create a new container
-    Create(create::CreateArgs),
-
-    /// Start one or more stopped containers
-    Start(start::StartArgs),
-
-    /// Stop one or more running containers
-    Stop(stop::StopArgs),
-
-    /// Restart one or more containers
-    Restart(restart::RestartArgs),
-
-    /// List containers
-    Ps(ps::PsArgs),
-
-    /// Remove one or more containers
-    Rm(rm::RmArgs),
-
-    /// Fetch the logs of a container
-    Logs(logs::LogsArgs),
-
-    /// Execute a command in a running container
-    Exec(exec::ExecArgs),
-
-    /// List images
-    Images(images::ImagesArgs),
-
-    /// Manage images
-    #[command(subcommand)]
-    Image(image::ImageCommands),
-
-    /// Pull an image from a registry
-    Pull(pull::PullArgs),
-
-    /// Remove one or more images
-    Rmi(images::RmiArgs),
-
     /// Manage Linux machines
     #[command(subcommand)]
     Machine(machine::MachineCommands),
@@ -132,9 +77,6 @@ pub enum Commands {
 
     /// Display system-wide information
     Info,
-
-    /// Run system diagnostics
-    Diagnose,
 
     /// Show version information
     Version,

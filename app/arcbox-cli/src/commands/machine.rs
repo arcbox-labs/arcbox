@@ -67,6 +67,17 @@ async fn machine_client() -> Result<MachineServiceClient<Channel>> {
     Ok(MachineServiceClient::new(channel))
 }
 
+/// Returns the number of machines visible through the daemon gRPC API.
+pub async fn machine_count() -> Result<usize> {
+    let mut client = machine_client().await?;
+    let response = client
+        .list(tonic::Request::new(ListMachinesRequest { all: true }))
+        .await
+        .context("Failed to list machines")?;
+
+    Ok(response.into_inner().machines.len())
+}
+
 fn parse_mount(mount: &str) -> Result<DirectoryMount> {
     let mut parts = mount.splitn(2, ':');
     let host = parts.next().unwrap_or_default().trim();
@@ -597,20 +608,4 @@ async fn exec_via_grpc(
         std::process::exit(exit_code);
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use arcbox_core::machine::MachineState;
-
-    #[test]
-    fn test_machine_state_display() {
-        assert_eq!(
-            match MachineState::Running {
-                MachineState::Running => "Running",
-                _ => "Other",
-            },
-            "Running"
-        );
-    }
 }
