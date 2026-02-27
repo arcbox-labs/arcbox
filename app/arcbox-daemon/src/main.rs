@@ -40,10 +40,6 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub initramfs: Option<PathBuf>,
 
-    /// Run in foreground.
-    #[arg(long, short = 'f')]
-    pub foreground: bool,
-
     /// Automatically enable Docker CLI integration.
     #[arg(long)]
     pub docker_integration: bool,
@@ -86,10 +82,6 @@ async fn main() -> Result<()> {
 }
 
 async fn run(args: DaemonArgs) -> Result<()> {
-    if !args.foreground {
-        info!("Running in foreground (`arcbox-daemon` does not daemonize itself)");
-    }
-
     info!("Starting ArcBox daemon...");
 
     let data_dir = resolve_data_dir(args.data_dir.as_ref());

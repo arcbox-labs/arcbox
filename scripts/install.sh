@@ -222,7 +222,6 @@ install_launchd_agent() {
     <key>ProgramArguments</key>
     <array>
         <string>${INSTALL_DIR}/arcbox-daemon</string>
-        <string>--foreground</string>
         <string>--docker-integration</string>
     </array>
 

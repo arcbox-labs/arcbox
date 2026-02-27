@@ -2,7 +2,7 @@
 //!
 //! This command controls the lifecycle of the `arcbox-daemon` binary:
 //! - start in background (default)
-//! - run in foreground (`--foreground`)
+//! - run in foreground (`-f`)
 //! - stop a running daemon (`arcbox daemon stop`)
 
 use anyhow::{Context, Result, bail};
@@ -97,7 +97,7 @@ pub async fn execute(args: DaemonArgs) -> Result<()> {
 
 fn exec_foreground(args: &DaemonArgs) -> Result<()> {
     let daemon_binary = resolve_daemon_binary()?;
-    let daemon_args = build_daemon_args(args, true);
+    let daemon_args = build_daemon_args(args);
 
     #[cfg(unix)]
     {
@@ -177,7 +177,7 @@ fn spawn_background(args: &DaemonArgs) -> Result<()> {
     }
 
     let daemon_binary = resolve_daemon_binary()?;
-    let daemon_args = build_daemon_args(args, true);
+    let daemon_args = build_daemon_args(args);
 
     let stdout_log = OpenOptions::new()
         .create(true)
@@ -237,7 +237,7 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn build_daemon_args(args: &DaemonArgs, foreground: bool) -> Vec<OsString> {
+fn build_daemon_args(args: &DaemonArgs) -> Vec<OsString> {
     let mut daemon_args = Vec::new();
 
     if let Some(socket) = &args.socket {
@@ -271,10 +271,6 @@ fn build_daemon_args(args: &DaemonArgs, foreground: bool) -> Vec<OsString> {
         daemon_args.push(OsString::from("--guest-docker-vsock-port"));
         daemon_args.push(OsString::from(port.to_string()));
     }
-    if foreground {
-        daemon_args.push(OsString::from("--foreground"));
-    }
-
     daemon_args
 }
 

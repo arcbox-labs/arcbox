@@ -27,7 +27,6 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/arcbox-daemon</string>
-        <string>--foreground</string>
         <string>--docker-integration</string>
     </array>
 
