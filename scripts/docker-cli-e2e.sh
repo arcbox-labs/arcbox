@@ -155,7 +155,7 @@ start_daemon() {
     mkdir -p "$TEST_DATA_DIR"
 
     # Build daemon command
-    DAEMON_CMD="$ARCBOX_BINARY daemon --socket $TEST_SOCKET --data-dir $TEST_DATA_DIR"
+    DAEMON_CMD="$ARCBOX_BINARY daemon start --socket $TEST_SOCKET --data-dir $TEST_DATA_DIR"
 
     if [[ "$HAS_VM_SUPPORT" == "true" ]]; then
         DAEMON_CMD="$DAEMON_CMD --kernel $KERNEL_PATH --initramfs $INITRAMFS_PATH"

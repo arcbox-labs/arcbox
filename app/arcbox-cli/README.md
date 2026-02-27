@@ -23,7 +23,7 @@ arcbox machine list
 arcbox machine stop myvm
 
 # Daemon management
-arcbox daemon                    # Start daemon in background
+arcbox daemon start              # Start daemon in background
 arcbox daemon stop               # Stop daemon
 arcbox info                      # System info
 arcbox version                   # Version info

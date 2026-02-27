@@ -290,7 +290,7 @@ print_summary() {
     fi
     echo ""
     bold "Quick start:"
-    echo "  arcbox daemon                    # Start daemon in background"
+    echo "  arcbox daemon start              # Start daemon in background"
     echo "  arcbox docker enable             # Use ArcBox with Docker CLI"
     echo "  docker run hello-world           # Run via Docker CLI"
     echo "  arcbox machine list              # List VMs"
@@ -300,7 +300,7 @@ print_summary() {
     echo "  docker run hello-world           # Works with standard Docker CLI"
     echo ""
     bold "Manage the daemon:"
-    echo "  arcbox daemon                    # Start in background"
+    echo "  arcbox daemon start              # Start in background"
     echo "  arcbox daemon stop               # Stop daemon"
     echo "  launchctl kickstart -k gui/$(id -u)/${PLIST_LABEL}  # Restart"
     echo "  launchctl bootout gui/$(id -u)/${PLIST_LABEL}       # Stop"

@@ -84,7 +84,7 @@ setup_from_user_cache() {
 
     if [[ ! -d "$USER_BOOT_DIR" ]]; then
         log_error "User boot cache not found: $USER_BOOT_DIR"
-        log_error "Please run 'arcbox daemon' first to download boot assets"
+        log_error "Please run 'arcbox daemon start' first to download boot assets"
         return 1
     fi
 

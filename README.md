@@ -23,7 +23,7 @@
 curl -sSL https://install.arcbox.dev | sh
 
 # 2. Start the daemon
-arcbox daemon
+arcbox daemon start
 
 # 3. Point Docker CLI at ArcBox
 arcbox docker enable
