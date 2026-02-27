@@ -47,6 +47,10 @@ pub enum VmmError {
     #[error("configuration error: {0}")]
     Config(String),
 
+    /// Vsock / guest-agent communication error.
+    #[error("vsock error: {0}")]
+    Vsock(String),
+
     /// Generic catch-all error.
     #[error("{0}")]
     Other(String),

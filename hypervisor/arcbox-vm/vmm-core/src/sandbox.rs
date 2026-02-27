@@ -17,7 +17,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use fc_sdk::VmBuilder;
 use fc_sdk::process::{FirecrackerProcessBuilder, JailerProcessBuilder};
-use fc_sdk::types::{BootSource, Drive, NetworkInterface};
+use fc_sdk::types::{BootSource, Drive, NetworkInterface, Vsock};
 use tokio::sync::broadcast;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -26,6 +26,7 @@ use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
 use crate::network::{NetworkAllocation, NetworkManager};
 use crate::snapshot::SnapshotCatalog;
+use crate::vsock::{self, ExecInputMsg, OutputChunk, StartCommand};
 
 /// Unique sandbox identifier (UUID string).
 pub type SandboxId = String;
@@ -163,6 +164,9 @@ pub struct SandboxInstance {
     pub network: Option<NetworkAllocation>,
     /// Directory holding the VM's runtime files (socket, logs, metrics).
     pub vm_dir: PathBuf,
+    /// Path to the Firecracker vsock Unix domain socket (host side).
+    /// `None` until the VM is booted.
+    pub vsock_uds_path: Option<PathBuf>,
     /// When the sandbox record was created.
     pub created_at: DateTime<Utc>,
     /// When the sandbox first became ready.
@@ -191,6 +195,7 @@ impl SandboxInstance {
             vm: None,
             network,
             vm_dir,
+            vsock_uds_path: None,
             created_at: Utc::now(),
             ready_at: None,
             last_exited_at: None,
@@ -571,6 +576,163 @@ impl SandboxManager {
     }
 
     // =========================================================================
+    // Workload execution (requires guest agent via vsock)
+    // =========================================================================
+
+    /// Run a command inside a ready sandbox and stream its output.
+    ///
+    /// The sandbox must be in `Ready` state.  It transitions to `Running`
+    /// immediately and back to `Ready` (emitting an `"idle"` event) when the
+    /// command exits.
+    ///
+    /// Returns a channel receiver yielding [`OutputChunk`]s.  The final chunk
+    /// has `stream == "exit"` and carries the process exit code.
+    pub async fn run_in_sandbox(
+        &self,
+        id: &SandboxId,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        working_dir: String,
+        user: String,
+        tty: bool,
+        tty_size: Option<(u16, u16)>,
+        timeout_seconds: u32,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<OutputChunk>>> {
+        let uds_path = self.require_ready_vsock(id)?;
+
+        // Transition to Running.
+        {
+            let inst = self.get_instance(id)?;
+            inst.lock().unwrap().state = SandboxState::Running;
+        }
+        let _ = self.events_tx.send(SandboxEvent::new(id, "running"));
+
+        let start = StartCommand {
+            cmd,
+            env,
+            working_dir,
+            user,
+            tty,
+            tty_width: tty_size.map(|(w, _)| w).unwrap_or(80),
+            tty_height: tty_size.map(|(_, h)| h).unwrap_or(24),
+            timeout_seconds,
+        };
+
+        let inner_rx = vsock::run(&uds_path, start).await?;
+
+        // Wrap the receiver to intercept MSG_EXIT and update state.
+        let (wrapped_tx, wrapped_rx) = tokio::sync::mpsc::channel(64);
+        let instances = Arc::clone(&self.instances);
+        let events_tx = self.events_tx.clone();
+        let sandbox_id = id.clone();
+        tokio::spawn(async move {
+            let mut inner_rx = inner_rx;
+            while let Some(result) = inner_rx.recv().await {
+                let send_result = match &result {
+                    Ok(chunk) if chunk.stream == "exit" => {
+                        let exit_code = chunk.exit_code;
+                        if let Some(arc) = instances.read().unwrap().get(&sandbox_id).cloned() {
+                            let mut inst = arc.lock().unwrap();
+                            inst.state = SandboxState::Ready;
+                            inst.last_exit_code = Some(exit_code);
+                            inst.last_exited_at = Some(Utc::now());
+                        }
+                        let _ = events_tx.send(
+                            SandboxEvent::new(&sandbox_id, "idle")
+                                .with_attr("exit_code", &exit_code.to_string()),
+                        );
+                        wrapped_tx.send(result).await
+                    }
+                    _ => wrapped_tx.send(result).await,
+                };
+                if send_result.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(wrapped_rx)
+    }
+
+    /// Start an interactive exec session inside a ready sandbox.
+    ///
+    /// The sandbox must be in `Ready` state.  It transitions to `Running`
+    /// immediately and back to `Ready` when the session ends.
+    ///
+    /// Returns `(input_sender, output_receiver)`:
+    /// - Push [`ExecInputMsg`]s (stdin bytes, TTY resize, EOF) into `input_sender`.
+    /// - Read [`OutputChunk`]s from `output_receiver` for stdout, stderr, and exit.
+    pub async fn exec_in_sandbox(
+        &self,
+        id: &SandboxId,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        working_dir: String,
+        user: String,
+        tty: bool,
+        tty_size: Option<(u16, u16)>,
+        timeout_seconds: u32,
+    ) -> Result<(
+        tokio::sync::mpsc::Sender<ExecInputMsg>,
+        tokio::sync::mpsc::Receiver<Result<OutputChunk>>,
+    )> {
+        let uds_path = self.require_ready_vsock(id)?;
+
+        // Transition to Running.
+        {
+            let inst = self.get_instance(id)?;
+            inst.lock().unwrap().state = SandboxState::Running;
+        }
+        let _ = self.events_tx.send(SandboxEvent::new(id, "running"));
+
+        let start = StartCommand {
+            cmd,
+            env,
+            working_dir,
+            user,
+            tty,
+            tty_width: tty_size.map(|(w, _)| w).unwrap_or(80),
+            tty_height: tty_size.map(|(_, h)| h).unwrap_or(24),
+            timeout_seconds,
+        };
+
+        let (in_tx, inner_rx) = vsock::exec(&uds_path, start).await?;
+
+        // Wrap the output receiver to intercept MSG_EXIT and update state.
+        let (wrapped_tx, wrapped_rx) = tokio::sync::mpsc::channel(64);
+        let instances = Arc::clone(&self.instances);
+        let events_tx = self.events_tx.clone();
+        let sandbox_id = id.clone();
+        tokio::spawn(async move {
+            let mut inner_rx = inner_rx;
+            while let Some(result) = inner_rx.recv().await {
+                let send_result = match &result {
+                    Ok(chunk) if chunk.stream == "exit" => {
+                        let exit_code = chunk.exit_code;
+                        if let Some(arc) = instances.read().unwrap().get(&sandbox_id).cloned() {
+                            let mut inst = arc.lock().unwrap();
+                            inst.state = SandboxState::Ready;
+                            inst.last_exit_code = Some(exit_code);
+                            inst.last_exited_at = Some(Utc::now());
+                        }
+                        let _ = events_tx.send(
+                            SandboxEvent::new(&sandbox_id, "idle")
+                                .with_attr("exit_code", &exit_code.to_string()),
+                        );
+                        wrapped_tx.send(result).await
+                    }
+                    _ => wrapped_tx.send(result).await,
+                };
+                if send_result.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok((in_tx, wrapped_rx))
+    }
+
+    // =========================================================================
     // Checkpoint / Restore
     // =========================================================================
 
@@ -681,6 +843,7 @@ impl SandboxManager {
             .join(&new_id);
         std::fs::create_dir_all(&vm_dir).map_err(VmmError::Io)?;
         let socket_path = vm_dir.join("firecracker.sock");
+        let vsock_uds_path = vm_dir.join("firecracker.vsock");
 
         // Locate checkpoint on disk.
         let snap_meta = self.snapshots.find_by_id(&spec.snapshot_id)?;
@@ -736,6 +899,7 @@ impl SandboxManager {
             SandboxInstance::new(new_id.clone(), restore_spec, net_alloc.clone(), vm_dir);
         instance.process = Some(process);
         instance.vm = Some(vm);
+        instance.vsock_uds_path = Some(vsock_uds_path);
         instance.state = SandboxState::Ready;
         instance.ready_at = Some(Utc::now());
 
@@ -811,6 +975,25 @@ impl SandboxManager {
             .ok_or_else(|| VmmError::NotFound(id.clone()))
     }
 
+    /// Verify the sandbox is `Ready` and return its vsock UDS path.
+    fn require_ready_vsock(&self, id: &SandboxId) -> Result<PathBuf> {
+        let instance = self.get_instance(id)?;
+        let inst = instance.lock().unwrap();
+        match inst.state {
+            SandboxState::Ready => {}
+            s => {
+                return Err(VmmError::WrongState {
+                    id: id.clone(),
+                    expected: "Ready".into(),
+                    actual: s.to_string(),
+                })
+            }
+        }
+        inst.vsock_uds_path
+            .clone()
+            .ok_or_else(|| VmmError::Vsock(format!("sandbox {id} has no vsock configured")))
+    }
+
     fn get_vm_handle(&self, id: &SandboxId) -> Result<Arc<fc_sdk::Vm>> {
         let instance = self.get_instance(id)?;
         let inst = instance.lock().unwrap();
@@ -841,12 +1024,13 @@ async fn boot_sandbox(
     events_tx: broadcast::Sender<SandboxEvent>,
 ) {
     match do_boot(&id, &spec, net_alloc.as_ref(), &vm_dir, &config).await {
-        Ok((process, vm)) => {
+        Ok((process, vm, vsock_uds_path)) => {
             let ready_at = Utc::now();
             if let Some(arc) = instances.read().unwrap().get(&id).cloned() {
                 let mut inst = arc.lock().unwrap();
                 inst.process = Some(process);
                 inst.vm = Some(vm);
+                inst.vsock_uds_path = Some(vsock_uds_path);
                 inst.state = SandboxState::Ready;
                 inst.ready_at = Some(ready_at);
             }
@@ -873,17 +1057,18 @@ async fn boot_sandbox(
 
 /// Perform the actual Firecracker boot: spawn process, configure, start VM.
 ///
-/// Returns `(FirecrackerProcess, Arc<Vm>)` on success.
+/// Returns `(FirecrackerProcess, Arc<Vm>, vsock_uds_path)` on success.
 async fn do_boot(
     id: &str,
     spec: &SandboxSpec,
     net_alloc: Option<&NetworkAllocation>,
     vm_dir: &PathBuf,
     config: &VmmConfig,
-) -> Result<(fc_sdk::FirecrackerProcess, Arc<fc_sdk::Vm>)> {
+) -> Result<(fc_sdk::FirecrackerProcess, Arc<fc_sdk::Vm>, PathBuf)> {
     let log_path = vm_dir.join("firecracker.log");
     let metrics_path = vm_dir.join("firecracker.metrics");
     let socket_path = vm_dir.join("firecracker.sock");
+    let vsock_uds_path = vm_dir.join("firecracker.vsock");
 
     let fc_cfg = &config.firecracker;
 
@@ -983,8 +1168,17 @@ async fn do_boot(
         });
     }
 
+    // Configure vsock device so the guest agent can receive connections.
+    builder = builder.vsock(Vsock {
+        // CID 3 is the conventional guest CID; each Firecracker process is
+        // isolated so the same CID is safe across concurrent sandboxes.
+        guest_cid: 3,
+        uds_path: vsock_uds_path.to_str().unwrap().to_owned(),
+        vsock_id: None,
+    });
+
     let vm = Arc::new(builder.start().await.map_err(VmmError::Sdk)?);
-    Ok((process, vm))
+    Ok((process, vm, vsock_uds_path))
 }
 
 // =============================================================================

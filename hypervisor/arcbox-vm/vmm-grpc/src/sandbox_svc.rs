@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::warn;
 
 use vmm_core::{
-    RestoreSandboxSpec, SandboxEvent as CoreEvent, SandboxManager, SandboxMountSpec,
+    ExecInputMsg, RestoreSandboxSpec, SandboxEvent as CoreEvent, SandboxManager, SandboxMountSpec,
     SandboxNetworkSpec, SandboxSpec,
 };
 
@@ -20,6 +20,7 @@ use crate::proto::sandbox::{
     RemoveSandboxRequest, ResourceLimits, RestoreRequest, RestoreResponse, RunOutput, RunRequest,
     SandboxEvent as ProtoEvent, SandboxEventsRequest, SandboxInfo as ProtoSandboxInfo,
     SandboxNetwork, SandboxSummary as ProtoSandboxSummary, SnapshotSummary, StopSandboxRequest,
+    exec_input,
     sandbox_service_server::SandboxService,
     sandbox_snapshot_service_server::SandboxSnapshotService,
 };
@@ -100,32 +101,134 @@ impl SandboxService for SandboxServiceImpl {
         }))
     }
 
-    type RunStream = ReceiverStream<Result<RunOutput, Status>>;
+    type RunStream = Pin<Box<dyn Stream<Item = Result<RunOutput, Status>> + Send + 'static>>;
 
     /// Run a command inside a sandbox and stream its output.
-    ///
-    /// Requires a guest agent (vsock) — not yet implemented.
     async fn run(
         &self,
-        _request: Request<RunRequest>,
+        request: Request<RunRequest>,
     ) -> Result<Response<Self::RunStream>, Status> {
-        Err(Status::unimplemented(
-            "Run requires a guest agent (vsock); not yet implemented",
-        ))
+        let req = request.into_inner();
+        let tty_size = if req.tty { Some((80u16, 24u16)) } else { None };
+
+        let rx = self
+            .manager
+            .run_in_sandbox(
+                &req.id,
+                req.cmd,
+                req.env,
+                req.working_dir,
+                req.user,
+                req.tty,
+                tty_size,
+                req.timeout_seconds,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let stream = ReceiverStream::new(rx).map(|result| {
+            result
+                .map(|chunk| {
+                    let done = chunk.stream == "exit";
+                    RunOutput {
+                        stream: chunk.stream,
+                        data: chunk.data,
+                        exit_code: chunk.exit_code,
+                        done,
+                    }
+                })
+                .map_err(|e| Status::internal(e.to_string()))
+        });
+
+        Ok(Response::new(Box::pin(stream)))
     }
 
-    type ExecStream = ReceiverStream<Result<ExecOutput, Status>>;
+    type ExecStream = Pin<Box<dyn Stream<Item = Result<ExecOutput, Status>> + Send + 'static>>;
 
-    /// Execute an interactive command inside a sandbox.
-    ///
-    /// Requires a guest agent (vsock) — not yet implemented.
+    /// Execute an interactive command inside a sandbox (bidirectional streaming).
     async fn exec(
         &self,
-        _request: Request<Streaming<ExecInput>>,
+        request: Request<Streaming<ExecInput>>,
     ) -> Result<Response<Self::ExecStream>, Status> {
-        Err(Status::unimplemented(
-            "Exec requires a guest agent (vsock); not yet implemented",
-        ))
+        let mut input_stream = request.into_inner();
+
+        // First message must be ExecInput { init: ExecRequest }.
+        let first = input_stream
+            .message()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::invalid_argument("exec stream closed before init message"))?;
+
+        let exec_req = match first.payload {
+            Some(exec_input::Payload::Init(r)) => r,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first exec message must be ExecInput { init: ... }",
+                ))
+            }
+        };
+
+        let tty_size = if exec_req.tty {
+            exec_req
+                .tty_size
+                .as_ref()
+                .map(|s| (s.width as u16, s.height as u16))
+                .or(Some((80, 24)))
+        } else {
+            None
+        };
+
+        let (in_tx, out_rx) = self
+            .manager
+            .exec_in_sandbox(
+                &exec_req.id,
+                exec_req.cmd,
+                exec_req.env,
+                exec_req.working_dir,
+                exec_req.user,
+                exec_req.tty,
+                tty_size,
+                exec_req.timeout_seconds,
+            )
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Forward subsequent input messages to the vsock writer.
+        tokio::spawn(async move {
+            let mut stream = input_stream;
+            while let Ok(Some(msg)) = stream.message().await {
+                let client_msg = match msg.payload {
+                    Some(exec_input::Payload::Stdin(data)) => ExecInputMsg::Stdin(data),
+                    Some(exec_input::Payload::Resize(sz)) => ExecInputMsg::Resize {
+                        width: sz.width as u16,
+                        height: sz.height as u16,
+                    },
+                    _ => ExecInputMsg::Eof,
+                };
+                if in_tx.send(client_msg).await.is_err() {
+                    break;
+                }
+            }
+            // Signal EOF when the gRPC client closes the send side.
+            let _ = in_tx.send(ExecInputMsg::Eof).await;
+        });
+
+        // Stream output back to the gRPC client.
+        let stream = ReceiverStream::new(out_rx).map(|result| {
+            result
+                .map(|chunk| {
+                    let done = chunk.stream == "exit";
+                    ExecOutput {
+                        stream: chunk.stream,
+                        data: chunk.data,
+                        exit_code: chunk.exit_code,
+                        done,
+                    }
+                })
+                .map_err(|e| Status::internal(e.to_string()))
+        });
+
+        Ok(Response::new(Box::pin(stream)))
     }
 
     /// Stop a sandbox gracefully.

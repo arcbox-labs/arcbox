@@ -18,6 +18,7 @@ pub mod network;
 pub mod sandbox;
 pub mod snapshot;
 pub mod store;
+pub mod vsock;
 
 // Keep the general VM manager available for internal tooling.
 pub mod instance;
@@ -32,6 +33,7 @@ pub use sandbox::{
     SandboxSpec, SandboxState, SandboxSummary,
 };
 pub use snapshot::{SnapshotCatalog, SnapshotInfo};
+pub use vsock::{ExecInputMsg, OutputChunk, StartCommand};
 
 // Re-export VmState for system_svc compatibility (internal use only).
 pub use instance::VmState;

@@ -1,5 +1,5 @@
 [workspace]
-members = ["vmm-core", "vmm-grpc", "vmm-daemon", "vmm-cli"]
+members = ["vmm-core", "vmm-grpc", "vmm-daemon", "vmm-cli", "vmm-guest-agent"]
 resolver = "3"
 
 [workspace.package]

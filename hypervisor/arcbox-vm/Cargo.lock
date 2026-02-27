@@ -2133,6 +2133,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmm-guest-agent"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "nix",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "want"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
