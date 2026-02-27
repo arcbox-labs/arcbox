@@ -21,8 +21,7 @@ pub async fn serve(
     unix_socket: &str,
     tcp_addr: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sandbox_svc =
-        SandboxServiceServer::new(SandboxServiceImpl::new(Arc::clone(&manager)));
+    let sandbox_svc = SandboxServiceServer::new(SandboxServiceImpl::new(Arc::clone(&manager)));
     let snapshot_svc =
         SandboxSnapshotServiceServer::new(SandboxSnapshotServiceImpl::new(Arc::clone(&manager)));
 
@@ -59,9 +58,7 @@ pub async fn serve(
         let tcp_server = async move {
             let addr = tcp_addr_str
                 .parse()
-                .map_err(|e: std::net::AddrParseError| {
-                    Box::new(e) as Box<dyn std::error::Error>
-                })?;
+                .map_err(|e: std::net::AddrParseError| Box::new(e) as Box<dyn std::error::Error>)?;
             info!(addr = %tcp_addr_str, "gRPC also listening on TCP");
             Server::builder()
                 .add_service(sandbox_svc)

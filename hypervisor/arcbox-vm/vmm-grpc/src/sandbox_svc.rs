@@ -20,8 +20,7 @@ use crate::proto::sandbox::{
     RemoveSandboxRequest, ResourceLimits, RestoreRequest, RestoreResponse, RunOutput, RunRequest,
     SandboxEvent as ProtoEvent, SandboxEventsRequest, SandboxInfo as ProtoSandboxInfo,
     SandboxNetwork, SandboxSummary as ProtoSandboxSummary, SnapshotSummary, StopSandboxRequest,
-    exec_input,
-    sandbox_service_server::SandboxService,
+    exec_input, sandbox_service_server::SandboxService,
     sandbox_snapshot_service_server::SandboxSnapshotService,
 };
 
@@ -104,10 +103,7 @@ impl SandboxService for SandboxServiceImpl {
     type RunStream = Pin<Box<dyn Stream<Item = Result<RunOutput, Status>> + Send + 'static>>;
 
     /// Run a command inside a sandbox and stream its output.
-    async fn run(
-        &self,
-        request: Request<RunRequest>,
-    ) -> Result<Response<Self::RunStream>, Status> {
+    async fn run(&self, request: Request<RunRequest>) -> Result<Response<Self::RunStream>, Status> {
         let req = request.into_inner();
         let tty_size = if req.tty { Some((80u16, 24u16)) } else { None };
 
@@ -164,7 +160,7 @@ impl SandboxService for SandboxServiceImpl {
             _ => {
                 return Err(Status::invalid_argument(
                     "first exec message must be ExecInput { init: ... }",
-                ))
+                ));
             }
         };
 
@@ -232,10 +228,7 @@ impl SandboxService for SandboxServiceImpl {
     }
 
     /// Stop a sandbox gracefully.
-    async fn stop(
-        &self,
-        request: Request<StopSandboxRequest>,
-    ) -> Result<Response<Empty>, Status> {
+    async fn stop(&self, request: Request<StopSandboxRequest>) -> Result<Response<Empty>, Status> {
         let req = request.into_inner();
         self.manager
             .stop_sandbox(&req.id, req.timeout_seconds)
@@ -296,9 +289,7 @@ impl SandboxService for SandboxServiceImpl {
         request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         let req = request.into_inner();
-        let summaries = self
-            .manager
-            .list_sandboxes(Some(&req.state), &req.labels);
+        let summaries = self.manager.list_sandboxes(Some(&req.state), &req.labels);
 
         let sandboxes = summaries
             .into_iter()
@@ -314,8 +305,7 @@ impl SandboxService for SandboxServiceImpl {
         Ok(Response::new(ListSandboxesResponse { sandboxes }))
     }
 
-    type EventsStream =
-        Pin<Box<dyn Stream<Item = Result<ProtoEvent, Status>> + Send + 'static>>;
+    type EventsStream = Pin<Box<dyn Stream<Item = Result<ProtoEvent, Status>> + Send + 'static>>;
 
     /// Subscribe to sandbox lifecycle events.
     async fn events(

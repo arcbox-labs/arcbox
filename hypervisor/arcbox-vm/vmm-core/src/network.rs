@@ -121,8 +121,13 @@ impl NetworkManager {
     fn create_tap(&self, tap_name: &str) -> Result<()> {
         use std::process::Command;
 
+        // Remove any stale TAP left over from a previous crashed run.
+        let _ = Command::new("/usr/sbin/ip")
+            .args(["link", "delete", tap_name])
+            .status();
+
         // Create TAP interface
-        let status = Command::new("ip")
+        let status = Command::new("/usr/sbin/ip")
             .args(["tuntap", "add", tap_name, "mode", "tap"])
             .status()
             .map_err(|e| VmmError::Network(format!("ip tuntap add: {e}")))?;
@@ -133,13 +138,13 @@ impl NetworkManager {
         }
 
         // Bring up
-        let _ = Command::new("ip")
+        let _ = Command::new("/usr/sbin/ip")
             .args(["link", "set", tap_name, "up"])
             .status();
 
         // Attach to bridge
         if !self.bridge.is_empty() {
-            let _ = Command::new("ip")
+            let _ = Command::new("/usr/sbin/ip")
                 .args(["link", "set", tap_name, "master", &self.bridge])
                 .status();
         }
@@ -155,7 +160,7 @@ impl NetworkManager {
 #[cfg(target_os = "linux")]
 fn destroy_tap(tap_name: &str) {
     use std::process::Command;
-    let _ = Command::new("ip")
+    let _ = Command::new("/usr/sbin/ip")
         .args(["link", "delete", tap_name])
         .status();
 }

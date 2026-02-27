@@ -29,7 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap             = { version = "4", features = ["derive", "env"] }
 tower            = "0.4"
 hyper-util       = { version = "0.1", features = ["tokio"] }
-nix              = { version = "0.29", features = ["net", "ioctl"] }
+nix              = { version = "0.29", features = ["net", "ioctl", "user", "fs"] }
 libc             = "0.2"
 chrono           = { version = "0.4", features = ["serde"] }
 toml             = "0.8"

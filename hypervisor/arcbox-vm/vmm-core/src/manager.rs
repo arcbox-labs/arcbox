@@ -500,6 +500,8 @@ impl VmmManager {
             vmstate_path,
             Some(mem_path),
             None,
+            None,
+            None,
         )?;
 
         if was_running {

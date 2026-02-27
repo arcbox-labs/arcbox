@@ -265,7 +265,10 @@ pub async fn run(
 pub async fn exec(
     uds_path: &Path,
     start: StartCommand,
-) -> Result<(mpsc::Sender<ExecInputMsg>, mpsc::Receiver<Result<OutputChunk>>)> {
+) -> Result<(
+    mpsc::Sender<ExecInputMsg>,
+    mpsc::Receiver<Result<OutputChunk>>,
+)> {
     let stream = connect_to_agent(uds_path).await?;
 
     // Send the start command.
@@ -283,9 +286,7 @@ pub async fn exec(
     tokio::spawn(async move {
         while let Some(msg) = in_rx.recv().await {
             let result = match msg {
-                ExecInputMsg::Stdin(data) => {
-                    write_frame(&mut write_half, MSG_STDIN, &data).await
-                }
+                ExecInputMsg::Stdin(data) => write_frame(&mut write_half, MSG_STDIN, &data).await,
                 ExecInputMsg::Resize { width, height } => {
                     let mut buf = [0u8; 4];
                     buf[..2].copy_from_slice(&width.to_le_bytes());

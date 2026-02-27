@@ -80,8 +80,12 @@ mod agent {
         timeout_seconds: u32,
     }
 
-    fn default_tty_width() -> u16 { 80 }
-    fn default_tty_height() -> u16 { 24 }
+    fn default_tty_width() -> u16 {
+        80
+    }
+    fn default_tty_height() -> u16 {
+        24
+    }
 
     // -------------------------------------------------------------------------
     // Framed I/O over a raw socket fd
@@ -102,22 +106,29 @@ mod agent {
     impl Read for VsockStream {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             // SAFETY: buf is a valid mutable slice; fd is a valid socket.
-            let n = unsafe {
-                libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-            };
-            if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n as usize) }
+            let n =
+                unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
         }
     }
 
     impl Write for VsockStream {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             // SAFETY: buf is a valid slice; fd is a valid socket.
-            let n = unsafe {
-                libc::write(self.fd, buf.as_ptr() as *const libc::c_void, buf.len())
-            };
-            if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n as usize) }
+            let n = unsafe { libc::write(self.fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+            if n < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(n as usize)
+            }
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     impl Drop for VsockStream {
@@ -138,7 +149,9 @@ mod agent {
         r.read_exact(&mut len_buf)?;
         let len = u32::from_le_bytes(len_buf) as usize;
         let mut payload = vec![0u8; len];
-        if len > 0 { r.read_exact(&mut payload)?; }
+        if len > 0 {
+            r.read_exact(&mut payload)?;
+        }
         Ok((type_buf[0], payload))
     }
 
@@ -161,7 +174,10 @@ mod agent {
 
         let (msg_type, payload) = match read_frame(&mut conn) {
             Ok(f) => f,
-            Err(e) => { eprintln!("agent: read MSG_START: {e}"); return; }
+            Err(e) => {
+                eprintln!("agent: read MSG_START: {e}");
+                return;
+            }
         };
         if msg_type != MSG_START {
             eprintln!("agent: expected MSG_START (0x01), got 0x{msg_type:02x}");
@@ -169,10 +185,17 @@ mod agent {
         }
         let start: StartCommand = match serde_json::from_slice(&payload) {
             Ok(s) => s,
-            Err(e) => { eprintln!("agent: parse StartCommand: {e}"); return; }
+            Err(e) => {
+                eprintln!("agent: parse StartCommand: {e}");
+                return;
+            }
         };
 
-        if start.tty { handle_tty(conn, start); } else { handle_piped(conn, start); }
+        if start.tty {
+            handle_tty(conn, start);
+        } else {
+            handle_piped(conn, start);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -185,12 +208,19 @@ mod agent {
         let mut cmd = Command::new(start.cmd.first().expect("empty cmd"));
         cmd.args(start.cmd.get(1..).unwrap_or(&[]));
         cmd.envs(&start.env);
-        if !start.working_dir.is_empty() { cmd.current_dir(&start.working_dir); }
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if !start.working_dir.is_empty() {
+            cmd.current_dir(&start.working_dir);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
-            Err(e) => { eprintln!("agent: spawn {:?}: {e}", start.cmd); return; }
+            Err(e) => {
+                eprintln!("agent: spawn {:?}: {e}", start.cmd);
+                return;
+            }
         };
 
         let mut child_stdin = child.stdin.take().unwrap();
@@ -207,7 +237,9 @@ mod agent {
             loop {
                 match out.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { let _ = write_frame(&mut *w1.lock().unwrap(), MSG_STDOUT, &buf[..n]); }
+                    Ok(n) => {
+                        let _ = write_frame(&mut *w1.lock().unwrap(), MSG_STDOUT, &buf[..n]);
+                    }
                 }
             }
         });
@@ -219,7 +251,9 @@ mod agent {
             loop {
                 match err.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { let _ = write_frame(&mut *w2.lock().unwrap(), MSG_STDERR, &buf[..n]); }
+                    Ok(n) => {
+                        let _ = write_frame(&mut *w2.lock().unwrap(), MSG_STDERR, &buf[..n]);
+                    }
                 }
             }
         });
@@ -240,8 +274,15 @@ mod agent {
         let mut reader = unsafe { VsockStream::from_raw_fd(read_fd) };
         loop {
             match read_frame(&mut reader) {
-                Ok((MSG_STDIN, data)) => { if child_stdin.write_all(&data).is_err() { break; } }
-                Ok((MSG_EOF, _)) | Err(_) => { drop(child_stdin); break; }
+                Ok((MSG_STDIN, data)) => {
+                    if child_stdin.write_all(&data).is_err() {
+                        break;
+                    }
+                }
+                Ok((MSG_EOF, _)) | Err(_) => {
+                    drop(child_stdin);
+                    break;
+                }
                 Ok(_) => {}
             }
         }
@@ -267,13 +308,18 @@ mod agent {
 
         let OpenptyResult { master, slave } = match nix::pty::openpty(None, None) {
             Ok(r) => r,
-            Err(e) => { eprintln!("agent: openpty: {e}"); return; }
+            Err(e) => {
+                eprintln!("agent: openpty: {e}");
+                return;
+            }
         };
 
         if start.tty_width > 0 && start.tty_height > 0 {
             let winsize = libc::winsize {
-                ws_col: start.tty_width, ws_row: start.tty_height,
-                ws_xpixel: 0, ws_ypixel: 0,
+                ws_col: start.tty_width,
+                ws_row: start.tty_height,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
             };
             // SAFETY: master is a valid PTY master fd.
             unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &winsize) };
@@ -290,14 +336,18 @@ mod agent {
                 let _ = setsid();
                 // SAFETY: all fds are valid in the child process.
                 unsafe {
-                    libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0);
+                    libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
                     libc::dup2(slave_fd, libc::STDIN_FILENO);
                     libc::dup2(slave_fd, libc::STDOUT_FILENO);
                     libc::dup2(slave_fd, libc::STDERR_FILENO);
-                    if slave_fd > libc::STDERR_FILENO { libc::close(slave_fd); }
+                    if slave_fd > libc::STDERR_FILENO {
+                        libc::close(slave_fd);
+                    }
                 }
 
-                let cstrings: Vec<std::ffi::CString> = start.cmd.iter()
+                let cstrings: Vec<std::ffi::CString> = start
+                    .cmd
+                    .iter()
                     .filter_map(|s| std::ffi::CString::new(s.as_str()).ok())
                     .collect();
                 let mut argv: Vec<*const libc::c_char> =
@@ -338,7 +388,11 @@ mod agent {
                         match r.read(&mut buf) {
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
-                                let _ = write_frame(&mut *w_read.lock().unwrap(), MSG_STDOUT, &buf[..n]);
+                                let _ = write_frame(
+                                    &mut *w_read.lock().unwrap(),
+                                    MSG_STDOUT,
+                                    &buf[..n],
+                                );
                             }
                         }
                     }
@@ -351,12 +405,15 @@ mod agent {
 
                 loop {
                     match read_frame(&mut reader) {
-                        Ok((MSG_STDIN, data)) => { let _ = master_writer.write_all(&data); }
+                        Ok((MSG_STDIN, data)) => {
+                            let _ = master_writer.write_all(&data);
+                        }
                         Ok((MSG_RESIZE, data)) if data.len() >= 4 => {
                             let winsize = libc::winsize {
                                 ws_col: u16::from_le_bytes([data[0], data[1]]),
                                 ws_row: u16::from_le_bytes([data[2], data[3]]),
-                                ws_xpixel: 0, ws_ypixel: 0,
+                                ws_xpixel: 0,
+                                ws_ypixel: 0,
                             };
                             // SAFETY: master_fd is valid.
                             unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &winsize) };
@@ -371,7 +428,11 @@ mod agent {
                 let mut status: libc::c_int = 0;
                 // SAFETY: child.as_raw() is a valid pid returned from fork.
                 unsafe { libc::waitpid(child.as_raw(), &mut status, 0) };
-                let exit_code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -1 };
+                let exit_code = if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    -1
+                };
                 let _ = write_frame(
                     &mut *writer.lock().unwrap(),
                     MSG_EXIT,
@@ -397,7 +458,11 @@ mod agent {
     fn create_vsock_listener(port: u32) -> RawFd {
         // SAFETY: socket(2) with valid AF_VSOCK constants.
         let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
-        assert!(fd >= 0, "socket(AF_VSOCK): {}", std::io::Error::last_os_error());
+        assert!(
+            fd >= 0,
+            "socket(AF_VSOCK): {}",
+            std::io::Error::last_os_error()
+        );
 
         let addr = libc::sockaddr_vm {
             svm_family: libc::AF_VSOCK as libc::sa_family_t,
@@ -414,7 +479,11 @@ mod agent {
                 std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
             )
         };
-        assert!(ret == 0, "bind vsock port {port}: {}", std::io::Error::last_os_error());
+        assert!(
+            ret == 0,
+            "bind vsock port {port}: {}",
+            std::io::Error::last_os_error()
+        );
         // SAFETY: fd is a bound socket.
         unsafe { libc::listen(fd, 128) };
         fd
@@ -423,12 +492,15 @@ mod agent {
     fn accept_connection(server_fd: RawFd) -> RawFd {
         loop {
             // SAFETY: server_fd is a listening vsock socket.
-            let conn_fd = unsafe {
-                libc::accept(server_fd, std::ptr::null_mut(), std::ptr::null_mut())
-            };
-            if conn_fd >= 0 { return conn_fd; }
+            let conn_fd =
+                unsafe { libc::accept(server_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+            if conn_fd >= 0 {
+                return conn_fd;
+            }
             let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::Interrupted { panic!("accept: {err}"); }
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                panic!("accept: {err}");
+            }
         }
     }
 }

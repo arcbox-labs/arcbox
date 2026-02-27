@@ -176,7 +176,10 @@ async fn main() -> Result<()> {
             let r = resp.into_inner();
             println!("Sandbox ID:  {}", r.id);
             println!("IP address:  {}", r.ip_address);
-            println!("State:       {} (poll `vmm inspect` or watch `vmm events`)", r.state);
+            println!(
+                "State:       {} (poll `vmm inspect` or watch `vmm events`)",
+                r.state
+            );
         }
 
         Cmd::Stop { id, timeout } => {
@@ -349,9 +352,7 @@ async fn run_snapshot(channel: Channel, cmd: SnapshotCmd) -> Result<()> {
 }
 
 /// Parse `"key=value"` label strings into a `HashMap`.
-fn parse_labels(
-    labels: &[String],
-) -> Result<std::collections::HashMap<String, String>> {
+fn parse_labels(labels: &[String]) -> Result<std::collections::HashMap<String, String>> {
     labels
         .iter()
         .map(|l| {

@@ -26,6 +26,12 @@ pub struct SnapshotMeta {
     pub created_at: DateTime<Utc>,
     /// Parent snapshot ID (diff chain).
     pub parent_id: Option<String>,
+    /// Host-absolute kernel path (required for jailer-mode restore staging).
+    #[serde(default)]
+    pub kernel_path: Option<String>,
+    /// Host-absolute rootfs path (required for jailer-mode restore staging).
+    #[serde(default)]
+    pub rootfs_path: Option<String>,
 }
 
 /// Info returned to callers / gRPC layer.
@@ -76,6 +82,7 @@ impl SnapshotCatalog {
     }
 
     /// Register a freshly-created snapshot.
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &self,
         vm_id: &str,
@@ -84,6 +91,8 @@ impl SnapshotCatalog {
         vmstate_path: PathBuf,
         mem_path: Option<PathBuf>,
         parent_id: Option<String>,
+        kernel_path: Option<String>,
+        rootfs_path: Option<String>,
     ) -> Result<SnapshotMeta> {
         let id = Uuid::new_v4().to_string();
         let meta = SnapshotMeta {
@@ -95,6 +104,8 @@ impl SnapshotCatalog {
             mem_path,
             created_at: Utc::now(),
             parent_id,
+            kernel_path,
+            rootfs_path,
         };
         self.write_meta(&meta)?;
         info!(snapshot_id = %id, vm_id, "snapshot registered");
@@ -154,10 +165,10 @@ impl SnapshotCatalog {
             let entry = entry.map_err(VmmError::Io)?;
             if entry.path().is_dir() {
                 let snap_path = entry.path().join(snapshot_id);
-                if snap_path.is_dir() {
-                    if let Ok(meta) = self.read_meta(&snap_path) {
-                        return Ok(meta);
-                    }
+                if snap_path.is_dir()
+                    && let Ok(meta) = self.read_meta(&snap_path)
+                {
+                    return Ok(meta);
                 }
             }
         }

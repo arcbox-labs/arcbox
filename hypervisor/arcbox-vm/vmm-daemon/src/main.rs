@@ -72,9 +72,8 @@ async fn main() -> Result<()> {
     let tcp_addr = config.grpc.tcp_addr.clone();
 
     // Build the sandbox manager.
-    let manager = Arc::new(
-        SandboxManager::new(config).context("failed to initialise SandboxManager")?,
-    );
+    let manager =
+        Arc::new(SandboxManager::new(config).context("failed to initialise SandboxManager")?);
 
     // Install signal handlers for graceful shutdown.
     let shutdown = install_signal_handler();

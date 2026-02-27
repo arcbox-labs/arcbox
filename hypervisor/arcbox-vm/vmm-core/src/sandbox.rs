@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -18,8 +18,9 @@ use chrono::{DateTime, Utc};
 use fc_sdk::VmBuilder;
 use fc_sdk::process::{FirecrackerProcessBuilder, JailerProcessBuilder};
 use fc_sdk::types::{BootSource, Drive, NetworkInterface, Vsock};
+use nix::unistd::{Gid, Uid, chown};
 use tokio::sync::broadcast;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::config::VmmConfig;
@@ -442,11 +443,12 @@ impl SandboxManager {
             let instances = Arc::clone(&self.instances);
             let network = Arc::clone(&self.network);
             let events_tx = self.events_tx.clone();
+            let config2 = Arc::clone(&self.config);
             let id2 = id.clone();
             let ttl = spec.ttl_seconds;
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(ttl as u64)).await;
-                remove_sandbox_impl(&id2, true, &instances, &network, &events_tx).await;
+                remove_sandbox_impl(&id2, true, &instances, &network, &events_tx, &config2).await;
             });
         }
 
@@ -485,11 +487,9 @@ impl SandboxManager {
                 30
             };
             // Ignore errors — VM may have already exited.
-            let _ = tokio::time::timeout(
-                Duration::from_secs(timeout as u64),
-                vm.send_ctrl_alt_del(),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(Duration::from_secs(timeout as u64), vm.send_ctrl_alt_del())
+                    .await;
         }
 
         {
@@ -519,7 +519,15 @@ impl SandboxManager {
             });
         }
 
-        remove_sandbox_impl(id, force, &self.instances, &self.network, &self.events_tx).await;
+        remove_sandbox_impl(
+            id,
+            force,
+            &self.instances,
+            &self.network,
+            &self.events_tx,
+            &self.config,
+        )
+        .await;
         info!(sandbox_id = %id, "sandbox removed");
         Ok(())
     }
@@ -544,10 +552,11 @@ impl SandboxManager {
             .filter_map(|arc| {
                 let inst = arc.lock().unwrap();
                 // State filter.
-                if let Some(sf) = state_filter {
-                    if !sf.is_empty() && inst.state.to_string() != sf {
-                        return None;
-                    }
+                if let Some(sf) = state_filter
+                    && !sf.is_empty()
+                    && inst.state.to_string() != sf
+                {
+                    return None;
                 }
                 // Label filter: all supplied key-value pairs must match.
                 for (k, v) in label_filter {
@@ -587,6 +596,7 @@ impl SandboxManager {
     ///
     /// Returns a channel receiver yielding [`OutputChunk`]s.  The final chunk
     /// has `stream == "exit"` and carries the process exit code.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_in_sandbox(
         &self,
         id: &SandboxId,
@@ -662,6 +672,7 @@ impl SandboxManager {
     /// Returns `(input_sender, output_receiver)`:
     /// - Push [`ExecInputMsg`]s (stdin bytes, TTY resize, EOF) into `input_sender`.
     /// - Read [`OutputChunk`]s from `output_receiver` for stdout, stderr, and exit.
+    #[allow(clippy::too_many_arguments)]
     pub async fn exec_in_sandbox(
         &self,
         id: &SandboxId,
@@ -744,18 +755,20 @@ impl SandboxManager {
         sandbox_id: &SandboxId,
         name: String,
     ) -> Result<CheckpointInfo> {
-        // Verify state.
-        {
+        // Verify state and capture the kernel/rootfs paths for jailer re-staging.
+        let (kernel_path, rootfs_path) = {
             let instance = self.get_instance(sandbox_id)?;
-            let state = instance.lock().unwrap().state;
-            if state != SandboxState::Ready {
+            let inst = instance.lock().unwrap();
+            if inst.state != SandboxState::Ready {
                 return Err(VmmError::WrongState {
                     id: sandbox_id.clone(),
                     expected: "Ready".into(),
-                    actual: state.to_string(),
+                    actual: inst.state.to_string(),
                 });
             }
-        }
+            // Only needed for jailer mode; safe to capture regardless.
+            (inst.spec.kernel.clone(), inst.spec.rootfs.clone())
+        };
 
         let vm = self.get_vm_handle(sandbox_id)?;
 
@@ -763,21 +776,71 @@ impl SandboxManager {
         vm.pause().await.map_err(VmmError::Sdk)?;
 
         let snapshot_id = Uuid::new_v4().to_string();
-        let snap_dir = self.snapshots.prepare_dir(sandbox_id, &snapshot_id)?;
-        let vmstate_path = snap_dir.join("vmstate");
-        let mem_path = snap_dir.join("mem");
+
+        // In jailer mode FC runs inside a chroot and can only write to paths
+        // within that chroot.  We create a temporary snapshot directory inside
+        // the chroot, pass the chroot-relative paths to FC, then move the
+        // resulting files to the standard catalog location on the host.
+        let (fc_vmstate_path, fc_mem_path, chroot_snap_dir_opt) =
+            if let Some(ref jc) = self.config.firecracker.jailer {
+                let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
+                let cr = chroot_root(&self.config.firecracker.binary, base, sandbox_id);
+                let chroot_snap = cr.join("snapshots").join(&snapshot_id);
+                std::fs::create_dir_all(&chroot_snap).map_err(VmmError::Io)?;
+                // Firecracker runs as jc.uid/jc.gid; chown the directory so it
+                // can create the snapshot files.
+                let uid = nix::unistd::Uid::from_raw(jc.uid);
+                let gid = nix::unistd::Gid::from_raw(jc.gid);
+                nix::unistd::chown(&chroot_snap, Some(uid), Some(gid))
+                    .map_err(|e| VmmError::Process(format!("chown snapshot dir: {e}")))?;
+                // Paths as seen by Firecracker inside the chroot.
+                let fc_vmstate = format!("/snapshots/{snapshot_id}/vmstate");
+                let fc_mem = format!("/snapshots/{snapshot_id}/mem");
+                (fc_vmstate, fc_mem, Some(chroot_snap))
+            } else {
+                let snap_dir = self.snapshots.prepare_dir(sandbox_id, &snapshot_id)?;
+                (
+                    snap_dir.join("vmstate").to_str().unwrap().to_owned(),
+                    snap_dir.join("mem").to_str().unwrap().to_owned(),
+                    None,
+                )
+            };
 
         let snap_result = vm
-            .create_snapshot(
-                vmstate_path.to_str().unwrap(),
-                mem_path.to_str().unwrap(),
-            )
+            .create_snapshot(&fc_vmstate_path, &fc_mem_path)
             .await;
 
         // Always resume regardless of snapshot success.
         let _ = vm.resume().await;
 
         snap_result.map_err(VmmError::Sdk)?;
+
+        // If jailer mode, move snapshot files from chroot to the catalog dir.
+        let (vmstate_path, mem_path) = if let Some(chroot_snap) = chroot_snap_dir_opt {
+            let catalog_dir = self.snapshots.prepare_dir(sandbox_id, &snapshot_id)?;
+            let dst_vmstate = catalog_dir.join("vmstate");
+            let dst_mem = catalog_dir.join("mem");
+            tokio::fs::rename(chroot_snap.join("vmstate"), &dst_vmstate)
+                .await
+                .map_err(VmmError::Io)?;
+            if chroot_snap.join("mem").exists() {
+                tokio::fs::rename(chroot_snap.join("mem"), &dst_mem)
+                    .await
+                    .map_err(VmmError::Io)?;
+            }
+            let _ = tokio::fs::remove_dir_all(&chroot_snap).await;
+            (dst_vmstate, dst_mem)
+        } else {
+            let snap_dir = self.snapshots.prepare_dir(sandbox_id, &snapshot_id)?;
+            (snap_dir.join("vmstate"), snap_dir.join("mem"))
+        };
+
+        // Store kernel/rootfs only in jailer mode — needed when restoring.
+        let (snap_kernel, snap_rootfs) = if self.config.firecracker.jailer.is_some() {
+            (Some(kernel_path), Some(rootfs_path))
+        } else {
+            (None, None)
+        };
 
         let meta = self.snapshots.register(
             sandbox_id,
@@ -786,6 +849,8 @@ impl SandboxManager {
             vmstate_path,
             Some(mem_path),
             None,
+            snap_kernel,
+            snap_rootfs,
         )?;
 
         let snap_dir_path = meta
@@ -807,10 +872,7 @@ impl SandboxManager {
     /// The restored sandbox starts in `Ready` state immediately.
     ///
     /// Returns `(sandbox_id, ip_address)`.
-    pub async fn restore_sandbox(
-        &self,
-        spec: RestoreSandboxSpec,
-    ) -> Result<(SandboxId, String)> {
+    pub async fn restore_sandbox(&self, spec: RestoreSandboxSpec) -> Result<(SandboxId, String)> {
         let new_id = spec
             .id
             .clone()
@@ -843,7 +905,6 @@ impl SandboxManager {
             .join(&new_id);
         std::fs::create_dir_all(&vm_dir).map_err(VmmError::Io)?;
         let socket_path = vm_dir.join("firecracker.sock");
-        let vsock_uds_path = vm_dir.join("firecracker.vsock");
 
         // Locate checkpoint on disk.
         let snap_meta = self.snapshots.find_by_id(&spec.snapshot_id)?;
@@ -856,18 +917,126 @@ impl SandboxManager {
             }
         });
 
-        // Spawn Firecracker process.
         let fc_cfg = &self.config.firecracker;
-        let process = FirecrackerProcessBuilder::new(&fc_cfg.binary, &socket_path)
-            .id(&new_id)
-            .spawn()
-            .await
-            .map_err(|e| VmmError::Process(e.to_string()))?;
+
+        // Determine the actual host-side vsock UDS path FC will bind to on restore
+        // and ensure the socket path is clear before spawning.
+        //
+        // - Jailer mode: each sandbox has its own chroot; FC sees `/run/firecracker.vsock`
+        //   which maps to `{chroot_root}/run/firecracker.vsock` on the host. No conflict
+        //   between sandboxes — we just ensure the `run/` directory exists.
+        // - Direct mode: the vmstate stores the ABSOLUTE host path from the original
+        //   sandbox. We must recreate that directory and delete any stale socket so FC
+        //   can bind successfully.
+        let (process, actual_vsock_path) = if let Some(ref jc) = fc_cfg.jailer {
+            let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
+            let cr = chroot_root(&fc_cfg.binary, base, &new_id);
+            // Ensure the `run/` directory exists inside the new chroot so FC can
+            // create the vsock socket there on restore.
+            let run_dir = cr.join("run");
+            std::fs::create_dir_all(&run_dir).map_err(VmmError::Io)?;
+            let vsock_path = cr.join("run/firecracker.vsock");
+            let _ = std::fs::remove_file(&vsock_path);
+
+            let mut jb =
+                JailerProcessBuilder::new(&jc.binary, &fc_cfg.binary, &new_id, jc.uid, jc.gid);
+            if let Some(ref base_dir) = jc.chroot_base_dir {
+                jb = jb.chroot_base_dir(base_dir);
+            }
+            if let Some(ref ns) = jc.netns {
+                jb = jb.netns(ns);
+            }
+            if jc.new_pid_ns {
+                jb = jb.new_pid_ns(true);
+            }
+            if let Some(ref ver) = jc.cgroup_version {
+                jb = jb.cgroup_version(ver);
+            }
+            if let Some(ref parent) = jc.parent_cgroup {
+                jb = jb.parent_cgroup(parent);
+            }
+            for limit in &jc.resource_limits {
+                jb = jb.resource_limit(limit);
+            }
+            if let Some(secs) = fc_cfg.socket_timeout_secs {
+                jb = jb.socket_timeout(Duration::from_secs(secs));
+            }
+            let proc = jb
+                .spawn()
+                .await
+                .map_err(|e| VmmError::Process(e.to_string()))?;
+            (proc, vsock_path)
+        } else {
+            // Direct mode: the vmstate embeds the original sandbox's full vsock path.
+            let original_vm_dir = PathBuf::from(&fc_cfg.data_dir)
+                .join("sandboxes")
+                .join(&snap_meta.vm_id);
+            let original_vsock_path = original_vm_dir.join("firecracker.vsock");
+            if let Err(e) = std::fs::create_dir_all(&original_vm_dir) {
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(VmmError::Io(e));
+                }
+            }
+            let _ = std::fs::remove_file(&original_vsock_path);
+
+            let proc = FirecrackerProcessBuilder::new(&fc_cfg.binary, &socket_path)
+                .id(&new_id)
+                .spawn()
+                .await
+                .map_err(|e| VmmError::Process(e.to_string()))?;
+            (proc, original_vsock_path)
+        };
+
+        // In jailer mode the restored FC process also runs inside a chroot and
+        // cannot access the catalog's host-absolute paths.  Copy the snapshot
+        // files into the new sandbox's chroot and use chroot-relative paths.
+        let (effective_vmstate, effective_mem) = if let Some(ref jc) = fc_cfg.jailer {
+            let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
+            let cr = chroot_root(&fc_cfg.binary, base, &new_id);
+            let snap_in_chroot = cr.join("snapshots").join(&spec.snapshot_id);
+            std::fs::create_dir_all(&snap_in_chroot).map_err(VmmError::Io)?;
+            let uid = nix::unistd::Uid::from_raw(jc.uid);
+            let gid = nix::unistd::Gid::from_raw(jc.gid);
+            nix::unistd::chown(&snap_in_chroot, Some(uid), Some(gid))
+                .map_err(|e| VmmError::Process(format!("chown snap dir: {e}")))?;
+
+            // Stage kernel and rootfs into the new chroot (same layout as boot).
+            if let (Some(k), Some(r)) = (snap_meta.kernel_path.as_deref(), snap_meta.rootfs_path.as_deref()) {
+                stage_files_for_jailer(&cr, k, r, jc.uid, jc.gid).await?;
+            }
+
+            // Copy vmstate into chroot.
+            let dst_vmstate = snap_in_chroot.join("vmstate");
+            tokio::fs::copy(&snap_meta.vmstate_path, &dst_vmstate)
+                .await
+                .map_err(VmmError::Io)?;
+            nix::unistd::chown(&dst_vmstate, Some(uid), Some(gid))
+                .map_err(|e| VmmError::Process(format!("chown vmstate: {e}")))?;
+
+            let effective_mem = if let Some(ref mf) = snap_meta.mem_path
+                && mf.exists()
+            {
+                let dst_mem = snap_in_chroot.join("mem");
+                tokio::fs::copy(mf, &dst_mem).await.map_err(VmmError::Io)?;
+                nix::unistd::chown(&dst_mem, Some(uid), Some(gid))
+                    .map_err(|e| VmmError::Process(format!("chown mem: {e}")))?;
+                Some(format!("/snapshots/{}/mem", spec.snapshot_id))
+            } else {
+                None
+            };
+
+            (
+                format!("/snapshots/{}/vmstate", spec.snapshot_id),
+                effective_mem,
+            )
+        } else {
+            (vmstate_str, mem_file)
+        };
 
         // Build the restore parameters.
         let mut load_params = fc_sdk::types::SnapshotLoadParams {
-            snapshot_path: vmstate_str,
-            mem_file_path: mem_file,
+            snapshot_path: effective_vmstate,
+            mem_file_path: effective_mem,
             mem_backend: None,
             enable_diff_snapshots: None,
             track_dirty_pages: None,
@@ -882,8 +1051,11 @@ impl SandboxManager {
             }];
         }
 
+        // In jailer mode, the actual socket path is inside the chroot; use the
+        // path reported by the process handle instead of vm_dir's socket_path.
+        let effective_socket = process.socket_path().to_owned();
         let vm = Arc::new(
-            fc_sdk::restore(socket_path.to_str().unwrap(), load_params)
+            fc_sdk::restore(effective_socket.to_str().unwrap(), load_params)
                 .await
                 .map_err(VmmError::Sdk)?,
         );
@@ -899,7 +1071,7 @@ impl SandboxManager {
             SandboxInstance::new(new_id.clone(), restore_spec, net_alloc.clone(), vm_dir);
         instance.process = Some(process);
         instance.vm = Some(vm);
-        instance.vsock_uds_path = Some(vsock_uds_path);
+        instance.vsock_uds_path = Some(actual_vsock_path);
         instance.state = SandboxState::Ready;
         instance.ready_at = Some(Utc::now());
 
@@ -915,11 +1087,12 @@ impl SandboxManager {
             let instances = Arc::clone(&self.instances);
             let network = Arc::clone(&self.network);
             let events_tx = self.events_tx.clone();
+            let config2 = Arc::clone(&self.config);
             let id2 = new_id.clone();
             let ttl = spec.ttl_seconds;
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(ttl as u64)).await;
-                remove_sandbox_impl(&id2, true, &instances, &network, &events_tx).await;
+                remove_sandbox_impl(&id2, true, &instances, &network, &events_tx, &config2).await;
             });
         }
 
@@ -932,10 +1105,7 @@ impl SandboxManager {
     }
 
     /// List checkpoints, optionally filtered by origin sandbox ID.
-    pub fn list_checkpoints(
-        &self,
-        sandbox_id: Option<&str>,
-    ) -> Result<Vec<CheckpointSummary>> {
+    pub fn list_checkpoints(&self, sandbox_id: Option<&str>) -> Result<Vec<CheckpointSummary>> {
         let infos = match sandbox_id {
             Some(sid) => self.snapshots.list(sid)?,
             None => self.snapshots.list_all()?,
@@ -986,7 +1156,7 @@ impl SandboxManager {
                     id: id.clone(),
                     expected: "Ready".into(),
                     actual: s.to_string(),
-                })
+                });
             }
         }
         inst.vsock_uds_path
@@ -1013,6 +1183,7 @@ impl SandboxManager {
 // =============================================================================
 
 /// Spawned by `create_sandbox`; boots the Firecracker VM and updates state.
+#[allow(clippy::too_many_arguments)]
 async fn boot_sandbox(
     id: SandboxId,
     spec: SandboxSpec,
@@ -1047,35 +1218,83 @@ async fn boot_sandbox(
             if let Some(ref net) = net_alloc {
                 network.release(net);
             }
-            let _ = events_tx.send(
-                SandboxEvent::new(&id, "failed").with_attr("error", &e.to_string()),
-            );
+            let _ =
+                events_tx.send(SandboxEvent::new(&id, "failed").with_attr("error", &e.to_string()));
             error!(sandbox_id = %id, error = %e, "sandbox boot failed");
         }
     }
 }
 
+/// Compute the host-side absolute path to the jailer chroot root directory.
+///
+/// Returns `{chroot_base_dir}/{fc_binary_filename}/{id}/root`.
+fn chroot_root(fc_binary: &str, chroot_base_dir: &str, id: &str) -> PathBuf {
+    let exec_name = Path::new(fc_binary)
+        .file_name()
+        .expect("fc_binary must have a filename")
+        .to_string_lossy();
+    PathBuf::from(chroot_base_dir)
+        .join(exec_name.as_ref())
+        .join(id)
+        .join("root")
+}
+
+/// Copy kernel and rootfs into the jailer chroot and set ownership.
+///
+/// Returns `(kernel_guest_path, rootfs_guest_path)` — paths relative to the
+/// chroot root (e.g., `"/vmlinux"`, `"/rootfs.ext4"`).
+async fn stage_files_for_jailer(
+    chroot_root: &Path,
+    kernel_src: &str,
+    rootfs_src: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<(String, String)> {
+    tokio::fs::create_dir_all(chroot_root)
+        .await
+        .map_err(VmmError::Io)?;
+
+    let kernel_dst = chroot_root.join("vmlinux");
+    let rootfs_dst = chroot_root.join("rootfs.ext4");
+
+    tokio::fs::copy(kernel_src, &kernel_dst)
+        .await
+        .map_err(VmmError::Io)?;
+    tokio::fs::copy(rootfs_src, &rootfs_dst)
+        .await
+        .map_err(VmmError::Io)?;
+
+    let uid = Uid::from_raw(uid);
+    let gid = Gid::from_raw(gid);
+    chown(&kernel_dst, Some(uid), Some(gid))
+        .map_err(|e| VmmError::Process(format!("chown kernel: {e}")))?;
+    chown(&rootfs_dst, Some(uid), Some(gid))
+        .map_err(|e| VmmError::Process(format!("chown rootfs: {e}")))?;
+
+    Ok(("/vmlinux".to_string(), "/rootfs.ext4".to_string()))
+}
+
 /// Perform the actual Firecracker boot: spawn process, configure, start VM.
 ///
 /// Returns `(FirecrackerProcess, Arc<Vm>, vsock_uds_path)` on success.
+/// `vsock_uds_path` is the host-side absolute path to the vsock UDS socket.
 async fn do_boot(
     id: &str,
     spec: &SandboxSpec,
     net_alloc: Option<&NetworkAllocation>,
-    vm_dir: &PathBuf,
+    vm_dir: &Path,
     config: &VmmConfig,
 ) -> Result<(fc_sdk::FirecrackerProcess, Arc<fc_sdk::Vm>, PathBuf)> {
     let log_path = vm_dir.join("firecracker.log");
     let metrics_path = vm_dir.join("firecracker.metrics");
+    // socket_path is used only for the direct (non-jailer) mode spawn.
     let socket_path = vm_dir.join("firecracker.sock");
-    let vsock_uds_path = vm_dir.join("firecracker.vsock");
 
     let fc_cfg = &config.firecracker;
 
     // Spawn the Firecracker process (direct or via Jailer).
     let process = if let Some(ref jc) = fc_cfg.jailer {
-        let mut jb =
-            JailerProcessBuilder::new(&jc.binary, &fc_cfg.binary, id, jc.uid, jc.gid);
+        let mut jb = JailerProcessBuilder::new(&jc.binary, &fc_cfg.binary, id, jc.uid, jc.gid);
         if let Some(ref base) = jc.chroot_base_dir {
             jb = jb.chroot_base_dir(base);
         }
@@ -1101,8 +1320,7 @@ async fn do_boot(
             .await
             .map_err(|e| VmmError::Process(e.to_string()))?
     } else {
-        let mut fb =
-            FirecrackerProcessBuilder::new(&fc_cfg.binary, &socket_path).id(id);
+        let mut fb = FirecrackerProcessBuilder::new(&fc_cfg.binary, &socket_path).id(id);
         fb = fb.log_path(&log_path).metrics_path(&metrics_path);
         if let Some(ref level) = fc_cfg.log_level {
             fb = fb.log_level(level);
@@ -1127,13 +1345,37 @@ async fn do_boot(
             .map_err(|e| VmmError::Process(e.to_string()))?
     };
 
+    // Determine kernel, rootfs, and vsock paths.
+    //
+    // In jailer mode the files must exist inside the chroot, and paths passed
+    // to the FC API are relative to the chroot root.  In direct mode the
+    // host-absolute paths from the spec are used as-is.
+    let (kernel_path, rootfs_path, vsock_fc_path, vsock_host_path) =
+        if let Some(ref jc) = fc_cfg.jailer {
+            let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
+            let cr = chroot_root(&fc_cfg.binary, base, id);
+            let (k, r) =
+                stage_files_for_jailer(&cr, &spec.kernel, &spec.rootfs, jc.uid, jc.gid).await?;
+            // FC creates the vsock socket at this path inside the chroot.
+            let vsock_host = cr.join("run/firecracker.vsock");
+            (k, r, "/run/firecracker.vsock".to_string(), vsock_host)
+        } else {
+            let vsock_path = vm_dir.join("firecracker.vsock");
+            (
+                spec.kernel.clone(),
+                spec.rootfs.clone(),
+                vsock_path.to_str().unwrap().to_owned(),
+                vsock_path,
+            )
+        };
+
     // Configure and boot the VM.
     let vcpu_count = NonZeroU64::new(spec.vcpus.max(1) as u64)
         .ok_or_else(|| VmmError::Config("vcpus must be > 0".into()))?;
 
-    let mut builder = VmBuilder::new(&socket_path)
+    let mut builder = VmBuilder::new(process.socket_path())
         .boot_source(BootSource {
-            kernel_image_path: spec.kernel.clone(),
+            kernel_image_path: kernel_path,
             boot_args: Some(spec.boot_args.clone()),
             initrd_path: None,
         })
@@ -1148,7 +1390,7 @@ async fn do_boot(
         })
         .drive(Drive {
             drive_id: "rootfs".into(),
-            path_on_host: Some(spec.rootfs.clone()),
+            path_on_host: Some(rootfs_path),
             is_root_device: true,
             is_read_only: Some(false),
             partuuid: None,
@@ -1169,16 +1411,18 @@ async fn do_boot(
     }
 
     // Configure vsock device so the guest agent can receive connections.
+    // vsock_fc_path is the path FC uses inside its own filesystem view;
+    // vsock_host_path is the host-absolute path used to connect from the host.
     builder = builder.vsock(Vsock {
         // CID 3 is the conventional guest CID; each Firecracker process is
         // isolated so the same CID is safe across concurrent sandboxes.
         guest_cid: 3,
-        uds_path: vsock_uds_path.to_str().unwrap().to_owned(),
+        uds_path: vsock_fc_path,
         vsock_id: None,
     });
 
     let vm = Arc::new(builder.start().await.map_err(VmmError::Sdk)?);
-    Ok((process, vm, vsock_uds_path))
+    Ok((process, vm, vsock_host_path))
 }
 
 // =============================================================================
@@ -1186,12 +1430,14 @@ async fn do_boot(
 // =============================================================================
 
 /// Shared implementation for `remove_sandbox` and TTL expiry tasks.
+#[allow(clippy::type_complexity)]
 async fn remove_sandbox_impl(
     id: &str,
     _force: bool,
     instances: &Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>,
     network: &Arc<NetworkManager>,
     events_tx: &broadcast::Sender<SandboxEvent>,
+    config: &Arc<VmmConfig>,
 ) {
     let entry = instances.read().unwrap().get(id).cloned();
     let Some(arc) = entry else {
@@ -1201,15 +1447,37 @@ async fn remove_sandbox_impl(
     {
         let mut inst = arc.lock().unwrap();
         // Kill the Firecracker process.
-        if let Some(ref mut proc) = inst.process {
-            if let Some(pid) = proc.pid() {
-                // SAFETY: pid is a valid process ID obtained from the spawned child.
-                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-            }
+        if let Some(ref mut proc) = inst.process
+            && let Some(pid) = proc.pid()
+        {
+            // SAFETY: pid is a valid process ID obtained from the spawned child.
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         }
         // Release network resources.
         if let Some(ref net) = inst.network {
             network.release(net);
+        }
+    }
+
+    // Clean up the jailer chroot directory if applicable.
+    if let Some(ref jc) = config.firecracker.jailer {
+        let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
+        let chroot_dir = chroot_root(&config.firecracker.binary, base, id);
+        // Remove {base}/{exec_name}/{id}/ (parent of "root/").
+        if let Some(parent) = chroot_dir.parent()
+            && let Err(e) = tokio::fs::remove_dir_all(parent).await
+        {
+            warn!(sandbox_id = %id, err = %e, "failed to remove jailer chroot dir");
+        }
+    }
+
+    // Remove the sandbox working directory (sockets, logs, etc.).
+    let vm_dir = PathBuf::from(&config.firecracker.data_dir)
+        .join("sandboxes")
+        .join(id);
+    if let Err(e) = tokio::fs::remove_dir_all(&vm_dir).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(sandbox_id = %id, err = %e, "failed to remove sandbox dir");
         }
     }
 

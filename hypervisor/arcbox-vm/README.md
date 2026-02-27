@@ -1,3 +1,4 @@
+
 # firecracker-vmm
 
 A production-grade sandbox manager built on top of
@@ -56,6 +57,7 @@ a self-contained [gRPC](https://grpc.io/) interface (`sandbox.v1`).
 | `vmm-grpc` | lib | gRPC server + service implementations |
 | `vmm-daemon` | bin | Daemon entrypoint |
 | `vmm-cli` | bin | Management CLI (gRPC client) |
+| `vmm-guest-agent` | bin | In-guest agent — receives `Run`/`Exec` commands over vsock |
 
 ---
 
@@ -73,8 +75,14 @@ a self-contained [gRPC](https://grpc.io/) interface (`sandbox.v1`).
 - **Restore** — boot a new sandbox from an existing checkpoint
 - **List / Delete** — manage checkpoints on disk
 
+### Workload Execution (via vsock guest agent)
+- **Run** — execute a command and stream stdout/stderr; sandbox returns to `Ready` on exit
+- **Exec** — interactive session with stdin, stdout/stderr, and TTY resize support
+- Both use the vsock binary frame protocol; the in-guest `vmm-guest-agent` binary must be present inside the rootfs
+
 ### Process Options
-- Direct Firecracker mode or Jailer sandbox
+- **Direct mode** — Firecracker runs as a normal process; socket and files live under `data_dir/sandboxes/{id}/`
+- **Jailer mode** — Firecracker runs under the Firecracker jailer (`pivot_root` + uid/gid drop + seccomp); kernel and rootfs are staged into the chroot at boot and cleaned up on removal; snapshot and restore also stage files through the chroot (see [Jailer Mode Internals](#jailer-mode-internals))
 - Configurable per-sandbox resources (vCPUs, memory)
 - Auto-destroy TTL per sandbox
 
@@ -92,8 +100,8 @@ a self-contained [gRPC](https://grpc.io/) interface (`sandbox.v1`).
 | RPC | Description |
 |-----|-------------|
 | `Create` | Boot a new sandbox (returns immediately; VM boots async) |
-| `Run` | Execute a workload in a sandbox *(future: vsock guest agent)* |
-| `Exec` | Attach to a running workload *(future: vsock guest agent)* |
+| `Run` | Execute a command and stream output (requires `vmm-guest-agent` in rootfs) |
+| `Exec` | Interactive session with stdin/stdout/stderr and TTY support |
 | `Stop` | Stop a running sandbox gracefully |
 | `Remove` | Delete sandbox and release all resources |
 | `Inspect` | Full sandbox detail (hardware, network, state) |
@@ -153,6 +161,8 @@ a self-contained [gRPC](https://grpc.io/) interface (`sandbox.v1`).
 
 ## Data Layout
 
+### Direct mode
+
 ```
 /var/lib/firecracker-vmm/
 ├── kernels/
@@ -162,6 +172,7 @@ a self-contained [gRPC](https://grpc.io/) interface (`sandbox.v1`).
 ├── sandboxes/
 │   └── {sandbox-id}/
 │       ├── firecracker.sock  # Firecracker API socket (while running)
+│       ├── firecracker.vsock # vsock UDS (while running)
 │       ├── firecracker.log
 │       └── firecracker.metrics
 └── snapshots/
@@ -171,6 +182,119 @@ a self-contained [gRPC](https://grpc.io/) interface (`sandbox.v1`).
             ├── mem           # memory file (full snapshots)
             └── meta.json     # snapshot metadata
 ```
+
+### Jailer mode
+
+Firecracker runs inside a chroot created by the jailer.  The daemon stages
+kernel and rootfs into the chroot before boot and removes the directory on
+sandbox removal.
+
+```
+{chroot_base_dir}/             # default: /srv/jailer
+└── firecracker/               # fc binary filename
+    └── {sandbox-id}/
+        └── root/              # chroot root (pivot_root target)
+            ├── vmlinux        # staged kernel (copied from spec path)
+            ├── rootfs.ext4    # staged rootfs (copied from spec path)
+            ├── snapshots/     # temp dir used during checkpoint (moved out after)
+            └── run/
+                ├── firecracker.socket  # Firecracker API socket
+                └── firecracker.vsock   # vsock UDS
+```
+
+---
+
+## Jailer Mode Internals
+
+### Create flow
+
+```
+vmm create
+    │
+    ├─ 1. NetworkManager.allocate()
+    │      create TAP, assign IP, attach to bridge
+    │
+    ├─ 2. JailerProcessBuilder.spawn()
+    │      jailer forks, sets up cgroups, calls pivot_root
+    │      waits until Firecracker API socket is ready
+    │
+    ├─ 3. stage_files_for_jailer()
+    │      copy kernel  →  {chroot}/vmlinux        (chown uid:gid)
+    │      copy rootfs  →  {chroot}/rootfs.ext4    (chown uid:gid)
+    │
+    ├─ 4. fc-sdk VmBuilder (via Firecracker API)
+    │      PUT /boot-source   path="/vmlinux"      (chroot-relative)
+    │      PUT /drives/rootfs path="/rootfs.ext4"  (chroot-relative)
+    │      PUT /network-interfaces/eth0  tap=vmtapXX
+    │      PUT /vsock          uds_path="/run/firecracker.vsock"
+    │      PUT /actions        {"action_type":"InstanceStart"}
+    │
+    └─ 5. background task polls boot; sets state=Ready
+          on failure → remove_sandbox_impl() cleans chroot + TAP
+```
+
+### Checkpoint flow
+
+```
+vmm snapshot create <id>
+    │
+    ├─ 1. fc-sdk Vm.pause()
+    │
+    ├─ 2. mkdir {chroot}/snapshots/{snapshot-id}/   (chown uid:gid)
+    │
+    ├─ 3. PUT /snapshot/create
+    │      snapshot_path="/snapshots/{snapshot-id}/vmstate"  (chroot-relative)
+    │      mem_file_path="/snapshots/{snapshot-id}/mem"
+    │
+    ├─ 4. fc-sdk Vm.resume()
+    │
+    ├─ 5. Move files out of chroot to catalog:
+    │      {chroot}/snapshots/{snapshot-id}/vmstate  →  {data_dir}/snapshots/{sandbox-id}/{snapshot-id}/vmstate
+    │      {chroot}/snapshots/{snapshot-id}/mem      →  {data_dir}/snapshots/{sandbox-id}/{snapshot-id}/mem
+    │
+    └─ 6. SnapshotCatalog.register()
+           writes meta.json including kernel_path + rootfs_path
+           (required for re-staging on restore)
+```
+
+### Restore flow
+
+```
+vmm snapshot restore <snapshot-id> --network-override
+    │
+    ├─ 1. NetworkManager.allocate()  (new TAP + IP for restored sandbox)
+    │
+    ├─ 2. JailerProcessBuilder.spawn()  (new sandbox-id, own chroot)
+    │      mkdir {new-chroot}/run/   (for vsock bind)
+    │
+    ├─ 3. stage_files_for_jailer()
+    │      re-copy kernel + rootfs from snapshot metadata paths
+    │      {new-chroot}/vmlinux / {new-chroot}/rootfs.ext4
+    │
+    ├─ 4. Copy snapshot files into new chroot:
+    │      {data_dir}/snapshots/.../vmstate  →  {new-chroot}/snapshots/{snapshot-id}/vmstate
+    │      {data_dir}/snapshots/.../mem      →  {new-chroot}/snapshots/{snapshot-id}/mem
+    │      (chown uid:gid)
+    │
+    ├─ 5. PUT /snapshot/load
+    │      snapshot_path="/snapshots/{snapshot-id}/vmstate"  (chroot-relative)
+    │      mem_file_path="/snapshots/{snapshot-id}/mem"
+    │      network_overrides=[{iface_id:"eth0", host_dev_name:"vmtapXX"}]
+    │      resume_vm=true
+    │
+    └─ 6. Register sandbox as state=Ready immediately
+```
+
+> **Why files must be inside the chroot:** Firecracker executes `pivot_root`
+> before processing any API requests, so all paths passed to the FC API are
+> resolved relative to the chroot root.  Host-absolute paths (e.g.
+> `/var/lib/firecracker-vmm/...`) do not exist inside the chroot and will
+> return `ENOENT`.
+
+> **vsock on restore:** The vmstate stores the vsock UDS path as seen by FC
+> (`/run/firecracker.vsock`, chroot-relative).  Each restored sandbox gets its
+> own jailer chroot, so this path maps to a unique host path
+> `{new-chroot}/run/firecracker.vsock` — no cross-sandbox socket conflicts.
 
 ---
 
@@ -276,12 +400,29 @@ vmm snapshot delete <snapshot-id>
 - `firecracker` binary (set `[firecracker].binary` in config or add to PATH)
 - Linux with `CAP_NET_ADMIN` for TAP interface creation
 - `protoc` for proto codegen
+- Jailer mode additionally requires: `jailer` binary, and running as root (or with `CAP_SYS_ADMIN`) to `pivot_root`
 
 ### Build
 
 ```bash
 cargo build --workspace
 ```
+
+### Cross-compile to Linux x86\_64 (static)
+
+The workspace ships a `.cargo/config.toml` that sets the musl linker.
+Install the target and toolchain, then build:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+brew install FiloSottile/musl-cross/musl-cross   # macOS
+
+cargo build --target x86_64-unknown-linux-musl --release
+# output: target/x86_64-unknown-linux-musl/release/{vmm-daemon,vmm,vmm-guest-agent}
+```
+
+The resulting binaries are statically linked (no glibc dependency) and run
+on any Linux x86\_64 host.
 
 ### Test
 
