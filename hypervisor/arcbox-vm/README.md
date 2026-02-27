@@ -1,7 +1,7 @@
 # firecracker-vmm
 
 A production-grade sandbox management library built on top of
-[`fc-sdk`](../firecracker-client) that orchestrates multiple
+[`fc-sdk`](../fc-sdk) that orchestrates multiple
 [Firecracker](https://firecracker-microvm.github.io/) microVMs.
 
 Exposes a `SandboxManager` API and optional gRPC service implementations
