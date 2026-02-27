@@ -8,7 +8,7 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::warn;
 
-use vmm_core::{
+use crate::{
     ExecInputMsg, RestoreSandboxSpec, SandboxEvent as CoreEvent, SandboxManager, SandboxMountSpec,
     SandboxNetworkSpec, SandboxSpec,
 };

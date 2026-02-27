@@ -4,13 +4,13 @@ use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::info;
 
-use vmm_core::SandboxManager;
+use crate::SandboxManager;
 
 use crate::proto::sandbox::{
     sandbox_service_server::SandboxServiceServer,
     sandbox_snapshot_service_server::SandboxSnapshotServiceServer,
 };
-use crate::sandbox_svc::{SandboxServiceImpl, SandboxSnapshotServiceImpl};
+use super::sandbox_svc::{SandboxServiceImpl, SandboxSnapshotServiceImpl};
 
 /// Start the gRPC server.
 ///

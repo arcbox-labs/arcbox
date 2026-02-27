@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Proto files live alongside this crate in vmm-grpc/proto/.
-    let proto_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("proto");
+    // sandbox.proto lives in arcbox-protocol; reference it by relative path.
+    let proto_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../comm/arcbox-protocol/proto");
 
-    // Compile sandbox.v1 — the single public API surface of this daemon.
     tonic_build::configure()
         .build_server(true)
         .build_client(true)

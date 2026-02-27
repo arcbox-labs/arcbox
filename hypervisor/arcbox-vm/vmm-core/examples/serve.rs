@@ -1,7 +1,8 @@
 //! Shows how to embed the sandbox gRPC services into a tonic server.
 //!
-//! This replaces the former `vmm-daemon` binary.  The caller (e.g. arcbox-vmm)
-//! is expected to own the process lifecycle, signal handling, and tokio runtime.
+//! The gRPC service implementations now live directly in `vmm-core::grpc`.
+//! The caller (e.g. arcbox-vmm) is expected to own the process lifecycle,
+//! signal handling, and tokio runtime.
 //!
 //! Run:
 //!   cargo run --example serve -- --unix-socket /tmp/vmm-test.sock
@@ -12,18 +13,18 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tonic::transport::Server;
 use vmm_core::{SandboxManager, VmmConfig};
-use vmm_grpc::proto::sandbox::{
+use vmm_core::proto::sandbox::{
     sandbox_service_server::SandboxServiceServer,
     sandbox_snapshot_service_server::SandboxSnapshotServiceServer,
 };
-use vmm_grpc::{SandboxServiceImpl, SandboxSnapshotServiceImpl};
+use vmm_core::{SandboxServiceImpl, SandboxSnapshotServiceImpl};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "vmm_core=debug,vmm_grpc=debug,info".into()),
+                .unwrap_or_else(|_| "vmm_core=debug,info".into()),
         )
         .init();
 

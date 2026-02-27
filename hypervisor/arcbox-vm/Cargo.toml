@@ -1,5 +1,5 @@
 [workspace]
-members = ["vmm-core", "vmm-grpc", "vmm-guest-agent"]
+members = ["vmm-core"]
 resolver = "3"
 
 [workspace.package]
@@ -11,7 +11,6 @@ repository = "https://github.com/arcbox-labs/firecracker-vmm"
 
 [workspace.dependencies]
 vmm-core = { path = "vmm-core" }
-vmm-grpc = { path = "vmm-grpc" }
 fc-sdk    = { path = "../firecracker-client/fc-sdk" }
 
 tonic            = { version = "0.12", features = ["transport"] }

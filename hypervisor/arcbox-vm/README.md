@@ -18,13 +18,10 @@ Exposes a `SandboxManager` API and optional gRPC service implementations
             └──────────────┬──────────────┘
                            │
             ┌──────────────▼──────────────┐
-            │          vmm-grpc           │
-            │  SandboxServiceImpl         │  ◄── sandbox.v1 proto
-            │  SandboxSnapshotServiceImpl │
-            └──────────────┬──────────────┘
-                           │
-            ┌──────────────▼──────────────┐
             │          vmm-core           │
+            │  SandboxServiceImpl         │  ◄── sandbox.v1 proto (arcbox-protocol)
+            │  SandboxSnapshotServiceImpl │
+            │  ──────────────────────     │
             │  SandboxManager             │
             │  ┌─────────────────────┐   │
             │  │  SandboxInstance    │   │
@@ -50,9 +47,7 @@ Exposes a `SandboxManager` API and optional gRPC service implementations
 
 | Crate | Type | Purpose |
 |-------|------|---------|
-| `vmm-core` | lib | Sandbox orchestration, state, networking, snapshots |
-| `vmm-grpc` | lib | gRPC service implementations (`sandbox.v1`) |
-| `vmm-guest-agent` | bin | In-guest agent — receives `Run`/`Exec` commands over vsock |
+| `vmm-core` | lib + bin | Sandbox orchestration, state, networking, snapshots; gRPC service implementations; ships the `vmm-guest-agent` binary |
 
 There is no standalone daemon or CLI binary. The gRPC server and direct API usage are demonstrated via the examples described below.
 
@@ -75,7 +70,7 @@ There is no standalone daemon or CLI binary. The gRPC server and direct API usag
 ### Workload Execution (via vsock guest agent)
 - **Run** — execute a command and stream stdout/stderr; sandbox returns to `Ready` on exit
 - **Exec** — interactive session with stdin, stdout/stderr, and TTY resize support
-- Both use the vsock binary frame protocol; the in-guest `vmm-guest-agent` binary must be present inside the rootfs
+- Both use the vsock binary frame protocol; the in-guest `vmm-guest-agent` binary (built from `vmm-core`) must be present inside the rootfs
 
 ### Process Options
 - **Direct mode** — Firecracker runs as a normal process; socket and files live under `data_dir/sandboxes/{id}/`
@@ -171,13 +166,12 @@ let (id, ip) = manager.create_sandbox(SandboxSpec {
 }).await?;
 ```
 
-### Embedding the gRPC services (`vmm-grpc`)
+### Embedding the gRPC services (`vmm-core::grpc`)
 
 ```rust
 use std::sync::Arc;
-use vmm_core::{SandboxManager, VmmConfig};
-use vmm_grpc::{SandboxServiceImpl, SandboxSnapshotServiceImpl};
-use vmm_grpc::proto::sandbox::{
+use vmm_core::{SandboxManager, VmmConfig, SandboxServiceImpl, SandboxSnapshotServiceImpl};
+use vmm_core::proto::sandbox::{
     sandbox_service_server::SandboxServiceServer,
     sandbox_snapshot_service_server::SandboxSnapshotServiceServer,
 };
@@ -222,7 +216,7 @@ cargo run --example sandbox_lifecycle
 
 ### `serve` — Embedded gRPC server
 
-[`vmm-grpc/examples/serve.rs`](vmm-grpc/examples/serve.rs)
+[`vmm-core/examples/serve.rs`](vmm-core/examples/serve.rs)
 
 Shows how to wire `SandboxServiceImpl` and `SandboxSnapshotServiceImpl` into a
 tonic server listening on a Unix socket.  This is the reference for embedding
@@ -422,6 +416,7 @@ boot_args  = "console=ttyS0 reboot=k panic=1 pci=off"
 - `firecracker` binary (set `[firecracker].binary` in config or add to PATH)
 - Linux with `CAP_NET_ADMIN` for TAP interface creation
 - `protoc` for proto codegen
+- `sandbox.proto` lives in `comm/arcbox-protocol/proto/sandbox.proto` (shared with main arcbox workspace)
 - Jailer mode additionally requires: `jailer` binary, and running as root (or with `CAP_SYS_ADMIN`) to `pivot_root`
 
 ### Build
@@ -439,7 +434,7 @@ Install the target and toolchain, then build:
 rustup target add x86_64-unknown-linux-musl
 brew install FiloSottile/musl-cross/musl-cross   # macOS
 
-cargo build --target x86_64-unknown-linux-musl --release
+cargo build -p vmm-core --target x86_64-unknown-linux-musl --release
 # output: target/x86_64-unknown-linux-musl/release/vmm-guest-agent
 ```
 
@@ -451,7 +446,7 @@ cargo test --workspace
 
 # Run examples (requires firecracker binary + CAP_NET_ADMIN)
 cargo run --example sandbox_lifecycle        # vmm-core: direct API
-cargo run --example serve                    # vmm-grpc: embedded gRPC server
+cargo run --example serve                    # vmm-core: embedded gRPC server
 ```
 
 ### Lint
@@ -466,3 +461,5 @@ cargo fmt --check
 ## License
 
 MIT OR Apache-2.0
+
+License files are inherited from the root arcbox repository.

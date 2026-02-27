@@ -6,6 +6,10 @@ authors.workspace   = true
 license.workspace   = true
 repository.workspace = true
 
+[[bin]]
+name = "vmm-guest-agent"
+path = "src/bin/vmm-guest-agent.rs"
+
 [dependencies]
 fc-sdk.workspace       = true
 tokio.workspace        = true
@@ -15,10 +19,16 @@ serde.workspace        = true
 serde_json.workspace   = true
 uuid.workspace         = true
 tracing.workspace      = true
-nix.workspace          = true
+tonic.workspace        = true
+prost.workspace        = true
+tokio-stream.workspace = true
+nix            = { workspace = true, features = ["process", "term", "signal"] }
 libc.workspace         = true
 chrono.workspace       = true
 toml.workspace         = true
+
+[build-dependencies]
+tonic-build.workspace = true
 
 [dev-dependencies]
 tokio              = { version = "1", features = ["rt", "macros"] }
