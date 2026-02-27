@@ -146,7 +146,6 @@ dependencies = [
 name = "arcbox-api"
 version = "0.0.1-alpha.1"
 dependencies = [
- "arcbox-container",
  "arcbox-core",
  "arcbox-docker",
  "arcbox-error",
@@ -253,7 +252,6 @@ dependencies = [
 name = "arcbox-docker"
 version = "0.0.1-alpha.1"
 dependencies = [
- "arcbox-container",
  "arcbox-core",
  "arcbox-error",
  "arcbox-image",

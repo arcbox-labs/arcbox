@@ -9,7 +9,6 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-arcbox-container = { workspace = true }
 arcbox-core = { workspace = true }
 arcbox-image = { workspace = true }
 arcbox-protocol = { workspace = true }
