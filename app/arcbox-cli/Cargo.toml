@@ -22,7 +22,6 @@ arcbox-docker = { workspace = true }
 arcbox-grpc = { workspace = true }
 arcbox-protocol = { workspace = true }
 tonic = { workspace = true }
-tower = "0.5"
 hyper-util = "0.1"
 clap = { workspace = true }
 tokio = { workspace = true }

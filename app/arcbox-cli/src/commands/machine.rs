@@ -10,11 +10,14 @@ use arcbox_protocol::v1::{
 use clap::{Args, Subcommand};
 use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Write;
+use std::pin::Pin;
 use std::path::PathBuf;
+use std::task::{Context as TaskContext, Poll};
 use tokio::net::UnixStream;
+use tonic::codegen::{Service, http::Uri};
 use tonic::transport::{Channel, Endpoint};
-use tower::service_fn;
 
 fn resolve_grpc_socket_path() -> PathBuf {
     if let Ok(path) = std::env::var("ARCBOX_GRPC_SOCKET") {
@@ -46,16 +49,9 @@ fn resolve_grpc_socket_path() -> PathBuf {
 
 async fn machine_client() -> Result<MachineServiceClient<Channel>> {
     let socket_path = resolve_grpc_socket_path();
-    let socket_for_connector = socket_path.clone();
 
     let channel = Endpoint::from_static("http://[::]:50051")
-        .connect_with_connector(service_fn(move |_| {
-            let socket_for_connector = socket_for_connector.clone();
-            async move {
-                let stream = UnixStream::connect(socket_for_connector).await?;
-                Ok::<_, std::io::Error>(TokioIo::new(stream))
-            }
-        }))
+        .connect_with_connector(UnixConnector::new(socket_path.clone()))
         .await
         .with_context(|| {
             format!(
@@ -65,6 +61,34 @@ async fn machine_client() -> Result<MachineServiceClient<Channel>> {
         })?;
 
     Ok(MachineServiceClient::new(channel))
+}
+
+struct UnixConnector {
+    socket_path: PathBuf,
+}
+
+impl UnixConnector {
+    fn new(socket_path: PathBuf) -> Self {
+        Self { socket_path }
+    }
+}
+
+impl Service<Uri> for UnixConnector {
+    type Response = TokioIo<UnixStream>;
+    type Error = std::io::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: Uri) -> Self::Future {
+        let socket_path = self.socket_path.clone();
+        Box::pin(async move {
+            let stream = UnixStream::connect(socket_path).await?;
+            Ok(TokioIo::new(stream))
+        })
+    }
 }
 
 /// Returns the number of machines visible through the daemon gRPC API.
