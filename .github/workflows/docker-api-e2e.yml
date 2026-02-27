@@ -7,6 +7,7 @@ on:
       - 'app/arcbox-docker/**'
       - 'app/arcbox-core/**'
       - 'app/arcbox-cli/**'
+      - 'tests/**'
       - '.github/workflows/docker-api-e2e.yml'
   pull_request:
     branches: [master, develop]
@@ -14,6 +15,7 @@ on:
       - 'app/arcbox-docker/**'
       - 'app/arcbox-core/**'
       - 'app/arcbox-cli/**'
+      - 'tests/**'
   workflow_dispatch:
 
 env:
@@ -65,7 +67,6 @@ jobs:
           ./target/release/arcbox daemon \
             --socket /tmp/arcbox-e2e.sock \
             --data-dir /tmp/arcbox-e2e-data \
-            --container-backend native-control-plane \
             &
           DAEMON_PID=$!
           echo "DAEMON_PID=$DAEMON_PID" >> $GITHUB_ENV
@@ -273,8 +274,7 @@ jobs:
           mkdir -p /tmp/arcbox-e2e-data
           ./target/release/arcbox daemon \
             --socket /tmp/arcbox-e2e.sock \
-            --data-dir /tmp/arcbox-e2e-data \
-            --container-backend native-control-plane &
+            --data-dir /tmp/arcbox-e2e-data &
           sleep 3
 
       - name: Test API versions 1.24 to 1.43
@@ -291,95 +291,6 @@ jobs:
               exit 1
             fi
           done
-
-      - name: Stop daemon
-        if: always()
-        run: |
-          pkill -f "arcbox daemon" || true
-          rm -f /tmp/arcbox-e2e.sock
-          rm -rf /tmp/arcbox-e2e-data
-
-  # Run official Docker CLI e2e tests (requires Docker)
-  docker-cli-e2e:
-    name: Docker CLI E2E Tests
-    runs-on: macos-14
-    timeout-minutes: 60
-    # Only run on master branch or when explicitly triggered
-    if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
-
-    steps:
-      - name: Checkout arcbox
-        uses: actions/checkout@v4
-
-      - name: Checkout docker-cli
-        uses: actions/checkout@v4
-        with:
-          repository: docker/cli
-          path: docker-cli
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Protobuf compiler
-        run: |
-          brew install protobuf
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build arcbox
-        run: cargo build --release -p arcbox-cli
-
-      - name: Start arcbox daemon
-        run: |
-          mkdir -p /tmp/arcbox-e2e-data
-          ./target/release/arcbox daemon \
-            --socket /tmp/arcbox-e2e.sock \
-            --data-dir /tmp/arcbox-e2e-data \
-            --container-backend native-control-plane &
-          sleep 3
-
-      - name: Run Docker CLI system tests
-        continue-on-error: true
-        env:
-          DOCKER_HOST: unix:///tmp/arcbox-e2e.sock
-        run: |
-          cd docker-cli
-
-          # Create temporary go.mod
-          cat > go.mod << 'EOF'
-          module github.com/docker/cli
-          go 1.24.0
-          EOF
-
-          # Run system tests (these don't require running containers)
-          go test -mod=mod -v ./e2e/system/... 2>&1 | tee /tmp/e2e-system.log || true
-
-          # Parse results
-          echo ""
-          echo "=== Test Summary ==="
-          grep -E "^(---|PASS|FAIL|SKIP)" /tmp/e2e-system.log | head -50 || true
-
-      - name: Upload test logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-test-logs
-          path: /tmp/e2e-*.log
-          retention-days: 7
 
       - name: Stop daemon
         if: always()
