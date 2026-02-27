@@ -7,6 +7,7 @@
 //! This crate only generates message types using prost-build.
 
 use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {
     let proto_dir = PathBuf::from("proto");
@@ -39,6 +40,10 @@ fn main() {
     config
         .compile_protos(&protos, &[proto_dir])
         .expect("Failed to compile protobuf files");
+
+    // Format generated code so `cargo fmt --check` stays clean.
+    let generated_file = out_dir.join("arcbox.v1.rs");
+    let _ = Command::new("rustfmt").arg(&generated_file).status();
 
     // Tell cargo to recompile if any proto file changes.
     for proto in &protos {
