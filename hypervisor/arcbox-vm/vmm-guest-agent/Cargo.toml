@@ -1,0 +1,19 @@
+[package]
+name        = "vmm-guest-agent"
+version.workspace   = true
+edition.workspace   = true
+authors.workspace   = true
+license.workspace   = true
+repository.workspace = true
+description = "In-VM guest agent for vmm sandbox exec/run (Linux/vsock only)"
+
+[[bin]]
+name = "vmm-guest-agent"
+path = "src/main.rs"
+
+[dependencies]
+libc    = { workspace = true }
+serde   = { workspace = true }
+serde_json = { workspace = true }
+# PTY + process features in addition to the workspace defaults.
+nix     = { workspace = true, features = ["process", "term", "signal", "fs"] }
