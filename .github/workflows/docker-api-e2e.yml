@@ -51,7 +51,7 @@ jobs:
           mkdir -p /tmp/arcbox-e2e-data
 
           # Start daemon in background (without VM support for basic API tests)
-          ./target/release/arcbox-daemon --foreground \
+          ./target/release/arcbox-daemon \
             --socket /tmp/arcbox-e2e.sock \
             --data-dir /tmp/arcbox-e2e-data \
             &
@@ -259,7 +259,7 @@ jobs:
       - name: Start daemon
         run: |
           mkdir -p /tmp/arcbox-e2e-data
-          ./target/release/arcbox-daemon --foreground \
+          ./target/release/arcbox-daemon \
             --socket /tmp/arcbox-e2e.sock \
             --data-dir /tmp/arcbox-e2e-data &
           sleep 3

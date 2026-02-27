@@ -5,7 +5,6 @@
 
 use anyhow::{Context, Result};
 use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode};
-use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};

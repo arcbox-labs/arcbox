@@ -134,7 +134,7 @@ async fn test_list_containers_empty() {
 /// Test container creation.
 ///
 /// This test requires a real image to be available in the local store.
-/// Run `arcbox pull alpine:latest` before running this test.
+/// Run `docker pull alpine:latest` before running this test.
 #[tokio::test]
 #[ignore = "requires image alpine:latest in local store"]
 async fn test_create_container() {
@@ -170,7 +170,7 @@ async fn test_create_container() {
 /// Test full container lifecycle (create, start, stop, remove).
 ///
 /// This test requires a real image to be available in the local store.
-/// Run `arcbox pull nginx:latest` before running this test.
+/// Run `docker pull nginx:latest` before running this test.
 #[tokio::test]
 #[ignore = "requires image nginx:latest in local store"]
 async fn test_container_lifecycle() {
@@ -282,7 +282,7 @@ async fn test_container_lifecycle() {
 /// Test container inspection.
 ///
 /// This test requires a real image to be available in the local store.
-/// Run `arcbox pull alpine:latest` before running this test.
+/// Run `docker pull alpine:latest` before running this test.
 #[tokio::test]
 #[ignore = "requires image alpine:latest in local store"]
 async fn test_inspect_container() {
@@ -384,7 +384,7 @@ async fn test_wait_container_invalid_condition_returns_bad_request() {
 /// Test exec creation in a container.
 ///
 /// This test requires a real image to be available in the local store.
-/// Run `arcbox pull alpine:latest` before running this test.
+/// Run `docker pull alpine:latest` before running this test.
 #[tokio::test]
 #[ignore = "requires image alpine:latest in local store"]
 async fn test_exec_create() {

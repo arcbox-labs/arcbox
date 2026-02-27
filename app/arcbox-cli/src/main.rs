@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Set ARCBOX_SOCKET env var if --socket was provided.
-    // This makes it available to DaemonClient via its env var lookup.
+    // This makes it available to gRPC socket resolution in machine commands.
     // SAFETY: This is called at the start of main(), before any threads are spawned,
     // and we're the only ones modifying this environment variable.
     if let Some(ref socket) = cli.socket {

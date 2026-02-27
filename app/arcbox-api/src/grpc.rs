@@ -1,8 +1,8 @@
 //! gRPC service implementations.
 //!
 //! This module implements the gRPC services defined in arcbox-protocol.
-//! All types are imported from arcbox_protocol::v1, and service traits
-//! are from arcbox_grpc::v1.
+//! All types are imported from `arcbox_protocol::v1`, and service traits
+//! are from `arcbox_grpc::v1`.
 
 use arcbox_core::Runtime;
 use arcbox_grpc::v1::machine_service_server;
@@ -29,7 +29,7 @@ pub struct MachineServiceImpl {
 impl MachineServiceImpl {
     /// Creates a new machine service.
     #[must_use]
-    pub fn new(runtime: Arc<Runtime>) -> Self {
+    pub const fn new(runtime: Arc<Runtime>) -> Self {
         Self { runtime }
     }
 }
@@ -191,7 +191,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                     .clone()
                     .unwrap_or_else(|| "linux".to_string()),
                 version: machine.distro_version.clone().unwrap_or_default(),
-                kernel: machine.kernel.clone().unwrap_or_default(),
+                kernel: machine.kernel.unwrap_or_default(),
             }),
             created: None,
             started_at: None,
@@ -264,7 +264,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
 
     async fn ssh_info(
         &self,
-        request: Request<arcbox_protocol::v1::SshInfoRequest>,
+        _request: Request<arcbox_protocol::v1::SshInfoRequest>,
     ) -> Result<Response<arcbox_protocol::v1::SshInfoResponse>, Status> {
         // TODO: Implement SSH info.
         Err(Status::unimplemented("ssh_info not implemented"))

@@ -3,8 +3,12 @@
 //! This module contains all the command handlers for the ArcBox CLI.
 //! Commands are organized into:
 //!
-//! - Machine operations (machine subcommands)
-//! - System operations (version, info)
+//! - Daemon lifecycle management
+//! - Machine management
+//! - Boot asset management
+//! - Docker CLI integration
+//! - DNS resolver management
+//! - System information and version output
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;

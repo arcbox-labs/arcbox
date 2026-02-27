@@ -50,7 +50,7 @@ if [[ "$SIGN" == "1" ]]; then
   fi
 fi
 
-exec "$BIN" --foreground \
+exec "$BIN" \
   --socket "$SOCKET" \
   --grpc-socket "$GRPC_SOCKET" \
   --data-dir "$DATA_DIR" \
