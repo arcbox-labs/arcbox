@@ -76,7 +76,7 @@ pub enum Commands {
     #[command(subcommand)]
     Dns(dns::DnsCommands),
 
-    /// Start the ArcBox daemon
+    /// Manage the ArcBox daemon
     Daemon(daemon::DaemonArgs),
 
     /// Display system-wide information

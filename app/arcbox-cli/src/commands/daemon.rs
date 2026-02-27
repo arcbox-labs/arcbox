@@ -1,8 +1,8 @@
 //! Daemon command implementation.
 //!
 //! This command controls the lifecycle of the `arcbox-daemon` binary:
-//! - start in background (default)
-//! - run in foreground (`-f`)
+//! - start in background (`arcbox daemon start`)
+//! - run in foreground (`arcbox daemon start -f`)
 //! - stop a running daemon (`arcbox daemon stop`)
 //! - inspect daemon status (`arcbox daemon status`)
 
@@ -24,9 +24,9 @@ use tracing::warn;
 /// Arguments for the daemon command.
 #[derive(Debug, Args)]
 pub struct DaemonArgs {
-    /// Optional daemon action.
+    /// Daemon action.
     #[arg(value_name = "ACTION")]
-    pub action: Option<DaemonAction>,
+    pub action: DaemonAction,
 
     /// Unix socket path for Docker API (default: ~/.arcbox/docker.sock).
     #[arg(long)]
@@ -68,6 +68,7 @@ pub struct DaemonArgs {
 /// Daemon actions.
 #[derive(Debug, Clone, ValueEnum)]
 pub enum DaemonAction {
+    Start,
     Stop,
     Status,
 }
@@ -91,10 +92,10 @@ impl ContainerProvisionArg {
 /// Executes the daemon command.
 pub async fn execute(args: DaemonArgs) -> Result<()> {
     match args.action {
-        Some(DaemonAction::Stop) => execute_stop(&args).await,
-        Some(DaemonAction::Status) => execute_status(&args).await,
-        None if args.foreground => exec_foreground(&args),
-        None => spawn_background(&args),
+        DaemonAction::Start if args.foreground => exec_foreground(&args),
+        DaemonAction::Start => spawn_background(&args),
+        DaemonAction::Stop => execute_stop(&args).await,
+        DaemonAction::Status => execute_status(&args).await,
     }
 }
 
@@ -196,7 +197,7 @@ async fn execute_status(args: &DaemonArgs) -> Result<()> {
     }
 
     let running = pid.is_some();
-    let status = if running { "running" } else { "not running" };
+    let status = if running { "running" } else { "stopped" };
     let uptime = if running {
         pid_file_uptime(&pid_file)
             .map(|duration| format_duration(duration).to_string())
