@@ -4,6 +4,7 @@ use crate::error::{CoreError, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
+use std::time::Duration;
 use uuid::Uuid;
 
 use arcbox_vmm::{SharedDirConfig as VmmSharedDirConfig, Vmm, VmmConfig};
@@ -352,6 +353,56 @@ impl VmManager {
 
         tracing::info!("Stopped VM {}", id);
         Ok(())
+    }
+
+    /// Attempts graceful VM shutdown via guest ACPI stop request.
+    ///
+    /// Returns `Ok(true)` if the VM stopped, `Ok(false)` if graceful shutdown
+    /// timed out or is unavailable.
+    pub fn graceful_stop(&self, id: &VmId, timeout: Duration) -> Result<bool> {
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|_| CoreError::Vm("lock poisoned".to_string()))?;
+
+        let entry = vms
+            .get_mut(id)
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+
+        if entry.info.state != VmState::Running {
+            return Err(CoreError::invalid_state(format!(
+                "cannot stop VM in state {:?}",
+                entry.info.state
+            )));
+        }
+
+        entry.info.state = VmState::Stopping;
+
+        let stop_result = entry
+            .vmm
+            .as_ref()
+            .ok_or_else(|| CoreError::Vm("VMM not initialized".to_string()))
+            .and_then(|vmm| {
+                vmm.request_stop(timeout)
+                    .map_err(|e| CoreError::Vm(e.to_string()))
+            });
+
+        match stop_result {
+            Ok(true) => {
+                entry.vmm = None;
+                entry.info.state = VmState::Stopped;
+                tracing::info!("Gracefully stopped VM {}", id);
+                Ok(true)
+            }
+            Ok(false) => {
+                entry.info.state = VmState::Running;
+                Ok(false)
+            }
+            Err(e) => {
+                entry.info.state = VmState::Running;
+                Err(e)
+            }
+        }
     }
 
     /// Marks a running VM as stopped without invoking hypervisor stop.

@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 /// Machine state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -729,6 +730,67 @@ impl MachineManager {
         let _ = self.persistence.update_state(name, MachineState::Stopped);
 
         Ok(())
+    }
+
+    /// Attempts graceful machine shutdown via guest ACPI stop request.
+    ///
+    /// Returns `Ok(true)` if the machine stopped, `Ok(false)` if graceful
+    /// shutdown timed out or is unavailable.
+    pub fn graceful_stop(&self, name: &str, timeout: Duration) -> Result<bool> {
+        let vm_id = {
+            let mut machines = self
+                .machines
+                .write()
+                .map_err(|_| CoreError::Machine("lock poisoned".to_string()))?;
+
+            let machine = machines
+                .get_mut(name)
+                .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+
+            if machine.state != MachineState::Running {
+                return Err(CoreError::invalid_state(format!(
+                    "machine '{}' is not running",
+                    name
+                )));
+            }
+
+            machine.state = MachineState::Stopping;
+            machine.vm_id.clone()
+        };
+
+        match self.vm_manager.graceful_stop(&vm_id, timeout) {
+            Ok(true) => {
+                let mut machines = self
+                    .machines
+                    .write()
+                    .map_err(|_| CoreError::Machine("lock poisoned".to_string()))?;
+
+                let machine = machines
+                    .get_mut(name)
+                    .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+                machine.state = MachineState::Stopped;
+                machine.cid = None;
+
+                let _ = self.persistence.update_state(name, MachineState::Stopped);
+                Ok(true)
+            }
+            Ok(false) => {
+                if let Ok(mut machines) = self.machines.write() {
+                    if let Some(machine) = machines.get_mut(name) {
+                        machine.state = MachineState::Running;
+                    }
+                }
+                Ok(false)
+            }
+            Err(e) => {
+                if let Ok(mut machines) = self.machines.write() {
+                    if let Some(machine) = machines.get_mut(name) {
+                        machine.state = MachineState::Running;
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Gets machine information.
