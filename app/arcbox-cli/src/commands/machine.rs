@@ -63,12 +63,12 @@ async fn machine_client() -> Result<MachineServiceClient<Channel>> {
     Ok(MachineServiceClient::new(channel))
 }
 
-struct UnixConnector {
+pub(crate) struct UnixConnector {
     socket_path: PathBuf,
 }
 
-impl UnixConnector {
-    fn new(socket_path: PathBuf) -> Self {
+pub(crate) impl UnixConnector {
+    pub(crate) fn new(socket_path: PathBuf) -> Self {
         Self { socket_path }
     }
 }
