@@ -32,7 +32,7 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 - `app/` — core orchestration, API server, Docker Engine API compat, CLI, facade crate
 - `pro/` — enhanced filesystem, advanced networking, snapshots, performance monitoring (BSL-1.1)
 - `guest/` — in-VM agent (cross-compiled for Linux)
-- `tests/` — e2e tests and test resources
+- `tests/` — test resources and fixture build scripts
 
 ## Planning
 
@@ -42,6 +42,7 @@ When asked to plan, the plan must be fully resolved before implementation begins
 
 - Run `cargo clippy` and `cargo fmt` before committing. All code must pass both with zero warnings.
 - All comments in English
+- When behavior or public API changes, update related comments and documentation in the same change.
 - `unsafe` blocks require `// SAFETY:` comments
 - Use `thiserror` for crate-specific errors, `anyhow` in CLI/API layers
 - Hot paths: prefer lock-free / `RwLock` over `Arc<Mutex<T>>`, use `#[repr(C, align(64))]` to avoid false sharing
