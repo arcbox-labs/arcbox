@@ -387,7 +387,7 @@ impl Runtime {
                 tracing::debug!("Stopping machine {}", machine.name);
                 let stopped_gracefully = match self
                     .machine_manager
-                    .graceful_stop(&machine.name, Duration::from_secs(3))
+                    .graceful_stop(&machine.name, Duration::from_secs(30))
                 {
                     Ok(true) => true,
                     Ok(false) => {

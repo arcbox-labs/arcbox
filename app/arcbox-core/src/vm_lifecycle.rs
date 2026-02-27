@@ -1127,7 +1127,7 @@ impl VmLifecycleManager {
         // Stop the machine (graceful first, then force-stop fallback).
         let stop_result = match self
             .machine_manager
-            .graceful_stop(DEFAULT_MACHINE_NAME, Duration::from_secs(5))
+            .graceful_stop(DEFAULT_MACHINE_NAME, Duration::from_secs(30))
         {
             Ok(true) => Ok(()),
             Ok(false) => {
