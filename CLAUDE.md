@@ -4,6 +4,8 @@
 
 ArcBox is a high-performance container and virtual machine runtime in Rust, targeting macOS (primary) and Linux. The goal is to surpass OrbStack on every metric.
 
+The project is in **alpha**. Breaking changes (internal or user-facing) are acceptable — always prioritize consistency, coherence, and long-term maintainability, even if that means large-scale rewrites.
+
 ## Performance Targets
 
 | Metric | Target | OrbStack |
