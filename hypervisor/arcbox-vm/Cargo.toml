@@ -7,7 +7,7 @@ edition = "2024"
 version = "0.1.0"
 authors = ["ArcBox Labs <oss@arcbox.dev>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/arcbox-labs/firecracker-vmm"
+repository = "https://github.com/arcbox-labs/arcbox"
 
 [workspace.dependencies]
 vmm-core = { path = "vmm-core" }
