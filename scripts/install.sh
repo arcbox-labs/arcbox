@@ -130,16 +130,25 @@ download_and_install() {
     info "Extracting..."
     tar xzf "$tarball" -C "$tmpdir" || die "Failed to extract archive."
 
-    # Locate binary (may be at top level or inside a directory)
-    local binary=""
+    # Locate binaries (may be at top level or inside a directory)
+    local arcbox_binary=""
+    local daemon_binary=""
     if [[ -f "$tmpdir/arcbox" ]]; then
-        binary="$tmpdir/arcbox"
+        arcbox_binary="$tmpdir/arcbox"
     else
-        binary="$(find "$tmpdir" -name arcbox -type f -perm +111 | head -1)"
+        arcbox_binary="$(find "$tmpdir" -name arcbox -type f | head -1)"
+    fi
+    if [[ -f "$tmpdir/arcbox-daemon" ]]; then
+        daemon_binary="$tmpdir/arcbox-daemon"
+    else
+        daemon_binary="$(find "$tmpdir" -name arcbox-daemon -type f | head -1)"
     fi
 
-    if [[ -z "$binary" || ! -f "$binary" ]]; then
+    if [[ -z "$arcbox_binary" || ! -f "$arcbox_binary" ]]; then
         die "Could not find arcbox binary in archive."
+    fi
+    if [[ -z "$daemon_binary" || ! -f "$daemon_binary" ]]; then
+        die "Could not find arcbox-daemon binary in archive."
     fi
 
     # Codesign with virtualization entitlement
@@ -155,20 +164,26 @@ download_and_install() {
 </dict>
 </plist>
 PLIST
-    codesign --entitlements "$entitlements" --force -s - "$binary" 2>/dev/null || warn "Codesign failed. VM features may not work without the virtualization entitlement."
+    codesign --entitlements "$entitlements" --force -s - "$arcbox_binary" 2>/dev/null || warn "Codesign failed for arcbox. VM features may not work without the virtualization entitlement."
+    codesign --entitlements "$entitlements" --force -s - "$daemon_binary" 2>/dev/null || warn "Codesign failed for arcbox-daemon. VM features may not work without the virtualization entitlement."
 
-    # Install binary
-    info "Installing to ${INSTALL_DIR}/arcbox..."
+    # Install binaries
+    info "Installing to ${INSTALL_DIR}/arcbox and ${INSTALL_DIR}/arcbox-daemon..."
     if [[ -w "$INSTALL_DIR" ]]; then
-        install -m 755 "$binary" "$INSTALL_DIR/arcbox"
+        install -m 755 "$arcbox_binary" "$INSTALL_DIR/arcbox"
+        install -m 755 "$daemon_binary" "$INSTALL_DIR/arcbox-daemon"
     else
         warn "Write permission denied for $INSTALL_DIR. Using sudo..."
-        sudo install -m 755 "$binary" "$INSTALL_DIR/arcbox"
+        sudo install -m 755 "$arcbox_binary" "$INSTALL_DIR/arcbox"
+        sudo install -m 755 "$daemon_binary" "$INSTALL_DIR/arcbox-daemon"
     fi
 
     # Verify installation
     if ! "$INSTALL_DIR/arcbox" version >/dev/null 2>&1; then
         warn "Installed binary does not respond to 'version'. It may require additional setup."
+    fi
+    if ! "$INSTALL_DIR/arcbox-daemon" --help >/dev/null 2>&1; then
+        warn "Installed daemon binary does not respond to '--help'. It may require additional setup."
     fi
 }
 
@@ -206,8 +221,7 @@ install_launchd_agent() {
 
     <key>ProgramArguments</key>
     <array>
-        <string>${INSTALL_DIR}/arcbox</string>
-        <string>daemon</string>
+        <string>${INSTALL_DIR}/arcbox-daemon</string>
         <string>--foreground</string>
         <string>--docker-integration</string>
     </array>
@@ -270,7 +284,7 @@ print_summary() {
     bold "  ArcBox v${VERSION} installed successfully!"
     bold "============================================"
     echo ""
-    echo "  Binary:    ${INSTALL_DIR}/arcbox"
+    echo "  Binaries:  ${INSTALL_DIR}/arcbox, ${INSTALL_DIR}/arcbox-daemon"
     echo "  Data dir:  ${DATA_DIR}"
     echo "  Logs:      ${LOG_DIR}"
     if [[ "${ARCBOX_NO_DAEMON:-0}" != "1" ]]; then
@@ -278,16 +292,18 @@ print_summary() {
     fi
     echo ""
     bold "Quick start:"
-    echo "  arcbox run -it alpine sh        # Run a container"
-    echo "  arcbox ps                        # List containers"
+    echo "  arcbox daemon                    # Start daemon in background"
+    echo "  arcbox docker enable             # Use ArcBox with Docker CLI"
+    echo "  docker run hello-world           # Run via Docker CLI"
     echo "  arcbox machine list              # List VMs"
     echo ""
     bold "Docker integration:"
-    echo "  arcbox docker use                # Use ArcBox as Docker backend"
+    echo "  arcbox docker enable             # Use ArcBox as Docker backend"
     echo "  docker run hello-world           # Works with standard Docker CLI"
     echo ""
     bold "Manage the daemon:"
-    echo "  arcbox daemon                    # Start in foreground"
+    echo "  arcbox daemon                    # Start in background"
+    echo "  arcbox daemon stop               # Stop daemon"
     echo "  launchctl kickstart -k gui/$(id -u)/${PLIST_LABEL}  # Restart"
     echo "  launchctl bootout gui/$(id -u)/${PLIST_LABEL}       # Stop"
     echo ""
@@ -306,7 +322,7 @@ print_summary() {
 print_uninstall_hint() {
     echo "To uninstall ArcBox:"
     echo "  launchctl bootout gui/$(id -u)/${PLIST_LABEL} 2>/dev/null"
-    echo "  rm -f ${INSTALL_DIR}/arcbox"
+    echo "  rm -f ${INSTALL_DIR}/arcbox ${INSTALL_DIR}/arcbox-daemon"
     echo "  rm -f ${PLIST_FILE}"
     echo "  rm -rf ${DATA_DIR}"
     echo "  rm -rf ${LOG_DIR}"

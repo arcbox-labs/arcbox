@@ -75,21 +75,25 @@ jobs:
             ${{ runner.os }}-cargo-release-
             ${{ runner.os }}-cargo-
 
-      - name: Build arcbox (release)
+      - name: Build arcbox binaries (release)
         timeout-minutes: 15
         run: |
-          cargo build --release --locked -p arcbox-cli
+          cargo build --release --locked -p arcbox-cli -p arcbox-daemon
 
-      - name: Codesign binary with virtualization entitlement
+      - name: Codesign binaries with virtualization entitlement
         run: |
           codesign --entitlements tests/resources/entitlements.plist \
             --force -s - target/release/arcbox
+          codesign --entitlements tests/resources/entitlements.plist \
+            --force -s - target/release/arcbox-daemon
 
       - name: Verify artifacts
         run: |
           echo "=== Build artifacts ==="
           ls -lh target/release/arcbox
+          ls -lh target/release/arcbox-daemon
           file target/release/arcbox
+          file target/release/arcbox-daemon
 
       - name: Create tarball
         id: tarball
@@ -100,8 +104,9 @@ jobs:
 
           mkdir -p "$STAGING"
 
-          # CLI binary
+          # CLI + daemon binaries
           cp target/release/arcbox "$STAGING/"
+          cp target/release/arcbox-daemon "$STAGING/"
 
           # Entitlements (needed for codesigning after install)
           cp tests/resources/entitlements.plist "$STAGING/"
@@ -199,11 +204,13 @@ jobs:
             tar xzf ${{ needs.build-macos-arm64.outputs.tarball }}
             cd arcbox-darwin-arm64-${{ needs.build-macos-arm64.outputs.version }}
 
-            # Re-sign binary with virtualization entitlement
+            # Re-sign binaries with virtualization entitlement
             codesign --entitlements entitlements.plist --force -s - arcbox
+            codesign --entitlements entitlements.plist --force -s - arcbox-daemon
 
-            # Install CLI
+            # Install binaries
             sudo cp arcbox /usr/local/bin/
+            sudo cp arcbox-daemon /usr/local/bin/
 
             # Download runtime boot assets
             arcbox boot prefetch

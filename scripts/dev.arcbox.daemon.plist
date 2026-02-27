@@ -23,11 +23,10 @@
     <key>Label</key>
     <string>dev.arcbox.daemon</string>
 
-    <!-- Command to run: arcbox daemon in foreground with Docker integration -->
+    <!-- Command to run: arcbox-daemon in foreground with Docker integration -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/arcbox</string>
-        <string>daemon</string>
+        <string>/usr/local/bin/arcbox-daemon</string>
         <string>--foreground</string>
         <string>--docker-integration</string>
     </array>

@@ -42,8 +42,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build arcbox
-        run: cargo build --release -p arcbox-cli
+      - name: Build arcbox daemon
+        run: cargo build --release -p arcbox-daemon
 
       - name: Start arcbox daemon
         run: |
@@ -51,7 +51,7 @@ jobs:
           mkdir -p /tmp/arcbox-e2e-data
 
           # Start daemon in background (without VM support for basic API tests)
-          ./target/release/arcbox daemon \
+          ./target/release/arcbox-daemon --foreground \
             --socket /tmp/arcbox-e2e.sock \
             --data-dir /tmp/arcbox-e2e-data \
             &
@@ -253,13 +253,13 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build arcbox
-        run: cargo build --release -p arcbox-cli
+      - name: Build arcbox daemon
+        run: cargo build --release -p arcbox-daemon
 
       - name: Start daemon
         run: |
           mkdir -p /tmp/arcbox-e2e-data
-          ./target/release/arcbox daemon \
+          ./target/release/arcbox-daemon --foreground \
             --socket /tmp/arcbox-e2e.sock \
             --data-dir /tmp/arcbox-e2e-data &
           sleep 3
@@ -282,6 +282,6 @@ jobs:
       - name: Stop daemon
         if: always()
         run: |
-          pkill -f "arcbox daemon" || true
+          pkill -f "arcbox-daemon" || true
           rm -f /tmp/arcbox-e2e.sock
           rm -rf /tmp/arcbox-e2e-data

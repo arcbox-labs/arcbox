@@ -11,7 +11,6 @@ INITRAMFS="${INITRAMFS:-$DEFAULT_INITRAMFS}"
 SOCKET="${SOCKET:-/tmp/arcbox.sock}"
 GRPC_SOCKET="${GRPC_SOCKET:-/tmp/arcbox-grpc.sock}"
 DATA_DIR="${DATA_DIR:-/tmp/arcbox-data}"
-CONTAINER_BACKEND="${CONTAINER_BACKEND:-guest-docker}"
 CONTAINER_PROVISION="${CONTAINER_PROVISION:-bundled-assets}"
 GUEST_DOCKER_VSOCK_PORT="${GUEST_DOCKER_VSOCK_PORT:-2375}"
 SIGN="${SIGN:-1}"
@@ -20,11 +19,11 @@ ENTITLEMENTS="${ENTITLEMENTS:-$ROOT/tests/resources/entitlements.plist}"
 cd "$ROOT"
 
 if [[ "$PROFILE" == "release" ]]; then
-  cargo build -p arcbox-cli --release
-  BIN="$ROOT/target/release/arcbox"
+  cargo build -p arcbox-cli -p arcbox-daemon --release
+  BIN="$ROOT/target/release/arcbox-daemon"
 else
-  cargo build -p arcbox-cli
-  BIN="$ROOT/target/debug/arcbox"
+  cargo build -p arcbox-cli -p arcbox-daemon
+  BIN="$ROOT/target/debug/arcbox-daemon"
 fi
 
 if [[ "$KERNEL" == "$DEFAULT_KERNEL" && "$INITRAMFS" == "$DEFAULT_INITRAMFS" ]]; then
@@ -51,12 +50,11 @@ if [[ "$SIGN" == "1" ]]; then
   fi
 fi
 
-exec "$BIN" daemon \
+exec "$BIN" --foreground \
   --socket "$SOCKET" \
   --grpc-socket "$GRPC_SOCKET" \
   --data-dir "$DATA_DIR" \
   --kernel "$KERNEL" \
   --initramfs "$INITRAMFS" \
-  --container-backend "$CONTAINER_BACKEND" \
   --container-provision "$CONTAINER_PROVISION" \
   --guest-docker-vsock-port "$GUEST_DOCKER_VSOCK_PORT"
