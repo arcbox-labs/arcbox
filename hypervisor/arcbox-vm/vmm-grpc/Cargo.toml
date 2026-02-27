@@ -18,5 +18,10 @@ serde.workspace        = true
 serde_json.workspace   = true
 chrono.workspace       = true
 
+[dev-dependencies]
+anyhow.workspace      = true
+tokio-stream.workspace = true
+tracing-subscriber.workspace = true
+
 [build-dependencies]
 tonic-build.workspace = true

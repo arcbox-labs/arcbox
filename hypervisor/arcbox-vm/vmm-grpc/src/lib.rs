@@ -15,4 +15,5 @@ pub mod proto {
 pub mod sandbox_svc;
 pub mod server;
 
+pub use sandbox_svc::{SandboxServiceImpl, SandboxSnapshotServiceImpl};
 pub use server::serve;
