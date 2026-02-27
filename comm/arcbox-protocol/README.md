@@ -1,57 +1,48 @@
 # arcbox-protocol
 
-Protocol definitions for ArcBox communication using Protocol Buffers.
+Protocol Buffer message and service definitions for ArcBox.
 
 ## Overview
 
-This crate defines the message types and service interfaces used for communication between:
+This crate provides generated Rust types for `arcbox.v1` protobuf schemas,
+re-exported through:
 
-- CLI <-> Daemon (ttrpc over Unix socket)
-- Host <-> Guest (ttrpc over vsock)
-- Docker CLI <-> Daemon (REST API, handled by arcbox-docker)
-
-Message types are generated at build time from `.proto` files using prost.
-
-## Features
-
-- Protocol Buffer message definitions for all ArcBox services
-- Efficient binary serialization for high-performance IPC
-- Type-safe Rust structs generated from `.proto` files
+- `arcbox_protocol::v1::*` (canonical)
+- compatibility modules (`arcbox_protocol::machine`, `::container`, `::agent`, etc.)
+- selected crate-root re-exports for convenience
 
 ## Modules
 
-| Module | Description |
-|--------|-------------|
-| `common` | Shared types (Timestamp, Mount, PortBinding, etc.) |
-| `container` | Container lifecycle operations |
-| `image` | Image management |
-| `machine` | Virtual machine management |
-| `agent` | Guest agent operations |
+| Module | Source proto | Description |
+|--------|--------------|-------------|
+| `common` | `common.proto` | Shared types (`Empty`, `Mount`, `PortBinding`, ...) |
+| `machine` | `machine.proto` | Machine lifecycle + agent passthrough requests |
+| `container` | `container.proto` | Container lifecycle and exec messages |
+| `image` | `image.proto` | Image pull/list/inspect/remove messages |
+| `agent` | `agent.proto` | Guest agent health/runtime messages |
+| `api` | `api.proto` | Network/system/volume API messages |
 
 ## Usage
 
 ```rust
-use arcbox_protocol::{
-    CreateContainerRequest, ContainerConfig,
-    PullImageRequest, ListMachinesRequest,
-};
+use arcbox_protocol::{CreateContainerRequest, PullImageRequest};
 
-// Create a container request
-let request = CreateContainerRequest {
-    id: "my-container".to_string(),
-    config: Some(ContainerConfig {
-        image: "alpine:latest".to_string(),
-        cmd: vec!["echo".to_string(), "hello".to_string()],
-        ..Default::default()
-    }),
+let create = CreateContainerRequest {
+    name: "demo".to_string(),
+    image: "alpine:latest".to_string(),
+    cmd: vec!["echo".to_string(), "hello".to_string()],
+    tty: false,
+    stdin_open: false,
     ..Default::default()
 };
 
-// Image pull request
-let pull_request = PullImageRequest {
+let pull = PullImageRequest {
     reference: "nginx:latest".to_string(),
     ..Default::default()
 };
+
+assert_eq!(create.image, "alpine:latest");
+assert_eq!(pull.reference, "nginx:latest");
 ```
 
 ## License

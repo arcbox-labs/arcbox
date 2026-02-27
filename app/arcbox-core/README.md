@@ -1,54 +1,49 @@
 # arcbox-core
 
-Core orchestration layer for ArcBox.
+Core orchestration runtime for ArcBox.
 
 ## Overview
 
-This crate provides the central orchestration layer that manages all high-level operations in ArcBox. It coordinates virtual machines, Linux machines, containers, images, and volumes through a unified `Runtime` struct.
+`arcbox-core` provides the host-side runtime that coordinates machine lifecycle,
+VM readiness, guest-agent connectivity, and networking/port-forward state.
 
-## Features
+The main entry point is `Runtime`:
 
-- **VmManager**: Virtual machine lifecycle management
-- **MachineManager**: Named Linux machine management
-- **VmLifecycleManager**: Automatic VM start/stop based on container activity
-- **AgentClient**: Guest agent RPC communication via vsock
-- **BootAssetProvider**: Kernel and initramfs management
-- **EventBus**: System-wide event coordination
+- `Runtime::new(config)` creates the runtime synchronously
+- `runtime.init().await` prepares runtime state and assets
+- `runtime.ensure_vm_ready().await` ensures the default machine is running
+
+## Key Components
+
+- `Runtime`: top-level orchestrator
+- `MachineManager`: named machine lifecycle and metadata
+- `VmLifecycleManager`: automatic start/health/recovery for default machine
+- `AgentClient`: guest RPC client over vsock
+- `NetworkManager`: network lifecycle and IP allocation
 
 ## Usage
 
 ```rust
-use arcbox_core::{Runtime, Config, VmConfig};
+use arcbox_core::{Config, Runtime};
 
-// Create runtime with default configuration
-let config = Config::default();
-let runtime = Runtime::new(config).await?;
-
-// Create and start a container (auto-starts VM if needed)
-let container = runtime.create_container(container_config).await?;
-runtime.start_container(&container.id).await?;
+let runtime = Runtime::new(Config::default())?;
+runtime.init().await?;
+let cid = runtime.ensure_vm_ready().await?;
+println!("default machine CID: {cid}");
 ```
 
 ## Architecture
 
 ```text
-┌─────────────────────────────────────────────────┐
-│                  arcbox-core                    │
-│  ┌─────────────┐ ┌─────────────┐ ┌───────────┐ │
-│  │  VmManager  │ │MachineManager│ │Container  │ │
-│  │             │ │             │ │ Manager   │ │
-│  └──────┬──────┘ └──────┬──────┘ └─────┬─────┘ │
-│         │               │               │       │
-│         └───────────────┼───────────────┘       │
-│                         ▼                       │
-│              ┌─────────────────┐               │
-│              │    EventBus     │               │
-│              └─────────────────┘               │
-└─────────────────────────────────────────────────┘
-                       │
-          ┌────────────┼────────────┐
-          ▼            ▼            ▼
-     arcbox-vmm   arcbox-fs   arcbox-container
+arcbox-api / arcbox-cli
+          |
+          v
+      arcbox-core::Runtime
+          |
+          +-- MachineManager
+          +-- VmLifecycleManager
+          +-- NetworkManager
+          +-- AgentClient accessors
 ```
 
 ## License

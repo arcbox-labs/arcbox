@@ -1,75 +1,35 @@
 # arcbox-grpc
 
-gRPC service clients and servers for ArcBox.
+gRPC client/server bindings for ArcBox services.
 
 ## Overview
 
-This crate provides tonic-generated gRPC client and server implementations for all ArcBox services. Message types are imported from `arcbox-protocol`.
+This crate contains tonic-generated service modules for the `arcbox.v1` package,
+with protobuf messages sourced from `arcbox-protocol`.
 
-## Services
+All generated services are available under `arcbox_grpc::v1::*`.
 
-| Service | Purpose | Key RPCs |
-|---------|---------|----------|
-| `MachineService` | VM management | Create, Start, Stop, List, Exec |
-| `ContainerService` | Container lifecycle | Create, Start, Stop, List, Logs |
-| `ImageService` | Image management | Pull, List, Remove, Import |
-| `AgentService` | Guest agent communication | Exec, FileOps, Health |
+## Crate-Root Re-exports
 
-## Features
+For convenience, crate root currently re-exports:
 
-- Tonic-based gRPC client and server implementations
-- Async/await support with tokio
-- Unix socket connectivity for daemon communication
-- Re-exports `tonic` and `arcbox_protocol` for convenience
+- Clients: `MachineServiceClient`, `AgentServiceClient`, `VolumeServiceClient`
+- Servers: `MachineService`, `MachineServiceServer`, `AgentService`,
+  `AgentServiceServer`, `VolumeService`, `VolumeServiceServer`
+
+Other generated clients/servers (for example container/image/network/system)
+are available via `arcbox_grpc::v1::<service_module>::...`.
 
 ## Usage
 
-### Client
-
 ```rust
 use arcbox_grpc::MachineServiceClient;
-use arcbox_protocol::machine::ListMachinesRequest;
-use tonic::transport::Channel;
+use arcbox_protocol::v1::ListMachinesRequest;
 
-// Connect to daemon via Unix socket
-let channel = tonic::transport::Endpoint::from_static("http://[::]:50051")
-    .connect_with_connector(tower::service_fn(|_| async {
-        tokio::net::UnixStream::connect("/var/run/arcbox.sock").await
-    }))
-    .await?;
-
-let mut client = MachineServiceClient::new(channel);
-
-// Make RPC calls
 let request = tonic::Request::new(ListMachinesRequest { all: true });
-let response = client.list(request).await?;
+// client.list(request).await?;
+# let _ = request;
 ```
-
-### Server
-
-```rust
-use arcbox_grpc::{MachineService, MachineServiceServer};
-use tonic::{Request, Response, Status};
-
-struct MyMachineService;
-
-#[tonic::async_trait]
-impl MachineService for MyMachineService {
-    async fn list(
-        &self,
-        request: Request<ListMachinesRequest>,
-    ) -> Result<Response<ListMachinesResponse>, Status> {
-        // Implementation
-    }
-}
-
-let server = MachineServiceServer::new(MyMachineService);
-```
-
-## Exported Types
-
-- **Clients**: `MachineServiceClient`, `ContainerServiceClient`, `ImageServiceClient`, `AgentServiceClient`
-- **Servers**: `MachineService` (trait), `MachineServiceServer`, `ContainerService`, `ContainerServiceServer`, etc.
 
 ## License
 

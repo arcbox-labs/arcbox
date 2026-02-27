@@ -1,60 +1,37 @@
 # arcbox-container
 
-Container runtime for ArcBox.
+Container domain types and exec orchestration primitives for ArcBox.
 
 ## Overview
 
-This crate provides Docker/OCI-compatible container state management. It handles container lifecycle, configuration, exec instances, and volume management. Containers run inside the ArcBox VM with a Linux kernel, and this crate communicates with the arcbox-agent inside the VM to manage container processes.
+This crate does not expose a monolithic container manager. Instead, it provides
+shared data models and exec coordination utilities used by higher-level
+services:
+
+- `ContainerConfig` for container creation parameters
+- `Container` / `ContainerState` for container identity and lifecycle state
+- `ExecManager` and related exec types for `docker exec`-style workflows
 
 ## Features
 
-- **Container Lifecycle**: Create, start, stop, pause, unpause, and remove containers
-- **ContainerManager**: Centralized container state management
-- **ExecManager**: Manage `docker exec` instances
-- **VolumeManager**: Named volume creation and management
-- **Resource Limits**: CPU and memory constraints
-- **Environment and Networking**: Container configuration
+- Container metadata and state models (`Container`, `ContainerId`, `ContainerState`)
+- Container configuration model (`ContainerConfig`)
+- Exec lifecycle model (`ExecInstance`, `ExecConfig`, `ExecId`)
+- Optional agent-backed exec operations via `ExecAgentConnection`
 
 ## Usage
 
 ```rust
-use arcbox_container::{ContainerManager, ContainerConfig, ContainerState};
+use arcbox_container::{Container, ContainerConfig, ContainerState};
 
-// Create a container manager
-let manager = ContainerManager::new(data_dir);
-
-// Create a container
 let config = ContainerConfig {
     image: "alpine:latest".to_string(),
     cmd: vec!["sh".to_string()],
     ..Default::default()
 };
-let container = manager.create(config)?;
 
-// List containers
-let containers = manager.list();
-for c in containers {
-    println!("{}: {:?}", c.name, c.state);
-}
-```
-
-## Architecture
-
-```text
-┌─────────────────────────────────────────────┐
-│               arcbox-container              │
-│  ┌─────────────────────────────────────┐   │
-│  │          ContainerManager           │   │
-│  │  - Container lifecycle              │   │
-│  │  - State management                 │   │
-│  └─────────────────────────────────────┘   │
-│                    │                        │
-│                    ▼                        │
-│  ┌─────────────────────────────────────┐   │
-│  │           arcbox-agent              │   │
-│  │         (inside guest VM)           │   │
-│  └─────────────────────────────────────┘   │
-└─────────────────────────────────────────────┘
+let container = Container::with_config("demo", config);
+assert_eq!(container.state, ContainerState::Created);
 ```
 
 ## License

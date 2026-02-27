@@ -1,21 +1,23 @@
 # arcbox-api
 
-API server for ArcBox.
+API server layer for ArcBox.
 
 ## Overview
 
-This crate provides the API server layer for ArcBox, offering multiple interfaces for client communication. It bridges external clients to the arcbox-core runtime, implementing service handlers for containers, machines, images, networks, and system operations.
+This crate wires two host-facing APIs to `arcbox-core` runtime state:
+
+- gRPC server (`MachineService` implementation)
+- Docker-compatible HTTP API server (via `arcbox-docker`)
+
+Current gRPC implementation in this crate is machine-focused (`MachineServiceImpl`).
+Other service definitions may exist in shared protocol crates but are not all
+implemented here.
 
 ## Features
 
-- **gRPC API**: High-performance native API using tonic for ArcBox CLI and desktop client
-- **Docker API**: Docker CLI compatibility via arcbox-docker integration
-- **Service Implementations**:
-  - ContainerService: Container lifecycle management
-  - MachineService: VM management
-  - ImageService: Image operations with streaming pull
-  - NetworkService: Network management
-  - SystemService: System info and health checks
+- `ApiServer` wrapper that initializes runtime and serves APIs
+- gRPC `MachineService` with machine lifecycle + guest-agent pass-through calls
+- Docker API integration through embedded `arcbox-docker` server
 
 ## Usage
 
@@ -31,25 +33,6 @@ let config = ApiServerConfig {
 
 let server = ApiServer::new(config, Config::default())?;
 server.run().await?;
-```
-
-## Architecture
-
-```text
-┌─────────────────────────────────────────────────┐
-│                   arcbox-api                    │
-│                                                 │
-│  ┌─────────────┐         ┌─────────────────┐   │
-│  │   gRPC      │         │   Docker API    │   │
-│  │   Server    │         │  (arcbox-docker)│   │
-│  └──────┬──────┘         └────────┬────────┘   │
-│         │                         │            │
-│         └────────────┬────────────┘            │
-│                      ▼                         │
-│              ┌─────────────┐                   │
-│              │ arcbox-core │                   │
-│              └─────────────┘                   │
-└─────────────────────────────────────────────────┘
 ```
 
 ## License
