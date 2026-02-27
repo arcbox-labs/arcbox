@@ -34,6 +34,10 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 - `guest/` — in-VM agent (cross-compiled for Linux)
 - `tests/` — e2e tests and test resources
 
+## Planning
+
+When asked to plan, the plan must be fully resolved before implementation begins. Every decision must be locked — no "TBD", no "option A or B", no open questions. The plan should have exactly one possible outcome. If anything is unclear or uncertain, ask the user before finalizing.
+
 ## Code Standards
 
 - Run `cargo clippy` and `cargo fmt` before committing. All code must pass both with zero warnings.
