@@ -262,9 +262,17 @@ mod agent {
             let pid = child.id();
             let timeout = start.timeout_seconds;
             thread::spawn(move || {
+                // Sleep for the configured timeout, then check if the process still exists
+                // before attempting to send SIGKILL. This reduces the risk of killing a
+                // different process if the PID has been recycled.
                 thread::sleep(std::time::Duration::from_secs(timeout as u64));
-                // SAFETY: pid is a valid process id from std::process::Child.
-                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                unsafe {
+                    // Probe the process with signal 0. If this fails with ESRCH, the PID
+                    // is not currently in use and we must not send SIGKILL.
+                    if libc::kill(pid as i32, 0) == 0 {
+                        let _ = libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                }
             });
         }
 
