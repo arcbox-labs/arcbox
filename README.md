@@ -23,7 +23,7 @@
 curl -sSL https://install.arcbox.dev | sh
 
 # 2. Start the daemon
-arcbox start
+arcbox daemon
 
 # 3. Point Docker CLI at ArcBox
 arcbox docker enable
@@ -131,7 +131,7 @@ codesign --entitlements tests/resources/entitlements.plist --force -s - \
 
 ```bash
 # Stop the daemon
-arcbox stop
+arcbox daemon stop
 
 # Restore Docker Desktop as default
 arcbox docker disable
