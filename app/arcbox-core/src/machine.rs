@@ -227,11 +227,6 @@ impl MachineManager {
         let users_dir = std::path::Path::new("/Users");
         if users_dir.is_dir() {
             shared_dirs.push(SharedDirConfig::new("/Users", "users"));
-        } else if let Some(home_dir) = dirs::home_dir() {
-            shared_dirs.push(SharedDirConfig::new(
-                home_dir.to_string_lossy().to_string(),
-                "home",
-            ));
         }
 
         // Load persisted machines
@@ -325,12 +320,6 @@ impl MachineManager {
         let users_dir = std::path::Path::new("/Users");
         if users_dir.is_dir() {
             shared_dirs.push(SharedDirConfig::new("/Users", "users"));
-        } else if let Some(home_dir) = dirs::home_dir() {
-            // Fallback for non-standard macOS layouts.
-            shared_dirs.push(SharedDirConfig::new(
-                home_dir.to_string_lossy().to_string(),
-                "home",
-            ));
         }
 
         // Create underlying VM
