@@ -164,7 +164,7 @@ We welcome contributions. See [CLAUDE.md](CLAUDE.md) for current contribution an
 
 ## License
 
-- **Core** (`common/`, `hypervisor/`, `services/`, `comm/`, `app/`) -- [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)
+- **Core** (`common/`, `virt/`, `services/`, `comm/`, `app/`) -- [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)
 - **Pro** (`pro/`) -- [BSL-1.1](LICENSE-BSL-1.1) (converts to MIT after 4 years)
 
 See [LICENSE](LICENSE) for the full text.

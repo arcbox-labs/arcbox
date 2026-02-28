@@ -26,7 +26,7 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 ## Project Structure
 
 - `common/` — shared error types
-- `hypervisor/` — Virtualization.framework bindings, cross-platform hypervisor traits, VMM, VirtIO devices
+- `virt/` — Virtualization.framework bindings, cross-platform hypervisor traits, VMM, VirtIO devices
 - `services/` — filesystem (VirtioFS), networking (NAT/DHCP/DNS), container state, OCI image/runtime
 - `comm/` — protobuf definitions, gRPC services, vsock/unix transport
 - `app/` — core orchestration, API server, Docker Engine API compat, thin CLI (`arcbox`), daemon binary (`arcbox-daemon`), facade crate
