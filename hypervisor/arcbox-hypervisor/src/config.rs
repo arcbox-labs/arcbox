@@ -15,8 +15,6 @@ pub struct VmConfig {
     pub kernel_path: Option<String>,
     /// Kernel command line arguments.
     pub kernel_cmdline: Option<String>,
-    /// Path to the initial ramdisk.
-    pub initrd_path: Option<String>,
     /// Enable Rosetta 2 translation (macOS ARM only).
     pub enable_rosetta: bool,
 }
@@ -29,7 +27,6 @@ impl Default for VmConfig {
             arch: CpuArch::native(),
             kernel_path: None,
             kernel_cmdline: None,
-            initrd_path: None,
             enable_rosetta: false,
         }
     }
@@ -82,13 +79,6 @@ impl VmConfigBuilder {
     #[must_use]
     pub fn kernel_cmdline(mut self, cmdline: impl Into<String>) -> Self {
         self.config.kernel_cmdline = Some(cmdline.into());
-        self
-    }
-
-    /// Sets the initrd path.
-    #[must_use]
-    pub fn initrd_path(mut self, path: impl Into<String>) -> Self {
-        self.config.initrd_path = Some(path.into());
         self
     }
 

@@ -3,7 +3,7 @@
 //! Usage:
 //! 1. Build: cargo build --bin arcbox-boot -p arcbox-hypervisor
 //! 2. Sign: codesign --entitlements tests/resources/entitlements.plist --force -s - target/debug/arcbox-boot
-//! 3. Run: arcbox-boot <kernel_path> [initrd_path] [options]
+//! 3. Run: arcbox-boot <kernel_path> [options]
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -20,10 +20,6 @@ struct Args {
     /// Path to the Linux kernel image
     #[arg(value_name = "KERNEL")]
     kernel: PathBuf,
-
-    /// Path to the initrd/initramfs image
-    #[arg(value_name = "INITRD")]
-    initrd: Option<PathBuf>,
 
     /// Attach a block device
     #[arg(long, value_name = "PATH")]
@@ -115,7 +111,7 @@ fn run_macos(args: Args) {
     let cmdline = args
         .cmdline
         .clone()
-        .unwrap_or_else(|| "console=hvc0 loglevel=8 root=/dev/ram0 rdinit=/init".to_string());
+        .unwrap_or_else(|| "console=hvc0 loglevel=8 root=/dev/vda rw init=/sbin/init".to_string());
     let memory_bytes = args.memory * 1024 * 1024;
 
     let config = VmConfig {
@@ -124,18 +120,11 @@ fn run_macos(args: Args) {
         arch: CpuArch::native(),
         kernel_path: Some(args.kernel.to_string_lossy().into_owned()),
         kernel_cmdline: Some(cmdline.clone()),
-        initrd_path: args
-            .initrd
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned()),
         ..Default::default()
     };
 
     println!("VM Configuration:");
     println!("  Kernel: {}", args.kernel.display());
-    if let Some(ref initrd) = args.initrd {
-        println!("  Initrd: {}", initrd.display());
-    }
     if let Some(ref disk) = args.disk {
         println!("  Disk: {}", disk.display());
     }

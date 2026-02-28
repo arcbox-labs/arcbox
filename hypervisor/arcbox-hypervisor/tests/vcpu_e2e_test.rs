@@ -44,12 +44,6 @@ fn kernel_available() -> bool {
     kernel_path.exists()
 }
 
-/// Checks if initramfs is available.
-fn initramfs_available() -> bool {
-    let initrd_path = test_resources_dir().join("initramfs-arm64");
-    initrd_path.exists()
-}
-
 // ============================================================================
 // E2E Tests: vCPU with VM Lifecycle
 // ============================================================================
@@ -317,7 +311,6 @@ fn test_vcpu_vm_state_awareness() {
 ///
 /// This test requires:
 /// - tests/resources/vmlinuz-arm64
-/// - tests/resources/initramfs-arm64 (optional)
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "Requires kernel and entitlement"]
@@ -338,26 +331,21 @@ fn test_vcpu_with_running_vm() {
         .try_init();
 
     let kernel_path = test_resources_dir().join("vmlinuz-arm64");
-    let initrd_path = test_resources_dir().join("initramfs-arm64");
 
     println!("Using kernel: {:?}", kernel_path);
 
     let hypervisor = DarwinHypervisor::new().expect("Failed to create hypervisor");
 
-    let mut config = VmConfig {
+    let config = VmConfig {
         vcpu_count: 2,
         memory_size: 512 * 1024 * 1024,
         arch: CpuArch::native(),
         kernel_path: Some(kernel_path.to_string_lossy().to_string()),
         kernel_cmdline: Some(
-            "console=hvc0 earlycon=pl011,0x09000000 root=/dev/ram0 rdinit=/bin/sh".to_string(),
+            "console=hvc0 earlycon=pl011,0x09000000 root=/dev/vda rw init=/sbin/init".to_string(),
         ),
         ..Default::default()
     };
-
-    if initramfs_available() {
-        config.initrd_path = Some(initrd_path.to_string_lossy().to_string());
-    }
 
     let mut vm = hypervisor.create_vm(config).expect("Failed to create VM");
 

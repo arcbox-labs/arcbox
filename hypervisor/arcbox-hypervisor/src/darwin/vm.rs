@@ -138,11 +138,6 @@ impl DarwinVm {
                 tracing::debug!("Set kernel cmdline: {}", cmdline);
             }
 
-            if let Some(ref initrd_path) = config.initrd_path {
-                boot_loader.set_initial_ramdisk(initrd_path);
-                tracing::debug!("Set initrd: {}", initrd_path);
-            }
-
             vz_config.set_boot_loader(boot_loader);
             tracing::debug!("Boot loader configured");
         }

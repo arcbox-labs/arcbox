@@ -5,7 +5,7 @@
 //! Usage:
 //! 1. Build: cargo build --bin arcbox-perf -p arcbox-hypervisor --release
 //! 2. Sign: codesign --entitlements tests/resources/entitlements.plist -s - target/release/arcbox-perf
-//! 3. Run: arcbox-perf <kernel_path> [initrd_path] [--iterations N]
+//! 3. Run: arcbox-perf <kernel_path> [--iterations N]
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -20,10 +20,6 @@ struct Args {
     /// Path to the Linux kernel image
     #[arg(value_name = "KERNEL")]
     kernel: PathBuf,
-
-    /// Path to the initrd/initramfs image
-    #[arg(value_name = "INITRD")]
-    initrd: Option<PathBuf>,
 
     /// Number of iterations to run
     #[arg(long, default_value = "1")]
@@ -50,8 +46,6 @@ fn main() {
         }
 
         let kernel_path = args.kernel.to_string_lossy().into_owned();
-        let initrd_path = args.initrd.map(|p| p.to_string_lossy().into_owned());
-
         for iteration in 0..args.iterations {
             if args.iterations > 1 {
                 println!(
@@ -74,9 +68,8 @@ fn main() {
                 arch: CpuArch::native(),
                 kernel_path: Some(kernel_path.clone()),
                 kernel_cmdline: Some(
-                    "console=hvc0 earlycon root=/dev/ram0 rdinit=/bin/sh".to_string(),
+                    "console=hvc0 earlycon root=/dev/vda rw init=/sbin/init".to_string(),
                 ),
-                initrd_path: initrd_path.clone(),
                 ..Default::default()
             };
             let config_time = t1.elapsed();

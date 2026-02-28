@@ -249,7 +249,6 @@ impl VmManager {
                 .map(PathBuf::from)
                 .unwrap_or_default(),
             kernel_cmdline: entry.config.cmdline.clone().unwrap_or_default(),
-            initrd_path: None,
             enable_rosetta: false,
             serial_console: true,
             virtio_console: true,

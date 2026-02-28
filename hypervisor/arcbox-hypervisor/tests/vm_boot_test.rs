@@ -2,7 +2,6 @@
 //!
 //! This test requires a Linux kernel to be present at:
 //! - tests/resources/vmlinuz-arm64
-//! - tests/resources/initramfs-arm64 (optional)
 //!
 //! Run `tests/resources/download-kernel.sh` to download test resources.
 
@@ -58,10 +57,7 @@ fn test_vm_boot_with_kernel() {
         .try_init();
 
     let kernel_path = test_resources_dir().join("vmlinuz-arm64");
-    let initrd_path = test_resources_dir().join("initramfs-arm64");
-
     println!("Using kernel: {:?}", kernel_path);
-    println!("Using initrd: {:?}", initrd_path);
 
     // Create hypervisor
     let hypervisor = DarwinHypervisor::new().expect("Failed to create hypervisor");
@@ -76,21 +72,16 @@ fn test_vm_boot_with_kernel() {
     println!("  Rosetta: {}", caps.rosetta);
 
     // Create VM config
-    let mut config = VmConfig {
+    let config = VmConfig {
         vcpu_count: 2,
         memory_size: 512 * 1024 * 1024, // 512MB
         arch: CpuArch::native(),
         kernel_path: Some(kernel_path.to_string_lossy().to_string()),
         kernel_cmdline: Some(
-            "console=hvc0 earlycon=pl011,0x09000000 root=/dev/ram0 rdinit=/bin/sh".to_string(),
+            "console=hvc0 earlycon=pl011,0x09000000 root=/dev/vda rw init=/sbin/init".to_string(),
         ),
         ..Default::default()
     };
-
-    // Add initrd if available
-    if initrd_path.exists() {
-        config.initrd_path = Some(initrd_path.to_string_lossy().to_string());
-    }
 
     // Create VM
     let mut vm = hypervisor.create_vm(config).expect("Failed to create VM");

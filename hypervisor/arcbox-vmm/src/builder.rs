@@ -80,7 +80,6 @@ pub struct VsockDeviceConfig {
 ///     .memory_mb(2048)
 ///     .kernel("/path/to/vmlinux")
 ///     .cmdline("console=hvc0 root=/dev/vda")
-///     .initrd("/path/to/initrd")
 ///     .block_device("/path/to/disk.img", false)
 ///     .network_device(None, None)
 ///     .console(80, 25)
@@ -92,7 +91,6 @@ pub struct VmBuilder {
     memory_size: u64,
     kernel_path: Option<PathBuf>,
     kernel_cmdline: String,
-    initrd_path: Option<PathBuf>,
     enable_rosetta: bool,
     block_devices: Vec<BlockDeviceConfig>,
     network_devices: Vec<NetworkDeviceConfig>,
@@ -111,7 +109,6 @@ impl VmBuilder {
             memory_size: 512 * 1024 * 1024, // 512MB
             kernel_path: None,
             kernel_cmdline: String::new(),
-            initrd_path: None,
             enable_rosetta: false,
             block_devices: Vec::new(),
             network_devices: Vec::new(),
@@ -177,13 +174,6 @@ impl VmBuilder {
             self.kernel_cmdline.push(' ');
         }
         self.kernel_cmdline.push_str(arg.as_ref());
-        self
-    }
-
-    /// Sets the initrd path.
-    #[must_use]
-    pub fn initrd(mut self, path: impl Into<PathBuf>) -> Self {
-        self.initrd_path = Some(path.into());
         self
     }
 
@@ -289,7 +279,6 @@ impl VmBuilder {
             memory_size: self.memory_size,
             kernel_path: self.kernel_path.unwrap_or_default(),
             kernel_cmdline: self.kernel_cmdline,
-            initrd_path: self.initrd_path,
             enable_rosetta: self.enable_rosetta,
             serial_console: self.console_config.is_some(),
             virtio_console: self.console_config.is_some(),

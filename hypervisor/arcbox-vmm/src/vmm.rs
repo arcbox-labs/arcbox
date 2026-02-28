@@ -67,8 +67,6 @@ pub struct VmmConfig {
     pub kernel_path: PathBuf,
     /// Kernel command line arguments.
     pub kernel_cmdline: String,
-    /// Path to initial ramdisk (optional).
-    pub initrd_path: Option<PathBuf>,
     /// Enable Rosetta 2 translation (macOS ARM only).
     pub enable_rosetta: bool,
     /// Enable serial console.
@@ -100,7 +98,6 @@ impl Default for VmmConfig {
             memory_size: 512 * 1024 * 1024, // 512MB
             kernel_path: PathBuf::new(),
             kernel_cmdline: String::new(),
-            initrd_path: None,
             enable_rosetta: false,
             serial_console: true,
             virtio_console: true,
@@ -117,18 +114,13 @@ impl Default for VmmConfig {
 impl VmmConfig {
     /// Creates a VmConfig for the hypervisor from this VMM config.
     fn to_vm_config(&self) -> VmConfig {
-        let mut builder = VmConfig::builder()
+        VmConfig::builder()
             .vcpu_count(self.vcpu_count)
             .memory_size(self.memory_size)
             .kernel_path(self.kernel_path.to_string_lossy())
             .kernel_cmdline(&self.kernel_cmdline)
-            .enable_rosetta(self.enable_rosetta);
-
-        if let Some(initrd_path) = &self.initrd_path {
-            builder = builder.initrd_path(initrd_path.to_string_lossy());
-        }
-
-        builder.build()
+            .enable_rosetta(self.enable_rosetta)
+            .build()
     }
 }
 
@@ -1417,14 +1409,6 @@ fn build_fdt_config(
     fdt_config.memory_base = 0;
     fdt_config.cmdline = config.kernel_cmdline.clone();
     fdt_config.virtio_devices = map_virtio_devices_to_fdt_entries(virtio_devices);
-
-    if let Some(initrd) = &config.initrd_path {
-        let size = std::fs::metadata(initrd)
-            .map_err(|e| VmmError::config(format!("Cannot stat initrd: {}", e)))?
-            .len();
-        fdt_config.initrd_addr = Some(arm64::INITRD_LOAD_ADDR);
-        fdt_config.initrd_size = Some(size);
-    }
 
     Ok(fdt_config)
 }
