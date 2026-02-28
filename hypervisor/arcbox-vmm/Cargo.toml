@@ -18,6 +18,8 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
+tokio-util = "0.7"
+libc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
