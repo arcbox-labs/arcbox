@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::error::{Result, VmmError};
-use crate::instance::VmInstance;
+use crate::instance::{VmInstance, VmState};
 
 /// Persisted VM record (a subset of `VmInstance` that survives daemon restarts).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,8 +13,8 @@ pub struct VmRecord {
     pub name: String,
     /// Spec used to create the VM.
     pub spec: crate::config::VmSpec,
-    /// Serialised `VmState`.
-    pub state: String,
+    /// VM lifecycle state.
+    pub state: VmState,
     /// Firecracker process PID (used to re-attach on restart).
     pub pid: Option<u32>,
     /// Absolute path to the Firecracker API socket.
@@ -51,7 +51,7 @@ impl VmStore {
             id: instance.id.clone(),
             name: instance.name.clone(),
             spec: instance.spec.clone(),
-            state: format!("{:?}", instance.state),
+            state: instance.state,
             pid: instance.process.as_ref().and_then(|p| p.pid()),
             socket_path: instance.socket_path.clone(),
             network_json: instance

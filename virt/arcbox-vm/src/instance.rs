@@ -12,6 +12,7 @@ pub type VmId = String;
 
 /// Lifecycle state of a single VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VmState {
     /// Resources allocated; process not yet started.
     Created,
