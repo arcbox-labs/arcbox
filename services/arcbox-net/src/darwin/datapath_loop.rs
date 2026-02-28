@@ -12,26 +12,29 @@
 //!     ├─ IPv4 0x0800
 //!     │   ├─ UDP:67 (DHCP) → DhcpServer → reply to guest
 //!     │   ├─ UDP:53 to gateway (DNS) → DnsForwarder → reply to guest
-//!     │   └─ other → NatEngine outbound → strip L2 → DarwinTun (L3)
+//!     │   ├─ ICMP → IcmpProxy (raw socket) → reply to guest
+//!     │   ├─ UDP → UdpProxy (host UdpSocket per flow) → reply to guest
+//!     │   └─ TCP → TcpProxy (host TcpStream + TCP state) → reply to guest
 //!     └─ other EtherType → drop
-//! DarwinTun recv → prepend L2 header → NatEngine inbound → guest FD
 //! ```
+//!
+//! Outbound traffic is proxied through host OS sockets instead of a utun +
+//! pf NAT. This bypasses kernel routing, VPN interference, and pf issues.
 
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use tokio::io::unix::AsyncFd;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::darwin::tun::DarwinTun;
+use crate::darwin::socket_proxy::SocketProxy;
 use crate::dhcp::DhcpServer;
 use crate::dns::DnsForwarder;
 use crate::ethernet::{
-    ArpResponder, EtherType, EthernetHeader, build_udp_ip_ethernet, prepend_ethernet_header,
-    strip_ethernet_header, ETH_HEADER_LEN,
+    ArpResponder, EtherType, EthernetHeader, build_udp_ip_ethernet, ETH_HEADER_LEN,
 };
-use crate::nat_engine::{NatDirection, NatEngine, NatResult};
 
 /// Maximum Ethernet frame size we handle (jumbo-safe).
 const MAX_FRAME_SIZE: usize = 65535;
@@ -45,14 +48,18 @@ impl AsRawFd for FdWrapper {
     }
 }
 
-/// Async network datapath bridging guest ↔ host through the custom stack.
+/// Async network datapath bridging guest ↔ host through socket proxying.
+///
+/// Outbound traffic is dispatched to protocol-specific host sockets (ICMP,
+/// UDP, TCP) instead of being forwarded through a utun device. Replies
+/// arrive on the `reply_rx` channel as complete L2 Ethernet frames.
 pub struct NetworkDatapath {
     /// Host end of the socketpair (guest L2 Ethernet frames).
     pub guest_fd: OwnedFd,
-    /// Host utun device for L3 I/O to the Internet.
-    pub tun: DarwinTun,
-    /// NAT engine (operates on full Ethernet frames).
-    pub nat_engine: NatEngine,
+    /// Socket proxy for ICMP/UDP/TCP traffic.
+    pub socket_proxy: SocketProxy,
+    /// Channel receiving L2 reply frames from the socket proxy.
+    pub reply_rx: mpsc::Receiver<Vec<u8>>,
     /// DHCP server.
     pub dhcp_server: DhcpServer,
     /// DNS forwarder.
@@ -71,13 +78,13 @@ impl NetworkDatapath {
     /// Creates a new datapath.
     ///
     /// `guest_fd` is the host side of the socketpair passed to VZ.
-    /// `tun` must already be configured and in non-blocking mode.
+    /// `socket_proxy` and `reply_rx` are created via `SocketProxy::new()`.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         guest_fd: OwnedFd,
-        tun: DarwinTun,
-        nat_engine: NatEngine,
+        socket_proxy: SocketProxy,
+        reply_rx: mpsc::Receiver<Vec<u8>>,
         dhcp_server: DhcpServer,
         dns_forwarder: DnsForwarder,
         gateway_ip: Ipv4Addr,
@@ -87,8 +94,8 @@ impl NetworkDatapath {
         let arp_responder = ArpResponder::new(gateway_ip, gateway_mac);
         Self {
             guest_fd,
-            tun,
-            nat_engine,
+            socket_proxy,
+            reply_rx,
             dhcp_server,
             dns_forwarder,
             gateway_mac,
@@ -101,8 +108,7 @@ impl NetworkDatapath {
     /// Runs the event loop until the cancellation token fires.
     ///
     /// Consumes `self` and destructures to avoid borrow conflicts between
-    /// the AsyncFd wrappers (which borrow guest_fd/tun) and the mutable
-    /// network processing state (nat_engine, dhcp_server, dns_forwarder).
+    /// the AsyncFd wrappers and the mutable network processing state.
     ///
     /// # Errors
     ///
@@ -110,8 +116,8 @@ impl NetworkDatapath {
     pub async fn run(self) -> io::Result<()> {
         let NetworkDatapath {
             guest_fd,
-            tun,
-            mut nat_engine,
+            mut socket_proxy,
+            mut reply_rx,
             mut dhcp_server,
             mut dns_forwarder,
             gateway_mac,
@@ -124,14 +130,14 @@ impl NetworkDatapath {
         set_nonblocking(guest_fd.as_raw_fd())?;
         let guest_async = AsyncFd::new(FdWrapper(guest_fd))?;
 
-        // DarwinTun is already non-blocking (set by caller).
-        let tun_async = AsyncFd::new(TunWrapper(&tun))?;
-
         let mut guest_buf = vec![0u8; MAX_FRAME_SIZE];
-        let mut tun_buf = vec![0u8; MAX_FRAME_SIZE];
         let mut guest_mac: Option<[u8; 6]> = None;
 
-        tracing::info!("Network datapath started");
+        // Periodic maintenance interval for cleaning up stale flows.
+        let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(30));
+        maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        tracing::info!("Network datapath started (socket proxy mode)");
 
         loop {
             tokio::select! {
@@ -152,8 +158,7 @@ impl NetworkDatapath {
                             dispatch_guest_frame(
                                 &guest_buf[..n],
                                 &guest_async,
-                                &tun,
-                                &mut nat_engine,
+                                &mut socket_proxy,
                                 &mut dhcp_server,
                                 &mut dns_forwarder,
                                 &arp_responder,
@@ -169,29 +174,14 @@ impl NetworkDatapath {
                     }
                 }
 
-                // Host → Guest: read an IP packet from the tun device.
-                readable = tun_async.readable() => {
-                    let mut guard = readable?;
-                    match guard.try_io(|_| {
-                        tun.recv_packet(&mut tun_buf)
-                    }) {
-                        Ok(Ok(n)) if n > 0 => {
-                            handle_host_packet(
-                                &tun_buf[..n],
-                                &guest_async,
-                                &mut nat_engine,
-                                gateway_mac,
-                                guest_mac.unwrap_or([0xFF; 6]),
-                            );
-                        }
-                        Ok(Err(e))
-                            if e.kind() != io::ErrorKind::Interrupted
-                                && e.kind() != io::ErrorKind::WouldBlock =>
-                        {
-                            tracing::warn!("Tun read error: {}", e);
-                        }
-                        _ => {}
-                    }
+                // Proxy → Guest: relay reply frames from socket proxy.
+                Some(reply_frame) = reply_rx.recv() => {
+                    write_to_guest(&guest_async, &reply_frame);
+                }
+
+                // Periodic maintenance.
+                _ = maintenance.tick() => {
+                    socket_proxy.maintenance();
                 }
             }
         }
@@ -209,8 +199,7 @@ impl NetworkDatapath {
 fn dispatch_guest_frame(
     frame: &[u8],
     guest_async: &AsyncFd<FdWrapper>,
-    tun: &DarwinTun,
-    nat_engine: &mut NatEngine,
+    socket_proxy: &mut SocketProxy,
     dhcp_server: &mut DhcpServer,
     dns_forwarder: &mut DnsForwarder,
     arp_responder: &ArpResponder,
@@ -226,9 +215,17 @@ fn dispatch_guest_frame(
     // Learn the guest MAC from the source address.
     learn_guest_mac(hdr.src_mac, guest_mac);
 
+    tracing::info!(
+        "Guest frame: ethertype={:?} len={} src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        hdr.ethertype, frame.len(),
+        hdr.src_mac[0], hdr.src_mac[1], hdr.src_mac[2],
+        hdr.src_mac[3], hdr.src_mac[4], hdr.src_mac[5],
+    );
+
     match hdr.ethertype {
         EtherType::Arp => {
             if let Some(reply) = arp_responder.handle_arp(frame) {
+                tracing::info!("Sending ARP reply ({} bytes)", reply.len());
                 write_to_guest(guest_async, &reply);
             }
         }
@@ -236,8 +233,7 @@ fn dispatch_guest_frame(
             handle_ipv4_from_guest(
                 frame,
                 guest_async,
-                tun,
-                nat_engine,
+                socket_proxy,
                 dhcp_server,
                 dns_forwarder,
                 gateway_ip,
@@ -252,13 +248,12 @@ fn dispatch_guest_frame(
 }
 
 /// Handles an IPv4 frame from the guest. Intercepts DHCP and DNS;
-/// everything else goes through NAT to the tun.
+/// everything else goes through the socket proxy.
 #[allow(clippy::too_many_arguments)]
 fn handle_ipv4_from_guest(
     frame: &[u8],
     guest_async: &AsyncFd<FdWrapper>,
-    tun: &DarwinTun,
-    nat_engine: &mut NatEngine,
+    socket_proxy: &mut SocketProxy,
     dhcp_server: &mut DhcpServer,
     dns_forwarder: &mut DnsForwarder,
     gateway_ip: Ipv4Addr,
@@ -287,6 +282,7 @@ fn handle_ipv4_from_guest(
 
         // DHCP: client sends to server port 67.
         if dst_port == 67 {
+            tracing::info!("DHCP packet from guest ({} bytes)", frame.len());
             handle_dhcp(
                 frame,
                 l4_start,
@@ -314,8 +310,13 @@ fn handle_ipv4_from_guest(
         }
     }
 
-    // General traffic: NAT outbound then send to tun.
-    nat_and_send_to_tun(frame, tun, nat_engine);
+    // All other traffic: proxy through host sockets.
+    tracing::info!("Socket proxy: protocol={} dst_port={}", protocol,
+        if (protocol == 17 || protocol == 6) && l4_start + 4 <= frame.len() {
+            u16::from_be_bytes([frame[l4_start + 2], frame[l4_start + 3]])
+        } else { 0 }
+    );
+    socket_proxy.handle_outbound(frame, guest_mac);
 }
 
 /// Handles a DHCP packet from the guest.
@@ -334,8 +335,10 @@ fn handle_dhcp(
     }
 
     let dhcp_data = &frame[dhcp_start..];
+    tracing::info!("DHCP payload: {} bytes starting at offset {}", dhcp_data.len(), dhcp_start);
     match dhcp_server.handle_packet(dhcp_data) {
         Ok(Some(response)) => {
+            tracing::info!("DHCP response generated: {} bytes", response.len());
             let reply_frame = build_udp_ip_ethernet(
                 gateway_ip,
                 Ipv4Addr::BROADCAST,
@@ -345,10 +348,12 @@ fn handle_dhcp(
                 gateway_mac,
                 guest_mac,
             );
+            tracing::info!("Sending DHCP reply frame: {} bytes", reply_frame.len());
             write_to_guest(guest_async, &reply_frame);
-            tracing::debug!("Sent DHCP response to guest");
         }
-        Ok(None) => {} // No response needed (e.g. RELEASE)
+        Ok(None) => {
+            tracing::info!("DHCP: no response needed");
+        }
         Err(e) => tracing::warn!("DHCP handling error: {}", e),
     }
 }
@@ -389,59 +394,6 @@ fn handle_dns(
     }
 }
 
-/// NAT-translates an outbound frame and sends the L3 packet through the tun.
-fn nat_and_send_to_tun(frame: &[u8], tun: &DarwinTun, nat_engine: &mut NatEngine) {
-    let mut frame_buf = frame.to_vec();
-
-    // SAFETY: frame_buf contains a valid Ethernet + IPv4 header (validated by caller).
-    let result = unsafe { nat_engine.translate(&mut frame_buf, NatDirection::Outbound) };
-
-    match result {
-        Ok(NatResult::Translated | NatResult::PassThrough) => {
-            let ip_packet = strip_ethernet_header(&frame_buf);
-            if !ip_packet.is_empty() {
-                if let Err(e) = tun.send_packet(ip_packet) {
-                    if e.kind() != io::ErrorKind::WouldBlock {
-                        tracing::warn!("Tun send error: {}", e);
-                    }
-                }
-            }
-        }
-        Ok(NatResult::Dropped) => {
-            tracing::trace!("NAT outbound: packet dropped");
-        }
-        Err(e) => {
-            tracing::trace!("NAT outbound error: {}", e);
-        }
-    }
-}
-
-/// Handles an IP packet received from the tun (host network stack).
-fn handle_host_packet(
-    ip_packet: &[u8],
-    guest_async: &AsyncFd<FdWrapper>,
-    nat_engine: &mut NatEngine,
-    gateway_mac: [u8; 6],
-    guest_mac: [u8; 6],
-) {
-    let mut frame = prepend_ethernet_header(ip_packet, guest_mac, gateway_mac);
-
-    // SAFETY: the frame was just constructed with a valid Ethernet + IP header.
-    let result = unsafe { nat_engine.translate(&mut frame, NatDirection::Inbound) };
-
-    match result {
-        Ok(NatResult::Translated | NatResult::PassThrough) => {
-            write_to_guest(guest_async, &frame);
-        }
-        Ok(NatResult::Dropped) => {
-            tracing::trace!("NAT inbound: packet dropped (no connection)");
-        }
-        Err(e) => {
-            tracing::trace!("NAT inbound error: {}", e);
-        }
-    }
-}
-
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -453,9 +405,13 @@ fn write_to_guest(guest_async: &AsyncFd<FdWrapper>, data: &[u8]) {
     let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
     if n < 0 {
         let err = io::Error::last_os_error();
-        if err.kind() != io::ErrorKind::WouldBlock {
+        if err.kind() == io::ErrorKind::WouldBlock {
+            tracing::warn!("Guest write WouldBlock: {} bytes dropped", data.len());
+        } else {
             tracing::warn!("Guest write error: {}", err);
         }
+    } else {
+        tracing::debug!("Guest write OK: {}/{} bytes", n, data.len());
     }
 }
 
@@ -488,15 +444,6 @@ fn fd_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     } else {
         #[allow(clippy::cast_sign_loss)]
         Ok(n as usize)
-    }
-}
-
-/// Wrapper to make `DarwinTun` usable with `AsyncFd` (borrows the tun).
-struct TunWrapper<'a>(&'a DarwinTun);
-
-impl AsRawFd for TunWrapper<'_> {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
     }
 }
 

@@ -26,7 +26,6 @@ use arcbox_hypervisor::VmConfig;
 #[cfg(target_os = "linux")]
 use arcbox_hypervisor::linux::VirtioDeviceInfo;
 
-use arcbox_net::nat_backend::NatNetBackend;
 #[cfg(target_os = "macos")]
 use tokio_util::sync::CancellationToken;
 
@@ -198,12 +197,6 @@ pub struct Vmm {
     /// Type-erased VM handle for managed execution mode.
     /// Stored to keep the VM alive and for lifecycle control.
     managed_vm: Option<ManagedVm>,
-    /// Custom NAT network backend bridging VirtioNet to the host network.
-    ///
-    /// On Darwin, this uses DarwinTun (utun) for host-side I/O with our
-    /// NatEngine for address translation. Wrapped in Arc<Mutex> so it can
-    /// be shared with VirtioNet via `set_backend()`.
-    net_backend: Option<Arc<Mutex<NatNetBackend>>>,
     /// Cancellation token for the network datapath task (Darwin only).
     #[cfg(target_os = "macos")]
     net_cancel: Option<CancellationToken>,
@@ -254,7 +247,6 @@ impl Vmm {
             event_loop: None,
             managed_execution: false,
             managed_vm: None,
-            net_backend: None,
             #[cfg(target_os = "macos")]
             net_cancel: None,
         })
@@ -447,18 +439,18 @@ impl Vmm {
 
     /// Creates the network device configuration for Darwin.
     ///
-    /// Sets up a socketpair for `VZFileHandleNetworkDeviceAttachment`, a utun
-    /// device, and the full custom network stack (NAT, DHCP, DNS). The
-    /// datapath task is spawned when `start()` is called.
+    /// Sets up a socketpair for `VZFileHandleNetworkDeviceAttachment` and a
+    /// socket proxy that routes guest traffic through host OS sockets. No
+    /// utun device or pf NAT is needed — this works in any network environment
+    /// including VPNs.
     ///
     /// Returns a `VirtioDeviceConfig` with the VZ-side FDs embedded.
     #[cfg(target_os = "macos")]
     fn create_network_device(&mut self) -> Result<VirtioDeviceConfig> {
         use arcbox_net::darwin::datapath_loop::NetworkDatapath;
-        use arcbox_net::darwin::tun::DarwinTun;
+        use arcbox_net::darwin::socket_proxy::SocketProxy;
         use arcbox_net::dhcp::{DhcpConfig, DhcpServer};
         use arcbox_net::dns::{DnsConfig, DnsForwarder};
-        use arcbox_net::nat_engine::{NatEngine, NatEngineConfig};
         use std::net::Ipv4Addr;
 
         let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
@@ -505,26 +497,17 @@ impl Vmm {
             );
         }
 
-        // 2. Create and configure the utun device.
-        let tun = DarwinTun::new()
-            .map_err(|e| VmmError::Device(format!("Failed to create utun: {}", e)))?;
-        tun.configure(gateway_ip, guest_ip, netmask)
-            .map_err(|e| VmmError::Device(format!("Failed to configure utun: {}", e)))?;
-        tun.set_nonblocking(true)
-            .map_err(|e| VmmError::Device(format!("Failed to set utun non-blocking: {}", e)))?;
+        // 2. Create the socket proxy and reply channel.
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        let socket_proxy = SocketProxy::new(gateway_ip, gateway_mac, reply_tx);
 
         tracing::info!(
-            "Custom network stack: {} (gateway={}, guest={})",
-            tun.name(),
+            "Custom network stack: socket proxy (gateway={}, guest={})",
             gateway_ip,
             guest_ip,
         );
 
         // 3. Create the network stack components.
-        let nat_config = NatEngineConfig::new(gateway_ip);
-        let mut nat_engine = NatEngine::new(&nat_config);
-        nat_engine.set_internal_network(Ipv4Addr::new(192, 168, 64, 0), 24);
-
         let dhcp_config = DhcpConfig::new(gateway_ip, netmask)
             .with_pool_range(guest_ip, Ipv4Addr::new(192, 168, 64, 254))
             .with_dns_servers(vec![gateway_ip]);
@@ -539,8 +522,8 @@ impl Vmm {
 
         let datapath = NetworkDatapath::new(
             host_fd,
-            tun,
-            nat_engine,
+            socket_proxy,
+            reply_rx,
             dhcp_server,
             dns_forwarder,
             gateway_ip,
@@ -853,22 +836,21 @@ impl Vmm {
             event_loop.stop();
         }
 
-        // Cancel the network datapath event loop.
+        // Stop managed VM before canceling the custom file-handle datapath.
         #[cfg(target_os = "macos")]
-        if let Some(cancel) = self.net_cancel.take() {
-            cancel.cancel();
-        }
-
         if self.managed_execution {
-            #[cfg(target_os = "macos")]
-            {
-                self.stop_managed_vm()?;
-            }
+            self.stop_managed_vm()?;
         } else {
             // Stop vCPUs
             if let Some(ref mut vcpu_manager) = self.vcpu_manager {
                 vcpu_manager.stop()?;
             }
+        }
+
+        // Cancel custom file-handle network datapath after VM stop.
+        #[cfg(target_os = "macos")]
+        if let Some(cancel) = self.net_cancel.take() {
+            cancel.cancel();
         }
 
         self.state = VmmState::Stopped;
@@ -1040,16 +1022,6 @@ impl Vmm {
     #[must_use]
     pub fn has_balloon(&self) -> bool {
         self.config.balloon
-    }
-
-    /// Returns the custom NAT network backend, if configured.
-    ///
-    /// This backend can be connected to a `VirtioNet` device via
-    /// `VirtioNet::set_backend()` for custom NAT with connection
-    /// tracking and port forwarding.
-    #[must_use]
-    pub fn net_backend(&self) -> Option<Arc<Mutex<NatNetBackend>>> {
-        self.net_backend.clone()
     }
 
     /// Gets balloon statistics.
