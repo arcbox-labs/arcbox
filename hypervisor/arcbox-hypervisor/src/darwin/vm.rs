@@ -897,11 +897,20 @@ impl VirtualMachine for DarwinVm {
                 }
             }
             VirtioDeviceType::Net => {
-                // Create network device with NAT using arcbox-vz API
-                let network_device = NetworkDeviceConfiguration::nat()
-                    .map_err(|e| HypervisorError::DeviceError(e.to_string()))?;
+                let network_device = if let Some(fd) = device.net_fd {
+                    // File-handle attachment: host owns the full network stack.
+                    NetworkDeviceConfiguration::file_handle(fd)
+                        .map_err(|e| HypervisorError::DeviceError(e.to_string()))?
+                } else {
+                    // Fallback to Apple's built-in NAT attachment.
+                    NetworkDeviceConfiguration::nat()
+                        .map_err(|e| HypervisorError::DeviceError(e.to_string()))?
+                };
                 vz_config.add_network_device(network_device);
-                tracing::debug!("Added network device with NAT");
+                tracing::debug!(
+                    "Added network device (file_handle={})",
+                    device.net_fd.is_some()
+                );
             }
             VirtioDeviceType::Console => {
                 // Console is handled separately via setup_serial_console()
