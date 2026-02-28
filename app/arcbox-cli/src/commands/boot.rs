@@ -123,11 +123,7 @@ async fn status(data_dir: PathBuf) -> anyhow::Result<()> {
 
         if rootfs.exists() {
             let meta = std::fs::metadata(&rootfs)?;
-            println!(
-                "  Rootfs:    {} ({} bytes)",
-                rootfs.display(),
-                meta.len()
-            );
+            println!("  Rootfs:    {} ({} bytes)", rootfs.display(), meta.len());
         }
 
         // Manifest is required for cached assets to be considered valid.
@@ -176,11 +172,7 @@ async fn status(data_dir: PathBuf) -> anyhow::Result<()> {
             );
             println!(
                 "  Rootfs:    {}",
-                if rootfs_exists {
-                    "✓"
-                } else {
-                    "✗ missing"
-                }
+                if rootfs_exists { "✓" } else { "✗ missing" }
             );
             println!(
                 "  Manifest:  {}",

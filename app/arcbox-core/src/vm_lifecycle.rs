@@ -787,10 +787,7 @@ impl VmLifecycleManager {
         let tokens: Vec<&str> = cmdline
             .split_whitespace()
             .filter(|t| {
-                !t.starts_with("root=")
-                    && !t.starts_with("init=")
-                    && *t != "rw"
-                    && *t != "ro"
+                !t.starts_with("root=") && !t.starts_with("init=") && *t != "rw" && *t != "ro"
             })
             .collect();
         cmdline = tokens.join(" ");
@@ -831,7 +828,10 @@ impl VmLifecycleManager {
             }
         }
 
-        tracing::info!("Using ext4 rootfs block device: {}", assets.rootfs_image.display());
+        tracing::info!(
+            "Using ext4 rootfs block device: {}",
+            assets.rootfs_image.display()
+        );
         let mut block_devices = vec![crate::vm::BlockDeviceConfig {
             path: assets.rootfs_image.to_string_lossy().to_string(),
             read_only: false,
