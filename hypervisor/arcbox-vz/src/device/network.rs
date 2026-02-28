@@ -90,16 +90,13 @@ impl Drop for NetworkDeviceConfiguration {
 // Helpers
 // ============================================================================
 
-fn create_file_handle_attachment(
-    file_handle: *mut AnyObject,
-) -> VZResult<*mut AnyObject> {
+fn create_file_handle_attachment(file_handle: *mut AnyObject) -> VZResult<*mut AnyObject> {
     unsafe {
-        let cls = get_class("VZFileHandleNetworkDeviceAttachment").ok_or_else(|| {
-            VZError::Internal {
+        let cls =
+            get_class("VZFileHandleNetworkDeviceAttachment").ok_or_else(|| VZError::Internal {
                 code: -1,
                 message: "VZFileHandleNetworkDeviceAttachment class not found".into(),
-            }
-        })?;
+            })?;
 
         let obj = msg_send!(cls, alloc);
 

@@ -597,8 +597,17 @@ mod tests {
         let dst_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 
         let frame = build_tcp_ip_ethernet(
-            src_ip, dst_ip, 80, 12345, 1000, 501, TCP_SYN | TCP_ACK, 65535,
-            &[], src_mac, dst_mac,
+            src_ip,
+            dst_ip,
+            80,
+            12345,
+            1000,
+            501,
+            TCP_SYN | TCP_ACK,
+            65535,
+            &[],
+            src_mac,
+            dst_mac,
         );
 
         // Verify Ethernet header
@@ -646,8 +655,17 @@ mod tests {
         let payload = b"HTTP/1.1 200 OK\r\n";
 
         let frame = build_tcp_ip_ethernet(
-            src_ip, dst_ip, 80, 50000, 100, 200, TCP_ACK | TCP_PSH, 32768,
-            payload, src_mac, dst_mac,
+            src_ip,
+            dst_ip,
+            80,
+            50000,
+            100,
+            200,
+            TCP_ACK | TCP_PSH,
+            32768,
+            payload,
+            src_mac,
+            dst_mac,
         );
 
         // Verify total frame length

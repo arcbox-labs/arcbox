@@ -210,7 +210,7 @@ impl VirtualMachine {
 
         // For simplicity, use polling instead of completion handler
         let inner = self.inner;
-        self.queue.sync(|| unsafe {
+        let stop_dispatch: VZResult<()> = self.queue.sync(|| unsafe {
             // Create a simple completion block
             static STOP_BLOCK: OnceLock<BlockPtr> = OnceLock::new();
 
@@ -249,8 +249,28 @@ impl VirtualMachine {
             let sel = objc2::sel!(stopWithCompletionHandler:);
             let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel, *const c_void) =
                 std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            func(inner as *const AnyObject, sel, block_ptr.0);
+            let result = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                func(inner as *const AnyObject, sel, block_ptr.0);
+            }));
+
+            match result {
+                Ok(()) => Ok(()),
+                Err(exception) => {
+                    let desc = match exception {
+                        Some(exc) => {
+                            let raw = &*exc as *const _ as *const AnyObject as *mut AnyObject;
+                            crate::ffi::nsstring_to_string(msg_send!(raw, description))
+                        }
+                        None => "unknown ObjC exception (nil)".to_string(),
+                    };
+                    Err(VZError::Internal {
+                        code: -2,
+                        message: format!("VM stop threw ObjC exception: {desc}"),
+                    })
+                }
+            }
         });
+        stop_dispatch?;
 
         // Poll for stopped state
         let timeout = Duration::from_secs(10);

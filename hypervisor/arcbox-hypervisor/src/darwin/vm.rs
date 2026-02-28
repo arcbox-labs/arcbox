@@ -907,7 +907,10 @@ impl VirtualMachine for DarwinVm {
                         .map_err(|e| HypervisorError::DeviceError(e.to_string()))?
                 };
                 vz_config.add_network_device(network_device);
-                tracing::debug!("Added network device (file_handle={})", device.net_fd.is_some());
+                tracing::debug!(
+                    "Added network device (file_handle={})",
+                    device.net_fd.is_some()
+                );
             }
             VirtioDeviceType::Console => {
                 // Console is handled separately via setup_serial_console()

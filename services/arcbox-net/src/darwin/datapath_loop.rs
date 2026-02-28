@@ -33,7 +33,7 @@ use crate::darwin::socket_proxy::SocketProxy;
 use crate::dhcp::DhcpServer;
 use crate::dns::DnsForwarder;
 use crate::ethernet::{
-    ArpResponder, EtherType, EthernetHeader, build_udp_ip_ethernet, ETH_HEADER_LEN,
+    ArpResponder, ETH_HEADER_LEN, EtherType, EthernetHeader, build_udp_ip_ethernet,
 };
 
 /// Maximum Ethernet frame size we handle (jumbo-safe).
@@ -217,9 +217,14 @@ fn dispatch_guest_frame(
 
     tracing::info!(
         "Guest frame: ethertype={:?} len={} src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        hdr.ethertype, frame.len(),
-        hdr.src_mac[0], hdr.src_mac[1], hdr.src_mac[2],
-        hdr.src_mac[3], hdr.src_mac[4], hdr.src_mac[5],
+        hdr.ethertype,
+        frame.len(),
+        hdr.src_mac[0],
+        hdr.src_mac[1],
+        hdr.src_mac[2],
+        hdr.src_mac[3],
+        hdr.src_mac[4],
+        hdr.src_mac[5],
     );
 
     match hdr.ethertype {
@@ -311,10 +316,14 @@ fn handle_ipv4_from_guest(
     }
 
     // All other traffic: proxy through host sockets.
-    tracing::info!("Socket proxy: protocol={} dst_port={}", protocol,
+    tracing::info!(
+        "Socket proxy: protocol={} dst_port={}",
+        protocol,
         if (protocol == 17 || protocol == 6) && l4_start + 4 <= frame.len() {
             u16::from_be_bytes([frame[l4_start + 2], frame[l4_start + 3]])
-        } else { 0 }
+        } else {
+            0
+        }
     );
     socket_proxy.handle_outbound(frame, guest_mac);
 }
@@ -335,7 +344,11 @@ fn handle_dhcp(
     }
 
     let dhcp_data = &frame[dhcp_start..];
-    tracing::info!("DHCP payload: {} bytes starting at offset {}", dhcp_data.len(), dhcp_start);
+    tracing::info!(
+        "DHCP payload: {} bytes starting at offset {}",
+        dhcp_data.len(),
+        dhcp_start
+    );
     match dhcp_server.handle_packet(dhcp_data) {
         Ok(Some(response)) => {
             tracing::info!("DHCP response generated: {} bytes", response.len());
@@ -385,7 +398,13 @@ fn handle_dns(
     match dns_forwarder.handle_query(dns_data) {
         Ok(response) => {
             let reply_frame = build_udp_ip_ethernet(
-                gateway_ip, src_ip, 53, src_port, &response, gateway_mac, guest_mac,
+                gateway_ip,
+                src_ip,
+                53,
+                src_port,
+                &response,
+                gateway_mac,
+                guest_mac,
             );
             write_to_guest(guest_async, &reply_frame);
             tracing::debug!("Sent DNS response to guest");

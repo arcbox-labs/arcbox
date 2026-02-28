@@ -566,6 +566,16 @@ impl DhcpServer {
                 .ok_or_else(|| NetError::Dhcp("no IP addresses available".to_string()))?
         };
 
+        // Record a pending lease so handle_request() can validate.
+        let lease = DhcpLease {
+            mac,
+            ip,
+            hostname: packet.hostname.clone(),
+            lease_start: Instant::now(),
+            lease_duration: self.config.lease_duration,
+        };
+        self.leases.insert(mac, lease);
+
         // Create OFFER response
         let mut response = DhcpPacket::new();
         response.op = 2; // BOOTREPLY
