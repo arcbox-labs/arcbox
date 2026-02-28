@@ -27,8 +27,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::ethernet::{
-    build_tcp_ip_ethernet, build_udp_ip_ethernet, prepend_ethernet_header, ETH_HEADER_LEN,
-    TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN,
+    ETH_HEADER_LEN, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, build_tcp_ip_ethernet,
+    build_udp_ip_ethernet, prepend_ethernet_header,
 };
 
 /// Per-flow UDP state.
@@ -47,11 +47,7 @@ struct UdpProxy {
 }
 
 impl UdpProxy {
-    fn new(
-        reply_tx: mpsc::Sender<Vec<u8>>,
-        gateway_mac: [u8; 6],
-        gateway_ip: Ipv4Addr,
-    ) -> Self {
+    fn new(reply_tx: mpsc::Sender<Vec<u8>>, gateway_mac: [u8; 6], gateway_ip: Ipv4Addr) -> Self {
         Self {
             flows: HashMap::new(),
             reply_tx,
@@ -102,9 +98,12 @@ impl UdpProxy {
         if let Some(flow) = self.flows.get_mut(&flow_key) {
             flow.last_active = Instant::now();
         } else {
-            self.flows.insert(flow_key, UdpFlow {
-                last_active: Instant::now(),
-            });
+            self.flows.insert(
+                flow_key,
+                UdpFlow {
+                    last_active: Instant::now(),
+                },
+            );
 
             // Spawn a recv task for this flow.
             let reply_tx = self.reply_tx.clone();
@@ -120,7 +119,10 @@ impl UdpProxy {
                     }
                 };
 
-                if let Err(e) = socket.connect(SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port))).await {
+                if let Err(e) = socket
+                    .connect(SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port)))
+                    .await
+                {
                     tracing::warn!("UDP proxy: failed to connect: {}", e);
                     return;
                 }
@@ -143,8 +145,13 @@ impl UdpProxy {
                     match recv {
                         Ok(Ok(n)) if n > 0 => {
                             let reply_frame = build_udp_ip_ethernet(
-                                gateway_ip, src_ip, dst_port, src_port, &buf[..n],
-                                gateway_mac, guest_mac,
+                                gateway_ip,
+                                src_ip,
+                                dst_port,
+                                src_port,
+                                &buf[..n],
+                                gateway_mac,
+                                guest_mac,
                             );
                             if reply_tx.send(reply_frame).await.is_err() {
                                 break;
@@ -219,17 +226,14 @@ impl IcmpProxy {
         let gateway_mac = self.gateway_mac;
 
         tokio::spawn(async move {
-            let raw_socket = match socket2::Socket::new(
-                Domain::IPV4,
-                Type::RAW,
-                Some(Protocol::ICMPV4),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("ICMP proxy: failed to create raw socket: {}", e);
-                    return;
-                }
-            };
+            let raw_socket =
+                match socket2::Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("ICMP proxy: failed to create raw socket: {}", e);
+                        return;
+                    }
+                };
 
             raw_socket.set_nonblocking(true).ok();
             let dst_addr: SocketAddr = SocketAddrV4::new(dst_ip, 0).into();
@@ -284,8 +288,7 @@ impl IcmpProxy {
             match recv {
                 Ok(Ok(n)) if n > 0 => {
                     // Raw socket returns IP header + ICMP; build L2 frame.
-                    let reply_frame =
-                        prepend_ethernet_header(&buf[..n], guest_mac, gateway_mac);
+                    let reply_frame = prepend_ethernet_header(&buf[..n], guest_mac, gateway_mac);
                     let _ = reply_tx.send(reply_frame).await;
                 }
                 _ => {
@@ -390,11 +393,7 @@ pub(crate) struct TcpProxy {
 }
 
 impl TcpProxy {
-    fn new(
-        reply_tx: mpsc::Sender<Vec<u8>>,
-        gateway_mac: [u8; 6],
-        gateway_ip: Ipv4Addr,
-    ) -> Self {
+    fn new(reply_tx: mpsc::Sender<Vec<u8>>, gateway_mac: [u8; 6], gateway_ip: Ipv4Addr) -> Self {
         Self {
             connections: HashMap::new(),
             reply_tx,
@@ -457,7 +456,13 @@ impl TcpProxy {
                         // Handshake complete.
                         conn.state = TcpState::Established;
                         conn.guest_seq = seq;
-                        tracing::debug!("TCP established: {}:{} -> {}:{}", src_ip, src_port, dst_ip, dst_port);
+                        tracing::debug!(
+                            "TCP established: {}:{} -> {}:{}",
+                            src_ip,
+                            src_port,
+                            dst_ip,
+                            dst_port
+                        );
                     }
                 }
                 TcpState::Established => {
@@ -474,10 +479,17 @@ impl TcpProxy {
                         conn.state = TcpState::FinWait;
 
                         let fin_ack = build_tcp_ip_ethernet(
-                            self.gateway_ip, src_ip, dst_port, src_port,
-                            conn.host_seq, conn.guest_seq,
-                            TCP_FIN | TCP_ACK, 65535, &[],
-                            self.gateway_mac, guest_mac,
+                            self.gateway_ip,
+                            src_ip,
+                            dst_port,
+                            src_port,
+                            conn.host_seq,
+                            conn.guest_seq,
+                            TCP_FIN | TCP_ACK,
+                            65535,
+                            &[],
+                            self.gateway_mac,
+                            guest_mac,
                         );
                         let reply_tx = self.reply_tx.clone();
                         tokio::spawn(async move {
@@ -497,10 +509,17 @@ impl TcpProxy {
 
                         // ACK the data.
                         let ack_frame = build_tcp_ip_ethernet(
-                            self.gateway_ip, src_ip, dst_port, src_port,
-                            conn.host_seq, conn.guest_seq,
-                            TCP_ACK, 65535, &[],
-                            self.gateway_mac, guest_mac,
+                            self.gateway_ip,
+                            src_ip,
+                            dst_port,
+                            src_port,
+                            conn.host_seq,
+                            conn.guest_seq,
+                            TCP_ACK,
+                            65535,
+                            &[],
+                            self.gateway_mac,
+                            guest_mac,
                         );
                         let reply_tx = self.reply_tx.clone();
                         let payload_vec = payload.to_vec();
@@ -521,10 +540,17 @@ impl TcpProxy {
         } else if flags & TCP_RST == 0 {
             // Unknown connection, send RST.
             let rst = build_tcp_ip_ethernet(
-                self.gateway_ip, src_ip, dst_port, src_port,
-                0, seq.wrapping_add(1),
-                TCP_RST | TCP_ACK, 0, &[],
-                self.gateway_mac, guest_mac,
+                self.gateway_ip,
+                src_ip,
+                dst_port,
+                src_port,
+                0,
+                seq.wrapping_add(1),
+                TCP_RST | TCP_ACK,
+                0,
+                &[],
+                self.gateway_mac,
+                guest_mac,
             );
             let reply_tx = self.reply_tx.clone();
             tokio::spawn(async move {
@@ -573,12 +599,24 @@ impl TcpProxy {
             {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
-                    tracing::debug!("TCP proxy: connect to {}:{} failed: {}", dst_ip, dst_port, e);
+                    tracing::debug!(
+                        "TCP proxy: connect to {}:{} failed: {}",
+                        dst_ip,
+                        dst_port,
+                        e
+                    );
                     let rst = build_tcp_ip_ethernet(
-                        gateway_ip, src_ip, dst_port, src_port,
-                        0, guest_isn.wrapping_add(1),
-                        TCP_RST | TCP_ACK, 0, &[],
-                        gateway_mac, guest_mac,
+                        gateway_ip,
+                        src_ip,
+                        dst_port,
+                        src_port,
+                        0,
+                        guest_isn.wrapping_add(1),
+                        TCP_RST | TCP_ACK,
+                        0,
+                        &[],
+                        gateway_mac,
+                        guest_mac,
                     );
                     let _ = reply_tx.send(rst).await;
                     return;
@@ -586,10 +624,17 @@ impl TcpProxy {
                 Err(_) => {
                     tracing::debug!("TCP proxy: connect to {}:{} timed out", dst_ip, dst_port);
                     let rst = build_tcp_ip_ethernet(
-                        gateway_ip, src_ip, dst_port, src_port,
-                        0, guest_isn.wrapping_add(1),
-                        TCP_RST | TCP_ACK, 0, &[],
-                        gateway_mac, guest_mac,
+                        gateway_ip,
+                        src_ip,
+                        dst_port,
+                        src_port,
+                        0,
+                        guest_isn.wrapping_add(1),
+                        TCP_RST | TCP_ACK,
+                        0,
+                        &[],
+                        gateway_mac,
+                        guest_mac,
                     );
                     let _ = reply_tx.send(rst).await;
                     return;
@@ -598,10 +643,17 @@ impl TcpProxy {
 
             // Send SYN-ACK to guest.
             let syn_ack = build_tcp_ip_ethernet(
-                gateway_ip, src_ip, dst_port, src_port,
-                host_isn, guest_isn.wrapping_add(1),
-                TCP_SYN | TCP_ACK, 65535, &[],
-                gateway_mac, guest_mac,
+                gateway_ip,
+                src_ip,
+                dst_port,
+                src_port,
+                host_isn,
+                guest_isn.wrapping_add(1),
+                TCP_SYN | TCP_ACK,
+                65535,
+                &[],
+                gateway_mac,
+                guest_mac,
             );
             if reply_tx.send(syn_ack).await.is_err() {
                 return;
@@ -609,8 +661,15 @@ impl TcpProxy {
 
             // Run bidirectional relay.
             tcp_relay(
-                stream, data_rx, reply_tx, gateway_ip, gateway_mac,
-                src_ip, src_port, dst_port, guest_mac,
+                stream,
+                data_rx,
+                reply_tx,
+                gateway_ip,
+                gateway_mac,
+                src_ip,
+                src_port,
+                dst_port,
+                guest_mac,
                 host_isn.wrapping_add(1),
             )
             .await;
@@ -651,18 +710,34 @@ async fn tcp_relay(
                 Ok(0) => {
                     // EOF: send FIN to guest.
                     let fin = build_tcp_ip_ethernet(
-                        gateway_ip, guest_ip, host_port, guest_port,
-                        host_seq, 0, TCP_FIN | TCP_ACK, 65535, &[],
-                        gateway_mac, guest_mac,
+                        gateway_ip,
+                        guest_ip,
+                        host_port,
+                        guest_port,
+                        host_seq,
+                        0,
+                        TCP_FIN | TCP_ACK,
+                        65535,
+                        &[],
+                        gateway_mac,
+                        guest_mac,
                     );
                     let _ = reply_tx2.send(fin).await;
                     break;
                 }
                 Ok(n) => {
                     let data_frame = build_tcp_ip_ethernet(
-                        gateway_ip, guest_ip, host_port, guest_port,
-                        host_seq, 0, TCP_ACK | TCP_PSH, 65535, &buf[..n],
-                        gateway_mac, guest_mac,
+                        gateway_ip,
+                        guest_ip,
+                        host_port,
+                        guest_port,
+                        host_seq,
+                        0,
+                        TCP_ACK | TCP_PSH,
+                        65535,
+                        &buf[..n],
+                        gateway_mac,
+                        guest_mac,
                     );
                     host_seq = host_seq.wrapping_add(n as u32);
                     if reply_tx2.send(data_frame).await.is_err() {
@@ -781,9 +856,12 @@ mod tests {
             Ipv4Addr::new(8, 8, 8, 8),
             53,
         );
-        proxy.flows.insert(key, UdpFlow {
-            last_active: Instant::now() - std::time::Duration::from_secs(120),
-        });
+        proxy.flows.insert(
+            key,
+            UdpFlow {
+                last_active: Instant::now() - std::time::Duration::from_secs(120),
+            },
+        );
         assert_eq!(proxy.flows.len(), 1);
 
         proxy.cleanup_stale_flows();
@@ -804,16 +882,23 @@ mod tests {
             80,
         );
         let (data_tx, _data_rx) = mpsc::channel(16);
-        proxy.connections.insert(key, TcpConnection {
-            state: TcpState::Closed,
-            guest_seq: 0,
-            host_seq: 0,
-            data_tx,
-        });
+        proxy.connections.insert(
+            key,
+            TcpConnection {
+                state: TcpState::Closed,
+                guest_seq: 0,
+                host_seq: 0,
+                data_tx,
+            },
+        );
         assert_eq!(proxy.connections.len(), 1);
 
         proxy.cleanup_closed();
-        assert_eq!(proxy.connections.len(), 0, "Closed connection should be removed");
+        assert_eq!(
+            proxy.connections.len(),
+            0,
+            "Closed connection should be removed"
+        );
     }
 
     /// Verifies that reply frames from the socket proxy flow through the
