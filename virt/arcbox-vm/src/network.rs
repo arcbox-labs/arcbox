@@ -71,7 +71,10 @@ impl NetworkManager {
         info!(vm_id, tap = %tap_name, ip = %ip, "allocating network");
 
         #[cfg(target_os = "linux")]
-        self.create_tap(&tap_name)?;
+        if let Err(e) = self.create_tap(&tap_name) {
+            self.allocated.lock().unwrap().remove(&u32::from(ip));
+            return Err(e);
+        }
 
         Ok(NetworkAllocation {
             tap_name,
