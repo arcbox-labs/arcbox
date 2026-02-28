@@ -268,13 +268,6 @@ mod linux {
         DOCKER_API_VSOCK_PORT_DEFAULT
     }
 
-    fn boot_asset_version() -> Option<String> {
-        std::env::var("ARCBOX_BOOT_ASSET_VERSION")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .or_else(|| cmdline_value("arcbox.boot_asset_version="))
-    }
-
     fn docker_data_device() -> String {
         cmdline_value(DOCKER_DATA_DEVICE_CMDLINE_KEY)
             .filter(|v| !v.trim().is_empty())
@@ -845,15 +838,7 @@ mod linux {
             }
         }
 
-        if let Some(version) = boot_asset_version() {
-            candidates.push(PathBuf::from(format!(
-                "/arcbox/boot/{}/runtime/bin",
-                version
-            )));
-        }
-
-        candidates.push(PathBuf::from("/arcbox/runtime/bin"));
-        candidates.push(PathBuf::from("/arcbox/boot/current/runtime/bin"));
+        candidates.push(PathBuf::from("/usr/local/bin"));
         candidates
     }
 
@@ -999,37 +984,14 @@ mod linux {
     }
 
     /// Redirects daemon stdout/stderr to a log file so crashes are diagnosable.
-    ///
-    /// Prefers `/arcbox/` (VirtioFS mount, visible from host as `~/.arcbox/`)
-    /// so that logs survive guest restarts and are accessible without exec.
-    /// Falls back to `/var/log/` (guest tmpfs) if VirtioFS is not mounted.
     fn daemon_log_file(name: &str) -> Stdio {
-        let arcbox_path = format!("/arcbox/{}.log", name);
-        let var_log_path = format!("/var/log/{}.log", name);
-
-        let log_path = if Path::new("/arcbox").exists() {
-            &arcbox_path
-        } else {
-            &var_log_path
-        };
-
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(log_path)
+            .open(format!("/var/log/{}.log", name))
         {
             Ok(f) => f.into(),
-            Err(_) => {
-                // Fallback to /var/log/ if /arcbox/ write fails.
-                match std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&var_log_path)
-                {
-                    Ok(f) => f.into(),
-                    Err(_) => Stdio::null(),
-                }
-            }
+            Err(_) => Stdio::null(),
         }
     }
 

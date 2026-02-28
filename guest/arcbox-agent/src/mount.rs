@@ -80,18 +80,8 @@ pub fn is_mounted(_path: &str) -> bool {
 /// Mount all standard VirtioFS shares if not already mounted.
 ///
 /// This mounts:
-/// - "arcbox" tag -> /arcbox (data directory)
 /// - "users" tag -> /Users (macOS /Users, bind-mounted to original path)
 pub fn mount_standard_shares() {
-    // Mount arcbox data directory
-    if !is_mounted("/arcbox") {
-        if let Err(e) = mount_virtiofs("arcbox", "/arcbox") {
-            tracing::warn!("Failed to mount arcbox share: {}", e);
-        } else {
-            tracing::info!("Mounted arcbox share at /arcbox");
-        }
-    }
-
     // Mount /Users share for transparent macOS path support.
     // This allows `docker run -v /Users/foo/project:/app` to work directly
     // because /Users exists in the guest at the same path as on the host.
