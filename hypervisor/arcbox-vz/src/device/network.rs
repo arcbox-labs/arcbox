@@ -1,9 +1,10 @@
 //! Network device configuration.
 
 use crate::error::{VZError, VZResult};
-use crate::ffi::get_class;
+use crate::ffi::{file_handle_for_fd, get_class};
 use crate::{msg_send, msg_send_void};
 use objc2::runtime::AnyObject;
+use std::os::unix::io::RawFd;
 
 /// Configuration for a VirtIO network device.
 pub struct NetworkDeviceConfiguration {
@@ -18,6 +19,26 @@ impl NetworkDeviceConfiguration {
     /// NAT allows the guest to access external networks through the host.
     pub fn nat() -> VZResult<Self> {
         let attachment = create_nat_attachment()?;
+        Self::with_attachment(attachment)
+    }
+
+    /// Creates a network device with file handle attachment.
+    ///
+    /// This gives the host direct access to raw L2 Ethernet frames from the
+    /// guest via a socketpair. The caller is responsible for all network
+    /// processing (ARP, DHCP, DNS, NAT) on the host side of the FD pair.
+    pub fn file_handle(read_fd: RawFd, write_fd: RawFd) -> VZResult<Self> {
+        let read_handle = file_handle_for_fd(read_fd);
+        let write_handle = file_handle_for_fd(write_fd);
+
+        if read_handle.is_null() || write_handle.is_null() {
+            return Err(VZError::Internal {
+                code: -1,
+                message: "Failed to create NSFileHandle for network FDs".into(),
+            });
+        }
+
+        let attachment = create_file_handle_attachment(read_handle, write_handle)?;
         Self::with_attachment(attachment)
     }
 
@@ -69,6 +90,32 @@ impl Drop for NetworkDeviceConfiguration {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+fn create_file_handle_attachment(
+    read_handle: *mut AnyObject,
+    write_handle: *mut AnyObject,
+) -> VZResult<*mut AnyObject> {
+    unsafe {
+        let cls = get_class("VZFileHandleNetworkDeviceAttachment").ok_or_else(|| {
+            VZError::Internal {
+                code: -1,
+                message: "VZFileHandleNetworkDeviceAttachment class not found".into(),
+            }
+        })?;
+
+        let obj = msg_send!(cls, alloc);
+        let attachment = msg_send!(obj, initWithFileHandleForReading: read_handle, fileHandleForWriting: write_handle);
+
+        if attachment.is_null() {
+            return Err(VZError::Internal {
+                code: -1,
+                message: "Failed to create file handle network attachment".into(),
+            });
+        }
+
+        Ok(attachment)
+    }
+}
 
 fn create_nat_attachment() -> VZResult<*mut AnyObject> {
     unsafe {
