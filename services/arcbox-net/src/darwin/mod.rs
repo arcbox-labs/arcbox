@@ -41,6 +41,7 @@
 
 pub mod datapath_loop;
 pub mod nat;
+pub mod socket_proxy;
 pub mod tun;
 pub mod vmnet;
 pub mod vmnet_ffi;
