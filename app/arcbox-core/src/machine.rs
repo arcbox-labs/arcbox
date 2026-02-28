@@ -36,7 +36,7 @@ mod tests {
     /// Creates a test MachineManager.
     fn test_machine_manager(data_dir: &std::path::Path) -> MachineManager {
         let vm_manager = VmManager::new();
-        MachineManager::new(vm_manager, data_dir.to_path_buf())
+        MachineManager::new(vm_manager, data_dir.join("machines"))
     }
 
     #[tokio::test]
@@ -205,25 +205,18 @@ pub struct MachineManager {
     machines: RwLock<HashMap<String, MachineInfo>>,
     vm_manager: VmManager,
     persistence: MachinePersistence,
-    /// Data directory for VirtioFS sharing.
-    data_dir: PathBuf,
-    /// Machine-specific directory (data_dir/machines/).
+    /// Machine-specific directory.
     machines_dir: PathBuf,
 }
 
 impl MachineManager {
     /// Creates a new machine manager.
     #[must_use]
-    pub fn new(vm_manager: VmManager, data_dir: PathBuf) -> Self {
-        let machines_dir = data_dir.join("machines");
+    pub fn new(vm_manager: VmManager, machines_dir: PathBuf) -> Self {
         let persistence = MachinePersistence::new(&machines_dir);
 
-        // Create the default shared directory config for VirtioFS.
-        // "arcbox" shares the data_dir; "users" shares /Users for transparent paths.
-        let mut shared_dirs = vec![SharedDirConfig::new(
-            data_dir.to_string_lossy().to_string(),
-            "arcbox",
-        )];
+        // Share /Users so macOS host paths work transparently in guest.
+        let mut shared_dirs = Vec::new();
         let users_dir = std::path::Path::new("/Users");
         if users_dir.is_dir() {
             shared_dirs.push(SharedDirConfig::new("/Users", "users"));
@@ -275,7 +268,6 @@ impl MachineManager {
             machines: RwLock::new(machines),
             vm_manager,
             persistence,
-            data_dir,
             machines_dir,
         }
     }
@@ -309,14 +301,9 @@ impl MachineManager {
         let machine_dir = self.machines_dir.join(&config.name);
         std::fs::create_dir_all(&machine_dir)?;
 
-        // Set up shared directories for VirtioFS.
-        // "arcbox" tag provides internal data (boot assets, logs, runtime).
-        // "users" tag shares /Users so macOS paths work transparently in guest
+        // Share /Users so macOS paths work transparently in guest
         // (e.g. `docker run -v /Users/foo/project:/app` just works).
-        let mut shared_dirs = vec![SharedDirConfig::new(
-            self.data_dir.to_string_lossy().to_string(),
-            "arcbox",
-        )];
+        let mut shared_dirs = Vec::new();
         let users_dir = std::path::Path::new("/Users");
         if users_dir.is_dir() {
             shared_dirs.push(SharedDirConfig::new("/Users", "users"));
