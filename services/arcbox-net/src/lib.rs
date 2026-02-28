@@ -49,6 +49,7 @@ pub mod backend;
 pub mod datapath;
 pub mod dhcp;
 pub mod dns;
+pub mod ethernet;
 pub mod error;
 pub mod mdns;
 pub mod mdns_protocol;
