@@ -59,6 +59,7 @@ When asked to plan, the plan must be fully resolved before implementation begins
 
 ## Change Discipline
 
+- For coherent change sets, create a new branch before starting work. Use `type/short-description` naming (e.g. `feat/virtio-console`, `fix/dhcp-lease-expiry`).
 - Commit messages: `type(scope): summary` (e.g. `fix(net): correct checksum on fragmented packets`). Do not add Co-Authored-By lines.
 - Keep each commit atomic — compilable, runnable. Target ~200 lines changed (excluding generated files); hard limit 400. Don't make commits too small either — group related changes into one coherent commit unless that's all there is.
 - Commit along the way. Do not batch all changes into a single commit at the end.
