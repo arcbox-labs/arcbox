@@ -16,7 +16,6 @@ use anyhow::Result;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod agent;
-mod machine_init;
 
 mod rpc;
 
@@ -29,13 +28,6 @@ mod dns;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Machine provisioning should only run in initramfs as PID 1.
-    // After switch_root, distro service managers also start arcbox-agent but
-    // those processes must run the RPC server directly.
-    if machine_init::is_machine_mode() && std::process::id() == 1 {
-        machine_init::run(); // Never returns.
-    }
-
     // Initialize logging
     tracing_subscriber::registry()
         .with(
