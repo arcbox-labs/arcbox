@@ -1,10 +1,11 @@
 [package]
-name        = "vmm-core"
-version.workspace   = true
-edition.workspace   = true
-authors.workspace   = true
-license.workspace   = true
+name              = "arcbox-vm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
 repository.workspace = true
+description       = "Firecracker-based sandbox VMM — orchestration, state, networking, and checkpoints."
 
 [[bin]]
 name = "vmm-guest-agent"

@@ -1,4 +1,4 @@
-//! `vmm-core` — sandbox orchestration, state, networking, and checkpoints.
+//! `arcbox-vm` — sandbox orchestration, state, networking, and checkpoints.
 // fc_sdk::Error is 144 bytes due to external library constraints; boxing every
 // call site would add noise without runtime benefit since these are never in
 // hot paths.

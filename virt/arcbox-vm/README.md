@@ -1,7 +1,7 @@
 # arcbox-vm
 
 A production-grade sandbox management library built on top of
-[`fc-sdk`](../fc-sdk) that orchestrates multiple
+[`fc-sdk`](https://crates.io/crates/fc-sdk) that orchestrates multiple
 [Firecracker](https://firecracker-microvm.github.io/) microVMs.
 
 Exposes a `SandboxManager` API and optional gRPC service implementations
@@ -18,7 +18,7 @@ Exposes a `SandboxManager` API and optional gRPC service implementations
             └──────────────┬──────────────┘
                            │
             ┌──────────────▼──────────────┐
-            │          vmm-core           │
+            │          arcbox-vm          │
             │  SandboxServiceImpl         │  ◄── sandbox.v1 proto (arcbox-protocol)
             │  SandboxSnapshotServiceImpl │
             │  ──────────────────────     │
@@ -47,7 +47,7 @@ Exposes a `SandboxManager` API and optional gRPC service implementations
 
 | Crate | Type | Purpose |
 |-------|------|---------|
-| `vmm-core` | lib + bin | Sandbox orchestration, state, networking, snapshots; gRPC service implementations; ships the `vmm-guest-agent` binary |
+| `arcbox-vm` | lib + bin | Sandbox orchestration, state, networking, snapshots; gRPC service implementations; ships the `vmm-guest-agent` binary |
 
 There is no standalone daemon or CLI binary. The gRPC server and direct API usage are demonstrated via the examples described below.
 
@@ -70,7 +70,7 @@ There is no standalone daemon or CLI binary. The gRPC server and direct API usag
 ### Workload Execution (via vsock guest agent)
 - **Run** — execute a command and stream stdout/stderr; sandbox returns to `Ready` on exit
 - **Exec** — interactive session with stdin, stdout/stderr, and TTY resize support
-- Both use the vsock binary frame protocol; the in-guest `vmm-guest-agent` binary (built from `vmm-core`) must be present inside the rootfs
+- Both use the vsock binary frame protocol; the in-guest `vmm-guest-agent` binary (built from `arcbox-vm`) must be present inside the rootfs
 
 ### Process Options
 - **Direct mode** — Firecracker runs as a normal process; socket and files live under `data_dir/sandboxes/{id}/`
@@ -148,14 +148,14 @@ There is no standalone daemon or CLI binary. The gRPC server and direct API usag
 
 ## Usage
 
-Both crates are designed to be embedded — there is no standalone daemon or CLI
-binary.  The examples below show the two main integration patterns.
+`arcbox-vm` is designed to be embedded — there is no standalone daemon or CLI
+binary. The examples below show the two main integration patterns.
 
-### Direct API (`vmm-core`)
+### Direct API
 
 ```rust
 use std::sync::Arc;
-use vmm_core::{SandboxManager, SandboxSpec, VmmConfig};
+use arcbox_vm::{SandboxManager, SandboxSpec, VmmConfig};
 
 let manager = Arc::new(SandboxManager::new(VmmConfig::default())?);
 
@@ -166,12 +166,12 @@ let (id, ip) = manager.create_sandbox(SandboxSpec {
 }).await?;
 ```
 
-### Embedding the gRPC services (`vmm-core::grpc`)
+### Embedding the gRPC services
 
 ```rust
 use std::sync::Arc;
-use vmm_core::{SandboxManager, VmmConfig, SandboxServiceImpl, SandboxSnapshotServiceImpl};
-use vmm_core::proto::sandbox::{
+use arcbox_vm::{SandboxManager, VmmConfig, SandboxServiceImpl, SandboxSnapshotServiceImpl};
+use arcbox_vm::proto::sandbox::{
     sandbox_service_server::SandboxServiceServer,
     sandbox_snapshot_service_server::SandboxSnapshotServiceServer,
 };
@@ -197,7 +197,7 @@ Server::builder()
 
 ### `sandbox_lifecycle` — Direct API walkthrough
 
-[`vmm-core/examples/sandbox_lifecycle.rs`](vmm-core/examples/sandbox_lifecycle.rs)
+[`examples/sandbox_lifecycle.rs`](examples/sandbox_lifecycle.rs)
 
 Demonstrates the full `SandboxManager` API without the gRPC layer:
 
@@ -211,19 +211,21 @@ Demonstrates the full `SandboxManager` API without the gRPC layer:
 8. **Cleanup** the restored sandbox
 
 ```bash
-cargo run --example sandbox_lifecycle
+# from arcbox workspace root
+cargo run -p arcbox-vm --example sandbox_lifecycle
 ```
 
 ### `serve` — Embedded gRPC server
 
-[`vmm-core/examples/serve.rs`](vmm-core/examples/serve.rs)
+[`examples/serve.rs`](examples/serve.rs)
 
 Shows how to wire `SandboxServiceImpl` and `SandboxSnapshotServiceImpl` into a
-tonic server listening on a Unix socket.  This is the reference for embedding
+tonic server listening on a Unix socket. This is the reference for embedding
 the sandbox services into a larger daemon (e.g. arcbox-vmm).
 
 ```bash
-cargo run --example serve -- --unix-socket /tmp/vmm-test.sock
+# from arcbox workspace root
+cargo run -p arcbox-vm --example serve -- --unix-socket /tmp/vmm-test.sock
 ```
 
 ---
@@ -254,7 +256,7 @@ cargo run --example serve -- --unix-socket /tmp/vmm-test.sock
 
 ### Jailer mode
 
-Firecracker runs inside a chroot created by the jailer.  Files are staged
+Firecracker runs inside a chroot created by the jailer. Files are staged
 into the chroot before boot and removed on sandbox removal.
 
 ```
@@ -355,12 +357,12 @@ SandboxManager::restore_sandbox()
 
 > **Why files must be inside the chroot:** Firecracker executes `pivot_root`
 > before processing any API requests, so all paths passed to the FC API are
-> resolved relative to the chroot root.  Host-absolute paths (e.g.
+> resolved relative to the chroot root. Host-absolute paths (e.g.
 > `/var/lib/firecracker-vmm/...`) do not exist inside the chroot and will
 > return `ENOENT`.
 
 > **vsock on restore:** The vmstate stores the vsock UDS path as seen by FC
-> (`/run/firecracker.vsock`, chroot-relative).  Each restored sandbox gets its
+> (`/run/firecracker.vsock`, chroot-relative). Each restored sandbox gets its
 > own jailer chroot, so this path maps to a unique host path
 > `{new-chroot}/run/firecracker.vsock` — no cross-sandbox socket conflicts.
 
@@ -412,29 +414,33 @@ boot_args  = "console=ttyS0 reboot=k panic=1 pci=off"
 
 ### Prerequisites
 
-- Rust 1.82+ (edition 2024)
+- Rust 1.85+ (edition 2024)
 - `firecracker` binary (set `[firecracker].binary` in config or add to PATH)
 - Linux with `CAP_NET_ADMIN` for TAP interface creation
 - `protoc` for proto codegen
-- `sandbox.proto` lives in `comm/arcbox-protocol/proto/sandbox.proto` (shared with main arcbox workspace)
+- `sandbox.proto` lives in `comm/arcbox-protocol/proto/sandbox.proto` (shared with the arcbox workspace)
 - Jailer mode additionally requires: `jailer` binary, and running as root (or with `CAP_SYS_ADMIN`) to `pivot_root`
 
 ### Build
 
 ```bash
-cargo build --workspace
+# from arcbox workspace root
+cargo build -p arcbox-vm
 ```
 
-### Cross-compile to Linux x86\_64 (static)
+### Cross-compile `vmm-guest-agent` to Linux (static)
 
-The workspace ships a `.cargo/config.toml` that sets the musl linker.
-Install the target and toolchain, then build:
+`vmm-guest-agent` targets x86_64 Linux only — Firecracker requires KVM, which
+is not available on ARM64 guests.
+
+The workspace `.cargo/config.toml` sets the musl linker. Install the target
+and toolchain, then build:
 
 ```bash
 rustup target add x86_64-unknown-linux-musl
 brew install FiloSottile/musl-cross/musl-cross   # macOS
 
-cargo build -p vmm-core --target x86_64-unknown-linux-musl --release
+cargo build -p arcbox-vm --bin vmm-guest-agent --target x86_64-unknown-linux-musl --release
 # output: target/x86_64-unknown-linux-musl/release/vmm-guest-agent
 ```
 
@@ -442,17 +448,17 @@ cargo build -p vmm-core --target x86_64-unknown-linux-musl --release
 
 ```bash
 # Unit + integration (no Firecracker required)
-cargo test --workspace
+cargo test -p arcbox-vm
 
 # Run examples (requires firecracker binary + CAP_NET_ADMIN)
-cargo run --example sandbox_lifecycle        # vmm-core: direct API
-cargo run --example serve                    # vmm-core: embedded gRPC server
+cargo run -p arcbox-vm --example sandbox_lifecycle
+cargo run -p arcbox-vm --example serve
 ```
 
 ### Lint
 
 ```bash
-cargo clippy --workspace -- -D warnings
+cargo clippy -p arcbox-vm -- -D warnings
 cargo fmt --check
 ```
 
