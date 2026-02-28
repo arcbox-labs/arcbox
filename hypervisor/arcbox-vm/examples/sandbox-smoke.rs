@@ -28,9 +28,9 @@ use std::net::Ipv4Addr;
 use std::str::FromStr;
 use std::time::Instant;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use arcbox_vm::{
-    config::VmmConfig, RestoreSandboxSpec, SandboxEvent, SandboxManager, SandboxSpec, SandboxState,
+    RestoreSandboxSpec, SandboxEvent, SandboxManager, SandboxSpec, SandboxState, config::VmmConfig,
 };
 use tokio::sync::broadcast;
 use tokio::time::timeout;
@@ -96,7 +96,10 @@ async fn main() -> anyhow::Result<()> {
     let list = manager.list_sandboxes(None, &HashMap::new());
     println!("  [list]    {} sandbox(es):", list.len());
     for s in &list {
-        println!("            - {} state={} ip={}", s.id, s.state, s.ip_address);
+        println!(
+            "            - {} state={} ip={}",
+            s.id, s.state, s.ip_address
+        );
     }
 
     // =========================================================================
@@ -111,7 +114,10 @@ async fn main() -> anyhow::Result<()> {
     println!("\n=== Phase N: Network verification ===");
 
     // N.1 — IP must be within the configured CIDR.
-    let net = info.network.as_ref().context("no network allocation on smoke-1")?;
+    let net = info
+        .network
+        .as_ref()
+        .context("no network allocation on smoke-1")?;
     println!(
         "  [net.1]  tap={} ip={} gw={}",
         net.tap_name, net.ip_address, net.gateway
@@ -155,8 +161,14 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|i| i.network)
             .map(|n| n.tap_name);
 
-        manager.stop_sandbox(&id2, 10).await.context("stop smoke-net-2")?;
-        manager.remove_sandbox(&id2, false).await.context("remove smoke-net-2")?;
+        manager
+            .stop_sandbox(&id2, 10)
+            .await
+            .context("stop smoke-net-2")?;
+        manager
+            .remove_sandbox(&id2, false)
+            .await
+            .context("remove smoke-net-2")?;
         println!("  [net.3]  smoke-net-2 removed");
 
         // N.4 — TAP must be gone after remove.
@@ -177,10 +189,7 @@ async fn main() -> anyhow::Result<()> {
         println!("\n=== Phase 2: Command execution ===");
 
         // Basic commands.
-        for cmd in [
-            vec!["echo", "hello from arcbox-vm"],
-            vec!["uname", "-a"],
-        ] {
+        for cmd in [vec!["echo", "hello from arcbox-vm"], vec!["uname", "-a"]] {
             run_cmd(&manager, &id, &cmd, 10).await?;
         }
 
@@ -210,8 +219,13 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Guest-side network: ping the gateway (one packet, 2 s timeout).
-        let ping_out =
-            run_cmd(&manager, &id, &["ping", "-c", "1", "-W", "2", &net_gateway], 10).await?;
+        let ping_out = run_cmd(
+            &manager,
+            &id,
+            &["ping", "-c", "1", "-W", "2", &net_gateway],
+            10,
+        )
+        .await?;
         if ping_out.contains("1 received") || ping_out.contains("1 packets received") {
             println!("  [net.guest.2]  ping {net_gateway} from guest succeeded ✓");
         } else {
@@ -220,8 +234,13 @@ async fn main() -> anyhow::Result<()> {
 
         // Guest-side network: reach external IP (proves NAT/masquerade is configured).
         // Uses 223.5.5.5 (Alibaba AliDNS) — reliably reachable from mainland China.
-        let ext_ping =
-            run_cmd(&manager, &id, &["ping", "-c", "1", "-W", "5", "223.5.5.5"], 15).await?;
+        let ext_ping = run_cmd(
+            &manager,
+            &id,
+            &["ping", "-c", "1", "-W", "5", "223.5.5.5"],
+            15,
+        )
+        .await?;
         if ext_ping.contains("1 received") || ext_ping.contains("1 packets received") {
             println!("  [net.guest.3]  ping 223.5.5.5 from guest succeeded ✓");
         } else {
@@ -255,7 +274,10 @@ async fn main() -> anyhow::Result<()> {
     // =========================================================================
     // Phase 1 cleanup
     // =========================================================================
-    manager.stop_sandbox(&id, 30).await.context("stop_sandbox")?;
+    manager
+        .stop_sandbox(&id, 30)
+        .await
+        .context("stop_sandbox")?;
     println!("\n  [stop]   done");
     manager
         .remove_sandbox(&id, false)
@@ -288,13 +310,17 @@ async fn main() -> anyhow::Result<()> {
         println!(
             "  [inspect] state={} ip={}",
             rinfo.state,
-            rinfo.network
+            rinfo
+                .network
                 .as_ref()
                 .map(|n| n.ip_address.as_str())
                 .unwrap_or("-"),
         );
 
-        manager.stop_sandbox(&rid, 30).await.context("stop restored")?;
+        manager
+            .stop_sandbox(&rid, 30)
+            .await
+            .context("stop restored")?;
         manager
             .remove_sandbox(&rid, false)
             .await
@@ -376,27 +402,24 @@ async fn wait_for_ready(
     }
 
     let id = id.to_owned();
-    timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        async {
-            loop {
-                match events.recv().await {
-                    Ok(ev) if ev.sandbox_id == id && ev.action == "ready" => return Ok(()),
-                    Ok(ev) if ev.sandbox_id == id && ev.action == "failed" => {
-                        let err = ev
-                            .attributes
-                            .get("error")
-                            .cloned()
-                            .unwrap_or_else(|| "unknown".into());
-                        return Err(anyhow::anyhow!("sandbox {id} failed: {err}"));
-                    }
-                    Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(e) => return Err(anyhow::anyhow!("event channel: {e}")),
+    timeout(std::time::Duration::from_secs(timeout_secs), async {
+        loop {
+            match events.recv().await {
+                Ok(ev) if ev.sandbox_id == id && ev.action == "ready" => return Ok(()),
+                Ok(ev) if ev.sandbox_id == id && ev.action == "failed" => {
+                    let err = ev
+                        .attributes
+                        .get("error")
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".into());
+                    return Err(anyhow::anyhow!("sandbox {id} failed: {err}"));
                 }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => return Err(anyhow::anyhow!("event channel: {e}")),
             }
-        },
-    )
+        }
+    })
     .await
     .with_context(|| format!("timed out after {timeout_secs}s waiting for {id} to be ready"))?
 }
@@ -413,7 +436,11 @@ fn check_ip_in_cidr(ip: &str, cidr: &str) -> anyhow::Result<()> {
 
     let base = u32::from(Ipv4Addr::from_str(base_str).context("CIDR base address invalid")?);
     let addr = u32::from(Ipv4Addr::from_str(ip).context("IP address invalid")?);
-    let mask = if prefix == 0 { 0 } else { !((1u32 << (32 - prefix)) - 1) };
+    let mask = if prefix == 0 {
+        0
+    } else {
+        !((1u32 << (32 - prefix)) - 1)
+    };
 
     if (addr & mask) == (base & mask) {
         Ok(())
