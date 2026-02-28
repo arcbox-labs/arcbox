@@ -1,6 +1,6 @@
 //! Boot asset management commands.
 //!
-//! Manage kernel and initramfs files required for VM boot.
+//! Manage kernel and rootfs files required for VM boot.
 
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
@@ -114,18 +114,18 @@ async fn status(data_dir: PathBuf) -> anyhow::Result<()> {
         println!("Status: ✓ Cached and valid");
 
         let kernel = version_dir.join("kernel");
-        let initramfs = version_dir.join("initramfs.cpio.gz");
+        let rootfs = version_dir.join("rootfs.ext4");
 
         if kernel.exists() {
             let meta = std::fs::metadata(&kernel)?;
             println!("  Kernel:    {} ({} bytes)", kernel.display(), meta.len());
         }
 
-        if initramfs.exists() {
-            let meta = std::fs::metadata(&initramfs)?;
+        if rootfs.exists() {
+            let meta = std::fs::metadata(&rootfs)?;
             println!(
-                "  Initramfs: {} ({} bytes)",
-                initramfs.display(),
+                "  Rootfs:    {} ({} bytes)",
+                rootfs.display(),
                 meta.len()
             );
         }
@@ -163,10 +163,10 @@ async fn status(data_dir: PathBuf) -> anyhow::Result<()> {
     } else {
         // Determine what is missing for a more helpful diagnostic.
         let kernel_exists = version_dir.join("kernel").exists();
-        let initramfs_exists = version_dir.join("initramfs.cpio.gz").exists();
+        let rootfs_exists = version_dir.join("rootfs.ext4").exists();
         let manifest_exists = version_dir.join("manifest.json").exists();
 
-        if !kernel_exists && !initramfs_exists && !manifest_exists {
+        if !kernel_exists && !rootfs_exists && !manifest_exists {
             println!("Status: ✗ Not cached");
         } else {
             println!("Status: ✗ Incomplete");
@@ -175,8 +175,8 @@ async fn status(data_dir: PathBuf) -> anyhow::Result<()> {
                 if kernel_exists { "✓" } else { "✗ missing" }
             );
             println!(
-                "  Initramfs: {}",
-                if initramfs_exists {
+                "  Rootfs:    {}",
+                if rootfs_exists {
                     "✓"
                 } else {
                     "✗ missing"

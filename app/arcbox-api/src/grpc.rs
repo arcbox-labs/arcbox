@@ -56,11 +56,6 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             } else {
                 Some(req.kernel)
             },
-            initrd: if req.initrd.is_empty() {
-                None
-            } else {
-                Some(req.initrd)
-            },
             cmdline: if req.cmdline.is_empty() {
                 None
             } else {

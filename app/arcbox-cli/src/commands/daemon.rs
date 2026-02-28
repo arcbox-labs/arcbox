@@ -44,10 +44,6 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub kernel: Option<PathBuf>,
 
-    /// Custom initramfs path for VM boot.
-    #[arg(long)]
-    pub initramfs: Option<PathBuf>,
-
     /// Run in foreground (don't daemonize).
     #[arg(long, short = 'f')]
     pub foreground: bool,
@@ -344,10 +340,6 @@ fn build_daemon_args(args: &DaemonArgs) -> Vec<OsString> {
     if let Some(kernel) = &args.kernel {
         daemon_args.push(OsString::from("--kernel"));
         daemon_args.push(kernel.as_os_str().to_os_string());
-    }
-    if let Some(initramfs) = &args.initramfs {
-        daemon_args.push(OsString::from("--initramfs"));
-        daemon_args.push(initramfs.as_os_str().to_os_string());
     }
     if args.docker_integration {
         daemon_args.push(OsString::from("--docker-integration"));

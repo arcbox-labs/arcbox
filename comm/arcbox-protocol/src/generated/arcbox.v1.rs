@@ -121,7 +121,8 @@ pub struct CreateMachineRequest {
     /// Kernel image path.
     #[prost(string, tag = "10")]
     pub kernel: ::prost::alloc::string::String,
-    /// Initrd/initramfs path.
+    /// Deprecated: initrd is ignored in schema v5 boot flow.
+    #[deprecated]
     #[prost(string, tag = "11")]
     pub initrd: ::prost::alloc::string::String,
     /// Kernel command line.

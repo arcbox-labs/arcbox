@@ -36,10 +36,6 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub kernel: Option<PathBuf>,
 
-    /// Custom initramfs path for VM boot.
-    #[arg(long)]
-    pub initramfs: Option<PathBuf>,
-
     /// Automatically enable Docker CLI integration.
     #[arg(long)]
     pub docker_integration: bool,
@@ -114,15 +110,9 @@ async fn run(args: DaemonArgs) -> Result<()> {
     if let Some(ref kernel) = config.vm.kernel_path {
         vm_lifecycle_config.default_vm.kernel = Some(kernel.clone());
     }
-    if let Some(ref initrd) = config.vm.initrd_path {
-        vm_lifecycle_config.default_vm.initramfs = Some(initrd.clone());
-    }
 
     if let Some(kernel) = args.kernel {
         vm_lifecycle_config.default_vm.kernel = Some(kernel);
-    }
-    if let Some(initramfs) = args.initramfs {
-        vm_lifecycle_config.default_vm.initramfs = Some(initramfs);
     }
 
     let runtime = Arc::new(

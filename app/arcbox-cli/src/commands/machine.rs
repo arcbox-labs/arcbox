@@ -181,9 +181,6 @@ pub struct CreateArgs {
     /// Custom kernel path (for advanced users / testing)
     #[arg(long)]
     pub kernel: Option<String>,
-    /// Custom initrd/initramfs path (for advanced users / testing)
-    #[arg(long)]
-    pub initrd: Option<String>,
     /// Custom kernel command line (for advanced users / testing)
     #[arg(long)]
     pub cmdline: Option<String>,
@@ -293,21 +290,24 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
         .map(|m| parse_mount(m))
         .collect::<Result<Vec<_>>>()?;
 
+    #[allow(deprecated)]
+    let request = CreateMachineRequest {
+        name: args.name.clone(),
+        cpus: args.cpus,
+        memory: args.memory.saturating_mul(1024_u64 * 1024),
+        disk_size: args.disk.saturating_mul(1024_u64 * 1024 * 1024),
+        distro: args.distro.clone().unwrap_or_default(),
+        version: args.distro_version.clone().unwrap_or_default(),
+        arch: std::env::consts::ARCH.to_string(),
+        mounts,
+        ssh_public_key: String::new(),
+        kernel: args.kernel.clone().unwrap_or_default(),
+        initrd: String::new(),
+        cmdline: args.cmdline.clone().unwrap_or_default(),
+    };
+
     client
-        .create(tonic::Request::new(CreateMachineRequest {
-            name: args.name.clone(),
-            cpus: args.cpus,
-            memory: args.memory.saturating_mul(1024_u64 * 1024),
-            disk_size: args.disk.saturating_mul(1024_u64 * 1024 * 1024),
-            distro: args.distro.clone().unwrap_or_default(),
-            version: args.distro_version.clone().unwrap_or_default(),
-            arch: std::env::consts::ARCH.to_string(),
-            mounts,
-            ssh_public_key: String::new(),
-            kernel: args.kernel.clone().unwrap_or_default(),
-            initrd: args.initrd.clone().unwrap_or_default(),
-            cmdline: args.cmdline.clone().unwrap_or_default(),
-        }))
+        .create(tonic::Request::new(request))
         .await
         .context("Failed to create machine")?;
 

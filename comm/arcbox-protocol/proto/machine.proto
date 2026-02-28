@@ -68,8 +68,8 @@ message CreateMachineRequest {
     string ssh_public_key = 9;
     // Kernel image path.
     string kernel = 10;
-    // Initrd/initramfs path.
-    string initrd = 11;
+    // Deprecated: initrd is ignored in schema v5 boot flow.
+    string initrd = 11 [deprecated = true];
     // Kernel command line.
     string cmdline = 12;
 }
