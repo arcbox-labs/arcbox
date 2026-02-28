@@ -55,9 +55,6 @@ impl Runtime {
         if let Some(ref kernel) = config.vm.kernel_path {
             vm_lifecycle_config.default_vm.kernel = Some(kernel.clone());
         }
-        if let Some(ref initrd) = config.vm.initrd_path {
-            vm_lifecycle_config.default_vm.initramfs = Some(initrd.clone());
-        }
 
         Self::with_vm_lifecycle_config(config, vm_lifecycle_config)
     }
@@ -433,7 +430,6 @@ mod tests {
         config.vm.cpus = 6;
         config.vm.memory_mb = 3072;
         config.vm.kernel_path = Some(PathBuf::from("/tmp/arcbox-test-kernel"));
-        config.vm.initrd_path = Some(PathBuf::from("/tmp/arcbox-test-initramfs"));
 
         let runtime = Runtime::new(config).expect("runtime init should succeed");
         let default_vm = runtime.vm_lifecycle().default_vm_config();
@@ -443,10 +439,6 @@ mod tests {
         assert_eq!(
             default_vm.kernel,
             Some(PathBuf::from("/tmp/arcbox-test-kernel"))
-        );
-        assert_eq!(
-            default_vm.initramfs,
-            Some(PathBuf::from("/tmp/arcbox-test-initramfs"))
         );
     }
 }
