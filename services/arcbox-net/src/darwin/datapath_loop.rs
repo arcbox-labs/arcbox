@@ -73,6 +73,7 @@ impl NetworkDatapath {
     /// `guest_fd` is the host side of the socketpair passed to VZ.
     /// `tun` must already be configured and in non-blocking mode.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         guest_fd: OwnedFd,
         tun: DarwinTun,
@@ -204,6 +205,7 @@ impl NetworkDatapath {
 // ============================================================================
 
 /// Dispatches an Ethernet frame received from the guest.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_guest_frame(
     frame: &[u8],
     guest_async: &AsyncFd<FdWrapper>,

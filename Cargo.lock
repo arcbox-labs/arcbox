@@ -368,6 +368,7 @@ dependencies = [
  "socket2 0.5.10",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -478,9 +479,11 @@ dependencies = [
  "arcbox-virtio",
  "bytes",
  "futures",
+ "libc",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

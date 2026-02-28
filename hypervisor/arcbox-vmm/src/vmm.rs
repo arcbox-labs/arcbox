@@ -4,6 +4,7 @@
 //! a virtual machine: hypervisor, vCPUs, memory, and devices.
 
 use std::any::Any;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,13 +21,14 @@ use crate::vcpu::VcpuManager;
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use arcbox_hypervisor::GuestAddress;
-#[cfg(target_os = "linux")]
 use arcbox_hypervisor::VirtioDeviceConfig;
 use arcbox_hypervisor::VmConfig;
 #[cfg(target_os = "linux")]
 use arcbox_hypervisor::linux::VirtioDeviceInfo;
 
 use arcbox_net::nat_backend::NatNetBackend;
+#[cfg(target_os = "macos")]
+use tokio_util::sync::CancellationToken;
 
 #[cfg(target_arch = "aarch64")]
 use crate::boot::arm64;
@@ -202,6 +204,9 @@ pub struct Vmm {
     /// NatEngine for address translation. Wrapped in Arc<Mutex> so it can
     /// be shared with VirtioNet via `set_backend()`.
     net_backend: Option<Arc<Mutex<NatNetBackend>>>,
+    /// Cancellation token for the network datapath task (Darwin only).
+    #[cfg(target_os = "macos")]
+    net_cancel: Option<CancellationToken>,
 }
 
 impl Vmm {
@@ -250,6 +255,8 @@ impl Vmm {
             managed_execution: false,
             managed_vm: None,
             net_backend: None,
+            #[cfg(target_os = "macos")]
+            net_cancel: None,
         })
     }
 
@@ -349,29 +356,25 @@ impl Vmm {
             );
         }
 
-        // Add networking if enabled
+        // Add networking if enabled.
+        //
+        // We try to set up a custom network stack using
+        // VZFileHandleNetworkDeviceAttachment (socketpair) so that all
+        // network traffic (ARP, DHCP, DNS, NAT) flows through our own
+        // code. If any step fails, fall back to Apple's built-in NAT.
         if self.config.networking {
-            let net_config = VirtioDeviceConfig::network();
-            vm.add_virtio_device(net_config)?;
-            tracing::info!("Added network device with NAT");
-
-            // Try custom NAT backend with DarwinTun for host-side I/O.
-            // If unavailable (for example permission/entitlement constraints),
-            // keep running with framework NAT only.
-            match self.setup_nat_backend() {
-                Ok(()) => {
-                    if let Err(e) = self.connect_net_backend() {
-                        tracing::warn!(
-                            "Failed to connect custom NAT backend, using framework NAT only: {}",
-                            e
-                        );
-                    }
+            match self.create_network_device() {
+                Ok(net_config) => {
+                    vm.add_virtio_device(net_config)?;
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "Custom NAT backend unavailable, using framework NAT only: {}",
+                        "Custom network stack unavailable, falling back to Apple NAT: {}",
                         e
                     );
+                    let net_config = VirtioDeviceConfig::network();
+                    vm.add_virtio_device(net_config)?;
+                    tracing::info!("Added network device with Apple NAT");
                 }
             }
         }
@@ -442,75 +445,119 @@ impl Vmm {
         Ok(())
     }
 
-    /// Sets up the custom NAT network backend with a DarwinTun device.
+    /// Creates the network device configuration for Darwin.
     ///
-    /// Creates a utun interface on the host, configures it with the NAT gateway
-    /// and guest IP addresses, and wraps it in a `NatNetBackend` for packet
-    /// translation. The backend is stored for later connection to a VirtioNet
-    /// device via `set_backend()`.
+    /// Sets up a socketpair for `VZFileHandleNetworkDeviceAttachment`, a utun
+    /// device, and the full custom network stack (NAT, DHCP, DNS). The
+    /// datapath task is spawned when `start()` is called.
+    ///
+    /// Returns a `VirtioDeviceConfig` with the VZ-side FDs embedded.
     #[cfg(target_os = "macos")]
-    fn setup_nat_backend(&mut self) -> Result<()> {
+    fn create_network_device(&mut self) -> Result<VirtioDeviceConfig> {
+        use arcbox_net::darwin::datapath_loop::NetworkDatapath;
         use arcbox_net::darwin::tun::DarwinTun;
-        use arcbox_net::nat_backend::NatNetBackendConfig;
+        use arcbox_net::dhcp::{DhcpConfig, DhcpServer};
+        use arcbox_net::dns::{DnsConfig, DnsForwarder};
+        use arcbox_net::nat_engine::{NatEngine, NatEngineConfig};
         use std::net::Ipv4Addr;
 
-        // Create the utun device for host-side packet I/O.
-        let tun = DarwinTun::new()
-            .map_err(|e| VmmError::Device(format!("Failed to create utun device: {}", e)))?;
-
-        // Configure the interface: local (host gateway) and peer (guest) addresses.
-        let local_ip = Ipv4Addr::new(192, 168, 64, 1);
-        let peer_ip = Ipv4Addr::new(192, 168, 64, 2);
+        let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
+        let guest_ip = Ipv4Addr::new(192, 168, 64, 2);
         let netmask = Ipv4Addr::new(255, 255, 255, 0);
+        let gateway_mac: [u8; 6] = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
 
-        tun.configure(local_ip, peer_ip, netmask)
-            .map_err(|e| VmmError::Device(format!("Failed to configure utun interface: {}", e)))?;
+        // 1. Create a SOCK_DGRAM socketpair for L2 Ethernet frame exchange.
+        let mut fds: [libc::c_int; 2] = [0; 2];
+        // SAFETY: socketpair with valid parameters.
+        let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+        if ret != 0 {
+            return Err(VmmError::Device(format!(
+                "socketpair failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
 
-        // Set non-blocking mode for integration with the event loop.
+        // fds[0] = VZ framework side (read guest tx, write guest rx)
+        // fds[1] = host datapath side
+        let vz_fd = fds[0];
+        // SAFETY: fds[1] is a valid fd from socketpair.
+        let host_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+
+        // Set a large socket buffer for the VZ side to avoid drops.
+        // SAFETY: setsockopt with valid fd and parameters.
+        let buf_size: libc::c_int = 2 * 1024 * 1024;
+        unsafe {
+            libc::setsockopt(
+                vz_fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &buf_size as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                vz_fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &buf_size as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+
+        // 2. Create and configure the utun device.
+        let tun = DarwinTun::new()
+            .map_err(|e| VmmError::Device(format!("Failed to create utun: {}", e)))?;
+        tun.configure(gateway_ip, guest_ip, netmask)
+            .map_err(|e| VmmError::Device(format!("Failed to configure utun: {}", e)))?;
         tun.set_nonblocking(true)
             .map_err(|e| VmmError::Device(format!("Failed to set utun non-blocking: {}", e)))?;
 
         tracing::info!(
-            "Created NAT backend: {} (local={}, peer={})",
+            "Custom network stack: {} (gateway={}, guest={})",
             tun.name(),
-            local_ip,
-            peer_ip,
+            gateway_ip,
+            guest_ip,
         );
 
-        // Create the NAT backend wrapping the tun device.
-        let nat_config = NatNetBackendConfig {
-            external_ip: local_ip,
-            internal_prefix: Ipv4Addr::new(192, 168, 64, 0),
-            internal_prefix_len: 24,
-            ..NatNetBackendConfig::default()
-        };
+        // 3. Create the network stack components.
+        let nat_config = NatEngineConfig::new(gateway_ip);
+        let mut nat_engine = NatEngine::new(&nat_config);
+        nat_engine.set_internal_network(Ipv4Addr::new(192, 168, 64, 0), 24);
 
-        let backend = NatNetBackend::new(nat_config, Box::new(tun));
-        self.net_backend = Some(Arc::new(Mutex::new(backend)));
+        let dhcp_config = DhcpConfig::new(gateway_ip, netmask)
+            .with_pool_range(guest_ip, Ipv4Addr::new(192, 168, 64, 254))
+            .with_dns_servers(vec![gateway_ip]);
+        let dhcp_server = DhcpServer::new(dhcp_config);
 
-        Ok(())
-    }
+        let dns_config = DnsConfig::new(gateway_ip);
+        let dns_forwarder = DnsForwarder::new(dns_config);
 
-    /// Connects the NAT network backend to a VirtioNet device.
-    ///
-    /// Creates a VirtioNet device, wires the NAT backend to it via
-    /// `set_backend()`, and registers it in the device manager.
-    /// Must be called after `setup_nat_backend()`.
-    #[cfg(target_os = "macos")]
-    fn connect_net_backend(&mut self) -> Result<()> {
-        use arcbox_virtio::net::{NetConfig, VirtioNet};
+        // 4. Build the datapath and spawn it on the tokio runtime.
+        let cancel = CancellationToken::new();
+        self.net_cancel = Some(cancel.clone());
 
-        let backend = match self.net_backend {
-            Some(ref b) => Arc::clone(b),
-            None => return Ok(()),
-        };
+        let datapath = NetworkDatapath::new(
+            host_fd,
+            tun,
+            nat_engine,
+            dhcp_server,
+            dns_forwarder,
+            gateway_ip,
+            gateway_mac,
+            cancel,
+        );
 
-        let mut net_device = VirtioNet::new(NetConfig::default());
-        net_device.set_backend(backend);
+        tokio::spawn(async move {
+            if let Err(e) = datapath.run().await {
+                tracing::error!("Network datapath exited with error: {}", e);
+            }
+        });
 
-        tracing::info!("Connected NatNetBackend to VirtioNet device");
+        tracing::info!("Network datapath task spawned");
 
-        Ok(())
+        // 5. Return the VirtioDeviceConfig with the VZ-side fd.
+        //    VZFileHandleNetworkDeviceAttachment uses the same fd for both
+        //    reading and writing on a SOCK_DGRAM socketpair.
+        Ok(VirtioDeviceConfig::network_file_handle(vz_fd, vz_fd))
     }
 
     /// Linux-specific initialization using KVM.
@@ -804,6 +851,12 @@ impl Vmm {
         // Stop event loop first
         if let Some(ref mut event_loop) = self.event_loop {
             event_loop.stop();
+        }
+
+        // Cancel the network datapath event loop.
+        #[cfg(target_os = "macos")]
+        if let Some(cancel) = self.net_cancel.take() {
+            cancel.cancel();
         }
 
         if self.managed_execution {
