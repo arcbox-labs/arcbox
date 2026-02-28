@@ -513,3 +513,153 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::FromRawFd;
+
+    /// Creates a SOCK_DGRAM socketpair, returning (fd_a, fd_b) as OwnedFds.
+    fn socketpair() -> (OwnedFd, OwnedFd) {
+        let mut fds: [i32; 2] = [0; 2];
+        // SAFETY: valid pointer to 2-element array.
+        let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(ret, 0, "socketpair() failed");
+        // SAFETY: fds are valid file descriptors from socketpair.
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    #[test]
+    fn test_learn_guest_mac_unicast() {
+        let mut mac = None;
+        learn_guest_mac([0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE], &mut mac);
+        assert_eq!(mac, Some([0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE]));
+    }
+
+    #[test]
+    fn test_learn_guest_mac_ignores_broadcast() {
+        let mut mac = None;
+        // Multicast bit set (LSB of first octet = 1)
+        learn_guest_mac([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], &mut mac);
+        assert!(mac.is_none(), "Should ignore broadcast MAC");
+    }
+
+    #[test]
+    fn test_learn_guest_mac_ignores_multicast() {
+        let mut mac = None;
+        learn_guest_mac([0x01, 0x00, 0x5E, 0x00, 0x00, 0x01], &mut mac);
+        assert!(mac.is_none(), "Should ignore multicast MAC");
+    }
+
+    #[test]
+    fn test_learn_guest_mac_ignores_zero() {
+        let mut mac = None;
+        learn_guest_mac([0; 6], &mut mac);
+        assert!(mac.is_none(), "Should ignore all-zero MAC");
+    }
+
+    #[test]
+    fn test_learn_guest_mac_updates() {
+        let mut mac = None;
+        learn_guest_mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x01], &mut mac);
+        learn_guest_mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x02], &mut mac);
+        assert_eq!(mac, Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]));
+    }
+
+    #[test]
+    fn test_set_nonblocking() {
+        let (a, _b) = socketpair();
+        set_nonblocking(a.as_raw_fd()).unwrap();
+
+        // Verify O_NONBLOCK is set.
+        // SAFETY: fcntl on a valid fd.
+        let flags = unsafe { libc::fcntl(a.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::O_NONBLOCK, 0, "O_NONBLOCK should be set");
+    }
+
+    #[test]
+    fn test_fd_read_write_roundtrip() {
+        let (a, b) = socketpair();
+        let data = b"hello network";
+
+        // Write to one end.
+        // SAFETY: writing from valid buffer to valid fd.
+        let n = unsafe { libc::write(b.as_raw_fd(), data.as_ptr().cast(), data.len()) };
+        assert_eq!(n as usize, data.len());
+
+        // Read from the other end.
+        let mut buf = [0u8; 64];
+        let n = fd_read(a.as_raw_fd(), &mut buf).unwrap();
+        assert_eq!(n, data.len());
+        assert_eq!(&buf[..n], data);
+    }
+
+    #[tokio::test]
+    async fn test_write_to_guest_roundtrip() {
+        let (a, b) = socketpair();
+
+        set_nonblocking(a.as_raw_fd()).unwrap();
+        let guest_async = AsyncFd::new(FdWrapper(a)).unwrap();
+
+        let frame = b"test ethernet frame data";
+        write_to_guest(&guest_async, frame);
+
+        // Read from the other end (blocking is fine, data was just written).
+        let mut buf = [0u8; 128];
+        let n = fd_read(b.as_raw_fd(), &mut buf).unwrap();
+        assert_eq!(n, frame.len());
+        assert_eq!(&buf[..n], frame.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_arp_response_via_socketpair() {
+        let (host_fd, guest_fd) = socketpair();
+        set_nonblocking(host_fd.as_raw_fd()).unwrap();
+        let host_async = AsyncFd::new(FdWrapper(host_fd)).unwrap();
+
+        let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
+        let gateway_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let guest_mac_addr = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+
+        let arp_responder = ArpResponder::new(gateway_ip, gateway_mac);
+
+        // Build an ARP request: "Who has 192.168.64.1? Tell 192.168.64.2"
+        let mut arp_request = Vec::with_capacity(42);
+        // Ethernet header: dst=broadcast, src=guest, type=ARP
+        arp_request.extend_from_slice(&[0xFF; 6]); // dst
+        arp_request.extend_from_slice(&guest_mac_addr); // src
+        arp_request.extend_from_slice(&[0x08, 0x06]); // ARP
+        // ARP payload
+        arp_request.extend_from_slice(&[0x00, 0x01]); // Hardware: Ethernet
+        arp_request.extend_from_slice(&[0x08, 0x00]); // Protocol: IPv4
+        arp_request.push(6); // Hardware addr len
+        arp_request.push(4); // Protocol addr len
+        arp_request.extend_from_slice(&[0x00, 0x01]); // Opcode: Request
+        arp_request.extend_from_slice(&guest_mac_addr); // Sender MAC
+        arp_request.extend_from_slice(&[192, 168, 64, 2]); // Sender IP
+        arp_request.extend_from_slice(&[0x00; 6]); // Target MAC (unknown)
+        arp_request.extend_from_slice(&[192, 168, 64, 1]); // Target IP (gateway)
+
+        // The ARP responder should generate a reply.
+        let reply = arp_responder.handle_arp(&arp_request);
+        assert!(reply.is_some(), "ARP responder should reply for gateway IP");
+
+        let reply = reply.unwrap();
+        write_to_guest(&host_async, &reply);
+
+        // Read the reply from the guest side.
+        let mut buf = [0u8; 256];
+        let n = fd_read(guest_fd.as_raw_fd(), &mut buf).unwrap();
+        assert!(n >= 42, "ARP reply should be at least 42 bytes");
+
+        // Verify it's an ARP reply (opcode 2).
+        assert_eq!(&buf[12..14], &[0x08, 0x06], "EtherType should be ARP");
+        assert_eq!(&buf[20..22], &[0x00, 0x02], "ARP opcode should be Reply");
+
+        // Verify the sender MAC in the reply is our gateway MAC.
+        assert_eq!(&buf[22..28], &gateway_mac);
+        // Verify the sender IP is the gateway IP.
+        assert_eq!(&buf[28..32], &[192, 168, 64, 1]);
+    }
+}
