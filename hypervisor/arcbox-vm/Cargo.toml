@@ -8,8 +8,8 @@ repository.workspace = true
 description       = "Firecracker-based sandbox VMM — orchestration, state, networking, and checkpoints."
 
 [[bin]]
-name = "vmm-guest-agent"
-path = "src/bin/vmm-guest-agent.rs"
+name = "vm-agent"
+path = "src/bin/vm-agent.rs"
 
 [dependencies]
 fc-sdk.workspace       = true
