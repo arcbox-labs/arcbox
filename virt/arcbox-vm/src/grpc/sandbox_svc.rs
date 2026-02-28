@@ -165,11 +165,24 @@ impl SandboxService for SandboxServiceImpl {
         };
 
         let tty_size = if exec_req.tty {
-            exec_req
-                .tty_size
-                .as_ref()
-                .map(|s| (s.width as u16, s.height as u16))
-                .or(Some((80, 24)))
+            match exec_req.tty_size.as_ref() {
+                Some(s) => {
+                    let w = u16::try_from(s.width).map_err(|_| {
+                        Status::invalid_argument(format!(
+                            "tty width {} exceeds u16 max",
+                            s.width
+                        ))
+                    })?;
+                    let h = u16::try_from(s.height).map_err(|_| {
+                        Status::invalid_argument(format!(
+                            "tty height {} exceeds u16 max",
+                            s.height
+                        ))
+                    })?;
+                    Some((w, h))
+                }
+                None => Some((80, 24)),
+            }
         } else {
             None
         };
