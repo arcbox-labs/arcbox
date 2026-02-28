@@ -772,7 +772,7 @@ async fn tcp_relay(
 }
 
 /// Generates a pseudo-random initial sequence number.
-fn rand_isn() -> u32 {
+pub(crate) fn rand_isn() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -40,6 +40,7 @@
 //! ```
 
 pub mod datapath_loop;
+pub mod inbound_relay;
 pub mod nat;
 pub mod socket_proxy;
 pub mod tun;
