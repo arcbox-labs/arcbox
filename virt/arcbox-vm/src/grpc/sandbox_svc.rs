@@ -77,12 +77,7 @@ impl SandboxService for SandboxServiceImpl {
                     readonly: m.readonly,
                 })
                 .collect(),
-            network: SandboxNetworkSpec {
-                mode: net.mode,
-                ip: net.ip,
-                egress_bps: net.egress_bps,
-                ingress_bps: net.ingress_bps,
-            },
+            network: SandboxNetworkSpec { mode: net.mode },
             ttl_seconds: req.ttl_seconds,
             ssh_public_key: req.ssh_public_key,
         };

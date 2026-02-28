@@ -75,12 +75,6 @@ impl std::fmt::Display for SandboxState {
 pub struct SandboxNetworkSpec {
     /// `"tap"` (default) or `"none"`.
     pub mode: String,
-    /// Static IP address (empty = allocate from pool).
-    pub ip: Option<String>,
-    /// Egress bandwidth cap in bytes/s (0 = unlimited).
-    pub egress_bps: u64,
-    /// Ingress bandwidth cap in bytes/s (0 = unlimited).
-    pub ingress_bps: u64,
 }
 
 /// A single bind-mount into the sandbox.

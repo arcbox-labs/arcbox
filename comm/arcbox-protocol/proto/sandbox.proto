@@ -96,12 +96,6 @@ message Empty {}
 message NetworkSpec {
     // Network mode: "tap" (default, TAP + IP pool) or "none" (no network).
     string mode = 1;
-    // Static IP address. Empty = allocate from pool.
-    optional string ip = 2;
-    // Egress bandwidth cap in bytes/s (0 = unlimited).
-    uint64 egress_bps = 3;
-    // Ingress bandwidth cap in bytes/s (0 = unlimited).
-    uint64 ingress_bps = 4;
 }
 
 // A single bind mount into the sandbox.
