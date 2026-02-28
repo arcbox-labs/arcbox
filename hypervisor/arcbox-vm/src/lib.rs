@@ -24,16 +24,6 @@ pub mod vsock;
 pub mod instance;
 pub mod manager;
 
-// Generated sandbox.v1 protobuf + tonic types.
-pub mod proto {
-    pub mod sandbox {
-        tonic::include_proto!("sandbox.v1");
-    }
-}
-
-// gRPC service implementations (SandboxService, SandboxSnapshotService).
-pub mod grpc;
-
 pub use config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig, VmmConfig};
 pub use error::{Result, VmmError};
 pub use network::{NetworkAllocation, NetworkManager};
@@ -47,5 +37,3 @@ pub use vsock::{ExecInputMsg, OutputChunk, StartCommand};
 
 // Re-export VmState for system_svc compatibility (internal use only).
 pub use instance::VmState;
-
-pub use grpc::{SandboxServiceImpl, SandboxSnapshotServiceImpl, serve};
