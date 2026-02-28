@@ -806,9 +806,7 @@ impl SandboxManager {
                 )
             };
 
-        let snap_result = vm
-            .create_snapshot(&fc_vmstate_path, &fc_mem_path)
-            .await;
+        let snap_result = vm.create_snapshot(&fc_vmstate_path, &fc_mem_path).await;
 
         // Always resume regardless of snapshot success.
         let _ = vm.resume().await;
@@ -1001,7 +999,10 @@ impl SandboxManager {
                 .map_err(|e| VmmError::Process(format!("chown snap dir: {e}")))?;
 
             // Stage kernel and rootfs into the new chroot (same layout as boot).
-            if let (Some(k), Some(r)) = (snap_meta.kernel_path.as_deref(), snap_meta.rootfs_path.as_deref()) {
+            if let (Some(k), Some(r)) = (
+                snap_meta.kernel_path.as_deref(),
+                snap_meta.rootfs_path.as_deref(),
+            ) {
                 stage_files_for_jailer(&cr, k, r, jc.uid, jc.gid).await?;
             }
 
