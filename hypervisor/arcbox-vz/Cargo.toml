@@ -10,7 +10,7 @@ categories = ["os::macos-apis", "virtualization"]
 
 [dependencies]
 # Objective-C runtime
-objc2 = "0.6"
+objc2 = { version = "0.6", features = ["exception"] }
 
 # Async runtime
 tokio = { version = "1", features = ["sync", "rt", "io-util", "net", "time"] }

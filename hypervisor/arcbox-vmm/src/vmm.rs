@@ -479,7 +479,9 @@ impl Vmm {
 
         // fds[0] = VZ framework side (read guest tx, write guest rx)
         // fds[1] = host datapath side
+        //
         let vz_fd = fds[0];
+
         // SAFETY: fds[1] is a valid fd from socketpair.
         let host_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
 
@@ -555,9 +557,7 @@ impl Vmm {
         tracing::info!("Network datapath task spawned");
 
         // 5. Return the VirtioDeviceConfig with the VZ-side fd.
-        //    VZFileHandleNetworkDeviceAttachment uses the same fd for both
-        //    reading and writing on a SOCK_DGRAM socketpair.
-        Ok(VirtioDeviceConfig::network_file_handle(vz_fd, vz_fd))
+        Ok(VirtioDeviceConfig::network_file_handle(vz_fd))
     }
 
     /// Linux-specific initialization using KVM.

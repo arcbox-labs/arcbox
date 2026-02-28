@@ -25,20 +25,19 @@ impl NetworkDeviceConfiguration {
     /// Creates a network device with file handle attachment.
     ///
     /// This gives the host direct access to raw L2 Ethernet frames from the
-    /// guest via a socketpair. The caller is responsible for all network
-    /// processing (ARP, DHCP, DNS, NAT) on the host side of the FD pair.
-    pub fn file_handle(read_fd: RawFd, write_fd: RawFd) -> VZResult<Self> {
-        let read_handle = file_handle_for_fd(read_fd);
-        let write_handle = file_handle_for_fd(write_fd);
+    /// guest via a connected datagram socket. The caller is responsible for
+    /// all network processing (ARP, DHCP, DNS, NAT) on the host side.
+    pub fn file_handle(fd: RawFd) -> VZResult<Self> {
+        let net_handle = file_handle_for_fd(fd);
 
-        if read_handle.is_null() || write_handle.is_null() {
+        if net_handle.is_null() {
             return Err(VZError::Internal {
                 code: -1,
-                message: "Failed to create NSFileHandle for network FDs".into(),
+                message: "Failed to create NSFileHandle for network fd".into(),
             });
         }
 
-        let attachment = create_file_handle_attachment(read_handle, write_handle)?;
+        let attachment = create_file_handle_attachment(net_handle)?;
         Self::with_attachment(attachment)
     }
 
@@ -92,8 +91,7 @@ impl Drop for NetworkDeviceConfiguration {
 // ============================================================================
 
 fn create_file_handle_attachment(
-    read_handle: *mut AnyObject,
-    write_handle: *mut AnyObject,
+    file_handle: *mut AnyObject,
 ) -> VZResult<*mut AnyObject> {
     unsafe {
         let cls = get_class("VZFileHandleNetworkDeviceAttachment").ok_or_else(|| {
@@ -104,7 +102,38 @@ fn create_file_handle_attachment(
         })?;
 
         let obj = msg_send!(cls, alloc);
-        let attachment = msg_send!(obj, initWithFileHandleForReading: read_handle, fileHandleForWriting: write_handle);
+
+        // Wrap the init call to catch ObjC exceptions (which would
+        // otherwise abort the process as "foreign exceptions").
+        let obj_safe = std::panic::AssertUnwindSafe(obj);
+        let fh_safe = std::panic::AssertUnwindSafe(file_handle);
+        let result = objc2::exception::catch(move || {
+            let obj = *obj_safe;
+            let fh = *fh_safe;
+            msg_send!(obj, initWithFileHandle: fh)
+        });
+
+        let attachment = match result {
+            Ok(ptr) => ptr,
+            Err(exception) => {
+                // Extract NSException description for diagnostics.
+                let desc = match exception {
+                    Some(exc) => {
+                        let raw = &*exc as *const _ as *const AnyObject as *mut AnyObject;
+                        crate::ffi::nsstring_to_string(msg_send!(raw, description))
+                    }
+                    None => "unknown ObjC exception (nil)".into(),
+                };
+                tracing::error!("VZFileHandleNetworkDeviceAttachment init threw: {}", desc);
+                return Err(VZError::Internal {
+                    code: -2,
+                    message: format!(
+                        "VZFileHandleNetworkDeviceAttachment init threw ObjC exception: {}",
+                        desc
+                    ),
+                });
+            }
+        };
 
         if attachment.is_null() {
             return Err(VZError::Internal {

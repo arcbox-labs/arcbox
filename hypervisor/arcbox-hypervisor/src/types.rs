@@ -136,10 +136,9 @@ pub struct VirtioDeviceConfig {
     pub read_only: bool,
     /// Tag for filesystem devices.
     pub tag: Option<String>,
-    /// File descriptor pair for file-handle-based network attachment.
-    /// (read_fd, write_fd) — the VZ framework reads from read_fd and writes to write_fd.
+    /// File descriptor for file-handle-based network attachment.
     #[serde(skip)]
-    pub net_fds: Option<(i32, i32)>,
+    pub net_fd: Option<i32>,
 }
 
 impl VirtioDeviceConfig {
@@ -151,7 +150,7 @@ impl VirtioDeviceConfig {
             path: Some(path.into()),
             read_only,
             tag: None,
-            net_fds: None,
+            net_fd: None,
         }
     }
 
@@ -163,22 +162,22 @@ impl VirtioDeviceConfig {
             path: None,
             read_only: false,
             tag: None,
-            net_fds: None,
+            net_fd: None,
         }
     }
 
     /// Creates a network device configuration with file-handle attachment.
     ///
-    /// The VZ framework side uses `read_fd` to receive frames from the guest
-    /// and `write_fd` to send frames to the guest.
-    pub fn network_file_handle(read_fd: i32, write_fd: i32) -> Self {
+    /// The VZ framework side uses one connected datagram socket file descriptor
+    /// for bidirectional frame I/O.
+    pub fn network_file_handle(fd: i32) -> Self {
         Self {
             device_type: VirtioDeviceType::Net,
             config: Vec::new(),
             path: None,
             read_only: false,
             tag: None,
-            net_fds: Some((read_fd, write_fd)),
+            net_fd: Some(fd),
         }
     }
 
@@ -190,7 +189,7 @@ impl VirtioDeviceConfig {
             path: None,
             read_only: false,
             tag: None,
-            net_fds: None,
+            net_fd: None,
         }
     }
 
@@ -202,7 +201,7 @@ impl VirtioDeviceConfig {
             path: Some(path.into()),
             read_only,
             tag: Some(tag.into()),
-            net_fds: None,
+            net_fd: None,
         }
     }
 
@@ -214,7 +213,7 @@ impl VirtioDeviceConfig {
             path: None,
             read_only: false,
             tag: None,
-            net_fds: None,
+            net_fd: None,
         }
     }
 
@@ -226,7 +225,7 @@ impl VirtioDeviceConfig {
             path: None,
             read_only: false,
             tag: None,
-            net_fds: None,
+            net_fd: None,
         }
     }
 }
@@ -309,7 +308,7 @@ impl VirtioDeviceConfig {
             path: None,
             read_only: false,
             tag: None,
-            net_fds: None,
+            net_fd: None,
         }
     }
 }
