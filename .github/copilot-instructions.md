@@ -6,7 +6,7 @@ ArcBox is a pure-Rust, high-performance container and VM runtime targeting macOS
 
 **Three-tier structure:**
 
-- **Core layer** (`common/`, `virt/`, `services/`, `comm/`, `app/`): MIT/Apache-2.0 licensed foundation
+- **Core layer** (`common/`, `hypervisor/`, `services/`, `comm/`, `app/`): MIT/Apache-2.0 licensed foundation
 - **Pro layer** (`pro/`): BSL-1.1 licensed enhanced features (smart caching, snapshots, advanced networking)
 - **Guest components** (`guest/arcbox-agent`): Runs inside VMs, cross-compiled to Linux ARM64/x86_64
 
@@ -118,7 +118,7 @@ cargo build -p arcbox-agent --target aarch64-unknown-linux-musl --release
 - Central orchestrator wiring `MachineManager`, `VmLifecycleManager`, container backend, networking, and port-forward state
 - Shared managers/state are held behind `Arc` for async task coordination
 
-**VirtIO device pattern** (`virt/arcbox-virtio/src/*.rs`):
+**VirtIO device pattern** (`hypervisor/arcbox-virtio/src/*.rs`):
 
 - `pop_avail()` to get descriptor chains from guest
 - Process I/O (zero-copy where possible)
@@ -130,7 +130,7 @@ cargo build -p arcbox-agent --target aarch64-unknown-linux-musl --release
 - Uses platform-specific syscall branches (`#[cfg(target_os = "...")]`)
 - Uses negative caching to avoid repeated misses
 
-**Hypervisor abstraction** (`virt/arcbox-hypervisor/src/traits.rs`):
+**Hypervisor abstraction** (`hypervisor/arcbox-hypervisor/src/traits.rs`):
 
 - Core traits: `Hypervisor`, `VirtualMachine`, `Vcpu`, `GuestMemory`
 - Platform implementations in `darwin/` (Virtualization.framework) and `linux/` (KVM)
@@ -166,7 +166,7 @@ RUST_BACKTRACE=1                      # Enable backtraces
 
 ## Licensing & Structure
 
-- Core (`common/`, `virt/`, `services/`, `comm/`, `app/`) + Guest: **MIT OR Apache-2.0**
+- Core (`common/`, `hypervisor/`, `services/`, `comm/`, `app/`) + Guest: **MIT OR Apache-2.0**
 - Pro (`pro/`): **BSL-1.1** - production use requires license after 4 years
 - Enterprise (separate repos): Proprietary (desktop app, SSO, K8s integration)
 - When adding files to core directories or `guest/`, include dual-license headers
