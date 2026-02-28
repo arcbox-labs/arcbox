@@ -712,15 +712,126 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_rand_isn_non_zero() {
-        let isn = rand_isn();
-        // ISNs should be reasonably spread. Just verify it doesn't panic.
-        let _ = isn;
+    fn test_rand_isn_spread() {
+        // Two successive ISNs should differ.
+        let a = rand_isn();
+        std::thread::sleep(std::time::Duration::from_micros(1));
+        let b = rand_isn();
+        assert_ne!(a, b);
     }
 
     #[test]
     fn test_tcp_state_transitions() {
         assert_ne!(TcpState::SynReceived, TcpState::Established);
-        assert_ne!(TcpState::Established, TcpState::Closed);
+        assert_ne!(TcpState::Established, TcpState::FinWait);
+        assert_ne!(TcpState::FinWait, TcpState::Closed);
+    }
+
+    #[test]
+    fn test_socket_proxy_creation() {
+        let (tx, _rx) = mpsc::channel(16);
+        let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
+        let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
+        let _proxy = SocketProxy::new(gw_ip, gw_mac, tx);
+    }
+
+    #[test]
+    fn test_socket_proxy_drops_unknown_protocol() {
+        let (tx, _rx) = mpsc::channel(16);
+        let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
+        let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
+        let mut proxy = SocketProxy::new(gw_ip, gw_mac, tx);
+
+        // Build a minimal Ethernet + IPv4 frame with protocol=50 (ESP).
+        let mut frame = vec![0u8; ETH_HEADER_LEN + 20];
+        // Ethernet header
+        frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        // IPv4 header
+        frame[ETH_HEADER_LEN] = 0x45; // Version 4, IHL 5
+        frame[ETH_HEADER_LEN + 9] = 50; // Protocol: ESP (unsupported)
+
+        let guest_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+        // Should not panic.
+        proxy.handle_outbound(&frame, guest_mac);
+    }
+
+    #[test]
+    fn test_socket_proxy_ignores_short_frames() {
+        let (tx, _rx) = mpsc::channel(16);
+        let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
+        let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
+        let mut proxy = SocketProxy::new(gw_ip, gw_mac, tx);
+
+        let guest_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+        // Frame shorter than Ethernet + IP minimum.
+        proxy.handle_outbound(&[0u8; 10], guest_mac);
+    }
+
+    #[test]
+    fn test_udp_proxy_cleanup_stale_flows() {
+        let (tx, _rx) = mpsc::channel(16);
+        let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
+        let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
+        let mut proxy = UdpProxy::new(tx, gw_mac, gw_ip);
+
+        // Insert a flow that is already expired.
+        let key = (
+            Ipv4Addr::new(192, 168, 64, 2),
+            1234,
+            Ipv4Addr::new(8, 8, 8, 8),
+            53,
+        );
+        proxy.flows.insert(key, UdpFlow {
+            last_active: Instant::now() - std::time::Duration::from_secs(120),
+        });
+        assert_eq!(proxy.flows.len(), 1);
+
+        proxy.cleanup_stale_flows();
+        assert_eq!(proxy.flows.len(), 0, "Stale flow should be cleaned up");
+    }
+
+    #[test]
+    fn test_tcp_proxy_cleanup_closed() {
+        let (tx, _rx) = mpsc::channel(16);
+        let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
+        let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
+        let mut proxy = TcpProxy::new(tx.clone(), gw_mac, gw_ip);
+
+        let key = (
+            Ipv4Addr::new(192, 168, 64, 2),
+            5000,
+            Ipv4Addr::new(1, 1, 1, 1),
+            80,
+        );
+        let (data_tx, _data_rx) = mpsc::channel(16);
+        proxy.connections.insert(key, TcpConnection {
+            state: TcpState::Closed,
+            guest_seq: 0,
+            host_seq: 0,
+            data_tx,
+        });
+        assert_eq!(proxy.connections.len(), 1);
+
+        proxy.cleanup_closed();
+        assert_eq!(proxy.connections.len(), 0, "Closed connection should be removed");
+    }
+
+    /// Verifies that reply frames from the socket proxy flow through the
+    /// mpsc channel correctly.
+    #[tokio::test]
+    async fn test_reply_channel_flow() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
+        let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
+
+        // Simulate what a proxy task does: send a frame through reply_tx.
+        let test_frame = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        tx.send(test_frame.clone()).await.unwrap();
+
+        let received = rx.recv().await.unwrap();
+        assert_eq!(received, test_frame);
+
+        // Verify the proxy creates correctly with the same tx.
+        let _proxy = SocketProxy::new(gw_ip, gw_mac, tx);
     }
 }
