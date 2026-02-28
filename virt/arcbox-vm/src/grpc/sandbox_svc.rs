@@ -163,16 +163,10 @@ impl SandboxService for SandboxServiceImpl {
             match exec_req.tty_size.as_ref() {
                 Some(s) => {
                     let w = u16::try_from(s.width).map_err(|_| {
-                        Status::invalid_argument(format!(
-                            "tty width {} exceeds u16 max",
-                            s.width
-                        ))
+                        Status::invalid_argument(format!("tty width {} exceeds u16 max", s.width))
                     })?;
                     let h = u16::try_from(s.height).map_err(|_| {
-                        Status::invalid_argument(format!(
-                            "tty height {} exceeds u16 max",
-                            s.height
-                        ))
+                        Status::invalid_argument(format!("tty height {} exceeds u16 max", s.height))
                     })?;
                     Some((w, h))
                 }
