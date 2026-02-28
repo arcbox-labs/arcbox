@@ -39,6 +39,7 @@
 //! vmnet.write_packet(&buf[..n])?;
 //! ```
 
+pub mod datapath_loop;
 pub mod nat;
 pub mod tun;
 pub mod vmnet;

@@ -23,6 +23,7 @@ ipnetwork = "0.20"
 hashbrown = "0.14"
 crossbeam-utils = "0.8"
 socket2 = { version = "0.5", features = ["all"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
