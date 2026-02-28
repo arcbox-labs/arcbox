@@ -232,8 +232,6 @@ pub struct DefaultVmConfig {
     pub disk_gb: u64,
     /// Path to kernel image (if None, use BootAssetProvider).
     pub kernel: Option<PathBuf>,
-    /// Path to initramfs (if None, use BootAssetProvider).
-    pub initramfs: Option<PathBuf>,
     /// Kernel command line.
     pub cmdline: Option<String>,
     /// Enable Rosetta for x86 emulation (Apple Silicon only).
@@ -251,7 +249,6 @@ impl Default for DefaultVmConfig {
             memory_mb: 2048,
             disk_gb: 50,
             kernel: None,
-            initramfs: None,
             cmdline: None,
             rosetta: cfg!(target_arch = "aarch64"),
         }
@@ -531,8 +528,7 @@ impl VmLifecycleManager {
     ) -> Self {
         let boot_assets = Arc::new(
             BootAssetProvider::new(data_dir.join("boot"))
-                .with_kernel(config.default_vm.kernel.clone().unwrap_or_default())
-                .with_initramfs(config.default_vm.initramfs.clone().unwrap_or_default()),
+                .with_kernel(config.default_vm.kernel.clone().unwrap_or_default()),
         );
 
         let health_monitor = Arc::new(HealthMonitor::new(
@@ -788,28 +784,17 @@ impl VmLifecycleManager {
             .clone()
             .unwrap_or(assets.cmdline);
 
-        // When rootfs.ext4 is present (schema_version >= 4), the initramfs
-        // mounts /dev/vda directly and switch_roots to /sbin/init (OpenRC).
-        // Override cmdline to use block device root instead of rdinit.
-        let has_rootfs_image = assets.rootfs_image.is_some();
-        if has_rootfs_image {
-            // Replace rdinit=/init with root=/dev/vda rw for block device boot.
-            let tokens: Vec<&str> = cmdline
-                .split_whitespace()
-                .filter(|t| !t.starts_with("rdinit=") && !t.starts_with("root="))
-                .collect();
-            cmdline = tokens.join(" ");
-            cmdline.push_str(" root=/dev/vda rw");
-
-            // The guest agent gates its machine-init path (mount /dev/vda,
-            // switch_root to OpenRC) on this token.
-            if !cmdline
-                .split_whitespace()
-                .any(|t| t == "arcbox.mode=machine")
-            {
-                cmdline.push_str(" arcbox.mode=machine");
-            }
-        }
+        let tokens: Vec<&str> = cmdline
+            .split_whitespace()
+            .filter(|t| {
+                !t.starts_with("root=")
+                    && !t.starts_with("init=")
+                    && *t != "rw"
+                    && *t != "ro"
+            })
+            .collect();
+        cmdline = tokens.join(" ");
+        cmdline.push_str(" root=/dev/vda rw init=/sbin/init");
 
         // Strip "quiet" so kernel boot messages are visible on the serial console.
         cmdline = cmdline
@@ -846,16 +831,11 @@ impl VmLifecycleManager {
             }
         }
 
-        // Attach rootfs.ext4 as a block device when available.
-        let mut block_devices = if let Some(ref rootfs_path) = assets.rootfs_image {
-            tracing::info!("Using ext4 rootfs block device: {}", rootfs_path.display());
-            vec![crate::vm::BlockDeviceConfig {
-                path: rootfs_path.to_string_lossy().to_string(),
-                read_only: false,
-            }]
-        } else {
-            Vec::new()
-        };
+        tracing::info!("Using ext4 rootfs block device: {}", assets.rootfs_image.display());
+        let mut block_devices = vec![crate::vm::BlockDeviceConfig {
+            path: assets.rootfs_image.to_string_lossy().to_string(),
+            read_only: false,
+        }];
 
         // Attach persistent Docker data disk (ext4 in guest at /var/lib/docker).
         let docker_data_image = self.data_dir.join(DOCKER_DATA_IMAGE_NAME);

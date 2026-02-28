@@ -1,14 +1,14 @@
 //! Boot asset management for VM startup.
 //!
 //! This module handles automatic downloading, verification, and caching
-//! of kernel/initramfs/rootfs/modloop files required for VM boot.
+//! of kernel/rootfs files required for VM boot.
 //!
 //! ## Asset Sources
 //!
 //! Boot assets can be obtained from:
 //! 1. **CDN/GitHub Releases** - Pre-built optimized boot bundle
 //! 2. **Local cache** - Previously downloaded assets
-//! 3. **Custom paths** - User-provided kernel/initramfs
+//! 3. **Custom paths** - User-provided kernel
 //!
 //! ## Asset Structure
 //!
@@ -17,9 +17,7 @@
 //! ~/.arcbox/boot/
 //! ├── v0.1.0/
 //! │   ├── kernel
-//! │   ├── initramfs.cpio.gz
-//! │   ├── rootfs.squashfs
-//! │   ├── modloop
+//! │   ├── rootfs.ext4
 //! │   └── manifest.json
 //! └── current -> v0.1.0/
 //! ```
@@ -40,7 +38,7 @@ use tokio::io::AsyncWriteExt;
 // =============================================================================
 
 /// Default boot asset version.
-/// This is pinned to a known-good kernel/initramfs bundle.
+/// This is pinned to a known-good kernel/rootfs bundle.
 pub const BOOT_ASSET_VERSION: &str = "0.1.2";
 
 /// Base URL for boot asset downloads.
@@ -54,28 +52,12 @@ const ASSET_BUNDLE_PATTERN: &str = "boot-assets";
 /// Kernel filename inside the bundle.
 const KERNEL_FILENAME: &str = "kernel";
 
-/// Initramfs filename inside the bundle.
-const INITRAMFS_FILENAME: &str = "initramfs.cpio.gz";
-
 /// Manifest filename inside the bundle.
 const MANIFEST_FILENAME: &str = "manifest.json";
 
-/// Rootfs squashfs filename inside the bundle.
-/// Introduced in schema_version 2 (squashfs rootfs architecture).
-/// Stage 1 initramfs mounts this image as the guest OS root filesystem.
-const ROOTFS_SQUASHFS_FILENAME: &str = "rootfs.squashfs";
-
 /// Rootfs ext4 image filename inside the bundle.
-/// Introduced in schema_version 4 (Alpine rootfs + OpenRC architecture).
-/// The VMM attaches this as a VirtIO block device; initramfs mounts it at
-/// /dev/vda and switch_roots to standard Alpine OpenRC init.
+/// In schema_version 5 this is required and booted directly by kernel cmdline.
 const ROOTFS_EXT4_FILENAME: &str = "rootfs.ext4";
-
-/// Alpine modloop filename inside the bundle.
-/// Introduced in schema_version 3.
-/// Stage 1 initramfs loop-mounts this squashfs and bind-mounts its modules
-/// tree into Stage 2 so modprobe works normally after switch_root.
-const MODLOOP_FILENAME: &str = "modloop";
 
 /// Checksum filename suffix.
 const CHECKSUM_SUFFIX: &str = ".sha256";
@@ -105,8 +87,6 @@ pub struct BootAssetConfig {
     pub verify_checksum: bool,
     /// Custom kernel path (overrides download).
     pub custom_kernel: Option<PathBuf>,
-    /// Custom initramfs path (overrides download).
-    pub custom_initramfs: Option<PathBuf>,
 }
 
 impl Default for BootAssetConfig {
@@ -131,7 +111,6 @@ impl Default for BootAssetConfig {
             cache_dir,
             verify_checksum: true,
             custom_kernel: None,
-            custom_initramfs: None,
         }
     }
 }
@@ -148,12 +127,6 @@ impl BootAssetConfig {
     /// Sets custom kernel path.
     pub fn with_kernel(mut self, kernel: PathBuf) -> Self {
         self.custom_kernel = Some(kernel);
-        self
-    }
-
-    /// Sets custom initramfs path.
-    pub fn with_initramfs(mut self, initramfs: PathBuf) -> Self {
-        self.custom_initramfs = Some(initramfs);
         self
     }
 
@@ -190,17 +163,13 @@ fn default_boot_asset_version() -> String {
 // Boot Assets
 // =============================================================================
 
-/// Boot assets (kernel + initramfs).
+/// Boot assets (kernel + rootfs).
 #[derive(Debug, Clone)]
 pub struct BootAssets {
     /// Path to kernel image.
     pub kernel: PathBuf,
-    /// Path to initramfs.
-    pub initramfs: PathBuf,
-    /// Path to rootfs ext4 image (schema_version >= 4, DistroEngine mode).
-    /// When present, the VMM attaches this as a VirtIO block device at /dev/vda
-    /// and the initramfs mounts it directly (no squashfs+overlay).
-    pub rootfs_image: Option<PathBuf>,
+    /// Path to rootfs ext4 image.
+    pub rootfs_image: PathBuf,
     /// Kernel command line.
     pub cmdline: String,
     /// Asset version.
@@ -211,17 +180,15 @@ pub struct BootAssets {
 
 impl BootAssets {
     /// Default kernel command line for ArcBox.
-    ///
-    /// Uses `rdinit=/init` for initramfs-based boot.
     pub fn default_cmdline() -> String {
-        "console=hvc0 console=ttyAMA0 rdinit=/init".to_string()
+        "console=hvc0 console=ttyAMA0 root=/dev/vda rw init=/sbin/init".to_string()
     }
 }
 
 /// Boot asset manifest metadata.
 ///
 /// This file is generated in the boot-assets release pipeline and bundled
-/// alongside kernel/initramfs as `manifest.json`.
+/// alongside kernel/rootfs as `manifest.json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BootAssetManifest {
     /// Manifest schema version.
@@ -234,7 +201,7 @@ pub struct BootAssetManifest {
     /// Kernel git commit used to build this asset.
     #[serde(default)]
     pub kernel_commit: Option<String>,
-    /// arcbox-agent git commit used to build initramfs.
+    /// arcbox-agent git commit used to build rootfs artifacts.
     #[serde(default)]
     pub agent_commit: Option<String>,
     /// Build timestamp in UTC (RFC3339 expected).
@@ -246,17 +213,7 @@ pub struct BootAssetManifest {
     /// Runtime binary metadata bundled in this boot asset.
     #[serde(default)]
     pub runtime_assets: Vec<RuntimeAssetManifestEntry>,
-    /// SHA256 of rootfs.squashfs (present in schema_version >= 2).
-    /// The squashfs image is the Stage 2 root filesystem; Stage 1 initramfs
-    /// mounts it via a tmpfs overlay so that pivot_root works for containers.
-    #[serde(default)]
-    pub rootfs_squashfs_sha256: Option<String>,
-    /// SHA256 of modloop (present in schema_version >= 3).
-    #[serde(default)]
-    pub modloop_sha256: Option<String>,
-    /// SHA256 of rootfs.ext4 (present in schema_version >= 4).
-    /// The ext4 image is attached as a VirtIO block device; Alpine OpenRC
-    /// handles all init instead of a custom two-stage init.
+    /// SHA256 of rootfs.ext4.
     #[serde(default)]
     pub rootfs_ext4_sha256: Option<String>,
 }
@@ -313,7 +270,7 @@ pub type ProgressCallback = Box<dyn Fn(DownloadProgress) + Send + Sync>;
 
 /// Boot asset provider with automatic downloading.
 ///
-/// Manages kernel and initramfs files required for VM boot.
+/// Manages kernel and rootfs files required for VM boot.
 /// Assets are automatically downloaded from CDN if not cached.
 pub struct BootAssetProvider {
     /// Configuration.
@@ -351,16 +308,6 @@ impl BootAssetProvider {
         self
     }
 
-    /// Sets custom initramfs path.
-    pub fn with_initramfs(mut self, initramfs: PathBuf) -> Self {
-        // Only set if path is not empty.
-        if initramfs.as_os_str().is_empty() {
-            return self;
-        }
-        self.config.custom_initramfs = Some(initramfs);
-        self
-    }
-
     /// Returns the configuration.
     pub fn config(&self) -> &BootAssetConfig {
         &self.config
@@ -382,8 +329,7 @@ impl BootAssetProvider {
         &self,
         progress: Option<ProgressCallback>,
     ) -> Result<BootAssets> {
-        let using_custom_paths =
-            self.config.custom_kernel.is_some() || self.config.custom_initramfs.is_some();
+        let using_custom_paths = self.config.custom_kernel.is_some();
 
         // Check for custom paths first.
         let kernel = if let Some(ref k) = self.config.custom_kernel {
@@ -401,21 +347,8 @@ impl BootAssetProvider {
             self.get_kernel_path(&progress).await?
         };
 
-        let initramfs = if let Some(ref i) = self.config.custom_initramfs {
-            if !i.exists() {
-                return Err(CoreError::config(format!(
-                    "custom initramfs not found: {}",
-                    i.display()
-                )));
-            }
-            tracing::debug!("Using custom initramfs: {}", i.display());
-            i.clone()
-        } else {
-            self.get_initramfs_path(&progress).await?
-        };
-
         let manifest = if using_custom_paths {
-            // Custom kernel/initramfs paths are used for local development.
+            // Custom kernel paths are used for local development.
             // Still try to load the cached manifest so kernel cmdline overrides
             // remain available. If no cached manifest exists, silently fall
             // back to None.
@@ -429,19 +362,16 @@ impl BootAssetProvider {
             .and_then(|m| m.kernel_cmdline.clone())
             .unwrap_or_else(BootAssets::default_cmdline);
 
-        // Check for rootfs.ext4 (schema_version >= 4, DistroEngine mode).
-        let rootfs_image = {
-            let ext4_path = self.config.version_cache_dir().join(ROOTFS_EXT4_FILENAME);
-            if ext4_path.exists() {
-                Some(ext4_path)
-            } else {
-                None
-            }
-        };
+        let rootfs_image = self.config.version_cache_dir().join(ROOTFS_EXT4_FILENAME);
+        if !rootfs_image.exists() {
+            return Err(CoreError::config(format!(
+                "rootfs not found after download: {}",
+                rootfs_image.display()
+            )));
+        }
 
         Ok(BootAssets {
             kernel,
-            initramfs,
             rootfs_image,
             cmdline,
             version: self.config.version.clone(),
@@ -468,28 +398,6 @@ impl BootAssetProvider {
             Err(CoreError::config(format!(
                 "kernel not found after download: {}",
                 kernel_path.display()
-            )))
-        }
-    }
-
-    /// Gets initramfs path, downloading if needed.
-    async fn get_initramfs_path(&self, progress: &Option<ProgressCallback>) -> Result<PathBuf> {
-        let initramfs_path = self.config.version_cache_dir().join(INITRAMFS_FILENAME);
-
-        if initramfs_path.exists() {
-            tracing::debug!("Using cached initramfs: {}", initramfs_path.display());
-            return Ok(initramfs_path);
-        }
-
-        // Need to download assets.
-        self.download_assets(progress).await?;
-
-        if initramfs_path.exists() {
-            Ok(initramfs_path)
-        } else {
-            Err(CoreError::config(format!(
-                "initramfs not found after download: {}",
-                initramfs_path.display()
             )))
         }
     }
@@ -748,14 +656,6 @@ impl BootAssetProvider {
             )));
         }
 
-        let initramfs_path = cache_dir.join(INITRAMFS_FILENAME);
-        if !initramfs_path.exists() {
-            return Err(CoreError::config(format!(
-                "boot bundle missing required file: {}",
-                initramfs_path.display()
-            )));
-        }
-
         let manifest = self.require_manifest_from_dir(cache_dir).await?;
         tracing::info!(
             "Boot asset manifest loaded: version={}, arch={}, kernel_commit={}, agent_commit={}",
@@ -765,47 +665,14 @@ impl BootAssetProvider {
             manifest.agent_commit.as_deref().unwrap_or("unknown"),
         );
 
-        // schema_version 2-3 use rootfs.squashfs (squashfs rootfs architecture).
-        // schema_version 4+ replaced squashfs with ext4 block device rootfs.
-        if manifest.schema_version >= 2 && manifest.schema_version < 4 {
-            let squashfs_path = cache_dir.join(ROOTFS_SQUASHFS_FILENAME);
-            if !squashfs_path.exists() {
-                return Err(CoreError::config(format!(
-                    "boot bundle (schema_version={}) missing required file: {}. \
-                     Run 'arcbox boot prefetch --force' to re-download the asset bundle.",
-                    manifest.schema_version,
-                    squashfs_path.display()
-                )));
-            }
-        }
-
-        // schema_version 3 adds modloop (Alpine kernel modules squashfs).
-        // Stage 1 mounts this inside /newroot so Stage 2 has /lib/modules.
-        if manifest.schema_version >= 3 && manifest.schema_version < 4 {
-            let modloop_path = cache_dir.join(MODLOOP_FILENAME);
-            if !modloop_path.exists() {
-                return Err(CoreError::config(format!(
-                    "boot bundle (schema_version={}) missing required file: {}. \
-                     Run 'arcbox boot prefetch --force' to re-download the asset bundle.",
-                    manifest.schema_version,
-                    modloop_path.display()
-                )));
-            }
-        }
-
-        // schema_version 4 adds rootfs.ext4 (Alpine rootfs + OpenRC).
-        // The VMM attaches this as a VirtIO block device; initramfs mounts
-        // /dev/vda and switch_roots to /sbin/init (OpenRC).
-        if manifest.schema_version >= 4 {
-            let ext4_path = cache_dir.join(ROOTFS_EXT4_FILENAME);
-            if !ext4_path.exists() {
-                return Err(CoreError::config(format!(
-                    "boot bundle (schema_version={}) missing required file: {}. \
-                     Run 'arcbox boot prefetch --force' to re-download the asset bundle.",
-                    manifest.schema_version,
-                    ext4_path.display()
-                )));
-            }
+        let ext4_path = cache_dir.join(ROOTFS_EXT4_FILENAME);
+        if !ext4_path.exists() {
+            return Err(CoreError::config(format!(
+                "boot bundle (schema_version={}) missing required file: {}. \
+                 Run 'arcbox boot prefetch --force' to re-download the asset bundle.",
+                manifest.schema_version,
+                ext4_path.display()
+            )));
         }
 
         Ok(())
@@ -900,7 +767,7 @@ impl BootAssetProvider {
     pub fn is_cached(&self) -> bool {
         let cache_dir = self.config.version_cache_dir();
         cache_dir.join(KERNEL_FILENAME).exists()
-            && cache_dir.join(INITRAMFS_FILENAME).exists()
+            && cache_dir.join(ROOTFS_EXT4_FILENAME).exists()
             && cache_dir.join(MANIFEST_FILENAME).exists()
     }
 
@@ -1254,7 +1121,7 @@ mod tests {
   "kernel_commit": "abc123",
   "agent_commit": "def456",
   "built_at": "2026-02-17T00:00:00Z",
-  "kernel_cmdline": "console=hvc0 rdinit=/init quiet",
+  "kernel_cmdline": "console=hvc0 root=/dev/vda rw init=/sbin/init quiet",
   "runtime_assets": [
     {
       "name": "dockerd",
@@ -1281,7 +1148,7 @@ mod tests {
         assert_eq!(manifest.arch, "arm64");
         assert_eq!(
             manifest.kernel_cmdline.as_deref(),
-            Some("console=hvc0 rdinit=/init quiet")
+            Some("console=hvc0 root=/dev/vda rw init=/sbin/init quiet")
         );
         assert_eq!(manifest.runtime_assets.len(), 1);
         assert_eq!(manifest.runtime_assets[0].name, "dockerd");
@@ -1418,8 +1285,8 @@ mod tests {
         std::fs::write(version_dir.join(KERNEL_FILENAME), b"kernel").unwrap();
         assert!(!provider.is_cached());
 
-        // Kernel + initramfs but no manifest: not cached.
-        std::fs::write(version_dir.join(INITRAMFS_FILENAME), b"initramfs").unwrap();
+        // Kernel + rootfs.ext4 but no manifest: not cached.
+        std::fs::write(version_dir.join(ROOTFS_EXT4_FILENAME), b"rootfs").unwrap();
         assert!(!provider.is_cached());
 
         // All three files: cached.
