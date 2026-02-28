@@ -15,7 +15,7 @@
 //! ## Architecture
 //!
 //! ```text
-//! Guest: mount -t virtiofs arcbox /mnt/arcbox
+//! Guest: mount -t virtiofs <tag> /mnt/shared
 //!                    │
 //!                    ▼
 //! ┌─────────────────────────────────────────┐
@@ -74,7 +74,7 @@ pub struct FsConfig {
 impl Default for FsConfig {
     fn default() -> Self {
         Self {
-            tag: "arcbox".to_string(),
+            tag: String::new(),
             source: String::new(),
             num_threads: 4,
             writeback_cache: true,

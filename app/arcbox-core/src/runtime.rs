@@ -1,6 +1,5 @@
 //! ArcBox runtime.
 
-use crate::boot_assets::BootAssetManifest;
 use crate::config::Config;
 use crate::container_backend::{DynContainerBackend, create_backend};
 use crate::error::{CoreError, Result};
@@ -12,98 +11,14 @@ use arcbox_net::{
     NetworkManager,
     port_forward::{PortForwardRule, PortForwarder},
 };
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock as TokioRwLock;
 
 /// Default guest VM IP address in NAT network.
 const DEFAULT_GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 2);
-const REQUIRED_RUNTIME_ASSETS: [&str; 3] = ["dockerd", "containerd", "youki"];
-
-fn validate_bundled_runtime_manifest(manifest: &BootAssetManifest, cache_dir: &Path) -> Result<()> {
-    let mut missing = Vec::new();
-
-    for required in REQUIRED_RUNTIME_ASSETS {
-        let Some(entry) = manifest
-            .runtime_assets
-            .iter()
-            .find(|item| item.name == required)
-        else {
-            missing.push(required);
-            continue;
-        };
-
-        if entry
-            .version
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-        {
-            return Err(CoreError::config(format!(
-                "boot manifest runtime asset '{}' is missing version",
-                required
-            )));
-        }
-        let expected_sha = entry.sha256.as_deref().unwrap_or_default().trim();
-        if expected_sha.is_empty() {
-            return Err(CoreError::config(format!(
-                "boot manifest runtime asset '{}' is missing sha256",
-                required
-            )));
-        }
-
-        let relative_path = Path::new(&entry.path);
-        if relative_path.as_os_str().is_empty()
-            || relative_path.is_absolute()
-            || relative_path
-                .components()
-                .any(|c| matches!(c, Component::ParentDir))
-        {
-            return Err(CoreError::config(format!(
-                "boot manifest runtime asset '{}' has invalid path '{}'",
-                required, entry.path
-            )));
-        }
-
-        let runtime_path = cache_dir.join(relative_path);
-        if !runtime_path.exists() {
-            return Err(CoreError::config(format!(
-                "boot runtime asset '{}' missing from cache: {}",
-                required,
-                runtime_path.display()
-            )));
-        }
-
-        let bytes = std::fs::read(&runtime_path).map_err(|e| {
-            CoreError::config(format!(
-                "failed to read boot runtime asset '{}': {}",
-                runtime_path.display(),
-                e
-            ))
-        })?;
-        let actual_sha = format!("{:x}", Sha256::digest(&bytes));
-        if actual_sha != expected_sha {
-            return Err(CoreError::config(format!(
-                "boot runtime asset '{}' checksum mismatch: expected {}, got {}",
-                required, expected_sha, actual_sha
-            )));
-        }
-    }
-
-    if !missing.is_empty() {
-        return Err(CoreError::config(format!(
-            "boot manifest runtime_assets missing required entries: {}",
-            missing.join(", ")
-        )));
-    }
-
-    Ok(())
-}
 
 pub struct Runtime {
     /// Configuration.
@@ -300,20 +215,6 @@ impl Runtime {
         tokio::fs::create_dir_all(&self.config.data_dir).await?;
         tokio::fs::create_dir_all(self.config.data_dir.join("vms")).await?;
         tokio::fs::create_dir_all(self.config.data_dir.join("machines")).await?;
-
-        if matches!(
-            self.config.container.provision,
-            crate::config::ContainerProvisionMode::BundledAssets
-        ) {
-            let boot_assets = self.vm_lifecycle.boot_assets().get_assets().await?;
-            let manifest = boot_assets.manifest.as_ref().ok_or_else(|| {
-                CoreError::config(
-                    "guest_docker + bundled_assets requires boot manifest with runtime_assets",
-                )
-            })?;
-            let cache_dir = self.vm_lifecycle.boot_assets().config().version_cache_dir();
-            validate_bundled_runtime_manifest(manifest, &cache_dir)?;
-        }
 
         self.ensure_vm_ready().await?;
 
@@ -519,91 +420,9 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
-    use super::{Runtime, validate_bundled_runtime_manifest};
-    use crate::boot_assets::{BootAssetManifest, RuntimeAssetManifestEntry};
+    use super::Runtime;
     use crate::config::Config;
-    use bytes::Bytes;
-    use sha2::{Digest, Sha256};
     use std::path::PathBuf;
-
-    fn runtime_entry(name: &str, content: &[u8]) -> RuntimeAssetManifestEntry {
-        RuntimeAssetManifestEntry {
-            name: name.to_string(),
-            path: format!("runtime/bin/{}", name),
-            version: Some("test-version".to_string()),
-            sha256: Some(format!("{:x}", Sha256::digest(content))),
-        }
-    }
-
-    #[test]
-    fn test_validate_bundled_runtime_manifest_ok() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let runtime_dir = temp_dir.path().join("runtime/bin");
-        std::fs::create_dir_all(&runtime_dir).unwrap();
-
-        std::fs::write(runtime_dir.join("dockerd"), b"dockerd-bin").unwrap();
-        std::fs::write(runtime_dir.join("containerd"), b"containerd-bin").unwrap();
-        std::fs::write(runtime_dir.join("youki"), b"youki-bin").unwrap();
-
-        let manifest = BootAssetManifest {
-            schema_version: 1,
-            asset_version: "test".to_string(),
-            arch: "arm64".to_string(),
-            kernel_commit: None,
-            agent_commit: None,
-            built_at: None,
-            kernel_cmdline: None,
-            runtime_assets: vec![
-                runtime_entry("dockerd", b"dockerd-bin"),
-                runtime_entry("containerd", b"containerd-bin"),
-                runtime_entry("youki", b"youki-bin"),
-            ],
-            rootfs_squashfs_sha256: None,
-            modloop_sha256: None,
-            rootfs_ext4_sha256: None,
-        };
-
-        let result = validate_bundled_runtime_manifest(&manifest, temp_dir.path());
-        assert!(
-            result.is_ok(),
-            "expected validation success, got {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_validate_bundled_runtime_manifest_missing_entry() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let runtime_dir = temp_dir.path().join("runtime/bin");
-        std::fs::create_dir_all(&runtime_dir).unwrap();
-        std::fs::write(runtime_dir.join("dockerd"), b"dockerd-bin").unwrap();
-        std::fs::write(runtime_dir.join("containerd"), b"containerd-bin").unwrap();
-
-        let manifest = BootAssetManifest {
-            schema_version: 1,
-            asset_version: "test".to_string(),
-            arch: "arm64".to_string(),
-            kernel_commit: None,
-            agent_commit: None,
-            built_at: None,
-            kernel_cmdline: None,
-            runtime_assets: vec![
-                runtime_entry("dockerd", b"dockerd-bin"),
-                runtime_entry("containerd", b"containerd-bin"),
-            ],
-            rootfs_squashfs_sha256: None,
-            modloop_sha256: None,
-            rootfs_ext4_sha256: None,
-        };
-
-        let err = validate_bundled_runtime_manifest(&manifest, temp_dir.path()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("runtime_assets missing required entries"),
-            "unexpected error: {}",
-            err
-        );
-    }
 
     #[test]
     fn test_runtime_new_propagates_config_vm_defaults() {

@@ -430,7 +430,7 @@ pub struct FsConfig {
 impl Default for FsConfig {
     fn default() -> Self {
         Self {
-            tag: "arcbox".to_string(),
+            tag: String::new(),
             num_queues: 1,
             queue_size: 1024,
             shared_dir: String::new(),
@@ -814,7 +814,7 @@ mod tests {
     #[test]
     fn test_fs_config_default() {
         let config = FsConfig::default();
-        assert_eq!(config.tag, "arcbox");
+        assert!(config.tag.is_empty());
         assert_eq!(config.num_queues, 1);
         assert_eq!(config.queue_size, 1024);
         assert!(config.shared_dir.is_empty());
@@ -854,7 +854,7 @@ mod tests {
     #[test]
     fn test_fs_new() {
         let fs = VirtioFs::new(FsConfig::default());
-        assert_eq!(fs.tag(), "arcbox");
+        assert_eq!(fs.tag(), "");
         assert!(fs.shared_dir().is_empty());
     }
 
