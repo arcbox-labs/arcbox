@@ -45,6 +45,11 @@ impl NetworkManager {
     /// `cidr` must be in `a.b.c.d/n` notation (e.g. `"172.20.0.0/16"`).
     pub fn new(bridge: &str, cidr: &str, gateway: &str, dns: Vec<String>) -> Result<Self> {
         let (base, prefix_len) = parse_cidr(cidr)?;
+        if !(1..=30).contains(&prefix_len) {
+            return Err(VmmError::Network(format!(
+                "prefix length {prefix_len} out of range 1–30"
+            )));
+        }
         let gateway = gateway
             .parse::<Ipv4Addr>()
             .map_err(|e| VmmError::Network(format!("invalid gateway: {e}")))?;
@@ -101,17 +106,18 @@ impl NetworkManager {
     // -------------------------------------------------------------------------
 
     fn next_ip(&self) -> Result<Ipv4Addr> {
-        let base = u32::from(self.base);
-        let mask = !((1u32 << (32 - self.prefix_len)) - 1);
-        let host_max = (1u32 << (32 - self.prefix_len)) - 2; // exclude network + broadcast
+        // prefix_len is validated to 1..=30 in new(), so shifts are safe.
+        let host_bits = 32 - u32::from(self.prefix_len);
+        let mask = !((1u32 << host_bits) - 1);
+        let host_max = (1u32 << host_bits) - 2; // excludes network address (0) and broadcast
+
+        // Mask away any host bits so arithmetic stays within the subnet.
+        let network_base = u32::from(self.base) & mask;
 
         let mut allocated = self.allocated.lock().unwrap();
-        // Start from .2 (skip network address and gateway at .1)
+        // offset 0 = network address, 1 = gateway; start at 2.
         for offset in 2..=host_max {
-            let candidate = base | offset;
-            if (candidate & mask) != (base & mask) {
-                break;
-            }
+            let candidate = network_base + offset;
             if !allocated.contains(&candidate) {
                 allocated.insert(candidate);
                 return Ok(Ipv4Addr::from(candidate));
@@ -236,5 +242,23 @@ mod tests {
     fn test_mac_deterministic() {
         assert_eq!(mac_from_vm_id("abc"), mac_from_vm_id("abc"));
         assert_ne!(mac_from_vm_id("abc"), mac_from_vm_id("xyz"));
+    }
+
+    #[test]
+    fn test_invalid_prefix_len_rejected() {
+        assert!(NetworkManager::new("br0", "10.0.0.0/0", "10.0.0.1", vec![]).is_err());
+        assert!(NetworkManager::new("br0", "10.0.0.0/31", "10.0.0.1", vec![]).is_err());
+        assert!(NetworkManager::new("br0", "10.0.0.0/32", "10.0.0.1", vec![]).is_err());
+        assert!(NetworkManager::new("br0", "10.0.0.0/24", "10.0.0.1", vec![]).is_ok());
+    }
+
+    #[test]
+    fn test_next_ip_respects_subnet_boundary() {
+        // /30 has exactly 2 host addresses (.1 gateway, .2 first usable)
+        let mgr = NetworkManager::new("br0", "10.0.0.0/30", "10.0.0.1", vec![]).unwrap();
+        let a = mgr.allocate("vm-1").unwrap();
+        assert_eq!(a.ip_address, "10.0.0.2".parse::<Ipv4Addr>().unwrap());
+        // Pool is now exhausted
+        assert!(mgr.allocate("vm-2").is_err());
     }
 }
