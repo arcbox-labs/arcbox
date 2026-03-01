@@ -220,8 +220,29 @@ fn mac_from_vm_id(vm_id: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Returns true when the process effective UID is 0.
+    /// TAP creation requires root on Linux; tests that call `allocate()` skip
+    /// when this returns false.
+    #[cfg(target_os = "linux")]
+    fn is_root() -> bool {
+        std::fs::read_to_string("/proc/self/status")
+            .map(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("Uid:"))
+                    .and_then(|l| l.split_whitespace().nth(2))
+                    .map(|uid| uid == "0")
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
     #[test]
     fn test_allocate_sequential_ips() {
+        #[cfg(target_os = "linux")]
+        if !is_root() {
+            eprintln!("SKIP test_allocate_sequential_ips — requires root (TAP creation)");
+            return;
+        }
         let mgr = NetworkManager::new("fcvmm0", "172.20.0.0/16", "172.20.0.1", vec![]).unwrap();
         let a1 = mgr.allocate("vm-1").unwrap();
         let a2 = mgr.allocate("vm-2").unwrap();
@@ -230,6 +251,11 @@ mod tests {
 
     #[test]
     fn test_release_returns_ip_to_pool() {
+        #[cfg(target_os = "linux")]
+        if !is_root() {
+            eprintln!("SKIP test_release_returns_ip_to_pool — requires root (TAP creation)");
+            return;
+        }
         let mgr = NetworkManager::new("fcvmm0", "172.20.0.0/16", "172.20.0.1", vec![]).unwrap();
         let a1 = mgr.allocate("vm-1").unwrap();
         let first_ip = a1.ip_address;
@@ -254,6 +280,11 @@ mod tests {
 
     #[test]
     fn test_next_ip_respects_subnet_boundary() {
+        #[cfg(target_os = "linux")]
+        if !is_root() {
+            eprintln!("SKIP test_next_ip_respects_subnet_boundary — requires root (TAP creation)");
+            return;
+        }
         // /30 has exactly 2 host addresses (.1 gateway, .2 first usable)
         let mgr = NetworkManager::new("br0", "10.0.0.0/30", "10.0.0.1", vec![]).unwrap();
         let a = mgr.allocate("vm-1").unwrap();
@@ -264,6 +295,11 @@ mod tests {
 
     #[test]
     fn test_pool_exhaustion_on_slash29() {
+        #[cfg(target_os = "linux")]
+        if !is_root() {
+            eprintln!("SKIP test_pool_exhaustion_on_slash29 — requires root (TAP creation)");
+            return;
+        }
         // /29 has 6 usable addresses; gateway takes offset 1, leaving 5 for VMs.
         let mgr = NetworkManager::new("br0", "10.0.0.0/29", "10.0.0.1", vec![]).unwrap();
         for i in 0..5 {
