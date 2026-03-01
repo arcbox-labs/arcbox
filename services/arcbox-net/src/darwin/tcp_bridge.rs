@@ -29,6 +29,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::time::Instant as StdInstant;
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::iface::{Interface, SocketSet};
@@ -36,7 +37,11 @@ use smoltcp::socket::tcp;
 use smoltcp::wire::IpEndpoint;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::darwin::smoltcp_device::{SmoltcpDevice, TcpSynInfo};
+use crate::ethernet::ETH_HEADER_LEN;
+use crate::nat_engine::checksum;
 
 /// Size of each smoltcp socket's rx/tx buffer. 256 KiB enables window scaling
 /// and provides enough headroom for high-bandwidth transfers.
@@ -58,6 +63,50 @@ const GUEST_TO_HOST_CHANNEL: usize = 64;
 const INBOUND_EPHEMERAL_START: u16 = 61000;
 /// End of the inbound ephemeral port range (inclusive).
 const INBOUND_EPHEMERAL_END: u16 = 65535;
+
+/// Maximum number of concurrent pending SYN gate entries. Prevents SYN flood
+/// from exhausting resources.
+const MAX_PENDING_SYNS: usize = 256;
+
+/// Timeout for host-side `TcpStream::connect` during SYN gate (seconds).
+const SYN_GATE_CONNECT_TIMEOUT_SECS: u64 = 5;
+
+/// TTL for pre-connected streams waiting to be consumed by
+/// `detect_new_connections`. If the guest doesn't retransmit SYN within this
+/// window, the stream is dropped.
+const PRE_CONNECTED_TTL_SECS: u64 = 10;
+
+/// Full four-tuple key for deduplicating SYN gate entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SynFlowKey {
+    src_ip: Ipv4Addr,
+    src_port: u16,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+}
+
+/// A TCP SYN waiting for host connect to complete before being injected into
+/// smoltcp.
+struct PendingSyn {
+    /// The original SYN frame to inject on success.
+    frame: Vec<u8>,
+    /// Initial sequence number from the SYN — used to detect new connection
+    /// attempts that reuse the same four-tuple but with a different ISN.
+    syn_seq: u32,
+    /// Receives the connected `TcpStream` on success, or `None` on failure.
+    result_rx: oneshot::Receiver<Option<tokio::net::TcpStream>>,
+    /// When this pending entry was created.
+    created: StdInstant,
+}
+
+/// A successfully connected host stream waiting for smoltcp to establish the
+/// guest-side connection so detect_new_connections can pick it up.
+struct PreConnected {
+    stream: tokio::net::TcpStream,
+    /// ISN from the SYN that triggered this connect, for strict matching.
+    syn_seq: u32,
+    created: StdInstant,
+}
 
 /// Tracks a single TCP connection bridged between smoltcp and a host TcpStream.
 ///
@@ -98,6 +147,11 @@ pub struct TcpBridge {
     port_handles: HashMap<u16, Vec<SocketHandle>>,
     /// Next inbound ephemeral port to allocate (wraps within 61000-65535).
     next_ephemeral: u16,
+    /// SYN gate: pending host connects keyed by four-tuple.
+    pending_syns: HashMap<SynFlowKey, PendingSyn>,
+    /// Pre-connected host streams ready for detect_new_connections to consume.
+    /// Keyed by four-tuple so the correct stream is matched to its connection.
+    pre_connected: HashMap<SynFlowKey, PreConnected>,
 }
 
 impl Default for TcpBridge {
@@ -114,6 +168,8 @@ impl TcpBridge {
             free_handles: Vec::new(),
             port_handles: HashMap::new(),
             next_ephemeral: INBOUND_EPHEMERAL_START,
+            pending_syns: HashMap::new(),
+            pre_connected: HashMap::new(),
         }
     }
 
@@ -160,6 +216,244 @@ impl TcpBridge {
 
             tracing::debug!("TCP bridge: listen socket created for port {port}");
         }
+    }
+
+    /// Processes gated TCP SYN frames: spawns a host connect task for each new
+    /// SYN, deduplicates retransmissions, and detects ISN changes.
+    ///
+    /// Called from the datapath loop with newly gated SYNs from SmoltcpDevice.
+    /// Returns RST frames for SYNs rejected due to capacity limits.
+    pub fn gate_syns(&mut self, syns: &[TcpSynInfo], gateway_mac: [u8; 6]) -> Vec<Vec<u8>> {
+        let mut rst_frames = Vec::new();
+
+        for syn in syns {
+            let key = SynFlowKey {
+                src_ip: syn.src_ip,
+                src_port: syn.src_port,
+                dst_ip: syn.dst_ip,
+                dst_port: syn.dst_port,
+            };
+
+            // Check for existing pending entry.
+            if let Some(existing) = self.pending_syns.get(&key) {
+                if existing.syn_seq == syn.syn_seq {
+                    tracing::debug!("TCP SYN gate: retransmit dropped for {key:?}");
+                    continue;
+                }
+                // Different ISN = new connection attempt, remove stale entry.
+                tracing::debug!("TCP SYN gate: ISN changed for {key:?}, replacing pending");
+                self.pending_syns.remove(&key);
+            }
+
+            // Check pre_connected: same ISN = retransmit (SYN will be injected
+            // on next poll), different ISN = guest retried with new connection.
+            if let Some(pre) = self.pre_connected.get(&key) {
+                if pre.syn_seq == syn.syn_seq {
+                    tracing::debug!(
+                        "TCP SYN gate: retransmit dropped (pre-connected exists) for {key:?}"
+                    );
+                    continue;
+                }
+                tracing::debug!(
+                    "TCP SYN gate: ISN changed for {key:?}, evicting stale pre-connected stream"
+                );
+                self.pre_connected.remove(&key);
+            }
+
+            // Capacity check — send RST instead of silent drop.
+            if self.pending_syns.len() >= MAX_PENDING_SYNS {
+                tracing::warn!("TCP SYN gate: capacity limit reached, sending RST for {key:?}");
+                if let Some(rst) = build_rst_from_syn(&syn.frame, gateway_mac) {
+                    rst_frames.push(rst);
+                }
+                continue;
+            }
+
+            let dst_addr = SocketAddr::V4(SocketAddrV4::new(syn.dst_ip, syn.dst_port));
+
+            let (result_tx, result_rx) = oneshot::channel();
+
+            // Spawn host connect task.
+            tokio::spawn(async move {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(SYN_GATE_CONNECT_TIMEOUT_SECS),
+                    tokio::net::TcpStream::connect(dst_addr),
+                )
+                .await;
+
+                let stream = match result {
+                    Ok(Ok(s)) => {
+                        tracing::debug!("TCP SYN gate: connected to {dst_addr}");
+                        Some(s)
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!("TCP SYN gate: connect to {dst_addr} failed: {e}");
+                        None
+                    }
+                    Err(_) => {
+                        tracing::debug!("TCP SYN gate: connect to {dst_addr} timed out");
+                        None
+                    }
+                };
+                let _ = result_tx.send(stream);
+            });
+
+            self.pending_syns.insert(
+                key,
+                PendingSyn {
+                    frame: syn.frame.clone(),
+                    syn_seq: syn.syn_seq,
+                    result_rx,
+                    created: StdInstant::now(),
+                },
+            );
+
+            tracing::debug!(
+                "TCP SYN gate: host connect started for {}:{} → {}:{}",
+                syn.src_ip,
+                syn.src_port,
+                syn.dst_ip,
+                syn.dst_port,
+            );
+        }
+
+        rst_frames
+    }
+
+    /// Polls pending SYN gate entries and processes results.
+    ///
+    /// - Success: injects the SYN frame into SmoltcpDevice, creates a listen
+    ///   socket, and stores the pre-connected stream.
+    /// - Failure: constructs an RST|ACK frame and queues it for the guest.
+    /// - Timeout: cleans up expired entries.
+    ///
+    /// Returns RST frames that should be written to the guest.
+    pub fn poll_pending_syns(
+        &mut self,
+        device: &mut SmoltcpDevice,
+        sockets: &mut SocketSet<'_>,
+        gateway_mac: [u8; 6],
+    ) -> Vec<Vec<u8>> {
+        let mut rst_frames = Vec::new();
+        let mut completed = Vec::new();
+
+        for (key, pending) in &mut self.pending_syns {
+            // Check if the oneshot has a result (non-blocking).
+            match pending.result_rx.try_recv() {
+                Ok(Some(stream)) => {
+                    // Host connect succeeded. Inject the SYN frame and create
+                    // a listen socket so smoltcp can process the handshake.
+                    completed.push((*key, Some(stream)));
+                }
+                Ok(None) => {
+                    // Host connect failed. Send RST|ACK to guest.
+                    completed.push((*key, None));
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    // Still waiting. Check deadline.
+                    if pending.created.elapsed()
+                        > std::time::Duration::from_secs(SYN_GATE_CONNECT_TIMEOUT_SECS + 1)
+                    {
+                        // Task probably leaked, clean up.
+                        completed.push((*key, None));
+                    }
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    // Sender dropped without sending (task panicked).
+                    completed.push((*key, None));
+                }
+            }
+        }
+
+        for (key, result) in completed {
+            let pending = self.pending_syns.remove(&key).unwrap();
+            match result {
+                Some(stream) => {
+                    // 1. Ensure listen socket for the port.
+                    if !self.ensure_listen_socket_for_port(key.dst_port, sockets) {
+                        // Listen failed — send RST instead of injecting SYN.
+                        if let Some(rst) = build_rst_from_syn(&pending.frame, gateway_mac) {
+                            rst_frames.push(rst);
+                            tracing::debug!(
+                                "TCP SYN gate: listen failed, sending RST for {key:?}"
+                            );
+                        }
+                        continue;
+                    }
+
+                    // 2. Inject the original SYN frame.
+                    device.inject_rx(pending.frame);
+
+                    // 3. Store the pre-connected stream.
+                    self.pre_connected.insert(
+                        key,
+                        PreConnected {
+                            stream,
+                            syn_seq: pending.syn_seq,
+                            created: StdInstant::now(),
+                        },
+                    );
+
+                    tracing::debug!(
+                        "TCP SYN gate: injected SYN + stored pre-connected stream for {key:?}"
+                    );
+                }
+                None => {
+                    // Build RST|ACK from the original SYN frame.
+                    if let Some(rst) = build_rst_from_syn(&pending.frame, gateway_mac) {
+                        rst_frames.push(rst);
+                        tracing::debug!("TCP SYN gate: sending RST for failed connect {key:?}");
+                    }
+                }
+            }
+        }
+
+        // Expire stale pre-connected streams.
+        self.pre_connected.retain(|key, pre| {
+            if pre.created.elapsed() > std::time::Duration::from_secs(PRE_CONNECTED_TTL_SECS) {
+                tracing::debug!("TCP SYN gate: pre-connected stream expired for {key:?}");
+                false
+            } else {
+                true
+            }
+        });
+
+        rst_frames
+    }
+
+    /// Creates a listen socket for a single port (used by SYN gate).
+    ///
+    /// Returns `true` if a listen socket is now available for `port`.
+    fn ensure_listen_socket_for_port(&mut self, port: u16, sockets: &mut SocketSet<'_>) -> bool {
+        if self.listening_ports.contains(&port) {
+            return true;
+        }
+
+        let handle = if let Some(h) = self.free_handles.pop() {
+            let sock = sockets.get_mut::<tcp::Socket>(h);
+            if let Err(e) = sock.listen(port) {
+                tracing::warn!("TCP bridge: failed to re-listen on port {port}: {e:?}");
+                return false;
+            }
+            sock.set_nagle_enabled(false);
+            h
+        } else {
+            let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+            let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+            let mut sock = tcp::Socket::new(rx_buf, tx_buf);
+            if let Err(e) = sock.listen(port) {
+                tracing::warn!("TCP bridge: failed to listen on port {port}: {e:?}");
+                return false;
+            }
+            sock.set_nagle_enabled(false);
+            sock.set_ack_delay(None);
+            sockets.add(sock)
+        };
+
+        self.listening_ports.insert(port);
+        self.port_handles.entry(port).or_default().push(handle);
+        tracing::debug!("TCP bridge: listen socket created for port {port}");
+        true
     }
 
     /// Initiates an inbound TCP connection: creates a smoltcp socket that
@@ -246,7 +540,10 @@ impl TcpBridge {
     }
 
     /// Detects smoltcp sockets that have transitioned from Listen to an active
-    /// state (SYN received), and opens host TcpStream connections for them.
+    /// state (SYN received), and sets up host relay for them.
+    ///
+    /// For outbound connections: uses a pre-connected stream from the SYN gate
+    /// (matched by four-tuple), or falls back to spawning a new host connect.
     fn detect_new_connections(&mut self, sockets: &mut SocketSet<'_>) {
         // Collect ports to scan: only ports we know have listen sockets.
         let ports: Vec<u16> = self.listening_ports.iter().copied().collect();
@@ -279,16 +576,34 @@ impl TcpBridge {
                 let remote_addr = endpoint_to_sockaddr(remote_ep);
                 let dest_addr = endpoint_to_sockaddr(local_ep);
 
-                tracing::debug!(
-                    "TCP bridge: new connection detected  guest:{remote_addr} → {dest_addr}"
-                );
+                // Build four-tuple key to look up pre-connected stream.
+                let flow_key = SynFlowKey {
+                    src_ip: match remote_ep.addr {
+                        smoltcp::wire::IpAddress::Ipv4(v4) => v4,
+                    },
+                    src_port: remote_ep.port,
+                    dst_ip: match local_ep.addr {
+                        smoltcp::wire::IpAddress::Ipv4(v4) => v4,
+                    },
+                    dst_port: local_ep.port,
+                };
 
                 // Create channels for host↔guest data bridging.
                 let (h2g_tx, h2g_rx) = mpsc::channel::<Vec<u8>>(HOST_TO_GUEST_CHANNEL);
                 let (g2h_tx, g2h_rx) = mpsc::channel::<Vec<u8>>(GUEST_TO_HOST_CHANNEL);
 
-                // Spawn host connection task.
-                tokio::spawn(host_conn_task(dest_addr, h2g_tx, g2h_rx));
+                // Try to use a pre-connected stream from the SYN gate.
+                if let Some(pre) = self.pre_connected.remove(&flow_key) {
+                    tracing::debug!(
+                        "TCP bridge: using pre-connected stream for guest:{remote_addr} → {dest_addr}"
+                    );
+                    tokio::spawn(inbound_host_relay(pre.stream, h2g_tx, g2h_rx));
+                } else {
+                    tracing::debug!(
+                        "TCP bridge: no pre-connected stream, spawning connect for guest:{remote_addr} → {dest_addr}"
+                    );
+                    tokio::spawn(host_conn_task(dest_addr, h2g_tx, g2h_rx));
+                }
 
                 self.connections.insert(
                     handle,
@@ -527,6 +842,88 @@ impl TcpBridge {
     }
 }
 
+/// Constructs an RST|ACK Ethernet frame in response to a SYN frame.
+///
+/// The RST has: seq=0, ack=syn_seq+1, flags=RST|ACK.
+/// MAC addresses are swapped (gateway MAC as source, original source as dest).
+/// IP addresses are swapped. Ports are swapped.
+fn build_rst_from_syn(syn_frame: &[u8], gateway_mac: [u8; 6]) -> Option<Vec<u8>> {
+    let ip_start = ETH_HEADER_LEN;
+    if syn_frame.len() < ip_start + 40 {
+        return None;
+    }
+
+    let ihl = ((syn_frame[ip_start] & 0x0F) as usize) * 4;
+    let l4_start = ip_start + ihl;
+    if l4_start + 20 > syn_frame.len() {
+        return None;
+    }
+
+    // Extract from original SYN.
+    let src_mac = &syn_frame[6..12];
+    let syn_src_ip = [
+        syn_frame[ip_start + 12],
+        syn_frame[ip_start + 13],
+        syn_frame[ip_start + 14],
+        syn_frame[ip_start + 15],
+    ];
+    let syn_dst_ip = [
+        syn_frame[ip_start + 16],
+        syn_frame[ip_start + 17],
+        syn_frame[ip_start + 18],
+        syn_frame[ip_start + 19],
+    ];
+    let syn_src_port = u16::from_be_bytes([syn_frame[l4_start], syn_frame[l4_start + 1]]);
+    let syn_dst_port = u16::from_be_bytes([syn_frame[l4_start + 2], syn_frame[l4_start + 3]]);
+    let syn_seq = u32::from_be_bytes([
+        syn_frame[l4_start + 4],
+        syn_frame[l4_start + 5],
+        syn_frame[l4_start + 6],
+        syn_frame[l4_start + 7],
+    ]);
+
+    // Build RST|ACK: ETH(14) + IP(20) + TCP(20) = 54 bytes.
+    let mut frame = vec![0u8; ETH_HEADER_LEN + 40];
+
+    // Ethernet header: dst=original src MAC, src=gateway MAC.
+    frame[0..6].copy_from_slice(src_mac);
+    frame[6..12].copy_from_slice(&gateway_mac);
+    frame[12..14].copy_from_slice(&[0x08, 0x00]); // IPv4
+
+    // IPv4 header (swapped IPs).
+    let ip = ETH_HEADER_LEN;
+    frame[ip] = 0x45; // version=4, IHL=5
+    frame[ip + 2..ip + 4].copy_from_slice(&40u16.to_be_bytes()); // total length
+    frame[ip + 6..ip + 8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF flag
+    frame[ip + 8] = 64; // TTL
+    frame[ip + 9] = 6; // TCP
+    // src = original dst, dst = original src (we're the "server" responding).
+    frame[ip + 12..ip + 16].copy_from_slice(&syn_dst_ip);
+    frame[ip + 16..ip + 20].copy_from_slice(&syn_src_ip);
+    // IP checksum.
+    let ip_cksum = checksum::ipv4_header_checksum(&frame[ip..ip + 20]);
+    frame[ip + 10..ip + 12].copy_from_slice(&ip_cksum.to_be_bytes());
+
+    // TCP header (swapped ports).
+    let tcp_start = ip + 20;
+    frame[tcp_start..tcp_start + 2].copy_from_slice(&syn_dst_port.to_be_bytes()); // src port
+    frame[tcp_start + 2..tcp_start + 4].copy_from_slice(&syn_src_port.to_be_bytes()); // dst port
+    // seq = 0
+    frame[tcp_start + 4..tcp_start + 8].copy_from_slice(&0u32.to_be_bytes());
+    // ack = syn_seq + 1
+    frame[tcp_start + 8..tcp_start + 12].copy_from_slice(&(syn_seq.wrapping_add(1)).to_be_bytes());
+    frame[tcp_start + 12] = 0x50; // data offset = 5 (20 bytes)
+    frame[tcp_start + 13] = 0x14; // RST|ACK
+    frame[tcp_start + 14..tcp_start + 16].copy_from_slice(&0u16.to_be_bytes()); // window = 0
+
+    // TCP checksum.
+    let tcp_cksum =
+        checksum::tcp_checksum(syn_dst_ip, syn_src_ip, &frame[tcp_start..tcp_start + 20]);
+    frame[tcp_start + 16..tcp_start + 18].copy_from_slice(&tcp_cksum.to_be_bytes());
+
+    Some(frame)
+}
+
 /// Host connection task: connects to the remote server and bridges data
 /// through channels back to the smoltcp poll loop.
 async fn host_conn_task(
@@ -534,6 +931,7 @@ async fn host_conn_task(
     h2g_tx: mpsc::Sender<Vec<u8>>,
     mut g2h_rx: mpsc::Receiver<Vec<u8>>,
 ) {
+    let connect_started = StdInstant::now();
     tracing::debug!("TCP bridge: host_conn_task started for {remote}");
     // Connect to the remote host.
     let stream = match tokio::time::timeout(
@@ -544,17 +942,26 @@ async fn host_conn_task(
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            tracing::debug!("TCP bridge: connect to {remote} failed: {e}");
+            tracing::debug!(
+                "TCP bridge: connect to {remote} failed after {:?}: {e}",
+                connect_started.elapsed()
+            );
             // Drop h2g_tx — bridge will detect Disconnected and abort.
             return;
         }
         Err(_) => {
-            tracing::debug!("TCP bridge: connect to {remote} timed out");
+            tracing::debug!(
+                "TCP bridge: connect to {remote} timed out after {:?}",
+                connect_started.elapsed()
+            );
             return;
         }
     };
 
-    tracing::debug!("TCP bridge: connected to {remote}");
+    tracing::debug!(
+        "TCP bridge: connected to {remote} in {:?}",
+        connect_started.elapsed()
+    );
 
     let (mut reader, mut writer) = stream.into_split();
 
@@ -571,9 +978,7 @@ async fn host_conn_task(
                         break;
                     }
                     Ok(n) => {
-                        tracing::debug!(
-                            "TCP bridge: host read {n} bytes from {remote}"
-                        );
+                        tracing::debug!("TCP bridge: host read {n} bytes from {remote}");
                         if h2g_tx.send(buf[..n].to_vec()).await.is_err() {
                             break;
                         }
@@ -593,8 +998,10 @@ async fn host_conn_task(
             if data.is_empty() {
                 // Guest closed connection.
                 let _ = writer.shutdown().await;
+                tracing::debug!("TCP bridge: host writer got guest EOF for {remote}");
                 break;
             }
+            tracing::debug!("TCP bridge: host write {} bytes to {remote}", data.len());
             if let Err(e) = writer.write_all(&data).await {
                 tracing::debug!("TCP bridge: host write error for {remote}: {e}");
                 break;
@@ -767,7 +1174,24 @@ mod tests {
         let (_iface, mut sockets) = make_iface_and_sockets(&mut device);
         let mut bridge = TcpBridge::new();
 
-        let syns = vec![TcpSynInfo { dst_port: 443 }, TcpSynInfo { dst_port: 80 }];
+        let syns = vec![
+            TcpSynInfo {
+                dst_port: 443,
+                src_ip: GUEST_IP,
+                src_port: 1000,
+                dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+                syn_seq: 0,
+                frame: vec![],
+            },
+            TcpSynInfo {
+                dst_port: 80,
+                src_ip: GUEST_IP,
+                src_port: 1001,
+                dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+                syn_seq: 0,
+                frame: vec![],
+            },
+        ];
 
         bridge.ensure_listen_sockets(&syns, &mut sockets);
 
@@ -783,7 +1207,14 @@ mod tests {
         let (_iface, mut sockets) = make_iface_and_sockets(&mut device);
         let mut bridge = TcpBridge::new();
 
-        let syns = vec![TcpSynInfo { dst_port: 443 }];
+        let syns = vec![TcpSynInfo {
+            dst_port: 443,
+            src_ip: GUEST_IP,
+            src_port: 1000,
+            dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+            syn_seq: 0,
+            frame: vec![],
+        }];
         bridge.ensure_listen_sockets(&syns, &mut sockets);
         bridge.ensure_listen_sockets(&syns, &mut sockets);
 
@@ -797,7 +1228,14 @@ mod tests {
         let mut bridge = TcpBridge::new();
 
         // Ensure a listen socket for port 443.
-        let syns = vec![TcpSynInfo { dst_port: 443 }];
+        let syns = vec![TcpSynInfo {
+            dst_port: 443,
+            src_ip: GUEST_IP,
+            src_port: 1000,
+            dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+            syn_seq: 0,
+            frame: vec![],
+        }];
         bridge.ensure_listen_sockets(&syns, &mut sockets);
 
         // First, inject an ARP request from the guest to populate smoltcp's
@@ -944,7 +1382,14 @@ mod tests {
         let mut bridge = TcpBridge::new();
 
         // Create a listen socket for port 443.
-        let syns = vec![TcpSynInfo { dst_port: 443 }];
+        let syns = vec![TcpSynInfo {
+            dst_port: 443,
+            src_ip: GUEST_IP,
+            src_port: 1000,
+            dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+            syn_seq: 0,
+            frame: vec![],
+        }];
         bridge.ensure_listen_sockets(&syns, &mut sockets);
 
         assert!(bridge.port_handles.contains_key(&443));
@@ -1056,5 +1501,288 @@ mod tests {
             sock.state()
         );
         assert_eq!(conn.remote, SocketAddr::V4(SocketAddrV4::new(GUEST_IP, 80)));
+    }
+
+    #[tokio::test]
+    async fn syn_gate_connect_success_injects_syn() {
+        let mut device = SmoltcpDevice::new(0, GW_IP);
+        let (_iface, mut sockets) = make_iface_and_sockets(&mut device);
+        let mut bridge = TcpBridge::new();
+
+        // Start a local TCP listener so the connect succeeds.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Build a SYN frame targeting the local listener.
+        let syn = make_syn_frame(addr.ip().to_string().parse().unwrap(), addr.port());
+        let syn_info = TcpSynInfo {
+            dst_port: addr.port(),
+            src_ip: GUEST_IP,
+            src_port: 12345,
+            dst_ip: addr.ip().to_string().parse().unwrap(),
+            syn_seq: 1000,
+            frame: syn.clone(),
+        };
+
+        // Gate the SYN — this spawns a connect task.
+        bridge.gate_syns(&[syn_info], GW_MAC);
+        assert_eq!(bridge.pending_syns.len(), 1);
+
+        // Accept the connection on the listener side.
+        let _accepted = listener.accept().await.unwrap();
+
+        // Allow the connect task to complete.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Poll pending SYNs — should inject frame and store pre-connected stream.
+        let rst_frames = bridge.poll_pending_syns(&mut device, &mut sockets, GW_MAC);
+        assert!(
+            rst_frames.is_empty(),
+            "No RST should be generated on success"
+        );
+        assert!(bridge.pending_syns.is_empty(), "Pending should be consumed");
+        assert_eq!(
+            bridge.pre_connected.len(),
+            1,
+            "Should have pre-connected stream"
+        );
+
+        // The SYN frame should have been injected into device rx_queue.
+        assert_eq!(device.take_tx_pending().len(), 0); // TX is separate
+        // A listen socket should have been created for the port.
+        assert!(bridge.listening_ports.contains(&addr.port()));
+    }
+
+    #[tokio::test]
+    async fn syn_gate_connect_failure_sends_rst() {
+        let mut device = SmoltcpDevice::new(0, GW_IP);
+        let (_iface, mut sockets) = make_iface_and_sockets(&mut device);
+        let mut bridge = TcpBridge::new();
+
+        // Use a port that's definitely not listening (connection refused).
+        let syn = make_syn_frame(Ipv4Addr::LOCALHOST, 1);
+        let syn_info = TcpSynInfo {
+            dst_port: 1,
+            src_ip: GUEST_IP,
+            src_port: 12345,
+            dst_ip: Ipv4Addr::LOCALHOST,
+            syn_seq: 1000,
+            frame: syn,
+        };
+
+        bridge.gate_syns(&[syn_info], GW_MAC);
+
+        // Wait for connect failure.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let rst_frames = bridge.poll_pending_syns(&mut device, &mut sockets, GW_MAC);
+        assert_eq!(rst_frames.len(), 1, "Should generate exactly one RST");
+        assert!(bridge.pending_syns.is_empty());
+        assert!(bridge.pre_connected.is_empty());
+
+        // Verify the RST frame structure.
+        let rst = &rst_frames[0];
+        assert!(rst.len() >= ETH_HEADER_LEN + 40);
+        let ip = ETH_HEADER_LEN;
+        let tcp_start = ip + 20;
+        // Flags should be RST|ACK (0x14).
+        assert_eq!(rst[tcp_start + 13], 0x14, "Flags should be RST|ACK");
+        // ack = syn_seq + 1 = 1001 (make_syn_frame uses seq=1000).
+        let ack = u32::from_be_bytes([
+            rst[tcp_start + 8],
+            rst[tcp_start + 9],
+            rst[tcp_start + 10],
+            rst[tcp_start + 11],
+        ]);
+        assert_eq!(ack, 1001, "ACK should be syn_seq + 1");
+        // Dst MAC should be guest MAC.
+        assert_eq!(&rst[0..6], &GUEST_MAC);
+        // Src MAC should be gateway MAC.
+        assert_eq!(&rst[6..12], &GW_MAC);
+    }
+
+    #[tokio::test]
+    async fn syn_gate_retransmit_dedup() {
+        let mut bridge = TcpBridge::new();
+
+        let syn = make_syn_frame(Ipv4Addr::new(1, 1, 1, 1), 443);
+        let syn_info = TcpSynInfo {
+            dst_port: 443,
+            src_ip: GUEST_IP,
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+            syn_seq: 1000,
+            frame: syn.clone(),
+        };
+
+        // Gate the same SYN twice with identical ISN.
+        bridge.gate_syns(&[syn_info.clone()], GW_MAC);
+        assert_eq!(bridge.pending_syns.len(), 1);
+
+        bridge.gate_syns(&[syn_info], GW_MAC);
+        // Should still be 1 — retransmit was deduplicated.
+        assert_eq!(bridge.pending_syns.len(), 1);
+
+        // Now gate with different ISN — should replace.
+        let syn_info_new_isn = TcpSynInfo {
+            dst_port: 443,
+            src_ip: GUEST_IP,
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+            syn_seq: 5000,
+            frame: syn,
+        };
+        bridge.gate_syns(&[syn_info_new_isn], GW_MAC);
+        assert_eq!(bridge.pending_syns.len(), 1);
+        let key = SynFlowKey {
+            src_ip: GUEST_IP,
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+            dst_port: 443,
+        };
+        assert_eq!(bridge.pending_syns[&key].syn_seq, 5000);
+    }
+
+    #[tokio::test]
+    async fn pre_connected_expires_after_ttl() {
+        let mut device = SmoltcpDevice::new(0, GW_IP);
+        let (_iface, mut sockets) = make_iface_and_sockets(&mut device);
+        let mut bridge = TcpBridge::new();
+
+        let key = SynFlowKey {
+            src_ip: GUEST_IP,
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+            dst_port: 443,
+        };
+
+        // Create a dummy TCP connection pair for the pre-connected stream.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::net::TcpStream::connect(addr);
+        let (stream, _accepted) = tokio::join!(connect, listener.accept());
+        let stream = stream.unwrap();
+
+        // Insert with an already-expired timestamp.
+        bridge.pre_connected.insert(
+            key,
+            PreConnected {
+                stream,
+                syn_seq: 1000,
+                created: StdInstant::now()
+                    - std::time::Duration::from_secs(PRE_CONNECTED_TTL_SECS + 1),
+            },
+        );
+
+        assert_eq!(bridge.pre_connected.len(), 1);
+
+        // poll_pending_syns should expire the stale entry.
+        let rst_frames = bridge.poll_pending_syns(&mut device, &mut sockets, GW_MAC);
+        assert!(rst_frames.is_empty());
+        assert!(
+            bridge.pre_connected.is_empty(),
+            "Expired entry should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_connected_same_isn_retransmit_dedup() {
+        let mut bridge = TcpBridge::new();
+
+        let key = SynFlowKey {
+            src_ip: GUEST_IP,
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+            dst_port: 443,
+        };
+
+        // Create a dummy pre-connected stream.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::net::TcpStream::connect(addr);
+        let (stream, _accepted) = tokio::join!(connect, listener.accept());
+        let stream = stream.unwrap();
+
+        bridge.pre_connected.insert(
+            key,
+            PreConnected {
+                stream,
+                syn_seq: 1000,
+                created: StdInstant::now(),
+            },
+        );
+
+        // Retransmit SYN with same ISN — should be dropped, no new pending entry.
+        let syn = make_syn_frame(Ipv4Addr::new(1, 1, 1, 1), 443);
+        let syn_info = TcpSynInfo {
+            dst_port: 443,
+            src_ip: GUEST_IP,
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+            syn_seq: 1000,
+            frame: syn,
+        };
+
+        bridge.gate_syns(&[syn_info], GW_MAC);
+        assert!(
+            bridge.pending_syns.is_empty(),
+            "Same ISN retransmit should not create a new pending entry"
+        );
+        assert_eq!(
+            bridge.pre_connected.len(),
+            1,
+            "Pre-connected stream should be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_connected_different_isn_evicts_stale_stream() {
+        let mut bridge = TcpBridge::new();
+
+        let key = SynFlowKey {
+            src_ip: GUEST_IP,
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+            dst_port: 443,
+        };
+
+        // Create a dummy pre-connected stream.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::net::TcpStream::connect(addr);
+        let (stream, _accepted) = tokio::join!(connect, listener.accept());
+        let stream = stream.unwrap();
+
+        bridge.pre_connected.insert(
+            key,
+            PreConnected {
+                stream,
+                syn_seq: 1000,
+                created: StdInstant::now(),
+            },
+        );
+
+        // New SYN with different ISN — should evict the stale stream and gate.
+        let syn = make_syn_frame(Ipv4Addr::new(1, 1, 1, 1), 443);
+        let syn_info = TcpSynInfo {
+            dst_port: 443,
+            src_ip: GUEST_IP,
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(1, 1, 1, 1),
+            syn_seq: 5000,
+            frame: syn,
+        };
+
+        bridge.gate_syns(&[syn_info], GW_MAC);
+        assert!(
+            bridge.pre_connected.is_empty(),
+            "Stale pre-connected stream should be evicted"
+        );
+        assert_eq!(
+            bridge.pending_syns.len(),
+            1,
+            "New ISN should create a new pending entry"
+        );
+        assert_eq!(bridge.pending_syns[&key].syn_seq, 5000);
     }
 }

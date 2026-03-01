@@ -250,11 +250,14 @@ impl NetworkDatapath {
                         );
                     }
 
-                    // Ensure listen sockets exist for any new TCP SYN dst ports
-                    // before smoltcp processes them.
-                    let tcp_syns = device.take_tcp_syns();
-                    if !tcp_syns.is_empty() {
-                        tcp_bridge.ensure_listen_sockets(&tcp_syns, &mut sockets);
+                    // Gate TCP SYN frames: start host connect, hold SYN
+                    // until connect completes.
+                    let gated_syns = device.take_gated_syns();
+                    if !gated_syns.is_empty() {
+                        let rst_frames = tcp_bridge.gate_syns(&gated_syns, gateway_mac);
+                        for rst in rst_frames {
+                            enqueue_or_write(&guest_async, rst, &mut write_queue);
+                        }
                     }
                 }
 
@@ -299,15 +302,27 @@ impl NetworkDatapath {
             //    branch fired. This ensures smoltcp retransmissions,
             //    tcp_bridge relay, and frame flushing are never starved.
 
+            // 1. Poll pending SYN gate entries — may inject SYN frames into
+            //    device rx_queue and create listen sockets, or produce RST frames.
+            let rst_frames = tcp_bridge.poll_pending_syns(&mut device, &mut sockets, gateway_mac);
+            for rst in rst_frames {
+                enqueue_or_write(&guest_async, rst, &mut write_queue);
+            }
+
+            // 2. smoltcp poll: processes injected SYN frames (from gate) +
+            //    retransmissions + ACKs.
             let ts = smoltcp::time::Instant::now();
             iface.poll(ts, &mut device, &mut sockets);
 
+            // 3. tcp_bridge relay: detect new connections, relay data,
+            //    cleanup closed.
             tcp_bridge.poll(&mut sockets);
 
-            // Re-poll to flush data pushed by tcp_bridge into TCP segments.
+            // 4. Re-poll to flush data pushed by tcp_bridge into TCP segments.
             let ts = smoltcp::time::Instant::now();
             iface.poll(ts, &mut device, &mut sockets);
 
+            // 5. Flush TX frames to guest.
             for frame in device.take_tx_pending() {
                 enqueue_or_write(&guest_async, frame, &mut write_queue);
             }
