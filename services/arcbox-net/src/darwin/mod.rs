@@ -42,7 +42,9 @@
 pub mod datapath_loop;
 pub mod inbound_relay;
 pub mod nat;
+pub mod smoltcp_device;
 pub mod socket_proxy;
+pub mod tcp_bridge;
 pub mod tun;
 pub mod vmnet;
 pub mod vmnet_ffi;
