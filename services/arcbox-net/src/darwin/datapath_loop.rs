@@ -256,24 +256,6 @@ impl NetworkDatapath {
                     if !tcp_syns.is_empty() {
                         tcp_bridge.ensure_listen_sockets(&tcp_syns, &mut sockets);
                     }
-
-                    // smoltcp processes ARP and TCP from the rx_queue.
-                    let ts = smoltcp::time::Instant::now();
-                    iface.poll(ts, &mut device, &mut sockets);
-
-                    // TCP bridge: relay data, detect new/closed connections.
-                    tcp_bridge.poll(&mut sockets);
-
-                    // Write smoltcp-generated frames (ARP replies, TCP segments)
-                    // to the guest FD.
-                    for frame in device.take_tx_pending() {
-                        enqueue_or_write(&guest_async, frame, &mut write_queue);
-                    }
-
-                    // Drain pending proxy replies (DNS, UDP, ICMP responses).
-                    // This avoids starvation of reply_rx under biased select!
-                    // when readable fires repeatedly.
-                    drain_reply_rx(&mut reply_rx, &guest_async, &mut write_queue);
                 }
 
                 // Proxy → Guest: relay reply frames from socket proxy.
@@ -294,12 +276,6 @@ impl NetworkDatapath {
                                 &mut iface,
                                 &mut sockets,
                             );
-                            // Immediately poll so smoltcp sends the SYN.
-                            let ts = smoltcp::time::Instant::now();
-                            iface.poll(ts, &mut device, &mut sockets);
-                            for frame in device.take_tx_pending() {
-                                enqueue_or_write(&guest_async, frame, &mut write_queue);
-                            }
                         }
                         cmd @ InboundCommand::UdpReceived { .. } => {
                             let mac = guest_mac.unwrap_or([0xFF; 6]);
@@ -308,22 +284,35 @@ impl NetworkDatapath {
                     }
                 }
 
-                // smoltcp periodic poll (retransmissions, ARP cache).
-                _ = smoltcp_timer.tick() => {
-                    let ts = smoltcp::time::Instant::now();
-                    iface.poll(ts, &mut device, &mut sockets);
-                    tcp_bridge.poll(&mut sockets);
-                    for frame in device.take_tx_pending() {
-                        enqueue_or_write(&guest_async, frame, &mut write_queue);
-                    }
-                    drain_reply_rx(&mut reply_rx, &guest_async, &mut write_queue);
-                }
+                // Wakeup when no other events: drives retransmissions during
+                // idle periods. Under load, the readable arm triggers smoltcp
+                // poll via the common tail below.
+                _ = smoltcp_timer.tick() => {}
 
                 // Periodic maintenance.
                 _ = maintenance.tick() => {
                     socket_proxy.maintenance();
                 }
             }
+
+            // ── Common tail: run on every iteration regardless of which
+            //    branch fired. This ensures smoltcp retransmissions,
+            //    tcp_bridge relay, and frame flushing are never starved.
+
+            let ts = smoltcp::time::Instant::now();
+            iface.poll(ts, &mut device, &mut sockets);
+
+            tcp_bridge.poll(&mut sockets);
+
+            // Re-poll to flush data pushed by tcp_bridge into TCP segments.
+            let ts = smoltcp::time::Instant::now();
+            iface.poll(ts, &mut device, &mut sockets);
+
+            for frame in device.take_tx_pending() {
+                enqueue_or_write(&guest_async, frame, &mut write_queue);
+            }
+
+            drain_reply_rx(&mut reply_rx, &guest_async, &mut write_queue);
         }
 
         Ok(())
