@@ -9,8 +9,7 @@
 //! ```text
 //! Guest frame → SocketProxy::handle_outbound()
 //!   ├─ ICMP → IcmpProxy (ICMP datagram socket sendto/recv)
-//!   ├─ UDP  → UdpProxy  (per-flow host UdpSocket)
-//!   └─ TCP  → TcpProxy  (per-connection host TcpStream)
+//!   └─ UDP  → UdpProxy  (per-flow host UdpSocket)
 //!         ↓
 //!   reply_tx → mpsc → datapath select! → guest FD
 //! ```
@@ -19,7 +18,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use socket2::{Domain, Protocol, Type};
@@ -27,10 +26,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-use crate::ethernet::{
-    ETH_HEADER_LEN, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, build_tcp_ip_ethernet,
-    build_udp_ip_ethernet, prepend_ethernet_header,
-};
+use crate::ethernet::{ETH_HEADER_LEN, build_udp_ip_ethernet, prepend_ethernet_header};
 
 /// Per-flow UDP state.
 struct UdpFlow {
@@ -436,7 +432,6 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
 pub struct SocketProxy {
     icmp: IcmpProxy,
     udp: UdpProxy,
-    tcp: TcpProxy,
     /// Inbound relay for host → guest port forwarding.
     inbound: super::inbound_relay::InboundRelay,
     /// Shared reply sender for injecting L2 frames towards the guest.
@@ -464,7 +459,6 @@ impl SocketProxy {
         Self {
             icmp: IcmpProxy::new(reply_tx.clone(), gateway_mac),
             udp: UdpProxy::new(reply_tx.clone(), gateway_mac),
-            tcp: TcpProxy::new(reply_tx.clone(), gateway_mac),
             inbound,
             reply_tx,
         }
@@ -495,7 +489,6 @@ impl SocketProxy {
         let protocol = frame[ETH_HEADER_LEN + 9];
         match protocol {
             1 => self.icmp.proxy_icmp(frame, guest_mac),
-            6 => self.tcp.proxy_tcp(frame, guest_mac),
             17 => self.udp.proxy_udp(frame, guest_mac),
             _ => {
                 tracing::trace!("Socket proxy: dropping protocol {}", protocol);
@@ -533,493 +526,8 @@ impl SocketProxy {
     /// Runs periodic maintenance (flow cleanup).
     pub fn maintenance(&mut self) {
         self.udp.cleanup_stale_flows();
-        self.tcp.cleanup_closed();
         self.inbound.cleanup();
     }
-}
-
-// ============================================================================
-// TCP Proxy
-// ============================================================================
-
-/// TCP connection state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TcpState {
-    SynReceived,
-    Established,
-    FinWait,
-    Closed,
-}
-
-/// Per-connection TCP state tracking.
-struct TcpConnection {
-    state: TcpState,
-    /// Next expected sequence number from the guest, shared with relay for ACK
-    /// numbers in host→guest data frames.
-    guest_seq: Arc<AtomicU32>,
-    /// Our sequence number to the guest, shared with the relay task so ACKs
-    /// always use the most up-to-date value.
-    host_seq: Arc<AtomicU32>,
-    /// Actual destination IP from the guest's SYN (used as source IP in replies).
-    remote_ip: Ipv4Addr,
-    /// Channel to send events to the connection relay task.
-    data_tx: mpsc::Sender<Vec<u8>>,
-}
-
-/// TCP proxy: per-connection host `TcpStream` with guest-facing TCP state.
-pub(crate) struct TcpProxy {
-    /// Active connections keyed by (src_ip, src_port, dst_ip, dst_port).
-    connections: HashMap<(Ipv4Addr, u16, Ipv4Addr, u16), TcpConnection>,
-    reply_tx: mpsc::Sender<Vec<u8>>,
-    gateway_mac: [u8; 6],
-}
-
-impl TcpProxy {
-    fn new(reply_tx: mpsc::Sender<Vec<u8>>, gateway_mac: [u8; 6]) -> Self {
-        Self {
-            connections: HashMap::new(),
-            reply_tx,
-            gateway_mac,
-        }
-    }
-
-    /// Handles a TCP segment from the guest.
-    fn proxy_tcp(&mut self, frame: &[u8], guest_mac: [u8; 6]) {
-        let ip_start = ETH_HEADER_LEN;
-        let ihl = ((frame[ip_start] & 0x0F) as usize) * 4;
-        let tcp_start = ip_start + ihl;
-
-        if frame.len() < tcp_start + 20 {
-            return;
-        }
-
-        let src_ip = Ipv4Addr::new(
-            frame[ip_start + 12],
-            frame[ip_start + 13],
-            frame[ip_start + 14],
-            frame[ip_start + 15],
-        );
-        let dst_ip = Ipv4Addr::new(
-            frame[ip_start + 16],
-            frame[ip_start + 17],
-            frame[ip_start + 18],
-            frame[ip_start + 19],
-        );
-        let src_port = u16::from_be_bytes([frame[tcp_start], frame[tcp_start + 1]]);
-        let dst_port = u16::from_be_bytes([frame[tcp_start + 2], frame[tcp_start + 3]]);
-        let seq = u32::from_be_bytes([
-            frame[tcp_start + 4],
-            frame[tcp_start + 5],
-            frame[tcp_start + 6],
-            frame[tcp_start + 7],
-        ]);
-        let _ack = u32::from_be_bytes([
-            frame[tcp_start + 8],
-            frame[tcp_start + 9],
-            frame[tcp_start + 10],
-            frame[tcp_start + 11],
-        ]);
-        let data_offset = ((frame[tcp_start + 12] >> 4) as usize) * 4;
-        let flags = frame[tcp_start + 13];
-
-        let conn_key = (src_ip, src_port, dst_ip, dst_port);
-
-        if flags & TCP_SYN != 0 && flags & TCP_ACK == 0 {
-            // New SYN: initiate connection.
-            self.handle_syn(conn_key, seq, dst_ip, dst_port, src_ip, src_port, guest_mac);
-            return;
-        }
-
-        if let Some(conn) = self.connections.get_mut(&conn_key) {
-            match conn.state {
-                TcpState::SynReceived => {
-                    if flags & TCP_ACK != 0 {
-                        // Handshake complete.
-                        conn.state = TcpState::Established;
-                        conn.guest_seq.store(seq, Ordering::Relaxed);
-                        tracing::debug!(
-                            "TCP established: {}:{} -> {}:{}",
-                            src_ip,
-                            src_port,
-                            dst_ip,
-                            dst_port
-                        );
-                    }
-                }
-                TcpState::Established => {
-                    let payload_start = tcp_start + data_offset;
-                    let payload = if payload_start < frame.len() {
-                        &frame[payload_start..]
-                    } else {
-                        &[]
-                    };
-
-                    if flags & TCP_FIN != 0 {
-                        // Guest is closing. Send FIN-ACK.
-                        let guest_seq = seq.wrapping_add(payload.len() as u32).wrapping_add(1);
-                        conn.guest_seq.store(guest_seq, Ordering::Relaxed);
-                        conn.state = TcpState::FinWait;
-                        let remote_ip = conn.remote_ip;
-                        let host_seq = conn.host_seq.load(Ordering::Relaxed);
-
-                        let fin_ack = build_tcp_ip_ethernet(
-                            remote_ip,
-                            src_ip,
-                            dst_port,
-                            src_port,
-                            host_seq,
-                            guest_seq,
-                            TCP_FIN | TCP_ACK,
-                            65535,
-                            &[],
-                            self.gateway_mac,
-                            guest_mac,
-                        );
-                        let _ = self.reply_tx.try_send(fin_ack);
-                        return;
-                    }
-
-                    if flags & TCP_RST != 0 {
-                        conn.state = TcpState::Closed;
-                        let _ = conn.data_tx.try_send(Vec::new()); // Signal close
-                        return;
-                    }
-
-                    if !payload.is_empty() {
-                        let expected_seq = conn.guest_seq.load(Ordering::Relaxed);
-
-                        // Reject retransmits and out-of-order segments.
-                        if seq != expected_seq {
-                            if seq_before(seq, expected_seq) {
-                                // Retransmit — send duplicate ACK so guest
-                                // knows we already have this data.
-                                let ack = build_tcp_ip_ethernet(
-                                    conn.remote_ip,
-                                    src_ip,
-                                    dst_port,
-                                    src_port,
-                                    conn.host_seq.load(Ordering::Relaxed),
-                                    expected_seq,
-                                    TCP_ACK,
-                                    65535,
-                                    &[],
-                                    self.gateway_mac,
-                                    guest_mac,
-                                );
-                                let _ = self.reply_tx.try_send(ack);
-                            }
-                            return;
-                        }
-
-                        // Synchronously queue payload for the host socket.
-                        // Using try_send (not tokio::spawn) preserves segment
-                        // ordering — critical for TLS and other stream protocols.
-                        match conn.data_tx.try_send(payload.to_vec()) {
-                            Ok(()) => {
-                                let new_seq = seq.wrapping_add(payload.len() as u32);
-                                conn.guest_seq.store(new_seq, Ordering::Relaxed);
-                                let ack = build_tcp_ip_ethernet(
-                                    conn.remote_ip,
-                                    src_ip,
-                                    dst_port,
-                                    src_port,
-                                    conn.host_seq.load(Ordering::Relaxed),
-                                    new_seq,
-                                    TCP_ACK,
-                                    65535,
-                                    &[],
-                                    self.gateway_mac,
-                                    guest_mac,
-                                );
-                                let _ = self.reply_tx.try_send(ack);
-                            }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                // Backpressure: don't ACK so guest retransmits.
-                                tracing::debug!("TCP data channel full, backpressure applied");
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                conn.state = TcpState::Closed;
-                            }
-                        }
-                    }
-                }
-                TcpState::FinWait => {
-                    if flags & TCP_ACK != 0 {
-                        conn.state = TcpState::Closed;
-                    }
-                }
-                TcpState::Closed => {}
-            }
-        } else if flags & TCP_RST == 0 {
-            // Unknown connection, send RST.
-            let rst = build_tcp_ip_ethernet(
-                dst_ip,
-                src_ip,
-                dst_port,
-                src_port,
-                0,
-                seq.wrapping_add(1),
-                TCP_RST | TCP_ACK,
-                0,
-                &[],
-                self.gateway_mac,
-                guest_mac,
-            );
-            let _ = self.reply_tx.try_send(rst);
-        }
-    }
-
-    /// Handles a new TCP SYN from the guest.
-    #[allow(clippy::too_many_arguments)]
-    fn handle_syn(
-        &mut self,
-        conn_key: (Ipv4Addr, u16, Ipv4Addr, u16),
-        guest_isn: u32,
-        dst_ip: Ipv4Addr,
-        dst_port: u16,
-        src_ip: Ipv4Addr,
-        src_port: u16,
-        guest_mac: [u8; 6],
-    ) {
-        // Remove any stale connection with the same key.
-        self.connections.remove(&conn_key);
-
-        let host_isn: u32 = rand_isn();
-        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(256);
-
-        // SYN-ACK uses seq=host_isn, consuming one seq number. After that,
-        // the next byte is host_isn+1. Share this counter with the relay task
-        // so ACKs from proxy_tcp always use the up-to-date value.
-        let shared_host_seq = Arc::new(AtomicU32::new(host_isn.wrapping_add(1)));
-        let relay_host_seq = Arc::clone(&shared_host_seq);
-        let shared_guest_seq = Arc::new(AtomicU32::new(guest_isn.wrapping_add(1)));
-        let relay_guest_seq = Arc::clone(&shared_guest_seq);
-
-        let conn = TcpConnection {
-            state: TcpState::SynReceived,
-            guest_seq: shared_guest_seq,
-            host_seq: shared_host_seq,
-            remote_ip: dst_ip,
-            data_tx,
-        };
-        self.connections.insert(conn_key, conn);
-
-        let reply_tx = self.reply_tx.clone();
-        let gateway_mac = self.gateway_mac;
-
-        tokio::spawn(async move {
-            // Try to connect to the remote host.
-            let stream = match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                tokio::net::TcpStream::connect(SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port))),
-            )
-            .await
-            {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    tracing::debug!(
-                        "TCP proxy: connect to {}:{} failed: {}",
-                        dst_ip,
-                        dst_port,
-                        e
-                    );
-                    let rst = build_tcp_ip_ethernet(
-                        dst_ip,
-                        src_ip,
-                        dst_port,
-                        src_port,
-                        0,
-                        guest_isn.wrapping_add(1),
-                        TCP_RST | TCP_ACK,
-                        0,
-                        &[],
-                        gateway_mac,
-                        guest_mac,
-                    );
-                    let _ = reply_tx.send(rst).await;
-                    return;
-                }
-                Err(_) => {
-                    tracing::debug!("TCP proxy: connect to {}:{} timed out", dst_ip, dst_port);
-                    let rst = build_tcp_ip_ethernet(
-                        dst_ip,
-                        src_ip,
-                        dst_port,
-                        src_port,
-                        0,
-                        guest_isn.wrapping_add(1),
-                        TCP_RST | TCP_ACK,
-                        0,
-                        &[],
-                        gateway_mac,
-                        guest_mac,
-                    );
-                    let _ = reply_tx.send(rst).await;
-                    return;
-                }
-            };
-
-            // Send SYN-ACK to guest.
-            let syn_ack = build_tcp_ip_ethernet(
-                dst_ip,
-                src_ip,
-                dst_port,
-                src_port,
-                host_isn,
-                guest_isn.wrapping_add(1),
-                TCP_SYN | TCP_ACK,
-                65535,
-                &[],
-                gateway_mac,
-                guest_mac,
-            );
-            if reply_tx.send(syn_ack).await.is_err() {
-                return;
-            }
-
-            // Run bidirectional relay.
-            tcp_relay(
-                stream,
-                data_rx,
-                reply_tx,
-                dst_ip,
-                gateway_mac,
-                src_ip,
-                src_port,
-                dst_port,
-                guest_mac,
-                relay_host_seq,
-                relay_guest_seq,
-            )
-            .await;
-        });
-    }
-
-    /// Removes closed connections from the table.
-    fn cleanup_closed(&mut self) {
-        self.connections
-            .retain(|_, conn| conn.state != TcpState::Closed);
-    }
-}
-
-/// Maximum TCP segment size for guest-facing frames.
-///
-/// Standard MSS for MTU 1500: 1500 - 20 (IPv4) - 20 (TCP) = 1460.
-const GUEST_MSS: usize = 1460;
-
-/// Bidirectional relay between a host `TcpStream` and guest TCP segments.
-#[allow(clippy::too_many_arguments)]
-async fn tcp_relay(
-    stream: tokio::net::TcpStream,
-    mut data_rx: mpsc::Receiver<Vec<u8>>,
-    reply_tx: mpsc::Sender<Vec<u8>>,
-    remote_ip: Ipv4Addr,
-    gateway_mac: [u8; 6],
-    guest_ip: Ipv4Addr,
-    guest_port: u16,
-    host_port: u16,
-    guest_mac: [u8; 6],
-    shared_host_seq: Arc<AtomicU32>,
-    shared_guest_seq: Arc<AtomicU32>,
-) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let (mut reader, mut writer) = stream.into_split();
-
-    // Host -> Guest relay: read from TcpStream, send MSS-sized data frames.
-    let reply_tx2 = reply_tx.clone();
-    let host_read = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65535];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) => {
-                    // EOF: send FIN to guest.
-                    let host_seq = shared_host_seq.load(Ordering::Relaxed);
-                    let guest_seq = shared_guest_seq.load(Ordering::Relaxed);
-                    let fin = build_tcp_ip_ethernet(
-                        remote_ip,
-                        guest_ip,
-                        host_port,
-                        guest_port,
-                        host_seq,
-                        guest_seq,
-                        TCP_FIN | TCP_ACK,
-                        65535,
-                        &[],
-                        gateway_mac,
-                        guest_mac,
-                    );
-                    let _ = reply_tx2.send(fin).await;
-                    break;
-                }
-                Ok(n) => {
-                    let guest_seq = shared_guest_seq.load(Ordering::Relaxed);
-                    let data = &buf[..n];
-
-                    // Segment into MSS-sized chunks to stay within guest MTU.
-                    let mut offset = 0;
-                    let mut failed = false;
-                    while offset < data.len() {
-                        let end = (offset + GUEST_MSS).min(data.len());
-                        let chunk = &data[offset..end];
-                        let host_seq = shared_host_seq.load(Ordering::Relaxed);
-
-                        let flags = if end == data.len() {
-                            TCP_ACK | TCP_PSH
-                        } else {
-                            TCP_ACK
-                        };
-
-                        let seg = build_tcp_ip_ethernet(
-                            remote_ip,
-                            guest_ip,
-                            host_port,
-                            guest_port,
-                            host_seq,
-                            guest_seq,
-                            flags,
-                            65535,
-                            chunk,
-                            gateway_mac,
-                            guest_mac,
-                        );
-                        shared_host_seq
-                            .store(host_seq.wrapping_add(chunk.len() as u32), Ordering::Relaxed);
-                        if reply_tx2.send(seg).await.is_err() {
-                            failed = true;
-                            break;
-                        }
-                        offset = end;
-                    }
-                    if failed {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("TCP relay read error: {}", e);
-                    break;
-                }
-            }
-        }
-    });
-
-    // Guest -> Host relay: receive data from guest, write to TcpStream.
-    let guest_write = tokio::spawn(async move {
-        while let Some(data) = data_rx.recv().await {
-            if data.is_empty() {
-                // Signal to close.
-                let _ = writer.shutdown().await;
-                break;
-            }
-            if let Err(e) = writer.write_all(&data).await {
-                tracing::debug!("TCP relay write error: {}", e);
-                break;
-            }
-        }
-    });
-
-    // Wait for both directions to finish.
-    let _ = tokio::join!(host_read, guest_write);
 }
 
 /// Returns true when sequence number `a` is before `b` in TCP sequence space.
@@ -1051,13 +559,6 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_micros(1));
         let b = rand_isn();
         assert_ne!(a, b);
-    }
-
-    #[test]
-    fn test_tcp_state_transitions() {
-        assert_ne!(TcpState::SynReceived, TcpState::Established);
-        assert_ne!(TcpState::Established, TcpState::FinWait);
-        assert_ne!(TcpState::FinWait, TcpState::Closed);
     }
 
     #[test]
@@ -1130,40 +631,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tcp_proxy_cleanup_closed() {
-        let (tx, _rx) = mpsc::channel(16);
-        let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
-        let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
-        let mut proxy = TcpProxy::new(tx.clone(), gw_mac);
-
-        let key = (
-            Ipv4Addr::new(192, 168, 64, 2),
-            5000,
-            Ipv4Addr::new(1, 1, 1, 1),
-            80,
-        );
-        let (data_tx, _data_rx) = mpsc::channel(16);
-        proxy.connections.insert(
-            key,
-            TcpConnection {
-                state: TcpState::Closed,
-                guest_seq: Arc::new(AtomicU32::new(0)),
-                host_seq: Arc::new(AtomicU32::new(0)),
-                remote_ip: Ipv4Addr::new(1, 1, 1, 1),
-                data_tx,
-            },
-        );
-        assert_eq!(proxy.connections.len(), 1);
-
-        proxy.cleanup_closed();
-        assert_eq!(
-            proxy.connections.len(),
-            0,
-            "Closed connection should be removed"
-        );
-    }
-
-    #[test]
     fn test_seq_before_basic() {
         assert!(seq_before(100, 200));
         assert!(!seq_before(200, 100));
@@ -1176,20 +643,6 @@ mod tests {
         assert!(seq_before(u32::MAX - 10, u32::MAX));
         assert!(seq_before(u32::MAX, 10)); // wraps around
         assert!(!seq_before(10, u32::MAX)); // 10 is "after" MAX in TCP space
-    }
-
-    #[test]
-    fn test_data_channel_backpressure() {
-        // When the data channel is full, try_send should fail with Full,
-        // which the proxy interprets as backpressure (don't ACK).
-        let (tx, _rx) = mpsc::channel::<Vec<u8>>(2);
-        assert!(tx.try_send(vec![1]).is_ok());
-        assert!(tx.try_send(vec![2]).is_ok());
-        // Channel is now full.
-        assert!(matches!(
-            tx.try_send(vec![3]),
-            Err(mpsc::error::TrySendError::Full(_))
-        ));
     }
 
     /// Verifies that reply frames from the socket proxy flow through the
