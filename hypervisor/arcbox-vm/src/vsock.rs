@@ -325,7 +325,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_read_frame_roundtrip() {
         let (mut a, mut b) = tokio::io::duplex(256);
-        write_frame(&mut a, MSG_START, b"hello world").await.unwrap();
+        write_frame(&mut a, MSG_START, b"hello world")
+            .await
+            .unwrap();
         let (msg_type, payload) = read_frame(&mut b).await.unwrap();
         assert_eq!(msg_type, MSG_START);
         assert_eq!(payload, b"hello world");
@@ -344,7 +346,9 @@ mod tests {
     async fn test_exit_code_encoding() {
         let exit_code: i32 = 42;
         let (mut a, mut b) = tokio::io::duplex(64);
-        write_frame(&mut a, MSG_EXIT, &exit_code.to_le_bytes()).await.unwrap();
+        write_frame(&mut a, MSG_EXIT, &exit_code.to_le_bytes())
+            .await
+            .unwrap();
         let (msg_type, payload) = read_frame(&mut b).await.unwrap();
         assert_eq!(msg_type, MSG_EXIT);
         let decoded = i32::from_le_bytes(payload[..4].try_into().unwrap());
@@ -360,7 +364,9 @@ mod tests {
         resize_payload[2..].copy_from_slice(&height.to_le_bytes());
 
         let (mut a, mut b) = tokio::io::duplex(64);
-        write_frame(&mut a, MSG_RESIZE, &resize_payload).await.unwrap();
+        write_frame(&mut a, MSG_RESIZE, &resize_payload)
+            .await
+            .unwrap();
         let (msg_type, payload) = read_frame(&mut b).await.unwrap();
         assert_eq!(msg_type, MSG_RESIZE);
         let w = u16::from_le_bytes(payload[..2].try_into().unwrap());

@@ -277,16 +277,20 @@ mod tests {
         let mac = mac_from_vm_id("test-vm");
         let first_byte = u8::from_str_radix(&mac[..2], 16).unwrap();
         // Bit 1 set → locally administered; bit 0 clear → unicast.
-        assert_eq!(first_byte & 0x02, 0x02, "locally administered bit must be set");
+        assert_eq!(
+            first_byte & 0x02,
+            0x02,
+            "locally administered bit must be set"
+        );
         assert_eq!(first_byte & 0x01, 0x00, "multicast bit must be clear");
     }
 
     #[test]
     fn test_tap_name_encodes_last_two_octets() {
         let ip: Ipv4Addr = "172.20.3.17".parse().unwrap();
-        assert_eq!(tap_name_from_ip(ip), "vmtap317");
+        assert_eq!(tap_name_from_ip(ip), "vmtap3-17");
 
         let ip2: Ipv4Addr = "10.0.255.1".parse().unwrap();
-        assert_eq!(tap_name_from_ip(ip2), "vmtap2551");
+        assert_eq!(tap_name_from_ip(ip2), "vmtap255-1");
     }
 }

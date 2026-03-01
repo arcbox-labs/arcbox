@@ -82,7 +82,9 @@ fn try_config(data_dir: &str) -> Option<VmmConfig> {
 /// Return a SandboxSpec with networking disabled (no TAP, no root required).
 fn no_tap() -> SandboxSpec {
     SandboxSpec {
-        network: SandboxNetworkSpec { mode: "none".into() },
+        network: SandboxNetworkSpec {
+            mode: "none".into(),
+        },
         ..Default::default()
     }
 }
