@@ -516,8 +516,8 @@ mod tests {
         assert_eq!(pool.free_count(), 0);
 
         // First 5 should be valid indices (0-4)
-        for i in 0..5 {
-            assert!(indices[i] < 5);
+        for idx in &indices[..5] {
+            assert!(*idx < 5);
         }
     }
 }
