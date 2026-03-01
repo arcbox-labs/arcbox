@@ -114,6 +114,7 @@ name = "arcbox-agent"
 version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
+ "arcbox-constants",
  "arcbox-protocol",
  "async-trait",
  "bytes",
@@ -187,6 +188,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-constants"
+version = "0.0.1-alpha.1"
+
+[[package]]
 name = "arcbox-container"
 version = "0.0.1-alpha.2"
 dependencies = [
@@ -204,6 +209,7 @@ dependencies = [
 name = "arcbox-core"
 version = "0.0.1-alpha.2"
 dependencies = [
+ "arcbox-constants",
  "arcbox-error",
  "arcbox-fs",
  "arcbox-hypervisor",
@@ -442,6 +448,7 @@ dependencies = [
 name = "arcbox-transport"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "arcbox-constants",
  "arcbox-error",
  "arcbox-protocol",
  "async-trait",

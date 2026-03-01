@@ -73,7 +73,7 @@ use bytes::Bytes;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 /// Default port for ArcBox agent communication.
-pub const DEFAULT_AGENT_PORT: u32 = 10000;
+pub use arcbox_constants::ports::AGENT_PORT as DEFAULT_AGENT_PORT;
 
 /// Vsock address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

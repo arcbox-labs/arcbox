@@ -1,0 +1,11 @@
+[package]
+name = "arcbox-constants"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared protocol and runtime constants for ArcBox"
+
+[dependencies]
