@@ -539,7 +539,7 @@ impl SocketProxy {
 }
 
 // ============================================================================
-// TCP Proxy (stub — full implementation in next commit)
+// TCP Proxy
 // ============================================================================
 
 /// TCP connection state.
@@ -1025,7 +1025,7 @@ async fn tcp_relay(
 /// Returns true when sequence number `a` is before `b` in TCP sequence space.
 ///
 /// Uses signed arithmetic to handle 32-bit wrapping correctly (RFC 1323 §4.2).
-fn seq_before(a: u32, b: u32) -> bool {
+pub(crate) fn seq_before(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) < 0
 }
 

@@ -39,7 +39,7 @@ use crate::ethernet::{
     build_udp_ip_ethernet,
 };
 
-use super::socket_proxy::rand_isn;
+use super::socket_proxy::{rand_isn, seq_before};
 
 // ---------------------------------------------------------------------------
 // Ephemeral port allocator
@@ -283,10 +283,7 @@ impl InboundRelay {
             if udp_len >= 8 && udp_start + udp_len <= frame.len() {
                 let payload = frame[udp_start + 8..udp_start + udp_len].to_vec();
                 flow.last_active = Instant::now();
-                let client_tx = flow.client_tx.clone();
-                tokio::spawn(async move {
-                    let _ = client_tx.send(payload).await;
-                });
+                let _ = flow.client_tx.try_send(payload);
             }
             return true;
         }
@@ -317,7 +314,7 @@ impl InboundRelay {
         // Remove any stale connection with the same key.
         self.tcp_conns.remove(&key);
 
-        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(256);
 
         self.tcp_conns.insert(
             key,
@@ -346,10 +343,7 @@ impl InboundRelay {
             guest_mac,
         );
 
-        let reply_tx = self.reply_tx.clone();
-        tokio::spawn(async move {
-            let _ = reply_tx.send(syn).await;
-        });
+        let _ = self.reply_tx.try_send(syn);
 
         tracing::debug!(
             "Inbound TCP: SYN injected  gw:{} → guest:{}",
@@ -412,10 +406,7 @@ impl InboundRelay {
                         guest_mac,
                     );
 
-                    let reply_tx = self.reply_tx.clone();
-                    tokio::spawn(async move {
-                        let _ = reply_tx.send(ack).await;
-                    });
+                    let _ = self.reply_tx.try_send(ack);
 
                     tracing::debug!(
                         "Inbound TCP: established  gw:{} ↔ guest:{}",
@@ -442,63 +433,151 @@ impl InboundRelay {
                     return;
                 }
 
+                let expected_seq = conn.guest_seq;
                 if flags & TCP_FIN != 0 {
-                    conn.guest_seq = seq.wrapping_add(payload.len() as u32).wrapping_add(1);
-                    conn.state = InboundTcpState::Closing;
+                    // Reject retransmits and out-of-order FIN/data.
+                    if seq != expected_seq {
+                        if seq_before(seq, expected_seq) {
+                            let ack = build_tcp_ip_ethernet(
+                                gw_ip,
+                                guest_ip,
+                                eph_port,
+                                container_port,
+                                conn.host_seq,
+                                expected_seq,
+                                TCP_ACK,
+                                65535,
+                                &[],
+                                self.gateway_mac,
+                                guest_mac,
+                            );
+                            let _ = self.reply_tx.try_send(ack);
+                        }
+                        return;
+                    }
+
+                    let payload_end_seq = seq.wrapping_add(payload.len() as u32);
 
                     // Forward any remaining payload.
                     if !payload.is_empty() {
-                        let _ = conn.data_tx.try_send(payload.to_vec());
+                        match conn.data_tx.try_send(payload.to_vec()) {
+                            Ok(()) => {
+                                conn.guest_seq = payload_end_seq;
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                tracing::debug!(
+                                    "Inbound TCP data channel full, backpressure applied"
+                                );
+                                return;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                conn.state = InboundTcpState::Closed;
+                                return;
+                            }
+                        }
                     }
-                    // Signal close to the relay task.
-                    let _ = conn.data_tx.try_send(Vec::new());
 
-                    // ACK the FIN.
-                    let fin_ack = build_tcp_ip_ethernet(
-                        gw_ip,
-                        guest_ip,
-                        eph_port,
-                        container_port,
-                        conn.host_seq,
-                        conn.guest_seq,
-                        TCP_FIN | TCP_ACK,
-                        65535,
-                        &[],
-                        self.gateway_mac,
-                        guest_mac,
-                    );
-                    let reply_tx = self.reply_tx.clone();
-                    tokio::spawn(async move {
-                        let _ = reply_tx.send(fin_ack).await;
-                    });
+                    // Signal close to the relay task. If backpressured, ACK only
+                    // payload bytes (if any) and wait for FIN retransmit.
+                    match conn.data_tx.try_send(Vec::new()) {
+                        Ok(()) => {
+                            conn.guest_seq = payload_end_seq.wrapping_add(1);
+                            conn.state = InboundTcpState::Closing;
+                            let fin_ack = build_tcp_ip_ethernet(
+                                gw_ip,
+                                guest_ip,
+                                eph_port,
+                                container_port,
+                                conn.host_seq,
+                                conn.guest_seq,
+                                TCP_FIN | TCP_ACK,
+                                65535,
+                                &[],
+                                self.gateway_mac,
+                                guest_mac,
+                            );
+                            let _ = self.reply_tx.try_send(fin_ack);
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::debug!(
+                                "Inbound TCP close channel full, delaying FIN acknowledgment"
+                            );
+                            if !payload.is_empty() {
+                                let ack = build_tcp_ip_ethernet(
+                                    gw_ip,
+                                    guest_ip,
+                                    eph_port,
+                                    container_port,
+                                    conn.host_seq,
+                                    payload_end_seq,
+                                    TCP_ACK,
+                                    65535,
+                                    &[],
+                                    self.gateway_mac,
+                                    guest_mac,
+                                );
+                                let _ = self.reply_tx.try_send(ack);
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            conn.state = InboundTcpState::Closed;
+                        }
+                    }
                     return;
                 }
 
                 if !payload.is_empty() {
-                    conn.guest_seq = seq.wrapping_add(payload.len() as u32);
+                    // Reject retransmits and out-of-order segments.
+                    if seq != expected_seq {
+                        if seq_before(seq, expected_seq) {
+                            // Retransmit — send duplicate ACK.
+                            let ack = build_tcp_ip_ethernet(
+                                gw_ip,
+                                guest_ip,
+                                eph_port,
+                                container_port,
+                                conn.host_seq,
+                                expected_seq,
+                                TCP_ACK,
+                                65535,
+                                &[],
+                                self.gateway_mac,
+                                guest_mac,
+                            );
+                            let _ = self.reply_tx.try_send(ack);
+                        }
+                        return;
+                    }
 
-                    // ACK the data.
-                    let ack = build_tcp_ip_ethernet(
-                        gw_ip,
-                        guest_ip,
-                        eph_port,
-                        container_port,
-                        conn.host_seq,
-                        conn.guest_seq,
-                        TCP_ACK,
-                        65535,
-                        &[],
-                        self.gateway_mac,
-                        guest_mac,
-                    );
-
-                    let reply_tx = self.reply_tx.clone();
-                    let payload_vec = payload.to_vec();
-                    let data_tx = conn.data_tx.clone();
-                    tokio::spawn(async move {
-                        let _ = reply_tx.send(ack).await;
-                        let _ = data_tx.send(payload_vec).await;
-                    });
+                    // Synchronously queue payload for the host socket.
+                    // Using try_send (not tokio::spawn) preserves segment
+                    // ordering — critical for TLS and other stream protocols.
+                    match conn.data_tx.try_send(payload.to_vec()) {
+                        Ok(()) => {
+                            conn.guest_seq = seq.wrapping_add(payload.len() as u32);
+                            let ack = build_tcp_ip_ethernet(
+                                gw_ip,
+                                guest_ip,
+                                eph_port,
+                                container_port,
+                                conn.host_seq,
+                                conn.guest_seq,
+                                TCP_ACK,
+                                65535,
+                                &[],
+                                self.gateway_mac,
+                                guest_mac,
+                            );
+                            let _ = self.reply_tx.try_send(ack);
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Backpressure: don't ACK so guest retransmits.
+                            tracing::debug!("Inbound TCP data channel full, backpressure applied");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            conn.state = InboundTcpState::Closed;
+                        }
+                    }
                 }
             }
 
@@ -588,10 +667,7 @@ impl InboundRelay {
             guest_mac,
         );
 
-        let reply_tx = self.reply_tx.clone();
-        tokio::spawn(async move {
-            let _ = reply_tx.send(frame).await;
-        });
+        let _ = self.reply_tx.try_send(frame);
 
         tracing::debug!(
             "Inbound UDP: injected {} bytes  gw:{} → guest:{}",
