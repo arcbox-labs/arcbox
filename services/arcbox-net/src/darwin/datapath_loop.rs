@@ -239,6 +239,7 @@ impl NetworkDatapath {
                         handle_intercepted_frame(
                             intercepted_frame,
                             &guest_async,
+                            &mut write_queue,
                             &mut socket_proxy,
                             &mut dhcp_server,
                             &dns_forwarder,
@@ -272,6 +273,7 @@ impl NetworkDatapath {
 
                 // Proxy → Guest: relay reply frames from socket proxy.
                 Some(reply_frame) = reply_rx.recv(), if accept_replies => {
+                    tracing::debug!("reply_rx: received {} byte frame, writing to guest", reply_frame.len());
                     enqueue_or_write(&guest_async, reply_frame, &mut write_queue);
                 }
 
@@ -332,6 +334,7 @@ impl NetworkDatapath {
 fn handle_intercepted_frame(
     intercepted: &crate::darwin::smoltcp_device::InterceptedFrame,
     guest_async: &AsyncFd<FdWrapper>,
+    write_queue: &mut VecDeque<Vec<u8>>,
     socket_proxy: &mut SocketProxy,
     dhcp_server: &mut DhcpServer,
     dns_forwarder: &DnsForwarder,
@@ -346,6 +349,7 @@ fn handle_intercepted_frame(
             handle_dhcp(
                 frame,
                 guest_async,
+                write_queue,
                 dhcp_server,
                 gateway_ip,
                 gateway_mac,
@@ -355,7 +359,6 @@ fn handle_intercepted_frame(
         InterceptedKind::Dns => {
             handle_dns(
                 frame,
-                guest_async,
                 dns_forwarder,
                 dns_reply_tx,
                 gateway_ip,
@@ -374,6 +377,7 @@ fn handle_intercepted_frame(
 fn handle_dhcp(
     frame: &[u8],
     guest_async: &AsyncFd<FdWrapper>,
+    write_queue: &mut VecDeque<Vec<u8>>,
     dhcp_server: &mut DhcpServer,
     gateway_ip: Ipv4Addr,
     gateway_mac: [u8; 6],
@@ -402,7 +406,7 @@ fn handle_dhcp(
                 guest_mac,
             );
             tracing::info!("Sending DHCP reply frame: {} bytes", reply_frame.len());
-            write_to_guest(guest_async, &reply_frame);
+            enqueue_or_write(guest_async, reply_frame, write_queue);
         }
         Ok(None) => {
             tracing::info!("DHCP: no response needed");
@@ -418,7 +422,6 @@ fn handle_dhcp(
 /// tokio task, keeping the datapath event loop unblocked.
 fn handle_dns(
     frame: &[u8],
-    guest_async: &AsyncFd<FdWrapper>,
     dns_forwarder: &DnsForwarder,
     dns_reply_tx: &mpsc::Sender<Vec<u8>>,
     gateway_ip: Ipv4Addr,
@@ -453,8 +456,13 @@ fn handle_dns(
             gateway_mac,
             guest_mac,
         );
-        write_to_guest(guest_async, &reply_frame);
-        tracing::debug!("Sent local DNS response to guest");
+        let tx = dns_reply_tx.clone();
+        tokio::spawn(async move {
+            if tx.send(reply_frame).await.is_err() {
+                tracing::debug!("DNS reply channel closed");
+            }
+        });
+        tracing::debug!("Queued local DNS response to guest");
         return;
     }
 
@@ -480,7 +488,23 @@ fn handle_dns(
                 }
                 tracing::debug!("Sent forwarded DNS response to guest");
             }
-            Err(e) => tracing::warn!("DNS forwarding failed: {e}"),
+            Err(e) => {
+                tracing::warn!("DNS forwarding failed: {e}");
+                if let Some(servfail) = build_dns_servfail_response(&data) {
+                    let reply_frame = build_udp_ip_ethernet(
+                        gateway_ip,
+                        src_ip,
+                        53,
+                        src_port,
+                        &servfail,
+                        gateway_mac,
+                        guest_mac,
+                    );
+                    if tx.send(reply_frame).await.is_err() {
+                        tracing::debug!("DNS reply channel closed");
+                    }
+                }
+            }
         }
     });
 }
@@ -504,6 +528,48 @@ async fn forward_dns_async(data: &[u8], upstream: &[SocketAddr]) -> Result<Vec<u
     }
 
     Err("all upstream DNS servers failed".to_string())
+}
+
+/// Builds a minimal DNS SERVFAIL response from the raw query.
+fn build_dns_servfail_response(query: &[u8]) -> Option<Vec<u8>> {
+    if query.len() < 12 {
+        return None;
+    }
+
+    // Parse first question section: QNAME + QTYPE + QCLASS.
+    let mut offset = 12;
+    while offset < query.len() {
+        let label_len = query[offset] as usize;
+        offset += 1;
+        if label_len == 0 {
+            break;
+        }
+        if offset + label_len > query.len() {
+            return None;
+        }
+        offset += label_len;
+    }
+    if offset + 4 > query.len() {
+        return None;
+    }
+    let question_end = offset + 4;
+
+    let mut response = Vec::with_capacity(question_end);
+    response.extend_from_slice(&query[..12]);
+
+    // Preserve opcode + RD, set QR=1.
+    response[2] = 0x80 | (query[2] & 0x79);
+    // RA=1, RCODE=2(SERVFAIL).
+    response[3] = 0x80 | 0x02;
+
+    // Single-question response with no answers/authority/additional.
+    response[4..6].copy_from_slice(&1u16.to_be_bytes());
+    response[6..8].copy_from_slice(&0u16.to_be_bytes());
+    response[8..10].copy_from_slice(&0u16.to_be_bytes());
+    response[10..12].copy_from_slice(&0u16.to_be_bytes());
+
+    response.extend_from_slice(&query[12..question_end]);
+    Some(response)
 }
 
 // ============================================================================
@@ -549,8 +615,8 @@ fn fd_write(fd: RawFd, data: &[u8]) -> io::Result<usize> {
 
 /// Writes a frame to the guest FD (best-effort, non-blocking).
 ///
-/// Used only for low-frequency control-plane frames (DHCP, local DNS)
-/// where `WouldBlock` is extremely unlikely and queuing is unnecessary.
+/// Used in tests for direct FD write verification.
+#[cfg(test)]
 fn write_to_guest(guest_async: &AsyncFd<FdWrapper>, data: &[u8]) {
     let fd = guest_async.get_ref().as_raw_fd();
     // SAFETY: writing from our buffer to a valid socketpair fd.
@@ -693,6 +759,32 @@ mod tests {
 
         assert_eq!(queue.len(), 2);
         assert_eq!(queue[1], frame);
+    }
+
+    #[test]
+    fn test_build_dns_servfail_response() {
+        let query = vec![
+            0x12, 0x34, // ID
+            0x01, 0x00, // Flags (RD)
+            0x00, 0x01, // QDCOUNT
+            0x00, 0x00, // ANCOUNT
+            0x00, 0x00, // NSCOUNT
+            0x00, 0x00, // ARCOUNT
+            0x01, b'a', // QNAME label "a"
+            0x00, // root
+            0x00, 0x01, // QTYPE A
+            0x00, 0x01, // QCLASS IN
+        ];
+
+        let response = build_dns_servfail_response(&query).expect("should build servfail");
+        assert_eq!(response[0..2], query[0..2]); // ID preserved
+        assert_eq!(response[2] & 0x80, 0x80); // QR=1
+        assert_eq!(response[3] & 0x0F, 0x02); // RCODE=SERVFAIL
+        assert_eq!(&response[4..6], &1u16.to_be_bytes()); // QDCOUNT=1
+        assert_eq!(&response[6..8], &0u16.to_be_bytes()); // ANCOUNT=0
+        assert_eq!(&response[8..10], &0u16.to_be_bytes()); // NSCOUNT=0
+        assert_eq!(&response[10..12], &0u16.to_be_bytes()); // ARCOUNT=0
+        assert_eq!(&response[12..], &query[12..]); // Question echoed
     }
 
     #[test]
