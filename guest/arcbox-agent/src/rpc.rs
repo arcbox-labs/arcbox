@@ -9,7 +9,7 @@ use prost::Message;
 use std::io::Cursor;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use arcbox_constants::wire::MessageType;
+pub use arcbox_constants::wire::MessageType;
 use arcbox_protocol::Empty;
 use arcbox_protocol::agent::{
     PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved, RuntimeEnsureRequest,
