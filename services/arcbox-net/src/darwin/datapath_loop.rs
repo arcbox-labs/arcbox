@@ -29,6 +29,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::darwin::inbound_relay::InboundCommand;
 use crate::darwin::socket_proxy::SocketProxy;
 use crate::dhcp::DhcpServer;
 use crate::dns::DnsForwarder;
@@ -60,6 +61,8 @@ pub struct NetworkDatapath {
     pub socket_proxy: SocketProxy,
     /// Channel receiving L2 reply frames from the socket proxy.
     pub reply_rx: mpsc::Receiver<Vec<u8>>,
+    /// Channel receiving inbound commands from `InboundListenerManager`.
+    pub cmd_rx: mpsc::Receiver<InboundCommand>,
     /// DHCP server.
     pub dhcp_server: DhcpServer,
     /// DNS forwarder.
@@ -85,6 +88,7 @@ impl NetworkDatapath {
         guest_fd: OwnedFd,
         socket_proxy: SocketProxy,
         reply_rx: mpsc::Receiver<Vec<u8>>,
+        cmd_rx: mpsc::Receiver<InboundCommand>,
         dhcp_server: DhcpServer,
         dns_forwarder: DnsForwarder,
         gateway_ip: Ipv4Addr,
@@ -96,6 +100,7 @@ impl NetworkDatapath {
             guest_fd,
             socket_proxy,
             reply_rx,
+            cmd_rx,
             dhcp_server,
             dns_forwarder,
             gateway_mac,
@@ -118,6 +123,7 @@ impl NetworkDatapath {
             guest_fd,
             mut socket_proxy,
             mut reply_rx,
+            mut cmd_rx,
             mut dhcp_server,
             mut dns_forwarder,
             gateway_mac,
@@ -177,6 +183,12 @@ impl NetworkDatapath {
                 // Proxy → Guest: relay reply frames from socket proxy.
                 Some(reply_frame) = reply_rx.recv() => {
                     write_to_guest(&guest_async, &reply_frame);
+                }
+
+                // Inbound commands from InboundListenerManager.
+                Some(cmd) = cmd_rx.recv() => {
+                    let mac = guest_mac.unwrap_or([0xFF; 6]);
+                    socket_proxy.handle_inbound_command(cmd, mac);
                 }
 
                 // Periodic maintenance.
