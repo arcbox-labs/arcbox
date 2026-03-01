@@ -26,6 +26,8 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -125,7 +127,7 @@ struct InboundTcpConn {
     /// Our (gateway) sequence number sent to the guest.
     host_seq: u32,
     /// Next expected sequence number from the guest.
-    guest_seq: u32,
+    guest_seq: Arc<AtomicU32>,
     /// Channel to forward data received from the guest to the relay write task.
     data_tx: mpsc::Sender<Vec<u8>>,
     /// Relay receiver — `Some` until the relay task is spawned (on Established).
@@ -244,7 +246,7 @@ impl InboundRelay {
         let key = (dst_ip, dst_port, src_ip, src_port);
 
         if self.tcp_conns.contains_key(&key) {
-            self.handle_tcp_reply(key, frame, tcp_start, guest_mac);
+            self.handle_tcp_reply(key, frame, ip_start, tcp_start, guest_mac);
             return true;
         }
 
@@ -321,7 +323,7 @@ impl InboundRelay {
             InboundTcpConn {
                 state: InboundTcpState::SynSent,
                 host_seq: host_isn,
-                guest_seq: 0,
+                guest_seq: Arc::new(AtomicU32::new(0)),
                 data_tx,
                 pending_rx: Some(data_rx),
                 stream: Some(stream),
@@ -360,9 +362,13 @@ impl InboundRelay {
         &mut self,
         key: (Ipv4Addr, u16, Ipv4Addr, u16),
         frame: &[u8],
+        ip_start: usize,
         tcp_start: usize,
         guest_mac: [u8; 6],
     ) {
+        if frame.len() < ip_start + 20 {
+            return;
+        }
         let flags = frame[tcp_start + 13];
         let seq = u32::from_be_bytes([
             frame[tcp_start + 4],
@@ -371,9 +377,18 @@ impl InboundRelay {
             frame[tcp_start + 7],
         ]);
         let data_offset = ((frame[tcp_start + 12] >> 4) as usize) * 4;
+        let ihl = ((frame[ip_start] & 0x0F) as usize) * 4;
+        let ip_total_len = u16::from_be_bytes([frame[ip_start + 2], frame[ip_start + 3]]) as usize;
+        if ip_total_len < ihl + data_offset {
+            return;
+        }
+        let ip_end = ip_start + ip_total_len;
+        if ip_end > frame.len() {
+            return;
+        }
         let payload_start = tcp_start + data_offset;
-        let payload = if payload_start < frame.len() {
-            &frame[payload_start..]
+        let payload = if payload_start < ip_end {
+            &frame[payload_start..ip_end]
         } else {
             &[]
         };
@@ -388,7 +403,7 @@ impl InboundRelay {
             InboundTcpState::SynSent => {
                 if flags & TCP_SYN != 0 && flags & TCP_ACK != 0 {
                     // Guest sent SYN-ACK. Complete handshake with ACK.
-                    conn.guest_seq = seq.wrapping_add(1);
+                    conn.guest_seq.store(seq.wrapping_add(1), Ordering::Relaxed);
                     conn.host_seq = conn.host_seq.wrapping_add(1); // SYN consumed one seq
                     conn.state = InboundTcpState::Established;
 
@@ -398,7 +413,7 @@ impl InboundRelay {
                         eph_port,
                         container_port,
                         conn.host_seq,
-                        conn.guest_seq,
+                        conn.guest_seq.load(Ordering::Relaxed),
                         TCP_ACK,
                         65535,
                         &[],
@@ -433,7 +448,7 @@ impl InboundRelay {
                     return;
                 }
 
-                let expected_seq = conn.guest_seq;
+                let expected_seq = conn.guest_seq.load(Ordering::Relaxed);
                 if flags & TCP_FIN != 0 {
                     // Reject retransmits and out-of-order FIN/data.
                     if seq != expected_seq {
@@ -462,7 +477,7 @@ impl InboundRelay {
                     if !payload.is_empty() {
                         match conn.data_tx.try_send(payload.to_vec()) {
                             Ok(()) => {
-                                conn.guest_seq = payload_end_seq;
+                                conn.guest_seq.store(payload_end_seq, Ordering::Relaxed);
                             }
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 tracing::debug!(
@@ -481,7 +496,8 @@ impl InboundRelay {
                     // payload bytes (if any) and wait for FIN retransmit.
                     match conn.data_tx.try_send(Vec::new()) {
                         Ok(()) => {
-                            conn.guest_seq = payload_end_seq.wrapping_add(1);
+                            conn.guest_seq
+                                .store(payload_end_seq.wrapping_add(1), Ordering::Relaxed);
                             conn.state = InboundTcpState::Closing;
                             let fin_ack = build_tcp_ip_ethernet(
                                 gw_ip,
@@ -489,7 +505,7 @@ impl InboundRelay {
                                 eph_port,
                                 container_port,
                                 conn.host_seq,
-                                conn.guest_seq,
+                                conn.guest_seq.load(Ordering::Relaxed),
                                 TCP_FIN | TCP_ACK,
                                 65535,
                                 &[],
@@ -554,14 +570,15 @@ impl InboundRelay {
                     // ordering — critical for TLS and other stream protocols.
                     match conn.data_tx.try_send(payload.to_vec()) {
                         Ok(()) => {
-                            conn.guest_seq = seq.wrapping_add(payload.len() as u32);
+                            conn.guest_seq
+                                .store(seq.wrapping_add(payload.len() as u32), Ordering::Relaxed);
                             let ack = build_tcp_ip_ethernet(
                                 gw_ip,
                                 guest_ip,
                                 eph_port,
                                 container_port,
                                 conn.host_seq,
-                                conn.guest_seq,
+                                conn.guest_seq.load(Ordering::Relaxed),
                                 TCP_ACK,
                                 65535,
                                 &[],
@@ -608,6 +625,7 @@ impl InboundRelay {
 
         let (gw_ip, eph_port, guest_ip, container_port) = key;
         let host_seq = conn.host_seq;
+        let guest_seq = Arc::clone(&conn.guest_seq);
         let reply_tx = self.reply_tx.clone();
         let gateway_mac = self.gateway_mac;
 
@@ -624,6 +642,7 @@ impl InboundRelay {
                 container_port,
                 guest_mac,
                 host_seq,
+                guest_seq,
             )
             .await;
         });
@@ -908,6 +927,7 @@ async fn inbound_tcp_relay(
     container_port: u16,
     guest_mac: [u8; 6],
     mut host_seq: u32,
+    shared_guest_seq: Arc<AtomicU32>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
 
@@ -925,7 +945,7 @@ async fn inbound_tcp_relay(
                         ephemeral_port,
                         container_port,
                         host_seq,
-                        0,
+                        shared_guest_seq.load(Ordering::Relaxed),
                         TCP_FIN | TCP_ACK,
                         65535,
                         &[],
@@ -942,7 +962,7 @@ async fn inbound_tcp_relay(
                         ephemeral_port,
                         container_port,
                         host_seq,
-                        0,
+                        shared_guest_seq.load(Ordering::Relaxed),
                         TCP_ACK | TCP_PSH,
                         65535,
                         &buf[..n],
@@ -1051,7 +1071,7 @@ mod tests {
             InboundTcpConn {
                 state: InboundTcpState::Closed,
                 host_seq: 0,
-                guest_seq: 0,
+                guest_seq: Arc::new(AtomicU32::new(0)),
                 data_tx,
                 pending_rx: None,
                 stream: None,
@@ -1061,6 +1081,50 @@ mod tests {
 
         relay.cleanup();
         assert_eq!(relay.tcp_conns.len(), 0);
+    }
+
+    #[test]
+    fn inbound_ack_padding_is_not_forwarded_as_payload() {
+        let (reply_tx, _reply_rx) = mpsc::channel(16);
+        let mut relay = InboundRelay::new(reply_tx, GW_MAC, GW_IP, GUEST_IP);
+
+        let (data_tx, mut data_rx) = mpsc::channel(16);
+        let key = (GW_IP, 61000, GUEST_IP, 443);
+        relay.tcp_conns.insert(
+            key,
+            InboundTcpConn {
+                state: InboundTcpState::Established,
+                host_seq: 20_000,
+                guest_seq: Arc::new(AtomicU32::new(10_000)),
+                data_tx,
+                pending_rx: None,
+                stream: None,
+            },
+        );
+
+        // ACK-only frame (IP total length = 40) with extra Ethernet padding.
+        let mut ack_frame = build_tcp_ip_ethernet(
+            GUEST_IP,
+            GW_IP,
+            443,
+            61000,
+            10_000,
+            20_000,
+            TCP_ACK,
+            65535,
+            &[],
+            GUEST_MAC,
+            GW_MAC,
+        );
+        ack_frame.resize(ETH_HEADER_LEN + 20 + 20 + 6, 0);
+
+        assert!(relay.try_handle_reply(&ack_frame, GUEST_MAC));
+        assert!(matches!(
+            data_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let conn = relay.tcp_conns.get(&key).expect("connection should exist");
+        assert_eq!(conn.guest_seq.load(Ordering::Relaxed), 10_000);
     }
 
     #[tokio::test]
@@ -1143,7 +1207,10 @@ mod tests {
         // Connection should now be Established.
         let conn = relay.tcp_conns.get(&key).unwrap();
         assert_eq!(conn.state, InboundTcpState::Established);
-        assert_eq!(conn.guest_seq, guest_isn.wrapping_add(1));
+        assert_eq!(
+            conn.guest_seq.load(Ordering::Relaxed),
+            guest_isn.wrapping_add(1)
+        );
         assert_eq!(conn.host_seq, host_isn.wrapping_add(1));
         // Stream and pending_rx should have been taken by spawn_relay.
         assert!(conn.stream.is_none(), "stream should be moved to relay");
