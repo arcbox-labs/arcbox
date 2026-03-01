@@ -851,6 +851,26 @@ impl MachineManager {
         Ok(())
     }
 
+    /// Takes the inbound listener manager from a running machine's VM (Darwin only).
+    ///
+    /// Returns `None` if the machine is not found, not running, or the manager
+    /// has already been taken.
+    #[cfg(target_os = "macos")]
+    pub fn take_inbound_listener_manager(
+        &self,
+        name: &str,
+    ) -> Option<arcbox_net::darwin::inbound_relay::InboundListenerManager> {
+        let vm_id = {
+            let machines = self.machines.read().ok()?;
+            let machine = machines.get(name)?;
+            if machine.state != MachineState::Running {
+                return None;
+            }
+            machine.vm_id.clone()
+        };
+        self.vm_manager.take_inbound_listener_manager(&vm_id)
+    }
+
     /// Registers a mock machine for testing purposes.
     ///
     /// This method creates a machine entry without creating an actual VM.

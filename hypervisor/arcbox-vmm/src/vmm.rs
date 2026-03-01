@@ -200,6 +200,9 @@ pub struct Vmm {
     /// Cancellation token for the network datapath task (Darwin only).
     #[cfg(target_os = "macos")]
     net_cancel: Option<CancellationToken>,
+    /// Inbound listener manager for port forwarding (Darwin only).
+    #[cfg(target_os = "macos")]
+    inbound_listener_manager: Option<arcbox_net::darwin::inbound_relay::InboundListenerManager>,
 }
 
 impl Vmm {
@@ -249,6 +252,8 @@ impl Vmm {
             managed_vm: None,
             #[cfg(target_os = "macos")]
             net_cancel: None,
+            #[cfg(target_os = "macos")]
+            inbound_listener_manager: None,
         })
     }
 
@@ -268,6 +273,25 @@ impl Vmm {
     #[must_use]
     pub fn running_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.running)
+    }
+
+    /// Returns a mutable reference to the inbound listener manager (Darwin only).
+    #[cfg(target_os = "macos")]
+    pub fn inbound_listener_manager(
+        &mut self,
+    ) -> Option<&mut arcbox_net::darwin::inbound_relay::InboundListenerManager> {
+        self.inbound_listener_manager.as_mut()
+    }
+
+    /// Takes the inbound listener manager out of the VMM (Darwin only).
+    ///
+    /// After this call, the VMM no longer owns the manager. The caller is
+    /// responsible for calling `stop_all()` on shutdown.
+    #[cfg(target_os = "macos")]
+    pub fn take_inbound_listener_manager(
+        &mut self,
+    ) -> Option<arcbox_net::darwin::inbound_relay::InboundListenerManager> {
+        self.inbound_listener_manager.take()
     }
 
     /// Initializes the VMM components.
@@ -448,6 +472,7 @@ impl Vmm {
     #[cfg(target_os = "macos")]
     fn create_network_device(&mut self) -> Result<VirtioDeviceConfig> {
         use arcbox_net::darwin::datapath_loop::NetworkDatapath;
+        use arcbox_net::darwin::inbound_relay::InboundListenerManager;
         use arcbox_net::darwin::socket_proxy::SocketProxy;
         use arcbox_net::dhcp::{DhcpConfig, DhcpServer};
         use arcbox_net::dns::{DnsConfig, DnsForwarder};
@@ -497,9 +522,13 @@ impl Vmm {
             );
         }
 
-        // 2. Create the socket proxy and reply channel.
+        // 2. Create the socket proxy, reply channel, and inbound command channel.
         let (reply_tx, reply_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
-        let socket_proxy = SocketProxy::new(gateway_ip, gateway_mac, reply_tx);
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
+        let socket_proxy = SocketProxy::new(gateway_ip, gateway_mac, guest_ip, reply_tx);
+
+        // Create the inbound listener manager for port forwarding.
+        self.inbound_listener_manager = Some(InboundListenerManager::new(cmd_tx));
 
         tracing::info!(
             "Custom network stack: socket proxy (gateway={}, guest={})",
@@ -524,6 +553,7 @@ impl Vmm {
             host_fd,
             socket_proxy,
             reply_rx,
+            cmd_rx,
             dhcp_server,
             dns_forwarder,
             gateway_ip,

@@ -8,19 +8,22 @@ use crate::event::EventBus;
 use crate::machine::{MachineManager, MachineState};
 use crate::vm::VmManager;
 use crate::vm_lifecycle::{DEFAULT_MACHINE_NAME, VmLifecycleConfig, VmLifecycleManager};
-use arcbox_net::{
-    NetworkManager,
-    port_forward::{PortForwardRule, PortForwarder},
-};
+use arcbox_net::NetworkManager;
+#[cfg(target_os = "macos")]
+use arcbox_net::darwin::inbound_relay::{InboundListenerManager, InboundProtocol};
+#[cfg(not(target_os = "macos"))]
+use arcbox_net::port_forward::{PortForwardRule, PortForwarder};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+#[cfg(not(target_os = "macos"))]
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock as TokioRwLock;
 
-/// Default guest VM IP address in NAT network.
+/// Default guest VM IP address in NAT network (used by PortForwarder fallback).
+#[cfg(not(target_os = "macos"))]
 const DEFAULT_GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 2);
 const REQUIRED_RUNTIME_ASSETS: [&str; 3] = ["dockerd", "containerd", "youki"];
 
@@ -120,7 +123,14 @@ pub struct Runtime {
     container_backend: DynContainerBackend,
     /// Network manager.
     network_manager: Arc<NetworkManager>,
-    /// Port forwarders for each container (keyed by container ID).
+    /// Inbound listener manager for port forwarding via L2 frame injection (macOS).
+    #[cfg(target_os = "macos")]
+    inbound_listener: Arc<TokioRwLock<Option<InboundListenerManager>>>,
+    /// Tracks which inbound rules belong to each container for cleanup (macOS).
+    #[cfg(target_os = "macos")]
+    inbound_rules: Arc<TokioRwLock<HashMap<String, Vec<(u16, InboundProtocol)>>>>,
+    /// Port forwarders for each container (non-macOS fallback).
+    #[cfg(not(target_os = "macos"))]
     port_forwarders: Arc<TokioRwLock<HashMap<String, PortForwarder>>>,
 }
 
@@ -190,6 +200,11 @@ impl Runtime {
             vm_lifecycle,
             container_backend,
             network_manager,
+            #[cfg(target_os = "macos")]
+            inbound_listener: Arc::new(TokioRwLock::new(None)),
+            #[cfg(target_os = "macos")]
+            inbound_rules: Arc::new(TokioRwLock::new(HashMap::new())),
+            #[cfg(not(target_os = "macos"))]
             port_forwarders: Arc::new(TokioRwLock::new(HashMap::new())),
         })
     }
@@ -466,6 +481,7 @@ impl Runtime {
 
     /// Gets the VM's IP address from machine state, falling back to the
     /// default NAT IP when the address is not known yet.
+    #[cfg(not(target_os = "macos"))]
     fn guest_ip_for_machine(&self, machine_name: &str) -> Ipv4Addr {
         let ip = self
             .machine_manager
@@ -487,12 +503,12 @@ impl Runtime {
 
     /// Starts port forwarding for a container from externally-provided bindings.
     ///
-    /// Used by the smart proxy layer which parses port bindings from the guest
-    /// Docker inspect response.
+    /// On macOS, uses `InboundListenerManager` with L2 frame injection through
+    /// the socketpair. On other platforms, falls back to `PortForwarder`.
     ///
     /// # Errors
     ///
-    /// Returns an error if listeners fail.
+    /// Returns an error if listeners fail to bind.
     pub async fn start_port_forwarding_for(
         &self,
         machine_name: &str,
@@ -503,6 +519,80 @@ impl Runtime {
             return Ok(());
         }
 
+        #[cfg(target_os = "macos")]
+        {
+            self.start_port_forwarding_macos(machine_name, container_id, bindings)
+                .await
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.start_port_forwarding_fallback(machine_name, container_id, bindings)
+                .await
+        }
+    }
+
+    /// macOS: add inbound rules via InboundListenerManager.
+    #[cfg(target_os = "macos")]
+    async fn start_port_forwarding_macos(
+        &self,
+        machine_name: &str,
+        container_id: &str,
+        bindings: &[(String, u16, u16, String)],
+    ) -> Result<()> {
+        // Lazily take the manager from the VMM on first use.
+        {
+            let mut guard = self.inbound_listener.write().await;
+            if guard.is_none() {
+                *guard = self
+                    .machine_manager
+                    .take_inbound_listener_manager(machine_name);
+                if guard.is_none() {
+                    return Err(CoreError::Machine(
+                        "inbound listener manager not available".to_string(),
+                    ));
+                }
+            }
+        }
+
+        let mut added_rules = Vec::new();
+
+        for (_host_ip_str, host_port, container_port, protocol) in bindings {
+            let proto = match protocol.to_lowercase().as_str() {
+                "udp" => InboundProtocol::Udp,
+                _ => InboundProtocol::Tcp,
+            };
+
+            let mut guard = self.inbound_listener.write().await;
+            let manager = guard.as_mut().expect("checked above");
+            if let Err(e) = manager.add_rule(*host_port, *container_port, proto).await {
+                tracing::warn!(
+                    "Failed to bind inbound port {}:{}: {}",
+                    host_port,
+                    protocol,
+                    e,
+                );
+                continue;
+            }
+            added_rules.push((*host_port, proto));
+        }
+
+        if !added_rules.is_empty() {
+            let mut rules = self.inbound_rules.write().await;
+            rules.insert(container_id.to_string(), added_rules);
+        }
+
+        Ok(())
+    }
+
+    /// Non-macOS fallback: use PortForwarder with direct TCP/UDP connect.
+    #[cfg(not(target_os = "macos"))]
+    async fn start_port_forwarding_fallback(
+        &self,
+        machine_name: &str,
+        container_id: &str,
+        bindings: &[(String, u16, u16, String)],
+    ) -> Result<()> {
         let guest_ip = self.guest_ip_for_machine(machine_name);
         let mut forwarder = PortForwarder::new();
 
@@ -540,19 +630,51 @@ impl Runtime {
 
     /// Stops port forwarding for a container by its string ID.
     pub async fn stop_port_forwarding_by_id(&self, container_id: &str) {
-        let mut forwarders = self.port_forwarders.write().await;
-        if let Some(mut forwarder) = forwarders.remove(container_id) {
-            forwarder.stop().await;
-            tracing::debug!("Stopped port forwarding for container {}", container_id);
+        #[cfg(target_os = "macos")]
+        {
+            let rules = {
+                let mut guard = self.inbound_rules.write().await;
+                guard.remove(container_id)
+            };
+            if let Some(rules) = rules {
+                let mut guard = self.inbound_listener.write().await;
+                if let Some(manager) = guard.as_mut() {
+                    for (host_port, proto) in rules {
+                        manager.remove_rule(host_port, proto);
+                    }
+                }
+                tracing::debug!("Stopped port forwarding for container {}", container_id);
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut forwarders = self.port_forwarders.write().await;
+            if let Some(mut forwarder) = forwarders.remove(container_id) {
+                forwarder.stop().await;
+                tracing::debug!("Stopped port forwarding for container {}", container_id);
+            }
         }
     }
 
     /// Stops all active port forwarders.
     pub async fn stop_port_forwarding_all(&self) {
-        let mut forwarders = self.port_forwarders.write().await;
-        for (container_id, mut forwarder) in forwarders.drain() {
-            tracing::debug!("Stopping port forwarder for container {}", container_id);
-            forwarder.stop().await;
+        #[cfg(target_os = "macos")]
+        {
+            let mut guard = self.inbound_listener.write().await;
+            if let Some(manager) = guard.as_mut() {
+                manager.stop_all();
+            }
+            self.inbound_rules.write().await.clear();
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut forwarders = self.port_forwarders.write().await;
+            for (container_id, mut forwarder) in forwarders.drain() {
+                tracing::debug!("Stopping port forwarder for container {}", container_id);
+                forwarder.stop().await;
+            }
         }
     }
 }
