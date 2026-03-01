@@ -262,7 +262,25 @@ impl DnsForwarder {
         self.local_hosts.get(&hostname).copied()
     }
 
-    /// Handles a DNS query packet.
+    /// Attempts to resolve a DNS query locally without any network I/O.
+    ///
+    /// Returns `Ok(Some(response))` if the query was resolved from local host
+    /// mappings, or `Ok(None)` if upstream forwarding is needed. Unsupported
+    /// query types (e.g. HTTPS/SVCB) gracefully return `None` instead of
+    /// failing, so the caller can forward the raw query.
+    pub fn try_resolve_locally(&self, data: &[u8]) -> Option<Vec<u8>> {
+        let query = DnsQuery::parse(data).ok()?;
+        let ip = self.resolve_local(&query.name)?;
+        self.build_local_response(&query, ip).ok()
+    }
+
+    /// Returns the upstream DNS server addresses.
+    #[must_use]
+    pub fn upstream(&self) -> &[SocketAddr] {
+        &self.config.upstream
+    }
+
+    /// Handles a DNS query packet (synchronous, blocks on upstream forwarding).
     ///
     /// Returns the response packet.
     ///

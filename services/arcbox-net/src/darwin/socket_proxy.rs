@@ -316,6 +316,8 @@ pub struct SocketProxy {
     tcp: TcpProxy,
     /// Inbound relay for host → guest port forwarding.
     inbound: super::inbound_relay::InboundRelay,
+    /// Shared reply sender for injecting L2 frames towards the guest.
+    reply_tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl SocketProxy {
@@ -339,9 +341,17 @@ impl SocketProxy {
         Self {
             icmp: IcmpProxy::new(reply_tx.clone(), gateway_mac),
             udp: UdpProxy::new(reply_tx.clone(), gateway_mac, gateway_ip),
-            tcp: TcpProxy::new(reply_tx, gateway_mac, gateway_ip),
+            tcp: TcpProxy::new(reply_tx.clone(), gateway_mac, gateway_ip),
             inbound,
+            reply_tx,
         }
+    }
+
+    /// Returns a clone of the reply sender for external use (e.g. async DNS
+    /// forwarding).
+    #[must_use]
+    pub fn reply_sender(&self) -> mpsc::Sender<Vec<u8>> {
+        self.reply_tx.clone()
     }
 
     /// Dispatches an outbound IPv4 frame to the appropriate protocol proxy.

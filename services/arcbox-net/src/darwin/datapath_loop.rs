@@ -22,8 +22,9 @@
 //! pf NAT. This bypasses kernel routing, VPN interference, and pf issues.
 
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::time::Duration;
 
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
@@ -125,7 +126,7 @@ impl NetworkDatapath {
             mut reply_rx,
             mut cmd_rx,
             mut dhcp_server,
-            mut dns_forwarder,
+            dns_forwarder,
             gateway_mac,
             gateway_ip,
             arp_responder,
@@ -135,6 +136,9 @@ impl NetworkDatapath {
         // Set guest_fd to non-blocking for AsyncFd.
         set_nonblocking(guest_fd.as_raw_fd())?;
         let guest_async = AsyncFd::new(FdWrapper(guest_fd))?;
+
+        // Clone the reply sender for async DNS forwarding tasks.
+        let dns_reply_tx = socket_proxy.reply_sender();
 
         let mut guest_buf = vec![0u8; MAX_FRAME_SIZE];
         let mut guest_mac: Option<[u8; 6]> = None;
@@ -166,7 +170,8 @@ impl NetworkDatapath {
                                 &guest_async,
                                 &mut socket_proxy,
                                 &mut dhcp_server,
-                                &mut dns_forwarder,
+                                &dns_forwarder,
+                                &dns_reply_tx,
                                 &arp_responder,
                                 gateway_ip,
                                 gateway_mac,
@@ -213,7 +218,8 @@ fn dispatch_guest_frame(
     guest_async: &AsyncFd<FdWrapper>,
     socket_proxy: &mut SocketProxy,
     dhcp_server: &mut DhcpServer,
-    dns_forwarder: &mut DnsForwarder,
+    dns_forwarder: &DnsForwarder,
+    dns_reply_tx: &mpsc::Sender<Vec<u8>>,
     arp_responder: &ArpResponder,
     gateway_ip: Ipv4Addr,
     gateway_mac: [u8; 6],
@@ -253,6 +259,7 @@ fn dispatch_guest_frame(
                 socket_proxy,
                 dhcp_server,
                 dns_forwarder,
+                dns_reply_tx,
                 gateway_ip,
                 gateway_mac,
                 guest_mac.unwrap_or([0xFF; 6]),
@@ -272,7 +279,8 @@ fn handle_ipv4_from_guest(
     guest_async: &AsyncFd<FdWrapper>,
     socket_proxy: &mut SocketProxy,
     dhcp_server: &mut DhcpServer,
-    dns_forwarder: &mut DnsForwarder,
+    dns_forwarder: &DnsForwarder,
+    dns_reply_tx: &mpsc::Sender<Vec<u8>>,
     gateway_ip: Ipv4Addr,
     gateway_mac: [u8; 6],
     guest_mac: [u8; 6],
@@ -319,6 +327,7 @@ fn handle_ipv4_from_guest(
                 l4_start,
                 guest_async,
                 dns_forwarder,
+                dns_reply_tx,
                 gateway_ip,
                 gateway_mac,
                 guest_mac,
@@ -384,11 +393,17 @@ fn handle_dhcp(
 }
 
 /// Handles a DNS query from the guest.
+///
+/// Local host mappings are resolved synchronously (no I/O). All other
+/// queries are forwarded to upstream servers asynchronously via a spawned
+/// tokio task, keeping the datapath event loop unblocked.
+#[allow(clippy::too_many_arguments)]
 fn handle_dns(
     frame: &[u8],
     l4_start: usize,
     guest_async: &AsyncFd<FdWrapper>,
-    dns_forwarder: &mut DnsForwarder,
+    dns_forwarder: &DnsForwarder,
+    dns_reply_tx: &mpsc::Sender<Vec<u8>>,
     gateway_ip: Ipv4Addr,
     gateway_mac: [u8; 6],
     guest_mac: [u8; 6],
@@ -407,22 +422,69 @@ fn handle_dns(
     let src_port = u16::from_be_bytes([frame[l4_start], frame[l4_start + 1]]);
 
     let dns_data = &frame[dns_start..];
-    match dns_forwarder.handle_query(dns_data) {
-        Ok(response) => {
-            let reply_frame = build_udp_ip_ethernet(
-                gateway_ip,
-                src_ip,
-                53,
-                src_port,
-                &response,
-                gateway_mac,
-                guest_mac,
-            );
-            write_to_guest(guest_async, &reply_frame);
-            tracing::debug!("Sent DNS response to guest");
-        }
-        Err(e) => tracing::warn!("DNS handling error: {}", e),
+
+    // Fast path: resolve from local host mappings (no I/O).
+    if let Some(response) = dns_forwarder.try_resolve_locally(dns_data) {
+        let reply_frame = build_udp_ip_ethernet(
+            gateway_ip,
+            src_ip,
+            53,
+            src_port,
+            &response,
+            gateway_mac,
+            guest_mac,
+        );
+        write_to_guest(guest_async, &reply_frame);
+        tracing::debug!("Sent local DNS response to guest");
+        return;
     }
+
+    // Slow path: forward to upstream asynchronously.
+    let upstream = dns_forwarder.upstream().to_vec();
+    let data = dns_data.to_vec();
+    let tx = dns_reply_tx.clone();
+
+    tokio::spawn(async move {
+        match forward_dns_async(&data, &upstream).await {
+            Ok(response) => {
+                let reply_frame = build_udp_ip_ethernet(
+                    gateway_ip,
+                    src_ip,
+                    53,
+                    src_port,
+                    &response,
+                    gateway_mac,
+                    guest_mac,
+                );
+                if tx.send(reply_frame).await.is_err() {
+                    tracing::debug!("DNS reply channel closed");
+                }
+                tracing::debug!("Sent forwarded DNS response to guest");
+            }
+            Err(e) => tracing::warn!("DNS forwarding failed: {e}"),
+        }
+    });
+}
+
+/// Forwards a raw DNS query to upstream servers using async I/O.
+async fn forward_dns_async(data: &[u8], upstream: &[SocketAddr]) -> Result<Vec<u8>, String> {
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+        .await
+        .map_err(|e| format!("bind failed: {e}"))?;
+
+    for addr in upstream {
+        if socket.send_to(data, addr).await.is_err() {
+            continue;
+        }
+
+        let mut buf = [0u8; 4096]; // EDNS0 can exceed 512 bytes.
+        match tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await {
+            Ok(Ok((len, _))) => return Ok(buf[..len].to_vec()),
+            _ => continue,
+        }
+    }
+
+    Err("all upstream DNS servers failed".to_string())
 }
 
 // ============================================================================
