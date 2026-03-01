@@ -607,8 +607,8 @@ mod tests {
         let ports: Vec<u16> = (0..20).map(|_| alloc.allocate()).collect();
 
         // Should cycle through the range
-        for i in 0..11 {
-            assert_eq!(ports[i], 1000 + (i as u16));
+        for (i, port) in ports.iter().enumerate().take(11) {
+            assert_eq!(*port, 1000 + (i as u16));
         }
         // Then wrap around
         assert_eq!(ports[11], 1000);
