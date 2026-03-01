@@ -25,6 +25,7 @@
 //! ```
 
 use crate::error::{CoreError, Result};
+use arcbox_constants::env::BOOT_ASSET_VERSION as BOOT_ASSET_VERSION_ENV;
 use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -183,7 +184,7 @@ impl BootAssetConfig {
 }
 
 fn default_boot_asset_version() -> String {
-    std::env::var("ARCBOX_BOOT_ASSET_VERSION").unwrap_or_else(|_| BOOT_ASSET_VERSION.to_string())
+    std::env::var(BOOT_ASSET_VERSION_ENV).unwrap_or_else(|_| BOOT_ASSET_VERSION.to_string())
 }
 
 // =============================================================================
@@ -816,8 +817,8 @@ impl BootAssetProvider {
             return Err(CoreError::config(format!(
                 "boot manifest version mismatch: expected '{}', got '{}'. \
                  Run 'arcbox boot prefetch --force' to re-download the correct version, \
-                 or set ARCBOX_BOOT_ASSET_VERSION to match your cached assets.",
-                self.config.version, manifest.asset_version
+                 or set {} to match your cached assets.",
+                self.config.version, manifest.asset_version, BOOT_ASSET_VERSION_ENV,
             )));
         }
 
@@ -1144,9 +1145,9 @@ mod tests {
     #[test]
     fn test_default_config_uses_boot_asset_version() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let original = std::env::var("ARCBOX_BOOT_ASSET_VERSION").ok();
+        let original = std::env::var(BOOT_ASSET_VERSION_ENV).ok();
         // SAFETY: Test code running under ENV_LOCK mutex, single-threaded access.
-        unsafe { std::env::remove_var("ARCBOX_BOOT_ASSET_VERSION") };
+        unsafe { std::env::remove_var(BOOT_ASSET_VERSION_ENV) };
 
         let config = BootAssetConfig::default();
         assert_eq!(config.version, BOOT_ASSET_VERSION.to_string());
@@ -1157,9 +1158,9 @@ mod tests {
     #[test]
     fn test_default_config_env_override() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let original = std::env::var("ARCBOX_BOOT_ASSET_VERSION").ok();
+        let original = std::env::var(BOOT_ASSET_VERSION_ENV).ok();
         // SAFETY: Test code running under ENV_LOCK mutex, single-threaded access.
-        unsafe { std::env::set_var("ARCBOX_BOOT_ASSET_VERSION", "9.9.9") };
+        unsafe { std::env::set_var(BOOT_ASSET_VERSION_ENV, "9.9.9") };
 
         let config = BootAssetConfig::default();
         assert_eq!(config.version, "9.9.9");
@@ -1432,8 +1433,8 @@ mod tests {
         // environment variables is safe.
         unsafe {
             match original {
-                Some(value) => std::env::set_var("ARCBOX_BOOT_ASSET_VERSION", value),
-                None => std::env::remove_var("ARCBOX_BOOT_ASSET_VERSION"),
+                Some(value) => std::env::set_var(BOOT_ASSET_VERSION_ENV, value),
+                None => std::env::remove_var(BOOT_ASSET_VERSION_ENV),
             }
         }
     }

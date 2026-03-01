@@ -36,6 +36,7 @@
 //! level = "info"
 //! ```
 
+use arcbox_constants::ports::DOCKER_API_VSOCK_PORT;
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
@@ -262,7 +263,7 @@ impl Default for ContainerRuntimeConfig {
     fn default() -> Self {
         Self {
             provision: ContainerProvisionMode::BundledAssets,
-            guest_docker_vsock_port: 2375,
+            guest_docker_vsock_port: DOCKER_API_VSOCK_PORT,
             startup_timeout_ms: 60_000,
         }
     }
@@ -348,7 +349,10 @@ mod tests {
             config.container.provision,
             ContainerProvisionMode::BundledAssets
         );
-        assert_eq!(config.container.guest_docker_vsock_port, 2375);
+        assert_eq!(
+            config.container.guest_docker_vsock_port,
+            DOCKER_API_VSOCK_PORT
+        );
     }
 
     #[test]

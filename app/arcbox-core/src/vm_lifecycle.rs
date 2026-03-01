@@ -31,6 +31,11 @@ use crate::boot_assets::{BootAssetConfig, BootAssetProvider, BootAssets};
 use crate::error::{CoreError, Result};
 use crate::event::{Event, EventBus};
 use crate::machine::{MachineConfig, MachineInfo, MachineManager, MachineState};
+use arcbox_constants::cmdline::{
+    BOOT_ASSET_VERSION_KEY, DOCKER_DATA_DEVICE_KEY as DOCKER_DATA_DEVICE_CMDLINE_KEY,
+    GUEST_DOCKER_VSOCK_PORT_KEY, MODE_MACHINE,
+};
+use arcbox_constants::devices::ROOT_BLOCK_DEVICE;
 use arcbox_error::CommonError;
 use std::fs::OpenOptions;
 use std::io::Seek;
@@ -48,9 +53,6 @@ use tokio_util::sync::CancellationToken;
 
 /// Default machine name used for container operations.
 pub const DEFAULT_MACHINE_NAME: &str = "default";
-
-/// Default agent port for vsock communication.
-pub const DEFAULT_AGENT_PORT: u32 = 1024;
 
 /// Default startup timeout in seconds.
 const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 30;
@@ -75,9 +77,6 @@ const BALLOON_SHRINK_DELAY_SECS: u64 = 10;
 const DOCKER_DATA_IMAGE_NAME: &str = "docker.img";
 /// Persistent guest dockerd data image size (64 GiB sparse file).
 const DOCKER_DATA_IMAGE_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-/// Kernel cmdline key for guest docker data device.
-const DOCKER_DATA_DEVICE_CMDLINE_KEY: &str = "arcbox.docker_data_device=";
-
 // =============================================================================
 // VM Lifecycle State
 // =============================================================================
@@ -799,15 +798,15 @@ impl VmLifecycleManager {
                 .filter(|t| !t.starts_with("rdinit=") && !t.starts_with("root="))
                 .collect();
             cmdline = tokens.join(" ");
-            cmdline.push_str(" root=/dev/vda rw");
+            cmdline.push_str(" root=");
+            cmdline.push_str(ROOT_BLOCK_DEVICE);
+            cmdline.push_str(" rw");
 
             // The guest agent gates its machine-init path (mount /dev/vda,
             // switch_root to OpenRC) on this token.
-            if !cmdline
-                .split_whitespace()
-                .any(|t| t == "arcbox.mode=machine")
-            {
-                cmdline.push_str(" arcbox.mode=machine");
+            if !cmdline.split_whitespace().any(|t| t == MODE_MACHINE) {
+                cmdline.push(' ');
+                cmdline.push_str(MODE_MACHINE);
             }
         }
 
@@ -826,23 +825,21 @@ impl VmLifecycleManager {
             cmdline.push_str(" earlycon");
         }
 
-        let boot_version_key = "arcbox.boot_asset_version=";
         if !cmdline
             .split_whitespace()
-            .any(|token| token.starts_with(boot_version_key))
+            .any(|token| token.starts_with(BOOT_ASSET_VERSION_KEY))
         {
             cmdline.push(' ');
-            cmdline.push_str(boot_version_key);
+            cmdline.push_str(BOOT_ASSET_VERSION_KEY);
             cmdline.push_str(&assets.version);
         }
         if let Some(port) = self.config.guest_docker_vsock_port {
-            let key = "arcbox.guest_docker_vsock_port=";
             if !cmdline
                 .split_whitespace()
-                .any(|token| token.starts_with(key))
+                .any(|token| token.starts_with(GUEST_DOCKER_VSOCK_PORT_KEY))
             {
                 cmdline.push(' ');
-                cmdline.push_str(&format!("{key}{port}"));
+                cmdline.push_str(&format!("{}{port}", GUEST_DOCKER_VSOCK_PORT_KEY));
             }
         }
 
