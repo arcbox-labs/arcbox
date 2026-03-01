@@ -269,11 +269,15 @@ impl NetworkDatapath {
                     for frame in device.take_tx_pending() {
                         enqueue_or_write(&guest_async, frame, &mut write_queue);
                     }
+
+                    // Drain pending proxy replies (DNS, UDP, ICMP responses).
+                    // This avoids starvation of reply_rx under biased select!
+                    // when readable fires repeatedly.
+                    drain_reply_rx(&mut reply_rx, &guest_async, &mut write_queue);
                 }
 
                 // Proxy → Guest: relay reply frames from socket proxy.
                 Some(reply_frame) = reply_rx.recv(), if accept_replies => {
-                    tracing::debug!("reply_rx: received {} byte frame, writing to guest", reply_frame.len());
                     enqueue_or_write(&guest_async, reply_frame, &mut write_queue);
                 }
 
@@ -312,6 +316,7 @@ impl NetworkDatapath {
                     for frame in device.take_tx_pending() {
                         enqueue_or_write(&guest_async, frame, &mut write_queue);
                     }
+                    drain_reply_rx(&mut reply_rx, &guest_async, &mut write_queue);
                 }
 
                 // Periodic maintenance.
@@ -575,6 +580,31 @@ fn build_dns_servfail_response(query: &[u8]) -> Option<Vec<u8>> {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Maximum number of reply frames to drain per call, preventing a single
+/// drain from starving other `select!` branches under high traffic.
+const DRAIN_REPLY_BATCH: usize = 64;
+
+/// Non-blocking drain of the reply channel. Delivers pending proxy
+/// responses (DNS, UDP, ICMP) to the guest without blocking the event loop.
+///
+/// Respects `WRITE_QUEUE_HIGH` backpressure and limits each call to
+/// `DRAIN_REPLY_BATCH` frames to avoid starving other `select!` branches.
+fn drain_reply_rx(
+    reply_rx: &mut mpsc::Receiver<Vec<u8>>,
+    guest_async: &AsyncFd<FdWrapper>,
+    write_queue: &mut VecDeque<Vec<u8>>,
+) {
+    for _ in 0..DRAIN_REPLY_BATCH {
+        if write_queue.len() >= WRITE_QUEUE_HIGH {
+            break;
+        }
+        match reply_rx.try_recv() {
+            Ok(reply_frame) => enqueue_or_write(guest_async, reply_frame, write_queue),
+            Err(_) => break,
+        }
+    }
+}
 
 /// Attempts a direct non-blocking write; queues the frame on `WouldBlock`.
 ///
