@@ -75,8 +75,9 @@ struct BridgedConn {
     guest_to_host_tx: mpsc::Sender<Vec<u8>>,
     /// Set to true when the host read task has sent all data (EOF).
     host_eof: bool,
-    /// Set to true when the host connect failed — abort the smoltcp socket.
-    connect_failed: bool,
+    /// Set to true when the host channel has disconnected (connect failed or
+    /// normal task exit after EOF).
+    host_disconnected: bool,
     /// Leftover bytes from a partial `send_slice` that need to be retried.
     pending_send: Option<Vec<u8>>,
     /// Set to true when the guest→host sender has been closed to signal EOF.
@@ -134,8 +135,10 @@ impl TcpBridge {
             // Try to reuse a free handle first.
             let handle = if let Some(h) = self.free_handles.pop() {
                 let sock = sockets.get_mut::<tcp::Socket>(h);
-                sock.listen(port)
-                    .expect("failed to re-listen on free socket");
+                if let Err(e) = sock.listen(port) {
+                    tracing::warn!("TCP bridge: failed to re-listen on port {port}: {e:?}");
+                    continue;
+                }
                 sock.set_nagle_enabled(false);
                 h
             } else {
@@ -143,7 +146,10 @@ impl TcpBridge {
                 let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
                 let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
                 let mut sock = tcp::Socket::new(rx_buf, tx_buf);
-                sock.listen(port).expect("failed to listen on new socket");
+                if let Err(e) = sock.listen(port) {
+                    tracing::warn!("TCP bridge: failed to listen on port {port}: {e:?}");
+                    continue;
+                }
                 sock.set_nagle_enabled(false);
                 sock.set_ack_delay(None);
                 sockets.add(sock)
@@ -206,7 +212,7 @@ impl TcpBridge {
                 host_to_guest_rx: h2g_rx,
                 guest_to_host_tx: g2h_tx,
                 host_eof: false,
-                connect_failed: false,
+                host_disconnected: false,
                 pending_send: None,
                 guest_eof_sent: false,
             },
@@ -291,7 +297,7 @@ impl TcpBridge {
                         host_to_guest_rx: h2g_rx,
                         guest_to_host_tx: g2h_tx,
                         host_eof: false,
-                        connect_failed: false,
+                        host_disconnected: false,
                         pending_send: None,
                         guest_eof_sent: false,
                     },
@@ -349,8 +355,8 @@ impl TcpBridge {
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
-                        // Host task exited (connect failed or stream closed).
-                        conn.connect_failed = true;
+                        // Host task exited — either connect failed or normal close.
+                        conn.host_disconnected = true;
                         break;
                     }
                 }
@@ -363,10 +369,22 @@ impl TcpBridge {
                 conn.host_eof = false;
             }
 
-            // If host connect failed, abort (RST to guest).
-            if conn.connect_failed {
-                sock.abort();
-                continue;
+            // If host channel disconnected before connection was established,
+            // this is a connect failure — abort (RST to guest).
+            // If disconnected after the connection was established (host_eof
+            // was previously received), it's a normal close — don't abort.
+            if conn.host_disconnected && !conn.host_eof {
+                match sock.state() {
+                    tcp::State::SynSent | tcp::State::SynReceived => {
+                        sock.abort();
+                        continue;
+                    }
+                    _ => {
+                        // Connection was established at some point.
+                        // Treat as host EOF if not already set.
+                        sock.close();
+                    }
+                }
             }
 
             // Guest → Host: drain smoltcp rx buffer into channel.
@@ -390,11 +408,23 @@ impl TcpBridge {
                 });
             }
 
-            // If the guest has sent FIN and we've consumed all data, signal
-            // EOF to the host write task by dropping the sender.
-            if !conn.guest_eof_sent && !sock.may_recv() && sock.state() != tcp::State::Listen {
-                conn.guest_to_host_tx = mpsc::channel(1).0;
-                conn.guest_eof_sent = true;
+            // Signal guest EOF to the host write task only when the guest has
+            // actually closed the receive half (FIN received). Check for
+            // specific states where the remote FIN has been processed, NOT
+            // just `!may_recv()` which is also false during handshake states.
+            if !conn.guest_eof_sent {
+                let guest_fin_received = matches!(
+                    sock.state(),
+                    tcp::State::CloseWait
+                        | tcp::State::LastAck
+                        | tcp::State::Closing
+                        | tcp::State::TimeWait
+                        | tcp::State::Closed
+                );
+                if guest_fin_received {
+                    conn.guest_to_host_tx = mpsc::channel(1).0;
+                    conn.guest_eof_sent = true;
+                }
             }
         }
     }
@@ -775,7 +805,7 @@ mod tests {
                 host_to_guest_rx: h2g_rx,
                 guest_to_host_tx: g2h_tx,
                 host_eof: false,
-                connect_failed: false,
+                host_disconnected: false,
                 pending_send: Some(vec![0xAA; 32]),
                 guest_eof_sent: false,
             },
@@ -818,7 +848,7 @@ mod tests {
                 host_to_guest_rx: h2g_rx,
                 guest_to_host_tx: g2h_tx,
                 host_eof: true,
-                connect_failed: false,
+                host_disconnected: false,
                 pending_send: Some(vec![0xBB; 10]),
                 guest_eof_sent: false,
             },
@@ -863,7 +893,7 @@ mod tests {
                 host_to_guest_rx: h2g_rx,
                 guest_to_host_tx: g2h_tx,
                 host_eof: false,
-                connect_failed: false,
+                host_disconnected: false,
                 pending_send: None,
                 guest_eof_sent: false,
             },
@@ -902,7 +932,7 @@ mod tests {
                 host_to_guest_rx: h2g_rx,
                 guest_to_host_tx: g2h_tx,
                 host_eof: false,
-                connect_failed: false,
+                host_disconnected: false,
                 pending_send: None,
                 guest_eof_sent: false,
             },
