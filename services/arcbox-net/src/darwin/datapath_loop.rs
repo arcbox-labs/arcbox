@@ -12,7 +12,7 @@
 //!     ├─ IPv4 0x0800
 //!     │   ├─ UDP:67 (DHCP) → DhcpServer → reply to guest
 //!     │   ├─ UDP:53 to gateway (DNS) → DnsForwarder → reply to guest
-//!     │   ├─ ICMP → IcmpProxy (raw socket) → reply to guest
+//!     │   ├─ ICMP → IcmpProxy (ICMP socket) → reply to guest
 //!     │   ├─ UDP → UdpProxy (host UdpSocket per flow) → reply to guest
 //!     │   └─ TCP → TcpProxy (host TcpStream + TCP state) → reply to guest
 //!     └─ other EtherType → drop
@@ -233,7 +233,7 @@ fn dispatch_guest_frame(
     // Learn the guest MAC from the source address.
     learn_guest_mac(hdr.src_mac, guest_mac);
 
-    tracing::info!(
+    tracing::debug!(
         "Guest frame: ethertype={:?} len={} src={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         hdr.ethertype,
         frame.len(),
@@ -337,7 +337,7 @@ fn handle_ipv4_from_guest(
     }
 
     // All other traffic: proxy through host sockets.
-    tracing::info!(
+    tracing::debug!(
         "Socket proxy: protocol={} dst_port={}",
         protocol,
         if (protocol == 17 || protocol == 6) && l4_start + 4 <= frame.len() {
