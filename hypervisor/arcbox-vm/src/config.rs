@@ -580,6 +580,9 @@ mod tests {
     fn test_from_file_missing_returns_config_error() {
         let result = VmmConfig::from_file("/nonexistent/arcbox-test-config.toml");
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), crate::error::VmmError::Config(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::error::VmmError::Config(_)
+        ));
     }
 }
