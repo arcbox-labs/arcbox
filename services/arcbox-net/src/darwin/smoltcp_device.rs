@@ -35,13 +35,19 @@ const PROTO_ICMP: u8 = 1;
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 
-/// TCP SYN destination port extracted during frame classification.
+/// TCP SYN connection info extracted during frame classification.
 ///
-/// The datapath loop uses this to ensure a smoltcp listen socket exists
-/// on the target port before `iface.poll()` processes the SYN.
-#[derive(Debug, Clone, Copy)]
+/// SYN frames are held back from smoltcp (`gated_syns`) until the host
+/// connect completes. The full frame is stored so it can be injected
+/// into the rx_queue later.
+#[derive(Debug, Clone)]
 pub struct TcpSynInfo {
     pub dst_port: u16,
+    pub src_ip: Ipv4Addr,
+    pub src_port: u16,
+    pub dst_ip: Ipv4Addr,
+    pub syn_seq: u32,
+    pub frame: Vec<u8>,
 }
 
 /// An intercepted frame from the guest that should not go through smoltcp.
@@ -79,9 +85,8 @@ pub struct SmoltcpDevice {
     tx_pending: Vec<Vec<u8>>,
     /// Frames intercepted from the guest (DHCP, DNS, UDP, ICMP).
     intercepted: Vec<InterceptedFrame>,
-    /// TCP SYN info extracted during classification — used by TcpBridge
-    /// to ensure listen sockets exist before smoltcp processes them.
-    tcp_syns: Vec<TcpSynInfo>,
+    /// TCP SYN frames held back from smoltcp until host connect completes.
+    gated_syns: Vec<TcpSynInfo>,
     /// Reusable read buffer to avoid per-call allocation in `drain_guest_fd`.
     read_buf: Vec<u8>,
 }
@@ -95,7 +100,7 @@ impl SmoltcpDevice {
             rx_queue: VecDeque::new(),
             tx_pending: Vec::new(),
             intercepted: Vec::new(),
-            tcp_syns: Vec::new(),
+            gated_syns: Vec::new(),
             read_buf: vec![0u8; MAX_FRAME_SIZE],
         }
     }
@@ -126,8 +131,8 @@ impl SmoltcpDevice {
 
     /// Injects a raw frame directly into the rx_queue for smoltcp processing.
     ///
-    /// Used in tests and for cases where frames need to bypass the FD read path.
-    #[cfg(test)]
+    /// Used by TcpBridge to inject gated SYN frames when host connect succeeds,
+    /// and in tests for frames that need to bypass the FD read path.
     pub fn inject_rx(&mut self, frame: Vec<u8>) {
         self.rx_queue.push_back(frame);
     }
@@ -142,9 +147,9 @@ impl SmoltcpDevice {
         std::mem::take(&mut self.tx_pending)
     }
 
-    /// Takes all TCP SYN info extracted during the last drain, leaving the buffer empty.
-    pub fn take_tcp_syns(&mut self) -> Vec<TcpSynInfo> {
-        std::mem::take(&mut self.tcp_syns)
+    /// Takes all gated TCP SYN frames, leaving the buffer empty.
+    pub fn take_gated_syns(&mut self) -> Vec<TcpSynInfo> {
+        std::mem::take(&mut self.gated_syns)
     }
 
     /// Classifies a frame and routes it to the appropriate queue.
@@ -212,9 +217,24 @@ impl SmoltcpDevice {
                         "TCP frame: {src_ip}:{src_port} → {dst_ip}:{dst_port} flags={flags:#04x} len={}",
                         frame.len()
                     );
-                    // SYN without ACK = new outbound connection attempt
+                    // SYN without ACK = new outbound connection attempt — gate it.
                     if flags & 0x02 != 0 && flags & 0x10 == 0 {
-                        self.tcp_syns.push(TcpSynInfo { dst_port });
+                        let syn_seq = u32::from_be_bytes([
+                            frame[l4_start + 4],
+                            frame[l4_start + 5],
+                            frame[l4_start + 6],
+                            frame[l4_start + 7],
+                        ]);
+                        tracing::debug!("TCP SYN gated: {src_ip}:{src_port} → {dst_ip}:{dst_port}");
+                        self.gated_syns.push(TcpSynInfo {
+                            dst_port,
+                            src_ip,
+                            src_port,
+                            dst_ip,
+                            syn_seq,
+                            frame: frame.clone(),
+                        });
+                        return;
                     }
                 }
                 self.rx_queue.push_back(frame);
@@ -279,7 +299,7 @@ impl Device for SmoltcpDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = ETHERNET_MTU;
-        caps.max_burst_size = Some(1);
+        caps.max_burst_size = Some(32);
         caps
     }
 }
@@ -581,5 +601,55 @@ mod tests {
         let mut mac = None;
         learn_guest_mac([0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE], &mut mac);
         assert_eq!(mac, Some([0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE]));
+    }
+
+    #[test]
+    fn classify_tcp_syn_is_gated() {
+        let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
+        let mut device = SmoltcpDevice::new(0, gateway_ip);
+        let mut guest_mac = None;
+
+        // Build a TCP SYN frame (flags = 0x02).
+        let mut frame = make_tcp_frame();
+        let ip = ETH_HEADER_LEN;
+        let l4 = ip + 20;
+        frame[l4 + 13] = 0x02; // SYN flag
+        // Set src port = 12345, dst port = 443
+        frame[l4..l4 + 2].copy_from_slice(&12345u16.to_be_bytes());
+        frame[l4 + 2..l4 + 4].copy_from_slice(&443u16.to_be_bytes());
+        // Set seq = 1000
+        frame[l4 + 4..l4 + 8].copy_from_slice(&1000u32.to_be_bytes());
+
+        device.classify_frame(frame.clone(), &mut guest_mac);
+
+        assert!(device.rx_queue.is_empty(), "SYN should NOT go to rx_queue");
+        assert_eq!(device.gated_syns.len(), 1);
+        assert_eq!(device.gated_syns[0].dst_port, 443);
+        assert_eq!(device.gated_syns[0].src_port, 12345);
+        assert_eq!(device.gated_syns[0].syn_seq, 1000);
+        assert_eq!(device.gated_syns[0].dst_ip, Ipv4Addr::new(1, 1, 1, 1));
+        assert_eq!(device.gated_syns[0].src_ip, Ipv4Addr::new(192, 168, 64, 2));
+    }
+
+    #[test]
+    fn classify_tcp_non_syn_goes_to_rx_queue() {
+        let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
+        let mut device = SmoltcpDevice::new(0, gateway_ip);
+        let mut guest_mac = None;
+
+        // Build a TCP ACK frame (flags = 0x10).
+        let mut frame = make_tcp_frame();
+        let ip = ETH_HEADER_LEN;
+        let l4 = ip + 20;
+        frame[l4 + 13] = 0x10; // ACK flag
+
+        device.classify_frame(frame, &mut guest_mac);
+
+        assert_eq!(
+            device.rx_queue.len(),
+            1,
+            "Non-SYN TCP should go to rx_queue"
+        );
+        assert!(device.gated_syns.is_empty());
     }
 }

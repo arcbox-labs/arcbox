@@ -328,6 +328,12 @@ impl NetworkDatapath {
             }
 
             drain_reply_rx(&mut reply_rx, &guest_async, &mut write_queue);
+
+            // Yield to the tokio runtime so spawned tasks (e.g. host relay
+            // read/write) get a chance to run on this worker thread. Without
+            // this, the tight synchronous common-tail loop can starve spawned
+            // tasks for seconds.
+            tokio::task::yield_now().await;
         }
 
         Ok(())

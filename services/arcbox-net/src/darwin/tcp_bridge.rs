@@ -575,6 +575,9 @@ impl TcpBridge {
 
                 let remote_addr = endpoint_to_sockaddr(remote_ep);
                 let dest_addr = endpoint_to_sockaddr(local_ep);
+                tracing::debug!(
+                    "TCP bridge: new connection detected  guest:{remote_addr} → {dest_addr}"
+                );
 
                 // Build four-tuple key to look up pre-connected stream.
                 let flow_key = SynFlowKey {
@@ -1019,25 +1022,34 @@ async fn inbound_host_relay(
     h2g_tx: mpsc::Sender<Vec<u8>>,
     mut g2h_rx: mpsc::Receiver<Vec<u8>>,
 ) {
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    tracing::debug!("TCP bridge: inbound relay started for {peer}");
+
     let (mut reader, mut writer) = stream.into_split();
 
     let read_task = {
         let h2g_tx = h2g_tx.clone();
+        let peer = peer.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 32768];
             loop {
                 match reader.read(&mut buf).await {
                     Ok(0) => {
+                        tracing::debug!("TCP bridge: inbound host EOF for {peer}");
                         let _ = h2g_tx.send(Vec::new()).await;
                         break;
                     }
                     Ok(n) => {
+                        tracing::debug!("TCP bridge: inbound host read {n} bytes from {peer}");
                         if h2g_tx.send(buf[..n].to_vec()).await.is_err() {
                             break;
                         }
                     }
                     Err(e) => {
-                        tracing::debug!("TCP bridge: inbound host read error: {e}");
+                        tracing::debug!("TCP bridge: inbound host read error for {peer}: {e}");
                         break;
                     }
                 }
@@ -1048,11 +1060,16 @@ async fn inbound_host_relay(
     let write_task = tokio::spawn(async move {
         while let Some(data) = g2h_rx.recv().await {
             if data.is_empty() {
+                tracing::debug!("TCP bridge: inbound guest EOF for {peer}");
                 let _ = writer.shutdown().await;
                 break;
             }
+            tracing::debug!(
+                "TCP bridge: inbound host write {} bytes to {peer}",
+                data.len()
+            );
             if let Err(e) = writer.write_all(&data).await {
-                tracing::debug!("TCP bridge: inbound host write error: {e}");
+                tracing::debug!("TCP bridge: inbound host write error for {peer}: {e}");
                 break;
             }
         }
@@ -1616,7 +1633,7 @@ mod tests {
         };
 
         // Gate the same SYN twice with identical ISN.
-        bridge.gate_syns(&[syn_info.clone()], GW_MAC);
+        bridge.gate_syns(std::slice::from_ref(&syn_info), GW_MAC);
         assert_eq!(bridge.pending_syns.len(), 1);
 
         bridge.gate_syns(&[syn_info], GW_MAC);
