@@ -355,10 +355,21 @@ impl TcpBridge {
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
-                        // Host task exited — either connect failed or normal close.
                         conn.host_disconnected = true;
                         break;
                     }
+                }
+            }
+
+            // Probe for host channel disconnect during handshake.
+            // can_send() is false in SynSent/SynReceived, so the loop above
+            // never runs — check the channel explicitly so we detect connect
+            // failures promptly.
+            if !conn.host_disconnected && !sock.can_send() {
+                if let Err(mpsc::error::TryRecvError::Disconnected) =
+                    conn.host_to_guest_rx.try_recv()
+                {
+                    conn.host_disconnected = true;
                 }
             }
 
@@ -369,10 +380,8 @@ impl TcpBridge {
                 conn.host_eof = false;
             }
 
-            // If host channel disconnected before connection was established,
-            // this is a connect failure — abort (RST to guest).
-            // If disconnected after the connection was established (host_eof
-            // was previously received), it's a normal close — don't abort.
+            // Host channel disconnected: abort during handshake (connect
+            // failure), gracefully close if already established.
             if conn.host_disconnected && !conn.host_eof {
                 match sock.state() {
                     tcp::State::SynSent | tcp::State::SynReceived => {
@@ -380,8 +389,6 @@ impl TcpBridge {
                         continue;
                     }
                     _ => {
-                        // Connection was established at some point.
-                        // Treat as host EOF if not already set.
                         sock.close();
                     }
                 }
