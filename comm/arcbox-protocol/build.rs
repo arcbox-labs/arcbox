@@ -16,7 +16,9 @@ fn main() {
     // Ensure output directory exists.
     std::fs::create_dir_all(&out_dir).expect("Failed to create output directory");
 
-    // All proto files to compile (unified arcbox.v1 package).
+    // All proto files to compile.
+    // arcbox.v1 package: shared types for the main ArcBox protocol.
+    // sandbox.v1 package: sandbox (microVM) lifecycle types.
     let protos = [
         "proto/common.proto",
         "proto/machine.proto",
@@ -24,6 +26,7 @@ fn main() {
         "proto/image.proto",
         "proto/agent.proto",
         "proto/api.proto",
+        "proto/sandbox.proto",
     ];
 
     // Configure prost-build (no tonic - services are in arcbox-grpc).
@@ -43,6 +46,8 @@ fn main() {
 
     // Format generated code so `cargo fmt --check` stays clean.
     let generated_file = out_dir.join("arcbox.v1.rs");
+    let _ = Command::new("rustfmt").arg(&generated_file).status();
+    let generated_file = out_dir.join("sandbox.v1.rs");
     let _ = Command::new("rustfmt").arg(&generated_file).status();
 
     // Tell cargo to recompile if any proto file changes.

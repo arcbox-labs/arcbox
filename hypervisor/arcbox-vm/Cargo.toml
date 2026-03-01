@@ -1,0 +1,32 @@
+[package]
+name              = "arcbox-vm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description       = "Firecracker-based sandbox VMM — orchestration, state, networking, and checkpoints."
+
+[[bin]]
+name = "vm-agent"
+path = "src/bin/vm-agent.rs"
+
+[dependencies]
+fc-sdk.workspace       = true
+tokio.workspace        = true
+thiserror.workspace    = true
+anyhow.workspace       = true
+serde.workspace        = true
+serde_json.workspace   = true
+uuid.workspace         = true
+tracing.workspace      = true
+nix            = { workspace = true, features = ["process", "term", "signal"] }
+libc.workspace         = true
+chrono.workspace       = true
+toml.workspace         = true
+
+[dev-dependencies]
+tokio              = { version = "1", features = ["rt", "macros"] }
+anyhow.workspace   = true
+tracing-subscriber.workspace = true
+tempfile.workspace = true

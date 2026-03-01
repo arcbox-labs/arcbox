@@ -53,6 +53,9 @@ mod generated;
 // Re-export the generated module as v1 (canonical path)
 pub use generated::arcbox_v1 as v1;
 
+// Re-export the sandbox.v1 generated module.
+pub use generated::sandbox_v1;
+
 // =============================================================================
 // Backward compatible module re-exports
 // =============================================================================

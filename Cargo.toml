@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     # ============================================
     # L0: Common (MIT OR Apache-2.0)
@@ -13,6 +13,7 @@ members = [
     "hypervisor/arcbox-hypervisor",
     "hypervisor/arcbox-vmm",
     "hypervisor/arcbox-virtio",
+    "hypervisor/arcbox-vm",
 
     # ============================================
     # L3: Services (MIT OR Apache-2.0)
@@ -142,6 +143,9 @@ nix = { version = "0.29", features = [
     "socket",
     "ioctl",
     "mman",
+    "term",
+    "signal",
+    "user",
 ] }
 
 # libc
@@ -150,12 +154,15 @@ libc = "0.2"
 # External crates
 macos-resolver = "0.2.0"
 
+fc-sdk = "0.2.1"
+
 # Internal crates (Core layer)
 arcbox-error = { version = "0.0.1-alpha.1", path = "common/arcbox-error" }
 arcbox-vz = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-vz" }
 arcbox-hypervisor = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-hypervisor" }
 arcbox-vmm = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-vmm" }
 arcbox-virtio = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-virtio" }
+arcbox-vm = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-vm" }
 arcbox-fs = { version = "0.0.1-alpha.1", path = "services/arcbox-fs" }
 arcbox-net = { version = "0.0.1-alpha.1", path = "services/arcbox-net" }
 arcbox-container = { version = "0.0.1-alpha.2", path = "services/arcbox-container" }

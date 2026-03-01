@@ -1,0 +1,149 @@
+name: arcbox-vm Linux
+
+on:
+  push:
+    branches: [master, develop]
+    paths:
+      - "hypervisor/arcbox-vm/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/arcbox-vm-linux.yml"
+  pull_request:
+    branches: [master, develop]
+    paths:
+      - "hypervisor/arcbox-vm/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/arcbox-vm-linux.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Firecracker CI assets (S3 bucket: spec.ccfc.min)
+  FC_S3_BASE: https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci
+  FC_S3_DIR: v1.10
+  FC_VERSION: v1.10.1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: unit tests — no KVM, no root required
+  # ---------------------------------------------------------------------------
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
+      - name: Check formatting
+        run: cargo fmt -p arcbox-vm --check
+
+      - name: Clippy
+        run: cargo clippy -p arcbox-vm -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --lib -p arcbox-vm
+
+  # ---------------------------------------------------------------------------
+  # Job 2: integration tests — requires root (TAP interface creation)
+  # ---------------------------------------------------------------------------
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
+      - name: Build test binary
+        run: cargo test --test integration -p arcbox-vm --no-run
+
+      - name: Run integration tests (as root for TAP creation)
+        run: sudo env PATH="$PATH" HOME="$HOME" cargo test --test integration -p arcbox-vm
+
+  # ---------------------------------------------------------------------------
+  # Job 3: E2E tests — requires KVM + root + Firecracker assets
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: E2E tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
+      - name: Enable KVM access
+        run: sudo chmod 666 /dev/kvm
+
+      - name: Download Firecracker assets from S3
+        run: |
+          mkdir -p /tmp/fc-assets
+          BASE="${FC_S3_BASE}/${FC_S3_DIR}/x86_64"
+          curl -sL "$BASE/firecracker-${FC_VERSION}"   -o /tmp/fc-assets/firecracker
+          curl -sL "$BASE/jailer-${FC_VERSION}"         -o /tmp/fc-assets/jailer
+          curl -sL "$BASE/vmlinux-5.10.223"             -o /tmp/fc-assets/vmlinux
+          curl -sL "$BASE/ubuntu-22.04.ext4"            -o /tmp/fc-assets/rootfs-base.ext4
+          chmod +x /tmp/fc-assets/firecracker /tmp/fc-assets/jailer
+
+      - name: Build vm-agent (Linux x86_64)
+        run: cargo build -p arcbox-vm --bin vm-agent --release
+
+      - name: Inject vm-agent into rootfs
+        run: |
+          cp /tmp/fc-assets/rootfs-base.ext4 /tmp/fc-assets/rootfs.ext4
+          sudo e2fsck -f -y /tmp/fc-assets/rootfs.ext4 || true
+          sudo resize2fs /tmp/fc-assets/rootfs.ext4 512M
+          mkdir -p /tmp/fc-mnt
+          sudo mount -o loop /tmp/fc-assets/rootfs.ext4 /tmp/fc-mnt
+          sudo cp target/release/vm-agent /tmp/fc-mnt/sbin/vm-agent
+          sudo chmod +x /tmp/fc-mnt/sbin/vm-agent
+          sudo umount /tmp/fc-mnt
+
+      - name: Run E2E tests (as root, one at a time)
+        env:
+          FC_BINARY: /tmp/fc-assets/firecracker
+          FC_KERNEL: /tmp/fc-assets/vmlinux
+          FC_ROOTFS: /tmp/fc-assets/rootfs.ext4
+        run: |
+          sudo env PATH="$PATH" HOME="$HOME" cargo test --test e2e -p arcbox-vm \
+            -- --include-ignored --test-threads=1
