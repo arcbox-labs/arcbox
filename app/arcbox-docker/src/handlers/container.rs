@@ -176,3 +176,42 @@ pub async fn attach_container(
 ) -> Result<Response> {
     proxy_upgrade(&state, &uri, req).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uri(s: &str) -> Uri {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn extract_id_from_start_path() {
+        let u = uri("/containers/abc123/start");
+        assert_eq!(extract_container_id(&u).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn extract_id_from_versioned_path() {
+        let u = uri("/v1.43/containers/def456/stop");
+        assert_eq!(extract_container_id(&u).as_deref(), Some("def456"));
+    }
+
+    #[test]
+    fn extract_id_from_delete_path() {
+        let u = uri("/containers/xyz789");
+        assert_eq!(extract_container_id(&u).as_deref(), Some("xyz789"));
+    }
+
+    #[test]
+    fn extract_id_skips_collection_endpoints() {
+        assert_eq!(extract_container_id(&uri("/containers/json")), None);
+        assert_eq!(extract_container_id(&uri("/containers/create")), None);
+        assert_eq!(extract_container_id(&uri("/containers/prune")), None);
+    }
+
+    #[test]
+    fn extract_id_no_containers_segment() {
+        assert_eq!(extract_container_id(&uri("/images/abc/json")), None);
+    }
+}

@@ -911,6 +911,11 @@ async fn inbound_tcp_relay(
 mod tests {
     use super::*;
 
+    const GW_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 1);
+    const GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 2);
+    const GW_MAC: [u8; 6] = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
+    const GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+
     #[test]
     fn ephemeral_ports_allocation() {
         let mut ep = EphemeralPorts::new();
@@ -939,12 +944,7 @@ mod tests {
     #[test]
     fn inbound_relay_rejects_non_ephemeral() {
         let (tx, _rx) = mpsc::channel(16);
-        let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
-        let guest_ip = Ipv4Addr::new(192, 168, 64, 2);
-        let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
-        let guest_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
-
-        let mut relay = InboundRelay::new(tx, gw_mac, gw_ip, guest_ip);
+        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP);
 
         // Build a minimal TCP frame with dst_port=80 (not in ephemeral range).
         let mut frame = vec![0u8; ETH_HEADER_LEN + 40];
@@ -952,28 +952,24 @@ mod tests {
         let ip = &mut frame[ETH_HEADER_LEN..];
         ip[0] = 0x45;
         ip[9] = 6; // TCP
-        ip[12..16].copy_from_slice(&guest_ip.octets());
-        ip[16..20].copy_from_slice(&gw_ip.octets());
+        ip[12..16].copy_from_slice(&GUEST_IP.octets());
+        ip[16..20].copy_from_slice(&GW_IP.octets());
         // TCP header: src_port=8080, dst_port=80
         let tcp = &mut frame[ETH_HEADER_LEN + 20..];
         tcp[0..2].copy_from_slice(&8080u16.to_be_bytes());
         tcp[2..4].copy_from_slice(&80u16.to_be_bytes());
         tcp[12] = 0x50; // data offset = 5
 
-        assert!(!relay.try_handle_reply(&frame, guest_mac));
+        assert!(!relay.try_handle_reply(&frame, GUEST_MAC));
     }
 
     #[test]
     fn inbound_relay_cleanup_removes_closed() {
         let (tx, _rx) = mpsc::channel(16);
-        let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
-        let guest_ip = Ipv4Addr::new(192, 168, 64, 2);
-        let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
-
-        let mut relay = InboundRelay::new(tx.clone(), gw_mac, gw_ip, guest_ip);
+        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP);
 
         let (data_tx, _data_rx) = mpsc::channel(16);
-        let key = (gw_ip, 61000, guest_ip, 80);
+        let key = (GW_IP, 61000, GUEST_IP, 80);
         relay.tcp_conns.insert(
             key,
             InboundTcpConn {
@@ -989,5 +985,224 @@ mod tests {
 
         relay.cleanup();
         assert_eq!(relay.tcp_conns.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn initiate_tcp_sends_syn_and_tracks_connection() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP);
+
+        // Create a pair of connected TcpStreams for the host-side stream.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::net::TcpStream::connect(addr);
+        let (stream, _accepted) = tokio::join!(connect, listener.accept());
+        let stream = stream.unwrap();
+
+        relay.initiate_tcp(80, stream, GUEST_MAC);
+
+        // Connection should be tracked in SynSent state.
+        let key = (GW_IP, EPHEMERAL_START, GUEST_IP, 80);
+        let conn = relay.tcp_conns.get(&key).expect("connection should exist");
+        assert_eq!(conn.state, InboundTcpState::SynSent);
+        assert!(conn.stream.is_some(), "stream should be stored");
+        assert!(conn.pending_rx.is_some(), "pending_rx should be stored");
+
+        // A SYN frame should have been sent via reply_tx.
+        let syn = rx.recv().await.expect("should receive SYN frame");
+        assert!(syn.len() >= ETH_HEADER_LEN + 40, "SYN frame too short");
+
+        // Verify TCP flags: SYN only.
+        let tcp_start = ETH_HEADER_LEN + 20;
+        let flags = syn[tcp_start + 13];
+        assert_eq!(flags & TCP_SYN, TCP_SYN, "SYN flag should be set");
+        assert_eq!(flags & TCP_ACK, 0, "ACK flag should NOT be set");
+
+        // Verify ports.
+        let src_port = u16::from_be_bytes([syn[tcp_start], syn[tcp_start + 1]]);
+        let dst_port = u16::from_be_bytes([syn[tcp_start + 2], syn[tcp_start + 3]]);
+        assert_eq!(src_port, EPHEMERAL_START);
+        assert_eq!(dst_port, 80);
+    }
+
+    #[tokio::test]
+    async fn syn_ack_transitions_to_established() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::net::TcpStream::connect(addr);
+        let (stream, _accepted) = tokio::join!(connect, listener.accept());
+        let stream = stream.unwrap();
+
+        relay.initiate_tcp(80, stream, GUEST_MAC);
+
+        // Drain the SYN frame.
+        let _syn = rx.recv().await.unwrap();
+
+        let key = (GW_IP, EPHEMERAL_START, GUEST_IP, 80);
+        let host_isn = relay.tcp_conns.get(&key).unwrap().host_seq;
+
+        // Construct a SYN-ACK from the guest.
+        let guest_isn: u32 = 5000;
+        let syn_ack = build_tcp_ip_ethernet(
+            GUEST_IP,
+            GW_IP,
+            80,
+            EPHEMERAL_START,
+            guest_isn,
+            host_isn.wrapping_add(1),
+            TCP_SYN | TCP_ACK,
+            65535,
+            &[],
+            GUEST_MAC,
+            GW_MAC,
+        );
+
+        // Feed the SYN-ACK to the relay.
+        let handled = relay.try_handle_reply(&syn_ack, GUEST_MAC);
+        assert!(handled, "SYN-ACK should be handled");
+
+        // Connection should now be Established.
+        let conn = relay.tcp_conns.get(&key).unwrap();
+        assert_eq!(conn.state, InboundTcpState::Established);
+        assert_eq!(conn.guest_seq, guest_isn.wrapping_add(1));
+        assert_eq!(conn.host_seq, host_isn.wrapping_add(1));
+        // Stream and pending_rx should have been taken by spawn_relay.
+        assert!(conn.stream.is_none(), "stream should be moved to relay");
+        assert!(
+            conn.pending_rx.is_none(),
+            "pending_rx should be moved to relay"
+        );
+
+        // An ACK should have been sent.
+        let ack = rx.recv().await.expect("should receive ACK frame");
+        let tcp_start = ETH_HEADER_LEN + 20;
+        let flags = ack[tcp_start + 13];
+        assert_eq!(flags & TCP_ACK, TCP_ACK, "ACK flag should be set");
+        assert_eq!(flags & TCP_SYN, 0, "SYN flag should NOT be set");
+    }
+
+    #[tokio::test]
+    async fn rst_during_handshake_transitions_to_closed() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::net::TcpStream::connect(addr);
+        let (stream, _accepted) = tokio::join!(connect, listener.accept());
+
+        relay.initiate_tcp(80, stream.unwrap(), GUEST_MAC);
+        let _syn = rx.recv().await.unwrap();
+
+        let key = (GW_IP, EPHEMERAL_START, GUEST_IP, 80);
+        let host_isn = relay.tcp_conns.get(&key).unwrap().host_seq;
+
+        // Send RST from guest.
+        let rst = build_tcp_ip_ethernet(
+            GUEST_IP,
+            GW_IP,
+            80,
+            EPHEMERAL_START,
+            0,
+            host_isn.wrapping_add(1),
+            TCP_RST,
+            0,
+            &[],
+            GUEST_MAC,
+            GW_MAC,
+        );
+
+        let handled = relay.try_handle_reply(&rst, GUEST_MAC);
+        assert!(handled, "RST should be handled");
+
+        let conn = relay.tcp_conns.get(&key).unwrap();
+        assert_eq!(conn.state, InboundTcpState::Closed);
+    }
+
+    #[tokio::test]
+    async fn inject_udp_sends_frame_and_tracks_flow() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP);
+
+        let (client_tx, _client_rx) = mpsc::channel(16);
+        relay.inject_udp(53, b"dns query", client_tx, GUEST_MAC);
+
+        // Flow should be tracked.
+        let key = (GW_IP, EPHEMERAL_START, GUEST_IP, 53);
+        assert!(relay.udp_flows.contains_key(&key));
+
+        // A UDP frame should have been sent.
+        let frame = rx.recv().await.expect("should receive UDP frame");
+        assert!(frame.len() >= ETH_HEADER_LEN + 28, "UDP frame too short");
+
+        // Verify IP protocol = UDP (17).
+        assert_eq!(frame[ETH_HEADER_LEN + 9], 17);
+
+        // Verify ports.
+        let udp_start = ETH_HEADER_LEN + 20;
+        let src_port = u16::from_be_bytes([frame[udp_start], frame[udp_start + 1]]);
+        let dst_port = u16::from_be_bytes([frame[udp_start + 2], frame[udp_start + 3]]);
+        assert_eq!(src_port, EPHEMERAL_START);
+        assert_eq!(dst_port, 53);
+    }
+
+    #[test]
+    fn cleanup_removes_expired_udp_flows() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP);
+
+        let (client_tx, _client_rx) = mpsc::channel(16);
+        let key = (GW_IP, 61000, GUEST_IP, 53);
+        relay.udp_flows.insert(
+            key,
+            InboundUdpFlow {
+                client_tx,
+                last_active: Instant::now() - std::time::Duration::from_secs(120),
+            },
+        );
+        assert_eq!(relay.udp_flows.len(), 1);
+
+        relay.cleanup();
+        assert_eq!(
+            relay.udp_flows.len(),
+            0,
+            "expired UDP flow should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_manager_add_and_remove_rule() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut manager = InboundListenerManager::new(cmd_tx);
+
+        // Add a TCP rule on an ephemeral port.
+        manager
+            .add_rule(0, 80, InboundProtocol::Tcp)
+            .await
+            .expect("should bind to port 0 (OS-assigned)");
+
+        // Remove it.
+        manager.remove_rule(0, InboundProtocol::Tcp);
+
+        // The cmd_rx channel should still be valid (no panic).
+        assert!(cmd_rx.try_recv().is_err(), "no commands expected yet");
+    }
+
+    #[tokio::test]
+    async fn listener_manager_stop_all() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let mut manager = InboundListenerManager::new(cmd_tx);
+
+        manager.add_rule(0, 80, InboundProtocol::Tcp).await.unwrap();
+        manager.add_rule(0, 53, InboundProtocol::Udp).await.unwrap();
+
+        manager.stop_all();
+        // After stop_all, the internal map should be empty. Since we can't
+        // inspect it directly, adding the same rule again should succeed (no
+        // duplicate key).
+        manager.add_rule(0, 80, InboundProtocol::Tcp).await.unwrap();
     }
 }
