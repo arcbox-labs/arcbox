@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 arcbox-error = { workspace = true }
 arcbox-protocol = { workspace = true }
+arcbox-constants = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
