@@ -309,12 +309,13 @@ impl AsRawFd for RawSocketWrapper {
 }
 
 /// Top-level socket proxy that dispatches guest traffic to protocol-specific
-/// handlers.
+/// handlers and manages inbound port forwarding.
 pub struct SocketProxy {
     icmp: IcmpProxy,
     udp: UdpProxy,
-    // TCP proxy state (added in a later commit).
     tcp: TcpProxy,
+    /// Inbound relay for host → guest port forwarding.
+    inbound: super::inbound_relay::InboundRelay,
 }
 
 impl SocketProxy {
@@ -326,18 +327,35 @@ impl SocketProxy {
     pub fn new(
         gateway_ip: Ipv4Addr,
         gateway_mac: [u8; 6],
+        guest_ip: Ipv4Addr,
         reply_tx: mpsc::Sender<Vec<u8>>,
     ) -> Self {
+        let inbound = super::inbound_relay::InboundRelay::new(
+            reply_tx.clone(),
+            gateway_mac,
+            gateway_ip,
+            guest_ip,
+        );
         Self {
             icmp: IcmpProxy::new(reply_tx.clone(), gateway_mac),
             udp: UdpProxy::new(reply_tx.clone(), gateway_mac, gateway_ip),
             tcp: TcpProxy::new(reply_tx, gateway_mac, gateway_ip),
+            inbound,
         }
     }
 
     /// Dispatches an outbound IPv4 frame to the appropriate protocol proxy.
+    ///
+    /// Inbound reply frames (matching an active inbound connection) are
+    /// intercepted first; everything else is proxied through host sockets.
     pub fn handle_outbound(&mut self, frame: &[u8], guest_mac: [u8; 6]) {
         if frame.len() < ETH_HEADER_LEN + 20 {
+            return;
+        }
+
+        // Check inbound relay first — fast-path ephemeral port range check
+        // short-circuits for 99%+ of outbound frames.
+        if self.inbound.try_handle_reply(frame, guest_mac) {
             return;
         }
 
@@ -352,10 +370,38 @@ impl SocketProxy {
         }
     }
 
+    /// Handles an inbound command from the listener manager.
+    pub(crate) fn handle_inbound_command(
+        &mut self,
+        cmd: super::inbound_relay::InboundCommand,
+        guest_mac: [u8; 6],
+    ) {
+        use super::inbound_relay::InboundCommand;
+        match cmd {
+            InboundCommand::TcpAccepted {
+                container_port,
+                stream,
+                ..
+            } => {
+                self.inbound.initiate_tcp(container_port, stream, guest_mac);
+            }
+            InboundCommand::UdpReceived {
+                container_port,
+                data,
+                reply_tx,
+                ..
+            } => {
+                self.inbound
+                    .inject_udp(container_port, &data, reply_tx, guest_mac);
+            }
+        }
+    }
+
     /// Runs periodic maintenance (flow cleanup).
     pub fn maintenance(&mut self) {
         self.udp.cleanup_stale_flows();
         self.tcp.cleanup_closed();
+        self.inbound.cleanup();
     }
 }
 
@@ -807,7 +853,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
         let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
-        let _proxy = SocketProxy::new(gw_ip, gw_mac, tx);
+        let guest_ip = Ipv4Addr::new(192, 168, 64, 2);
+        let _proxy = SocketProxy::new(gw_ip, gw_mac, guest_ip, tx);
     }
 
     #[test]
@@ -815,7 +862,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
         let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
-        let mut proxy = SocketProxy::new(gw_ip, gw_mac, tx);
+        let guest_ip = Ipv4Addr::new(192, 168, 64, 2);
+        let mut proxy = SocketProxy::new(gw_ip, gw_mac, guest_ip, tx);
 
         // Build a minimal Ethernet + IPv4 frame with protocol=50 (ESP).
         let mut frame = vec![0u8; ETH_HEADER_LEN + 20];
@@ -835,7 +883,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
         let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
-        let mut proxy = SocketProxy::new(gw_ip, gw_mac, tx);
+        let guest_ip = Ipv4Addr::new(192, 168, 64, 2);
+        let mut proxy = SocketProxy::new(gw_ip, gw_mac, guest_ip, tx);
 
         let guest_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
         // Frame shorter than Ethernet + IP minimum.
@@ -917,6 +966,7 @@ mod tests {
         assert_eq!(received, test_frame);
 
         // Verify the proxy creates correctly with the same tx.
-        let _proxy = SocketProxy::new(gw_ip, gw_mac, tx);
+        let guest_ip = Ipv4Addr::new(192, 168, 64, 2);
+        let _proxy = SocketProxy::new(gw_ip, gw_mac, guest_ip, tx);
     }
 }

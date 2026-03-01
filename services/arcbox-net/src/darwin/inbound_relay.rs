@@ -85,7 +85,7 @@ impl EphemeralPorts {
 // ---------------------------------------------------------------------------
 
 /// Command sent from `InboundListenerManager` listener tasks to the datapath.
-pub(crate) enum InboundCommand {
+pub enum InboundCommand {
     /// A new TCP connection was accepted on a host listener.
     TcpAccepted {
         host_port: u16,
@@ -628,7 +628,7 @@ pub enum InboundProtocol {
 
 /// Manages host-side listeners that accept incoming connections / datagrams
 /// and send `InboundCommand` messages to the datapath.
-pub(crate) struct InboundListenerManager {
+pub struct InboundListenerManager {
     cmd_tx: mpsc::Sender<InboundCommand>,
     listeners: HashMap<(u16, InboundProtocol), (JoinHandle<()>, CancellationToken)>,
 }
