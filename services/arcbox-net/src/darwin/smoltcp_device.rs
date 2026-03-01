@@ -9,7 +9,7 @@
 //!
 //! - **ARP** and **TCP** → passed to smoltcp via `receive()`
 //! - **DHCP** (UDP:67), **DNS** (UDP:53 to gateway), **UDP**, **ICMP** →
-//!   intercepted and stored in `intercepted` queue for the datapath loop
+//!   intercepted and stored in the `intercepted` queue for the datapath loop
 //!
 //! This keeps the existing DHCP/DNS/UDP/ICMP handlers unchanged while smoltcp
 //! handles ARP automatically and TCP via its socket pool.
@@ -62,8 +62,6 @@ pub enum InterceptedKind {
     Udp,
     /// ICMP traffic.
     Icmp,
-    /// TCP destined to inbound ephemeral port range (InboundRelay).
-    InboundTcp,
 }
 
 /// smoltcp `Device` implementation wrapping the guest VM's socketpair FD.
@@ -186,22 +184,9 @@ impl SmoltcpDevice {
         let l4_start = ip_start + ihl;
 
         match protocol {
-            // TCP → smoltcp for outbound; intercept inbound ephemeral replies
             PROTO_TCP => {
                 if l4_start + 14 <= frame.len() {
                     let dst_port = u16::from_be_bytes([frame[l4_start + 2], frame[l4_start + 3]]);
-
-                    // Inbound ephemeral port range (61000-65535) — these are
-                    // replies to host→guest connections managed by InboundRelay,
-                    // not smoltcp. Route through the socket proxy.
-                    if dst_port >= 61000 {
-                        self.intercepted.push(InterceptedFrame {
-                            frame,
-                            kind: InterceptedKind::InboundTcp,
-                        });
-                        return;
-                    }
-
                     let flags = frame[l4_start + 13];
                     // SYN without ACK = new outbound connection attempt
                     if flags & 0x02 != 0 && flags & 0x10 == 0 {

@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use smoltcp::iface::SocketHandle;
-use smoltcp::iface::SocketSet;
+use smoltcp::iface::{Interface, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::wire::IpEndpoint;
 
@@ -54,12 +54,20 @@ const HOST_TO_GUEST_CHANNEL: usize = 64;
 /// propagates through smoltcp's flow control when the host socket is slow.
 const GUEST_TO_HOST_CHANNEL: usize = 64;
 
-/// Tracks a single outbound TCP connection bridged between smoltcp and a host
-/// TcpStream.
-struct OutboundConn {
+/// Start of the inbound ephemeral port range.
+const INBOUND_EPHEMERAL_START: u16 = 61000;
+/// End of the inbound ephemeral port range (inclusive).
+const INBOUND_EPHEMERAL_END: u16 = 65535;
+
+/// Tracks a single TCP connection bridged between smoltcp and a host TcpStream.
+///
+/// Used for both outbound (guest-initiated) and inbound (host-initiated)
+/// connections. The relay logic in `relay_all` is identical in both directions.
+struct BridgedConn {
     /// smoltcp socket handle.
     handle: SocketHandle,
-    /// Actual remote IP:port the guest connected to.
+    /// Remote address label (actual destination for outbound, guest endpoint
+    /// for inbound) used in log messages.
     remote: SocketAddr,
     /// Receives data from the host TcpStream read task.
     host_to_guest_rx: mpsc::Receiver<Vec<u8>>,
@@ -75,10 +83,11 @@ struct OutboundConn {
     guest_eof_sent: bool,
 }
 
-/// Manages outbound TCP connections through the smoltcp socket pool.
+/// Manages TCP connections bridged between the smoltcp socket pool and host
+/// TcpStreams, for both outbound (guest→host) and inbound (host→guest) flows.
 pub struct TcpBridge {
-    /// Active outbound connections keyed by smoltcp socket handle.
-    connections: HashMap<SocketHandle, OutboundConn>,
+    /// Active connections keyed by smoltcp socket handle.
+    connections: HashMap<SocketHandle, BridgedConn>,
     /// Ports that have at least one listen socket in the socket set.
     listening_ports: HashSet<u16>,
     /// Free listen socket handles (Closed/TimeWait) available for re-listen.
@@ -86,6 +95,8 @@ pub struct TcpBridge {
     /// Maps a port to the socket handles listening on it, so we can track
     /// which ports are covered.
     port_handles: HashMap<u16, Vec<SocketHandle>>,
+    /// Next inbound ephemeral port to allocate (wraps within 61000-65535).
+    next_ephemeral: u16,
 }
 
 impl Default for TcpBridge {
@@ -101,6 +112,7 @@ impl TcpBridge {
             listening_ports: HashSet::new(),
             free_handles: Vec::new(),
             port_handles: HashMap::new(),
+            next_ephemeral: INBOUND_EPHEMERAL_START,
         }
     }
 
@@ -142,6 +154,79 @@ impl TcpBridge {
 
             tracing::debug!("TCP bridge: listen socket created for port {port}");
         }
+    }
+
+    /// Initiates an inbound TCP connection: creates a smoltcp socket that
+    /// actively connects to the guest, and spawns a relay task for the
+    /// already-accepted host `TcpStream`.
+    ///
+    /// Called when `InboundListenerManager` accepts a new host connection.
+    pub fn initiate_inbound(
+        &mut self,
+        container_port: u16,
+        stream: tokio::net::TcpStream,
+        guest_ip: Ipv4Addr,
+        gateway_ip: Ipv4Addr,
+        iface: &mut Interface,
+        sockets: &mut SocketSet<'_>,
+    ) {
+        let eph_port = self.allocate_ephemeral();
+
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+        let mut sock = tcp::Socket::new(rx_buf, tx_buf);
+        sock.set_nagle_enabled(false);
+        sock.set_ack_delay(None);
+
+        let local_ep = IpEndpoint::new(gateway_ip.into(), eph_port);
+        let remote_ep = IpEndpoint::new(guest_ip.into(), container_port);
+
+        if let Err(e) = sock.connect(iface.context(), remote_ep, local_ep) {
+            tracing::warn!("TCP bridge: inbound connect to guest:{container_port} failed: {e:?}");
+            return;
+        }
+
+        let handle = sockets.add(sock);
+
+        let (h2g_tx, h2g_rx) = mpsc::channel::<Vec<u8>>(HOST_TO_GUEST_CHANNEL);
+        let (g2h_tx, g2h_rx) = mpsc::channel::<Vec<u8>>(GUEST_TO_HOST_CHANNEL);
+
+        // Spawn a task that relays between the already-connected host TcpStream
+        // and the channels. Same pattern as host_conn_task but the stream is
+        // already connected.
+        tokio::spawn(inbound_host_relay(stream, h2g_tx, g2h_rx));
+
+        let guest_addr = SocketAddr::V4(SocketAddrV4::new(guest_ip, container_port));
+
+        self.connections.insert(
+            handle,
+            BridgedConn {
+                handle,
+                remote: guest_addr,
+                host_to_guest_rx: h2g_rx,
+                guest_to_host_tx: g2h_tx,
+                host_eof: false,
+                connect_failed: false,
+                pending_send: None,
+                guest_eof_sent: false,
+            },
+        );
+
+        tracing::debug!(
+            "TCP bridge: inbound connect initiated  gw:{eph_port} → guest:{container_port}"
+        );
+    }
+
+    /// Allocates the next inbound ephemeral port, wrapping at the end of the
+    /// range.
+    fn allocate_ephemeral(&mut self) -> u16 {
+        let port = self.next_ephemeral;
+        self.next_ephemeral = if self.next_ephemeral == INBOUND_EPHEMERAL_END {
+            INBOUND_EPHEMERAL_START
+        } else {
+            self.next_ephemeral + 1
+        };
+        port
     }
 
     /// Polls all connections, performing bidirectional data relay and detecting
@@ -200,7 +285,7 @@ impl TcpBridge {
 
                 self.connections.insert(
                     handle,
-                    OutboundConn {
+                    BridgedConn {
                         handle,
                         remote: dest_addr,
                         host_to_guest_rx: h2g_rx,
@@ -418,6 +503,55 @@ async fn host_conn_task(
     let _ = tokio::join!(read_task, write_task);
 }
 
+/// Relays data between an already-connected host TcpStream and channels,
+/// for inbound (host→guest) connections where the stream is already accepted.
+async fn inbound_host_relay(
+    stream: tokio::net::TcpStream,
+    h2g_tx: mpsc::Sender<Vec<u8>>,
+    mut g2h_rx: mpsc::Receiver<Vec<u8>>,
+) {
+    let (mut reader, mut writer) = stream.into_split();
+
+    let read_task = {
+        let h2g_tx = h2g_tx.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 32768];
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => {
+                        let _ = h2g_tx.send(Vec::new()).await;
+                        break;
+                    }
+                    Ok(n) => {
+                        if h2g_tx.send(buf[..n].to_vec()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("TCP bridge: inbound host read error: {e}");
+                        break;
+                    }
+                }
+            }
+        })
+    };
+
+    let write_task = tokio::spawn(async move {
+        while let Some(data) = g2h_rx.recv().await {
+            if data.is_empty() {
+                let _ = writer.shutdown().await;
+                break;
+            }
+            if let Err(e) = writer.write_all(&data).await {
+                tracing::debug!("TCP bridge: inbound host write error: {e}");
+                break;
+            }
+        }
+    });
+
+    let _ = tokio::join!(read_task, write_task);
+}
+
 /// Converts a smoltcp `IpEndpoint` to a `SocketAddr`.
 fn endpoint_to_sockaddr(ep: IpEndpoint) -> SocketAddr {
     let smoltcp::wire::IpAddress::Ipv4(v4) = ep.addr;
@@ -622,7 +756,7 @@ mod tests {
         let mut sock = tcp::Socket::new(rx_buf, tx_buf);
         sock.set_nagle_enabled(false);
         // Put socket in a state where can_send() returns true. We'll test
-        // OutboundConn's pending_send logic directly via relay_all.
+        // BridgedConn's pending_send logic directly via relay_all.
         let handle = sockets.add(sock);
 
         let (_h2g_tx, h2g_rx) = mpsc::channel::<Vec<u8>>(4);
@@ -635,7 +769,7 @@ mod tests {
         // the tx buffer.
         bridge.connections.insert(
             handle,
-            OutboundConn {
+            BridgedConn {
                 handle,
                 remote,
                 host_to_guest_rx: h2g_rx,
@@ -678,7 +812,7 @@ mod tests {
         // Simulate: host EOF received but there's still pending data.
         bridge.connections.insert(
             handle,
-            OutboundConn {
+            BridgedConn {
                 handle,
                 remote,
                 host_to_guest_rx: h2g_rx,
@@ -723,7 +857,7 @@ mod tests {
         let (g2h_tx, _g2h_rx) = mpsc::channel::<Vec<u8>>(1);
         bridge.connections.insert(
             handle,
-            OutboundConn {
+            BridgedConn {
                 handle,
                 remote: "1.1.1.1:443".parse().unwrap(),
                 host_to_guest_rx: h2g_rx,
@@ -762,7 +896,7 @@ mod tests {
 
         bridge.connections.insert(
             handle,
-            OutboundConn {
+            BridgedConn {
                 handle,
                 remote,
                 host_to_guest_rx: h2g_rx,
@@ -788,5 +922,37 @@ mod tests {
             g2h_rx.try_recv().is_err(),
             "Receiver should see disconnect after sender replaced and dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn initiate_inbound_creates_connecting_socket() {
+        let mut device = SmoltcpDevice::new(0, GW_IP);
+        let (mut iface, mut sockets) = make_iface_and_sockets(&mut device);
+        let mut bridge = TcpBridge::new();
+
+        // Create a pair of connected TcpStreams for the host-side stream.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::net::TcpStream::connect(addr);
+        let (stream, _accepted) = tokio::join!(connect, listener.accept());
+        let stream = stream.unwrap();
+
+        bridge.initiate_inbound(80, stream, GUEST_IP, GW_IP, &mut iface, &mut sockets);
+
+        assert_eq!(
+            bridge.active_count(),
+            1,
+            "Should have one inbound connection"
+        );
+
+        // The socket should be in SynSent state (attempting connect to guest).
+        let (handle, conn) = bridge.connections.iter().next().unwrap();
+        let sock = sockets.get_mut::<tcp::Socket>(*handle);
+        assert!(
+            sock.is_open(),
+            "Socket should be open after connect; state={:?}",
+            sock.state()
+        );
+        assert_eq!(conn.remote, SocketAddr::V4(SocketAddrV4::new(GUEST_IP, 80)));
     }
 }

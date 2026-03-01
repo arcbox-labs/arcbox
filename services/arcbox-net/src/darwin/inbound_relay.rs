@@ -17,7 +17,6 @@
 //!     │
 //!     ▼
 //! InboundRelay
-//!     ├─ TCP: inject SYN → guest SYN-ACK → ACK → spawn relay task
 //!     └─ UDP: inject datagram → guest reply → forward to client
 //!     │
 //!     ▼
@@ -26,22 +25,14 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::ethernet::{
-    ETH_HEADER_LEN, TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN, build_tcp_ip_ethernet,
-    build_udp_ip_ethernet,
-};
-
-use super::socket_proxy::{rand_isn, seq_before};
+use crate::ethernet::{ETH_HEADER_LEN, build_udp_ip_ethernet};
 
 // ---------------------------------------------------------------------------
 // Ephemeral port allocator
@@ -106,37 +97,6 @@ pub enum InboundCommand {
 }
 
 // ---------------------------------------------------------------------------
-// TCP connection state
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InboundTcpState {
-    /// SYN injected, waiting for SYN-ACK from guest.
-    SynSent,
-    /// Three-way handshake complete, relay task spawned.
-    Established,
-    /// FIN sent or received, tearing down.
-    Closing,
-    /// Fully closed, awaiting cleanup.
-    Closed,
-}
-
-/// Per-connection inbound TCP state.
-struct InboundTcpConn {
-    state: InboundTcpState,
-    /// Our (gateway) sequence number sent to the guest.
-    host_seq: u32,
-    /// Next expected sequence number from the guest.
-    guest_seq: Arc<AtomicU32>,
-    /// Channel to forward data received from the guest to the relay write task.
-    data_tx: mpsc::Sender<Vec<u8>>,
-    /// Relay receiver — `Some` until the relay task is spawned (on Established).
-    pending_rx: Option<mpsc::Receiver<Vec<u8>>>,
-    /// Host-side TcpStream — `Some` until moved into the relay task.
-    stream: Option<tokio::net::TcpStream>,
-}
-
-// ---------------------------------------------------------------------------
 // UDP flow state
 // ---------------------------------------------------------------------------
 
@@ -155,8 +115,6 @@ struct InboundUdpFlow {
 /// Handles inbound (host → guest) connections by injecting L2 Ethernet frames
 /// directly into the guest FD through the `reply_tx` channel.
 pub(crate) struct InboundRelay {
-    /// Active TCP connections keyed by (gateway_ip, ephemeral_port, guest_ip, container_port).
-    tcp_conns: HashMap<(Ipv4Addr, u16, Ipv4Addr, u16), InboundTcpConn>,
     /// Active UDP flows keyed by (gateway_ip, ephemeral_port, guest_ip, container_port).
     udp_flows: HashMap<(Ipv4Addr, u16, Ipv4Addr, u16), InboundUdpFlow>,
     /// Channel to inject L2 frames towards the guest.
@@ -175,7 +133,6 @@ impl InboundRelay {
         guest_ip: Ipv4Addr,
     ) -> Self {
         Self {
-            tcp_conns: HashMap::new(),
             udp_flows: HashMap::new(),
             reply_tx,
             gateway_mac,
@@ -194,7 +151,7 @@ impl InboundRelay {
     ///
     /// Fast-path: `EphemeralPorts::in_range(dst_port)` rejects 99%+ of
     /// outbound frames before any `HashMap` lookup.
-    pub(crate) fn try_handle_reply(&mut self, frame: &[u8], guest_mac: [u8; 6]) -> bool {
+    pub(crate) fn try_handle_reply(&mut self, frame: &[u8], _guest_mac: [u8; 6]) -> bool {
         if frame.len() < ETH_HEADER_LEN + 20 {
             return false;
         }
@@ -206,51 +163,10 @@ impl InboundRelay {
         let l4_start = ip_start + ihl;
 
         match protocol {
-            6 => self.try_handle_tcp_reply(frame, ip_start, l4_start, guest_mac),
+            6 => false, // TCP is now handled by smoltcp
             17 => self.try_handle_udp_reply(frame, ip_start, l4_start),
             _ => false,
         }
-    }
-
-    /// Checks if a TCP frame is a reply to an inbound connection.
-    fn try_handle_tcp_reply(
-        &mut self,
-        frame: &[u8],
-        ip_start: usize,
-        tcp_start: usize,
-        guest_mac: [u8; 6],
-    ) -> bool {
-        if frame.len() < tcp_start + 20 {
-            return false;
-        }
-
-        let dst_port = u16::from_be_bytes([frame[tcp_start + 2], frame[tcp_start + 3]]);
-        if !EphemeralPorts::in_range(dst_port) {
-            return false;
-        }
-
-        let src_ip = Ipv4Addr::new(
-            frame[ip_start + 12],
-            frame[ip_start + 13],
-            frame[ip_start + 14],
-            frame[ip_start + 15],
-        );
-        let dst_ip = Ipv4Addr::new(
-            frame[ip_start + 16],
-            frame[ip_start + 17],
-            frame[ip_start + 18],
-            frame[ip_start + 19],
-        );
-        let src_port = u16::from_be_bytes([frame[tcp_start], frame[tcp_start + 1]]);
-
-        let key = (dst_ip, dst_port, src_ip, src_port);
-
-        if self.tcp_conns.contains_key(&key) {
-            self.handle_tcp_reply(key, frame, ip_start, tcp_start, guest_mac);
-            return true;
-        }
-
-        false
     }
 
     /// Checks if a UDP frame is a reply to an inbound flow.
@@ -291,361 +207,6 @@ impl InboundRelay {
         }
 
         false
-    }
-
-    // -----------------------------------------------------------------------
-    // TCP: initiate connection to guest
-    // -----------------------------------------------------------------------
-
-    /// Initiates a TCP connection to the guest by injecting a SYN frame.
-    pub(crate) fn initiate_tcp(
-        &mut self,
-        container_port: u16,
-        stream: tokio::net::TcpStream,
-        guest_mac: [u8; 6],
-    ) {
-        let ephemeral_port = self.ephemeral_ports.allocate();
-        let host_isn = rand_isn();
-        let key = (
-            self.gateway_ip,
-            ephemeral_port,
-            self.guest_ip,
-            container_port,
-        );
-
-        // Remove any stale connection with the same key.
-        self.tcp_conns.remove(&key);
-
-        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(256);
-
-        self.tcp_conns.insert(
-            key,
-            InboundTcpConn {
-                state: InboundTcpState::SynSent,
-                host_seq: host_isn,
-                guest_seq: Arc::new(AtomicU32::new(0)),
-                data_tx,
-                pending_rx: Some(data_rx),
-                stream: Some(stream),
-            },
-        );
-
-        // Inject SYN.
-        let syn = build_tcp_ip_ethernet(
-            self.gateway_ip,
-            self.guest_ip,
-            ephemeral_port,
-            container_port,
-            host_isn,
-            0,
-            TCP_SYN,
-            65535,
-            &[],
-            self.gateway_mac,
-            guest_mac,
-        );
-
-        let _ = self.reply_tx.try_send(syn);
-
-        tracing::debug!(
-            "Inbound TCP: SYN injected  gw:{} → guest:{}",
-            ephemeral_port,
-            container_port,
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // TCP: handle reply frames from guest
-    // -----------------------------------------------------------------------
-
-    fn handle_tcp_reply(
-        &mut self,
-        key: (Ipv4Addr, u16, Ipv4Addr, u16),
-        frame: &[u8],
-        ip_start: usize,
-        tcp_start: usize,
-        guest_mac: [u8; 6],
-    ) {
-        if frame.len() < ip_start + 20 {
-            return;
-        }
-        let flags = frame[tcp_start + 13];
-        let seq = u32::from_be_bytes([
-            frame[tcp_start + 4],
-            frame[tcp_start + 5],
-            frame[tcp_start + 6],
-            frame[tcp_start + 7],
-        ]);
-        let data_offset = ((frame[tcp_start + 12] >> 4) as usize) * 4;
-        let ihl = ((frame[ip_start] & 0x0F) as usize) * 4;
-        let ip_total_len = u16::from_be_bytes([frame[ip_start + 2], frame[ip_start + 3]]) as usize;
-        if ip_total_len < ihl + data_offset {
-            return;
-        }
-        let ip_end = ip_start + ip_total_len;
-        if ip_end > frame.len() {
-            return;
-        }
-        let payload_start = tcp_start + data_offset;
-        let payload = if payload_start < ip_end {
-            &frame[payload_start..ip_end]
-        } else {
-            &[]
-        };
-
-        let (gw_ip, eph_port, guest_ip, container_port) = key;
-
-        let Some(conn) = self.tcp_conns.get_mut(&key) else {
-            return;
-        };
-
-        match conn.state {
-            InboundTcpState::SynSent => {
-                if flags & TCP_SYN != 0 && flags & TCP_ACK != 0 {
-                    // Guest sent SYN-ACK. Complete handshake with ACK.
-                    conn.guest_seq.store(seq.wrapping_add(1), Ordering::Relaxed);
-                    conn.host_seq = conn.host_seq.wrapping_add(1); // SYN consumed one seq
-                    conn.state = InboundTcpState::Established;
-
-                    let ack = build_tcp_ip_ethernet(
-                        gw_ip,
-                        guest_ip,
-                        eph_port,
-                        container_port,
-                        conn.host_seq,
-                        conn.guest_seq.load(Ordering::Relaxed),
-                        TCP_ACK,
-                        65535,
-                        &[],
-                        self.gateway_mac,
-                        guest_mac,
-                    );
-
-                    let _ = self.reply_tx.try_send(ack);
-
-                    tracing::debug!(
-                        "Inbound TCP: established  gw:{} ↔ guest:{}",
-                        eph_port,
-                        container_port,
-                    );
-
-                    // Spawn the bidirectional relay task.
-                    self.spawn_relay(key, guest_mac);
-                } else if flags & TCP_RST != 0 {
-                    tracing::debug!(
-                        "Inbound TCP: RST during handshake  gw:{} → guest:{}",
-                        eph_port,
-                        container_port,
-                    );
-                    conn.state = InboundTcpState::Closed;
-                }
-            }
-
-            InboundTcpState::Established => {
-                if flags & TCP_RST != 0 {
-                    conn.state = InboundTcpState::Closed;
-                    let _ = conn.data_tx.try_send(Vec::new()); // Signal close.
-                    return;
-                }
-
-                let expected_seq = conn.guest_seq.load(Ordering::Relaxed);
-                if flags & TCP_FIN != 0 {
-                    // Reject retransmits and out-of-order FIN/data.
-                    if seq != expected_seq {
-                        if seq_before(seq, expected_seq) {
-                            let ack = build_tcp_ip_ethernet(
-                                gw_ip,
-                                guest_ip,
-                                eph_port,
-                                container_port,
-                                conn.host_seq,
-                                expected_seq,
-                                TCP_ACK,
-                                65535,
-                                &[],
-                                self.gateway_mac,
-                                guest_mac,
-                            );
-                            let _ = self.reply_tx.try_send(ack);
-                        }
-                        return;
-                    }
-
-                    let payload_end_seq = seq.wrapping_add(payload.len() as u32);
-
-                    // Forward any remaining payload.
-                    if !payload.is_empty() {
-                        match conn.data_tx.try_send(payload.to_vec()) {
-                            Ok(()) => {
-                                conn.guest_seq.store(payload_end_seq, Ordering::Relaxed);
-                            }
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                tracing::debug!(
-                                    "Inbound TCP data channel full, backpressure applied"
-                                );
-                                return;
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                conn.state = InboundTcpState::Closed;
-                                return;
-                            }
-                        }
-                    }
-
-                    // Signal close to the relay task. If backpressured, ACK only
-                    // payload bytes (if any) and wait for FIN retransmit.
-                    match conn.data_tx.try_send(Vec::new()) {
-                        Ok(()) => {
-                            conn.guest_seq
-                                .store(payload_end_seq.wrapping_add(1), Ordering::Relaxed);
-                            conn.state = InboundTcpState::Closing;
-                            let fin_ack = build_tcp_ip_ethernet(
-                                gw_ip,
-                                guest_ip,
-                                eph_port,
-                                container_port,
-                                conn.host_seq,
-                                conn.guest_seq.load(Ordering::Relaxed),
-                                TCP_FIN | TCP_ACK,
-                                65535,
-                                &[],
-                                self.gateway_mac,
-                                guest_mac,
-                            );
-                            let _ = self.reply_tx.try_send(fin_ack);
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            tracing::debug!(
-                                "Inbound TCP close channel full, delaying FIN acknowledgment"
-                            );
-                            if !payload.is_empty() {
-                                let ack = build_tcp_ip_ethernet(
-                                    gw_ip,
-                                    guest_ip,
-                                    eph_port,
-                                    container_port,
-                                    conn.host_seq,
-                                    payload_end_seq,
-                                    TCP_ACK,
-                                    65535,
-                                    &[],
-                                    self.gateway_mac,
-                                    guest_mac,
-                                );
-                                let _ = self.reply_tx.try_send(ack);
-                            }
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            conn.state = InboundTcpState::Closed;
-                        }
-                    }
-                    return;
-                }
-
-                if !payload.is_empty() {
-                    // Reject retransmits and out-of-order segments.
-                    if seq != expected_seq {
-                        if seq_before(seq, expected_seq) {
-                            // Retransmit — send duplicate ACK.
-                            let ack = build_tcp_ip_ethernet(
-                                gw_ip,
-                                guest_ip,
-                                eph_port,
-                                container_port,
-                                conn.host_seq,
-                                expected_seq,
-                                TCP_ACK,
-                                65535,
-                                &[],
-                                self.gateway_mac,
-                                guest_mac,
-                            );
-                            let _ = self.reply_tx.try_send(ack);
-                        }
-                        return;
-                    }
-
-                    // Synchronously queue payload for the host socket.
-                    // Using try_send (not tokio::spawn) preserves segment
-                    // ordering — critical for TLS and other stream protocols.
-                    match conn.data_tx.try_send(payload.to_vec()) {
-                        Ok(()) => {
-                            conn.guest_seq
-                                .store(seq.wrapping_add(payload.len() as u32), Ordering::Relaxed);
-                            let ack = build_tcp_ip_ethernet(
-                                gw_ip,
-                                guest_ip,
-                                eph_port,
-                                container_port,
-                                conn.host_seq,
-                                conn.guest_seq.load(Ordering::Relaxed),
-                                TCP_ACK,
-                                65535,
-                                &[],
-                                self.gateway_mac,
-                                guest_mac,
-                            );
-                            let _ = self.reply_tx.try_send(ack);
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            // Backpressure: don't ACK so guest retransmits.
-                            tracing::debug!("Inbound TCP data channel full, backpressure applied");
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            conn.state = InboundTcpState::Closed;
-                        }
-                    }
-                }
-            }
-
-            InboundTcpState::Closing => {
-                if flags & TCP_ACK != 0 {
-                    conn.state = InboundTcpState::Closed;
-                }
-            }
-
-            InboundTcpState::Closed => {}
-        }
-    }
-
-    /// Spawns the bidirectional relay task once the TCP handshake completes.
-    fn spawn_relay(&mut self, key: (Ipv4Addr, u16, Ipv4Addr, u16), guest_mac: [u8; 6]) {
-        let Some(conn) = self.tcp_conns.get_mut(&key) else {
-            return;
-        };
-
-        let stream = match conn.stream.take() {
-            Some(s) => s,
-            None => return,
-        };
-        let data_rx = match conn.pending_rx.take() {
-            Some(r) => r,
-            None => return,
-        };
-
-        let (gw_ip, eph_port, guest_ip, container_port) = key;
-        let host_seq = conn.host_seq;
-        let guest_seq = Arc::clone(&conn.guest_seq);
-        let reply_tx = self.reply_tx.clone();
-        let gateway_mac = self.gateway_mac;
-
-        // Host-to-guest relay: read TcpStream → build TCP data frames → reply_tx.
-        tokio::spawn(async move {
-            inbound_tcp_relay(
-                stream,
-                data_rx,
-                reply_tx,
-                gw_ip,
-                gateway_mac,
-                guest_ip,
-                eph_port,
-                container_port,
-                guest_mac,
-                host_seq,
-                guest_seq,
-            )
-            .await;
-        });
     }
 
     // -----------------------------------------------------------------------
@@ -700,11 +261,8 @@ impl InboundRelay {
     // Maintenance
     // -----------------------------------------------------------------------
 
-    /// Removes closed TCP connections and expired UDP flows.
+    /// Removes expired UDP flows.
     pub(crate) fn cleanup(&mut self) {
-        self.tcp_conns
-            .retain(|_, conn| conn.state != InboundTcpState::Closed);
-
         let cutoff = Instant::now() - std::time::Duration::from_secs(60);
         self.udp_flows.retain(|_, flow| flow.last_active > cutoff);
     }
@@ -912,94 +470,6 @@ async fn udp_listener_task(
 }
 
 // ---------------------------------------------------------------------------
-// Bidirectional TCP relay (host TcpStream ↔ guest TCP segments)
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-async fn inbound_tcp_relay(
-    stream: tokio::net::TcpStream,
-    mut data_rx: mpsc::Receiver<Vec<u8>>,
-    reply_tx: mpsc::Sender<Vec<u8>>,
-    gateway_ip: Ipv4Addr,
-    gateway_mac: [u8; 6],
-    guest_ip: Ipv4Addr,
-    ephemeral_port: u16,
-    container_port: u16,
-    guest_mac: [u8; 6],
-    mut host_seq: u32,
-    shared_guest_seq: Arc<AtomicU32>,
-) {
-    let (mut reader, mut writer) = stream.into_split();
-
-    // Host → Guest: read from TcpStream, inject data frames.
-    let reply_tx2 = reply_tx.clone();
-    let host_to_guest = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65535];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) => {
-                    // EOF: send FIN to guest.
-                    let fin = build_tcp_ip_ethernet(
-                        gateway_ip,
-                        guest_ip,
-                        ephemeral_port,
-                        container_port,
-                        host_seq,
-                        shared_guest_seq.load(Ordering::Relaxed),
-                        TCP_FIN | TCP_ACK,
-                        65535,
-                        &[],
-                        gateway_mac,
-                        guest_mac,
-                    );
-                    let _ = reply_tx2.send(fin).await;
-                    break;
-                }
-                Ok(n) => {
-                    let data_frame = build_tcp_ip_ethernet(
-                        gateway_ip,
-                        guest_ip,
-                        ephemeral_port,
-                        container_port,
-                        host_seq,
-                        shared_guest_seq.load(Ordering::Relaxed),
-                        TCP_ACK | TCP_PSH,
-                        65535,
-                        &buf[..n],
-                        gateway_mac,
-                        guest_mac,
-                    );
-                    host_seq = host_seq.wrapping_add(n as u32);
-                    if reply_tx2.send(data_frame).await.is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("Inbound TCP relay read error: {}", e);
-                    break;
-                }
-            }
-        }
-    });
-
-    // Guest → Host: receive data from data_rx, write to TcpStream.
-    let guest_to_host = tokio::spawn(async move {
-        while let Some(data) = data_rx.recv().await {
-            if data.is_empty() {
-                let _ = writer.shutdown().await;
-                break;
-            }
-            if let Err(e) = writer.write_all(&data).await {
-                tracing::debug!("Inbound TCP relay write error: {}", e);
-                break;
-            }
-        }
-    });
-
-    let _ = tokio::join!(host_to_guest, guest_to_host);
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1057,212 +527,6 @@ mod tests {
         tcp[12] = 0x50; // data offset = 5
 
         assert!(!relay.try_handle_reply(&frame, GUEST_MAC));
-    }
-
-    #[test]
-    fn inbound_relay_cleanup_removes_closed() {
-        let (tx, _rx) = mpsc::channel(16);
-        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP);
-
-        let (data_tx, _data_rx) = mpsc::channel(16);
-        let key = (GW_IP, 61000, GUEST_IP, 80);
-        relay.tcp_conns.insert(
-            key,
-            InboundTcpConn {
-                state: InboundTcpState::Closed,
-                host_seq: 0,
-                guest_seq: Arc::new(AtomicU32::new(0)),
-                data_tx,
-                pending_rx: None,
-                stream: None,
-            },
-        );
-        assert_eq!(relay.tcp_conns.len(), 1);
-
-        relay.cleanup();
-        assert_eq!(relay.tcp_conns.len(), 0);
-    }
-
-    #[test]
-    fn inbound_ack_padding_is_not_forwarded_as_payload() {
-        let (reply_tx, _reply_rx) = mpsc::channel(16);
-        let mut relay = InboundRelay::new(reply_tx, GW_MAC, GW_IP, GUEST_IP);
-
-        let (data_tx, mut data_rx) = mpsc::channel(16);
-        let key = (GW_IP, 61000, GUEST_IP, 443);
-        relay.tcp_conns.insert(
-            key,
-            InboundTcpConn {
-                state: InboundTcpState::Established,
-                host_seq: 20_000,
-                guest_seq: Arc::new(AtomicU32::new(10_000)),
-                data_tx,
-                pending_rx: None,
-                stream: None,
-            },
-        );
-
-        // ACK-only frame (IP total length = 40) with extra Ethernet padding.
-        let mut ack_frame = build_tcp_ip_ethernet(
-            GUEST_IP,
-            GW_IP,
-            443,
-            61000,
-            10_000,
-            20_000,
-            TCP_ACK,
-            65535,
-            &[],
-            GUEST_MAC,
-            GW_MAC,
-        );
-        ack_frame.resize(ETH_HEADER_LEN + 20 + 20 + 6, 0);
-
-        assert!(relay.try_handle_reply(&ack_frame, GUEST_MAC));
-        assert!(matches!(
-            data_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-        let conn = relay.tcp_conns.get(&key).expect("connection should exist");
-        assert_eq!(conn.guest_seq.load(Ordering::Relaxed), 10_000);
-    }
-
-    #[tokio::test]
-    async fn initiate_tcp_sends_syn_and_tracks_connection() {
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP);
-
-        // Create a pair of connected TcpStreams for the host-side stream.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let connect = tokio::net::TcpStream::connect(addr);
-        let (stream, _accepted) = tokio::join!(connect, listener.accept());
-        let stream = stream.unwrap();
-
-        relay.initiate_tcp(80, stream, GUEST_MAC);
-
-        // Connection should be tracked in SynSent state.
-        let key = (GW_IP, EPHEMERAL_START, GUEST_IP, 80);
-        let conn = relay.tcp_conns.get(&key).expect("connection should exist");
-        assert_eq!(conn.state, InboundTcpState::SynSent);
-        assert!(conn.stream.is_some(), "stream should be stored");
-        assert!(conn.pending_rx.is_some(), "pending_rx should be stored");
-
-        // A SYN frame should have been sent via reply_tx.
-        let syn = rx.recv().await.expect("should receive SYN frame");
-        assert!(syn.len() >= ETH_HEADER_LEN + 40, "SYN frame too short");
-
-        // Verify TCP flags: SYN only.
-        let tcp_start = ETH_HEADER_LEN + 20;
-        let flags = syn[tcp_start + 13];
-        assert_eq!(flags & TCP_SYN, TCP_SYN, "SYN flag should be set");
-        assert_eq!(flags & TCP_ACK, 0, "ACK flag should NOT be set");
-
-        // Verify ports.
-        let src_port = u16::from_be_bytes([syn[tcp_start], syn[tcp_start + 1]]);
-        let dst_port = u16::from_be_bytes([syn[tcp_start + 2], syn[tcp_start + 3]]);
-        assert_eq!(src_port, EPHEMERAL_START);
-        assert_eq!(dst_port, 80);
-    }
-
-    #[tokio::test]
-    async fn syn_ack_transitions_to_established() {
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP);
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let connect = tokio::net::TcpStream::connect(addr);
-        let (stream, _accepted) = tokio::join!(connect, listener.accept());
-        let stream = stream.unwrap();
-
-        relay.initiate_tcp(80, stream, GUEST_MAC);
-
-        // Drain the SYN frame.
-        let _syn = rx.recv().await.unwrap();
-
-        let key = (GW_IP, EPHEMERAL_START, GUEST_IP, 80);
-        let host_isn = relay.tcp_conns.get(&key).unwrap().host_seq;
-
-        // Construct a SYN-ACK from the guest.
-        let guest_isn: u32 = 5000;
-        let syn_ack = build_tcp_ip_ethernet(
-            GUEST_IP,
-            GW_IP,
-            80,
-            EPHEMERAL_START,
-            guest_isn,
-            host_isn.wrapping_add(1),
-            TCP_SYN | TCP_ACK,
-            65535,
-            &[],
-            GUEST_MAC,
-            GW_MAC,
-        );
-
-        // Feed the SYN-ACK to the relay.
-        let handled = relay.try_handle_reply(&syn_ack, GUEST_MAC);
-        assert!(handled, "SYN-ACK should be handled");
-
-        // Connection should now be Established.
-        let conn = relay.tcp_conns.get(&key).unwrap();
-        assert_eq!(conn.state, InboundTcpState::Established);
-        assert_eq!(
-            conn.guest_seq.load(Ordering::Relaxed),
-            guest_isn.wrapping_add(1)
-        );
-        assert_eq!(conn.host_seq, host_isn.wrapping_add(1));
-        // Stream and pending_rx should have been taken by spawn_relay.
-        assert!(conn.stream.is_none(), "stream should be moved to relay");
-        assert!(
-            conn.pending_rx.is_none(),
-            "pending_rx should be moved to relay"
-        );
-
-        // An ACK should have been sent.
-        let ack = rx.recv().await.expect("should receive ACK frame");
-        let tcp_start = ETH_HEADER_LEN + 20;
-        let flags = ack[tcp_start + 13];
-        assert_eq!(flags & TCP_ACK, TCP_ACK, "ACK flag should be set");
-        assert_eq!(flags & TCP_SYN, 0, "SYN flag should NOT be set");
-    }
-
-    #[tokio::test]
-    async fn rst_during_handshake_transitions_to_closed() {
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP);
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let connect = tokio::net::TcpStream::connect(addr);
-        let (stream, _accepted) = tokio::join!(connect, listener.accept());
-
-        relay.initiate_tcp(80, stream.unwrap(), GUEST_MAC);
-        let _syn = rx.recv().await.unwrap();
-
-        let key = (GW_IP, EPHEMERAL_START, GUEST_IP, 80);
-        let host_isn = relay.tcp_conns.get(&key).unwrap().host_seq;
-
-        // Send RST from guest.
-        let rst = build_tcp_ip_ethernet(
-            GUEST_IP,
-            GW_IP,
-            80,
-            EPHEMERAL_START,
-            0,
-            host_isn.wrapping_add(1),
-            TCP_RST,
-            0,
-            &[],
-            GUEST_MAC,
-            GW_MAC,
-        );
-
-        let handled = relay.try_handle_reply(&rst, GUEST_MAC);
-        assert!(handled, "RST should be handled");
-
-        let conn = relay.tcp_conns.get(&key).unwrap();
-        assert_eq!(conn.state, InboundTcpState::Closed);
     }
 
     #[tokio::test]

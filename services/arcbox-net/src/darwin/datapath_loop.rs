@@ -76,6 +76,8 @@ pub struct NetworkDatapath {
     pub gateway_mac: [u8; 6],
     /// Gateway IP address.
     pub gateway_ip: Ipv4Addr,
+    /// Guest IP address (for inbound TCP connections via smoltcp).
+    pub guest_ip: Ipv4Addr,
     /// Cancellation token for graceful shutdown.
     pub cancel: CancellationToken,
 }
@@ -95,6 +97,7 @@ impl NetworkDatapath {
         dhcp_server: DhcpServer,
         dns_forwarder: DnsForwarder,
         gateway_ip: Ipv4Addr,
+        guest_ip: Ipv4Addr,
         gateway_mac: [u8; 6],
         cancel: CancellationToken,
     ) -> Self {
@@ -107,6 +110,7 @@ impl NetworkDatapath {
             dns_forwarder,
             gateway_mac,
             gateway_ip,
+            guest_ip,
             cancel,
         }
     }
@@ -129,6 +133,7 @@ impl NetworkDatapath {
             dns_forwarder,
             gateway_mac,
             gateway_ip,
+            guest_ip,
             cancel,
         } = self;
 
@@ -272,8 +277,29 @@ impl NetworkDatapath {
 
                 // Inbound commands from InboundListenerManager.
                 Some(cmd) = cmd_rx.recv() => {
-                    let mac = guest_mac.unwrap_or([0xFF; 6]);
-                    socket_proxy.handle_inbound_command(cmd, mac);
+                    use crate::darwin::inbound_relay::InboundCommand;
+                    match cmd {
+                        InboundCommand::TcpAccepted { container_port, stream, .. } => {
+                            tcp_bridge.initiate_inbound(
+                                container_port,
+                                stream,
+                                guest_ip,
+                                gateway_ip,
+                                &mut iface,
+                                &mut sockets,
+                            );
+                            // Immediately poll so smoltcp sends the SYN.
+                            let ts = smoltcp::time::Instant::now();
+                            iface.poll(ts, &mut device, &mut sockets);
+                            for frame in device.take_tx_pending() {
+                                enqueue_or_write(&guest_async, frame, &mut write_queue);
+                            }
+                        }
+                        cmd @ InboundCommand::UdpReceived { .. } => {
+                            let mac = guest_mac.unwrap_or([0xFF; 6]);
+                            socket_proxy.handle_inbound_command(cmd, mac);
+                        }
+                    }
                 }
 
                 // smoltcp periodic poll (retransmissions, ARP cache).
@@ -337,8 +363,8 @@ fn handle_intercepted_frame(
                 guest_mac,
             );
         }
-        InterceptedKind::Udp | InterceptedKind::Icmp | InterceptedKind::InboundTcp => {
-            // Route through socket proxy (UDP/ICMP + inbound relay matching).
+        InterceptedKind::Udp | InterceptedKind::Icmp => {
+            // Route through socket proxy (UDP/ICMP).
             socket_proxy.handle_outbound(frame, guest_mac);
         }
     }
