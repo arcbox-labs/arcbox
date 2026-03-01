@@ -538,3 +538,48 @@ pub struct RestoreSpec {
     /// Override the network configuration (e.g., assign a fresh TAP interface).
     pub network_override: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config_has_sane_values() {
+        let cfg = VmmConfig::default();
+        assert_eq!(cfg.defaults.vcpus, 1);
+        assert_eq!(cfg.defaults.memory_mib, 512);
+        assert!(cfg.defaults.boot_args.contains("console=ttyS0"));
+        assert!(!cfg.network.cidr.is_empty());
+        assert!(!cfg.firecracker.binary.is_empty());
+    }
+
+    #[test]
+    fn test_vmm_config_json_roundtrip() {
+        let cfg = VmmConfig::default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let decoded: VmmConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.defaults.vcpus, cfg.defaults.vcpus);
+        assert_eq!(decoded.defaults.memory_mib, cfg.defaults.memory_mib);
+        assert_eq!(decoded.network.cidr, cfg.network.cidr);
+        assert_eq!(decoded.network.gateway, cfg.network.gateway);
+    }
+
+    #[test]
+    fn test_vm_spec_default_is_empty() {
+        let spec = VmSpec::default();
+        assert!(spec.name.is_empty());
+        assert!(spec.kernel.is_empty());
+        assert!(spec.rootfs.is_empty());
+        assert_eq!(spec.vcpus, 0);
+        assert_eq!(spec.memory_mib, 0);
+        assert!(!spec.smt);
+        assert!(!spec.track_dirty_pages);
+    }
+
+    #[test]
+    fn test_from_file_missing_returns_config_error() {
+        let result = VmmConfig::from_file("/nonexistent/arcbox-test-config.toml");
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), crate::error::VmmError::Config(_)));
+    }
+}

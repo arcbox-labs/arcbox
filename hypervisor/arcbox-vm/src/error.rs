@@ -58,3 +58,47 @@ pub enum VmmError {
 
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, VmmError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_not_found_display() {
+        let e = VmmError::NotFound("vm-123".into());
+        assert_eq!(e.to_string(), "VM not found: vm-123");
+    }
+
+    #[test]
+    fn test_already_exists_display() {
+        let e = VmmError::AlreadyExists("my-vm".into());
+        assert_eq!(e.to_string(), "VM already exists: my-vm");
+    }
+
+    #[test]
+    fn test_wrong_state_display() {
+        let e = VmmError::WrongState {
+            id: "vm-1".into(),
+            expected: "running".into(),
+            actual: "stopped".into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("vm-1"));
+        assert!(s.contains("running"));
+        assert!(s.contains("stopped"));
+    }
+
+    #[test]
+    fn test_from_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let vmm_err = VmmError::from(io_err);
+        assert!(matches!(vmm_err, VmmError::Io(_)));
+        assert!(vmm_err.to_string().contains("I/O error"));
+    }
+
+    #[test]
+    fn test_network_error_display() {
+        let e = VmmError::Network("TAP creation failed".into());
+        assert_eq!(e.to_string(), "network error: TAP creation failed");
+    }
+}

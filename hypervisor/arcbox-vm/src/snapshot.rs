@@ -231,3 +231,103 @@ impl SnapshotCatalog {
         Ok(meta)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SnapshotType;
+
+    fn register_one(catalog: &SnapshotCatalog, vm_id: &str) -> SnapshotMeta {
+        catalog
+            .register(
+                vm_id,
+                None,
+                SnapshotType::Full,
+                PathBuf::from("/tmp/vmstate"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn test_list_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        assert!(catalog.list("vm-1").unwrap().is_empty());
+        assert!(catalog.list_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_register_and_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        let meta = register_one(&catalog, "vm-1");
+        let snapshots = catalog.list("vm-1").unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].id, meta.id);
+        assert_eq!(snapshots[0].vm_id, "vm-1");
+    }
+
+    #[test]
+    fn test_register_and_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        let meta = catalog
+            .register(
+                "vm-2",
+                Some("my-snap".into()),
+                SnapshotType::Diff,
+                PathBuf::from("/tmp/vmstate"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let loaded = catalog.get("vm-2", &meta.id).unwrap();
+        assert_eq!(loaded.id, meta.id);
+        assert_eq!(loaded.snapshot_type, SnapshotType::Diff);
+        assert_eq!(loaded.name.as_deref(), Some("my-snap"));
+    }
+
+    #[test]
+    fn test_delete_removes_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        let meta = register_one(&catalog, "vm-1");
+        catalog.delete("vm-1", &meta.id).unwrap();
+        assert!(catalog.list("vm-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_find_by_id_across_vms() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        let meta = register_one(&catalog, "vm-42");
+        let found = catalog.find_by_id(&meta.id).unwrap();
+        assert_eq!(found.vm_id, "vm-42");
+    }
+
+    #[test]
+    fn test_list_all_across_multiple_vms() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        register_one(&catalog, "vm-a");
+        register_one(&catalog, "vm-a");
+        register_one(&catalog, "vm-b");
+        let all = catalog.list_all().unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_delete_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = SnapshotCatalog::new(dir.path().to_str().unwrap());
+        let meta = register_one(&catalog, "vm-1");
+        catalog.delete_by_id(&meta.id).unwrap();
+        assert!(catalog.list_all().unwrap().is_empty());
+    }
+}
