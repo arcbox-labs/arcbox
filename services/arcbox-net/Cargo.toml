@@ -23,6 +23,8 @@ ipnetwork = "0.20"
 hashbrown = "0.14"
 crossbeam-utils = "0.8"
 socket2 = { version = "0.5", features = ["all"] }
+tokio-util = "0.7"
+smoltcp = { version = "0.12.0", default-features = false, features = ["std", "alloc", "log", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-tcp-cubic"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

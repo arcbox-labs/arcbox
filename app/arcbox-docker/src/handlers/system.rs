@@ -1,5 +1,3 @@
-use crate::handlers::proxy_handler;
-
-proxy_handler!(ping);
-proxy_handler!(get_version);
-proxy_handler!(get_info);
+crate::handlers::proxy_handler!(ping);
+crate::handlers::proxy_handler!(get_version);
+crate::handlers::proxy_handler!(get_info);

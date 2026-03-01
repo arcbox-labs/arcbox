@@ -8,6 +8,7 @@
 //! The implementation handles basic A and AAAA record queries.
 
 use std::collections::HashMap;
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -56,10 +57,15 @@ impl DnsConfig {
     /// Creates a new DNS configuration.
     #[must_use]
     pub fn new(listen_addr: Ipv4Addr) -> Self {
-        Self {
+        let mut config = Self {
             listen_addr: SocketAddr::new(IpAddr::V4(listen_addr), DNS_PORT),
             ..Default::default()
+        };
+        let detected = detect_system_upstream();
+        if !detected.is_empty() {
+            config.upstream = detected;
         }
+        config
     }
 
     /// Sets the listen address.
@@ -89,6 +95,42 @@ impl DnsConfig {
         self.local_domain = Some(domain.into());
         self
     }
+}
+
+/// Parses `nameserver` entries from resolv.conf text.
+fn parse_resolv_conf_nameservers(contents: &str) -> Vec<SocketAddr> {
+    let mut servers = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("nameserver") {
+            continue;
+        }
+        let Some(raw_ip) = parts.next() else {
+            continue;
+        };
+
+        let Ok(ip) = raw_ip.parse::<IpAddr>() else {
+            continue;
+        };
+        let addr = SocketAddr::new(ip, DNS_PORT);
+        if !servers.contains(&addr) {
+            servers.push(addr);
+        }
+    }
+    servers
+}
+
+/// Detects system DNS upstream servers from `/etc/resolv.conf`.
+fn detect_system_upstream() -> Vec<SocketAddr> {
+    let Ok(contents) = fs::read_to_string("/etc/resolv.conf") else {
+        return Vec::new();
+    };
+    parse_resolv_conf_nameservers(&contents)
 }
 
 /// DNS record type.
@@ -262,7 +304,25 @@ impl DnsForwarder {
         self.local_hosts.get(&hostname).copied()
     }
 
-    /// Handles a DNS query packet.
+    /// Attempts to resolve a DNS query locally without any network I/O.
+    ///
+    /// Returns `Ok(Some(response))` if the query was resolved from local host
+    /// mappings, or `Ok(None)` if upstream forwarding is needed. Unsupported
+    /// query types (e.g. HTTPS/SVCB) gracefully return `None` instead of
+    /// failing, so the caller can forward the raw query.
+    pub fn try_resolve_locally(&self, data: &[u8]) -> Option<Vec<u8>> {
+        let query = DnsQuery::parse(data).ok()?;
+        let ip = self.resolve_local(&query.name)?;
+        self.build_local_response(&query, ip).ok()
+    }
+
+    /// Returns the upstream DNS server addresses.
+    #[must_use]
+    pub fn upstream(&self) -> &[SocketAddr] {
+        &self.config.upstream
+    }
+
+    /// Handles a DNS query packet (synchronous, blocks on upstream forwarding).
     ///
     /// Returns the response packet.
     ///
@@ -630,5 +690,28 @@ mod tests {
         );
 
         assert_eq!(server.listen_addr(), Ipv4Addr::new(192, 168, 64, 1));
+    }
+
+    #[test]
+    fn test_parse_resolv_conf_nameservers() {
+        let conf = r#"
+# comment
+nameserver 10.0.0.2
+search local
+nameserver 2001:4860:4860::8888
+nameserver invalid
+nameserver 10.0.0.2
+"#;
+        let servers = parse_resolv_conf_nameservers(conf);
+        assert_eq!(
+            servers,
+            vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), DNS_PORT),
+                SocketAddr::new(
+                    IpAddr::V6("2001:4860:4860::8888".parse().unwrap()),
+                    DNS_PORT
+                )
+            ]
+        );
     }
 }

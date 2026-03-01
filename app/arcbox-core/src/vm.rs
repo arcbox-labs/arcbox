@@ -692,6 +692,21 @@ impl VmManager {
         Ok(vmm.get_balloon_stats())
     }
 
+    /// Takes the inbound listener manager from a running VM (Darwin only).
+    ///
+    /// The manager is created during VM start when the network device is set up.
+    /// After this call the VMM no longer owns the manager; the caller must call
+    /// `stop_all()` on shutdown.
+    #[cfg(target_os = "macos")]
+    pub fn take_inbound_listener_manager(
+        &self,
+        id: &VmId,
+    ) -> Option<arcbox_net::darwin::inbound_relay::InboundListenerManager> {
+        let mut vms = self.vms.write().ok()?;
+        let entry = vms.get_mut(id)?;
+        entry.vmm.as_mut()?.take_inbound_listener_manager()
+    }
+
     #[cfg(test)]
     pub(crate) fn guest_cid_for_test(&self, id: &VmId) -> Option<u32> {
         self.vms
