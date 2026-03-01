@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use crate::darwin::inbound_relay::InboundCommand;
 use crate::darwin::smoltcp_device::{InterceptedKind, SmoltcpDevice};
 use crate::darwin::socket_proxy::SocketProxy;
+use crate::darwin::tcp_bridge::TcpBridge;
 use crate::dhcp::DhcpServer;
 use crate::dns::DnsForwarder;
 use crate::ethernet::{ETH_HEADER_LEN, build_udp_ip_ethernet};
@@ -150,11 +151,21 @@ impl NetworkDatapath {
         });
 
         // Enable any_ip so smoltcp accepts packets to any destination IP,
-        // which is required for the TCP listen pool (Phase 2).
+        // which is required for the TCP listen pool.
         iface.set_any_ip(true);
 
-        // Create socket set (empty for Phase 1, TCP sockets added in Phase 2).
+        // Add a default route so smoltcp can send TCP replies (SYN-ACK, etc.)
+        // to the guest for connections to arbitrary external IPs.
+        iface
+            .routes_mut()
+            .add_default_ipv4_route(gateway_ip)
+            .expect("failed to add default route to smoltcp interface");
+
+        // Create socket set (TCP sockets added dynamically by TcpBridge).
         let mut sockets = SocketSet::new(vec![]);
+
+        // TCP bridge: manages smoltcp TCP socket pool and host connections.
+        let mut tcp_bridge = TcpBridge::new();
 
         let guest_async = AsyncFd::new(FdWrapper(guest_fd))?;
 
@@ -233,9 +244,19 @@ impl NetworkDatapath {
                         );
                     }
 
+                    // Ensure listen sockets exist for any new TCP SYN dst ports
+                    // before smoltcp processes them.
+                    let tcp_syns = device.take_tcp_syns();
+                    if !tcp_syns.is_empty() {
+                        tcp_bridge.ensure_listen_sockets(&tcp_syns, &mut sockets);
+                    }
+
                     // smoltcp processes ARP and TCP from the rx_queue.
                     let ts = smoltcp::time::Instant::now();
                     iface.poll(ts, &mut device, &mut sockets);
+
+                    // TCP bridge: relay data, detect new/closed connections.
+                    tcp_bridge.poll(&mut sockets);
 
                     // Write smoltcp-generated frames (ARP replies, TCP segments)
                     // to the guest FD.
@@ -259,6 +280,7 @@ impl NetworkDatapath {
                 _ = smoltcp_timer.tick() => {
                     let ts = smoltcp::time::Instant::now();
                     iface.poll(ts, &mut device, &mut sockets);
+                    tcp_bridge.poll(&mut sockets);
                     for frame in device.take_tx_pending() {
                         enqueue_or_write(&guest_async, frame, &mut write_queue);
                     }
@@ -315,7 +337,7 @@ fn handle_intercepted_frame(
                 guest_mac,
             );
         }
-        InterceptedKind::Udp | InterceptedKind::Icmp => {
+        InterceptedKind::Udp | InterceptedKind::Icmp | InterceptedKind::InboundTcp => {
             // Route through socket proxy (UDP/ICMP + inbound relay matching).
             socket_proxy.handle_outbound(frame, guest_mac);
         }

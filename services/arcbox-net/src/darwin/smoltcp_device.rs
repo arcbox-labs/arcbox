@@ -35,6 +35,15 @@ const PROTO_ICMP: u8 = 1;
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
 
+/// TCP SYN destination port extracted during frame classification.
+///
+/// The datapath loop uses this to ensure a smoltcp listen socket exists
+/// on the target port before `iface.poll()` processes the SYN.
+#[derive(Debug, Clone, Copy)]
+pub struct TcpSynInfo {
+    pub dst_port: u16,
+}
+
 /// An intercepted frame from the guest that should not go through smoltcp.
 #[derive(Debug)]
 pub struct InterceptedFrame {
@@ -53,6 +62,8 @@ pub enum InterceptedKind {
     Udp,
     /// ICMP traffic.
     Icmp,
+    /// TCP destined to inbound ephemeral port range (InboundRelay).
+    InboundTcp,
 }
 
 /// smoltcp `Device` implementation wrapping the guest VM's socketpair FD.
@@ -70,6 +81,9 @@ pub struct SmoltcpDevice {
     tx_pending: Vec<Vec<u8>>,
     /// Frames intercepted from the guest (DHCP, DNS, UDP, ICMP).
     intercepted: Vec<InterceptedFrame>,
+    /// TCP SYN info extracted during classification — used by TcpBridge
+    /// to ensure listen sockets exist before smoltcp processes them.
+    tcp_syns: Vec<TcpSynInfo>,
 }
 
 impl SmoltcpDevice {
@@ -81,6 +95,7 @@ impl SmoltcpDevice {
             rx_queue: VecDeque::new(),
             tx_pending: Vec::new(),
             intercepted: Vec::new(),
+            tcp_syns: Vec::new(),
         }
     }
 
@@ -126,6 +141,11 @@ impl SmoltcpDevice {
         std::mem::take(&mut self.tx_pending)
     }
 
+    /// Takes all TCP SYN info extracted during the last drain, leaving the buffer empty.
+    pub fn take_tcp_syns(&mut self) -> Vec<TcpSynInfo> {
+        std::mem::take(&mut self.tcp_syns)
+    }
+
     /// Classifies a frame and routes it to the appropriate queue.
     fn classify_frame(&mut self, frame: Vec<u8>, guest_mac: &mut Option<[u8; 6]>) {
         if frame.len() < ETH_HEADER_LEN {
@@ -166,8 +186,28 @@ impl SmoltcpDevice {
         let l4_start = ip_start + ihl;
 
         match protocol {
-            // TCP → smoltcp
+            // TCP → smoltcp for outbound; intercept inbound ephemeral replies
             PROTO_TCP => {
+                if l4_start + 14 <= frame.len() {
+                    let dst_port = u16::from_be_bytes([frame[l4_start + 2], frame[l4_start + 3]]);
+
+                    // Inbound ephemeral port range (61000-65535) — these are
+                    // replies to host→guest connections managed by InboundRelay,
+                    // not smoltcp. Route through the socket proxy.
+                    if dst_port >= 61000 {
+                        self.intercepted.push(InterceptedFrame {
+                            frame,
+                            kind: InterceptedKind::InboundTcp,
+                        });
+                        return;
+                    }
+
+                    let flags = frame[l4_start + 13];
+                    // SYN without ACK = new outbound connection attempt
+                    if flags & 0x02 != 0 && flags & 0x10 == 0 {
+                        self.tcp_syns.push(TcpSynInfo { dst_port });
+                    }
+                }
                 self.rx_queue.push_back(frame);
             }
             // UDP → check for DHCP/DNS interception
