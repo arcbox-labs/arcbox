@@ -187,6 +187,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-constants"
+version = "0.0.1-alpha.1"
+
+[[package]]
 name = "arcbox-container"
 version = "0.0.1-alpha.2"
 dependencies = [

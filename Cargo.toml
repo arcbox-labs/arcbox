@@ -4,6 +4,7 @@ members = [
     # ============================================
     # L0: Common (MIT OR Apache-2.0)
     # ============================================
+    "common/arcbox-constants",
     "common/arcbox-error",
 
     # ============================================
@@ -151,6 +152,7 @@ libc = "0.2"
 macos-resolver = "0.2.0"
 
 # Internal crates (Core layer)
+arcbox-constants = { version = "0.0.1-alpha.1", path = "common/arcbox-constants" }
 arcbox-error = { version = "0.0.1-alpha.1", path = "common/arcbox-error" }
 arcbox-vz = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-vz" }
 arcbox-hypervisor = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-hypervisor" }
