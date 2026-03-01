@@ -21,6 +21,7 @@
 //! Outbound traffic is proxied through host OS sockets instead of a utun +
 //! pf NAT. This bypasses kernel routing, VPN interference, and pf issues.
 
+use std::collections::VecDeque;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -40,6 +41,10 @@ use crate::ethernet::{
 
 /// Maximum Ethernet frame size we handle (jumbo-safe).
 const MAX_FRAME_SIZE: usize = 65535;
+
+/// Stop consuming reply_rx when write queue exceeds this depth, propagating
+/// backpressure through the reply channel to upstream TCP/UDP proxies.
+const WRITE_QUEUE_HIGH: usize = 512;
 
 /// Wraps an `OwnedFd` so it can be registered with `AsyncFd`.
 struct FdWrapper(OwnedFd);
@@ -143,6 +148,10 @@ impl NetworkDatapath {
         let mut guest_buf = vec![0u8; MAX_FRAME_SIZE];
         let mut guest_mac: Option<[u8; 6]> = None;
 
+        // Write queue: buffers frames that couldn't be written to the guest FD
+        // due to EWOULDBLOCK. Drained when the FD becomes writable again.
+        let mut write_queue: VecDeque<Vec<u8>> = VecDeque::new();
+
         // Periodic maintenance interval for cleaning up stale flows.
         let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(30));
         maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -150,12 +159,32 @@ impl NetworkDatapath {
         tracing::info!("Network datapath started (socket proxy mode)");
 
         loop {
+            let has_pending = !write_queue.is_empty();
+            let accept_replies = write_queue.len() < WRITE_QUEUE_HIGH;
+
             tokio::select! {
                 biased;
 
                 _ = cancel.cancelled() => {
                     tracing::info!("Network datapath shutting down");
                     break;
+                }
+
+                // Drain pending writes when the guest FD becomes writable.
+                // Highest priority after cancel to minimize queue depth.
+                writable = guest_async.writable(), if has_pending => {
+                    let mut guard = writable?;
+                    while let Some(frame) = write_queue.front() {
+                        match guard.try_io(|inner| fd_write(inner.get_ref().as_raw_fd(), frame)) {
+                            Ok(Ok(_)) => { write_queue.pop_front(); }
+                            Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Ok(Err(e)) => {
+                                tracing::warn!("Guest write error: {}", e);
+                                write_queue.pop_front();
+                            }
+                            Err(_) => break, // Guard not ready, retry next iteration.
+                        }
+                    }
                 }
 
                 // Guest → Host: read an Ethernet frame from the guest FD.
@@ -186,8 +215,9 @@ impl NetworkDatapath {
                 }
 
                 // Proxy → Guest: relay reply frames from socket proxy.
-                Some(reply_frame) = reply_rx.recv() => {
-                    write_to_guest(&guest_async, &reply_frame);
+                // Backpressure: stop consuming when write queue is deep.
+                Some(reply_frame) = reply_rx.recv(), if accept_replies => {
+                    enqueue_or_write(&guest_async, reply_frame, &mut write_queue);
                 }
 
                 // Inbound commands from InboundListenerManager.
@@ -491,7 +521,49 @@ async fn forward_dns_async(data: &[u8], upstream: &[SocketAddr]) -> Result<Vec<u
 // Helpers
 // ============================================================================
 
+/// Attempts a direct non-blocking write; queues the frame on `WouldBlock`.
+///
+/// If the write queue is non-empty, the frame is appended directly to
+/// preserve ordering. This is the primary write path for proxy reply frames.
+fn enqueue_or_write(
+    guest_async: &AsyncFd<FdWrapper>,
+    frame: Vec<u8>,
+    write_queue: &mut VecDeque<Vec<u8>>,
+) {
+    if !write_queue.is_empty() {
+        // Must enqueue to maintain frame ordering.
+        write_queue.push_back(frame);
+        return;
+    }
+    // Try direct write first.
+    let fd = guest_async.get_ref().as_raw_fd();
+    match fd_write(fd, &frame) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            write_queue.push_back(frame);
+        }
+        Err(e) => {
+            tracing::warn!("Guest write error: {}", e);
+        }
+    }
+}
+
+/// Writes data to a raw file descriptor, returning bytes written or an error.
+fn fd_write(fd: RawFd, data: &[u8]) -> io::Result<usize> {
+    // SAFETY: writing from our buffer to a valid socketpair fd.
+    let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        #[allow(clippy::cast_sign_loss)]
+        Ok(n as usize)
+    }
+}
+
 /// Writes a frame to the guest FD (best-effort, non-blocking).
+///
+/// Used only for low-frequency control-plane frames (ARP, DHCP, local DNS)
+/// where `WouldBlock` is extremely unlikely and queuing is unnecessary.
 fn write_to_guest(guest_async: &AsyncFd<FdWrapper>, data: &[u8]) {
     let fd = guest_async.get_ref().as_raw_fd();
     // SAFETY: writing from our buffer to a valid socketpair fd.
@@ -650,6 +722,53 @@ mod tests {
         let n = fd_read(b.as_raw_fd(), &mut buf).unwrap();
         assert_eq!(n, frame.len());
         assert_eq!(&buf[..n], frame.as_slice());
+    }
+
+    #[test]
+    fn test_fd_write_roundtrip() {
+        let (a, b) = socketpair();
+        let data = b"fd_write test data";
+        let n = fd_write(b.as_raw_fd(), data).unwrap();
+        assert_eq!(n, data.len());
+
+        let mut buf = [0u8; 64];
+        let n = fd_read(a.as_raw_fd(), &mut buf).unwrap();
+        assert_eq!(&buf[..n], data);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_or_write_direct() {
+        let (a, b) = socketpair();
+        set_nonblocking(a.as_raw_fd()).unwrap();
+        let guest_async = AsyncFd::new(FdWrapper(a)).unwrap();
+
+        let mut queue = VecDeque::new();
+        let frame = b"direct write frame".to_vec();
+        enqueue_or_write(&guest_async, frame.clone(), &mut queue);
+
+        // Should have written directly, queue stays empty.
+        assert!(queue.is_empty(), "Queue should be empty after direct write");
+
+        let mut buf = [0u8; 128];
+        let n = fd_read(b.as_raw_fd(), &mut buf).unwrap();
+        assert_eq!(&buf[..n], frame.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_or_write_queues_when_nonempty() {
+        let (a, _b) = socketpair();
+        set_nonblocking(a.as_raw_fd()).unwrap();
+        let guest_async = AsyncFd::new(FdWrapper(a)).unwrap();
+
+        let mut queue = VecDeque::new();
+        queue.push_back(b"already queued".to_vec());
+
+        let frame = b"new frame".to_vec();
+        enqueue_or_write(&guest_async, frame.clone(), &mut queue);
+
+        // Should enqueue without attempting write to preserve ordering.
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[1], frame);
     }
 
     #[tokio::test]
