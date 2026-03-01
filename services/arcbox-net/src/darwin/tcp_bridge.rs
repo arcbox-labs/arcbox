@@ -364,12 +364,19 @@ impl TcpBridge {
             // Probe for host channel disconnect during handshake.
             // can_send() is false in SynSent/SynReceived, so the loop above
             // never runs — check the channel explicitly so we detect connect
-            // failures promptly.
-            if !conn.host_disconnected && !sock.can_send() {
-                if let Err(mpsc::error::TryRecvError::Disconnected) =
-                    conn.host_to_guest_rx.try_recv()
-                {
-                    conn.host_disconnected = true;
+            // failures promptly. If data arrives instead, save it for later.
+            if !conn.host_disconnected && !conn.host_eof && !sock.can_send() {
+                match conn.host_to_guest_rx.try_recv() {
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        conn.host_disconnected = true;
+                    }
+                    Ok(data) if data.is_empty() => {
+                        conn.host_eof = true;
+                    }
+                    Ok(data) => {
+                        conn.pending_send = Some(data);
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => {}
                 }
             }
 
