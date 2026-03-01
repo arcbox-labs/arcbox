@@ -69,6 +69,10 @@ struct OutboundConn {
     host_eof: bool,
     /// Set to true when the host connect failed — abort the smoltcp socket.
     connect_failed: bool,
+    /// Leftover bytes from a partial `send_slice` that need to be retried.
+    pending_send: Option<Vec<u8>>,
+    /// Set to true when the guest→host sender has been closed to signal EOF.
+    guest_eof_sent: bool,
 }
 
 /// Manages outbound TCP connections through the smoltcp socket pool.
@@ -203,6 +207,8 @@ impl TcpBridge {
                         guest_to_host_tx: g2h_tx,
                         host_eof: false,
                         connect_failed: false,
+                        pending_send: None,
+                        guest_eof_sent: false,
                     },
                 );
 
@@ -220,24 +226,34 @@ impl TcpBridge {
         for conn in self.connections.values_mut() {
             let sock = sockets.get_mut::<tcp::Socket>(conn.handle);
 
-            // Host → Guest: drain channel into smoltcp tx buffer.
+            // Host → Guest: flush pending partial send first, then drain channel.
             while sock.can_send() {
+                // Retry leftover bytes from a previous partial send.
+                if let Some(pending) = conn.pending_send.take() {
+                    match sock.send_slice(&pending) {
+                        Ok(sent) if sent < pending.len() => {
+                            conn.pending_send = Some(pending[sent..].to_vec());
+                            break;
+                        }
+                        Ok(_) => {} // fully sent, continue draining channel
+                        Err(e) => {
+                            tracing::debug!("TCP bridge: send error to {}: {e:?}", conn.remote);
+                            conn.pending_send = Some(pending);
+                            break;
+                        }
+                    }
+                }
+
                 match conn.host_to_guest_rx.try_recv() {
                     Ok(data) => {
                         if data.is_empty() {
-                            // EOF signal from host.
                             conn.host_eof = true;
                             break;
                         }
                         match sock.send_slice(&data) {
                             Ok(sent) if sent < data.len() => {
-                                // Partial send — this shouldn't happen since we
-                                // check can_send(), but handle gracefully.
-                                tracing::debug!(
-                                    "TCP bridge: partial send {sent}/{} to {}",
-                                    data.len(),
-                                    conn.remote
-                                );
+                                conn.pending_send = Some(data[sent..].to_vec());
+                                break;
                             }
                             Err(e) => {
                                 tracing::debug!("TCP bridge: send error to {}: {e:?}", conn.remote);
@@ -255,11 +271,11 @@ impl TcpBridge {
                 }
             }
 
-            // If host read EOF'd and all data flushed to smoltcp, close the
-            // smoltcp socket (sends FIN to guest).
-            if conn.host_eof && sock.may_send() {
+            // If host read EOF'd and all pending data flushed to smoltcp,
+            // close the smoltcp socket (sends FIN to guest).
+            if conn.host_eof && conn.pending_send.is_none() && sock.may_send() {
                 sock.close();
-                conn.host_eof = false; // Only close once.
+                conn.host_eof = false;
             }
 
             // If host connect failed, abort (RST to guest).
@@ -290,11 +306,10 @@ impl TcpBridge {
             }
 
             // If the guest has sent FIN and we've consumed all data, signal
-            // close to the host task.
-            if !sock.may_recv() && sock.state() != tcp::State::Listen {
-                // Close the guest_to_host channel so the host write task sees
-                // EOF and shuts down the write half.
-                // (Dropping the sender is handled in cleanup.)
+            // EOF to the host write task by dropping the sender.
+            if !conn.guest_eof_sent && !sock.may_recv() && sock.state() != tcp::State::Listen {
+                conn.guest_to_host_tx = mpsc::channel(1).0;
+                conn.guest_eof_sent = true;
             }
         }
     }
@@ -313,11 +328,12 @@ impl TcpBridge {
 
         for handle in to_remove {
             self.connections.remove(&handle);
-            // Don't recycle to free_handles — the socket still has its large
-            // buffers allocated. We'll create new sockets on demand as needed
-            // to avoid unbounded memory growth. When smoltcp finishes
-            // TIME-WAIT, the socket returns to Closed and we could re-listen.
-            // For now, just remove from the socket set.
+            // Remove the handle from port_handles so it doesn't get scanned
+            // in detect_new_connections for a port that no longer has this socket.
+            self.port_handles.retain(|_, handles| {
+                handles.retain(|h| *h != handle);
+                !handles.is_empty()
+            });
             sockets.remove(handle);
         }
     }
@@ -593,5 +609,184 @@ mod tests {
     fn bridge_active_count_starts_at_zero() {
         let bridge = TcpBridge::new();
         assert_eq!(bridge.active_count(), 0);
+    }
+
+    #[test]
+    fn partial_send_preserves_remainder() {
+        let mut device = SmoltcpDevice::new(0, GW_IP);
+        let (_iface, mut sockets) = make_iface_and_sockets(&mut device);
+
+        // Create a socket with a tiny tx buffer to force partial sends.
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; 64]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; 16]);
+        let mut sock = tcp::Socket::new(rx_buf, tx_buf);
+        sock.set_nagle_enabled(false);
+        // Put socket in a state where can_send() returns true. We'll test
+        // OutboundConn's pending_send logic directly via relay_all.
+        let handle = sockets.add(sock);
+
+        let (_h2g_tx, h2g_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (g2h_tx, _g2h_rx) = mpsc::channel::<Vec<u8>>(4);
+
+        let mut bridge = TcpBridge::new();
+        let remote: SocketAddr = "1.1.1.1:443".parse().unwrap();
+
+        // Manually construct a connection with pending data larger than
+        // the tx buffer.
+        bridge.connections.insert(
+            handle,
+            OutboundConn {
+                handle,
+                remote,
+                host_to_guest_rx: h2g_rx,
+                guest_to_host_tx: g2h_tx,
+                host_eof: false,
+                connect_failed: false,
+                pending_send: Some(vec![0xAA; 32]),
+                guest_eof_sent: false,
+            },
+        );
+
+        // The socket is in Closed state (not connected), so can_send() is
+        // false. The pending data should be preserved across the relay call.
+        bridge.relay_all(&mut sockets);
+
+        let conn = bridge.connections.get(&handle).unwrap();
+        assert!(
+            conn.pending_send.is_some(),
+            "Pending data should be preserved when socket can't send"
+        );
+        assert_eq!(conn.pending_send.as_ref().unwrap().len(), 32);
+    }
+
+    #[test]
+    fn host_eof_waits_for_pending_send() {
+        let mut device = SmoltcpDevice::new(0, GW_IP);
+        let (_iface, mut sockets) = make_iface_and_sockets(&mut device);
+
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; 64]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; 64]);
+        let sock = tcp::Socket::new(rx_buf, tx_buf);
+        let handle = sockets.add(sock);
+
+        let (_h2g_tx, h2g_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (g2h_tx, _g2h_rx) = mpsc::channel::<Vec<u8>>(4);
+
+        let mut bridge = TcpBridge::new();
+        let remote: SocketAddr = "1.1.1.1:443".parse().unwrap();
+
+        // Simulate: host EOF received but there's still pending data.
+        bridge.connections.insert(
+            handle,
+            OutboundConn {
+                handle,
+                remote,
+                host_to_guest_rx: h2g_rx,
+                guest_to_host_tx: g2h_tx,
+                host_eof: true,
+                connect_failed: false,
+                pending_send: Some(vec![0xBB; 10]),
+                guest_eof_sent: false,
+            },
+        );
+
+        // Socket is closed (can't send), so pending stays. The key check is
+        // that host_eof is NOT consumed when pending_send is non-empty.
+        bridge.relay_all(&mut sockets);
+
+        let conn = bridge.connections.get(&handle).unwrap();
+        assert!(
+            conn.host_eof,
+            "host_eof should remain set while pending_send is non-empty"
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_stale_port_handles() {
+        let mut device = SmoltcpDevice::new(0, GW_IP);
+        let (_iface, mut sockets) = make_iface_and_sockets(&mut device);
+        let mut bridge = TcpBridge::new();
+
+        // Create a listen socket for port 443.
+        let syns = vec![TcpSynInfo { dst_port: 443 }];
+        bridge.ensure_listen_sockets(&syns, &mut sockets);
+
+        assert!(bridge.port_handles.contains_key(&443));
+        let handle = bridge.port_handles[&443][0];
+
+        // Close the socket so it transitions from Listen to Closed.
+        let sock = sockets.get_mut::<tcp::Socket>(handle);
+        sock.abort();
+
+        // Simulate: the socket was an active connection that has now closed.
+        let (_h2g_tx, h2g_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (g2h_tx, _g2h_rx) = mpsc::channel::<Vec<u8>>(1);
+        bridge.connections.insert(
+            handle,
+            OutboundConn {
+                handle,
+                remote: "1.1.1.1:443".parse().unwrap(),
+                host_to_guest_rx: h2g_rx,
+                guest_to_host_tx: g2h_tx,
+                host_eof: false,
+                connect_failed: false,
+                pending_send: None,
+                guest_eof_sent: false,
+            },
+        );
+
+        bridge.cleanup_closed(&mut sockets);
+
+        assert!(
+            !bridge.port_handles.contains_key(&443),
+            "port_handles should be cleaned up after socket removal"
+        );
+        assert!(bridge.connections.is_empty());
+    }
+
+    #[test]
+    fn guest_eof_drops_sender() {
+        let mut device = SmoltcpDevice::new(0, GW_IP);
+        let (_iface, mut sockets) = make_iface_and_sockets(&mut device);
+
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; 64]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; 64]);
+        let sock = tcp::Socket::new(rx_buf, tx_buf);
+        let handle = sockets.add(sock);
+
+        let (_h2g_tx, h2g_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (g2h_tx, mut g2h_rx) = mpsc::channel::<Vec<u8>>(4);
+
+        let mut bridge = TcpBridge::new();
+        let remote: SocketAddr = "1.1.1.1:443".parse().unwrap();
+
+        bridge.connections.insert(
+            handle,
+            OutboundConn {
+                handle,
+                remote,
+                host_to_guest_rx: h2g_rx,
+                guest_to_host_tx: g2h_tx,
+                host_eof: false,
+                connect_failed: false,
+                pending_send: None,
+                guest_eof_sent: false,
+            },
+        );
+
+        // Socket is Closed — may_recv() returns false, state != Listen.
+        // This should trigger the guest EOF signal (drop the sender).
+        bridge.relay_all(&mut sockets);
+
+        let conn = bridge.connections.get(&handle).unwrap();
+        assert!(conn.guest_eof_sent, "guest_eof_sent should be set");
+
+        // The original sender was replaced, so the receiver should detect
+        // disconnection once the replacement is dropped.
+        drop(bridge);
+        assert!(
+            g2h_rx.try_recv().is_err(),
+            "Receiver should see disconnect after sender replaced and dropped"
+        );
     }
 }
