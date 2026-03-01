@@ -9,6 +9,7 @@ use prost::Message;
 use std::io::Cursor;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use arcbox_constants::wire::MessageType;
 use arcbox_protocol::Empty;
 use arcbox_protocol::agent::{
     PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved, RuntimeEnsureRequest,
@@ -17,50 +18,6 @@ use arcbox_protocol::agent::{
 
 /// Agent version string.
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// RPC message types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum MessageType {
-    // Request types (0x0000 - 0x0FFF).
-    PingRequest = 0x0001,
-    GetSystemInfoRequest = 0x0002,
-    EnsureRuntimeRequest = 0x0003,
-    RuntimeStatusRequest = 0x0004,
-
-    // Response types (0x1000 - 0x1FFF).
-    PingResponse = 0x1001,
-    GetSystemInfoResponse = 0x1002,
-    EnsureRuntimeResponse = 0x1003,
-    RuntimeStatusResponse = 0x1004,
-    PortBindingsChanged = 0x1030,
-    PortBindingsRemoved = 0x1031,
-
-    // Special types.
-    Empty = 0x0000,
-    Error = 0xFFFF,
-}
-
-impl MessageType {
-    /// Converts a u32 to a MessageType.
-    pub fn from_u32(value: u32) -> Option<Self> {
-        match value {
-            0x0001 => Some(Self::PingRequest),
-            0x0002 => Some(Self::GetSystemInfoRequest),
-            0x0003 => Some(Self::EnsureRuntimeRequest),
-            0x0004 => Some(Self::RuntimeStatusRequest),
-            0x1001 => Some(Self::PingResponse),
-            0x1002 => Some(Self::GetSystemInfoResponse),
-            0x1003 => Some(Self::EnsureRuntimeResponse),
-            0x1004 => Some(Self::RuntimeStatusResponse),
-            0x1030 => Some(Self::PortBindingsChanged),
-            0x1031 => Some(Self::PortBindingsRemoved),
-            0x0000 => Some(Self::Empty),
-            0xFFFF => Some(Self::Error),
-            _ => None,
-        }
-    }
-}
 
 /// Error response message.
 #[derive(Debug, Clone)]

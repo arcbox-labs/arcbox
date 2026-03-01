@@ -4,9 +4,7 @@
 //! It manages container lifecycle and executes commands in the guest VM.
 
 use anyhow::Result;
-
-/// Vsock port for agent communication.
-pub const AGENT_PORT: u32 = 1024;
+use arcbox_constants::ports::AGENT_PORT;
 
 // =============================================================================
 // EnsureRuntime State Machine (platform-independent, testable)
@@ -15,13 +13,12 @@ pub const AGENT_PORT: u32 = 1024;
 pub(crate) mod ensure_runtime {
     use std::sync::OnceLock;
 
+    pub use arcbox_constants::status::{
+        RUNTIME_FAILED as STATUS_FAILED, RUNTIME_REUSED as STATUS_REUSED,
+        RUNTIME_STARTED as STATUS_STARTED,
+    };
     use arcbox_protocol::agent::RuntimeEnsureResponse;
     use tokio::sync::{Mutex, Notify};
-
-    /// Outcome status constants for `RuntimeEnsureResponse.status`.
-    pub const STATUS_STARTED: &str = "started";
-    pub const STATUS_REUSED: &str = "reused";
-    pub const STATUS_FAILED: &str = "failed";
 
     /// Runtime lifecycle state.
     #[derive(Debug, Clone)]
@@ -215,14 +212,23 @@ mod linux {
         AGENT_VERSION, ErrorResponse, MessageType, RpcRequest, RpcResponse, parse_request,
         read_message, write_response,
     };
+    use arcbox_constants::cmdline::{
+        BOOT_ASSET_VERSION_KEY, DOCKER_DATA_DEVICE_KEY as DOCKER_DATA_DEVICE_CMDLINE_KEY,
+        GUEST_DOCKER_VSOCK_PORT_KEY,
+    };
+    use arcbox_constants::devices::DOCKER_DATA_BLOCK_DEVICE as DOCKER_DATA_DEVICE_DEFAULT;
+    use arcbox_constants::env::{
+        BOOT_ASSET_VERSION as BOOT_ASSET_VERSION_ENV,
+        GUEST_DOCKER_VSOCK_PORT as GUEST_DOCKER_VSOCK_PORT_ENV,
+    };
+    use arcbox_constants::ports::DOCKER_API_VSOCK_PORT;
+    use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
 
     use arcbox_protocol::agent::{
         PingResponse, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
         RuntimeStatusResponse, SystemInfo,
     };
 
-    /// Default guest-side raw Docker API proxy port on vsock.
-    const DOCKER_API_VSOCK_PORT_DEFAULT: u32 = 2375;
     /// Docker Unix socket path in guest.
     const DOCKER_API_UNIX_SOCKET: &str = "/var/run/docker.sock";
     /// Containerd socket candidates.
@@ -230,10 +236,6 @@ mod linux {
         "/run/containerd/containerd.sock",
         "/var/run/containerd/containerd.sock",
     ];
-    /// Kernel cmdline key for guest docker data block device.
-    const DOCKER_DATA_DEVICE_CMDLINE_KEY: &str = "arcbox.docker_data_device=";
-    /// Default docker data block device when cmdline is missing.
-    const DOCKER_DATA_DEVICE_DEFAULT: &str = "/dev/vdb";
     /// Mount point for dockerd persistent state.
     const DOCKER_DATA_MOUNT_POINT: &str = "/var/lib/docker";
 
@@ -250,7 +252,7 @@ mod linux {
     }
 
     fn docker_api_vsock_port() -> u32 {
-        if let Some(port) = std::env::var("ARCBOX_GUEST_DOCKER_VSOCK_PORT")
+        if let Some(port) = std::env::var(GUEST_DOCKER_VSOCK_PORT_ENV)
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|port| *port > 0)
@@ -258,21 +260,21 @@ mod linux {
             return port;
         }
 
-        if let Some(port) = cmdline_value("arcbox.guest_docker_vsock_port=")
+        if let Some(port) = cmdline_value(GUEST_DOCKER_VSOCK_PORT_KEY)
             .and_then(|raw| raw.parse::<u32>().ok())
             .filter(|port| *port > 0)
         {
             return port;
         }
 
-        DOCKER_API_VSOCK_PORT_DEFAULT
+        DOCKER_API_VSOCK_PORT
     }
 
     fn boot_asset_version() -> Option<String> {
-        std::env::var("ARCBOX_BOOT_ASSET_VERSION")
+        std::env::var(BOOT_ASSET_VERSION_ENV)
             .ok()
             .filter(|v| !v.is_empty())
-            .or_else(|| cmdline_value("arcbox.boot_asset_version="))
+            .or_else(|| cmdline_value(BOOT_ASSET_VERSION_KEY))
     }
 
     fn docker_data_device() -> String {
@@ -692,11 +694,6 @@ mod linux {
         RpcResponse::RuntimeStatus(collect_runtime_status().await)
     }
 
-    /// Service status constants.
-    const SERVICE_STATUS_READY: &str = "ready";
-    const SERVICE_STATUS_NOT_READY: &str = "not_ready";
-    const SERVICE_STATUS_ERROR: &str = "error";
-
     async fn collect_runtime_status() -> RuntimeStatusResponse {
         use arcbox_protocol::agent::ServiceStatus;
 
@@ -710,7 +707,7 @@ mod linux {
         services.push(if containerd_ready {
             ServiceStatus {
                 name: "containerd".to_string(),
-                status: SERVICE_STATUS_READY.to_string(),
+                status: SERVICE_READY.to_string(),
                 detail: format!(
                     "socket reachable: {}",
                     CONTAINERD_SOCKET_CANDIDATES
@@ -727,7 +724,7 @@ mod linux {
                 .join(", ");
             ServiceStatus {
                 name: "containerd".to_string(),
-                status: SERVICE_STATUS_NOT_READY.to_string(),
+                status: SERVICE_NOT_READY.to_string(),
                 detail: format!("no reachable socket found; checked: {}", socket_paths),
             }
         });
@@ -747,11 +744,11 @@ mod linux {
         services.push(ServiceStatus {
             name: "dockerd".to_string(),
             status: if docker_ready {
-                SERVICE_STATUS_READY.to_string()
+                SERVICE_READY.to_string()
             } else if Path::new(DOCKER_API_UNIX_SOCKET).exists() {
-                SERVICE_STATUS_ERROR.to_string()
+                SERVICE_ERROR.to_string()
             } else {
-                SERVICE_STATUS_NOT_READY.to_string()
+                SERVICE_NOT_READY.to_string()
             },
             detail: docker_detail,
         });
@@ -763,20 +760,20 @@ mod linux {
                 if youki_bin.exists() {
                     ServiceStatus {
                         name: "youki".to_string(),
-                        status: SERVICE_STATUS_READY.to_string(),
+                        status: SERVICE_READY.to_string(),
                         detail: format!("binary found: {}", youki_bin.display()),
                     }
                 } else {
                     ServiceStatus {
                         name: "youki".to_string(),
-                        status: SERVICE_STATUS_NOT_READY.to_string(),
+                        status: SERVICE_NOT_READY.to_string(),
                         detail: format!("binary missing at {}", youki_bin.display()),
                     }
                 }
             }
             None => ServiceStatus {
                 name: "youki".to_string(),
-                status: SERVICE_STATUS_NOT_READY.to_string(),
+                status: SERVICE_NOT_READY.to_string(),
                 detail: runtime_missing_detail(),
             },
         };

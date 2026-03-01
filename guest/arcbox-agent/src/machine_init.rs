@@ -27,11 +27,9 @@ use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 
-/// Setup VirtioFS tag name (must match host-side SharedDirConfig).
-const SETUP_TAG: &str = "arcbox-setup";
-
-/// Block device path for the rootfs disk.
-const BLOCK_DEVICE: &str = "/dev/vda";
+use arcbox_constants::cmdline::MODE_MACHINE;
+use arcbox_constants::devices::ROOT_BLOCK_DEVICE as BLOCK_DEVICE;
+use arcbox_constants::virtiofs::TAG_SETUP as SETUP_TAG;
 
 /// Mount points.
 const MNT_SETUP: &str = "/mnt/setup";
@@ -583,7 +581,7 @@ fn manual_switch_root(new_root: &str) -> ! {
 /// Checks if the kernel command line contains `arcbox.mode=machine`.
 pub fn is_machine_mode() -> bool {
     match fs::read_to_string("/proc/cmdline") {
-        Ok(cmdline) => cmdline.contains("arcbox.mode=machine"),
+        Ok(cmdline) => cmdline.contains(MODE_MACHINE),
         Err(_) => false,
     }
 }

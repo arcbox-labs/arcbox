@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 arcbox-protocol = { workspace = true }
+arcbox-constants = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
