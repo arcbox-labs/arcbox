@@ -32,6 +32,8 @@ use crate::ethernet::{ETH_HEADER_LEN, build_udp_ip_ethernet, prepend_ethernet_he
 struct UdpFlow {
     /// Last time traffic was seen on this flow.
     last_active: Instant,
+    /// Channel to send subsequent payloads to the flow's host socket task.
+    payload_tx: mpsc::Sender<Vec<u8>>,
 }
 
 /// UDP proxy: per-flow host sockets.
@@ -89,85 +91,94 @@ impl UdpProxy {
         let payload = frame[l4_start + 8..l4_start + udp_len].to_vec();
         let flow_key = (src_ip, src_port, dst_ip, dst_port);
 
-        // Update or create flow.
+        // Existing flow: send payload through its channel.
         if let Some(flow) = self.flows.get_mut(&flow_key) {
             flow.last_active = Instant::now();
-        } else {
-            self.flows.insert(
-                flow_key,
-                UdpFlow {
-                    last_active: Instant::now(),
-                },
-            );
-
-            // Spawn a recv task for this flow.
-            let reply_tx = self.reply_tx.clone();
-            let gateway_mac = self.gateway_mac;
-
-            tokio::spawn(async move {
-                let socket = match UdpSocket::bind("0.0.0.0:0").await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!("UDP proxy: failed to bind socket: {}", e);
-                        return;
-                    }
-                };
-
-                if let Err(e) = socket
-                    .connect(SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port)))
-                    .await
-                {
-                    tracing::warn!("UDP proxy: failed to connect: {}", e);
-                    return;
-                }
-
-                // Send the initial payload.
-                if let Err(e) = socket.send(&payload).await {
-                    tracing::warn!("UDP proxy: send failed: {}", e);
-                    return;
-                }
-
-                // Receive replies and forward them to the guest.
-                let mut buf = vec![0u8; 65535];
-                loop {
-                    let recv = tokio::time::timeout(
-                        std::time::Duration::from_secs(60),
-                        socket.recv(&mut buf),
-                    )
-                    .await;
-
-                    match recv {
-                        Ok(Ok(n)) if n > 0 => {
-                            let reply_frame = build_udp_ip_ethernet(
-                                dst_ip,
-                                src_ip,
-                                dst_port,
-                                src_port,
-                                &buf[..n],
-                                gateway_mac,
-                                guest_mac,
-                            );
-                            if reply_tx.send(reply_frame).await.is_err() {
-                                break;
-                            }
-                        }
-                        _ => break, // Timeout or error
-                    }
-                }
-            });
-
-            // Return here — the initial payload send happens in the spawned task.
+            if flow.payload_tx.try_send(payload).is_err() {
+                // Task exited or channel full — remove stale flow so it
+                // gets recreated on the next packet.
+                self.flows.remove(&flow_key);
+            }
             return;
         }
 
-        // For existing flows, send via a one-shot task.
-        let dst = SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port));
+        // New flow: create a channel and spawn a task that owns the socket.
+        let (payload_tx, mut payload_rx) = mpsc::channel::<Vec<u8>>(64);
+
+        self.flows.insert(
+            flow_key,
+            UdpFlow {
+                last_active: Instant::now(),
+                payload_tx: payload_tx.clone(),
+            },
+        );
+
+        let reply_tx = self.reply_tx.clone();
+        let gateway_mac = self.gateway_mac;
+
         tokio::spawn(async move {
             let socket = match UdpSocket::bind("0.0.0.0:0").await {
                 Ok(s) => s,
-                Err(_) => return,
+                Err(e) => {
+                    tracing::warn!("UDP proxy: failed to bind socket: {}", e);
+                    return;
+                }
             };
-            let _ = socket.send_to(&payload, dst).await;
+
+            if let Err(e) = socket
+                .connect(SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port)))
+                .await
+            {
+                tracing::warn!("UDP proxy: failed to connect: {}", e);
+                return;
+            }
+
+            // Send the initial payload.
+            if let Err(e) = socket.send(&payload).await {
+                tracing::warn!("UDP proxy: send failed: {}", e);
+                return;
+            }
+
+            let mut buf = vec![0u8; 65535];
+            loop {
+                tokio::select! {
+                    // Subsequent payloads from the same flow.
+                    msg = payload_rx.recv() => {
+                        match msg {
+                            Some(data) => {
+                                if let Err(e) = socket.send(&data).await {
+                                    tracing::debug!("UDP proxy: send failed: {e}");
+                                    break;
+                                }
+                            }
+                            None => break, // Channel closed, flow removed.
+                        }
+                    }
+                    // Replies from the remote host.
+                    recv = tokio::time::timeout(
+                        std::time::Duration::from_secs(60),
+                        socket.recv(&mut buf),
+                    ) => {
+                        match recv {
+                            Ok(Ok(n)) if n > 0 => {
+                                let reply_frame = build_udp_ip_ethernet(
+                                    dst_ip,
+                                    src_ip,
+                                    dst_port,
+                                    src_port,
+                                    &buf[..n],
+                                    gateway_mac,
+                                    guest_mac,
+                                );
+                                if reply_tx.send(reply_frame).await.is_err() {
+                                    break;
+                                }
+                            }
+                            _ => break, // Timeout or error
+                        }
+                    }
+                }
+            }
         });
     }
 
@@ -587,6 +598,7 @@ mod tests {
             key,
             UdpFlow {
                 last_active: Instant::now() - std::time::Duration::from_secs(120),
+                payload_tx: mpsc::channel(1).0,
             },
         );
         assert_eq!(proxy.flows.len(), 1);
