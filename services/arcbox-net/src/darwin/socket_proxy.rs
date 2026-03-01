@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 use socket2::{Domain, Protocol, Type};
@@ -554,10 +554,12 @@ enum TcpState {
 /// Per-connection TCP state tracking.
 struct TcpConnection {
     state: TcpState,
-    /// Next expected sequence number from the guest.
-    guest_seq: u32,
-    /// Our sequence number to the guest.
-    host_seq: u32,
+    /// Next expected sequence number from the guest, shared with relay for ACK
+    /// numbers in host→guest data frames.
+    guest_seq: Arc<AtomicU32>,
+    /// Our sequence number to the guest, shared with the relay task so ACKs
+    /// always use the most up-to-date value.
+    host_seq: Arc<AtomicU32>,
     /// Actual destination IP from the guest's SYN (used as source IP in replies).
     remote_ip: Ipv4Addr,
     /// Channel to send events to the connection relay task.
@@ -634,7 +636,7 @@ impl TcpProxy {
                     if flags & TCP_ACK != 0 {
                         // Handshake complete.
                         conn.state = TcpState::Established;
-                        conn.guest_seq = seq;
+                        conn.guest_seq.store(seq, Ordering::Relaxed);
                         tracing::debug!(
                             "TCP established: {}:{} -> {}:{}",
                             src_ip,
@@ -654,17 +656,19 @@ impl TcpProxy {
 
                     if flags & TCP_FIN != 0 {
                         // Guest is closing. Send FIN-ACK.
-                        conn.guest_seq = seq.wrapping_add(payload.len() as u32).wrapping_add(1);
+                        let guest_seq = seq.wrapping_add(payload.len() as u32).wrapping_add(1);
+                        conn.guest_seq.store(guest_seq, Ordering::Relaxed);
                         conn.state = TcpState::FinWait;
                         let remote_ip = conn.remote_ip;
+                        let host_seq = conn.host_seq.load(Ordering::Relaxed);
 
                         let fin_ack = build_tcp_ip_ethernet(
                             remote_ip,
                             src_ip,
                             dst_port,
                             src_port,
-                            conn.host_seq,
-                            conn.guest_seq,
+                            host_seq,
+                            guest_seq,
                             TCP_FIN | TCP_ACK,
                             65535,
                             &[],
@@ -685,8 +689,10 @@ impl TcpProxy {
                     }
 
                     if !payload.is_empty() {
-                        conn.guest_seq = seq.wrapping_add(payload.len() as u32);
+                        let guest_seq = seq.wrapping_add(payload.len() as u32);
+                        conn.guest_seq.store(guest_seq, Ordering::Relaxed);
                         let remote_ip = conn.remote_ip;
+                        let host_seq = conn.host_seq.load(Ordering::Relaxed);
 
                         // ACK the data.
                         let ack_frame = build_tcp_ip_ethernet(
@@ -694,8 +700,8 @@ impl TcpProxy {
                             src_ip,
                             dst_port,
                             src_port,
-                            conn.host_seq,
-                            conn.guest_seq,
+                            host_seq,
+                            guest_seq,
                             TCP_ACK,
                             65535,
                             &[],
@@ -758,10 +764,18 @@ impl TcpProxy {
         let host_isn: u32 = rand_isn();
         let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
 
+        // SYN-ACK uses seq=host_isn, consuming one seq number. After that,
+        // the next byte is host_isn+1. Share this counter with the relay task
+        // so ACKs from proxy_tcp always use the up-to-date value.
+        let shared_host_seq = Arc::new(AtomicU32::new(host_isn.wrapping_add(1)));
+        let relay_host_seq = Arc::clone(&shared_host_seq);
+        let shared_guest_seq = Arc::new(AtomicU32::new(guest_isn.wrapping_add(1)));
+        let relay_guest_seq = Arc::clone(&shared_guest_seq);
+
         let conn = TcpConnection {
             state: TcpState::SynReceived,
-            guest_seq: guest_isn.wrapping_add(1),
-            host_seq: host_isn,
+            guest_seq: shared_guest_seq,
+            host_seq: shared_host_seq,
             remote_ip: dst_ip,
             data_tx,
         };
@@ -851,7 +865,8 @@ impl TcpProxy {
                 src_port,
                 dst_port,
                 guest_mac,
-                host_isn.wrapping_add(1),
+                relay_host_seq,
+                relay_guest_seq,
             )
             .await;
         });
@@ -863,6 +878,11 @@ impl TcpProxy {
             .retain(|_, conn| conn.state != TcpState::Closed);
     }
 }
+
+/// Maximum TCP segment size for guest-facing frames.
+///
+/// Standard MSS for MTU 1500: 1500 - 20 (IPv4) - 20 (TCP) = 1460.
+const GUEST_MSS: usize = 1460;
 
 /// Bidirectional relay between a host `TcpStream` and guest TCP segments.
 #[allow(clippy::too_many_arguments)]
@@ -876,13 +896,14 @@ async fn tcp_relay(
     guest_port: u16,
     host_port: u16,
     guest_mac: [u8; 6],
-    mut host_seq: u32,
+    shared_host_seq: Arc<AtomicU32>,
+    shared_guest_seq: Arc<AtomicU32>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (mut reader, mut writer) = stream.into_split();
 
-    // Host -> Guest relay: read from TcpStream, send data frames.
+    // Host -> Guest relay: read from TcpStream, send MSS-sized data frames.
     let reply_tx2 = reply_tx.clone();
     let host_read = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
@@ -890,13 +911,15 @@ async fn tcp_relay(
             match reader.read(&mut buf).await {
                 Ok(0) => {
                     // EOF: send FIN to guest.
+                    let host_seq = shared_host_seq.load(Ordering::Relaxed);
+                    let guest_seq = shared_guest_seq.load(Ordering::Relaxed);
                     let fin = build_tcp_ip_ethernet(
                         remote_ip,
                         guest_ip,
                         host_port,
                         guest_port,
                         host_seq,
-                        0,
+                        guest_seq,
                         TCP_FIN | TCP_ACK,
                         65535,
                         &[],
@@ -907,21 +930,45 @@ async fn tcp_relay(
                     break;
                 }
                 Ok(n) => {
-                    let data_frame = build_tcp_ip_ethernet(
-                        remote_ip,
-                        guest_ip,
-                        host_port,
-                        guest_port,
-                        host_seq,
-                        0,
-                        TCP_ACK | TCP_PSH,
-                        65535,
-                        &buf[..n],
-                        gateway_mac,
-                        guest_mac,
-                    );
-                    host_seq = host_seq.wrapping_add(n as u32);
-                    if reply_tx2.send(data_frame).await.is_err() {
+                    let guest_seq = shared_guest_seq.load(Ordering::Relaxed);
+                    let data = &buf[..n];
+
+                    // Segment into MSS-sized chunks to stay within guest MTU.
+                    let mut offset = 0;
+                    let mut failed = false;
+                    while offset < data.len() {
+                        let end = (offset + GUEST_MSS).min(data.len());
+                        let chunk = &data[offset..end];
+                        let host_seq = shared_host_seq.load(Ordering::Relaxed);
+
+                        let flags = if end == data.len() {
+                            TCP_ACK | TCP_PSH
+                        } else {
+                            TCP_ACK
+                        };
+
+                        let seg = build_tcp_ip_ethernet(
+                            remote_ip,
+                            guest_ip,
+                            host_port,
+                            guest_port,
+                            host_seq,
+                            guest_seq,
+                            flags,
+                            65535,
+                            chunk,
+                            gateway_mac,
+                            guest_mac,
+                        );
+                        shared_host_seq
+                            .store(host_seq.wrapping_add(chunk.len() as u32), Ordering::Relaxed);
+                        if reply_tx2.send(seg).await.is_err() {
+                            failed = true;
+                            break;
+                        }
+                        offset = end;
+                    }
+                    if failed {
                         break;
                     }
                 }
@@ -1070,8 +1117,8 @@ mod tests {
             key,
             TcpConnection {
                 state: TcpState::Closed,
-                guest_seq: 0,
-                host_seq: 0,
+                guest_seq: Arc::new(AtomicU32::new(0)),
+                host_seq: Arc::new(AtomicU32::new(0)),
                 remote_ip: Ipv4Addr::new(1, 1, 1, 1),
                 data_tx,
             },
