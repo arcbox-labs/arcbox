@@ -3,6 +3,10 @@
 //! Provides RPC communication with the arcbox-agent running inside guest VMs.
 
 use crate::error::{CoreError, Result};
+use arcbox_constants::ports::AGENT_PORT;
+use arcbox_constants::wire::{
+    ERROR_HEADER_SIZE, FRAME_HEADER_SIZE, MessageType, TRACE_LEN_FIELD_SIZE, TYPE_FIELD_SIZE,
+};
 use arcbox_protocol::agent::{
     PingRequest, PingResponse, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
     RuntimeStatusResponse, SystemInfo,
@@ -11,54 +15,6 @@ use arcbox_transport::Transport;
 use arcbox_transport::vsock::{VsockAddr, VsockTransport};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use prost::Message;
-
-/// Default vsock port for agent communication.
-pub const AGENT_PORT: u32 = 1024;
-
-/// RPC message types (must match guest agent's rpc.rs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-enum MessageType {
-    // Request types.
-    PingRequest = 0x0001,
-    GetSystemInfoRequest = 0x0002,
-    EnsureRuntimeRequest = 0x0003,
-    RuntimeStatusRequest = 0x0004,
-
-    // Response types.
-    PingResponse = 0x1001,
-    GetSystemInfoResponse = 0x1002,
-    EnsureRuntimeResponse = 0x1003,
-    RuntimeStatusResponse = 0x1004,
-
-    // Reserved response types kept for future port binding notifications.
-    PortBindingsChanged = 0x1030,
-    PortBindingsRemoved = 0x1031,
-
-    // Special types.
-    EmptyResponse = 0x0000,
-    Error = 0xFFFF,
-}
-
-impl MessageType {
-    fn from_u32(value: u32) -> Option<Self> {
-        match value {
-            0x0001 => Some(Self::PingRequest),
-            0x0002 => Some(Self::GetSystemInfoRequest),
-            0x0003 => Some(Self::EnsureRuntimeRequest),
-            0x0004 => Some(Self::RuntimeStatusRequest),
-            0x1001 => Some(Self::PingResponse),
-            0x1002 => Some(Self::GetSystemInfoResponse),
-            0x1003 => Some(Self::EnsureRuntimeResponse),
-            0x1004 => Some(Self::RuntimeStatusResponse),
-            0x1030 => Some(Self::PortBindingsChanged),
-            0x1031 => Some(Self::PortBindingsRemoved),
-            0x0000 => Some(Self::EmptyResponse),
-            0xFFFF => Some(Self::Error),
-            _ => None,
-        }
-    }
-}
 
 /// Agent client for a single VM.
 pub struct AgentClient {
@@ -157,8 +113,10 @@ impl AgentClient {
         let trace_bytes = trace_id.as_bytes();
         let trace_len = trace_bytes.len().min(u16::MAX as usize);
         // Length = type(4) + trace_len_field(2) + trace_bytes + payload
-        let length = 4 + 2 + trace_len + payload.len();
-        let mut buf = BytesMut::with_capacity(4 + length);
+        let length = TYPE_FIELD_SIZE + TRACE_LEN_FIELD_SIZE + trace_len + payload.len();
+        let mut buf = BytesMut::with_capacity(
+            FRAME_HEADER_SIZE + TRACE_LEN_FIELD_SIZE + trace_len + payload.len(),
+        );
         buf.put_u32(length as u32);
         buf.put_u32(msg_type as u32);
         buf.put_u16(trace_len as u16);
@@ -171,23 +129,23 @@ impl AgentClient {
 
     /// Parses a V2 wire response. Returns (resp_type, trace_id, payload).
     fn parse_response(response: &[u8]) -> Result<(u32, String, Vec<u8>)> {
-        if response.len() < 8 {
+        if response.len() < FRAME_HEADER_SIZE {
             return Err(CoreError::Machine("response too short".to_string()));
         }
         let mut cursor = std::io::Cursor::new(response);
         let length = cursor.get_u32() as usize;
         let resp_type = cursor.get_u32();
 
-        let remaining = length.saturating_sub(4);
-        let offset = 8usize; // Past length + type.
+        let remaining = length.saturating_sub(TYPE_FIELD_SIZE);
+        let offset = FRAME_HEADER_SIZE;
 
-        if remaining < 2 || response.len() < offset + 2 {
+        if remaining < TRACE_LEN_FIELD_SIZE || response.len() < offset + TRACE_LEN_FIELD_SIZE {
             // No trace_len field; treat the rest as payload.
             return Ok((resp_type, String::new(), response[offset..].to_vec()));
         }
 
         let trace_len = u16::from_be_bytes([response[offset], response[offset + 1]]) as usize;
-        let trace_start = offset + 2;
+        let trace_start = offset + TRACE_LEN_FIELD_SIZE;
         let trace_end = trace_start + trace_len;
         let payload_start = trace_end;
 
@@ -347,7 +305,7 @@ impl AgentClient {
 
 /// Parses an error response from the agent.
 fn parse_error_response(payload: &[u8]) -> Result<String> {
-    if payload.len() < 8 {
+    if payload.len() < ERROR_HEADER_SIZE {
         return Ok("unknown error".to_string());
     }
 
@@ -355,11 +313,11 @@ fn parse_error_response(payload: &[u8]) -> Result<String> {
     let _code = cursor.get_i32();
     let msg_len = cursor.get_u32() as usize;
 
-    if payload.len() < 8 + msg_len {
+    if payload.len() < ERROR_HEADER_SIZE + msg_len {
         return Ok("truncated error message".to_string());
     }
 
-    String::from_utf8(payload[8..8 + msg_len].to_vec())
+    String::from_utf8(payload[ERROR_HEADER_SIZE..ERROR_HEADER_SIZE + msg_len].to_vec())
         .map_err(|_| CoreError::Machine("invalid error message encoding".to_string()))
 }
 

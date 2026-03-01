@@ -16,6 +16,7 @@ arcbox-fs = { workspace = true }
 arcbox-net = { workspace = true }
 arcbox-protocol = { workspace = true }
 arcbox-transport = { workspace = true }
+arcbox-constants = { workspace = true }
 arcbox-error = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }

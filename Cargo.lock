@@ -209,6 +209,7 @@ dependencies = [
 name = "arcbox-core"
 version = "0.0.1-alpha.2"
 dependencies = [
+ "arcbox-constants",
  "arcbox-error",
  "arcbox-fs",
  "arcbox-hypervisor",

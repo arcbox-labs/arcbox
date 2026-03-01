@@ -6,6 +6,8 @@
 use crate::error::{CoreError, Result};
 use crate::persistence::MachinePersistence;
 use crate::vm::{SharedDirConfig, VmConfig, VmId, VmManager};
+use arcbox_constants::ports::AGENT_PORT;
+use arcbox_constants::virtiofs::{MOUNT_USERS, TAG_ARCBOX, TAG_USERS};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -222,11 +224,11 @@ impl MachineManager {
         // "arcbox" shares the data_dir; "users" shares /Users for transparent paths.
         let mut shared_dirs = vec![SharedDirConfig::new(
             data_dir.to_string_lossy().to_string(),
-            "arcbox",
+            TAG_ARCBOX,
         )];
-        let users_dir = std::path::Path::new("/Users");
+        let users_dir = std::path::Path::new(MOUNT_USERS);
         if users_dir.is_dir() {
-            shared_dirs.push(SharedDirConfig::new("/Users", "users"));
+            shared_dirs.push(SharedDirConfig::new(MOUNT_USERS, TAG_USERS));
         }
 
         // Load persisted machines
@@ -315,11 +317,11 @@ impl MachineManager {
         // (e.g. `docker run -v /Users/foo/project:/app` just works).
         let mut shared_dirs = vec![SharedDirConfig::new(
             self.data_dir.to_string_lossy().to_string(),
-            "arcbox",
+            TAG_ARCBOX,
         )];
-        let users_dir = std::path::Path::new("/Users");
+        let users_dir = std::path::Path::new(MOUNT_USERS);
         if users_dir.is_dir() {
-            shared_dirs.push(SharedDirConfig::new("/Users", "users"));
+            shared_dirs.push(SharedDirConfig::new(MOUNT_USERS, TAG_USERS));
         }
 
         // Create underlying VM
@@ -577,7 +579,7 @@ impl MachineManager {
     /// Returns an error if the machine is not found, not running, or connection fails.
     #[cfg(target_os = "macos")]
     pub fn connect_agent(&self, name: &str) -> Result<crate::agent_client::AgentClient> {
-        use crate::agent_client::{AGENT_PORT, AgentClient};
+        use crate::agent_client::AgentClient;
         let cid = self
             .get_cid(name)
             .ok_or_else(|| CoreError::Machine("CID not assigned".to_string()))?;
