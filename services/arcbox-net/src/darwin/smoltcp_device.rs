@@ -82,6 +82,8 @@ pub struct SmoltcpDevice {
     /// TCP SYN info extracted during classification — used by TcpBridge
     /// to ensure listen sockets exist before smoltcp processes them.
     tcp_syns: Vec<TcpSynInfo>,
+    /// Reusable read buffer to avoid per-call allocation in `drain_guest_fd`.
+    read_buf: Vec<u8>,
 }
 
 impl SmoltcpDevice {
@@ -94,6 +96,7 @@ impl SmoltcpDevice {
             tx_pending: Vec::new(),
             intercepted: Vec::new(),
             tcp_syns: Vec::new(),
+            read_buf: vec![0u8; MAX_FRAME_SIZE],
         }
     }
 
@@ -103,11 +106,11 @@ impl SmoltcpDevice {
     /// Must be called before `iface.poll()` to feed smoltcp with new data.
     /// Also learns the guest MAC address from frame source addresses.
     pub fn drain_guest_fd(&mut self, guest_mac: &mut Option<[u8; 6]>) {
-        let mut buf = vec![0u8; MAX_FRAME_SIZE];
         loop {
-            match fd_read(self.fd, &mut buf) {
+            match fd_read(self.fd, &mut self.read_buf) {
                 Ok(n) if n > 0 => {
-                    let frame = buf[..n].to_vec();
+                    tracing::debug!("drain_guest_fd: read {n} bytes");
+                    let frame = self.read_buf[..n].to_vec();
                     self.classify_frame(frame, guest_mac);
                 }
                 Ok(_) => break,
@@ -167,7 +170,11 @@ impl SmoltcpDevice {
             }
             // Everything else → drop
             _ => {
-                tracing::trace!("Dropping frame with EtherType {:#06x}", ethertype);
+                tracing::debug!(
+                    "Dropping frame with EtherType {:#06x}, len={}",
+                    ethertype,
+                    frame.len()
+                );
             }
         }
     }
@@ -187,7 +194,24 @@ impl SmoltcpDevice {
             PROTO_TCP => {
                 if l4_start + 14 <= frame.len() {
                     let dst_port = u16::from_be_bytes([frame[l4_start + 2], frame[l4_start + 3]]);
+                    let src_port = u16::from_be_bytes([frame[l4_start], frame[l4_start + 1]]);
                     let flags = frame[l4_start + 13];
+                    let dst_ip = Ipv4Addr::new(
+                        frame[ip_start + 16],
+                        frame[ip_start + 17],
+                        frame[ip_start + 18],
+                        frame[ip_start + 19],
+                    );
+                    let src_ip = Ipv4Addr::new(
+                        frame[ip_start + 12],
+                        frame[ip_start + 13],
+                        frame[ip_start + 14],
+                        frame[ip_start + 15],
+                    );
+                    tracing::debug!(
+                        "TCP frame: {src_ip}:{src_port} → {dst_ip}:{dst_port} flags={flags:#04x} len={}",
+                        frame.len()
+                    );
                     // SYN without ACK = new outbound connection attempt
                     if flags & 0x02 != 0 && flags & 0x10 == 0 {
                         self.tcp_syns.push(TcpSynInfo { dst_port });
@@ -225,7 +249,7 @@ impl SmoltcpDevice {
                 });
             }
             _ => {
-                tracing::trace!("Dropping IPv4 protocol {}", protocol);
+                tracing::debug!("Dropping IPv4 protocol {}", protocol);
             }
         }
     }
