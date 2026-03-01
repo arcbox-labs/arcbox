@@ -190,8 +190,8 @@ fn parse_cidr(cidr: &str) -> Result<(Ipv4Addr, u8)> {
 
 fn tap_name_from_ip(ip: Ipv4Addr) -> String {
     let octets = ip.octets();
-    // Encode last two octets to keep name short and unique.
-    format!("vmtap{}{}", octets[2], octets[3])
+    // Encode last two octets with a delimiter to keep name short and unambiguous.
+    format!("vmtap{}-{}", octets[2], octets[3])
 }
 
 fn mac_from_vm_id(vm_id: &str) -> String {
