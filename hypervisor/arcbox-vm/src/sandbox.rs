@@ -964,10 +964,10 @@ impl SandboxManager {
                 .join("sandboxes")
                 .join(&snap_meta.vm_id);
             let original_vsock_path = original_vm_dir.join("firecracker.vsock");
-            if let Err(e) = std::fs::create_dir_all(&original_vm_dir) {
-                if e.kind() != std::io::ErrorKind::AlreadyExists {
-                    return Err(VmmError::Io(e));
-                }
+            if let Err(e) = std::fs::create_dir_all(&original_vm_dir)
+                && e.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(VmmError::Io(e));
             }
             let _ = std::fs::remove_file(&original_vsock_path);
 
@@ -1470,10 +1470,10 @@ async fn remove_sandbox_impl(
     let vm_dir = PathBuf::from(&config.firecracker.data_dir)
         .join("sandboxes")
         .join(id);
-    if let Err(e) = tokio::fs::remove_dir_all(&vm_dir).await {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            warn!(sandbox_id = %id, err = %e, "failed to remove sandbox dir");
-        }
+    if let Err(e) = tokio::fs::remove_dir_all(&vm_dir).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(sandbox_id = %id, err = %e, "failed to remove sandbox dir");
     }
 
     instances.write().unwrap().remove(id);

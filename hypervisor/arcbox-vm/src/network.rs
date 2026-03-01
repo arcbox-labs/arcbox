@@ -261,4 +261,32 @@ mod tests {
         // Pool is now exhausted
         assert!(mgr.allocate("vm-2").is_err());
     }
+
+    #[test]
+    fn test_pool_exhaustion_on_slash29() {
+        // /29 has 6 usable addresses; gateway takes offset 1, leaving 5 for VMs.
+        let mgr = NetworkManager::new("br0", "10.0.0.0/29", "10.0.0.1", vec![]).unwrap();
+        for i in 0..5 {
+            mgr.allocate(&format!("vm-{i}")).unwrap();
+        }
+        assert!(mgr.allocate("vm-overflow").is_err());
+    }
+
+    #[test]
+    fn test_mac_unicast_and_locally_administered_bits() {
+        let mac = mac_from_vm_id("test-vm");
+        let first_byte = u8::from_str_radix(&mac[..2], 16).unwrap();
+        // Bit 1 set → locally administered; bit 0 clear → unicast.
+        assert_eq!(first_byte & 0x02, 0x02, "locally administered bit must be set");
+        assert_eq!(first_byte & 0x01, 0x00, "multicast bit must be clear");
+    }
+
+    #[test]
+    fn test_tap_name_encodes_last_two_octets() {
+        let ip: Ipv4Addr = "172.20.3.17".parse().unwrap();
+        assert_eq!(tap_name_from_ip(ip), "vmtap317");
+
+        let ip2: Ipv4Addr = "10.0.255.1".parse().unwrap();
+        assert_eq!(tap_name_from_ip(ip2), "vmtap2551");
+    }
 }

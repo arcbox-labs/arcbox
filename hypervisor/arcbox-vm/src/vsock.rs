@@ -308,3 +308,94 @@ pub async fn exec(
 
     Ok((in_tx, out_rx))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a raw frame byte-by-byte for use in read tests.
+    fn make_raw_frame(msg_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(msg_type);
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    #[tokio::test]
+    async fn test_write_read_frame_roundtrip() {
+        let (mut a, mut b) = tokio::io::duplex(256);
+        write_frame(&mut a, MSG_START, b"hello world").await.unwrap();
+        let (msg_type, payload) = read_frame(&mut b).await.unwrap();
+        assert_eq!(msg_type, MSG_START);
+        assert_eq!(payload, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_empty_payload_frame() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        write_frame(&mut a, MSG_EOF, &[]).await.unwrap();
+        let (msg_type, payload) = read_frame(&mut b).await.unwrap();
+        assert_eq!(msg_type, MSG_EOF);
+        assert!(payload.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_exit_code_encoding() {
+        let exit_code: i32 = 42;
+        let (mut a, mut b) = tokio::io::duplex(64);
+        write_frame(&mut a, MSG_EXIT, &exit_code.to_le_bytes()).await.unwrap();
+        let (msg_type, payload) = read_frame(&mut b).await.unwrap();
+        assert_eq!(msg_type, MSG_EXIT);
+        let decoded = i32::from_le_bytes(payload[..4].try_into().unwrap());
+        assert_eq!(decoded, 42);
+    }
+
+    #[tokio::test]
+    async fn test_resize_frame_encoding() {
+        let width: u16 = 80;
+        let height: u16 = 24;
+        let mut resize_payload = [0u8; 4];
+        resize_payload[..2].copy_from_slice(&width.to_le_bytes());
+        resize_payload[2..].copy_from_slice(&height.to_le_bytes());
+
+        let (mut a, mut b) = tokio::io::duplex(64);
+        write_frame(&mut a, MSG_RESIZE, &resize_payload).await.unwrap();
+        let (msg_type, payload) = read_frame(&mut b).await.unwrap();
+        assert_eq!(msg_type, MSG_RESIZE);
+        let w = u16::from_le_bytes(payload[..2].try_into().unwrap());
+        let h = u16::from_le_bytes(payload[2..].try_into().unwrap());
+        assert_eq!(w, 80);
+        assert_eq!(h, 24);
+    }
+
+    #[tokio::test]
+    async fn test_read_frame_from_raw_bytes() {
+        // Verify the parser accepts hand-crafted bytes (regression guard).
+        let raw = make_raw_frame(MSG_STDOUT, b"output line\n");
+        let mut cursor = std::io::Cursor::new(raw);
+        let (msg_type, payload) = read_frame(&mut cursor).await.unwrap();
+        assert_eq!(msg_type, MSG_STDOUT);
+        assert_eq!(payload, b"output line\n");
+    }
+
+    #[test]
+    fn test_start_command_json_serde() {
+        let cmd = StartCommand {
+            cmd: vec!["echo".into(), "hello".into()],
+            env: HashMap::new(),
+            working_dir: "/tmp".into(),
+            user: "root".into(),
+            tty: false,
+            tty_width: 0,
+            tty_height: 0,
+            timeout_seconds: 30,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let decoded: StartCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.cmd, vec!["echo", "hello"]);
+        assert_eq!(decoded.working_dir, "/tmp");
+        assert_eq!(decoded.timeout_seconds, 30);
+        assert!(!decoded.tty);
+    }
+}
