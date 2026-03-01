@@ -496,30 +496,22 @@ impl SocketProxy {
         }
     }
 
-    /// Handles an inbound command from the listener manager.
+    /// Handles an inbound UDP command from the listener manager.
     pub(crate) fn handle_inbound_command(
         &mut self,
         cmd: super::inbound_relay::InboundCommand,
         guest_mac: [u8; 6],
     ) {
         use super::inbound_relay::InboundCommand;
-        match cmd {
-            InboundCommand::TcpAccepted {
-                container_port,
-                stream,
-                ..
-            } => {
-                self.inbound.initiate_tcp(container_port, stream, guest_mac);
-            }
-            InboundCommand::UdpReceived {
-                container_port,
-                data,
-                reply_tx,
-                ..
-            } => {
-                self.inbound
-                    .inject_udp(container_port, &data, reply_tx, guest_mac);
-            }
+        if let InboundCommand::UdpReceived {
+            container_port,
+            data,
+            reply_tx,
+            ..
+        } = cmd
+        {
+            self.inbound
+                .inject_udp(container_port, &data, reply_tx, guest_mac);
         }
     }
 
@@ -530,36 +522,9 @@ impl SocketProxy {
     }
 }
 
-/// Returns true when sequence number `a` is before `b` in TCP sequence space.
-///
-/// Uses signed arithmetic to handle 32-bit wrapping correctly (RFC 1323 §4.2).
-pub(crate) fn seq_before(a: u32, b: u32) -> bool {
-    (a.wrapping_sub(b) as i32) < 0
-}
-
-/// Generates a pseudo-random initial sequence number.
-pub(crate) fn rand_isn() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    // Simple hash to spread ISNs.
-    (t.wrapping_mul(6364136223846793005).wrapping_add(1) >> 16) as u32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_rand_isn_spread() {
-        // Two successive ISNs should differ.
-        let a = rand_isn();
-        std::thread::sleep(std::time::Duration::from_micros(1));
-        let b = rand_isn();
-        assert_ne!(a, b);
-    }
 
     #[test]
     fn test_socket_proxy_creation() {
@@ -628,21 +593,6 @@ mod tests {
 
         proxy.cleanup_stale_flows();
         assert_eq!(proxy.flows.len(), 0, "Stale flow should be cleaned up");
-    }
-
-    #[test]
-    fn test_seq_before_basic() {
-        assert!(seq_before(100, 200));
-        assert!(!seq_before(200, 100));
-        assert!(!seq_before(100, 100));
-    }
-
-    #[test]
-    fn test_seq_before_wrapping() {
-        // Near the 32-bit wraparound boundary.
-        assert!(seq_before(u32::MAX - 10, u32::MAX));
-        assert!(seq_before(u32::MAX, 10)); // wraps around
-        assert!(!seq_before(10, u32::MAX)); // 10 is "after" MAX in TCP space
     }
 
     /// Verifies that reply frames from the socket proxy flow through the

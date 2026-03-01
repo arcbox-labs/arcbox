@@ -557,6 +557,7 @@ impl Vmm {
             dhcp_server,
             dns_forwarder,
             gateway_ip,
+            guest_ip,
             gateway_mac,
             cancel,
         );
