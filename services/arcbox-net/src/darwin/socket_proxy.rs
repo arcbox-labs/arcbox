@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! Guest frame → SocketProxy::handle_outbound()
-//!   ├─ ICMP → IcmpProxy (raw socket sendto/recvfrom)
+//!   ├─ ICMP → IcmpProxy (ICMP datagram socket sendto/recv)
 //!   ├─ UDP  → UdpProxy  (per-flow host UdpSocket)
 //!   └─ TCP  → TcpProxy  (per-connection host TcpStream)
 //!         ↓
@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use socket2::{Domain, Protocol, Type};
@@ -43,16 +44,14 @@ struct UdpProxy {
     flows: HashMap<(Ipv4Addr, u16, Ipv4Addr, u16), UdpFlow>,
     reply_tx: mpsc::Sender<Vec<u8>>,
     gateway_mac: [u8; 6],
-    gateway_ip: Ipv4Addr,
 }
 
 impl UdpProxy {
-    fn new(reply_tx: mpsc::Sender<Vec<u8>>, gateway_mac: [u8; 6], gateway_ip: Ipv4Addr) -> Self {
+    fn new(reply_tx: mpsc::Sender<Vec<u8>>, gateway_mac: [u8; 6]) -> Self {
         Self {
             flows: HashMap::new(),
             reply_tx,
             gateway_mac,
-            gateway_ip,
         }
     }
 
@@ -108,7 +107,6 @@ impl UdpProxy {
             // Spawn a recv task for this flow.
             let reply_tx = self.reply_tx.clone();
             let gateway_mac = self.gateway_mac;
-            let gateway_ip = self.gateway_ip;
 
             tokio::spawn(async move {
                 let socket = match UdpSocket::bind("0.0.0.0:0").await {
@@ -145,7 +143,7 @@ impl UdpProxy {
                     match recv {
                         Ok(Ok(n)) if n > 0 => {
                             let reply_frame = build_udp_ip_ethernet(
-                                gateway_ip,
+                                dst_ip,
                                 src_ip,
                                 dst_port,
                                 src_port,
@@ -184,10 +182,14 @@ impl UdpProxy {
     }
 }
 
-/// ICMP proxy: raw socket per echo.
+/// ICMP proxy: ICMP socket per echo.
 struct IcmpProxy {
     reply_tx: mpsc::Sender<Vec<u8>>,
     gateway_mac: [u8; 6],
+    /// When true, ICMP proxying is disabled due to persistent permission errors.
+    disabled: Arc<AtomicBool>,
+    /// Ensures permission-denied warning is emitted only once.
+    permission_warned: Arc<AtomicBool>,
 }
 
 impl IcmpProxy {
@@ -195,11 +197,17 @@ impl IcmpProxy {
         Self {
             reply_tx,
             gateway_mac,
+            disabled: Arc::new(AtomicBool::new(false)),
+            permission_warned: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Proxies an ICMP packet from the guest to the host.
     fn proxy_icmp(&self, frame: &[u8], guest_mac: [u8; 6]) {
+        if self.disabled.load(Ordering::Relaxed) {
+            return;
+        }
+
         let ip_start = ETH_HEADER_LEN;
         let ihl = ((frame[ip_start] & 0x0F) as usize) * 4;
         let icmp_start = ip_start + ihl;
@@ -224,27 +232,44 @@ impl IcmpProxy {
         let icmp_payload = frame[icmp_start..].to_vec();
         let reply_tx = self.reply_tx.clone();
         let gateway_mac = self.gateway_mac;
+        let disabled = Arc::clone(&self.disabled);
+        let permission_warned = Arc::clone(&self.permission_warned);
 
         tokio::spawn(async move {
-            let raw_socket =
-                match socket2::Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
+            // On modern macOS, SOCK_RAW for ICMP requires elevated privileges.
+            // Prefer SOCK_DGRAM + IPPROTO_ICMP to support unprivileged daemon.
+            let icmp_socket =
+                match socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4)) {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::warn!("ICMP proxy: failed to create raw socket: {}", e);
+                        disabled.store(true, Ordering::Relaxed);
+                        if e.kind() == std::io::ErrorKind::PermissionDenied
+                            && !permission_warned.swap(true, Ordering::Relaxed)
+                        {
+                            tracing::warn!(
+                                "ICMP proxy disabled: failed to create ICMP datagram socket: {}",
+                                e
+                            );
+                        } else {
+                            tracing::debug!(
+                                "ICMP proxy disabled: failed to create ICMP datagram socket: {}",
+                                e
+                            );
+                        }
                         return;
                     }
                 };
 
-            raw_socket.set_nonblocking(true).ok();
+            icmp_socket.set_nonblocking(true).ok();
             let dst_addr: SocketAddr = SocketAddrV4::new(dst_ip, 0).into();
 
-            if let Err(e) = raw_socket.send_to(&icmp_payload, &dst_addr.into()) {
+            if let Err(e) = icmp_socket.send_to(&icmp_payload, &dst_addr.into()) {
                 tracing::warn!("ICMP proxy: sendto failed: {}", e);
                 return;
             }
 
-            // Wait for reply using AsyncFd on the raw socket.
-            let async_fd = match AsyncFd::new(RawSocketWrapper(raw_socket)) {
+            // Wait for reply using AsyncFd on the ICMP socket.
+            let async_fd = match AsyncFd::new(RawSocketWrapper(icmp_socket)) {
                 Ok(fd) => fd,
                 Err(e) => {
                     tracing::warn!("ICMP proxy: AsyncFd failed: {}", e);
@@ -287,8 +312,19 @@ impl IcmpProxy {
 
             match recv {
                 Ok(Ok(n)) if n > 0 => {
-                    // Raw socket returns IP header + ICMP; build L2 frame.
-                    let reply_frame = prepend_ethernet_header(&buf[..n], guest_mac, gateway_mac);
+                    let reply_packet = &buf[..n];
+                    // Some systems return full IPv4 packet, others return ICMP payload.
+                    let reply_frame = if looks_like_ipv4_icmp(reply_packet) {
+                        prepend_ethernet_header(reply_packet, guest_mac, gateway_mac)
+                    } else {
+                        build_icmp_ipv4_ethernet(
+                            dst_ip,
+                            src_ip,
+                            reply_packet,
+                            gateway_mac,
+                            guest_mac,
+                        )
+                    };
                     let _ = reply_tx.send(reply_frame).await;
                 }
                 _ => {
@@ -306,6 +342,93 @@ impl AsRawFd for RawSocketWrapper {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.0.as_raw_fd()
     }
+}
+
+/// Returns true when the payload appears to be a complete IPv4 ICMP packet.
+fn looks_like_ipv4_icmp(packet: &[u8]) -> bool {
+    if packet.len() < 20 {
+        return false;
+    }
+    let version = packet[0] >> 4;
+    let ihl = (packet[0] & 0x0F) as usize * 4;
+    version == 4 && ihl >= 20 && packet.len() >= ihl && packet[9] == 1
+}
+
+/// Builds an Ethernet frame containing an IPv4 ICMP packet.
+fn build_icmp_ipv4_ethernet(
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    icmp_payload: &[u8],
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+) -> Vec<u8> {
+    let ip_total_len = 20 + icmp_payload.len();
+    let frame_len = ETH_HEADER_LEN + ip_total_len;
+    let mut frame = vec![0u8; frame_len];
+
+    // Ethernet header
+    frame[0..6].copy_from_slice(&dst_mac);
+    frame[6..12].copy_from_slice(&src_mac);
+    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+
+    // IPv4 header (20 bytes, no options)
+    let ip_start = ETH_HEADER_LEN;
+    let ip = &mut frame[ip_start..ip_start + 20];
+    ip[0] = 0x45; // Version 4, IHL 5
+    ip[2..4].copy_from_slice(&(ip_total_len as u16).to_be_bytes());
+    ip[8] = 64; // TTL
+    ip[9] = 1; // Protocol: ICMP
+    ip[12..16].copy_from_slice(&src_ip.octets());
+    ip[16..20].copy_from_slice(&dst_ip.octets());
+    let ip_cksum = ipv4_checksum(ip);
+    ip[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+
+    // ICMP payload
+    let icmp_start = ETH_HEADER_LEN + 20;
+    frame[icmp_start..].copy_from_slice(icmp_payload);
+
+    // Recompute ICMP checksum when header is present.
+    if icmp_payload.len() >= 4 {
+        frame[icmp_start + 2] = 0;
+        frame[icmp_start + 3] = 0;
+        let icmp_cksum = internet_checksum(&frame[icmp_start..]);
+        frame[icmp_start + 2..icmp_start + 4].copy_from_slice(&icmp_cksum.to_be_bytes());
+    }
+
+    frame
+}
+
+/// Computes RFC 1071 checksum over bytes.
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u32::from(u16::from_be_bytes([data[i], data[i + 1]]));
+        i += 2;
+    }
+    if i < data.len() {
+        sum += u32::from(data[i]) << 8;
+    }
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !sum as u16
+}
+
+/// Computes IPv4 header checksum while skipping the checksum field itself.
+fn ipv4_checksum(header: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < header.len() {
+        if i != 10 {
+            sum += u32::from(u16::from_be_bytes([header[i], header[i + 1]]));
+        }
+        i += 2;
+    }
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !sum as u16
 }
 
 /// Top-level socket proxy that dispatches guest traffic to protocol-specific
@@ -340,8 +463,8 @@ impl SocketProxy {
         );
         Self {
             icmp: IcmpProxy::new(reply_tx.clone(), gateway_mac),
-            udp: UdpProxy::new(reply_tx.clone(), gateway_mac, gateway_ip),
-            tcp: TcpProxy::new(reply_tx.clone(), gateway_mac, gateway_ip),
+            udp: UdpProxy::new(reply_tx.clone(), gateway_mac),
+            tcp: TcpProxy::new(reply_tx.clone(), gateway_mac),
             inbound,
             reply_tx,
         }
@@ -435,6 +558,8 @@ struct TcpConnection {
     guest_seq: u32,
     /// Our sequence number to the guest.
     host_seq: u32,
+    /// Actual destination IP from the guest's SYN (used as source IP in replies).
+    remote_ip: Ipv4Addr,
     /// Channel to send events to the connection relay task.
     data_tx: mpsc::Sender<Vec<u8>>,
 }
@@ -445,16 +570,14 @@ pub(crate) struct TcpProxy {
     connections: HashMap<(Ipv4Addr, u16, Ipv4Addr, u16), TcpConnection>,
     reply_tx: mpsc::Sender<Vec<u8>>,
     gateway_mac: [u8; 6],
-    gateway_ip: Ipv4Addr,
 }
 
 impl TcpProxy {
-    fn new(reply_tx: mpsc::Sender<Vec<u8>>, gateway_mac: [u8; 6], gateway_ip: Ipv4Addr) -> Self {
+    fn new(reply_tx: mpsc::Sender<Vec<u8>>, gateway_mac: [u8; 6]) -> Self {
         Self {
             connections: HashMap::new(),
             reply_tx,
             gateway_mac,
-            gateway_ip,
         }
     }
 
@@ -533,9 +656,10 @@ impl TcpProxy {
                         // Guest is closing. Send FIN-ACK.
                         conn.guest_seq = seq.wrapping_add(payload.len() as u32).wrapping_add(1);
                         conn.state = TcpState::FinWait;
+                        let remote_ip = conn.remote_ip;
 
                         let fin_ack = build_tcp_ip_ethernet(
-                            self.gateway_ip,
+                            remote_ip,
                             src_ip,
                             dst_port,
                             src_port,
@@ -562,10 +686,11 @@ impl TcpProxy {
 
                     if !payload.is_empty() {
                         conn.guest_seq = seq.wrapping_add(payload.len() as u32);
+                        let remote_ip = conn.remote_ip;
 
                         // ACK the data.
                         let ack_frame = build_tcp_ip_ethernet(
-                            self.gateway_ip,
+                            remote_ip,
                             src_ip,
                             dst_port,
                             src_port,
@@ -596,7 +721,7 @@ impl TcpProxy {
         } else if flags & TCP_RST == 0 {
             // Unknown connection, send RST.
             let rst = build_tcp_ip_ethernet(
-                self.gateway_ip,
+                dst_ip,
                 src_ip,
                 dst_port,
                 src_port,
@@ -637,13 +762,13 @@ impl TcpProxy {
             state: TcpState::SynReceived,
             guest_seq: guest_isn.wrapping_add(1),
             host_seq: host_isn,
+            remote_ip: dst_ip,
             data_tx,
         };
         self.connections.insert(conn_key, conn);
 
         let reply_tx = self.reply_tx.clone();
         let gateway_mac = self.gateway_mac;
-        let gateway_ip = self.gateway_ip;
 
         tokio::spawn(async move {
             // Try to connect to the remote host.
@@ -662,7 +787,7 @@ impl TcpProxy {
                         e
                     );
                     let rst = build_tcp_ip_ethernet(
-                        gateway_ip,
+                        dst_ip,
                         src_ip,
                         dst_port,
                         src_port,
@@ -680,7 +805,7 @@ impl TcpProxy {
                 Err(_) => {
                     tracing::debug!("TCP proxy: connect to {}:{} timed out", dst_ip, dst_port);
                     let rst = build_tcp_ip_ethernet(
-                        gateway_ip,
+                        dst_ip,
                         src_ip,
                         dst_port,
                         src_port,
@@ -699,7 +824,7 @@ impl TcpProxy {
 
             // Send SYN-ACK to guest.
             let syn_ack = build_tcp_ip_ethernet(
-                gateway_ip,
+                dst_ip,
                 src_ip,
                 dst_port,
                 src_port,
@@ -720,7 +845,7 @@ impl TcpProxy {
                 stream,
                 data_rx,
                 reply_tx,
-                gateway_ip,
+                dst_ip,
                 gateway_mac,
                 src_ip,
                 src_port,
@@ -745,7 +870,7 @@ async fn tcp_relay(
     stream: tokio::net::TcpStream,
     mut data_rx: mpsc::Receiver<Vec<u8>>,
     reply_tx: mpsc::Sender<Vec<u8>>,
-    gateway_ip: Ipv4Addr,
+    remote_ip: Ipv4Addr,
     gateway_mac: [u8; 6],
     guest_ip: Ipv4Addr,
     guest_port: u16,
@@ -766,7 +891,7 @@ async fn tcp_relay(
                 Ok(0) => {
                     // EOF: send FIN to guest.
                     let fin = build_tcp_ip_ethernet(
-                        gateway_ip,
+                        remote_ip,
                         guest_ip,
                         host_port,
                         guest_port,
@@ -783,7 +908,7 @@ async fn tcp_relay(
                 }
                 Ok(n) => {
                     let data_frame = build_tcp_ip_ethernet(
-                        gateway_ip,
+                        remote_ip,
                         guest_ip,
                         host_port,
                         guest_port,
@@ -906,7 +1031,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
         let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
-        let mut proxy = UdpProxy::new(tx, gw_mac, gw_ip);
+        let mut proxy = UdpProxy::new(tx, gw_mac);
 
         // Insert a flow that is already expired.
         let key = (
@@ -932,7 +1057,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
         let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
-        let mut proxy = TcpProxy::new(tx.clone(), gw_mac, gw_ip);
+        let mut proxy = TcpProxy::new(tx.clone(), gw_mac);
 
         let key = (
             Ipv4Addr::new(192, 168, 64, 2),
@@ -947,6 +1072,7 @@ mod tests {
                 state: TcpState::Closed,
                 guest_seq: 0,
                 host_seq: 0,
+                remote_ip: Ipv4Addr::new(1, 1, 1, 1),
                 data_tx,
             },
         );
