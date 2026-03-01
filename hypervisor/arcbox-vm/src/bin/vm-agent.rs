@@ -68,8 +68,8 @@ mod agent {
         env: HashMap<String, String>,
         #[serde(default)]
         working_dir: String,
-        #[serde(default)]
-        user: String,
+        #[serde(default, rename = "user")]
+        _user: String,
         #[serde(default)]
         tty: bool,
         #[serde(default = "default_tty_width")]
@@ -278,7 +278,7 @@ mod agent {
 
         // Read stdin frames from the host and forward to the child.
         // SAFETY: dup gives us a second fd for reading while the Arc owns the write fd.
-        let read_fd = unsafe { libc::dup((*writer.lock().unwrap()).fd) };
+        let read_fd = unsafe { libc::dup(writer.lock().unwrap().fd) };
         let mut reader = unsafe { VsockStream::from_raw_fd(read_fd) };
         loop {
             match read_frame(&mut reader) {
@@ -301,7 +301,7 @@ mod agent {
         let _ = write_frame(
             &mut *writer.lock().unwrap(),
             MSG_EXIT,
-            &(exit_code as i32).to_le_bytes(),
+            &exit_code.to_le_bytes(),
         );
     }
 
@@ -371,11 +371,11 @@ mod agent {
                         unsafe { libc::setenv(ck.as_ptr(), cv.as_ptr(), 1) };
                     }
                 }
-                if !start.working_dir.is_empty() {
-                    if let Ok(cwd) = std::ffi::CString::new(start.working_dir.as_str()) {
-                        // SAFETY: cwd is a valid C string.
-                        unsafe { libc::chdir(cwd.as_ptr()) };
-                    }
+                if !start.working_dir.is_empty()
+                    && let Ok(cwd) = std::ffi::CString::new(start.working_dir.as_str())
+                {
+                    // SAFETY: cwd is a valid C string.
+                    unsafe { libc::chdir(cwd.as_ptr()) };
                 }
 
                 // SAFETY: exec replaces the process image; argv is null-terminated.
@@ -406,7 +406,7 @@ mod agent {
                     }
                 });
 
-                let read_fd = unsafe { libc::dup((*writer.lock().unwrap()).fd) };
+                let read_fd = unsafe { libc::dup(writer.lock().unwrap().fd) };
                 let mut reader = unsafe { VsockStream::from_raw_fd(read_fd) };
                 // SAFETY: master_fd is valid; File takes ownership for writes.
                 let mut master_writer = unsafe { std::fs::File::from_raw_fd(master_fd) };
@@ -444,7 +444,7 @@ mod agent {
                 let _ = write_frame(
                     &mut *writer.lock().unwrap(),
                     MSG_EXIT,
-                    &(exit_code as i32).to_le_bytes(),
+                    &exit_code.to_le_bytes(),
                 );
             }
         }
