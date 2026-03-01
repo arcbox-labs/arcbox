@@ -98,7 +98,7 @@ impl NetworkManager {
         debug!(tap = %alloc.tap_name, ip = %alloc.ip_address, "releasing network");
 
         #[cfg(target_os = "linux")]
-        let _ = destroy_tap(&alloc.tap_name);
+        destroy_tap(&alloc.tap_name);
     }
 
     // -------------------------------------------------------------------------

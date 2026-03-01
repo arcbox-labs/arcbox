@@ -86,7 +86,7 @@ jobs:
         run: cargo test --test integration -p arcbox-vm --no-run
 
       - name: Run integration tests (as root for TAP creation)
-        run: sudo env PATH="$PATH" cargo test --test integration -p arcbox-vm
+        run: sudo env PATH="$PATH" HOME="$HOME" cargo test --test integration -p arcbox-vm
 
   # ---------------------------------------------------------------------------
   # Job 3: E2E tests — requires KVM + root + Firecracker assets
@@ -145,5 +145,5 @@ jobs:
           FC_KERNEL: /tmp/fc-assets/vmlinux
           FC_ROOTFS: /tmp/fc-assets/rootfs.ext4
         run: |
-          sudo env PATH="$PATH" cargo test --test e2e -p arcbox-vm \
+          sudo env PATH="$PATH" HOME="$HOME" cargo test --test e2e -p arcbox-vm \
             -- --include-ignored --test-threads=1
