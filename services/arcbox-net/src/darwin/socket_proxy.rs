@@ -675,10 +675,7 @@ impl TcpProxy {
                             self.gateway_mac,
                             guest_mac,
                         );
-                        let reply_tx = self.reply_tx.clone();
-                        tokio::spawn(async move {
-                            let _ = reply_tx.send(fin_ack).await;
-                        });
+                        let _ = self.reply_tx.try_send(fin_ack);
                         return;
                     }
 
@@ -689,32 +686,61 @@ impl TcpProxy {
                     }
 
                     if !payload.is_empty() {
-                        let guest_seq = seq.wrapping_add(payload.len() as u32);
-                        conn.guest_seq.store(guest_seq, Ordering::Relaxed);
-                        let remote_ip = conn.remote_ip;
-                        let host_seq = conn.host_seq.load(Ordering::Relaxed);
+                        let expected_seq = conn.guest_seq.load(Ordering::Relaxed);
 
-                        // ACK the data.
-                        let ack_frame = build_tcp_ip_ethernet(
-                            remote_ip,
-                            src_ip,
-                            dst_port,
-                            src_port,
-                            host_seq,
-                            guest_seq,
-                            TCP_ACK,
-                            65535,
-                            &[],
-                            self.gateway_mac,
-                            guest_mac,
-                        );
-                        let reply_tx = self.reply_tx.clone();
-                        let payload_vec = payload.to_vec();
-                        let data_tx = conn.data_tx.clone();
-                        tokio::spawn(async move {
-                            let _ = reply_tx.send(ack_frame).await;
-                            let _ = data_tx.send(payload_vec).await;
-                        });
+                        // Reject retransmits and out-of-order segments.
+                        if seq != expected_seq {
+                            if seq_before(seq, expected_seq) {
+                                // Retransmit — send duplicate ACK so guest
+                                // knows we already have this data.
+                                let ack = build_tcp_ip_ethernet(
+                                    conn.remote_ip,
+                                    src_ip,
+                                    dst_port,
+                                    src_port,
+                                    conn.host_seq.load(Ordering::Relaxed),
+                                    expected_seq,
+                                    TCP_ACK,
+                                    65535,
+                                    &[],
+                                    self.gateway_mac,
+                                    guest_mac,
+                                );
+                                let _ = self.reply_tx.try_send(ack);
+                            }
+                            return;
+                        }
+
+                        // Synchronously queue payload for the host socket.
+                        // Using try_send (not tokio::spawn) preserves segment
+                        // ordering — critical for TLS and other stream protocols.
+                        match conn.data_tx.try_send(payload.to_vec()) {
+                            Ok(()) => {
+                                let new_seq = seq.wrapping_add(payload.len() as u32);
+                                conn.guest_seq.store(new_seq, Ordering::Relaxed);
+                                let ack = build_tcp_ip_ethernet(
+                                    conn.remote_ip,
+                                    src_ip,
+                                    dst_port,
+                                    src_port,
+                                    conn.host_seq.load(Ordering::Relaxed),
+                                    new_seq,
+                                    TCP_ACK,
+                                    65535,
+                                    &[],
+                                    self.gateway_mac,
+                                    guest_mac,
+                                );
+                                let _ = self.reply_tx.try_send(ack);
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                // Backpressure: don't ACK so guest retransmits.
+                                tracing::debug!("TCP data channel full, backpressure applied");
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                conn.state = TcpState::Closed;
+                            }
+                        }
                     }
                 }
                 TcpState::FinWait => {
@@ -739,10 +765,7 @@ impl TcpProxy {
                 self.gateway_mac,
                 guest_mac,
             );
-            let reply_tx = self.reply_tx.clone();
-            tokio::spawn(async move {
-                let _ = reply_tx.send(rst).await;
-            });
+            let _ = self.reply_tx.try_send(rst);
         }
     }
 
@@ -762,7 +785,7 @@ impl TcpProxy {
         self.connections.remove(&conn_key);
 
         let host_isn: u32 = rand_isn();
-        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(256);
 
         // SYN-ACK uses seq=host_isn, consuming one seq number. After that,
         // the next byte is host_isn+1. Share this counter with the relay task
@@ -999,6 +1022,13 @@ async fn tcp_relay(
     let _ = tokio::join!(host_read, guest_write);
 }
 
+/// Returns true when sequence number `a` is before `b` in TCP sequence space.
+///
+/// Uses signed arithmetic to handle 32-bit wrapping correctly (RFC 1323 §4.2).
+fn seq_before(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+
 /// Generates a pseudo-random initial sequence number.
 pub(crate) fn rand_isn() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1131,6 +1161,35 @@ mod tests {
             0,
             "Closed connection should be removed"
         );
+    }
+
+    #[test]
+    fn test_seq_before_basic() {
+        assert!(seq_before(100, 200));
+        assert!(!seq_before(200, 100));
+        assert!(!seq_before(100, 100));
+    }
+
+    #[test]
+    fn test_seq_before_wrapping() {
+        // Near the 32-bit wraparound boundary.
+        assert!(seq_before(u32::MAX - 10, u32::MAX));
+        assert!(seq_before(u32::MAX, 10)); // wraps around
+        assert!(!seq_before(10, u32::MAX)); // 10 is "after" MAX in TCP space
+    }
+
+    #[test]
+    fn test_data_channel_backpressure() {
+        // When the data channel is full, try_send should fail with Full,
+        // which the proxy interprets as backpressure (don't ACK).
+        let (tx, _rx) = mpsc::channel::<Vec<u8>>(2);
+        assert!(tx.try_send(vec![1]).is_ok());
+        assert!(tx.try_send(vec![2]).is_ok());
+        // Channel is now full.
+        assert!(matches!(
+            tx.try_send(vec![3]),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
     }
 
     /// Verifies that reply frames from the socket proxy flow through the
