@@ -250,6 +250,7 @@ impl TcpBridge {
     fn detect_new_connections(&mut self, sockets: &mut SocketSet<'_>) {
         // Collect ports to scan: only ports we know have listen sockets.
         let ports: Vec<u16> = self.listening_ports.iter().copied().collect();
+        let mut ports_to_replenish = Vec::new();
 
         for port in ports {
             let Some(handles) = self.port_handles.get(&port) else {
@@ -304,11 +305,50 @@ impl TcpBridge {
                 );
 
                 // This port's listen socket is now occupied. Remove from
-                // listening_ports so the next SYN on the same port creates a
-                // new listen socket.
+                // listening_ports and schedule a replacement.
                 self.listening_ports.remove(&port);
+                ports_to_replenish.push(port);
             }
         }
+
+        // Replenish listen sockets for consumed ports so the next SYN
+        // (retransmitted or concurrent) finds a ready listener.
+        for port in ports_to_replenish {
+            self.replenish_listen_socket(port, sockets);
+        }
+    }
+
+    /// Creates a fresh listen socket for the given port, so smoltcp can
+    /// accept the next SYN without waiting for a new frame batch.
+    fn replenish_listen_socket(&mut self, port: u16, sockets: &mut SocketSet<'_>) {
+        if self.listening_ports.contains(&port) {
+            return;
+        }
+
+        let handle = if let Some(h) = self.free_handles.pop() {
+            let sock = sockets.get_mut::<tcp::Socket>(h);
+            if let Err(e) = sock.listen(port) {
+                tracing::warn!("TCP bridge: failed to re-listen on port {port}: {e:?}");
+                return;
+            }
+            sock.set_nagle_enabled(false);
+            h
+        } else {
+            let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+            let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+            let mut sock = tcp::Socket::new(rx_buf, tx_buf);
+            if let Err(e) = sock.listen(port) {
+                tracing::warn!("TCP bridge: failed to listen on port {port}: {e:?}");
+                return;
+            }
+            sock.set_nagle_enabled(false);
+            sock.set_ack_delay(None);
+            sockets.add(sock)
+        };
+
+        self.listening_ports.insert(port);
+        self.port_handles.entry(port).or_default().push(handle);
+        tracing::debug!("TCP bridge: replenished listen socket for port {port}");
     }
 
     /// Relays data between smoltcp sockets and host TcpStreams for all active
@@ -341,6 +381,11 @@ impl TcpBridge {
                             conn.host_eof = true;
                             break;
                         }
+                        tracing::debug!(
+                            "TCP bridge: h2g relay {} bytes to {}",
+                            data.len(),
+                            conn.remote
+                        );
                         match sock.send_slice(&data) {
                             Ok(sent) if sent < data.len() => {
                                 conn.pending_send = Some(data[sent..].to_vec());
@@ -361,11 +406,15 @@ impl TcpBridge {
                 }
             }
 
-            // Probe for host channel disconnect during handshake.
-            // can_send() is false in SynSent/SynReceived, so the loop above
-            // never runs — check the channel explicitly so we detect connect
-            // failures promptly. If data arrives instead, save it for later.
-            if !conn.host_disconnected && !conn.host_eof && !sock.can_send() {
+            // Probe for host channel disconnect while the socket can't send.
+            // Only probe when there is no queued partial payload; otherwise a
+            // queued host payload could overwrite `pending_send` and corrupt
+            // the host→guest byte stream ordering.
+            if !conn.host_disconnected
+                && !conn.host_eof
+                && conn.pending_send.is_none()
+                && !sock.can_send()
+            {
                 match conn.host_to_guest_rx.try_recv() {
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         conn.host_disconnected = true;
@@ -407,6 +456,11 @@ impl TcpBridge {
                     if buf.is_empty() {
                         return (0, ());
                     }
+                    tracing::debug!(
+                        "TCP bridge: g2h relay {} bytes from {}",
+                        buf.len(),
+                        conn.remote
+                    );
                     match conn.guest_to_host_tx.try_send(buf.to_vec()) {
                         Ok(()) => (buf.len(), ()),
                         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -480,6 +534,7 @@ async fn host_conn_task(
     h2g_tx: mpsc::Sender<Vec<u8>>,
     mut g2h_rx: mpsc::Receiver<Vec<u8>>,
 ) {
+    tracing::debug!("TCP bridge: host_conn_task started for {remote}");
     // Connect to the remote host.
     let stream = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -516,6 +571,9 @@ async fn host_conn_task(
                         break;
                     }
                     Ok(n) => {
+                        tracing::debug!(
+                            "TCP bridge: host read {n} bytes from {remote}"
+                        );
                         if h2g_tx.send(buf[..n].to_vec()).await.is_err() {
                             break;
                         }
