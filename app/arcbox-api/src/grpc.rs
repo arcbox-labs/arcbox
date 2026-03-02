@@ -7,6 +7,7 @@
 use arcbox_core::Runtime;
 use arcbox_grpc::v1::machine_service_server;
 use arcbox_grpc::{SandboxService, SandboxSnapshotService};
+use arcbox_protocol::sandbox_v1::Empty as SandboxEmpty;
 use arcbox_protocol::sandbox_v1::{
     CheckpointRequest, CheckpointResponse, CreateSandboxRequest, CreateSandboxResponse,
     DeleteSnapshotRequest, ExecInput, ExecOutput, InspectSandboxRequest, ListSandboxesRequest,
@@ -14,7 +15,6 @@ use arcbox_protocol::sandbox_v1::{
     RestoreRequest, RestoreResponse, RunOutput, RunRequest, SandboxEvent, SandboxEventsRequest,
     SandboxInfo, StopSandboxRequest,
 };
-use arcbox_protocol::sandbox_v1::Empty as SandboxEmpty;
 use arcbox_protocol::v1::{
     CreateMachineRequest, CreateMachineResponse, Empty, InspectMachineRequest, ListMachinesRequest,
     ListMachinesResponse, MachineAgentRequest, MachineExecOutput, MachineExecRequest, MachineInfo,
@@ -327,7 +327,10 @@ impl SandboxService for SandboxServiceImpl {
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
         let machine = extract_machine_id(&request)?;
-        let mut agent = self.runtime.get_agent(&machine).map_err(|e| core_to_status(&e))?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
         let resp = agent
             .sandbox_create(request.into_inner())
             .await
@@ -335,15 +338,14 @@ impl SandboxService for SandboxServiceImpl {
         Ok(Response::new(resp))
     }
 
-    type RunStream =
-        Pin<Box<dyn Stream<Item = Result<RunOutput, Status>> + Send + 'static>>;
+    type RunStream = Pin<Box<dyn Stream<Item = Result<RunOutput, Status>> + Send + 'static>>;
 
-    async fn run(
-        &self,
-        request: Request<RunRequest>,
-    ) -> Result<Response<Self::RunStream>, Status> {
+    async fn run(&self, request: Request<RunRequest>) -> Result<Response<Self::RunStream>, Status> {
         let machine = extract_machine_id(&request)?;
-        let agent = self.runtime.get_agent(&machine).map_err(|e| core_to_status(&e))?;
+        let agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
         let rx = agent
             .sandbox_run(request.into_inner())
             .await
@@ -353,8 +355,7 @@ impl SandboxService for SandboxServiceImpl {
         Ok(Response::new(Box::pin(stream)))
     }
 
-    type ExecStream =
-        Pin<Box<dyn Stream<Item = Result<ExecOutput, Status>> + Send + 'static>>;
+    type ExecStream = Pin<Box<dyn Stream<Item = Result<ExecOutput, Status>> + Send + 'static>>;
 
     async fn exec(
         &self,
@@ -370,7 +371,10 @@ impl SandboxService for SandboxServiceImpl {
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<SandboxEmpty>, Status> {
         let machine = extract_machine_id(&request)?;
-        let mut agent = self.runtime.get_agent(&machine).map_err(|e| core_to_status(&e))?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
         agent
             .sandbox_stop(request.into_inner())
             .await
@@ -383,7 +387,10 @@ impl SandboxService for SandboxServiceImpl {
         request: Request<RemoveSandboxRequest>,
     ) -> Result<Response<SandboxEmpty>, Status> {
         let machine = extract_machine_id(&request)?;
-        let mut agent = self.runtime.get_agent(&machine).map_err(|e| core_to_status(&e))?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
         agent
             .sandbox_remove(request.into_inner())
             .await
@@ -396,7 +403,10 @@ impl SandboxService for SandboxServiceImpl {
         request: Request<InspectSandboxRequest>,
     ) -> Result<Response<SandboxInfo>, Status> {
         let machine = extract_machine_id(&request)?;
-        let mut agent = self.runtime.get_agent(&machine).map_err(|e| core_to_status(&e))?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
         let info = agent
             .sandbox_inspect(request.into_inner())
             .await
@@ -409,7 +419,10 @@ impl SandboxService for SandboxServiceImpl {
         request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         let machine = extract_machine_id(&request)?;
-        let mut agent = self.runtime.get_agent(&machine).map_err(|e| core_to_status(&e))?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
         let resp = agent
             .sandbox_list(request.into_inner())
             .await
@@ -417,15 +430,17 @@ impl SandboxService for SandboxServiceImpl {
         Ok(Response::new(resp))
     }
 
-    type EventsStream =
-        Pin<Box<dyn Stream<Item = Result<SandboxEvent, Status>> + Send + 'static>>;
+    type EventsStream = Pin<Box<dyn Stream<Item = Result<SandboxEvent, Status>> + Send + 'static>>;
 
     async fn events(
         &self,
         request: Request<SandboxEventsRequest>,
     ) -> Result<Response<Self::EventsStream>, Status> {
         let machine = extract_machine_id(&request)?;
-        let agent = self.runtime.get_agent(&machine).map_err(|e| core_to_status(&e))?;
+        let agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
         let rx = agent
             .sandbox_events(request.into_inner())
             .await
@@ -460,7 +475,10 @@ impl SandboxSnapshotService for SandboxSnapshotServiceImpl {
         request: Request<CheckpointRequest>,
     ) -> Result<Response<CheckpointResponse>, Status> {
         let machine = extract_machine_id(&request)?;
-        let mut agent = self.runtime.get_agent(&machine).map_err(|e| core_to_status(&e))?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
         let resp = agent
             .sandbox_checkpoint(request.into_inner())
             .await
@@ -473,7 +491,10 @@ impl SandboxSnapshotService for SandboxSnapshotServiceImpl {
         request: Request<RestoreRequest>,
     ) -> Result<Response<RestoreResponse>, Status> {
         let machine = extract_machine_id(&request)?;
-        let mut agent = self.runtime.get_agent(&machine).map_err(|e| core_to_status(&e))?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
         let resp = agent
             .sandbox_restore(request.into_inner())
             .await
@@ -486,7 +507,10 @@ impl SandboxSnapshotService for SandboxSnapshotServiceImpl {
         request: Request<ListSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
         let machine = extract_machine_id(&request)?;
-        let mut agent = self.runtime.get_agent(&machine).map_err(|e| core_to_status(&e))?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
         let resp = agent
             .sandbox_list_snapshots(request.into_inner())
             .await
@@ -499,7 +523,10 @@ impl SandboxSnapshotService for SandboxSnapshotServiceImpl {
         request: Request<DeleteSnapshotRequest>,
     ) -> Result<Response<SandboxEmpty>, Status> {
         let machine = extract_machine_id(&request)?;
-        let mut agent = self.runtime.get_agent(&machine).map_err(|e| core_to_status(&e))?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
         agent
             .sandbox_delete_snapshot(request.into_inner())
             .await

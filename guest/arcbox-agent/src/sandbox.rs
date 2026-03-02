@@ -90,10 +90,7 @@ impl SandboxService {
     }
 
     /// List sandboxes.
-    pub fn list(
-        &self,
-        payload: &[u8],
-    ) -> Result<sandbox_v1::ListSandboxesResponse, String> {
+    pub fn list(&self, payload: &[u8]) -> Result<sandbox_v1::ListSandboxesResponse, String> {
         let req = sandbox_v1::ListSandboxesRequest::decode(payload)
             .map_err(|e| format!("decode error: {e}"))?;
         let state_filter = if req.state.is_empty() {
@@ -112,12 +109,9 @@ impl SandboxService {
     // =========================================================================
 
     /// Run a command in a sandbox.  Returns a channel of encoded [`RunOutput`] payloads.
-    pub async fn run(
-        &self,
-        payload: &[u8],
-    ) -> Result<mpsc::UnboundedReceiver<Vec<u8>>, String> {
-        let req = sandbox_v1::RunRequest::decode(payload)
-            .map_err(|e| format!("decode error: {e}"))?;
+    pub async fn run(&self, payload: &[u8]) -> Result<mpsc::UnboundedReceiver<Vec<u8>>, String> {
+        let req =
+            sandbox_v1::RunRequest::decode(payload).map_err(|e| format!("decode error: {e}"))?;
 
         let tty_size = None; // RunRequest has no tty_size field; use default.
 
@@ -236,14 +230,15 @@ impl SandboxService {
     }
 
     /// Restore a sandbox from a snapshot.
-    pub async fn restore(
-        &self,
-        payload: &[u8],
-    ) -> Result<sandbox_v1::RestoreResponse, String> {
+    pub async fn restore(&self, payload: &[u8]) -> Result<sandbox_v1::RestoreResponse, String> {
         let req = sandbox_v1::RestoreRequest::decode(payload)
             .map_err(|e| format!("decode error: {e}"))?;
         let spec = RestoreSandboxSpec {
-            id: if req.id.is_empty() { None } else { Some(req.id) },
+            id: if req.id.is_empty() {
+                None
+            } else {
+                Some(req.id)
+            },
             snapshot_id: req.snapshot_id,
             labels: req.labels,
             network_override: req.network_override,
@@ -274,7 +269,10 @@ impl SandboxService {
             .list_checkpoints(filter)
             .map_err(|e| e.to_string())?;
         Ok(sandbox_v1::ListSnapshotsResponse {
-            snapshots: summaries.into_iter().map(checkpoint_summary_to_proto).collect(),
+            snapshots: summaries
+                .into_iter()
+                .map(checkpoint_summary_to_proto)
+                .collect(),
         })
     }
 
@@ -297,7 +295,11 @@ fn proto_to_spec(req: sandbox_v1::CreateSandboxRequest) -> SandboxSpec {
     let limits = req.limits.unwrap_or_default();
     let network = req.network.unwrap_or_default();
     SandboxSpec {
-        id: if req.id.is_empty() { None } else { Some(req.id) },
+        id: if req.id.is_empty() {
+            None
+        } else {
+            Some(req.id)
+        },
         labels: req.labels,
         kernel: req.kernel,
         rootfs: req.rootfs,

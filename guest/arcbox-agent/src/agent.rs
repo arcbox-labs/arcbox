@@ -212,6 +212,7 @@ mod linux {
         AGENT_VERSION, ErrorResponse, MessageType, RpcRequest, RpcResponse, parse_request,
         read_message, write_message, write_response,
     };
+    use crate::sandbox::SandboxService;
     use arcbox_constants::cmdline::{
         BOOT_ASSET_VERSION_KEY, DOCKER_DATA_DEVICE_KEY as DOCKER_DATA_DEVICE_CMDLINE_KEY,
         GUEST_DOCKER_VSOCK_PORT_KEY,
@@ -223,7 +224,6 @@ mod linux {
     };
     use arcbox_constants::ports::DOCKER_API_VSOCK_PORT;
     use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
-    use crate::sandbox::SandboxService;
 
     use arcbox_protocol::agent::{
         PingResponse, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
@@ -645,13 +645,7 @@ mod linux {
             Some(s) => Arc::clone(s),
             None => {
                 let err = ErrorResponse::new(503, "sandbox service unavailable");
-                write_message(
-                    stream,
-                    MessageType::Error,
-                    trace_id,
-                    &err.encode(),
-                )
-                .await?;
+                write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
                 return Ok(());
             }
         };
@@ -660,89 +654,68 @@ mod linux {
             // -----------------------------------------------------------------
             // CRUD
             // -----------------------------------------------------------------
-            MessageType::SandboxCreateRequest => {
-                match svc.create(payload).await {
-                    Ok(resp) => {
-                        use prost::Message as _;
-                        write_message(
-                            stream,
-                            MessageType::SandboxCreateResponse,
-                            trace_id,
-                            &resp.encode_to_vec(),
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        send_sandbox_error(stream, trace_id, 500, &e).await?;
-                    }
+            MessageType::SandboxCreateRequest => match svc.create(payload).await {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxCreateResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
                 }
-            }
-            MessageType::SandboxStopRequest => {
-                match svc.stop(payload).await {
-                    Ok(()) => {
-                        write_message(
-                            stream,
-                            MessageType::SandboxStopResponse,
-                            trace_id,
-                            &[],
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        send_sandbox_error(stream, trace_id, 500, &e).await?;
-                    }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
                 }
-            }
-            MessageType::SandboxRemoveRequest => {
-                match svc.remove(payload).await {
-                    Ok(()) => {
-                        write_message(
-                            stream,
-                            MessageType::SandboxRemoveResponse,
-                            trace_id,
-                            &[],
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        send_sandbox_error(stream, trace_id, 500, &e).await?;
-                    }
+            },
+            MessageType::SandboxStopRequest => match svc.stop(payload).await {
+                Ok(()) => {
+                    write_message(stream, MessageType::SandboxStopResponse, trace_id, &[]).await?;
                 }
-            }
-            MessageType::SandboxInspectRequest => {
-                match svc.inspect(payload) {
-                    Ok(resp) => {
-                        use prost::Message as _;
-                        write_message(
-                            stream,
-                            MessageType::SandboxInspectResponse,
-                            trace_id,
-                            &resp.encode_to_vec(),
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        send_sandbox_error(stream, trace_id, 500, &e).await?;
-                    }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
                 }
-            }
-            MessageType::SandboxListRequest => {
-                match svc.list(payload) {
-                    Ok(resp) => {
-                        use prost::Message as _;
-                        write_message(
-                            stream,
-                            MessageType::SandboxListResponse,
-                            trace_id,
-                            &resp.encode_to_vec(),
-                        )
+            },
+            MessageType::SandboxRemoveRequest => match svc.remove(payload).await {
+                Ok(()) => {
+                    write_message(stream, MessageType::SandboxRemoveResponse, trace_id, &[])
                         .await?;
-                    }
-                    Err(e) => {
-                        send_sandbox_error(stream, trace_id, 500, &e).await?;
-                    }
                 }
-            }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxInspectRequest => match svc.inspect(payload) {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxInspectResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxListRequest => match svc.list(payload) {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxListResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
             // -----------------------------------------------------------------
             // Streaming: Run
             // -----------------------------------------------------------------
@@ -765,73 +738,65 @@ mod linux {
             // -----------------------------------------------------------------
             // Snapshots
             // -----------------------------------------------------------------
-            MessageType::SandboxCheckpointRequest => {
-                match svc.checkpoint(payload).await {
-                    Ok(resp) => {
-                        use prost::Message as _;
-                        write_message(
-                            stream,
-                            MessageType::SandboxCheckpointResponse,
-                            trace_id,
-                            &resp.encode_to_vec(),
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        send_sandbox_error(stream, trace_id, 500, &e).await?;
-                    }
+            MessageType::SandboxCheckpointRequest => match svc.checkpoint(payload).await {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxCheckpointResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
                 }
-            }
-            MessageType::SandboxRestoreRequest => {
-                match svc.restore(payload).await {
-                    Ok(resp) => {
-                        use prost::Message as _;
-                        write_message(
-                            stream,
-                            MessageType::SandboxRestoreResponse,
-                            trace_id,
-                            &resp.encode_to_vec(),
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        send_sandbox_error(stream, trace_id, 500, &e).await?;
-                    }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
                 }
-            }
-            MessageType::SandboxListSnapshotsRequest => {
-                match svc.list_snapshots(payload) {
-                    Ok(resp) => {
-                        use prost::Message as _;
-                        write_message(
-                            stream,
-                            MessageType::SandboxListSnapshotsResponse,
-                            trace_id,
-                            &resp.encode_to_vec(),
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        send_sandbox_error(stream, trace_id, 500, &e).await?;
-                    }
+            },
+            MessageType::SandboxRestoreRequest => match svc.restore(payload).await {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxRestoreResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
                 }
-            }
-            MessageType::SandboxDeleteSnapshotRequest => {
-                match svc.delete_snapshot(payload) {
-                    Ok(()) => {
-                        write_message(
-                            stream,
-                            MessageType::SandboxDeleteSnapshotResponse,
-                            trace_id,
-                            &[],
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        send_sandbox_error(stream, trace_id, 500, &e).await?;
-                    }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
                 }
-            }
+            },
+            MessageType::SandboxListSnapshotsRequest => match svc.list_snapshots(payload) {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxListSnapshotsResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxDeleteSnapshotRequest => match svc.delete_snapshot(payload) {
+                Ok(()) => {
+                    write_message(
+                        stream,
+                        MessageType::SandboxDeleteSnapshotResponse,
+                        trace_id,
+                        &[],
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
             _ => {
                 send_sandbox_error(stream, trace_id, 400, "unrecognised sandbox message type")
                     .await?;

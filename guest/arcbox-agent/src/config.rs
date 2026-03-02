@@ -8,9 +8,7 @@
 //! 3. Built-in guest defaults
 
 use arcbox_vm::VmmConfig;
-use arcbox_vm::config::{
-    DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig,
-};
+use arcbox_vm::config::{DefaultVmConfig, FirecrackerConfig, GrpcConfig, NetworkConfig};
 
 /// Guest-specific VMM configuration defaults.
 ///
