@@ -411,6 +411,7 @@ pub async fn proxy_fallback(
     OriginalUri(uri): OriginalUri,
     req: axum::http::Request<Body>,
 ) -> Result<Response<Body>> {
+    tracing::debug!("proxy_fallback: method={} uri={}", req.method(), uri);
     state
         .runtime
         .ensure_vm_ready()

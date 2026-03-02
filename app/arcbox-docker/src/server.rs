@@ -86,9 +86,8 @@ impl DockerApiServer {
         // prefixes *before* route matching. `Router::layer` runs after routing
         // and cannot be used for URI rewriting.
         let version_layer = tower::util::MapRequestLayer::new(strip_api_version_prefix);
-        let app = version_layer.layer(
-            create_router(Arc::clone(&self.runtime)).layer(TraceLayer::new_for_http()),
-        );
+        let app = version_layer
+            .layer(create_router(Arc::clone(&self.runtime)).layer(TraceLayer::new_for_http()));
 
         loop {
             let (stream, _) = listener
