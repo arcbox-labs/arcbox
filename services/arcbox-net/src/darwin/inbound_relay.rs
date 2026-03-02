@@ -320,10 +320,9 @@ impl InboundListenerManager {
 
         let handle = match protocol {
             InboundProtocol::Tcp => {
-                let listener = TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(
-                    host_ip, host_port,
-                )))
-                .await?;
+                let listener =
+                    TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(host_ip, host_port)))
+                        .await?;
                 tracing::info!(
                     "Inbound listener: TCP {}:{} → container :{}",
                     host_ip,
@@ -336,10 +335,8 @@ impl InboundListenerManager {
                 })
             }
             InboundProtocol::Udp => {
-                let socket = UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(
-                    host_ip, host_port,
-                )))
-                .await?;
+                let socket =
+                    UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(host_ip, host_port))).await?;
                 tracing::info!(
                     "Inbound listener: UDP {}:{} → container :{}",
                     host_ip,
@@ -363,7 +360,12 @@ impl InboundListenerManager {
         if let Some((handle, cancel)) = self.listeners.remove(&key) {
             cancel.cancel();
             handle.abort();
-            tracing::debug!("Inbound listener removed: {:?} {}:{}", protocol, host_ip, host_port);
+            tracing::debug!(
+                "Inbound listener removed: {:?} {}:{}",
+                protocol,
+                host_ip,
+                host_port
+            );
         }
     }
 
@@ -603,14 +605,23 @@ mod tests {
         let (cmd_tx, _cmd_rx) = mpsc::channel(16);
         let mut manager = InboundListenerManager::new(cmd_tx);
 
-        manager.add_rule(Ipv4Addr::LOCALHOST, 0, 80, InboundProtocol::Tcp).await.unwrap();
-        manager.add_rule(Ipv4Addr::LOCALHOST, 0, 53, InboundProtocol::Udp).await.unwrap();
+        manager
+            .add_rule(Ipv4Addr::LOCALHOST, 0, 80, InboundProtocol::Tcp)
+            .await
+            .unwrap();
+        manager
+            .add_rule(Ipv4Addr::LOCALHOST, 0, 53, InboundProtocol::Udp)
+            .await
+            .unwrap();
 
         manager.stop_all();
         // After stop_all, the internal map should be empty. Since we can't
         // inspect it directly, adding the same rule again should succeed (no
         // duplicate key).
-        manager.add_rule(Ipv4Addr::LOCALHOST, 0, 80, InboundProtocol::Tcp).await.unwrap();
+        manager
+            .add_rule(Ipv4Addr::LOCALHOST, 0, 80, InboundProtocol::Tcp)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -640,7 +651,10 @@ mod tests {
     fn invalid_host_ip_is_rejected() {
         // Verify that HostIp parsing used by runtime rejects non-IPv4 strings.
         // The runtime calls `host_ip_str.parse::<Ipv4Addr>()` and skips on Err.
-        assert!("::1".parse::<Ipv4Addr>().is_err(), "IPv6 should fail Ipv4Addr parse");
+        assert!(
+            "::1".parse::<Ipv4Addr>().is_err(),
+            "IPv6 should fail Ipv4Addr parse"
+        );
         assert!("not-an-ip".parse::<Ipv4Addr>().is_err());
         assert!("".parse::<Ipv4Addr>().is_err());
         // Valid cases the runtime accepts:
