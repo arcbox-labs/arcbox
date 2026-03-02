@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Machine(cmd) => commands::machine::execute(cmd).await,
+        Commands::Sandbox(cmd) => commands::sandbox::execute(cmd).await,
         Commands::Docker(cmd) => commands::docker::execute(cmd).await,
         Commands::Boot(cmd) => commands::boot::execute(cmd).await,
         Commands::Dns(cmd) => commands::dns::execute(cmd).await,

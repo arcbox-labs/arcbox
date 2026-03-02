@@ -11,10 +11,18 @@ use arcbox_protocol::agent::{
     PingRequest, PingResponse, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
     RuntimeStatusResponse, SystemInfo,
 };
+use arcbox_protocol::sandbox_v1::{
+    CheckpointRequest, CheckpointResponse, CreateSandboxRequest, CreateSandboxResponse,
+    DeleteSnapshotRequest, InspectSandboxRequest, ListSandboxesRequest, ListSandboxesResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, RemoveSandboxRequest, RestoreRequest,
+    RestoreResponse, RunOutput, RunRequest, SandboxEvent, SandboxEventsRequest, SandboxInfo,
+    StopSandboxRequest,
+};
 use arcbox_transport::Transport;
 use arcbox_transport::vsock::{VsockAddr, VsockTransport};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use prost::Message;
+use tokio::sync::mpsc;
 
 /// Agent client for a single VM.
 pub struct AgentClient {
@@ -300,6 +308,377 @@ impl AgentClient {
 
         RuntimeStatusResponse::decode(&resp_payload[..])
             .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+    }
+
+    // =========================================================================
+    // Sandbox operations
+    // =========================================================================
+
+    /// Creates a new sandbox in the guest VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_create(
+        &mut self,
+        req: CreateSandboxRequest,
+    ) -> Result<CreateSandboxResponse> {
+        let payload = req.encode_to_vec();
+        let (resp_type, resp_payload) = self
+            .rpc_call(MessageType::SandboxCreateRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::SandboxCreateResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: 0x{:04x}",
+                resp_type
+            )));
+        }
+
+        CreateSandboxResponse::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+    }
+
+    /// Stops a sandbox in the guest VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_stop(&mut self, req: StopSandboxRequest) -> Result<()> {
+        let payload = req.encode_to_vec();
+        let (resp_type, _) = self
+            .rpc_call(MessageType::SandboxStopRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::SandboxStopResponse as u32
+            && resp_type != MessageType::Empty as u32
+        {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: 0x{:04x}",
+                resp_type
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Removes a sandbox from the guest VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_remove(&mut self, req: RemoveSandboxRequest) -> Result<()> {
+        let payload = req.encode_to_vec();
+        let (resp_type, _) = self
+            .rpc_call(MessageType::SandboxRemoveRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::SandboxRemoveResponse as u32
+            && resp_type != MessageType::Empty as u32
+        {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: 0x{:04x}",
+                resp_type
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Inspects a sandbox in the guest VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_inspect(&mut self, req: InspectSandboxRequest) -> Result<SandboxInfo> {
+        let payload = req.encode_to_vec();
+        let (resp_type, resp_payload) = self
+            .rpc_call(MessageType::SandboxInspectRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::SandboxInspectResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: 0x{:04x}",
+                resp_type
+            )));
+        }
+
+        SandboxInfo::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+    }
+
+    /// Lists sandboxes in the guest VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_list(
+        &mut self,
+        req: ListSandboxesRequest,
+    ) -> Result<ListSandboxesResponse> {
+        let payload = req.encode_to_vec();
+        let (resp_type, resp_payload) = self
+            .rpc_call(MessageType::SandboxListRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::SandboxListResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: 0x{:04x}",
+                resp_type
+            )));
+        }
+
+        ListSandboxesResponse::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+    }
+
+    /// Runs a command inside a sandbox and returns a channel of streaming output.
+    ///
+    /// Consumes the client because the stream task requires exclusive transport access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the initial send fails.
+    pub async fn sandbox_run(
+        mut self,
+        req: RunRequest,
+    ) -> Result<mpsc::UnboundedReceiver<Result<RunOutput>>> {
+        if !self.connected {
+            self.connect().await?;
+        }
+
+        let payload = req.encode_to_vec();
+        let buf = Self::build_message(MessageType::SandboxRunRequest, "", &payload);
+        self.transport
+            .send(buf)
+            .await
+            .map_err(|e| CoreError::Machine(format!("failed to send run request: {}", e)))?;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let raw = match self.transport.recv().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(CoreError::Machine(format!("recv error: {}", e))));
+                        break;
+                    }
+                };
+
+                let (resp_type, _, resp_payload) = match Self::parse_response(&raw) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                };
+
+                if resp_type == MessageType::Error as u32 {
+                    let msg = parse_error_response(&resp_payload)
+                        .unwrap_or_else(|_| "unknown error".to_string());
+                    let _ = tx.send(Err(CoreError::Machine(msg)));
+                    break;
+                }
+
+                if resp_type != MessageType::SandboxRunOutput as u32 {
+                    let _ = tx.send(Err(CoreError::Machine(format!(
+                        "unexpected response type: 0x{:04x}",
+                        resp_type
+                    ))));
+                    break;
+                }
+
+                match RunOutput::decode(&resp_payload[..]) {
+                    Ok(output) => {
+                        let done = output.done;
+                        let _ = tx.send(Ok(output));
+                        if done {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(CoreError::Machine(format!(
+                            "decode error: {}",
+                            e
+                        ))));
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
+    /// Subscribes to sandbox lifecycle events and returns a channel of streaming events.
+    ///
+    /// Consumes the client because the stream task requires exclusive transport access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the initial send fails.
+    pub async fn sandbox_events(
+        mut self,
+        req: SandboxEventsRequest,
+    ) -> Result<mpsc::UnboundedReceiver<Result<SandboxEvent>>> {
+        if !self.connected {
+            self.connect().await?;
+        }
+
+        let payload = req.encode_to_vec();
+        let buf = Self::build_message(MessageType::SandboxEventsRequest, "", &payload);
+        self.transport
+            .send(buf)
+            .await
+            .map_err(|e| CoreError::Machine(format!("failed to send events request: {}", e)))?;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let raw = match self.transport.recv().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(CoreError::Machine(format!("recv error: {}", e))));
+                        break;
+                    }
+                };
+
+                let (resp_type, _, resp_payload) = match Self::parse_response(&raw) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                };
+
+                if resp_type == MessageType::Error as u32 {
+                    let msg = parse_error_response(&resp_payload)
+                        .unwrap_or_else(|_| "unknown error".to_string());
+                    let _ = tx.send(Err(CoreError::Machine(msg)));
+                    break;
+                }
+
+                if resp_type != MessageType::SandboxEvent as u32 {
+                    let _ = tx.send(Err(CoreError::Machine(format!(
+                        "unexpected response type: 0x{:04x}",
+                        resp_type
+                    ))));
+                    break;
+                }
+
+                match SandboxEvent::decode(&resp_payload[..]) {
+                    Ok(event) => {
+                        let _ = tx.send(Ok(event));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(CoreError::Machine(format!(
+                            "decode error: {}",
+                            e
+                        ))));
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
+    /// Checkpoints a sandbox (creates a snapshot).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_checkpoint(
+        &mut self,
+        req: CheckpointRequest,
+    ) -> Result<CheckpointResponse> {
+        let payload = req.encode_to_vec();
+        let (resp_type, resp_payload) = self
+            .rpc_call(MessageType::SandboxCheckpointRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::SandboxCheckpointResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: 0x{:04x}",
+                resp_type
+            )));
+        }
+
+        CheckpointResponse::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+    }
+
+    /// Restores a sandbox from a snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_restore(&mut self, req: RestoreRequest) -> Result<RestoreResponse> {
+        let payload = req.encode_to_vec();
+        let (resp_type, resp_payload) = self
+            .rpc_call(MessageType::SandboxRestoreRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::SandboxRestoreResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: 0x{:04x}",
+                resp_type
+            )));
+        }
+
+        RestoreResponse::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+    }
+
+    /// Lists snapshots for sandboxes in the guest VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_list_snapshots(
+        &mut self,
+        req: ListSnapshotsRequest,
+    ) -> Result<ListSnapshotsResponse> {
+        let payload = req.encode_to_vec();
+        let (resp_type, resp_payload) = self
+            .rpc_call(MessageType::SandboxListSnapshotsRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::SandboxListSnapshotsResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: 0x{:04x}",
+                resp_type
+            )));
+        }
+
+        ListSnapshotsResponse::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+    }
+
+    /// Deletes a snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_delete_snapshot(&mut self, req: DeleteSnapshotRequest) -> Result<()> {
+        let payload = req.encode_to_vec();
+        let (resp_type, _) = self
+            .rpc_call(MessageType::SandboxDeleteSnapshotRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::SandboxDeleteSnapshotResponse as u32
+            && resp_type != MessageType::Empty as u32
+        {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: 0x{:04x}",
+                resp_type
+            )));
+        }
+
+        Ok(())
     }
 }
 

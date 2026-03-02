@@ -16,12 +16,15 @@ fn main() {
         "../arcbox-protocol/proto/image.proto",
         "../arcbox-protocol/proto/agent.proto",
         "../arcbox-protocol/proto/api.proto",
+        "../arcbox-protocol/proto/sandbox.proto",
     ];
 
     // Configure tonic-build
     tonic_build::configure()
         // Map arcbox.v1 package to arcbox_protocol::v1 types
         .extern_path(".arcbox.v1", "::arcbox_protocol::v1")
+        // Map sandbox.v1 package to arcbox_protocol::sandbox_v1 types
+        .extern_path(".sandbox.v1", "::arcbox_protocol::sandbox_v1")
         // Generate client code
         .build_client(true)
         // Generate server code

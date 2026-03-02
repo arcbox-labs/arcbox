@@ -8,6 +8,8 @@
 //! - `MachineService` - Virtual machine management
 //! - `AgentService` - Guest agent communication
 //! - `VolumeService` - Volume management (from api.proto)
+//! - `SandboxService` - Sandbox lifecycle (create / run / exec / stop / remove)
+//! - `SandboxSnapshotService` - Sandbox checkpoint and restore
 //!
 //! # Usage
 //!
@@ -44,6 +46,17 @@ pub mod v1 {
     tonic::include_proto!("arcbox.v1");
 }
 
+/// gRPC services from the sandbox.v1 package.
+///
+/// This module contains tonic-generated client and server code for:
+/// - SandboxService - Sandbox lifecycle (create / run / exec / stop / remove)
+/// - SandboxSnapshotService - Checkpoint and restore
+///
+/// Message types are imported from `arcbox_protocol::sandbox_v1`.
+pub mod sandbox_v1 {
+    tonic::include_proto!("sandbox.v1");
+}
+
 // =============================================================================
 // Client re-exports
 // =============================================================================
@@ -51,6 +64,8 @@ pub mod v1 {
 pub use v1::agent_service_client::AgentServiceClient;
 pub use v1::machine_service_client::MachineServiceClient;
 pub use v1::volume_service_client::VolumeServiceClient;
+pub use sandbox_v1::sandbox_service_client::SandboxServiceClient;
+pub use sandbox_v1::sandbox_snapshot_service_client::SandboxSnapshotServiceClient;
 
 // =============================================================================
 // Server re-exports
@@ -59,3 +74,7 @@ pub use v1::volume_service_client::VolumeServiceClient;
 pub use v1::agent_service_server::{AgentService, AgentServiceServer};
 pub use v1::machine_service_server::{MachineService, MachineServiceServer};
 pub use v1::volume_service_server::{VolumeService, VolumeServiceServer};
+pub use sandbox_v1::sandbox_service_server::{SandboxService, SandboxServiceServer};
+pub use sandbox_v1::sandbox_snapshot_service_server::{
+    SandboxSnapshotService, SandboxSnapshotServiceServer,
+};
