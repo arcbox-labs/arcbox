@@ -245,27 +245,30 @@ impl IcmpProxy {
         tokio::spawn(async move {
             // On modern macOS, SOCK_RAW for ICMP requires elevated privileges.
             // Prefer SOCK_DGRAM + IPPROTO_ICMP to support unprivileged daemon.
-            let icmp_socket =
-                match socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4)) {
-                    Ok(s) => s,
-                    Err(e) => {
+            let icmp_socket = match socket2::Socket::new(
+                Domain::IPV4,
+                Type::DGRAM,
+                Some(Protocol::ICMPV4),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::PermissionDenied {
                         disabled.store(true, Ordering::Relaxed);
-                        if e.kind() == std::io::ErrorKind::PermissionDenied
-                            && !permission_warned.swap(true, Ordering::Relaxed)
-                        {
+                        if !permission_warned.swap(true, Ordering::Relaxed) {
                             tracing::warn!(
                                 "ICMP proxy disabled: failed to create ICMP datagram socket: {}",
                                 e
                             );
-                        } else {
-                            tracing::debug!(
-                                "ICMP proxy disabled: failed to create ICMP datagram socket: {}",
-                                e
-                            );
                         }
-                        return;
+                    } else {
+                        tracing::debug!(
+                            "ICMP proxy: failed to create ICMP datagram socket (will retry): {}",
+                            e
+                        );
                     }
-                };
+                    return;
+                }
+            };
 
             icmp_socket.set_nonblocking(true).ok();
             let dst_addr: SocketAddr = SocketAddrV4::new(dst_ip, 0).into();
