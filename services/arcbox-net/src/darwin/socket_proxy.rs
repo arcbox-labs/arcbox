@@ -515,14 +515,16 @@ impl SocketProxy {
     ) {
         use super::inbound_relay::InboundCommand;
         if let InboundCommand::UdpReceived {
-            container_port,
+            host_port,
             data,
             reply_tx,
             ..
         } = cmd
         {
+            // Use host_port (the Docker-exposed port on the guest), not
+            // container_port (the port inside the container).
             self.inbound
-                .inject_udp(container_port, &data, reply_tx, guest_mac);
+                .inject_udp(host_port, &data, reply_tx, guest_mac);
         }
     }
 
