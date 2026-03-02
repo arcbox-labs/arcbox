@@ -222,7 +222,8 @@ mod linux {
         GUEST_DOCKER_VSOCK_PORT as GUEST_DOCKER_VSOCK_PORT_ENV,
     };
     use arcbox_constants::paths::{
-        ARCBOX_RUNTIME_BIN_DIR, CONTAINERD_SOCKET, DOCKER_API_UNIX_SOCKET, DOCKER_DATA_MOUNT_POINT,
+        ARCBOX_LOG_DIR, ARCBOX_RUNTIME_BIN_DIR, CONTAINERD_ROOT_DIR, CONTAINERD_SOCKET,
+        DOCKER_API_UNIX_SOCKET, DOCKER_DATA_MOUNT_POINT,
     };
     use arcbox_constants::ports::DOCKER_API_VSOCK_PORT;
     use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
@@ -280,102 +281,231 @@ mod linux {
             .unwrap_or_else(|| DOCKER_DATA_DEVICE_DEFAULT.to_string())
     }
 
-    fn has_ext4_superblock(device: &str) -> bool {
+    /// Btrfs primary superblock magic `_BHRfS_M` at absolute disk offset
+    /// `0x10040` (superblock starts at `0x10000`, magic at internal offset `0x40`).
+    const BTRFS_MAGIC: [u8; 8] = [0x5f, 0x42, 0x48, 0x52, 0x66, 0x53, 0x5f, 0x4d];
+    const BTRFS_MAGIC_OFFSET: u64 = 0x10040;
+
+    /// Temporary mount point for the raw Btrfs device before subvolume bind mounts.
+    const BTRFS_TEMP_MOUNT: &str = "/mnt/data";
+
+    fn has_btrfs_superblock(device: &str) -> bool {
         let mut file = match std::fs::File::open(device) {
             Ok(file) => file,
             Err(_) => return false,
         };
-        if file.seek(SeekFrom::Start(1024 + 56)).is_err() {
+        if file.seek(SeekFrom::Start(BTRFS_MAGIC_OFFSET)).is_err() {
             return false;
         }
-        let mut magic = [0_u8; 2];
+        let mut magic = [0_u8; 8];
         if file.read_exact(&mut magic).is_err() {
             return false;
         }
-        magic == [0x53, 0xEF]
+        magic == BTRFS_MAGIC
     }
 
-    fn format_ext4_if_needed(device: &str) -> String {
-        if has_ext4_superblock(device) {
-            return "docker data device already formatted as ext4".to_string();
+    /// Formats the device as Btrfs if it does not already have a Btrfs superblock.
+    /// Old ext4 disks are unconditionally wiped (alpha breaking change).
+    fn ensure_btrfs_format(device: &str) -> Result<String, String> {
+        if has_btrfs_superblock(device) {
+            return Ok("data device already Btrfs".to_string());
         }
 
-        let mkfs_candidates = [
-            ("/sbin/mkfs.ext4", vec!["-F", device]),
-            ("/usr/sbin/mkfs.ext4", vec!["-F", device]),
-            ("/sbin/mke2fs", vec!["-F", "-t", "ext4", device]),
-            ("/usr/sbin/mke2fs", vec!["-F", "-t", "ext4", device]),
-            ("/bin/busybox", vec!["mke2fs", "-F", "-t", "ext4", device]),
-        ];
-
-        for (binary, args) in mkfs_candidates {
-            if !Path::new(binary).exists() {
-                continue;
-            }
-            match std::process::Command::new(binary).args(&args).status() {
-                Ok(status) if status.success() => {
-                    return format!("formatted {} as ext4 via {}", device, binary);
-                }
-                Ok(status) => {
-                    tracing::warn!(
-                        binary,
-                        exit_code = status.code().unwrap_or_default(),
-                        device,
-                        "failed to format docker data device"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(binary, device, error = %e, "failed to execute formatter");
-                }
-            }
+        // /sbin/mkfs.btrfs is baked into the EROFS rootfs.
+        let binary = "/sbin/mkfs.btrfs";
+        if !Path::new(binary).exists() {
+            return Err(format!("{} not found in EROFS rootfs", binary));
         }
 
-        format!(
-            "failed to format docker data device {}; mkfs.ext4/mke2fs unavailable",
-            device
-        )
+        match std::process::Command::new(binary)
+            .args(["-f", device])
+            .status()
+        {
+            Ok(status) if status.success() => Ok(format!("formatted {} as Btrfs", device)),
+            Ok(status) => Err(format!(
+                "mkfs.btrfs failed on {} (exit={})",
+                device,
+                status.code().unwrap_or(-1)
+            )),
+            Err(e) => Err(format!("failed to execute mkfs.btrfs: {}", e)),
+        }
     }
 
-    fn ensure_docker_data_mount() -> String {
-        if crate::mount::is_mounted(DOCKER_DATA_MOUNT_POINT) {
-            return format!("docker data already mounted at {}", DOCKER_DATA_MOUNT_POINT);
-        }
-
-        if let Err(e) = std::fs::create_dir_all(DOCKER_DATA_MOUNT_POINT) {
-            return format!("failed to create {}: {}", DOCKER_DATA_MOUNT_POINT, e);
+    /// Mounts the data volume (Btrfs), creates subvolumes, and bind-mounts them.
+    ///
+    /// Layout after this function returns:
+    /// - `/mnt/data` — raw Btrfs mount (internal, not used by daemons)
+    /// - `/var/lib/docker` — bind mount of `@docker` subvolume
+    /// - `/var/log/arcbox` — bind mount of `@logs` subvolume
+    fn ensure_data_mount() -> String {
+        // Already fully set up?
+        if crate::mount::is_mounted(DOCKER_DATA_MOUNT_POINT)
+            && crate::mount::is_mounted(ARCBOX_LOG_DIR)
+        {
+            return "data subvolumes already mounted".to_string();
         }
 
         let device = docker_data_device();
         if !Path::new(&device).exists() {
-            return format!("docker data device missing: {}", device);
+            return format!("data device missing: {}", device);
         }
 
-        match crate::mount::mount_fs(&device, DOCKER_DATA_MOUNT_POINT, "ext4", &[]) {
-            Ok(()) => format!(
-                "mounted docker data {} -> {}",
-                device, DOCKER_DATA_MOUNT_POINT
-            ),
-            Err(initial_mount_err) => {
-                if has_ext4_superblock(&device) {
+        // Step 1: Format if not Btrfs.
+        match ensure_btrfs_format(&device) {
+            Ok(note) => tracing::info!("{}", note),
+            Err(e) => return e,
+        }
+
+        // Step 2: Mount raw Btrfs to /mnt/data.
+        if !crate::mount::is_mounted(BTRFS_TEMP_MOUNT) {
+            if let Err(e) = std::fs::create_dir_all(BTRFS_TEMP_MOUNT) {
+                return format!("failed to create {}: {}", BTRFS_TEMP_MOUNT, e);
+            }
+            match std::process::Command::new("/bin/busybox")
+                .args([
+                    "mount",
+                    "-t",
+                    "btrfs",
+                    "-o",
+                    "compress=zstd:3",
+                    &device,
+                    BTRFS_TEMP_MOUNT,
+                ])
+                .status()
+            {
+                Ok(s) if s.success() => {}
+                Ok(s) => {
                     return format!(
-                        "failed to mount docker data {} -> {}: {}",
-                        device, DOCKER_DATA_MOUNT_POINT, initial_mount_err
+                        "mount -t btrfs {} {} failed (exit={})",
+                        device,
+                        BTRFS_TEMP_MOUNT,
+                        s.code().unwrap_or(-1)
                     );
                 }
-
-                let format_note = format_ext4_if_needed(&device);
-                match crate::mount::mount_fs(&device, DOCKER_DATA_MOUNT_POINT, "ext4", &[]) {
-                    Ok(()) => format!(
-                        "mounted docker data {} -> {} ({})",
-                        device, DOCKER_DATA_MOUNT_POINT, format_note
-                    ),
-                    Err(e) => format!(
-                        "failed to mount docker data {} -> {}: {} ({})",
-                        device, DOCKER_DATA_MOUNT_POINT, e, format_note
-                    ),
-                }
+                Err(e) => return format!("mount exec failed: {}", e),
             }
         }
+
+        // Step 3: Create subvolumes if missing.
+        for subvol in ["@docker", "@logs"] {
+            let subvol_path = format!("{}/{}", BTRFS_TEMP_MOUNT, subvol);
+            if Path::new(&subvol_path).exists() {
+                continue;
+            }
+            // btrfs subvolume create requires the btrfs tool. We use busybox
+            // mount for the filesystem, but subvolume creation can be done via
+            // mount -o subvol= on first access. However, the standard approach
+            // is to use the btrfs CLI. Since EROFS only has busybox, we create
+            // the subvolume by mounting, creating a directory marker, and then
+            // using mount -o subvol=.
+            //
+            // Actually: the kernel Btrfs driver supports creating subvolumes
+            // via the ioctl interface. But the simplest cross-tool approach is
+            // to just mkdir the subvolume path — Btrfs does NOT auto-create
+            // subvolumes from mkdir. We need the `btrfs` CLI.
+            //
+            // Since we don't have the full btrfs-progs in EROFS (only mkfs.btrfs),
+            // use the Btrfs ioctl directly to create subvolumes.
+            if let Err(e) = btrfs_create_subvolume(&subvol_path) {
+                return format!("failed to create subvolume {}: {}", subvol, e);
+            }
+        }
+
+        let mut notes = Vec::new();
+
+        // Step 4: Bind mount subvolumes to final paths.
+        for (subvol, target) in [
+            ("@docker", DOCKER_DATA_MOUNT_POINT),
+            ("@logs", ARCBOX_LOG_DIR),
+        ] {
+            if crate::mount::is_mounted(target) {
+                continue;
+            }
+            if let Err(e) = std::fs::create_dir_all(target) {
+                return format!("failed to create {}: {}", target, e);
+            }
+            let opts = format!("compress=zstd:3,subvol={}", subvol);
+            match std::process::Command::new("/bin/busybox")
+                .args(["mount", "-t", "btrfs", "-o", &opts, &device, target])
+                .status()
+            {
+                Ok(s) if s.success() => {
+                    notes.push(format!("mounted {} -> {}", subvol, target));
+                }
+                Ok(s) => {
+                    return format!(
+                        "mount subvol={} {} failed (exit={})",
+                        subvol,
+                        target,
+                        s.code().unwrap_or(-1)
+                    );
+                }
+                Err(e) => return format!("mount exec failed: {}", e),
+            }
+        }
+
+        if notes.is_empty() {
+            "data subvolumes already mounted".to_string()
+        } else {
+            notes.join("; ")
+        }
+    }
+
+    /// Creates a Btrfs subvolume using the `BTRFS_IOC_SUBVOL_CREATE` ioctl.
+    ///
+    /// This avoids needing the full `btrfs-progs` CLI in the EROFS rootfs.
+    #[cfg(target_os = "linux")]
+    fn btrfs_create_subvolume(path: &str) -> Result<(), String> {
+        use std::ffi::CString;
+        use std::os::unix::io::AsRawFd;
+
+        // BTRFS_IOC_SUBVOL_CREATE = _IOW(0x94, 14, struct btrfs_ioctl_vol_args)
+        // struct btrfs_ioctl_vol_args { __s64 fd; char name[4088]; }  // total 4096 bytes
+        const BTRFS_IOC_SUBVOL_CREATE: libc::c_ulong = 0x5000940E;
+
+        let parent = Path::new(path)
+            .parent()
+            .ok_or_else(|| "no parent directory".to_string())?;
+        let name = Path::new(path)
+            .file_name()
+            .ok_or_else(|| "no subvolume name".to_string())?
+            .to_str()
+            .ok_or_else(|| "invalid subvolume name".to_string())?;
+
+        let parent_dir =
+            std::fs::File::open(parent).map_err(|e| format!("open {}: {}", parent.display(), e))?;
+
+        let mut args = [0u8; 4096];
+        // First 8 bytes: fd field (unused for SUBVOL_CREATE, set to 0).
+        // Bytes 8..4096: null-terminated name.
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() >= 4088 {
+            return Err("subvolume name too long".to_string());
+        }
+        args[8..8 + name_bytes.len()].copy_from_slice(name_bytes);
+
+        // SAFETY: ioctl with a valid fd and correctly sized buffer.
+        let ret = unsafe {
+            libc::ioctl(
+                parent_dir.as_raw_fd(),
+                BTRFS_IOC_SUBVOL_CREATE,
+                args.as_ptr(),
+            )
+        };
+        if ret < 0 {
+            return Err(format!(
+                "BTRFS_IOC_SUBVOL_CREATE: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        tracing::info!("created Btrfs subvolume {}", path);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn btrfs_create_subvolume(_path: &str) -> Result<(), String> {
+        Err("Btrfs subvolume creation is only supported on Linux".to_string())
     }
 
     /// Result from handling a request.
@@ -1054,15 +1184,14 @@ mod linux {
             tracing::info!(prerequisites = %prereq_notes.join("; "), "runtime prerequisites");
         }
         notes.extend(prereq_notes);
-        notes.push(ensure_docker_data_mount());
+        notes.push(ensure_data_mount());
 
         for dir in [
             "/run/containerd",
             "/var/run/docker",
-            "/var/lib/containerd",
-            DOCKER_DATA_MOUNT_POINT,
+            CONTAINERD_ROOT_DIR,
             "/etc/docker",
-            "/var/log",
+            ARCBOX_LOG_DIR,
         ] {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 notes.push(format!("mkdir {} failed({})", dir, e));
@@ -1103,7 +1232,7 @@ mod linux {
                 "--address",
                 CONTAINERD_SOCKET,
                 "--root",
-                "/var/lib/containerd",
+                CONTAINERD_ROOT_DIR,
                 "--state",
                 "/run/containerd",
             ])
