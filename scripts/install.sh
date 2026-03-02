@@ -270,7 +270,7 @@ prefetch_boot_assets() {
         return
     fi
 
-    info "Downloading boot assets (kernel + initramfs)..."
+    info "Downloading boot assets (kernel + rootfs)..."
     "$INSTALL_DIR/arcbox" boot prefetch || warn "Boot asset prefetch failed. You can retry later: arcbox boot prefetch"
 }
 
