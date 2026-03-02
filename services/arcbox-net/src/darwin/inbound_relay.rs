@@ -612,4 +612,39 @@ mod tests {
         // duplicate key).
         manager.add_rule(Ipv4Addr::LOCALHOST, 0, 80, InboundProtocol::Tcp).await.unwrap();
     }
+
+    #[tokio::test]
+    async fn same_port_different_ip_coexist() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let mut manager = InboundListenerManager::new(cmd_tx);
+
+        // Bind the same container port on two different host IPs (port 0 = OS-assigned).
+        manager
+            .add_rule(Ipv4Addr::LOCALHOST, 0, 80, InboundProtocol::Tcp)
+            .await
+            .unwrap();
+        manager
+            .add_rule(Ipv4Addr::UNSPECIFIED, 0, 80, InboundProtocol::Tcp)
+            .await
+            .unwrap();
+
+        // Remove only the localhost rule; re-adding it should succeed (not a dup).
+        manager.remove_rule(Ipv4Addr::LOCALHOST, 0, InboundProtocol::Tcp);
+        manager
+            .add_rule(Ipv4Addr::LOCALHOST, 0, 80, InboundProtocol::Tcp)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn invalid_host_ip_is_rejected() {
+        // Verify that HostIp parsing used by runtime rejects non-IPv4 strings.
+        // The runtime calls `host_ip_str.parse::<Ipv4Addr>()` and skips on Err.
+        assert!("::1".parse::<Ipv4Addr>().is_err(), "IPv6 should fail Ipv4Addr parse");
+        assert!("not-an-ip".parse::<Ipv4Addr>().is_err());
+        assert!("".parse::<Ipv4Addr>().is_err());
+        // Valid cases the runtime accepts:
+        assert!("127.0.0.1".parse::<Ipv4Addr>().is_ok());
+        assert!("0.0.0.0".parse::<Ipv4Addr>().is_ok());
+    }
 }
