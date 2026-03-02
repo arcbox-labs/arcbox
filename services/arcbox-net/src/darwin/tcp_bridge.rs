@@ -781,7 +781,7 @@ impl TcpBridge {
         }
     }
 
-    /// Removes closed connections and recycles their socket handles.
+    /// Removes closed connections and their socket handles.
     fn cleanup_closed(&mut self, sockets: &mut SocketSet<'_>) {
         let mut to_remove = Vec::new();
 
