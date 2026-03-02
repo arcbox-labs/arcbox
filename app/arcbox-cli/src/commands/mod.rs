@@ -68,7 +68,7 @@ pub enum Commands {
     #[command(subcommand)]
     Docker(docker::DockerCommands),
 
-    /// Manage boot assets (kernel/initramfs)
+    /// Manage boot assets (kernel/rootfs)
     #[command(subcommand)]
     Boot(boot::BootCommands),
 

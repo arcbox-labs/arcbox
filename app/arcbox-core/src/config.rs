@@ -150,8 +150,6 @@ pub struct VmDefaults {
     pub memory_mb: u64,
     /// Kernel path (optional, uses embedded kernel if not set).
     pub kernel_path: Option<PathBuf>,
-    /// Initrd path (optional).
-    pub initrd_path: Option<PathBuf>,
 }
 
 impl Default for VmDefaults {
@@ -160,7 +158,6 @@ impl Default for VmDefaults {
             cpus: 4,
             memory_mb: 4096,
             kernel_path: None,
-            initrd_path: None,
         }
     }
 }
