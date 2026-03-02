@@ -337,29 +337,33 @@ mod linux {
     /// - `/mnt/data` — raw Btrfs mount (internal, not used by daemons)
     /// - `/var/lib/docker` — bind mount of `@docker` subvolume
     /// - `/var/log/arcbox` — bind mount of `@logs` subvolume
-    fn ensure_data_mount() -> String {
+    ///
+    /// Returns `Ok(notes)` on success or `Err(reason)` if the data volume
+    /// could not be set up. Callers must abort runtime startup on error —
+    /// running containerd/dockerd without persistent storage is unsafe.
+    fn ensure_data_mount() -> Result<String, String> {
         // Already fully set up?
         if crate::mount::is_mounted(DOCKER_DATA_MOUNT_POINT)
             && crate::mount::is_mounted(ARCBOX_LOG_DIR)
         {
-            return "data subvolumes already mounted".to_string();
+            return Ok("data subvolumes already mounted".to_string());
         }
 
         let device = docker_data_device();
         if !Path::new(&device).exists() {
-            return format!("data device missing: {}", device);
+            return Err(format!("data device missing: {}", device));
         }
 
         // Step 1: Format if not Btrfs.
         match ensure_btrfs_format(&device) {
             Ok(note) => tracing::info!("{}", note),
-            Err(e) => return e,
+            Err(e) => return Err(e),
         }
 
         // Step 2: Mount raw Btrfs to /mnt/data.
         if !crate::mount::is_mounted(BTRFS_TEMP_MOUNT) {
             if let Err(e) = std::fs::create_dir_all(BTRFS_TEMP_MOUNT) {
-                return format!("failed to create {}: {}", BTRFS_TEMP_MOUNT, e);
+                return Err(format!("failed to create {}: {}", BTRFS_TEMP_MOUNT, e));
             }
             match std::process::Command::new("/bin/busybox")
                 .args([
@@ -375,14 +379,14 @@ mod linux {
             {
                 Ok(s) if s.success() => {}
                 Ok(s) => {
-                    return format!(
+                    return Err(format!(
                         "mount -t btrfs {} {} failed (exit={})",
                         device,
                         BTRFS_TEMP_MOUNT,
                         s.code().unwrap_or(-1)
-                    );
+                    ));
                 }
-                Err(e) => return format!("mount exec failed: {}", e),
+                Err(e) => return Err(format!("mount exec failed: {}", e)),
             }
         }
 
@@ -392,22 +396,10 @@ mod linux {
             if Path::new(&subvol_path).exists() {
                 continue;
             }
-            // btrfs subvolume create requires the btrfs tool. We use busybox
-            // mount for the filesystem, but subvolume creation can be done via
-            // mount -o subvol= on first access. However, the standard approach
-            // is to use the btrfs CLI. Since EROFS only has busybox, we create
-            // the subvolume by mounting, creating a directory marker, and then
-            // using mount -o subvol=.
-            //
-            // Actually: the kernel Btrfs driver supports creating subvolumes
-            // via the ioctl interface. But the simplest cross-tool approach is
-            // to just mkdir the subvolume path — Btrfs does NOT auto-create
-            // subvolumes from mkdir. We need the `btrfs` CLI.
-            //
-            // Since we don't have the full btrfs-progs in EROFS (only mkfs.btrfs),
-            // use the Btrfs ioctl directly to create subvolumes.
+            // EROFS only includes mkfs.btrfs, not full btrfs-progs. Use the
+            // BTRFS_IOC_SUBVOL_CREATE ioctl directly to create subvolumes.
             if let Err(e) = btrfs_create_subvolume(&subvol_path) {
-                return format!("failed to create subvolume {}: {}", subvol, e);
+                return Err(format!("failed to create subvolume {}: {}", subvol, e));
             }
         }
 
@@ -422,7 +414,7 @@ mod linux {
                 continue;
             }
             if let Err(e) = std::fs::create_dir_all(target) {
-                return format!("failed to create {}: {}", target, e);
+                return Err(format!("failed to create {}: {}", target, e));
             }
             let opts = format!("compress=zstd:3,subvol={}", subvol);
             match std::process::Command::new("/bin/busybox")
@@ -433,35 +425,38 @@ mod linux {
                     notes.push(format!("mounted {} -> {}", subvol, target));
                 }
                 Ok(s) => {
-                    return format!(
+                    return Err(format!(
                         "mount subvol={} {} failed (exit={})",
                         subvol,
                         target,
                         s.code().unwrap_or(-1)
-                    );
+                    ));
                 }
-                Err(e) => return format!("mount exec failed: {}", e),
+                Err(e) => return Err(format!("mount exec failed: {}", e)),
             }
         }
 
         if notes.is_empty() {
-            "data subvolumes already mounted".to_string()
+            Ok("data subvolumes already mounted".to_string())
         } else {
-            notes.join("; ")
+            Ok(notes.join("; "))
         }
     }
+
+    // BTRFS_IOC_SUBVOL_CREATE = _IOW(0x94, 14, struct btrfs_ioctl_vol_args)
+    // struct btrfs_ioctl_vol_args { __s64 fd; char name[4088]; }  total = 4096 bytes
+    //
+    // nix::ioctl_write_ptr! computes the request number portably (handles
+    // c_int on musl vs c_ulong on glibc).
+    #[cfg(target_os = "linux")]
+    nix::ioctl_write_ptr!(btrfs_ioc_subvol_create, 0x94, 14, [u8; 4096]);
 
     /// Creates a Btrfs subvolume using the `BTRFS_IOC_SUBVOL_CREATE` ioctl.
     ///
     /// This avoids needing the full `btrfs-progs` CLI in the EROFS rootfs.
     #[cfg(target_os = "linux")]
     fn btrfs_create_subvolume(path: &str) -> Result<(), String> {
-        use std::ffi::CString;
         use std::os::unix::io::AsRawFd;
-
-        // BTRFS_IOC_SUBVOL_CREATE = _IOW(0x94, 14, struct btrfs_ioctl_vol_args)
-        // struct btrfs_ioctl_vol_args { __s64 fd; char name[4088]; }  // total 4096 bytes
-        const BTRFS_IOC_SUBVOL_CREATE: libc::c_ulong = 0x5000940E;
 
         let parent = Path::new(path)
             .parent()
@@ -484,20 +479,10 @@ mod linux {
         }
         args[8..8 + name_bytes.len()].copy_from_slice(name_bytes);
 
-        // SAFETY: ioctl with a valid fd and correctly sized buffer.
-        let ret = unsafe {
-            libc::ioctl(
-                parent_dir.as_raw_fd(),
-                BTRFS_IOC_SUBVOL_CREATE,
-                args.as_ptr(),
-            )
-        };
-        if ret < 0 {
-            return Err(format!(
-                "BTRFS_IOC_SUBVOL_CREATE: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+        // SAFETY: valid fd from File::open, args buffer is 4096 bytes matching
+        // the kernel struct btrfs_ioctl_vol_args layout.
+        unsafe { btrfs_ioc_subvol_create(parent_dir.as_raw_fd(), &args) }
+            .map_err(|e| format!("BTRFS_IOC_SUBVOL_CREATE: {}", e))?;
 
         tracing::info!("created Btrfs subvolume {}", path);
         Ok(())
@@ -1184,7 +1169,10 @@ mod linux {
             tracing::info!(prerequisites = %prereq_notes.join("; "), "runtime prerequisites");
         }
         notes.extend(prereq_notes);
-        notes.push(ensure_data_mount());
+        match ensure_data_mount() {
+            Ok(note) => notes.push(note),
+            Err(e) => return format!("data volume setup failed: {}", e),
+        }
 
         for dir in [
             "/run/containerd",

@@ -100,7 +100,7 @@ mod platform {
             let name = self
                 .children
                 .iter()
-                .find(|(_, &p)| p == pid)
+                .find(|(_, p)| **p == pid)
                 .map(|(n, _)| n.clone());
             if let Some(ref n) = name {
                 self.children.remove(n);

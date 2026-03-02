@@ -181,7 +181,7 @@ mod platform {
     }
 
     fn write_etc_hosts() {
-        let hostname = nix::unistd::gethostname()
+        let hostname = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
             .unwrap_or_else(|| "arcbox".to_string());
