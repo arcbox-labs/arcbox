@@ -1,0 +1,44 @@
+name: Check nested KVM support
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Enable KVM access
+        run: sudo chmod 666 /dev/kvm
+
+      - name: CPU virtualization flags
+        run: grep -m1 -oE 'vmx|svm' /proc/cpuinfo || echo "no vmx/svm"
+
+      - name: Nested KVM kernel parameter
+        run: |
+          cat /sys/module/kvm_intel/parameters/nested 2>/dev/null \
+            || cat /sys/module/kvm_amd/parameters/nested 2>/dev/null \
+            || echo "nested param not found"
+
+      - name: Hypervisor type
+        run: systemd-detect-virt || true
+
+      - name: Try booting a VM with KVM and check /dev/kvm inside it
+        run: |
+          sudo apt-get install -y qemu-system-x86 2>/dev/null
+          # Download tiny alpine kernel + initrd for a quick boot
+          curl -sL https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/netboot/vmlinuz-lts \
+            -o /tmp/vmlinuz
+          curl -sL https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/netboot/initramfs-lts \
+            -o /tmp/initramfs
+
+          # Boot with KVM, run a one-shot init that prints whether /dev/kvm exists
+          timeout 30 qemu-system-x86_64 \
+            -enable-kvm \
+            -m 256 \
+            -kernel /tmp/vmlinuz \
+            -initrd /tmp/initramfs \
+            -append "console=ttyS0 quiet -- sh -c 'ls /dev/kvm && echo NESTED_KVM=YES || echo NESTED_KVM=NO; poweroff -f'" \
+            -nographic \
+            -no-reboot 2>&1 | tee /tmp/vm-output.txt || true
+
+          grep -E 'NESTED_KVM|/dev/kvm' /tmp/vm-output.txt || echo "could not determine nested KVM status"
