@@ -68,8 +68,8 @@ message CreateMachineRequest {
     string ssh_public_key = 9;
     // Kernel image path.
     string kernel = 10;
-    // Initrd/initramfs path.
-    string initrd = 11;
+    // Field 11 was initrd (removed in schema v6).
+    reserved 11;
     // Kernel command line.
     string cmdline = 12;
 }

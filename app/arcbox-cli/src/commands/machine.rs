@@ -302,7 +302,6 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
             mounts,
             ssh_public_key: String::new(),
             kernel: args.kernel.clone().unwrap_or_default(),
-            initrd: String::new(),
             cmdline: args.cmdline.clone().unwrap_or_default(),
         }))
         .await

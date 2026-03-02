@@ -841,7 +841,6 @@ impl VmLifecycleManager {
             memory_mb: self.config.default_vm.memory_mb,
             disk_gb: self.config.default_vm.disk_gb,
             kernel: Some(assets.kernel.to_string_lossy().to_string()),
-            initrd: None,
             cmdline: Some(cmdline),
             block_devices,
             distro: None,

@@ -121,9 +121,6 @@ pub struct CreateMachineRequest {
     /// Kernel image path.
     #[prost(string, tag = "10")]
     pub kernel: ::prost::alloc::string::String,
-    /// Initrd/initramfs path.
-    #[prost(string, tag = "11")]
-    pub initrd: ::prost::alloc::string::String,
     /// Kernel command line.
     #[prost(string, tag = "12")]
     pub cmdline: ::prost::alloc::string::String,

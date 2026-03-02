@@ -23,9 +23,6 @@ pub struct PersistedMachine {
     /// Kernel path.
     #[serde(default)]
     pub kernel: Option<String>,
-    /// Initrd path.
-    #[serde(default)]
-    pub initrd: Option<String>,
     /// Kernel command line.
     #[serde(default)]
     pub cmdline: Option<String>,
@@ -99,7 +96,6 @@ impl From<&MachineInfo> for PersistedMachine {
             memory_mb: info.memory_mb,
             disk_gb: info.disk_gb,
             kernel: info.kernel.clone(),
-            initrd: info.initrd.clone(),
             cmdline: info.cmdline.clone(),
             block_devices: info.block_devices.clone(),
             distro: info.distro.clone(),
@@ -268,7 +264,6 @@ mod tests {
             memory_mb: 4096,
             disk_gb: 50,
             kernel: Some("/path/to/kernel".to_string()),
-            initrd: Some("/path/to/initrd".to_string()),
             cmdline: Some("console=ttyS0".to_string()),
             block_devices: Vec::new(),
             distro: None,
@@ -287,7 +282,6 @@ mod tests {
         assert_eq!(loaded.cpus, 4);
         assert_eq!(loaded.memory_mb, 4096);
         assert_eq!(loaded.kernel, Some("/path/to/kernel".to_string()));
-        assert_eq!(loaded.initrd, Some("/path/to/initrd".to_string()));
         assert_eq!(loaded.cmdline, Some("console=ttyS0".to_string()));
         // Check created_at is preserved (within 1 second tolerance)
         assert!((loaded.created_at - created_at).num_seconds().abs() < 1);
@@ -308,7 +302,6 @@ mod tests {
                 memory_mb: 2048,
                 disk_gb: 20,
                 kernel: None,
-                initrd: None,
                 cmdline: None,
                 block_devices: Vec::new(),
                 distro: None,
@@ -342,7 +335,6 @@ mod tests {
             memory_mb: 2048,
             disk_gb: 20,
             kernel: None,
-            initrd: None,
             cmdline: None,
             block_devices: Vec::new(),
             distro: None,
