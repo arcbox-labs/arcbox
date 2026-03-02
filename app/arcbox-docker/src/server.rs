@@ -1,6 +1,6 @@
 //! Docker API server.
 
-use crate::api::create_router;
+use crate::api::{create_router, strip_api_version_prefix};
 use crate::error::{DockerError, Result};
 use arcbox_core::Runtime;
 use hyper::body::Incoming;
@@ -9,7 +9,7 @@ use hyper_util::rt::TokioIo;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixListener;
-use tower::Service;
+use tower::{Layer, Service};
 use tower_http::trace::TraceLayer;
 
 /// Docker API server configuration.
@@ -82,7 +82,13 @@ impl DockerApiServer {
 
 impl DockerApiServer {
     async fn run_native_http(&self, listener: UnixListener) -> Result<()> {
-        let app = create_router(Arc::clone(&self.runtime)).layer(TraceLayer::new_for_http());
+        // Wrap the Axum Router with a MapRequestLayer that strips API version
+        // prefixes *before* route matching. `Router::layer` runs after routing
+        // and cannot be used for URI rewriting.
+        let version_layer = tower::util::MapRequestLayer::new(strip_api_version_prefix);
+        let app = version_layer.layer(
+            create_router(Arc::clone(&self.runtime)).layer(TraceLayer::new_for_http()),
+        );
 
         loop {
             let (stream, _) = listener
