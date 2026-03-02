@@ -268,23 +268,16 @@ impl NetworkDatapath {
 
                 // Inbound commands from InboundListenerManager.
                 Some(cmd) = cmd_rx.recv() => {
-                    use crate::darwin::inbound_relay::InboundCommand;
-                    match cmd {
-                        InboundCommand::TcpAccepted { container_port, stream, .. } => {
-                            tcp_bridge.initiate_inbound(
-                                container_port,
-                                stream,
-                                guest_ip,
-                                gateway_ip,
-                                &mut iface,
-                                &mut sockets,
-                            );
-                        }
-                        cmd @ InboundCommand::UdpReceived { .. } => {
-                            let mac = guest_mac.unwrap_or([0xFF; 6]);
-                            socket_proxy.handle_inbound_command(cmd, mac);
-                        }
-                    }
+                    process_inbound_cmd(
+                        cmd,
+                        &mut tcp_bridge,
+                        &mut socket_proxy,
+                        &mut iface,
+                        &mut sockets,
+                        guest_ip,
+                        gateway_ip,
+                        guest_mac,
+                    );
                 }
 
                 // Wakeup when no other events: drives retransmissions during
@@ -308,6 +301,19 @@ impl NetworkDatapath {
             for rst in rst_frames {
                 enqueue_or_write(&guest_async, rst, &mut write_queue);
             }
+
+            // 1.5. Drain inbound listener commands so `cmd_rx.recv()` cannot be
+            //      starved by the biased readable branch under sustained traffic.
+            drain_cmd_rx(
+                &mut cmd_rx,
+                &mut tcp_bridge,
+                &mut socket_proxy,
+                &mut iface,
+                &mut sockets,
+                guest_ip,
+                gateway_ip,
+                guest_mac,
+            );
 
             // 2. smoltcp poll: processes injected SYN frames (from gate) +
             //    retransmissions + ACKs.
@@ -384,6 +390,42 @@ fn handle_intercepted_frame(
         InterceptedKind::Udp | InterceptedKind::Icmp => {
             // Route through socket proxy (UDP/ICMP).
             socket_proxy.handle_outbound(frame, guest_mac);
+        }
+    }
+}
+
+/// Processes one inbound command from `InboundListenerManager`.
+///
+/// TCP accepted streams are bridged via smoltcp active-connect; UDP datagrams
+/// are routed through the socket proxy inbound path.
+#[allow(clippy::too_many_arguments)]
+fn process_inbound_cmd(
+    cmd: InboundCommand,
+    tcp_bridge: &mut TcpBridge,
+    socket_proxy: &mut SocketProxy,
+    iface: &mut Interface,
+    sockets: &mut SocketSet<'_>,
+    guest_ip: Ipv4Addr,
+    gateway_ip: Ipv4Addr,
+    guest_mac: Option<[u8; 6]>,
+) {
+    match cmd {
+        InboundCommand::TcpAccepted {
+            host_port, stream, ..
+        } => {
+            tracing::debug!(
+                "Inbound TCP accepted: guest_port={} peer={:?}",
+                host_port,
+                stream.peer_addr().ok(),
+            );
+            // Connect to the host_port on the guest, not the container_port.
+            // Docker inside the guest listens on `host_port` (e.g. 8080) and
+            // forwards to the container's internal port (e.g. 80).
+            tcp_bridge.initiate_inbound(host_port, stream, guest_ip, gateway_ip, iface, sockets);
+        }
+        cmd @ InboundCommand::UdpReceived { .. } => {
+            let mac = guest_mac.unwrap_or([0xFF; 6]);
+            socket_proxy.handle_inbound_command(cmd, mac);
         }
     }
 }
@@ -595,6 +637,12 @@ fn build_dns_servfail_response(query: &[u8]) -> Option<Vec<u8>> {
 /// drain from starving other `select!` branches under high traffic.
 const DRAIN_REPLY_BATCH: usize = 64;
 
+/// Maximum number of inbound listener commands to drain per common-tail pass.
+///
+/// Batching prevents command draining from monopolizing the event loop while
+/// still guaranteeing forward progress when `cmd_rx.recv()` is starved.
+const DRAIN_CMD_BATCH: usize = 64;
+
 /// Non-blocking drain of the reply channel. Delivers pending proxy
 /// responses (DNS, UDP, ICMP) to the guest without blocking the event loop.
 ///
@@ -611,6 +659,38 @@ fn drain_reply_rx(
         }
         match reply_rx.try_recv() {
             Ok(reply_frame) => enqueue_or_write(guest_async, reply_frame, write_queue),
+            Err(_) => break,
+        }
+    }
+}
+
+/// Non-blocking drain of inbound listener commands.
+///
+/// Prevents starvation of `cmd_rx.recv()` in the biased `select!` loop when
+/// the guest FD readable branch is continuously ready.
+#[allow(clippy::too_many_arguments)]
+fn drain_cmd_rx(
+    cmd_rx: &mut mpsc::Receiver<InboundCommand>,
+    tcp_bridge: &mut TcpBridge,
+    socket_proxy: &mut SocketProxy,
+    iface: &mut Interface,
+    sockets: &mut SocketSet<'_>,
+    guest_ip: Ipv4Addr,
+    gateway_ip: Ipv4Addr,
+    guest_mac: Option<[u8; 6]>,
+) {
+    for _ in 0..DRAIN_CMD_BATCH {
+        match cmd_rx.try_recv() {
+            Ok(cmd) => process_inbound_cmd(
+                cmd,
+                tcp_bridge,
+                socket_proxy,
+                iface,
+                sockets,
+                guest_ip,
+                gateway_ip,
+                guest_mac,
+            ),
             Err(_) => break,
         }
     }
