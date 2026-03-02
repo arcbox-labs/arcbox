@@ -128,8 +128,17 @@ mod platform {
     /// Must be called from a tokio runtime. Runs until the process exits.
     pub fn spawn_reaper(supervisor: Arc<Mutex<Supervisor>>) {
         tokio::spawn(async move {
-            let mut sigchld = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
-                .expect("failed to register SIGCHLD handler");
+            let mut sigchld = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::child(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    // PID 1 must not panic. Degrade gracefully: zombies may
+                    // accumulate but the agent keeps running.
+                    tracing::error!(error = %e, "failed to register SIGCHLD handler, zombie reaping disabled");
+                    return;
+                }
+            };
 
             loop {
                 sigchld.recv().await;
