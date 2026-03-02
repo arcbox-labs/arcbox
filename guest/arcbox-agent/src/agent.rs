@@ -213,14 +213,11 @@ mod linux {
         read_message, write_response,
     };
     use arcbox_constants::cmdline::{
-        BOOT_ASSET_VERSION_KEY, DOCKER_DATA_DEVICE_KEY as DOCKER_DATA_DEVICE_CMDLINE_KEY,
+        DOCKER_DATA_DEVICE_KEY as DOCKER_DATA_DEVICE_CMDLINE_KEY,
         GUEST_DOCKER_VSOCK_PORT_KEY,
     };
     use arcbox_constants::devices::DOCKER_DATA_BLOCK_DEVICE as DOCKER_DATA_DEVICE_DEFAULT;
-    use arcbox_constants::env::{
-        BOOT_ASSET_VERSION as BOOT_ASSET_VERSION_ENV,
-        GUEST_DOCKER_VSOCK_PORT as GUEST_DOCKER_VSOCK_PORT_ENV,
-    };
+    use arcbox_constants::env::GUEST_DOCKER_VSOCK_PORT as GUEST_DOCKER_VSOCK_PORT_ENV;
     use arcbox_constants::paths::{
         ARCBOX_LOG_DIR, ARCBOX_RUNTIME_BIN_DIR, CONTAINERD_ROOT_DIR, CONTAINERD_SOCKET,
         DOCKER_API_UNIX_SOCKET, DOCKER_DATA_MOUNT_POINT,
@@ -266,13 +263,6 @@ mod linux {
         }
 
         DOCKER_API_VSOCK_PORT
-    }
-
-    fn boot_asset_version() -> Option<String> {
-        std::env::var(BOOT_ASSET_VERSION_ENV)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .or_else(|| cmdline_value(BOOT_ASSET_VERSION_KEY))
     }
 
     fn docker_data_device() -> String {
@@ -512,13 +502,8 @@ mod linux {
 
         /// Runs the agent, listening on vsock.
         pub async fn run(&self) -> Result<()> {
-            // Mount standard VirtioFS shares if not already mounted
+            // Mount standard VirtioFS shares if not already mounted.
             crate::mount::mount_standard_shares();
-
-            // Best-effort: ensure guest vsock modules are available before we
-            // attempt to bind listeners. This is especially important when the
-            // agent is started by distro init systems after switch_root.
-            ensure_vsock_modules_loaded().await;
 
             // Start guest-side Docker API proxy (vsock -> unix socket).
             tokio::spawn(async {
@@ -546,30 +531,6 @@ mod linux {
                     Err(e) => {
                         tracing::error!("Accept error: {}", e);
                     }
-                }
-            }
-        }
-    }
-
-    async fn ensure_vsock_modules_loaded() {
-        for module in [
-            "vsock",
-            "vmw_vsock_virtio_transport_common",
-            "vmw_vsock_virtio_transport",
-        ] {
-            match Command::new("modprobe").arg(module).status().await {
-                Ok(status) if status.success() => {
-                    tracing::debug!(module, "loaded kernel module");
-                }
-                Ok(status) => {
-                    tracing::debug!(
-                        module,
-                        exit_code = status.code().unwrap_or(-1),
-                        "modprobe exited non-zero"
-                    );
-                }
-                Err(e) => {
-                    tracing::debug!(module, error = %e, "modprobe unavailable/failed");
                 }
             }
         }
@@ -704,10 +665,6 @@ mod linux {
             RpcRequest::RuntimeStatus(req) => {
                 RequestResult::Single(handle_runtime_status(req).await)
             }
-            _ => RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
-                404,
-                "legacy container runtime RPC removed",
-            ))),
         }
     }
 
@@ -751,7 +708,7 @@ mod linux {
     /// Performs the actual runtime start sequence (called only by the driver).
     async fn do_ensure_runtime_start() -> RuntimeEnsureResponse {
         let mut notes = Vec::new();
-        let note = try_start_runtime_services().await;
+        let note = try_start_bundled_runtime().await;
         if !note.is_empty() {
             notes.push(note);
         }
@@ -891,7 +848,7 @@ mod linux {
         };
         services.push(youki_status);
 
-        // Build the summary detail string for backward compatibility.
+        // Build the summary detail string.
         let detail = if docker_ready {
             "docker socket ready".to_string()
         } else if Path::new(DOCKER_API_UNIX_SOCKET).exists() {
@@ -899,17 +856,12 @@ mod linux {
                 "docker socket exists but not reachable: {}",
                 DOCKER_API_UNIX_SOCKET
             )
-        } else if !Path::new("/run/systemd/system").exists()
-            && !Path::new("/sbin/rc-service").exists()
-            && !Path::new("/usr/sbin/rc-service").exists()
-        {
+        } else {
             format!(
                 "docker socket missing: {}; {}",
                 DOCKER_API_UNIX_SOCKET,
                 runtime_missing_detail()
             )
-        } else {
-            format!("docker socket missing: {}", DOCKER_API_UNIX_SOCKET)
         };
 
         RuntimeStatusResponse {
@@ -945,41 +897,19 @@ mod linux {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn runtime_bin_dir_candidates() -> Vec<PathBuf> {
-        let mut candidates = Vec::new();
-
-        if let Ok(path) = std::env::var("ARCBOX_RUNTIME_BIN_DIR") {
-            if !path.trim().is_empty() {
-                candidates.push(PathBuf::from(path));
-            }
-        }
-
-        if let Some(version) = boot_asset_version() {
-            candidates.push(PathBuf::from(format!(
-                "/arcbox/boot/{}/runtime/bin",
-                version
-            )));
-        }
-
-        candidates.push(PathBuf::from(ARCBOX_RUNTIME_BIN_DIR));
-        candidates.push(PathBuf::from("/arcbox/boot/current/runtime/bin"));
-        candidates
-    }
-
     fn detect_runtime_bin_dir() -> Option<PathBuf> {
-        runtime_bin_dir_candidates()
-            .into_iter()
-            .find(|dir| dir.join("containerd").exists() && dir.join("dockerd").exists())
+        let dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
+        if dir.join("containerd").exists() && dir.join("dockerd").exists() {
+            Some(dir)
+        } else {
+            None
+        }
     }
 
     fn runtime_missing_detail() -> String {
-        let candidates: Vec<String> = runtime_bin_dir_candidates()
-            .into_iter()
-            .map(|p| p.display().to_string())
-            .collect();
         format!(
-            "bundled runtime binaries not found; expected containerd+dockerd under one of: {}",
-            candidates.join(", ")
+            "bundled runtime binaries not found; expected containerd+dockerd under {}",
+            ARCBOX_RUNTIME_BIN_DIR
         )
     }
 
@@ -988,8 +918,7 @@ mod linux {
     fn ensure_runtime_prerequisites() -> Vec<String> {
         let mut notes = Vec::new();
 
-        // Alpine initramfs does not set PATH, so bare command names may not be
-        // found. Use /bin/busybox <applet> which is always present in Alpine.
+        // Use /bin/busybox <applet> directly — always present on EROFS rootfs.
         let busybox = "/bin/busybox";
 
         // Mount cgroup2 unified hierarchy (required by dockerd).
@@ -1186,8 +1115,8 @@ mod linux {
             }
         }
 
-        // Alpine initramfs does not export PATH. Always include standard search
-        // paths so containerd/dockerd can invoke modprobe, mount, etc.
+        // Include standard search paths so containerd/dockerd can invoke
+        // modprobe, mount, etc.
         let path_env = {
             let standard = "/usr/sbin:/usr/bin:/sbin:/bin";
             match std::env::var("PATH") {
@@ -1299,77 +1228,6 @@ mod linux {
                     notes.push(format!("spawned bundled dockerd (pid={})", pid));
                 }
                 Err(e) => return format!("failed to spawn bundled dockerd: {}", e),
-            }
-        }
-
-        notes.join("; ")
-    }
-
-    async fn try_start_runtime_services() -> String {
-        let mut notes = Vec::new();
-        let mut all_service_starts_succeeded = false;
-
-        if Path::new("/run/systemd/system").exists() {
-            all_service_starts_succeeded = true;
-            for service in ["containerd.service", "docker.service"] {
-                match Command::new("systemctl")
-                    .args(["start", service])
-                    .status()
-                    .await
-                {
-                    Ok(status) if status.success() => {
-                        notes.push(format!("started {}", service));
-                    }
-                    Ok(status) => {
-                        all_service_starts_succeeded = false;
-                        notes.push(format!(
-                            "systemctl start {} failed(exit={})",
-                            service,
-                            status.code().unwrap_or(-1)
-                        ));
-                    }
-                    Err(e) => {
-                        all_service_starts_succeeded = false;
-                        notes.push(format!("systemctl start {} error({})", service, e));
-                    }
-                }
-            }
-        } else if Path::new("/sbin/rc-service").exists()
-            || Path::new("/usr/sbin/rc-service").exists()
-            || Path::new("/bin/rc-service").exists()
-        {
-            all_service_starts_succeeded = true;
-            for service in ["containerd", "docker"] {
-                let status = Command::new("rc-service")
-                    .args([service, "start"])
-                    .status()
-                    .await;
-                match status {
-                    Ok(status) if status.success() => {
-                        notes.push(format!("started {}", service));
-                    }
-                    Ok(status) => {
-                        all_service_starts_succeeded = false;
-                        notes.push(format!(
-                            "rc-service {} start failed(exit={})",
-                            service,
-                            status.code().unwrap_or(-1)
-                        ));
-                    }
-                    Err(e) => {
-                        all_service_starts_succeeded = false;
-                        notes.push(format!("rc-service {} start error({})", service, e));
-                    }
-                }
-            }
-        } else {
-            notes.push("no init service manager found, using bundled runtime".to_string());
-        }
-
-        if !all_service_starts_succeeded {
-            let note = try_start_bundled_runtime().await;
-            if !note.is_empty() {
-                notes.push(note);
             }
         }
 
