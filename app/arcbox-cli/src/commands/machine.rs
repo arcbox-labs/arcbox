@@ -181,9 +181,6 @@ pub struct CreateArgs {
     /// Custom kernel path (for advanced users / testing)
     #[arg(long)]
     pub kernel: Option<String>,
-    /// Custom initrd/initramfs path (for advanced users / testing)
-    #[arg(long)]
-    pub initrd: Option<String>,
     /// Custom kernel command line (for advanced users / testing)
     #[arg(long)]
     pub cmdline: Option<String>,
@@ -305,7 +302,7 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
             mounts,
             ssh_public_key: String::new(),
             kernel: args.kernel.clone().unwrap_or_default(),
-            initrd: args.initrd.clone().unwrap_or_default(),
+            initrd: String::new(),
             cmdline: args.cmdline.clone().unwrap_or_default(),
         }))
         .await

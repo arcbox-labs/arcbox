@@ -58,7 +58,7 @@ pub use agent_client::AgentClient;
 pub use boot_assets::{
     BootAssetConfig, BootAssetManifest, BootAssetProvider, BootAssets, DownloadProgress,
 };
-pub use config::{Config, ContainerProvisionMode, ContainerRuntimeConfig};
+pub use config::{Config, ContainerRuntimeConfig};
 pub use error::{CoreError, Result};
 pub use machine::MachineManager;
 pub use runtime::Runtime;

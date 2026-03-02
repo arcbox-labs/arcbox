@@ -28,8 +28,6 @@
 //! socket_path = "~/.arcbox/docker.sock"
 //!
 //! [container]
-//! backend = "guest_docker"
-//! provision = "bundled_assets"
 //! guest_docker_vsock_port = 2375
 //!
 //! [logging]
@@ -234,22 +232,10 @@ impl Default for DockerConfig {
     }
 }
 
-/// Guest Docker runtime provisioning mode.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ContainerProvisionMode {
-    /// Runtime assets bundled with boot-assets release.
-    BundledAssets,
-    /// Runtime installed from distro packages inside guest.
-    DistroEngine,
-}
-
 /// Container runtime configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContainerRuntimeConfig {
-    /// Guest runtime provisioning mode.
-    pub provision: ContainerProvisionMode,
     /// Guest dockerd API vsock port.
     pub guest_docker_vsock_port: u32,
     /// Backend startup timeout in milliseconds.
@@ -259,7 +245,6 @@ pub struct ContainerRuntimeConfig {
 impl Default for ContainerRuntimeConfig {
     fn default() -> Self {
         Self {
-            provision: ContainerProvisionMode::BundledAssets,
             guest_docker_vsock_port: DOCKER_API_VSOCK_PORT,
             startup_timeout_ms: 60_000,
         }
@@ -342,10 +327,6 @@ mod tests {
         assert_eq!(config.vm.memory_mb, 4096);
         assert_eq!(config.machine.disk_gb, 50);
         assert!(config.docker.enabled);
-        assert_eq!(
-            config.container.provision,
-            ContainerProvisionMode::BundledAssets
-        );
         assert_eq!(
             config.container.guest_docker_vsock_port,
             DOCKER_API_VSOCK_PORT

@@ -52,10 +52,6 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub docker_integration: bool,
 
-    /// Guest runtime provisioning mode.
-    #[arg(long, value_enum)]
-    pub container_provision: Option<ContainerProvisionArg>,
-
     /// Guest dockerd API vsock port.
     #[arg(long)]
     pub guest_docker_vsock_port: Option<u32>,
@@ -67,22 +63,6 @@ pub enum DaemonAction {
     Start,
     Stop,
     Status,
-}
-
-/// CLI argument values for provisioning mode.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum ContainerProvisionArg {
-    BundledAssets,
-    DistroEngine,
-}
-
-impl ContainerProvisionArg {
-    fn as_arg_value(self) -> &'static str {
-        match self {
-            Self::BundledAssets => "bundled-assets",
-            Self::DistroEngine => "distro-engine",
-        }
-    }
 }
 
 /// Executes the daemon command.
@@ -343,10 +323,6 @@ fn build_daemon_args(args: &DaemonArgs) -> Vec<OsString> {
     }
     if args.docker_integration {
         daemon_args.push(OsString::from("--docker-integration"));
-    }
-    if let Some(mode) = args.container_provision {
-        daemon_args.push(OsString::from("--container-provision"));
-        daemon_args.push(OsString::from(mode.as_arg_value()));
     }
     if let Some(port) = args.guest_docker_vsock_port {
         daemon_args.push(OsString::from("--guest-docker-vsock-port"));

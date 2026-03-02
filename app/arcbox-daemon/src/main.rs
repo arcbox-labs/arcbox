@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use arcbox_api::{MachineServiceImpl, machine_service_server::MachineServiceServer};
-use arcbox_core::{Config, ContainerProvisionMode, Runtime, VmLifecycleConfig};
+use arcbox_core::{Config, Runtime, VmLifecycleConfig};
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use macos_resolver::{FileResolver, to_env_prefix};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,28 +40,9 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub docker_integration: bool,
 
-    /// Guest runtime provisioning mode.
-    #[arg(long, value_enum)]
-    pub container_provision: Option<ContainerProvisionArg>,
-
     /// Guest dockerd API vsock port.
     #[arg(long)]
     pub guest_docker_vsock_port: Option<u32>,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum ContainerProvisionArg {
-    BundledAssets,
-    DistroEngine,
-}
-
-impl From<ContainerProvisionArg> for ContainerProvisionMode {
-    fn from(value: ContainerProvisionArg) -> Self {
-        match value {
-            ContainerProvisionArg::BundledAssets => Self::BundledAssets,
-            ContainerProvisionArg::DistroEngine => Self::DistroEngine,
-        }
-    }
 }
 
 #[tokio::main]
@@ -95,13 +76,9 @@ async fn run(args: DaemonArgs) -> Result<()> {
         data_dir: data_dir.clone(),
         ..Default::default()
     };
-    if let Some(mode) = args.container_provision {
-        config.container.provision = mode.into();
-    }
     if let Some(port) = args.guest_docker_vsock_port {
         config.container.guest_docker_vsock_port = port;
     }
-    let selected_provision = config.container.provision;
     let selected_guest_docker_port = config.container.guest_docker_vsock_port;
 
     let mut vm_lifecycle_config = VmLifecycleConfig::default();
@@ -125,7 +102,6 @@ async fn run(args: DaemonArgs) -> Result<()> {
 
     info!(
         data_dir = %data_dir.display(),
-        provision = ?selected_provision,
         guest_docker_vsock_port = selected_guest_docker_port,
         "Runtime initialized"
     );
