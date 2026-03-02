@@ -32,9 +32,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 dirs = { workspace = true }
 crossterm = { workspace = true }
-macos-resolver = { workspace = true }
 libc.workspace = true
 humantime = "2.3.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+macos-resolver = { workspace = true }
 
 [features]
 default = []

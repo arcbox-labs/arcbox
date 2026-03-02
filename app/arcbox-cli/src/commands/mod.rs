@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 pub mod boot;
 pub mod daemon;
+#[cfg(target_os = "macos")]
 pub mod dns;
 pub mod docker;
 pub mod machine;
@@ -78,6 +79,7 @@ pub enum Commands {
     Boot(boot::BootCommands),
 
     /// Manage DNS resolver for *.arcbox.local
+    #[cfg(target_os = "macos")]
     #[command(subcommand)]
     Dns(dns::DnsCommands),
 

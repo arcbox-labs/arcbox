@@ -6,6 +6,7 @@ use arcbox_api::{
 use arcbox_core::{Config, ContainerProvisionMode, Runtime, VmLifecycleConfig};
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
 use clap::{Parser, ValueEnum};
+#[cfg(target_os = "macos")]
 use macos_resolver::{FileResolver, to_env_prefix};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -174,6 +175,7 @@ async fn run(args: DaemonArgs) -> Result<()> {
         }
     }
 
+    #[cfg(target_os = "macos")]
     check_resolver_installed();
 
     println!("ArcBox daemon started");
@@ -290,11 +292,13 @@ async fn shutdown_signal() {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn dns_domain() -> String {
     let key = format!("{}_DNS_DOMAIN", to_env_prefix(DNS_PREFIX));
     std::env::var(key).unwrap_or_else(|_| DEFAULT_DNS_DOMAIN.to_string())
 }
 
+#[cfg(target_os = "macos")]
 fn check_resolver_installed() {
     let resolver = FileResolver::new(DNS_PREFIX);
     let domain = dns_domain();
