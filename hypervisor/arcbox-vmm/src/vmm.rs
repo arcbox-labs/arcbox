@@ -568,7 +568,12 @@ impl Vmm {
             cancel,
         );
 
-        tokio::spawn(async move {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+            VmmError::Device(format!(
+                "tokio runtime not available for network datapath: {e}"
+            ))
+        })?;
+        runtime.spawn(async move {
             if let Err(e) = datapath.run().await {
                 tracing::error!("Network datapath exited with error: {}", e);
             }
