@@ -374,9 +374,7 @@ impl TcpBridge {
                         // Listen failed — send RST instead of injecting SYN.
                         if let Some(rst) = build_rst_from_syn(&pending.frame, gateway_mac) {
                             rst_frames.push(rst);
-                            tracing::debug!(
-                                "TCP SYN gate: listen failed, sending RST for {key:?}"
-                            );
+                            tracing::debug!("TCP SYN gate: listen failed, sending RST for {key:?}");
                         }
                         continue;
                     }

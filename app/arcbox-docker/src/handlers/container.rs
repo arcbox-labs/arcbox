@@ -135,7 +135,23 @@ async fn setup_port_forwarding(state: &AppState, container_id: &str) {
 
     let bindings = parse_port_bindings(&body_bytes);
     if bindings.is_empty() {
+        tracing::debug!("No port bindings found for container {}", container_id,);
         return;
+    }
+
+    tracing::info!(
+        "Port forwarding: {} bindings for container {}",
+        bindings.len(),
+        container_id,
+    );
+    for b in &bindings {
+        tracing::info!(
+            "  bind {}:{} → container:{}/{}",
+            b.host_ip,
+            b.host_port,
+            b.container_port,
+            b.protocol,
+        );
     }
 
     let rules: Vec<_> = bindings

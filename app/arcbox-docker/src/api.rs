@@ -52,10 +52,9 @@ pub fn strip_api_version_prefix<B>(mut req: axum::http::Request<B>) -> axum::htt
     if let Some(stripped) = strip_version_prefix(&path) {
         let query = req.uri().query().map(str::to_owned);
         let original_uri = req.uri().clone();
-        let new_pq = query.as_ref().map_or_else(
-            || stripped.to_string(),
-            |q| format!("{stripped}?{q}"),
-        );
+        let new_pq = query
+            .as_ref()
+            .map_or_else(|| stripped.to_string(), |q| format!("{stripped}?{q}"));
 
         // Preserve the original versioned URI for proxy forwarding.
         req.extensions_mut().insert(OriginalUri(original_uri));
@@ -101,10 +100,16 @@ fn api_routes() -> Router<AppState> {
         .route("/containers/{id}/json", get(handlers::inspect_container))
         .route("/containers/{id}/start", post(handlers::start_container))
         .route("/containers/{id}/stop", post(handlers::stop_container))
-        .route("/containers/{id}/restart", post(handlers::restart_container))
+        .route(
+            "/containers/{id}/restart",
+            post(handlers::restart_container),
+        )
         .route("/containers/{id}/kill", post(handlers::kill_container))
         .route("/containers/{id}/pause", post(handlers::pause_container))
-        .route("/containers/{id}/unpause", post(handlers::unpause_container))
+        .route(
+            "/containers/{id}/unpause",
+            post(handlers::unpause_container),
+        )
         .route("/containers/{id}/rename", post(handlers::rename_container))
         .route("/containers/{id}/wait", post(handlers::wait_container))
         .route("/containers/{id}/logs", get(handlers::container_logs))
