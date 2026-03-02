@@ -64,6 +64,8 @@ mod platform {
     }
 
     fn mount_tmpfs(target: &str) {
+        // Ensure mount point exists — EROFS may not have /etc or /var.
+        mkdir_p(target);
         if let Err(e) = mount(
             Some("tmpfs"),
             target,
