@@ -16,6 +16,7 @@ use anyhow::Result;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod agent;
+mod init;
 mod machine_init;
 
 mod rpc;
