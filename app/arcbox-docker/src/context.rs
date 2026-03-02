@@ -473,7 +473,7 @@ mod tests {
         let socket_path = temp_dir.path().join("docker.sock");
         let docker_config_dir = temp_dir.path().join(".docker");
 
-        let manager = DockerContextManager::with_config_dir(socket_path, docker_config_dir.clone());
+        let manager = DockerContextManager::with_config_dir(socket_path, docker_config_dir);
 
         // Initially no context.
         assert!(!manager.context_exists());
@@ -500,14 +500,16 @@ mod tests {
         let socket_path = temp_dir.path().join("docker.sock");
         let docker_config_dir = temp_dir.path().join(".docker");
 
-        let manager = DockerContextManager::with_config_dir(socket_path, docker_config_dir.clone());
+        let manager = DockerContextManager::with_config_dir(socket_path, docker_config_dir);
 
         // Create context first.
         manager.create_context().unwrap();
 
         // Set up an existing default context.
-        let mut config = DockerConfig::default();
-        config.current_context = Some("desktop-linux".to_string());
+        let config = DockerConfig {
+            current_context: Some("desktop-linux".to_string()),
+            ..DockerConfig::default()
+        };
         manager.write_docker_config(&config).unwrap();
 
         // Set arcbox as default.
@@ -533,7 +535,7 @@ mod tests {
         let socket_path = temp_dir.path().join("docker.sock");
         let docker_config_dir = temp_dir.path().join(".docker");
 
-        let manager = DockerContextManager::with_config_dir(socket_path, docker_config_dir.clone());
+        let manager = DockerContextManager::with_config_dir(socket_path, docker_config_dir);
 
         // Enable creates context and sets default.
         manager.enable().unwrap();
@@ -633,8 +635,10 @@ mod tests {
         let manager = DockerContextManager::with_config_dir(socket_path, docker_config_dir);
 
         // Set up: create context with a previous default.
-        let mut config = DockerConfig::default();
-        config.current_context = Some("orbstack".to_string());
+        let config = DockerConfig {
+            current_context: Some("orbstack".to_string()),
+            ..DockerConfig::default()
+        };
         manager.create_context().unwrap();
         manager.write_docker_config(&config).unwrap();
         manager.set_default().unwrap();
@@ -679,8 +683,10 @@ mod tests {
         let manager = DockerContextManager::with_config_dir(socket_path, docker_config_dir);
 
         // Set up initial context.
-        let mut config = DockerConfig::default();
-        config.current_context = Some("default".to_string());
+        let config = DockerConfig {
+            current_context: Some("default".to_string()),
+            ..DockerConfig::default()
+        };
         fs::create_dir_all(manager.docker_config_dir()).unwrap();
         manager.write_docker_config(&config).unwrap();
 
@@ -792,7 +798,7 @@ mod tests {
         let socket_path = temp_dir.path().join("test.sock");
         let docker_config_dir = temp_dir.path().join(".docker");
 
-        let manager = DockerContextManager::with_config_dir(socket_path.clone(), docker_config_dir);
+        let manager = DockerContextManager::with_config_dir(socket_path, docker_config_dir);
         manager.create_context().unwrap();
 
         // Read and verify the meta.json structure matches Docker's format.
@@ -837,23 +843,24 @@ mod tests {
         let socket_path = temp_dir.path().join("docker.sock");
         let docker_config_dir = temp_dir.path().join(".docker");
 
-        let manager = DockerContextManager::with_config_dir(socket_path, docker_config_dir.clone());
+        let manager =
+            DockerContextManager::with_config_dir(socket_path, docker_config_dir.clone());
         manager.create_context().unwrap();
 
         // Verify Docker-compatible directory structure.
-        let contexts_dir = docker_config_dir.join("contexts");
-        let meta_dir = contexts_dir.join("meta");
+        let contexts_base = docker_config_dir.join("contexts");
+        let meta_dir = contexts_base.join("meta");
 
-        assert!(contexts_dir.exists());
+        assert!(contexts_base.exists());
         assert!(meta_dir.exists());
 
         // Context should be in a hash-named directory.
         let hash = DockerContextManager::context_hash(ARCBOX_CONTEXT_NAME);
-        let context_dir = meta_dir.join(&hash);
-        assert!(context_dir.exists());
+        let hashed_dir = meta_dir.join(&hash);
+        assert!(hashed_dir.exists());
 
         // meta.json should exist in the context directory.
-        let meta_path = context_dir.join("meta.json");
+        let meta_path = hashed_dir.join("meta.json");
         assert!(meta_path.exists());
     }
 

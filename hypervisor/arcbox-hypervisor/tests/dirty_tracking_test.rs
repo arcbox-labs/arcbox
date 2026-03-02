@@ -303,7 +303,7 @@ fn test_dirty_tracking_performance() {
 
     // Test with different memory sizes
     let test_sizes = [
-        (1 * 1024 * 1024, "1MB"),   // 256 pages
+        (1024 * 1024, "1MB"),        // 256 pages
         (16 * 1024 * 1024, "16MB"), // 4096 pages
         (64 * 1024 * 1024, "64MB"), // 16384 pages
     ];
@@ -317,7 +317,7 @@ fn test_dirty_tracking_performance() {
 
     for (size, label) in test_sizes {
         let mut memory = DarwinMemory::new(size).expect("Failed to create memory");
-        let num_pages = size / PAGE_SIZE as u64;
+        let num_pages = size / PAGE_SIZE;
 
         // Measure enable_dirty_tracking time (computes all checksums)
         let start = Instant::now();
