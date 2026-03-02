@@ -224,14 +224,11 @@ impl NetworkDatapath {
                 // Guest → Host: read frames, classify, and dispatch.
                 readable = guest_async.readable() => {
                     let mut guard = readable?;
-                    // Clear the readiness so we don't spin if no data available.
-                    match guard.try_io(|_| Ok::<(), io::Error>(())) {
-                        Ok(_) => {}
-                        Err(_) => continue,
-                    }
-
                     // Drain all available frames from the FD, classifying each.
                     device.drain_guest_fd(&mut guest_mac);
+                    // We drained until WouldBlock; clear readiness to avoid
+                    // spinning on the biased readable arm.
+                    guard.clear_ready();
 
                     // Process intercepted frames (DHCP, DNS, UDP, ICMP).
                     let intercepted = device.take_intercepted();

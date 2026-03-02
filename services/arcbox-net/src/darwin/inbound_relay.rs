@@ -429,6 +429,7 @@ async fn udp_listener_task(
 ) {
     let host_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
     let socket = Arc::new(socket);
+    let mut reply_flows: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>> = HashMap::new();
     let mut buf = vec![0u8; 65535];
 
     loop {
@@ -438,18 +439,16 @@ async fn udp_listener_task(
             result = socket.recv_from(&mut buf) => {
                 match result {
                     Ok((n, client_addr)) => {
-                        // Create a reply channel for this client.
-                        let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(16);
-
-                        // Spawn a task that relays reply datagrams back to the
-                        // client using the same listener socket so the source
-                        // port matches what the client expects.
-                        let reply_sock = Arc::clone(&socket);
-                        tokio::spawn(async move {
-                            while let Some(data) = reply_rx.recv().await {
-                                let _ = reply_sock.send_to(&data, client_addr).await;
+                        let reply_tx = if let Some(tx) = reply_flows.get(&client_addr) {
+                            if tx.is_closed() {
+                                reply_flows.remove(&client_addr);
+                                create_udp_reply_flow(client_addr, &socket, &cancel, &mut reply_flows)
+                            } else {
+                                tx.clone()
                             }
-                        });
+                        } else {
+                            create_udp_reply_flow(client_addr, &socket, &cancel, &mut reply_flows)
+                        };
 
                         let cmd = InboundCommand::UdpReceived {
                             host_port,
@@ -469,6 +468,33 @@ async fn udp_listener_task(
             }
         }
     }
+}
+
+fn create_udp_reply_flow(
+    client_addr: SocketAddr,
+    socket: &Arc<UdpSocket>,
+    cancel: &CancellationToken,
+    reply_flows: &mut HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>,
+) -> mpsc::Sender<Vec<u8>> {
+    let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(16);
+    let reply_sock = Arc::clone(socket);
+    let flow_cancel = cancel.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = flow_cancel.cancelled() => break,
+                maybe_data = reply_rx.recv() => {
+                    let Some(data) = maybe_data else {
+                        break;
+                    };
+                    let _ = reply_sock.send_to(&data, client_addr).await;
+                }
+            }
+        }
+    });
+    reply_flows.insert(client_addr, reply_tx.clone());
+    reply_tx
 }
 
 // ---------------------------------------------------------------------------

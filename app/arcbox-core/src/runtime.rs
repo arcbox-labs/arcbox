@@ -541,17 +541,33 @@ impl Runtime {
         container_id: &str,
         bindings: &[(String, u16, u16, String)],
     ) -> Result<()> {
-        // Lazily take the manager from the VMM on first use.
+        // Keep the cached manager fresh across VM restarts.
         {
             let mut guard = self.inbound_listener.write().await;
+            if let Some(manager) = self
+                .machine_manager
+                .take_inbound_listener_manager(machine_name)
+            {
+                *guard = Some(manager);
+            }
             if guard.is_none() {
-                *guard = self
-                    .machine_manager
-                    .take_inbound_listener_manager(machine_name);
-                if guard.is_none() {
-                    return Err(CoreError::Machine(
-                        "inbound listener manager not available".to_string(),
-                    ));
+                return Err(CoreError::Machine(
+                    "inbound listener manager not available".to_string(),
+                ));
+            }
+        }
+
+        // Remove previously tracked listeners for this container before
+        // applying new bindings, so stale ports do not leak.
+        let previous_rules = {
+            let mut rules = self.inbound_rules.write().await;
+            rules.remove(container_id)
+        };
+        if let Some(previous_rules) = previous_rules {
+            let mut guard = self.inbound_listener.write().await;
+            if let Some(manager) = guard.as_mut() {
+                for (host_ip, host_port, proto) in previous_rules {
+                    manager.remove_rule(host_ip, host_port, proto);
                 }
             }
         }

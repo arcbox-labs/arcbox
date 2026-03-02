@@ -4,7 +4,7 @@
 //! a virtual machine: hypervisor, vCPUs, memory, and devices.
 
 use std::any::Any;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -200,6 +200,10 @@ pub struct Vmm {
     /// Cancellation token for the network datapath task (Darwin only).
     #[cfg(target_os = "macos")]
     net_cancel: Option<CancellationToken>,
+    /// VZ side network fd for VZFileHandleNetworkDeviceAttachment lifecycle.
+    /// Kept open while the VM is running and closed on stop.
+    #[cfg(target_os = "macos")]
+    net_vz_fd: Option<OwnedFd>,
     /// Inbound listener manager for port forwarding (Darwin only).
     #[cfg(target_os = "macos")]
     inbound_listener_manager: Option<arcbox_net::darwin::inbound_relay::InboundListenerManager>,
@@ -252,6 +256,8 @@ impl Vmm {
             managed_vm: None,
             #[cfg(target_os = "macos")]
             net_cancel: None,
+            #[cfg(target_os = "macos")]
+            net_vz_fd: None,
             #[cfg(target_os = "macos")]
             inbound_listener_manager: None,
         })
@@ -497,9 +503,9 @@ impl Vmm {
         // fds[0] = VZ framework side (read guest tx, write guest rx)
         // fds[1] = host datapath side
         //
-        let vz_fd = fds[0];
-
-        // SAFETY: fds[1] is a valid fd from socketpair.
+        // SAFETY: fds are valid file descriptors returned by socketpair.
+        let vz_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: fds are valid file descriptors returned by socketpair.
         let host_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
 
         // Set a large socket buffer for the VZ side to avoid drops.
@@ -507,14 +513,14 @@ impl Vmm {
         let buf_size: libc::c_int = 2 * 1024 * 1024;
         unsafe {
             libc::setsockopt(
-                vz_fd,
+                vz_fd.as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_SNDBUF,
                 &buf_size as *const libc::c_int as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
             libc::setsockopt(
-                vz_fd,
+                vz_fd.as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_RCVBUF,
                 &buf_size as *const libc::c_int as *const libc::c_void,
@@ -570,8 +576,11 @@ impl Vmm {
 
         tracing::info!("Network datapath task spawned");
 
-        // 5. Return the VirtioDeviceConfig with the VZ-side fd.
-        Ok(VirtioDeviceConfig::network_file_handle(vz_fd))
+        // 5. Keep ownership of the VZ-side fd for VM lifetime and pass the raw
+        // fd into the hypervisor attachment config.
+        let vz_raw_fd = vz_fd.as_raw_fd();
+        self.net_vz_fd = Some(vz_fd);
+        Ok(VirtioDeviceConfig::network_file_handle(vz_raw_fd))
     }
 
     /// Linux-specific initialization using KVM.
@@ -883,6 +892,8 @@ impl Vmm {
         if let Some(cancel) = self.net_cancel.take() {
             cancel.cancel();
         }
+        #[cfg(target_os = "macos")]
+        let _ = self.net_vz_fd.take();
 
         self.state = VmmState::Stopped;
         tracing::info!("VMM stopped");
