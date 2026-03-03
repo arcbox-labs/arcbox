@@ -7,9 +7,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 TEST_DIR="/tmp/arcbox-boot-test-$$"
-BOOT_ASSETS_VERSION_DEFAULT="$(awk -F '\"' '/pub const BOOT_ASSET_VERSION/ {print $2; exit}' "$PROJECT_DIR/crates/arcbox-core/src/boot_assets.rs")"
+BOOT_ASSETS_VERSION_DEFAULT="$(awk -F '\"' '/pub const BOOT_ASSET_VERSION/ {print $2; exit}' "$PROJECT_DIR/app/arcbox-core/src/boot_assets.rs")"
 if [[ -z "$BOOT_ASSETS_VERSION_DEFAULT" ]]; then
-    echo "Failed to resolve BOOT_ASSET_VERSION from crates/arcbox-core/src/boot_assets.rs" >&2
+    echo "Failed to resolve BOOT_ASSET_VERSION from app/arcbox-core/src/boot_assets.rs" >&2
     exit 1
 fi
 BOOT_ASSETS_VERSION="${ARCBOX_BOOT_ASSET_VERSION:-$BOOT_ASSETS_VERSION_DEFAULT}"
@@ -121,7 +121,6 @@ start_daemon() {
     "$PROJECT_DIR/target/release/arcbox-daemon" \
         --data-dir "$TEST_DIR" \
         --socket "$TEST_DIR/docker.sock" \
-        --container-provision bundled-assets \
         --guest-docker-vsock-port "$GUEST_DOCKER_VSOCK_PORT" \
         > "$TEST_DIR/daemon.log" 2>&1 &
 
@@ -358,7 +357,12 @@ print_summary() {
     kernel_version=$(strings "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/kernel" 2>/dev/null | grep -E "^[0-9]+\.[0-9]+\.[0-9]+" | head -1)
 
     echo "Kernel:     $kernel_version"
-    echo "Rootfs:     $(ls -lh "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/rootfs.erofs" 2>/dev/null | awk '{print $5}' || echo 'N/A')"
+    local rootfs_file="$TEST_DIR/boot/$BOOT_ASSETS_VERSION/rootfs.erofs"
+    if [[ -f "$rootfs_file" ]]; then
+        echo "Rootfs:     $(ls -lh "$rootfs_file" | awk '{print $5}')"
+    else
+        echo "Rootfs:     N/A"
+    fi
     echo ""
 
     local pass=0

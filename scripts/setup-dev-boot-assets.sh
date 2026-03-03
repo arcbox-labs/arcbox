@@ -55,6 +55,10 @@ setup_from_kernel_repo() {
     if [[ -f "$KERNEL_OUTPUT_DIR/manifest.json" ]]; then
         cp "$KERNEL_OUTPUT_DIR/manifest.json" "$DEV_BOOT_DIR/manifest.json"
         log_info "Copied manifest.json from arcbox-kernel output"
+    else
+        log_warn "manifest.json not found in arcbox-kernel output — downstream checks may fail"
+        log_warn "Generate one with: arcbox boot manifest or copy from a release"
+        return 1
     fi
 
     log_info "Copied kernel + rootfs.erofs from arcbox-kernel output"

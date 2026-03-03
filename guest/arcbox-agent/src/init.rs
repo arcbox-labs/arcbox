@@ -64,6 +64,9 @@ mod platform {
     }
 
     fn mount_tmpfs(target: &str) {
+        if crate::mount::is_mounted(target) {
+            return;
+        }
         // Ensure mount point exists — EROFS may not have /etc or /var.
         mkdir_p(target);
         if let Err(e) = mount(
