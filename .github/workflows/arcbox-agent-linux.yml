@@ -142,7 +142,9 @@ jobs:
 
       - name: Run blackbox smoke example
         run: |
-          sudo env ARCBOX_AGENT_CID=1 ./target/release/examples/sandbox_smoke
+          CID="$(cat /proc/sys/net/vsock/local_cid)"
+          echo "Using ARCBOX_AGENT_CID=$CID"
+          sudo env ARCBOX_AGENT_CID="$CID" ./target/release/examples/sandbox_smoke
 
       - name: Show agent log on failure
         if: failure()

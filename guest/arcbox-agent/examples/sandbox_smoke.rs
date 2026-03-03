@@ -123,10 +123,7 @@ mod linux {
     }
 
     async fn connect_with_retry() -> Result<VsockStream> {
-        let cid = std::env::var("ARCBOX_AGENT_CID")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(VMADDR_CID_LOCAL);
+        let cid = resolve_target_cid();
         let addr = VsockAddr::new(cid, AGENT_PORT);
 
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -140,6 +137,24 @@ mod linux {
                 Err(e) => return Err(e).context("connect to arcbox-agent over vsock failed"),
             }
         }
+    }
+
+    fn resolve_target_cid() -> u32 {
+        if let Some(cid) = std::env::var("ARCBOX_AGENT_CID")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            return cid;
+        }
+
+        if let Some(cid) = std::fs::read_to_string("/proc/sys/net/vsock/local_cid")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        {
+            return cid;
+        }
+
+        VMADDR_CID_LOCAL
     }
 
     async fn wait_until_ready(stream: &mut VsockStream, id: &str, timeout: Duration) -> Result<()> {
@@ -170,7 +185,6 @@ mod linux {
         let payload = req.encode_to_vec();
         write_message(stream, MessageType::SandboxRunRequest, "", &payload).await?;
 
-        let mut saw_done = false;
         loop {
             let (resp_type_raw, _trace, resp_payload) = read_message(stream).await?;
 
@@ -191,16 +205,11 @@ mod linux {
             }
 
             if output.done {
-                saw_done = true;
                 if output.exit_code != 0 {
                     bail!("run exited with non-zero status: {}", output.exit_code);
                 }
                 break;
             }
-        }
-
-        if !saw_done {
-            bail!("run stream ended without done=true frame");
         }
         Ok(())
     }
