@@ -165,7 +165,8 @@ dependencies = [
 [[package]]
 name = "arcbox-boot"
 version = "0.2.0"
-source = "git+https://github.com/arcbox-labs/boot-assets.git#c79bbab87e16952e9c2a2a98b9e04dc783783d5b"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ed93ea8949bfdda7057ace79344c9f900f4b4839322c5cc002da2aa5fa85e1d"
 dependencies = [
  "dirs",
  "futures-util",
