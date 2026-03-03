@@ -1,0 +1,153 @@
+name: arcbox-agent Linux
+
+on:
+  push:
+    branches: [master, develop]
+    paths:
+      - "guest/arcbox-agent/**"
+      - "hypervisor/arcbox-vm/**"
+      - "common/arcbox-constants/**"
+      - "comm/arcbox-protocol/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/arcbox-agent-linux.yml"
+  pull_request:
+    branches: [master, develop]
+    paths:
+      - "guest/arcbox-agent/**"
+      - "hypervisor/arcbox-vm/**"
+      - "common/arcbox-constants/**"
+      - "comm/arcbox-protocol/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/arcbox-agent-linux.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FC_S3_BASE: https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci
+  FC_S3_DIR: v1.10
+  FC_VERSION: v1.10.1
+
+jobs:
+  smoke:
+    name: Blackbox sandbox smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
+      - name: Enable KVM access
+        run: sudo chmod 666 /dev/kvm
+
+      - name: Check vsock support
+        run: |
+          echo "=== /dev/vsock ==="
+          ls -l /dev/vsock 2>/dev/null || echo "/dev/vsock missing"
+          echo "=== vsock modules ==="
+          lsmod | grep -E '(^vsock|vhost_vsock|vmw_vsock_virtio_transport)' || echo "no vsock-related modules loaded"
+          sudo modprobe vsock || true
+          sudo modprobe vhost_vsock || true
+          sudo modprobe vmw_vsock_virtio_transport || true
+          echo "=== Python AF_VSOCK probe ==="
+          python3 - <<'PY'
+          import socket
+          if not hasattr(socket, "AF_VSOCK"):
+              print("AF_VSOCK not exposed by Python socket module")
+              raise SystemExit(1)
+          s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+          s.close()
+          print("AF_VSOCK socket() succeeded")
+          PY
+
+      - name: Download Firecracker assets from S3
+        run: |
+          mkdir -p /tmp/fc-assets
+          BASE="${FC_S3_BASE}/${FC_S3_DIR}/x86_64"
+          curl -sL "$BASE/firecracker-${FC_VERSION}" -o /tmp/fc-assets/firecracker
+          curl -sL "$BASE/jailer-${FC_VERSION}" -o /tmp/fc-assets/jailer
+          curl -sL "$BASE/vmlinux-5.10.223" -o /tmp/fc-assets/vmlinux
+          curl -sL "$BASE/ubuntu-22.04.ext4" -o /tmp/fc-assets/rootfs-base.ext4
+          chmod +x /tmp/fc-assets/firecracker /tmp/fc-assets/jailer
+
+      - name: Build binaries
+        run: |
+          cargo build -p arcbox-vm --bin vm-agent --release
+          cargo build -p arcbox-agent --bin arcbox-agent --example sandbox_smoke --release
+
+      - name: Inject vm-agent into rootfs
+        run: |
+          cp /tmp/fc-assets/rootfs-base.ext4 /tmp/fc-assets/rootfs.ext4
+          sudo e2fsck -f -y /tmp/fc-assets/rootfs.ext4 || true
+          sudo resize2fs /tmp/fc-assets/rootfs.ext4 512M
+          mkdir -p /tmp/fc-mnt
+          sudo mount -o loop /tmp/fc-assets/rootfs.ext4 /tmp/fc-mnt
+          sudo cp target/release/vm-agent /tmp/fc-mnt/sbin/vm-agent
+          sudo chmod +x /tmp/fc-mnt/sbin/vm-agent
+          sudo umount /tmp/fc-mnt
+
+      - name: Write temporary VMM config
+        run: |
+          cat >/tmp/arcbox-agent-vmm.toml <<'EOF'
+          [firecracker]
+          binary = "/tmp/fc-assets/firecracker"
+          data_dir = "/tmp/arcbox-agent-data"
+          no_seccomp = false
+
+          [network]
+          bridge = ""
+          cidr = "172.31.0.0/16"
+          gateway = "172.31.0.1"
+          dns = ["1.1.1.1", "8.8.8.8"]
+
+          [grpc]
+          unix_socket = "/tmp/arcbox-agent-vmm.sock"
+          tcp_addr = ""
+
+          [defaults]
+          vcpus = 1
+          memory_mib = 256
+          kernel = "/tmp/fc-assets/vmlinux"
+          rootfs = "/tmp/fc-assets/rootfs.ext4"
+          boot_args = "console=ttyS0 reboot=k panic=1 pci=off"
+          EOF
+
+      - name: Start arcbox-agent
+        run: |
+          sudo mkdir -p /tmp/arcbox-agent-data
+          sudo env ARCBOX_VMM_CONFIG=/tmp/arcbox-agent-vmm.toml \
+            RUST_LOG=arcbox_agent=info \
+            ./target/release/arcbox-agent > /tmp/arcbox-agent.log 2>&1 &
+          echo $! >/tmp/arcbox-agent.pid
+          sleep 3
+
+      - name: Run blackbox smoke example
+        run: |
+          sudo env ARCBOX_AGENT_CID=1 ./target/release/examples/sandbox_smoke
+
+      - name: Show agent log on failure
+        if: failure()
+        run: |
+          echo "===== arcbox-agent.log ====="
+          sudo cat /tmp/arcbox-agent.log || true
+
+      - name: Stop arcbox-agent
+        if: always()
+        run: |
+          if [ -f /tmp/arcbox-agent.pid ]; then
+            sudo kill "$(cat /tmp/arcbox-agent.pid)" 2>/dev/null || true
+          fi
