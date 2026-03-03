@@ -110,7 +110,7 @@ mod platform {
     }
 
     fn mount_shm() {
-        if Path::new("/dev/shm").exists() {
+        if crate::mount::is_mounted("/dev/shm") {
             return;
         }
         mkdir_p("/dev/shm");
@@ -148,11 +148,16 @@ mod platform {
             tracing::warn!(error = %e, "failed to enable ip_forward");
         }
         // Bring up loopback interface.
-        let status = std::process::Command::new("/bin/busybox")
+        match std::process::Command::new("/bin/busybox")
             .args(["ip", "link", "set", "lo", "up"])
-            .status();
-        if let Err(e) = status {
-            tracing::warn!(error = %e, "failed to bring up loopback");
+            .status()
+        {
+            Ok(s) if s.success() => {}
+            Ok(s) => tracing::warn!(
+                exit_code = s.code().unwrap_or(-1),
+                "loopback 'ip link set lo up' exited non-zero"
+            ),
+            Err(e) => tracing::warn!(error = %e, "failed to bring up loopback"),
         }
     }
 
@@ -220,8 +225,14 @@ mod platform {
             tracing::debug!(source, "symlink source does not exist, skipping");
             return;
         }
-        if let Err(e) = unix_fs::symlink(source, link) {
-            tracing::warn!(source, link, error = %e, "failed to create symlink");
+        match unix_fs::symlink(source, link) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Idempotent: symlink already in place.
+            }
+            Err(e) => {
+                tracing::warn!(source, link, error = %e, "failed to create symlink");
+            }
         }
     }
 }

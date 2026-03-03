@@ -75,15 +75,21 @@ mod platform {
                             "child killed by signal"
                         );
                     }
-                    // No more zombies or error (ECHILD = no children).
-                    Ok(WaitStatus::StillAlive) | Err(_) => break,
+                    // No more zombies.
+                    Ok(WaitStatus::StillAlive) => break,
+                    // ECHILD = no children at all; any other error is unexpected.
+                    Err(nix::errno::Errno::ECHILD) => break,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "unexpected waitpid error");
+                        break;
+                    }
                     _ => continue,
                 }
             }
         }
 
         /// Gracefully stop all tracked children (SIGTERM, wait, reap).
-        pub fn shutdown_all(&mut self) {
+        pub async fn shutdown_all(&mut self) {
             use nix::sys::signal::{Signal, kill};
             use nix::unistd::Pid;
 
@@ -92,7 +98,7 @@ mod platform {
                 let _ = kill(Pid::from_raw(*pid as i32), Signal::SIGTERM);
             }
             // Brief grace period, then reap.
-            std::thread::sleep(Duration::from_secs(2));
+            tokio::time::sleep(Duration::from_secs(2)).await;
             self.reap_children();
         }
 
@@ -141,7 +147,12 @@ mod platform {
             };
 
             loop {
-                sigchld.recv().await;
+                if sigchld.recv().await.is_none() {
+                    // Signal stream closed — should not happen for PID 1,
+                    // but degrade gracefully rather than spin.
+                    tracing::error!("SIGCHLD stream closed unexpectedly, zombie reaping disabled");
+                    return;
+                }
                 supervisor.lock().await.reap_children();
             }
         });
