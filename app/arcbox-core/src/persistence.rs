@@ -26,7 +26,7 @@ pub struct PersistedMachine {
     /// Kernel command line.
     #[serde(default)]
     pub cmdline: Option<String>,
-    /// Block devices (e.g., rootfs ext4 image).
+    /// Block devices (e.g., EROFS rootfs, Btrfs data disk).
     #[serde(default)]
     pub block_devices: Vec<crate::vm::BlockDeviceConfig>,
     /// Distribution name.

@@ -119,7 +119,7 @@ pub struct VmConfig {
     pub cmdline: Option<String>,
     /// Shared directories for VirtioFS.
     pub shared_dirs: Vec<SharedDirConfig>,
-    /// Block devices (for example, rootfs ext4 image).
+    /// Block devices (e.g., EROFS rootfs, Btrfs data disk).
     pub block_devices: Vec<BlockDeviceConfig>,
     /// Enable networking.
     pub networking: bool,
