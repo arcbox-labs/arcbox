@@ -843,8 +843,7 @@ mod tests {
         let socket_path = temp_dir.path().join("docker.sock");
         let docker_config_dir = temp_dir.path().join(".docker");
 
-        let manager =
-            DockerContextManager::with_config_dir(socket_path, docker_config_dir.clone());
+        let manager = DockerContextManager::with_config_dir(socket_path, docker_config_dir.clone());
         manager.create_context().unwrap();
 
         // Verify Docker-compatible directory structure.

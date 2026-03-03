@@ -303,7 +303,7 @@ fn test_dirty_tracking_performance() {
 
     // Test with different memory sizes
     let test_sizes = [
-        (1024 * 1024, "1MB"),        // 256 pages
+        (1024 * 1024, "1MB"),       // 256 pages
         (16 * 1024 * 1024, "16MB"), // 4096 pages
         (64 * 1024 * 1024, "64MB"), // 16384 pages
     ];
