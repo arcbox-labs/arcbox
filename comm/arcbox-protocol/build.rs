@@ -34,6 +34,9 @@ fn main() {
 
     // Output to src/generated/ for IDE support.
     config.out_dir(&out_dir);
+    // Keep compatibility with older protoc versions used in CI.
+    // Newer protoc versions simply ignore this switch.
+    config.protoc_arg("--experimental_allow_proto3_optional");
 
     // Generate serde derives for all messages.
     config.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
