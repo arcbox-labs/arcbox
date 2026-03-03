@@ -277,15 +277,11 @@ impl MachineManager {
 
     /// Creates a new machine.
     ///
-    /// When `config.distro` is set, this performs full machine VM setup:
-    /// 1. Resolve and download distro rootfs tarball
-    /// 2. Generate SSH key pair
-    /// 3. Create ext4 disk image
-    /// 4. Write setup.json for first-boot provisioning
-    /// 5. Configure block device + VirtioFS sharing
+    /// Sets up EROFS rootfs (read-only, /dev/vda) and a Btrfs data disk
+    /// (/dev/vdb) with block device and VirtioFS sharing configured.
     ///
-    /// When `config.distro` is None, creates a lightweight container VM
-    /// (existing behavior).
+    /// When `config.distro` is set, also resolves and downloads a distro
+    /// rootfs tarball and generates an SSH key pair.
     ///
     /// # Errors
     ///
