@@ -62,12 +62,24 @@ jobs:
       - name: Download Firecracker assets from S3
         run: |
           mkdir -p /tmp/fc-assets
-          BASE="${FC_S3_BASE}/${FC_S3_DIR}/x86_64"
-          curl -sL "$BASE/firecracker-${FC_VERSION}" -o /tmp/fc-assets/firecracker
-          curl -sL "$BASE/jailer-${FC_VERSION}" -o /tmp/fc-assets/jailer
-          curl -sL "$BASE/vmlinux-5.10.223" -o /tmp/fc-assets/vmlinux
-          curl -sL "$BASE/ubuntu-22.04.ext4" -o /tmp/fc-assets/rootfs-base.ext4
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64) FC_ARCH="x86_64" ;;
+            aarch64|arm64) FC_ARCH="aarch64" ;;
+            *)
+              echo "unsupported runner architecture: $ARCH"
+              exit 1
+              ;;
+          esac
+          echo "Runner arch: $ARCH (Firecracker assets: $FC_ARCH)"
+          BASE="${FC_S3_BASE}/${FC_S3_DIR}/${FC_ARCH}"
+          curl -fsSL "$BASE/firecracker-${FC_VERSION}" -o /tmp/fc-assets/firecracker
+          curl -fsSL "$BASE/jailer-${FC_VERSION}" -o /tmp/fc-assets/jailer
+          curl -fsSL "$BASE/vmlinux-5.10.223" -o /tmp/fc-assets/vmlinux
+          curl -fsSL "$BASE/ubuntu-22.04.ext4" -o /tmp/fc-assets/rootfs-base.ext4
           chmod +x /tmp/fc-assets/firecracker /tmp/fc-assets/jailer
+          file /tmp/fc-assets/firecracker
+          /tmp/fc-assets/firecracker --version
 
       - name: Build binaries
         run: |
