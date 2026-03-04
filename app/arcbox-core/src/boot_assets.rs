@@ -21,7 +21,7 @@ pub use arcbox_boot::manifest::Manifest as BootAssetManifest;
 // =============================================================================
 
 /// Boot asset version pinned by this daemon release.
-pub const BOOT_ASSET_VERSION: &str = "0.2.3";
+pub const BOOT_ASSET_VERSION: &str = "0.3.0";
 
 /// Default CDN base URL.
 const DEFAULT_CDN_BASE_URL: &str = "https://boot.arcboxcdn.com";
