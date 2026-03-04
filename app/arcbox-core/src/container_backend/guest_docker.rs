@@ -8,7 +8,7 @@ use std::os::fd::FromRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Guest Docker backend (dockerd/containerd/youki inside VM).
+/// Guest Docker backend (dockerd/containerd/runc inside VM).
 pub struct GuestDockerBackend {
     vm_lifecycle: Arc<VmLifecycleManager>,
     machine_manager: Arc<MachineManager>,

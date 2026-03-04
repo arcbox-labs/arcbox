@@ -193,7 +193,7 @@ impl BootAssetProvider {
         })
     }
 
-    /// Prepare host-side binaries (dockerd, containerd, youki) into `dest_dir`.
+    /// Prepare host-side binaries (dockerd, containerd, shim, runc) into `dest_dir`.
     pub async fn prepare_binaries(
         &self,
         dest_dir: &Path,

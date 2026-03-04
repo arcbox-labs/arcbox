@@ -119,7 +119,7 @@ async fn prefetch(
         .await?;
     println!("\n  Boot assets ready");
 
-    // 2. Download runtime binaries (dockerd, containerd, youki).
+    // 2. Download runtime binaries (dockerd, containerd, shim, runc).
     // Also idempotent — skips if cached and checksum matches.
     let runtime_bin_dir = root_data_dir.join("runtime/bin");
     tokio::fs::create_dir_all(&runtime_bin_dir).await?;

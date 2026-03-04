@@ -231,9 +231,9 @@ exit 0
                 "-n",
                 "-q",
                 "-t",
-                "5",
-                "-T",
                 "3",
+                "-T",
+                "2",
                 "-s",
                 udhcpc_script,
             ])
@@ -262,7 +262,13 @@ exit 0
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
-            if name == "lo" {
+            // Skip loopback and virtual interfaces that are not real NICs.
+            if name == "lo"
+                || name.starts_with("dummy")
+                || name.starts_with("veth")
+                || name.starts_with("br-")
+                || name.starts_with("docker")
+            {
                 continue;
             }
             candidates.push(name);
