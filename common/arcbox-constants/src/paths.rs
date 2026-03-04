@@ -15,7 +15,7 @@ pub const CONTAINERD_ROOT_DIR: &str = "/var/lib/docker/containerd";
 /// containerd gRPC socket path in guest.
 pub const CONTAINERD_SOCKET: &str = "/run/containerd/containerd.sock";
 
-/// Directory where runtime binaries (containerd, dockerd, youki, …) are
+/// Directory where runtime binaries (containerd, dockerd, runc, …) are
 /// accessed via VirtioFS live execution.
 pub const ARCBOX_RUNTIME_BIN_DIR: &str = "/arcbox/runtime/bin";
 
