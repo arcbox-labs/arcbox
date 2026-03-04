@@ -153,6 +153,7 @@ nix = { version = "0.29", features = [
 libc = "0.2"
 
 # External crates
+arcbox-boot = { version = "0.2", features = ["download"] }
 macos-resolver = "0.2.0"
 
 fc-sdk = "0.2.1"

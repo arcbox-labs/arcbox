@@ -8,7 +8,7 @@ use std::os::fd::FromRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Guest Docker backend (dockerd/containerd/youki inside VM).
+/// Guest Docker backend (dockerd/containerd/runc inside VM).
 pub struct GuestDockerBackend {
     vm_lifecycle: Arc<VmLifecycleManager>,
     machine_manager: Arc<MachineManager>,
@@ -49,6 +49,10 @@ impl GuestDockerBackend {
                 match agent.ensure_runtime(true).await {
                     Ok(resp) => {
                         last_status_detail = Some(resp.message.clone());
+                        if resp.ready {
+                            validate_reported_vsock_endpoint(&resp.endpoint, port)?;
+                            docker_ready = true;
+                        }
                         tracing::debug!(
                             ready = resp.ready,
                             endpoint = resp.endpoint,
@@ -62,24 +66,18 @@ impl GuestDockerBackend {
                     }
                 }
 
-                match agent.get_runtime_status().await {
-                    Ok(status) => {
-                        last_status_detail = Some(status.detail.clone());
-                        if status.docker_ready {
-                            docker_ready = true;
-                            if let Some(endpoint_port) = parse_vsock_endpoint_port(&status.endpoint)
-                            {
-                                if endpoint_port != port {
-                                    return Err(CoreError::Machine(format!(
-                                        "guest runtime endpoint mismatch: guest reports vsock:{} but host is configured for vsock:{}",
-                                        endpoint_port, port
-                                    )));
-                                }
+                if !docker_ready {
+                    match agent.get_runtime_status().await {
+                        Ok(status) => {
+                            last_status_detail = Some(status.detail.clone());
+                            if status.docker_ready {
+                                validate_reported_vsock_endpoint(&status.endpoint, port)?;
+                                docker_ready = true;
                             }
                         }
-                    }
-                    Err(e) => {
-                        tracing::trace!("failed to get guest runtime status: {}", e);
+                        Err(e) => {
+                            tracing::trace!("failed to get guest runtime status: {}", e);
+                        }
                     }
                 }
             }
@@ -136,9 +134,27 @@ fn parse_vsock_endpoint_port(endpoint: &str) -> Option<u32> {
     endpoint.strip_prefix("vsock:")?.parse::<u32>().ok()
 }
 
+fn validate_reported_vsock_endpoint(endpoint: &str, expected_port: u32) -> Result<()> {
+    let endpoint_port = parse_vsock_endpoint_port(endpoint).ok_or_else(|| {
+        CoreError::Machine(format!(
+            "guest runtime endpoint format invalid: '{}'; expected 'vsock:<port>'",
+            endpoint
+        ))
+    })?;
+
+    if endpoint_port != expected_port {
+        return Err(CoreError::Machine(format!(
+            "guest runtime endpoint mismatch: guest reports vsock:{} but host is configured for vsock:{}",
+            endpoint_port, expected_port
+        )));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_vsock_endpoint_port;
+    use super::{parse_vsock_endpoint_port, validate_reported_vsock_endpoint};
 
     #[test]
     fn test_parse_vsock_endpoint_port_ok() {
@@ -153,6 +169,24 @@ mod tests {
         );
         assert_eq!(parse_vsock_endpoint_port("vsock:not-a-number"), None);
         assert_eq!(parse_vsock_endpoint_port("2375"), None);
+    }
+
+    #[test]
+    fn test_validate_reported_vsock_endpoint_ok() {
+        assert!(validate_reported_vsock_endpoint("vsock:2375", 2375).is_ok());
+    }
+
+    #[test]
+    fn test_validate_reported_vsock_endpoint_mismatch() {
+        let err = validate_reported_vsock_endpoint("vsock:2375", 1234).unwrap_err();
+        assert!(err.to_string().contains("endpoint mismatch"));
+    }
+
+    #[test]
+    fn test_validate_reported_vsock_endpoint_invalid_format() {
+        let err =
+            validate_reported_vsock_endpoint("unix:///var/run/docker.sock", 2375).unwrap_err();
+        assert!(err.to_string().contains("format invalid"));
     }
 }
 

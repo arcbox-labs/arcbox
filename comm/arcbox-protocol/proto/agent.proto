@@ -114,7 +114,7 @@ message PortBindingsRemoved {
 
 // Individual service status within the guest runtime stack.
 message ServiceStatus {
-    // Service name (e.g. "containerd", "dockerd", "youki").
+    // Service name (e.g. "containerd", "dockerd", "runc").
     string name = 1;
     // Service status: "ready", "not_ready", or "error".
     string status = 2;

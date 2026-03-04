@@ -3,7 +3,7 @@
 //! Manage kernel and rootfs files required for VM boot.
 
 use clap::{Args, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Boot asset management commands.
 #[derive(Subcommand)]
@@ -35,61 +35,99 @@ pub struct PrefetchArgs {
 
 /// Execute boot commands.
 pub async fn execute(command: BootCommands) -> anyhow::Result<()> {
-    // Use Config::load() so the cache directory is consistent with daemon.
+    // Use Config::load() so the cache directory are consistent with daemon.
     let config = arcbox_core::Config::load().unwrap_or_default();
-    let data_dir = config.data_dir.join("boot");
+    let boot_cache_dir = config.data_dir.join("boot");
 
     match command {
-        BootCommands::Prefetch(args) => prefetch(data_dir, args).await,
-        BootCommands::Status => status(data_dir).await,
-        BootCommands::Clear => clear(data_dir).await,
-        BootCommands::List => list(data_dir).await,
+        BootCommands::Prefetch(args) => prefetch(&config.data_dir, boot_cache_dir, args).await,
+        BootCommands::Status => status(boot_cache_dir).await,
+        BootCommands::Clear => clear(boot_cache_dir).await,
+        BootCommands::List => list(boot_cache_dir).await,
     }
 }
 
-/// Prefetch boot assets.
-async fn prefetch(data_dir: PathBuf, args: PrefetchArgs) -> anyhow::Result<()> {
+/// Prefetch boot assets and runtime binaries.
+async fn prefetch(
+    root_data_dir: &Path,
+    boot_cache_dir: PathBuf,
+    args: PrefetchArgs,
+) -> anyhow::Result<()> {
     use arcbox_core::boot_assets::{BootAssetConfig, BootAssetProvider, DownloadProgress};
 
     println!("Prefetching boot assets...");
 
-    let mut config = BootAssetConfig::with_cache_dir(data_dir);
+    let mut config = BootAssetConfig::with_cache_dir(boot_cache_dir);
 
     if let Some(version) = args.asset_version {
         config = config.with_version(version);
     }
 
-    let provider = BootAssetProvider::with_config(config.clone());
-
-    // Check if already cached (unless force).
-    if !args.force && provider.is_cached() {
-        println!("Boot assets already cached (version: {})", config.version);
-        println!("Use --force to re-download.");
-        return Ok(());
-    }
+    let provider = BootAssetProvider::with_config(config.clone())?;
 
     // Clear cache if force.
     if args.force {
         provider.clear_cache().await?;
     }
 
-    // Create progress callback.
-    let progress_callback = Box::new(|progress: DownloadProgress| {
-        if let Some(pct) = progress.percentage() {
-            print!("\r{} [{}%]", progress.phase, pct);
-        } else {
-            print!("\r{}", progress.phase);
-        }
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-    });
+    let make_progress_callback = || -> Box<dyn Fn(DownloadProgress) + Send + Sync> {
+        Box::new(|progress: DownloadProgress| {
+            use arcbox_core::boot_assets::PreparePhase;
+            use std::io::Write;
 
-    // Prefetch with progress.
+            let status = match &progress.phase {
+                PreparePhase::Checking => format!(
+                    "[{}/{}] {} checking...",
+                    progress.current, progress.total, progress.name
+                ),
+                PreparePhase::Downloading { downloaded, total } => {
+                    if let Some(t) = total {
+                        let pct = if *t > 0 { downloaded * 100 / t } else { 0 };
+                        format!(
+                            "[{}/{}] {} downloading {}%",
+                            progress.current, progress.total, progress.name, pct
+                        )
+                    } else {
+                        format!(
+                            "[{}/{}] {} downloading {} bytes",
+                            progress.current, progress.total, progress.name, downloaded
+                        )
+                    }
+                }
+                PreparePhase::Verifying => format!(
+                    "[{}/{}] {} verifying...",
+                    progress.current, progress.total, progress.name
+                ),
+                PreparePhase::Ready => format!(
+                    "[{}/{}] {} ready",
+                    progress.current, progress.total, progress.name
+                ),
+                PreparePhase::Cached => format!(
+                    "[{}/{}] {} cached",
+                    progress.current, progress.total, progress.name
+                ),
+            };
+            print!("\r{:<60}", status);
+            let _ = std::io::stdout().flush();
+        })
+    };
+
+    // 1. Prefetch boot assets (kernel + rootfs).
+    // prepare() is idempotent — skips download if already cached and valid.
     provider
-        .prefetch_with_progress(Some(progress_callback))
+        .prefetch_with_progress(Some(make_progress_callback()))
         .await?;
+    println!("\n  Boot assets ready");
 
-    println!("\n✓ Boot assets ready");
+    // 2. Download runtime binaries (dockerd, containerd, shim, runc).
+    // Also idempotent — skips if cached and checksum matches.
+    let runtime_bin_dir = root_data_dir.join("runtime/bin");
+    tokio::fs::create_dir_all(&runtime_bin_dir).await?;
+
+    provider
+        .prepare_binaries(&runtime_bin_dir, Some(make_progress_callback()))
+        .await?;
+    println!("\n  Runtime binaries ready");
 
     Ok(())
 }
@@ -99,7 +137,7 @@ async fn status(data_dir: PathBuf) -> anyhow::Result<()> {
     use arcbox_core::boot_assets::{BootAssetConfig, BootAssetProvider};
 
     let config = BootAssetConfig::with_cache_dir(data_dir.clone());
-    let provider = BootAssetProvider::with_config(config.clone());
+    let provider = BootAssetProvider::with_config(config.clone())?;
     let version_dir = config.version_cache_dir();
 
     println!("Boot Asset Status");
@@ -134,14 +172,11 @@ async fn status(data_dir: PathBuf) -> anyhow::Result<()> {
                     "  Manifest:  ✓ {}",
                     version_dir.join("manifest.json").display()
                 );
-                println!("  Schema:    {}", manifest.schema_version);
+                println!("  Schema:    v{}", manifest.schema_version);
+                println!("  Build At:  {}", manifest.built_at);
                 println!(
-                    "  Build At:  {}",
-                    manifest.built_at.as_deref().unwrap_or("unknown")
-                );
-                println!(
-                    "  Kernel SHA: {}",
-                    manifest.kernel_commit.as_deref().unwrap_or("unknown")
+                    "  Source:    {}",
+                    manifest.source_sha.as_deref().unwrap_or("unknown")
                 );
             }
             Err(e) => {
@@ -193,7 +228,7 @@ async fn clear(data_dir: PathBuf) -> anyhow::Result<()> {
     use arcbox_core::boot_assets::{BootAssetConfig, BootAssetProvider};
 
     let config = BootAssetConfig::with_cache_dir(data_dir.clone());
-    let provider = BootAssetProvider::with_config(config);
+    let provider = BootAssetProvider::with_config(config)?;
 
     if !data_dir.exists() {
         println!("Cache directory does not exist.");
@@ -212,7 +247,7 @@ async fn list(data_dir: PathBuf) -> anyhow::Result<()> {
     use arcbox_core::boot_assets::{BootAssetConfig, BootAssetProvider};
 
     let config = BootAssetConfig::with_cache_dir(data_dir);
-    let provider = BootAssetProvider::with_config(config);
+    let provider = BootAssetProvider::with_config(config)?;
 
     let versions = provider.list_cached_versions().await?;
 

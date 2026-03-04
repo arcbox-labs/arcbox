@@ -12,7 +12,7 @@ Current request surface includes:
 
 - Ping
 - System information
-- Ensure guest runtime stack (`containerd`/`dockerd`/`youki`) is ready
+- Ensure guest runtime stack (`containerd`/`dockerd`/`runc`) is ready
 - Runtime status
 
 When running as PID 1, the agent also performs basic system initialisation
@@ -21,7 +21,7 @@ When running as PID 1, the agent also performs basic system initialisation
 ## Runtime Bootstrap Role
 
 At startup, the agent detects and launches the bundled runtime stack
-(`containerd` / `dockerd` / `youki`) so the host-side Docker API proxy can
+(`containerd` / `dockerd` / `runc`) so the host-side Docker API proxy can
 target a healthy guest `dockerd` endpoint.
 
 ## Cross-Compilation

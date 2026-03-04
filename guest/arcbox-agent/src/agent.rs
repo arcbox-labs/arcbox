@@ -305,7 +305,10 @@ mod linux {
     const BTRFS_MAGIC_OFFSET: u64 = 0x10040;
 
     /// Temporary mount point for the raw Btrfs device before subvolume bind mounts.
-    const BTRFS_TEMP_MOUNT: &str = "/mnt/data";
+    ///
+    /// Must live on a writable filesystem. `/run` is tmpfs (set up in PID1 init),
+    /// while EROFS root is read-only and cannot host dynamic mountpoints.
+    const BTRFS_TEMP_MOUNT: &str = "/run/arcbox/data";
 
     fn has_btrfs_superblock(device: &str) -> bool {
         let mut file = match std::fs::File::open(device) {
@@ -352,7 +355,7 @@ mod linux {
     /// Mounts the data volume (Btrfs), creates subvolumes, and bind-mounts them.
     ///
     /// Layout after this function returns:
-    /// - `/mnt/data` — raw Btrfs mount (internal, not used by daemons)
+    /// - `/run/arcbox/data` — raw Btrfs mount (internal, not used by daemons)
     /// - `/var/lib/docker` — bind mount of `@docker` subvolume
     /// - `/var/log/arcbox` — bind mount of `@logs` subvolume
     ///
@@ -378,7 +381,7 @@ mod linux {
             Err(e) => return Err(e),
         }
 
-        // Step 2: Mount raw Btrfs to /mnt/data.
+        // Step 2: Mount raw Btrfs to temporary writable mount point.
         if !crate::mount::is_mounted(BTRFS_TEMP_MOUNT) {
             if let Err(e) = std::fs::create_dir_all(BTRFS_TEMP_MOUNT) {
                 return Err(format!("failed to create {}: {}", BTRFS_TEMP_MOUNT, e));
@@ -1056,6 +1059,8 @@ mod linux {
 
         let containerd_ready = probe_first_ready_socket(&CONTAINERD_SOCKET_CANDIDATES).await;
         let docker_ready = probe_unix_socket(DOCKER_API_UNIX_SOCKET).await;
+        let runtime_dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
+        let missing_runtime_binaries = missing_runtime_binaries_at(&runtime_dir);
 
         // Build per-service status entries.
         let mut services = Vec::new();
@@ -1110,32 +1115,6 @@ mod linux {
             detail: docker_detail,
         });
 
-        // youki status (OCI runtime)
-        let youki_status = match detect_runtime_bin_dir() {
-            Some(bin_dir) => {
-                let youki_bin = bin_dir.join("youki");
-                if youki_bin.exists() {
-                    ServiceStatus {
-                        name: "youki".to_string(),
-                        status: SERVICE_READY.to_string(),
-                        detail: format!("binary found: {}", youki_bin.display()),
-                    }
-                } else {
-                    ServiceStatus {
-                        name: "youki".to_string(),
-                        status: SERVICE_NOT_READY.to_string(),
-                        detail: format!("binary missing at {}", youki_bin.display()),
-                    }
-                }
-            }
-            None => ServiceStatus {
-                name: "youki".to_string(),
-                status: SERVICE_NOT_READY.to_string(),
-                detail: runtime_missing_detail(),
-            },
-        };
-        services.push(youki_status);
-
         // Build the summary detail string.
         let detail = if docker_ready {
             "docker socket ready".to_string()
@@ -1144,12 +1123,14 @@ mod linux {
                 "docker socket exists but not reachable: {}",
                 DOCKER_API_UNIX_SOCKET
             )
-        } else {
+        } else if !missing_runtime_binaries.is_empty() {
             format!(
                 "docker socket missing: {}; {}",
                 DOCKER_API_UNIX_SOCKET,
-                runtime_missing_detail()
+                runtime_missing_detail_from(&missing_runtime_binaries)
             )
+        } else {
+            format!("docker socket missing: {}", DOCKER_API_UNIX_SOCKET)
         };
 
         RuntimeStatusResponse {
@@ -1185,9 +1166,12 @@ mod linux {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    const REQUIRED_RUNTIME_BINARIES: &[&str] =
+        &["dockerd", "containerd", "containerd-shim-runc-v2", "runc"];
+
     fn detect_runtime_bin_dir() -> Option<PathBuf> {
         let dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
-        if dir.join("containerd").exists() && dir.join("dockerd").exists() {
+        if missing_runtime_binaries_at(&dir).is_empty() {
             Some(dir)
         } else {
             None
@@ -1195,10 +1179,29 @@ mod linux {
     }
 
     fn runtime_missing_detail() -> String {
-        format!(
-            "bundled runtime binaries not found; expected containerd+dockerd under {}",
-            ARCBOX_RUNTIME_BIN_DIR
-        )
+        let dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
+        let missing = missing_runtime_binaries_at(&dir);
+        runtime_missing_detail_from(&missing)
+    }
+
+    fn runtime_missing_detail_from(missing: &[&'static str]) -> String {
+        if missing.is_empty() {
+            format!("all runtime binaries present under {ARCBOX_RUNTIME_BIN_DIR}")
+        } else {
+            format!(
+                "missing runtime binaries under {}: {}",
+                ARCBOX_RUNTIME_BIN_DIR,
+                missing.join(", ")
+            )
+        }
+    }
+
+    fn missing_runtime_binaries_at(dir: &Path) -> Vec<&'static str> {
+        REQUIRED_RUNTIME_BINARIES
+            .iter()
+            .copied()
+            .filter(|name| !dir.join(name).exists())
+            .collect()
     }
 
     /// Ensures the guest environment has the prerequisites that dockerd/containerd
@@ -1377,7 +1380,6 @@ mod linux {
 
         let containerd_bin = runtime_bin_dir.join("containerd");
         let dockerd_bin = runtime_bin_dir.join("dockerd");
-        let youki_bin = runtime_bin_dir.join("youki");
         let mut notes = Vec::new();
 
         // Ensure kernel/filesystem prerequisites before spawning daemons.
@@ -1490,24 +1492,11 @@ mod linux {
                 .arg(format!("--containerd={CONTAINERD_SOCKET}"))
                 .arg("--exec-root=/var/run/docker")
                 .arg(format!("--data-root={DOCKER_DATA_MOUNT_POINT}"))
+                .arg("--userland-proxy=false")
                 .env("PATH", &path_env)
                 .stdin(Stdio::null())
                 .stdout(daemon_log_file("dockerd"))
                 .stderr(daemon_log_file("dockerd"));
-
-            // Register youki as the default OCI runtime.
-            // 'runc' is a reserved name in dockerd and cannot be registered via
-            // --add-runtime; it is already the built-in default. We only need to
-            // register youki and set it as the default. If youki fails, the user can
-            // fall back via `docker run --runtime=runc`.
-            if youki_bin.exists() {
-                cmd.arg("--add-runtime")
-                    .arg(format!("youki={}", youki_bin.display()))
-                    .arg("--default-runtime=youki");
-                notes.push("OCI runtime: youki (default), runc (built-in fallback)".to_string());
-            } else {
-                notes.push("youki missing, dockerd will use built-in runc".to_string());
-            }
 
             match cmd.spawn() {
                 Ok(child) => {

@@ -416,7 +416,7 @@ impl RecoveryPolicy {
 /// ## Usage
 ///
 /// ```ignore
-/// let manager = VmLifecycleManager::new(machine_manager, event_bus, data_dir, config);
+/// let manager = VmLifecycleManager::new(machine_manager, event_bus, data_dir, config)?;
 ///
 /// // Ensure VM is ready before any container operation
 /// let agent = manager.ensure_ready().await?;
@@ -522,10 +522,10 @@ impl VmLifecycleManager {
         event_bus: EventBus,
         data_dir: PathBuf,
         config: VmLifecycleConfig,
-    ) -> Self {
+    ) -> Result<Self> {
         let boot_assets = Arc::new(
-            BootAssetProvider::new(data_dir.join("boot"))
-                .with_kernel(config.default_vm.kernel.clone().unwrap_or_default()),
+            BootAssetProvider::new(data_dir.join("boot"))?
+                .with_kernel(config.default_vm.kernel.clone().unwrap_or_default())?,
         );
 
         let health_monitor = Arc::new(HealthMonitor::new(
@@ -547,7 +547,7 @@ impl VmLifecycleManager {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        Self {
+        Ok(Self {
             machine_manager,
             event_bus,
             state: RwLock::new(initial_state),
@@ -559,7 +559,7 @@ impl VmLifecycleManager {
             transition_lock: Mutex::new(()),
             last_activity_ms: AtomicU64::new(now_ms),
             balloon_shrunk: std::sync::atomic::AtomicBool::new(false),
-        }
+        })
     }
 
     /// Returns the current lifecycle state.

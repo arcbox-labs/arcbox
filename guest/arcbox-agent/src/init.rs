@@ -12,7 +12,9 @@
 
 #[cfg(target_os = "linux")]
 mod platform {
+    use std::fs;
     use std::os::unix::fs as unix_fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use nix::mount::{MsFlags, mount};
@@ -162,6 +164,117 @@ mod platform {
             ),
             Err(e) => tracing::warn!(error = %e, "failed to bring up loopback"),
         }
+
+        // Configure the primary interface via DHCP so the guest can reach
+        // gateway services (DNS/NAT at 192.168.64.1).
+        configure_primary_interface_dhcp();
+    }
+
+    fn configure_primary_interface_dhcp() {
+        let Some(interface) = detect_primary_interface() else {
+            tracing::warn!("no non-loopback network interface found for DHCP");
+            return;
+        };
+
+        match std::process::Command::new("/bin/busybox")
+            .args(["ip", "link", "set", interface.as_str(), "up"])
+            .status()
+        {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                tracing::warn!(
+                    interface,
+                    exit_code = s.code().unwrap_or(-1),
+                    "failed to bring interface up before DHCP"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(interface, error = %e, "failed to execute 'ip link set up'");
+            }
+        }
+
+        // BusyBox udhcpc requires a script to apply lease settings.
+        let udhcpc_script = "/run/udhcpc.script";
+        let script = r#"#!/bin/sh
+set -e
+case "$1" in
+  deconfig)
+    /bin/busybox ifconfig "$interface" 0.0.0.0 || true
+    ;;
+  renew|bound)
+    /bin/busybox ifconfig "$interface" "$ip" netmask "${subnet:-255.255.255.0}" broadcast "${broadcast:-+}" up
+    if [ -n "${router:-}" ]; then
+      while /bin/busybox route del default gw 0.0.0.0 dev "$interface" 2>/dev/null; do :; done
+      for r in $router; do
+        /bin/busybox route add default gw "$r" dev "$interface" && break
+      done
+    fi
+    ;;
+esac
+exit 0
+"#;
+
+        if let Err(e) = fs::write(udhcpc_script, script) {
+            tracing::warn!(error = %e, "failed to write udhcpc script");
+            return;
+        }
+        if let Err(e) = fs::set_permissions(udhcpc_script, fs::Permissions::from_mode(0o755)) {
+            tracing::warn!(error = %e, "failed to chmod udhcpc script");
+            return;
+        }
+
+        match std::process::Command::new("/bin/busybox")
+            .args([
+                "udhcpc",
+                "-i",
+                interface.as_str(),
+                "-n",
+                "-q",
+                "-t",
+                "3",
+                "-T",
+                "2",
+                "-s",
+                udhcpc_script,
+            ])
+            .status()
+        {
+            Ok(s) if s.success() => {
+                tracing::info!(interface, "DHCP lease acquired");
+            }
+            Ok(s) => {
+                tracing::warn!(
+                    interface,
+                    exit_code = s.code().unwrap_or(-1),
+                    "DHCP request failed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(interface, error = %e, "failed to run udhcpc");
+            }
+        }
+    }
+
+    fn detect_primary_interface() -> Option<String> {
+        let entries = fs::read_dir("/sys/class/net").ok()?;
+        let mut candidates = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            // Skip loopback and virtual interfaces that are not real NICs.
+            if name == "lo"
+                || name.starts_with("dummy")
+                || name.starts_with("veth")
+                || name.starts_with("br-")
+                || name.starts_with("docker")
+            {
+                continue;
+            }
+            candidates.push(name);
+        }
+        candidates.sort();
+        candidates.into_iter().next()
     }
 
     fn sync_clock() {

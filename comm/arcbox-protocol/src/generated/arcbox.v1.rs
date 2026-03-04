@@ -1555,7 +1555,7 @@ pub struct PortBindingsRemoved {
 #[serde(rename_all = "camelCase")]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ServiceStatus {
-    /// Service name (e.g. "containerd", "dockerd", "youki").
+    /// Service name (e.g. "containerd", "dockerd", "runc").
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
     /// Service status: "ready", "not_ready", or "error".

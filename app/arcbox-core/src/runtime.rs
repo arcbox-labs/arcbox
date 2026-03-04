@@ -24,7 +24,8 @@ use tokio::sync::RwLock as TokioRwLock;
 /// Default guest VM IP address in NAT network (used by PortForwarder fallback).
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 2);
-const REQUIRED_RUNTIME_ASSETS: [&str; 3] = ["dockerd", "containerd", "youki"];
+const REQUIRED_RUNTIME_ASSETS: [&str; 4] =
+    ["dockerd", "containerd", "containerd-shim-runc-v2", "runc"];
 
 /// Checks that a file exists and has at least one executable permission bit set.
 fn check_executable(path: &Path, context: &str) -> Result<()> {
@@ -148,7 +149,7 @@ impl Runtime {
             event_bus.clone(),
             config.data_dir.clone(),
             vm_lifecycle_config,
-        ));
+        )?);
         let container_backend = create_backend(
             &config.container,
             Arc::clone(&vm_lifecycle),
@@ -285,7 +286,15 @@ impl Runtime {
         tokio::fs::create_dir_all(self.config.data_dir.join("vms")).await?;
         tokio::fs::create_dir_all(self.config.data_dir.join("machines")).await?;
 
-        // Validate guest binaries before VM start (boot-blocking).
+        // Download runtime binaries (dockerd, containerd, shim, runc) if not cached.
+        let runtime_bin_dir = self.config.data_dir.join("runtime/bin");
+        tokio::fs::create_dir_all(&runtime_bin_dir).await?;
+        self.vm_lifecycle
+            .boot_assets()
+            .prepare_binaries(&runtime_bin_dir, None)
+            .await?;
+
+        // Validate all guest binaries are present and executable (boot-blocking).
         ensure_guest_binaries(&self.config.data_dir)?;
 
         self.ensure_vm_ready().await?;
@@ -668,7 +677,8 @@ mod tests {
             "bin/arcbox-agent",
             "runtime/bin/dockerd",
             "runtime/bin/containerd",
-            "runtime/bin/youki",
+            "runtime/bin/containerd-shim-runc-v2",
+            "runtime/bin/runc",
         ] {
             let path = data_dir.join(name);
             std::fs::write(&path, b"binary").unwrap();

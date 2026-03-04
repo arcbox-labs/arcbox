@@ -18,6 +18,7 @@ arcbox-protocol = { workspace = true }
 arcbox-transport = { workspace = true }
 arcbox-constants = { workspace = true }
 arcbox-error = { workspace = true }
+arcbox-boot = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
@@ -27,11 +28,6 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = "0.7"
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
-sha2 = "0.10"
-flate2 = "1"
-tar = "0.4"
-futures-util = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 figment = { workspace = true }

@@ -57,6 +57,7 @@ pub mod vm_lifecycle;
 pub use agent_client::AgentClient;
 pub use boot_assets::{
     BootAssetConfig, BootAssetManifest, BootAssetProvider, BootAssets, DownloadProgress,
+    PreparePhase,
 };
 pub use config::{Config, ContainerRuntimeConfig};
 pub use error::{CoreError, Result};
