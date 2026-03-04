@@ -50,6 +50,16 @@ impl GuestDockerBackend {
                     Ok(resp) => {
                         last_status_detail = Some(resp.message.clone());
                         if resp.ready {
+                            if let Some(endpoint_port) =
+                                parse_vsock_endpoint_port(&resp.endpoint)
+                            {
+                                if endpoint_port != port {
+                                    return Err(CoreError::Machine(format!(
+                                        "guest runtime endpoint mismatch: guest reports vsock:{} but host is configured for vsock:{}",
+                                        endpoint_port, port
+                                    )));
+                                }
+                            }
                             docker_ready = true;
                         }
                         tracing::debug!(
