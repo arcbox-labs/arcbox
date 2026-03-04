@@ -278,7 +278,7 @@ mod linux {
     /// Temporary mount point for the raw Btrfs device before subvolume bind mounts.
     ///
     /// Must live on a writable filesystem. `/run` is tmpfs (set up in PID1 init),
-    /// while EROFS root is read-only and cannot create `/mnt/data` at runtime.
+    /// while EROFS root is read-only and cannot host dynamic mountpoints.
     const BTRFS_TEMP_MOUNT: &str = "/run/arcbox/data";
 
     fn has_btrfs_superblock(device: &str) -> bool {
@@ -770,6 +770,8 @@ mod linux {
 
         let containerd_ready = probe_first_ready_socket(&CONTAINERD_SOCKET_CANDIDATES).await;
         let docker_ready = probe_unix_socket(DOCKER_API_UNIX_SOCKET).await;
+        let runtime_dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
+        let missing_runtime_binaries = missing_runtime_binaries_at(&runtime_dir);
 
         // Build per-service status entries.
         let mut services = Vec::new();
@@ -832,11 +834,11 @@ mod linux {
                 "docker socket exists but not reachable: {}",
                 DOCKER_API_UNIX_SOCKET
             )
-        } else if detect_runtime_bin_dir().is_none() {
+        } else if !missing_runtime_binaries.is_empty() {
             format!(
                 "docker socket missing: {}; {}",
                 DOCKER_API_UNIX_SOCKET,
-                runtime_missing_detail()
+                runtime_missing_detail_from(&missing_runtime_binaries)
             )
         } else {
             format!("docker socket missing: {}", DOCKER_API_UNIX_SOCKET)
@@ -880,10 +882,7 @@ mod linux {
 
     fn detect_runtime_bin_dir() -> Option<PathBuf> {
         let dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
-        if REQUIRED_RUNTIME_BINARIES
-            .iter()
-            .all(|name| dir.join(name).exists())
-        {
+        if missing_runtime_binaries_at(&dir).is_empty() {
             Some(dir)
         } else {
             None
@@ -892,11 +891,11 @@ mod linux {
 
     fn runtime_missing_detail() -> String {
         let dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
-        let missing: Vec<&str> = REQUIRED_RUNTIME_BINARIES
-            .iter()
-            .filter(|name| !dir.join(name).exists())
-            .copied()
-            .collect();
+        let missing = missing_runtime_binaries_at(&dir);
+        runtime_missing_detail_from(&missing)
+    }
+
+    fn runtime_missing_detail_from(missing: &[&'static str]) -> String {
         if missing.is_empty() {
             format!("all runtime binaries present under {ARCBOX_RUNTIME_BIN_DIR}")
         } else {
@@ -906,6 +905,14 @@ mod linux {
                 missing.join(", ")
             )
         }
+    }
+
+    fn missing_runtime_binaries_at(dir: &Path) -> Vec<&'static str> {
+        REQUIRED_RUNTIME_BINARIES
+            .iter()
+            .copied()
+            .filter(|name| !dir.join(name).exists())
+            .collect()
     }
 
     /// Ensures the guest environment has the prerequisites that dockerd/containerd
