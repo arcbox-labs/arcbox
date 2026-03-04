@@ -47,7 +47,6 @@ mod platform {
         // Writable subdirectories under /var.
         mkdir_p("/var/lib/docker");
         mkdir_p("/var/run/docker");
-        mkdir_p("/var/log/arcbox");
         mkdir_p("/run/containerd");
 
         // Pseudo-filesystems.

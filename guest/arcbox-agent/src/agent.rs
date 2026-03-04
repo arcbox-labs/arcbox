@@ -219,8 +219,7 @@ mod linux {
     use arcbox_constants::devices::DOCKER_DATA_BLOCK_DEVICE as DOCKER_DATA_DEVICE_DEFAULT;
     use arcbox_constants::env::GUEST_DOCKER_VSOCK_PORT as GUEST_DOCKER_VSOCK_PORT_ENV;
     use arcbox_constants::paths::{
-        ARCBOX_LOG_DIR, ARCBOX_RUNTIME_BIN_DIR, CONTAINERD_ROOT_DIR, CONTAINERD_SOCKET,
-        DOCKER_API_UNIX_SOCKET, DOCKER_DATA_MOUNT_POINT,
+        ARCBOX_RUNTIME_BIN_DIR, CONTAINERD_SOCKET, DOCKER_API_UNIX_SOCKET, DOCKER_DATA_MOUNT_POINT,
     };
     use arcbox_constants::ports::DOCKER_API_VSOCK_PORT;
     use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
@@ -309,6 +308,7 @@ mod linux {
     /// Must live on a writable filesystem. `/run` is tmpfs (set up in PID1 init),
     /// while EROFS root is read-only and cannot host dynamic mountpoints.
     const BTRFS_TEMP_MOUNT: &str = "/run/arcbox/data";
+    const CONTAINERD_DATA_MOUNT_POINT: &str = "/var/lib/containerd";
 
     fn has_btrfs_superblock(device: &str) -> bool {
         let mut file = match std::fs::File::open(device) {
@@ -357,7 +357,7 @@ mod linux {
     /// Layout after this function returns:
     /// - `/run/arcbox/data` — raw Btrfs mount (internal, not used by daemons)
     /// - `/var/lib/docker` — bind mount of `@docker` subvolume
-    /// - `/var/log/arcbox` — bind mount of `@logs` subvolume
+    /// - `/var/lib/containerd` — bind mount of `@containerd` subvolume
     ///
     /// Returns `Ok(notes)` on success or `Err(reason)` if the data volume
     /// could not be set up. Callers must abort runtime startup on error —
@@ -365,7 +365,7 @@ mod linux {
     fn ensure_data_mount() -> Result<String, String> {
         // Already fully set up?
         if crate::mount::is_mounted(DOCKER_DATA_MOUNT_POINT)
-            && crate::mount::is_mounted(ARCBOX_LOG_DIR)
+            && crate::mount::is_mounted(CONTAINERD_DATA_MOUNT_POINT)
         {
             return Ok("data subvolumes already mounted".to_string());
         }
@@ -412,7 +412,7 @@ mod linux {
         }
 
         // Step 3: Create subvolumes if missing.
-        for subvol in ["@docker", "@logs"] {
+        for subvol in ["@docker", "@containerd"] {
             let subvol_path = format!("{}/{}", BTRFS_TEMP_MOUNT, subvol);
             if Path::new(&subvol_path).exists() {
                 continue;
@@ -429,7 +429,7 @@ mod linux {
         // Step 4: Bind mount subvolumes to final paths.
         for (subvol, target) in [
             ("@docker", DOCKER_DATA_MOUNT_POINT),
-            ("@logs", ARCBOX_LOG_DIR),
+            ("@containerd", CONTAINERD_DATA_MOUNT_POINT),
         ] {
             if crate::mount::is_mounted(target) {
                 continue;
@@ -1331,15 +1331,15 @@ mod linux {
     ///
     /// Prefers `/arcbox/` (VirtioFS mount, visible from host as `~/.arcbox/`)
     /// so that logs survive guest restarts and are accessible without exec.
-    /// Falls back to `/var/log/` (guest tmpfs) if VirtioFS is not mounted.
+    /// Falls back to `/tmp/` (guest tmpfs) if VirtioFS is not mounted.
     fn daemon_log_file(name: &str) -> Stdio {
         let arcbox_path = format!("/arcbox/{}.log", name);
-        let var_log_path = format!("/var/log/{}.log", name);
+        let tmp_log_path = format!("/tmp/{}.log", name);
 
         let log_path = if Path::new("/arcbox").exists() {
             &arcbox_path
         } else {
-            &var_log_path
+            &tmp_log_path
         };
 
         match std::fs::OpenOptions::new()
@@ -1349,11 +1349,11 @@ mod linux {
         {
             Ok(f) => f.into(),
             Err(_) => {
-                // Fallback to /var/log/ if /arcbox/ write fails.
+                // Fallback to /tmp/ if /arcbox/ write fails.
                 match std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(&var_log_path)
+                    .open(&tmp_log_path)
                 {
                     Ok(f) => f.into(),
                     Err(_) => Stdio::null(),
@@ -1393,13 +1393,7 @@ mod linux {
             Err(e) => return format!("data volume setup failed: {}", e),
         }
 
-        for dir in [
-            "/run/containerd",
-            "/var/run/docker",
-            CONTAINERD_ROOT_DIR,
-            "/etc/docker",
-            ARCBOX_LOG_DIR,
-        ] {
+        for dir in ["/run/containerd", "/var/run/docker", "/etc/docker"] {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 notes.push(format!("mkdir {} failed({})", dir, e));
             }
@@ -1438,8 +1432,6 @@ mod linux {
                 containerd_config,
                 "--address",
                 CONTAINERD_SOCKET,
-                "--root",
-                CONTAINERD_ROOT_DIR,
                 "--state",
                 "/run/containerd",
             ])
