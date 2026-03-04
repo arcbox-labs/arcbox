@@ -16,6 +16,9 @@ on:
       - "Cargo.lock"
       - ".github/workflows/arcbox-vm-linux.yml"
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
