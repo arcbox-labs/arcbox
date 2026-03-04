@@ -34,6 +34,7 @@ figment = { workspace = true }
 uuid = { workspace = true }
 dirs = { workspace = true }
 toml = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

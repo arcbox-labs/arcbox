@@ -9,9 +9,9 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 DEV_BOOT_DIR="$PROJECT_DIR/boot-assets/dev"
 KERNEL_REPO_DIR="${ARCBOX_KERNEL_DIR:-$PROJECT_DIR/../arcbox-kernel}"
 KERNEL_OUTPUT_DIR="$KERNEL_REPO_DIR/output"
-BOOT_ASSET_VERSION_DEFAULT="$(awk -F '"' '/pub const BOOT_ASSET_VERSION/ {print $2; exit}' "$PROJECT_DIR/app/arcbox-core/src/boot_assets.rs")"
+BOOT_ASSET_VERSION_DEFAULT="$(awk -F '"' '/^version[[:space:]]*=/ {print $2; exit}' "$PROJECT_DIR/boot-assets.lock")"
 if [[ -z "$BOOT_ASSET_VERSION_DEFAULT" ]]; then
-    echo "Failed to resolve BOOT_ASSET_VERSION from app/arcbox-core/src/boot_assets.rs" >&2
+    echo "Failed to resolve version from boot-assets.lock" >&2
     exit 1
 fi
 BOOT_ASSET_VERSION="${ARCBOX_BOOT_ASSET_VERSION:-$BOOT_ASSET_VERSION_DEFAULT}"

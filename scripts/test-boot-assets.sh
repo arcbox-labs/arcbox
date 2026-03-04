@@ -7,9 +7,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 TEST_DIR="/tmp/arcbox-boot-test-$$"
-BOOT_ASSETS_VERSION_DEFAULT="$(awk -F '\"' '/pub const BOOT_ASSET_VERSION/ {print $2; exit}' "$PROJECT_DIR/app/arcbox-core/src/boot_assets.rs")"
+BOOT_ASSETS_VERSION_DEFAULT="$(awk -F '"' '/^version[[:space:]]*=/ {print $2; exit}' "$PROJECT_DIR/boot-assets.lock")"
 if [[ -z "$BOOT_ASSETS_VERSION_DEFAULT" ]]; then
-    echo "Failed to resolve BOOT_ASSET_VERSION from app/arcbox-core/src/boot_assets.rs" >&2
+    echo "Failed to resolve version from boot-assets.lock" >&2
     exit 1
 fi
 BOOT_ASSETS_VERSION="${ARCBOX_BOOT_ASSET_VERSION:-$BOOT_ASSETS_VERSION_DEFAULT}"

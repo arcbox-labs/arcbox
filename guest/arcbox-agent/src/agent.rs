@@ -279,7 +279,6 @@ mod linux {
     /// Must live on a writable filesystem. `/run` is tmpfs (set up in PID1 init),
     /// while EROFS root is read-only and cannot host dynamic mountpoints.
     const BTRFS_TEMP_MOUNT: &str = "/run/arcbox/data";
-    const CONTAINERD_DATA_MOUNT_POINT: &str = "/var/lib/containerd";
 
     fn has_btrfs_superblock(device: &str) -> bool {
         let mut file = match std::fs::File::open(device) {

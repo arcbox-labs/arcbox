@@ -119,6 +119,9 @@ crossterm = "0.27"
 # Bytes and buffer
 bytes = "1"
 
+# Cryptography
+sha2 = "0.10"
+
 # Concurrent data structures
 dashmap = "6"
 

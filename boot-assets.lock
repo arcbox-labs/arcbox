@@ -1,0 +1,3 @@
+version = "0.3.0"
+cdn = "https://boot.arcboxcdn.com"
+manifest_sha256 = ""

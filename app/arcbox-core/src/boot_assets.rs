@@ -1,6 +1,6 @@
 //! Boot asset management for VM startup.
 //!
-//! Thin wrapper around `arcbox_boot::AssetManager` (schema v7).
+//! Thin wrapper around `arcbox_boot::AssetManager`.
 //! All downloading, caching, and verification logic lives in the
 //! `arcbox-boot` crate; this module provides daemon-specific
 //! configuration defaults, error mapping, and the `BootAssets` struct
@@ -10,21 +10,45 @@ use crate::error::{CoreError, Result};
 use arcbox_boot::asset_manager::{AssetManager, AssetManagerConfig};
 use arcbox_boot::download::{PrepareProgress, ProgressCallback as InnerProgressCallback};
 use arcbox_constants::env::BOOT_ASSET_VERSION as BOOT_ASSET_VERSION_ENV;
+use sha2::Digest;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 // Re-exports for consumers (CLI, lib.rs).
 pub use arcbox_boot::download::{PreparePhase, PrepareProgress as DownloadProgress};
 pub use arcbox_boot::manifest::Manifest as BootAssetManifest;
 
 // =============================================================================
-// Constants
+// Lockfile
 // =============================================================================
 
-/// Boot asset version pinned by this daemon release.
-pub const BOOT_ASSET_VERSION: &str = "0.2.3";
+/// Embedded lockfile (compiled-in from workspace root).
+const LOCK_TOML: &str = include_str!("../../../boot-assets.lock");
 
-/// Default CDN base URL.
-const DEFAULT_CDN_BASE_URL: &str = "https://dl.arcbox.dev/boot-assets";
+/// Parsed lockfile.
+#[derive(Debug, serde::Deserialize)]
+struct BootAssetsLock {
+    version: String,
+    cdn: Option<String>,
+    manifest_sha256: Option<String>,
+}
+
+static LOCK: LazyLock<BootAssetsLock> = LazyLock::new(|| {
+    toml::from_str(LOCK_TOML).expect("invalid boot-assets.lock")
+});
+
+/// Default CDN base URL (fallback when lockfile omits `cdn`).
+const DEFAULT_CDN_BASE_URL: &str = "https://boot.arcboxcdn.com";
+
+/// Boot asset version pinned by this daemon release.
+pub fn boot_asset_version() -> &'static str {
+    &LOCK.version
+}
+
+/// CDN base URL resolved from lockfile (or default).
+pub fn boot_asset_cdn() -> &'static str {
+    LOCK.cdn.as_deref().unwrap_or(DEFAULT_CDN_BASE_URL)
+}
 
 // =============================================================================
 // Configuration
@@ -48,7 +72,7 @@ pub struct BootAssetConfig {
 impl Default for BootAssetConfig {
     fn default() -> Self {
         let version = std::env::var(BOOT_ASSET_VERSION_ENV)
-            .unwrap_or_else(|_| BOOT_ASSET_VERSION.to_string());
+            .unwrap_or_else(|_| boot_asset_version().to_string());
 
         let arch = if cfg!(target_arch = "aarch64") {
             "arm64"
@@ -58,7 +82,7 @@ impl Default for BootAssetConfig {
         .to_string();
 
         Self {
-            cdn_base_url: DEFAULT_CDN_BASE_URL.to_string(),
+            cdn_base_url: boot_asset_cdn().to_string(),
             version,
             arch,
             cache_dir: dirs::home_dir()
@@ -183,6 +207,19 @@ impl BootAssetProvider {
             .prepare(cb)
             .await
             .map_err(|e| CoreError::config(format!("boot asset error: {e}")))?;
+
+        // Verify manifest SHA256 if the lockfile specifies one.
+        if let Some(expected) = LOCK.manifest_sha256.as_deref().filter(|s| !s.is_empty()) {
+            let manifest_path = self.config.version_cache_dir().join("manifest.json");
+            let bytes = std::fs::read(&manifest_path)
+                .map_err(|e| CoreError::config(format!("read manifest: {e}")))?;
+            let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
+            if actual != expected {
+                return Err(CoreError::config(format!(
+                    "manifest SHA256 mismatch: expected {expected}, got {actual}"
+                )));
+            }
+        }
 
         Ok(BootAssets {
             kernel: prepared.kernel,
@@ -317,7 +354,7 @@ mod tests {
         unsafe { std::env::remove_var(BOOT_ASSET_VERSION_ENV) };
 
         let config = BootAssetConfig::default();
-        assert_eq!(config.version, BOOT_ASSET_VERSION);
+        assert_eq!(config.version, boot_asset_version());
 
         restore_env(original);
     }
