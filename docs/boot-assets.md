@@ -3,7 +3,7 @@
 ## Overview
 
 ArcBox boot assets are built and released from the dedicated
-repository [`arcbox-labs/boot-assets`](https://github.com/arcbox-labs/boot-assets).
+repository [`arcboxlabs/boot-assets`](https://github.com/arcboxlabs/boot-assets).
 
 Each release contains per-architecture artifacts plus a unified multi-target manifest:
 
@@ -27,7 +27,7 @@ Agent and runtime binaries are distributed via VirtioFS from the host.
 ## Responsibilities In boot-assets Repository
 
 1. Build EROFS rootfs from Alpine static binaries
-2. Download pre-built kernels from `arcbox-labs/kernel`
+2. Download pre-built kernels from `arcboxlabs/kernel`
 3. Sync upstream runtime binaries (Docker 27.5.1 static package)
 4. Package tarball + checksum + manifest
 5. Publish to GitHub Releases and Cloudflare R2 CDN

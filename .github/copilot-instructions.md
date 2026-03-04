@@ -156,7 +156,7 @@ RUST_BACKTRACE=1                      # Enable backtraces
 **Test resources:**
 
 - Test kernel images live under `tests/resources/`
-- Release boot assets (kernel + EROFS rootfs) are built in `arcbox-labs/boot-assets`
+- Release boot assets (kernel + EROFS rootfs) are built in `arcboxlabs/boot-assets`
 
 ## Documentation References
 
