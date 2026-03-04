@@ -48,7 +48,11 @@ pub async fn execute(command: BootCommands) -> anyhow::Result<()> {
 }
 
 /// Prefetch boot assets and runtime binaries.
-async fn prefetch(root_data_dir: &Path, boot_cache_dir: PathBuf, args: PrefetchArgs) -> anyhow::Result<()> {
+async fn prefetch(
+    root_data_dir: &Path,
+    boot_cache_dir: PathBuf,
+    args: PrefetchArgs,
+) -> anyhow::Result<()> {
     use arcbox_core::boot_assets::{BootAssetConfig, BootAssetProvider, DownloadProgress};
 
     println!("Prefetching boot assets...");
@@ -72,18 +76,36 @@ async fn prefetch(root_data_dir: &Path, boot_cache_dir: PathBuf, args: PrefetchA
             use std::io::Write;
 
             let status = match &progress.phase {
-                PreparePhase::Checking => format!("[{}/{}] {} checking...", progress.current, progress.total, progress.name),
+                PreparePhase::Checking => format!(
+                    "[{}/{}] {} checking...",
+                    progress.current, progress.total, progress.name
+                ),
                 PreparePhase::Downloading { downloaded, total } => {
                     if let Some(t) = total {
                         let pct = if *t > 0 { downloaded * 100 / t } else { 0 };
-                        format!("[{}/{}] {} downloading {}%", progress.current, progress.total, progress.name, pct)
+                        format!(
+                            "[{}/{}] {} downloading {}%",
+                            progress.current, progress.total, progress.name, pct
+                        )
                     } else {
-                        format!("[{}/{}] {} downloading {} bytes", progress.current, progress.total, progress.name, downloaded)
+                        format!(
+                            "[{}/{}] {} downloading {} bytes",
+                            progress.current, progress.total, progress.name, downloaded
+                        )
                     }
                 }
-                PreparePhase::Verifying => format!("[{}/{}] {} verifying...", progress.current, progress.total, progress.name),
-                PreparePhase::Ready => format!("[{}/{}] {} ready", progress.current, progress.total, progress.name),
-                PreparePhase::Cached => format!("[{}/{}] {} cached", progress.current, progress.total, progress.name),
+                PreparePhase::Verifying => format!(
+                    "[{}/{}] {} verifying...",
+                    progress.current, progress.total, progress.name
+                ),
+                PreparePhase::Ready => format!(
+                    "[{}/{}] {} ready",
+                    progress.current, progress.total, progress.name
+                ),
+                PreparePhase::Cached => format!(
+                    "[{}/{}] {} cached",
+                    progress.current, progress.total, progress.name
+                ),
             };
             print!("\r{:<60}", status);
             let _ = std::io::stdout().flush();

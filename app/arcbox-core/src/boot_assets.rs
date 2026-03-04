@@ -6,10 +6,10 @@
 //! configuration defaults, error mapping, and the `BootAssets` struct
 //! that `vm_lifecycle` consumes.
 
-use arcbox_boot::asset_manager::{AssetManager, AssetManagerConfig};
-use arcbox_boot::download::{ProgressCallback as InnerProgressCallback, PrepareProgress};
-use arcbox_constants::env::BOOT_ASSET_VERSION as BOOT_ASSET_VERSION_ENV;
 use crate::error::{CoreError, Result};
+use arcbox_boot::asset_manager::{AssetManager, AssetManagerConfig};
+use arcbox_boot::download::{PrepareProgress, ProgressCallback as InnerProgressCallback};
+use arcbox_constants::env::BOOT_ASSET_VERSION as BOOT_ASSET_VERSION_ENV;
 use std::path::{Path, PathBuf};
 
 // Re-exports for consumers (CLI, lib.rs).
@@ -21,7 +21,7 @@ pub use arcbox_boot::manifest::Manifest as BootAssetManifest;
 // =============================================================================
 
 /// Boot asset version pinned by this daemon release.
-pub const BOOT_ASSET_VERSION: &str = "0.2.0";
+pub const BOOT_ASSET_VERSION: &str = "0.2.2";
 
 /// Default CDN base URL.
 const DEFAULT_CDN_BASE_URL: &str = "https://dl.arcbox.dev/boot-assets";

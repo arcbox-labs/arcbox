@@ -276,7 +276,10 @@ mod linux {
     const BTRFS_MAGIC_OFFSET: u64 = 0x10040;
 
     /// Temporary mount point for the raw Btrfs device before subvolume bind mounts.
-    const BTRFS_TEMP_MOUNT: &str = "/mnt/data";
+    ///
+    /// Must live on a writable filesystem. `/run` is tmpfs (set up in PID1 init),
+    /// while EROFS root is read-only and cannot create `/mnt/data` at runtime.
+    const BTRFS_TEMP_MOUNT: &str = "/run/arcbox/data";
 
     fn has_btrfs_superblock(device: &str) -> bool {
         let mut file = match std::fs::File::open(device) {
@@ -323,7 +326,7 @@ mod linux {
     /// Mounts the data volume (Btrfs), creates subvolumes, and bind-mounts them.
     ///
     /// Layout after this function returns:
-    /// - `/mnt/data` — raw Btrfs mount (internal, not used by daemons)
+    /// - `/run/arcbox/data` — raw Btrfs mount (internal, not used by daemons)
     /// - `/var/lib/docker` — bind mount of `@docker` subvolume
     /// - `/var/log/arcbox` — bind mount of `@logs` subvolume
     ///
@@ -349,7 +352,7 @@ mod linux {
             Err(e) => return Err(e),
         }
 
-        // Step 2: Mount raw Btrfs to /mnt/data.
+        // Step 2: Mount raw Btrfs to temporary writable mount point.
         if !crate::mount::is_mounted(BTRFS_TEMP_MOUNT) {
             if let Err(e) = std::fs::create_dir_all(BTRFS_TEMP_MOUNT) {
                 return Err(format!("failed to create {}: {}", BTRFS_TEMP_MOUNT, e));
@@ -855,12 +858,14 @@ mod linux {
                 "docker socket exists but not reachable: {}",
                 DOCKER_API_UNIX_SOCKET
             )
-        } else {
+        } else if detect_runtime_bin_dir().is_none() {
             format!(
                 "docker socket missing: {}; {}",
                 DOCKER_API_UNIX_SOCKET,
                 runtime_missing_detail()
             )
+        } else {
+            format!("docker socket missing: {}", DOCKER_API_UNIX_SOCKET)
         };
 
         RuntimeStatusResponse {
@@ -1196,11 +1201,19 @@ mod linux {
         }
 
         if !probe_unix_socket(DOCKER_API_UNIX_SOCKET).await {
+            // Ensure runc is available for dockerd's built-in BuildKit worker.
+            // Workaround: symlink youki as runc until real runc is in runtime assets.
+            let runc_path = runtime_bin_dir.join("runc");
+            if !runc_path.exists() && youki_bin.exists() {
+                let _ = std::os::unix::fs::symlink(&youki_bin, &runc_path);
+            }
+
             let mut cmd = Command::new(&dockerd_bin);
             cmd.arg(format!("--host=unix://{DOCKER_API_UNIX_SOCKET}"))
                 .arg(format!("--containerd={CONTAINERD_SOCKET}"))
                 .arg("--exec-root=/var/run/docker")
                 .arg(format!("--data-root={DOCKER_DATA_MOUNT_POINT}"))
+                .arg("--userland-proxy=false")
                 .env("PATH", &path_env)
                 .stdin(Stdio::null())
                 .stdout(daemon_log_file("dockerd"))
