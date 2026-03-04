@@ -14,7 +14,7 @@
 # Prerequisites:
 #   - Docker installed (for building e2e test image)
 #   - arcbox binary built (cargo build)
-#   - kernel/initramfs prepared (tests/resources/download-kernel.sh)
+#   - boot assets prepared (kernel + EROFS rootfs)
 
 set -e
 
@@ -115,15 +115,14 @@ check_prerequisites() {
     fi
     echo "  ✓ docker-cli repo"
 
-    # Check kernel/initramfs
+    # Check kernel (boot assets are downloaded automatically by daemon)
     KERNEL_PATH="${PROJECT_ROOT}/tests/resources/Image-arm64"
-    INITRAMFS_PATH="${PROJECT_ROOT}/tests/resources/initramfs-arcbox"
 
-    if [[ -f "$KERNEL_PATH" ]] && [[ -f "$INITRAMFS_PATH" ]]; then
-        echo "  ✓ kernel and initramfs"
+    if [[ -f "$KERNEL_PATH" ]]; then
+        echo "  ✓ kernel"
         HAS_VM_SUPPORT=true
     else
-        echo -e "  ${YELLOW}⚠ kernel/initramfs not found (VM tests will be limited)${NC}"
+        echo -e "  ${YELLOW}⚠ kernel not found (VM tests will be limited)${NC}"
         HAS_VM_SUPPORT=false
     fi
 
@@ -158,7 +157,7 @@ start_daemon() {
     DAEMON_CMD="$ARCBOX_BINARY daemon start --socket $TEST_SOCKET --data-dir $TEST_DATA_DIR"
 
     if [[ "$HAS_VM_SUPPORT" == "true" ]]; then
-        DAEMON_CMD="$DAEMON_CMD --kernel $KERNEL_PATH --initramfs $INITRAMFS_PATH"
+        DAEMON_CMD="$DAEMON_CMD --kernel $KERNEL_PATH"
     fi
 
     # Start daemon in background

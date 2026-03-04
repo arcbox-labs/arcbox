@@ -1,25 +1,23 @@
 //! Boot asset management for VM startup.
 //!
 //! This module handles automatic downloading, verification, and caching
-//! of kernel/initramfs/rootfs/modloop files required for VM boot.
+//! of kernel and EROFS rootfs files required for VM boot.
 //!
 //! ## Asset Sources
 //!
 //! Boot assets can be obtained from:
 //! 1. **CDN/GitHub Releases** - Pre-built optimized boot bundle
 //! 2. **Local cache** - Previously downloaded assets
-//! 3. **Custom paths** - User-provided kernel/initramfs
+//! 3. **Custom paths** - User-provided kernel
 //!
-//! ## Asset Structure
+//! ## Asset Structure (schema v6)
 //!
 //! Downloaded assets are stored in:
 //! ```text
 //! ~/.arcbox/boot/
 //! ├── v0.1.0/
 //! │   ├── kernel
-//! │   ├── initramfs.cpio.gz
-//! │   ├── rootfs.squashfs
-//! │   ├── modloop
+//! │   ├── rootfs.erofs
 //! │   └── manifest.json
 //! └── current -> v0.1.0/
 //! ```
@@ -41,7 +39,7 @@ use tokio::io::AsyncWriteExt;
 // =============================================================================
 
 /// Default boot asset version.
-/// This is pinned to a known-good kernel/initramfs bundle.
+/// This is pinned to a known-good kernel + EROFS rootfs bundle.
 pub const BOOT_ASSET_VERSION: &str = "0.1.2";
 
 /// Base URL for boot asset downloads.
@@ -55,28 +53,13 @@ const ASSET_BUNDLE_PATTERN: &str = "boot-assets";
 /// Kernel filename inside the bundle.
 const KERNEL_FILENAME: &str = "kernel";
 
-/// Initramfs filename inside the bundle.
-const INITRAMFS_FILENAME: &str = "initramfs.cpio.gz";
-
 /// Manifest filename inside the bundle.
 const MANIFEST_FILENAME: &str = "manifest.json";
 
-/// Rootfs squashfs filename inside the bundle.
-/// Introduced in schema_version 2 (squashfs rootfs architecture).
-/// Stage 1 initramfs mounts this image as the guest OS root filesystem.
-const ROOTFS_SQUASHFS_FILENAME: &str = "rootfs.squashfs";
-
-/// Rootfs ext4 image filename inside the bundle.
-/// Introduced in schema_version 4 (Alpine rootfs + OpenRC architecture).
-/// The VMM attaches this as a VirtIO block device; initramfs mounts it at
-/// /dev/vda and switch_roots to standard Alpine OpenRC init.
-const ROOTFS_EXT4_FILENAME: &str = "rootfs.ext4";
-
-/// Alpine modloop filename inside the bundle.
-/// Introduced in schema_version 3.
-/// Stage 1 initramfs loop-mounts this squashfs and bind-mounts its modules
-/// tree into Stage 2 so modprobe works normally after switch_root.
-const MODLOOP_FILENAME: &str = "modloop";
+/// EROFS read-only rootfs image filename inside the bundle (schema v6+).
+/// The VMM attaches this as a VirtIO block device at /dev/vda (read-only).
+/// Contains: busybox trampoline, mkfs.btrfs, iptables-legacy, CA cert bundle.
+const ROOTFS_EROFS_FILENAME: &str = "rootfs.erofs";
 
 /// Checksum filename suffix.
 const CHECKSUM_SUFFIX: &str = ".sha256";
@@ -106,8 +89,6 @@ pub struct BootAssetConfig {
     pub verify_checksum: bool,
     /// Custom kernel path (overrides download).
     pub custom_kernel: Option<PathBuf>,
-    /// Custom initramfs path (overrides download).
-    pub custom_initramfs: Option<PathBuf>,
 }
 
 impl Default for BootAssetConfig {
@@ -132,7 +113,6 @@ impl Default for BootAssetConfig {
             cache_dir,
             verify_checksum: true,
             custom_kernel: None,
-            custom_initramfs: None,
         }
     }
 }
@@ -149,12 +129,6 @@ impl BootAssetConfig {
     /// Sets custom kernel path.
     pub fn with_kernel(mut self, kernel: PathBuf) -> Self {
         self.custom_kernel = Some(kernel);
-        self
-    }
-
-    /// Sets custom initramfs path.
-    pub fn with_initramfs(mut self, initramfs: PathBuf) -> Self {
-        self.custom_initramfs = Some(initramfs);
         self
     }
 
@@ -191,41 +165,40 @@ fn default_boot_asset_version() -> String {
 // Boot Assets
 // =============================================================================
 
-/// Boot assets (kernel + initramfs).
+/// Boot assets required for VM startup (schema v6).
+///
+/// Contains kernel + EROFS read-only rootfs. No initramfs.
 #[derive(Debug, Clone)]
 pub struct BootAssets {
     /// Path to kernel image.
     pub kernel: PathBuf,
-    /// Path to initramfs.
-    pub initramfs: PathBuf,
-    /// Path to rootfs ext4 image (schema_version >= 4, DistroEngine mode).
-    /// When present, the VMM attaches this as a VirtIO block device at /dev/vda
-    /// and the initramfs mounts it directly (no squashfs+overlay).
-    pub rootfs_image: Option<PathBuf>,
+    /// Path to EROFS rootfs image (attached as /dev/vda, read-only).
+    pub rootfs_image: PathBuf,
     /// Kernel command line.
     pub cmdline: String,
     /// Asset version.
     pub version: String,
-    /// Parsed manifest metadata (if present in cache bundle).
-    pub manifest: Option<BootAssetManifest>,
+    /// Parsed manifest metadata.
+    pub manifest: BootAssetManifest,
 }
 
 impl BootAssets {
-    /// Default kernel command line for ArcBox.
-    ///
-    /// Uses `rdinit=/init` for initramfs-based boot.
+    /// Default kernel command line for EROFS rootfs boot.
     pub fn default_cmdline() -> String {
-        "console=hvc0 console=ttyAMA0 rdinit=/init".to_string()
+        "console=hvc0 root=/dev/vda ro rootfstype=erofs earlycon".to_string()
     }
 }
 
-/// Boot asset manifest metadata.
+/// Boot asset manifest metadata (schema v6).
 ///
-/// This file is generated in the boot-assets release pipeline and bundled
-/// alongside kernel/initramfs as `manifest.json`.
+/// Generated by the boot-assets release pipeline and bundled alongside
+/// the kernel and EROFS rootfs as `manifest.json`.
+///
+/// Schema v6 is a hard break: manifests with `schema_version < 6` are
+/// rejected with a clear error message. No v1-v5 fallback paths.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BootAssetManifest {
-    /// Manifest schema version.
+    /// Manifest schema version (must be >= 6).
     #[serde(default)]
     pub schema_version: u32,
     /// Boot asset version (must match configured version).
@@ -235,46 +208,15 @@ pub struct BootAssetManifest {
     /// Kernel git commit used to build this asset.
     #[serde(default)]
     pub kernel_commit: Option<String>,
-    /// arcbox-agent git commit used to build initramfs.
-    #[serde(default)]
-    pub agent_commit: Option<String>,
     /// Build timestamp in UTC (RFC3339 expected).
     #[serde(default)]
     pub built_at: Option<String>,
     /// Recommended kernel cmdline for this boot asset.
     #[serde(default)]
     pub kernel_cmdline: Option<String>,
-    /// Runtime binary metadata bundled in this boot asset.
+    /// SHA256 of rootfs.erofs.
     #[serde(default)]
-    pub runtime_assets: Vec<RuntimeAssetManifestEntry>,
-    /// SHA256 of rootfs.squashfs (present in schema_version >= 2).
-    /// The squashfs image is the Stage 2 root filesystem; Stage 1 initramfs
-    /// mounts it via a tmpfs overlay so that pivot_root works for containers.
-    #[serde(default)]
-    pub rootfs_squashfs_sha256: Option<String>,
-    /// SHA256 of modloop (present in schema_version >= 3).
-    #[serde(default)]
-    pub modloop_sha256: Option<String>,
-    /// SHA256 of rootfs.ext4 (present in schema_version >= 4).
-    /// The ext4 image is attached as a VirtIO block device; Alpine OpenRC
-    /// handles all init instead of a custom two-stage init.
-    #[serde(default)]
-    pub rootfs_ext4_sha256: Option<String>,
-}
-
-/// Runtime artifact metadata in boot manifest.
-#[derive(Debug, Clone, Deserialize)]
-pub struct RuntimeAssetManifestEntry {
-    /// Runtime component name (for example: dockerd, containerd, youki).
-    pub name: String,
-    /// Relative path inside boot asset bundle.
-    pub path: String,
-    /// Optional component version.
-    #[serde(default)]
-    pub version: Option<String>,
-    /// Optional sha256 checksum for this file.
-    #[serde(default)]
-    pub sha256: Option<String>,
+    pub rootfs_erofs_sha256: Option<String>,
 }
 
 // =============================================================================
@@ -314,7 +256,7 @@ pub type ProgressCallback = Box<dyn Fn(DownloadProgress) + Send + Sync>;
 
 /// Boot asset provider with automatic downloading.
 ///
-/// Manages kernel and initramfs files required for VM boot.
+/// Manages kernel and rootfs files required for VM boot.
 /// Assets are automatically downloaded from CDN if not cached.
 pub struct BootAssetProvider {
     /// Configuration.
@@ -352,16 +294,6 @@ impl BootAssetProvider {
         self
     }
 
-    /// Sets custom initramfs path.
-    pub fn with_initramfs(mut self, initramfs: PathBuf) -> Self {
-        // Only set if path is not empty.
-        if initramfs.as_os_str().is_empty() {
-            return self;
-        }
-        self.config.custom_initramfs = Some(initramfs);
-        self
-    }
-
     /// Returns the configuration.
     pub fn config(&self) -> &BootAssetConfig {
         &self.config
@@ -377,16 +309,15 @@ impl BootAssetProvider {
 
     /// Gets boot assets with progress callback.
     ///
+    /// Returns kernel + EROFS rootfs. Rejects manifests with schema_version < 6.
+    ///
     /// # Errors
     /// Returns an error if assets cannot be found or downloaded.
     pub async fn get_assets_with_progress(
         &self,
         progress: Option<ProgressCallback>,
     ) -> Result<BootAssets> {
-        let using_custom_paths =
-            self.config.custom_kernel.is_some() || self.config.custom_initramfs.is_some();
-
-        // Check for custom paths first.
+        // Kernel: custom path or downloaded.
         let kernel = if let Some(ref k) = self.config.custom_kernel {
             if !k.exists() {
                 return Err(CoreError::config(format!(
@@ -395,54 +326,22 @@ impl BootAssetProvider {
                 )));
             }
             tracing::debug!("Using custom kernel: {}", k.display());
-            // Decompress ZBOOT into cache dir so we never modify the user's
-            // original file (it may be read-only or a build artifact).
             ensure_kernel_decompressed_to_cache(k, &self.config.version_cache_dir()).await?
         } else {
             self.get_kernel_path(&progress).await?
         };
 
-        let initramfs = if let Some(ref i) = self.config.custom_initramfs {
-            if !i.exists() {
-                return Err(CoreError::config(format!(
-                    "custom initramfs not found: {}",
-                    i.display()
-                )));
-            }
-            tracing::debug!("Using custom initramfs: {}", i.display());
-            i.clone()
-        } else {
-            self.get_initramfs_path(&progress).await?
-        };
+        // EROFS rootfs: always from cache (no custom path override).
+        let rootfs_image = self.get_rootfs_erofs_path(&progress).await?;
 
-        let manifest = if using_custom_paths {
-            // Custom kernel/initramfs paths are used for local development.
-            // Still try to load the cached manifest so the bundled runtime
-            // validation in runtime.rs (which reads runtime_assets) continues
-            // to work. If no cached manifest exists, silently fall back to None.
-            self.read_cached_manifest().await.ok().flatten()
-        } else {
-            Some(self.read_cached_manifest_required().await?)
-        };
-
+        let manifest = self.read_cached_manifest_required().await?;
         let cmdline = manifest
-            .as_ref()
-            .and_then(|m| m.kernel_cmdline.clone())
+            .kernel_cmdline
+            .clone()
             .unwrap_or_else(BootAssets::default_cmdline);
-
-        // Check for rootfs.ext4 (schema_version >= 4, DistroEngine mode).
-        let rootfs_image = {
-            let ext4_path = self.config.version_cache_dir().join(ROOTFS_EXT4_FILENAME);
-            if ext4_path.exists() {
-                Some(ext4_path)
-            } else {
-                None
-            }
-        };
 
         Ok(BootAssets {
             kernel,
-            initramfs,
             rootfs_image,
             cmdline,
             version: self.config.version.clone(),
@@ -473,24 +372,24 @@ impl BootAssetProvider {
         }
     }
 
-    /// Gets initramfs path, downloading if needed.
-    async fn get_initramfs_path(&self, progress: &Option<ProgressCallback>) -> Result<PathBuf> {
-        let initramfs_path = self.config.version_cache_dir().join(INITRAMFS_FILENAME);
+    /// Gets EROFS rootfs path, downloading if needed.
+    async fn get_rootfs_erofs_path(&self, progress: &Option<ProgressCallback>) -> Result<PathBuf> {
+        let erofs_path = self.config.version_cache_dir().join(ROOTFS_EROFS_FILENAME);
 
-        if initramfs_path.exists() {
-            tracing::debug!("Using cached initramfs: {}", initramfs_path.display());
-            return Ok(initramfs_path);
+        if erofs_path.exists() {
+            tracing::debug!("Using cached EROFS rootfs: {}", erofs_path.display());
+            return Ok(erofs_path);
         }
 
         // Need to download assets.
         self.download_assets(progress).await?;
 
-        if initramfs_path.exists() {
-            Ok(initramfs_path)
+        if erofs_path.exists() {
+            Ok(erofs_path)
         } else {
             Err(CoreError::config(format!(
-                "initramfs not found after download: {}",
-                initramfs_path.display()
+                "rootfs.erofs not found after download: {}",
+                erofs_path.display()
             )))
         }
     }
@@ -739,8 +638,25 @@ impl BootAssetProvider {
         .map_err(|e| CoreError::config(format!("extraction task failed: {}", e)))?
     }
 
-    /// Validates required files after extraction.
+    /// Validates required files after extraction (schema v6 only).
     async fn validate_extracted_assets(&self, cache_dir: &Path) -> Result<()> {
+        let manifest = self.require_manifest_from_dir(cache_dir).await?;
+
+        if manifest.schema_version < 6 {
+            return Err(CoreError::config(format!(
+                "unsupported boot asset schema_version {} (minimum: 6). \
+                 Run 'arcbox boot prefetch --force' to download compatible assets.",
+                manifest.schema_version
+            )));
+        }
+
+        tracing::info!(
+            "Boot asset manifest loaded: version={}, arch={}, kernel_commit={}",
+            manifest.asset_version,
+            manifest.arch,
+            manifest.kernel_commit.as_deref().unwrap_or("unknown"),
+        );
+
         let kernel_path = cache_dir.join(KERNEL_FILENAME);
         if !kernel_path.exists() {
             return Err(CoreError::config(format!(
@@ -749,70 +665,28 @@ impl BootAssetProvider {
             )));
         }
 
-        let initramfs_path = cache_dir.join(INITRAMFS_FILENAME);
-        if !initramfs_path.exists() {
+        let erofs_path = cache_dir.join(ROOTFS_EROFS_FILENAME);
+        if !erofs_path.exists() {
             return Err(CoreError::config(format!(
-                "boot bundle missing required file: {}",
-                initramfs_path.display()
+                "boot bundle missing required file: {}. \
+                 Run 'arcbox boot prefetch --force' to re-download the asset bundle.",
+                erofs_path.display()
             )));
-        }
-
-        let manifest = self.require_manifest_from_dir(cache_dir).await?;
-        tracing::info!(
-            "Boot asset manifest loaded: version={}, arch={}, kernel_commit={}, agent_commit={}",
-            manifest.asset_version,
-            manifest.arch,
-            manifest.kernel_commit.as_deref().unwrap_or("unknown"),
-            manifest.agent_commit.as_deref().unwrap_or("unknown"),
-        );
-
-        // schema_version 2-3 use rootfs.squashfs (squashfs rootfs architecture).
-        // schema_version 4+ replaced squashfs with ext4 block device rootfs.
-        if manifest.schema_version >= 2 && manifest.schema_version < 4 {
-            let squashfs_path = cache_dir.join(ROOTFS_SQUASHFS_FILENAME);
-            if !squashfs_path.exists() {
-                return Err(CoreError::config(format!(
-                    "boot bundle (schema_version={}) missing required file: {}. \
-                     Run 'arcbox boot prefetch --force' to re-download the asset bundle.",
-                    manifest.schema_version,
-                    squashfs_path.display()
-                )));
-            }
-        }
-
-        // schema_version 3 adds modloop (Alpine kernel modules squashfs).
-        // Stage 1 mounts this inside /newroot so Stage 2 has /lib/modules.
-        if manifest.schema_version >= 3 && manifest.schema_version < 4 {
-            let modloop_path = cache_dir.join(MODLOOP_FILENAME);
-            if !modloop_path.exists() {
-                return Err(CoreError::config(format!(
-                    "boot bundle (schema_version={}) missing required file: {}. \
-                     Run 'arcbox boot prefetch --force' to re-download the asset bundle.",
-                    manifest.schema_version,
-                    modloop_path.display()
-                )));
-            }
-        }
-
-        // schema_version 4 adds rootfs.ext4 (Alpine rootfs + OpenRC).
-        // The VMM attaches this as a VirtIO block device; initramfs mounts
-        // /dev/vda and switch_roots to /sbin/init (OpenRC).
-        if manifest.schema_version >= 4 {
-            let ext4_path = cache_dir.join(ROOTFS_EXT4_FILENAME);
-            if !ext4_path.exists() {
-                return Err(CoreError::config(format!(
-                    "boot bundle (schema_version={}) missing required file: {}. \
-                     Run 'arcbox boot prefetch --force' to re-download the asset bundle.",
-                    manifest.schema_version,
-                    ext4_path.display()
-                )));
-            }
         }
 
         Ok(())
     }
 
     fn validate_manifest(&self, manifest: &BootAssetManifest) -> Result<()> {
+        if manifest.schema_version < 6 {
+            return Err(CoreError::config(format!(
+                "unsupported boot asset schema_version {} (minimum: 6). \
+                 This version of ArcBox requires schema v6 boot assets. \
+                 Run 'arcbox boot prefetch --force' to download compatible assets.",
+                manifest.schema_version
+            )));
+        }
+
         if manifest.asset_version != self.config.version {
             return Err(CoreError::config(format!(
                 "boot manifest version mismatch: expected '{}', got '{}'. \
@@ -897,11 +771,11 @@ impl BootAssetProvider {
         Ok(())
     }
 
-    /// Checks if boot assets are cached.
+    /// Checks if boot assets are cached (kernel + rootfs.erofs + manifest).
     pub fn is_cached(&self) -> bool {
         let cache_dir = self.config.version_cache_dir();
         cache_dir.join(KERNEL_FILENAME).exists()
-            && cache_dir.join(INITRAMFS_FILENAME).exists()
+            && cache_dir.join(ROOTFS_EROFS_FILENAME).exists()
             && cache_dir.join(MANIFEST_FILENAME).exists()
     }
 
@@ -1249,21 +1123,13 @@ mod tests {
         std::fs::write(
             version_dir.join(MANIFEST_FILENAME),
             r#"{
-  "schema_version": 1,
+  "schema_version": 6,
   "asset_version": "1.0.0",
   "arch": "arm64",
   "kernel_commit": "abc123",
-  "agent_commit": "def456",
   "built_at": "2026-02-17T00:00:00Z",
-  "kernel_cmdline": "console=hvc0 rdinit=/init quiet",
-  "runtime_assets": [
-    {
-      "name": "dockerd",
-      "path": "runtime/bin/dockerd",
-      "version": "28.0.0",
-      "sha256": "deadbeef"
-    }
-  ]
+  "kernel_cmdline": "console=hvc0 root=/dev/vda ro rootfstype=erofs earlycon",
+  "rootfs_erofs_sha256": "deadbeef"
 }"#,
         )
         .unwrap();
@@ -1277,24 +1143,14 @@ mod tests {
         let provider = BootAssetProvider::with_config(config);
 
         let manifest = provider.read_cached_manifest().await.unwrap().unwrap();
-        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.schema_version, 6);
         assert_eq!(manifest.asset_version, "1.0.0");
         assert_eq!(manifest.arch, "arm64");
         assert_eq!(
             manifest.kernel_cmdline.as_deref(),
-            Some("console=hvc0 rdinit=/init quiet")
+            Some("console=hvc0 root=/dev/vda ro rootfstype=erofs earlycon")
         );
-        assert_eq!(manifest.runtime_assets.len(), 1);
-        assert_eq!(manifest.runtime_assets[0].name, "dockerd");
-        assert_eq!(manifest.runtime_assets[0].path, "runtime/bin/dockerd");
-        assert_eq!(
-            manifest.runtime_assets[0].version.as_deref(),
-            Some("28.0.0")
-        );
-        assert_eq!(
-            manifest.runtime_assets[0].sha256.as_deref(),
-            Some("deadbeef")
-        );
+        assert_eq!(manifest.rootfs_erofs_sha256.as_deref(), Some("deadbeef"));
     }
 
     #[tokio::test]
@@ -1307,7 +1163,7 @@ mod tests {
         std::fs::write(
             version_dir.join(MANIFEST_FILENAME),
             r#"{
-  "schema_version": 1,
+  "schema_version": 6,
   "asset_version": "2.0.0",
   "arch": "arm64"
 }"#,
@@ -1325,6 +1181,39 @@ mod tests {
         let err = provider.read_cached_manifest().await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("manifest version mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_read_cached_manifest_rejects_schema_v5() {
+        let temp = tempdir().unwrap();
+        let cache_dir = temp.path().to_path_buf();
+        let version = "1.0.0".to_string();
+        let version_dir = cache_dir.join(&version);
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(
+            version_dir.join(MANIFEST_FILENAME),
+            r#"{
+  "schema_version": 5,
+  "asset_version": "1.0.0",
+  "arch": "arm64"
+}"#,
+        )
+        .unwrap();
+
+        let config = BootAssetConfig {
+            cache_dir,
+            version,
+            arch: "arm64".to_string(),
+            ..Default::default()
+        };
+        let provider = BootAssetProvider::with_config(config);
+
+        let err = provider.read_cached_manifest().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported boot asset schema_version 5"),
+            "got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -1376,7 +1265,7 @@ mod tests {
         std::fs::write(
             version_dir.join(MANIFEST_FILENAME),
             r#"{
-  "schema_version": 1,
+  "schema_version": 6,
   "asset_version": "1.0.0",
   "arch": "x86_64"
 }"#,
@@ -1419,8 +1308,8 @@ mod tests {
         std::fs::write(version_dir.join(KERNEL_FILENAME), b"kernel").unwrap();
         assert!(!provider.is_cached());
 
-        // Kernel + initramfs but no manifest: not cached.
-        std::fs::write(version_dir.join(INITRAMFS_FILENAME), b"initramfs").unwrap();
+        // Kernel + rootfs.erofs but no manifest: not cached.
+        std::fs::write(version_dir.join(ROOTFS_EROFS_FILENAME), b"rootfs").unwrap();
         assert!(!provider.is_cached());
 
         // All three files: cached.

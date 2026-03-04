@@ -1,6 +1,6 @@
 //! Boot asset management commands.
 //!
-//! Manage kernel and initramfs files required for VM boot.
+//! Manage kernel and rootfs files required for VM boot.
 
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
@@ -114,20 +114,16 @@ async fn status(data_dir: PathBuf) -> anyhow::Result<()> {
         println!("Status: ✓ Cached and valid");
 
         let kernel = version_dir.join("kernel");
-        let initramfs = version_dir.join("initramfs.cpio.gz");
+        let rootfs = version_dir.join("rootfs.erofs");
 
         if kernel.exists() {
             let meta = std::fs::metadata(&kernel)?;
             println!("  Kernel:    {} ({} bytes)", kernel.display(), meta.len());
         }
 
-        if initramfs.exists() {
-            let meta = std::fs::metadata(&initramfs)?;
-            println!(
-                "  Initramfs: {} ({} bytes)",
-                initramfs.display(),
-                meta.len()
-            );
+        if rootfs.exists() {
+            let meta = std::fs::metadata(&rootfs)?;
+            println!("  Rootfs:    {} ({} bytes)", rootfs.display(), meta.len());
         }
 
         // Manifest is required for cached assets to be considered valid.
@@ -147,10 +143,6 @@ async fn status(data_dir: PathBuf) -> anyhow::Result<()> {
                     "  Kernel SHA: {}",
                     manifest.kernel_commit.as_deref().unwrap_or("unknown")
                 );
-                println!(
-                    "  Agent SHA:  {}",
-                    manifest.agent_commit.as_deref().unwrap_or("unknown")
-                );
             }
             Err(e) => {
                 println!("  Manifest:  ✗ INVALID");
@@ -163,10 +155,10 @@ async fn status(data_dir: PathBuf) -> anyhow::Result<()> {
     } else {
         // Determine what is missing for a more helpful diagnostic.
         let kernel_exists = version_dir.join("kernel").exists();
-        let initramfs_exists = version_dir.join("initramfs.cpio.gz").exists();
+        let rootfs_exists = version_dir.join("rootfs.erofs").exists();
         let manifest_exists = version_dir.join("manifest.json").exists();
 
-        if !kernel_exists && !initramfs_exists && !manifest_exists {
+        if !kernel_exists && !rootfs_exists && !manifest_exists {
             println!("Status: ✗ Not cached");
         } else {
             println!("Status: ✗ Incomplete");
@@ -175,12 +167,8 @@ async fn status(data_dir: PathBuf) -> anyhow::Result<()> {
                 if kernel_exists { "✓" } else { "✗ missing" }
             );
             println!(
-                "  Initramfs: {}",
-                if initramfs_exists {
-                    "✓"
-                } else {
-                    "✗ missing"
-                }
+                "  Rootfs:    {}",
+                if rootfs_exists { "✓" } else { "✗ missing" }
             );
             println!(
                 "  Manifest:  {}",

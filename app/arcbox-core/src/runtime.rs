@@ -1,6 +1,5 @@
 //! ArcBox runtime.
 
-use crate::boot_assets::BootAssetManifest;
 use crate::config::Config;
 use crate::container_backend::{DynContainerBackend, create_backend};
 use crate::error::{CoreError, Result};
@@ -13,12 +12,11 @@ use arcbox_net::NetworkManager;
 use arcbox_net::darwin::inbound_relay::{InboundListenerManager, InboundProtocol};
 #[cfg(not(target_os = "macos"))]
 use arcbox_net::port_forward::{PortForwardRule, PortForwarder};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 #[cfg(not(target_os = "macos"))]
 use std::net::{SocketAddr, SocketAddrV4};
-use std::path::{Component, Path};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock as TokioRwLock;
@@ -28,84 +26,54 @@ use tokio::sync::RwLock as TokioRwLock;
 const DEFAULT_GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 2);
 const REQUIRED_RUNTIME_ASSETS: [&str; 3] = ["dockerd", "containerd", "youki"];
 
-fn validate_bundled_runtime_manifest(manifest: &BootAssetManifest, cache_dir: &Path) -> Result<()> {
-    let mut missing = Vec::new();
-
-    for required in REQUIRED_RUNTIME_ASSETS {
-        let Some(entry) = manifest
-            .runtime_assets
-            .iter()
-            .find(|item| item.name == required)
-        else {
-            missing.push(required);
-            continue;
-        };
-
-        if entry
-            .version
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-        {
-            return Err(CoreError::config(format!(
-                "boot manifest runtime asset '{}' is missing version",
-                required
-            )));
-        }
-        let expected_sha = entry.sha256.as_deref().unwrap_or_default().trim();
-        if expected_sha.is_empty() {
-            return Err(CoreError::config(format!(
-                "boot manifest runtime asset '{}' is missing sha256",
-                required
-            )));
-        }
-
-        let relative_path = Path::new(&entry.path);
-        if relative_path.as_os_str().is_empty()
-            || relative_path.is_absolute()
-            || relative_path
-                .components()
-                .any(|c| matches!(c, Component::ParentDir))
-        {
-            return Err(CoreError::config(format!(
-                "boot manifest runtime asset '{}' has invalid path '{}'",
-                required, entry.path
-            )));
-        }
-
-        let runtime_path = cache_dir.join(relative_path);
-        if !runtime_path.exists() {
-            return Err(CoreError::config(format!(
-                "boot runtime asset '{}' missing from cache: {}",
-                required,
-                runtime_path.display()
-            )));
-        }
-
-        let bytes = std::fs::read(&runtime_path).map_err(|e| {
-            CoreError::config(format!(
-                "failed to read boot runtime asset '{}': {}",
-                runtime_path.display(),
-                e
-            ))
-        })?;
-        let actual_sha = format!("{:x}", Sha256::digest(&bytes));
-        if actual_sha != expected_sha {
-            return Err(CoreError::config(format!(
-                "boot runtime asset '{}' checksum mismatch: expected {}, got {}",
-                required, expected_sha, actual_sha
-            )));
-        }
-    }
-
-    if !missing.is_empty() {
+/// Checks that a file exists and has at least one executable permission bit set.
+fn check_executable(path: &Path, context: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(path)
+        .map_err(|_| CoreError::config(format!("{} at {}", context, path.display())))?;
+    if !meta.is_file() {
         return Err(CoreError::config(format!(
-            "boot manifest runtime_assets missing required entries: {}",
-            missing.join(", ")
+            "{} is not a regular file",
+            path.display()
         )));
     }
+    if meta.permissions().mode() & 0o111 == 0 {
+        return Err(CoreError::config(format!(
+            "{} is not executable (chmod +x)",
+            path.display()
+        )));
+    }
+    Ok(())
+}
 
+/// Ensures all guest binaries are present and executable in the VirtioFS-shared
+/// directories. Called before VM start. Fails fast if any binary is missing or
+/// not executable.
+///
+/// These binaries are provisioned by `arcbox boot prefetch` (release builds) or
+/// manually by developers (see scripts/setup-dev-boot-assets.sh). This function
+/// only validates — it does not download or install anything.
+fn ensure_guest_binaries(data_dir: &Path) -> Result<()> {
+    let agent_path = data_dir.join("bin/arcbox-agent");
+    check_executable(
+        &agent_path,
+        "agent binary not found; run 'arcbox boot prefetch' or build with: cargo build -p arcbox-agent --target <triple>",
+    )?;
+
+    let runtime_dir = data_dir.join("runtime/bin");
+    for name in REQUIRED_RUNTIME_ASSETS {
+        check_executable(
+            &runtime_dir.join(name),
+            &format!(
+                "runtime binary '{name}' not found; run 'arcbox boot prefetch' to download runtime assets"
+            ),
+        )?;
+    }
+
+    tracing::info!(
+        "All guest binaries verified: agent + {} runtime assets",
+        REQUIRED_RUNTIME_ASSETS.len()
+    );
     Ok(())
 }
 
@@ -150,9 +118,6 @@ impl Runtime {
         vm_lifecycle_config.default_vm.memory_mb = config.vm.memory_mb;
         if let Some(ref kernel) = config.vm.kernel_path {
             vm_lifecycle_config.default_vm.kernel = Some(kernel.clone());
-        }
-        if let Some(ref initrd) = config.vm.initrd_path {
-            vm_lifecycle_config.default_vm.initramfs = Some(initrd.clone());
         }
 
         Self::with_vm_lifecycle_config(config, vm_lifecycle_config)
@@ -308,68 +273,20 @@ impl Runtime {
 
     /// Initializes the runtime and eagerly starts the default VM.
     ///
+    /// Validates that all guest binaries (agent + runtime) are present and
+    /// executable before starting the VM. This is a boot-blocking check.
+    ///
     /// # Errors
     ///
-    /// Returns an error if initialization fails.
+    /// Returns an error if initialization fails or guest binaries are missing.
     pub async fn init(&self) -> Result<()> {
         // Create data directories.
         tokio::fs::create_dir_all(&self.config.data_dir).await?;
         tokio::fs::create_dir_all(self.config.data_dir.join("vms")).await?;
         tokio::fs::create_dir_all(self.config.data_dir.join("machines")).await?;
 
-        if matches!(
-            self.config.container.provision,
-            crate::config::ContainerProvisionMode::BundledAssets
-        ) {
-            let boot_assets = self.vm_lifecycle.boot_assets().get_assets().await?;
-            let manifest = boot_assets.manifest.as_ref().ok_or_else(|| {
-                CoreError::config(
-                    "guest_docker + bundled_assets requires boot manifest with runtime_assets",
-                )
-            })?;
-            let cache_dir = self.vm_lifecycle.boot_assets().config().version_cache_dir();
-            validate_bundled_runtime_manifest(manifest, &cache_dir)?;
-
-            // Ensure the guest agent binary is available at data_dir/bin/arcbox-agent.
-            // The OpenRC service inside the guest mounts data_dir via VirtioFS at /arcbox
-            // and expects the agent at /arcbox/bin/arcbox-agent.
-            let agent_src = cache_dir.join("bin/arcbox-agent");
-            if agent_src.exists() {
-                let bin_dir = self.config.data_dir.join("bin");
-                tokio::fs::create_dir_all(&bin_dir).await?;
-                let agent_dst = bin_dir.join("arcbox-agent");
-                let needs_copy = if agent_dst.exists() {
-                    let src_meta = tokio::fs::metadata(&agent_src).await?;
-                    let dst_meta = tokio::fs::metadata(&agent_dst).await?;
-                    src_meta.len() != dst_meta.len()
-                } else {
-                    true
-                };
-                if needs_copy {
-                    tokio::fs::copy(&agent_src, &agent_dst).await.map_err(|e| {
-                        CoreError::config(format!(
-                            "failed to install agent binary to {}: {}",
-                            agent_dst.display(),
-                            e
-                        ))
-                    })?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        tokio::fs::set_permissions(
-                            &agent_dst,
-                            std::fs::Permissions::from_mode(0o755),
-                        )
-                        .await?;
-                    }
-                    tracing::info!(
-                        src = %agent_src.display(),
-                        dst = %agent_dst.display(),
-                        "Installed guest agent binary"
-                    );
-                }
-            }
-        }
+        // Validate guest binaries before VM start (boot-blocking).
+        ensure_guest_binaries(&self.config.data_dir)?;
 
         self.ensure_vm_ready().await?;
 
@@ -732,90 +649,85 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
-    use super::{Runtime, validate_bundled_runtime_manifest};
-    use crate::boot_assets::{BootAssetManifest, RuntimeAssetManifestEntry};
+    use super::{Runtime, check_executable, ensure_guest_binaries};
     use crate::config::Config;
-    use bytes::Bytes;
-    use sha2::{Digest, Sha256};
     use std::path::PathBuf;
 
-    fn runtime_entry(name: &str, content: &[u8]) -> RuntimeAssetManifestEntry {
-        RuntimeAssetManifestEntry {
-            name: name.to_string(),
-            path: format!("runtime/bin/{}", name),
-            version: Some("test-version".to_string()),
-            sha256: Some(format!("{:x}", Sha256::digest(content))),
+    #[test]
+    fn test_ensure_guest_binaries_ok() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_dir = temp_dir.path();
+
+        let bin_dir = data_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let runtime_dir = data_dir.join("runtime/bin");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+
+        // Create all required binaries with executable permission.
+        for name in [
+            "bin/arcbox-agent",
+            "runtime/bin/dockerd",
+            "runtime/bin/containerd",
+            "runtime/bin/youki",
+        ] {
+            let path = data_dir.join(name);
+            std::fs::write(&path, b"binary").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
         }
+
+        let result = ensure_guest_binaries(data_dir);
+        assert!(result.is_ok(), "expected success, got {:?}", result);
     }
 
     #[test]
-    fn test_validate_bundled_runtime_manifest_ok() {
+    fn test_ensure_guest_binaries_missing_agent() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let runtime_dir = temp_dir.path().join("runtime/bin");
-        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let data_dir = temp_dir.path();
 
-        std::fs::write(runtime_dir.join("dockerd"), b"dockerd-bin").unwrap();
-        std::fs::write(runtime_dir.join("containerd"), b"containerd-bin").unwrap();
-        std::fs::write(runtime_dir.join("youki"), b"youki-bin").unwrap();
-
-        let manifest = BootAssetManifest {
-            schema_version: 1,
-            asset_version: "test".to_string(),
-            arch: "arm64".to_string(),
-            kernel_commit: None,
-            agent_commit: None,
-            built_at: None,
-            kernel_cmdline: None,
-            runtime_assets: vec![
-                runtime_entry("dockerd", b"dockerd-bin"),
-                runtime_entry("containerd", b"containerd-bin"),
-                runtime_entry("youki", b"youki-bin"),
-            ],
-            rootfs_squashfs_sha256: None,
-            modloop_sha256: None,
-            rootfs_ext4_sha256: None,
-        };
-
-        let result = validate_bundled_runtime_manifest(&manifest, temp_dir.path());
+        // Don't create agent binary — should fail.
+        let err = ensure_guest_binaries(data_dir).unwrap_err();
         assert!(
-            result.is_ok(),
-            "expected validation success, got {:?}",
-            result
+            err.to_string().contains("agent binary not found"),
+            "got: {err}"
         );
     }
 
     #[test]
-    fn test_validate_bundled_runtime_manifest_missing_entry() {
+    fn test_ensure_guest_binaries_missing_runtime() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let runtime_dir = temp_dir.path().join("runtime/bin");
-        std::fs::create_dir_all(&runtime_dir).unwrap();
-        std::fs::write(runtime_dir.join("dockerd"), b"dockerd-bin").unwrap();
-        std::fs::write(runtime_dir.join("containerd"), b"containerd-bin").unwrap();
+        let data_dir = temp_dir.path();
 
-        let manifest = BootAssetManifest {
-            schema_version: 1,
-            asset_version: "test".to_string(),
-            arch: "arm64".to_string(),
-            kernel_commit: None,
-            agent_commit: None,
-            built_at: None,
-            kernel_cmdline: None,
-            runtime_assets: vec![
-                runtime_entry("dockerd", b"dockerd-bin"),
-                runtime_entry("containerd", b"containerd-bin"),
-            ],
-            rootfs_squashfs_sha256: None,
-            modloop_sha256: None,
-            rootfs_ext4_sha256: None,
-        };
+        // Create agent but not runtime binaries.
+        let agent = data_dir.join("bin/arcbox-agent");
+        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        std::fs::write(&agent, b"agent").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
-        let err = validate_bundled_runtime_manifest(&manifest, temp_dir.path()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("runtime_assets missing required entries"),
-            "unexpected error: {}",
-            err
-        );
+        let err = ensure_guest_binaries(data_dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("runtime binary"), "got: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_executable_not_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("not-exec");
+        std::fs::write(&path, b"data").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = check_executable(&path, "test").unwrap_err();
+        assert!(err.to_string().contains("not executable"), "got: {err}");
     }
 
     #[test]
@@ -827,7 +739,6 @@ mod tests {
         config.vm.cpus = 6;
         config.vm.memory_mb = 3072;
         config.vm.kernel_path = Some(PathBuf::from("/tmp/arcbox-test-kernel"));
-        config.vm.initrd_path = Some(PathBuf::from("/tmp/arcbox-test-initramfs"));
 
         let runtime = Runtime::new(config).expect("runtime init should succeed");
         let default_vm = runtime.vm_lifecycle().default_vm_config();
@@ -837,10 +748,6 @@ mod tests {
         assert_eq!(
             default_vm.kernel,
             Some(PathBuf::from("/tmp/arcbox-test-kernel"))
-        );
-        assert_eq!(
-            default_vm.initramfs,
-            Some(PathBuf::from("/tmp/arcbox-test-initramfs"))
         );
     }
 }

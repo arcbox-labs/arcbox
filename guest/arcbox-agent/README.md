@@ -15,13 +15,14 @@ Current request surface includes:
 - Ensure guest runtime stack (`containerd`/`dockerd`/`youki`) is ready
 - Runtime status
 
-The agent also handles machine bootstrap responsibilities when running in
-initramfs/PID1 mode.
+When running as PID 1, the agent also performs basic system initialisation
+(mount filesystems, set hostname, spawn a child reaper).
 
 ## Runtime Bootstrap Role
 
-At startup, the agent can provision and verify guest runtime prerequisites so
-host-side Docker API proxying can target a healthy guest `dockerd` endpoint.
+At startup, the agent detects and launches the bundled runtime stack
+(`containerd` / `dockerd` / `youki`) so the host-side Docker API proxy can
+target a healthy guest `dockerd` endpoint.
 
 ## Cross-Compilation
 

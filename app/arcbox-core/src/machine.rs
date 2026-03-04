@@ -140,11 +140,9 @@ pub struct MachineInfo {
     pub disk_gb: u64,
     /// Kernel path.
     pub kernel: Option<String>,
-    /// Initrd path.
-    pub initrd: Option<String>,
     /// Kernel command line.
     pub cmdline: Option<String>,
-    /// Block devices (e.g., rootfs ext4 image).
+    /// Block devices (e.g., EROFS rootfs image).
     pub block_devices: Vec<crate::vm::BlockDeviceConfig>,
     /// Distribution name (e.g., "alpine", "ubuntu").
     pub distro: Option<String>,
@@ -154,7 +152,7 @@ pub struct MachineInfo {
     pub disk_path: Option<PathBuf>,
     /// Path to the SSH private key.
     pub ssh_key_path: Option<PathBuf>,
-    /// Guest IP address (reported by machine init via vsock).
+    /// Guest IP address (reported by agent via vsock).
     pub ip_address: Option<String>,
     /// Creation time.
     pub created_at: DateTime<Utc>,
@@ -173,11 +171,9 @@ pub struct MachineConfig {
     pub disk_gb: u64,
     /// Kernel path.
     pub kernel: Option<String>,
-    /// Initrd path.
-    pub initrd: Option<String>,
     /// Kernel command line.
     pub cmdline: Option<String>,
-    /// Block devices (for example, rootfs ext4 image).
+    /// Block devices (e.g., EROFS rootfs image).
     pub block_devices: Vec<crate::vm::BlockDeviceConfig>,
     /// Distribution name (e.g., "alpine", "ubuntu").
     pub distro: Option<String>,
@@ -193,7 +189,6 @@ impl Default for MachineConfig {
             memory_mb: 4096,
             disk_gb: 50,
             kernel: None,
-            initrd: None,
             cmdline: None,
             block_devices: Vec::new(),
             distro: None,
@@ -239,7 +234,6 @@ impl MachineManager {
                 cpus: persisted.cpus,
                 memory_mb: persisted.memory_mb,
                 kernel: persisted.kernel.clone(),
-                initrd: persisted.initrd.clone(),
                 cmdline: persisted.cmdline.clone(),
                 shared_dirs: shared_dirs.clone(),
                 block_devices: persisted.block_devices.clone(),
@@ -257,7 +251,6 @@ impl MachineManager {
                     memory_mb: persisted.memory_mb,
                     disk_gb: persisted.disk_gb,
                     kernel: persisted.kernel.clone(),
-                    initrd: persisted.initrd.clone(),
                     cmdline: persisted.cmdline,
                     block_devices: persisted.block_devices.clone(),
                     distro: persisted.distro.clone(),
@@ -284,15 +277,11 @@ impl MachineManager {
 
     /// Creates a new machine.
     ///
-    /// When `config.distro` is set, this performs full machine VM setup:
-    /// 1. Resolve and download distro rootfs tarball
-    /// 2. Generate SSH key pair
-    /// 3. Create ext4 disk image
-    /// 4. Write setup.json for first-boot provisioning
-    /// 5. Configure block device + VirtioFS sharing
+    /// Sets up EROFS rootfs (read-only, /dev/vda) and a Btrfs data disk
+    /// (/dev/vdb) with block device and VirtioFS sharing configured.
     ///
-    /// When `config.distro` is None, creates a lightweight container VM
-    /// (existing behavior).
+    /// When `config.distro` is set, also resolves and downloads a distro
+    /// rootfs tarball and generates an SSH key pair.
     ///
     /// # Errors
     ///
@@ -329,7 +318,6 @@ impl MachineManager {
             cpus: config.cpus,
             memory_mb: config.memory_mb,
             kernel: config.kernel.clone(),
-            initrd: config.initrd.clone(),
             cmdline: config.cmdline.clone(),
             shared_dirs,
             block_devices: config.block_devices.clone(),
@@ -346,7 +334,6 @@ impl MachineManager {
             memory_mb: config.memory_mb,
             disk_gb: config.disk_gb,
             kernel: config.kernel,
-            initrd: config.initrd,
             cmdline: config.cmdline,
             block_devices: config.block_devices,
             distro: config.distro,
@@ -899,7 +886,6 @@ impl MachineManager {
             memory_mb: 4096,
             disk_gb: 50,
             kernel: None,
-            initrd: None,
             cmdline: None,
             block_devices: Vec::new(),
             distro: None,

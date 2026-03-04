@@ -3,10 +3,9 @@ use arcbox_api::{
     MachineServiceImpl, SandboxServiceImpl, SandboxServiceServer, SandboxSnapshotServiceImpl,
     SandboxSnapshotServiceServer, machine_service_server::MachineServiceServer,
 };
-use arcbox_core::{Config, ContainerProvisionMode, Runtime, VmLifecycleConfig};
+use arcbox_core::{Config, Runtime, VmLifecycleConfig};
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
-use clap::{Parser, ValueEnum};
-#[cfg(target_os = "macos")]
+use clap::Parser;
 use macos_resolver::{FileResolver, to_env_prefix};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,36 +39,13 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub kernel: Option<PathBuf>,
 
-    /// Custom initramfs path for VM boot.
-    #[arg(long)]
-    pub initramfs: Option<PathBuf>,
-
     /// Automatically enable Docker CLI integration.
     #[arg(long)]
     pub docker_integration: bool,
 
-    /// Guest runtime provisioning mode.
-    #[arg(long, value_enum)]
-    pub container_provision: Option<ContainerProvisionArg>,
-
     /// Guest dockerd API vsock port.
     #[arg(long)]
     pub guest_docker_vsock_port: Option<u32>,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum ContainerProvisionArg {
-    BundledAssets,
-    DistroEngine,
-}
-
-impl From<ContainerProvisionArg> for ContainerProvisionMode {
-    fn from(value: ContainerProvisionArg) -> Self {
-        match value {
-            ContainerProvisionArg::BundledAssets => Self::BundledAssets,
-            ContainerProvisionArg::DistroEngine => Self::DistroEngine,
-        }
-    }
 }
 
 #[tokio::main]
@@ -103,13 +79,9 @@ async fn run(args: DaemonArgs) -> Result<()> {
         data_dir: data_dir.clone(),
         ..Default::default()
     };
-    if let Some(mode) = args.container_provision {
-        config.container.provision = mode.into();
-    }
     if let Some(port) = args.guest_docker_vsock_port {
         config.container.guest_docker_vsock_port = port;
     }
-    let selected_provision = config.container.provision;
     let selected_guest_docker_port = config.container.guest_docker_vsock_port;
 
     let mut vm_lifecycle_config = VmLifecycleConfig::default();
@@ -118,15 +90,8 @@ async fn run(args: DaemonArgs) -> Result<()> {
     if let Some(ref kernel) = config.vm.kernel_path {
         vm_lifecycle_config.default_vm.kernel = Some(kernel.clone());
     }
-    if let Some(ref initrd) = config.vm.initrd_path {
-        vm_lifecycle_config.default_vm.initramfs = Some(initrd.clone());
-    }
-
     if let Some(kernel) = args.kernel {
         vm_lifecycle_config.default_vm.kernel = Some(kernel);
-    }
-    if let Some(initramfs) = args.initramfs {
-        vm_lifecycle_config.default_vm.initramfs = Some(initramfs);
     }
 
     let runtime = Arc::new(
@@ -140,7 +105,6 @@ async fn run(args: DaemonArgs) -> Result<()> {
 
     info!(
         data_dir = %data_dir.display(),
-        provision = ?selected_provision,
         guest_docker_vsock_port = selected_guest_docker_port,
         "Runtime initialized"
     );
@@ -175,7 +139,6 @@ async fn run(args: DaemonArgs) -> Result<()> {
         }
     }
 
-    #[cfg(target_os = "macos")]
     check_resolver_installed();
 
     println!("ArcBox daemon started");
@@ -292,13 +255,11 @@ async fn shutdown_signal() {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn dns_domain() -> String {
     let key = format!("{}_DNS_DOMAIN", to_env_prefix(DNS_PREFIX));
     std::env::var(key).unwrap_or_else(|_| DEFAULT_DNS_DOMAIN.to_string())
 }
 
-#[cfg(target_os = "macos")]
 fn check_resolver_installed() {
     let resolver = FileResolver::new(DNS_PREFIX);
     let domain = dns_domain();

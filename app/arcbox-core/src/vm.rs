@@ -115,13 +115,11 @@ pub struct VmConfig {
     pub memory_mb: u64,
     /// Kernel path.
     pub kernel: Option<String>,
-    /// Initrd path.
-    pub initrd: Option<String>,
     /// Kernel command line.
     pub cmdline: Option<String>,
     /// Shared directories for VirtioFS.
     pub shared_dirs: Vec<SharedDirConfig>,
-    /// Block devices (for example, rootfs ext4 image).
+    /// Block devices (e.g., EROFS rootfs, Btrfs data disk).
     pub block_devices: Vec<BlockDeviceConfig>,
     /// Enable networking.
     pub networking: bool,
@@ -142,7 +140,6 @@ impl Default for VmConfig {
             cpus: 4,
             memory_mb: 4096,
             kernel: None,
-            initrd: None,
             cmdline: None,
             shared_dirs: Vec::new(),
             block_devices: Vec::new(),
@@ -252,7 +249,7 @@ impl VmManager {
                 .map(PathBuf::from)
                 .unwrap_or_default(),
             kernel_cmdline: entry.config.cmdline.clone().unwrap_or_default(),
-            initrd_path: entry.config.initrd.as_ref().map(PathBuf::from),
+            initrd_path: None,
             enable_rosetta: false,
             serial_console: true,
             virtio_console: true,
