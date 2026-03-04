@@ -2,14 +2,14 @@
 
 ## Overview
 
-ArcBox boot assets (schema v7) are built and released from the dedicated
+ArcBox boot assets are built and released from the dedicated
 repository [`arcbox-labs/boot-assets`](https://github.com/arcbox-labs/boot-assets).
 
 Each release contains per-architecture artifacts plus a unified multi-target manifest:
 
 - `kernel` — pre-built Linux kernel (all drivers built-in, `CONFIG_MODULES=n`)
 - `rootfs.erofs` — minimal read-only EROFS rootfs (busybox + mkfs.btrfs + iptables-legacy + CA certs)
-- `manifest.json` — schema v7 manifest with SHA256 checksums and kernel cmdline
+- `manifest.json` — manifest with SHA256 checksums and kernel cmdline (`schema_version` = major of `asset_version`)
 - Runtime binaries — dockerd, containerd, containerd-shim-runc-v2, runc (from Docker 27.5.1 static package)
 
 No initramfs. The kernel boots directly into the EROFS rootfs (`root=/dev/vda ro rootfstype=erofs`).
@@ -29,7 +29,7 @@ Agent and runtime binaries are distributed via VirtioFS from the host.
 1. Build EROFS rootfs from Alpine static binaries
 2. Download pre-built kernels from `arcbox-labs/kernel`
 3. Sync upstream runtime binaries (Docker 27.5.1 static package)
-4. Package tarball + checksum + manifest (schema v7)
+4. Package tarball + checksum + manifest
 5. Publish to GitHub Releases and Cloudflare R2 CDN
 
 ## CDN Layout
@@ -38,7 +38,7 @@ Agent and runtime binaries are distributed via VirtioFS from the host.
 https://dl.arcbox.dev/boot-assets/
 ├── latest.json                     # {"version":"x.y.z"}
 └── v0.2.3/
-    ├── manifest.json               # unified schema v7
+    ├── manifest.json               # unified manifest
     ├── arm64/kernel
     ├── arm64/rootfs.erofs
     ├── x86_64/kernel

@@ -1,6 +1,6 @@
 //! Boot asset management for VM startup.
 //!
-//! Thin wrapper around `arcbox_boot::AssetManager` (schema v7).
+//! Thin wrapper around `arcbox_boot::AssetManager`.
 //! All downloading, caching, and verification logic lives in the
 //! `arcbox-boot` crate; this module provides daemon-specific
 //! configuration defaults, error mapping, and the `BootAssets` struct
