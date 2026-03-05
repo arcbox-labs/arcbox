@@ -86,6 +86,11 @@ pub struct SandboxMountSpec {
 }
 
 /// Full sandbox creation parameters.
+///
+/// Fields related to workload execution (`cmd`, `env`, `working_dir`, `user`,
+/// `mounts`) are **not consumed by `create_sandbox`**.  They are stored in the
+/// spec for later use by `run_in_sandbox` / `exec_in_sandbox` or passed through
+/// the gRPC layer.  `image` and `ssh_public_key` are reserved for future use.
 #[derive(Debug, Clone, Default)]
 pub struct SandboxSpec {
     /// Caller-supplied ID; auto-generated (UUID) when `None` or empty.
@@ -946,17 +951,37 @@ impl SandboxManager {
             let proc = spawn_jailer(jc, fc_cfg, &new_id).await?;
             (proc, vsock_path)
         } else {
-            // Direct mode: the vmstate embeds the original sandbox's full vsock path.
+            // Direct mode: the vmstate embeds the original sandbox's full vsock
+            // path.  Firecracker cannot override this on restore, so we must
+            // reuse the original directory.  This means concurrent restores from
+            // the same checkpoint (or restoring while the source sandbox is
+            // still running) will conflict on the vsock socket.
             let original_vm_dir = PathBuf::from(&fc_cfg.data_dir)
                 .join("sandboxes")
                 .join(&snap_meta.vm_id);
             let original_vsock_path = original_vm_dir.join("firecracker.vsock");
+
+            // Guard: if the vsock socket is already in use (source sandbox or
+            // another restore is still running), reject early.
+            if original_vsock_path.exists() {
+                // Check if the socket is live by attempting a non-blocking connect.
+                if std::os::unix::net::UnixStream::connect(&original_vsock_path).is_ok() {
+                    return Err(VmmError::Vsock(format!(
+                        "vsock path {} is already in use by another sandbox; \
+                         direct-mode restore does not support concurrent restores \
+                         from the same checkpoint",
+                        original_vsock_path.display(),
+                    )));
+                }
+                // Stale socket file — safe to remove.
+                let _ = std::fs::remove_file(&original_vsock_path);
+            }
+
             if let Err(e) = std::fs::create_dir_all(&original_vm_dir)
                 && e.kind() != std::io::ErrorKind::AlreadyExists
             {
                 return Err(VmmError::Io(e));
             }
-            let _ = std::fs::remove_file(&original_vsock_path);
 
             let log_path = vm_dir.join("firecracker.log");
             let metrics_path = vm_dir.join("firecracker.metrics");
