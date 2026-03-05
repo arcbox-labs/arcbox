@@ -9,7 +9,7 @@
 //!
 //! Host routing supports Docker Engine API compatibility paths `v1.24..v1.43`
 //! (plus unversioned endpoints). Request handling is split between local
-//! ArcBox handlers and pass-through proxying to guest `dockerd`.
+//! `ArcBox` handlers and pass-through proxying to guest `dockerd`.
 //!
 //! Supported operation groups include:
 //!
@@ -41,10 +41,6 @@
 //! docker context use arcbox
 //! docker ps  # Now uses ArcBox!
 //! ```
-
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
-#![allow(clippy::module_name_repetitions)]
-
 pub mod api;
 pub mod context;
 pub mod error;

@@ -9,9 +9,9 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 DEV_BOOT_DIR="$PROJECT_DIR/boot-assets/dev"
 KERNEL_REPO_DIR="${ARCBOX_KERNEL_DIR:-$PROJECT_DIR/../arcbox-kernel}"
 KERNEL_OUTPUT_DIR="$KERNEL_REPO_DIR/output"
-BOOT_ASSET_VERSION_DEFAULT="$(awk -F '\"' '/pub const BOOT_ASSET_VERSION/ {print $2; exit}' "$PROJECT_DIR/crates/arcbox-core/src/boot_assets.rs")"
+BOOT_ASSET_VERSION_DEFAULT="$(awk -F '"' '/^version[[:space:]]*=/ {print $2; exit}' "$PROJECT_DIR/boot-assets.lock")"
 if [[ -z "$BOOT_ASSET_VERSION_DEFAULT" ]]; then
-    echo "Failed to resolve BOOT_ASSET_VERSION from crates/arcbox-core/src/boot_assets.rs" >&2
+    echo "Failed to resolve version from boot-assets.lock" >&2
     exit 1
 fi
 BOOT_ASSET_VERSION="${ARCBOX_BOOT_ASSET_VERSION:-$BOOT_ASSET_VERSION_DEFAULT}"
@@ -43,33 +43,31 @@ setup_from_kernel_repo() {
     fi
 
     if [[ ! -f "$KERNEL_OUTPUT_DIR/kernel-arm64" ]] \
-        || [[ ! -f "$KERNEL_OUTPUT_DIR/initramfs-arm64.cpio.gz" ]] \
-        || [[ ! -f "$KERNEL_OUTPUT_DIR/rootfs.squashfs" ]] \
-        || [[ ! -f "$KERNEL_OUTPUT_DIR/modloop" ]]; then
+        || [[ ! -f "$KERNEL_OUTPUT_DIR/rootfs.erofs" ]]; then
         log_warn "arcbox-kernel output incomplete: $KERNEL_OUTPUT_DIR"
-        log_warn "Expected: kernel-arm64 + initramfs-arm64.cpio.gz + rootfs.squashfs + modloop"
+        log_warn "Expected: kernel-arm64 + rootfs.erofs"
         return 1
     fi
 
     mkdir -p "$DEV_BOOT_DIR"
     cp "$KERNEL_OUTPUT_DIR/kernel-arm64" "$DEV_BOOT_DIR/kernel"
-    cp "$KERNEL_OUTPUT_DIR/initramfs-arm64.cpio.gz" "$DEV_BOOT_DIR/initramfs.cpio.gz"
-    cp "$KERNEL_OUTPUT_DIR/rootfs.squashfs" "$DEV_BOOT_DIR/rootfs.squashfs"
-    cp "$KERNEL_OUTPUT_DIR/modloop" "$DEV_BOOT_DIR/modloop"
+    cp "$KERNEL_OUTPUT_DIR/rootfs.erofs" "$DEV_BOOT_DIR/rootfs.erofs"
     if [[ -f "$KERNEL_OUTPUT_DIR/manifest.json" ]]; then
         cp "$KERNEL_OUTPUT_DIR/manifest.json" "$DEV_BOOT_DIR/manifest.json"
         log_info "Copied manifest.json from arcbox-kernel output"
+    else
+        log_warn "manifest.json not found in arcbox-kernel output — downstream checks may fail"
+        log_warn "Generate one with: arcbox boot manifest or copy from a release"
+        return 1
     fi
 
-    log_info "Copied kernel/initramfs/rootfs/modloop from arcbox-kernel output"
+    log_info "Copied kernel + rootfs.erofs from arcbox-kernel output"
     return 0
 }
 
 check_dev_assets() {
     if [[ -f "$DEV_BOOT_DIR/kernel" ]] \
-        && [[ -f "$DEV_BOOT_DIR/initramfs.cpio.gz" ]] \
-        && [[ -f "$DEV_BOOT_DIR/rootfs.squashfs" ]] \
-        && [[ -f "$DEV_BOOT_DIR/modloop" ]] \
+        && [[ -f "$DEV_BOOT_DIR/rootfs.erofs" ]] \
         && [[ -f "$DEV_BOOT_DIR/manifest.json" ]]; then
         if grep -Eq "\"asset_version\"[[:space:]]*:[[:space:]]*\"$BOOT_ASSET_VERSION\"" "$DEV_BOOT_DIR/manifest.json"; then
             return 0
@@ -99,27 +97,12 @@ setup_from_user_cache() {
         return 1
     fi
 
-    if [[ -f "$USER_BOOT_DIR/initramfs.cpio.gz" ]]; then
-        cp "$USER_BOOT_DIR/initramfs.cpio.gz" "$DEV_BOOT_DIR/"
-        log_info "Copied initramfs"
+    # Copy EROFS rootfs
+    if [[ -f "$USER_BOOT_DIR/rootfs.erofs" ]]; then
+        cp "$USER_BOOT_DIR/rootfs.erofs" "$DEV_BOOT_DIR/"
+        log_info "Copied rootfs.erofs"
     else
-        log_error "Initramfs not found in user cache"
-        return 1
-    fi
-
-    if [[ -f "$USER_BOOT_DIR/rootfs.squashfs" ]]; then
-        cp "$USER_BOOT_DIR/rootfs.squashfs" "$DEV_BOOT_DIR/"
-        log_info "Copied rootfs.squashfs"
-    else
-        log_error "rootfs.squashfs not found in user cache"
-        return 1
-    fi
-
-    if [[ -f "$USER_BOOT_DIR/modloop" ]]; then
-        cp "$USER_BOOT_DIR/modloop" "$DEV_BOOT_DIR/"
-        log_info "Copied modloop"
-    else
-        log_error "modloop not found in user cache"
+        log_error "rootfs.erofs not found in user cache"
         return 1
     fi
 
@@ -150,20 +133,10 @@ print_info() {
         echo "Kernel:     $kernel_size"
     fi
 
-    if [[ -f "$DEV_BOOT_DIR/initramfs.cpio.gz" ]]; then
-        local initramfs_size
-        initramfs_size=$(ls -lh "$DEV_BOOT_DIR/initramfs.cpio.gz" | awk '{print $5}')
-        echo "Initramfs:  $initramfs_size"
-    fi
-    if [[ -f "$DEV_BOOT_DIR/rootfs.squashfs" ]]; then
+    if [[ -f "$DEV_BOOT_DIR/rootfs.erofs" ]]; then
         local rootfs_size
-        rootfs_size=$(ls -lh "$DEV_BOOT_DIR/rootfs.squashfs" | awk '{print $5}')
+        rootfs_size=$(ls -lh "$DEV_BOOT_DIR/rootfs.erofs" | awk '{print $5}')
         echo "Rootfs:     $rootfs_size"
-    fi
-    if [[ -f "$DEV_BOOT_DIR/modloop" ]]; then
-        local modloop_size
-        modloop_size=$(ls -lh "$DEV_BOOT_DIR/modloop" | awk '{print $5}')
-        echo "Modloop:    $modloop_size"
     fi
     if [[ -f "$DEV_BOOT_DIR/manifest.json" ]]; then
         echo "Manifest:   $(ls -lh "$DEV_BOOT_DIR/manifest.json" | awk '{print $5}')"

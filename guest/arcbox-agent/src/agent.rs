@@ -4,27 +4,25 @@
 //! It manages container lifecycle and executes commands in the guest VM.
 
 use anyhow::Result;
-
-/// Vsock port for agent communication.
-pub const AGENT_PORT: u32 = 1024;
+use arcbox_constants::ports::AGENT_PORT;
 
 // =============================================================================
 // EnsureRuntime State Machine (platform-independent, testable)
 // =============================================================================
 
-pub(crate) mod ensure_runtime {
+pub mod ensure_runtime {
     use std::sync::OnceLock;
 
+    pub use arcbox_constants::status::{
+        RUNTIME_FAILED as STATUS_FAILED, RUNTIME_REUSED as STATUS_REUSED,
+        RUNTIME_STARTED as STATUS_STARTED,
+    };
     use arcbox_protocol::agent::RuntimeEnsureResponse;
     use tokio::sync::{Mutex, Notify};
 
-    /// Outcome status constants for `RuntimeEnsureResponse.status`.
-    pub const STATUS_STARTED: &str = "started";
-    pub const STATUS_REUSED: &str = "reused";
-    pub const STATUS_FAILED: &str = "failed";
-
     /// Runtime lifecycle state.
     #[derive(Debug, Clone)]
+    #[allow(dead_code)]
     pub enum RuntimeState {
         /// No ensure has been attempted yet.
         NotStarted,
@@ -38,6 +36,7 @@ pub(crate) mod ensure_runtime {
 
     /// Global singleton guard that serializes EnsureRuntime attempts and caches
     /// the outcome so that repeated / concurrent calls are idempotent.
+    #[allow(dead_code)]
     pub struct RuntimeGuard {
         pub state: Mutex<RuntimeState>,
         /// Notified when a Starting -> Ready/Failed transition completes so
@@ -46,6 +45,7 @@ pub(crate) mod ensure_runtime {
     }
 
     impl RuntimeGuard {
+        #[allow(dead_code)]
         pub fn new() -> Self {
             Self {
                 state: Mutex::new(RuntimeState::NotStarted),
@@ -55,6 +55,7 @@ pub(crate) mod ensure_runtime {
     }
 
     /// Returns the global RuntimeGuard singleton.
+    #[allow(dead_code)]
     pub fn runtime_guard() -> &'static RuntimeGuard {
         static GUARD: OnceLock<RuntimeGuard> = OnceLock::new();
         GUARD.get_or_init(RuntimeGuard::new)
@@ -70,6 +71,7 @@ pub(crate) mod ensure_runtime {
     ///
     /// `start_fn` is invoked only by the driver; it performs the actual start sequence.
     /// `probe_fn` is invoked for start_if_needed=false to report current status.
+    #[allow(dead_code)]
     pub async fn ensure_runtime<F, P>(
         guard: &RuntimeGuard,
         start_if_needed: bool,
@@ -203,7 +205,7 @@ mod linux {
     use std::time::Duration;
 
     use anyhow::{Context, Result};
-    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncWrite};
     use tokio::net::UnixStream;
     use tokio::process::Command;
     use tokio::sync::Mutex;
@@ -213,29 +215,57 @@ mod linux {
     use super::ensure_runtime;
     use crate::rpc::{
         AGENT_VERSION, ErrorResponse, MessageType, RpcRequest, RpcResponse, parse_request,
-        read_message, write_response,
+        read_message, write_message, write_response,
     };
+    use crate::sandbox::SandboxService;
+    use arcbox_constants::cmdline::{
+        DOCKER_DATA_DEVICE_KEY as DOCKER_DATA_DEVICE_CMDLINE_KEY, GUEST_DOCKER_VSOCK_PORT_KEY,
+    };
+    use arcbox_constants::devices::DOCKER_DATA_BLOCK_DEVICE as DOCKER_DATA_DEVICE_DEFAULT;
+    use arcbox_constants::env::GUEST_DOCKER_VSOCK_PORT as GUEST_DOCKER_VSOCK_PORT_ENV;
+    use arcbox_constants::paths::{
+        ARCBOX_RUNTIME_BIN_DIR, CONTAINERD_DATA_MOUNT_POINT, CONTAINERD_SOCKET,
+        DOCKER_API_UNIX_SOCKET, DOCKER_DATA_MOUNT_POINT,
+    };
+    use arcbox_constants::ports::DOCKER_API_VSOCK_PORT;
+    use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
 
     use arcbox_protocol::agent::{
         PingResponse, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
         RuntimeStatusResponse, SystemInfo,
     };
 
-    /// Default guest-side raw Docker API proxy port on vsock.
-    const DOCKER_API_VSOCK_PORT_DEFAULT: u32 = 2375;
-    /// Docker Unix socket path in guest.
-    const DOCKER_API_UNIX_SOCKET: &str = "/var/run/docker.sock";
-    /// Containerd socket candidates.
-    const CONTAINERD_SOCKET_CANDIDATES: [&str; 2] = [
-        "/run/containerd/containerd.sock",
-        "/var/run/containerd/containerd.sock",
-    ];
-    /// Kernel cmdline key for guest docker data block device.
-    const DOCKER_DATA_DEVICE_CMDLINE_KEY: &str = "arcbox.docker_data_device=";
-    /// Default docker data block device when cmdline is missing.
-    const DOCKER_DATA_DEVICE_DEFAULT: &str = "/dev/vdb";
-    /// Mount point for dockerd persistent state.
-    const DOCKER_DATA_MOUNT_POINT: &str = "/var/lib/docker";
+    // =========================================================================
+    // Sandbox service singleton
+    // =========================================================================
+
+    /// Returns the global [`SandboxService`] singleton.
+    ///
+    /// The service is initialised lazily on the first call.  Initialisation
+    /// failures are logged as warnings and `None` is stored, so sandbox
+    /// operations will return a 503 error rather than crashing the agent.
+    fn sandbox_service() -> Option<&'static Arc<SandboxService>> {
+        static SERVICE: OnceLock<Option<Arc<SandboxService>>> = OnceLock::new();
+        SERVICE
+            .get_or_init(|| {
+                let config = crate::config::load();
+                match SandboxService::new(config) {
+                    Ok(svc) => {
+                        tracing::info!("sandbox service initialised");
+                        Some(Arc::new(svc))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sandbox service unavailable");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// Containerd socket candidates (primary + legacy fallback).
+    const CONTAINERD_SOCKET_CANDIDATES: [&str; 2] =
+        [CONTAINERD_SOCKET, "/var/run/containerd/containerd.sock"];
 
     fn cmdline_value(key: &str) -> Option<String> {
         let cmdline = std::fs::read_to_string("/proc/cmdline").ok()?;
@@ -250,7 +280,7 @@ mod linux {
     }
 
     fn docker_api_vsock_port() -> u32 {
-        if let Some(port) = std::env::var("ARCBOX_GUEST_DOCKER_VSOCK_PORT")
+        if let Some(port) = std::env::var(GUEST_DOCKER_VSOCK_PORT_ENV)
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|port| *port > 0)
@@ -258,21 +288,14 @@ mod linux {
             return port;
         }
 
-        if let Some(port) = cmdline_value("arcbox.guest_docker_vsock_port=")
+        if let Some(port) = cmdline_value(GUEST_DOCKER_VSOCK_PORT_KEY)
             .and_then(|raw| raw.parse::<u32>().ok())
             .filter(|port| *port > 0)
         {
             return port;
         }
 
-        DOCKER_API_VSOCK_PORT_DEFAULT
-    }
-
-    fn boot_asset_version() -> Option<String> {
-        std::env::var("ARCBOX_BOOT_ASSET_VERSION")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .or_else(|| cmdline_value("arcbox.boot_asset_version="))
+        DOCKER_API_VSOCK_PORT
     }
 
     fn docker_data_device() -> String {
@@ -281,102 +304,219 @@ mod linux {
             .unwrap_or_else(|| DOCKER_DATA_DEVICE_DEFAULT.to_string())
     }
 
-    fn has_ext4_superblock(device: &str) -> bool {
+    /// Btrfs primary superblock magic `_BHRfS_M` at absolute disk offset
+    /// `0x10040` (superblock starts at `0x10000`, magic at internal offset `0x40`).
+    const BTRFS_MAGIC: [u8; 8] = [0x5f, 0x42, 0x48, 0x52, 0x66, 0x53, 0x5f, 0x4d];
+    const BTRFS_MAGIC_OFFSET: u64 = 0x10040;
+
+    /// Temporary mount point for the raw Btrfs device before subvolume bind mounts.
+    ///
+    /// Must live on a writable filesystem. `/run` is tmpfs (set up in PID1 init),
+    /// while EROFS root is read-only and cannot host dynamic mountpoints.
+    const BTRFS_TEMP_MOUNT: &str = "/run/arcbox/data";
+
+    fn has_btrfs_superblock(device: &str) -> bool {
         let mut file = match std::fs::File::open(device) {
             Ok(file) => file,
             Err(_) => return false,
         };
-        if file.seek(SeekFrom::Start(1024 + 56)).is_err() {
+        if file.seek(SeekFrom::Start(BTRFS_MAGIC_OFFSET)).is_err() {
             return false;
         }
-        let mut magic = [0_u8; 2];
+        let mut magic = [0_u8; 8];
         if file.read_exact(&mut magic).is_err() {
             return false;
         }
-        magic == [0x53, 0xEF]
+        magic == BTRFS_MAGIC
     }
 
-    fn format_ext4_if_needed(device: &str) -> String {
-        if has_ext4_superblock(device) {
-            return "docker data device already formatted as ext4".to_string();
+    /// Formats the device as Btrfs if it does not already have a Btrfs superblock.
+    /// Old ext4 disks are unconditionally wiped (alpha breaking change).
+    fn ensure_btrfs_format(device: &str) -> Result<String, String> {
+        if has_btrfs_superblock(device) {
+            return Ok("data device already Btrfs".to_string());
         }
 
-        let mkfs_candidates = [
-            ("/sbin/mkfs.ext4", vec!["-F", device]),
-            ("/usr/sbin/mkfs.ext4", vec!["-F", device]),
-            ("/sbin/mke2fs", vec!["-F", "-t", "ext4", device]),
-            ("/usr/sbin/mke2fs", vec!["-F", "-t", "ext4", device]),
-            ("/bin/busybox", vec!["mke2fs", "-F", "-t", "ext4", device]),
-        ];
-
-        for (binary, args) in mkfs_candidates {
-            if !Path::new(binary).exists() {
-                continue;
-            }
-            match std::process::Command::new(binary).args(&args).status() {
-                Ok(status) if status.success() => {
-                    return format!("formatted {} as ext4 via {}", device, binary);
-                }
-                Ok(status) => {
-                    tracing::warn!(
-                        binary,
-                        exit_code = status.code().unwrap_or_default(),
-                        device,
-                        "failed to format docker data device"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(binary, device, error = %e, "failed to execute formatter");
-                }
-            }
+        // /sbin/mkfs.btrfs is baked into the EROFS rootfs.
+        let binary = "/sbin/mkfs.btrfs";
+        if !Path::new(binary).exists() {
+            return Err(format!("{} not found in EROFS rootfs", binary));
         }
 
-        format!(
-            "failed to format docker data device {}; mkfs.ext4/mke2fs unavailable",
-            device
-        )
+        match std::process::Command::new(binary)
+            .args(["-f", device])
+            .status()
+        {
+            Ok(status) if status.success() => Ok(format!("formatted {} as Btrfs", device)),
+            Ok(status) => Err(format!(
+                "mkfs.btrfs failed on {} (exit={})",
+                device,
+                status.code().unwrap_or(-1)
+            )),
+            Err(e) => Err(format!("failed to execute mkfs.btrfs: {}", e)),
+        }
     }
 
-    fn ensure_docker_data_mount() -> String {
-        if crate::mount::is_mounted(DOCKER_DATA_MOUNT_POINT) {
-            return format!("docker data already mounted at {}", DOCKER_DATA_MOUNT_POINT);
-        }
-
-        if let Err(e) = std::fs::create_dir_all(DOCKER_DATA_MOUNT_POINT) {
-            return format!("failed to create {}: {}", DOCKER_DATA_MOUNT_POINT, e);
+    /// Mounts the data volume (Btrfs), creates subvolumes, and bind-mounts them.
+    ///
+    /// Layout after this function returns:
+    /// - `/run/arcbox/data` — raw Btrfs mount (internal, not used by daemons)
+    /// - `/var/lib/docker` — bind mount of `@docker` subvolume
+    /// - `/var/lib/containerd` — bind mount of `@containerd` subvolume
+    ///
+    /// Returns `Ok(notes)` on success or `Err(reason)` if the data volume
+    /// could not be set up. Callers must abort runtime startup on error —
+    /// running containerd/dockerd without persistent storage is unsafe.
+    fn ensure_data_mount() -> Result<String, String> {
+        // Already fully set up?
+        if crate::mount::is_mounted(DOCKER_DATA_MOUNT_POINT)
+            && crate::mount::is_mounted(CONTAINERD_DATA_MOUNT_POINT)
+        {
+            return Ok("data subvolumes already mounted".to_string());
         }
 
         let device = docker_data_device();
         if !Path::new(&device).exists() {
-            return format!("docker data device missing: {}", device);
+            return Err(format!("data device missing: {}", device));
         }
 
-        match crate::mount::mount_fs(&device, DOCKER_DATA_MOUNT_POINT, "ext4", &[]) {
-            Ok(()) => format!(
-                "mounted docker data {} -> {}",
-                device, DOCKER_DATA_MOUNT_POINT
-            ),
-            Err(initial_mount_err) => {
-                if has_ext4_superblock(&device) {
-                    return format!(
-                        "failed to mount docker data {} -> {}: {}",
-                        device, DOCKER_DATA_MOUNT_POINT, initial_mount_err
-                    );
-                }
+        // Step 1: Format if not Btrfs.
+        match ensure_btrfs_format(&device) {
+            Ok(note) => tracing::info!("{}", note),
+            Err(e) => return Err(e),
+        }
 
-                let format_note = format_ext4_if_needed(&device);
-                match crate::mount::mount_fs(&device, DOCKER_DATA_MOUNT_POINT, "ext4", &[]) {
-                    Ok(()) => format!(
-                        "mounted docker data {} -> {} ({})",
-                        device, DOCKER_DATA_MOUNT_POINT, format_note
-                    ),
-                    Err(e) => format!(
-                        "failed to mount docker data {} -> {}: {} ({})",
-                        device, DOCKER_DATA_MOUNT_POINT, e, format_note
-                    ),
+        // Step 2: Mount raw Btrfs to temporary writable mount point.
+        if !crate::mount::is_mounted(BTRFS_TEMP_MOUNT) {
+            if let Err(e) = std::fs::create_dir_all(BTRFS_TEMP_MOUNT) {
+                return Err(format!("failed to create {}: {}", BTRFS_TEMP_MOUNT, e));
+            }
+            match std::process::Command::new("/bin/busybox")
+                .args([
+                    "mount",
+                    "-t",
+                    "btrfs",
+                    "-o",
+                    "compress=zstd:3",
+                    &device,
+                    BTRFS_TEMP_MOUNT,
+                ])
+                .status()
+            {
+                Ok(s) if s.success() => {}
+                Ok(s) => {
+                    return Err(format!(
+                        "mount -t btrfs {} {} failed (exit={})",
+                        device,
+                        BTRFS_TEMP_MOUNT,
+                        s.code().unwrap_or(-1)
+                    ));
                 }
+                Err(e) => return Err(format!("mount exec failed: {}", e)),
             }
         }
+
+        // Step 3: Create subvolumes if missing.
+        for subvol in ["@docker", "@containerd"] {
+            let subvol_path = format!("{}/{}", BTRFS_TEMP_MOUNT, subvol);
+            if Path::new(&subvol_path).exists() {
+                continue;
+            }
+            // EROFS only includes mkfs.btrfs, not full btrfs-progs. Use the
+            // BTRFS_IOC_SUBVOL_CREATE ioctl directly to create subvolumes.
+            if let Err(e) = btrfs_create_subvolume(&subvol_path) {
+                return Err(format!("failed to create subvolume {}: {}", subvol, e));
+            }
+        }
+
+        let mut notes = Vec::new();
+
+        // Step 4: Bind mount subvolumes to final paths.
+        for (subvol, target) in [
+            ("@docker", DOCKER_DATA_MOUNT_POINT),
+            ("@containerd", CONTAINERD_DATA_MOUNT_POINT),
+        ] {
+            if crate::mount::is_mounted(target) {
+                continue;
+            }
+            if let Err(e) = std::fs::create_dir_all(target) {
+                return Err(format!("failed to create {}: {}", target, e));
+            }
+            let opts = format!("compress=zstd:3,subvol={}", subvol);
+            match std::process::Command::new("/bin/busybox")
+                .args(["mount", "-t", "btrfs", "-o", &opts, &device, target])
+                .status()
+            {
+                Ok(s) if s.success() => {
+                    notes.push(format!("mounted {} -> {}", subvol, target));
+                }
+                Ok(s) => {
+                    return Err(format!(
+                        "mount subvol={} {} failed (exit={})",
+                        subvol,
+                        target,
+                        s.code().unwrap_or(-1)
+                    ));
+                }
+                Err(e) => return Err(format!("mount exec failed: {}", e)),
+            }
+        }
+
+        if notes.is_empty() {
+            Ok("data subvolumes already mounted".to_string())
+        } else {
+            Ok(notes.join("; "))
+        }
+    }
+
+    // BTRFS_IOC_SUBVOL_CREATE = _IOW(0x94, 14, struct btrfs_ioctl_vol_args)
+    // struct btrfs_ioctl_vol_args { __s64 fd; char name[4088]; }  total = 4096 bytes
+    //
+    // nix::ioctl_write_ptr! computes the request number portably (handles
+    // c_int on musl vs c_ulong on glibc).
+    #[cfg(target_os = "linux")]
+    nix::ioctl_write_ptr!(btrfs_ioc_subvol_create, 0x94, 14, [u8; 4096]);
+
+    /// Creates a Btrfs subvolume using the `BTRFS_IOC_SUBVOL_CREATE` ioctl.
+    ///
+    /// This avoids needing the full `btrfs-progs` CLI in the EROFS rootfs.
+    #[cfg(target_os = "linux")]
+    fn btrfs_create_subvolume(path: &str) -> Result<(), String> {
+        use std::os::unix::io::AsRawFd;
+
+        let parent = Path::new(path)
+            .parent()
+            .ok_or_else(|| "no parent directory".to_string())?;
+        let name = Path::new(path)
+            .file_name()
+            .ok_or_else(|| "no subvolume name".to_string())?
+            .to_str()
+            .ok_or_else(|| "invalid subvolume name".to_string())?;
+
+        let parent_dir =
+            std::fs::File::open(parent).map_err(|e| format!("open {}: {}", parent.display(), e))?;
+
+        let mut args = [0u8; 4096];
+        // First 8 bytes: fd field (unused for SUBVOL_CREATE, set to 0).
+        // Bytes 8..4096: null-terminated name.
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() >= 4088 {
+            return Err("subvolume name too long".to_string());
+        }
+        args[8..8 + name_bytes.len()].copy_from_slice(name_bytes);
+
+        // SAFETY: valid fd from File::open, args buffer is 4096 bytes matching
+        // the kernel struct btrfs_ioctl_vol_args layout.
+        unsafe { btrfs_ioc_subvol_create(parent_dir.as_raw_fd(), &args) }
+            .map_err(|e| format!("BTRFS_IOC_SUBVOL_CREATE: {}", e))?;
+
+        tracing::info!("created Btrfs subvolume {}", path);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn btrfs_create_subvolume(_path: &str) -> Result<(), String> {
+        Err("Btrfs subvolume creation is only supported on Linux".to_string())
     }
 
     /// Result from handling a request.
@@ -398,13 +538,13 @@ mod linux {
 
         /// Runs the agent, listening on vsock.
         pub async fn run(&self) -> Result<()> {
-            // Mount standard VirtioFS shares if not already mounted
+            // Mount standard VirtioFS shares if not already mounted.
             crate::mount::mount_standard_shares();
 
-            // Best-effort: ensure guest vsock modules are available before we
-            // attempt to bind listeners. This is especially important when the
-            // agent is started by distro init systems after switch_root.
-            ensure_vsock_modules_loaded().await;
+            // Eagerly initialise the sandbox service so its first-time
+            // NetworkManager setup (which requires root) happens at startup
+            // rather than on the first sandbox request.
+            let _ = sandbox_service();
 
             // Start guest-side Docker API proxy (vsock -> unix socket).
             tokio::spawn(async {
@@ -432,30 +572,6 @@ mod linux {
                     Err(e) => {
                         tracing::error!("Accept error: {}", e);
                     }
-                }
-            }
-        }
-    }
-
-    async fn ensure_vsock_modules_loaded() {
-        for module in [
-            "vsock",
-            "vmw_vsock_virtio_transport_common",
-            "vmw_vsock_virtio_transport",
-        ] {
-            match Command::new("modprobe").arg(module).status().await {
-                Ok(status) if status.success() => {
-                    tracing::debug!(module, "loaded kernel module");
-                }
-                Ok(status) => {
-                    tracing::debug!(
-                        module,
-                        exit_code = status.code().unwrap_or(-1),
-                        "modprobe exited non-zero"
-                    );
-                }
-                Err(e) => {
-                    tracing::debug!(module, error = %e, "modprobe unavailable/failed");
                 }
             }
         }
@@ -557,7 +673,19 @@ mod linux {
                 payload.len()
             );
 
-            // Parse and handle the request
+            // Sandbox requests are handled separately — they bypass the normal
+            // RPC request/response cycle because streaming operations hold the
+            // connection open and write multiple frames.
+            if msg_type.is_sandbox_request() {
+                if let Err(e) =
+                    handle_sandbox_message(&mut stream, msg_type, &trace_id, &payload).await
+                {
+                    tracing::warn!(trace_id = %trace_id, error = %e, "sandbox handler error");
+                }
+                continue;
+            }
+
+            // Parse and handle the request.
             let result = match parse_request(msg_type, &payload) {
                 Ok(request) => handle_request(request).await,
                 Err(e) => {
@@ -579,6 +707,249 @@ mod linux {
         }
     }
 
+    /// Dispatches a sandbox RPC request.
+    ///
+    /// Non-streaming requests (CRUD, snapshots) write a single response frame
+    /// and return.  Streaming requests (Run, Events) write multiple frames
+    /// until the stream ends.
+    async fn handle_sandbox_message<S>(
+        stream: &mut S,
+        msg_type: MessageType,
+        trace_id: &str,
+        payload: &[u8],
+    ) -> anyhow::Result<()>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        let svc = match sandbox_service() {
+            Some(s) => Arc::clone(s),
+            None => {
+                let err = ErrorResponse::new(503, "sandbox service unavailable");
+                write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
+                return Ok(());
+            }
+        };
+
+        match msg_type {
+            // -----------------------------------------------------------------
+            // CRUD
+            // -----------------------------------------------------------------
+            MessageType::SandboxCreateRequest => match svc.create(payload).await {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxCreateResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxStopRequest => match svc.stop(payload).await {
+                Ok(()) => {
+                    write_message(stream, MessageType::SandboxStopResponse, trace_id, &[]).await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxRemoveRequest => match svc.remove(payload).await {
+                Ok(()) => {
+                    write_message(stream, MessageType::SandboxRemoveResponse, trace_id, &[])
+                        .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxInspectRequest => match svc.inspect(payload) {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxInspectResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxListRequest => match svc.list(payload) {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxListResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            // -----------------------------------------------------------------
+            // Streaming: Run
+            // -----------------------------------------------------------------
+            MessageType::SandboxRunRequest => {
+                handle_sandbox_run(stream, &svc, trace_id, payload).await?;
+            }
+            // -----------------------------------------------------------------
+            // Streaming: Events
+            // -----------------------------------------------------------------
+            MessageType::SandboxEventsRequest => {
+                handle_sandbox_events(stream, &svc, trace_id, payload).await?;
+            }
+            // -----------------------------------------------------------------
+            // Exec: not yet implemented
+            // -----------------------------------------------------------------
+            MessageType::SandboxExecRequest => {
+                send_sandbox_error(stream, trace_id, 501, "SandboxExec not yet implemented")
+                    .await?;
+            }
+            // -----------------------------------------------------------------
+            // Snapshots
+            // -----------------------------------------------------------------
+            MessageType::SandboxCheckpointRequest => match svc.checkpoint(payload).await {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxCheckpointResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxRestoreRequest => match svc.restore(payload).await {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxRestoreResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxListSnapshotsRequest => match svc.list_snapshots(payload) {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxListSnapshotsResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxDeleteSnapshotRequest => match svc.delete_snapshot(payload) {
+                Ok(()) => {
+                    write_message(
+                        stream,
+                        MessageType::SandboxDeleteSnapshotResponse,
+                        trace_id,
+                        &[],
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            _ => {
+                send_sandbox_error(stream, trace_id, 400, "unrecognised sandbox message type")
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Stream `SandboxRunOutput` frames from `SandboxService::run`.
+    async fn handle_sandbox_run<S>(
+        stream: &mut S,
+        svc: &SandboxService,
+        trace_id: &str,
+        payload: &[u8],
+    ) -> anyhow::Result<()>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        let mut rx = match svc.run(payload).await {
+            Ok(r) => r,
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, 500, &e).await?;
+                return Ok(());
+            }
+        };
+
+        while let Some(encoded) = rx.recv().await {
+            write_message(stream, MessageType::SandboxRunOutput, trace_id, &encoded).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Stream `SandboxEvent` frames from `SandboxService::subscribe_events`.
+    async fn handle_sandbox_events<S>(
+        stream: &mut S,
+        svc: &SandboxService,
+        trace_id: &str,
+        payload: &[u8],
+    ) -> anyhow::Result<()>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        let mut rx = match svc.subscribe_events(payload) {
+            Ok(r) => r,
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, 500, &e).await?;
+                return Ok(());
+            }
+        };
+
+        while let Some(encoded) = rx.recv().await {
+            write_message(stream, MessageType::SandboxEvent, trace_id, &encoded).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Write a single `Error` frame back to the caller.
+    async fn send_sandbox_error<S>(
+        stream: &mut S,
+        trace_id: &str,
+        code: i32,
+        message: &str,
+    ) -> anyhow::Result<()>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        let err = ErrorResponse::new(code, message);
+        write_message(stream, MessageType::Error, trace_id, &err.encode()).await
+    }
+
     /// Handles a single RPC request.
     async fn handle_request(request: RpcRequest) -> RequestResult {
         match request {
@@ -590,10 +961,6 @@ mod linux {
             RpcRequest::RuntimeStatus(req) => {
                 RequestResult::Single(handle_runtime_status(req).await)
             }
-            _ => RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
-                404,
-                "legacy container runtime RPC removed",
-            ))),
         }
     }
 
@@ -637,7 +1004,7 @@ mod linux {
     /// Performs the actual runtime start sequence (called only by the driver).
     async fn do_ensure_runtime_start() -> RuntimeEnsureResponse {
         let mut notes = Vec::new();
-        let note = try_start_runtime_services().await;
+        let note = try_start_bundled_runtime().await;
         if !note.is_empty() {
             notes.push(note);
         }
@@ -692,16 +1059,13 @@ mod linux {
         RpcResponse::RuntimeStatus(collect_runtime_status().await)
     }
 
-    /// Service status constants.
-    const SERVICE_STATUS_READY: &str = "ready";
-    const SERVICE_STATUS_NOT_READY: &str = "not_ready";
-    const SERVICE_STATUS_ERROR: &str = "error";
-
     async fn collect_runtime_status() -> RuntimeStatusResponse {
         use arcbox_protocol::agent::ServiceStatus;
 
         let containerd_ready = probe_first_ready_socket(&CONTAINERD_SOCKET_CANDIDATES).await;
         let docker_ready = probe_unix_socket(DOCKER_API_UNIX_SOCKET).await;
+        let runtime_dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
+        let missing_runtime_binaries = missing_runtime_binaries_at(&runtime_dir);
 
         // Build per-service status entries.
         let mut services = Vec::new();
@@ -710,7 +1074,7 @@ mod linux {
         services.push(if containerd_ready {
             ServiceStatus {
                 name: "containerd".to_string(),
-                status: SERVICE_STATUS_READY.to_string(),
+                status: SERVICE_READY.to_string(),
                 detail: format!(
                     "socket reachable: {}",
                     CONTAINERD_SOCKET_CANDIDATES
@@ -727,7 +1091,7 @@ mod linux {
                 .join(", ");
             ServiceStatus {
                 name: "containerd".to_string(),
-                status: SERVICE_STATUS_NOT_READY.to_string(),
+                status: SERVICE_NOT_READY.to_string(),
                 detail: format!("no reachable socket found; checked: {}", socket_paths),
             }
         });
@@ -747,42 +1111,16 @@ mod linux {
         services.push(ServiceStatus {
             name: "dockerd".to_string(),
             status: if docker_ready {
-                SERVICE_STATUS_READY.to_string()
+                SERVICE_READY.to_string()
             } else if Path::new(DOCKER_API_UNIX_SOCKET).exists() {
-                SERVICE_STATUS_ERROR.to_string()
+                SERVICE_ERROR.to_string()
             } else {
-                SERVICE_STATUS_NOT_READY.to_string()
+                SERVICE_NOT_READY.to_string()
             },
             detail: docker_detail,
         });
 
-        // youki status (OCI runtime)
-        let youki_status = match detect_runtime_bin_dir() {
-            Some(bin_dir) => {
-                let youki_bin = bin_dir.join("youki");
-                if youki_bin.exists() {
-                    ServiceStatus {
-                        name: "youki".to_string(),
-                        status: SERVICE_STATUS_READY.to_string(),
-                        detail: format!("binary found: {}", youki_bin.display()),
-                    }
-                } else {
-                    ServiceStatus {
-                        name: "youki".to_string(),
-                        status: SERVICE_STATUS_NOT_READY.to_string(),
-                        detail: format!("binary missing at {}", youki_bin.display()),
-                    }
-                }
-            }
-            None => ServiceStatus {
-                name: "youki".to_string(),
-                status: SERVICE_STATUS_NOT_READY.to_string(),
-                detail: runtime_missing_detail(),
-            },
-        };
-        services.push(youki_status);
-
-        // Build the summary detail string for backward compatibility.
+        // Build the summary detail string.
         let detail = if docker_ready {
             "docker socket ready".to_string()
         } else if Path::new(DOCKER_API_UNIX_SOCKET).exists() {
@@ -790,14 +1128,11 @@ mod linux {
                 "docker socket exists but not reachable: {}",
                 DOCKER_API_UNIX_SOCKET
             )
-        } else if !Path::new("/run/systemd/system").exists()
-            && !Path::new("/sbin/rc-service").exists()
-            && !Path::new("/usr/sbin/rc-service").exists()
-        {
+        } else if !missing_runtime_binaries.is_empty() {
             format!(
                 "docker socket missing: {}; {}",
                 DOCKER_API_UNIX_SOCKET,
-                runtime_missing_detail()
+                runtime_missing_detail_from(&missing_runtime_binaries)
             )
         } else {
             format!("docker socket missing: {}", DOCKER_API_UNIX_SOCKET)
@@ -836,42 +1171,42 @@ mod linux {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn runtime_bin_dir_candidates() -> Vec<PathBuf> {
-        let mut candidates = Vec::new();
-
-        if let Ok(path) = std::env::var("ARCBOX_RUNTIME_BIN_DIR") {
-            if !path.trim().is_empty() {
-                candidates.push(PathBuf::from(path));
-            }
-        }
-
-        if let Some(version) = boot_asset_version() {
-            candidates.push(PathBuf::from(format!(
-                "/arcbox/boot/{}/runtime/bin",
-                version
-            )));
-        }
-
-        candidates.push(PathBuf::from("/arcbox/runtime/bin"));
-        candidates.push(PathBuf::from("/arcbox/boot/current/runtime/bin"));
-        candidates
-    }
+    const REQUIRED_RUNTIME_BINARIES: &[&str] =
+        &["dockerd", "containerd", "containerd-shim-runc-v2", "runc"];
 
     fn detect_runtime_bin_dir() -> Option<PathBuf> {
-        runtime_bin_dir_candidates()
-            .into_iter()
-            .find(|dir| dir.join("containerd").exists() && dir.join("dockerd").exists())
+        let dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
+        if missing_runtime_binaries_at(&dir).is_empty() {
+            Some(dir)
+        } else {
+            None
+        }
     }
 
     fn runtime_missing_detail() -> String {
-        let candidates: Vec<String> = runtime_bin_dir_candidates()
-            .into_iter()
-            .map(|p| p.display().to_string())
-            .collect();
-        format!(
-            "bundled runtime binaries not found; expected containerd+dockerd under one of: {}",
-            candidates.join(", ")
-        )
+        let dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
+        let missing = missing_runtime_binaries_at(&dir);
+        runtime_missing_detail_from(&missing)
+    }
+
+    fn runtime_missing_detail_from(missing: &[&'static str]) -> String {
+        if missing.is_empty() {
+            format!("all runtime binaries present under {ARCBOX_RUNTIME_BIN_DIR}")
+        } else {
+            format!(
+                "missing runtime binaries under {}: {}",
+                ARCBOX_RUNTIME_BIN_DIR,
+                missing.join(", ")
+            )
+        }
+    }
+
+    fn missing_runtime_binaries_at(dir: &Path) -> Vec<&'static str> {
+        REQUIRED_RUNTIME_BINARIES
+            .iter()
+            .copied()
+            .filter(|name| !dir.join(name).exists())
+            .collect()
     }
 
     /// Ensures the guest environment has the prerequisites that dockerd/containerd
@@ -879,8 +1214,7 @@ mod linux {
     fn ensure_runtime_prerequisites() -> Vec<String> {
         let mut notes = Vec::new();
 
-        // Alpine initramfs does not set PATH, so bare command names may not be
-        // found. Use /bin/busybox <applet> which is always present in Alpine.
+        // Use /bin/busybox <applet> directly — always present on EROFS rootfs.
         let busybox = "/bin/busybox";
 
         // Mount cgroup2 unified hierarchy (required by dockerd).
@@ -1002,15 +1336,15 @@ mod linux {
     ///
     /// Prefers `/arcbox/` (VirtioFS mount, visible from host as `~/.arcbox/`)
     /// so that logs survive guest restarts and are accessible without exec.
-    /// Falls back to `/var/log/` (guest tmpfs) if VirtioFS is not mounted.
+    /// Falls back to `/tmp/` (guest tmpfs) if VirtioFS is not mounted.
     fn daemon_log_file(name: &str) -> Stdio {
         let arcbox_path = format!("/arcbox/{}.log", name);
-        let var_log_path = format!("/var/log/{}.log", name);
+        let tmp_log_path = format!("/tmp/{}.log", name);
 
         let log_path = if Path::new("/arcbox").exists() {
             &arcbox_path
         } else {
-            &var_log_path
+            &tmp_log_path
         };
 
         match std::fs::OpenOptions::new()
@@ -1020,11 +1354,11 @@ mod linux {
         {
             Ok(f) => f.into(),
             Err(_) => {
-                // Fallback to /var/log/ if /arcbox/ write fails.
+                // Fallback to /tmp/ if /arcbox/ write fails.
                 match std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(&var_log_path)
+                    .open(&tmp_log_path)
                 {
                     Ok(f) => f.into(),
                     Err(_) => Stdio::null(),
@@ -1051,7 +1385,6 @@ mod linux {
 
         let containerd_bin = runtime_bin_dir.join("containerd");
         let dockerd_bin = runtime_bin_dir.join("dockerd");
-        let youki_bin = runtime_bin_dir.join("youki");
         let mut notes = Vec::new();
 
         // Ensure kernel/filesystem prerequisites before spawning daemons.
@@ -1060,23 +1393,19 @@ mod linux {
             tracing::info!(prerequisites = %prereq_notes.join("; "), "runtime prerequisites");
         }
         notes.extend(prereq_notes);
-        notes.push(ensure_docker_data_mount());
+        match ensure_data_mount() {
+            Ok(note) => notes.push(note),
+            Err(e) => return format!("data volume setup failed: {}", e),
+        }
 
-        for dir in [
-            "/run/containerd",
-            "/var/run/docker",
-            "/var/lib/containerd",
-            "/var/lib/docker",
-            "/etc/docker",
-            "/var/log",
-        ] {
+        for dir in ["/run/containerd", "/var/run/docker", "/etc/docker"] {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 notes.push(format!("mkdir {} failed({})", dir, e));
             }
         }
 
-        // Alpine initramfs does not export PATH. Always include standard search
-        // paths so containerd/dockerd can invoke modprobe, mount, etc.
+        // Include standard search paths so containerd/dockerd can invoke
+        // modprobe, mount, etc.
         let path_env = {
             let standard = "/usr/sbin:/usr/bin:/sbin:/bin";
             match std::env::var("PATH") {
@@ -1107,9 +1436,7 @@ mod linux {
                 "--config",
                 containerd_config,
                 "--address",
-                "/run/containerd/containerd.sock",
-                "--root",
-                "/var/lib/containerd",
+                CONTAINERD_SOCKET,
                 "--state",
                 "/run/containerd",
             ])
@@ -1158,28 +1485,15 @@ mod linux {
 
         if !probe_unix_socket(DOCKER_API_UNIX_SOCKET).await {
             let mut cmd = Command::new(&dockerd_bin);
-            cmd.arg("--host=unix:///var/run/docker.sock")
-                .arg("--containerd=/run/containerd/containerd.sock")
+            cmd.arg(format!("--host=unix://{DOCKER_API_UNIX_SOCKET}"))
+                .arg(format!("--containerd={CONTAINERD_SOCKET}"))
                 .arg("--exec-root=/var/run/docker")
-                .arg("--data-root=/var/lib/docker")
+                .arg(format!("--data-root={DOCKER_DATA_MOUNT_POINT}"))
+                .arg("--userland-proxy=false")
                 .env("PATH", &path_env)
                 .stdin(Stdio::null())
                 .stdout(daemon_log_file("dockerd"))
                 .stderr(daemon_log_file("dockerd"));
-
-            // Register youki as the default OCI runtime.
-            // 'runc' is a reserved name in dockerd and cannot be registered via
-            // --add-runtime; it is already the built-in default. We only need to
-            // register youki and set it as the default. If youki fails, the user can
-            // fall back via `docker run --runtime=runc`.
-            if youki_bin.exists() {
-                cmd.arg("--add-runtime")
-                    .arg(format!("youki={}", youki_bin.display()))
-                    .arg("--default-runtime=youki");
-                notes.push("OCI runtime: youki (default), runc (built-in fallback)".to_string());
-            } else {
-                notes.push("youki missing, dockerd will use built-in runc".to_string());
-            }
 
             match cmd.spawn() {
                 Ok(child) => {
@@ -1188,77 +1502,6 @@ mod linux {
                     notes.push(format!("spawned bundled dockerd (pid={})", pid));
                 }
                 Err(e) => return format!("failed to spawn bundled dockerd: {}", e),
-            }
-        }
-
-        notes.join("; ")
-    }
-
-    async fn try_start_runtime_services() -> String {
-        let mut notes = Vec::new();
-        let mut all_service_starts_succeeded = false;
-
-        if Path::new("/run/systemd/system").exists() {
-            all_service_starts_succeeded = true;
-            for service in ["containerd.service", "docker.service"] {
-                match Command::new("systemctl")
-                    .args(["start", service])
-                    .status()
-                    .await
-                {
-                    Ok(status) if status.success() => {
-                        notes.push(format!("started {}", service));
-                    }
-                    Ok(status) => {
-                        all_service_starts_succeeded = false;
-                        notes.push(format!(
-                            "systemctl start {} failed(exit={})",
-                            service,
-                            status.code().unwrap_or(-1)
-                        ));
-                    }
-                    Err(e) => {
-                        all_service_starts_succeeded = false;
-                        notes.push(format!("systemctl start {} error({})", service, e));
-                    }
-                }
-            }
-        } else if Path::new("/sbin/rc-service").exists()
-            || Path::new("/usr/sbin/rc-service").exists()
-            || Path::new("/bin/rc-service").exists()
-        {
-            all_service_starts_succeeded = true;
-            for service in ["containerd", "docker"] {
-                let status = Command::new("rc-service")
-                    .args([service, "start"])
-                    .status()
-                    .await;
-                match status {
-                    Ok(status) if status.success() => {
-                        notes.push(format!("started {}", service));
-                    }
-                    Ok(status) => {
-                        all_service_starts_succeeded = false;
-                        notes.push(format!(
-                            "rc-service {} start failed(exit={})",
-                            service,
-                            status.code().unwrap_or(-1)
-                        ));
-                    }
-                    Err(e) => {
-                        all_service_starts_succeeded = false;
-                        notes.push(format!("rc-service {} start error({})", service, e));
-                    }
-                }
-            }
-        } else {
-            notes.push("no init service manager found, using bundled runtime".to_string());
-        }
-
-        if !all_service_starts_succeeded {
-            let note = try_start_bundled_runtime().await;
-            if !note.is_empty() {
-                notes.push(note);
             }
         }
 

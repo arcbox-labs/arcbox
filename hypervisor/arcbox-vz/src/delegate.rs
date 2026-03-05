@@ -165,7 +165,7 @@ pub fn get_delegate_class() -> Result<*const AnyClass, DelegateError> {
     }
 }
 
-/// Creates the VZSocketListenerDelegate Objective-C class dynamically.
+/// Creates the `VZSocketListenerDelegate` Objective-C class dynamically.
 unsafe fn create_delegate_class() -> Result<*const AnyClass, DelegateError> {
     unsafe {
         // Get NSObject as superclass

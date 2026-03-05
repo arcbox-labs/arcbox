@@ -60,8 +60,7 @@ impl LinuxBootLoader {
 
             if obj.is_null() {
                 return Err(VZError::InvalidConfiguration(format!(
-                    "Failed to create boot loader for kernel: {}",
-                    path_str
+                    "Failed to create boot loader for kernel: {path_str}"
                 )));
             }
 

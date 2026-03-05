@@ -1,6 +1,6 @@
 //! # arcbox-core
 //!
-//! Core orchestration layer for ArcBox.
+//! Core orchestration layer for `ArcBox`.
 //!
 //! This crate provides high-level management of:
 //!
@@ -28,19 +28,6 @@
 //!           ▼            ▼
 //!      arcbox-vmm   arcbox-fs
 //! ```
-
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
-#![allow(clippy::module_name_repetitions)]
-// Core orchestration layer is still under active development.
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-#![allow(unreachable_code)]
-#![allow(clippy::all)]
-#![allow(clippy::pedantic)]
-#![allow(clippy::nursery)]
-
 pub mod agent_client;
 pub mod boot_assets;
 pub mod config;
@@ -57,8 +44,9 @@ pub mod vm_lifecycle;
 pub use agent_client::AgentClient;
 pub use boot_assets::{
     BootAssetConfig, BootAssetManifest, BootAssetProvider, BootAssets, DownloadProgress,
+    PreparePhase, boot_asset_version,
 };
-pub use config::{Config, ContainerProvisionMode, ContainerRuntimeConfig};
+pub use config::{Config, ContainerRuntimeConfig};
 pub use error::{CoreError, Result};
 pub use machine::MachineManager;
 pub use runtime::Runtime;

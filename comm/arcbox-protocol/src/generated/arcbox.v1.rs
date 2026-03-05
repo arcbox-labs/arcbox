@@ -121,9 +121,6 @@ pub struct CreateMachineRequest {
     /// Kernel image path.
     #[prost(string, tag = "10")]
     pub kernel: ::prost::alloc::string::String,
-    /// Initrd/initramfs path.
-    #[prost(string, tag = "11")]
-    pub initrd: ::prost::alloc::string::String,
     /// Kernel command line.
     #[prost(string, tag = "12")]
     pub cmdline: ::prost::alloc::string::String,
@@ -1558,7 +1555,7 @@ pub struct PortBindingsRemoved {
 #[serde(rename_all = "camelCase")]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ServiceStatus {
-    /// Service name (e.g. "containerd", "dockerd", "youki").
+    /// Service name (e.g. "containerd", "dockerd", "runc").
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
     /// Service status: "ready", "not_ready", or "error".

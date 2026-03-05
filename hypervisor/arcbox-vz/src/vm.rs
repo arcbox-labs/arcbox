@@ -80,7 +80,7 @@ unsafe impl Send for VirtualMachine {}
 unsafe impl Sync for VirtualMachine {}
 
 impl VirtualMachine {
-    /// Creates a VirtualMachine from raw pointers.
+    /// Creates a `VirtualMachine` from raw pointers.
     ///
     /// This is called internally by `VirtualMachineConfiguration::build()`.
     pub(crate) fn from_raw(ptr: *mut AnyObject, queue: DispatchQueue) -> Self {
@@ -116,6 +116,7 @@ impl VirtualMachine {
     }
 
     /// Returns whether a stop can be requested.
+    #[must_use]
     pub fn can_request_stop(&self) -> bool {
         self.queue
             .sync(|| unsafe { msg_send_bool!(self.inner, canRequestStop).as_bool() })
@@ -210,7 +211,7 @@ impl VirtualMachine {
 
         // For simplicity, use polling instead of completion handler
         let inner = self.inner;
-        self.queue.sync(|| unsafe {
+        let stop_dispatch: VZResult<()> = self.queue.sync(|| unsafe {
             // Create a simple completion block
             static STOP_BLOCK: OnceLock<BlockPtr> = OnceLock::new();
 
@@ -249,8 +250,28 @@ impl VirtualMachine {
             let sel = objc2::sel!(stopWithCompletionHandler:);
             let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel, *const c_void) =
                 std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            func(inner as *const AnyObject, sel, block_ptr.0);
+            let result = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                func(inner as *const AnyObject, sel, block_ptr.0);
+            }));
+
+            match result {
+                Ok(()) => Ok(()),
+                Err(exception) => {
+                    let desc = match exception {
+                        Some(exc) => {
+                            let raw = &*exc as *const _ as *const AnyObject as *mut AnyObject;
+                            crate::ffi::nsstring_to_string(msg_send!(raw, description))
+                        }
+                        None => "unknown ObjC exception (nil)".to_string(),
+                    };
+                    Err(VZError::Internal {
+                        code: -2,
+                        message: format!("VM stop threw ObjC exception: {desc}"),
+                    })
+                }
+            }
         });
+        stop_dispatch?;
 
         // Poll for stopped state
         let timeout = Duration::from_secs(10);
@@ -452,6 +473,7 @@ impl VirtualMachine {
     /// Returns the memory balloon devices configured on this VM.
     ///
     /// These can be used for dynamic memory management between host and guest.
+    #[must_use]
     pub fn memory_balloon_devices(&self) -> Vec<MemoryBalloonDevice> {
         vm_memory_balloon_devices(self.inner)
     }
@@ -459,6 +481,7 @@ impl VirtualMachine {
     /// Returns the first memory balloon device, if any.
     ///
     /// This is a convenience method for VMs with a single balloon device.
+    #[must_use]
     pub fn first_balloon_device(&self) -> Option<MemoryBalloonDevice> {
         self.memory_balloon_devices().into_iter().next()
     }

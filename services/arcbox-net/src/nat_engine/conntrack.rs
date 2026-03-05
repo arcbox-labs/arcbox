@@ -387,7 +387,7 @@ impl ConnTrackTable {
     /// Looks up a connection by NAT'd address (reverse lookup).
     pub fn lookup_reverse(&mut self, nat_key: &ConnTrackKey) -> Option<&ConnTrackEntry> {
         // Clone the key to avoid borrow conflict with lookup().
-        let orig_key = self.reverse.get(nat_key).cloned()?;
+        let orig_key = self.reverse.get(nat_key).copied()?;
         self.lookup(&orig_key)
     }
 
@@ -607,8 +607,8 @@ mod tests {
         let ports: Vec<u16> = (0..20).map(|_| alloc.allocate()).collect();
 
         // Should cycle through the range
-        for i in 0..11 {
-            assert_eq!(ports[i], 1000 + (i as u16));
+        for (i, port) in ports.iter().enumerate().take(11) {
+            assert_eq!(*port, 1000 + (i as u16));
         }
         // Then wrap around
         assert_eq!(ports[11], 1000);

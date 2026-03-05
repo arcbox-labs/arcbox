@@ -1,9 +1,10 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     # ============================================
     # L0: Common (MIT OR Apache-2.0)
     # ============================================
+    "common/arcbox-constants",
     "common/arcbox-error",
 
     # ============================================
@@ -13,6 +14,7 @@ members = [
     "hypervisor/arcbox-hypervisor",
     "hypervisor/arcbox-vmm",
     "hypervisor/arcbox-virtio",
+    "hypervisor/arcbox-vm",
 
     # ============================================
     # L3: Services (MIT OR Apache-2.0)
@@ -43,14 +45,6 @@ members = [
     # Guest Components (MIT OR Apache-2.0)
     # ============================================
     "guest/arcbox-agent",
-
-    # ============================================
-    # Pro Layer (BSL-1.1)
-    # ============================================
-    "pro/arcbox-fs-enhanced",
-    "pro/arcbox-net-advanced",
-    "pro/arcbox-snapshot",
-    "pro/arcbox-perf",
 ]
 
 # ============================================
@@ -100,7 +94,7 @@ ttrpc = "0.8"
 ttrpc-codegen = "0.5"
 
 # HTTP server (Docker REST API)
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 hyper = { version = "1", features = ["full"] }
@@ -117,6 +111,9 @@ crossterm = "0.27"
 
 # Bytes and buffer
 bytes = "1"
+
+# Cryptography
+sha2 = "0.10"
 
 # Concurrent data structures
 dashmap = "6"
@@ -142,20 +139,28 @@ nix = { version = "0.29", features = [
     "socket",
     "ioctl",
     "mman",
+    "term",
+    "signal",
+    "user",
 ] }
 
 # libc
 libc = "0.2"
 
 # External crates
+arcbox-boot = { version = "0.2", features = ["download"] }
 macos-resolver = "0.2.0"
 
+fc-sdk = "0.2.3"
+
 # Internal crates (Core layer)
+arcbox-constants = { version = "0.0.1-alpha.1", path = "common/arcbox-constants" }
 arcbox-error = { version = "0.0.1-alpha.1", path = "common/arcbox-error" }
 arcbox-vz = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-vz" }
 arcbox-hypervisor = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-hypervisor" }
 arcbox-vmm = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-vmm" }
 arcbox-virtio = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-virtio" }
+arcbox-vm = { version = "0.0.1-alpha.1", path = "hypervisor/arcbox-vm" }
 arcbox-fs = { version = "0.0.1-alpha.1", path = "services/arcbox-fs" }
 arcbox-net = { version = "0.0.1-alpha.1", path = "services/arcbox-net" }
 arcbox-container = { version = "0.0.1-alpha.2", path = "services/arcbox-container" }
@@ -170,14 +175,51 @@ arcbox-cli = { version = "0.0.1-alpha.1", path = "app/arcbox-cli" }
 arcbox-agent = { version = "0.0.1-alpha.1", path = "guest/arcbox-agent" }
 arcbox = { version = "0.0.1-alpha.1", path = "app/arcbox" }
 
-# Internal crates (Pro layer)
-arcbox-fs-enhanced = { version = "0.0.1-alpha.1", path = "pro/arcbox-fs-enhanced" }
-arcbox-net-advanced = { version = "0.0.1-alpha.1", path = "pro/arcbox-net-advanced" }
-arcbox-snapshot = { version = "0.0.1-alpha.1", path = "pro/arcbox-snapshot" }
-arcbox-perf = { version = "0.0.1-alpha.1", path = "pro/arcbox-perf" }
-
 # Test infrastructure
 tempfile = "3"
+
+[workspace.lints.clippy]
+# Enable pedantic and nursery at workspace level
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Pedantic lints that are project-wide noise
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+missing_const_for_fn = "allow"
+# Style preferences
+uninlined_format_args = "allow"
+redundant_else = "allow"
+items_after_statements = "allow"
+if_not_else = "allow"
+single_match_else = "allow"
+option_if_let_else = "allow"
+redundant_closure_for_method_calls = "allow"
+significant_drop_tightening = "allow"
+# Numeric casts — common in low-level/systems code
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+# Protobuf generated code
+derive_partial_eq_without_eq = "allow"
+# Other pedantic lints not useful for this project
+similar_names = "allow"
+unreadable_literal = "allow"
+match_same_arms = "allow"
+needless_pass_by_value = "allow"
+unused_self = "allow"
+unused_async = "allow"
+too_many_lines = "allow"
+return_self_not_must_use = "allow"
+struct_excessive_bools = "allow"
+manual_let_else = "allow"
+default_trait_access = "allow"
+wildcard_imports = "allow"
+
+[workspace.lints.rust]
 
 [profile.release]
 lto = true

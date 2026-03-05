@@ -68,7 +68,7 @@ pub trait VirtualMachine: Send + Sync {
     /// Returns an error if the vCPU cannot be created.
     fn create_vcpu(&mut self, id: u32) -> Result<Self::Vcpu, HypervisorError>;
 
-    /// Adds a VirtIO device to the VM.
+    /// Adds a `VirtIO` device to the VM.
     ///
     /// # Errors
     ///
@@ -158,7 +158,7 @@ pub trait Vcpu: Send {
 
     /// Sets the result of an I/O read operation.
     ///
-    /// This is called after handling an IoIn exit to provide the value
+    /// This is called after handling an `IoIn` exit to provide the value
     /// that should be returned to the guest.
     ///
     /// # Errors
@@ -168,7 +168,7 @@ pub trait Vcpu: Send {
 
     /// Sets the result of an MMIO read operation.
     ///
-    /// This is called after handling an MmioRead exit to provide the value
+    /// This is called after handling an `MmioRead` exit to provide the value
     /// that should be returned to the guest.
     ///
     /// # Errors

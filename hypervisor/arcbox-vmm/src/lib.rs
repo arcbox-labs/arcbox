@@ -1,6 +1,6 @@
 //! # arcbox-vmm
 //!
-//! Virtual Machine Monitor (VMM) for ArcBox.
+//! Virtual Machine Monitor (VMM) for `ArcBox`.
 //!
 //! This crate provides high-level VM management on top of the hypervisor
 //! abstraction layer:
@@ -53,16 +53,6 @@
 //!
 //! vm.run().await?;
 //! ```
-
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
-#![allow(clippy::module_name_repetitions)]
-// VMM code involves many low-level operations.
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(clippy::all)]
-#![allow(clippy::pedantic)]
-#![allow(clippy::nursery)]
-
 pub mod boot;
 pub mod builder;
 pub mod device;
@@ -71,6 +61,7 @@ pub mod event;
 pub mod fdt;
 pub mod irq;
 pub mod memory;
+pub mod snapshot;
 pub mod vcpu;
 pub mod vmm;
 
@@ -79,5 +70,9 @@ pub use builder::{VmBuilder, VmInstance};
 pub use device::{DeviceId, DeviceInfo, DeviceManager, DeviceTreeEntry, DeviceType};
 pub use error::{Result, VmmError};
 pub use fdt::{FdtBuilder, FdtConfig};
+pub use snapshot::{
+    SnapshotCreateOptions, SnapshotError, SnapshotInfo, SnapshotManager, SnapshotState,
+    SnapshotTargetType, VmRestoreData, VmSnapshotContext,
+};
 pub use vcpu::{DeviceManagerExitHandler, ExitHandler, VcpuManager};
 pub use vmm::{SharedDirConfig, Vmm, VmmConfig, VmmState};

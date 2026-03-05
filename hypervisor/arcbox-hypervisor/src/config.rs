@@ -52,21 +52,21 @@ pub struct VmConfigBuilder {
 impl VmConfigBuilder {
     /// Sets the number of vCPUs.
     #[must_use]
-    pub fn vcpu_count(mut self, count: u32) -> Self {
+    pub const fn vcpu_count(mut self, count: u32) -> Self {
         self.config.vcpu_count = count;
         self
     }
 
     /// Sets the memory size in bytes.
     #[must_use]
-    pub fn memory_size(mut self, size: u64) -> Self {
+    pub const fn memory_size(mut self, size: u64) -> Self {
         self.config.memory_size = size;
         self
     }
 
     /// Sets the CPU architecture.
     #[must_use]
-    pub fn arch(mut self, arch: CpuArch) -> Self {
+    pub const fn arch(mut self, arch: CpuArch) -> Self {
         self.config.arch = arch;
         self
     }
@@ -94,7 +94,7 @@ impl VmConfigBuilder {
 
     /// Enables Rosetta 2 translation.
     #[must_use]
-    pub fn enable_rosetta(mut self, enable: bool) -> Self {
+    pub const fn enable_rosetta(mut self, enable: bool) -> Self {
         self.config.enable_rosetta = enable;
         self
     }

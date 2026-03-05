@@ -7,9 +7,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 TEST_DIR="/tmp/arcbox-boot-test-$$"
-BOOT_ASSETS_VERSION_DEFAULT="$(awk -F '\"' '/pub const BOOT_ASSET_VERSION/ {print $2; exit}' "$PROJECT_DIR/crates/arcbox-core/src/boot_assets.rs")"
+BOOT_ASSETS_VERSION_DEFAULT="$(awk -F '"' '/^version[[:space:]]*=/ {print $2; exit}' "$PROJECT_DIR/boot-assets.lock")"
 if [[ -z "$BOOT_ASSETS_VERSION_DEFAULT" ]]; then
-    echo "Failed to resolve BOOT_ASSET_VERSION from crates/arcbox-core/src/boot_assets.rs" >&2
+    echo "Failed to resolve version from boot-assets.lock" >&2
     exit 1
 fi
 BOOT_ASSETS_VERSION="${ARCBOX_BOOT_ASSET_VERSION:-$BOOT_ASSETS_VERSION_DEFAULT}"
@@ -92,26 +92,22 @@ setup_test_env() {
     # Use development boot assets
     local dev_boot_dir="$PROJECT_DIR/boot-assets/dev"
     local dev_kernel="$dev_boot_dir/kernel"
-    local dev_initramfs="$dev_boot_dir/initramfs.cpio.gz"
-    local dev_rootfs="$dev_boot_dir/rootfs.squashfs"
-    local dev_modloop="$dev_boot_dir/modloop"
+    local dev_rootfs="$dev_boot_dir/rootfs.erofs"
     local dev_manifest="$dev_boot_dir/manifest.json"
 
-    if [[ ! -f "$dev_kernel" ]] || [[ ! -f "$dev_initramfs" ]] || [[ ! -f "$dev_rootfs" ]] || [[ ! -f "$dev_modloop" ]] || [[ ! -f "$dev_manifest" ]]; then
+    if [[ ! -f "$dev_kernel" ]] || [[ ! -f "$dev_rootfs" ]] || [[ ! -f "$dev_manifest" ]]; then
         log_warn "Development boot assets incomplete, refreshing..."
         (cd "$PROJECT_DIR" && ./scripts/setup-dev-boot-assets.sh)
     fi
 
-    if [[ -f "$dev_kernel" ]] && [[ -f "$dev_initramfs" ]] && [[ -f "$dev_rootfs" ]] && [[ -f "$dev_modloop" ]] && [[ -f "$dev_manifest" ]]; then
+    if [[ -f "$dev_kernel" ]] && [[ -f "$dev_rootfs" ]] && [[ -f "$dev_manifest" ]]; then
         cp "$dev_kernel" "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/"
-        cp "$dev_initramfs" "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/"
         cp "$dev_rootfs" "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/"
-        cp "$dev_modloop" "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/"
         cp "$dev_manifest" "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/"
         log_info "Using development boot assets from $dev_boot_dir"
     else
         log_error "Development boot assets not found or incomplete at $dev_boot_dir"
-        log_error "Required files: kernel, initramfs.cpio.gz, rootfs.squashfs, modloop, manifest.json"
+        log_error "Required files: kernel, rootfs.erofs, manifest.json"
         log_error "Run: ./scripts/setup-dev-boot-assets.sh"
         exit 1
     fi
@@ -125,7 +121,6 @@ start_daemon() {
     "$PROJECT_DIR/target/release/arcbox-daemon" \
         --data-dir "$TEST_DIR" \
         --socket "$TEST_DIR/docker.sock" \
-        --container-provision bundled-assets \
         --guest-docker-vsock-port "$GUEST_DOCKER_VSOCK_PORT" \
         > "$TEST_DIR/daemon.log" 2>&1 &
 
@@ -362,9 +357,12 @@ print_summary() {
     kernel_version=$(strings "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/kernel" 2>/dev/null | grep -E "^[0-9]+\.[0-9]+\.[0-9]+" | head -1)
 
     echo "Kernel:     $kernel_version"
-    echo "Initramfs:  $(ls -lh "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/initramfs.cpio.gz" | awk '{print $5}')"
-    echo "Rootfs:     $(ls -lh "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/rootfs.squashfs" | awk '{print $5}')"
-    echo "Modloop:    $(ls -lh "$TEST_DIR/boot/$BOOT_ASSETS_VERSION/modloop" | awk '{print $5}')"
+    local rootfs_file="$TEST_DIR/boot/$BOOT_ASSETS_VERSION/rootfs.erofs"
+    if [[ -f "$rootfs_file" ]]; then
+        echo "Rootfs:     $(ls -lh "$rootfs_file" | awk '{print $5}')"
+    else
+        echo "Rootfs:     N/A"
+    fi
     echo ""
 
     local pass=0

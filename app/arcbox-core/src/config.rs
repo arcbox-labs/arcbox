@@ -1,6 +1,6 @@
 //! Configuration management.
 //!
-//! ArcBox configuration is loaded from multiple sources with the following priority:
+//! `ArcBox` configuration is loaded from multiple sources with the following priority:
 //!
 //! 1. Environment variables (ARCBOX_*)
 //! 2. Configuration file (~/.config/arcbox/config.toml)
@@ -28,14 +28,13 @@
 //! socket_path = "~/.arcbox/docker.sock"
 //!
 //! [container]
-//! backend = "guest_docker"
-//! provision = "bundled_assets"
 //! guest_docker_vsock_port = 2375
 //!
 //! [logging]
 //! level = "info"
 //! ```
 
+use arcbox_constants::ports::DOCKER_API_VSOCK_PORT;
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
@@ -43,7 +42,7 @@ use figment::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// ArcBox configuration.
+/// `ArcBox` configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -149,8 +148,6 @@ pub struct VmDefaults {
     pub memory_mb: u64,
     /// Kernel path (optional, uses embedded kernel if not set).
     pub kernel_path: Option<PathBuf>,
-    /// Initrd path (optional).
-    pub initrd_path: Option<PathBuf>,
 }
 
 impl Default for VmDefaults {
@@ -159,7 +156,6 @@ impl Default for VmDefaults {
             cpus: 4,
             memory_mb: 4096,
             kernel_path: None,
-            initrd_path: None,
         }
     }
 }
@@ -236,22 +232,10 @@ impl Default for DockerConfig {
     }
 }
 
-/// Guest Docker runtime provisioning mode.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ContainerProvisionMode {
-    /// Runtime assets bundled with boot-assets release.
-    BundledAssets,
-    /// Runtime installed from distro packages inside guest.
-    DistroEngine,
-}
-
 /// Container runtime configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContainerRuntimeConfig {
-    /// Guest runtime provisioning mode.
-    pub provision: ContainerProvisionMode,
     /// Guest dockerd API vsock port.
     pub guest_docker_vsock_port: u32,
     /// Backend startup timeout in milliseconds.
@@ -261,8 +245,7 @@ pub struct ContainerRuntimeConfig {
 impl Default for ContainerRuntimeConfig {
     fn default() -> Self {
         Self {
-            provision: ContainerProvisionMode::BundledAssets,
-            guest_docker_vsock_port: 2375,
+            guest_docker_vsock_port: DOCKER_API_VSOCK_PORT,
             startup_timeout_ms: 60_000,
         }
     }
@@ -345,10 +328,9 @@ mod tests {
         assert_eq!(config.machine.disk_gb, 50);
         assert!(config.docker.enabled);
         assert_eq!(
-            config.container.provision,
-            ContainerProvisionMode::BundledAssets
+            config.container.guest_docker_vsock_port,
+            DOCKER_API_VSOCK_PORT
         );
-        assert_eq!(config.container.guest_docker_vsock_port, 2375);
     }
 
     #[test]

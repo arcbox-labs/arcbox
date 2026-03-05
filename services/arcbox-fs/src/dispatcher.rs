@@ -149,8 +149,9 @@ impl ResponseBuilder {
     }
 
     fn write_struct<T: Copy>(&mut self, value: &T) {
-        let bytes =
-            unsafe { std::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(std::ptr::from_ref::<T>(value) as *const u8, size_of::<T>())
+        };
         self.buffer.extend_from_slice(bytes);
     }
 }
@@ -787,7 +788,7 @@ impl FuseDispatcher {
                     // Write dirent header
                     let dirent_bytes = unsafe {
                         std::slice::from_raw_parts(
-                            &dirent as *const FuseDirent as *const u8,
+                            std::ptr::from_ref::<FuseDirent>(&dirent) as *const u8,
                             size_of::<FuseDirent>(),
                         )
                     };
@@ -798,7 +799,7 @@ impl FuseDispatcher {
 
                     // Pad to 8-byte boundary
                     let padding = entry_size - size_of::<FuseDirent>() - name_bytes.len();
-                    dirent_buf.extend(std::iter::repeat(0u8).take(padding));
+                    dirent_buf.extend(std::iter::repeat_n(0u8, padding));
 
                     offset += 1;
                 }

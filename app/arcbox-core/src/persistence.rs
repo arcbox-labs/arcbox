@@ -23,13 +23,10 @@ pub struct PersistedMachine {
     /// Kernel path.
     #[serde(default)]
     pub kernel: Option<String>,
-    /// Initrd path.
-    #[serde(default)]
-    pub initrd: Option<String>,
     /// Kernel command line.
     #[serde(default)]
     pub cmdline: Option<String>,
-    /// Block devices (e.g., rootfs ext4 image).
+    /// Block devices (e.g., EROFS rootfs, Btrfs data disk).
     #[serde(default)]
     pub block_devices: Vec<crate::vm::BlockDeviceConfig>,
     /// Distribution name.
@@ -99,7 +96,6 @@ impl From<&MachineInfo> for PersistedMachine {
             memory_mb: info.memory_mb,
             disk_gb: info.disk_gb,
             kernel: info.kernel.clone(),
-            initrd: info.initrd.clone(),
             cmdline: info.cmdline.clone(),
             block_devices: info.block_devices.clone(),
             distro: info.distro.clone(),
@@ -155,7 +151,7 @@ impl MachinePersistence {
 
         let persisted = PersistedMachine::from(machine);
         let content = toml::to_string_pretty(&persisted)
-            .map_err(|e| CoreError::Machine(format!("Failed to serialize config: {}", e)))?;
+            .map_err(|e| CoreError::Machine(format!("Failed to serialize config: {e}")))?;
 
         fs::write(self.config_path(&machine.name), content)?;
 
@@ -171,20 +167,21 @@ impl MachinePersistence {
     pub fn load(&self, name: &str) -> Result<PersistedMachine> {
         let path = self.config_path(name);
         let content = fs::read_to_string(&path)
-            .map_err(|e| CoreError::not_found(format!("Machine config not found: {}", e)))?;
+            .map_err(|e| CoreError::not_found(format!("Machine config not found: {e}")))?;
 
         toml::from_str(&content)
-            .map_err(|e| CoreError::Machine(format!("Failed to parse config: {}", e)))
+            .map_err(|e| CoreError::Machine(format!("Failed to parse config: {e}")))
     }
 
     /// Lists all saved machines.
+    #[must_use]
     pub fn list(&self) -> Vec<String> {
         let Ok(entries) = fs::read_dir(&self.base_dir) else {
             return Vec::new();
         };
 
         entries
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| e.path().is_dir())
             .filter(|e| e.path().join("config.toml").exists())
             .filter_map(|e| e.file_name().into_string().ok())
@@ -192,6 +189,7 @@ impl MachinePersistence {
     }
 
     /// Loads all saved machines.
+    #[must_use]
     pub fn load_all(&self) -> Vec<PersistedMachine> {
         self.list()
             .iter()
@@ -223,7 +221,7 @@ impl MachinePersistence {
         machine.state = state.into();
 
         let content = toml::to_string_pretty(&machine)
-            .map_err(|e| CoreError::Machine(format!("Failed to serialize config: {}", e)))?;
+            .map_err(|e| CoreError::Machine(format!("Failed to serialize config: {e}")))?;
 
         fs::write(self.config_path(name), content)?;
 
@@ -240,7 +238,7 @@ impl MachinePersistence {
         machine.ip_address = ip.map(ToString::to_string);
 
         let content = toml::to_string_pretty(&machine)
-            .map_err(|e| CoreError::Machine(format!("Failed to serialize config: {}", e)))?;
+            .map_err(|e| CoreError::Machine(format!("Failed to serialize config: {e}")))?;
 
         fs::write(self.config_path(name), content)?;
 
@@ -268,7 +266,6 @@ mod tests {
             memory_mb: 4096,
             disk_gb: 50,
             kernel: Some("/path/to/kernel".to_string()),
-            initrd: Some("/path/to/initrd".to_string()),
             cmdline: Some("console=ttyS0".to_string()),
             block_devices: Vec::new(),
             distro: None,
@@ -287,7 +284,6 @@ mod tests {
         assert_eq!(loaded.cpus, 4);
         assert_eq!(loaded.memory_mb, 4096);
         assert_eq!(loaded.kernel, Some("/path/to/kernel".to_string()));
-        assert_eq!(loaded.initrd, Some("/path/to/initrd".to_string()));
         assert_eq!(loaded.cmdline, Some("console=ttyS0".to_string()));
         // Check created_at is preserved (within 1 second tolerance)
         assert!((loaded.created_at - created_at).num_seconds().abs() < 1);
@@ -308,7 +304,6 @@ mod tests {
                 memory_mb: 2048,
                 disk_gb: 20,
                 kernel: None,
-                initrd: None,
                 cmdline: None,
                 block_devices: Vec::new(),
                 distro: None,
@@ -342,7 +337,6 @@ mod tests {
             memory_mb: 2048,
             disk_gb: 20,
             kernel: None,
-            initrd: None,
             cmdline: None,
             block_devices: Vec::new(),
             distro: None,

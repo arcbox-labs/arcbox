@@ -15,9 +15,11 @@ use std::path::PathBuf;
 
 pub mod boot;
 pub mod daemon;
+#[cfg(target_os = "macos")]
 pub mod dns;
 pub mod docker;
 pub mod machine;
+pub mod sandbox;
 pub mod version;
 
 /// ArcBox - High-performance container and VM runtime
@@ -64,15 +66,20 @@ pub enum Commands {
     #[command(subcommand)]
     Machine(machine::MachineCommands),
 
+    /// Manage sandboxes inside a machine
+    #[command(subcommand)]
+    Sandbox(sandbox::SandboxCommands),
+
     /// Manage Docker CLI integration
     #[command(subcommand)]
     Docker(docker::DockerCommands),
 
-    /// Manage boot assets (kernel/initramfs)
+    /// Manage boot assets (kernel/rootfs)
     #[command(subcommand)]
     Boot(boot::BootCommands),
 
     /// Manage DNS resolver for *.arcbox.local
+    #[cfg(target_os = "macos")]
     #[command(subcommand)]
     Dns(dns::DnsCommands),
 

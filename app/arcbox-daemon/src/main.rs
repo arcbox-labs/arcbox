@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
-use arcbox_api::{MachineServiceImpl, machine_service_server::MachineServiceServer};
-use arcbox_core::{Config, ContainerProvisionMode, Runtime, VmLifecycleConfig};
+use arcbox_api::{
+    MachineServiceImpl, SandboxServiceImpl, SandboxServiceServer, SandboxSnapshotServiceImpl,
+    SandboxSnapshotServiceServer, machine_service_server::MachineServiceServer,
+};
+use arcbox_core::{Config, Runtime, VmLifecycleConfig};
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use macos_resolver::{FileResolver, to_env_prefix};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,36 +39,13 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub kernel: Option<PathBuf>,
 
-    /// Custom initramfs path for VM boot.
-    #[arg(long)]
-    pub initramfs: Option<PathBuf>,
-
     /// Automatically enable Docker CLI integration.
     #[arg(long)]
     pub docker_integration: bool,
 
-    /// Guest runtime provisioning mode.
-    #[arg(long, value_enum)]
-    pub container_provision: Option<ContainerProvisionArg>,
-
     /// Guest dockerd API vsock port.
     #[arg(long)]
     pub guest_docker_vsock_port: Option<u32>,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum ContainerProvisionArg {
-    BundledAssets,
-    DistroEngine,
-}
-
-impl From<ContainerProvisionArg> for ContainerProvisionMode {
-    fn from(value: ContainerProvisionArg) -> Self {
-        match value {
-            ContainerProvisionArg::BundledAssets => Self::BundledAssets,
-            ContainerProvisionArg::DistroEngine => Self::DistroEngine,
-        }
-    }
 }
 
 #[tokio::main]
@@ -99,13 +79,9 @@ async fn run(args: DaemonArgs) -> Result<()> {
         data_dir: data_dir.clone(),
         ..Default::default()
     };
-    if let Some(mode) = args.container_provision {
-        config.container.provision = mode.into();
-    }
     if let Some(port) = args.guest_docker_vsock_port {
         config.container.guest_docker_vsock_port = port;
     }
-    let selected_provision = config.container.provision;
     let selected_guest_docker_port = config.container.guest_docker_vsock_port;
 
     let mut vm_lifecycle_config = VmLifecycleConfig::default();
@@ -114,15 +90,8 @@ async fn run(args: DaemonArgs) -> Result<()> {
     if let Some(ref kernel) = config.vm.kernel_path {
         vm_lifecycle_config.default_vm.kernel = Some(kernel.clone());
     }
-    if let Some(ref initrd) = config.vm.initrd_path {
-        vm_lifecycle_config.default_vm.initramfs = Some(initrd.clone());
-    }
-
     if let Some(kernel) = args.kernel {
         vm_lifecycle_config.default_vm.kernel = Some(kernel);
-    }
-    if let Some(initramfs) = args.initramfs {
-        vm_lifecycle_config.default_vm.initramfs = Some(initramfs);
     }
 
     let runtime = Arc::new(
@@ -136,7 +105,6 @@ async fn run(args: DaemonArgs) -> Result<()> {
 
     info!(
         data_dir = %data_dir.display(),
-        provision = ?selected_provision,
         guest_docker_vsock_port = selected_guest_docker_port,
         "Runtime initialized"
     );
@@ -219,9 +187,10 @@ async fn run(args: DaemonArgs) -> Result<()> {
 
 fn resolve_data_dir(data_dir: Option<&PathBuf>) -> PathBuf {
     data_dir.cloned().unwrap_or_else(|| {
-        dirs::home_dir()
-            .map(|home| home.join(".arcbox"))
-            .unwrap_or_else(|| PathBuf::from("/var/lib/arcbox"))
+        dirs::home_dir().map_or_else(
+            || PathBuf::from("/var/lib/arcbox"),
+            |home| home.join(".arcbox"),
+        )
     })
 }
 
@@ -244,10 +213,14 @@ async fn start_grpc_server(
     info!(socket = %socket_path.display(), "gRPC server listening");
 
     let machine_service = MachineServiceImpl::new(Arc::clone(&runtime));
+    let sandbox_service = SandboxServiceImpl::new(Arc::clone(&runtime));
+    let sandbox_snapshot_service = SandboxSnapshotServiceImpl::new(Arc::clone(&runtime));
 
     let handle = tokio::spawn(async move {
         let result = Server::builder()
             .add_service(MachineServiceServer::new(machine_service))
+            .add_service(SandboxServiceServer::new(sandbox_service))
+            .add_service(SandboxSnapshotServiceServer::new(sandbox_snapshot_service))
             .serve_with_incoming(incoming)
             .await;
 
@@ -278,8 +251,8 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        () = ctrl_c => {},
+        () = terminate => {},
     }
 }
 

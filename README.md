@@ -52,8 +52,16 @@ arcbox docker disable
 
 ArcBox ships as two binaries:
 
-- `arcbox`: thin CLI for machine management, daemon lifecycle, boot assets, Docker integration, and DNS helpers
-- `arcbox-daemon`: long-running daemon process that owns runtime state and serves Docker API + gRPC
+- `arcbox` -- thin CLI for machine management, daemon lifecycle, boot assets, Docker integration, and DNS helpers
+- `arcbox-daemon` -- long-running daemon process that owns runtime state and serves Docker API + gRPC
+
+Each VM boots a lightweight Linux guest via Apple's Virtualization.framework:
+
+1. A compressed, read-only EROFS rootfs provides the base filesystem (busybox, iptables, mkfs.btrfs)
+2. A busybox trampoline (`/sbin/init`) mounts essential filesystems and hands off to the ArcBox agent
+3. The agent binary is delivered from the host via VirtioFS -- not baked into boot assets -- so it updates instantly with the host CLI
+4. The agent initializes networking, syncs the clock, formats a Btrfs data volume, and starts containerd + dockerd
+5. The host daemon proxies Docker API requests over vsock to the guest dockerd
 
 ## What Works Today
 
@@ -67,6 +75,7 @@ ArcBox can already serve as a drop-in Docker engine for common workflows:
 - **Inter-container DNS** -- containers on the same network resolve each other by name
 - **Docker Compose** -- basic `docker-compose up/down` for multi-container projects
 - **Docker context switching** -- `arcbox docker enable/disable` to toggle between ArcBox and Docker Desktop
+- **Machine management** -- `arcbox machine create/start/stop/rm/ls/inspect/exec/ssh`
 - **40+ Docker API endpoints** -- compatible with Docker Engine API v1.43
 
 ## Known Limitations
@@ -86,7 +95,7 @@ Other things to be aware of:
 - Cold boot takes a few seconds on first launch. Subsequent container starts are faster.
 - Some advanced Docker API features (swarm, secrets, configs) are not implemented.
 - Error messages may be less polished than Docker Desktop.
-- If you hit a bug, please [open an issue](https://github.com/arcboxd/arcbox/issues).
+- If you hit a bug, please [open an issue](https://github.com/arcboxlabs/arcbox/issues).
 
 ## Performance
 
@@ -104,25 +113,35 @@ stable release (these are goals, not guarantees at this stage):
 Current alpha performance varies. We are focused on correctness first, then
 optimization.
 
+## Project Structure
+
+```
+common/          Shared error types and constants
+hypervisor/      Virtualization.framework bindings, VMM, VirtIO devices
+services/        VirtioFS, networking (NAT/DHCP/DNS), container state, OCI
+comm/            Protobuf definitions, gRPC services, vsock/unix transport
+app/             Core orchestration, API server, Docker Engine API, CLI, daemon
+guest/           In-VM agent (cross-compiled for Linux)
+```
+
 ## Building from Source
 
 If you prefer to build ArcBox yourself:
 
 ```bash
 # Clone
-git clone https://github.com/arcboxd/arcbox.git
+git clone https://github.com/arcboxlabs/arcbox.git
 cd arcbox
 
 # Build
 cargo build --release -p arcbox-cli -p arcbox-daemon
 
-# Sign daemon (required for macOS virtualization)
+# Sign both binaries (required for macOS virtualization)
 codesign --entitlements tests/resources/entitlements.plist --force -s - \
-    target/release/arcbox-daemon
+    target/release/arcbox target/release/arcbox-daemon
 
 # Run
 ./target/release/arcbox --help
-./target/release/arcbox-daemon --help
 ```
 
 ### Build Requirements
@@ -133,6 +152,7 @@ codesign --entitlements tests/resources/entitlements.plist --force -s - \
   ```bash
   brew install FiloSottile/musl-cross/musl-cross
   rustup target add aarch64-unknown-linux-musl
+  cargo build -p arcbox-agent --target aarch64-unknown-linux-musl --release
   ```
 
 ## Uninstall
@@ -164,8 +184,7 @@ We welcome contributions. See [CLAUDE.md](CLAUDE.md) for current contribution an
 
 ## License
 
-- **Core** (`common/`, `hypervisor/`, `services/`, `comm/`, `app/`) -- [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)
-- **Pro** (`pro/`) -- [BSL-1.1](LICENSE-BSL-1.1) (converts to MIT after 4 years)
+- **Core + Guest** (`common/`, `hypervisor/`, `services/`, `comm/`, `app/`, `guest/`) -- [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)
 
 See [LICENSE](LICENSE) for the full text.
 

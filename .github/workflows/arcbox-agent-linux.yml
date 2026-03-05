@@ -1,0 +1,107 @@
+name: arcbox-agent Linux
+
+on:
+  push:
+    branches: [master, develop]
+    paths:
+      - "guest/arcbox-agent/**"
+      - "hypervisor/arcbox-vm/**"
+      - "common/arcbox-constants/**"
+      - "comm/arcbox-protocol/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/arcbox-agent-linux.yml"
+  pull_request:
+    branches: [master, develop]
+    paths:
+      - "guest/arcbox-agent/**"
+      - "hypervisor/arcbox-vm/**"
+      - "common/arcbox-constants/**"
+      - "comm/arcbox-protocol/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/arcbox-agent-linux.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FC_S3_BASE: https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci
+  FC_S3_DIR: v1.10
+  FC_VERSION: v1.10.1
+
+jobs:
+  smoke:
+    name: SandboxService -> SandboxManager integration
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
+      - name: Enable KVM access
+        run: sudo chmod 666 /dev/kvm
+
+      - name: Install Firecracker and jailer via firecracker.sh
+        run: |
+          mkdir -p /tmp/fc-assets
+          if ! curl -fsSL https://arcbox.sh/firecracker.sh | bash -s -- install --version "${FC_VERSION}" --prefix /tmp/fc-assets; then
+            echo "Version ${FC_VERSION} unavailable, falling back to latest"
+            curl -fsSL https://arcbox.sh/firecracker.sh | bash -s -- install --prefix /tmp/fc-assets
+          fi
+
+          file /tmp/fc-assets/firecracker
+          /tmp/fc-assets/firecracker --version
+
+      - name: Download kernel/rootfs assets from S3
+        run: |
+          BASE="${FC_S3_BASE}/${FC_S3_DIR}/x86_64"
+          curl -sL "$BASE/vmlinux-6.1.102"              -o /tmp/fc-assets/vmlinux
+          curl -sL "$BASE/ubuntu-22.04.ext4"            -o /tmp/fc-assets/rootfs-base.ext4
+
+      - name: Build binaries
+        run: |
+          cargo build -p arcbox-vm --bin vmm-guest-agent --release
+          cargo test -p arcbox-agent --test sandbox_service_manager --no-run
+
+      - name: Inject vmm-guest-agent into rootfs
+        run: |
+          cp /tmp/fc-assets/rootfs-base.ext4 /tmp/fc-assets/rootfs.ext4
+          sudo e2fsck -f -y /tmp/fc-assets/rootfs.ext4 || true
+          sudo resize2fs /tmp/fc-assets/rootfs.ext4 512M
+          mkdir -p /tmp/fc-mnt
+          sudo mount -o loop /tmp/fc-assets/rootfs.ext4 /tmp/fc-mnt
+          sudo cp target/release/vmm-guest-agent /tmp/fc-mnt/sbin/vm-agent
+          sudo chmod +x /tmp/fc-mnt/sbin/vm-agent
+          sudo umount /tmp/fc-mnt
+
+      - name: Run integration test (as root)
+        run: |
+          sudo env \
+            PATH="$PATH" \
+            HOME="$HOME" \
+            FC_BINARY=/tmp/fc-assets/firecracker \
+            FC_KERNEL=/tmp/fc-assets/vmlinux \
+            FC_ROOTFS=/tmp/fc-assets/rootfs.ext4 \
+            RUST_LOG=arcbox_agent=info \
+            cargo test -p arcbox-agent --test sandbox_service_manager -- --ignored --test-threads=1

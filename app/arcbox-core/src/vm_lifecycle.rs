@@ -27,10 +27,13 @@
 //!              └─────────────────┘
 //! ```
 
-use crate::boot_assets::{BootAssetConfig, BootAssetProvider, BootAssets};
+use crate::boot_assets::BootAssetProvider;
 use crate::error::{CoreError, Result};
 use crate::event::{Event, EventBus};
 use crate::machine::{MachineConfig, MachineInfo, MachineManager, MachineState};
+use arcbox_constants::cmdline::{
+    DOCKER_DATA_DEVICE_KEY as DOCKER_DATA_DEVICE_CMDLINE_KEY, GUEST_DOCKER_VSOCK_PORT_KEY,
+};
 use arcbox_error::CommonError;
 use std::fs::OpenOptions;
 use std::io::Seek;
@@ -38,7 +41,7 @@ use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -48,9 +51,6 @@ use tokio_util::sync::CancellationToken;
 
 /// Default machine name used for container operations.
 pub const DEFAULT_MACHINE_NAME: &str = "default";
-
-/// Default agent port for vsock communication.
-pub const DEFAULT_AGENT_PORT: u32 = 1024;
 
 /// Default startup timeout in seconds.
 const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 30;
@@ -75,9 +75,6 @@ const BALLOON_SHRINK_DELAY_SECS: u64 = 10;
 const DOCKER_DATA_IMAGE_NAME: &str = "docker.img";
 /// Persistent guest dockerd data image size (64 GiB sparse file).
 const DOCKER_DATA_IMAGE_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-/// Kernel cmdline key for guest docker data device.
-const DOCKER_DATA_DEVICE_CMDLINE_KEY: &str = "arcbox.docker_data_device=";
-
 // =============================================================================
 // VM Lifecycle State
 // =============================================================================
@@ -111,13 +108,13 @@ pub enum VmLifecycleState {
 impl VmLifecycleState {
     /// Returns true if VM is in a state where it can accept commands.
     #[must_use]
-    pub fn is_ready(&self) -> bool {
+    pub const fn is_ready(&self) -> bool {
         matches!(self, Self::Running | Self::Idle)
     }
 
     /// Returns true if VM needs to be started.
     #[must_use]
-    pub fn needs_start(&self) -> bool {
+    pub const fn needs_start(&self) -> bool {
         matches!(
             self,
             Self::NotExist | Self::Created | Self::Stopped | Self::Failed
@@ -126,7 +123,7 @@ impl VmLifecycleState {
 
     /// Returns the state name for logging.
     #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::NotExist => "not_exist",
             Self::Creating => "creating",
@@ -164,7 +161,7 @@ pub enum VmEvent {
     Start,
     /// Agent became ready.
     AgentReady,
-    /// VM became idle (no activity for idle_timeout).
+    /// VM became idle (no activity for `idle_timeout`).
     IdleTimeout,
     /// Activity detected, exit idle state.
     Activity,
@@ -230,10 +227,8 @@ pub struct DefaultVmConfig {
     pub memory_mb: u64,
     /// Disk size in GB (default: 50).
     pub disk_gb: u64,
-    /// Path to kernel image (if None, use BootAssetProvider).
+    /// Path to kernel image (if None, use `BootAssetProvider`).
     pub kernel: Option<PathBuf>,
-    /// Path to initramfs (if None, use BootAssetProvider).
-    pub initramfs: Option<PathBuf>,
     /// Kernel command line.
     pub cmdline: Option<String>,
     /// Enable Rosetta for x86 emulation (Apple Silicon only).
@@ -251,7 +246,6 @@ impl Default for DefaultVmConfig {
             memory_mb: 2048,
             disk_gb: 50,
             kernel: None,
-            initramfs: None,
             cmdline: None,
             rosetta: cfg!(target_arch = "aarch64"),
         }
@@ -268,6 +262,7 @@ impl Default for DefaultVmConfig {
 ///
 /// Continuously monitors VM health via agent ping.
 /// Reports failures after consecutive failures exceed threshold.
+#[allow(dead_code)]
 pub struct HealthMonitor {
     /// Health check interval.
     interval: Duration,
@@ -281,6 +276,7 @@ pub struct HealthMonitor {
 
 impl HealthMonitor {
     /// Creates a new health monitor.
+    #[must_use]
     pub fn new(interval: Duration, max_failures: u32) -> Self {
         Self {
             interval,
@@ -372,7 +368,8 @@ pub struct RecoveryPolicy {
 
 impl RecoveryPolicy {
     /// Creates a new recovery policy.
-    pub fn new(max_retries: u32, backoff: BackoffStrategy) -> Self {
+    #[must_use]
+    pub const fn new(max_retries: u32, backoff: BackoffStrategy) -> Self {
         Self {
             max_retries,
             backoff,
@@ -422,7 +419,7 @@ impl RecoveryPolicy {
 /// ## Usage
 ///
 /// ```ignore
-/// let manager = VmLifecycleManager::new(machine_manager, event_bus, data_dir, config);
+/// let manager = VmLifecycleManager::new(machine_manager, event_bus, data_dir, config)?;
 ///
 /// // Ensure VM is ready before any container operation
 /// let agent = manager.ensure_ready().await?;
@@ -459,8 +456,7 @@ impl VmLifecycleManager {
     fn virtio_block_device_path(index: usize) -> Result<String> {
         if index >= 26 {
             return Err(CoreError::config(format!(
-                "too many block devices configured: {}",
-                index
+                "too many block devices configured: {index}"
             )));
         }
         Ok(format!("/dev/vd{}", (b'a' + index as u8) as char))
@@ -528,11 +524,10 @@ impl VmLifecycleManager {
         event_bus: EventBus,
         data_dir: PathBuf,
         config: VmLifecycleConfig,
-    ) -> Self {
+    ) -> Result<Self> {
         let boot_assets = Arc::new(
-            BootAssetProvider::new(data_dir.join("boot"))
-                .with_kernel(config.default_vm.kernel.clone().unwrap_or_default())
-                .with_initramfs(config.default_vm.initramfs.clone().unwrap_or_default()),
+            BootAssetProvider::new(data_dir.join("boot"))?
+                .with_kernel(config.default_vm.kernel.clone().unwrap_or_default())?,
         );
 
         let health_monitor = Arc::new(HealthMonitor::new(
@@ -554,7 +549,7 @@ impl VmLifecycleManager {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        Self {
+        Ok(Self {
             machine_manager,
             event_bus,
             state: RwLock::new(initial_state),
@@ -566,7 +561,7 @@ impl VmLifecycleManager {
             transition_lock: Mutex::new(()),
             last_activity_ms: AtomicU64::new(now_ms),
             balloon_shrunk: std::sync::atomic::AtomicBool::new(false),
-        }
+        })
     }
 
     /// Returns the current lifecycle state.
@@ -777,9 +772,12 @@ impl VmLifecycleManager {
         }
     }
 
-    /// Creates the default machine with configured settings.
+    /// Creates the default machine with EROFS rootfs and no initramfs.
+    ///
+    /// Block devices:
+    /// - vda: rootfs.erofs (read-only)
+    /// - vdb: docker-data.img (read-write)
     async fn create_default_machine(&self) -> Result<()> {
-        // Get boot assets
         let assets = self.boot_assets.get_assets().await?;
         let mut cmdline = self
             .config
@@ -787,29 +785,6 @@ impl VmLifecycleManager {
             .cmdline
             .clone()
             .unwrap_or(assets.cmdline);
-
-        // When rootfs.ext4 is present (schema_version >= 4), the initramfs
-        // mounts /dev/vda directly and switch_roots to /sbin/init (OpenRC).
-        // Override cmdline to use block device root instead of rdinit.
-        let has_rootfs_image = assets.rootfs_image.is_some();
-        if has_rootfs_image {
-            // Replace rdinit=/init with root=/dev/vda rw for block device boot.
-            let tokens: Vec<&str> = cmdline
-                .split_whitespace()
-                .filter(|t| !t.starts_with("rdinit=") && !t.starts_with("root="))
-                .collect();
-            cmdline = tokens.join(" ");
-            cmdline.push_str(" root=/dev/vda rw");
-
-            // The guest agent gates its machine-init path (mount /dev/vda,
-            // switch_root to OpenRC) on this token.
-            if !cmdline
-                .split_whitespace()
-                .any(|t| t == "arcbox.mode=machine")
-            {
-                cmdline.push_str(" arcbox.mode=machine");
-            }
-        }
 
         // Strip "quiet" so kernel boot messages are visible on the serial console.
         cmdline = cmdline
@@ -826,38 +801,24 @@ impl VmLifecycleManager {
             cmdline.push_str(" earlycon");
         }
 
-        let boot_version_key = "arcbox.boot_asset_version=";
-        if !cmdline
-            .split_whitespace()
-            .any(|token| token.starts_with(boot_version_key))
-        {
-            cmdline.push(' ');
-            cmdline.push_str(boot_version_key);
-            cmdline.push_str(&assets.version);
-        }
+        // Inject guest docker vsock port if configured.
         if let Some(port) = self.config.guest_docker_vsock_port {
-            let key = "arcbox.guest_docker_vsock_port=";
             if !cmdline
                 .split_whitespace()
-                .any(|token| token.starts_with(key))
+                .any(|token| token.starts_with(GUEST_DOCKER_VSOCK_PORT_KEY))
             {
                 cmdline.push(' ');
-                cmdline.push_str(&format!("{key}{port}"));
+                cmdline.push_str(&format!("{GUEST_DOCKER_VSOCK_PORT_KEY}{port}"));
             }
         }
 
-        // Attach rootfs.ext4 as a block device when available.
-        let mut block_devices = if let Some(ref rootfs_path) = assets.rootfs_image {
-            tracing::info!("Using ext4 rootfs block device: {}", rootfs_path.display());
-            vec![crate::vm::BlockDeviceConfig {
-                path: rootfs_path.to_string_lossy().to_string(),
-                read_only: false,
-            }]
-        } else {
-            Vec::new()
-        };
+        // Block devices: vda = EROFS rootfs (read-only), vdb = Docker data (read-write).
+        let mut block_devices = vec![crate::vm::BlockDeviceConfig {
+            path: assets.rootfs_image.to_string_lossy().to_string(),
+            read_only: true,
+        }];
 
-        // Attach persistent Docker data disk (ext4 in guest at /var/lib/docker).
+        // Attach persistent Docker data disk.
         let docker_data_image = self.data_dir.join(DOCKER_DATA_IMAGE_NAME);
         Self::ensure_sparse_block_image(&docker_data_image, DOCKER_DATA_IMAGE_SIZE_BYTES)?;
 
@@ -882,7 +843,6 @@ impl VmLifecycleManager {
             memory_mb: self.config.default_vm.memory_mb,
             disk_gb: self.config.default_vm.disk_gb,
             kernel: Some(assets.kernel.to_string_lossy().to_string()),
-            initrd: Some(assets.initramfs.to_string_lossy().to_string()),
             cmdline: Some(cmdline),
             block_devices,
             distro: None,
@@ -890,16 +850,15 @@ impl VmLifecycleManager {
         };
 
         tracing::info!(
-            "Creating default machine: cpus={}, memory={}MB, kernel={}",
+            "Creating default machine: cpus={}, memory={}MB, kernel={}, rootfs={}",
             config.cpus,
             config.memory_mb,
-            config.kernel.as_deref().unwrap_or("default")
+            config.kernel.as_deref().unwrap_or("default"),
+            assets.rootfs_image.display(),
         );
 
         // Write host wall-clock time to the VirtioFS share so the guest can
-        // set its system clock before TLS-dependent services (dockerd, chronyd)
-        // start.  The ARM generic timer only provides monotonic time; without
-        // this the guest boots with clock at epoch (1970).
+        // set its system clock before TLS-dependent services start.
         if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             let ts_path = self.data_dir.join(".host_time");
             let _ = tokio::fs::write(&ts_path, now.as_secs().to_string()).await;
@@ -1083,8 +1042,8 @@ impl VmLifecycleManager {
             let check_interval = Duration::from_secs(BALLOON_SHRINK_DELAY_SECS);
             loop {
                 tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = tokio::time::sleep(check_interval) => {}
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(check_interval) => {}
                 }
 
                 let state = *this.state.read().await;
@@ -1185,12 +1144,12 @@ impl VmLifecycleManager {
     }
 
     /// Returns the configuration.
-    pub fn config(&self) -> &VmLifecycleConfig {
+    pub const fn config(&self) -> &VmLifecycleConfig {
         &self.config
     }
 
     /// Returns the boot asset provider.
-    pub fn boot_assets(&self) -> &Arc<BootAssetProvider> {
+    pub const fn boot_assets(&self) -> &Arc<BootAssetProvider> {
         &self.boot_assets
     }
 
@@ -1201,7 +1160,7 @@ impl VmLifecycleManager {
     }
 
     /// Returns the health monitor.
-    pub fn health_monitor(&self) -> &Arc<HealthMonitor> {
+    pub const fn health_monitor(&self) -> &Arc<HealthMonitor> {
         &self.health_monitor
     }
 
@@ -1211,7 +1170,7 @@ impl VmLifecycleManager {
     }
 }
 
-fn is_not_found_error(err: &CoreError) -> bool {
+const fn is_not_found_error(err: &CoreError) -> bool {
     matches!(err, CoreError::Common(CommonError::NotFound(_)))
 }
 

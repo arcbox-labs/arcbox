@@ -24,7 +24,6 @@ arcbox-protocol = { workspace = true }
 
 [features]
 default = []
-# Enable all features
-full = ["pro"]
-# Pro features (BSL-1.1 licensed)
-pro = []
+
+[lints]
+workspace = true

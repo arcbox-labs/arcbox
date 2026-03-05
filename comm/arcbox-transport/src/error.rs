@@ -45,7 +45,7 @@ impl From<std::io::Error> for TransportError {
 }
 
 impl TransportError {
-    /// Creates an I/O error from std::io::Error.
+    /// Creates an I/O error from `std::io::Error`.
     #[must_use]
     pub fn io(err: std::io::Error) -> Self {
         Self::Common(CommonError::from(err))

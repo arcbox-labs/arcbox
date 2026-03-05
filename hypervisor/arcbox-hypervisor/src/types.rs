@@ -5,16 +5,16 @@ use serde::{Deserialize, Serialize};
 /// CPU architecture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CpuArch {
-    /// x86_64 / AMD64
+    /// `x86_64` / AMD64
     X86_64,
-    /// ARM64 / AArch64
+    /// ARM64 / `AArch64`
     Aarch64,
 }
 
 impl CpuArch {
     /// Returns the native CPU architecture of the current system.
     #[must_use]
-    pub fn native() -> Self {
+    pub const fn native() -> Self {
         #[cfg(target_arch = "x86_64")]
         {
             Self::X86_64
@@ -123,7 +123,7 @@ pub enum VcpuExit {
     Unknown(i32),
 }
 
-/// VirtIO device configuration for attaching to a VM.
+/// `VirtIO` device configuration for attaching to a VM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtioDeviceConfig {
     /// Device type.
@@ -136,6 +136,9 @@ pub struct VirtioDeviceConfig {
     pub read_only: bool,
     /// Tag for filesystem devices.
     pub tag: Option<String>,
+    /// File descriptor for file-handle-based network attachment.
+    #[serde(skip)]
+    pub net_fd: Option<i32>,
 }
 
 impl VirtioDeviceConfig {
@@ -147,28 +150,49 @@ impl VirtioDeviceConfig {
             path: Some(path.into()),
             read_only,
             tag: None,
+            net_fd: None,
         }
     }
 
-    /// Creates a new network device configuration.
-    pub fn network() -> Self {
+    /// Creates a new network device configuration with NAT attachment.
+    #[must_use]
+    pub const fn network() -> Self {
         Self {
             device_type: VirtioDeviceType::Net,
             config: Vec::new(),
             path: None,
             read_only: false,
             tag: None,
+            net_fd: None,
+        }
+    }
+
+    /// Creates a network device configuration with file-handle attachment.
+    ///
+    /// The VZ framework side uses one connected datagram socket file descriptor
+    /// for bidirectional frame I/O.
+    #[must_use]
+    pub const fn network_file_handle(fd: i32) -> Self {
+        Self {
+            device_type: VirtioDeviceType::Net,
+            config: Vec::new(),
+            path: None,
+            read_only: false,
+            tag: None,
+            net_fd: Some(fd),
         }
     }
 
     /// Creates a new console device configuration.
-    pub fn console() -> Self {
+    #[must_use]
+    pub const fn console() -> Self {
         Self {
             device_type: VirtioDeviceType::Console,
             config: Vec::new(),
             path: None,
             read_only: false,
             tag: None,
+            net_fd: None,
         }
     }
 
@@ -180,33 +204,38 @@ impl VirtioDeviceConfig {
             path: Some(path.into()),
             read_only,
             tag: Some(tag.into()),
+            net_fd: None,
         }
     }
 
     /// Creates a new vsock device configuration.
-    pub fn vsock() -> Self {
+    #[must_use]
+    pub const fn vsock() -> Self {
         Self {
             device_type: VirtioDeviceType::Vsock,
             config: Vec::new(),
             path: None,
             read_only: false,
             tag: None,
+            net_fd: None,
         }
     }
 
     /// Creates a new entropy device configuration.
-    pub fn entropy() -> Self {
+    #[must_use]
+    pub const fn entropy() -> Self {
         Self {
             device_type: VirtioDeviceType::Rng,
             config: Vec::new(),
             path: None,
             read_only: false,
             tag: None,
+            net_fd: None,
         }
     }
 }
 
-/// VirtIO device types.
+/// `VirtIO` device types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VirtioDeviceType {
     /// Block device.
@@ -257,7 +286,7 @@ impl BalloonStats {
     ///
     /// This is `configured_bytes - current_bytes`.
     #[must_use]
-    pub fn effective_memory(&self) -> u64 {
+    pub const fn effective_memory(&self) -> u64 {
         self.configured_bytes.saturating_sub(self.current_bytes)
     }
 
@@ -277,13 +306,14 @@ impl VirtioDeviceConfig {
     /// The balloon device allows dynamic memory management by inflating
     /// (reclaiming memory from guest) or deflating (returning memory to guest).
     #[must_use]
-    pub fn balloon() -> Self {
+    pub const fn balloon() -> Self {
         Self {
             device_type: VirtioDeviceType::Balloon,
             config: Vec::new(),
             path: None,
             read_only: false,
             tag: None,
+            net_fd: None,
         }
     }
 }
@@ -318,7 +348,7 @@ pub struct VcpuSnapshot {
     pub id: u32,
     /// CPU architecture.
     pub arch: CpuArch,
-    /// x86_64 registers (if applicable).
+    /// `x86_64` registers (if applicable).
     pub x86_regs: Option<Registers>,
     /// ARM64 registers (if applicable).
     pub arm64_regs: Option<Arm64Registers>,
@@ -327,9 +357,9 @@ pub struct VcpuSnapshot {
 }
 
 impl VcpuSnapshot {
-    /// Creates a new x86_64 vCPU snapshot.
+    /// Creates a new `x86_64` vCPU snapshot.
     #[must_use]
-    pub fn new_x86(id: u32, regs: Registers) -> Self {
+    pub const fn new_x86(id: u32, regs: Registers) -> Self {
         Self {
             id,
             arch: CpuArch::X86_64,
@@ -341,13 +371,25 @@ impl VcpuSnapshot {
 
     /// Creates a new ARM64 vCPU snapshot.
     #[must_use]
-    pub fn new_arm64(id: u32, regs: Arm64Registers) -> Self {
+    pub const fn new_arm64(id: u32, regs: Arm64Registers) -> Self {
         Self {
             id,
             arch: CpuArch::Aarch64,
             x86_regs: None,
             arm64_regs: Some(regs),
             extra_state: Vec::new(),
+        }
+    }
+
+    /// Returns `true` if this snapshot contains only default (zeroed) register
+    /// state, i.e. it was created as a placeholder and does not represent real
+    /// captured vCPU registers.
+    #[must_use]
+    pub fn is_placeholder(&self) -> bool {
+        match (&self.x86_regs, &self.arm64_regs) {
+            (Some(regs), _) => regs.rip == 0 && regs.rsp == 0 && regs.rflags == 0,
+            (_, Some(regs)) => regs.pc == 0 && regs.sp == 0 && regs.pstate == 0,
+            (None, None) => true,
         }
     }
 }

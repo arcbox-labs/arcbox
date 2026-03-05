@@ -1,7 +1,7 @@
-//! VirtioFS filesystem sharing configuration.
+//! `VirtioFS` filesystem sharing configuration.
 //!
 //! This module provides types for sharing directories between the host and guest
-//! using VirtioFS (virtio-fs).
+//! using `VirtioFS` (virtio-fs).
 //!
 //! # Example
 //!
@@ -77,7 +77,7 @@ impl SharedDirectory {
     /// Returns an error if:
     /// - The path doesn't exist
     /// - The path is not a directory
-    /// - The VZSharedDirectory class is not available
+    /// - The `VZSharedDirectory` class is not available
     pub fn new(path: impl AsRef<Path>, read_only: bool) -> VZResult<Self> {
         let path = path.as_ref();
 
@@ -153,6 +153,7 @@ impl SharedDirectory {
     }
 
     /// Consumes the shared directory and returns the raw pointer.
+    #[must_use]
     pub fn into_ptr(self) -> *mut AnyObject {
         let ptr = self.inner;
         std::mem::forget(self);
@@ -175,7 +176,7 @@ impl Drop for SharedDirectory {
 /// Trait for directory share configurations.
 ///
 /// This trait is implemented by different share types that can be
-/// attached to a VirtioFS device.
+/// attached to a `VirtioFS` device.
 pub trait DirectoryShare {
     /// Returns the raw pointer to the underlying share object.
     fn as_ptr(&self) -> *mut AnyObject;
@@ -371,11 +372,13 @@ impl MultipleDirectoryShare {
     }
 
     /// Returns the number of directories in the share.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.directories.len()
     }
 
     /// Returns true if the share has no directories.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.directories.is_empty()
     }
@@ -407,7 +410,7 @@ impl Drop for MultipleDirectoryShare {
 // VirtioFileSystemDeviceConfiguration
 // ============================================================================
 
-/// Configuration for a VirtioFS filesystem device.
+/// Configuration for a `VirtioFS` filesystem device.
 ///
 /// This wraps `VZVirtioFileSystemDeviceConfiguration` and provides
 /// filesystem sharing between host and guest.
@@ -443,7 +446,7 @@ pub struct VirtioFileSystemDeviceConfiguration {
 unsafe impl Send for VirtioFileSystemDeviceConfiguration {}
 
 impl VirtioFileSystemDeviceConfiguration {
-    /// Creates a new VirtioFS device configuration.
+    /// Creates a new `VirtioFS` device configuration.
     ///
     /// # Arguments
     ///
@@ -453,7 +456,7 @@ impl VirtioFileSystemDeviceConfiguration {
     ///
     /// Returns an error if:
     /// - The tag is invalid (empty or contains invalid characters)
-    /// - The VZVirtioFileSystemDeviceConfiguration class is not available
+    /// - The `VZVirtioFileSystemDeviceConfiguration` class is not available
     pub fn new(tag: &str) -> VZResult<Self> {
         // Validate tag is not empty
         if tag.is_empty() {
@@ -490,11 +493,11 @@ impl VirtioFileSystemDeviceConfiguration {
             );
 
             if !valid.as_bool() {
-                let error_msg = if !error.is_null() {
+                let error_msg = if error.is_null() {
+                    format!("Invalid VirtioFS tag: {tag}")
+                } else {
                     let desc: *mut AnyObject = msg_send!(error, localizedDescription);
                     crate::ffi::nsstring_to_string(desc)
-                } else {
-                    format!("Invalid VirtioFS tag: {}", tag)
                 };
                 return Err(VZError::InvalidConfiguration(error_msg));
             }
@@ -555,6 +558,7 @@ impl VirtioFileSystemDeviceConfiguration {
     }
 
     /// Returns the tag for this filesystem device.
+    #[must_use]
     pub fn tag(&self) -> &str {
         &self.tag
     }
@@ -566,6 +570,7 @@ impl VirtioFileSystemDeviceConfiguration {
     }
 
     /// Consumes the configuration and returns the raw pointer.
+    #[must_use]
     pub fn into_ptr(self) -> *mut AnyObject {
         let ptr = self.inner;
         std::mem::forget(self);
@@ -598,7 +603,7 @@ pub enum RosettaAvailability {
 
 /// A share configuration for Linux Rosetta translation.
 ///
-/// This wraps `VZLinuxRosettaDirectoryShare` and enables x86_64 binary
+/// This wraps `VZLinuxRosettaDirectoryShare` and enables `x86_64` binary
 /// translation on Apple Silicon Macs.
 ///
 /// # Availability
@@ -663,8 +668,7 @@ impl LinuxRosettaDirectoryShare {
         let avail = Self::availability();
         if avail != RosettaAvailability::Supported {
             return Err(VZError::OperationFailed(format!(
-                "Rosetta is not available: {:?}",
-                avail
+                "Rosetta is not available: {avail:?}"
             )));
         }
 

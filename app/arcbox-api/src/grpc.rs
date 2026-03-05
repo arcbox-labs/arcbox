@@ -6,6 +6,15 @@
 
 use arcbox_core::Runtime;
 use arcbox_grpc::v1::machine_service_server;
+use arcbox_grpc::{SandboxService, SandboxSnapshotService};
+use arcbox_protocol::sandbox_v1::Empty as SandboxEmpty;
+use arcbox_protocol::sandbox_v1::{
+    CheckpointRequest, CheckpointResponse, CreateSandboxRequest, CreateSandboxResponse,
+    DeleteSnapshotRequest, ExecInput, ExecOutput, InspectSandboxRequest, ListSandboxesRequest,
+    ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse, RemoveSandboxRequest,
+    RestoreRequest, RestoreResponse, RunOutput, RunRequest, SandboxEvent, SandboxEventsRequest,
+    SandboxInfo, StopSandboxRequest,
+};
 use arcbox_protocol::v1::{
     CreateMachineRequest, CreateMachineResponse, Empty, InspectMachineRequest, ListMachinesRequest,
     ListMachinesResponse, MachineAgentRequest, MachineExecOutput, MachineExecRequest, MachineInfo,
@@ -15,6 +24,9 @@ use arcbox_protocol::v1::{
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::Stream;
+use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tonic::codec::Streaming;
 use tonic::{Request, Response, Status};
 
 // =============================================================================
@@ -55,11 +67,6 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 None
             } else {
                 Some(req.kernel)
-            },
-            initrd: if req.initrd.is_empty() {
-                None
-            } else {
-                Some(req.initrd)
             },
             cmdline: if req.cmdline.is_empty() {
                 None
@@ -268,5 +275,257 @@ impl machine_service_server::MachineService for MachineServiceImpl {
     ) -> Result<Response<arcbox_protocol::v1::SshInfoResponse>, Status> {
         // TODO: Implement SSH info.
         Err(Status::unimplemented("ssh_info not implemented"))
+    }
+}
+
+// =============================================================================
+// Sandbox Service
+// =============================================================================
+
+/// Extracts the machine name from the `x-machine` gRPC metadata header.
+#[allow(clippy::result_large_err)]
+fn extract_machine_id<T>(request: &Request<T>) -> Result<String, Status> {
+    request
+        .metadata()
+        .get("x-machine")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .ok_or_else(|| Status::invalid_argument("missing x-machine metadata header"))
+}
+
+/// Maps a `CoreError` to a gRPC `Status`.
+fn core_to_status(e: &arcbox_core::CoreError) -> Status {
+    Status::internal(e.to_string())
+}
+
+/// Sandbox service implementation.
+///
+/// Routes each RPC to the `arcbox-agent` running in the target guest VM
+/// via the port-1024 vsock binary-frame protocol. The target machine is
+/// identified by the `x-machine` gRPC metadata header attached by the CLI.
+pub struct SandboxServiceImpl {
+    runtime: Arc<Runtime>,
+}
+
+impl SandboxServiceImpl {
+    /// Creates a new sandbox service.
+    #[must_use]
+    pub const fn new(runtime: Arc<Runtime>) -> Self {
+        Self { runtime }
+    }
+}
+
+#[tonic::async_trait]
+impl SandboxService for SandboxServiceImpl {
+    async fn create(
+        &self,
+        request: Request<CreateSandboxRequest>,
+    ) -> Result<Response<CreateSandboxResponse>, Status> {
+        let machine = extract_machine_id(&request)?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
+        let resp = agent
+            .sandbox_create(request.into_inner())
+            .await
+            .map_err(|e| core_to_status(&e))?;
+        Ok(Response::new(resp))
+    }
+
+    type RunStream = Pin<Box<dyn Stream<Item = Result<RunOutput, Status>> + Send + 'static>>;
+
+    async fn run(&self, request: Request<RunRequest>) -> Result<Response<Self::RunStream>, Status> {
+        let machine = extract_machine_id(&request)?;
+        let agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
+        let rx = agent
+            .sandbox_run(request.into_inner())
+            .await
+            .map_err(|e| core_to_status(&e))?;
+        let stream = UnboundedReceiverStream::new(rx)
+            .map(|r| r.map_err(|e| Status::internal(e.to_string())));
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    type ExecStream = Pin<Box<dyn Stream<Item = Result<ExecOutput, Status>> + Send + 'static>>;
+
+    async fn exec(
+        &self,
+        _request: Request<Streaming<ExecInput>>,
+    ) -> Result<Response<Self::ExecStream>, Status> {
+        Err(Status::unimplemented(
+            "sandbox exec bidirectional stream not yet implemented",
+        ))
+    }
+
+    async fn stop(
+        &self,
+        request: Request<StopSandboxRequest>,
+    ) -> Result<Response<SandboxEmpty>, Status> {
+        let machine = extract_machine_id(&request)?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
+        agent
+            .sandbox_stop(request.into_inner())
+            .await
+            .map_err(|e| core_to_status(&e))?;
+        Ok(Response::new(SandboxEmpty {}))
+    }
+
+    async fn remove(
+        &self,
+        request: Request<RemoveSandboxRequest>,
+    ) -> Result<Response<SandboxEmpty>, Status> {
+        let machine = extract_machine_id(&request)?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
+        agent
+            .sandbox_remove(request.into_inner())
+            .await
+            .map_err(|e| core_to_status(&e))?;
+        Ok(Response::new(SandboxEmpty {}))
+    }
+
+    async fn inspect(
+        &self,
+        request: Request<InspectSandboxRequest>,
+    ) -> Result<Response<SandboxInfo>, Status> {
+        let machine = extract_machine_id(&request)?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
+        let info = agent
+            .sandbox_inspect(request.into_inner())
+            .await
+            .map_err(|e| core_to_status(&e))?;
+        Ok(Response::new(info))
+    }
+
+    async fn list(
+        &self,
+        request: Request<ListSandboxesRequest>,
+    ) -> Result<Response<ListSandboxesResponse>, Status> {
+        let machine = extract_machine_id(&request)?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
+        let resp = agent
+            .sandbox_list(request.into_inner())
+            .await
+            .map_err(|e| core_to_status(&e))?;
+        Ok(Response::new(resp))
+    }
+
+    type EventsStream = Pin<Box<dyn Stream<Item = Result<SandboxEvent, Status>> + Send + 'static>>;
+
+    async fn events(
+        &self,
+        request: Request<SandboxEventsRequest>,
+    ) -> Result<Response<Self::EventsStream>, Status> {
+        let machine = extract_machine_id(&request)?;
+        let agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
+        let rx = agent
+            .sandbox_events(request.into_inner())
+            .await
+            .map_err(|e| core_to_status(&e))?;
+        let stream = UnboundedReceiverStream::new(rx)
+            .map(|r| r.map_err(|e| Status::internal(e.to_string())));
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+// =============================================================================
+// Sandbox Snapshot Service
+// =============================================================================
+
+/// Sandbox snapshot service implementation.
+pub struct SandboxSnapshotServiceImpl {
+    runtime: Arc<Runtime>,
+}
+
+impl SandboxSnapshotServiceImpl {
+    /// Creates a new sandbox snapshot service.
+    #[must_use]
+    pub const fn new(runtime: Arc<Runtime>) -> Self {
+        Self { runtime }
+    }
+}
+
+#[tonic::async_trait]
+impl SandboxSnapshotService for SandboxSnapshotServiceImpl {
+    async fn checkpoint(
+        &self,
+        request: Request<CheckpointRequest>,
+    ) -> Result<Response<CheckpointResponse>, Status> {
+        let machine = extract_machine_id(&request)?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
+        let resp = agent
+            .sandbox_checkpoint(request.into_inner())
+            .await
+            .map_err(|e| core_to_status(&e))?;
+        Ok(Response::new(resp))
+    }
+
+    async fn restore(
+        &self,
+        request: Request<RestoreRequest>,
+    ) -> Result<Response<RestoreResponse>, Status> {
+        let machine = extract_machine_id(&request)?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
+        let resp = agent
+            .sandbox_restore(request.into_inner())
+            .await
+            .map_err(|e| core_to_status(&e))?;
+        Ok(Response::new(resp))
+    }
+
+    async fn list_snapshots(
+        &self,
+        request: Request<ListSnapshotsRequest>,
+    ) -> Result<Response<ListSnapshotsResponse>, Status> {
+        let machine = extract_machine_id(&request)?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
+        let resp = agent
+            .sandbox_list_snapshots(request.into_inner())
+            .await
+            .map_err(|e| core_to_status(&e))?;
+        Ok(Response::new(resp))
+    }
+
+    async fn delete_snapshot(
+        &self,
+        request: Request<DeleteSnapshotRequest>,
+    ) -> Result<Response<SandboxEmpty>, Status> {
+        let machine = extract_machine_id(&request)?;
+        let mut agent = self
+            .runtime
+            .get_agent(&machine)
+            .map_err(|e| core_to_status(&e))?;
+        agent
+            .sandbox_delete_snapshot(request.into_inner())
+            .await
+            .map_err(|e| core_to_status(&e))?;
+        Ok(Response::new(SandboxEmpty {}))
     }
 }

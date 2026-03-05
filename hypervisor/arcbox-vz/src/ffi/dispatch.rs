@@ -1,6 +1,6 @@
 //! Grand Central Dispatch (GCD) queue handling.
 //!
-//! VZVirtualMachine requires all operations to be performed on a designated
+//! `VZVirtualMachine` requires all operations to be performed on a designated
 //! dispatch queue. This module provides safe wrappers for dispatch queue operations.
 
 use objc2::runtime::AnyObject;
@@ -43,6 +43,7 @@ unsafe impl Sync for DispatchQueue {}
 
 impl DispatchQueue {
     /// Creates a new serial dispatch queue with the given label.
+    #[must_use]
     pub fn new(label: &str) -> Self {
         let label_cstr = std::ffi::CString::new(label).unwrap();
         let queue = unsafe {
@@ -60,6 +61,7 @@ impl DispatchQueue {
     /// Gets the main dispatch queue.
     ///
     /// Note: The main queue is not owned and should not be released.
+    #[must_use]
     pub fn main() -> Self {
         Self {
             inner: unsafe { _dispatch_main_q },
@@ -81,6 +83,7 @@ impl DispatchQueue {
     }
 
     /// Returns the raw queue pointer.
+    #[must_use]
     pub fn as_ptr(&self) -> *mut AnyObject {
         self.inner
     }

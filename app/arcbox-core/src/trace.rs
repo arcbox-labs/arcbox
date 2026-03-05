@@ -12,8 +12,9 @@ tokio::task_local! {
 
 /// Returns the current trace ID from task-local storage, or an empty string
 /// if none is set (e.g. when called outside an HTTP request context).
+#[must_use]
 pub fn current_trace_id() -> String {
     CURRENT_TRACE_ID
-        .try_with(|id| id.clone())
+        .try_with(std::clone::Clone::clone)
         .unwrap_or_default()
 }

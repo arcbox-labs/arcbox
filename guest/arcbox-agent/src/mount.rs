@@ -3,6 +3,7 @@
 //! This module is only functional on Linux as it runs inside the guest VM.
 
 use anyhow::Result;
+use arcbox_constants::virtiofs::{MOUNT_ARCBOX, MOUNT_USERS, TAG_ARCBOX, TAG_USERS};
 
 /// Mount a filesystem.
 #[cfg(target_os = "linux")]
@@ -84,22 +85,22 @@ pub fn is_mounted(_path: &str) -> bool {
 /// - "users" tag -> /Users (macOS /Users, bind-mounted to original path)
 pub fn mount_standard_shares() {
     // Mount arcbox data directory
-    if !is_mounted("/arcbox") {
-        if let Err(e) = mount_virtiofs("arcbox", "/arcbox") {
+    if !is_mounted(MOUNT_ARCBOX) {
+        if let Err(e) = mount_virtiofs(TAG_ARCBOX, MOUNT_ARCBOX) {
             tracing::warn!("Failed to mount arcbox share: {}", e);
         } else {
-            tracing::info!("Mounted arcbox share at /arcbox");
+            tracing::info!("Mounted arcbox share at {}", MOUNT_ARCBOX);
         }
     }
 
     // Mount /Users share for transparent macOS path support.
     // This allows `docker run -v /Users/foo/project:/app` to work directly
     // because /Users exists in the guest at the same path as on the host.
-    if !is_mounted("/Users") {
-        if let Err(e) = mount_virtiofs("users", "/Users") {
+    if !is_mounted(MOUNT_USERS) {
+        if let Err(e) = mount_virtiofs(TAG_USERS, MOUNT_USERS) {
             tracing::debug!("Users share not available: {}", e);
         } else {
-            tracing::info!("Mounted users share at /Users");
+            tracing::info!("Mounted users share at {}", MOUNT_USERS);
         }
     }
 }

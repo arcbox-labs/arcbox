@@ -1,0 +1,499 @@
+// Sandbox service protocol definitions.
+//
+// A sandbox is a short-lived, strongly-isolated microVM bound to a single
+// workload (function, task, or container). Unlike MachineService VMs, a
+// sandbox is decoupled from its workload: the initial cmd process exiting does
+// NOT destroy the sandbox — it simply transitions back to "ready" and continues
+// accepting Run calls until an explicit Stop/Remove or TTL expiry.
+//
+// Create returns immediately with state "starting"; callers subscribe to
+// Events (action="ready") or poll Inspect to learn when the sandbox is usable.
+//
+// Two services are defined:
+//   - SandboxService         : core lifecycle (create / run / exec / stop / remove)
+//   - SandboxSnapshotService : checkpoint / restore for cold-start optimisation
+
+syntax = "proto3";
+
+package sandbox.v1;
+
+// =============================================================================
+// SandboxService
+// =============================================================================
+
+// SandboxService manages short-lived, strongly-isolated microVM sandboxes.
+service SandboxService {
+    // Create a sandbox and return immediately with state "starting".
+    // Subscribe to Events or poll Inspect to wait for state "ready".
+    rpc Create(CreateSandboxRequest) returns (CreateSandboxResponse);
+
+    // Run a command inside a sandbox and stream its output.
+    // The stream closes with a final RunOutput{done: true} carrying the exit
+    // code. The sandbox remains alive after the command exits.
+    rpc Run(RunRequest) returns (stream RunOutput);
+
+    // Execute an interactive command inside a sandbox with full stdin support.
+    // Send ExecInput{init: ...} as the first message to start the process,
+    // then stream ExecInput{stdin: ...} for input and ExecInput{resize: ...}
+    // for TTY resize events.
+    rpc Exec(stream ExecInput) returns (stream ExecOutput);
+
+    // Stop a sandbox gracefully (waits for any active workload to exit, then
+    // shuts down the VM).
+    rpc Stop(StopSandboxRequest) returns (Empty);
+
+    // Forcibly destroy a sandbox and release all resources immediately.
+    rpc Remove(RemoveSandboxRequest) returns (Empty);
+
+    // Return the current state and metadata of a sandbox.
+    rpc Inspect(InspectSandboxRequest) returns (SandboxInfo);
+
+    // List sandboxes, optionally filtered by state or labels.
+    rpc List(ListSandboxesRequest) returns (ListSandboxesResponse);
+
+    // Subscribe to sandbox lifecycle events.
+    // Emitted actions: "created" | "ready" | "running" | "idle" |
+    //                  "stopping" | "stopped" | "failed" | "removed"
+    rpc Events(SandboxEventsRequest) returns (stream SandboxEvent);
+}
+
+// =============================================================================
+// SandboxSnapshotService
+// =============================================================================
+
+// SandboxSnapshotService provides checkpoint / restore for cold-start
+// optimisation. A snapshot captures a fully-booted, idle sandbox so that
+// future sandboxes can be restored from it instead of booting from scratch.
+service SandboxSnapshotService {
+    // Checkpoint a sandbox into a reusable snapshot.
+    // The sandbox is paused, snapshotted, then resumed automatically.
+    // The sandbox must be in "ready" or "idle" state.
+    rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse);
+
+    // Restore a new sandbox from a previously created snapshot.
+    // The restored sandbox starts in "ready" state; boot time is near-zero.
+    rpc Restore(RestoreRequest) returns (RestoreResponse);
+
+    // List all snapshots, optionally filtered by origin sandbox or label.
+    rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+
+    // Delete a snapshot and its on-disk data.
+    rpc DeleteSnapshot(DeleteSnapshotRequest) returns (Empty);
+}
+
+// =============================================================================
+// Common
+// =============================================================================
+
+// Empty response / request.
+message Empty {}
+
+// =============================================================================
+// Resource primitives
+// =============================================================================
+
+// Network configuration for a sandbox.
+message NetworkSpec {
+    // Network mode: "tap" (default, TAP + IP pool) or "none" (no network).
+    string mode = 1;
+}
+
+// A single bind mount into the sandbox.
+message Mount {
+    // Source path on the host.
+    string source = 1;
+    // Target path inside the sandbox.
+    string target = 2;
+    // Mount read-only.
+    bool readonly = 3;
+}
+
+// CPU and memory resource limits.
+message ResourceLimits {
+    // Number of vCPUs (0 = daemon default).
+    uint32 vcpus = 1;
+    // Memory in MiB (0 = daemon default).
+    uint64 memory_mib = 2;
+}
+
+// Terminal size for TTY resize events.
+message TerminalSize {
+    // Terminal width in columns.
+    uint32 width = 1;
+    // Terminal height in rows.
+    uint32 height = 2;
+}
+
+// =============================================================================
+// CreateSandbox
+// =============================================================================
+
+// Request to create a sandbox.
+message CreateSandboxRequest {
+    // Caller-supplied unique ID for idempotent creation.
+    // If empty the daemon generates a UUID.
+    string id = 1;
+
+    // Arbitrary key-value metadata (used for filtering in List / Events).
+    map<string, string> labels = 2;
+
+    // --- VM image ---
+    // Kernel image path (empty = daemon default).
+    string kernel = 3;
+    // Root filesystem image path (empty = daemon default).
+    string rootfs = 4;
+    // Kernel command-line arguments (empty = daemon default).
+    string boot_args = 5;
+
+    // --- Resources ---
+    ResourceLimits limits = 6;
+
+    // --- Initial workload (optional) ---
+    // OCI image reference. When set, the agent pulls and runs this image
+    // inside the sandbox. Empty = use rootfs directly.
+    string image = 7;
+    // Initial command launched automatically after boot.
+    // Empty = sandbox enters "ready" without running anything.
+    // When this process exits the sandbox transitions back to "ready"
+    // (NOT destroyed) and continues accepting Run calls.
+    repeated string cmd = 8;
+    // Environment variables for the initial command.
+    map<string, string> env = 9;
+    // Working directory for the initial command.
+    string working_dir = 10;
+    // User to run the initial command as.
+    string user = 11;
+
+    // --- Filesystem ---
+    repeated Mount mounts = 12;
+
+    // --- Network ---
+    NetworkSpec network = 13;
+
+    // --- Lifecycle ---
+    // Sandbox auto-destruction timeout in seconds (0 = no limit).
+    // The timer starts from the moment the sandbox is created and is not
+    // reset by workload activity.
+    uint32 ttl_seconds = 14;
+
+    // --- Provisioning ---
+    // SSH public key injected via MMDS (empty = no SSH).
+    optional string ssh_public_key = 15;
+}
+
+// Response to CreateSandbox.
+// Returned immediately; the sandbox may still be booting (state "starting").
+message CreateSandboxResponse {
+    // Assigned or caller-supplied sandbox ID.
+    string id = 1;
+    // IP address pre-allocated for the sandbox (empty if mode = "none").
+    // Available even while state is "starting".
+    string ip_address = 2;
+    // State at time of response: always "starting".
+    string state = 3;
+}
+
+// =============================================================================
+// Run
+// =============================================================================
+
+// Request to run a command inside a ready sandbox.
+// The sandbox must be in "ready" or "idle" state; if it is "running" the call
+// returns FAILED_PRECONDITION.
+message RunRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Command and arguments.
+    repeated string cmd = 2;
+    // Environment variable overrides.
+    map<string, string> env = 3;
+    // Working directory (empty = rootfs default).
+    string working_dir = 4;
+    // User to run as (empty = rootfs default).
+    string user = 5;
+    // Allocate a pseudo-TTY.
+    bool tty = 6;
+    // Kill the command after this many seconds (0 = no timeout).
+    uint32 timeout_seconds = 7;
+}
+
+// A single chunk of streaming output from Run.
+message RunOutput {
+    // Stream name: "stdout" | "stderr" | "exit".
+    string stream = 1;
+    // Raw output bytes (empty when stream == "exit").
+    bytes data = 2;
+    // Process exit code. Only valid on the final message (done == true).
+    int32 exit_code = 3;
+    // True on the last message of the stream.
+    bool done = 4;
+}
+
+// =============================================================================
+// Exec  (bidirectional stream)
+// =============================================================================
+
+// A single message sent by the client during an Exec session.
+message ExecInput {
+    oneof payload {
+        // Must be the first message in the stream. Carries command parameters.
+        ExecRequest init = 1;
+        // Subsequent messages: raw bytes forwarded to the process stdin.
+        bytes stdin = 2;
+        // Resize the pseudo-TTY. Only valid when ExecRequest.tty == true.
+        TerminalSize resize = 3;
+    }
+}
+
+// Parameters for starting an exec session. Sent as ExecInput{init: ...}.
+message ExecRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Command and arguments.
+    repeated string cmd = 2;
+    // Environment variable overrides.
+    map<string, string> env = 3;
+    // Working directory.
+    string working_dir = 4;
+    // User to run as.
+    string user = 5;
+    // Allocate a pseudo-TTY.
+    bool tty = 6;
+    // Initial terminal size (required when tty == true).
+    TerminalSize tty_size = 7;
+    // Kill the command after this many seconds (0 = no timeout).
+    uint32 timeout_seconds = 8;
+}
+
+// A single chunk of streaming output from Exec.
+message ExecOutput {
+    // Stream name: "stdout" | "stderr" | "exit".
+    string stream = 1;
+    // Raw output bytes (empty when stream == "exit").
+    bytes data = 2;
+    // Process exit code. Only valid on the final message (done == true).
+    int32 exit_code = 3;
+    // True on the last message of the stream.
+    bool done = 4;
+}
+
+// =============================================================================
+// Stop / Remove
+// =============================================================================
+
+// Request to stop a sandbox gracefully.
+message StopSandboxRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Seconds to wait for any active workload to exit before force-killing
+    // the VM (0 = daemon default of 30 s).
+    uint32 timeout_seconds = 2;
+}
+
+// Request to forcibly remove a sandbox.
+message RemoveSandboxRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Force removal even if the sandbox is in "running" state.
+    bool force = 2;
+}
+
+// =============================================================================
+// Inspect / List
+// =============================================================================
+
+// Request to inspect a sandbox.
+message InspectSandboxRequest {
+    // Sandbox ID.
+    string id = 1;
+}
+
+// Full sandbox state.
+//
+// State machine:
+//
+//   starting ──► ready ──► running ──► ready   (cmd/Run exited, sandbox alive)
+//                  │          │
+//                  └──────────┴──► stopping ──► stopped
+//                                       │
+//                                    failed
+//
+// "idle" is an alias for "ready" used in event payloads to signal that a
+// previously running workload has just finished.
+message SandboxInfo {
+    // Sandbox ID.
+    string id = 1;
+    // State: starting | ready | running | stopping | stopped | failed.
+    string state = 2;
+    // User-supplied labels.
+    map<string, string> labels = 3;
+    // Effective resource limits.
+    ResourceLimits limits = 4;
+    // Network information.
+    SandboxNetwork network = 5;
+    // Creation timestamp (Unix seconds).
+    int64 created_at = 6;
+    // Timestamp when the sandbox first became ready (Unix seconds, 0 if not yet).
+    int64 ready_at = 7;
+    // Timestamp when the last workload exited (Unix seconds, 0 if none has run).
+    int64 last_exited_at = 8;
+    // Exit code of the last workload (only meaningful when last_exited_at > 0).
+    int32 last_exit_code = 9;
+    // Human-readable error message (only set when state == "failed").
+    string error = 10;
+}
+
+// Network details of a sandbox.
+message SandboxNetwork {
+    // Assigned IP address.
+    string ip_address = 1;
+    // Gateway address.
+    string gateway = 2;
+    // TAP interface name on the host.
+    string tap_name = 3;
+}
+
+// Request to list sandboxes.
+message ListSandboxesRequest {
+    // Filter by state (empty = all states).
+    string state = 1;
+    // Filter by labels (all key-value pairs must match).
+    map<string, string> labels = 2;
+}
+
+// Response to ListSandboxes.
+message ListSandboxesResponse {
+    repeated SandboxSummary sandboxes = 1;
+}
+
+// Lightweight sandbox summary for List.
+message SandboxSummary {
+    // Sandbox ID.
+    string id = 1;
+    // State.
+    string state = 2;
+    // Labels.
+    map<string, string> labels = 3;
+    // IP address.
+    string ip_address = 4;
+    // Creation timestamp (Unix seconds).
+    int64 created_at = 5;
+}
+
+// =============================================================================
+// Events
+// =============================================================================
+
+// Request to subscribe to sandbox lifecycle events.
+message SandboxEventsRequest {
+    // Filter by sandbox ID (empty = all sandboxes).
+    string id = 1;
+    // Filter by event action (empty = all actions).
+    string action = 2;
+}
+
+// A sandbox lifecycle event.
+message SandboxEvent {
+    // Sandbox ID.
+    string sandbox_id = 1;
+    // Action:
+    //   "created"  — sandbox record created, VM booting
+    //   "ready"    — VM booted, sandbox accepting workloads
+    //   "running"  — a workload (cmd or Run) started
+    //   "idle"     — active workload exited, sandbox back to ready
+    //   "stopping" — Stop called, draining workload
+    //   "stopped"  — VM shut down
+    //   "failed"   — unrecoverable error
+    //   "removed"  — sandbox deleted
+    string action = 2;
+    // Unix nanoseconds.
+    int64 timestamp = 3;
+    // Additional context, e.g.:
+    //   "exit_code" on "idle" / "stopped"
+    //   "error"     on "failed"
+    map<string, string> attributes = 4;
+}
+
+// =============================================================================
+// Checkpoint / Restore
+// =============================================================================
+
+// Request to checkpoint a sandbox.
+// The sandbox must be in "ready" or "idle" state (no active workload).
+message CheckpointRequest {
+    // Sandbox ID to checkpoint.
+    string sandbox_id = 1;
+    // Human-readable label for the snapshot.
+    string name = 2;
+    // Labels attached to the snapshot.
+    map<string, string> labels = 3;
+}
+
+// Response to Checkpoint.
+message CheckpointResponse {
+    // Snapshot ID.
+    string snapshot_id = 1;
+    // On-disk directory containing vmstate and mem files.
+    string snapshot_dir = 2;
+    // Creation timestamp (RFC3339).
+    string created_at = 3;
+}
+
+// Request to restore a sandbox from a snapshot.
+message RestoreRequest {
+    // Caller-supplied ID for the new sandbox (empty = auto-generated).
+    string id = 1;
+    // Source snapshot ID.
+    string snapshot_id = 2;
+    // Labels to assign to the restored sandbox.
+    map<string, string> labels = 3;
+    // Assign a fresh TAP interface and IP. Required when running multiple
+    // sandboxes restored from the same snapshot concurrently.
+    bool network_override = 4;
+    // TTL for the restored sandbox in seconds (0 = no limit).
+    uint32 ttl_seconds = 5;
+}
+
+// Response to Restore.
+// The restored sandbox starts in "ready" state immediately.
+message RestoreResponse {
+    // ID of the newly created sandbox.
+    string id = 1;
+    // Allocated IP address.
+    string ip_address = 2;
+}
+
+// Request to list snapshots.
+message ListSnapshotsRequest {
+    // Filter by the origin sandbox ID (empty = all).
+    string sandbox_id = 1;
+    // Filter by labels.
+    map<string, string> labels = 2;
+}
+
+// Response to ListSnapshots.
+message ListSnapshotsResponse {
+    repeated SnapshotSummary snapshots = 1;
+}
+
+// Lightweight snapshot summary.
+message SnapshotSummary {
+    // Snapshot ID.
+    string id = 1;
+    // ID of the sandbox that was checkpointed.
+    string sandbox_id = 2;
+    // Human-readable label.
+    string name = 3;
+    // Labels.
+    map<string, string> labels = 4;
+    // On-disk directory.
+    string snapshot_dir = 5;
+    // Creation timestamp (RFC3339).
+    string created_at = 6;
+}
+
+// Request to delete a snapshot.
+message DeleteSnapshotRequest {
+    // Snapshot ID.
+    string snapshot_id = 1;
+}

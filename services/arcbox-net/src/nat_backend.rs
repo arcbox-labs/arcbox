@@ -226,11 +226,18 @@ pub struct LoopbackHostIO {
 }
 
 #[cfg(test)]
-impl LoopbackHostIO {
-    pub fn new() -> Self {
+impl Default for LoopbackHostIO {
+    fn default() -> Self {
         Self {
             packets: std::cell::RefCell::new(VecDeque::new()),
         }
+    }
+}
+
+#[cfg(test)]
+impl LoopbackHostIO {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 

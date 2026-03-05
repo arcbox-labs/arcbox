@@ -66,7 +66,7 @@ struct MmioAllocator {
 
 impl MmioAllocator {
     /// Creates a new MMIO allocator.
-    fn new(base: u64, size: u64) -> Self {
+    const fn new(base: u64, size: u64) -> Self {
         Self {
             base,
             size,
@@ -75,7 +75,7 @@ impl MmioAllocator {
     }
 
     /// Allocates an MMIO region.
-    fn allocate(&mut self, size: u64) -> Option<u64> {
+    const fn allocate(&mut self, size: u64) -> Option<u64> {
         // Align to 4KB
         let aligned_size = (size + 0xFFF) & !0xFFF;
 
@@ -92,7 +92,7 @@ impl MmioAllocator {
 impl MemoryManager {
     /// Creates a new memory manager.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         // Default MMIO region starts at 3GB, 1GB size
         let mmio_base = 3 * 1024 * 1024 * 1024; // 3GB
         let mmio_size = 1024 * 1024 * 1024; // 1GB
@@ -137,13 +137,13 @@ impl MemoryManager {
 
     /// Returns whether memory is initialized.
     #[must_use]
-    pub fn is_initialized(&self) -> bool {
+    pub const fn is_initialized(&self) -> bool {
         self.initialized
     }
 
     /// Returns the total RAM size.
     #[must_use]
-    pub fn total_ram(&self) -> u64 {
+    pub const fn total_ram(&self) -> u64 {
         self.total_ram
     }
 
@@ -205,7 +205,7 @@ impl MemoryManager {
             } else {
                 MemoryRegionType::Ram
             },
-            name: format!("region_{:#x}", addr),
+            name: format!("region_{addr:#x}"),
             host_addr: region.host_addr,
         };
 

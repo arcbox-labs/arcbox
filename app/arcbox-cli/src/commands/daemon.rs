@@ -44,10 +44,6 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub kernel: Option<PathBuf>,
 
-    /// Custom initramfs path for VM boot.
-    #[arg(long)]
-    pub initramfs: Option<PathBuf>,
-
     /// Run in foreground (don't daemonize).
     #[arg(long, short = 'f')]
     pub foreground: bool,
@@ -55,10 +51,6 @@ pub struct DaemonArgs {
     /// Automatically enable Docker CLI integration.
     #[arg(long)]
     pub docker_integration: bool,
-
-    /// Guest runtime provisioning mode.
-    #[arg(long, value_enum)]
-    pub container_provision: Option<ContainerProvisionArg>,
 
     /// Guest dockerd API vsock port.
     #[arg(long)]
@@ -71,22 +63,6 @@ pub enum DaemonAction {
     Start,
     Stop,
     Status,
-}
-
-/// CLI argument values for provisioning mode.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum ContainerProvisionArg {
-    BundledAssets,
-    DistroEngine,
-}
-
-impl ContainerProvisionArg {
-    fn as_arg_value(self) -> &'static str {
-        match self {
-            Self::BundledAssets => "bundled-assets",
-            Self::DistroEngine => "distro-engine",
-        }
-    }
 }
 
 /// Executes the daemon command.
@@ -199,9 +175,10 @@ async fn execute_status(args: &DaemonArgs) -> Result<()> {
     let running = pid.is_some();
     let status = if running { "running" } else { "stopped" };
     let uptime = if running {
-        pid_file_uptime(&pid_file)
-            .map(|duration| format_duration(duration).to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+        pid_file_uptime(&pid_file).map_or_else(
+            || "unknown".to_string(),
+            |duration| format_duration(duration).to_string(),
+        )
     } else {
         "n/a".to_string()
     };
@@ -214,8 +191,7 @@ async fn execute_status(args: &DaemonArgs) -> Result<()> {
     println!("ArcBox daemon status: {status}");
     println!(
         "PID: {}",
-        pid.map(|value| value.to_string())
-            .unwrap_or_else(|| "n/a".to_string())
+        pid.map_or_else(|| "n/a".to_string(), |value| value.to_string())
     );
     println!("Docker socket: {}", docker_socket.display());
     println!("gRPC socket: {}", grpc_socket.display());
@@ -345,16 +321,8 @@ fn build_daemon_args(args: &DaemonArgs) -> Vec<OsString> {
         daemon_args.push(OsString::from("--kernel"));
         daemon_args.push(kernel.as_os_str().to_os_string());
     }
-    if let Some(initramfs) = &args.initramfs {
-        daemon_args.push(OsString::from("--initramfs"));
-        daemon_args.push(initramfs.as_os_str().to_os_string());
-    }
     if args.docker_integration {
         daemon_args.push(OsString::from("--docker-integration"));
-    }
-    if let Some(mode) = args.container_provision {
-        daemon_args.push(OsString::from("--container-provision"));
-        daemon_args.push(OsString::from(mode.as_arg_value()));
     }
     if let Some(port) = args.guest_docker_vsock_port {
         daemon_args.push(OsString::from("--guest-docker-vsock-port"));
@@ -365,9 +333,10 @@ fn build_daemon_args(args: &DaemonArgs) -> Vec<OsString> {
 
 fn resolve_data_dir(data_dir: Option<&PathBuf>) -> PathBuf {
     data_dir.cloned().unwrap_or_else(|| {
-        dirs::home_dir()
-            .map(|home| home.join(".arcbox"))
-            .unwrap_or_else(|| PathBuf::from("/var/lib/arcbox"))
+        dirs::home_dir().map_or_else(
+            || PathBuf::from("/var/lib/arcbox"),
+            |home| home.join(".arcbox"),
+        )
     })
 }
 

@@ -11,6 +11,5 @@ description = "Common error types for ArcBox"
 [dependencies]
 thiserror.workspace = true
 
-[lints.clippy]
-pedantic = "warn"
-nursery = "warn"
+[lints]
+workspace = true

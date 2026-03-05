@@ -9,7 +9,7 @@
 //! name (extracted from the compose naming pattern `project-service-N`) are
 //! registered.
 
-use std::collections::HashSet;
+#![allow(dead_code)]
 
 /// IP address used for container name resolution.
 /// All containers share the guest network namespace, so localhost works.

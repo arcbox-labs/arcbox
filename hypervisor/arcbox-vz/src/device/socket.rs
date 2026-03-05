@@ -5,7 +5,7 @@ use crate::ffi::get_class;
 use crate::msg_send;
 use objc2::runtime::AnyObject;
 
-/// Configuration for a VirtIO socket device.
+/// Configuration for a `VirtIO` socket device.
 ///
 /// This device enables vsock communication between the host and guest.
 pub struct SocketDeviceConfiguration {
@@ -38,6 +38,7 @@ impl SocketDeviceConfiguration {
     }
 
     /// Consumes the configuration and returns the raw pointer.
+    #[must_use]
     pub fn into_ptr(self) -> *mut AnyObject {
         let ptr = self.inner;
         std::mem::forget(self);

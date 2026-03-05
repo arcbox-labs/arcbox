@@ -187,7 +187,7 @@ impl DhcpLease {
         if elapsed >= self.lease_duration {
             Duration::ZERO
         } else {
-            self.lease_duration - elapsed
+            self.lease_duration.checked_sub(elapsed).unwrap()
         }
     }
 }
@@ -297,7 +297,7 @@ impl DhcpPacket {
     }
 
     /// Parses DHCP options.
-    fn parse_options(packet: &mut DhcpPacket, data: &[u8]) -> Result<()> {
+    fn parse_options(packet: &mut Self, data: &[u8]) -> Result<()> {
         let mut i = 0;
         while i < data.len() {
             let option_code = data[i];
@@ -565,6 +565,16 @@ impl DhcpServer {
                 .allocate()
                 .ok_or_else(|| NetError::Dhcp("no IP addresses available".to_string()))?
         };
+
+        // Record a pending lease so handle_request() can validate.
+        let lease = DhcpLease {
+            mac,
+            ip,
+            hostname: packet.hostname.clone(),
+            lease_start: Instant::now(),
+            lease_duration: self.config.lease_duration,
+        };
+        self.leases.insert(mac, lease);
 
         // Create OFFER response
         let mut response = DhcpPacket::new();

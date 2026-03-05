@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 arcbox-protocol = { workspace = true }
+arcbox-constants = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -21,7 +22,7 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-nix = { workspace = true, features = ["mount", "process", "sched", "signal", "feature", "term"] }
+nix = { workspace = true, features = ["mount", "process", "sched", "signal", "feature", "term", "ioctl"] }
 libc = { workspace = true }
 prost = { workspace = true }
 uuid = { workspace = true }
@@ -38,9 +39,10 @@ flate2 = "1"
 tar = "0.4"
 num_cpus = "1"
 
-# vsock is Linux-only
+# vsock and arcbox-vm are Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = "0.5"
+arcbox-vm = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -54,3 +56,6 @@ provision-distro = []
 
 # When building for the guest VM (Linux), vsock is fully functional.
 # On macOS host, we provide stubs for development/testing.
+
+[lints]
+workspace = true

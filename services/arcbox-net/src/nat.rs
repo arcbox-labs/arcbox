@@ -149,8 +149,7 @@ impl NatNetwork {
         self.allocator
             .lock()
             .ok()
-            .map(|mut a| a.allocate_specific(ip))
-            .unwrap_or(false)
+            .is_some_and(|mut a| a.allocate_specific(ip))
     }
 
     /// Releases an IP address back to the pool.
@@ -166,8 +165,7 @@ impl NatNetwork {
         self.allocator
             .lock()
             .ok()
-            .map(|a| a.is_available(ip))
-            .unwrap_or(false)
+            .is_some_and(|a| a.is_available(ip))
     }
 
     /// Returns the number of allocated addresses.
@@ -176,8 +174,7 @@ impl NatNetwork {
         self.allocator
             .lock()
             .ok()
-            .map(|a| a.allocated_count())
-            .unwrap_or(0)
+            .map_or(0, |a| a.allocated_count())
     }
 
     /// Returns the number of available addresses.
@@ -186,8 +183,7 @@ impl NatNetwork {
         self.allocator
             .lock()
             .ok()
-            .map(|a| a.available_count())
-            .unwrap_or(0)
+            .map_or(0, |a| a.available_count())
     }
 }
 

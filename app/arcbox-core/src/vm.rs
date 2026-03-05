@@ -7,7 +7,10 @@ use std::sync::RwLock;
 use std::time::Duration;
 use uuid::Uuid;
 
-use arcbox_vmm::{SharedDirConfig as VmmSharedDirConfig, Vmm, VmmConfig};
+use arcbox_vmm::{
+    SharedDirConfig as VmmSharedDirConfig, SnapshotCreateOptions, SnapshotInfo, SnapshotManager,
+    SnapshotTargetType, Vmm, VmmConfig, VmmState,
+};
 
 /// VM identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -67,7 +70,7 @@ pub struct VmInfo {
     pub memory_mb: u64,
 }
 
-/// Shared directory configuration for VirtioFS.
+/// Shared directory configuration for `VirtioFS`.
 #[derive(Debug, Clone)]
 pub struct SharedDirConfig {
     /// Host path to share.
@@ -91,7 +94,7 @@ impl SharedDirConfig {
 
     /// Sets the share as read-only.
     #[must_use]
-    pub fn read_only(mut self) -> Self {
+    pub const fn read_only(mut self) -> Self {
         self.read_only = true;
         self
     }
@@ -115,13 +118,11 @@ pub struct VmConfig {
     pub memory_mb: u64,
     /// Kernel path.
     pub kernel: Option<String>,
-    /// Initrd path.
-    pub initrd: Option<String>,
     /// Kernel command line.
     pub cmdline: Option<String>,
-    /// Shared directories for VirtioFS.
+    /// Shared directories for `VirtioFS`.
     pub shared_dirs: Vec<SharedDirConfig>,
-    /// Block devices (for example, rootfs ext4 image).
+    /// Block devices (e.g., EROFS rootfs, Btrfs data disk).
     pub block_devices: Vec<BlockDeviceConfig>,
     /// Enable networking.
     pub networking: bool,
@@ -142,7 +143,6 @@ impl Default for VmConfig {
             cpus: 4,
             memory_mb: 4096,
             kernel: None,
-            initrd: None,
             cmdline: None,
             shared_dirs: Vec::new(),
             block_devices: Vec::new(),
@@ -164,14 +164,16 @@ struct VmEntry {
 /// VM manager.
 pub struct VmManager {
     vms: RwLock<HashMap<VmId, VmEntry>>,
+    snapshot_manager: SnapshotManager,
 }
 
 impl VmManager {
     /// Creates a new VM manager.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(snapshot_dir: PathBuf) -> Self {
         Self {
             vms: RwLock::new(HashMap::new()),
+            snapshot_manager: SnapshotManager::new(snapshot_dir),
         }
     }
 
@@ -252,7 +254,7 @@ impl VmManager {
                 .map(PathBuf::from)
                 .unwrap_or_default(),
             kernel_cmdline: entry.config.cmdline.clone().unwrap_or_default(),
-            initrd_path: entry.config.initrd.as_ref().map(PathBuf::from),
+            initrd_path: None,
             enable_rosetta: false,
             serial_console: true,
             virtio_console: true,
@@ -489,6 +491,195 @@ impl VmManager {
         Ok(())
     }
 
+    /// Creates a VM snapshot for a running VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if VM is not running, snapshot capture fails,
+    /// or snapshot data cannot be persisted.
+    pub async fn create_vm_snapshot(
+        &self,
+        id: &VmId,
+        options: SnapshotCreateOptions,
+    ) -> Result<SnapshotInfo> {
+        let pause_vm = options.pause_vm;
+        let context = {
+            let mut vms = self
+                .vms
+                .write()
+                .map_err(|_| CoreError::Vm("lock poisoned".to_string()))?;
+
+            let entry = vms
+                .get_mut(id)
+                .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+
+            if entry.info.state != VmState::Running {
+                return Err(CoreError::invalid_state(format!(
+                    "cannot snapshot VM in state {:?}",
+                    entry.info.state
+                )));
+            }
+
+            let vmm = entry
+                .vmm
+                .as_mut()
+                .ok_or_else(|| CoreError::Vm("VMM not initialized".to_string()))?;
+
+            let resume_after_capture = if pause_vm && vmm.state() == VmmState::Running {
+                vmm.pause().map_err(|e| CoreError::Vm(e.to_string()))?;
+                true
+            } else {
+                false
+            };
+
+            let capture_result = vmm
+                .capture_snapshot_context()
+                .map_err(|e| CoreError::Vm(e.to_string()));
+
+            if resume_after_capture {
+                vmm.resume().map_err(|e| {
+                    CoreError::Vm(format!("failed to resume VM after snapshot capture: {e}"))
+                })?;
+            }
+
+            capture_result?
+        };
+
+        self.snapshot_manager
+            .create_vm_with_context(id.as_str(), options, context)
+            .await
+            .map_err(|e| CoreError::Vm(format!("snapshot create failed: {e}")))
+    }
+
+    /// Lists snapshots for a VM, newest first.
+    #[must_use]
+    pub fn list_vm_snapshots(&self, id: &VmId) -> Vec<SnapshotInfo> {
+        let mut snapshots = self.snapshot_manager.list(id.as_str());
+        snapshots.sort_by(|a, b| b.created.cmp(&a.created));
+        snapshots
+    }
+
+    /// Deletes a snapshot by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot does not exist or cannot be deleted.
+    pub async fn delete_snapshot(&self, snapshot_id: &str) -> Result<()> {
+        self.snapshot_manager
+            .delete(snapshot_id)
+            .await
+            .map_err(|e| CoreError::Vm(format!("snapshot delete failed: {e}")))
+    }
+
+    /// Prunes old snapshots for a VM, keeping only `keep` most recent snapshots.
+    ///
+    /// # Returns
+    ///
+    /// Returns deleted snapshot IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if snapshot deletion fails.
+    pub async fn prune_vm_snapshots(&self, id: &VmId, keep: usize) -> Result<Vec<String>> {
+        let mut snapshots = self.snapshot_manager.list(id.as_str());
+        if snapshots.len() <= keep {
+            return Ok(Vec::new());
+        }
+
+        snapshots.sort_by(|a, b| b.created.cmp(&a.created));
+
+        let mut deleted = Vec::new();
+        for snapshot in snapshots.into_iter().skip(keep) {
+            self.snapshot_manager
+                .delete(&snapshot.id)
+                .await
+                .map_err(|e| CoreError::Vm(format!("snapshot prune failed: {e}")))?;
+            deleted.push(snapshot.id);
+        }
+
+        Ok(deleted)
+    }
+
+    /// Restores a VM from snapshot data.
+    ///
+    /// The VM is paused before applying snapshot state and resumed afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if snapshot loading fails or VM restore application fails.
+    pub async fn restore_vm_snapshot(&self, id: &VmId, snapshot_id: &str) -> Result<()> {
+        let info = self
+            .snapshot_manager
+            .get(snapshot_id)
+            .ok_or_else(|| CoreError::not_found(format!("snapshot {snapshot_id}")))?;
+
+        if info.target_type != SnapshotTargetType::Vm {
+            return Err(CoreError::invalid_state(format!(
+                "snapshot {snapshot_id} is not a VM snapshot"
+            )));
+        }
+
+        if info.target_id != id.as_str() {
+            return Err(CoreError::invalid_state(format!(
+                "snapshot {snapshot_id} belongs to VM {}, not {}",
+                info.target_id, id
+            )));
+        }
+
+        self.snapshot_manager
+            .restore(snapshot_id)
+            .await
+            .map_err(|e| CoreError::Vm(format!("snapshot restore failed: {e}")))?;
+
+        let restore_data = self
+            .snapshot_manager
+            .take_restore_data(snapshot_id)
+            .ok_or_else(|| {
+                CoreError::Vm(format!(
+                    "snapshot {snapshot_id} restore data is unavailable after restore"
+                ))
+            })?;
+
+        let mut vms = self
+            .vms
+            .write()
+            .map_err(|_| CoreError::Vm("lock poisoned".to_string()))?;
+
+        let entry = vms
+            .get_mut(id)
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+
+        if entry.info.state != VmState::Running {
+            return Err(CoreError::invalid_state(format!(
+                "cannot restore VM in state {:?}",
+                entry.info.state
+            )));
+        }
+
+        let vmm = entry
+            .vmm
+            .as_mut()
+            .ok_or_else(|| CoreError::Vm("VMM not initialized".to_string()))?;
+
+        // Pause the VM before applying snapshot state so guest CPUs don't
+        // execute while memory and device state are being overwritten.
+        let was_running = vmm.state() == VmmState::Running;
+        if was_running {
+            vmm.pause()
+                .map_err(|e| CoreError::Vm(format!("failed to pause VM for restore: {e}")))?;
+        }
+
+        let apply_result = vmm.restore_from_snapshot_data(&restore_data);
+
+        if was_running {
+            vmm.resume()
+                .map_err(|e| CoreError::Vm(format!("failed to resume VM after restore: {e}")))?;
+        }
+
+        apply_result
+            .map_err(|e| CoreError::Vm(format!("failed to apply snapshot {snapshot_id}: {e}")))
+    }
+
     /// Gets VM information.
     #[must_use]
     pub fn get(&self, id: &VmId) -> Option<VmInfo> {
@@ -567,7 +758,7 @@ impl VmManager {
             .ok_or_else(|| CoreError::Vm("VMM not initialized".to_string()))?;
 
         vmm.connect_vsock(port)
-            .map_err(|e| CoreError::Vm(format!("vsock connect failed: {}", e)))
+            .map_err(|e| CoreError::Vm(format!("vsock connect failed: {e}")))
     }
 
     /// Reads serial console output from a running VM (macOS only).
@@ -595,7 +786,7 @@ impl VmManager {
             .ok_or_else(|| CoreError::Vm("VMM not initialized".to_string()))?;
 
         vmm.read_console_output()
-            .map_err(|e| CoreError::Vm(format!("read console failed: {}", e)))
+            .map_err(|e| CoreError::Vm(format!("read console failed: {e}")))
     }
 
     // ========================================================================
@@ -638,7 +829,7 @@ impl VmManager {
             .ok_or_else(|| CoreError::Vm("VMM not initialized".to_string()))?;
 
         vmm.set_balloon_target(target_bytes)
-            .map_err(|e| CoreError::Vm(format!("set balloon target failed: {}", e)))
+            .map_err(|e| CoreError::Vm(format!("set balloon target failed: {e}")))
     }
 
     /// Gets the current target memory size from the balloon device.
@@ -692,6 +883,21 @@ impl VmManager {
         Ok(vmm.get_balloon_stats())
     }
 
+    /// Takes the inbound listener manager from a running VM (Darwin only).
+    ///
+    /// The manager is created during VM start when the network device is set up.
+    /// After this call the VMM no longer owns the manager; the caller must call
+    /// `stop_all()` on shutdown.
+    #[cfg(target_os = "macos")]
+    pub fn take_inbound_listener_manager(
+        &self,
+        id: &VmId,
+    ) -> Option<arcbox_net::darwin::inbound_relay::InboundListenerManager> {
+        let mut vms = self.vms.write().ok()?;
+        let entry = vms.get_mut(id)?;
+        entry.vmm.as_mut()?.take_inbound_listener_manager()
+    }
+
     #[cfg(test)]
     pub(crate) fn guest_cid_for_test(&self, id: &VmId) -> Option<u32> {
         self.vms
@@ -717,10 +923,17 @@ impl VmManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn test_vm_manager() -> (VmManager, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = VmManager::new(temp_dir.path().join("snapshots"));
+        (manager, temp_dir)
+    }
 
     #[test]
     fn test_set_guest_cid_updates_vm_config() {
-        let manager = VmManager::new();
+        let (manager, _dir) = test_vm_manager();
         let mut config = VmConfig::default();
         config.guest_cid = None;
 
@@ -732,7 +945,7 @@ mod tests {
 
     #[test]
     fn test_build_vmm_config_includes_guest_cid() {
-        let manager = VmManager::new();
+        let (manager, _dir) = test_vm_manager();
         let mut config = VmConfig::default();
         config.guest_cid = Some(9);
 
@@ -743,17 +956,11 @@ mod tests {
 
     #[test]
     fn test_start_failure_rolls_back_to_created() {
-        let manager = VmManager::new();
+        let (manager, _dir) = test_vm_manager();
         let vm_id = manager.create(VmConfig::default()).unwrap();
 
         let _ = manager.start(&vm_id);
         let info = manager.get(&vm_id).expect("vm should still exist");
         assert_eq!(info.state, VmState::Created);
-    }
-}
-
-impl Default for VmManager {
-    fn default() -> Self {
-        Self::new()
     }
 }

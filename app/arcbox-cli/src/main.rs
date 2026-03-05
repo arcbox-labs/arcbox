@@ -38,8 +38,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Machine(cmd) => commands::machine::execute(cmd).await,
+        Commands::Sandbox(cmd) => commands::sandbox::execute(cmd).await,
         Commands::Docker(cmd) => commands::docker::execute(cmd).await,
         Commands::Boot(cmd) => commands::boot::execute(cmd).await,
+        #[cfg(target_os = "macos")]
         Commands::Dns(cmd) => commands::dns::execute(cmd).await,
         Commands::Daemon(args) => commands::daemon::execute(args).await,
         Commands::Info => execute_info().await,

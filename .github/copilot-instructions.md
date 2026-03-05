@@ -155,8 +155,8 @@ RUST_BACKTRACE=1                      # Enable backtraces
 
 **Test resources:**
 
-- Kernel images and initramfs live under `tests/resources/`
-- Build scripts for assets are in `tests/resources/` and `scripts/`
+- Test kernel images live under `tests/resources/`
+- Release boot assets (kernel + EROFS rootfs) are built in `arcboxlabs/boot-assets`
 
 ## Documentation References
 

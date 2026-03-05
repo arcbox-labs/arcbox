@@ -6,6 +6,8 @@
 use crate::error::{CoreError, Result};
 use crate::persistence::MachinePersistence;
 use crate::vm::{SharedDirConfig, VmConfig, VmId, VmManager};
+use arcbox_constants::ports::AGENT_PORT;
+use arcbox_constants::virtiofs::{MOUNT_USERS, TAG_ARCBOX, TAG_USERS};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -35,7 +37,7 @@ mod tests {
 
     /// Creates a test MachineManager.
     fn test_machine_manager(data_dir: &std::path::Path) -> MachineManager {
-        let vm_manager = VmManager::new();
+        let vm_manager = Arc::new(VmManager::new(data_dir.join("snapshots")));
         MachineManager::new(vm_manager, data_dir.to_path_buf())
     }
 
@@ -138,11 +140,9 @@ pub struct MachineInfo {
     pub disk_gb: u64,
     /// Kernel path.
     pub kernel: Option<String>,
-    /// Initrd path.
-    pub initrd: Option<String>,
     /// Kernel command line.
     pub cmdline: Option<String>,
-    /// Block devices (e.g., rootfs ext4 image).
+    /// Block devices (e.g., EROFS rootfs image).
     pub block_devices: Vec<crate::vm::BlockDeviceConfig>,
     /// Distribution name (e.g., "alpine", "ubuntu").
     pub distro: Option<String>,
@@ -152,7 +152,7 @@ pub struct MachineInfo {
     pub disk_path: Option<PathBuf>,
     /// Path to the SSH private key.
     pub ssh_key_path: Option<PathBuf>,
-    /// Guest IP address (reported by machine init via vsock).
+    /// Guest IP address (reported by agent via vsock).
     pub ip_address: Option<String>,
     /// Creation time.
     pub created_at: DateTime<Utc>,
@@ -171,11 +171,9 @@ pub struct MachineConfig {
     pub disk_gb: u64,
     /// Kernel path.
     pub kernel: Option<String>,
-    /// Initrd path.
-    pub initrd: Option<String>,
     /// Kernel command line.
     pub cmdline: Option<String>,
-    /// Block devices (for example, rootfs ext4 image).
+    /// Block devices (e.g., EROFS rootfs image).
     pub block_devices: Vec<crate::vm::BlockDeviceConfig>,
     /// Distribution name (e.g., "alpine", "ubuntu").
     pub distro: Option<String>,
@@ -191,7 +189,6 @@ impl Default for MachineConfig {
             memory_mb: 4096,
             disk_gb: 50,
             kernel: None,
-            initrd: None,
             cmdline: None,
             block_devices: Vec::new(),
             distro: None,
@@ -203,18 +200,18 @@ impl Default for MachineConfig {
 /// Machine manager.
 pub struct MachineManager {
     machines: RwLock<HashMap<String, MachineInfo>>,
-    vm_manager: VmManager,
+    vm_manager: Arc<VmManager>,
     persistence: MachinePersistence,
-    /// Data directory for VirtioFS sharing.
+    /// Data directory for `VirtioFS` sharing.
     data_dir: PathBuf,
-    /// Machine-specific directory (data_dir/machines/).
+    /// Machine-specific directory (`data_dir/machines`/).
     machines_dir: PathBuf,
 }
 
 impl MachineManager {
     /// Creates a new machine manager.
     #[must_use]
-    pub fn new(vm_manager: VmManager, data_dir: PathBuf) -> Self {
+    pub fn new(vm_manager: Arc<VmManager>, data_dir: PathBuf) -> Self {
         let machines_dir = data_dir.join("machines");
         let persistence = MachinePersistence::new(&machines_dir);
 
@@ -222,11 +219,11 @@ impl MachineManager {
         // "arcbox" shares the data_dir; "users" shares /Users for transparent paths.
         let mut shared_dirs = vec![SharedDirConfig::new(
             data_dir.to_string_lossy().to_string(),
-            "arcbox",
+            TAG_ARCBOX,
         )];
-        let users_dir = std::path::Path::new("/Users");
+        let users_dir = std::path::Path::new(MOUNT_USERS);
         if users_dir.is_dir() {
-            shared_dirs.push(SharedDirConfig::new("/Users", "users"));
+            shared_dirs.push(SharedDirConfig::new(MOUNT_USERS, TAG_USERS));
         }
 
         // Load persisted machines
@@ -237,7 +234,6 @@ impl MachineManager {
                 cpus: persisted.cpus,
                 memory_mb: persisted.memory_mb,
                 kernel: persisted.kernel.clone(),
-                initrd: persisted.initrd.clone(),
                 cmdline: persisted.cmdline.clone(),
                 shared_dirs: shared_dirs.clone(),
                 block_devices: persisted.block_devices.clone(),
@@ -255,7 +251,6 @@ impl MachineManager {
                     memory_mb: persisted.memory_mb,
                     disk_gb: persisted.disk_gb,
                     kernel: persisted.kernel.clone(),
-                    initrd: persisted.initrd.clone(),
                     cmdline: persisted.cmdline,
                     block_devices: persisted.block_devices.clone(),
                     distro: persisted.distro.clone(),
@@ -282,15 +277,11 @@ impl MachineManager {
 
     /// Creates a new machine.
     ///
-    /// When `config.distro` is set, this performs full machine VM setup:
-    /// 1. Resolve and download distro rootfs tarball
-    /// 2. Generate SSH key pair
-    /// 3. Create ext4 disk image
-    /// 4. Write setup.json for first-boot provisioning
-    /// 5. Configure block device + VirtioFS sharing
+    /// Sets up EROFS rootfs (read-only, /dev/vda) and a Btrfs data disk
+    /// (/dev/vdb) with block device and `VirtioFS` sharing configured.
     ///
-    /// When `config.distro` is None, creates a lightweight container VM
-    /// (existing behavior).
+    /// When `config.distro` is set, also resolves and downloads a distro
+    /// rootfs tarball and generates an SSH key pair.
     ///
     /// # Errors
     ///
@@ -315,11 +306,11 @@ impl MachineManager {
         // (e.g. `docker run -v /Users/foo/project:/app` just works).
         let mut shared_dirs = vec![SharedDirConfig::new(
             self.data_dir.to_string_lossy().to_string(),
-            "arcbox",
+            TAG_ARCBOX,
         )];
-        let users_dir = std::path::Path::new("/Users");
+        let users_dir = std::path::Path::new(MOUNT_USERS);
         if users_dir.is_dir() {
-            shared_dirs.push(SharedDirConfig::new("/Users", "users"));
+            shared_dirs.push(SharedDirConfig::new(MOUNT_USERS, TAG_USERS));
         }
 
         // Create underlying VM
@@ -327,7 +318,6 @@ impl MachineManager {
             cpus: config.cpus,
             memory_mb: config.memory_mb,
             kernel: config.kernel.clone(),
-            initrd: config.initrd.clone(),
             cmdline: config.cmdline.clone(),
             shared_dirs,
             block_devices: config.block_devices.clone(),
@@ -344,7 +334,6 @@ impl MachineManager {
             memory_mb: config.memory_mb,
             disk_gb: config.disk_gb,
             kernel: config.kernel,
-            initrd: config.initrd,
             cmdline: config.cmdline,
             block_devices: config.block_devices,
             distro: config.distro,
@@ -413,8 +402,7 @@ impl MachineManager {
         if is_machine_vm {
             self.wait_for_machine_ready(name).await.map_err(|e| {
                 CoreError::Machine(format!(
-                    "Machine '{}' started but readiness check failed: {}",
-                    name, e
+                    "Machine '{name}' started but readiness check failed: {e}"
                 ))
             })?;
         }
@@ -425,7 +413,7 @@ impl MachineManager {
     /// Waits for the guest agent to become ready and discovers the IP address.
     ///
     /// Polls the agent via vsock with exponential backoff. Once the agent
-    /// responds, queries SystemInfo to get the guest IP.
+    /// responds, queries `SystemInfo` to get the guest IP.
     async fn wait_for_machine_ready(&self, name: &str) -> Result<()> {
         const MAX_ATTEMPTS: u32 = 20;
         const INITIAL_DELAY_MS: u64 = 500;
@@ -511,8 +499,7 @@ impl MachineManager {
         }
 
         Err(CoreError::Machine(format!(
-            "Machine '{}' agent did not report a routable IP within timeout",
-            name
+            "Machine '{name}' agent did not report a routable IP within timeout"
         )))
     }
 
@@ -529,15 +516,13 @@ impl MachineManager {
 
             if machine.state == MachineState::Running {
                 return Err(CoreError::invalid_state(format!(
-                    "machine '{}' is already running",
-                    name
+                    "machine '{name}' is already running"
                 )));
             }
 
             if machine.state == MachineState::Starting || machine.state == MachineState::Stopping {
                 return Err(CoreError::invalid_state(format!(
-                    "machine '{}' is in transition state",
-                    name
+                    "machine '{name}' is in transition state"
                 )));
             }
 
@@ -577,7 +562,7 @@ impl MachineManager {
     /// Returns an error if the machine is not found, not running, or connection fails.
     #[cfg(target_os = "macos")]
     pub fn connect_agent(&self, name: &str) -> Result<crate::agent_client::AgentClient> {
-        use crate::agent_client::{AGENT_PORT, AgentClient};
+        use crate::agent_client::AgentClient;
         let cid = self
             .get_cid(name)
             .ok_or_else(|| CoreError::Machine("CID not assigned".to_string()))?;
@@ -602,8 +587,7 @@ impl MachineManager {
 
         if machine.state != MachineState::Running {
             return Err(CoreError::invalid_state(format!(
-                "machine '{}' is not running",
-                name
+                "machine '{name}' is not running"
             )));
         }
 
@@ -675,8 +659,7 @@ impl MachineManager {
 
         if machine.state != MachineState::Running {
             return Err(CoreError::invalid_state(format!(
-                "machine '{}' is not running",
-                name
+                "machine '{name}' is not running"
             )));
         }
 
@@ -700,8 +683,7 @@ impl MachineManager {
 
         if machine.state != MachineState::Running {
             return Err(CoreError::invalid_state(format!(
-                "machine '{}' is not running",
-                name
+                "machine '{name}' is not running"
             )));
         }
 
@@ -738,8 +720,7 @@ impl MachineManager {
 
             if machine.state != MachineState::Running {
                 return Err(CoreError::invalid_state(format!(
-                    "machine '{}' is not running",
-                    name
+                    "machine '{name}' is not running"
                 )));
             }
 
@@ -851,6 +832,26 @@ impl MachineManager {
         Ok(())
     }
 
+    /// Takes the inbound listener manager from a running machine's VM (Darwin only).
+    ///
+    /// Returns `None` if the machine is not found, not running, or the manager
+    /// has already been taken.
+    #[cfg(target_os = "macos")]
+    pub fn take_inbound_listener_manager(
+        &self,
+        name: &str,
+    ) -> Option<arcbox_net::darwin::inbound_relay::InboundListenerManager> {
+        let vm_id = {
+            let machines = self.machines.read().ok()?;
+            let machine = machines.get(name)?;
+            if machine.state != MachineState::Running {
+                return None;
+            }
+            machine.vm_id.clone()
+        };
+        self.vm_manager.take_inbound_listener_manager(&vm_id)
+    }
+
     /// Registers a mock machine for testing purposes.
     ///
     /// This method creates a machine entry without creating an actual VM.
@@ -877,7 +878,6 @@ impl MachineManager {
             memory_mb: 4096,
             disk_gb: 50,
             kernel: None,
-            initrd: None,
             cmdline: None,
             block_devices: Vec::new(),
             distro: None,

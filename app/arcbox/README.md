@@ -57,8 +57,6 @@ let version = arcbox::version();
 | Feature | Description |
 |---------|-------------|
 | `default` | Core functionality only |
-| `pro` | Pro layer features (BSL-1.1 licensed) |
-| `full` | All features including pro |
 
 ## Related Crates
 

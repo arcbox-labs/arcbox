@@ -22,20 +22,15 @@ pub const MAX_IRQS: u32 = 256;
 pub const MAX_GSIS: u32 = 24;
 
 /// Interrupt trigger mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TriggerMode {
     /// Edge-triggered: interrupt is signaled on level transition.
     /// Device asserts then deasserts the IRQ line.
+    #[default]
     Edge,
     /// Level-triggered: interrupt remains asserted until acknowledged.
     /// Device keeps line asserted until serviced.
     Level,
-}
-
-impl Default for TriggerMode {
-    fn default() -> Self {
-        Self::Edge
-    }
 }
 
 /// IRQ configuration for a single interrupt line.
@@ -108,7 +103,7 @@ impl IrqChip {
         let mut cb = self
             .trigger_callback
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *cb = Some(callback);
         tracing::debug!("IRQ trigger callback registered");
     }
@@ -135,7 +130,10 @@ impl IrqChip {
         };
 
         {
-            let mut configs = self.irq_configs.write().unwrap_or_else(|e| e.into_inner());
+            let mut configs = self
+                .irq_configs
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             configs.insert(irq, config);
         }
 
@@ -169,7 +167,10 @@ impl IrqChip {
         };
 
         {
-            let mut configs = self.irq_configs.write().unwrap_or_else(|e| e.into_inner());
+            let mut configs = self
+                .irq_configs
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             configs.insert(irq, config);
         }
 
@@ -180,7 +181,10 @@ impl IrqChip {
 
     /// Configures an existing IRQ.
     pub fn configure_irq(&self, irq: Irq, gsi: Gsi, trigger_mode: TriggerMode) -> Result<()> {
-        let mut configs = self.irq_configs.write().unwrap_or_else(|e| e.into_inner());
+        let mut configs = self
+            .irq_configs
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(config) = configs.get_mut(&irq) {
             config.gsi = gsi;
             config.trigger_mode = trigger_mode;
@@ -193,8 +197,7 @@ impl IrqChip {
             Ok(())
         } else {
             Err(crate::error::VmmError::Irq(format!(
-                "IRQ {} not allocated",
-                irq
+                "IRQ {irq} not allocated"
             )))
         }
     }
@@ -218,7 +221,10 @@ impl IrqChip {
         }
 
         // Get configuration
-        let configs = self.irq_configs.read().unwrap_or_else(|e| e.into_inner());
+        let configs = self
+            .irq_configs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = configs.get(&irq);
         let (gsi, trigger_mode) = match config {
             Some(c) => (c.gsi, c.trigger_mode),
@@ -248,7 +254,7 @@ impl IrqChip {
         let callback = self
             .trigger_callback
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(ref cb) = *callback {
             match trigger_mode {
                 TriggerMode::Edge => {
@@ -264,7 +270,10 @@ impl IrqChip {
                     cb(gsi, true)?;
                     // Mark as asserted in config
                     drop(callback);
-                    let mut configs = self.irq_configs.write().unwrap_or_else(|e| e.into_inner());
+                    let mut configs = self
+                        .irq_configs
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if let Some(c) = configs.get_mut(&irq) {
                         c.asserted = true;
                     }
@@ -286,7 +295,10 @@ impl IrqChip {
     /// For level-triggered IRQs, the device calls this when the interrupt
     /// condition is cleared (e.g., data read from FIFO).
     pub fn deassert_irq(&self, irq: Irq) -> Result<()> {
-        let configs = self.irq_configs.read().unwrap_or_else(|e| e.into_inner());
+        let configs = self
+            .irq_configs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = configs.get(&irq);
         let gsi = match config {
             Some(c) if c.trigger_mode == TriggerMode::Level => c.gsi,
@@ -304,13 +316,16 @@ impl IrqChip {
         let callback = self
             .trigger_callback
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(ref cb) = *callback {
             cb(gsi, false)?;
         }
 
         // Mark as deasserted
-        let mut configs = self.irq_configs.write().unwrap_or_else(|e| e.into_inner());
+        let mut configs = self
+            .irq_configs
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(c) = configs.get_mut(&irq) {
             c.asserted = false;
         }
@@ -371,14 +386,20 @@ impl IrqChip {
     /// Gets the GSI for an IRQ.
     #[must_use]
     pub fn get_gsi(&self, irq: Irq) -> Option<Gsi> {
-        let configs = self.irq_configs.read().unwrap_or_else(|e| e.into_inner());
+        let configs = self
+            .irq_configs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         configs.get(&irq).map(|c| c.gsi)
     }
 
     /// Gets the trigger mode for an IRQ.
     #[must_use]
     pub fn get_trigger_mode(&self, irq: Irq) -> Option<TriggerMode> {
-        let configs = self.irq_configs.read().unwrap_or_else(|e| e.into_inner());
+        let configs = self
+            .irq_configs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         configs.get(&irq).map(|c| c.trigger_mode)
     }
 

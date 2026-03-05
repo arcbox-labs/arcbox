@@ -51,7 +51,7 @@ unsafe extern "C" {
 // Connect Context
 // ============================================================================
 
-/// Context passed to dispatch_async_f for vsock connection.
+/// Context passed to `dispatch_async_f` for vsock connection.
 struct ConnectContext {
     /// Socket device pointer.
     device: *mut AnyObject,
@@ -241,8 +241,7 @@ impl VirtioSocketDevice {
                 // so it will just fail to send
                 tracing::warn!("Vsock connection timed out after {:?}", timeout);
                 Err(VZError::Timeout(format!(
-                    "Vsock connection to port {} timed out",
-                    port
+                    "Vsock connection to port {port} timed out"
                 )))
             }
         }
@@ -306,7 +305,7 @@ impl VirtioSocketDevice {
                     unregister_listener(handle);
                     return Err(VZError::Internal {
                         code: -1,
-                        message: format!("Failed to create delegate instance: {}", e),
+                        message: format!("Failed to create delegate instance: {e}"),
                     });
                 }
             };
@@ -469,18 +468,21 @@ impl VirtioSocketConnection {
     ///
     /// This can be used with tokio's `AsyncFd` for async I/O.
     #[inline]
+    #[must_use]
     pub fn as_raw_fd(&self) -> RawFd {
         self.fd
     }
 
     /// Returns the source port (assigned by the framework).
     #[inline]
+    #[must_use]
     pub fn source_port(&self) -> u32 {
         self.source_port
     }
 
     /// Returns the destination port (the port we connected to).
     #[inline]
+    #[must_use]
     pub fn destination_port(&self) -> u32 {
         self.destination_port
     }
@@ -528,6 +530,7 @@ impl VirtioSocketConnection {
     /// Consumes the connection and returns the raw file descriptor.
     ///
     /// The caller is responsible for closing the file descriptor.
+    #[must_use]
     pub fn into_raw_fd(self) -> RawFd {
         let fd = self.fd;
         std::mem::forget(self);
@@ -581,7 +584,7 @@ pub struct VirtioSocketListener {
     handle: ListenerHandle,
     /// Channel receiver for incoming connections.
     receiver: mpsc::UnboundedReceiver<IncomingConnection>,
-    /// VZVirtioSocketListener object.
+    /// `VZVirtioSocketListener` object.
     listener_obj: *mut AnyObject,
     /// Delegate object.
     delegate: *mut AnyObject,
@@ -594,6 +597,7 @@ unsafe impl Send for VirtioSocketListener {}
 impl VirtioSocketListener {
     /// Returns the port this listener is bound to.
     #[inline]
+    #[must_use]
     pub fn port(&self) -> u32 {
         self.port
     }
