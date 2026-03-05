@@ -1424,6 +1424,9 @@ pub struct AgentPingRequest {
     /// Optional payload.
     #[prost(string, tag = "1")]
     pub message: ::prost::alloc::string::String,
+    /// Host wall-clock time in Unix seconds. Agent sets clock when > 0.
+    #[prost(int64, tag = "2")]
+    pub timestamp_secs: i64,
 }
 /// Ping response.
 #[derive(serde::Serialize, serde::Deserialize)]

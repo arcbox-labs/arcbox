@@ -227,6 +227,10 @@ impl AgentClient {
     pub async fn ping(&mut self) -> Result<PingResponse> {
         let req = PingRequest {
             message: "ping".to_string(),
+            timestamp_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| i64::try_from(d.as_secs()).unwrap_or(0))
+                .unwrap_or(0),
         };
         let payload = req.encode_to_vec();
 

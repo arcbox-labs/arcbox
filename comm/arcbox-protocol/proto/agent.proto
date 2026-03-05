@@ -27,6 +27,8 @@ service AgentService {
 message AgentPingRequest {
     // Optional payload.
     string message = 1;
+    // Host wall-clock time in Unix seconds. Agent sets clock when > 0.
+    int64 timestamp_secs = 2;
 }
 
 // Ping response.
