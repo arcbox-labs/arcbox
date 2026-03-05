@@ -435,8 +435,10 @@ impl Vmm {
         #[cfg(target_os = "macos")]
         if self.managed_execution {
             self.stop_managed_vm()?;
-        } else {
-            // Stop vCPUs
+        }
+
+        // Stop vCPU threads (Linux always, macOS only in non-managed mode)
+        if !self.managed_execution {
             if let Some(ref mut vcpu_manager) = self.vcpu_manager {
                 vcpu_manager.stop()?;
             }

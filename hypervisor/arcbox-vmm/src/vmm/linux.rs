@@ -11,13 +11,15 @@ use arcbox_hypervisor::VirtioDeviceConfig;
 use arcbox_hypervisor::linux::VirtioDeviceInfo;
 
 #[cfg(target_arch = "aarch64")]
+use crate::boot::arm64;
+#[cfg(target_arch = "aarch64")]
 use crate::fdt::{FdtConfig, generate_fdt};
 
 impl Vmm {
     /// Linux-specific initialization using KVM.
     pub(super) fn initialize_linux(&mut self) -> Result<()> {
         use arcbox_hypervisor::linux::KvmVm;
-        use arcbox_hypervisor::traits::VirtualMachine;
+        use arcbox_hypervisor::traits::{Hypervisor, VirtualMachine};
         use std::sync::Mutex;
 
         // Create hypervisor and VM
@@ -379,6 +381,8 @@ fn write_fdt_to_guest(
     config: &VmmConfig,
     virtio_devices: &[VirtioDeviceInfo],
 ) -> Result<()> {
+    use arcbox_hypervisor::traits::{GuestMemory, VirtualMachine};
+
     let fdt_config = build_fdt_config(config, virtio_devices)?;
     let blob = generate_fdt(&fdt_config)?;
 
