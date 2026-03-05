@@ -29,7 +29,7 @@ pub enum VmmError {
 
     /// Error from the Firecracker SDK.
     #[error("fc-sdk error: {0}")]
-    Sdk(Box<fc_sdk::Error>),
+    Sdk(#[from] fc_sdk::Error),
 
     /// Network-related error (TAP creation, IP allocation, etc.).
     #[error("network error: {0}")]
@@ -59,11 +59,6 @@ pub enum VmmError {
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, VmmError>;
 
-impl From<fc_sdk::Error> for VmmError {
-    fn from(e: fc_sdk::Error) -> Self {
-        VmmError::Sdk(Box::new(e))
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -1027,9 +1027,9 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "fc-api"
-version = "0.2.1"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2039fab9a2910d7ef2361df7da39f34b65c94bdddecfaf0c59816b06f864fc19"
+checksum = "e8e97fce992ee72f577b927e012f769bdd401143d1dc5bee870105bcd353accf"
 dependencies = [
  "futures",
  "openapiv3",
@@ -1044,9 +1044,9 @@ dependencies = [
 
 [[package]]
 name = "fc-sdk"
-version = "0.2.1"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "312675126974152ae3509e71ec3cdd0ce66a465cc1b0c246b8225849d47ee382"
+checksum = "8f527f191f67fbc2e056e1fb4e891256faf9c6d2c2b54e6e585da6e365b04058"
 dependencies = [
  "fc-api",
  "libc",
@@ -1502,7 +1502,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2387,7 +2387,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "thiserror",
  "tokio",
  "tracing",
@@ -2424,7 +2424,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -3785,7 +3785,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

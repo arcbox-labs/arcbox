@@ -151,7 +151,7 @@ libc = "0.2"
 arcbox-boot = { version = "0.2", features = ["download"] }
 macos-resolver = "0.2.0"
 
-fc-sdk = "0.2.1"
+fc-sdk = "0.2.3"
 
 # Internal crates (Core layer)
 arcbox-constants = { version = "0.0.1-alpha.1", path = "common/arcbox-constants" }
