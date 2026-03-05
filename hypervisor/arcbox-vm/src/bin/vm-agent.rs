@@ -515,7 +515,10 @@ mod agent {
                 return conn_fd;
             }
             let err = std::io::Error::last_os_error();
-            assert!(err.kind() == std::io::ErrorKind::Interrupted, "accept: {err}");
+            assert!(
+                err.kind() == std::io::ErrorKind::Interrupted,
+                "accept: {err}"
+            );
         }
     }
 }
