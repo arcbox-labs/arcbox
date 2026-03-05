@@ -134,11 +134,90 @@ jobs:
           retention-days: 30
 
   # ==========================================================================
+  # Build DMG (Desktop App)
+  # ==========================================================================
+  build-dmg:
+    name: Build DMG
+    needs: [build-macos-arm64]
+    runs-on: macos-26
+    timeout-minutes: 45
+    outputs:
+      dmg: ${{ steps.dmg.outputs.dmg }}
+
+    steps:
+      - name: Checkout arcbox
+        uses: actions/checkout@v4
+
+      - name: Checkout arcbox-desktop-swift
+        uses: actions/checkout@v4
+        with:
+          repository: arcboxd/arcbox-desktop-swift
+          token: ${{ secrets.DESKTOP_REPO_TOKEN }}
+          path: arcbox-desktop-swift
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install Protobuf compiler
+        timeout-minutes: 5
+        run: brew install protobuf
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+            ${{ runner.os }}-cargo-
+
+      - name: Build Rust binaries (release)
+        timeout-minutes: 15
+        run: cargo build --release --locked -p arcbox-cli -p arcbox-daemon
+
+      - name: Prefetch boot-assets
+        run: |
+          codesign --entitlements tests/resources/entitlements.plist \
+            --force -s - target/release/arcbox-daemon
+          codesign --force -s - target/release/arcbox
+          target/release/arcbox boot prefetch
+
+      - name: Build DMG
+        id: dmg
+        run: |
+          DESKTOP_REPO=arcbox-desktop-swift scripts/package-dmg.sh
+          DMG_PATH=$(ls target/ArcBox-*.dmg | head -1)
+          DMG_NAME=$(basename "$DMG_PATH")
+          echo "dmg=$DMG_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Generate DMG checksum
+        run: |
+          DMG="${{ steps.dmg.outputs.dmg }}"
+          shasum -a 256 "target/$DMG" > "target/${DMG}.sha256"
+          cat "target/${DMG}.sha256"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arcbox-dmg
+          path: |
+            target/${{ steps.dmg.outputs.dmg }}
+            target/${{ steps.dmg.outputs.dmg }}.sha256
+          retention-days: 30
+
+  # ==========================================================================
   # Create GitHub Release
   # ==========================================================================
   create-release:
     name: Create Release
-    needs: [build-macos-arm64]
+    needs: [build-macos-arm64, build-dmg]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -157,7 +236,7 @@ jobs:
       - name: Collect release assets
         run: |
           mkdir -p release-assets
-          find artifacts/ -type f \( -name '*.tar.gz' -o -name '*.sha256' \) \
+          find artifacts/ -type f \( -name '*.tar.gz' -o -name '*.dmg' -o -name '*.sha256' \) \
             -exec cp {} release-assets/ \;
           echo "=== Release assets ==="
           ls -lh release-assets/
@@ -178,12 +257,18 @@ jobs:
           generate_release_notes: true
           files: |
             release-assets/*.tar.gz
+            release-assets/*.dmg
             release-assets/*.sha256
             release-assets/checksums.txt
           body: |
             ## Installation
 
-            ### Recommended (install script)
+            ### Desktop App (DMG)
+
+            Download `${{ needs.build-dmg.outputs.dmg }}`, open the DMG, and drag ArcBox Desktop to Applications.
+            Boot-assets and daemon are bundled — no additional setup required.
+
+            ### CLI only (install script)
 
             ```bash
             curl -fsSL https://get.arcbox.dev | bash
