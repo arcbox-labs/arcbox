@@ -4,8 +4,7 @@
 //! already mounted /proc, /sys, /dev (devtmpfs), and /arcbox (VirtioFS).
 //!
 //! This module sets up everything else: writable tmpfs layers over the read-only
-//! EROFS rootfs, populates /etc, mounts pseudo-filesystems, configures networking,
-//! and syncs the system clock.
+//! EROFS rootfs, populates /etc, mounts pseudo-filesystems, and configures networking.
 //!
 //! All operations are idempotent and best-effort — failures are logged but do not
 //! abort, since PID 1 must not exit.
@@ -54,9 +53,8 @@ mod platform {
         mount_devpts();
         mount_shm();
 
-        // Network and time.
+        // Network.
         setup_networking();
-        sync_clock();
 
         // Optional host /Users share (non-fatal if not configured).
         mount_virtiofs_optional("users", "/Users");
@@ -274,23 +272,6 @@ exit 0
         }
         candidates.sort();
         candidates.into_iter().next()
-    }
-
-    fn sync_clock() {
-        // One-shot NTP sync. Without a correct clock, TLS cert validation fails
-        // with "x509: certificate is not yet valid" because VZ guest RTC starts
-        // at epoch.
-        let status = std::process::Command::new("/bin/busybox")
-            .args(["ntpd", "-q", "-n", "-p", "pool.ntp.org"])
-            .status();
-        match status {
-            Ok(s) if s.success() => tracing::info!("NTP clock synced"),
-            Ok(s) => tracing::warn!(
-                exit_code = s.code().unwrap_or(-1),
-                "NTP sync exited non-zero"
-            ),
-            Err(e) => tracing::warn!(error = %e, "NTP sync failed"),
-        }
     }
 
     fn write_etc_resolv_conf() {

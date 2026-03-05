@@ -967,6 +967,22 @@ mod linux {
     /// Handles a Ping request.
     fn handle_ping(req: arcbox_protocol::agent::PingRequest) -> RpcResponse {
         tracing::debug!("Ping request: {:?}", req.message);
+        if req.timestamp_secs > 0 {
+            let ts = libc::timespec {
+                tv_sec: req.timestamp_secs,
+                tv_nsec: 0,
+            };
+            // SAFETY: `ts` points to a valid initialized timespec for this call,
+            // and CLOCK_REALTIME is a valid clock ID on Linux guests.
+            let ret = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
+            if ret != 0 {
+                tracing::warn!(
+                    timestamp_secs = req.timestamp_secs,
+                    error = %std::io::Error::last_os_error(),
+                    "failed to set clock from host ping"
+                );
+            }
+        }
         RpcResponse::Ping(PingResponse {
             message: if req.message.is_empty() {
                 "pong".to_string()
