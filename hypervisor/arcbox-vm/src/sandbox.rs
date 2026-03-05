@@ -56,12 +56,12 @@ pub enum SandboxState {
 impl std::fmt::Display for SandboxState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SandboxState::Starting => write!(f, "starting"),
-            SandboxState::Ready => write!(f, "ready"),
-            SandboxState::Running => write!(f, "running"),
-            SandboxState::Stopping => write!(f, "stopping"),
-            SandboxState::Stopped => write!(f, "stopped"),
-            SandboxState::Failed => write!(f, "failed"),
+            Self::Starting => write!(f, "starting"),
+            Self::Ready => write!(f, "ready"),
+            Self::Running => write!(f, "running"),
+            Self::Stopping => write!(f, "stopping"),
+            Self::Stopped => write!(f, "stopped"),
+            Self::Failed => write!(f, "failed"),
         }
     }
 }
@@ -347,13 +347,13 @@ impl SandboxManager {
         // Apply daemon defaults for fields not supplied by the caller.
         let defaults = &self.config.defaults;
         if spec.kernel.is_empty() {
-            spec.kernel = defaults.kernel.clone();
+            spec.kernel.clone_from(&defaults.kernel);
         }
         if spec.rootfs.is_empty() {
-            spec.rootfs = defaults.rootfs.clone();
+            spec.rootfs.clone_from(&defaults.rootfs);
         }
         if spec.boot_args.is_empty() {
-            spec.boot_args = defaults.boot_args.clone();
+            spec.boot_args.clone_from(&defaults.boot_args);
         }
         if spec.vcpus == 0 {
             spec.vcpus = defaults.vcpus as u32;
@@ -375,7 +375,7 @@ impl SandboxManager {
         {
             let instances = self.instances.read().unwrap();
             if instances.contains_key(&id) {
-                return Err(VmmError::AlreadyExists(id.clone()));
+                return Err(VmmError::AlreadyExists(id));
             }
         }
 
@@ -416,7 +416,7 @@ impl SandboxManager {
             let events_tx = self.events_tx.clone();
             let id_clone = id.clone();
             let spec_clone = spec.clone();
-            let net_alloc_clone = net_alloc.clone();
+            let net_alloc_clone = net_alloc;
             tokio::spawn(async move {
                 boot_sandbox(
                     id_clone,
@@ -459,11 +459,11 @@ impl SandboxManager {
             let instance = self.get_instance(id)?;
             let mut inst = instance.lock().unwrap();
             match inst.state {
-                SandboxState::Ready | SandboxState::Running | SandboxState::Starting => {}
+                SandboxState::Ready | SandboxState::Running => {}
                 s => {
                     return Err(VmmError::WrongState {
                         id: id.clone(),
-                        expected: "Starting, Ready, or Running".into(),
+                        expected: "Ready or Running".into(),
                         actual: s.to_string(),
                     });
                 }
@@ -486,9 +486,20 @@ impl SandboxManager {
                     .await;
         }
 
+        // Force-kill the Firecracker process if it is still alive.
         {
             let instance = self.get_instance(id)?;
             let mut inst = instance.lock().unwrap();
+            if let Some(ref mut proc) = inst.process
+                && let Some(pid) = proc.pid()
+                && pid > 0
+            {
+                let _ = nix::sys::signal::kill(
+                    #[allow(clippy::cast_possible_wrap)]
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
             inst.state = SandboxState::Stopped;
         }
 
@@ -604,25 +615,25 @@ impl SandboxManager {
     ) -> Result<tokio::sync::mpsc::Receiver<Result<OutputChunk>>> {
         let uds_path = self.require_ready_vsock(id)?;
 
-        // Transition to Running.
-        {
-            let inst = self.get_instance(id)?;
-            inst.lock().unwrap().state = SandboxState::Running;
-        }
-        let _ = self.events_tx.send(SandboxEvent::new(id, "running"));
-
         let start = StartCommand {
             cmd,
             env,
             working_dir,
             user,
             tty,
-            tty_width: tty_size.map(|(w, _)| w).unwrap_or(80),
-            tty_height: tty_size.map(|(_, h)| h).unwrap_or(24),
+            tty_width: tty_size.map_or(80, |(w, _)| w),
+            tty_height: tty_size.map_or(24, |(_, h)| h),
             timeout_seconds,
         };
 
         let inner_rx = vsock::run(&uds_path, start).await?;
+
+        // Transition to Running only after vsock session is established.
+        {
+            let inst = self.get_instance(id)?;
+            inst.lock().unwrap().state = SandboxState::Running;
+        }
+        let _ = self.events_tx.send(SandboxEvent::new(id, "running"));
 
         // Wrap the receiver to intercept MSG_EXIT and update state.
         let (wrapped_tx, wrapped_rx) = tokio::sync::mpsc::channel(64);
@@ -635,7 +646,8 @@ impl SandboxManager {
                 let send_result = match &result {
                     Ok(chunk) if chunk.stream == "exit" => {
                         let exit_code = chunk.exit_code;
-                        if let Some(arc) = instances.read().unwrap().get(&sandbox_id).cloned() {
+                        let value = instances.read().unwrap().get(&sandbox_id).cloned();
+                        if let Some(arc) = value {
                             let mut inst = arc.lock().unwrap();
                             inst.state = SandboxState::Ready;
                             inst.last_exit_code = Some(exit_code);
@@ -683,25 +695,25 @@ impl SandboxManager {
     )> {
         let uds_path = self.require_ready_vsock(id)?;
 
-        // Transition to Running.
-        {
-            let inst = self.get_instance(id)?;
-            inst.lock().unwrap().state = SandboxState::Running;
-        }
-        let _ = self.events_tx.send(SandboxEvent::new(id, "running"));
-
         let start = StartCommand {
             cmd,
             env,
             working_dir,
             user,
             tty,
-            tty_width: tty_size.map(|(w, _)| w).unwrap_or(80),
-            tty_height: tty_size.map(|(_, h)| h).unwrap_or(24),
+            tty_width: tty_size.map_or(80, |(w, _)| w),
+            tty_height: tty_size.map_or(24, |(_, h)| h),
             timeout_seconds,
         };
 
         let (in_tx, inner_rx) = vsock::exec(&uds_path, start).await?;
+
+        // Transition to Running only after vsock session is established.
+        {
+            let inst = self.get_instance(id)?;
+            inst.lock().unwrap().state = SandboxState::Running;
+        }
+        let _ = self.events_tx.send(SandboxEvent::new(id, "running"));
 
         // Wrap the output receiver to intercept MSG_EXIT and update state.
         let (wrapped_tx, wrapped_rx) = tokio::sync::mpsc::channel(64);
@@ -714,7 +726,8 @@ impl SandboxManager {
                 let send_result = match &result {
                     Ok(chunk) if chunk.stream == "exit" => {
                         let exit_code = chunk.exit_code;
-                        if let Some(arc) = instances.read().unwrap().get(&sandbox_id).cloned() {
+                        let value = instances.read().unwrap().get(&sandbox_id).cloned();
+                        if let Some(arc) = value {
                             let mut inst = arc.lock().unwrap();
                             inst.state = SandboxState::Ready;
                             inst.last_exit_code = Some(exit_code);
@@ -1165,8 +1178,14 @@ async fn boot_sandbox(
     match do_boot(&id, &spec, net_alloc.as_ref(), &vm_dir, &config).await {
         Ok((process, vm, vsock_uds_path)) => {
             let ready_at = Utc::now();
-            if let Some(arc) = instances.read().unwrap().get(&id).cloned() {
+            let value = instances.read().unwrap().get(&id).cloned();
+            if let Some(arc) = value {
                 let mut inst = arc.lock().unwrap();
+                // If stop was requested while booting, do not transition to Ready.
+                if inst.state == SandboxState::Stopping || inst.state == SandboxState::Stopped {
+                    info!(sandbox_id = %id, "sandbox boot completed but stop was requested; staying stopped");
+                    return;
+                }
                 inst.process = Some(process);
                 inst.vm = Some(vm);
                 inst.vsock_uds_path = Some(vsock_uds_path);
@@ -1177,7 +1196,8 @@ async fn boot_sandbox(
             info!(sandbox_id = %id, "sandbox booted and ready");
         }
         Err(e) => {
-            if let Some(arc) = instances.read().unwrap().get(&id).cloned() {
+            let value = instances.read().unwrap().get(&id).cloned();
+            if let Some(arc) = value {
                 let mut inst = arc.lock().unwrap();
                 inst.state = SandboxState::Failed;
                 inst.error = Some(e.to_string());
@@ -1314,6 +1334,7 @@ async fn do_boot(
         })
         .machine_config(fc_sdk::types::MachineConfiguration {
             vcpu_count,
+            #[allow(clippy::cast_possible_wrap)]
             mem_size_mib: spec.memory_mib as i64,
             smt: false,
             // Enable dirty-page tracking so checkpointing is always available.
@@ -1385,6 +1406,7 @@ async fn remove_sandbox_impl(
             && pid > 0
         {
             let _ = nix::sys::signal::kill(
+                #[allow(clippy::cast_possible_wrap)]
                 nix::unistd::Pid::from_raw(pid as i32),
                 nix::sys::signal::Signal::SIGKILL,
             );
