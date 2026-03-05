@@ -185,7 +185,6 @@ We welcome contributions. See [CLAUDE.md](CLAUDE.md) for current contribution an
 ## License
 
 - **Core + Guest** (`common/`, `hypervisor/`, `services/`, `comm/`, `app/`, `guest/`) -- [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)
-- **Snapshot** (`pro/arcbox-snapshot/`) -- [BSL-1.1](LICENSE-BSL-1.1) (converts to MIT after 4 years; migrating to core)
 
 See [LICENSE](LICENSE) for the full text.
 
