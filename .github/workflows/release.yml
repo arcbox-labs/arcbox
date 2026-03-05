@@ -160,9 +160,9 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Install Protobuf compiler
+      - name: Install dependencies
         timeout-minutes: 5
-        run: brew install protobuf
+        run: brew install protobuf create-dmg
 
       - name: Cache cargo
         uses: actions/cache@v4
