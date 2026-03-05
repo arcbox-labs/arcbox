@@ -121,7 +121,6 @@ hypervisor/      Virtualization.framework bindings, VMM, VirtIO devices
 services/        VirtioFS, networking (NAT/DHCP/DNS), container state, OCI
 comm/            Protobuf definitions, gRPC services, vsock/unix transport
 app/             Core orchestration, API server, Docker Engine API, CLI, daemon
-pro/             Enhanced filesystem, advanced networking, snapshots (BSL-1.1)
 guest/           In-VM agent (cross-compiled for Linux)
 ```
 
@@ -186,7 +185,7 @@ We welcome contributions. See [CLAUDE.md](CLAUDE.md) for current contribution an
 ## License
 
 - **Core + Guest** (`common/`, `hypervisor/`, `services/`, `comm/`, `app/`, `guest/`) -- [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE)
-- **Pro** (`pro/`) -- [BSL-1.1](LICENSE-BSL-1.1) (converts to MIT after 4 years)
+- **Snapshot** (`pro/arcbox-snapshot/`) -- [BSL-1.1](LICENSE-BSL-1.1) (converts to MIT after 4 years; migrating to core)
 
 See [LICENSE](LICENSE) for the full text.
 

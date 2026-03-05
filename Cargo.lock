@@ -329,16 +329,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arcbox-fs-enhanced"
-version = "0.0.1-alpha.1"
-dependencies = [
- "arcbox-fs",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "arcbox-grpc"
 version = "0.0.1-alpha.1"
 dependencies = [
@@ -395,16 +385,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arcbox-net-advanced"
-version = "0.0.1-alpha.1"
-dependencies = [
- "arcbox-net",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "arcbox-oci"
 version = "0.0.1-alpha.1"
 dependencies = [
@@ -417,18 +397,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "arcbox-perf"
-version = "0.0.1-alpha.1"
-dependencies = [
- "chrono",
- "libc",
- "serde",
- "thiserror",
- "tokio",
- "tracing",
 ]
 
 [[package]]
