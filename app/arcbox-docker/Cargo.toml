@@ -45,3 +45,6 @@ hyper = { workspace = true }
 default = []
 api-native = []
 api-proxy = []
+
+[lints]
+workspace = true

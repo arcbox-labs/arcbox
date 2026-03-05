@@ -42,7 +42,7 @@ pub struct DnsConfig {
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
-            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), DNS_PORT),
+            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DNS_PORT),
             upstream: DEFAULT_UPSTREAM
                 .iter()
                 .map(|ip| SocketAddr::new(IpAddr::V4(*ip), DNS_PORT))
@@ -571,7 +571,7 @@ impl DnsQuery {
         let qclass_raw = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
 
         let qtype = DnsRecordType::try_from(qtype_raw)
-            .map_err(|_| NetError::Dns(format!("unsupported query type: {}", qtype_raw)))?;
+            .map_err(|()| NetError::Dns(format!("unsupported query type: {}", qtype_raw)))?;
 
         let qclass = if qclass_raw == 1 {
             DnsClass::In

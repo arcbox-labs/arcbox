@@ -6,7 +6,7 @@ use crate::{msg_send, msg_send_void};
 use objc2::runtime::AnyObject;
 use std::os::unix::io::RawFd;
 
-/// Configuration for a VirtIO network device.
+/// Configuration for a `VirtIO` network device.
 pub struct NetworkDeviceConfiguration {
     inner: *mut AnyObject,
 }
@@ -71,6 +71,7 @@ impl NetworkDeviceConfiguration {
     }
 
     /// Consumes the configuration and returns the raw pointer.
+    #[must_use]
     pub fn into_ptr(self) -> *mut AnyObject {
         let ptr = self.inner;
         std::mem::forget(self);
@@ -125,8 +126,7 @@ fn create_file_handle_attachment(file_handle: *mut AnyObject) -> VZResult<*mut A
                 return Err(VZError::Internal {
                     code: -2,
                     message: format!(
-                        "VZFileHandleNetworkDeviceAttachment init threw ObjC exception: {}",
-                        desc
+                        "VZFileHandleNetworkDeviceAttachment init threw ObjC exception: {desc}"
                     ),
                 });
             }

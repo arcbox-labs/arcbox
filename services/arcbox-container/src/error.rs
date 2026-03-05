@@ -63,13 +63,13 @@ impl ContainerError {
 
     /// Returns true if this is a not found error.
     #[must_use]
-    pub fn is_not_found(&self) -> bool {
+    pub const fn is_not_found(&self) -> bool {
         matches!(self, Self::Common(CommonError::NotFound(_)))
     }
 
     /// Returns true if this is an invalid state error.
     #[must_use]
-    pub fn is_invalid_state(&self) -> bool {
+    pub const fn is_invalid_state(&self) -> bool {
         matches!(self, Self::Common(CommonError::InvalidState(_)))
     }
 }

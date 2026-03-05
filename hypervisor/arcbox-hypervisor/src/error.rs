@@ -69,13 +69,13 @@ pub enum HypervisorError {
 }
 
 impl HypervisorError {
-    /// Creates a timeout error via CommonError.
+    /// Creates a timeout error via `CommonError`.
     #[must_use]
     pub fn timeout(msg: impl Into<String>) -> Self {
         Self::Common(CommonError::timeout(msg))
     }
 
-    /// Creates an invalid config error via CommonError.
+    /// Creates an invalid config error via `CommonError`.
     #[must_use]
     pub fn invalid_config(msg: impl Into<String>) -> Self {
         Self::Common(CommonError::config(msg))

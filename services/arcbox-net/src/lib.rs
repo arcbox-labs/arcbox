@@ -36,13 +36,6 @@
 //! └─────────────────────────────────────────────────┘
 //! ```
 
-#![warn(clippy::all)]
-#![allow(clippy::module_name_repetitions)]
-// Network code has many low-level structures and datapath components
-// not yet connected to the VirtIO layer. Allow dead_code at crate level
-// until the integration is complete (Phase 2.2).
-#![allow(dead_code)]
-// Pedantic/nursery lints: enable incrementally as the crate stabilizes.
 #![allow(unused_imports, unused_variables, unused_mut)]
 
 pub mod backend;

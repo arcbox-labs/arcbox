@@ -3,10 +3,8 @@
 //! This module generates device tree blobs for ARM64 VMs, describing
 //! the virtual hardware configuration to the guest kernel.
 
-use crate::boot::arm64;
 use crate::device::DeviceTreeEntry;
-use crate::error::{Result, VmmError};
-use arcbox_hypervisor::GuestAddress;
+use crate::error::Result;
 
 /// FDT header magic number.
 pub const FDT_MAGIC: u32 = 0xD00DFEED;
@@ -69,6 +67,7 @@ impl FdtBuilder {
     }
 
     /// Writes a 64-bit big-endian value.
+    #[allow(dead_code)]
     fn write_u64(&mut self, value: u64) {
         self.data.extend_from_slice(&value.to_be_bytes());
     }
@@ -217,7 +216,7 @@ pub struct FdtConfig {
     pub initrd_addr: Option<u64>,
     /// Initrd size (if any).
     pub initrd_size: Option<u64>,
-    /// VirtIO devices.
+    /// `VirtIO` devices.
     pub virtio_devices: Vec<DeviceTreeEntry>,
     /// GIC (interrupt controller) version.
     pub gic_version: u32,
@@ -225,7 +224,7 @@ pub struct FdtConfig {
     pub gic_dist_addr: u64,
     /// GIC distributor size.
     pub gic_dist_size: u64,
-    /// GIC redistributor address (GICv3).
+    /// GIC redistributor address (`GICv3`).
     pub gic_redist_addr: u64,
     /// GIC redistributor size.
     pub gic_redist_size: u64,
@@ -292,7 +291,7 @@ pub fn generate_fdt(config: &FdtConfig) -> Result<Vec<u8>> {
     fdt.property_u32("#size-cells", 0);
 
     for i in 0..config.num_cpus {
-        fdt.begin_node(&format!("cpu@{}", i));
+        fdt.begin_node(&format!("cpu@{i}"));
         fdt.property_string("device_type", "cpu");
         fdt.property_string("compatible", "arm,arm-v8");
         fdt.property_string("enable-method", "psci");

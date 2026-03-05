@@ -184,9 +184,10 @@ async fn run(args: DaemonArgs) -> Result<()> {
 
 fn resolve_data_dir(data_dir: Option<&PathBuf>) -> PathBuf {
     data_dir.cloned().unwrap_or_else(|| {
-        dirs::home_dir()
-            .map(|home| home.join(".arcbox"))
-            .unwrap_or_else(|| PathBuf::from("/var/lib/arcbox"))
+        dirs::home_dir().map_or_else(
+            || PathBuf::from("/var/lib/arcbox"),
+            |home| home.join(".arcbox"),
+        )
     })
 }
 
@@ -243,8 +244,8 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        () = ctrl_c => {},
+        () = terminate => {},
     }
 }
 

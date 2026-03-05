@@ -1,4 +1,4 @@
-//! ArcBox runtime.
+//! `ArcBox` runtime.
 
 use crate::config::Config;
 use crate::container_backend::{DynContainerBackend, create_backend};
@@ -178,37 +178,37 @@ impl Runtime {
 
     /// Returns the configuration.
     #[must_use]
-    pub fn config(&self) -> &Config {
+    pub const fn config(&self) -> &Config {
         &self.config
     }
 
     /// Returns the event bus.
     #[must_use]
-    pub fn event_bus(&self) -> &EventBus {
+    pub const fn event_bus(&self) -> &EventBus {
         &self.event_bus
     }
 
     /// Returns the VM manager.
     #[must_use]
-    pub fn vm_manager(&self) -> &Arc<VmManager> {
+    pub const fn vm_manager(&self) -> &Arc<VmManager> {
         &self.vm_manager
     }
 
     /// Returns the machine manager.
     #[must_use]
-    pub fn machine_manager(&self) -> &Arc<MachineManager> {
+    pub const fn machine_manager(&self) -> &Arc<MachineManager> {
         &self.machine_manager
     }
 
     /// Returns the network manager.
     #[must_use]
-    pub fn network_manager(&self) -> &Arc<NetworkManager> {
+    pub const fn network_manager(&self) -> &Arc<NetworkManager> {
         &self.network_manager
     }
 
     /// Returns the VM lifecycle manager.
     #[must_use]
-    pub fn vm_lifecycle(&self) -> &Arc<VmLifecycleManager> {
+    pub const fn vm_lifecycle(&self) -> &Arc<VmLifecycleManager> {
         &self.vm_lifecycle
     }
 
@@ -220,7 +220,7 @@ impl Runtime {
 
     /// Returns the configured guest Docker vsock port.
     #[must_use]
-    pub fn guest_docker_vsock_port(&self) -> u32 {
+    pub const fn guest_docker_vsock_port(&self) -> u32 {
         self.config.container.guest_docker_vsock_port
     }
 
@@ -241,14 +241,14 @@ impl Runtime {
 
     /// Returns the default machine name used for automatic VM lifecycle.
     #[must_use]
-    pub fn default_machine_name(&self) -> &'static str {
+    pub const fn default_machine_name(&self) -> &'static str {
         DEFAULT_MACHINE_NAME
     }
 
     /// Gets an agent client for a machine.
     ///
     /// On macOS, this uses the hypervisor layer to establish vsock connections.
-    /// On Linux, it creates a direct AF_VSOCK connection.
+    /// On Linux, it creates a direct `AF_VSOCK` connection.
     ///
     /// # Errors
     /// Returns an error if the machine is not found or connection fails.
@@ -459,7 +459,7 @@ impl Runtime {
         }
     }
 
-    /// macOS: add inbound rules via InboundListenerManager.
+    /// macOS: add inbound rules via `InboundListenerManager`.
     #[cfg(target_os = "macos")]
     async fn start_port_forwarding_macos(
         &self,
@@ -508,19 +508,16 @@ impl Runtime {
 
             let host_ip: Ipv4Addr = if host_ip_str.is_empty() || host_ip_str == "0.0.0.0" {
                 Ipv4Addr::UNSPECIFIED
+            } else if let Ok(ip) = host_ip_str.parse() {
+                ip
             } else {
-                match host_ip_str.parse() {
-                    Ok(ip) => ip,
-                    Err(_) => {
-                        tracing::warn!(
-                            "Skipping inbound rule: invalid HostIp '{}' for port {}:{}",
-                            host_ip_str,
-                            host_port,
-                            protocol,
-                        );
-                        continue;
-                    }
-                }
+                tracing::warn!(
+                    "Skipping inbound rule: invalid HostIp '{}' for port {}:{}",
+                    host_ip_str,
+                    host_port,
+                    protocol,
+                );
+                continue;
             };
 
             let mut guard = self.inbound_listener.write().await;

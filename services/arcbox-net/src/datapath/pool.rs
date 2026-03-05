@@ -308,7 +308,7 @@ impl PacketPool {
                 unsafe {
                     (*self.buffers[head as usize].get())
                         .refcount
-                        .store(1, Ordering::Release)
+                        .store(1, Ordering::Release);
                 };
                 return Some(head);
             }

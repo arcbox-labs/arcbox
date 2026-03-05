@@ -331,7 +331,7 @@ pub unsafe fn cfnumber_from_i64(value: i64) -> CFNumberRef {
         CFNumberCreate(
             kCFAllocatorDefault,
             CFNumberType::SInt64,
-            &value as *const _ as *const c_void,
+            (&raw const value).cast::<c_void>(),
         )
     }
 }

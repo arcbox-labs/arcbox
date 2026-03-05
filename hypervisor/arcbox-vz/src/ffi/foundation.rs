@@ -1,4 +1,4 @@
-//! Foundation framework helpers (NSString, NSURL, NSArray, etc.)
+//! Foundation framework helpers (`NSString`, NSURL, `NSArray`, etc.)
 
 use objc2::runtime::AnyObject;
 use std::ffi::c_void;
@@ -10,7 +10,7 @@ use crate::msg_send;
 // NSString
 // ============================================================================
 
-/// Creates an NSString from a Rust string.
+/// Creates an `NSString` from a Rust string.
 pub fn nsstring(s: &str) -> *mut AnyObject {
     unsafe {
         let cls = get_class("NSString").expect("NSString class not found");
@@ -28,7 +28,7 @@ pub fn nsstring(s: &str) -> *mut AnyObject {
     }
 }
 
-/// Gets NSString contents as a Rust String.
+/// Gets `NSString` contents as a Rust String.
 pub fn nsstring_to_string(obj: *mut AnyObject) -> String {
     if obj.is_null() {
         return String::new();
@@ -79,7 +79,7 @@ pub fn nsurl_file_path(path: &str) -> *mut AnyObject {
 // NSArray
 // ============================================================================
 
-/// Creates an NSArray from raw pointers.
+/// Creates an `NSArray` from raw pointers.
 pub fn nsarray(objects: &[*mut AnyObject]) -> *mut AnyObject {
     unsafe {
         let cls = get_class("NSArray").expect("NSArray class not found");
@@ -94,7 +94,7 @@ pub fn nsarray(objects: &[*mut AnyObject]) -> *mut AnyObject {
     }
 }
 
-/// Gets the count of an NSArray.
+/// Gets the count of an `NSArray`.
 pub fn nsarray_count(array: *mut AnyObject) -> usize {
     if array.is_null() {
         return 0;
@@ -107,7 +107,7 @@ pub fn nsarray_count(array: *mut AnyObject) -> usize {
     }
 }
 
-/// Gets an object from an NSArray at index.
+/// Gets an object from an `NSArray` at index.
 pub fn nsarray_object_at_index(array: *mut AnyObject, index: usize) -> *mut AnyObject {
     if array.is_null() {
         return std::ptr::null_mut();
@@ -129,7 +129,7 @@ pub fn nsarray_object_at_index(array: *mut AnyObject, index: usize) -> *mut AnyO
 
 /// Creates a file handle for a file descriptor.
 ///
-/// Uses `initWithFileDescriptor:closeOnDealloc:NO` to prevent NSFileHandle
+/// Uses `initWithFileDescriptor:closeOnDealloc:NO` to prevent `NSFileHandle`
 /// from closing the fd when deallocated.
 pub fn file_handle_for_fd(fd: i32) -> *mut AnyObject {
     unsafe {

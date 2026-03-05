@@ -109,7 +109,7 @@ impl UdpProxy {
             flow_key,
             UdpFlow {
                 last_active: Instant::now(),
-                payload_tx: payload_tx.clone(),
+                payload_tx,
             },
         );
 
@@ -184,7 +184,9 @@ impl UdpProxy {
 
     /// Removes flows inactive for more than 60 seconds.
     fn cleanup_stale_flows(&mut self) {
-        let cutoff = Instant::now() - std::time::Duration::from_secs(60);
+        let cutoff = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .unwrap();
         self.flows.retain(|_, flow| flow.last_active > cutoff);
     }
 }

@@ -43,8 +43,7 @@ fn allocate_memory(size: u64) -> Result<*mut u8, HypervisorError> {
         if ptr == libc::MAP_FAILED {
             let errno = *libc::__error();
             return Err(HypervisorError::MemoryError(format!(
-                "mmap failed: errno={}",
-                errno
+                "mmap failed: errno={errno}"
             )));
         }
 
@@ -87,7 +86,7 @@ pub struct DarwinMemory {
     total_size: u64,
     /// Whether dirty page tracking is enabled.
     dirty_tracking_enabled: std::sync::atomic::AtomicBool,
-    /// Page checksums for dirty tracking (guest_addr -> checksum).
+    /// Page checksums for dirty tracking (`guest_addr` -> checksum).
     /// Only populated when dirty tracking is enabled.
     page_checksums: RwLock<HashMap<u64, u64>>,
 }
@@ -262,8 +261,7 @@ impl DarwinMemory {
         }
 
         Err(HypervisorError::MemoryError(format!(
-            "Address {} not mapped",
-            addr
+            "Address {addr} not mapped"
         )))
     }
 

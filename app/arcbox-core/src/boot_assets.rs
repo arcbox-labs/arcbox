@@ -40,11 +40,13 @@ static LOCK: LazyLock<BootAssetsLock> =
 const DEFAULT_CDN_BASE_URL: &str = "https://boot.arcboxcdn.com";
 
 /// Boot asset version pinned by this daemon release.
+#[must_use]
 pub fn boot_asset_version() -> &'static str {
     &LOCK.version
 }
 
 /// CDN base URL resolved from lockfile (or default).
+#[must_use]
 pub fn boot_asset_cdn() -> &'static str {
     LOCK.cdn.as_deref().unwrap_or(DEFAULT_CDN_BASE_URL)
 }
@@ -95,6 +97,7 @@ impl Default for BootAssetConfig {
 
 impl BootAssetConfig {
     /// Creates config with an explicit cache directory.
+    #[must_use]
     pub fn with_cache_dir(cache_dir: PathBuf) -> Self {
         Self {
             cache_dir,
@@ -109,6 +112,7 @@ impl BootAssetConfig {
     }
 
     /// Returns the versioned cache directory (e.g. `~/.arcbox/boot/0.2.0`).
+    #[must_use]
     pub fn version_cache_dir(&self) -> PathBuf {
         self.cache_dir.join(&self.version)
     }
@@ -137,6 +141,7 @@ pub struct BootAssets {
 
 impl BootAssets {
     /// Default kernel command line for EROFS rootfs boot.
+    #[must_use]
     pub fn default_cmdline() -> String {
         "console=hvc0 root=/dev/vda ro rootfstype=erofs earlycon".to_string()
     }
@@ -185,7 +190,8 @@ impl BootAssetProvider {
     }
 
     /// Returns the configuration.
-    pub fn config(&self) -> &BootAssetConfig {
+    #[must_use]
+    pub const fn config(&self) -> &BootAssetConfig {
         &self.config
     }
 
@@ -248,6 +254,7 @@ impl BootAssetProvider {
 
     /// Returns true if the current version's boot assets are fully cached
     /// (manifest + kernel + rootfs all present).
+    #[must_use]
     pub fn is_cached(&self) -> bool {
         let dir = self.config.version_cache_dir();
         dir.join("manifest.json").exists()

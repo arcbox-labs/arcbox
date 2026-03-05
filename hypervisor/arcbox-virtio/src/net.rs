@@ -1,6 +1,6 @@
-//! VirtIO network device (virtio-net).
+//! `VirtIO` network device (virtio-net).
 //!
-//! Implements the VirtIO network device for Ethernet connectivity.
+//! Implements the `VirtIO` network device for Ethernet connectivity.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -54,7 +54,7 @@ impl NetConfig {
     }
 }
 
-/// VirtIO network header.
+/// `VirtIO` network header.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VirtioNetHeader {
@@ -135,7 +135,7 @@ impl VirtioNetHeader {
 /// Network packet.
 #[derive(Debug, Clone)]
 pub struct NetPacket {
-    /// VirtIO header.
+    /// `VirtIO` header.
     pub header: VirtioNetHeader,
     /// Packet data (Ethernet frame).
     pub data: Vec<u8>,
@@ -474,7 +474,7 @@ impl NetBackend for SocketBackend {
 impl LoopbackBackend {
     /// Creates a new loopback backend.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             packets: VecDeque::new(),
         }
@@ -519,7 +519,7 @@ pub enum NetStatus {
     Announce = 2,
 }
 
-/// VirtIO network device.
+/// `VirtIO` network device.
 pub struct VirtioNet {
     config: NetConfig,
     features: u64,
@@ -577,7 +577,7 @@ impl VirtioNet {
     pub const FEATURE_STATUS: u64 = 1 << 16;
     /// Feature: Multiple queues.
     pub const FEATURE_MQ: u64 = 1 << 22;
-    /// VirtIO 1.0 feature.
+    /// `VirtIO` 1.0 feature.
     pub const FEATURE_VERSION_1: u64 = 1 << 32;
 
     /// Creates a new network device.
@@ -621,24 +621,24 @@ impl VirtioNet {
 
     /// Returns the MAC address.
     #[must_use]
-    pub fn mac(&self) -> &[u8; 6] {
+    pub const fn mac(&self) -> &[u8; 6] {
         &self.config.mac
     }
 
     /// Returns TX statistics.
     #[must_use]
-    pub fn tx_stats(&self) -> (u64, u64) {
+    pub const fn tx_stats(&self) -> (u64, u64) {
         (self.tx_packets, self.tx_bytes)
     }
 
     /// Returns RX statistics.
     #[must_use]
-    pub fn rx_stats(&self) -> (u64, u64) {
+    pub const fn rx_stats(&self) -> (u64, u64) {
         (self.rx_packets, self.rx_bytes)
     }
 
     /// Sets the link status.
-    pub fn set_link_up(&mut self, up: bool) {
+    pub const fn set_link_up(&mut self, up: bool) {
         if up {
             self.status |= NetStatus::LinkUp as u16;
         } else {
@@ -648,7 +648,7 @@ impl VirtioNet {
 
     /// Returns whether the link is up.
     #[must_use]
-    pub fn is_link_up(&self) -> bool {
+    pub const fn is_link_up(&self) -> bool {
         self.status & (NetStatus::LinkUp as u16) != 0
     }
 
@@ -677,10 +677,10 @@ impl VirtioNet {
         if let Some(backend) = &self.backend {
             let mut backend = backend
                 .lock()
-                .map_err(|e| VirtioError::Io(format!("Failed to lock backend: {}", e)))?;
+                .map_err(|e| VirtioError::Io(format!("Failed to lock backend: {e}")))?;
             backend
                 .send(&packet)
-                .map_err(|e| VirtioError::Io(format!("Send failed: {}", e)))?;
+                .map_err(|e| VirtioError::Io(format!("Send failed: {e}")))?;
         }
 
         tracing::trace!("Net TX: {} bytes", packet.data.len());
@@ -744,13 +744,13 @@ impl VirtioNet {
         if let Some(backend) = &self.backend {
             let mut backend = backend
                 .lock()
-                .map_err(|e| VirtioError::Io(format!("Failed to lock backend: {}", e)))?;
+                .map_err(|e| VirtioError::Io(format!("Failed to lock backend: {e}")))?;
 
             while backend.has_data() {
                 let mut buf = vec![0u8; 65536];
                 let n = backend
                     .recv(&mut buf)
-                    .map_err(|e| VirtioError::Io(format!("Recv failed: {}", e)))?;
+                    .map_err(|e| VirtioError::Io(format!("Recv failed: {e}")))?;
 
                 if n > 0 {
                     buf.truncate(n);

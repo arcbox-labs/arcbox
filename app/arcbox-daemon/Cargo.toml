@@ -26,3 +26,6 @@ anyhow = { workspace = true }
 dirs = { workspace = true }
 macos-resolver = { workspace = true }
 libc = { workspace = true }
+
+[lints]
+workspace = true

@@ -5,7 +5,7 @@
 
 use crate::SplitDnsRule;
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io::{self};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -32,7 +32,7 @@ pub enum RecordType {
 }
 
 impl RecordType {
-    fn from_u16(value: u16) -> Option<Self> {
+    const fn from_u16(value: u16) -> Option<Self> {
         match value {
             1 => Some(Self::A),
             28 => Some(Self::AAAA),
@@ -111,6 +111,7 @@ struct CacheEntry {
 }
 
 /// DNS resolver with caching and split DNS support.
+#[allow(dead_code)]
 pub struct DnsResolver {
     /// Default DNS servers.
     default_servers: Vec<SocketAddr>,
@@ -147,7 +148,7 @@ impl DnsResolver {
     }
 
     /// Sets the query timeout.
-    pub fn set_timeout(&mut self, timeout: Duration) {
+    pub const fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
     }
 
@@ -217,7 +218,7 @@ impl DnsResolver {
         let servers = self.servers_for(hostname);
 
         // Try each server until one succeeds.
-        let mut last_error = io::Error::new(io::ErrorKind::Other, "No DNS servers available");
+        let mut last_error = io::Error::other("No DNS servers available");
 
         for server in servers {
             match self.query_server(&server, hostname, record_type) {
@@ -290,7 +291,7 @@ impl DnsResolver {
     /// Caches a DNS response.
     fn cache_response(&self, hostname: &str, record_type: RecordType, response: &DnsResponse) {
         // Determine TTL from response.
-        let ttl = response.answers.first().map(|r| r.ttl).unwrap_or(300);
+        let ttl = response.answers.first().map_or(300, |r| r.ttl);
 
         let entry = CacheEntry {
             response: response.clone(),
@@ -329,6 +330,7 @@ impl Default for DnsResolver {
 }
 
 /// Split DNS resolver (legacy API).
+#[allow(dead_code)]
 pub struct SplitDnsResolver {
     rules: Vec<SplitDnsRule>,
     default_servers: Vec<Ipv4Addr>,
@@ -337,7 +339,7 @@ pub struct SplitDnsResolver {
 impl SplitDnsResolver {
     /// Creates a new split DNS resolver.
     #[must_use]
-    pub fn new(default_servers: Vec<Ipv4Addr>) -> Self {
+    pub const fn new(default_servers: Vec<Ipv4Addr>) -> Self {
         Self {
             rules: Vec::new(),
             default_servers,
@@ -496,7 +498,7 @@ fn skip_name(data: &[u8], mut offset: usize) -> io::Result<usize> {
 fn read_name(data: &[u8], mut offset: usize) -> io::Result<(String, usize)> {
     let mut name = String::new();
     let mut jumped = false;
-    let original_offset = offset;
+    let _original_offset = offset;
     let mut final_offset = offset;
 
     loop {
@@ -598,7 +600,7 @@ fn parse_resource_record(data: &[u8], offset: usize) -> io::Result<(DnsRecord, u
             octets.copy_from_slice(rdata);
             DnsRecordData::AAAA(Ipv6Addr::from(octets))
         }
-        Some(RecordType::CNAME) | Some(RecordType::NS) | Some(RecordType::PTR) => {
+        Some(RecordType::CNAME | RecordType::NS | RecordType::PTR) => {
             let (name, _) = read_name(data, offset)?;
             match record_type {
                 Some(RecordType::CNAME) => DnsRecordData::CNAME(name),
@@ -614,8 +616,7 @@ fn parse_resource_record(data: &[u8], offset: usize) -> io::Result<(DnsRecord, u
         }
         Some(RecordType::TXT) if !rdata.is_empty() => {
             let txt_len = rdata[0] as usize;
-            let txt =
-                String::from_utf8_lossy(&rdata[1..1 + txt_len.min(rdata.len() - 1)]).to_string();
+            let txt = String::from_utf8_lossy(&rdata[1..=txt_len.min(rdata.len() - 1)]).to_string();
             DnsRecordData::TXT(txt)
         }
         Some(RecordType::SRV) if rdlength >= 6 => {

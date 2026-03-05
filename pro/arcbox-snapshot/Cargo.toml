@@ -25,3 +25,6 @@ nix = { workspace = true }
 [features]
 default = []
 criu = []
+
+[lints]
+workspace = true

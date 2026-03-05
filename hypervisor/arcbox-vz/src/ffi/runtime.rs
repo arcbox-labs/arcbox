@@ -10,6 +10,7 @@ use super::ensure_framework_loaded;
 // ============================================================================
 
 /// Gets an Objective-C class by name.
+#[must_use]
 pub fn get_class(name: &str) -> Option<&'static AnyClass> {
     ensure_framework_loaded();
     let name_cstr = std::ffi::CString::new(name).ok()?;

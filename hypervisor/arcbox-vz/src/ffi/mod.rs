@@ -103,7 +103,7 @@ pub fn min_memory_size() -> u64 {
 // Error Handling
 // ============================================================================
 
-/// Extracts error information from an NSError object.
+/// Extracts error information from an `NSError` object.
 pub fn extract_nserror(error: *mut AnyObject) -> VZError {
     if error.is_null() {
         return VZError::Internal {

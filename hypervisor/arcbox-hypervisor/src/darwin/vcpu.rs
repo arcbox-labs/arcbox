@@ -29,7 +29,7 @@ use crate::{
 /// trait, but the actual execution model is different:
 ///
 /// - **Managed execution**: The VM's vCPUs run automatically after `VZVirtualMachine.start()`
-/// - **run() semantics**: Instead of executing guest code, `run()` waits for VM state changes
+/// - **`run()` semantics**: Instead of executing guest code, `run()` waits for VM state changes
 /// - **No register access**: Virtualization.framework doesn't expose vCPU registers
 ///
 /// For code that needs to distinguish between managed and manual execution,
@@ -37,12 +37,12 @@ use crate::{
 pub struct DarwinVcpu {
     /// vCPU ID.
     id: u32,
-    /// Whether the vCPU's run() method is currently blocking.
+    /// Whether the vCPU's `run()` method is currently blocking.
     running: Arc<AtomicBool>,
     /// Current register state (cached, not synced with actual vCPU).
     /// Note: Virtualization.framework doesn't expose register access.
     regs: Registers,
-    /// Raw pointer to the VZVirtualMachine for state queries.
+    /// Raw pointer to the `VZVirtualMachine` for state queries.
     /// This is safe to read from any thread (state property is thread-safe).
     vz_vm: *mut AnyObject,
 }
@@ -56,6 +56,7 @@ impl DarwinVcpu {
     ///
     /// For managed execution VMs (Virtualization.framework), use `new_managed()`
     /// to pass the VM pointer for state queries.
+    #[allow(dead_code)]
     pub(crate) fn new(id: u32) -> Self {
         Self {
             id,
@@ -109,12 +110,12 @@ impl DarwinVcpu {
     }
 
     /// Sets the instruction pointer.
-    pub fn set_instruction_pointer(&mut self, ip: u64) {
+    pub const fn set_instruction_pointer(&mut self, ip: u64) {
         self.regs.rip = ip;
     }
 
     /// Sets the stack pointer.
-    pub fn set_stack_pointer(&mut self, sp: u64) {
+    pub const fn set_stack_pointer(&mut self, sp: u64) {
         self.regs.rsp = sp;
     }
 
@@ -189,13 +190,12 @@ impl Vcpu for DarwinVcpu {
         tracing::debug!("vCPU {} entering managed execution wait loop", self.id);
 
         loop {
-            let state = match self.query_vm_state() {
-                Some(s) => s,
-                None => {
-                    // VM pointer became invalid
-                    self.running.store(false, Ordering::SeqCst);
-                    return Ok(VcpuExit::Halt);
-                }
+            let state = if let Some(s) = self.query_vm_state() {
+                s
+            } else {
+                // VM pointer became invalid
+                self.running.store(false, Ordering::SeqCst);
+                return Ok(VcpuExit::Halt);
             };
 
             match state {

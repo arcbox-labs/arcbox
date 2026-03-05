@@ -6,8 +6,8 @@
 use std::any::Any;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::device::DeviceManager;
@@ -29,15 +29,13 @@ use arcbox_hypervisor::linux::VirtioDeviceInfo;
 #[cfg(target_os = "macos")]
 use tokio_util::sync::CancellationToken;
 
-#[cfg(target_arch = "aarch64")]
-use crate::boot::arm64;
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 use crate::fdt::{FdtConfig, generate_fdt};
 
 /// Type-erased VM handle for managed execution mode.
 type ManagedVm = Box<dyn Any + Send + Sync>;
 
-/// Shared directory configuration for VirtioFS.
+/// Shared directory configuration for `VirtioFS`.
 #[derive(Debug, Clone)]
 pub struct SharedDirConfig {
     /// Host path to share.
@@ -48,7 +46,7 @@ pub struct SharedDirConfig {
     pub read_only: bool,
 }
 
-/// Block device configuration for VirtIO block devices.
+/// Block device configuration for `VirtIO` block devices.
 #[derive(Debug, Clone)]
 pub struct BlockDeviceConfig {
     /// Path to the disk image file on the host.
@@ -76,7 +74,7 @@ pub struct VmmConfig {
     pub serial_console: bool,
     /// Enable virtio-console.
     pub virtio_console: bool,
-    /// Shared directories for VirtioFS.
+    /// Shared directories for `VirtioFS`.
     pub shared_dirs: Vec<SharedDirConfig>,
     /// Enable networking.
     pub networking: bool,
@@ -116,7 +114,7 @@ impl Default for VmmConfig {
 }
 
 impl VmmConfig {
-    /// Creates a VmConfig for the hypervisor from this VMM config.
+    /// Creates a `VmConfig` for the hypervisor from this VMM config.
     fn to_vm_config(&self) -> VmConfig {
         let mut builder = VmConfig::builder()
             .vcpu_count(self.vcpu_count)
@@ -200,7 +198,7 @@ pub struct Vmm {
     /// Cancellation token for the network datapath task (Darwin only).
     #[cfg(target_os = "macos")]
     net_cancel: Option<CancellationToken>,
-    /// VZ side network fd for VZFileHandleNetworkDeviceAttachment lifecycle.
+    /// VZ side network fd for `VZFileHandleNetworkDeviceAttachment` lifecycle.
     /// Kept open while the VM is running and closed on stop.
     #[cfg(target_os = "macos")]
     net_vz_fd: Option<OwnedFd>,
@@ -265,7 +263,7 @@ impl Vmm {
 
     /// Returns the current VMM state.
     #[must_use]
-    pub fn state(&self) -> VmmState {
+    pub const fn state(&self) -> VmmState {
         self.state
     }
 
@@ -283,7 +281,7 @@ impl Vmm {
 
     /// Returns a mutable reference to the inbound listener manager (Darwin only).
     #[cfg(target_os = "macos")]
-    pub fn inbound_listener_manager(
+    pub const fn inbound_listener_manager(
         &mut self,
     ) -> Option<&mut arcbox_net::darwin::inbound_relay::InboundListenerManager> {
         self.inbound_listener_manager.as_mut()
@@ -294,7 +292,7 @@ impl Vmm {
     /// After this call, the VMM no longer owns the manager. The caller is
     /// responsible for calling `stop_all()` on shutdown.
     #[cfg(target_os = "macos")]
-    pub fn take_inbound_listener_manager(
+    pub const fn take_inbound_listener_manager(
         &mut self,
     ) -> Option<arcbox_net::darwin::inbound_relay::InboundListenerManager> {
         self.inbound_listener_manager.take()
@@ -516,14 +514,14 @@ impl Vmm {
                 vz_fd.as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_SNDBUF,
-                &buf_size as *const libc::c_int as *const libc::c_void,
+                (&raw const buf_size).cast::<libc::c_void>(),
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
             libc::setsockopt(
                 vz_fd.as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_RCVBUF,
-                &buf_size as *const libc::c_int as *const libc::c_void,
+                (&raw const buf_size).cast::<libc::c_void>(),
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
         }
@@ -792,10 +790,8 @@ impl Vmm {
             {
                 self.pause_managed_vm()?;
             }
-        } else {
-            if let Some(ref mut vcpu_manager) = self.vcpu_manager {
-                vcpu_manager.pause()?;
-            }
+        } else if let Some(ref mut vcpu_manager) = self.vcpu_manager {
+            vcpu_manager.pause()?;
         }
 
         self.state = VmmState::Paused;
@@ -837,10 +833,8 @@ impl Vmm {
             {
                 self.resume_managed_vm()?;
             }
-        } else {
-            if let Some(ref mut vcpu_manager) = self.vcpu_manager {
-                vcpu_manager.resume()?;
-            }
+        } else if let Some(ref mut vcpu_manager) = self.vcpu_manager {
+            vcpu_manager.resume()?;
         }
 
         self.state = VmmState::Running;
@@ -1061,13 +1055,13 @@ impl Vmm {
     ///
     /// This is the maximum memory the guest can use when the balloon is fully deflated.
     #[must_use]
-    pub fn configured_memory(&self) -> u64 {
+    pub const fn configured_memory(&self) -> u64 {
         self.config.memory_size
     }
 
     /// Returns whether a balloon device is configured for this VM.
     #[must_use]
-    pub fn has_balloon(&self) -> bool {
+    pub const fn has_balloon(&self) -> bool {
         self.config.balloon
     }
 
@@ -1185,7 +1179,6 @@ impl Vmm {
     /// Handles an event from the event loop.
     fn handle_event(&mut self, event: crate::event::VmmEvent) -> Result<()> {
         use crate::event::VmmEvent;
-        use arcbox_hypervisor::VcpuExit;
 
         match event {
             VmmEvent::VcpuExit { vcpu_id, exit } => {

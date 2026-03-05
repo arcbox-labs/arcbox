@@ -281,7 +281,7 @@ fn run_interactive_console(vm: &mut arcbox_hypervisor::darwin::DarwinVm) {
             revents: 0,
         };
 
-        let poll_result = unsafe { libc::poll(&mut pollfd, 1, 10) }; // 10ms timeout
+        let poll_result = unsafe { libc::poll(&raw mut pollfd, 1, 10) }; // 10ms timeout
 
         if poll_result > 0 && (pollfd.revents & libc::POLLIN) != 0 {
             match stdin.read(&mut input_buf) {
@@ -410,7 +410,7 @@ fn setup_raw_mode() -> libc::termios {
         raw.c_cc[libc::VMIN] = 0;
         raw.c_cc[libc::VTIME] = 0;
 
-        libc::tcsetattr(0, libc::TCSANOW, &raw);
+        libc::tcsetattr(0, libc::TCSANOW, &raw const raw);
 
         original
     }
@@ -419,6 +419,6 @@ fn setup_raw_mode() -> libc::termios {
 #[cfg(target_os = "macos")]
 fn restore_terminal(original: libc::termios) {
     unsafe {
-        libc::tcsetattr(0, libc::TCSANOW, &original);
+        libc::tcsetattr(0, libc::TCSANOW, &raw const original);
     }
 }

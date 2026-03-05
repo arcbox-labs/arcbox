@@ -124,7 +124,7 @@ impl NetworkDatapath {
     ///
     /// Returns an error if the AsyncFd registration fails.
     pub async fn run(self) -> io::Result<()> {
-        let NetworkDatapath {
+        let Self {
             guest_fd,
             mut socket_proxy,
             mut reply_rx,
@@ -200,7 +200,7 @@ impl NetworkDatapath {
             tokio::select! {
                 biased;
 
-                _ = cancel.cancelled() => {
+                () = cancel.cancelled() => {
                     tracing::info!("Network datapath shutting down");
                     break;
                 }
@@ -751,6 +751,7 @@ fn write_to_guest(guest_async: &AsyncFd<FdWrapper>, data: &[u8]) {
 }
 
 /// Reads from a file descriptor into `buf`, returning number of bytes read.
+#[allow(dead_code)]
 fn fd_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     // SAFETY: reading into our buffer from a valid fd.
     let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };

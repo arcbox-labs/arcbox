@@ -126,7 +126,7 @@ pub fn prefetch_write<T>(ptr: *mut T) {
 /// Checks if a value is a power of 2.
 #[inline]
 pub const fn is_power_of_two(n: usize) -> bool {
-    n != 0 && (n & (n - 1)) == 0
+    n != 0 && n.is_power_of_two()
 }
 
 /// Rounds up to the next power of 2.

@@ -220,7 +220,7 @@ impl ExecManager {
 
     /// Starts an exec instance.
     ///
-    /// Sends an ExecStartRequest to the agent and waits for completion.
+    /// Sends an `ExecStartRequest` to the agent and waits for completion.
     /// If detach=true, returns immediately after the process starts.
     ///
     /// # Arguments
@@ -289,7 +289,7 @@ impl ExecManager {
         // Send request to agent if connected.
         let result = if let Some(ref agent) = self.agent {
             agent.exec_start(params).await.map_err(|e| {
-                crate::ContainerError::Runtime(format!("agent exec_start failed: {}", e))
+                crate::ContainerError::Runtime(format!("agent exec_start failed: {e}"))
             })?
         } else {
             // No agent - return empty result (for testing without VM).
@@ -361,7 +361,7 @@ impl ExecManager {
                 .exec_resize(&id.to_string(), width, height)
                 .await
                 .map_err(|e| {
-                    crate::ContainerError::Runtime(format!("agent exec_resize failed: {}", e))
+                    crate::ContainerError::Runtime(format!("agent exec_resize failed: {e}"))
                 })?;
         }
 

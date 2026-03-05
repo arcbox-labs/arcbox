@@ -1,15 +1,15 @@
 //! Device management for VMM.
 //!
-//! This module provides device management including VirtIO MMIO transport.
+//! This module provides device management including `VirtIO` MMIO transport.
 //!
 //! The device manager bridges between:
 //! - MMIO transport layer (`VirtioMmioState`) that handles guest MMIO accesses
-//! - VirtIO device implementations (`VirtioDevice`) from arcbox-virtio
+//! - `VirtIO` device implementations (`VirtioDevice`) from arcbox-virtio
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use arcbox_virtio::{DeviceStatus, VirtioDevice, VirtioDeviceId};
+use arcbox_virtio::{DeviceStatus, VirtioDevice};
 
 use crate::error::{Result, VmmError};
 use crate::irq::{Irq, IrqChip};
@@ -38,15 +38,15 @@ impl DeviceId {
 pub enum DeviceType {
     /// Serial port.
     Serial,
-    /// VirtIO block device.
+    /// `VirtIO` block device.
     VirtioBlock,
-    /// VirtIO network device.
+    /// `VirtIO` network device.
     VirtioNet,
-    /// VirtIO console.
+    /// `VirtIO` console.
     VirtioConsole,
-    /// VirtIO filesystem.
+    /// `VirtIO` filesystem.
     VirtioFs,
-    /// VirtIO vsock.
+    /// `VirtIO` vsock.
     VirtioVsock,
     /// Other device.
     Other,
@@ -69,13 +69,13 @@ pub struct DeviceInfo {
     pub irq: Option<Irq>,
 }
 
-/// VirtIO MMIO transport registers.
+/// `VirtIO` MMIO transport registers.
 ///
-/// Based on VirtIO 1.1 specification.
+/// Based on `VirtIO` 1.1 specification.
 pub mod virtio_mmio {
     /// Magic value ("virt").
     pub const MAGIC_VALUE: u32 = 0x74726976;
-    /// VirtIO version (legacy: 1, modern: 2).
+    /// `VirtIO` version (legacy: 1, modern: 2).
     pub const VERSION: u32 = 2;
     /// Vendor ID.
     pub const VENDOR_ID: u32 = 0x554D4551; // "QEMU"
@@ -136,7 +136,7 @@ pub mod virtio_mmio {
     pub const MMIO_SIZE: u64 = 0x200;
 }
 
-/// VirtIO MMIO device state.
+/// `VirtIO` MMIO device state.
 pub struct VirtioMmioState {
     /// Device type ID.
     pub device_id: u32,
@@ -169,9 +169,9 @@ pub struct VirtioMmioState {
 }
 
 impl VirtioMmioState {
-    /// Creates a new VirtIO MMIO state.
+    /// Creates a new `VirtIO` MMIO state.
     #[must_use]
-    pub fn new(device_id: u32, features: u64) -> Self {
+    pub const fn new(device_id: u32, features: u64) -> Self {
         Self {
             device_id,
             device_features: features,
@@ -216,7 +216,7 @@ impl VirtioMmioState {
                 }
             }
             regs::INTERRUPT_STATUS => self.interrupt_status,
-            regs::STATUS => self.status as u32,
+            regs::STATUS => u32::from(self.status),
             regs::CONFIG_GENERATION => self.config_generation,
             _ => {
                 tracing::trace!("VirtIO MMIO read unknown offset: {:#x}", offset);
@@ -319,7 +319,7 @@ impl VirtioMmioState {
     }
 
     /// Triggers an interrupt.
-    pub fn trigger_interrupt(&mut self, reason: u32) {
+    pub const fn trigger_interrupt(&mut self, reason: u32) {
         self.interrupt_status |= reason;
     }
 }
@@ -333,11 +333,11 @@ pub trait MmioDevice: Send + Sync {
     fn mmio_write(&mut self, offset: u64, size: usize, value: u64);
 }
 
-/// A registered device with MMIO state and VirtIO device implementation.
+/// A registered device with MMIO state and `VirtIO` device implementation.
 struct RegisteredDevice {
     info: DeviceInfo,
     mmio_state: Option<Arc<RwLock<VirtioMmioState>>>,
-    /// The actual VirtIO device implementation.
+    /// The actual `VirtIO` device implementation.
     virtio_device: Option<Arc<Mutex<dyn VirtioDevice>>>,
 }
 
@@ -394,9 +394,9 @@ impl DeviceManager {
         Ok(id)
     }
 
-    /// Registers a VirtIO device with MMIO transport (without actual device).
+    /// Registers a `VirtIO` device with MMIO transport (without actual device).
     ///
-    /// Use `register_virtio_device` to register with an actual VirtIO device implementation.
+    /// Use `register_virtio_device` to register with an actual `VirtIO` device implementation.
     ///
     /// # Errors
     ///
@@ -452,9 +452,9 @@ impl DeviceManager {
         Ok(id)
     }
 
-    /// Registers a VirtIO device with MMIO transport and device implementation.
+    /// Registers a `VirtIO` device with MMIO transport and device implementation.
     ///
-    /// This is the preferred method for registering VirtIO devices as it connects
+    /// This is the preferred method for registering `VirtIO` devices as it connects
     /// the MMIO transport layer with the actual device logic.
     ///
     /// # Errors
@@ -527,7 +527,7 @@ impl DeviceManager {
         self.devices.get(&id).and_then(|d| d.mmio_state.clone())
     }
 
-    /// Gets the VirtIO device for a device ID.
+    /// Gets the `VirtIO` device for a device ID.
     #[must_use]
     pub fn get_virtio_device(&self, id: DeviceId) -> Option<Arc<Mutex<dyn VirtioDevice>>> {
         self.devices.get(&id).and_then(|d| d.virtio_device.clone())
@@ -547,7 +547,7 @@ impl DeviceManager {
         if let Some(state) = &device.mmio_state {
             let mut state = state
                 .write()
-                .map_err(|e| VmmError::Device(format!("Failed to lock device state: {}", e)))?;
+                .map_err(|e| VmmError::Device(format!("Failed to lock device state: {e}")))?;
             state.trigger_interrupt(reason);
         }
 
@@ -575,7 +575,7 @@ impl DeviceManager {
     pub fn handle_mmio_read(&self, addr: u64, size: usize) -> Result<u64> {
         let device_id = self
             .find_by_mmio(addr)
-            .ok_or_else(|| VmmError::Device(format!("No device at MMIO address {:#x}", addr)))?;
+            .ok_or_else(|| VmmError::Device(format!("No device at MMIO address {addr:#x}")))?;
 
         let device = self
             .devices
@@ -588,14 +588,14 @@ impl DeviceManager {
         if let Some(state) = &device.mmio_state {
             let state = state
                 .read()
-                .map_err(|e| VmmError::Device(format!("Failed to lock device state: {}", e)))?;
+                .map_err(|e| VmmError::Device(format!("Failed to lock device state: {e}")))?;
 
             // Handle config space reads - forward to actual device
             if offset >= virtio_mmio::regs::CONFIG {
                 let config_offset = offset - virtio_mmio::regs::CONFIG;
                 if let Some(virtio_dev) = &device.virtio_device {
                     let dev = virtio_dev.lock().map_err(|e| {
-                        VmmError::Device(format!("Failed to lock virtio device: {}", e))
+                        VmmError::Device(format!("Failed to lock virtio device: {e}"))
                     })?;
                     let mut data = vec![0u8; size];
                     dev.read_config(config_offset, &mut data);
@@ -634,7 +634,7 @@ impl DeviceManager {
     pub fn handle_mmio_write(&self, addr: u64, size: usize, value: u64) -> Result<()> {
         let device_id = self
             .find_by_mmio(addr)
-            .ok_or_else(|| VmmError::Device(format!("No device at MMIO address {:#x}", addr)))?;
+            .ok_or_else(|| VmmError::Device(format!("No device at MMIO address {addr:#x}")))?;
 
         let device = self
             .devices
@@ -648,7 +648,7 @@ impl DeviceManager {
             let old_status = {
                 let s = state
                     .read()
-                    .map_err(|e| VmmError::Device(format!("Failed to lock device state: {}", e)))?;
+                    .map_err(|e| VmmError::Device(format!("Failed to lock device state: {e}")))?;
                 s.status
             };
 
@@ -657,7 +657,7 @@ impl DeviceManager {
                 let config_offset = offset - virtio_mmio::regs::CONFIG;
                 if let Some(virtio_dev) = &device.virtio_device {
                     let mut dev = virtio_dev.lock().map_err(|e| {
-                        VmmError::Device(format!("Failed to lock virtio device: {}", e))
+                        VmmError::Device(format!("Failed to lock virtio device: {e}"))
                     })?;
                     let data: Vec<u8> = match size {
                         1 => vec![value as u8],
@@ -682,7 +682,7 @@ impl DeviceManager {
             {
                 let mut state = state
                     .write()
-                    .map_err(|e| VmmError::Device(format!("Failed to lock device state: {}", e)))?;
+                    .map_err(|e| VmmError::Device(format!("Failed to lock device state: {e}")))?;
                 state.write(offset, value32);
             }
 
@@ -697,10 +697,10 @@ impl DeviceManager {
                     {
                         if let Some(virtio_dev) = &device.virtio_device {
                             let mmio_state = state.read().map_err(|e| {
-                                VmmError::Device(format!("Failed to lock device state: {}", e))
+                                VmmError::Device(format!("Failed to lock device state: {e}"))
                             })?;
                             let mut dev = virtio_dev.lock().map_err(|e| {
-                                VmmError::Device(format!("Failed to lock virtio device: {}", e))
+                                VmmError::Device(format!("Failed to lock virtio device: {e}"))
                             })?;
                             dev.ack_features(mmio_state.driver_features);
                             tracing::debug!(
@@ -717,10 +717,10 @@ impl DeviceManager {
                     {
                         if let Some(virtio_dev) = &device.virtio_device {
                             let mut dev = virtio_dev.lock().map_err(|e| {
-                                VmmError::Device(format!("Failed to lock virtio device: {}", e))
+                                VmmError::Device(format!("Failed to lock virtio device: {e}"))
                             })?;
                             dev.activate().map_err(|e| {
-                                VmmError::Device(format!("Failed to activate device: {}", e))
+                                VmmError::Device(format!("Failed to activate device: {e}"))
                             })?;
                             tracing::info!("Device {} activated", device_id.0);
                         }
@@ -730,7 +730,7 @@ impl DeviceManager {
                     if new_status == 0 {
                         if let Some(virtio_dev) = &device.virtio_device {
                             let mut dev = virtio_dev.lock().map_err(|e| {
-                                VmmError::Device(format!("Failed to lock virtio device: {}", e))
+                                VmmError::Device(format!("Failed to lock virtio device: {e}"))
                             })?;
                             dev.reset();
                             tracing::info!("Device {} reset", device_id.0);
@@ -753,7 +753,7 @@ impl DeviceManager {
         self.devices.values().map(|d| &d.info)
     }
 
-    /// Returns device tree entries for all VirtIO devices.
+    /// Returns device tree entries for all `VirtIO` devices.
     #[must_use]
     pub fn device_tree_entries(&self) -> Vec<DeviceTreeEntry> {
         self.devices

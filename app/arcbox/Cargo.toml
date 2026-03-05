@@ -28,3 +28,6 @@ default = []
 full = ["pro"]
 # Pro features (BSL-1.1 licensed)
 pro = []
+
+[lints]
+workspace = true

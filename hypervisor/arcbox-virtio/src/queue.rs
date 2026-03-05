@@ -1,4 +1,4 @@
-//! VirtIO queue (virtqueue) implementation.
+//! `VirtIO` queue (virtqueue) implementation.
 //!
 //! This module provides the core virtqueue data structures used for
 //! communication between the guest driver and host device.
@@ -32,19 +32,19 @@ pub struct Descriptor {
 impl Descriptor {
     /// Checks if this descriptor has the NEXT flag.
     #[must_use]
-    pub fn has_next(&self) -> bool {
+    pub const fn has_next(&self) -> bool {
         self.flags & flags::NEXT != 0
     }
 
     /// Checks if this descriptor is write-only.
     #[must_use]
-    pub fn is_write_only(&self) -> bool {
+    pub const fn is_write_only(&self) -> bool {
         self.flags & flags::WRITE != 0
     }
 
     /// Checks if this descriptor is indirect.
     #[must_use]
-    pub fn is_indirect(&self) -> bool {
+    pub const fn is_indirect(&self) -> bool {
         self.flags & flags::INDIRECT != 0
     }
 }
@@ -111,7 +111,7 @@ impl UsedRing {
     }
 }
 
-/// VirtIO queue implementation.
+/// `VirtIO` queue implementation.
 #[derive(Debug)]
 pub struct VirtQueue {
     /// Queue size (number of descriptors).
@@ -159,18 +159,18 @@ impl VirtQueue {
 
     /// Returns the queue size.
     #[must_use]
-    pub fn size(&self) -> u16 {
+    pub const fn size(&self) -> u16 {
         self.size
     }
 
     /// Returns whether the queue is ready.
     #[must_use]
-    pub fn is_ready(&self) -> bool {
+    pub const fn is_ready(&self) -> bool {
         self.ready
     }
 
     /// Sets the queue ready state.
-    pub fn set_ready(&mut self, ready: bool) {
+    pub const fn set_ready(&mut self, ready: bool) {
         self.ready = ready;
     }
 
@@ -210,7 +210,7 @@ impl VirtQueue {
 
     /// Checks if there are available descriptors.
     #[must_use]
-    pub fn has_available(&self) -> bool {
+    pub const fn has_available(&self) -> bool {
         self.avail.idx != self.last_avail_idx
     }
 

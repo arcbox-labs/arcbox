@@ -27,7 +27,7 @@
 //!              └─────────────────┘
 //! ```
 
-use crate::boot_assets::{BootAssetConfig, BootAssetProvider, BootAssets};
+use crate::boot_assets::BootAssetProvider;
 use crate::error::{CoreError, Result};
 use crate::event::{Event, EventBus};
 use crate::machine::{MachineConfig, MachineInfo, MachineManager, MachineState};
@@ -41,7 +41,7 @@ use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -108,13 +108,13 @@ pub enum VmLifecycleState {
 impl VmLifecycleState {
     /// Returns true if VM is in a state where it can accept commands.
     #[must_use]
-    pub fn is_ready(&self) -> bool {
+    pub const fn is_ready(&self) -> bool {
         matches!(self, Self::Running | Self::Idle)
     }
 
     /// Returns true if VM needs to be started.
     #[must_use]
-    pub fn needs_start(&self) -> bool {
+    pub const fn needs_start(&self) -> bool {
         matches!(
             self,
             Self::NotExist | Self::Created | Self::Stopped | Self::Failed
@@ -123,7 +123,7 @@ impl VmLifecycleState {
 
     /// Returns the state name for logging.
     #[must_use]
-    pub fn as_str(&self) -> &'static str {
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::NotExist => "not_exist",
             Self::Creating => "creating",
@@ -161,7 +161,7 @@ pub enum VmEvent {
     Start,
     /// Agent became ready.
     AgentReady,
-    /// VM became idle (no activity for idle_timeout).
+    /// VM became idle (no activity for `idle_timeout`).
     IdleTimeout,
     /// Activity detected, exit idle state.
     Activity,
@@ -227,7 +227,7 @@ pub struct DefaultVmConfig {
     pub memory_mb: u64,
     /// Disk size in GB (default: 50).
     pub disk_gb: u64,
-    /// Path to kernel image (if None, use BootAssetProvider).
+    /// Path to kernel image (if None, use `BootAssetProvider`).
     pub kernel: Option<PathBuf>,
     /// Kernel command line.
     pub cmdline: Option<String>,
@@ -262,6 +262,7 @@ impl Default for DefaultVmConfig {
 ///
 /// Continuously monitors VM health via agent ping.
 /// Reports failures after consecutive failures exceed threshold.
+#[allow(dead_code)]
 pub struct HealthMonitor {
     /// Health check interval.
     interval: Duration,
@@ -275,6 +276,7 @@ pub struct HealthMonitor {
 
 impl HealthMonitor {
     /// Creates a new health monitor.
+    #[must_use]
     pub fn new(interval: Duration, max_failures: u32) -> Self {
         Self {
             interval,
@@ -366,7 +368,8 @@ pub struct RecoveryPolicy {
 
 impl RecoveryPolicy {
     /// Creates a new recovery policy.
-    pub fn new(max_retries: u32, backoff: BackoffStrategy) -> Self {
+    #[must_use]
+    pub const fn new(max_retries: u32, backoff: BackoffStrategy) -> Self {
         Self {
             max_retries,
             backoff,
@@ -453,8 +456,7 @@ impl VmLifecycleManager {
     fn virtio_block_device_path(index: usize) -> Result<String> {
         if index >= 26 {
             return Err(CoreError::config(format!(
-                "too many block devices configured: {}",
-                index
+                "too many block devices configured: {index}"
             )));
         }
         Ok(format!("/dev/vd{}", (b'a' + index as u8) as char))
@@ -806,7 +808,7 @@ impl VmLifecycleManager {
                 .any(|token| token.starts_with(GUEST_DOCKER_VSOCK_PORT_KEY))
             {
                 cmdline.push(' ');
-                cmdline.push_str(&format!("{}{port}", GUEST_DOCKER_VSOCK_PORT_KEY));
+                cmdline.push_str(&format!("{GUEST_DOCKER_VSOCK_PORT_KEY}{port}"));
             }
         }
 
@@ -1040,8 +1042,8 @@ impl VmLifecycleManager {
             let check_interval = Duration::from_secs(BALLOON_SHRINK_DELAY_SECS);
             loop {
                 tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = tokio::time::sleep(check_interval) => {}
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(check_interval) => {}
                 }
 
                 let state = *this.state.read().await;
@@ -1142,12 +1144,12 @@ impl VmLifecycleManager {
     }
 
     /// Returns the configuration.
-    pub fn config(&self) -> &VmLifecycleConfig {
+    pub const fn config(&self) -> &VmLifecycleConfig {
         &self.config
     }
 
     /// Returns the boot asset provider.
-    pub fn boot_assets(&self) -> &Arc<BootAssetProvider> {
+    pub const fn boot_assets(&self) -> &Arc<BootAssetProvider> {
         &self.boot_assets
     }
 
@@ -1158,7 +1160,7 @@ impl VmLifecycleManager {
     }
 
     /// Returns the health monitor.
-    pub fn health_monitor(&self) -> &Arc<HealthMonitor> {
+    pub const fn health_monitor(&self) -> &Arc<HealthMonitor> {
         &self.health_monitor
     }
 
@@ -1168,7 +1170,7 @@ impl VmLifecycleManager {
     }
 }
 
-fn is_not_found_error(err: &CoreError) -> bool {
+const fn is_not_found_error(err: &CoreError) -> bool {
     matches!(err, CoreError::Common(CommonError::NotFound(_)))
 }
 

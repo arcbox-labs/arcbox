@@ -265,7 +265,9 @@ impl InboundRelay {
 
     /// Removes expired UDP flows.
     pub(crate) fn cleanup(&mut self) {
-        let cutoff = Instant::now() - std::time::Duration::from_secs(60);
+        let cutoff = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .unwrap();
         self.udp_flows.retain(|_, flow| flow.last_active > cutoff);
     }
 }
@@ -394,7 +396,7 @@ async fn tcp_listener_task(
     loop {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => break,
+            () = cancel.cancelled() => break,
             result = listener.accept() => {
                 match result {
                     Ok((stream, peer)) => {
@@ -435,7 +437,7 @@ async fn udp_listener_task(
     loop {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => break,
+            () = cancel.cancelled() => break,
             result = socket.recv_from(&mut buf) => {
                 match result {
                     Ok((n, client_addr)) => {
@@ -483,7 +485,7 @@ fn create_udp_reply_flow(
         loop {
             tokio::select! {
                 biased;
-                _ = flow_cancel.cancelled() => break,
+                () = flow_cancel.cancelled() => break,
                 maybe_data = reply_rx.recv() => {
                     let Some(data) = maybe_data else {
                         break;

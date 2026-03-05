@@ -175,9 +175,10 @@ async fn execute_status(args: &DaemonArgs) -> Result<()> {
     let running = pid.is_some();
     let status = if running { "running" } else { "stopped" };
     let uptime = if running {
-        pid_file_uptime(&pid_file)
-            .map(|duration| format_duration(duration).to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+        pid_file_uptime(&pid_file).map_or_else(
+            || "unknown".to_string(),
+            |duration| format_duration(duration).to_string(),
+        )
     } else {
         "n/a".to_string()
     };
@@ -190,8 +191,7 @@ async fn execute_status(args: &DaemonArgs) -> Result<()> {
     println!("ArcBox daemon status: {status}");
     println!(
         "PID: {}",
-        pid.map(|value| value.to_string())
-            .unwrap_or_else(|| "n/a".to_string())
+        pid.map_or_else(|| "n/a".to_string(), |value| value.to_string())
     );
     println!("Docker socket: {}", docker_socket.display());
     println!("gRPC socket: {}", grpc_socket.display());
@@ -333,9 +333,10 @@ fn build_daemon_args(args: &DaemonArgs) -> Vec<OsString> {
 
 fn resolve_data_dir(data_dir: Option<&PathBuf>) -> PathBuf {
     data_dir.cloned().unwrap_or_else(|| {
-        dirs::home_dir()
-            .map(|home| home.join(".arcbox"))
-            .unwrap_or_else(|| PathBuf::from("/var/lib/arcbox"))
+        dirs::home_dir().map_or_else(
+            || PathBuf::from("/var/lib/arcbox"),
+            |home| home.join(".arcbox"),
+        )
     })
 }
 

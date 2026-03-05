@@ -18,7 +18,7 @@ pub struct GuestDockerBackend {
 
 impl GuestDockerBackend {
     #[must_use]
-    pub fn new(
+    pub const fn new(
         vm_lifecycle: Arc<VmLifecycleManager>,
         machine_manager: Arc<MachineManager>,
         machine_name: &'static str,
@@ -137,15 +137,13 @@ fn parse_vsock_endpoint_port(endpoint: &str) -> Option<u32> {
 fn validate_reported_vsock_endpoint(endpoint: &str, expected_port: u32) -> Result<()> {
     let endpoint_port = parse_vsock_endpoint_port(endpoint).ok_or_else(|| {
         CoreError::Machine(format!(
-            "guest runtime endpoint format invalid: '{}'; expected 'vsock:<port>'",
-            endpoint
+            "guest runtime endpoint format invalid: '{endpoint}'; expected 'vsock:<port>'"
         ))
     })?;
 
     if endpoint_port != expected_port {
         return Err(CoreError::Machine(format!(
-            "guest runtime endpoint mismatch: guest reports vsock:{} but host is configured for vsock:{}",
-            endpoint_port, expected_port
+            "guest runtime endpoint mismatch: guest reports vsock:{endpoint_port} but host is configured for vsock:{expected_port}"
         )));
     }
 

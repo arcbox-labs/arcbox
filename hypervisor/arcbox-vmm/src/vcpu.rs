@@ -29,15 +29,15 @@ pub trait ExitHandler: Send + Sync {
     fn handle_io_write(&self, port: u16, size: usize, data: u64);
 }
 
-/// Default exit handler that forwards to DeviceManager.
+/// Default exit handler that forwards to `DeviceManager`.
 pub struct DeviceManagerExitHandler {
     device_manager: Arc<RwLock<DeviceManager>>,
 }
 
 impl DeviceManagerExitHandler {
-    /// Creates a new exit handler wrapping a DeviceManager.
+    /// Creates a new exit handler wrapping a `DeviceManager`.
     #[must_use]
-    pub fn new(device_manager: Arc<RwLock<DeviceManager>>) -> Self {
+    pub const fn new(device_manager: Arc<RwLock<DeviceManager>>) -> Self {
         Self { device_manager }
     }
 }
@@ -136,6 +136,7 @@ pub struct VcpuManager {
 }
 
 /// Handle to a single vCPU thread.
+#[allow(dead_code)]
 struct VcpuHandle {
     /// vCPU ID.
     id: u32,
@@ -169,7 +170,7 @@ impl VcpuManager {
 
     /// Returns the number of vCPUs.
     #[must_use]
-    pub fn vcpu_count(&self) -> u32 {
+    pub const fn vcpu_count(&self) -> u32 {
         self.vcpu_count
     }
 
@@ -192,11 +193,11 @@ impl VcpuManager {
 
         // Create vCPU thread (but don't start yet)
         let thread = thread::Builder::new()
-            .name(format!("vcpu-{}", id))
+            .name(format!("vcpu-{id}"))
             .spawn(move || {
                 Self::vcpu_thread(id, vcpu, cmd_rx, running, exit_handler);
             })
-            .map_err(|e| VmmError::Vcpu(format!("failed to spawn vCPU thread: {}", e)))?;
+            .map_err(|e| VmmError::Vcpu(format!("failed to spawn vCPU thread: {e}")))?;
 
         self.handles.push(VcpuHandle {
             id,
@@ -349,7 +350,7 @@ impl VcpuManager {
             handle
                 .cmd_tx
                 .send(VcpuCommand::Run)
-                .map_err(|e| VmmError::Vcpu(format!("failed to send Run command: {}", e)))?;
+                .map_err(|e| VmmError::Vcpu(format!("failed to send Run command: {e}")))?;
         }
 
         tracing::info!("Started {} vCPUs", self.vcpu_count);
@@ -366,7 +367,7 @@ impl VcpuManager {
             handle
                 .cmd_tx
                 .send(VcpuCommand::Pause)
-                .map_err(|e| VmmError::Vcpu(format!("failed to send Pause command: {}", e)))?;
+                .map_err(|e| VmmError::Vcpu(format!("failed to send Pause command: {e}")))?;
         }
 
         tracing::info!("Paused {} vCPUs", self.vcpu_count);
@@ -383,7 +384,7 @@ impl VcpuManager {
             handle
                 .cmd_tx
                 .send(VcpuCommand::Resume)
-                .map_err(|e| VmmError::Vcpu(format!("failed to send Resume command: {}", e)))?;
+                .map_err(|e| VmmError::Vcpu(format!("failed to send Resume command: {e}")))?;
         }
 
         tracing::info!("Resumed {} vCPUs", self.vcpu_count);

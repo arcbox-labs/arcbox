@@ -185,6 +185,49 @@ arcbox-perf = { version = "0.0.1-alpha.1", path = "pro/arcbox-perf" }
 # Test infrastructure
 tempfile = "3"
 
+[workspace.lints.clippy]
+# Enable pedantic and nursery at workspace level
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Pedantic lints that are project-wide noise
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+missing_const_for_fn = "allow"
+# Style preferences
+uninlined_format_args = "allow"
+redundant_else = "allow"
+items_after_statements = "allow"
+if_not_else = "allow"
+single_match_else = "allow"
+option_if_let_else = "allow"
+redundant_closure_for_method_calls = "allow"
+significant_drop_tightening = "allow"
+# Numeric casts — common in low-level/systems code
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+# Protobuf generated code
+derive_partial_eq_without_eq = "allow"
+# Other pedantic lints not useful for this project
+similar_names = "allow"
+unreadable_literal = "allow"
+match_same_arms = "allow"
+needless_pass_by_value = "allow"
+unused_self = "allow"
+unused_async = "allow"
+too_many_lines = "allow"
+return_self_not_must_use = "allow"
+struct_excessive_bools = "allow"
+manual_let_else = "allow"
+default_trait_access = "allow"
+wildcard_imports = "allow"
+
+[workspace.lints.rust]
+
 [profile.release]
 lto = true
 codegen-units = 1

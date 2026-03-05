@@ -47,3 +47,6 @@ path = "examples/simple_vm.rs"
 [[example]]
 name = "vsock_echo"
 path = "examples/vsock_echo.rs"
+
+[lints]
+workspace = true

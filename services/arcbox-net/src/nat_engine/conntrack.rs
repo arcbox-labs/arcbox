@@ -387,7 +387,7 @@ impl ConnTrackTable {
     /// Looks up a connection by NAT'd address (reverse lookup).
     pub fn lookup_reverse(&mut self, nat_key: &ConnTrackKey) -> Option<&ConnTrackEntry> {
         // Clone the key to avoid borrow conflict with lookup().
-        let orig_key = self.reverse.get(nat_key).cloned()?;
+        let orig_key = self.reverse.get(nat_key).copied()?;
         self.lookup(&orig_key)
     }
 

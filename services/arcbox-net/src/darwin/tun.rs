@@ -37,6 +37,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 const AF_HEADER_SIZE: usize = 4;
 
 /// Maximum reasonable MTU including the AF header.
+#[allow(dead_code)]
 const MAX_PACKET_SIZE: usize = 65535 + AF_HEADER_SIZE;
 
 // macOS ioctl constants not exposed by the libc crate.
@@ -114,7 +115,7 @@ impl DarwinTun {
         let ret = unsafe {
             libc::connect(
                 fd.as_raw_fd(),
-                &addr as *const libc::sockaddr_ctl as *const libc::sockaddr,
+                (&raw const addr).cast::<libc::sockaddr>(),
                 std::mem::size_of::<libc::sockaddr_ctl>() as libc::socklen_t,
             )
         };
@@ -146,7 +147,7 @@ impl DarwinTun {
                 libc::SYSPROTO_CONTROL,
                 UTUN_OPT_IFNAME,
                 name_buf.as_mut_ptr().cast(),
-                &mut name_len,
+                &raw mut name_len,
             )
         };
         if ret < 0 {
@@ -259,8 +260,8 @@ impl DarwinTun {
         // Safety: sockaddr_in fits within the ifr_ifru union.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                &sin as *const libc::sockaddr_in as *const u8,
-                &mut ifr.ifr_ifru as *mut _ as *mut u8,
+                (&raw const sin).cast::<u8>(),
+                (&raw mut ifr.ifr_ifru).cast::<u8>(),
                 std::mem::size_of::<libc::sockaddr_in>(),
             );
         }
@@ -461,7 +462,7 @@ impl crate::nat_backend::HostNetIO for DarwinTun {
             revents: 0,
         };
         // Safety: poll with timeout=0 is non-blocking and safe with a valid fd.
-        let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+        let ret = unsafe { libc::poll(&raw mut pfd, 1, 0) };
         ret > 0 && (pfd.revents & libc::POLLIN) != 0
     }
 

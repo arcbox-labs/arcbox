@@ -8,7 +8,7 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::ptr;
 
-/// Configuration for a VirtIO block storage device.
+/// Configuration for a `VirtIO` block storage device.
 pub struct StorageDeviceConfiguration {
     inner: *mut AnyObject,
 }
@@ -55,6 +55,7 @@ impl StorageDeviceConfiguration {
     }
 
     /// Consumes the configuration and returns the raw pointer.
+    #[must_use]
     pub fn into_ptr(self) -> *mut AnyObject {
         let ptr = self.inner;
         std::mem::forget(self);

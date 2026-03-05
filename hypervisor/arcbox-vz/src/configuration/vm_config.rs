@@ -151,10 +151,10 @@ impl VirtualMachineConfiguration {
         self
     }
 
-    /// Adds a VirtioFS directory sharing device to the VM.
+    /// Adds a `VirtioFS` directory sharing device to the VM.
     ///
     /// This allows sharing directories between the host and guest using
-    /// the VirtIO file system protocol.
+    /// the `VirtIO` file system protocol.
     pub fn add_directory_share(
         &mut self,
         device: VirtioFileSystemDeviceConfiguration,

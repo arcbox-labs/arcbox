@@ -83,7 +83,7 @@ impl Default for CacheConfig {
 pub struct FileCache {
     /// Cache configuration.
     config: CacheConfig,
-    /// Cache entries keyed by (inode, block_offset).
+    /// Cache entries keyed by (inode, `block_offset`).
     entries: RwLock<HashMap<CacheKey, CacheEntry>>,
     /// Current cache size in bytes.
     current_size: AtomicU64,
@@ -131,21 +131,19 @@ impl FileCache {
             block_offset,
         };
 
-        let entries = match self.entries.read() {
-            Ok(e) => e,
-            Err(_) => {
-                self.record_miss();
-                return None;
-            }
+        let entries = if let Ok(e) = self.entries.read() {
+            e
+        } else {
+            self.record_miss();
+            return None;
         };
 
-        let entry = match entries.get(&key) {
-            Some(e) => e,
-            None => {
-                drop(entries);
-                self.record_miss();
-                return None;
-            }
+        let entry = if let Some(e) = entries.get(&key) {
+            e
+        } else {
+            drop(entries);
+            self.record_miss();
+            return None;
         };
 
         // Check if the requested range is within this cache entry.
@@ -164,21 +162,19 @@ impl FileCache {
             }
 
             // Extract the requested portion.
-            let entries = match self.entries.read() {
-                Ok(e) => e,
-                Err(_) => {
-                    self.record_miss();
-                    return None;
-                }
+            let entries = if let Ok(e) = self.entries.read() {
+                e
+            } else {
+                self.record_miss();
+                return None;
             };
 
-            let entry = match entries.get(&key) {
-                Some(e) => e,
-                None => {
-                    drop(entries);
-                    self.record_miss();
-                    return None;
-                }
+            let entry = if let Some(e) = entries.get(&key) {
+                e
+            } else {
+                drop(entries);
+                self.record_miss();
+                return None;
             };
 
             let start_idx = (offset - entry.offset) as usize;
@@ -336,12 +332,12 @@ impl FileCache {
 
     /// Returns cache capacity in bytes.
     #[must_use]
-    pub fn capacity(&self) -> u64 {
+    pub const fn capacity(&self) -> u64 {
         self.config.max_size
     }
 
     /// Aligns offset to block boundary.
-    fn align_offset(&self, offset: u64) -> u64 {
+    const fn align_offset(&self, offset: u64) -> u64 {
         (offset / self.config.block_size as u64) * self.config.block_size as u64
     }
 

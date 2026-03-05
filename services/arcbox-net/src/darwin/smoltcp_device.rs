@@ -232,7 +232,7 @@ impl SmoltcpDevice {
                             src_port,
                             dst_ip,
                             syn_seq,
-                            frame: frame.clone(),
+                            frame,
                         });
                         return;
                     }
@@ -323,7 +323,7 @@ pub struct SmoltcpTxToken<'a> {
     tx_pending: &'a mut Vec<Vec<u8>>,
 }
 
-impl<'a> TxToken for SmoltcpTxToken<'a> {
+impl TxToken for SmoltcpTxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,

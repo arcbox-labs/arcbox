@@ -93,7 +93,7 @@ impl DarwinHypervisor {
 
     /// Checks if Rosetta 2 translation is available.
     #[must_use]
-    pub fn rosetta_available(&self) -> bool {
+    pub const fn rosetta_available(&self) -> bool {
         self.capabilities.rosetta
     }
 }

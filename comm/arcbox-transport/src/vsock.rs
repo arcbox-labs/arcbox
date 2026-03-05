@@ -4,7 +4,7 @@
 //!
 //! ## Platform Support
 //!
-//! - **Linux**: Uses AF_VSOCK socket family directly via nix crate.
+//! - **Linux**: Uses `AF_VSOCK` socket family directly via nix crate.
 //!   Standard `bind()` and `connect()` operations work as expected.
 //!
 //! - **macOS**: Uses Virtualization.framework (`VZVirtioSocketDevice`).
@@ -72,7 +72,7 @@ use bytes::Bytes;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-/// Default port for ArcBox agent communication.
+/// Default port for `ArcBox` agent communication.
 pub use arcbox_constants::ports::AGENT_PORT as DEFAULT_AGENT_PORT;
 
 /// Vsock address.
@@ -339,7 +339,7 @@ mod darwin {
     ///
     /// On macOS, vsock connections are obtained through the Virtualization.framework
     /// via the hypervisor layer. This struct wraps a file descriptor returned from
-    /// VZVirtioSocketDevice's connection.
+    /// `VZVirtioSocketDevice`'s connection.
     pub struct VsockStream {
         fd: StdOwnedFd,
     }
@@ -348,7 +348,7 @@ mod darwin {
         /// Creates a new vsock stream from an existing file descriptor.
         ///
         /// On macOS, this fd comes from `DarwinVm::connect_vsock()` which uses
-        /// VZVirtioSocketDevice internally.
+        /// `VZVirtioSocketDevice` internally.
         ///
         /// # Safety
         /// The caller must ensure the fd is a valid connected vsock fd.
@@ -466,7 +466,7 @@ mod darwin {
 
     /// Vsock listener handle for macOS.
     ///
-    /// On macOS, vsock listening is done through VZVirtioSocketDevice.
+    /// On macOS, vsock listening is done through `VZVirtioSocketDevice`.
     /// This handle wraps a channel that receives incoming connections
     /// from the Virtualization.framework layer.
     ///
@@ -516,12 +516,15 @@ mod darwin {
         ///
         /// * `port` - The port number being listened on
         /// * `receiver` - Channel receiver for incoming connections from VZ layer
-        pub fn new(port: u32, receiver: mpsc::UnboundedReceiver<IncomingVsockConnection>) -> Self {
+        pub const fn new(
+            port: u32,
+            receiver: mpsc::UnboundedReceiver<IncomingVsockConnection>,
+        ) -> Self {
             Self { port, receiver }
         }
 
         /// Returns the port number.
-        pub fn port(&self) -> u32 {
+        pub const fn port(&self) -> u32 {
             self.port
         }
 
@@ -576,19 +579,19 @@ pub struct VsockTransport {
 impl VsockTransport {
     /// Creates a new vsock transport for the given address.
     #[must_use]
-    pub fn new(addr: VsockAddr) -> Self {
+    pub const fn new(addr: VsockAddr) -> Self {
         Self { addr, stream: None }
     }
 
     /// Creates a transport to the host on the default agent port.
     #[must_use]
-    pub fn to_host() -> Self {
+    pub const fn to_host() -> Self {
         Self::new(VsockAddr::host(DEFAULT_AGENT_PORT))
     }
 
     /// Returns the vsock address.
     #[must_use]
-    pub fn addr(&self) -> VsockAddr {
+    pub const fn addr(&self) -> VsockAddr {
         self.addr
     }
 
@@ -603,7 +606,8 @@ impl VsockTransport {
 
     /// Creates a transport from an existing stream (macOS).
     #[cfg(target_os = "macos")]
-    pub fn from_stream(stream: VsockStream, addr: VsockAddr) -> Self {
+    #[must_use]
+    pub const fn from_stream(stream: VsockStream, addr: VsockAddr) -> Self {
         Self {
             addr,
             stream: Some(stream),
@@ -613,7 +617,7 @@ impl VsockTransport {
     /// Creates a transport from a raw file descriptor (macOS).
     ///
     /// On macOS, vsock connections are obtained through the hypervisor layer
-    /// (DarwinVm::connect_vsock). This method allows wrapping that fd into
+    /// (`DarwinVm::connect_vsock`). This method allows wrapping that fd into
     /// a transport.
     ///
     /// # Arguments
@@ -726,8 +730,8 @@ impl Transport for VsockTransport {
 
 /// Vsock listener for accepting connections.
 ///
-/// On Linux, this uses AF_VSOCK sockets directly.
-/// On macOS, this requires a channel connected to VZVirtioSocketDevice.
+/// On Linux, this uses `AF_VSOCK` sockets directly.
+/// On macOS, this requires a channel connected to `VZVirtioSocketDevice`.
 pub struct VsockListener {
     port: u32,
     #[cfg(target_os = "linux")]
@@ -743,9 +747,9 @@ impl VsockListener {
     ///
     /// - **Linux**: After calling `bind()`, the listener will be ready to accept connections.
     /// - **macOS**: Use `from_channel()` instead to provide a channel connected to
-    ///   VZVirtioSocketDevice. Calling `bind()` on this listener will fail.
+    ///   `VZVirtioSocketDevice`. Calling `bind()` on this listener will fail.
     #[must_use]
-    pub fn new(port: u32) -> Self {
+    pub const fn new(port: u32) -> Self {
         Self {
             port,
             #[cfg(target_os = "linux")]
@@ -757,7 +761,7 @@ impl VsockListener {
 
     /// Creates a listener from a channel (macOS).
     ///
-    /// On macOS, vsock listening is done through VZVirtioSocketDevice.
+    /// On macOS, vsock listening is done through `VZVirtioSocketDevice`.
     /// This method creates a listener that receives connections from a channel
     /// bridged to the Virtualization.framework layer.
     ///
@@ -807,7 +811,7 @@ impl VsockListener {
     /// ```
     #[cfg(target_os = "macos")]
     #[must_use]
-    pub fn from_channel(
+    pub const fn from_channel(
         port: u32,
         receiver: tokio::sync::mpsc::UnboundedReceiver<darwin::IncomingVsockConnection>,
     ) -> Self {
@@ -819,13 +823,13 @@ impl VsockListener {
 
     /// Creates a listener on the default agent port.
     #[must_use]
-    pub fn default_agent() -> Self {
+    pub const fn default_agent() -> Self {
         Self::new(DEFAULT_AGENT_PORT)
     }
 
     /// Returns the port number.
     #[must_use]
-    pub fn port(&self) -> u32 {
+    pub const fn port(&self) -> u32 {
         self.port
     }
 }

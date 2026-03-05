@@ -107,7 +107,7 @@ impl EventLoop {
     pub fn post_event(&self, event: VmmEvent) -> Result<()> {
         self.event_tx
             .send(event)
-            .map_err(|e| VmmError::EventLoop(format!("failed to post event: {}", e)))
+            .map_err(|e| VmmError::EventLoop(format!("failed to post event: {e}")))
     }
 
     /// Polls for the next event.
@@ -123,7 +123,7 @@ impl EventLoop {
             event = self.event_rx.recv() => {
                 event
             }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+            () = tokio::time::sleep(Duration::from_millis(100)) => {
                 None
             }
         }

@@ -990,8 +990,7 @@ async fn inbound_host_relay(
 ) {
     let peer = stream
         .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "unknown".into());
+        .map_or_else(|_| "unknown".into(), |a| a.to_string());
     tracing::debug!("TCP bridge: inbound relay started for {peer}");
 
     let (mut reader, mut writer) = stream.into_split();
