@@ -108,7 +108,7 @@ mod agent {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             // SAFETY: buf is a valid mutable slice; fd is a valid socket.
             let n =
-                unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                unsafe { libc::read(self.fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
             if n < 0 {
                 Err(std::io::Error::last_os_error())
             } else {
@@ -120,7 +120,7 @@ mod agent {
     impl Write for VsockStream {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             // SAFETY: buf is a valid slice; fd is a valid socket.
-            let n = unsafe { libc::write(self.fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+            let n = unsafe { libc::write(self.fd, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
             if n < 0 {
                 Err(std::io::Error::last_os_error())
             } else {
@@ -276,8 +276,10 @@ mod agent {
                 unsafe {
                     // Probe the process with signal 0. If this fails with ESRCH, the PID
                     // is not currently in use and we must not send SIGKILL.
-                    if libc::kill(pid as i32, 0) == 0 {
-                        let _ = libc::kill(pid as i32, libc::SIGKILL);
+                    #[allow(clippy::cast_possible_wrap)]
+                    let pid_i32 = pid as i32;
+                    if libc::kill(pid_i32, 0) == 0 {
+                        let _ = libc::kill(pid_i32, libc::SIGKILL);
                     }
                 }
             });
@@ -442,7 +444,7 @@ mod agent {
 
                 let mut status: libc::c_int = 0;
                 // SAFETY: child.as_raw() is a valid pid returned from fork.
-                unsafe { libc::waitpid(child.as_raw(), &mut status, 0) };
+                unsafe { libc::waitpid(child.as_raw(), &raw mut status, 0) };
                 let exit_code = if libc::WIFEXITED(status) {
                     libc::WEXITSTATUS(status)
                 } else {
@@ -490,7 +492,7 @@ mod agent {
         let ret = unsafe {
             libc::bind(
                 fd,
-                &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+                (&raw const addr).cast::<libc::sockaddr>(),
                 std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
             )
         };
@@ -513,9 +515,7 @@ mod agent {
                 return conn_fd;
             }
             let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::Interrupted {
-                panic!("accept: {err}");
-            }
+            assert!(err.kind() == std::io::ErrorKind::Interrupted, "accept: {err}");
         }
     }
 }
