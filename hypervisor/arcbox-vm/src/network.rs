@@ -147,15 +147,30 @@ impl NetworkManager {
         }
 
         // Bring up
-        let _ = Command::new("/usr/sbin/ip")
+        let status = Command::new("/usr/sbin/ip")
             .args(["link", "set", tap_name, "up"])
-            .status();
+            .status()
+            .map_err(|e| VmmError::Network(format!("ip link set up: {e}")))?;
+        if !status.success() {
+            destroy_tap(tap_name);
+            return Err(VmmError::Network(format!(
+                "failed to bring up TAP {tap_name}"
+            )));
+        }
 
         // Attach to bridge
         if !self.bridge.is_empty() {
-            let _ = Command::new("/usr/sbin/ip")
+            let status = Command::new("/usr/sbin/ip")
                 .args(["link", "set", tap_name, "master", &self.bridge])
-                .status();
+                .status()
+                .map_err(|e| VmmError::Network(format!("ip link set master: {e}")))?;
+            if !status.success() {
+                destroy_tap(tap_name);
+                return Err(VmmError::Network(format!(
+                    "failed to attach TAP {tap_name} to bridge {}",
+                    self.bridge
+                )));
+            }
         }
 
         Ok(())
