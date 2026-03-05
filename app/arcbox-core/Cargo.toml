@@ -46,3 +46,6 @@ backend-native = []
 backend-guest-docker = []
 provision-bundled = []
 provision-distro = []
+
+[lints]
+workspace = true

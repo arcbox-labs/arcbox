@@ -15,11 +15,11 @@ use std::process::Command;
 pub enum VpnType {
     /// Apple/macOS native VPN (utun).
     AppleUtun,
-    /// WireGuard VPN.
+    /// `WireGuard` VPN.
     WireGuard,
-    /// OpenVPN (tun/tap).
+    /// `OpenVPN` (tun/tap).
     OpenVpn,
-    /// IPSec VPN.
+    /// `IPSec` VPN.
     IpSec,
     /// PPP-based VPN (PPTP, L2TP).
     Ppp,
@@ -32,13 +32,13 @@ pub enum VpnType {
 impl VpnType {
     /// Returns the typical interface name pattern for this VPN type.
     #[must_use]
-    pub fn interface_pattern(&self) -> &'static str {
+    pub const fn interface_pattern(&self) -> &'static str {
         match self {
-            VpnType::AppleUtun | VpnType::WireGuard | VpnType::Tailscale => "utun",
-            VpnType::OpenVpn => "tun",
-            VpnType::IpSec => "ipsec",
-            VpnType::Ppp => "ppp",
-            VpnType::Unknown => "",
+            Self::AppleUtun | Self::WireGuard | Self::Tailscale => "utun",
+            Self::OpenVpn => "tun",
+            Self::IpSec => "ipsec",
+            Self::Ppp => "ppp",
+            Self::Unknown => "",
         }
     }
 }
@@ -74,7 +74,7 @@ pub struct VpnDetector {
 impl VpnDetector {
     /// Creates a new VPN detector.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             interfaces: Vec::new(),
             last_check: None,
@@ -84,7 +84,7 @@ impl VpnDetector {
 
     /// Creates a new VPN detector with custom cache duration.
     #[must_use]
-    pub fn with_cache_duration(cache_duration: std::time::Duration) -> Self {
+    pub const fn with_cache_duration(cache_duration: std::time::Duration) -> Self {
         Self {
             interfaces: Vec::new(),
             last_check: None,

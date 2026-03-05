@@ -55,3 +55,6 @@ provision-distro = []
 
 # When building for the guest VM (Linux), vsock is fully functional.
 # On macOS host, we provide stubs for development/testing.
+
+[lints]
+workspace = true

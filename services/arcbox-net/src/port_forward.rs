@@ -329,8 +329,8 @@ async fn handle_tcp_connection(mut client: TcpStream, guest_addr: SocketAddr) {
 
     // Run both directions concurrently, complete when either finishes.
     tokio::select! {
-        _ = client_to_guest => {}
-        _ = guest_to_client => {}
+        () = client_to_guest => {}
+        () = guest_to_client => {}
     }
 }
 

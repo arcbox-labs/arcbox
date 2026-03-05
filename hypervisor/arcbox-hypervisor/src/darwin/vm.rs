@@ -90,7 +90,7 @@ pub struct DarwinVm {
     /// Whether a balloon device has been configured.
     ///
     /// The balloon device configuration is stored here during VM setup
-    /// and added to the VZ configuration in finalize_configuration().
+    /// and added to the VZ configuration in `finalize_configuration()`.
     balloon_configured: bool,
 }
 
@@ -117,7 +117,7 @@ impl DarwinVm {
 
         // Set up generic platform for Linux VMs on Apple Silicon
         let platform = GenericPlatform::new().map_err(|e| {
-            HypervisorError::VmCreationFailed(format!("Failed to create platform: {}", e))
+            HypervisorError::VmCreationFailed(format!("Failed to create platform: {e}"))
         })?;
         if GenericPlatform::is_nested_virt_supported() {
             platform.set_nested_virt_enabled(true);
@@ -129,7 +129,7 @@ impl DarwinVm {
         // Set up boot loader if kernel path is specified
         if let Some(ref kernel_path) = config.kernel_path {
             let mut boot_loader = LinuxBootLoader::new(kernel_path).map_err(|e| {
-                HypervisorError::VmCreationFailed(format!("Failed to create boot loader: {}", e))
+                HypervisorError::VmCreationFailed(format!("Failed to create boot loader: {e}"))
             })?;
             tracing::debug!("Created boot loader for kernel: {}", kernel_path);
 
@@ -149,7 +149,7 @@ impl DarwinVm {
 
         // Add entropy device for random number generation
         let entropy = EntropyDeviceConfiguration::new().map_err(|e| {
-            HypervisorError::VmCreationFailed(format!("Failed to create entropy device: {}", e))
+            HypervisorError::VmCreationFailed(format!("Failed to create entropy device: {e}"))
         })?;
         vz_config.add_entropy_device(entropy);
         tracing::debug!("Entropy device configured");
@@ -228,8 +228,7 @@ impl DarwinVm {
         if self.balloon_configured {
             let balloon = MemoryBalloonDeviceConfiguration::new().map_err(|e| {
                 HypervisorError::DeviceError(format!(
-                    "Failed to create balloon device configuration: {}",
-                    e
+                    "Failed to create balloon device configuration: {e}"
                 ))
             })?;
             vz_config.add_memory_balloon_device(balloon);
@@ -240,7 +239,7 @@ impl DarwinVm {
         // the VZVirtualMachine instance with a dedicated dispatch queue.
         let vz_vm = vz_config
             .build()
-            .map_err(|e| HypervisorError::VmCreationFailed(format!("Failed to build VM: {}", e)))?;
+            .map_err(|e| HypervisorError::VmCreationFailed(format!("Failed to build VM: {e}")))?;
 
         self.vz_vm = Some(vz_vm);
 
@@ -287,8 +286,7 @@ impl DarwinVm {
                 if let Some(ref vm) = self.vz_vm {
                     let state = vm.state();
                     return Err(HypervisorError::timeout(format!(
-                        "Timed out waiting for VM state {:?}, current state: {:?}",
-                        target, state
+                        "Timed out waiting for VM state {target:?}, current state: {state:?}"
                     )));
                 }
                 return Err(HypervisorError::timeout("Timed out waiting for VM state"));
@@ -316,7 +314,7 @@ impl DarwinVm {
         }
 
         vm.request_stop()
-            .map_err(|e| HypervisorError::VmError(format!("Failed to request VM stop: {}", e)))?;
+            .map_err(|e| HypervisorError::VmError(format!("Failed to request VM stop: {e}")))?;
 
         match self.wait_for_state(VirtualMachineState::Stopped, timeout) {
             Ok(()) => Ok(true),
@@ -447,12 +445,12 @@ impl DarwinVm {
         self.serial_fds
             .map(|(master_fd, _)| unsafe {
                 let slave_name = libc::ptsname(master_fd);
-                if !slave_name.is_null() {
+                if slave_name.is_null() {
+                    String::new()
+                } else {
                     std::ffi::CStr::from_ptr(slave_name)
                         .to_string_lossy()
                         .into_owned()
-                } else {
-                    String::new()
                 }
             })
             .filter(|s| !s.is_empty())
@@ -479,7 +477,7 @@ impl DarwinVm {
         if state != VmState::Running {
             return Err(HypervisorError::VmStateError {
                 expected: "Running".to_string(),
-                actual: format!("{:?}", state),
+                actual: format!("{state:?}"),
             });
         }
 
@@ -503,10 +501,9 @@ impl DarwinVm {
         })?;
 
         // Use block_in_place to allow blocking in async context
-        let connection = tokio::task::block_in_place(|| rt.block_on(socket_device.connect(port)))
-            .map_err(|e| {
-            HypervisorError::DeviceError(format!("vsock connect failed: {}", e))
-        })?;
+        let connection =
+            tokio::task::block_in_place(|| rt.block_on(socket_device.connect(port)))
+                .map_err(|e| HypervisorError::DeviceError(format!("vsock connect failed: {e}")))?;
 
         // Get the raw fd and take ownership (prevents close on drop)
         let fd = connection.into_raw_fd();
@@ -518,13 +515,13 @@ impl DarwinVm {
 
     /// Returns the VM ID.
     #[must_use]
-    pub fn id(&self) -> u64 {
+    pub const fn id(&self) -> u64 {
         self.id
     }
 
     /// Returns the VM configuration.
     #[must_use]
-    pub fn config(&self) -> &VmConfig {
+    pub const fn config(&self) -> &VmConfig {
         &self.config
     }
 
@@ -729,7 +726,7 @@ impl DarwinVm {
 
     /// Returns whether a balloon device is configured for this VM.
     #[must_use]
-    pub fn has_balloon_device(&self) -> bool {
+    pub const fn has_balloon_device(&self) -> bool {
         self.balloon_configured
     }
 
@@ -750,7 +747,7 @@ impl DarwinVm {
         if state != VmState::Running {
             return Err(HypervisorError::VmStateError {
                 expected: "Running".to_string(),
-                actual: format!("{:?}", state),
+                actual: format!("{state:?}"),
             });
         }
 
@@ -792,7 +789,7 @@ impl DarwinVm {
 
         self.vz_vm
             .as_ref()
-            .and_then(|vm| vm.first_balloon_device())
+            .and_then(arcbox_vz::VirtualMachine::first_balloon_device)
             .map_or(0, |balloon| balloon.target_memory_size())
     }
 
@@ -800,7 +797,7 @@ impl DarwinVm {
     ///
     /// This is the maximum memory the guest can use when the balloon is fully deflated.
     #[must_use]
-    pub fn configured_memory_size(&self) -> u64 {
+    pub const fn configured_memory_size(&self) -> u64 {
         self.config.memory_size
     }
 }
@@ -969,7 +966,7 @@ impl VirtualMachine for DarwinVm {
         if state != VmState::Created && state != VmState::Stopped {
             return Err(HypervisorError::VmStateError {
                 expected: "Created or Stopped".to_string(),
-                actual: format!("{:?}", state),
+                actual: format!("{state:?}"),
             });
         }
 
@@ -1000,7 +997,7 @@ impl VirtualMachine for DarwinVm {
             // Use block_in_place to allow blocking in async context
             tokio::task::block_in_place(|| rt.block_on(vm.start())).map_err(|e| {
                 self.set_state(VmState::Error);
-                HypervisorError::VmError(format!("Failed to start VM: {}", e))
+                HypervisorError::VmError(format!("Failed to start VM: {e}"))
             })?;
 
             tracing::debug!("Waiting for VM {} to reach Running state...", self.id);
@@ -1041,7 +1038,7 @@ impl VirtualMachine for DarwinVm {
         if state != VmState::Running {
             return Err(HypervisorError::VmStateError {
                 expected: "Running".to_string(),
-                actual: format!("{:?}", state),
+                actual: format!("{state:?}"),
             });
         }
 
@@ -1054,7 +1051,7 @@ impl VirtualMachine for DarwinVm {
             // Pause using arcbox-vz's async pause
             // Use block_in_place to allow blocking in async context
             tokio::task::block_in_place(|| rt.block_on(vm.pause()))
-                .map_err(|e| HypervisorError::VmError(format!("Failed to pause VM: {}", e)))?;
+                .map_err(|e| HypervisorError::VmError(format!("Failed to pause VM: {e}")))?;
 
             self.wait_for_state(VirtualMachineState::Paused, Duration::from_secs(10))?;
         }
@@ -1070,7 +1067,7 @@ impl VirtualMachine for DarwinVm {
         if state != VmState::Paused {
             return Err(HypervisorError::VmStateError {
                 expected: "Paused".to_string(),
-                actual: format!("{:?}", state),
+                actual: format!("{state:?}"),
             });
         }
 
@@ -1083,7 +1080,7 @@ impl VirtualMachine for DarwinVm {
             // Resume using arcbox-vz's async resume
             // Use block_in_place to allow blocking in async context
             tokio::task::block_in_place(|| rt.block_on(vm.resume()))
-                .map_err(|e| HypervisorError::VmError(format!("Failed to resume VM: {}", e)))?;
+                .map_err(|e| HypervisorError::VmError(format!("Failed to resume VM: {e}")))?;
 
             self.wait_for_state(VirtualMachineState::Running, Duration::from_secs(10))?;
         }
@@ -1099,7 +1096,7 @@ impl VirtualMachine for DarwinVm {
         if state != VmState::Running && state != VmState::Paused {
             return Err(HypervisorError::VmStateError {
                 expected: "Running or Paused".to_string(),
-                actual: format!("{:?}", state),
+                actual: format!("{state:?}"),
             });
         }
 
@@ -1193,20 +1190,20 @@ impl VirtualMachine for DarwinVm {
                             path.rsplit('/').next().unwrap_or("disk")
                         )
                     } else {
-                        format!("block-{}", idx)
+                        format!("block-{idx}")
                     }
                 }
-                VirtioDeviceType::Net => format!("net-{}", idx),
+                VirtioDeviceType::Net => format!("net-{idx}"),
                 VirtioDeviceType::Console => "console-0".to_string(),
                 VirtioDeviceType::Fs => {
                     if let Some(ref tag) = config.tag {
-                        format!("fs-{}", tag)
+                        format!("fs-{tag}")
                     } else {
-                        format!("fs-{}", idx)
+                        format!("fs-{idx}")
                     }
                 }
                 VirtioDeviceType::Vsock => "vsock-0".to_string(),
-                _ => format!("device-{}", idx),
+                _ => format!("device-{idx}"),
             };
 
             snapshots.push(DeviceSnapshot {

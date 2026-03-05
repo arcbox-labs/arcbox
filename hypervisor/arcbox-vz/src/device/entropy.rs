@@ -5,7 +5,7 @@ use crate::ffi::get_class;
 use crate::msg_send;
 use objc2::runtime::AnyObject;
 
-/// Configuration for a VirtIO entropy device.
+/// Configuration for a `VirtIO` entropy device.
 ///
 /// This device provides random number generation to the guest OS.
 pub struct EntropyDeviceConfiguration {
@@ -41,6 +41,7 @@ impl EntropyDeviceConfiguration {
     }
 
     /// Consumes the configuration and returns the raw pointer.
+    #[must_use]
     pub fn into_ptr(self) -> *mut AnyObject {
         let ptr = self.inner;
         std::mem::forget(self);

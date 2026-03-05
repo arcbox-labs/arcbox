@@ -69,7 +69,7 @@ pub struct BlockDescriptorWithHelpers {
     pub dispose_helper: unsafe extern "C" fn(*mut c_void),
 }
 
-/// Block structure for completion handlers that take (NSError *).
+/// Block structure for completion handlers that take (`NSError` *).
 #[repr(C)]
 pub struct CompletionBlock {
     /// ISA pointer (class pointer).
@@ -84,7 +84,7 @@ pub struct CompletionBlock {
     pub descriptor: *const BlockDescriptor,
 }
 
-/// Block structure for vsock completion handlers that take (VZVirtioSocketConnection *, NSError *).
+/// Block structure for vsock completion handlers that take (`VZVirtioSocketConnection` *, `NSError` *).
 #[repr(C)]
 pub struct VsockCompletionBlock {
     /// ISA pointer.
@@ -124,7 +124,7 @@ pub type VsockResult = Result<VsockConnectionInfo, VsockConnectionError>;
 
 /// Block structure for vsock completion with captured context.
 ///
-/// This block captures a pointer to a oneshot::Sender that will receive
+/// This block captures a pointer to a `oneshot::Sender` that will receive
 /// the connection result.
 #[repr(C)]
 pub struct VsockContextBlock {
@@ -135,14 +135,14 @@ pub struct VsockContextBlock {
     /// Reserved.
     pub reserved: i32,
     /// Invoke function pointer.
-    pub invoke: unsafe extern "C" fn(*mut VsockContextBlock, *mut AnyObject, *mut AnyObject),
+    pub invoke: unsafe extern "C" fn(*mut Self, *mut AnyObject, *mut AnyObject),
     /// Block descriptor.
     pub descriptor: *const BlockDescriptorWithHelpers,
-    /// Captured context: raw pointer to Box<oneshot::Sender<VsockResult>>.
+    /// Captured context: raw pointer to Box<`oneshot::Sender`<VsockResult>>.
     pub sender_ptr: *mut c_void,
 }
 
-/// Descriptor for VsockContextBlock.
+/// Descriptor for `VsockContextBlock`.
 static VSOCK_CONTEXT_BLOCK_DESCRIPTOR: BlockDescriptorWithHelpers = BlockDescriptorWithHelpers {
     reserved: 0,
     size: std::mem::size_of::<VsockContextBlock>() as u64,
@@ -150,7 +150,7 @@ static VSOCK_CONTEXT_BLOCK_DESCRIPTOR: BlockDescriptorWithHelpers = BlockDescrip
     dispose_helper: vsock_block_dispose,
 };
 
-/// Copy helper for VsockContextBlock.
+/// Copy helper for `VsockContextBlock`.
 ///
 /// When a block is copied from stack to heap, this function is called.
 /// We don't need to do anything special since we're using raw pointers.
@@ -159,7 +159,7 @@ unsafe extern "C" fn vsock_block_copy(_dst: *mut c_void, _src: *const c_void) {
     // The ownership is transferred with the block
 }
 
-/// Dispose helper for VsockContextBlock.
+/// Dispose helper for `VsockContextBlock`.
 ///
 /// When a block is released, this function is called.
 /// We need to drop the sender if it hasn't been used.
@@ -174,7 +174,7 @@ unsafe extern "C" fn vsock_block_dispose(block: *mut c_void) {
     }
 }
 
-/// Invoke function for VsockContextBlock.
+/// Invoke function for `VsockContextBlock`.
 ///
 /// This is called when the block is invoked by Virtualization.framework.
 unsafe extern "C" fn vsock_block_invoke(
@@ -211,7 +211,7 @@ unsafe extern "C" fn vsock_block_invoke(
                 let err = std::io::Error::last_os_error();
                 tracing::error!("Failed to dup vsock fd: {}", err);
                 let _ = sender.send(Err(VsockConnectionError {
-                    message: format!("Failed to dup fd: {}", err),
+                    message: format!("Failed to dup fd: {err}"),
                 }));
                 return;
             }
@@ -264,6 +264,7 @@ unsafe extern "C" fn vsock_block_invoke(
 ///
 /// The returned block must be used with Virtualization.framework's
 /// `connectToPort:completionHandler:` method.
+#[must_use]
 pub fn create_vsock_context_block(sender: oneshot::Sender<VsockResult>) -> *const c_void {
     // Box the sender and get a raw pointer
     let sender_box = Box::new(sender);

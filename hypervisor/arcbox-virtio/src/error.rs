@@ -1,12 +1,12 @@
-//! Error types for VirtIO devices.
+//! Error types for `VirtIO` devices.
 
 use arcbox_error::CommonError;
 use thiserror::Error;
 
-/// Result type alias for VirtIO operations.
+/// Result type alias for `VirtIO` operations.
 pub type Result<T> = std::result::Result<T, VirtioError>;
 
-/// Errors that can occur during VirtIO operations.
+/// Errors that can occur during `VirtIO` operations.
 #[derive(Debug, Error)]
 pub enum VirtioError {
     /// Common error from arcbox-error.
@@ -29,7 +29,7 @@ pub enum VirtioError {
     #[error("buffer too small: need {needed}, got {got}")]
     BufferTooSmall { needed: usize, got: usize },
 
-    /// VirtIO I/O error (string message).
+    /// `VirtIO` I/O error (string message).
     #[error("I/O error: {0}")]
     Io(String),
 

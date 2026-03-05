@@ -1,6 +1,6 @@
 //! Core Foundation Run Loop utilities.
 //!
-//! Provides wrappers around CFRunLoop for handling asynchronous operations
+//! Provides wrappers around `CFRunLoop` for handling asynchronous operations
 //! that require the run loop to be active.
 
 use std::ffi::c_void;
@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 // Types
 // ============================================================================
 
-/// Opaque type for CFRunLoop reference.
+/// Opaque type for `CFRunLoop` reference.
 pub type CFRunLoopRef = *mut c_void;
 
 /// Result of running the run loop in a specific mode.
@@ -59,16 +59,18 @@ unsafe extern "C" {
 // Public API
 // ============================================================================
 
-/// Gets the main CFRunLoop.
+/// Gets the main `CFRunLoop`.
 ///
 /// The main run loop is the run loop of the main thread.
+#[must_use]
 pub fn cf_run_loop_get_main() -> CFRunLoopRef {
     unsafe { CFRunLoopGetMain() }
 }
 
-/// Gets the current thread's CFRunLoop.
+/// Gets the current thread's `CFRunLoop`.
 ///
 /// Each thread has its own run loop.
+#[must_use]
 pub fn cf_run_loop_get_current() -> CFRunLoopRef {
     unsafe { CFRunLoopGetCurrent() }
 }
@@ -107,6 +109,7 @@ pub unsafe fn cf_run_loop_stop(rl: CFRunLoopRef) {
 /// # Returns
 ///
 /// The result indicating why the run loop exited.
+#[must_use]
 pub fn cf_run_loop_run_in_mode(
     seconds: f64,
     return_after_source_handled: bool,

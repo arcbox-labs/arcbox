@@ -1,6 +1,6 @@
-//! VirtIO console device (virtio-console).
+//! `VirtIO` console device (virtio-console).
 //!
-//! Implements the VirtIO console device for serial I/O.
+//! Implements the `VirtIO` console device for serial I/O.
 //!
 //! Supports multiple console backends:
 //! - Standard I/O (stdin/stdout)
@@ -44,6 +44,7 @@ impl Default for ConsoleConfig {
 
 /// Console port state.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct ConsolePort {
     /// Port number.
     id: u32,
@@ -106,7 +107,7 @@ pub struct BufferConsole {
 impl BufferConsole {
     /// Creates a new buffer console.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             input: VecDeque::new(),
             output: Vec::new(),
@@ -235,7 +236,7 @@ impl PtyConsole {
 
     /// Returns the master file descriptor.
     #[must_use]
-    pub fn master_fd(&self) -> std::os::unix::io::RawFd {
+    pub const fn master_fd(&self) -> std::os::unix::io::RawFd {
         self.master_fd
     }
 
@@ -279,6 +280,7 @@ impl PtyConsole {
     }
 
     /// Checks if data is available to read.
+    #[must_use]
     pub fn has_data(&self) -> bool {
         let mut pollfd = libc::pollfd {
             fd: self.master_fd,
@@ -417,7 +419,7 @@ impl SocketConsole {
 
     /// Checks if a client is connected.
     #[must_use]
-    pub fn is_connected(&self) -> bool {
+    pub const fn is_connected(&self) -> bool {
         self.client.is_some()
     }
 }
@@ -478,7 +480,8 @@ impl ConsoleIo for SocketConsole {
     }
 }
 
-/// VirtIO console device.
+/// `VirtIO` console device.
+#[allow(dead_code)]
 pub struct VirtioConsole {
     config: ConsoleConfig,
     features: u64,
@@ -502,7 +505,7 @@ impl VirtioConsole {
     pub const FEATURE_MULTIPORT: u64 = 1 << 1;
     /// Feature: Emergency write.
     pub const FEATURE_EMERG_WRITE: u64 = 1 << 2;
-    /// VirtIO 1.0 feature.
+    /// `VirtIO` 1.0 feature.
     pub const FEATURE_VERSION_1: u64 = 1 << 32;
 
     /// Creates a new console device.
@@ -577,11 +580,11 @@ impl VirtioConsole {
         if let Some(io) = &self.io {
             let mut io = io
                 .lock()
-                .map_err(|e| VirtioError::Io(format!("Failed to lock I/O: {}", e)))?;
+                .map_err(|e| VirtioError::Io(format!("Failed to lock I/O: {e}")))?;
             io.write(data)
-                .map_err(|e| VirtioError::Io(format!("Write failed: {}", e)))?;
+                .map_err(|e| VirtioError::Io(format!("Write failed: {e}")))?;
             io.flush()
-                .map_err(|e| VirtioError::Io(format!("Flush failed: {}", e)))?;
+                .map_err(|e| VirtioError::Io(format!("Flush failed: {e}")))?;
         }
 
         tracing::trace!("Console TX: {} bytes", data.len());
@@ -589,6 +592,7 @@ impl VirtioConsole {
     }
 
     /// Handles data to the guest (RX).
+    #[allow(dead_code)]
     fn handle_rx(&mut self, buf: &mut [u8]) -> Result<usize> {
         // First check input buffer
         if let Some(port) = self.ports.first_mut() {
@@ -605,10 +609,10 @@ impl VirtioConsole {
         if let Some(io) = &self.io {
             let mut io = io
                 .lock()
-                .map_err(|e| VirtioError::Io(format!("Failed to lock I/O: {}", e)))?;
+                .map_err(|e| VirtioError::Io(format!("Failed to lock I/O: {e}")))?;
             let n = io
                 .read(buf)
-                .map_err(|e| VirtioError::Io(format!("Read failed: {}", e)))?;
+                .map_err(|e| VirtioError::Io(format!("Read failed: {e}")))?;
             tracing::trace!("Console RX: {} bytes", n);
             return Ok(n);
         }
@@ -711,7 +715,7 @@ impl VirtioDevice for VirtioConsole {
             if ch != 0 {
                 // Emergency character output
                 if let Some(c) = char::from_u32(ch) {
-                    eprint!("{}", c);
+                    eprint!("{c}");
                 }
             }
         }

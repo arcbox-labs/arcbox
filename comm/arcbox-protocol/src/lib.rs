@@ -1,6 +1,6 @@
 //! # arcbox-protocol
 //!
-//! Protocol definitions for ArcBox communication.
+//! Protocol definitions for `ArcBox` communication.
 //!
 //! This crate defines the message types and service interfaces used for
 //! communication between:
@@ -31,22 +31,6 @@
 //! - Virtual machine management
 //! - Guest agent operations
 //! - Network, volume, and system operations (API layer)
-
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
-#![allow(clippy::module_name_repetitions)]
-// Generated protobuf code has many clippy warnings that we cannot control.
-#![allow(clippy::derive_partial_eq_without_eq)]
-#![allow(clippy::doc_markdown)]
-#![allow(clippy::missing_errors_doc)]
-#![allow(clippy::missing_panics_doc)]
-#![allow(clippy::must_use_candidate)]
-#![allow(clippy::uninlined_format_args)]
-#![allow(clippy::redundant_closure_for_method_calls)]
-#![allow(clippy::missing_const_for_fn)]
-#![allow(clippy::too_many_lines)]
-#![allow(clippy::similar_names)]
-#![allow(clippy::struct_excessive_bools)]
-#![allow(clippy::zero_sized_map_values)]
 
 mod generated;
 
@@ -215,8 +199,8 @@ pub use v1::{ShellInput, ShellOutput, TerminalSize};
 // Backward compatibility type aliases at crate level
 // =============================================================================
 
-/// Backward compatibility: Ping request (alias for AgentPingRequest).
+/// Backward compatibility: Ping request (alias for `AgentPingRequest`).
 pub type PingRequest = AgentPingRequest;
 
-/// Backward compatibility: Ping response (alias for AgentPingResponse).
+/// Backward compatibility: Ping response (alias for `AgentPingResponse`).
 pub type PingResponse = AgentPingResponse;

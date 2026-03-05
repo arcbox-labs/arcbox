@@ -1,8 +1,8 @@
 //! # arcbox-virtio
 //!
-//! VirtIO device implementations for ArcBox.
+//! `VirtIO` device implementations for `ArcBox`.
 //!
-//! This crate provides VirtIO device emulation including:
+//! This crate provides `VirtIO` device emulation including:
 //!
 //! - [`blk`]: Block device (virtio-blk)
 //! - [`net`]: Network device (virtio-net)
@@ -10,9 +10,9 @@
 //! - [`fs`]: Filesystem device (virtio-fs)
 //! - [`vsock`]: Socket device (virtio-vsock)
 //!
-//! ## VirtIO Queue
+//! ## `VirtIO` Queue
 //!
-//! All devices use the standard VirtIO queue (virtqueue) mechanism for
+//! All devices use the standard `VirtIO` queue (virtqueue) mechanism for
 //! communication with the guest. The [`queue`] module provides the core
 //! queue implementation.
 //!
@@ -30,42 +30,14 @@
 //! └─────────────────────────────────────────┘
 //! ```
 
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
-#![allow(clippy::module_name_repetitions)]
-// VirtIO code involves many unsafe operations and bit manipulations.
-#![allow(dead_code)]
-#![allow(clippy::doc_markdown)]
-#![allow(clippy::missing_errors_doc)]
-#![allow(clippy::missing_panics_doc)]
-#![allow(clippy::must_use_candidate)]
-#![allow(clippy::missing_const_for_fn)]
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::cast_sign_loss)]
-#![allow(clippy::cast_lossless)]
 #![allow(clippy::ptr_as_ptr)]
 #![allow(clippy::borrow_as_ptr)]
-#![allow(clippy::items_after_statements)]
-#![allow(clippy::redundant_else)]
-#![allow(clippy::uninlined_format_args)]
-#![allow(clippy::significant_drop_tightening)]
-#![allow(clippy::option_if_let_else)]
-#![allow(clippy::similar_names)]
-#![allow(clippy::unreadable_literal)]
 #![allow(clippy::unnecessary_cast)]
 #![allow(clippy::cognitive_complexity)]
-#![allow(clippy::too_many_lines)]
-#![allow(clippy::struct_excessive_bools)]
-#![allow(clippy::if_not_else)]
-#![allow(clippy::redundant_closure_for_method_calls)]
-#![allow(clippy::single_match_else)]
-#![allow(clippy::match_same_arms)]
-#![allow(clippy::cast_precision_loss)]
-#![allow(clippy::needless_pass_by_value)]
 #![allow(clippy::map_unwrap_or)]
 #![allow(clippy::useless_vec)]
 #![allow(clippy::unnecessary_wraps)]
 #![allow(clippy::redundant_clone)]
-#![allow(clippy::clone_on_copy)]
 #![allow(clippy::unnecessary_map_or)]
 #![allow(clippy::missing_fields_in_debug)]
 #![allow(clippy::needless_lifetimes)]
@@ -83,7 +55,7 @@ pub mod vsock;
 pub use error::{Result, VirtioError};
 pub use queue::{AvailRing, Descriptor, UsedRing, VirtQueue};
 
-/// VirtIO device type IDs.
+/// `VirtIO` device type IDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum VirtioDeviceId {
@@ -105,7 +77,7 @@ pub enum VirtioDeviceId {
     Vsock = 19,
 }
 
-/// VirtIO device status flags.
+/// `VirtIO` device status flags.
 #[derive(Debug, Clone, Copy)]
 pub struct DeviceStatus(u8);
 
@@ -142,17 +114,17 @@ impl DeviceStatus {
     }
 
     /// Sets a flag.
-    pub fn set(&mut self, flag: u8) {
+    pub const fn set(&mut self, flag: u8) {
         self.0 |= flag;
     }
 
     /// Clears a flag.
-    pub fn clear(&mut self, flag: u8) {
+    pub const fn clear(&mut self, flag: u8) {
         self.0 &= !flag;
     }
 }
 
-/// Trait for VirtIO devices.
+/// Trait for `VirtIO` devices.
 pub trait VirtioDevice: Send + Sync {
     /// Returns the device type ID.
     fn device_id(&self) -> VirtioDeviceId;

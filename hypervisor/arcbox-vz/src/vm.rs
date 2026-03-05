@@ -80,7 +80,7 @@ unsafe impl Send for VirtualMachine {}
 unsafe impl Sync for VirtualMachine {}
 
 impl VirtualMachine {
-    /// Creates a VirtualMachine from raw pointers.
+    /// Creates a `VirtualMachine` from raw pointers.
     ///
     /// This is called internally by `VirtualMachineConfiguration::build()`.
     pub(crate) fn from_raw(ptr: *mut AnyObject, queue: DispatchQueue) -> Self {
@@ -116,6 +116,7 @@ impl VirtualMachine {
     }
 
     /// Returns whether a stop can be requested.
+    #[must_use]
     pub fn can_request_stop(&self) -> bool {
         self.queue
             .sync(|| unsafe { msg_send_bool!(self.inner, canRequestStop).as_bool() })
@@ -472,6 +473,7 @@ impl VirtualMachine {
     /// Returns the memory balloon devices configured on this VM.
     ///
     /// These can be used for dynamic memory management between host and guest.
+    #[must_use]
     pub fn memory_balloon_devices(&self) -> Vec<MemoryBalloonDevice> {
         vm_memory_balloon_devices(self.inner)
     }
@@ -479,6 +481,7 @@ impl VirtualMachine {
     /// Returns the first memory balloon device, if any.
     ///
     /// This is a convenience method for VMs with a single balloon device.
+    #[must_use]
     pub fn first_balloon_device(&self) -> Option<MemoryBalloonDevice> {
         self.memory_balloon_devices().into_iter().next()
     }

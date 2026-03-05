@@ -9,14 +9,14 @@ use std::os::unix::io::RawFd;
 /// Configuration for a serial port.
 pub struct SerialPortConfiguration {
     inner: *mut AnyObject,
-    /// File descriptors for the serial port (read_fd, write_fd).
+    /// File descriptors for the serial port (`read_fd`, `write_fd`).
     fds: Option<(RawFd, RawFd)>,
 }
 
 unsafe impl Send for SerialPortConfiguration {}
 
 impl SerialPortConfiguration {
-    /// Creates a VirtIO console serial port configuration using pipes.
+    /// Creates a `VirtIO` console serial port configuration using pipes.
     ///
     /// This creates a serial port that appears as `hvc0` in the guest.
     /// Returns the configuration and the file descriptors for reading/writing.
@@ -92,11 +92,13 @@ impl SerialPortConfiguration {
     }
 
     /// Returns the file descriptor for reading output from the VM.
+    #[must_use]
     pub fn read_fd(&self) -> Option<RawFd> {
         self.fds.map(|(r, _)| r)
     }
 
     /// Returns the file descriptor for writing input to the VM.
+    #[must_use]
     pub fn write_fd(&self) -> Option<RawFd> {
         self.fds.map(|(_, w)| w)
     }
@@ -105,6 +107,7 @@ impl SerialPortConfiguration {
     ///
     /// Note: The file descriptors are NOT closed when this is called.
     /// The caller is responsible for managing them.
+    #[must_use]
     pub fn into_ptr(self) -> *mut AnyObject {
         let ptr = self.inner;
         std::mem::forget(self);

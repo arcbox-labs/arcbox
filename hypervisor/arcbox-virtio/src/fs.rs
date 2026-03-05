@@ -1,4 +1,4 @@
-//! VirtIO filesystem device (virtio-fs).
+//! `VirtIO` filesystem device (virtio-fs).
 //!
 //! This implements the high-performance shared filesystem using virtiofs
 //! protocol for host-guest file sharing.
@@ -88,7 +88,7 @@ pub trait FuseRequestHandler: Send + Sync {
 
     /// Called when the FUSE session is initialized.
     ///
-    /// This is invoked after the FUSE_INIT handshake completes successfully.
+    /// This is invoked after the `FUSE_INIT` handshake completes successfully.
     fn on_init(&self, _session: &FuseSession) {}
 
     /// Called when the FUSE session is destroyed.
@@ -227,7 +227,7 @@ impl FuseResponse {
 /// and feature negotiation.
 #[derive(Debug)]
 pub struct FuseSession {
-    /// Whether FUSE_INIT has been received and processed.
+    /// Whether `FUSE_INIT` has been received and processed.
     initialized: AtomicBool,
     /// Negotiated protocol major version.
     major: u32,
@@ -246,7 +246,7 @@ pub struct FuseSession {
 impl FuseSession {
     /// Creates a new FUSE session with default settings.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             initialized: AtomicBool::new(false),
             major: FUSE_KERNEL_VERSION,
@@ -300,7 +300,7 @@ impl FuseSession {
         self.max_pages
     }
 
-    /// Handles FUSE_INIT request and returns the response.
+    /// Handles `FUSE_INIT` request and returns the response.
     ///
     /// This negotiates the protocol version and features with the guest driver.
     pub fn handle_init(&mut self, request: &[u8]) -> Result<Vec<u8>> {
@@ -332,8 +332,7 @@ impl FuseSession {
             return Err(VirtioError::DeviceError {
                 device: "fs".to_string(),
                 message: format!(
-                    "FUSE version mismatch: guest {}.{} < required {}.{}",
-                    guest_major, guest_minor, FUSE_KERNEL_VERSION, FUSE_KERNEL_MINOR_VERSION
+                    "FUSE version mismatch: guest {guest_major}.{guest_minor} < required {FUSE_KERNEL_VERSION}.{FUSE_KERNEL_MINOR_VERSION}"
                 ),
             });
         }
@@ -442,7 +441,7 @@ impl Default for FsConfig {
 // VirtIO Filesystem Device
 // ============================================================================
 
-/// VirtIO filesystem device.
+/// `VirtIO` filesystem device.
 ///
 /// Provides high-performance file sharing between host and guest using
 /// the FUSE protocol over virtio transport.
@@ -553,8 +552,8 @@ impl VirtioFs {
     /// # Flow
     ///
     /// 1. Parse request opcode
-    /// 2. If FUSE_INIT: handle initialization handshake
-    /// 3. If FUSE_DESTROY: clean up session
+    /// 2. If `FUSE_INIT`: handle initialization handshake
+    /// 3. If `FUSE_DESTROY`: clean up session
     /// 4. Otherwise: delegate to request handler
     ///
     /// # Errors
@@ -637,7 +636,7 @@ impl VirtioFs {
         // This releases the borrow on self.request_queues
         let pending_requests = {
             let queue = self.request_queues.get_mut(queue_index).ok_or_else(|| {
-                VirtioError::NotReady(format!("request queue {} not available", queue_index))
+                VirtioError::NotReady(format!("request queue {queue_index} not available"))
             })?;
 
             let mut requests = Vec::new();

@@ -10,18 +10,18 @@ use arcbox_constants::ports::AGENT_PORT;
 // EnsureRuntime State Machine (platform-independent, testable)
 // =============================================================================
 
-pub(crate) mod ensure_runtime {
+pub mod ensure_runtime {
     use std::sync::OnceLock;
 
     pub use arcbox_constants::status::{
         RUNTIME_FAILED as STATUS_FAILED, RUNTIME_REUSED as STATUS_REUSED,
-        RUNTIME_STARTED as STATUS_STARTED,
     };
     use arcbox_protocol::agent::RuntimeEnsureResponse;
     use tokio::sync::{Mutex, Notify};
 
     /// Runtime lifecycle state.
     #[derive(Debug, Clone)]
+    #[allow(dead_code)]
     pub enum RuntimeState {
         /// No ensure has been attempted yet.
         NotStarted,
@@ -35,6 +35,7 @@ pub(crate) mod ensure_runtime {
 
     /// Global singleton guard that serializes EnsureRuntime attempts and caches
     /// the outcome so that repeated / concurrent calls are idempotent.
+    #[allow(dead_code)]
     pub struct RuntimeGuard {
         pub state: Mutex<RuntimeState>,
         /// Notified when a Starting -> Ready/Failed transition completes so
@@ -43,6 +44,7 @@ pub(crate) mod ensure_runtime {
     }
 
     impl RuntimeGuard {
+        #[allow(dead_code)]
         pub fn new() -> Self {
             Self {
                 state: Mutex::new(RuntimeState::NotStarted),
@@ -52,6 +54,7 @@ pub(crate) mod ensure_runtime {
     }
 
     /// Returns the global RuntimeGuard singleton.
+    #[allow(dead_code)]
     pub fn runtime_guard() -> &'static RuntimeGuard {
         static GUARD: OnceLock<RuntimeGuard> = OnceLock::new();
         GUARD.get_or_init(RuntimeGuard::new)
@@ -67,6 +70,7 @@ pub(crate) mod ensure_runtime {
     ///
     /// `start_fn` is invoked only by the driver; it performs the actual start sequence.
     /// `probe_fn` is invoked for start_if_needed=false to report current status.
+    #[allow(dead_code)]
     pub async fn ensure_runtime<F, P>(
         guard: &RuntimeGuard,
         start_if_needed: bool,

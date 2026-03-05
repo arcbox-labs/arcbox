@@ -1,4 +1,4 @@
-//! VirtIO socket device (virtio-vsock).
+//! `VirtIO` socket device (virtio-vsock).
 //!
 //! Provides socket communication between host and guest without requiring
 //! network configuration.
@@ -29,7 +29,7 @@ impl Default for VsockConfig {
     }
 }
 
-/// VirtIO vsock device.
+/// `VirtIO` vsock device.
 ///
 /// Enables socket communication between host (CID 2) and guest using
 /// virtio transport.
@@ -85,7 +85,7 @@ impl VirtioVsock {
 
     /// Returns the guest CID.
     #[must_use]
-    pub fn guest_cid(&self) -> u64 {
+    pub const fn guest_cid(&self) -> u64 {
         self.config.guest_cid
     }
 
@@ -281,7 +281,7 @@ pub enum VsockOp {
 impl VsockOp {
     /// Converts from u16.
     #[must_use]
-    pub fn from_u16(val: u16) -> Option<Self> {
+    pub const fn from_u16(val: u16) -> Option<Self> {
         match val {
             0 => Some(Self::Invalid),
             1 => Some(Self::Request),
@@ -328,7 +328,7 @@ impl VsockHeader {
 
     /// Creates a new header.
     #[must_use]
-    pub fn new(src: VsockAddr, dst: VsockAddr, op: VsockOp) -> Self {
+    pub const fn new(src: VsockAddr, dst: VsockAddr, op: VsockOp) -> Self {
         Self {
             src_cid: src.cid,
             dst_cid: dst.cid,
@@ -345,7 +345,7 @@ impl VsockHeader {
 
     /// Returns the operation type.
     #[must_use]
-    pub fn operation(&self) -> Option<VsockOp> {
+    pub const fn operation(&self) -> Option<VsockOp> {
         VsockOp::from_u16(self.op)
     }
 }
@@ -371,6 +371,7 @@ pub enum ConnectionState {
 
 /// A vsock connection.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct VsockConnection {
     /// Local address.
     pub local: VsockAddr,
@@ -445,7 +446,7 @@ impl VsockConnection {
     }
 
     /// Updates peer credit info.
-    pub fn update_peer_credit(&mut self, buf_alloc: u32, fwd_cnt: u32) {
+    pub const fn update_peer_credit(&mut self, buf_alloc: u32, fwd_cnt: u32) {
         self.peer_buf_alloc = buf_alloc;
         self.peer_fwd_cnt = fwd_cnt;
     }
@@ -554,12 +555,12 @@ impl TcpBackend {
     /// Listens on a vsock port.
     pub fn listen(&self, port: u32) -> Result<()> {
         let tcp_port = self.base_port + port as u16;
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", tcp_port))
-            .map_err(|e| VirtioError::Io(format!("Failed to bind: {}", e)))?;
+        let listener = TcpListener::bind(format!("127.0.0.1:{tcp_port}"))
+            .map_err(|e| VirtioError::Io(format!("Failed to bind: {e}")))?;
 
         listener
             .set_nonblocking(true)
-            .map_err(|e| VirtioError::Io(format!("Failed to set nonblocking: {}", e)))?;
+            .map_err(|e| VirtioError::Io(format!("Failed to set nonblocking: {e}")))?;
 
         self.listeners.write().unwrap().insert(port, listener);
         tracing::info!("Vsock listening on port {} (TCP {})", port, tcp_port);
@@ -572,9 +573,9 @@ impl TcpBackend {
         if let Some(listener) = listeners.get(&port) {
             match listener.accept() {
                 Ok((stream, _addr)) => {
-                    stream.set_nonblocking(true).map_err(|e| {
-                        VirtioError::Io(format!("Failed to set nonblocking: {}", e))
-                    })?;
+                    stream
+                        .set_nonblocking(true)
+                        .map_err(|e| VirtioError::Io(format!("Failed to set nonblocking: {e}")))?;
 
                     let local = VsockAddr::new(VirtioVsock::HOST_CID, port);
                     let remote = VsockAddr::new(self.guest_cid, port);
@@ -583,7 +584,7 @@ impl TcpBackend {
                     Ok(Some(local))
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-                Err(e) => Err(VirtioError::Io(format!("Accept failed: {}", e))),
+                Err(e) => Err(VirtioError::Io(format!("Accept failed: {e}"))),
             }
         } else {
             Ok(None)
@@ -594,12 +595,12 @@ impl TcpBackend {
 impl VsockBackend for TcpBackend {
     fn on_connect(&mut self, addr: VsockAddr) -> Result<()> {
         let tcp_port = self.base_port + addr.port as u16;
-        let stream = TcpStream::connect(format!("127.0.0.1:{}", tcp_port))
-            .map_err(|e| VirtioError::Io(format!("Connect failed: {}", e)))?;
+        let stream = TcpStream::connect(format!("127.0.0.1:{tcp_port}"))
+            .map_err(|e| VirtioError::Io(format!("Connect failed: {e}")))?;
 
         stream
             .set_nonblocking(true)
-            .map_err(|e| VirtioError::Io(format!("Failed to set nonblocking: {}", e)))?;
+            .map_err(|e| VirtioError::Io(format!("Failed to set nonblocking: {e}")))?;
 
         self.connections.write().unwrap().insert(addr, stream);
         Ok(())
@@ -610,7 +611,7 @@ impl VsockBackend for TcpBackend {
         if let Some(stream) = connections.get_mut(&addr) {
             stream
                 .write(data)
-                .map_err(|e| VirtioError::Io(format!("Send failed: {}", e)))
+                .map_err(|e| VirtioError::Io(format!("Send failed: {e}")))
         } else {
             Err(VirtioError::InvalidOperation("Connection not found".into()))
         }
@@ -622,7 +623,7 @@ impl VsockBackend for TcpBackend {
             match stream.read(buf) {
                 Ok(n) => Ok(n),
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
-                Err(e) => Err(VirtioError::Io(format!("Recv failed: {}", e))),
+                Err(e) => Err(VirtioError::Io(format!("Recv failed: {e}"))),
             }
         } else {
             Err(VirtioError::InvalidOperation("Connection not found".into()))

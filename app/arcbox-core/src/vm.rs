@@ -67,7 +67,7 @@ pub struct VmInfo {
     pub memory_mb: u64,
 }
 
-/// Shared directory configuration for VirtioFS.
+/// Shared directory configuration for `VirtioFS`.
 #[derive(Debug, Clone)]
 pub struct SharedDirConfig {
     /// Host path to share.
@@ -91,7 +91,7 @@ impl SharedDirConfig {
 
     /// Sets the share as read-only.
     #[must_use]
-    pub fn read_only(mut self) -> Self {
+    pub const fn read_only(mut self) -> Self {
         self.read_only = true;
         self
     }
@@ -117,7 +117,7 @@ pub struct VmConfig {
     pub kernel: Option<String>,
     /// Kernel command line.
     pub cmdline: Option<String>,
-    /// Shared directories for VirtioFS.
+    /// Shared directories for `VirtioFS`.
     pub shared_dirs: Vec<SharedDirConfig>,
     /// Block devices (e.g., EROFS rootfs, Btrfs data disk).
     pub block_devices: Vec<BlockDeviceConfig>,
@@ -564,7 +564,7 @@ impl VmManager {
             .ok_or_else(|| CoreError::Vm("VMM not initialized".to_string()))?;
 
         vmm.connect_vsock(port)
-            .map_err(|e| CoreError::Vm(format!("vsock connect failed: {}", e)))
+            .map_err(|e| CoreError::Vm(format!("vsock connect failed: {e}")))
     }
 
     /// Reads serial console output from a running VM (macOS only).
@@ -592,7 +592,7 @@ impl VmManager {
             .ok_or_else(|| CoreError::Vm("VMM not initialized".to_string()))?;
 
         vmm.read_console_output()
-            .map_err(|e| CoreError::Vm(format!("read console failed: {}", e)))
+            .map_err(|e| CoreError::Vm(format!("read console failed: {e}")))
     }
 
     // ========================================================================
@@ -635,7 +635,7 @@ impl VmManager {
             .ok_or_else(|| CoreError::Vm("VMM not initialized".to_string()))?;
 
         vmm.set_balloon_target(target_bytes)
-            .map_err(|e| CoreError::Vm(format!("set balloon target failed: {}", e)))
+            .map_err(|e| CoreError::Vm(format!("set balloon target failed: {e}")))
     }
 
     /// Gets the current target memory size from the balloon device.

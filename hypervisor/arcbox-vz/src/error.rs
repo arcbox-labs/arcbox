@@ -33,7 +33,7 @@ pub enum VZError {
 
     /// Internal framework error.
     Internal {
-        /// Error code from NSError.
+        /// Error code from `NSError`.
         code: i32,
         /// Error message.
         message: String,
@@ -61,5 +61,5 @@ impl fmt::Display for VZError {
 
 impl std::error::Error for VZError {}
 
-/// Result type alias for VZError.
+/// Result type alias for `VZError`.
 pub type VZResult<T> = Result<T, VZError>;

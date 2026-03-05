@@ -1,6 +1,6 @@
 //! # arcbox-snapshot
 //!
-//! Snapshot and restore functionality for ArcBox Pro.
+//! Snapshot and restore functionality for `ArcBox` Pro.
 //!
 //! Features:
 //!
@@ -13,28 +13,8 @@
 //!
 //! This crate is licensed under BSL-1.1, which converts to MIT after 2 years.
 
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
-#![allow(clippy::module_name_repetitions)]
-// TODO: Remove these allows once the module is complete.
-#![allow(dead_code)]
-#![allow(clippy::doc_markdown)]
-#![allow(clippy::missing_errors_doc)]
-#![allow(clippy::missing_panics_doc)]
-#![allow(clippy::must_use_candidate)]
-#![allow(clippy::missing_const_for_fn)]
-#![allow(clippy::uninlined_format_args)]
-#![allow(clippy::similar_names)]
-#![allow(clippy::redundant_else)]
-#![allow(clippy::option_if_let_else)]
-#![allow(clippy::significant_drop_tightening)]
-#![allow(clippy::items_after_statements)]
-#![allow(clippy::unused_async)]
-#![allow(clippy::cast_precision_loss)]
-#![allow(clippy::default_trait_access)]
 #![allow(clippy::type_complexity)]
-#![allow(clippy::clone_on_copy)]
 #![allow(clippy::or_fun_call)]
-#![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::map_unwrap_or)]
 
 use chrono::{DateTime, Utc};
@@ -148,7 +128,7 @@ impl VmRestoreData {
 
     /// Returns the total memory size.
     #[must_use]
-    pub fn memory_size(&self) -> u64 {
+    pub const fn memory_size(&self) -> u64 {
         self.vm_snapshot.total_memory
     }
 
@@ -160,7 +140,7 @@ impl VmRestoreData {
 
     /// Whether the snapshot was compressed.
     #[must_use]
-    pub fn was_compressed(&self) -> bool {
+    pub const fn was_compressed(&self) -> bool {
         self.vm_snapshot.compressed
     }
 }
@@ -359,7 +339,7 @@ impl SnapshotManager {
                 .device_snapshots
                 .iter()
                 .map(|d| arcbox_hypervisor::DeviceSnapshot {
-                    device_type: d.device_type.clone(),
+                    device_type: d.device_type,
                     name: d.name.clone(),
                     state: d.state.clone(),
                 })
@@ -1069,7 +1049,7 @@ fn format_size(bytes: u64) -> String {
     } else if bytes >= KB {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
-        format!("{} bytes", bytes)
+        format!("{bytes} bytes")
     }
 }
 

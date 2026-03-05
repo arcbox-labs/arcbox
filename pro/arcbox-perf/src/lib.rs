@@ -13,22 +13,6 @@
 //!
 //! This crate is licensed under BSL-1.1, which converts to MIT after 2 years.
 
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
-#![allow(clippy::module_name_repetitions)]
-// TODO: Remove these allows once the module is complete.
-#![allow(dead_code)]
-#![allow(clippy::similar_names)]
-#![allow(clippy::doc_markdown)]
-#![allow(clippy::unused_self)]
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::cast_sign_loss)]
-#![allow(clippy::cast_precision_loss)]
-#![allow(clippy::items_after_statements)]
-#![allow(clippy::significant_drop_tightening)]
-#![allow(clippy::option_if_let_else)]
-#![allow(clippy::tuple_array_conversions)]
-#![allow(clippy::missing_const_for_fn)]
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -118,13 +102,13 @@ pub struct VmMetrics {
     pub memory_used: u64,
     /// Guest memory total in bytes.
     pub memory_total: u64,
-    /// VirtIO block read bytes.
+    /// `VirtIO` block read bytes.
     pub virtio_blk_read: u64,
-    /// VirtIO block write bytes.
+    /// `VirtIO` block write bytes.
     pub virtio_blk_write: u64,
-    /// VirtIO net RX bytes.
+    /// `VirtIO` net RX bytes.
     pub virtio_net_rx: u64,
-    /// VirtIO net TX bytes.
+    /// `VirtIO` net TX bytes.
     pub virtio_net_tx: u64,
 }
 
@@ -148,6 +132,7 @@ impl Default for HistoryConfig {
 
 /// Internal state for CPU usage calculation.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 struct CpuState {
     /// Previous CPU times.
     prev_times: Option<CpuTimes>,
@@ -157,6 +142,7 @@ struct CpuState {
 
 /// CPU time breakdown.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 struct CpuTimes {
     user: u64,
     system: u64,
@@ -166,6 +152,7 @@ struct CpuTimes {
 
 /// Internal state for I/O rate calculation.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 struct IoState {
     /// Previous disk read bytes.
     prev_disk_read: u64,
@@ -190,6 +177,7 @@ struct IoState {
 /// Performance monitor.
 ///
 /// Collects and tracks system, container, and VM performance metrics.
+#[allow(dead_code)]
 pub struct PerfMonitor {
     /// Configuration.
     config: HistoryConfig,
@@ -897,7 +885,7 @@ impl PerfMonitor {
 
     /// Returns the sample interval.
     #[must_use]
-    pub fn sample_interval_ms(&self) -> u64 {
+    pub const fn sample_interval_ms(&self) -> u64 {
         self.config.sample_interval_ms
     }
 
@@ -921,7 +909,7 @@ impl Default for PerfMonitor {
     }
 }
 
-fn normalize_cpu_percent(value: f64) -> f64 {
+const fn normalize_cpu_percent(value: f64) -> f64 {
     if value.is_finite() {
         value.clamp(0.0, 100.0)
     } else {
@@ -960,7 +948,7 @@ fn parse_cpu_line(line: &str) -> CpuTimes {
     }
 }
 
-/// Parses value from vm_stat output line.
+/// Parses value from `vm_stat` output line.
 #[cfg(target_os = "macos")]
 fn parse_vm_stat_value(line: &str) -> u64 {
     line.split(':')

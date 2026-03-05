@@ -64,7 +64,7 @@ async fn machine_client() -> Result<MachineServiceClient<Channel>> {
     Ok(MachineServiceClient::new(channel))
 }
 
-pub(crate) struct UnixConnector {
+pub struct UnixConnector {
     socket_path: PathBuf,
 }
 

@@ -1,28 +1,17 @@
 //! # arcbox-net-advanced
 //!
-//! Advanced networking features for ArcBox Pro.
+//! Advanced networking features for `ArcBox` Pro.
 //!
 //! This crate extends arcbox-net with:
 //!
 //! - **VPN awareness**: Auto-detect VPN and route traffic
 //! - **Advanced DNS**: Split DNS, custom resolvers
-//! - **Traffic shaping**: QoS and bandwidth limits
+//! - **Traffic shaping**: `QoS` and bandwidth limits
 //! - **Network policies**: Fine-grained access control
 //!
 //! ## License
 //!
 //! This crate is licensed under BSL-1.1, which converts to MIT after 2 years.
-
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
-#![allow(clippy::module_name_repetitions)]
-// TODO: Remove these allows once the module is complete.
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(clippy::all)]
-#![allow(clippy::pedantic)]
-#![allow(clippy::nursery)]
-
 pub mod dns;
 pub mod vpn;
 

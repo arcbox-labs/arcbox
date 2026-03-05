@@ -3,6 +3,8 @@
 //! This module implements a length-prefixed RPC protocol over vsock.
 //! Payloads are protobuf-encoded messages.
 
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use bytes::{Buf, BufMut, BytesMut};
 use prost::Message;

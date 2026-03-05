@@ -23,3 +23,6 @@ tempfile = "3"
 
 [features]
 default = []
+
+[lints]
+workspace = true

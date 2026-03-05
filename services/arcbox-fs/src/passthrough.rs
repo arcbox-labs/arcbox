@@ -29,6 +29,7 @@ use std::time::Duration;
 
 /// Inode data stored for each known file/directory.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct InodeData {
     /// Path relative to root.
     path: PathBuf,
@@ -118,6 +119,7 @@ impl FileType {
 
 /// Handle data for an open file.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct HandleData {
     /// The open file.
     file: File,
@@ -324,8 +326,7 @@ impl PassthroughFs {
     /// Gets the relative path from full path.
     fn relative_path(&self, path: &Path) -> PathBuf {
         path.strip_prefix(&self.root)
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|_| path.to_path_buf())
+            .map_or_else(|_| path.to_path_buf(), Path::to_path_buf)
     }
 
     /// Creates `FuseAttr` from metadata.
@@ -832,7 +833,7 @@ impl PassthroughFs {
                 .map_err(|_| FsError::Cache("failed to acquire inode lock".to_string()))?;
             for data in inodes.values_mut() {
                 if data.path == old_relative {
-                    data.path = new_relative.clone();
+                    data.path = new_relative;
                     break;
                 }
             }
@@ -1416,7 +1417,7 @@ impl PassthroughFs {
             .map_err(|_| FsError::InvalidPath("invalid path".to_string()))?;
 
         let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-        let ret = unsafe { libc::statfs(path_cstr.as_ptr(), &mut stat) };
+        let ret = unsafe { libc::statfs(path_cstr.as_ptr(), &raw mut stat) };
         if ret != 0 {
             return Err(FsError::io(std::io::Error::last_os_error()));
         }

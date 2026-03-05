@@ -9,3 +9,6 @@ authors.workspace = true
 description = "Shared protocol and runtime constants for ArcBox"
 
 [dependencies]
+
+[lints]
+workspace = true

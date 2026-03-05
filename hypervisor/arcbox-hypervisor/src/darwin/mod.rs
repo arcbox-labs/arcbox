@@ -6,7 +6,7 @@
 //! # Requirements
 //!
 //! - macOS 11.0 or later
-//! - Apple Silicon (ARM64) or Intel x86_64
+//! - Apple Silicon (ARM64) or Intel `x86_64`
 //! - Entitlements for virtualization (com.apple.security.virtualization)
 //!
 //! # Architecture

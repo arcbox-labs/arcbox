@@ -1,6 +1,6 @@
 //! # arcbox-fs-enhanced
 //!
-//! Enhanced filesystem service for ArcBox Pro.
+//! Enhanced filesystem service for `ArcBox` Pro.
 //!
 //! This crate extends arcbox-fs with advanced features:
 //!
@@ -12,16 +12,6 @@
 //! ## License
 //!
 //! This crate is licensed under BSL-1.1, which converts to MIT after 2 years.
-
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
-#![allow(clippy::module_name_repetitions)]
-// TODO: Remove these allows once the module is complete.
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(clippy::all)]
-#![allow(clippy::pedantic)]
-#![allow(clippy::nursery)]
-
 pub mod cache;
 pub mod prefetch;
 

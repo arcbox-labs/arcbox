@@ -149,9 +149,9 @@ pub enum VmnetMode {
 impl From<VmnetMode> for VmnetOperatingMode {
     fn from(mode: VmnetMode) -> Self {
         match mode {
-            VmnetMode::Shared => VmnetOperatingMode::Shared,
-            VmnetMode::HostOnly => VmnetOperatingMode::Host,
-            VmnetMode::Bridged => VmnetOperatingMode::Bridged,
+            VmnetMode::Shared => Self::Shared,
+            VmnetMode::HostOnly => Self::Host,
+            VmnetMode::Bridged => Self::Bridged,
         }
     }
 }
@@ -205,7 +205,7 @@ impl Vmnet {
         let config_dict = unsafe {
             let dict = create_vmnet_config_dict();
             if dict.is_null() {
-                dispatch_release(queue as *mut _);
+                dispatch_release(queue.cast());
                 return Err(NetError::config(
                     "failed to create config dictionary".to_string(),
                 ));
@@ -214,8 +214,8 @@ impl Vmnet {
             // Set operating mode.
             let mode_value: i64 = VmnetOperatingMode::from(config.mode) as i64;
             let mode_num = cfnumber_from_i64(mode_value);
-            CFDictionarySetValue(dict, vmnet_operation_mode_key as _, mode_num as _);
-            CFRelease(mode_num as _);
+            CFDictionarySetValue(dict, vmnet_operation_mode_key.cast(), mode_num.cast());
+            CFRelease(mode_num.cast());
 
             // Set MAC address if provided.
             if let Some(mac) = config.mac {
@@ -224,15 +224,15 @@ impl Vmnet {
                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
                 );
                 let mac_cf = cfstring_from_str(&mac_str);
-                CFDictionarySetValue(dict, vmnet_mac_address_key as _, mac_cf as _);
-                CFRelease(mac_cf as _);
+                CFDictionarySetValue(dict, vmnet_mac_address_key.cast(), mac_cf.cast());
+                CFRelease(mac_cf.cast());
             }
 
             // Set MTU.
             let mtu_value: i64 = i64::from(config.mtu);
             let mtu_num = cfnumber_from_i64(mtu_value);
-            CFDictionarySetValue(dict, vmnet_mtu_key as _, mtu_num as _);
-            CFRelease(mtu_num as _);
+            CFDictionarySetValue(dict, vmnet_mtu_key.cast(), mtu_num.cast());
+            CFRelease(mtu_num.cast());
 
             // Mode-specific configuration.
             match config.mode {
@@ -240,31 +240,35 @@ impl Vmnet {
                     // Set DHCP range if provided.
                     if let Some(start) = config.dhcp_start {
                         let start_cf = cfstring_from_str(&start.to_string());
-                        CFDictionarySetValue(dict, vmnet_start_address_key as _, start_cf as _);
-                        CFRelease(start_cf as _);
+                        CFDictionarySetValue(dict, vmnet_start_address_key.cast(), start_cf.cast());
+                        CFRelease(start_cf.cast());
                     }
                     if let Some(end) = config.dhcp_end {
                         let end_cf = cfstring_from_str(&end.to_string());
-                        CFDictionarySetValue(dict, vmnet_end_address_key as _, end_cf as _);
-                        CFRelease(end_cf as _);
+                        CFDictionarySetValue(dict, vmnet_end_address_key.cast(), end_cf.cast());
+                        CFRelease(end_cf.cast());
                     }
                     if let Some(mask) = config.subnet_mask {
                         let mask_cf = cfstring_from_str(&mask.to_string());
-                        CFDictionarySetValue(dict, vmnet_subnet_mask_key as _, mask_cf as _);
-                        CFRelease(mask_cf as _);
+                        CFDictionarySetValue(dict, vmnet_subnet_mask_key.cast(), mask_cf.cast());
+                        CFRelease(mask_cf.cast());
                     }
                 }
                 VmnetMode::HostOnly => {
                     // Set isolation if enabled.
                     if config.isolated {
-                        CFDictionarySetValue(dict, vmnet_enable_isolation_key as _, kCFBooleanTrue);
+                        CFDictionarySetValue(
+                            dict,
+                            vmnet_enable_isolation_key.cast(),
+                            kCFBooleanTrue,
+                        );
 
                         // Generate unique interface ID for isolation.
                         let uuid = CFUUIDCreate(kCFAllocatorDefault);
                         let uuid_str = CFUUIDCreateString(kCFAllocatorDefault, uuid);
-                        CFDictionarySetValue(dict, vmnet_interface_id_key as _, uuid_str as _);
-                        CFRelease(uuid_str as _);
-                        CFRelease(uuid as _);
+                        CFDictionarySetValue(dict, vmnet_interface_id_key.cast(), uuid_str.cast());
+                        CFRelease(uuid_str.cast());
+                        CFRelease(uuid.cast());
                     }
                 }
                 VmnetMode::Bridged => {
@@ -273,13 +277,13 @@ impl Vmnet {
                         let iface_cf = cfstring_from_str(iface);
                         CFDictionarySetValue(
                             dict,
-                            vmnet_shared_interface_name_key as _,
-                            iface_cf as _,
+                            vmnet_shared_interface_name_key.cast(),
+                            iface_cf.cast(),
                         );
-                        CFRelease(iface_cf as _);
+                        CFRelease(iface_cf.cast());
                     } else {
-                        CFRelease(dict as _);
-                        dispatch_release(queue as *mut _);
+                        CFRelease(dict.cast_const());
+                        dispatch_release(queue.cast());
                         return Err(NetError::config(
                             "bridge mode requires interface name".to_string(),
                         ));
@@ -296,16 +300,17 @@ impl Vmnet {
         // A production implementation might use proper block support for async operation.
 
         // Safety: We're calling vmnet with valid configuration.
-        let interface = unsafe { vmnet_start_interface(config_dict as _, queue, ptr::null()) };
+        let interface =
+            unsafe { vmnet_start_interface(config_dict.cast_const(), queue, ptr::null()) };
 
         // Release the config dictionary.
         unsafe {
-            CFRelease(config_dict as _);
+            CFRelease(config_dict.cast_const());
         }
 
         if interface.is_null() {
             unsafe {
-                dispatch_release(queue as *mut _);
+                dispatch_release(queue.cast());
             }
             return Err(NetError::config(
                 "failed to start vmnet interface (requires root or entitlements)".to_string(),
@@ -381,13 +386,13 @@ impl Vmnet {
 
         // Create iovec for the buffer.
         let mut iov = iovec {
-            iov_base: buf.as_mut_ptr() as *mut _,
+            iov_base: buf.as_mut_ptr().cast(),
             iov_len: buf.len(),
         };
 
         // Create packet descriptor.
         let mut packet = VmnetPacket {
-            vm_pkt_iov: &mut iov,
+            vm_pkt_iov: &raw mut iov,
             vm_pkt_iovcnt: 1,
             vm_pkt_size: 0,
             vm_flags: 0,
@@ -396,7 +401,7 @@ impl Vmnet {
         let mut pktcnt: c_int = 1;
 
         // Safety: vmnet_read is safe when called with valid parameters.
-        let status = unsafe { vmnet_read(self.interface, &mut packet, &mut pktcnt) };
+        let status = unsafe { vmnet_read(self.interface, &raw mut packet, &raw mut pktcnt) };
 
         if !status.is_success() {
             if status == VmnetReturnT::BufferExhausted {
@@ -440,7 +445,7 @@ impl Vmnet {
 
         // Create packet descriptor.
         let mut packet = VmnetPacket {
-            vm_pkt_iov: &mut iov,
+            vm_pkt_iov: &raw mut iov,
             vm_pkt_iovcnt: 1,
             vm_pkt_size: data.len() as u32,
             vm_flags: 0,
@@ -449,7 +454,7 @@ impl Vmnet {
         let mut pktcnt: c_int = 1;
 
         // Safety: vmnet_write is safe when called with valid parameters.
-        let status = unsafe { vmnet_write(self.interface, &mut packet, &mut pktcnt) };
+        let status = unsafe { vmnet_write(self.interface, &raw mut packet, &raw mut pktcnt) };
 
         if !status.is_success() {
             return Err(NetError::io(std::io::Error::other(status.message())));
@@ -501,7 +506,7 @@ impl Drop for Vmnet {
         // Release the dispatch queue.
         // Safety: dispatch_release is safe for a valid queue.
         unsafe {
-            dispatch_release(self.queue as *mut _);
+            dispatch_release(self.queue.cast());
         }
     }
 }

@@ -29,7 +29,7 @@ pub struct AgentClient {
 impl AgentClient {
     /// Creates a new agent client for the given VM CID.
     #[must_use]
-    pub fn new(cid: u32) -> Self {
+    pub const fn new(cid: u32) -> Self {
         let addr = VsockAddr::new(cid, AGENT_PORT);
         Self {
             cid,
@@ -42,7 +42,7 @@ impl AgentClient {
     ///
     /// This is used on macOS where vsock connections are obtained through
     /// the hypervisor layer (Virtualization.framework) rather than directly
-    /// through AF_VSOCK.
+    /// through `AF_VSOCK`.
     ///
     /// # Arguments
     /// * `cid` - The VM's CID (for tracking purposes)
@@ -54,7 +54,7 @@ impl AgentClient {
     pub fn from_fd(cid: u32, fd: std::os::unix::io::RawFd) -> Result<Self> {
         let addr = VsockAddr::new(cid, AGENT_PORT);
         let transport = VsockTransport::from_raw_fd(fd, addr)
-            .map_err(|e| CoreError::Machine(format!("invalid vsock fd: {}", e)))?;
+            .map_err(|e| CoreError::Machine(format!("invalid vsock fd: {e}")))?;
 
         Ok(Self {
             cid,
@@ -65,7 +65,7 @@ impl AgentClient {
 
     /// Returns the VM CID.
     #[must_use]
-    pub fn cid(&self) -> u32 {
+    pub const fn cid(&self) -> u32 {
         self.cid
     }
 
@@ -82,7 +82,7 @@ impl AgentClient {
         self.transport
             .connect()
             .await
-            .map_err(|e| CoreError::Machine(format!("failed to connect to agent: {}", e)))?;
+            .map_err(|e| CoreError::Machine(format!("failed to connect to agent: {e}")))?;
 
         self.connected = true;
         tracing::debug!(cid = self.cid, "connected to agent");
@@ -95,13 +95,13 @@ impl AgentClient {
             self.transport
                 .disconnect()
                 .await
-                .map_err(|e| CoreError::Machine(format!("failed to disconnect: {}", e)))?;
+                .map_err(|e| CoreError::Machine(format!("failed to disconnect: {e}")))?;
             self.connected = false;
         }
         Ok(())
     }
 
-    /// Builds a V2 wire message with an optional trace_id.
+    /// Builds a V2 wire message with an optional `trace_id`.
     ///
     /// Wire format V2:
     /// ```text
@@ -127,7 +127,7 @@ impl AgentClient {
         buf.freeze()
     }
 
-    /// Parses a V2 wire response. Returns (resp_type, trace_id, payload).
+    /// Parses a V2 wire response. Returns (`resp_type`, `trace_id`, payload).
     fn parse_response(response: &[u8]) -> Result<(u32, String, Vec<u8>)> {
         if response.len() < FRAME_HEADER_SIZE {
             return Err(CoreError::Machine("response too short".to_string()));
@@ -174,7 +174,7 @@ impl AgentClient {
         self.rpc_call_traced(msg_type, &trace_id, payload).await
     }
 
-    /// Sends an RPC request with a trace_id and receives a response.
+    /// Sends an RPC request with a `trace_id` and receives a response.
     async fn rpc_call_traced(
         &mut self,
         msg_type: MessageType,
@@ -191,14 +191,14 @@ impl AgentClient {
         self.transport
             .send(buf)
             .await
-            .map_err(|e| CoreError::Machine(format!("failed to send request: {}", e)))?;
+            .map_err(|e| CoreError::Machine(format!("failed to send request: {e}")))?;
 
         // Receive response.
         let response = self
             .transport
             .recv()
             .await
-            .map_err(|e| CoreError::Machine(format!("failed to receive response: {}", e)))?;
+            .map_err(|e| CoreError::Machine(format!("failed to receive response: {e}")))?;
 
         let (resp_type, _resp_trace, payload) = Self::parse_response(&response)?;
 
@@ -226,13 +226,12 @@ impl AgentClient {
 
         if resp_type != MessageType::PingResponse as u32 {
             return Err(CoreError::Machine(format!(
-                "unexpected response type: {}",
-                resp_type
+                "unexpected response type: {resp_type}"
             )));
         }
 
         PingResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
     }
 
     /// Gets system information from the guest.
@@ -247,13 +246,12 @@ impl AgentClient {
 
         if resp_type != MessageType::GetSystemInfoResponse as u32 {
             return Err(CoreError::Machine(format!(
-                "unexpected response type: {}",
-                resp_type
+                "unexpected response type: {resp_type}"
             )));
         }
 
         SystemInfo::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
     }
 
     /// Ensures guest runtime services are ready.
@@ -270,13 +268,12 @@ impl AgentClient {
 
         if resp_type != MessageType::EnsureRuntimeResponse as u32 {
             return Err(CoreError::Machine(format!(
-                "unexpected response type: {}",
-                resp_type
+                "unexpected response type: {resp_type}"
             )));
         }
 
         RuntimeEnsureResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
     }
 
     /// Gets guest runtime status.
@@ -293,13 +290,12 @@ impl AgentClient {
 
         if resp_type != MessageType::RuntimeStatusResponse as u32 {
             return Err(CoreError::Machine(format!(
-                "unexpected response type: {}",
-                resp_type
+                "unexpected response type: {resp_type}"
             )));
         }
 
         RuntimeStatusResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
     }
 }
 

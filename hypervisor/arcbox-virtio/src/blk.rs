@@ -1,11 +1,11 @@
-//! VirtIO block device (virtio-blk).
+//! `VirtIO` block device (virtio-blk).
 //!
-//! Implements the VirtIO block device specification for disk I/O.
+//! Implements the `VirtIO` block device specification for disk I/O.
 //!
 //! Supports:
 //! - Synchronous I/O with standard file operations
 //! - Asynchronous I/O with tokio
-//! - Direct I/O (O_DIRECT) for bypassing OS cache
+//! - Direct I/O (`O_DIRECT`) for bypassing OS cache
 //! - Memory-mapped I/O for zero-copy operations
 
 use std::fs::{File, OpenOptions};
@@ -174,6 +174,7 @@ impl Drop for DirectIoBackend {
 // ============================================================================
 
 /// Async file-based block backend using tokio.
+#[allow(dead_code)]
 pub struct AsyncFileBackend {
     /// Path to the backing file.
     path: PathBuf,
@@ -326,7 +327,7 @@ impl MmapBackend {
 
     /// Returns the capacity in sectors (512 bytes each).
     #[must_use]
-    pub fn capacity(&self) -> u64 {
+    pub const fn capacity(&self) -> u64 {
         (self.size / 512) as u64
     }
 
@@ -379,7 +380,7 @@ impl MmapBackend {
     ///
     /// The caller must ensure the pointer is used within the valid range.
     #[must_use]
-    pub unsafe fn as_ptr(&self) -> *const u8 {
+    pub const unsafe fn as_ptr(&self) -> *const u8 {
         self.ptr
     }
 
@@ -390,7 +391,7 @@ impl MmapBackend {
     /// The caller must ensure the pointer is used within the valid range and
     /// the backend is not read-only.
     #[must_use]
-    pub unsafe fn as_mut_ptr(&self) -> *mut u8 {
+    pub const unsafe fn as_mut_ptr(&self) -> *mut u8 {
         self.ptr
     }
 }
@@ -429,7 +430,7 @@ impl Default for BlockConfig {
     }
 }
 
-/// VirtIO block request types.
+/// `VirtIO` block request types.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockRequestType {
@@ -459,14 +460,13 @@ impl TryFrom<u32> for BlockRequestType {
             11 => Ok(Self::Discard),
             13 => Ok(Self::WriteZeroes),
             _ => Err(VirtioError::InvalidOperation(format!(
-                "Unknown block request type: {}",
-                value
+                "Unknown block request type: {value}"
             ))),
         }
     }
 }
 
-/// VirtIO block request status.
+/// `VirtIO` block request status.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
 pub enum BlockStatus {
@@ -478,7 +478,7 @@ pub enum BlockStatus {
     Unsupp = 2,
 }
 
-/// VirtIO block request header.
+/// `VirtIO` block request header.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockRequestHeader {
@@ -512,7 +512,7 @@ impl BlockRequestHeader {
     }
 }
 
-/// VirtIO block device.
+/// `VirtIO` block device.
 pub struct VirtioBlock {
     config: BlockConfig,
     features: u64,
@@ -546,7 +546,7 @@ impl VirtioBlock {
     pub const FEATURE_DISCARD: u64 = 1 << 13;
     /// Feature: Write zeroes command.
     pub const FEATURE_WRITE_ZEROES: u64 = 1 << 14;
-    /// VirtIO 1.0 feature.
+    /// `VirtIO` 1.0 feature.
     pub const FEATURE_VERSION_1: u64 = 1 << 32;
 
     /// Creates a new block device.
@@ -597,7 +597,7 @@ impl VirtioBlock {
 
         let metadata = file
             .metadata()
-            .map_err(|e| VirtioError::Io(format!("Failed to get metadata: {}", e)))?;
+            .map_err(|e| VirtioError::Io(format!("Failed to get metadata: {e}")))?;
 
         let capacity = metadata.len() / 512;
 
@@ -654,15 +654,15 @@ impl VirtioBlock {
 
         let mut file = file
             .write()
-            .map_err(|e| VirtioError::Io(format!("Failed to lock file: {}", e)))?;
+            .map_err(|e| VirtioError::Io(format!("Failed to lock file: {e}")))?;
 
         let offset = sector * u64::from(self.config.blk_size);
         file.seek(SeekFrom::Start(offset))
-            .map_err(|e| VirtioError::Io(format!("Seek failed: {}", e)))?;
+            .map_err(|e| VirtioError::Io(format!("Seek failed: {e}")))?;
 
         let bytes_read = file
             .read(data)
-            .map_err(|e| VirtioError::Io(format!("Read failed: {}", e)))?;
+            .map_err(|e| VirtioError::Io(format!("Read failed: {e}")))?;
 
         tracing::trace!("Read {} bytes from sector {}", bytes_read, sector);
         Ok(bytes_read)
@@ -680,15 +680,15 @@ impl VirtioBlock {
 
         let mut file = file
             .write()
-            .map_err(|e| VirtioError::Io(format!("Failed to lock file: {}", e)))?;
+            .map_err(|e| VirtioError::Io(format!("Failed to lock file: {e}")))?;
 
         let offset = sector * u64::from(self.config.blk_size);
         file.seek(SeekFrom::Start(offset))
-            .map_err(|e| VirtioError::Io(format!("Seek failed: {}", e)))?;
+            .map_err(|e| VirtioError::Io(format!("Seek failed: {e}")))?;
 
         let bytes_written = file
             .write(data)
-            .map_err(|e| VirtioError::Io(format!("Write failed: {}", e)))?;
+            .map_err(|e| VirtioError::Io(format!("Write failed: {e}")))?;
 
         tracing::trace!("Wrote {} bytes to sector {}", bytes_written, sector);
         Ok(bytes_written)
@@ -702,10 +702,10 @@ impl VirtioBlock {
 
         let file = file
             .write()
-            .map_err(|e| VirtioError::Io(format!("Failed to lock file: {}", e)))?;
+            .map_err(|e| VirtioError::Io(format!("Failed to lock file: {e}")))?;
 
         file.sync_all()
-            .map_err(|e| VirtioError::Io(format!("Flush failed: {}", e)))?;
+            .map_err(|e| VirtioError::Io(format!("Flush failed: {e}")))?;
 
         tracing::trace!("Flushed block device");
         Ok(0)

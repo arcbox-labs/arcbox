@@ -13,7 +13,7 @@ use objc2::runtime::AnyObject;
 // Balloon Device Configuration
 // ============================================================================
 
-/// Configuration for a VirtIO traditional memory balloon device.
+/// Configuration for a `VirtIO` traditional memory balloon device.
 ///
 /// This device allows dynamic memory management between the host and guest.
 /// The host can reclaim memory from the guest by inflating the balloon,
@@ -51,6 +51,7 @@ impl MemoryBalloonDeviceConfiguration {
     }
 
     /// Consumes the configuration and returns the raw pointer.
+    #[must_use]
     pub fn into_ptr(self) -> *mut AnyObject {
         let ptr = self.inner;
         std::mem::forget(self);
@@ -76,7 +77,7 @@ impl Drop for MemoryBalloonDeviceConfiguration {
 // Memory Balloon Device (Runtime)
 // ============================================================================
 
-/// A running VirtIO memory balloon device.
+/// A running `VirtIO` memory balloon device.
 ///
 /// This represents an active balloon device on a running VM.
 /// Use `set_target_memory_size()` to adjust the balloon.
@@ -133,6 +134,7 @@ impl MemoryBalloonDevice {
     }
 
     /// Returns the raw object pointer.
+    #[must_use]
     pub fn as_ptr(&self) -> *mut AnyObject {
         self.inner
     }
@@ -146,12 +148,12 @@ impl MemoryBalloonDevice {
 ///
 /// # Arguments
 ///
-/// * `vm_ptr` - Raw pointer to VZVirtualMachine
+/// * `vm_ptr` - Raw pointer to `VZVirtualMachine`
 ///
 /// # Returns
 ///
 /// A vector of `MemoryBalloonDevice` wrappers.
-pub(crate) fn vm_memory_balloon_devices(vm_ptr: *mut AnyObject) -> Vec<MemoryBalloonDevice> {
+pub fn vm_memory_balloon_devices(vm_ptr: *mut AnyObject) -> Vec<MemoryBalloonDevice> {
     if vm_ptr.is_null() {
         return Vec::new();
     }

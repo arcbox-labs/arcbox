@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 use std::time::Duration;
 
 /// Machine state.
@@ -202,9 +202,9 @@ pub struct MachineManager {
     machines: RwLock<HashMap<String, MachineInfo>>,
     vm_manager: VmManager,
     persistence: MachinePersistence,
-    /// Data directory for VirtioFS sharing.
+    /// Data directory for `VirtioFS` sharing.
     data_dir: PathBuf,
-    /// Machine-specific directory (data_dir/machines/).
+    /// Machine-specific directory (`data_dir/machines`/).
     machines_dir: PathBuf,
 }
 
@@ -278,7 +278,7 @@ impl MachineManager {
     /// Creates a new machine.
     ///
     /// Sets up EROFS rootfs (read-only, /dev/vda) and a Btrfs data disk
-    /// (/dev/vdb) with block device and VirtioFS sharing configured.
+    /// (/dev/vdb) with block device and `VirtioFS` sharing configured.
     ///
     /// When `config.distro` is set, also resolves and downloads a distro
     /// rootfs tarball and generates an SSH key pair.
@@ -402,8 +402,7 @@ impl MachineManager {
         if is_machine_vm {
             self.wait_for_machine_ready(name).await.map_err(|e| {
                 CoreError::Machine(format!(
-                    "Machine '{}' started but readiness check failed: {}",
-                    name, e
+                    "Machine '{name}' started but readiness check failed: {e}"
                 ))
             })?;
         }
@@ -414,7 +413,7 @@ impl MachineManager {
     /// Waits for the guest agent to become ready and discovers the IP address.
     ///
     /// Polls the agent via vsock with exponential backoff. Once the agent
-    /// responds, queries SystemInfo to get the guest IP.
+    /// responds, queries `SystemInfo` to get the guest IP.
     async fn wait_for_machine_ready(&self, name: &str) -> Result<()> {
         const MAX_ATTEMPTS: u32 = 20;
         const INITIAL_DELAY_MS: u64 = 500;
@@ -500,8 +499,7 @@ impl MachineManager {
         }
 
         Err(CoreError::Machine(format!(
-            "Machine '{}' agent did not report a routable IP within timeout",
-            name
+            "Machine '{name}' agent did not report a routable IP within timeout"
         )))
     }
 
@@ -518,15 +516,13 @@ impl MachineManager {
 
             if machine.state == MachineState::Running {
                 return Err(CoreError::invalid_state(format!(
-                    "machine '{}' is already running",
-                    name
+                    "machine '{name}' is already running"
                 )));
             }
 
             if machine.state == MachineState::Starting || machine.state == MachineState::Stopping {
                 return Err(CoreError::invalid_state(format!(
-                    "machine '{}' is in transition state",
-                    name
+                    "machine '{name}' is in transition state"
                 )));
             }
 
@@ -547,7 +543,7 @@ impl MachineManager {
 
     /// Returns a reference to the underlying VM manager.
     #[must_use]
-    pub fn vm_manager(&self) -> &VmManager {
+    pub const fn vm_manager(&self) -> &VmManager {
         &self.vm_manager
     }
 
@@ -591,8 +587,7 @@ impl MachineManager {
 
         if machine.state != MachineState::Running {
             return Err(CoreError::invalid_state(format!(
-                "machine '{}' is not running",
-                name
+                "machine '{name}' is not running"
             )));
         }
 
@@ -664,8 +659,7 @@ impl MachineManager {
 
         if machine.state != MachineState::Running {
             return Err(CoreError::invalid_state(format!(
-                "machine '{}' is not running",
-                name
+                "machine '{name}' is not running"
             )));
         }
 
@@ -689,8 +683,7 @@ impl MachineManager {
 
         if machine.state != MachineState::Running {
             return Err(CoreError::invalid_state(format!(
-                "machine '{}' is not running",
-                name
+                "machine '{name}' is not running"
             )));
         }
 
@@ -727,8 +720,7 @@ impl MachineManager {
 
             if machine.state != MachineState::Running {
                 return Err(CoreError::invalid_state(format!(
-                    "machine '{}' is not running",
-                    name
+                    "machine '{name}' is not running"
                 )));
             }
 

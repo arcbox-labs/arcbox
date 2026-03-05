@@ -44,13 +44,13 @@ pub enum VmmError {
 }
 
 impl VmmError {
-    /// Creates an invalid state error via CommonError.
+    /// Creates an invalid state error via `CommonError`.
     #[must_use]
     pub fn invalid_state(msg: impl Into<String>) -> Self {
         Self::Common(CommonError::invalid_state(msg))
     }
 
-    /// Creates a config error via CommonError.
+    /// Creates a config error via `CommonError`.
     #[must_use]
     pub fn config(msg: impl Into<String>) -> Self {
         Self::Common(CommonError::config(msg))

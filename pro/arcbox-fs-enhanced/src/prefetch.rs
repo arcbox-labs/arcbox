@@ -173,10 +173,7 @@ impl PrefetchEngine {
             self.evict_old_transitions();
         }
 
-        let stats = self
-            .transitions
-            .entry(from_path)
-            .or_insert_with(TransitionStats::default);
+        let stats = self.transitions.entry(from_path).or_default();
 
         *stats.transitions.entry(to_path.to_string()).or_insert(0) += 1;
         stats.total += 1;
@@ -263,7 +260,7 @@ impl PrefetchEngine {
                 for (target, &count) in &stats.transitions {
                     if count >= self.config.min_transition_count {
                         // Probability-based score (higher weight).
-                        let prob = count as f64 / stats.total as f64;
+                        let prob = f64::from(count) / f64::from(stats.total);
                         *scores.entry(target.clone()).or_insert(0.0) += prob * 10.0;
                     }
                 }
@@ -273,7 +270,7 @@ impl PrefetchEngine {
 
     /// Scores files based on access frequency.
     fn score_from_frequency(&self, scores: &mut HashMap<String, f64>) {
-        let max_freq = self.frequency.values().copied().max().unwrap_or(1) as f64;
+        let max_freq = f64::from(self.frequency.values().copied().max().unwrap_or(1));
 
         for (path, &count) in &self.frequency {
             if count >= self.config.min_hot_frequency {
@@ -282,7 +279,7 @@ impl PrefetchEngine {
                     continue;
                 }
                 // Normalized frequency score.
-                let score = (count as f64 / max_freq) * 3.0;
+                let score = (f64::from(count) / max_freq) * 3.0;
                 *scores.entry(path.clone()).or_insert(0.0) += score;
             }
         }
@@ -305,7 +302,7 @@ impl PrefetchEngine {
                 let dir = parent.to_string_lossy().to_string();
                 if let Some(&dir_count) = recent_dirs.get(&dir) {
                     // Small boost based on directory activity.
-                    *freq_score += (dir_count as f64).ln() * 0.5;
+                    *freq_score += f64::from(dir_count).ln() * 0.5;
                 }
             }
         }

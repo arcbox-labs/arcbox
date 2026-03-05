@@ -46,3 +46,6 @@ path = "src/bin/arcbox-perf.rs"
 
 [features]
 default = []
+
+[lints]
+workspace = true

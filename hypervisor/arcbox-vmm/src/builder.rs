@@ -5,13 +5,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::device::{DeviceManager, DeviceType};
 use crate::error::{Result, VmmError};
-use crate::irq::IrqChip;
-use crate::memory::MemoryManager;
 use crate::vmm::{Vmm, VmmConfig};
 
-use arcbox_virtio::VirtioDevice;
 use arcbox_virtio::blk::{BlockConfig, VirtioBlock};
 use arcbox_virtio::console::{ConsoleConfig, VirtioConsole};
 use arcbox_virtio::fs::{FsConfig, VirtioFs};
@@ -130,28 +126,28 @@ impl VmBuilder {
 
     /// Sets the number of CPUs.
     #[must_use]
-    pub fn cpus(mut self, count: u32) -> Self {
+    pub const fn cpus(mut self, count: u32) -> Self {
         self.cpus = count;
         self
     }
 
     /// Sets the memory size in bytes.
     #[must_use]
-    pub fn memory(mut self, size: u64) -> Self {
+    pub const fn memory(mut self, size: u64) -> Self {
         self.memory_size = size;
         self
     }
 
     /// Sets the memory size in megabytes.
     #[must_use]
-    pub fn memory_mb(mut self, mb: u64) -> Self {
+    pub const fn memory_mb(mut self, mb: u64) -> Self {
         self.memory_size = mb * 1024 * 1024;
         self
     }
 
     /// Sets the memory size in gigabytes.
     #[must_use]
-    pub fn memory_gb(mut self, gb: u64) -> Self {
+    pub const fn memory_gb(mut self, gb: u64) -> Self {
         self.memory_size = gb * 1024 * 1024 * 1024;
         self
     }
@@ -189,7 +185,7 @@ impl VmBuilder {
 
     /// Enables Rosetta 2 translation (macOS ARM only).
     #[must_use]
-    pub fn rosetta(mut self, enable: bool) -> Self {
+    pub const fn rosetta(mut self, enable: bool) -> Self {
         self.enable_rosetta = enable;
         self
     }
@@ -233,14 +229,14 @@ impl VmBuilder {
 
     /// Sets the console configuration.
     #[must_use]
-    pub fn console(mut self, cols: u16, rows: u16) -> Self {
+    pub const fn console(mut self, cols: u16, rows: u16) -> Self {
         self.console_config = Some(ConsoleDeviceConfig { cols, rows });
         self
     }
 
     /// Disables the console.
     #[must_use]
-    pub fn no_console(mut self) -> Self {
+    pub const fn no_console(mut self) -> Self {
         self.console_config = None;
         self
     }
@@ -263,7 +259,7 @@ impl VmBuilder {
 
     /// Enables vsock with the given guest CID.
     #[must_use]
-    pub fn vsock(mut self, guest_cid: u64) -> Self {
+    pub const fn vsock(mut self, guest_cid: u64) -> Self {
         self.vsock_config = Some(VsockDeviceConfig { guest_cid });
         self
     }
@@ -344,7 +340,7 @@ impl Default for VmBuilder {
 /// Extended VMM with device management.
 ///
 /// This is returned by `VmBuilder::build_with_devices()` and includes
-/// the configured VirtIO devices.
+/// the configured `VirtIO` devices.
 pub struct VmInstance {
     /// The underlying VMM.
     pub vmm: Vmm,
@@ -363,7 +359,7 @@ pub struct VmInstance {
 impl VmBuilder {
     /// Builds the VM with configured devices.
     ///
-    /// This creates all the VirtIO devices specified in the builder
+    /// This creates all the `VirtIO` devices specified in the builder
     /// and returns a `VmInstance` with access to them.
     ///
     /// # Errors

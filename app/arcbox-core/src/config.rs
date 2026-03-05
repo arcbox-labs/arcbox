@@ -1,6 +1,6 @@
 //! Configuration management.
 //!
-//! ArcBox configuration is loaded from multiple sources with the following priority:
+//! `ArcBox` configuration is loaded from multiple sources with the following priority:
 //!
 //! 1. Environment variables (ARCBOX_*)
 //! 2. Configuration file (~/.config/arcbox/config.toml)
@@ -42,7 +42,7 @@ use figment::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// ArcBox configuration.
+/// `ArcBox` configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {

@@ -151,7 +151,7 @@ impl MachinePersistence {
 
         let persisted = PersistedMachine::from(machine);
         let content = toml::to_string_pretty(&persisted)
-            .map_err(|e| CoreError::Machine(format!("Failed to serialize config: {}", e)))?;
+            .map_err(|e| CoreError::Machine(format!("Failed to serialize config: {e}")))?;
 
         fs::write(self.config_path(&machine.name), content)?;
 
@@ -167,20 +167,21 @@ impl MachinePersistence {
     pub fn load(&self, name: &str) -> Result<PersistedMachine> {
         let path = self.config_path(name);
         let content = fs::read_to_string(&path)
-            .map_err(|e| CoreError::not_found(format!("Machine config not found: {}", e)))?;
+            .map_err(|e| CoreError::not_found(format!("Machine config not found: {e}")))?;
 
         toml::from_str(&content)
-            .map_err(|e| CoreError::Machine(format!("Failed to parse config: {}", e)))
+            .map_err(|e| CoreError::Machine(format!("Failed to parse config: {e}")))
     }
 
     /// Lists all saved machines.
+    #[must_use]
     pub fn list(&self) -> Vec<String> {
         let Ok(entries) = fs::read_dir(&self.base_dir) else {
             return Vec::new();
         };
 
         entries
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| e.path().is_dir())
             .filter(|e| e.path().join("config.toml").exists())
             .filter_map(|e| e.file_name().into_string().ok())
@@ -188,6 +189,7 @@ impl MachinePersistence {
     }
 
     /// Loads all saved machines.
+    #[must_use]
     pub fn load_all(&self) -> Vec<PersistedMachine> {
         self.list()
             .iter()
@@ -219,7 +221,7 @@ impl MachinePersistence {
         machine.state = state.into();
 
         let content = toml::to_string_pretty(&machine)
-            .map_err(|e| CoreError::Machine(format!("Failed to serialize config: {}", e)))?;
+            .map_err(|e| CoreError::Machine(format!("Failed to serialize config: {e}")))?;
 
         fs::write(self.config_path(name), content)?;
 
@@ -236,7 +238,7 @@ impl MachinePersistence {
         machine.ip_address = ip.map(ToString::to_string);
 
         let content = toml::to_string_pretty(&machine)
-            .map_err(|e| CoreError::Machine(format!("Failed to serialize config: {}", e)))?;
+            .map_err(|e| CoreError::Machine(format!("Failed to serialize config: {e}")))?;
 
         fs::write(self.config_path(name), content)?;
 
