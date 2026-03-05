@@ -69,8 +69,13 @@ const BALLOON_SHRINK_DELAY_SECS: u64 = 10;
 
 /// Persistent guest dockerd data image name.
 const DOCKER_DATA_IMAGE_NAME: &str = "docker.img";
-/// Persistent guest dockerd data image size (64 GiB sparse file).
-const DOCKER_DATA_IMAGE_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Persistent guest dockerd data image size (8 TiB sparse file).
+///
+/// This is the virtual size of the block device. The host file is sparse and
+/// only consumes actual disk space for written blocks. 8 TiB matches OrbStack
+/// and prevents users from hitting artificial limits.
+const DOCKER_DATA_IMAGE_SIZE_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
+
 /// Extended VM lifecycle state.
 ///
 /// This extends the basic `MachineState` with additional states
@@ -322,43 +327,52 @@ impl VmLifecycleManager {
         })?;
 
         if current_len.len() < size_bytes {
-            // Pre-allocate the image file on macOS (APFS). This eliminates
-            // host-side space allocation overhead on every guest write,
-            // preventing double-CoW amplification (Btrfs CoW + APFS CoW).
+            // Pre-allocate a bounded initial chunk on macOS (APFS) to reduce
+            // double-CoW amplification (Btrfs CoW + APFS CoW) for the working
+            // set. The full virtual size is set via `set_len` below, but we
+            // never ask APFS to physically reserve all of it — at 8 TiB that
+            // would either fail outright or, on a large disk, consume the
+            // entire requested capacity. The bounded cap matches the previous
+            // default working set and is best-effort; failures are ignored.
             #[cfg(target_os = "macos")]
             {
                 use std::os::unix::io::AsRawFd;
-                let fd = file.as_raw_fd();
-                // fstore_t: fst_flags, fst_posmode, fst_offset, fst_length, fst_bytesalloc
-                #[repr(C)]
-                #[allow(clippy::struct_field_names)] // mirrors macOS fstore_t C struct
-                struct FStore {
-                    fst_flags: u32,
-                    fst_posmode: i32,
-                    fst_offset: i64,
-                    fst_length: i64,
-                    fst_bytesalloc: i64,
-                }
-                const F_ALLOCATEALL: u32 = 0x00000004;
-                const F_PEOFPOSMODE: i32 = 3;
-                const F_PREALLOCATE: libc::c_int = 42;
-                let mut store = FStore {
-                    fst_flags: F_ALLOCATEALL,
-                    fst_posmode: F_PEOFPOSMODE,
-                    fst_offset: 0,
-                    #[allow(clippy::cast_possible_wrap)]
-                    fst_length: size_bytes as i64,
-                    fst_bytesalloc: 0,
-                };
-                // Best-effort: if pre-allocation fails (e.g. not enough disk
-                // space), fall through to ftruncate which creates a sparse file.
-                let ret = unsafe { libc::fcntl(fd, F_PREALLOCATE, &mut store) };
-                if ret == 0 {
-                    tracing::info!(
-                        path = %path.display(),
-                        allocated_bytes = store.fst_bytesalloc,
-                        "pre-allocated docker data image (APFS)"
-                    );
+                /// Upper bound on initial APFS preallocation, in bytes.
+                const APFS_PREALLOC_CAP_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+                let prealloc_target = size_bytes.min(APFS_PREALLOC_CAP_BYTES);
+                if current_len.len() < prealloc_target {
+                    let fd = file.as_raw_fd();
+                    // fstore_t: fst_flags, fst_posmode, fst_offset, fst_length, fst_bytesalloc
+                    #[repr(C)]
+                    #[allow(clippy::struct_field_names)] // mirrors macOS fstore_t C struct
+                    struct FStore {
+                        fst_flags: u32,
+                        fst_posmode: i32,
+                        fst_offset: i64,
+                        fst_length: i64,
+                        fst_bytesalloc: i64,
+                    }
+                    const F_ALLOCATEALL: u32 = 0x00000004;
+                    const F_PEOFPOSMODE: i32 = 3;
+                    const F_PREALLOCATE: libc::c_int = 42;
+                    let mut store = FStore {
+                        fst_flags: F_ALLOCATEALL,
+                        fst_posmode: F_PEOFPOSMODE,
+                        fst_offset: 0,
+                        #[allow(clippy::cast_possible_wrap)]
+                        fst_length: prealloc_target as i64,
+                        fst_bytesalloc: 0,
+                    };
+                    // Best-effort: if pre-allocation fails (e.g. not enough disk
+                    // space), fall through to ftruncate which creates a sparse file.
+                    let ret = unsafe { libc::fcntl(fd, F_PREALLOCATE, &mut store) };
+                    if ret == 0 {
+                        tracing::info!(
+                            path = %path.display(),
+                            allocated_bytes = store.fst_bytesalloc,
+                            "pre-allocated docker data image (APFS)"
+                        );
+                    }
                 }
             }
 
