@@ -47,7 +47,7 @@ Exposes a `SandboxManager` API and optional gRPC service implementations
 
 | Crate | Type | Purpose |
 |-------|------|---------|
-| `arcbox-vm` | lib + bin | Sandbox orchestration, state, networking, snapshots; gRPC service implementations; ships the `vm-agent` binary |
+| `arcbox-vm` | lib + bin | Sandbox orchestration, state, networking, snapshots; gRPC service implementations; ships the `vmm-guest-agent` binary |
 
 There is no standalone daemon or CLI binary. The gRPC server and direct API usage are demonstrated via the examples described below.
 
@@ -440,8 +440,8 @@ and toolchain, then build:
 rustup target add x86_64-unknown-linux-musl
 brew install FiloSottile/musl-cross/musl-cross   # macOS
 
-cargo build -p arcbox-vm --bin vm-agent --target x86_64-unknown-linux-musl --release
-# output: target/x86_64-unknown-linux-musl/release/vm-agent
+cargo build -p arcbox-vm --bin vmm-guest-agent --target x86_64-unknown-linux-musl --release
+# output: target/x86_64-unknown-linux-musl/release/vmm-guest-agent
 ```
 
 ### Test
