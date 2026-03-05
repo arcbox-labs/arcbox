@@ -15,6 +15,7 @@ pub mod ensure_runtime {
 
     pub use arcbox_constants::status::{
         RUNTIME_FAILED as STATUS_FAILED, RUNTIME_REUSED as STATUS_REUSED,
+        RUNTIME_STARTED as STATUS_STARTED,
     };
     use arcbox_protocol::agent::RuntimeEnsureResponse;
     use tokio::sync::{Mutex, Notify};
@@ -204,7 +205,7 @@ mod linux {
     use std::time::Duration;
 
     use anyhow::{Context, Result};
-    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncWrite};
     use tokio::net::UnixStream;
     use tokio::process::Command;
     use tokio::sync::Mutex;
@@ -214,15 +215,17 @@ mod linux {
     use super::ensure_runtime;
     use crate::rpc::{
         AGENT_VERSION, ErrorResponse, MessageType, RpcRequest, RpcResponse, parse_request,
-        read_message, write_response,
+        read_message, write_message, write_response,
     };
+    use crate::sandbox::SandboxService;
     use arcbox_constants::cmdline::{
         DOCKER_DATA_DEVICE_KEY as DOCKER_DATA_DEVICE_CMDLINE_KEY, GUEST_DOCKER_VSOCK_PORT_KEY,
     };
     use arcbox_constants::devices::DOCKER_DATA_BLOCK_DEVICE as DOCKER_DATA_DEVICE_DEFAULT;
     use arcbox_constants::env::GUEST_DOCKER_VSOCK_PORT as GUEST_DOCKER_VSOCK_PORT_ENV;
     use arcbox_constants::paths::{
-        ARCBOX_RUNTIME_BIN_DIR, CONTAINERD_SOCKET, DOCKER_API_UNIX_SOCKET, DOCKER_DATA_MOUNT_POINT,
+        ARCBOX_RUNTIME_BIN_DIR, CONTAINERD_DATA_MOUNT_POINT, CONTAINERD_SOCKET,
+        DOCKER_API_UNIX_SOCKET, DOCKER_DATA_MOUNT_POINT,
     };
     use arcbox_constants::ports::DOCKER_API_VSOCK_PORT;
     use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
@@ -231,6 +234,34 @@ mod linux {
         PingResponse, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
         RuntimeStatusResponse, SystemInfo,
     };
+
+    // =========================================================================
+    // Sandbox service singleton
+    // =========================================================================
+
+    /// Returns the global [`SandboxService`] singleton.
+    ///
+    /// The service is initialised lazily on the first call.  Initialisation
+    /// failures are logged as warnings and `None` is stored, so sandbox
+    /// operations will return a 503 error rather than crashing the agent.
+    fn sandbox_service() -> Option<&'static Arc<SandboxService>> {
+        static SERVICE: OnceLock<Option<Arc<SandboxService>>> = OnceLock::new();
+        SERVICE
+            .get_or_init(|| {
+                let config = crate::config::load();
+                match SandboxService::new(config) {
+                    Ok(svc) => {
+                        tracing::info!("sandbox service initialised");
+                        Some(Arc::new(svc))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sandbox service unavailable");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
 
     /// Containerd socket candidates (primary + legacy fallback).
     const CONTAINERD_SOCKET_CANDIDATES: [&str; 2] =
@@ -510,6 +541,11 @@ mod linux {
             // Mount standard VirtioFS shares if not already mounted.
             crate::mount::mount_standard_shares();
 
+            // Eagerly initialise the sandbox service so its first-time
+            // NetworkManager setup (which requires root) happens at startup
+            // rather than on the first sandbox request.
+            let _ = sandbox_service();
+
             // Start guest-side Docker API proxy (vsock -> unix socket).
             tokio::spawn(async {
                 if let Err(e) = run_docker_api_proxy().await {
@@ -637,7 +673,19 @@ mod linux {
                 payload.len()
             );
 
-            // Parse and handle the request
+            // Sandbox requests are handled separately — they bypass the normal
+            // RPC request/response cycle because streaming operations hold the
+            // connection open and write multiple frames.
+            if msg_type.is_sandbox_request() {
+                if let Err(e) =
+                    handle_sandbox_message(&mut stream, msg_type, &trace_id, &payload).await
+                {
+                    tracing::warn!(trace_id = %trace_id, error = %e, "sandbox handler error");
+                }
+                continue;
+            }
+
+            // Parse and handle the request.
             let result = match parse_request(msg_type, &payload) {
                 Ok(request) => handle_request(request).await,
                 Err(e) => {
@@ -657,6 +705,249 @@ mod linux {
                 }
             }
         }
+    }
+
+    /// Dispatches a sandbox RPC request.
+    ///
+    /// Non-streaming requests (CRUD, snapshots) write a single response frame
+    /// and return.  Streaming requests (Run, Events) write multiple frames
+    /// until the stream ends.
+    async fn handle_sandbox_message<S>(
+        stream: &mut S,
+        msg_type: MessageType,
+        trace_id: &str,
+        payload: &[u8],
+    ) -> anyhow::Result<()>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        let svc = match sandbox_service() {
+            Some(s) => Arc::clone(s),
+            None => {
+                let err = ErrorResponse::new(503, "sandbox service unavailable");
+                write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
+                return Ok(());
+            }
+        };
+
+        match msg_type {
+            // -----------------------------------------------------------------
+            // CRUD
+            // -----------------------------------------------------------------
+            MessageType::SandboxCreateRequest => match svc.create(payload).await {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxCreateResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxStopRequest => match svc.stop(payload).await {
+                Ok(()) => {
+                    write_message(stream, MessageType::SandboxStopResponse, trace_id, &[]).await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxRemoveRequest => match svc.remove(payload).await {
+                Ok(()) => {
+                    write_message(stream, MessageType::SandboxRemoveResponse, trace_id, &[])
+                        .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxInspectRequest => match svc.inspect(payload) {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxInspectResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxListRequest => match svc.list(payload) {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxListResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            // -----------------------------------------------------------------
+            // Streaming: Run
+            // -----------------------------------------------------------------
+            MessageType::SandboxRunRequest => {
+                handle_sandbox_run(stream, &svc, trace_id, payload).await?;
+            }
+            // -----------------------------------------------------------------
+            // Streaming: Events
+            // -----------------------------------------------------------------
+            MessageType::SandboxEventsRequest => {
+                handle_sandbox_events(stream, &svc, trace_id, payload).await?;
+            }
+            // -----------------------------------------------------------------
+            // Exec: not yet implemented
+            // -----------------------------------------------------------------
+            MessageType::SandboxExecRequest => {
+                send_sandbox_error(stream, trace_id, 501, "SandboxExec not yet implemented")
+                    .await?;
+            }
+            // -----------------------------------------------------------------
+            // Snapshots
+            // -----------------------------------------------------------------
+            MessageType::SandboxCheckpointRequest => match svc.checkpoint(payload).await {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxCheckpointResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxRestoreRequest => match svc.restore(payload).await {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxRestoreResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxListSnapshotsRequest => match svc.list_snapshots(payload) {
+                Ok(resp) => {
+                    use prost::Message as _;
+                    write_message(
+                        stream,
+                        MessageType::SandboxListSnapshotsResponse,
+                        trace_id,
+                        &resp.encode_to_vec(),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            MessageType::SandboxDeleteSnapshotRequest => match svc.delete_snapshot(payload) {
+                Ok(()) => {
+                    write_message(
+                        stream,
+                        MessageType::SandboxDeleteSnapshotResponse,
+                        trace_id,
+                        &[],
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_sandbox_error(stream, trace_id, 500, &e).await?;
+                }
+            },
+            _ => {
+                send_sandbox_error(stream, trace_id, 400, "unrecognised sandbox message type")
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Stream `SandboxRunOutput` frames from `SandboxService::run`.
+    async fn handle_sandbox_run<S>(
+        stream: &mut S,
+        svc: &SandboxService,
+        trace_id: &str,
+        payload: &[u8],
+    ) -> anyhow::Result<()>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        let mut rx = match svc.run(payload).await {
+            Ok(r) => r,
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, 500, &e).await?;
+                return Ok(());
+            }
+        };
+
+        while let Some(encoded) = rx.recv().await {
+            write_message(stream, MessageType::SandboxRunOutput, trace_id, &encoded).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Stream `SandboxEvent` frames from `SandboxService::subscribe_events`.
+    async fn handle_sandbox_events<S>(
+        stream: &mut S,
+        svc: &SandboxService,
+        trace_id: &str,
+        payload: &[u8],
+    ) -> anyhow::Result<()>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        let mut rx = match svc.subscribe_events(payload) {
+            Ok(r) => r,
+            Err(e) => {
+                send_sandbox_error(stream, trace_id, 500, &e).await?;
+                return Ok(());
+            }
+        };
+
+        while let Some(encoded) = rx.recv().await {
+            write_message(stream, MessageType::SandboxEvent, trace_id, &encoded).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Write a single `Error` frame back to the caller.
+    async fn send_sandbox_error<S>(
+        stream: &mut S,
+        trace_id: &str,
+        code: i32,
+        message: &str,
+    ) -> anyhow::Result<()>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        let err = ErrorResponse::new(code, message);
+        write_message(stream, MessageType::Error, trace_id, &err.encode()).await
     }
 
     /// Handles a single RPC request.

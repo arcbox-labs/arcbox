@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use arcbox_api::{MachineServiceImpl, machine_service_server::MachineServiceServer};
+use arcbox_api::{
+    MachineServiceImpl, SandboxServiceImpl, SandboxServiceServer, SandboxSnapshotServiceImpl,
+    SandboxSnapshotServiceServer, machine_service_server::MachineServiceServer,
+};
 use arcbox_core::{Config, Runtime, VmLifecycleConfig};
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
 use clap::Parser;
@@ -210,10 +213,14 @@ async fn start_grpc_server(
     info!(socket = %socket_path.display(), "gRPC server listening");
 
     let machine_service = MachineServiceImpl::new(Arc::clone(&runtime));
+    let sandbox_service = SandboxServiceImpl::new(Arc::clone(&runtime));
+    let sandbox_snapshot_service = SandboxSnapshotServiceImpl::new(Arc::clone(&runtime));
 
     let handle = tokio::spawn(async move {
         let result = Server::builder()
             .add_service(MachineServiceServer::new(machine_service))
+            .add_service(SandboxServiceServer::new(sandbox_service))
+            .add_service(SandboxSnapshotServiceServer::new(sandbox_snapshot_service))
             .serve_with_incoming(incoming)
             .await;
 

@@ -3,6 +3,11 @@
 /// Backed by the Btrfs `@docker` subvolume on `/dev/vdb`.
 pub const DOCKER_DATA_MOUNT_POINT: &str = "/var/lib/docker";
 
+/// Guest mount point for containerd persistent state (`/var/lib/containerd`).
+///
+/// Backed by the Btrfs `@containerd` subvolume on `/dev/vdb`.
+pub const CONTAINERD_DATA_MOUNT_POINT: &str = "/var/lib/containerd";
+
 /// Docker Engine API Unix socket path in guest.
 pub const DOCKER_API_UNIX_SOCKET: &str = "/var/run/docker.sock";
 

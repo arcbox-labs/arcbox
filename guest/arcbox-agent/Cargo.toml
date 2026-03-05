@@ -39,9 +39,10 @@ flate2 = "1"
 tar = "0.4"
 num_cpus = "1"
 
-# vsock is Linux-only
+# vsock and arcbox-vm are Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = "0.5"
+arcbox-vm = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
