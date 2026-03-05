@@ -136,6 +136,7 @@ fn mount_fs(source: &str, target: &str, fstype: &str, options: &str) {
         Err(e) => {
             // Fall back to mount(2) syscall if busybox is not available.
             eprintln!("[arcbox-init] busybox mount failed ({}), trying syscall", e);
+            #[cfg(target_os = "linux")]
             {
                 use nix::mount::{MsFlags, mount};
                 let flags = MsFlags::empty();
@@ -526,6 +527,7 @@ fn switch_root(new_root: &str) -> ! {
         Err(e) => {
             eprintln!("[arcbox-init] switch_root failed: {}", e);
             // Fall back to manual approach.
+            #[cfg(target_os = "linux")]
             {
                 eprintln!("[arcbox-init] Attempting manual pivot_root...");
                 manual_switch_root(new_root);
@@ -542,6 +544,7 @@ fn switch_root(new_root: &str) -> ! {
 }
 
 /// Manual switch_root using pivot_root and chroot.
+#[cfg(target_os = "linux")]
 fn manual_switch_root(new_root: &str) -> ! {
     use nix::unistd::{chdir, chroot, execv};
     use std::ffi::CString;
@@ -559,6 +562,7 @@ fn manual_switch_root(new_root: &str) -> ! {
     let _ = chdir("/");
 
     // Unmount old root.
+    #[cfg(target_os = "linux")]
     {
         use nix::mount::{MntFlags, umount2};
         let _ = umount2("/oldroot", MntFlags::MNT_DETACH);

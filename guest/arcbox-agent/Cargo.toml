@@ -37,6 +37,9 @@ tokio-util = "0.7"
 flate2 = "1"
 tar = "0.4"
 num_cpus = "1"
+
+# vsock is Linux-only
+[target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = "0.5"
 
 [dev-dependencies]
@@ -48,3 +51,6 @@ engine-native = []
 engine-docker-supervisor = []
 provision-bundled = []
 provision-distro = []
+
+# When building for the guest VM (Linux), vsock is fully functional.
+# On macOS host, we provide stubs for development/testing.

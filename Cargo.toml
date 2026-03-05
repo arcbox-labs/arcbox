@@ -52,53 +52,6 @@ members = [
     "pro/arcbox-snapshot",
     "pro/arcbox-perf",
 ]
-default-members = [
-    # ============================================
-    # L0: Common (MIT OR Apache-2.0)
-    # ============================================
-    "common/arcbox-error",
-
-    # ============================================
-    # L1-2: Hypervisor (MIT OR Apache-2.0)
-    # ============================================
-    "hypervisor/arcbox-vz",
-    "hypervisor/arcbox-hypervisor",
-    "hypervisor/arcbox-vmm",
-    "hypervisor/arcbox-virtio",
-
-    # ============================================
-    # L3: Services (MIT OR Apache-2.0)
-    # ============================================
-    "services/arcbox-fs",
-    "services/arcbox-net",
-    "services/arcbox-container",
-    "services/arcbox-oci",
-
-    # ============================================
-    # L4: Communication (MIT OR Apache-2.0)
-    # ============================================
-    "comm/arcbox-protocol",
-    "comm/arcbox-grpc",
-    "comm/arcbox-transport",
-
-    # ============================================
-    # L5-6: Application (MIT OR Apache-2.0)
-    # ============================================
-    "app/arcbox-core",
-    "app/arcbox-api",
-    "app/arcbox-docker",
-    "app/arcbox-cli",
-    "app/arcbox-daemon",
-    "app/arcbox",
-
-    # ============================================
-    # Pro Layer (BSL-1.1)
-    # ============================================
-    "pro/arcbox-fs-enhanced",
-    "pro/arcbox-net-advanced",
-    "pro/arcbox-snapshot",
-    "pro/arcbox-perf",
-]
 
 # ============================================
 # Enterprise Layer (Proprietary, separate repos)

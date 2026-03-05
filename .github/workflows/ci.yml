@@ -45,13 +45,13 @@ jobs:
         run: cargo fmt --check
 
       - name: Run clippy
-        run: cargo clippy
+        run: cargo clippy --workspace --exclude arcbox-agent
 
       - name: Build workspace
-        run: cargo build
+        run: cargo build --workspace --exclude arcbox-agent
 
       - name: Run tests
-        run: cargo test
+        run: cargo test --workspace --exclude arcbox-agent
 
       - name: Code sign arcbox-daemon
         run: |
