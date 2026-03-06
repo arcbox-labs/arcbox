@@ -1,15 +1,18 @@
 //! # arcbox-api
 //!
-//! gRPC service implementations for `ArcBox`.
+//! gRPC and REST service implementations for `ArcBox`.
 //!
 //! This crate hosts service implementations consumed by the `arcbox-daemon`
-//! binary. It provides machine and sandbox gRPC services.
+//! binary. It provides:
+//! - Machine and sandbox gRPC services
+//! - REST/HTTP+JSON API for external SDKs and the Swift desktop app
 //!
 //! On Linux the sandbox services call `arcbox-vm::SandboxManager` directly.
 //! On macOS they proxy through the guest agent running inside the VM.
 
 pub mod error;
 pub mod grpc;
+pub mod rest;
 
 // Sandbox service: platform-split implementations.
 #[cfg(target_os = "linux")]

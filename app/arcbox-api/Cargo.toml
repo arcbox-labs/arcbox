@@ -23,6 +23,11 @@ tokio-stream = { workspace = true }
 async-stream = { workspace = true }
 libc = { workspace = true }
 uuid = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hyper = { workspace = true }
+tower = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 arcbox-vm = { workspace = true }

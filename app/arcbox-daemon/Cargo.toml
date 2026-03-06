@@ -25,6 +25,9 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }
 libc = { workspace = true }
+hyper = { workspace = true }
+hyper-util = "0.1"
+tower = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-resolver = { workspace = true }
