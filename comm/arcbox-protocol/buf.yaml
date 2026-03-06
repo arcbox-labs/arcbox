@@ -1,0 +1,23 @@
+# Buf Schema Registry configuration for ArcBox protobuf definitions.
+#
+# This enables publishing proto files to buf.build/arcboxd/arcbox so that
+# language-specific SDKs can generate client code via `buf generate`.
+#
+# CI publishes on merge to master:
+#   buf push --module proto
+#
+# SDK generation:
+#   buf generate buf.build/arcboxd/arcbox
+
+version: v2
+modules:
+  - path: proto
+    name: buf.build/arcboxd/arcbox
+lint:
+  use:
+    - STANDARD
+  except:
+    - PACKAGE_VERSION_SUFFIX
+breaking:
+  use:
+    - FILE
