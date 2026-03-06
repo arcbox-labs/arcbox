@@ -6,21 +6,25 @@
 //! # Architecture
 //!
 //! ```text
-//! Guest Driver (virtio-fs)
-//!       │
-//!       ▼ (virtqueue)
-//! ┌─────────────────────────┐
-//! │      VirtioFs           │
-//! │  ┌─────────────────┐   │
-//! │  │   FuseSession   │   │
-//! │  │  - INIT state   │   │
-//! │  │  - features     │   │
-//! │  └─────────────────┘   │
-//! └───────────┬─────────────┘
-//!             │ dispatch
-//!             ▼
-//!     FuseRequestHandler
-//!       (implemented by arcbox-fs)
+//! ┌────────────────────┐
+//! │                    │
+//! │    GuestDriver     │
+//! │                    │
+//! └──────────┬─────────┘
+//!            │
+//!            ▼
+//! ┌────────────────────┐
+//! │                    │
+//! │    FuseSession     │
+//! │                    │
+//! └──────────┬─────────┘
+//!            │
+//!            ▼
+//! ┌────────────────────┐
+//! │                    │
+//! │ FuseRequestHandler │
+//! │                    │
+//! └────────────────────┘
 //! ```
 
 use crate::error::{Result, VirtioError};

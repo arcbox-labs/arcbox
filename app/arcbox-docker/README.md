@@ -32,11 +32,18 @@ docker images
 ## Architecture
 
 ```text
-docker CLI ──► Unix Socket ──► arcbox-docker ──► arcbox-core
-                                     │
-                                     ▼
-                              HTTP REST API
-                             (Axum server)
+┌────────────┐     ┌─────────────┐     ┌───────────────┐     ┌───────────────┐
+│            │     │             │     │               │     │               │
+│ docker-CLI ├────►│ Unix-Socket ├────►│ arcbox-docker ├────►│  arcbox-core  │
+│            │     │             │     │               │     │               │
+└────────────┘     └─────────────┘     └───────┬───────┘     └───────────────┘
+                                               │
+                                               │
+                                               │             ┌───────────────┐
+                                               │             │               │
+                                               └────────────►│ HTTP-REST-API │
+                                                             │               │
+                                                             └───────────────┘
 ```
 
 ## API Version
