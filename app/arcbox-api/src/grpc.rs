@@ -17,9 +17,10 @@ use arcbox_protocol::sandbox_v1::{
 };
 use arcbox_protocol::v1::{
     CreateMachineRequest, CreateMachineResponse, Empty, InspectMachineRequest, ListMachinesRequest,
-    ListMachinesResponse, MachineAgentRequest, MachineExecOutput, MachineExecRequest, MachineInfo,
-    MachineNetwork, MachinePingResponse, MachineSummary, MachineSystemInfo, RemoveMachineRequest,
-    StartMachineRequest, StopMachineRequest,
+    ListMachinesResponse, MachineAgentRequest, MachineEvent, MachineEventsRequest,
+    MachineExecOutput, MachineExecRequest, MachineInfo, MachineNetwork, MachinePingResponse,
+    MachineSummary, MachineSystemInfo, RemoveMachineRequest, StartMachineRequest,
+    StopMachineRequest,
 };
 use std::pin::Pin;
 use std::sync::Arc;
@@ -157,6 +158,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
 
         Ok(Response::new(ListMachinesResponse {
             machines: summaries,
+            next_page_token: String::new(),
         }))
     }
 
@@ -275,6 +277,17 @@ impl machine_service_server::MachineService for MachineServiceImpl {
     ) -> Result<Response<arcbox_protocol::v1::SshInfoResponse>, Status> {
         // TODO: Implement SSH info.
         Err(Status::unimplemented("ssh_info not implemented"))
+    }
+
+    type EventsStream =
+        Pin<Box<dyn Stream<Item = Result<MachineEvent, Status>> + Send + 'static>>;
+
+    async fn events(
+        &self,
+        _request: Request<MachineEventsRequest>,
+    ) -> Result<Response<Self::EventsStream>, Status> {
+        // TODO: Wire up to Runtime event bus when machine events are implemented.
+        Err(Status::unimplemented("machine events not yet implemented"))
     }
 }
 

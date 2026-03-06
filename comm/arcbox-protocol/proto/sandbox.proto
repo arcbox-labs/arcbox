@@ -359,11 +359,17 @@ message ListSandboxesRequest {
     string state = 1;
     // Filter by labels (all key-value pairs must match).
     map<string, string> labels = 2;
+    // Maximum number of results to return (0 = no limit).
+    int32 page_size = 3;
+    // Opaque pagination token from a previous response.
+    string page_token = 4;
 }
 
 // Response to ListSandboxes.
 message ListSandboxesResponse {
     repeated SandboxSummary sandboxes = 1;
+    // Token for the next page (empty when no more results).
+    string next_page_token = 2;
 }
 
 // Lightweight sandbox summary for List.
@@ -469,11 +475,17 @@ message ListSnapshotsRequest {
     string sandbox_id = 1;
     // Filter by labels.
     map<string, string> labels = 2;
+    // Maximum number of results to return (0 = no limit).
+    int32 page_size = 3;
+    // Opaque pagination token from a previous response.
+    string page_token = 4;
 }
 
 // Response to ListSnapshots.
 message ListSnapshotsResponse {
     repeated SnapshotSummary snapshots = 1;
+    // Token for the next page (empty when no more results).
+    string next_page_token = 2;
 }
 
 // Lightweight snapshot summary.

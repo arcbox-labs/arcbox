@@ -320,6 +320,8 @@ async fn execute_list(args: ListArgs) -> Result<()> {
     let req = ListSandboxesRequest {
         state: args.state.unwrap_or_default(),
         labels: HashMap::new(),
+        page_size: 0,
+        page_token: String::new(),
     };
     let sandboxes = client
         .list(attach_machine(tonic::Request::new(req)))
@@ -522,6 +524,8 @@ async fn execute_list_snapshots(args: ListSnapshotsArgs) -> Result<()> {
     let req = ListSnapshotsRequest {
         sandbox_id: args.sandbox_id.unwrap_or_default(),
         labels: HashMap::new(),
+        page_size: 0,
+        page_token: String::new(),
     };
     let snapshots = client
         .list_snapshots(attach_machine(tonic::Request::new(req)))
