@@ -238,6 +238,26 @@ struct MachineQuery {
     machine: Option<String>,
 }
 
+/// Returns a non-empty machine name, falling back to the runtime default.
+///
+/// Handles both `None` and `Some("")` (which can come from `?machine=` or
+/// `"machine": ""` in JSON) by treating empty strings as absent.
+#[cfg(not(target_os = "linux"))]
+fn resolve_machine<'a>(name: Option<&'a str>, runtime: &'a Runtime) -> &'a str {
+    match name {
+        Some(s) if !s.is_empty() => s,
+        _ => runtime.default_machine_name(),
+    }
+}
+
+/// Formats a Unix timestamp (seconds) as RFC 3339.
+#[cfg(not(target_os = "linux"))]
+fn unix_to_rfc3339(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default()
+}
+
 #[derive(Serialize)]
 struct SandboxSummaryJson {
     id: String,
@@ -279,10 +299,7 @@ async fn list_sandboxes(
 
     #[cfg(not(target_os = "linux"))]
     {
-        let machine = _query
-            .machine
-            .as_deref()
-            .unwrap_or_else(|| _runtime.default_machine_name());
+        let machine = resolve_machine(_query.machine.as_deref(), &_runtime);
         let mut agent = _runtime
             .get_agent(machine)
             .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -298,7 +315,7 @@ async fn list_sandboxes(
                 state: s.state,
                 ip_address: s.ip_address,
                 labels: s.labels,
-                created_at: s.created_at.to_string(),
+                created_at: unix_to_rfc3339(s.created_at),
             })
             .collect();
         Ok(Json(ListSandboxesResponse { sandboxes }))
@@ -377,11 +394,10 @@ async fn create_sandbox(
 
     #[cfg(not(target_os = "linux"))]
     {
-        let machine = _req
-            .machine
-            .as_deref()
-            .or(_query.machine.as_deref())
-            .unwrap_or_else(|| _runtime.default_machine_name());
+        let machine = resolve_machine(
+            _req.machine.as_deref().or(_query.machine.as_deref()),
+            &_runtime,
+        );
         let mut agent = _runtime
             .get_agent(machine)
             .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -438,10 +454,7 @@ async fn inspect_sandbox(
 
     #[cfg(not(target_os = "linux"))]
     {
-        let machine = _query
-            .machine
-            .as_deref()
-            .unwrap_or_else(|| _runtime.default_machine_name());
+        let machine = resolve_machine(_query.machine.as_deref(), &_runtime);
         let mut agent = _runtime
             .get_agent(machine)
             .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -449,9 +462,14 @@ async fn inspect_sandbox(
             .sandbox_inspect(proto::InspectSandboxRequest { id: _id })
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
-        Ok(Json(
-            serde_json::to_value(info).map_err(|e| ApiError::internal(e.to_string()))?,
-        ))
+        let limits = info.limits.unwrap_or_default();
+        Ok(Json(serde_json::json!({
+            "id": info.id,
+            "state": info.state,
+            "vcpus": limits.vcpus,
+            "memory_mib": limits.memory_mib,
+            "created_at": unix_to_rfc3339(info.created_at),
+        })))
     }
 }
 
@@ -473,10 +491,7 @@ async fn stop_sandbox(
 
     #[cfg(not(target_os = "linux"))]
     {
-        let machine = _query
-            .machine
-            .as_deref()
-            .unwrap_or_else(|| _runtime.default_machine_name());
+        let machine = resolve_machine(_query.machine.as_deref(), &_runtime);
         let mut agent = _runtime
             .get_agent(machine)
             .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -509,10 +524,7 @@ async fn remove_sandbox(
 
     #[cfg(not(target_os = "linux"))]
     {
-        let machine = _query
-            .machine
-            .as_deref()
-            .unwrap_or_else(|| _runtime.default_machine_name());
+        let machine = resolve_machine(_query.machine.as_deref(), &_runtime);
         let mut agent = _runtime
             .get_agent(machine)
             .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -588,10 +600,7 @@ async fn run_sandbox(
 
     #[cfg(not(target_os = "linux"))]
     {
-        let machine = _query
-            .machine
-            .as_deref()
-            .unwrap_or_else(|| _runtime.default_machine_name());
+        let machine = resolve_machine(_query.machine.as_deref(), &_runtime);
         let agent = _runtime
             .get_agent(machine)
             .map_err(|e| ApiError::internal(e.to_string()))?;

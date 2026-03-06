@@ -155,6 +155,7 @@ dependencies = [
  "arcbox-vm",
  "async-stream",
  "axum 0.8.8",
+ "chrono",
  "hyper",
  "libc",
  "prost",
