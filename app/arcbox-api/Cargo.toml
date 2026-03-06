@@ -24,6 +24,9 @@ async-stream = { workspace = true }
 libc = { workspace = true }
 uuid = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+arcbox-vm = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 
