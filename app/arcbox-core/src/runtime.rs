@@ -13,7 +13,7 @@ use arcbox_net::darwin::inbound_relay::{InboundListenerManager, InboundProtocol}
 #[cfg(not(target_os = "macos"))]
 use arcbox_net::port_forward::{PortForwardRule, PortForwarder};
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 #[cfg(not(target_os = "macos"))]
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::Path;
@@ -102,6 +102,8 @@ pub struct Runtime {
     /// Port forwarders for each container (non-macOS fallback).
     #[cfg(not(target_os = "macos"))]
     port_forwarders: Arc<TokioRwLock<HashMap<String, PortForwarder>>>,
+    /// Tracks DNS registrations: canonical container ID → hostname.
+    dns_entries: Arc<TokioRwLock<HashMap<String, String>>>,
 }
 
 impl Runtime {
@@ -174,6 +176,7 @@ impl Runtime {
             inbound_rules: Arc::new(TokioRwLock::new(HashMap::new())),
             #[cfg(not(target_os = "macos"))]
             port_forwarders: Arc::new(TokioRwLock::new(HashMap::new())),
+            dns_entries: Arc::new(TokioRwLock::new(HashMap::new())),
         })
     }
 
@@ -628,6 +631,35 @@ impl Runtime {
                 tracing::debug!("Stopped port forwarding for container {}", container_id);
             }
         }
+    }
+
+    /// Registers a DNS entry for a container.
+    ///
+    /// Maps `hostname.arcbox.local` → `ip` so the host can reach the container
+    /// by name. Also tracks the `container_id → hostname` mapping for cleanup.
+    pub async fn register_dns(&self, container_id: &str, hostname: &str, ip: IpAddr) {
+        self.network_manager.register_dns(hostname, ip);
+        self.dns_entries
+            .write()
+            .await
+            .insert(container_id.to_string(), hostname.to_string());
+        tracing::info!(
+            container_id,
+            hostname,
+            %ip,
+            "DNS entry registered",
+        );
+    }
+
+    /// Removes a DNS entry for a container by its canonical ID.
+    ///
+    /// Returns the old hostname if an entry existed (used by rename to know
+    /// which name to deregister from the forwarder).
+    pub async fn deregister_dns_by_id(&self, container_id: &str) -> Option<String> {
+        let hostname = self.dns_entries.write().await.remove(container_id)?;
+        self.network_manager.deregister_dns(&hostname);
+        tracing::info!(container_id, hostname, "DNS entry deregistered");
+        Some(hostname)
     }
 
     /// Stops all active port forwarders.
