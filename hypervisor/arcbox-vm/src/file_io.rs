@@ -128,12 +128,12 @@ pub async fn read_file(uds_path: &Path, path: &str) -> Result<Vec<u8>> {
             FILE_ERR => {
                 return Err(VmmError::Vsock(
                     String::from_utf8_lossy(&payload).into_owned(),
-                ))
+                ));
             }
             other => {
                 return Err(VmmError::Vsock(format!(
                     "file read: unexpected frame type 0x{other:02x}"
-                )))
+                )));
             }
         }
     }

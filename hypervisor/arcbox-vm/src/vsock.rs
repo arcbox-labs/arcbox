@@ -208,7 +208,9 @@ pub(crate) async fn write_frame<W: AsyncWriteExt + Unpin>(
 }
 
 /// Read a single frame from any `AsyncRead`.
-pub(crate) async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<(u8, Vec<u8>)> {
+pub(crate) async fn read_frame<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+) -> std::io::Result<(u8, Vec<u8>)> {
     let msg_type = r.read_u8().await?;
     let len = r.read_u32_le().await? as usize;
     if len > MAX_FRAME_SIZE {
