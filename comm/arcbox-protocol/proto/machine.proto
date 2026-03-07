@@ -44,6 +44,10 @@ service MachineService {
 
     // Gets the SSH connection info.
     rpc SSHInfo(SSHInfoRequest) returns (SSHInfoResponse);
+
+    // Subscribe to machine lifecycle events.
+    // Emitted actions: "created" | "started" | "stopped" | "removed" | "error"
+    rpc Events(MachineEventsRequest) returns (stream MachineEvent);
 }
 
 // Request to create a machine.
@@ -158,12 +162,18 @@ message RemoveMachineRequest {
 message ListMachinesRequest {
     // Show all machines (including stopped).
     bool all = 1;
+    // Maximum number of results to return (0 = no limit).
+    int32 page_size = 2;
+    // Opaque pagination token from a previous response.
+    string page_token = 3;
 }
 
 // Response to list machines.
 message ListMachinesResponse {
     // List of machines.
     repeated MachineSummary machines = 1;
+    // Token for the next page (empty when no more results).
+    string next_page_token = 2;
 }
 
 // Summary information about a machine.
@@ -304,4 +314,28 @@ message SSHInfoResponse {
     string identity_file = 4;
     // SSH command string.
     string command = 5;
+}
+
+// =============================================================================
+// Events
+// =============================================================================
+
+// Request to subscribe to machine lifecycle events.
+message MachineEventsRequest {
+    // Filter by machine ID (empty = all machines).
+    string id = 1;
+    // Filter by event action (empty = all actions).
+    string action = 2;
+}
+
+// A machine lifecycle event.
+message MachineEvent {
+    // Machine ID or name.
+    string machine_id = 1;
+    // Action: "created" | "started" | "stopped" | "removed" | "error"
+    string action = 2;
+    // Unix timestamp in nanoseconds.
+    int64 timestamp = 3;
+    // Additional context (e.g. "error" on failures).
+    map<string, string> attributes = 4;
 }

@@ -93,6 +93,9 @@ pub struct Runtime {
     container_backend: DynContainerBackend,
     /// Network manager.
     network_manager: Arc<NetworkManager>,
+    /// Sandbox manager for Firecracker microVMs (Linux only).
+    #[cfg(target_os = "linux")]
+    sandbox_manager: Option<Arc<arcbox_vm::SandboxManager>>,
     /// Inbound listener manager for port forwarding via L2 frame injection (macOS).
     #[cfg(target_os = "macos")]
     inbound_listener: Arc<TokioRwLock<Option<InboundListenerManager>>>,
@@ -160,6 +163,23 @@ impl Runtime {
 
         let network_manager = Arc::new(NetworkManager::new(arcbox_net::NetConfig::default()));
 
+        #[cfg(target_os = "linux")]
+        let sandbox_manager = if config.sandbox.enabled {
+            let vmm_config = config.sandbox.to_vmm_config();
+            match arcbox_vm::SandboxManager::new(vmm_config) {
+                Ok(mgr) => {
+                    tracing::info!("Sandbox manager initialized (Firecracker)");
+                    Some(Arc::new(mgr))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to initialize sandbox manager: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             event_bus,
@@ -168,6 +188,8 @@ impl Runtime {
             vm_lifecycle,
             container_backend,
             network_manager,
+            #[cfg(target_os = "linux")]
+            sandbox_manager,
             #[cfg(target_os = "macos")]
             inbound_listener: Arc::new(TokioRwLock::new(None)),
             #[cfg(target_os = "macos")]
@@ -223,6 +245,13 @@ impl Runtime {
     #[must_use]
     pub const fn guest_docker_vsock_port(&self) -> u32 {
         self.config.container.guest_docker_vsock_port
+    }
+
+    /// Returns the sandbox manager (Linux only, `None` when disabled or on macOS).
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn sandbox_manager(&self) -> Option<&Arc<arcbox_vm::SandboxManager>> {
+        self.sandbox_manager.as_ref()
     }
 
     /// Ensures the default VM is running and ready for container operations.
@@ -317,6 +346,19 @@ impl Runtime {
 
         // 1. Stop all active host port forwarders.
         self.stop_port_forwarding_all().await;
+
+        // 1b. Stop all sandboxes (Linux only).
+        #[cfg(target_os = "linux")]
+        if let Some(ref sandbox_mgr) = self.sandbox_manager {
+            let sandboxes = sandbox_mgr.list_sandboxes(None, None);
+            for sb in sandboxes {
+                if sb.state != "stopped" {
+                    if let Err(e) = sandbox_mgr.stop_sandbox(&sb.id, 10).await {
+                        tracing::warn!("Failed to stop sandbox {}: {}", sb.id, e);
+                    }
+                }
+            }
+        }
 
         // 2. Shutdown VM lifecycle manager (gracefully stops default VM).
         if let Err(e) = self.vm_lifecycle.shutdown().await {

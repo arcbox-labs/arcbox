@@ -13,6 +13,7 @@ use tokio::net::UnixListener;
 use tokio::signal;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
+use tower::Service as _;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -30,6 +31,10 @@ pub struct DaemonArgs {
     /// Unix socket path for gRPC API (desktop/GUI clients).
     #[arg(long)]
     pub grpc_socket: Option<PathBuf>,
+
+    /// Unix socket path for REST API (SDKs, desktop app).
+    #[arg(long)]
+    pub rest_socket: Option<PathBuf>,
 
     /// Data directory for ArcBox.
     #[arg(long)]
@@ -74,6 +79,9 @@ async fn run(args: DaemonArgs) -> Result<()> {
     let grpc_socket = args
         .grpc_socket
         .unwrap_or_else(|| data_dir.join("arcbox.sock"));
+    let rest_socket = args
+        .rest_socket
+        .unwrap_or_else(|| data_dir.join("api.sock"));
 
     let mut config = Config {
         data_dir: data_dir.clone(),
@@ -123,6 +131,7 @@ async fn run(args: DaemonArgs) -> Result<()> {
     });
 
     let grpc_handle = start_grpc_server(Arc::clone(&runtime), grpc_socket.clone()).await?;
+    let rest_handle = start_rest_server(Arc::clone(&runtime), rest_socket.clone()).await?;
 
     if args.docker_integration {
         match DockerContextManager::new(socket_path.clone()) {
@@ -144,6 +153,7 @@ async fn run(args: DaemonArgs) -> Result<()> {
     println!("ArcBox daemon started");
     println!("  Docker API: {}", socket_path.display());
     println!("  gRPC API:   {}", grpc_socket.display());
+    println!("  REST API:   {}", rest_socket.display());
     println!("  Data:       {}", data_dir.display());
     println!();
     println!("Use 'arcbox docker enable' to configure Docker CLI integration.");
@@ -155,6 +165,7 @@ async fn run(args: DaemonArgs) -> Result<()> {
     info!("Shutting down...");
     docker_handle.abort();
     grpc_handle.abort();
+    rest_handle.abort();
 
     runtime
         .shutdown()
@@ -167,7 +178,7 @@ async fn run(args: DaemonArgs) -> Result<()> {
         }
     }
 
-    for path in [&socket_path, &grpc_socket] {
+    for path in [&socket_path, &grpc_socket, &rest_socket] {
         if let Err(e) = std::fs::remove_file(path) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 warn!("Failed to remove socket {}: {}", path.display(), e);
@@ -226,6 +237,58 @@ async fn start_grpc_server(
 
         if let Err(e) = result {
             tracing::error!("gRPC server error: {}", e);
+        }
+    });
+
+    Ok(handle)
+}
+
+async fn start_rest_server(
+    runtime: Arc<Runtime>,
+    socket_path: PathBuf,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let _ = std::fs::remove_file(&socket_path);
+
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent).context("Failed to create REST socket directory")?;
+    }
+
+    let listener = tokio::net::UnixListener::bind(&socket_path).context(format!(
+        "Failed to bind REST socket: {}",
+        socket_path.display()
+    ))?;
+
+    info!(socket = %socket_path.display(), "REST API server listening");
+
+    let router = arcbox_api::rest::router(runtime);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _addr) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::warn!("REST accept error: {}", e);
+                    continue;
+                }
+            };
+
+            let tower_service = router.clone();
+            tokio::spawn(async move {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let hyper_service =
+                    hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let mut svc = tower_service.clone();
+                        async move { svc.call(req).await }
+                    });
+                if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection(io, hyper_service)
+                .await
+                {
+                    tracing::debug!("REST connection error: {}", e);
+                }
+            });
         }
     });
 

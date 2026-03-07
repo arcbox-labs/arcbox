@@ -1,0 +1,22 @@
+# Buf code generation configuration.
+#
+# Generates client/server stubs for Tier1 SDKs (TypeScript, Python).
+#
+# Usage:
+#   buf generate              # generates from local proto/
+#   buf generate buf.build/arcboxd/arcbox  # generates from BSR
+
+version: v2
+plugins:
+  # TypeScript / Connect-ES
+  - remote: buf.build/connectrpc/es
+    out: gen/ts
+    opt: target=ts
+
+  # Python / gRPC
+  - remote: buf.build/grpc/python
+    out: gen/python
+
+  # Python / protobuf messages
+  - remote: buf.build/protocolbuffers/python
+    out: gen/python

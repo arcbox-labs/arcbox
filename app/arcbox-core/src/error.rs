@@ -28,6 +28,10 @@ pub enum CoreError {
     /// Network error.
     #[error("network error: {0}")]
     Net(#[from] arcbox_net::NetError),
+
+    /// Sandbox error (Firecracker microVM).
+    #[error("sandbox error: {0}")]
+    Sandbox(String),
 }
 
 impl CoreError {
@@ -60,5 +64,12 @@ impl CoreError {
 impl From<std::io::Error> for CoreError {
     fn from(err: std::io::Error) -> Self {
         Self::Common(CommonError::from(err))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<arcbox_vm::VmmError> for CoreError {
+    fn from(err: arcbox_vm::VmmError) -> Self {
+        Self::Sandbox(err.to_string())
     }
 }

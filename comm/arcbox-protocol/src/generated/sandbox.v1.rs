@@ -364,6 +364,12 @@ pub struct ListSandboxesRequest {
     #[prost(map = "string, string", tag = "2")]
     pub labels:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Maximum number of results to return (0 = no limit).
+    #[prost(int32, tag = "3")]
+    pub page_size: i32,
+    /// Opaque pagination token from a previous response.
+    #[prost(string, tag = "4")]
+    pub page_token: ::prost::alloc::string::String,
 }
 /// Response to ListSandboxes.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -372,6 +378,9 @@ pub struct ListSandboxesRequest {
 pub struct ListSandboxesResponse {
     #[prost(message, repeated, tag = "1")]
     pub sandboxes: ::prost::alloc::vec::Vec<SandboxSummary>,
+    /// Token for the next page (empty when no more results).
+    #[prost(string, tag = "2")]
+    pub next_page_token: ::prost::alloc::string::String,
 }
 /// Lightweight sandbox summary for List.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -516,6 +525,12 @@ pub struct ListSnapshotsRequest {
     #[prost(map = "string, string", tag = "2")]
     pub labels:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Maximum number of results to return (0 = no limit).
+    #[prost(int32, tag = "3")]
+    pub page_size: i32,
+    /// Opaque pagination token from a previous response.
+    #[prost(string, tag = "4")]
+    pub page_token: ::prost::alloc::string::String,
 }
 /// Response to ListSnapshots.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -524,6 +539,9 @@ pub struct ListSnapshotsRequest {
 pub struct ListSnapshotsResponse {
     #[prost(message, repeated, tag = "1")]
     pub snapshots: ::prost::alloc::vec::Vec<SnapshotSummary>,
+    /// Token for the next page (empty when no more results).
+    #[prost(string, tag = "2")]
+    pub next_page_token: ::prost::alloc::string::String,
 }
 /// Lightweight snapshot summary.
 #[derive(serde::Serialize, serde::Deserialize)]

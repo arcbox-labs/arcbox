@@ -37,6 +37,9 @@ toml = { workspace = true }
 sha2 = { workspace = true }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+arcbox-vm = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"

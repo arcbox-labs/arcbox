@@ -62,6 +62,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     /// Storage configuration.
     pub storage: StorageConfig,
+    /// Sandbox (Firecracker microVM) configuration (Linux only).
+    pub sandbox: SandboxConfig,
 }
 
 impl Default for Config {
@@ -75,6 +77,7 @@ impl Default for Config {
             container: ContainerRuntimeConfig::default(),
             logging: LoggingConfig::default(),
             storage: StorageConfig::default(),
+            sandbox: SandboxConfig::default(),
         }
     }
 }
@@ -295,6 +298,89 @@ impl Default for StorageConfig {
         Self {
             driver: "overlay2".to_string(),
             image_backend: "oci".to_string(),
+        }
+    }
+}
+
+/// Sandbox (Firecracker microVM) configuration.
+///
+/// Only meaningful on Linux where Firecracker is available.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SandboxConfig {
+    /// Enable the sandbox subsystem.
+    pub enabled: bool,
+    /// Path to the `firecracker` binary.
+    pub firecracker_binary: String,
+    /// Data directory for sandbox VMs, snapshots, and images.
+    pub data_dir: String,
+    /// Linux bridge interface name for sandbox uplinks.
+    pub bridge: String,
+    /// IP CIDR pool for guest address allocation.
+    pub cidr: String,
+    /// Default gateway advertised to sandbox guests.
+    pub gateway: String,
+    /// Default vCPU count for new sandboxes.
+    pub default_vcpus: u64,
+    /// Default memory in MiB for new sandboxes.
+    pub default_memory_mib: u64,
+    /// Default kernel image path.
+    pub default_kernel: String,
+    /// Default root filesystem image path.
+    pub default_rootfs: String,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            firecracker_binary: "/usr/bin/firecracker".to_string(),
+            data_dir: "/var/lib/arcbox/sandboxes".to_string(),
+            bridge: "fcvmm0".to_string(),
+            cidr: "172.20.0.0/16".to_string(),
+            gateway: "172.20.0.1".to_string(),
+            default_vcpus: 1,
+            default_memory_mib: 512,
+            default_kernel: "/var/lib/arcbox/sandboxes/kernels/vmlinux".to_string(),
+            default_rootfs: "/var/lib/arcbox/sandboxes/images/rootfs.ext4".to_string(),
+        }
+    }
+}
+
+impl SandboxConfig {
+    /// Converts to `arcbox_vm::VmmConfig` for initializing the `SandboxManager`.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn to_vmm_config(&self) -> arcbox_vm::VmmConfig {
+        arcbox_vm::VmmConfig {
+            firecracker: arcbox_vm::FirecrackerConfig {
+                binary: self.firecracker_binary.clone(),
+                jailer: None,
+                data_dir: self.data_dir.clone(),
+                log_level: None,
+                no_seccomp: false,
+                seccomp_filter: None,
+                http_api_max_payload_size: None,
+                mmds_size_limit: None,
+                socket_timeout_secs: None,
+            },
+            network: arcbox_vm::NetworkConfig {
+                bridge: self.bridge.clone(),
+                cidr: self.cidr.clone(),
+                gateway: self.gateway.clone(),
+                dns: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
+            },
+            grpc: arcbox_vm::GrpcConfig {
+                unix_socket: String::new(),
+                tcp_addr: String::new(),
+            },
+            defaults: arcbox_vm::DefaultVmConfig {
+                vcpus: self.default_vcpus,
+                memory_mib: self.default_memory_mib,
+                kernel: self.default_kernel.clone(),
+                rootfs: self.default_rootfs.clone(),
+                boot_args: "console=ttyS0 reboot=k panic=1 pci=off".to_string(),
+            },
         }
     }
 }
