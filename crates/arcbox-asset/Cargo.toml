@@ -1,0 +1,29 @@
+[package]
+name = "arcbox-asset"
+description = "Generic asset download, verification, and caching primitives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# Async download + SHA-256 verification.
+download = [
+    "dep:reqwest",
+    "dep:sha2",
+    "dep:tokio",
+    "dep:futures-util",
+]
+
+[dependencies]
+thiserror = { workspace = true }
+reqwest = { version = "0.12", optional = true, features = ["rustls-tls", "stream"] }
+sha2 = { version = "0.10", optional = true }
+tokio = { version = "1", features = ["fs", "io-util"], optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[lints]
+workspace = true

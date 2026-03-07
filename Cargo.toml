@@ -6,6 +6,7 @@ members = [
     # ============================================
     "common/arcbox-constants",
     "common/arcbox-error",
+    "crates/arcbox-asset",
 
     # ============================================
     # L1-2: Hypervisor (MIT OR Apache-2.0)
@@ -159,6 +160,8 @@ nix = { version = "0.29", features = [
 
 # libc
 libc = "0.2"
+
+arcbox-asset = { version = "0.1.2", path = "crates/arcbox-asset", features = ["download"] }
 
 # External crates
 arcbox-boot = { version = "0.3", features = ["download"] }
