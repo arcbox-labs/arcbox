@@ -59,7 +59,7 @@ jobs:
             target/debug/arcbox-daemon
 
       - name: Smoke test arcbox CLI
-        run: ./target/debug/arcbox --help
+        run: ./target/debug/abctl --help
 
       - name: Smoke test arcbox daemon
         run: ./target/debug/arcbox-daemon --help

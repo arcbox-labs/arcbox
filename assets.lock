@@ -1,0 +1,30 @@
+# ArcBox asset lock — pins versions and checksums for reproducible builds.
+
+[boot]
+version = "0.3.0"
+cdn = "https://boot.arcboxcdn.com"
+manifest_sha256 = ""
+
+[[tools]]
+name = "docker"
+version = "27.5.1"
+sha256_arm64 = "b0366bf473b9b97b0c5556c4c2fd6d92ea63e4848af2f869c93a98d2e2e1d3fa"
+sha256_x86_64 = "425560a99d1231433ae4b7149a4d1235461cb28783af32481741a367bd1a9f6a"
+
+[[tools]]
+name = "docker-buildx"
+version = "0.21.1"
+sha256_arm64 = "ae147cfa0c56b8d86d7358962c31ff810f1d943a011dd74a643a5fbdfdd5aa19"
+sha256_x86_64 = "2e8f454062d21f2bf877f5b364c22d00d6c3346fad5b810efd7e1ceb8eb264e4"
+
+[[tools]]
+name = "docker-compose"
+version = "2.33.1"
+sha256_arm64 = "0577710624554abe3c357be069205321751f8d429d75f93de993be0de2e27107"
+sha256_x86_64 = "17c05c6a42cab2302efed50e837aac099a52b10f9fc90dab04929496449b22ef"
+
+[[tools]]
+name = "docker-credential-osxkeychain"
+version = "0.9.1"
+sha256_arm64 = "564552e7d97eb236956f1fc8040f816463667da32db187eccc16c7fb51a089af"
+sha256_x86_64 = "34d7dcabc4630b2b2c2861c230b4f65a6499448d4cd1a129175ebbc54642928b"

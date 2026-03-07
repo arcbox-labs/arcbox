@@ -23,18 +23,24 @@ pub use arcbox_boot::manifest::Manifest as BootAssetManifest;
 // =============================================================================
 
 /// Embedded lockfile (compiled-in from workspace root).
-const LOCK_TOML: &str = include_str!("../../../boot-assets.lock");
+const LOCK_TOML: &str = include_str!("../../../assets.lock");
 
-/// Parsed lockfile.
+/// Top-level lockfile structure.
 #[derive(Debug, serde::Deserialize)]
-struct BootAssetsLock {
+struct AssetsLock {
+    boot: BootSection,
+}
+
+/// The `[boot]` section of `assets.lock`.
+#[derive(Debug, serde::Deserialize)]
+struct BootSection {
     version: String,
     cdn: Option<String>,
     manifest_sha256: Option<String>,
 }
 
-static LOCK: LazyLock<BootAssetsLock> =
-    LazyLock::new(|| toml::from_str(LOCK_TOML).expect("invalid boot-assets.lock"));
+static LOCK: LazyLock<AssetsLock> =
+    LazyLock::new(|| toml::from_str(LOCK_TOML).expect("invalid assets.lock"));
 
 /// Default CDN base URL (fallback when lockfile omits `cdn`).
 const DEFAULT_CDN_BASE_URL: &str = "https://boot.arcboxcdn.com";
@@ -42,13 +48,13 @@ const DEFAULT_CDN_BASE_URL: &str = "https://boot.arcboxcdn.com";
 /// Boot asset version pinned by this daemon release.
 #[must_use]
 pub fn boot_asset_version() -> &'static str {
-    &LOCK.version
+    &LOCK.boot.version
 }
 
 /// CDN base URL resolved from lockfile (or default).
 #[must_use]
 pub fn boot_asset_cdn() -> &'static str {
-    LOCK.cdn.as_deref().unwrap_or(DEFAULT_CDN_BASE_URL)
+    LOCK.boot.cdn.as_deref().unwrap_or(DEFAULT_CDN_BASE_URL)
 }
 
 // =============================================================================
@@ -214,7 +220,12 @@ impl BootAssetProvider {
             .map_err(|e| CoreError::config(format!("boot asset error: {e}")))?;
 
         // Verify manifest SHA256 if the lockfile specifies one.
-        if let Some(expected) = LOCK.manifest_sha256.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(expected) = LOCK
+            .boot
+            .manifest_sha256
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
             let manifest_path = self.config.version_cache_dir().join("manifest.json");
             let bytes = std::fs::read(&manifest_path)
                 .map_err(|e| CoreError::config(format!("read manifest: {e}")))?;

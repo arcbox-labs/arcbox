@@ -88,9 +88,9 @@ jobs:
       - name: Verify artifacts
         run: |
           echo "=== Build artifacts ==="
-          ls -lh target/release/arcbox
+          ls -lh target/release/abctl
           ls -lh target/release/arcbox-daemon
-          file target/release/arcbox
+          file target/release/abctl
           file target/release/arcbox-daemon
 
       - name: Create tarball
@@ -103,7 +103,7 @@ jobs:
           mkdir -p "$STAGING"
 
           # CLI + daemon binaries
-          cp target/release/arcbox "$STAGING/"
+          cp target/release/abctl "$STAGING/"
           cp target/release/arcbox-daemon "$STAGING/"
 
           # Entitlements (needed for codesigning after install)
@@ -206,11 +206,11 @@ jobs:
             codesign --entitlements entitlements.plist --force -s - arcbox-daemon
 
             # Install binaries
-            sudo cp arcbox /usr/local/bin/
+            sudo cp abctl /usr/local/bin/
             sudo cp arcbox-daemon /usr/local/bin/
 
             # Download runtime boot assets
-            arcbox boot prefetch
+            abctl boot prefetch
             ```
 
             ### Verify checksums

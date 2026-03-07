@@ -29,7 +29,7 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DOCKER_CLI_PATH="${DOCKER_CLI_PATH:-/Users/Shiro/Developer/arcboxd/docker-cli}"
-ARCBOX_BINARY="${PROJECT_ROOT}/target/debug/arcbox"
+ARCBOX_BINARY="${PROJECT_ROOT}/target/debug/abctl"
 
 # Test configuration
 TEST_SOCKET="/tmp/arcbox-e2e-test.sock"
@@ -101,11 +101,11 @@ check_prerequisites() {
 
     # Check arcbox binary
     if [[ ! -x "$ARCBOX_BINARY" ]]; then
-        echo -e "${RED}Error: arcbox binary not found at $ARCBOX_BINARY${NC}"
+        echo -e "${RED}Error: abctl binary not found at $ARCBOX_BINARY${NC}"
         echo "  Run: cargo build"
         exit 1
     fi
-    echo "  ✓ arcbox binary"
+    echo "  ✓ abctl binary"
 
     # Check docker-cli repo
     if [[ ! -d "$DOCKER_CLI_PATH" ]]; then

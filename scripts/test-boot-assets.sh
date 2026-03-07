@@ -65,7 +65,7 @@ check_prerequisites() {
     log_info "Checking prerequisites..."
 
     if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
-        log_info "Building latest arcbox release binary..."
+        log_info "Building latest abctl release binary..."
         (cd "$PROJECT_DIR" && cargo build --release -p arcbox-cli)
     fi
 

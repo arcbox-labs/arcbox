@@ -20,11 +20,12 @@ pub mod dns;
 pub mod docker;
 pub mod machine;
 pub mod sandbox;
+pub mod setup;
 pub mod version;
 
 /// ArcBox - High-performance container and VM runtime
 #[derive(Parser)]
-#[command(name = "arcbox")]
+#[command(name = "abctl")]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 pub struct Cli {
@@ -85,6 +86,10 @@ pub enum Commands {
 
     /// Manage the ArcBox daemon
     Daemon(daemon::DaemonArgs),
+
+    /// Manage CLI shell integration (PATH, completions)
+    #[command(subcommand)]
+    Setup(setup::SetupCommands),
 
     /// Display system-wide information
     Info,

@@ -48,17 +48,36 @@ pub struct DaemonArgs {
     pub guest_docker_vsock_port: Option<u32>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Sentry must be initialized before the tokio runtime so that spawned
+    // threads inherit the Hub from the main thread.
+    // When SENTRY_DSN is unset, this is a no-op with zero overhead.
+    let _sentry_guard = sentry::init(sentry::ClientOptions {
+        dsn: std::env::var("SENTRY_DSN")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+        release: Some(env!("CARGO_PKG_VERSION").into()),
+        environment: std::env::var("SENTRY_ENVIRONMENT").ok().map(Into::into),
+        traces_sample_rate: 0.2,
+        sample_rate: 1.0,
+        attach_stacktrace: true,
+        ..Default::default()
+    });
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "arcbox=info,arcbox_daemon=info".into()),
         )
         .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(sentry::integrations::tracing::layer())
         .init();
 
-    run(DaemonArgs::parse()).await
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to build tokio runtime")
+        .block_on(run(DaemonArgs::parse()))
 }
 
 async fn run(args: DaemonArgs) -> Result<()> {
