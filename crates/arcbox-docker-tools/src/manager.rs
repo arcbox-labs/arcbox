@@ -16,6 +16,10 @@ pub struct DockerToolManager {
     install_dir: PathBuf,
     /// Tool entries parsed from `assets.lock`.
     tools: Vec<ToolEntry>,
+    /// Optional directory containing pre-bundled tool binaries (e.g. app bundle's
+    /// `Contents/MacOS/xbin/`). When set, binaries are copied from here before
+    /// falling back to CDN download.
+    bundle_dir: Option<PathBuf>,
 }
 
 impl DockerToolManager {
@@ -26,7 +30,18 @@ impl DockerToolManager {
             arch: arch.into(),
             install_dir,
             tools,
+            bundle_dir: None,
         }
+    }
+
+    /// Set the bundle directory containing pre-built tool binaries.
+    ///
+    /// When a tool is not cached, the manager will try to copy it from this
+    /// directory before falling back to a CDN download.
+    #[must_use]
+    pub fn with_bundle_dir(mut self, dir: PathBuf) -> Self {
+        self.bundle_dir = Some(dir);
+        self
     }
 
     /// Install all configured Docker tools.
@@ -86,6 +101,38 @@ impl DockerToolManager {
                     info!(tool = %tool.name, "already installed, checksum matches");
                     return Ok(());
                 }
+            }
+        }
+
+        // Try copying from the app bundle before downloading from CDN.
+        if let Some(bundle) = &self.bundle_dir {
+            let src = bundle.join(&tool.name);
+            if src.is_file() {
+                tokio::fs::copy(&src, &dest)
+                    .await
+                    .map_err(DockerToolError::Io)?;
+                if let Ok(actual) = sha256_file(&dest).await {
+                    if actual == expected_sha {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let mut perms = tokio::fs::metadata(&dest)
+                                .await
+                                .map_err(DockerToolError::Io)?
+                                .permissions();
+                            perms.set_mode(0o755);
+                            tokio::fs::set_permissions(&dest, perms)
+                                .await
+                                .map_err(DockerToolError::Io)?;
+                        }
+                        pg(PreparePhase::Ready);
+                        info!(tool = %tool.name, "installed from app bundle");
+                        return Ok(());
+                    }
+                }
+                // Checksum mismatch — remove and fall through to CDN download.
+                let _ = tokio::fs::remove_file(&dest).await;
+                info!(tool = %tool.name, "bundle binary checksum mismatch, downloading from CDN");
             }
         }
 

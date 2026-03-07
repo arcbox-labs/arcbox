@@ -10,6 +10,9 @@ use anyhow::{Context, Result};
 use arcbox_docker::DockerContextManager;
 use arcbox_docker_tools::{DockerToolManager, parse_tools};
 use clap::Subcommand;
+use serde::Serialize;
+
+use super::OutputFormat;
 
 /// Embedded `assets.lock` (same copy used by boot_assets).
 const LOCK_TOML: &str = include_str!("../../../../assets.lock");
@@ -41,7 +44,7 @@ pub enum DockerCommands {
 }
 
 /// Executes a docker subcommand.
-pub async fn execute(cmd: DockerCommands) -> Result<()> {
+pub async fn execute(cmd: DockerCommands, format: OutputFormat) -> Result<()> {
     match cmd {
         DockerCommands::Enable => {
             let manager = context_manager()?;
@@ -56,7 +59,7 @@ pub async fn execute(cmd: DockerCommands) -> Result<()> {
             execute_status(&manager);
             Ok(())
         }
-        DockerCommands::Setup => execute_setup().await,
+        DockerCommands::Setup => execute_setup(format).await,
     }
 }
 
@@ -65,8 +68,35 @@ fn context_manager() -> Result<DockerContextManager> {
         .context("Failed to initialize Docker context manager")
 }
 
+/// NDJSON progress line for `arcbox docker setup --format json`.
+#[derive(Serialize, Default)]
+struct SetupProgress {
+    phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    downloaded_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    percent: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Emit a single NDJSON progress line to stdout.
+fn emit_ndjson(p: SetupProgress) {
+    if let Ok(json) = serde_json::to_string(&p) {
+        println!("{json}");
+    }
+}
+
 /// Downloads and installs Docker CLI tools.
-async fn execute_setup() -> Result<()> {
+async fn execute_setup(format: OutputFormat) -> Result<()> {
     let home = dirs::home_dir().context("could not determine home directory")?;
     let runtime_bin = home.join(".arcbox/runtime/bin");
     let user_bin = home.join(".arcbox/bin");
@@ -74,18 +104,100 @@ async fn execute_setup() -> Result<()> {
     // Parse tool entries from lockfile.
     let tools = parse_tools(LOCK_TOML).context("failed to parse assets.lock")?;
     if tools.is_empty() {
-        println!("No Docker tools configured in assets.lock.");
+        if matches!(format, OutputFormat::Table | OutputFormat::Quiet) {
+            println!("No Docker tools configured in assets.lock.");
+        }
         return Ok(());
     }
 
     let arch = arcbox_asset::current_arch().to_string();
 
+    let mut manager = DockerToolManager::new(tools, &arch, runtime_bin.clone());
+    if let Some(xbin) = detect_bundle_xbin() {
+        if matches!(format, OutputFormat::Table | OutputFormat::Quiet) {
+            println!("Using Docker tools from app bundle: {}", xbin.display());
+        }
+        manager = manager.with_bundle_dir(xbin);
+    }
+
+    match format {
+        OutputFormat::Json => execute_setup_json(&manager, &runtime_bin, &user_bin).await,
+        OutputFormat::Table | OutputFormat::Quiet => {
+            execute_setup_table(&manager, &home, &runtime_bin, &user_bin).await
+        }
+    }
+}
+
+/// Install Docker tools with NDJSON progress output.
+async fn execute_setup_json(
+    manager: &DockerToolManager,
+    runtime_bin: &Path,
+    user_bin: &Path,
+) -> Result<()> {
+    let progress_cb: arcbox_asset::ProgressCallback =
+        Box::new(|p: arcbox_asset::PrepareProgress| {
+            let (phase, downloaded_bytes, total_bytes, percent) = match &p.phase {
+                arcbox_asset::PreparePhase::Checking => {
+                    ("checking".to_string(), None, None, None)
+                }
+                arcbox_asset::PreparePhase::Downloading { downloaded, total } => {
+                    let pct = total.map(|t| if t > 0 { downloaded * 100 / t } else { 0 });
+                    ("downloading".to_string(), Some(*downloaded), *total, pct)
+                }
+                arcbox_asset::PreparePhase::Verifying => {
+                    ("verifying".to_string(), None, None, None)
+                }
+                arcbox_asset::PreparePhase::Ready => ("ready".to_string(), None, None, None),
+                arcbox_asset::PreparePhase::Cached => ("cached".to_string(), None, None, None),
+            };
+
+            emit_ndjson(SetupProgress {
+                phase,
+                name: Some(p.name.clone()),
+                current: Some(p.current),
+                total: Some(p.total),
+                downloaded_bytes,
+                total_bytes,
+                percent,
+                ..Default::default()
+            });
+        });
+
+    if let Err(e) = manager.install_all(Some(&Arc::new(progress_cb))).await {
+        emit_ndjson(SetupProgress {
+            phase: "error".to_string(),
+            error: Some(e.to_string()),
+            ..Default::default()
+        });
+        return Err(e.into());
+    }
+
+    // Create symlinks.
+    tokio::fs::create_dir_all(user_bin).await?;
+    for tool in manager.tools() {
+        let target = runtime_bin.join(&tool.name);
+        let link = user_bin.join(&tool.name);
+        create_or_update_symlink(&target, &link).await?;
+    }
+
+    emit_ndjson(SetupProgress {
+        phase: "complete".to_string(),
+        ..Default::default()
+    });
+
+    Ok(())
+}
+
+/// Install Docker tools with human-readable table output.
+async fn execute_setup_table(
+    manager: &DockerToolManager,
+    home: &Path,
+    runtime_bin: &Path,
+    user_bin: &Path,
+) -> Result<()> {
     println!("Installing Docker CLI tools...");
     println!();
 
-    let manager = DockerToolManager::new(tools, &arch, runtime_bin.clone());
-
-    // Progress callback.
     let progress_cb: arcbox_asset::ProgressCallback =
         Box::new(|p: arcbox_asset::PrepareProgress| match &p.phase {
             arcbox_asset::PreparePhase::Checking => {
@@ -126,7 +238,7 @@ async fn execute_setup() -> Result<()> {
         .context("failed to install Docker tools")?;
 
     // Create symlinks in ~/.arcbox/bin/.
-    tokio::fs::create_dir_all(&user_bin).await?;
+    tokio::fs::create_dir_all(user_bin).await?;
     for tool in manager.tools() {
         let target = runtime_bin.join(&tool.name);
         let link = user_bin.join(&tool.name);
@@ -138,7 +250,7 @@ async fn execute_setup() -> Result<()> {
     println!("Symlinks created in {}", user_bin.display());
 
     // Generate Docker shell completions.
-    generate_docker_completions(&home, &runtime_bin).await?;
+    generate_docker_completions(home, runtime_bin).await?;
 
     println!();
     println!("Restart your shell or re-source your profile to use Docker completions.");
@@ -322,6 +434,19 @@ fn execute_status(manager: &DockerContextManager) {
         println!("Status: Not configured");
         println!("        Run 'arcbox docker enable' to set up");
     }
+}
+
+/// Detect the `xbin/` directory inside an app bundle.
+///
+/// When `abctl` is running from `Contents/MacOS/bin/abctl`, the xbin directory
+/// is at `Contents/MacOS/xbin/`. Returns `Some(path)` if the directory exists.
+fn detect_bundle_xbin() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    // exe = …/Contents/MacOS/bin/abctl
+    // parent = …/Contents/MacOS/bin/
+    // parent.parent = …/Contents/MacOS/
+    let xbin = exe.parent()?.parent()?.join("xbin");
+    xbin.is_dir().then_some(xbin)
 }
 
 /// Returns the default socket path for the Docker-compatible API.

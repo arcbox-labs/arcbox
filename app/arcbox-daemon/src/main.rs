@@ -53,11 +53,19 @@ fn main() -> Result<()> {
     // threads inherit the Hub from the main thread.
     // When SENTRY_DSN is unset, this is a no-op with zero overhead.
     let _sentry_guard = sentry::init(sentry::ClientOptions {
-        dsn: std::env::var("SENTRY_DSN")
+        dsn: std::env::var("ARCBOX_DAEMON_SENTRY_DSN")
+            .or_else(|_| std::env::var("SENTRY_DSN"))
             .ok()
             .and_then(|s| s.parse().ok()),
         release: Some(env!("CARGO_PKG_VERSION").into()),
-        environment: std::env::var("SENTRY_ENVIRONMENT").ok().map(Into::into),
+        environment: Some(
+            std::env::var("ARCBOX_DAEMON_SENTRY_ENVIRONMENT")
+                .or_else(|_| std::env::var("SENTRY_ENVIRONMENT"))
+                .unwrap_or_else(|_| {
+                    if cfg!(debug_assertions) { "development" } else { "production" }.into()
+                })
+                .into(),
+        ),
         traces_sample_rate: 0.2,
         sample_rate: 1.0,
         attach_stacktrace: true,
