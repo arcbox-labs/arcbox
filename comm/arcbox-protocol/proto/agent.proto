@@ -114,6 +114,26 @@ message PortBindingsRemoved {
     string container_id = 1;
 }
 
+// Request to ensure k3s is available.
+message K3sEnsureRequest {
+    // Whether to attempt starting k3s when not ready.
+    bool start_if_needed = 1;
+}
+
+// Response from k3s ensure operation.
+message K3sEnsureResponse {
+    // Whether k3s API server is ready.
+    bool ready = 1;
+    // k3s API endpoint (e.g. "https://localhost:6443").
+    string endpoint = 2;
+    // Host-visible kubeconfig path.
+    string kubeconfig_path = 3;
+    // Additional status detail.
+    string message = 4;
+    // Outcome: "started", "reused", or "failed".
+    string status = 5;
+}
+
 // Individual service status within the guest runtime stack.
 message ServiceStatus {
     // Service name (e.g. "containerd", "dockerd", "runc").

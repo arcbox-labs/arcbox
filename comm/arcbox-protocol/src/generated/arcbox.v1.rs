@@ -1553,6 +1553,36 @@ pub struct PortBindingsRemoved {
     #[prost(string, tag = "1")]
     pub container_id: ::prost::alloc::string::String,
 }
+/// Request to ensure k3s is available.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct K3sEnsureRequest {
+    /// Whether to attempt starting k3s when not ready.
+    #[prost(bool, tag = "1")]
+    pub start_if_needed: bool,
+}
+/// Response from k3s ensure operation.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct K3sEnsureResponse {
+    /// Whether k3s API server is ready.
+    #[prost(bool, tag = "1")]
+    pub ready: bool,
+    /// k3s API endpoint (e.g. "https://localhost:6443").
+    #[prost(string, tag = "2")]
+    pub endpoint: ::prost::alloc::string::String,
+    /// Host-visible kubeconfig path.
+    #[prost(string, tag = "3")]
+    pub kubeconfig_path: ::prost::alloc::string::String,
+    /// Additional status detail.
+    #[prost(string, tag = "4")]
+    pub message: ::prost::alloc::string::String,
+    /// Outcome: "started", "reused", or "failed".
+    #[prost(string, tag = "5")]
+    pub status: ::prost::alloc::string::String,
+}
 /// Individual service status within the guest runtime stack.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
