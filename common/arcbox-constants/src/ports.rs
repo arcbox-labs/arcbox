@@ -3,3 +3,6 @@ pub const AGENT_PORT: u32 = 1024;
 
 /// Guest Docker API vsock proxy port.
 pub const DOCKER_API_VSOCK_PORT: u32 = 2375;
+
+/// NFS server port (NFSv4, TCP).
+pub const NFS_PORT: u16 = 2049;

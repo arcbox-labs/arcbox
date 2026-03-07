@@ -1553,6 +1553,30 @@ pub struct PortBindingsRemoved {
     #[prost(string, tag = "1")]
     pub container_id: ::prost::alloc::string::String,
 }
+/// Request to ensure NFS server is available.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct NfsEnsureRequest {
+    /// Whether to attempt starting the NFS server when not ready.
+    #[prost(bool, tag = "1")]
+    pub start_if_needed: bool,
+}
+/// Response from NFS ensure operation.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NfsEnsureResponse {
+    /// Whether the NFS server is ready.
+    #[prost(bool, tag = "1")]
+    pub ready: bool,
+    /// Additional status detail.
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+    /// Outcome: "started", "reused", or "failed".
+    #[prost(string, tag = "3")]
+    pub status: ::prost::alloc::string::String,
+}
 /// Individual service status within the guest runtime stack.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

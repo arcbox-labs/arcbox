@@ -114,6 +114,22 @@ message PortBindingsRemoved {
     string container_id = 1;
 }
 
+// Request to ensure NFS server is available.
+message NfsEnsureRequest {
+    // Whether to attempt starting the NFS server when not ready.
+    bool start_if_needed = 1;
+}
+
+// Response from NFS ensure operation.
+message NfsEnsureResponse {
+    // Whether the NFS server is ready.
+    bool ready = 1;
+    // Additional status detail.
+    string message = 2;
+    // Outcome: "started", "reused", or "failed".
+    string status = 3;
+}
+
 // Individual service status within the guest runtime stack.
 message ServiceStatus {
     // Service name (e.g. "containerd", "dockerd", "runc").

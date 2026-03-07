@@ -97,9 +97,9 @@ pub mod image {
 /// Re-exports all agent-related types for backward compatibility.
 pub mod agent {
     pub use super::v1::{
-        AgentPingRequest, AgentPingResponse, PortBindingsChanged, PortBindingsRemoved,
-        RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
-        ServiceStatus, SystemInfo,
+        AgentPingRequest, AgentPingResponse, NfsEnsureRequest, NfsEnsureResponse,
+        PortBindingsChanged, PortBindingsRemoved, RuntimeEnsureRequest, RuntimeEnsureResponse,
+        RuntimeStatusRequest, RuntimeStatusResponse, ServiceStatus, SystemInfo,
     };
 
     // Backward compatibility type aliases (short names without Agent prefix).
@@ -171,9 +171,9 @@ pub use v1::{
 
 // Agent types
 pub use v1::{
-    AgentPingRequest, AgentPingResponse, PortBindingsChanged, PortBindingsRemoved,
-    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
-    ServiceStatus, SystemInfo,
+    AgentPingRequest, AgentPingResponse, NfsEnsureRequest, NfsEnsureResponse, PortBindingsChanged,
+    PortBindingsRemoved, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
+    RuntimeStatusResponse, ServiceStatus, SystemInfo,
 };
 
 // API types - Network
