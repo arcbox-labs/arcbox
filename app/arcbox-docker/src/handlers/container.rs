@@ -76,16 +76,19 @@ pub async fn stop_container(
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
-    // Resolve canonical ID before proxy — the name/short-id is still valid now.
-    let canonical = extract_container_id(&uri)
-        .map(|id| async { resolve_canonical_id(&state, &id).await.unwrap_or(id) });
+    // Resolve canonical ID before proxy — the name/short-id is still valid now
+    // but may become stale after stop (e.g. --rm containers).
+    let canonical = if let Some(id) = extract_container_id(&uri) {
+        Some(resolve_canonical_id(&state, &id).await.unwrap_or(id))
+    } else {
+        None
+    };
 
     let response = proxy(&state, &uri, req).await?;
 
     // Only tear down networking after a successful stop.
     if response.status().is_success() {
         if let Some(canonical) = canonical {
-            let canonical = canonical.await;
             state.runtime.stop_port_forwarding_by_id(&canonical).await;
             state.runtime.deregister_dns_by_id(&canonical).await;
         }

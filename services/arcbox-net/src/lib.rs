@@ -148,6 +148,18 @@ impl NetworkManager {
         }
     }
 
+    /// Replaces the DNS forwarder's local domain.
+    ///
+    /// Call this before registering any hostnames to ensure the domain suffix
+    /// is consistent across all entries.
+    pub fn set_dns_domain(&self, domain: &str) {
+        if let Ok(mut forwarder) = self.dns_forwarder.write() {
+            let mut cfg = forwarder.config().clone();
+            cfg.local_domain = Some(domain.to_string());
+            *forwarder = dns::DnsForwarder::new(cfg);
+        }
+    }
+
     /// Returns the network configuration.
     #[must_use]
     pub fn config(&self) -> &NetConfig {

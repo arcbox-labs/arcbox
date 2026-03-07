@@ -136,6 +136,12 @@ async fn run(args: DaemonArgs) -> Result<()> {
         "Runtime initialized"
     );
 
+    // Apply custom DNS domain if configured via ARCBOX_DNS_DOMAIN.
+    let dns_local_domain = dns_domain();
+    if dns_local_domain != DEFAULT_DNS_DOMAIN {
+        runtime.network_manager().set_dns_domain(&dns_local_domain);
+    }
+
     // Bind DNS socket eagerly — failure aborts the daemon.
     let dns_listen_port = dns_port();
     let dns_service = DnsService::bind(Arc::clone(runtime.network_manager()), dns_listen_port)
