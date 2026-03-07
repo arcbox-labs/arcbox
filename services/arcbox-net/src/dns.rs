@@ -735,6 +735,83 @@ mod tests {
         assert_eq!(server.listen_addr(), Ipv4Addr::new(192, 168, 64, 1));
     }
 
+    /// Builds a minimal DNS query packet for testing.
+    fn build_test_query(name: &str) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(64);
+        // Header: ID=0xABCD, flags=0x0100 (RD=1), QDCOUNT=1
+        packet.extend_from_slice(&[0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00]);
+        packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        // Question section: encode name labels
+        for label in name.split('.') {
+            packet.push(label.len() as u8);
+            packet.extend_from_slice(label.as_bytes());
+        }
+        packet.push(0x00); // root label
+        packet.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
+        packet.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+        packet
+    }
+
+    #[test]
+    fn test_try_resolve_locally_or_nxdomain_returns_response_for_registered() {
+        let config = DnsConfig::default();
+        let mut forwarder = DnsForwarder::new(config);
+        let ip = IpAddr::V4(Ipv4Addr::new(172, 17, 0, 2));
+        forwarder.add_local_host("my-nginx", ip);
+
+        let query = build_test_query("my-nginx.arcbox.local");
+        let response = forwarder
+            .try_resolve_locally_or_nxdomain(&query)
+            .expect("should resolve registered host");
+
+        // Verify QR=1, RCODE=0, ANCOUNT=1.
+        assert_eq!(response[2] & 0x80, 0x80, "QR bit");
+        assert_eq!(response[3] & 0x0F, 0, "RCODE=NoError");
+        assert_eq!(response[7], 1, "ANCOUNT=1");
+    }
+
+    #[test]
+    fn test_try_resolve_locally_or_nxdomain_returns_nxdomain() {
+        let config = DnsConfig::default();
+        let forwarder = DnsForwarder::new(config);
+
+        let query = build_test_query("nonexistent.arcbox.local");
+        let response = forwarder
+            .try_resolve_locally_or_nxdomain(&query)
+            .expect("should return NXDOMAIN for unregistered local host");
+
+        // Verify QR=1, RCODE=3 (NXDOMAIN), ANCOUNT=0.
+        assert_eq!(response[2] & 0x80, 0x80, "QR bit");
+        assert_eq!(response[3] & 0x0F, 3, "RCODE=NXDOMAIN");
+        assert_eq!(response[7], 0, "ANCOUNT=0");
+    }
+
+    #[test]
+    fn test_try_resolve_locally_or_nxdomain_returns_none_for_external() {
+        let config = DnsConfig::default();
+        let forwarder = DnsForwarder::new(config);
+
+        let query = build_test_query("google.com");
+        let result = forwarder.try_resolve_locally_or_nxdomain(&query);
+
+        assert!(result.is_none(), "should return None for non-local domains");
+    }
+
+    #[test]
+    fn test_try_resolve_locally_or_nxdomain_bare_domain() {
+        // Query for "arcbox.local" itself (no subdomain) should also NXDOMAIN
+        // if not registered.
+        let config = DnsConfig::default();
+        let forwarder = DnsForwarder::new(config);
+
+        let query = build_test_query("arcbox.local");
+        let response = forwarder
+            .try_resolve_locally_or_nxdomain(&query)
+            .expect("bare domain should return NXDOMAIN");
+
+        assert_eq!(response[3] & 0x0F, 3, "RCODE=NXDOMAIN");
+    }
+
     #[test]
     fn test_parse_resolv_conf_nameservers() {
         let conf = r#"

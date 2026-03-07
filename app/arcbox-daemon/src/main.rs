@@ -417,7 +417,10 @@ async fn recover_dns_entries(runtime: &Arc<Runtime>) {
     }
 
     if recovered > 0 {
-        info!(count = recovered, "Recovered DNS entries for running containers");
+        info!(
+            count = recovered,
+            "Recovered DNS entries for running containers"
+        );
     }
 }
 

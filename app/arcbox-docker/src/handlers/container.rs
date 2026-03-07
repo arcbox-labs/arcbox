@@ -218,11 +218,7 @@ async fn setup_port_forwarding_from_inspect(
 /// Falls back through `/NetworkSettings/IPAddress` → per-network IPs.
 fn extract_container_dns_info(inspect_json: &[u8]) -> Option<(String, IpAddr)> {
     let v: serde_json::Value = serde_json::from_slice(inspect_json).ok()?;
-    let name = v
-        .get("Name")?
-        .as_str()?
-        .trim_start_matches('/')
-        .to_string();
+    let name = v.get("Name")?.as_str()?.trim_start_matches('/').to_string();
 
     if name.is_empty() {
         return None;
