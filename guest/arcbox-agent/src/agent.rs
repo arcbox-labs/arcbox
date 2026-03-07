@@ -15,6 +15,7 @@ pub mod ensure_runtime {
 
     pub use arcbox_constants::status::{
         RUNTIME_FAILED as STATUS_FAILED, RUNTIME_REUSED as STATUS_REUSED,
+        RUNTIME_STARTED as STATUS_STARTED,
     };
     use arcbox_protocol::agent::RuntimeEnsureResponse;
     use tokio::sync::{Mutex, Notify};
