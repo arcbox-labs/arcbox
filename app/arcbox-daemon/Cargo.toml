@@ -28,6 +28,9 @@ dirs = { workspace = true }
 libc = { workspace = true }
 arcbox-net = { version = "0.1.2", path = "../../services/arcbox-net" }
 serde_json.workspace = true
+axum.workspace = true
+bytes.workspace = true
+http-body-util = "0.1.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-resolver = { workspace = true }
