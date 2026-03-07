@@ -7,6 +7,7 @@ use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, Method, Request, Uri};
 use axum::response::Response;
 use bytes::Bytes;
+use std::net::IpAddr;
 
 crate::handlers::proxy_handler!(list_containers);
 crate::handlers::proxy_handler!(inspect_container);
@@ -14,7 +15,6 @@ crate::handlers::proxy_handler!(container_logs);
 crate::handlers::proxy_handler!(wait_container);
 crate::handlers::proxy_handler!(pause_container);
 crate::handlers::proxy_handler!(unpause_container);
-crate::handlers::proxy_handler!(rename_container);
 crate::handlers::proxy_handler!(container_top);
 crate::handlers::proxy_handler!(container_stats);
 crate::handlers::proxy_handler!(container_changes);
@@ -41,7 +41,7 @@ fn extract_container_id(uri: &Uri) -> Option<String> {
     None
 }
 
-/// Start a container, then set up host-side port forwarding.
+/// Start a container, then set up host-side port forwarding and DNS.
 ///
 /// # Errors
 ///
@@ -56,17 +56,17 @@ pub async fn start_container(
     // Proxy start request to guest.
     let response = proxy(&state, &uri, req).await?;
 
-    // On success, inspect the container and set up port forwarding.
+    // On success, inspect the container and set up port forwarding + DNS.
     if response.status().is_success() {
         if let Some(ref id) = container_id {
-            setup_port_forwarding(&state, id).await;
+            setup_container_networking(&state, id).await;
         }
     }
 
     Ok(response)
 }
 
-/// Stop a container and tear down its port forwarding rules.
+/// Stop a container and tear down its port forwarding + DNS.
 ///
 /// # Errors
 ///
@@ -79,11 +79,12 @@ pub async fn stop_container(
     if let Some(id) = extract_container_id(&uri) {
         let canonical = resolve_canonical_id(&state, &id).await.unwrap_or(id);
         state.runtime.stop_port_forwarding_by_id(&canonical).await;
+        state.runtime.deregister_dns_by_id(&canonical).await;
     }
     proxy(&state, &uri, req).await
 }
 
-/// Remove a container and tear down its port forwarding rules.
+/// Remove a container and tear down its port forwarding + DNS.
 ///
 /// # Errors
 ///
@@ -96,12 +97,34 @@ pub async fn remove_container(
     if let Some(id) = extract_container_id(&uri) {
         let canonical = resolve_canonical_id(&state, &id).await.unwrap_or(id);
         state.runtime.stop_port_forwarding_by_id(&canonical).await;
+        state.runtime.deregister_dns_by_id(&canonical).await;
     }
     proxy(&state, &uri, req).await
 }
 
-/// Inspect a started container and configure port forwarding from its bindings.
-async fn setup_port_forwarding(state: &AppState, container_id: &str) {
+/// Inspect a started container and configure port forwarding + DNS registration.
+///
+/// Shares a single inspect call for both port forwarding and DNS setup.
+async fn setup_container_networking(state: &AppState, container_id: &str) {
+    let Some(body_bytes) = inspect_container_body(state, container_id).await else {
+        return;
+    };
+
+    // Use the canonical full container ID from inspect (not the URI token which
+    // may be a name or short ID) so that stop/remove can reliably match the key.
+    let canonical_id = canonical_id_or_fallback(container_id, &body_bytes);
+
+    // Port forwarding.
+    setup_port_forwarding_from_inspect(state, &canonical_id, &body_bytes).await;
+
+    // DNS registration.
+    if let Some((name, ip)) = extract_container_dns_info(&body_bytes) {
+        state.runtime.register_dns(&canonical_id, &name, ip).await;
+    }
+}
+
+/// Fetches the inspect JSON body for a container from guest dockerd.
+async fn inspect_container_body(state: &AppState, container_id: &str) -> Option<Bytes> {
     let inspect_path = format!("/containers/{container_id}/json");
     let inspect_resp = match proxy_to_guest(
         &state.runtime,
@@ -119,27 +142,30 @@ async fn setup_port_forwarding(state: &AppState, container_id: &str) {
                 container_id,
                 resp.status()
             );
-            return;
+            return None;
         }
         Err(e) => {
             tracing::debug!("Failed to inspect container {}: {}", container_id, e);
-            return;
+            return None;
         }
     };
 
-    let body_bytes = match http_body_util::BodyExt::collect(inspect_resp.into_body()).await {
-        Ok(collected) => collected.to_bytes(),
+    match http_body_util::BodyExt::collect(inspect_resp.into_body()).await {
+        Ok(collected) => Some(collected.to_bytes()),
         Err(e) => {
             tracing::debug!("Failed to read inspect body for {}: {}", container_id, e);
-            return;
+            None
         }
-    };
+    }
+}
 
-    // Use the canonical full container ID from inspect (not the URI token which
-    // may be a name or short ID) so that stop/remove can reliably match the key.
-    let canonical_id = canonical_id_or_fallback(container_id, &body_bytes);
-
-    let bindings = parse_port_bindings(&body_bytes);
+/// Configures port forwarding from pre-fetched inspect JSON.
+async fn setup_port_forwarding_from_inspect(
+    state: &AppState,
+    canonical_id: &str,
+    body_bytes: &[u8],
+) {
+    let bindings = parse_port_bindings(body_bytes);
     if bindings.is_empty() {
         tracing::debug!("No port bindings found for container {}", canonical_id);
         return;
@@ -175,7 +201,7 @@ async fn setup_port_forwarding(state: &AppState, container_id: &str) {
     let machine_name = state.runtime.default_machine_name();
     if let Err(e) = state
         .runtime
-        .start_port_forwarding_for(machine_name, &canonical_id, &rules)
+        .start_port_forwarding_for(machine_name, canonical_id, &rules)
         .await
     {
         tracing::warn!(
@@ -184,6 +210,74 @@ async fn setup_port_forwarding(state: &AppState, container_id: &str) {
             e
         );
     }
+}
+
+/// Extracts container name and IP address from Docker inspect JSON.
+///
+/// Returns `(name, ip)` where `name` is the container name without leading `/`.
+/// Falls back through `/NetworkSettings/IPAddress` → per-network IPs.
+fn extract_container_dns_info(inspect_json: &[u8]) -> Option<(String, IpAddr)> {
+    let v: serde_json::Value = serde_json::from_slice(inspect_json).ok()?;
+    let name = v
+        .get("Name")?
+        .as_str()?
+        .trim_start_matches('/')
+        .to_string();
+
+    if name.is_empty() {
+        return None;
+    }
+
+    // Primary: top-level IPAddress.
+    let ip_str = v
+        .pointer("/NetworkSettings/IPAddress")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        // Fallback: first non-empty IP from Networks map.
+        .or_else(|| {
+            v.pointer("/NetworkSettings/Networks")?
+                .as_object()?
+                .values()
+                .find_map(|net| net.get("IPAddress")?.as_str().filter(|s| !s.is_empty()))
+        })?;
+
+    Some((name, ip_str.parse().ok()?))
+}
+
+/// Rename a container and update its DNS entry.
+///
+/// # Errors
+///
+/// Returns an error if VM readiness fails or proxying to guest dockerd fails.
+pub async fn rename_container(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    req: Request<Body>,
+) -> Result<Response> {
+    let container_id = extract_container_id(&uri);
+
+    // Proxy rename to guest.
+    let response = proxy(&state, &uri, req).await?;
+
+    if response.status().is_success() {
+        if let Some(ref id) = container_id {
+            let canonical = resolve_canonical_id(&state, id)
+                .await
+                .unwrap_or_else(|| id.clone());
+
+            // 1. Remove old DNS entry (returns old hostname atomically).
+            state.runtime.deregister_dns_by_id(&canonical).await;
+
+            // 2. Inspect to get new name + IP, then register.
+            if let Some(body_bytes) = inspect_container_body(&state, &canonical).await {
+                if let Some((new_name, ip)) = extract_container_dns_info(&body_bytes) {
+                    state.runtime.register_dns(&canonical, &new_name, ip).await;
+                }
+            }
+        }
+    }
+
+    Ok(response)
 }
 
 /// Attach to a container.
@@ -316,5 +410,72 @@ mod tests {
             canonical_id_or_fallback("web", b"not json"),
             "web".to_string()
         );
+    }
+
+    #[test]
+    fn test_extract_container_dns_info_basic() {
+        let json = serde_json::json!({
+            "Id": "abc123",
+            "Name": "/my-nginx",
+            "NetworkSettings": {
+                "IPAddress": "172.17.0.2",
+                "Networks": {}
+            }
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let (name, ip) = extract_container_dns_info(&bytes).unwrap();
+        assert_eq!(name, "my-nginx");
+        assert_eq!(ip, "172.17.0.2".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_extract_container_dns_info_network_fallback() {
+        let json = serde_json::json!({
+            "Id": "abc123",
+            "Name": "/web-app",
+            "NetworkSettings": {
+                "IPAddress": "",
+                "Networks": {
+                    "bridge": {
+                        "IPAddress": "172.18.0.3"
+                    }
+                }
+            }
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let (name, ip) = extract_container_dns_info(&bytes).unwrap();
+        assert_eq!(name, "web-app");
+        assert_eq!(ip, "172.18.0.3".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_extract_container_dns_info_no_ip() {
+        let json = serde_json::json!({
+            "Id": "abc123",
+            "Name": "/isolated",
+            "NetworkSettings": {
+                "IPAddress": "",
+                "Networks": {}
+            }
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        assert!(extract_container_dns_info(&bytes).is_none());
+    }
+
+    #[test]
+    fn test_extract_container_dns_info_invalid_json() {
+        assert!(extract_container_dns_info(b"not json").is_none());
+    }
+
+    #[test]
+    fn test_extract_container_dns_info_no_name() {
+        let json = serde_json::json!({
+            "Id": "abc123",
+            "NetworkSettings": {
+                "IPAddress": "172.17.0.2"
+            }
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        assert!(extract_container_dns_info(&bytes).is_none());
     }
 }
