@@ -10,6 +10,7 @@
 
 pub mod config;
 pub mod error;
+pub mod file_io;
 pub mod network;
 pub mod sandbox;
 pub mod snapshot;

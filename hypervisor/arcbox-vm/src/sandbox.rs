@@ -1085,6 +1085,14 @@ impl SandboxManager {
                 .map_err(VmmError::from)?,
         );
 
+        // Synchronise the guest clock to the host after restore.  The sandbox
+        // clock is frozen at snapshot creation time; correct it before any
+        // workload runs.  A failure here is non-fatal — the sandbox is still
+        // usable, just with a potentially stale clock.
+        if let Err(e) = vsock::sync_clock(&actual_vsock_path).await {
+            warn!(sandbox_id = %new_id, "clock sync after restore failed: {e}");
+        }
+
         // Build and register the new sandbox instance.
         let restore_spec = SandboxSpec {
             id: Some(new_id.clone()),

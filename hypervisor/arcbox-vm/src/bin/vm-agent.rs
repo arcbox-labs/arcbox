@@ -48,14 +48,26 @@ mod agent {
     // -------------------------------------------------------------------------
 
     pub const AGENT_PORT: u32 = 52;
+    const FILE_PORT: u32 = 53;
 
+    // Exec channel (vsock:52) frame types.
     const MSG_START: u8 = 0x01;
     const MSG_STDIN: u8 = 0x02;
     const MSG_RESIZE: u8 = 0x03;
     const MSG_EOF: u8 = 0x04;
+    const MSG_CLOCK_SYNC: u8 = 0x05;
     const MSG_STDOUT: u8 = 0x10;
     const MSG_STDERR: u8 = 0x11;
     const MSG_EXIT: u8 = 0x12;
+
+    // File I/O channel (vsock:53) frame types.
+    const FILE_WRITE_REQ: u8 = 0x20;
+    const FILE_DATA: u8 = 0x21;
+    const FILE_DONE: u8 = 0x22;
+    const FILE_READ_REQ: u8 = 0x23;
+    const FILE_ACK: u8 = 0x30;
+    const FILE_ERR: u8 = 0x31;
+
     const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
     // -------------------------------------------------------------------------
@@ -182,27 +194,183 @@ mod agent {
         let (msg_type, payload) = match read_frame(&mut conn) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("agent: read MSG_START: {e}");
-                return;
-            }
-        };
-        if msg_type != MSG_START {
-            eprintln!("agent: expected MSG_START (0x01), got 0x{msg_type:02x}");
-            return;
-        }
-        let start: StartCommand = match serde_json::from_slice(&payload) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("agent: parse StartCommand: {e}");
+                eprintln!("agent: read first frame: {e}");
                 return;
             }
         };
 
-        if start.tty {
-            handle_tty(conn, start);
-        } else {
-            handle_piped(conn, start);
+        match msg_type {
+            MSG_CLOCK_SYNC => handle_clock_sync(conn, &payload),
+            MSG_START => {
+                let start: StartCommand = match serde_json::from_slice(&payload) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("agent: parse StartCommand: {e}");
+                        return;
+                    }
+                };
+                if start.tty {
+                    handle_tty(conn, start);
+                } else {
+                    handle_piped(conn, start);
+                }
+            }
+            other => {
+                eprintln!("agent: unexpected frame type 0x{other:02x} on exec port");
+            }
         }
+    }
+
+    fn handle_clock_sync(mut conn: VsockStream, payload: &[u8]) {
+        if payload.len() < 12 {
+            eprintln!(
+                "agent: MSG_CLOCK_SYNC: payload too short ({} bytes)",
+                payload.len()
+            );
+            let _ = write_frame(&mut conn, MSG_EXIT, &(-1i32).to_le_bytes());
+            return;
+        }
+        let secs = i64::from_le_bytes(payload[..8].try_into().unwrap());
+        let nanos = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+
+        // SAFETY: clock_settime requires CAP_SYS_TIME; vm-agent runs as root inside guest.
+        unsafe {
+            let ts = libc::timespec {
+                tv_sec: secs,
+                tv_nsec: nanos as libc::c_long,
+            };
+            libc::clock_settime(libc::CLOCK_REALTIME, &raw const ts);
+        }
+        let _ = write_frame(&mut conn, MSG_EXIT, &0i32.to_le_bytes());
+    }
+
+    // -------------------------------------------------------------------------
+    // File I/O handler (vsock:53)
+    // -------------------------------------------------------------------------
+
+    fn handle_file_connection(conn_fd: RawFd) {
+        // SAFETY: conn_fd is a freshly accepted socket fd.
+        let mut conn = unsafe { VsockStream::from_raw_fd(conn_fd) };
+
+        let (msg_type, payload) = match read_frame(&mut conn) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("agent: file: read first frame: {e}");
+                return;
+            }
+        };
+
+        match msg_type {
+            FILE_WRITE_REQ => handle_file_write(conn, &payload),
+            FILE_READ_REQ => handle_file_read(conn, &payload),
+            other => eprintln!("agent: file: unexpected frame type 0x{other:02x}"),
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct WriteReq {
+        path: String,
+        #[serde(default)]
+        mode: u32,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ReadReq {
+        path: String,
+    }
+
+    fn handle_file_write(mut conn: VsockStream, header_payload: &[u8]) {
+        let req: WriteReq = match serde_json::from_slice(header_payload) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = write_frame(
+                    &mut conn,
+                    FILE_ERR,
+                    format!("parse WriteReq: {e}").as_bytes(),
+                );
+                return;
+            }
+        };
+        let mode = if req.mode == 0 { 0o644 } else { req.mode };
+
+        // Collect FILE_DATA chunks until FILE_DONE.
+        let mut data: Vec<u8> = Vec::new();
+        loop {
+            match read_frame(&mut conn) {
+                Ok((FILE_DATA, chunk)) => data.extend_from_slice(&chunk),
+                Ok((FILE_DONE, _)) => break,
+                Ok((other, _)) => {
+                    let _ = write_frame(
+                        &mut conn,
+                        FILE_ERR,
+                        format!("expected FILE_DATA/DONE, got 0x{other:02x}").as_bytes(),
+                    );
+                    return;
+                }
+                Err(e) => {
+                    let _ = write_frame(&mut conn, FILE_ERR, format!("read data: {e}").as_bytes());
+                    return;
+                }
+            }
+        }
+
+        let path = std::path::Path::new(&req.path);
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            let _ = write_frame(&mut conn, FILE_ERR, format!("create dirs: {e}").as_bytes());
+            return;
+        }
+
+        use std::os::unix::fs::OpenOptionsExt;
+        let result = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(&data)
+            });
+
+        match result {
+            Ok(()) => {
+                let _ = write_frame(&mut conn, FILE_ACK, &[]);
+            }
+            Err(e) => {
+                let _ = write_frame(&mut conn, FILE_ERR, format!("write file: {e}").as_bytes());
+            }
+        }
+    }
+
+    fn handle_file_read(mut conn: VsockStream, header_payload: &[u8]) {
+        let req: ReadReq = match serde_json::from_slice(header_payload) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = write_frame(
+                    &mut conn,
+                    FILE_ERR,
+                    format!("parse ReadReq: {e}").as_bytes(),
+                );
+                return;
+            }
+        };
+
+        let data = match std::fs::read(&req.path) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = write_frame(&mut conn, FILE_ERR, format!("read file: {e}").as_bytes());
+                return;
+            }
+        };
+
+        for chunk in data.chunks(MAX_FRAME_SIZE) {
+            if write_frame(&mut conn, FILE_DATA, chunk).is_err() {
+                return;
+            }
+        }
+        let _ = write_frame(&mut conn, FILE_DONE, &[]);
     }
 
     // -------------------------------------------------------------------------
@@ -464,10 +632,23 @@ mod agent {
     // -------------------------------------------------------------------------
 
     pub fn run() {
-        eprintln!("vmm-guest-agent: listening on vsock port {AGENT_PORT}");
-        let server_fd = create_vsock_listener(AGENT_PORT);
+        eprintln!(
+            "vmm-guest-agent: listening on vsock ports {AGENT_PORT} (exec), {FILE_PORT} (file I/O)"
+        );
+        let exec_fd = create_vsock_listener(AGENT_PORT);
+        let file_fd = create_vsock_listener(FILE_PORT);
+
+        // File I/O listener thread.
+        thread::spawn(move || {
+            loop {
+                let conn_fd = accept_connection(file_fd);
+                thread::spawn(move || handle_file_connection(conn_fd));
+            }
+        });
+
+        // Exec listener (main thread).
         loop {
-            let conn_fd = accept_connection(server_fd);
+            let conn_fd = accept_connection(exec_fd);
             thread::spawn(move || handle_connection(conn_fd));
         }
     }
