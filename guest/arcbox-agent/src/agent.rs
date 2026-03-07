@@ -225,7 +225,7 @@ mod linux {
     use arcbox_constants::env::GUEST_DOCKER_VSOCK_PORT as GUEST_DOCKER_VSOCK_PORT_ENV;
     use arcbox_constants::paths::{
         ARCBOX_RUNTIME_BIN_DIR, CONTAINERD_DATA_MOUNT_POINT, CONTAINERD_SOCKET,
-        DOCKER_API_UNIX_SOCKET, DOCKER_DATA_MOUNT_POINT,
+        DOCKER_API_UNIX_SOCKET, DOCKER_DATA_MOUNT_POINT, K3S_DATA_MOUNT_POINT,
     };
     use arcbox_constants::ports::DOCKER_API_VSOCK_PORT;
     use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
@@ -371,6 +371,7 @@ mod linux {
         // Already fully set up?
         if crate::mount::is_mounted(DOCKER_DATA_MOUNT_POINT)
             && crate::mount::is_mounted(CONTAINERD_DATA_MOUNT_POINT)
+            && crate::mount::is_mounted(K3S_DATA_MOUNT_POINT)
         {
             return Ok("data subvolumes already mounted".to_string());
         }
@@ -417,7 +418,7 @@ mod linux {
         }
 
         // Step 3: Create subvolumes if missing.
-        for subvol in ["@docker", "@containerd"] {
+        for subvol in ["@docker", "@containerd", "@k3s"] {
             let subvol_path = format!("{}/{}", BTRFS_TEMP_MOUNT, subvol);
             if Path::new(&subvol_path).exists() {
                 continue;
@@ -435,6 +436,7 @@ mod linux {
         for (subvol, target) in [
             ("@docker", DOCKER_DATA_MOUNT_POINT),
             ("@containerd", CONTAINERD_DATA_MOUNT_POINT),
+            ("@k3s", K3S_DATA_MOUNT_POINT),
         ] {
             if crate::mount::is_mounted(target) {
                 continue;
@@ -481,7 +483,7 @@ mod linux {
     ///
     /// This avoids needing the full `btrfs-progs` CLI in the EROFS rootfs.
     #[cfg(target_os = "linux")]
-    fn btrfs_create_subvolume(path: &str) -> Result<(), String> {
+    pub(crate) fn btrfs_create_subvolume(path: &str) -> Result<(), String> {
         use std::os::unix::io::AsRawFd;
 
         let parent = Path::new(path)
@@ -515,7 +517,7 @@ mod linux {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn btrfs_create_subvolume(_path: &str) -> Result<(), String> {
+    pub(crate) fn btrfs_create_subvolume(_path: &str) -> Result<(), String> {
         Err("Btrfs subvolume creation is only supported on Linux".to_string())
     }
 
@@ -964,12 +966,8 @@ mod linux {
             RpcRequest::EnsureNfs(req) => {
                 RequestResult::Single(crate::nfs::handle_ensure_nfs(req).await)
             }
-            RpcRequest::EnsureK3s(_) => {
-                // k3s handler will be wired in a subsequent commit.
-                RequestResult::Single(RpcResponse::Error(ErrorResponse::new(
-                    501,
-                    "k3s not yet implemented",
-                )))
+            RpcRequest::EnsureK3s(req) => {
+                RequestResult::Single(crate::k3s::handle_ensure_k3s(req).await)
             }
         }
     }
@@ -1159,6 +1157,25 @@ mod linux {
                 format!("tcp:{} reachable", arcbox_constants::ports::NFS_PORT)
             } else {
                 format!("tcp:{} not reachable", arcbox_constants::ports::NFS_PORT)
+            },
+        });
+
+        // k3s status — TCP probe on port 6443
+        let k3s_ready = probe_tcp_port(arcbox_constants::ports::K3S_API_PORT).await;
+        services.push(ServiceStatus {
+            name: "k3s".to_string(),
+            status: if k3s_ready {
+                SERVICE_READY.to_string()
+            } else {
+                SERVICE_NOT_READY.to_string()
+            },
+            detail: if k3s_ready {
+                format!("tcp:{} reachable", arcbox_constants::ports::K3S_API_PORT)
+            } else {
+                format!(
+                    "tcp:{} not reachable",
+                    arcbox_constants::ports::K3S_API_PORT
+                )
             },
         });
 
@@ -1388,7 +1405,7 @@ mod linux {
     /// Prefers `/arcbox/` (VirtioFS mount, visible from host as `~/.arcbox/`)
     /// so that logs survive guest restarts and are accessible without exec.
     /// Falls back to `/tmp/` (guest tmpfs) if VirtioFS is not mounted.
-    fn daemon_log_file(name: &str) -> Stdio {
+    pub(crate) fn daemon_log_file(name: &str) -> Stdio {
         let arcbox_path = format!("/arcbox/{}.log", name);
         let tmp_log_path = format!("/tmp/{}.log", name);
 
