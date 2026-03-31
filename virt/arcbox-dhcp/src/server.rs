@@ -46,6 +46,11 @@ impl DhcpLease {
     }
 }
 
+/// How long a declined IP stays quarantined before being returned to the pool.
+/// ArcBox pools are typically small, so 5 minutes is enough to avoid handing
+/// out the same conflicting address immediately while not permanently losing it.
+const DECLINE_QUARANTINE: Duration = Duration::from_secs(300);
+
 /// DHCP server.
 ///
 /// Provides IP addresses to clients via the DHCP protocol.
@@ -58,6 +63,10 @@ pub struct DhcpServer {
     leases: HashMap<[u8; 6], DhcpLease>,
     /// IP reservations (MAC -> IP).
     reservations: HashMap<[u8; 6], Ipv4Addr>,
+    /// Declined IPs quarantined until their expiry time.
+    /// These remain marked as allocated in the allocator until the quarantine
+    /// expires, at which point they are released back to the pool.
+    declined_ips: HashMap<Ipv4Addr, Instant>,
 }
 
 impl DhcpServer {
@@ -71,6 +80,7 @@ impl DhcpServer {
             allocator,
             leases: HashMap::new(),
             reservations: HashMap::new(),
+            declined_ips: HashMap::new(),
         }
     }
 
@@ -312,17 +322,41 @@ impl DhcpServer {
     }
 
     /// Handles DHCPDECLINE.
+    ///
+    /// The client is reporting that the offered IP conflicts with an existing
+    /// host on the network. We quarantine the address for [`DECLINE_QUARANTINE`]
+    /// so it is not immediately re-offered, then release it back to the pool
+    /// once the quarantine expires (handled by [`cleanup_expired_leases`]).
     fn handle_decline(&mut self, packet: &DhcpPacket) {
-        // Client is saying the IP is already in use
-        // We should mark it as unavailable
+        let mac = packet.client_mac();
+
         if let Some(ip) = packet.requested_ip {
+            // Remove the lease so the client can start fresh with DISCOVER.
+            if let Some(lease) = self.leases.remove(&mac) {
+                // If the declined IP differs from the lease IP (unusual, but
+                // possible), release the lease IP since the client won't use it.
+                if lease.ip != ip && !self.reservations.contains_key(&mac) {
+                    self.allocator.release(lease.ip);
+                }
+            }
+
+            // Ensure the declined IP is marked as allocated so it cannot be
+            // handed out during the quarantine window. If it was already
+            // allocated (the common case), this is a no-op.
             self.allocator.allocate_specific(ip);
 
-            tracing::warn!("DHCPDECLINE: {} reported as in use", ip);
+            // Record the quarantine start time.
+            self.declined_ips.insert(ip, Instant::now());
+
+            tracing::warn!(
+                "DHCPDECLINE: {} quarantined for {:?}",
+                ip,
+                DECLINE_QUARANTINE
+            );
         }
     }
 
-    /// Cleans up expired leases.
+    /// Cleans up expired leases and quarantined declined IPs.
     pub fn cleanup_expired_leases(&mut self) {
         let expired: Vec<[u8; 6]> = self
             .leases
@@ -336,6 +370,20 @@ impl DhcpServer {
                 self.allocator.release(lease.ip);
                 tracing::debug!("Expired lease for {}", lease.ip);
             }
+        }
+
+        // Release quarantined declined IPs whose quarantine has elapsed.
+        let expired_declines: Vec<Ipv4Addr> = self
+            .declined_ips
+            .iter()
+            .filter(|&(_, &quarantined_at)| quarantined_at.elapsed() >= DECLINE_QUARANTINE)
+            .map(|(&ip, _)| ip)
+            .collect();
+
+        for ip in expired_declines {
+            self.declined_ips.remove(&ip);
+            self.allocator.release(ip);
+            tracing::debug!("Released quarantined declined IP {}", ip);
         }
     }
 }
@@ -394,5 +442,58 @@ mod tests {
 
         server.remove_reservation(&mac);
         assert!(server.allocator.is_available(ip));
+    }
+
+    #[test]
+    fn test_declined_ip_quarantine_and_expiry() {
+        let config = DhcpConfig::new(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(255, 255, 255, 0));
+        let mut server = DhcpServer::new(config);
+
+        let ip = Ipv4Addr::new(10, 0, 0, 5);
+
+        // Simulate a lease for the IP, then a DECLINE.
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        server.allocator.allocate_specific(ip);
+        server.leases.insert(
+            mac,
+            DhcpLease {
+                mac,
+                ip,
+                hostname: None,
+                lease_start: Instant::now(),
+                lease_duration: Duration::from_secs(3600),
+            },
+        );
+
+        // Build a minimal DECLINE packet.
+        let mut decline_pkt = DhcpPacket::new();
+        decline_pkt.op = 1;
+        decline_pkt.chaddr = [0; 16];
+        decline_pkt.chaddr[..6].copy_from_slice(&mac);
+        decline_pkt.message_type = Some(DhcpMessageType::Decline);
+        decline_pkt.requested_ip = Some(ip);
+
+        server.handle_decline(&decline_pkt);
+
+        // The IP should be quarantined (unavailable) and the lease removed.
+        assert!(!server.allocator.is_available(ip));
+        assert!(!server.leases.contains_key(&mac));
+        assert!(server.declined_ips.contains_key(&ip));
+
+        // A normal cleanup should NOT release it yet (quarantine is 300 s).
+        server.cleanup_expired_leases();
+        assert!(!server.allocator.is_available(ip));
+
+        // Manually backdate the quarantine timestamp to simulate expiry.
+        server.declined_ips.insert(
+            ip,
+            Instant::now() - DECLINE_QUARANTINE - Duration::from_secs(1),
+        );
+
+        server.cleanup_expired_leases();
+
+        // Now the IP should be released back to the pool.
+        assert!(server.allocator.is_available(ip));
+        assert!(!server.declined_ips.contains_key(&ip));
     }
 }
