@@ -434,9 +434,9 @@ fn canonical_id_or_fallback(container_id: &str, inspect_json: &[u8]) -> String {
 }
 
 /// Extracts a container identifier from the URI and resolves it to the
-/// canonical full ID. Returns `None` (with a warning) when canonical
-/// resolution fails, so callers skip teardown rather than using a
-/// potentially wrong key (name/short-id).
+/// canonical full ID. Falls back to the raw URI-extracted ID when canonical
+/// resolution fails, so callers always attempt teardown instead of leaking
+/// port forwarding listeners and DNS entries.
 ///
 /// Ensures VM readiness first, since [`resolve_canonical_id`] uses
 /// `proxy_to_guest` directly (which does not call `ensure_vm_ready`).
@@ -449,9 +449,9 @@ async fn resolve_canonical_from_uri(state: &AppState, uri: &Uri) -> Option<Strin
         None => {
             tracing::warn!(
                 container_id = %id,
-                "Failed to resolve canonical container ID; skipping networking teardown"
+                "Failed to resolve canonical container ID; using raw ID for teardown"
             );
-            None
+            Some(id)
         }
     }
 }
