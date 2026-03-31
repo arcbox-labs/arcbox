@@ -19,5 +19,7 @@
             <integer>438</integer>
         </dict>
     </dict>
+    <key>ExitTimeOut</key>
+    <integer>45</integer>
 </dict>
 </plist>

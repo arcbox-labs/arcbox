@@ -69,5 +69,13 @@
     <!-- Minimum interval between restarts (seconds) to avoid rapid restart loops -->
     <key>ThrottleInterval</key>
     <integer>5</integer>
+
+    <!--
+      ExitTimeOut: seconds launchd waits after SIGTERM before sending SIGKILL.
+      Default is 20s, but daemon shutdown needs ~35s (5s gRPC drain + 30s VM
+      graceful stop). Set to 45s to avoid SIGKILL mid-shutdown.
+    -->
+    <key>ExitTimeOut</key>
+    <integer>45</integer>
 </dict>
 </plist>
