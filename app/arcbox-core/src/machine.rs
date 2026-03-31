@@ -318,13 +318,12 @@ impl MachineManager {
     ///
     /// Returns an error if the machine cannot be created.
     pub async fn create(&self, config: MachineConfig) -> Result<String> {
-        // Check if machine already exists
-        if self
-            .machines
-            .read()
-            .map_err(|_| CoreError::LockPoisoned)?
-            .contains_key(&config.name)
-        {
+        // Hold the write lock for the entire create operation to prevent TOCTOU
+        // races: without this, two concurrent creates with the same name could
+        // both pass the existence check before either inserts.
+        let mut machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
+
+        if machines.contains_key(&config.name) {
             return Err(CoreError::already_exists(config.name));
         }
 
@@ -382,10 +381,7 @@ impl MachineManager {
         // Persist the machine config
         self.persistence.save(&info)?;
 
-        self.machines
-            .write()
-            .map_err(|_| CoreError::LockPoisoned)?
-            .insert(config.name.clone(), info);
+        machines.insert(config.name.clone(), info);
 
         Ok(config.name)
     }
