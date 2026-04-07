@@ -288,3 +288,281 @@ impl Default for BatchDgram {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    use super::*;
+
+    /// Creates a non-blocking `AF_UNIX SOCK_DGRAM` socketpair with enlarged
+    /// buffers (1 MB each direction).
+    fn socketpair() -> (OwnedFd, OwnedFd) {
+        let mut fds: [i32; 2] = [0; 2];
+        let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(ret, 0, "socketpair failed");
+        let (a, b) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        // Enlarge socket buffers so tests with many/large datagrams don't
+        // hit ENOBUFS or partial sends.
+        let buf_size: libc::c_int = 1024 * 1024;
+        for fd in [a.as_raw_fd(), b.as_raw_fd()] {
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    std::ptr::from_ref(&buf_size).cast(),
+                    std::mem::size_of_val(&buf_size) as libc::socklen_t,
+                );
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    std::ptr::from_ref(&buf_size).cast(),
+                    std::mem::size_of_val(&buf_size) as libc::socklen_t,
+                );
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+        (a, b)
+    }
+
+    fn write_datagram(fd: RawFd, data: &[u8]) {
+        // SAFETY: writing to a valid socketpair fd.
+        let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+        assert_eq!(n as usize, data.len(), "write_datagram short write");
+    }
+
+    fn read_datagram(fd: RawFd, buf: &mut [u8]) -> usize {
+        // SAFETY: reading from a valid socketpair fd.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        assert!(n >= 0, "read_datagram failed");
+        n as usize
+    }
+
+    #[test]
+    fn test_recv_send_single() {
+        let (a, b) = socketpair();
+
+        let payload = b"hello batch";
+        write_datagram(a.as_raw_fd(), payload);
+
+        let mut batch = BatchDgram::new();
+        let mut buf = vec![0u8; 128];
+        let mut bufs: Vec<&mut [u8]> = vec![buf.as_mut_slice()];
+        let (entries, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(entries[0].len, payload.len());
+        assert_eq!(&buf[..payload.len()], payload);
+    }
+
+    #[test]
+    fn test_recv_send_batch() {
+        let (a, b) = socketpair();
+
+        for i in 0..10u8 {
+            write_datagram(a.as_raw_fd(), &[i; 64]);
+        }
+
+        let mut batch = BatchDgram::new();
+        let mut buffers: Vec<Vec<u8>> = (0..10).map(|_| vec![0u8; 128]).collect();
+        let mut bufs: Vec<&mut [u8]> = buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
+
+        let (entries, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+
+        assert_eq!(count, 10);
+        for i in 0..10u8 {
+            assert_eq!(entries[i as usize].len, 64);
+            assert_eq!(buffers[i as usize][0], i);
+        }
+    }
+
+    #[test]
+    fn test_send_batch_roundtrip() {
+        let (a, b) = socketpair();
+
+        let payloads: Vec<Vec<u8>> = (0..10u8).map(|i| vec![i; 100]).collect();
+        let bufs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+
+        let mut batch = BatchDgram::new();
+        let sent = batch.send_batch(a.as_raw_fd(), &bufs).unwrap();
+        assert_eq!(sent, 10);
+
+        let mut buf = [0u8; 256];
+        for i in 0..10u8 {
+            let n = read_datagram(b.as_raw_fd(), &mut buf);
+            assert_eq!(n, 100);
+            assert_eq!(buf[0], i);
+        }
+    }
+
+    #[test]
+    fn test_full_roundtrip() {
+        let (a, b) = socketpair();
+
+        let payloads: Vec<Vec<u8>> = (0..20u8).map(|i| vec![i; 200]).collect();
+        let send_bufs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+
+        let mut batch = BatchDgram::new();
+        let sent = batch.send_batch(a.as_raw_fd(), &send_bufs).unwrap();
+        assert_eq!(sent, 20);
+
+        let mut recv_buffers: Vec<Vec<u8>> = (0..20).map(|_| vec![0u8; 256]).collect();
+        let mut recv_bufs: Vec<&mut [u8]> =
+            recv_buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
+
+        let (entries, count) = batch.recv_batch(b.as_raw_fd(), &mut recv_bufs).unwrap();
+        assert_eq!(count, 20);
+        for i in 0..20u8 {
+            assert_eq!(entries[i as usize].len, 200);
+            assert_eq!(recv_buffers[i as usize][0], i);
+        }
+    }
+
+    #[test]
+    fn test_wouldblock_empty() {
+        let (_a, b) = socketpair();
+
+        let mut batch = BatchDgram::new();
+        let mut buf = vec![0u8; 128];
+        let mut bufs: Vec<&mut [u8]> = vec![buf.as_mut_slice()];
+
+        let (_, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_partial_batch() {
+        let (a, b) = socketpair();
+
+        for i in 0..3u8 {
+            write_datagram(a.as_raw_fd(), &[i; 50]);
+        }
+
+        let mut batch = BatchDgram::new();
+        let mut buffers: Vec<Vec<u8>> = (0..10).map(|_| vec![0u8; 128]).collect();
+        let mut bufs: Vec<&mut [u8]> = buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
+
+        let (entries, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+        assert_eq!(count, 3);
+        for i in 0..3 {
+            assert_eq!(entries[i].len, 50);
+        }
+    }
+
+    #[test]
+    fn test_zero_length_datagram() {
+        let (a, b) = socketpair();
+
+        write_datagram(a.as_raw_fd(), &[]);
+
+        let mut batch = BatchDgram::new();
+        let mut buf = vec![0u8; 128];
+        let mut bufs: Vec<&mut [u8]> = vec![buf.as_mut_slice()];
+
+        let (entries, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(entries[0].len, 0);
+    }
+
+    #[test]
+    fn test_max_batch_cap() {
+        let (_a, b) = socketpair();
+
+        let mut buffers: Vec<Vec<u8>> = (0..300).map(|_| vec![0u8; 64]).collect();
+        let mut bufs: Vec<&mut [u8]> = buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
+
+        let mut batch = BatchDgram::new();
+        let (_, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_varying_sizes() {
+        let (a, b) = socketpair();
+
+        let sizes = [1, 100, 1000, 4000];
+        for &size in &sizes {
+            let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+            write_datagram(a.as_raw_fd(), &data);
+        }
+
+        let mut batch = BatchDgram::new();
+        let mut buffers: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 8192]).collect();
+        let mut bufs: Vec<&mut [u8]> = buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
+
+        let (entries, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+        assert_eq!(count, 4);
+        for (i, &size) in sizes.iter().enumerate() {
+            assert_eq!(entries[i].len, size, "datagram {i} size mismatch");
+        }
+    }
+
+    #[test]
+    fn test_empty_bufs() {
+        let (_a, b) = socketpair();
+
+        let mut batch = BatchDgram::new();
+        let mut bufs: Vec<&mut [u8]> = vec![];
+        let (_, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+        assert_eq!(count, 0);
+
+        let send_bufs: Vec<&[u8]> = vec![];
+        let sent = batch.send_batch(b.as_raw_fd(), &send_bufs).unwrap();
+        assert_eq!(sent, 0);
+    }
+
+    #[test]
+    fn test_threaded_correctness() {
+        let (a, b) = socketpair();
+        let fd_a = a.as_raw_fd();
+        let fd_b = b.as_raw_fd();
+
+        // Fds must outlive both threads. Move OwnedFds into a shared
+        // scope that drops after both threads join.
+        let sender = std::thread::spawn(move || {
+            let mut batch = BatchDgram::new();
+            for chunk_start in (0u16..200).step_by(10) {
+                let payloads: Vec<Vec<u8>> = (chunk_start..chunk_start + 10)
+                    .map(|i| i.to_le_bytes().to_vec())
+                    .collect();
+                let bufs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+                loop {
+                    match batch.send_batch(fd_a, &bufs) {
+                        Ok(n) if n > 0 => break,
+                        Ok(_) => std::thread::yield_now(),
+                        Err(e) => panic!("send error: {e}"),
+                    }
+                }
+            }
+        });
+
+        let receiver = std::thread::spawn(move || {
+            let mut batch = BatchDgram::new();
+            let mut received = 0usize;
+            while received < 200 {
+                let mut buffers: Vec<Vec<u8>> = (0..64).map(|_| vec![0u8; 64]).collect();
+                let mut bufs: Vec<&mut [u8]> =
+                    buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
+                match batch.recv_batch(fd_b, &mut bufs) {
+                    Ok((_, count)) => {
+                        if count == 0 {
+                            std::thread::yield_now();
+                        }
+                        received += count;
+                    }
+                    Err(e) => panic!("recv error: {e}"),
+                }
+            }
+            received
+        });
+
+        sender.join().unwrap();
+        let total = receiver.join().unwrap();
+        assert!(total >= 200, "expected >= 200 datagrams, got {total}");
+        drop(a);
+        drop(b);
+    }
+}
