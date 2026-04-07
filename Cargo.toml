@@ -10,6 +10,7 @@ members = [
     "common/arcbox-asset",
     "common/arcbox-logging",
     "common/arcbox-route",
+    "common/arcbox-xnu-net",
 
     # ============================================
     # L1-3: Virtualization (MIT OR Apache-2.0)
@@ -131,6 +132,9 @@ pin-project-lite = "0.2"
 
 # Terminal
 crossterm = "0.27"
+
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
 
 # Bytes and buffer
 bytes = "1"
