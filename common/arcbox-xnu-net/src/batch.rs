@@ -447,8 +447,8 @@ mod tests {
 
         let (entries, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
         assert_eq!(count, 3);
-        for i in 0..3 {
-            assert_eq!(entries[i].len, 50);
+        for entry in entries.iter().take(3) {
+            assert_eq!(entry.len, 50);
         }
     }
 
