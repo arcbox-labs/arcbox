@@ -106,6 +106,7 @@ pub fn is_mounted(_path: &str) -> bool {
 ///
 /// This mounts:
 /// - "arcbox" tag -> /arcbox (data directory)
+/// - "private" tag -> /private (macOS symlink targets: /tmp, /var/folders, …)
 /// - "users" tag -> /Users (macOS /Users, bind-mounted to original path)
 pub fn mount_standard_shares() {
     // The /arcbox share may already be mounted by the trampoline (without
