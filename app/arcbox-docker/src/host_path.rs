@@ -5,8 +5,8 @@
 //! its own `/tmp` and `/var` as isolated tmpfs. This module resolves the
 //! top-level symlink so bind-mount source paths land on the VirtioFS share.
 //!
-//! On Linux hosts nothing is a symlink at the top level, so every function
-//! here is a no-op without any `#[cfg]` gating.
+//! The symlink resolution is `#[cfg(target_os = "macos")]`; on other hosts
+//! `resolve()` is a no-op.
 
 use bytes::Bytes;
 use std::borrow::Cow;
@@ -23,6 +23,7 @@ use std::path::{Component, Path};
 /// /var/folders/x/y  → /private/var/folders/x/y
 /// /Users/me/proj    → /Users/me/proj        (/Users is not a symlink)
 /// ```
+#[cfg(target_os = "macos")]
 pub fn resolve(path: &str) -> Cow<'_, str> {
     let p = Path::new(path);
     let mut components = p.components();
@@ -63,6 +64,11 @@ pub fn resolve(path: &str) -> Cow<'_, str> {
     } else {
         Cow::Owned(s.into_owned())
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn resolve(path: &str) -> Cow<'_, str> {
+    Cow::Borrowed(path)
 }
 
 /// Rewrites bind-mount source paths in a container-create request body.

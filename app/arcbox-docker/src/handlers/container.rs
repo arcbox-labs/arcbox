@@ -38,7 +38,10 @@ pub async fn create_container(
         .to_bytes();
 
     let body_bytes = crate::host_path::rewrite_create_body(body_bytes);
-    let req = Request::from_parts(parts, Body::from(body_bytes));
+    let mut req = Request::from_parts(parts, Body::from(body_bytes));
+    // Body may have changed size; remove Content-Length so the proxy
+    // recomputes framing from the actual body.
+    req.headers_mut().remove(axum::http::header::CONTENT_LENGTH);
     proxy(&state, &uri, req).await
 }
 
