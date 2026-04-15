@@ -19,7 +19,28 @@ crate::handlers::proxy_handler!(container_top);
 crate::handlers::proxy_handler!(container_stats);
 crate::handlers::proxy_handler!(container_changes);
 crate::handlers::proxy_handler!(prune_containers);
-crate::handlers::proxy_handler!(create_container);
+
+/// Create a container, resolving macOS symlinks in bind-mount source paths.
+///
+/// On macOS, `/tmp` → `/private/tmp` and `/var` → `/private/var`. The guest
+/// mounts host `/private` via VirtioFS while its `/tmp` and `/var` are
+/// isolated tmpfs. This handler resolves the top-level symlink so
+/// bind-mount paths land on the VirtioFS share.
+pub async fn create_container(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    req: Request<Body>,
+) -> Result<Response> {
+    let (parts, body) = req.into_parts();
+    let body_bytes = http_body_util::BodyExt::collect(body)
+        .await
+        .map_err(|e| crate::error::DockerError::Server(format!("failed to read body: {e}")))?
+        .to_bytes();
+
+    let body_bytes = crate::host_path::rewrite_create_body(body_bytes);
+    let req = Request::from_parts(parts, Body::from(body_bytes));
+    proxy(&state, &uri, req).await
+}
 
 /// Extract container ID from URI path.
 ///

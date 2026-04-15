@@ -7,7 +7,7 @@ use crate::error::{CoreError, Result};
 use crate::persistence::MachinePersistence;
 use crate::vm::{SharedDirConfig, VmConfig, VmId, VmManager};
 use arcbox_constants::ports::AGENT_PORT;
-use arcbox_constants::virtiofs::{MOUNT_USERS, TAG_ARCBOX, TAG_USERS};
+use arcbox_constants::virtiofs::{MOUNT_PRIVATE, MOUNT_USERS, TAG_ARCBOX, TAG_PRIVATE, TAG_USERS};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -231,6 +231,10 @@ impl MachineManager {
         if users_dir.is_dir() {
             shared_dirs.push(SharedDirConfig::new(MOUNT_USERS, TAG_USERS));
         }
+        let private_dir = std::path::Path::new(MOUNT_PRIVATE);
+        if private_dir.is_dir() {
+            shared_dirs.push(SharedDirConfig::new(MOUNT_PRIVATE, TAG_PRIVATE));
+        }
 
         // Load persisted machines
         let mut machines = HashMap::new();
@@ -338,6 +342,10 @@ impl MachineManager {
         let users_dir = std::path::Path::new(MOUNT_USERS);
         if users_dir.is_dir() {
             shared_dirs.push(SharedDirConfig::new(MOUNT_USERS, TAG_USERS));
+        }
+        let private_dir = std::path::Path::new(MOUNT_PRIVATE);
+        if private_dir.is_dir() {
+            shared_dirs.push(SharedDirConfig::new(MOUNT_PRIVATE, TAG_PRIVATE));
         }
 
         // Create underlying VM

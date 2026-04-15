@@ -29,6 +29,11 @@ mod platform {
         // Docker Desktop and OrbStack both set 1048576 in their guest VMs.
         raise_fd_limits();
 
+        // Mount host /private for macOS symlink targets (/tmp, /var/folders).
+        // Must come before tmpfs mounts so /private is available as a VirtioFS
+        // target. Guest /tmp and /var remain isolated tmpfs.
+        mount_virtiofs_optional("private", "/private");
+
         // Writable layers on top of read-only EROFS.
         mount_tmpfs("/tmp");
         mount_tmpfs("/run");

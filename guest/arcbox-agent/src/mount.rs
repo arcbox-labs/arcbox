@@ -3,7 +3,9 @@
 //! This module is only functional on Linux as it runs inside the guest VM.
 
 use anyhow::Result;
-use arcbox_constants::virtiofs::{MOUNT_ARCBOX, MOUNT_USERS, TAG_ARCBOX, TAG_USERS};
+use arcbox_constants::virtiofs::{
+    MOUNT_ARCBOX, MOUNT_PRIVATE, MOUNT_USERS, TAG_ARCBOX, TAG_PRIVATE, TAG_USERS,
+};
 
 /// Mount a filesystem.
 #[cfg(target_os = "linux")]
@@ -116,6 +118,17 @@ pub fn mount_standard_shares() {
         tracing::warn!("Failed to mount arcbox share: {}", e);
     } else {
         tracing::info!("Mounted arcbox share at {} (dax=always)", MOUNT_ARCBOX);
+    }
+
+    // Mount /private share for macOS symlink targets (/tmp → /private/tmp, etc.).
+    // The Docker API proxy rewrites bind-mount paths so they resolve here
+    // instead of hitting the guest's isolated tmpfs.
+    if !is_mounted(MOUNT_PRIVATE) {
+        if let Err(e) = mount_virtiofs(TAG_PRIVATE, MOUNT_PRIVATE) {
+            tracing::debug!("Private share not available: {}", e);
+        } else {
+            tracing::info!("Mounted private share at {}", MOUNT_PRIVATE);
+        }
     }
 
     // Mount /Users share for transparent macOS path support.
