@@ -9,7 +9,7 @@
 //! whether the user opens the app first or installs via `brew`.
 
 use anyhow::{Context, Result};
-use arcbox_constants::paths::{HostLayout, labels};
+use arcbox_constants::paths::{DOCKER_CLI_TOOLS, HostLayout, labels};
 use clap::Subcommand;
 
 use super::OutputFormat;
@@ -118,11 +118,19 @@ async fn brew_uninstall() -> Result<()> {
     // 3. Remove shell integration — same code path as `abctl setup uninstall`.
     super::setup::execute(super::setup::SetupCommands::Uninstall, OutputFormat::Quiet).await?;
 
-    // Note: `/usr/local/bin/docker*` symlinks (if any) are owned by the
-    // privileged helper and removed by `sudo abctl _uninstall`. This hook
-    // is unprivileged and cannot touch them.
+    // 4. Remove `/usr/local/bin/docker*` via the helper. The helper plist
+    //    survives this hook (its full removal belongs to `sudo abctl _uninstall`),
+    //    so its launchd-activated socket is still reachable here. Best-effort:
+    //    if the helper was never installed (app never launched), the connect
+    //    fails and we leave nothing to clean up anyway. The helper's `cli_unlink`
+    //    is gated on `is_arcbox_owned`, so foreign symlinks are left alone.
+    if let Ok(client) = arcbox_helper::client::Client::connect().await {
+        for name in DOCKER_CLI_TOOLS {
+            let _ = client.cli_unlink(name).await;
+        }
+    }
 
-    // 4. Remove run directory contents (sockets, pid, lock) so stale files
+    // 5. Remove run directory contents (sockets, pid, lock) so stale files
     //    don't confuse a future reinstall.
     let _ = tokio::fs::remove_dir_all(&layout.run_dir).await;
 
