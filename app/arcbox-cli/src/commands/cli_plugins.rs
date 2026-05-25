@@ -278,9 +278,13 @@ async fn update_extra_dirs(config_path: &Path, user_bin: &str, insert: bool) -> 
         let entry = obj
             .entry("cliPluginsExtraDirs")
             .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-        let array = entry
-            .as_array_mut()
-            .context("cliPluginsExtraDirs is not an array")?;
+        let Some(array) = entry.as_array_mut() else {
+            // Pre-existing non-array value (string, number, …) is foreign
+            // state we did not create. Don't fail registration — the
+            // symlink-based discovery path is still in place, and the user
+            // is best served by leaving their oddly-shaped config alone.
+            return Ok(false);
+        };
         if array.iter().any(|v| v.as_str() == Some(user_bin)) {
             false
         } else {
@@ -677,5 +681,36 @@ mod tests {
         let auths = rewritten.find("auths").unwrap();
         let extra = rewritten.find("cliPluginsExtraDirs").unwrap();
         assert!(ctx < creds && creds < auths && auths < extra);
+    }
+
+    #[tokio::test]
+    async fn register_tolerates_non_array_extra_dirs() {
+        let tmp = tempdir().unwrap();
+        let user_bin = tmp.path().join("bin");
+        let docker_cfg = tmp.path().join("docker");
+        fs::create_dir_all(&user_bin).unwrap();
+        fs::create_dir_all(&docker_cfg).unwrap();
+        touch_exe(&user_bin, "docker-compose");
+
+        // Pre-existing config with cliPluginsExtraDirs as a string — foreign
+        // state we shouldn't blow up on.
+        fs::write(
+            docker_cfg.join("config.json"),
+            r#"{"cliPluginsExtraDirs":"/opt/plugins","auths":{"ghcr.io":{}}}"#,
+        )
+        .unwrap();
+
+        let outcome = register(&user_bin, &docker_cfg).await.unwrap();
+
+        // Symlink still gets created; only the config-side update is skipped.
+        assert_eq!(outcome.symlinks.len(), 1);
+        assert!(!outcome.config_updated);
+
+        // The original (foreign) value is preserved verbatim.
+        let cfg: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(docker_cfg.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(cfg["cliPluginsExtraDirs"].as_str(), Some("/opt/plugins"));
+        assert!(cfg["auths"]["ghcr.io"].is_object());
     }
 }
