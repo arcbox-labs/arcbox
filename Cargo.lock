@@ -219,6 +219,7 @@ dependencies = [
  "arcbox-docker",
  "arcbox-docker-tools",
  "arcbox-grpc",
+ "arcbox-helper",
  "arcbox-protocol",
  "clap",
  "clap_complete",
