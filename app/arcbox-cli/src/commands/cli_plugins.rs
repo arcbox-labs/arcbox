@@ -132,7 +132,7 @@ pub async fn register(user_bin: &Path, docker_config_dir: &Path) -> Result<Outco
                     if existing == target {
                         continue;
                     }
-                    if !is_arcbox_bin_target(&existing, user_bin) {
+                    if !is_arcbox_bin_target(&existing, user_bin, &link) {
                         // Foreign symlink (e.g. Docker Desktop). Leave it
                         // alone — extraDirs below still makes ArcBox win at
                         // resolution time.
@@ -195,7 +195,7 @@ pub async fn unregister(user_bin: &Path, docker_config_dir: &Path) -> Result<Out
             let Ok(target) = tokio::fs::read_link(&link).await else {
                 continue;
             };
-            if !is_arcbox_bin_target(&target, user_bin) {
+            if !is_arcbox_bin_target(&target, user_bin, &link) {
                 continue;
             }
             if tokio::fs::remove_file(&link).await.is_ok() {
@@ -219,7 +219,7 @@ pub async fn status(user_bin: &Path, docker_config_dir: &Path) -> RegistrationSt
     for plugin in DOCKER_CLI_PLUGINS {
         let link = plugins_dir.join(plugin);
         if let Ok(target) = tokio::fs::read_link(&link).await {
-            if is_arcbox_bin_target(&target, user_bin) {
+            if is_arcbox_bin_target(&target, user_bin, &link) {
                 result.symlinked.push((*plugin).to_string());
             }
         }
@@ -242,9 +242,40 @@ pub async fn status(user_bin: &Path, docker_config_dir: &Path) -> RegistrationSt
     result
 }
 
-/// True if `target` is a path inside `user_bin` (i.e. a symlink ArcBox owns).
-fn is_arcbox_bin_target(target: &Path, user_bin: &Path) -> bool {
-    target.starts_with(user_bin)
+/// True if `target` (the value returned by `read_link(link)`) resolves to a
+/// path inside `user_bin` — i.e. a symlink ArcBox owns.
+///
+/// `read_link` may return a relative path; we resolve it against the
+/// symlink's parent directory before comparing, and lexically normalize
+/// both sides so `..`/`.` components don't trip the check. We don't
+/// canonicalize because canonicalize follows further symlinks (including
+/// the app-bundle symlinks under `user_bin`), which would yield a path
+/// outside `user_bin` and produce false negatives.
+fn is_arcbox_bin_target(target: &Path, user_bin: &Path, link: &Path) -> bool {
+    let resolved = if target.is_absolute() {
+        target.to_path_buf()
+    } else if let Some(parent) = link.parent() {
+        parent.join(target)
+    } else {
+        return false;
+    };
+    lexical_normalize(&resolved).starts_with(lexical_normalize(user_bin))
+}
+
+/// Lexical path normalization: collapses `.` and `..` components without
+/// touching the filesystem. Does not resolve symlinks.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Reads `~/.docker/config.json`, adds or removes `user_bin` from the
@@ -712,5 +743,23 @@ mod tests {
                 .unwrap();
         assert_eq!(cfg["cliPluginsExtraDirs"].as_str(), Some("/opt/plugins"));
         assert!(cfg["auths"]["ghcr.io"].is_object());
+    }
+
+    #[test]
+    fn is_arcbox_bin_target_recognizes_relative_symlinks() {
+        let user_bin = PathBuf::from("/home/u/.arcbox/bin");
+        let link = PathBuf::from("/home/u/.docker/cli-plugins/docker-compose");
+
+        // Relative target that traverses up into ~/.arcbox/bin/.
+        let relative = PathBuf::from("../../.arcbox/bin/docker-compose");
+        assert!(is_arcbox_bin_target(&relative, &user_bin, &link));
+
+        // Foreign relative target — different parent.
+        let foreign = PathBuf::from("../../somewhere/else/docker-compose");
+        assert!(!is_arcbox_bin_target(&foreign, &user_bin, &link));
+
+        // Absolute target inside user_bin still works.
+        let absolute = user_bin.join("docker-compose");
+        assert!(is_arcbox_bin_target(&absolute, &user_bin, &link));
     }
 }
