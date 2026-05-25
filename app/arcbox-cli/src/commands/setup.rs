@@ -607,11 +607,11 @@ async fn remove_profile_injection(shell: ShellKind) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
-/// Links Docker tools into `~/.arcbox/bin/` (path 2, user-space, no root).
+/// Links Docker tools into `~/.arcbox/bin/` (user-space, no root).
 ///
-/// Unlike the system-wide paths 1 & 3 which use `safe_link` with ownership
-/// checks, this writes to `~/.arcbox/bin/` which is ArcBox-owned, so
-/// `create_or_update_symlink` (unconditional replace) is safe.
+/// The system-wide `/usr/local/bin/*` path is handled by `arcbox-helper` with
+/// ownership checks. Here we write into `~/.arcbox/bin/` which is ArcBox-owned,
+/// so `create_or_update_symlink` (unconditional replace) is safe.
 ///
 /// Searches xbin (app bundle) first, then `~/.arcbox/runtime/bin/` (daemon).
 async fn link_docker_tools_to_user_bin(abctl_exe: &Path, user_bin: &Path) -> usize {
