@@ -70,6 +70,9 @@ impl SetupTask for CliTools {
     }
 
     async fn apply(&self, client: &Client) -> Result<(), ClientError> {
+        let mut attempted = 0usize;
+        let mut succeeded = 0usize;
+        let mut last_err: Option<ClientError> = None;
         for name in DOCKER_CLI_TOOLS {
             let target = self.xbin_dir.join(name);
             if !target.exists() {
@@ -85,11 +88,22 @@ impl SetupTask for CliTools {
                     );
                 }
                 SlotStatus::Vacant => {
-                    if let Err(e) = client.cli_link(name, &target.to_string_lossy()).await {
-                        tracing::warn!(tool = name, error = %e, "cli_link failed");
+                    attempted += 1;
+                    match client.cli_link(name, &target.to_string_lossy()).await {
+                        Ok(()) => succeeded += 1,
+                        Err(e) => {
+                            tracing::warn!(tool = name, error = %e, "cli_link failed");
+                            last_err = Some(e);
+                        }
                     }
                 }
             }
+        }
+        // If we tried to link any vacant slot and every attempt failed, surface
+        // the last error so the setup runner logs it (rather than silently
+        // swallowing a total failure as success).
+        if attempted > 0 && succeeded == 0 {
+            return Err(last_err.expect("attempted>0 && succeeded==0 implies at least one Err"));
         }
         Ok(())
     }
