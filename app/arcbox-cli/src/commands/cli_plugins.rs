@@ -25,6 +25,9 @@
 //! correctly even when the user has switched to another Docker backend.
 //! This means `docker compose` keeps working after `abctl docker disable`
 //! — it just talks to whichever backend the user switched to.
+//!
+//! The Docker config directory is resolved via `DOCKER_CONFIG` (matching
+//! upstream `docker` CLI behaviour), falling back to `~/.docker`.
 
 use std::path::{Path, PathBuf};
 
@@ -52,8 +55,21 @@ pub struct RegistrationStatus {
     pub extra_dirs_entry_present: bool,
 }
 
-/// Resolves `~/.docker/` for the current user.
+/// Resolves the user's Docker config directory.
+///
+/// Honours the `DOCKER_CONFIG` environment variable (matching the
+/// upstream `docker` CLI). Falls back to `~/.docker` when the variable
+/// is unset or empty.
 pub fn default_docker_config_dir() -> Result<PathBuf> {
+    resolve_docker_config_dir(std::env::var_os("DOCKER_CONFIG"))
+}
+
+fn resolve_docker_config_dir(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(value) = env_override {
+        if !value.is_empty() {
+            return Ok(PathBuf::from(value));
+        }
+    }
     dirs::home_dir()
         .map(|h| h.join(".docker"))
         .context("could not determine home directory")
@@ -569,5 +585,18 @@ mod tests {
         let after = status(&user_bin, &docker_cfg).await;
         assert_eq!(after.symlinked.len(), 2);
         assert!(after.extra_dirs_entry_present);
+    }
+
+    #[test]
+    fn resolve_docker_config_dir_honors_env_override() {
+        let custom = PathBuf::from("/tmp/custom-docker");
+        let resolved = resolve_docker_config_dir(Some(custom.as_os_str().to_os_string())).unwrap();
+        assert_eq!(resolved, custom);
+    }
+
+    #[test]
+    fn resolve_docker_config_dir_ignores_empty_env() {
+        let resolved = resolve_docker_config_dir(Some(std::ffi::OsString::new())).unwrap();
+        assert!(resolved.ends_with(".docker"));
     }
 }
