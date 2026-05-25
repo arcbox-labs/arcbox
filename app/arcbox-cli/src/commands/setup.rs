@@ -148,11 +148,21 @@ async fn install(format: OutputFormat) -> Result<()> {
     //     `docker compose` (space-separated) and `docker buildx` resolve
     //     the same binaries as `docker-compose` / `docker-buildx` do on
     //     $PATH. See `cli_plugins` module docs for the rationale.
-    let plugins_registered = match super::cli_plugins::default_docker_config_dir() {
-        Ok(docker_cfg) => super::cli_plugins::register(&bin, &docker_cfg)
-            .await
-            .unwrap_or_default(),
-        Err(_) => super::cli_plugins::Outcome::default(),
+    //     Non-fatal: a failure here doesn't block the rest of install, but
+    //     we capture the error so the user can see why plugins are missing
+    //     instead of silently reporting 0 registered.
+    let (plugins_registered, plugin_error) = match super::cli_plugins::default_docker_config_dir() {
+        Ok(docker_cfg) => match super::cli_plugins::register(&bin, &docker_cfg).await {
+            Ok(o) => (o, None),
+            Err(e) => (
+                super::cli_plugins::Outcome::default(),
+                Some(format!("{e:#}")),
+            ),
+        },
+        Err(e) => (
+            super::cli_plugins::Outcome::default(),
+            Some(format!("{e:#}")),
+        ),
     };
 
     // 3. Write shell init scripts.
@@ -174,6 +184,7 @@ async fn install(format: OutputFormat) -> Result<()> {
                     "bin": symlink_path.display().to_string(),
                     "docker_tools": docker_tools_linked,
                     "docker_plugins": plugins_registered,
+                    "docker_plugins_error": plugin_error,
                     "shell_init": shell.display().to_string(),
                     "completions": comp.display().to_string(),
                     "profile": profile_path.as_ref().map(|p| p.display().to_string()),
@@ -202,6 +213,9 @@ async fn install(format: OutputFormat) -> Result<()> {
                     "  CLI plugins: {plugin_count} registered (`docker compose` / `docker buildx`)"
                 );
             }
+            if let Some(ref err) = plugin_error {
+                println!("  CLI plugins: WARN: {err}");
+            }
             println!("  Shell init:  {}", shell.display());
             println!("  Completions: {}", comp.display());
             if let Some(ref p) = profile_path {
@@ -226,12 +240,21 @@ async fn uninstall(format: OutputFormat) -> Result<()> {
     let comp = completions_dir()?;
 
     // Unregister Docker CLI plugins first — while `bin` still exists, so the
-    // symlink-target ownership check can resolve. Idempotent and non-fatal.
-    let plugins_unregistered = match super::cli_plugins::default_docker_config_dir() {
-        Ok(docker_cfg) => super::cli_plugins::unregister(&bin, &docker_cfg)
-            .await
-            .unwrap_or_default(),
-        Err(_) => super::cli_plugins::Outcome::default(),
+    // symlink-target ownership check can resolve. Idempotent and non-fatal,
+    // but we capture any error so it surfaces in output rather than vanishing.
+    let (plugins_unregistered, plugin_error) = match super::cli_plugins::default_docker_config_dir()
+    {
+        Ok(docker_cfg) => match super::cli_plugins::unregister(&bin, &docker_cfg).await {
+            Ok(o) => (o, None),
+            Err(e) => (
+                super::cli_plugins::Outcome::default(),
+                Some(format!("{e:#}")),
+            ),
+        },
+        Err(e) => (
+            super::cli_plugins::Outcome::default(),
+            Some(format!("{e:#}")),
+        ),
     };
 
     // Remove directories.
@@ -250,6 +273,7 @@ async fn uninstall(format: OutputFormat) -> Result<()> {
                 serde_json::to_string(&serde_json::json!({
                     "uninstalled": true,
                     "docker_plugins": plugins_unregistered,
+                    "docker_plugins_error": plugin_error,
                     "profile_cleaned": removed_from.as_ref().map(|p| p.display().to_string()),
                 }))?
             );
@@ -262,6 +286,9 @@ async fn uninstall(format: OutputFormat) -> Result<()> {
                     "  CLI plugins:  {} symlinks removed",
                     plugins_unregistered.symlinks.len()
                 );
+            }
+            if let Some(ref err) = plugin_error {
+                println!("  CLI plugins:  WARN: {err}");
             }
             if let Some(ref p) = removed_from {
                 println!("  Cleaned profile: {}", p.display());
