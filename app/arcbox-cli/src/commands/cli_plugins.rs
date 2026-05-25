@@ -313,10 +313,44 @@ async fn update_extra_dirs(config_path: &Path, user_bin: &str, insert: bool) -> 
     }
 
     let serialized = serde_json::to_string_pretty(&value)?;
-    tokio::fs::write(config_path, format!("{serialized}\n"))
-        .await
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    atomic_write(config_path, format!("{serialized}\n").as_bytes()).await?;
     Ok(true)
+}
+
+/// Write `contents` to `path` atomically: write into a sibling temp file
+/// in the same directory, then `rename` over the destination.
+///
+/// `tokio::fs::write` opens with `O_TRUNC`, so a crash between truncate
+/// and write completion would leave the destination empty — catastrophic
+/// for files like `~/.docker/config.json` that hold the user's registry
+/// credentials.
+async fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("arcbox-tmp");
+    // PID-scoped tmp name keeps concurrent processes from clobbering each
+    // other's in-flight writes. Same-directory tmp guarantees `rename` is
+    // atomic (same filesystem).
+    let tmp_name = format!(".{}.{}.tmp", file_name, std::process::id());
+    let tmp_path = path.with_file_name(tmp_name);
+
+    if let Err(e) = tokio::fs::write(&tmp_path, contents).await {
+        // Best-effort cleanup so a failed write doesn't leave a stale tmp.
+        tokio::fs::remove_file(&tmp_path).await.ok();
+        return Err(
+            anyhow::Error::from(e).context(format!("failed to write {}", tmp_path.display()))
+        );
+    }
+
+    tokio::fs::rename(&tmp_path, path).await.with_context(|| {
+        format!(
+            "failed to rename {} -> {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -598,5 +632,50 @@ mod tests {
     fn resolve_docker_config_dir_ignores_empty_env() {
         let resolved = resolve_docker_config_dir(Some(std::ffi::OsString::new())).unwrap();
         assert!(resolved.ends_with(".docker"));
+    }
+
+    #[tokio::test]
+    async fn atomic_write_leaves_no_tmp_files_on_success() {
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("config.json");
+        atomic_write(&target, b"{}\n").await.unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "{}\n");
+
+        // Nothing of the form `.config.json.<pid>.tmp` should remain.
+        let leftover = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover, "atomic_write must clean up its tmp file");
+    }
+
+    #[tokio::test]
+    async fn register_preserves_top_level_key_order() {
+        // With serde_json's `preserve_order` feature, round-tripping a
+        // config object through `Value::Object` keeps insertion order
+        // intact — so users diffing config.json see only the
+        // cliPluginsExtraDirs append, not a spurious alphabetic resort.
+        let tmp = tempdir().unwrap();
+        let user_bin = tmp.path().join("bin");
+        let docker_cfg = tmp.path().join("docker");
+        fs::create_dir_all(&user_bin).unwrap();
+        fs::create_dir_all(&docker_cfg).unwrap();
+        touch_exe(&user_bin, "docker-compose");
+
+        fs::write(
+            docker_cfg.join("config.json"),
+            r#"{"currentContext":"desktop","credsStore":"osxkeychain","auths":{}}"#,
+        )
+        .unwrap();
+
+        register(&user_bin, &docker_cfg).await.unwrap();
+
+        let rewritten = fs::read_to_string(docker_cfg.join("config.json")).unwrap();
+        let ctx = rewritten.find("currentContext").unwrap();
+        let creds = rewritten.find("credsStore").unwrap();
+        let auths = rewritten.find("auths").unwrap();
+        let extra = rewritten.find("cliPluginsExtraDirs").unwrap();
+        assert!(ctx < creds && creds < auths && auths < extra);
     }
 }
