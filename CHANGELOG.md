@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2](https://github.com/arcboxlabs/arcbox/compare/v0.4.1...v0.4.2) (2026-05-26)
+
+
+### Bug Fixes
+
+* **agent:** redact docker proxy payload from logs ([e1933b9](https://github.com/arcboxlabs/arcbox/commit/e1933b9f6a350b75ca6e05a720efbf70ce09ee2f))
+* **agent:** use is_peer_closed_error for RPC EOF detection ([0b9d446](https://github.com/arcboxlabs/arcbox/commit/0b9d4465c920266a691290bc6e6a5632f2208e36))
+* **brew:** drop redundant unprivileged /usr/local/bin link (ABXD-75) ([5c716b0](https://github.com/arcboxlabs/arcbox/commit/5c716b0053b789372aad605ef569fe84f8ff299b))
+* **brew:** unlink /usr/local/bin/docker* via helper on brew-uninstall ([acd1229](https://github.com/arcboxlabs/arcbox/commit/acd1229e92bbde868fb1987cbc2e6252c1beb6ad))
+* **cli:** consider any plugin binary when assessing setup status ([9e625e1](https://github.com/arcboxlabs/arcbox/commit/9e625e104d8de4f996dc649eb8c305155dbfee4b))
+* **cli:** honour DOCKER_CONFIG when locating Docker plugin config ([5ea790a](https://github.com/arcboxlabs/arcbox/commit/5ea790a7773ea19fc61f7feed6058b1d79c8162f))
+* **cli:** recognise relative symlink targets in plugin ownership check ([515405e](https://github.com/arcboxlabs/arcbox/commit/515405e8d2ba7e9824e7ea62eaa08d943a224cc9))
+* **cli:** surface plugin register/unregister errors in setup output ([6621f74](https://github.com/arcboxlabs/arcbox/commit/6621f7483a88ac740b45322ed244f67673c677ee))
+* **cli:** tolerate non-array cliPluginsExtraDirs as foreign state ([331db06](https://github.com/arcboxlabs/arcbox/commit/331db068e998931a0d265d4452c6a9c8744e342d))
+* **cli:** write ~/.docker/config.json atomically ([0a51b7b](https://github.com/arcboxlabs/arcbox/commit/0a51b7ba9f32094d563d85db3c9cd12079c0ff14))
+* **daemon:** surface total cli_link failure in CliTools::apply ([3367ce9](https://github.com/arcboxlabs/arcbox/commit/3367ce9005e2f5df349a1b11a0fce22a25b0b2c2))
+* **release-please:** stop bumping arcbox-hv workspace dep pin ([01835a8](https://github.com/arcboxlabs/arcbox/commit/01835a896cd568e2e007080b773a0578dd6600c0))
+
+
+### Code Refactoring
+
+* **agent:** extract agent + rpc modules and finish the split ([e571706](https://github.com/arcboxlabs/arcbox/commit/e571706b5289b078ac5784afa440110055c307cf))
+* **agent:** extract kubernetes module (k3s lifecycle + RPC) ([b907690](https://github.com/arcboxlabs/arcbox/commit/b907690d3188da23231590aafac57a7076add87e))
+* **agent:** extract leaf modules (cmdline/vsock/probe/btrfs) ([52a9b76](https://github.com/arcboxlabs/arcbox/commit/52a9b76981f794b1179208053f3428ec90076ad5))
+* **agent:** extract linux/stub mods into separate files ([6215cbd](https://github.com/arcboxlabs/arcbox/commit/6215cbdd2281cc190cbc61f12b7f2e788f0adcf5))
+* **agent:** extract proxy / sandbox / system_info modules ([c0cee46](https://github.com/arcboxlabs/arcbox/commit/c0cee46406803c0de0049432b80d07cbd8ff885e))
+* **agent:** extract runtime module (containerd + dockerd lifecycle) ([51a7c75](https://github.com/arcboxlabs/arcbox/commit/51a7c75629b5c13be87d79eaf8f452570e647397))
+* **net:** extract vmnet bindings into arcbox-vmnet crate ([33be013](https://github.com/arcboxlabs/arcbox/commit/33be013120800d2bc280add2b10faf7651b4a25a))
+* **vmnet:** tighten public API and harden error paths ([00d665b](https://github.com/arcboxlabs/arcbox/commit/00d665b5ed8850f3acfecdaa6d8774ab01c155dd))
+
+
+### Tests
+
+* **vmnet:** add integration test suite for public API ([52d1951](https://github.com/arcboxlabs/arcbox/commit/52d1951090959082dc073566f330f60713965cd7))
+
+
+### Miscellaneous Chores
+
+* bump `dimicon` and enable `simpleicon` ([#277](https://github.com/arcboxlabs/arcbox/issues/277)) ([a045b52](https://github.com/arcboxlabs/arcbox/commit/a045b52b32e9c3f5d27a58641f18d58484b79871))
+* bump `dimicon` to `0.2.0` and enable `simpleicon` ([a045b52](https://github.com/arcboxlabs/arcbox/commit/a045b52b32e9c3f5d27a58641f18d58484b79871))
+* **deps:** enable serde_json preserve_order ([ff05fcf](https://github.com/arcboxlabs/arcbox/commit/ff05fcfcaf49360bb6260f9652b73b6ffd553eee))
+* **workspace:** promote internal path deps to workspace.dependencies ([cfeffd8](https://github.com/arcboxlabs/arcbox/commit/cfeffd80da6ed26825a9f46096931ea0b5bfa384))
+
 ## [0.4.1](https://github.com/arcboxlabs/arcbox/compare/v0.4.0...v0.4.1) (2026-04-24)
 
 
