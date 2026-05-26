@@ -1371,6 +1371,14 @@ async fn stage_rootfs_copy_for_jailer(
         .await
         .map_err(VmmError::Io)?;
     let rootfs_dst = chroot_root.join("rootfs.ext4");
+    // Remove any stale entry — a previous crash or a failed mknod-then-chown
+    // fallback may have left a block device node here, in which case
+    // `tokio::fs::copy` would write into the device instead of replacing it.
+    if let Err(e) = tokio::fs::remove_file(&rootfs_dst).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(VmmError::Io(e));
+    }
     tokio::fs::copy(rootfs_src, &rootfs_dst)
         .await
         .map_err(VmmError::Io)?;
@@ -1397,6 +1405,13 @@ async fn stage_rootfs_device_for_jailer(
         .map_err(VmmError::Io)?;
     let (major, minor) = crate::snapshot_cow::device_major_minor(dm_device).await?;
     let node_path = chroot_root.join("rootfs.ext4");
+    // Remove any leftover entry from a previous crash so mknod can succeed
+    // (and so we never end up writing into a stale device node).
+    if let Err(e) = tokio::fs::remove_file(&node_path).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(VmmError::Io(e));
+    }
     crate::snapshot_cow::mknod_blkdev(&node_path, major, minor).await?;
     chown(
         &node_path,
@@ -1426,8 +1441,9 @@ async fn stage_files_for_jailer(
 /// Perform the actual Firecracker boot: spawn process, configure, start VM.
 ///
 /// Returns `(FirecrackerProcess, Arc<Vm>, vsock_uds_path, Option<CowHandle>)`
-/// on success.  The `CowHandle` is `Some` when dm-snapshot CoW is active
-/// (direct mode only in Phase 1).
+/// on success.  The `CowHandle` is `Some` whenever dm-snapshot CoW is
+/// active — both direct mode and jailer mode (when the snapshot device
+/// node is successfully created inside the chroot).
 #[allow(clippy::type_complexity)]
 async fn do_boot(
     id: &str,
