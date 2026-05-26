@@ -76,28 +76,33 @@ impl AsyncBatchDgram {
         Ok(self.batch.last_entries(n))
     }
 
-    /// Waits for the FD to become writable, then sends a batch.
+    /// Sends `bufs` in full, looping over readiness as needed.
     ///
-    /// Returns the number of datagrams sent.
+    /// Partial sends (where the kernel accepts only some datagrams before
+    /// the buffer fills) are handled internally — this returns only once
+    /// every datagram has been queued or an unrecoverable error is hit.
+    /// `WouldBlock` causes the loop to clear readiness and re-await.
     ///
     /// # Errors
     ///
-    /// Propagates I/O errors from the underlying batch send. `WouldBlock`
-    /// is handled internally by clearing readiness and re-awaiting.
+    /// Propagates I/O errors from the underlying batch send other than
+    /// `WouldBlock`. On error, any datagrams sent before the failure are
+    /// already on the wire — there is no rollback.
     #[allow(clippy::future_not_send)] // intentional: contains raw pointers from iovec arrays
-    pub async fn send_batch(&mut self, bufs: &[&[u8]]) -> io::Result<usize> {
+    pub async fn send_batch(&mut self, bufs: &[&[u8]]) -> io::Result<()> {
         let Self { inner, batch } = self;
-        loop {
+        let mut sent = 0;
+        while sent < bufs.len() {
             let mut guard = inner.writable().await?;
             let fd = guard.get_inner().as_raw_fd();
-            match batch.send_batch(fd, bufs) {
-                Ok(n) => return Ok(n),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    guard.clear_ready();
-                }
+            match batch.send_batch(fd, &bufs[sent..]) {
+                Ok(n) if n > 0 => sent += n,
+                Ok(_) => guard.clear_ready(),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => guard.clear_ready(),
                 Err(e) => return Err(e),
             }
         }
+        Ok(())
     }
 
     /// Provides read access to the inner [`AsyncFd`] for use in custom
@@ -171,8 +176,7 @@ mod tests {
 
         let payloads: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i; 100]).collect();
         let bufs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
-        let sent = sender.send_batch(&bufs).await.unwrap();
-        assert_eq!(sent, 5);
+        sender.send_batch(&bufs).await.unwrap();
 
         let mut recv_buffers: Vec<Vec<u8>> = (0..5).map(|_| vec![0u8; 256]).collect();
         let mut recv_bufs: Vec<&mut [u8]> =
@@ -194,8 +198,7 @@ mod tests {
 
         let payloads: Vec<Vec<u8>> = (0..50u8).map(|i| vec![i; 64]).collect();
         let bufs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
-        let sent = sender.send_batch(&bufs).await.unwrap();
-        assert_eq!(sent, 50);
+        sender.send_batch(&bufs).await.unwrap();
 
         let mut total = 0;
         while total < 50 {
