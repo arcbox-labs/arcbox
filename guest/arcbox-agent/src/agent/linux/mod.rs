@@ -6,6 +6,7 @@
 mod agent;
 mod btrfs;
 mod cmdline;
+mod disk;
 mod kubernetes;
 mod probe;
 mod proxy;

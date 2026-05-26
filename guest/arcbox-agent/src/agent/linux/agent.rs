@@ -5,6 +5,7 @@ use anyhow::Result;
 
 use arcbox_constants::ports::AGENT_PORT;
 
+use super::disk::fstrim_loop;
 use super::proxy::{run_docker_api_proxy, run_kubernetes_api_proxy};
 use super::rpc::handle_connection;
 use super::sandbox::sandbox_service;
@@ -44,6 +45,9 @@ impl Agent {
                 tracing::warn!("Kubernetes API proxy exited: {}", e);
             }
         });
+
+        // Periodic fstrim to reclaim sparse file space on the host.
+        tokio::spawn(fstrim_loop());
 
         let mut listener = bind_vsock_listener_with_retry(AGENT_PORT, "agent rpc listener").await?;
 
