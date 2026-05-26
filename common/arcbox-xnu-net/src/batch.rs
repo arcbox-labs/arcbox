@@ -83,6 +83,19 @@ impl BatchDgram {
         Ok(&self.entries[..n])
     }
 
+    /// Returns the first `count` [`RxEntry`] slots from the last
+    /// [`recv_batch`](Self::recv_batch) call.
+    ///
+    /// Used by the async wrapper to re-borrow entries after the readiness
+    /// loop releases its mutable borrow. Callers must pass the count
+    /// returned by the latest `recv_batch`; passing a larger value reveals
+    /// stale data from prior batches.
+    #[cfg(any(feature = "tokio", test))]
+    #[must_use]
+    pub(crate) fn last_entries(&self, count: usize) -> &[RxEntry] {
+        &self.entries[..count]
+    }
+
     /// Sends up to `bufs.len()` datagrams (capped at [`MAX_BATCH`]) on `fd`.
     ///
     /// Returns the number of datagrams actually sent. `EINTR` is retried

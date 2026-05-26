@@ -8,23 +8,14 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 use tokio::io::unix::AsyncFd;
 
-use crate::batch::BatchDgram;
-
-/// Newtype so `AsyncFd` can track a raw `OwnedFd`.
-pub struct FdWrapper(OwnedFd);
-
-impl AsRawFd for FdWrapper {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
-    }
-}
+use crate::batch::{BatchDgram, RxEntry};
 
 /// Async batch datagram I/O backed by tokio's [`AsyncFd`].
 ///
-/// Combines [`BatchDgram`] with readiness-based I/O polling. The FD must
-/// be non-blocking (`O_NONBLOCK`) before constructing this type.
+/// Combines [`BatchDgram`] with readiness-based I/O polling. The FD is
+/// set to `O_NONBLOCK` during construction.
 pub struct AsyncBatchDgram {
-    inner: AsyncFd<FdWrapper>,
+    inner: AsyncFd<OwnedFd>,
     batch: BatchDgram,
 }
 
@@ -32,12 +23,17 @@ impl AsyncBatchDgram {
     /// Creates a new async batch context, registering `fd` with the tokio
     /// reactor.
     ///
+    /// Sets `O_NONBLOCK` on `fd` — required for the readiness-based polling
+    /// model and to keep batch syscalls from blocking the reactor thread.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the tokio reactor registration fails.
+    /// Returns an error if `fcntl(F_GETFL|F_SETFL)` fails or the tokio
+    /// reactor registration fails.
     pub fn new(fd: OwnedFd) -> io::Result<Self> {
+        set_nonblocking(fd.as_raw_fd())?;
         Ok(Self {
-            inner: AsyncFd::new(FdWrapper(fd))?,
+            inner: AsyncFd::new(fd)?,
             batch: BatchDgram::new(),
         })
     }
@@ -49,24 +45,35 @@ impl AsyncBatchDgram {
 
     /// Waits for the FD to become readable, then receives a batch.
     ///
-    /// Returns the number of datagrams received. Per-datagram lengths are
-    /// accessible via the returned count and the internal entries.
+    /// Returns a slice of [`RxEntry`] mirroring [`BatchDgram::recv_batch`].
+    /// `entries.len()` is the number of datagrams received and
+    /// `entries[i].len` is the byte length written into `bufs[i]`.
     ///
     /// # Errors
     ///
-    /// Propagates I/O errors from the underlying batch receive.
+    /// Propagates I/O errors from the underlying batch receive. `WouldBlock`
+    /// is handled internally by clearing readiness and re-awaiting.
     #[allow(clippy::future_not_send)] // intentional: contains raw pointers from iovec arrays
-    pub async fn recv_batch(&mut self, bufs: &mut [&mut [u8]]) -> io::Result<usize> {
-        loop {
-            let mut guard = self.inner.readable().await?;
-            match guard.try_io(|inner| {
-                let fd = inner.get_ref().as_raw_fd();
-                self.batch.recv_batch(fd, bufs).map(|(_, n)| n)
-            }) {
-                Ok(result) => return result,
-                Err(_would_block) => {}
+    pub async fn recv_batch(&mut self, bufs: &mut [&mut [u8]]) -> io::Result<&[RxEntry]> {
+        // Drive readiness in an inner scope that yields just the datagram
+        // count; re-borrow entries from self.batch afterwards. The detour
+        // avoids the NLL/Polonius limitation where returning a borrow from
+        // a loop iteration prevents the next iteration's reborrow.
+        let n = {
+            let Self { inner, batch } = self;
+            loop {
+                let mut guard = inner.readable().await?;
+                let fd = guard.get_inner().as_raw_fd();
+                match batch.recv_batch(fd, bufs) {
+                    Ok(entries) => break entries.len(),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        guard.clear_ready();
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-        }
+        };
+        Ok(self.batch.last_entries(n))
     }
 
     /// Waits for the FD to become writable, then sends a batch.
@@ -75,26 +82,43 @@ impl AsyncBatchDgram {
     ///
     /// # Errors
     ///
-    /// Propagates I/O errors from the underlying batch send.
+    /// Propagates I/O errors from the underlying batch send. `WouldBlock`
+    /// is handled internally by clearing readiness and re-awaiting.
     #[allow(clippy::future_not_send)] // intentional: contains raw pointers from iovec arrays
     pub async fn send_batch(&mut self, bufs: &[&[u8]]) -> io::Result<usize> {
+        let Self { inner, batch } = self;
         loop {
-            let mut guard = self.inner.writable().await?;
-            match guard.try_io(|inner| {
-                let fd = inner.get_ref().as_raw_fd();
-                self.batch.send_batch(fd, bufs)
-            }) {
-                Ok(result) => return result,
-                Err(_would_block) => {}
+            let mut guard = inner.writable().await?;
+            let fd = guard.get_inner().as_raw_fd();
+            match batch.send_batch(fd, bufs) {
+                Ok(n) => return Ok(n),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    guard.clear_ready();
+                }
+                Err(e) => return Err(e),
             }
         }
     }
 
     /// Provides read access to the inner [`AsyncFd`] for use in custom
     /// `tokio::select!` loops.
-    pub fn inner(&self) -> &AsyncFd<FdWrapper> {
+    pub fn inner(&self) -> &AsyncFd<OwnedFd> {
         &self.inner
     }
+}
+
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: fd is valid for the duration of the fcntl calls.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is valid; O_NONBLOCK is a safe flag to set.
+    let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -103,34 +127,39 @@ mod tests {
 
     use super::*;
 
-    /// Creates a non-blocking socketpair with 1 MB buffers.
+    /// Creates a socketpair with 1 MB buffers. `O_NONBLOCK` is set later
+    /// by [`AsyncBatchDgram::new`].
     fn socketpair() -> (OwnedFd, OwnedFd) {
         let mut fds: [i32; 2] = [0; 2];
+        // SAFETY: fds is a valid 2-element array; AF_UNIX SOCK_DGRAM is universally supported.
         let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
-        assert_eq!(ret, 0);
+        assert_eq!(ret, 0, "socketpair failed: {}", io::Error::last_os_error());
+        // SAFETY: fds[0]/fds[1] are freshly allocated by socketpair, owned by us.
         let (a, b) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        let buf_size: libc::c_int = 1024 * 1024;
         for fd in [a.as_raw_fd(), b.as_raw_fd()] {
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_SNDBUF,
-                    std::ptr::from_ref(&buf_size).cast(),
-                    std::mem::size_of_val(&buf_size) as libc::socklen_t,
-                );
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVBUF,
-                    std::ptr::from_ref(&buf_size).cast(),
-                    std::mem::size_of_val(&buf_size) as libc::socklen_t,
-                );
-                let flags = libc::fcntl(fd, libc::F_GETFL);
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
+            set_buf_size(fd, libc::SO_SNDBUF, 1024 * 1024);
+            set_buf_size(fd, libc::SO_RCVBUF, 1024 * 1024);
         }
         (a, b)
+    }
+
+    fn set_buf_size(fd: RawFd, name: libc::c_int, size: libc::c_int) {
+        // SAFETY: fd is valid for the duration of the setsockopt call.
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                name,
+                std::ptr::from_ref(&size).cast(),
+                std::mem::size_of_val(&size) as libc::socklen_t,
+            )
+        };
+        assert_eq!(
+            ret,
+            0,
+            "setsockopt(name={name}) failed for fd {fd}: {}",
+            io::Error::last_os_error()
+        );
     }
 
     #[tokio::test]
@@ -148,10 +177,11 @@ mod tests {
         let mut recv_buffers: Vec<Vec<u8>> = (0..5).map(|_| vec![0u8; 256]).collect();
         let mut recv_bufs: Vec<&mut [u8]> =
             recv_buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
-        let count = receiver.recv_batch(&mut recv_bufs).await.unwrap();
-        assert_eq!(count, 5);
-        for i in 0..5u8 {
-            assert_eq!(recv_buffers[i as usize][0], i);
+        let entries = receiver.recv_batch(&mut recv_bufs).await.unwrap();
+        assert_eq!(entries.len(), 5);
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.len, 100);
+            assert_eq!(recv_buffers[i][0], i as u8);
         }
     }
 
@@ -171,8 +201,8 @@ mod tests {
         while total < 50 {
             let mut buffers: Vec<Vec<u8>> = (0..64).map(|_| vec![0u8; 128]).collect();
             let mut bufs: Vec<&mut [u8]> = buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
-            let count = receiver.recv_batch(&mut bufs).await.unwrap();
-            total += count;
+            let entries = receiver.recv_batch(&mut bufs).await.unwrap();
+            total += entries.len();
         }
         assert_eq!(total, 50);
     }

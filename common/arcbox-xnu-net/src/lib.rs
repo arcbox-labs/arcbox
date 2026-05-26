@@ -34,10 +34,13 @@
 pub mod batch;
 pub(crate) mod ffi;
 
-#[cfg(feature = "tokio")]
+// Compiled under `cfg(test)` as well as the `tokio` feature so the async
+// test suite runs by default via `cargo test` (the workspace CI does not
+// pass `--all-features`). The `tokio` dev-dependency is unconditional.
+#[cfg(any(feature = "tokio", test))]
 pub mod async_batch;
 
 pub use batch::{BatchDgram, MAX_BATCH, RxEntry};
 
-#[cfg(feature = "tokio")]
+#[cfg(any(feature = "tokio", test))]
 pub use async_batch::AsyncBatchDgram;
