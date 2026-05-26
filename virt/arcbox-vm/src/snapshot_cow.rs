@@ -5,8 +5,9 @@
 //! The template image is shared read-only across all sandboxes that
 //! use the same rootfs; only written blocks consume disk space.
 //!
-//! Requires `CONFIG_DM_SNAPSHOT=y` in the guest kernel and the
-//! `dmsetup` binary on `PATH` or at `/arcbox/bin/dmsetup`.
+//! Requires `CONFIG_DM_SNAPSHOT=y` in the guest kernel and the `dmsetup`
+//! binary at one of [`DMSETUP_CANDIDATES`].  `PATH` is not searched — the
+//! guest does not have a meaningful one.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,14 +26,47 @@ use crate::error::{Result, VmmError};
 /// Busybox binary (used for `losetup` and `blockdev` applets).
 const BUSYBOX: &str = "/bin/busybox";
 
-/// Candidate paths for the `dmsetup` binary.
-const DMSETUP_CANDIDATES: &[&str] = &["/arcbox/bin/dmsetup", "/usr/sbin/dmsetup"];
+/// Candidate paths for the `dmsetup` binary.  The first existing entry
+/// wins.  `/sbin/dmsetup` covers stock Debian/Alpine; `/usr/sbin/dmsetup`
+/// covers usrmerged distros; `/arcbox/bin/dmsetup` is the guest's bundled
+/// copy.
+const DMSETUP_CANDIDATES: &[&str] = &["/arcbox/bin/dmsetup", "/usr/sbin/dmsetup", "/sbin/dmsetup"];
 
 /// dm-snapshot chunk size in 512-byte sectors (4096 bytes = 8 sectors).
 const SNAPSHOT_CHUNK_SECTORS: u64 = 8;
 
 /// Device-mapper name prefix for sandbox snapshots.
 const DM_NAME_PREFIX: &str = "arcbox-snap-";
+
+/// Maximum length of a device-mapper name (DM_NAME_LEN - 1, from linux/dm-ioctl.h).
+const DM_NAME_MAX_LEN: usize = 127;
+
+/// Validate that `sandbox_id` can be used as the suffix of a dm-name.
+///
+/// Device-mapper allows `[A-Za-z0-9_+.-]` (see kernel `validate_name`).
+/// Sandboxes are most commonly UUIDs, which already pass; this rejects
+/// caller-supplied IDs containing whitespace, `/`, `:`, etc., before
+/// `dmsetup create` errors out with a confusing message.
+fn validate_dm_name_suffix(sandbox_id: &str) -> Result<()> {
+    if sandbox_id.is_empty() {
+        return Err(VmmError::DeviceMapper("empty sandbox id".into()));
+    }
+    if DM_NAME_PREFIX.len() + sandbox_id.len() > DM_NAME_MAX_LEN {
+        return Err(VmmError::DeviceMapper(format!(
+            "sandbox id too long for dm-name (max {} chars after prefix)",
+            DM_NAME_MAX_LEN - DM_NAME_PREFIX.len()
+        )));
+    }
+    if let Some(bad) = sandbox_id
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '.' | '-')))
+    {
+        return Err(VmmError::DeviceMapper(format!(
+            "sandbox id contains character {bad:?} not allowed in dm-name"
+        )));
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -115,6 +149,8 @@ impl CowManager {
     /// Returns a [`CowHandle`] whose `dm_device` field can be passed to
     /// Firecracker as the rootfs block device.
     pub async fn setup(&self, sandbox_id: &str, rootfs_path: &str) -> Result<CowHandle> {
+        validate_dm_name_suffix(sandbox_id)?;
+
         let dmsetup = self
             .dmsetup_bin
             .as_deref()
@@ -251,8 +287,10 @@ impl CowManager {
     }
 
     /// Tear down a dm-snapshot.  Best-effort: each step logs errors but
-    /// continues to the next so resources are not leaked.
-    pub async fn teardown(&self, handle: &CowHandle) -> Result<()> {
+    /// continues to the next so resources are not leaked.  The return type
+    /// is intentionally `()` — callers cannot do anything more useful than
+    /// log on individual step failures, which this function already does.
+    pub async fn teardown(&self, handle: &CowHandle) {
         let dmsetup = self.dmsetup_bin.as_deref().unwrap_or("dmsetup");
 
         // 1. Remove dm device.
@@ -285,11 +323,11 @@ impl CowManager {
         self.release_template(&handle.template_path);
 
         info!(sandbox = %handle.dm_name, "dm-snapshot teardown complete");
-        Ok(())
     }
 
-    /// Synchronous version of [`cleanup_stale`](Self::cleanup_stale) for use
-    /// during construction (before a tokio runtime is guaranteed).
+    /// Remove orphaned dm-snapshot devices and COW files left over from a
+    /// previous crash.  Called once at startup before a tokio runtime is
+    /// guaranteed to exist, so this is intentionally synchronous.
     fn cleanup_stale_sync(&self) {
         let dmsetup = match self.dmsetup_bin.as_deref() {
             Some(bin) => bin,
@@ -334,58 +372,6 @@ impl CowManager {
                             let _ = Command::new(BUSYBOX)
                                 .args(["losetup", "-d", dev.trim()])
                                 .output();
-                        }
-                    }
-                }
-                debug!(file = %path.display(), "removing stale cow file");
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-    }
-
-    /// Remove orphaned dm-snapshot devices and COW files left over from a
-    /// previous crash.  Called once at startup.
-    pub async fn cleanup_stale(&self) {
-        let dmsetup = match self.dmsetup_bin.as_deref() {
-            Some(bin) => bin,
-            None => return,
-        };
-
-        // Remove stale dm devices.
-        let mut cmd = Command::new(dmsetup);
-        cmd.args(["ls", "--target", "snapshot"]);
-        if let Ok(output) = run_cmd(cmd).await {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Some(name) = line.split_whitespace().next()
-                    && name.starts_with(DM_NAME_PREFIX)
-                {
-                    debug!(dm = %name, "removing stale dm-snapshot");
-                    let _ = dmsetup_remove(dmsetup, name).await;
-                }
-            }
-        }
-
-        // Remove stale COW files and detach associated loop devices.
-        let entries = match std::fs::read_dir(&self.cow_dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("arcbox-cow-"))
-            {
-                // Try to find and detach any loop device backed by this file.
-                let mut cmd = Command::new(BUSYBOX);
-                cmd.args(["losetup", "-j", path.to_str().unwrap_or("")]);
-                if let Ok(output) = run_cmd(cmd).await {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    for line in stdout.lines() {
-                        if let Some(dev) = line.split(':').next() {
-                            let _ = losetup_detach(BUSYBOX, dev.trim()).await;
                         }
                     }
                 }
@@ -626,6 +612,22 @@ mod tests {
     fn test_dm_name_format() {
         let name = format!("{DM_NAME_PREFIX}test-sandbox-123");
         assert_eq!(name, "arcbox-snap-test-sandbox-123");
+    }
+
+    #[test]
+    fn validate_dm_name_suffix_accepts_uuid_and_basic_ids() {
+        validate_dm_name_suffix("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        validate_dm_name_suffix("sandbox_1").unwrap();
+        validate_dm_name_suffix("a.b+c-d").unwrap();
+    }
+
+    #[test]
+    fn validate_dm_name_suffix_rejects_invalid_chars() {
+        assert!(validate_dm_name_suffix("").is_err());
+        assert!(validate_dm_name_suffix("has space").is_err());
+        assert!(validate_dm_name_suffix("with/slash").is_err());
+        assert!(validate_dm_name_suffix("with:colon").is_err());
+        assert!(validate_dm_name_suffix(&"x".repeat(DM_NAME_MAX_LEN)).is_err());
     }
 
     #[test]
