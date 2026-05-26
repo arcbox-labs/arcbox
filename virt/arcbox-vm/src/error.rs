@@ -39,6 +39,10 @@ pub enum VmmError {
     #[error("snapshot error: {0}")]
     Snapshot(String),
 
+    /// Device-mapper / dm-snapshot error.
+    #[error("device-mapper error: {0}")]
+    DeviceMapper(String),
+
     /// Process lifecycle error.
     #[error("process error: {0}")]
     Process(String),

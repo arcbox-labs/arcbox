@@ -17,19 +17,17 @@ fn guest_defaults() -> VmmConfig {
     VmmConfig {
         firecracker: FirecrackerConfig {
             binary: "/arcbox/bin/firecracker".into(),
-            // TODO: re-enable jailer once /srv/jailer exists in EROFS rootfs.
-            // jailer: Some(JailerConfig {
-            //     binary: "/arcbox/bin/jailer".into(),
-            //     uid: 0,
-            //     gid: 0,
-            //     chroot_base_dir: None,
-            //     netns: None,
-            //     new_pid_ns: false,
-            //     cgroup_version: None,
-            //     parent_cgroup: None,
-            //     resource_limits: vec![],
-            // }),
-            jailer: None,
+            jailer: Some(arcbox_vm::config::JailerConfig {
+                binary: "/arcbox/bin/jailer".into(),
+                uid: 0,
+                gid: 0,
+                chroot_base_dir: Some("/var/lib/arcbox/jailer".into()),
+                netns: None,
+                new_pid_ns: false,
+                cgroup_version: None,
+                parent_cgroup: None,
+                resource_limits: vec![],
+            }),
             data_dir: "/var/lib/arcbox".into(),
             log_level: None,
             no_seccomp: false,

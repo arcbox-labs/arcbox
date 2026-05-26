@@ -19,7 +19,7 @@ use fc_sdk::VmBuilder;
 use fc_sdk::types::{BootSource, Drive, NetworkInterface, Vsock};
 use nix::unistd::{Gid, Uid, chown};
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::boot_proto::KernelIpParam;
@@ -27,6 +27,7 @@ use crate::config::VmmConfig;
 use crate::error::{Result, VmmError};
 use crate::network::{NetworkAllocation, NetworkManager};
 use crate::snapshot::SnapshotCatalog;
+use crate::snapshot_cow::{CowHandle, CowManager};
 use crate::spawn::{spawn_direct, spawn_jailer};
 use crate::vsock::{self, ExecInputMsg, OutputChunk, StartCommand};
 
@@ -178,6 +179,8 @@ pub struct SandboxInstance {
     pub last_exit_code: Option<i32>,
     /// Human-readable error (only set when state == `Failed`).
     pub error: Option<String>,
+    /// dm-snapshot CoW handle (present when snapshot-based rootfs is active).
+    pub cow_handle: Option<CowHandle>,
 }
 
 impl SandboxInstance {
@@ -202,6 +205,7 @@ impl SandboxInstance {
             last_exited_at: None,
             last_exit_code: None,
             error: None,
+            cow_handle: None,
         }
     }
 
@@ -315,6 +319,7 @@ pub struct SandboxManager {
     snapshots: Arc<SnapshotCatalog>,
     config: Arc<VmmConfig>,
     events_tx: broadcast::Sender<SandboxEvent>,
+    cow_manager: Arc<CowManager>,
 }
 
 impl SandboxManager {
@@ -327,6 +332,16 @@ impl SandboxManager {
         )?);
         let snapshots = Arc::new(SnapshotCatalog::new(&config.firecracker.data_dir));
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let cow_manager = Arc::new(
+            CowManager::new(&config.firecracker.data_dir)
+                .map_err(|e| VmmError::Config(format!("CowManager init: {e}")))?,
+        );
+
+        // Ensure the jailer chroot base directory exists.
+        if let Some(ref jc) = config.firecracker.jailer {
+            let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
+            std::fs::create_dir_all(base).map_err(VmmError::Io)?;
+        }
 
         Ok(Self {
             instances: Arc::new(RwLock::new(HashMap::new())),
@@ -334,6 +349,7 @@ impl SandboxManager {
             snapshots,
             config: Arc::new(config),
             events_tx,
+            cow_manager,
         })
     }
 
@@ -427,6 +443,7 @@ impl SandboxManager {
             let network = Arc::clone(&self.network);
             let config = Arc::clone(&self.config);
             let events_tx = self.events_tx.clone();
+            let cow_manager = Arc::clone(&self.cow_manager);
             let id_clone = id.clone();
             let spec_clone = spec.clone();
             let net_alloc_clone = net_alloc;
@@ -440,6 +457,7 @@ impl SandboxManager {
                     network,
                     config,
                     events_tx,
+                    cow_manager,
                 )
                 .await;
             });
@@ -451,11 +469,15 @@ impl SandboxManager {
             let network = Arc::clone(&self.network);
             let events_tx = self.events_tx.clone();
             let config2 = Arc::clone(&self.config);
+            let cow2 = Arc::clone(&self.cow_manager);
             let id2 = id.clone();
             let ttl = spec.ttl_seconds;
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(ttl as u64)).await;
-                remove_sandbox_impl(&id2, true, &instances, &network, &events_tx, &config2).await;
+                remove_sandbox_impl(
+                    &id2, true, &instances, &network, &events_tx, &config2, &cow2,
+                )
+                .await;
             });
         }
 
@@ -544,6 +566,7 @@ impl SandboxManager {
             &self.network,
             &self.events_tx,
             &self.config,
+            &self.cow_manager,
         )
         .await;
         info!(sandbox_id = %id, "sandbox removed");
@@ -1136,11 +1159,15 @@ impl SandboxManager {
             let network = Arc::clone(&self.network);
             let events_tx = self.events_tx.clone();
             let config2 = Arc::clone(&self.config);
+            let cow2 = Arc::clone(&self.cow_manager);
             let id2 = new_id.clone();
             let ttl = spec.ttl_seconds;
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(ttl as u64)).await;
-                remove_sandbox_impl(&id2, true, &instances, &network, &events_tx, &config2).await;
+                remove_sandbox_impl(
+                    &id2, true, &instances, &network, &events_tx, &config2, &cow2,
+                )
+                .await;
             });
         }
 
@@ -1241,9 +1268,19 @@ async fn boot_sandbox(
     network: Arc<NetworkManager>,
     config: Arc<VmmConfig>,
     events_tx: broadcast::Sender<SandboxEvent>,
+    cow_manager: Arc<CowManager>,
 ) {
-    match do_boot(&id, &spec, net_alloc.as_ref(), &vm_dir, &config).await {
-        Ok((process, vm, vsock_uds_path)) => {
+    match do_boot(
+        &id,
+        &spec,
+        net_alloc.as_ref(),
+        &vm_dir,
+        &config,
+        &cow_manager,
+    )
+    .await
+    {
+        Ok((process, vm, vsock_uds_path, cow_handle)) => {
             let ready_at = Utc::now();
 
             let value = instances.read().unwrap().get(&id).cloned();
@@ -1257,6 +1294,7 @@ async fn boot_sandbox(
                 inst.process = Some(process);
                 inst.vm = Some(vm);
                 inst.vsock_uds_path = Some(vsock_uds_path);
+                inst.cow_handle = cow_handle;
                 inst.state = SandboxState::Ready;
                 inst.ready_at = Some(ready_at);
             }
@@ -1295,6 +1333,95 @@ fn chroot_root(fc_binary: &str, chroot_base_dir: &str, id: &str) -> PathBuf {
         .join("root")
 }
 
+/// Copy kernel into the jailer chroot and set ownership.
+///
+/// Returns the chroot-relative kernel path (e.g. `"/vmlinux"`).
+async fn stage_kernel_for_jailer(
+    chroot_root: &Path,
+    kernel_src: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<String> {
+    tokio::fs::create_dir_all(chroot_root)
+        .await
+        .map_err(VmmError::Io)?;
+    let kernel_dst = chroot_root.join("vmlinux");
+    tokio::fs::copy(kernel_src, &kernel_dst)
+        .await
+        .map_err(VmmError::Io)?;
+    chown(
+        &kernel_dst,
+        Some(Uid::from_raw(uid)),
+        Some(Gid::from_raw(gid)),
+    )
+    .map_err(|e| VmmError::Process(format!("chown kernel: {e}")))?;
+    Ok("/vmlinux".to_string())
+}
+
+/// Copy rootfs into the jailer chroot and set ownership.
+///
+/// Returns the chroot-relative rootfs path (e.g. `"/rootfs.ext4"`).
+async fn stage_rootfs_copy_for_jailer(
+    chroot_root: &Path,
+    rootfs_src: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<String> {
+    tokio::fs::create_dir_all(chroot_root)
+        .await
+        .map_err(VmmError::Io)?;
+    let rootfs_dst = chroot_root.join("rootfs.ext4");
+    // Remove any stale entry — a previous crash or a failed mknod-then-chown
+    // fallback may have left a block device node here, in which case
+    // `tokio::fs::copy` would write into the device instead of replacing it.
+    if let Err(e) = tokio::fs::remove_file(&rootfs_dst).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(VmmError::Io(e));
+    }
+    tokio::fs::copy(rootfs_src, &rootfs_dst)
+        .await
+        .map_err(VmmError::Io)?;
+    chown(
+        &rootfs_dst,
+        Some(Uid::from_raw(uid)),
+        Some(Gid::from_raw(gid)),
+    )
+    .map_err(|e| VmmError::Process(format!("chown rootfs: {e}")))?;
+    Ok("/rootfs.ext4".to_string())
+}
+
+/// Create a block device node in the jailer chroot pointing to a dm device.
+///
+/// Returns the chroot-relative rootfs path (`"/rootfs.ext4"`).
+async fn stage_rootfs_device_for_jailer(
+    chroot_root: &Path,
+    dm_device: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<String> {
+    tokio::fs::create_dir_all(chroot_root)
+        .await
+        .map_err(VmmError::Io)?;
+    let (major, minor) = crate::snapshot_cow::device_major_minor(dm_device).await?;
+    let node_path = chroot_root.join("rootfs.ext4");
+    // Remove any leftover entry from a previous crash so mknod can succeed
+    // (and so we never end up writing into a stale device node).
+    if let Err(e) = tokio::fs::remove_file(&node_path).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(VmmError::Io(e));
+    }
+    crate::snapshot_cow::mknod_blkdev(&node_path, major, minor).await?;
+    chown(
+        &node_path,
+        Some(Uid::from_raw(uid)),
+        Some(Gid::from_raw(gid)),
+    )
+    .map_err(|e| VmmError::Process(format!("chown rootfs device: {e}")))?;
+    Ok("/rootfs.ext4".to_string())
+}
+
 /// Copy kernel and rootfs into the jailer chroot and set ownership.
 ///
 /// Returns `(kernel_guest_path, rootfs_guest_path)` — paths relative to the
@@ -1306,41 +1433,31 @@ async fn stage_files_for_jailer(
     uid: u32,
     gid: u32,
 ) -> Result<(String, String)> {
-    tokio::fs::create_dir_all(chroot_root)
-        .await
-        .map_err(VmmError::Io)?;
-
-    let kernel_dst = chroot_root.join("vmlinux");
-    let rootfs_dst = chroot_root.join("rootfs.ext4");
-
-    tokio::fs::copy(kernel_src, &kernel_dst)
-        .await
-        .map_err(VmmError::Io)?;
-    tokio::fs::copy(rootfs_src, &rootfs_dst)
-        .await
-        .map_err(VmmError::Io)?;
-
-    let uid = Uid::from_raw(uid);
-    let gid = Gid::from_raw(gid);
-    chown(&kernel_dst, Some(uid), Some(gid))
-        .map_err(|e| VmmError::Process(format!("chown kernel: {e}")))?;
-    chown(&rootfs_dst, Some(uid), Some(gid))
-        .map_err(|e| VmmError::Process(format!("chown rootfs: {e}")))?;
-
-    Ok(("/vmlinux".to_string(), "/rootfs.ext4".to_string()))
+    let k = stage_kernel_for_jailer(chroot_root, kernel_src, uid, gid).await?;
+    let r = stage_rootfs_copy_for_jailer(chroot_root, rootfs_src, uid, gid).await?;
+    Ok((k, r))
 }
 
 /// Perform the actual Firecracker boot: spawn process, configure, start VM.
 ///
-/// Returns `(FirecrackerProcess, Arc<Vm>, vsock_uds_path)` on success.
-/// `vsock_uds_path` is the host-side absolute path to the vsock UDS socket.
+/// Returns `(FirecrackerProcess, Arc<Vm>, vsock_uds_path, Option<CowHandle>)`
+/// on success.  The `CowHandle` is `Some` whenever dm-snapshot CoW is
+/// active — both direct mode and jailer mode (when the snapshot device
+/// node is successfully created inside the chroot).
+#[allow(clippy::type_complexity)]
 async fn do_boot(
     id: &str,
     spec: &SandboxSpec,
     net_alloc: Option<&NetworkAllocation>,
     vm_dir: &Path,
     config: &VmmConfig,
-) -> Result<(fc_sdk::FirecrackerProcess, Arc<fc_sdk::Vm>, PathBuf)> {
+    cow_manager: &CowManager,
+) -> Result<(
+    fc_sdk::FirecrackerProcess,
+    Arc<fc_sdk::Vm>,
+    PathBuf,
+    Option<CowHandle>,
+)> {
     let log_path = vm_dir.join("firecracker.log");
     let metrics_path = vm_dir.join("firecracker.metrics");
     // socket_path is used only for the direct (non-jailer) mode spawn.
@@ -1371,22 +1488,73 @@ async fn do_boot(
     // In jailer mode the files must exist inside the chroot, and paths passed
     // to the FC API are relative to the chroot root.  In direct mode the
     // host-absolute paths from the spec are used as-is.
-    let (kernel_path, rootfs_path, vsock_fc_path, vsock_host_path) =
+    let (kernel_path, rootfs_path, vsock_fc_path, vsock_host_path, cow_handle) =
         if let Some(ref jc) = fc_cfg.jailer {
+            // Jailer mode: stage kernel + rootfs into chroot.
             let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
             let cr = chroot_root(&fc_cfg.binary, base, id);
-            let (k, r) =
-                stage_files_for_jailer(&cr, &spec.kernel, &spec.rootfs, jc.uid, jc.gid).await?;
-            // FC creates the vsock socket at this path inside the chroot.
+
+            // Kernel is always copied (small, ~16MB).
+            let k = stage_kernel_for_jailer(&cr, &spec.kernel, jc.uid, jc.gid).await?;
+
+            // Rootfs: try dm-snapshot + mknod, fall back to full copy.
+            let (r, cow) = match cow_manager.setup(id, &spec.rootfs).await {
+                Ok(handle) => {
+                    match stage_rootfs_device_for_jailer(&cr, &handle.dm_device, jc.uid, jc.gid)
+                        .await
+                    {
+                        Ok(path) => (path, Some(handle)),
+                        Err(e) => {
+                            debug!(
+                                sandbox_id = %id,
+                                error = %e,
+                                "mknod failed, falling back to rootfs copy"
+                            );
+                            cow_manager.teardown(&handle).await;
+                            let path =
+                                stage_rootfs_copy_for_jailer(&cr, &spec.rootfs, jc.uid, jc.gid)
+                                    .await?;
+                            (path, None)
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        sandbox_id = %id,
+                        error = %e,
+                        "dm-snapshot unavailable, copying rootfs into chroot"
+                    );
+                    let path =
+                        stage_rootfs_copy_for_jailer(&cr, &spec.rootfs, jc.uid, jc.gid).await?;
+                    (path, None)
+                }
+            };
+
             let vsock_host = cr.join("run/firecracker.vsock");
-            (k, r, "/run/firecracker.vsock".to_string(), vsock_host)
+            (k, r, "/run/firecracker.vsock".to_string(), vsock_host, cow)
         } else {
+            // Direct mode: try dm-snapshot CoW, fall back to using rootfs directly.
+            let (rootfs, cow) = match cow_manager.setup(id, &spec.rootfs).await {
+                Ok(handle) => {
+                    let path = handle.dm_device.clone();
+                    (path, Some(handle))
+                }
+                Err(e) => {
+                    debug!(
+                        sandbox_id = %id,
+                        error = %e,
+                        "dm-snapshot unavailable, using rootfs directly"
+                    );
+                    (spec.rootfs.clone(), None)
+                }
+            };
             let vsock_path = vm_dir.join("firecracker.vsock");
             (
                 spec.kernel.clone(),
-                spec.rootfs.clone(),
+                rootfs,
                 vsock_path.to_str().unwrap().to_owned(),
                 vsock_path,
+                cow,
             )
         };
 
@@ -1461,8 +1629,17 @@ async fn do_boot(
         vsock_id: None,
     });
 
-    let vm = Arc::new(builder.start().await.map_err(VmmError::from)?);
-    Ok((process, vm, vsock_host_path))
+    let vm = match builder.start().await {
+        Ok(v) => Arc::new(v),
+        Err(e) => {
+            // Clean up dm-snapshot if boot fails after setup.
+            if let Some(ref handle) = cow_handle {
+                cow_manager.teardown(handle).await;
+            }
+            return Err(VmmError::from(e));
+        }
+    };
+    Ok((process, vm, vsock_host_path, cow_handle))
 }
 
 // =============================================================================
@@ -1478,6 +1655,7 @@ async fn remove_sandbox_impl(
     network: &Arc<NetworkManager>,
     events_tx: &broadcast::Sender<SandboxEvent>,
     config: &Arc<VmmConfig>,
+    cow_manager: &Arc<CowManager>,
 ) {
     let entry = instances.read().unwrap().get(id).cloned();
     let Some(arc) = entry else {
@@ -1506,6 +1684,16 @@ async fn remove_sandbox_impl(
     if let Some(ref mut proc) = fc_process {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), proc.wait()).await;
     }
+
+    // Teardown dm-snapshot CoW device (must happen after FC process exits
+    // because Firecracker holds the block device open).
+    {
+        let cow_handle = arc.lock().unwrap().cow_handle.take();
+        if let Some(ref handle) = cow_handle {
+            cow_manager.teardown(handle).await;
+        }
+    }
+
     // Release network resources (destroys TAP via ioctl).
     {
         let inst = arc.lock().unwrap();
