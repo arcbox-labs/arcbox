@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4](https://github.com/arcboxlabs/arcbox/compare/v0.4.3...v0.4.4) (2026-05-26)
+
+
+### Features
+
+* **xnu-net:** add batch datagram I/O crate ([11842bf](https://github.com/arcboxlabs/arcbox/commit/11842bf4100bf36d8ae77467f0c21660a0f60302))
+
+
+### Bug Fixes
+
+* **xnu-net:** loop until all sent in AsyncBatchDgram::send_batch ([495762d](https://github.com/arcboxlabs/arcbox/commit/495762dd92a58ff0c766ac0c4267b340aa6bc14d))
+* **xnu-net:** propagate WouldBlock from BatchDgram and capture errno once ([c60b99f](https://github.com/arcboxlabs/arcbox/commit/c60b99fef5e4d2f3415c891ce1b78f1ae85990ac))
+
+
+### Performance Improvements
+
+* **xnu-net:** add criterion benchmarks for batch vs single I/O ([caf067c](https://github.com/arcboxlabs/arcbox/commit/caf067ce96639363890bcb2d3adf640a8a752fcc))
+* **xnu-net:** interleave bench send/recv, hoist allocations, retry EAGAIN ([4e69855](https://github.com/arcboxlabs/arcbox/commit/4e6985536f3fd1c28aa50a02303377b512a57097))
+
+
+### Code Refactoring
+
+* **xnu-net:** drop FdWrapper, expose RxEntry from async wrapper, compile async tests by default ([dde99ba](https://github.com/arcboxlabs/arcbox/commit/dde99ba3a43bc8fd9dcb1ef56942c8bdd9cee561))
+* **xnu-net:** impl Send for BatchDgram, document MAX_BATCH, test the cap ([60d063c](https://github.com/arcboxlabs/arcbox/commit/60d063c7ef9e0616c02563df4b57c35e10094fe4))
+
+
+### Tests
+
+* **xnu-net:** add test suite for BatchDgram and AsyncBatchDgram ([e64388d](https://github.com/arcboxlabs/arcbox/commit/e64388d470490ceb35556a904b015c9d517ea70a))
+
+
+### Documentation
+
+* **xnu-net:** align lib doctest with new recv_batch return type ([1b5e785](https://github.com/arcboxlabs/arcbox/commit/1b5e785b172533577b9dc14f8e967ed995b62b46))
+
+
+### Miscellaneous Chores
+
+* update Cargo.lock after master merge ([308fe31](https://github.com/arcboxlabs/arcbox/commit/308fe3182003fd61134e429c39f5a352333b9949))
+
 ## [0.4.3](https://github.com/arcboxlabs/arcbox/compare/v0.4.2...v0.4.3) (2026-05-26)
 
 
