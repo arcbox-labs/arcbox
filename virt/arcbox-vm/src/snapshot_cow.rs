@@ -49,7 +49,10 @@ struct TemplateEntry {
 }
 
 /// Per-sandbox CoW state.  Stored in `SandboxInstance` for cleanup.
-#[derive(Debug, Clone)]
+///
+/// Intentionally `!Clone`: every handle owns a refcount on its template,
+/// and a stray clone would double-decrement on teardown.
+#[derive(Debug)]
 pub struct CowHandle {
     /// dm device name, e.g. `arcbox-snap-<sandbox_id>`.
     pub dm_name: String,
@@ -121,13 +124,15 @@ impl CowManager {
 
         // --- 1. Acquire template loop device (shared, refcounted) -----------
         //
-        // Check the cache first (under the lock), then drop the lock before
-        // any async work.  If the template is new, create the loop device
-        // outside the lock and insert afterwards.
-        let (template_loop, sectors) = {
-            let existing = {
+        // Fast path: cache hit under the sync mutex, no I/O needed.
+        // Slow path: hold the async losetup_lock across attach+insert so a
+        // concurrent first-time setup of the same template cannot race ahead,
+        // attach a second loop device, and leak the loser's entry on insert.
+        let (template_loop, sectors) = 'acquire: {
+            // Fast path under the sync mutex.
+            if let Some(cached) = {
                 let mut templates = self.templates.lock().unwrap();
-                if let Some(entry) = templates.get_mut(&template) {
+                templates.get_mut(&template).map(|entry| {
                     entry.refcount += 1;
                     debug!(
                         template = %rootfs_path,
@@ -135,45 +140,61 @@ impl CowManager {
                         refcount = entry.refcount,
                         "reusing template loop device"
                     );
-                    Some((entry.loop_device.clone(), entry.sectors))
-                } else {
-                    None
-                }
-            }; // MutexGuard dropped here.
-
-            if let Some(cached) = existing {
-                cached
-            } else {
-                // First time seeing this template — create a read-only loop device.
-                // Hold losetup_lock to prevent TOCTOU race on `-f` + attach.
-                let losetup_guard = self.losetup_lock.lock().await;
-                let loop_dev = losetup_attach(BUSYBOX, Path::new(rootfs_path), true).await?;
-                drop(losetup_guard);
-                let sectors = blockdev_getsz(BUSYBOX, &loop_dev).await.inspect_err(|_| {
-                    let ld = loop_dev.clone();
-                    tokio::spawn(async move {
-                        let _ = losetup_detach(BUSYBOX, &ld).await;
-                    });
-                })?;
-                debug!(
-                    template = %rootfs_path,
-                    loop_dev = %loop_dev,
-                    sectors,
-                    "attached new template loop device"
-                );
-                {
-                    let mut templates = self.templates.lock().unwrap();
-                    templates.insert(
-                        template.clone(),
-                        TemplateEntry {
-                            loop_device: loop_dev.clone(),
-                            sectors,
-                            refcount: 1,
-                        },
-                    );
-                }
-                (loop_dev, sectors)
+                    (entry.loop_device.clone(), entry.sectors)
+                })
+            } {
+                break 'acquire cached;
             }
+
+            // Slow path: serialize attach+insert across all concurrent
+            // first-time callers for this template.
+            let _losetup_guard = self.losetup_lock.lock().await;
+
+            // Re-check the cache: another caller may have populated it while
+            // we were waiting for the lock.
+            if let Some(cached) = {
+                let mut templates = self.templates.lock().unwrap();
+                templates.get_mut(&template).map(|entry| {
+                    entry.refcount += 1;
+                    debug!(
+                        template = %rootfs_path,
+                        loop_dev = %entry.loop_device,
+                        refcount = entry.refcount,
+                        "reusing template loop device (after lock)"
+                    );
+                    (entry.loop_device.clone(), entry.sectors)
+                })
+            } {
+                break 'acquire cached;
+            }
+
+            // Genuinely first to attach — do the work and publish the entry
+            // before releasing the lock.
+            let loop_dev = losetup_attach(BUSYBOX, Path::new(rootfs_path), true).await?;
+            let sectors = blockdev_getsz(BUSYBOX, &loop_dev).await.inspect_err(|_| {
+                let ld = loop_dev.clone();
+                tokio::spawn(async move {
+                    let _ = losetup_detach(BUSYBOX, &ld).await;
+                });
+            })?;
+            debug!(
+                template = %rootfs_path,
+                loop_dev = %loop_dev,
+                sectors,
+                "attached new template loop device"
+            );
+            {
+                let mut templates = self.templates.lock().unwrap();
+                templates.insert(
+                    template.clone(),
+                    TemplateEntry {
+                        loop_device: loop_dev.clone(),
+                        sectors,
+                        refcount: 1,
+                    },
+                );
+            }
+            (loop_dev, sectors)
         };
 
         // --- 2. Create sparse COW file (O(1), no actual I/O) ---------------
