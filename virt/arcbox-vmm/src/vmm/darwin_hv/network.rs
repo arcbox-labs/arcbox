@@ -237,8 +237,7 @@ impl Vmm {
         memory_manager: &mut crate::memory::MemoryManager,
         irq_chip: &crate::irq::IrqChip,
     ) -> Result<()> {
-        use arcbox_net::darwin::vmnet::{Vmnet, VmnetConfig};
-        use arcbox_net::darwin::vmnet_relay::VmnetRelay;
+        use arcbox_vmnet::{Vmnet, VmnetConfig, VmnetRelay};
 
         // Parse MAC from config (stable per VM for bridge FDB lookup).
         let config = if let Some(ref mac_str) = self.config.bridge_nic_mac {

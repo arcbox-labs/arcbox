@@ -17,11 +17,18 @@ pub struct AssetsLock {
 }
 
 /// Tool installation group.
+///
+/// New groups must be added here even if this crate does not consume them —
+/// `parse_tools()` deserializes the entire `[[tools]]` array before filtering,
+/// so an unknown group value would fail parsing for every caller. The
+/// `Desktop` variant is consumed by `arcbox-desktop` (host-only binaries
+/// embedded in the app bundle) and is inert for docker/kubernetes callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolGroup {
     Docker,
     Kubernetes,
+    Desktop,
 }
 
 /// Per-architecture metadata for a tool.
@@ -98,12 +105,18 @@ name = "kubectl"
 group = "kubernetes"
 version = "1.35.3"
 arch.arm64.sha256 = "ddd"
+
+[[tools]]
+name = "pstramp"
+group = "desktop"
+version = "0.2.0"
+arch.arm64.sha256 = "eee"
 "#;
 
     #[test]
     fn parse_tool_entries() {
         let tools = parse_tools(SAMPLE).unwrap();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
         assert_eq!(tools[0].name, "docker");
         assert_eq!(tools[0].group, ToolGroup::Docker);
         assert_eq!(tools[0].version, "29.3.1");
@@ -125,6 +138,12 @@ arch.arm64.sha256 = "ddd"
         let kubernetes_tools = parse_tools_for_group(SAMPLE, ToolGroup::Kubernetes).unwrap();
         assert_eq!(kubernetes_tools.len(), 1);
         assert_eq!(kubernetes_tools[0].name, "kubectl");
+
+        // Desktop group should parse cleanly even though this crate does not
+        // consume it — docker/kubernetes flows must coexist with desktop tools.
+        let desktop_tools = parse_tools_for_group(SAMPLE, ToolGroup::Desktop).unwrap();
+        assert_eq!(desktop_tools.len(), 1);
+        assert_eq!(desktop_tools[0].name, "pstramp");
     }
 
     #[test]

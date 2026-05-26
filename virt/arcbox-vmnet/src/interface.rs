@@ -1,18 +1,7 @@
-//! vmnet.framework backend implementation.
+//! High-level vmnet.framework interface.
 //!
-//! This module provides a high-level Rust interface to Apple's vmnet.framework
-//! for creating virtual network interfaces on macOS.
-//!
-//! # Modes
-//!
-//! - **Shared (NAT)**: VMs share host network via NAT, with DHCP
-//! - **Host-only**: Isolated network between VMs and host
-//! - **Bridged**: VMs appear as separate devices on physical network
-//!
-//! # Requirements
-//!
-//! - macOS 11.0 or later
-//! - Privileged user or appropriate entitlements
+//! Provides a safe Rust wrapper around vmnet.framework for creating virtual
+//! network interfaces on macOS in shared (NAT), host-only, or bridged mode.
 
 use std::ffi::CString;
 use std::net::Ipv4Addr;
@@ -20,13 +9,12 @@ use std::os::raw::c_int;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::vmnet_ffi::*;
-use crate::backend::NetworkBackend;
-use crate::error::{NetError, Result};
+use crate::error::{Result, VmnetError};
+use crate::ffi::*;
 
-/// Information returned by vmnet_start_interface completion handler.
+/// Information returned by `vmnet_start_interface` completion handler.
 ///
-/// Only available when the `vmnet` feature is enabled (proper block ABI).
+/// Only fully populated when the `vmnet` feature is enabled (proper block ABI).
 #[derive(Debug, Clone)]
 pub struct VmnetInterfaceInfo {
     /// MAC address assigned by vmnet.
@@ -41,8 +29,9 @@ pub struct VmnetInterfaceInfo {
 const DEFAULT_MTU: u16 = 1500;
 
 /// Default maximum packet size (Ethernet frame + VLAN tag).
-/// The actual value is returned by vmnet_start_interface completion handler,
-/// but without proper Objective-C block support, we use this default.
+///
+/// The actual value is returned by `vmnet_start_interface`'s completion handler,
+/// but without proper Objective-C block support we use this default.
 const DEFAULT_MAX_PACKET_SIZE: usize = 1518;
 
 /// vmnet interface configuration.
@@ -198,7 +187,7 @@ pub struct Vmnet {
     interface_info: Option<VmnetInterfaceInfo>,
 }
 
-// Safety: Vmnet uses thread-safe primitives and vmnet.framework is thread-safe.
+// SAFETY: Vmnet uses thread-safe primitives and vmnet.framework is thread-safe.
 unsafe impl Send for Vmnet {}
 unsafe impl Sync for Vmnet {}
 
@@ -215,13 +204,11 @@ impl Vmnet {
         // Create dispatch queue for vmnet operations.
         let queue_label = CString::new("com.arcbox.vmnet").unwrap();
 
-        // Safety: dispatch_queue_create is safe to call with valid parameters.
+        // SAFETY: dispatch_queue_create is safe to call with valid parameters.
         let queue = unsafe { dispatch_queue_create(queue_label.as_ptr(), ptr::null()) };
 
         if queue.is_null() {
-            return Err(NetError::config(
-                "failed to create dispatch queue".to_string(),
-            ));
+            return Err(VmnetError::config("failed to create dispatch queue"));
         }
 
         // Build XPC configuration dictionary.
@@ -230,9 +217,7 @@ impl Vmnet {
             let dict = xpc_dictionary_create(ptr::null(), ptr::null(), 0);
             if dict.is_null() {
                 dispatch_release(queue.cast());
-                return Err(NetError::config(
-                    "failed to create xpc config dictionary".to_string(),
-                ));
+                return Err(VmnetError::config("failed to create xpc config dictionary"));
             }
 
             // Set operating mode.
@@ -280,20 +265,22 @@ impl Vmnet {
                     }
                 }
                 VmnetMode::Bridged => {
-                    if let Some(ref iface) = config.bridge_interface {
-                        let s = std::ffi::CString::new(iface.as_str()).unwrap();
-                        xpc_dictionary_set_string(
-                            dict,
-                            vmnet_shared_interface_name_key,
-                            s.as_ptr(),
-                        );
-                    } else {
+                    let Some(ref iface) = config.bridge_interface else {
                         xpc_release(dict);
                         dispatch_release(queue.cast());
-                        return Err(NetError::config(
-                            "bridge mode requires interface name".to_string(),
-                        ));
-                    }
+                        return Err(VmnetError::config("bridge mode requires interface name"));
+                    };
+                    let s = match std::ffi::CString::new(iface.as_str()) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            xpc_release(dict);
+                            dispatch_release(queue.cast());
+                            return Err(VmnetError::config(
+                                "bridge interface name contains a NUL byte",
+                            ));
+                        }
+                    };
+                    xpc_dictionary_set_string(dict, vmnet_shared_interface_name_key, s.as_ptr());
                 }
             }
 
@@ -322,9 +309,10 @@ impl Vmnet {
 
     /// Starts vmnet with a proper Objective-C block completion handler.
     ///
-    /// Extracts MAC, MTU, and max_packet_size from the interface_param dictionary
-    /// returned by vmnet. This path is only available when the `vmnet` feature is
-    /// enabled (requires `com.apple.vm.networking` entitlement or root).
+    /// Extracts MAC, MTU, and `max_packet_size` from the `interface_param`
+    /// dictionary returned by vmnet. This path is only available when the
+    /// `vmnet` feature is enabled (requires `com.apple.vm.networking`
+    /// entitlement or root).
     #[cfg(feature = "vmnet")]
     fn start_with_completion_handler(
         config_dict: XpcObjectT,
@@ -340,9 +328,7 @@ impl Vmnet {
                 xpc_release(config_dict);
                 dispatch_release(queue.cast());
             }
-            return Err(NetError::config(
-                "failed to create dispatch semaphore".to_string(),
-            ));
+            return Err(VmnetError::config("failed to create dispatch semaphore"));
         }
 
         // SAFETY: create_vmnet_completion_block takes a valid semaphore.
@@ -366,9 +352,8 @@ impl Vmnet {
             // A small leak is preferable to a crash. The dispatch queue is
             // also leaked to keep the handler's execution context valid.
             unsafe { xpc_release(config_dict) };
-            return Err(NetError::config(
-                "vmnet_start_interface timed out after 10s (completion handler never fired)"
-                    .to_string(),
+            return Err(VmnetError::config(
+                "vmnet_start_interface timed out after 10s (completion handler never fired)",
             ));
         }
 
@@ -390,7 +375,7 @@ impl Vmnet {
                 dispatch_release(sema);
                 dispatch_release(queue.cast());
             }
-            return Err(NetError::config(format!(
+            return Err(VmnetError::config(format!(
                 "vmnet_start_interface failed: {} (requires entitlement or root)",
                 status.message()
             )));
@@ -412,7 +397,7 @@ impl Vmnet {
                 // SAFETY: mac_ptr is a valid C string from XPC.
                 let mac_cstr = unsafe { CStr::from_ptr(mac_ptr) };
                 if let Ok(mac_str) = mac_cstr.to_str() {
-                    if let Ok(parsed) = super::parse_mac(mac_str) {
+                    if let Some(parsed) = parse_mac(mac_str) {
                         info.mac = parsed;
                     }
                 }
@@ -442,12 +427,21 @@ impl Vmnet {
             dispatch_release(sema);
         }
 
-        // If the user specified a MAC, prefer it. Otherwise use what vmnet returned.
-        let mac = config.mac.unwrap_or(info.mac);
-        let mtu = if config.mtu != DEFAULT_MTU {
-            config.mtu
-        } else {
+        // Prefer user-specified MAC; otherwise the one vmnet returned. If
+        // both are absent (vmnet did not populate the dictionary or parsing
+        // failed), fall back to a generated locally-administered MAC so we
+        // never advertise the all-zero address.
+        let mac = config.mac.unwrap_or_else(|| {
+            if info.mac == [0u8; 6] {
+                generate_mac()
+            } else {
+                info.mac
+            }
+        });
+        let mtu = if config.mtu == DEFAULT_MTU {
             info.mtu
+        } else {
+            config.mtu
         };
         let max_packet_size = info.max_packet_size;
 
@@ -461,10 +455,10 @@ impl Vmnet {
         Ok((interface, mac, mtu, max_packet_size, Some(final_info)))
     }
 
-    /// Starts vmnet with NULL handler (synchronous, no interface_param).
+    /// Starts vmnet with NULL handler (synchronous, no `interface_param`).
     ///
     /// Fallback when the `vmnet` feature is not enabled. Uses default values
-    /// for max_packet_size since the completion handler is not invoked.
+    /// for `max_packet_size` since the completion handler is not invoked.
     #[cfg(not(feature = "vmnet"))]
     fn start_with_null_handler(
         config_dict: XpcObjectT,
@@ -478,12 +472,12 @@ impl Vmnet {
 
         if interface.is_null() {
             unsafe { dispatch_release(queue.cast()) };
-            return Err(NetError::config(
-                "failed to start vmnet interface (requires root or entitlements)".to_string(),
+            return Err(VmnetError::config(
+                "failed to start vmnet interface (requires root or entitlements)",
             ));
         }
 
-        let mac = config.mac.unwrap_or_else(super::generate_mac);
+        let mac = config.mac.unwrap_or_else(generate_mac);
 
         Ok((interface, mac, config.mtu, DEFAULT_MAX_PACKET_SIZE, None))
     }
@@ -529,6 +523,18 @@ impl Vmnet {
         self.running.load(Ordering::Acquire)
     }
 
+    /// Returns the assigned MAC address.
+    #[must_use]
+    pub fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+
+    /// Returns the negotiated MTU.
+    #[must_use]
+    pub fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
     /// Returns the maximum packet size.
     #[must_use]
     pub fn max_packet_size(&self) -> usize {
@@ -542,7 +548,7 @@ impl Vmnet {
     /// Returns an error if the read operation fails.
     pub fn read_packet(&self, buf: &mut [u8]) -> Result<usize> {
         if !self.is_running() {
-            return Err(NetError::config("interface not running".to_string()));
+            return Err(VmnetError::config("interface not running"));
         }
 
         // Create iovec for the buffer.
@@ -561,7 +567,7 @@ impl Vmnet {
 
         let mut pktcnt: c_int = 1;
 
-        // Safety: vmnet_read is safe when called with valid parameters.
+        // SAFETY: vmnet_read is safe when called with valid parameters.
         let status = unsafe { vmnet_read(self.interface, &raw mut packet, &raw mut pktcnt) };
 
         if !status.is_success() {
@@ -569,7 +575,7 @@ impl Vmnet {
                 // No packets available.
                 return Ok(0);
             }
-            return Err(NetError::io(std::io::Error::other(status.message())));
+            return Err(VmnetError::Io(std::io::Error::other(status.message())));
         }
 
         if pktcnt == 0 {
@@ -586,11 +592,11 @@ impl Vmnet {
     /// Returns an error if the write operation fails.
     pub fn write_packet(&self, data: &[u8]) -> Result<usize> {
         if !self.is_running() {
-            return Err(NetError::config("interface not running".to_string()));
+            return Err(VmnetError::config("interface not running"));
         }
 
         if data.len() > self.max_packet_size {
-            return Err(NetError::config(format!(
+            return Err(VmnetError::config(format!(
                 "packet too large: {} > {}",
                 data.len(),
                 self.max_packet_size
@@ -615,15 +621,15 @@ impl Vmnet {
 
         let mut pktcnt: c_int = 1;
 
-        // Safety: vmnet_write is safe when called with valid parameters.
+        // SAFETY: vmnet_write is safe when called with valid parameters.
         let status = unsafe { vmnet_write(self.interface, &raw mut packet, &raw mut pktcnt) };
 
         if !status.is_success() {
-            return Err(NetError::io(std::io::Error::other(status.message())));
+            return Err(VmnetError::Io(std::io::Error::other(status.message())));
         }
 
         if pktcnt == 0 {
-            return Err(NetError::io(std::io::Error::new(
+            return Err(VmnetError::Io(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "no packets written",
             )));
@@ -635,29 +641,11 @@ impl Vmnet {
     /// Stops the vmnet interface.
     pub fn stop(&self) {
         if self.running.swap(false, Ordering::AcqRel) {
-            // Safety: vmnet_stop_interface is safe when called with valid parameters.
+            // SAFETY: vmnet_stop_interface is safe when called with valid parameters.
             unsafe {
                 vmnet_stop_interface(self.interface, self.queue, ptr::null());
             }
         }
-    }
-}
-
-impl NetworkBackend for Vmnet {
-    fn send(&self, data: &[u8]) -> Result<usize> {
-        self.write_packet(data)
-    }
-
-    fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-        self.read_packet(buf)
-    }
-
-    fn mac(&self) -> [u8; 6] {
-        self.mac
-    }
-
-    fn mtu(&self) -> u16 {
-        self.mtu
     }
 }
 
@@ -666,17 +654,54 @@ impl Drop for Vmnet {
         self.stop();
 
         // Release the dispatch queue.
-        // Safety: dispatch_release is safe for a valid queue.
+        // SAFETY: dispatch_release is safe for a valid queue.
         unsafe {
             dispatch_release(self.queue.cast());
         }
     }
 }
 
+/// Parses a MAC address from a colon-separated hex string ("aa:bb:cc:dd:ee:ff").
+///
+/// Returns `None` if the string is malformed.
+#[cfg(any(feature = "vmnet", test))]
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16).ok()?;
+    }
+    Some(mac)
+}
+
+/// Generates a random MAC address with the locally administered bit set.
+fn generate_mac() -> [u8; 6] {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+
+    let mut state = seed;
+    let mut mac = [0u8; 6];
+
+    for byte in &mut mac {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *byte = (state >> 32) as u8;
+    }
+
+    // Set locally administered bit, clear multicast bit.
+    mac[0] = (mac[0] & 0xFC) | 0x02;
+    mac
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
 
     #[test]
     fn test_vmnet_config_default() {
@@ -763,8 +788,20 @@ mod tests {
         assert_eq!(config.mtu, cloned.mtu);
     }
 
+    #[test]
+    fn test_parse_mac() {
+        assert_eq!(
+            parse_mac("02:ab:cd:ef:12:34"),
+            Some([0x02, 0xAB, 0xCD, 0xEF, 0x12, 0x34])
+        );
+        assert!(parse_mac("invalid").is_none());
+        assert!(parse_mac("02:ab:cd:ef:12").is_none());
+        assert!(parse_mac("02:ab:cd:ef:12:34:56").is_none());
+        assert!(parse_mac("02:ab:cd:ef:12:gg").is_none());
+    }
+
     // Integration tests that require root/entitlements.
-    // Run with: sudo cargo test -p arcbox-net vmnet_integration -- --ignored
+    // Run with: sudo cargo test -p arcbox-vmnet vmnet_integration -- --ignored
     #[test]
     #[ignore = "requires macOS vmnet entitlements and root"]
     fn test_vmnet_create_shared() {
@@ -811,7 +848,6 @@ mod tests {
         let vmnet = Vmnet::new_shared().expect("Failed to create vmnet");
         let mut buf = [0u8; 1500];
 
-        // Reading with no data should return 0 or BufferExhausted.
         let result = vmnet.read_packet(&mut buf);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
@@ -822,13 +858,9 @@ mod tests {
     fn test_vmnet_write_packet() {
         let vmnet = Vmnet::new_shared().expect("Failed to create vmnet");
 
-        // Create a minimal Ethernet frame (14 bytes header + payload).
         let mut packet = vec![0u8; 64];
-        // Destination MAC (broadcast).
         packet[0..6].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-        // Source MAC.
         packet[6..12].copy_from_slice(&vmnet.mac());
-        // EtherType (0x0800 = IPv4).
         packet[12..14].copy_from_slice(&[0x08, 0x00]);
 
         let result = vmnet.write_packet(&packet);

@@ -273,7 +273,7 @@ pub struct Vmm {
     >,
     /// vmnet bridge interface for the bridge NIC (`vmnet` feature only).
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
-    vmnet_bridge: Option<std::sync::Arc<arcbox_net::darwin::Vmnet>>,
+    vmnet_bridge: Option<std::sync::Arc<arcbox_vmnet::Vmnet>>,
     /// Cancellation token for the vmnet relay task.
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
     vmnet_relay_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -513,7 +513,7 @@ impl Vmm {
     /// Only populated when `vmnet` feature is enabled and interface started.
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
     #[must_use]
-    pub fn vmnet_interface_info(&self) -> Option<arcbox_net::darwin::VmnetInterfaceInfo> {
+    pub fn vmnet_interface_info(&self) -> Option<arcbox_vmnet::VmnetInterfaceInfo> {
         self.vmnet_bridge
             .as_ref()
             .and_then(|v| v.interface_info().cloned())

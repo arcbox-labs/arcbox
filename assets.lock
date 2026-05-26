@@ -1,11 +1,10 @@
 # ArcBox asset lock — pins versions and checksums for reproducible builds.
 #
-# The [[tools]] section serves two purposes:
-#   1. Host-side CLI: downloaded to ~/.arcbox/runtime/bin/ and symlinked into
-#      the user's PATH (abctl docker setup / abctl setup install).
-#   2. Guest-side daemon: the same binaries are exposed to the VM via VirtioFS
-#      at /arcbox/runtime/bin and launched by arcbox-agent (dockerd, containerd,
-#      runc, etc.).
+# The [[tools]] section pins third-party and internal binaries:
+#   - group "docker"/"kubernetes": downloaded to ~/.arcbox/runtime/bin/ and
+#     exposed to the VM via VirtioFS. Used by both host CLI and guest daemon.
+#   - group "desktop": host-only binaries embedded in the app bundle
+#     (e.g. pstramp for PTY session isolation).
 #
 # Because both paths read from this single lockfile, the Docker CLI and the
 # guest dockerd are always the same version — there is no CLI/daemon version
@@ -43,6 +42,13 @@ group = "docker"
 version = "0.9.5"
 arch.arm64.sha256 = "bc216761bc10e5a707f52d4e5b4050dd7ee7a2daae63c35a97ed7fed2ea64822"
 arch.x86_64.sha256 = "578294a426d86322a17f998cf814258fe7aa764bf505354fcebee51a7456266c"
+
+[[tools]]
+name = "pstramp"
+group = "desktop"
+version = "0.2.0"
+arch.arm64.sha256 = "48448a426bb994e45b603588b19b62629f07d6040f1501235e969c07ecc57413"
+arch.x86_64.sha256 = "eb3cc921de1aed02348821f4a653705a33b012b6a1da7466e577673c5ce80609"
 
 [[tools]]
 name = "kubectl"

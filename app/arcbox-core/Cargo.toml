@@ -39,7 +39,7 @@ sha2 = { workspace = true }
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json"] }
 arcbox-dns = { workspace = true }
 arcbox-helper = { workspace = true }
-arcbox-migration = { path = "../arcbox-migration" }
+arcbox-migration = { workspace = true }
 libc = { workspace = true }
 tempfile = "3"
 

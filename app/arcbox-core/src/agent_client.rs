@@ -8,12 +8,12 @@ use arcbox_constants::wire::{
     ERROR_HEADER_SIZE, FRAME_HEADER_SIZE, MessageType, TRACE_LEN_FIELD_SIZE, TYPE_FIELD_SIZE,
 };
 use arcbox_protocol::agent::{
-    KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
-    KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
-    KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
-    KubernetesStopResponse, MmapReadFileRequest, MmapReadFileResponse, PingRequest, PingResponse,
-    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
-    SystemInfo,
+    DiskTrimRequest, DiskTrimResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
+    KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
+    KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
+    KubernetesStopRequest, KubernetesStopResponse, MmapReadFileRequest, MmapReadFileResponse,
+    PingRequest, PingResponse, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
+    RuntimeStatusResponse, SystemInfo,
 };
 use arcbox_protocol::sandbox_v1::{
     CheckpointRequest, CheckpointResponse, CreateSandboxRequest, CreateSandboxResponse,
@@ -629,6 +629,27 @@ impl AgentClient {
         }
 
         KubernetesKubeconfigResponse::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+    }
+
+    /// Triggers an immediate fstrim on guest data mount points.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn disk_trim(&mut self) -> Result<DiskTrimResponse> {
+        let payload = DiskTrimRequest {}.encode_to_vec();
+        let (resp_type, resp_payload) = self
+            .rpc_call(MessageType::DiskTrimRequest, &payload)
+            .await?;
+
+        if resp_type != MessageType::DiskTrimResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: {resp_type}"
+            )));
+        }
+
+        DiskTrimResponse::decode(&resp_payload[..])
             .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
     }
 

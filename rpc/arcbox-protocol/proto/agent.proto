@@ -40,6 +40,10 @@ service AgentService {
     // Requests graceful guest shutdown. The agent responds immediately,
     // then performs orderly process teardown and powers off the VM.
     rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+
+    // Triggers an immediate fstrim on data mount points to reclaim sparse
+    // file space on the host.
+    rpc DiskTrim(DiskTrimRequest) returns (DiskTrimResponse);
 }
 
 // Ping request.
@@ -117,6 +121,15 @@ message RuntimeStatusResponse {
     string detail = 4;
     // Per-service status entries for fine-grained observability.
     repeated ServiceStatus services = 5;
+}
+
+// Request to trigger an immediate fstrim on data mount points.
+message DiskTrimRequest {}
+
+// Response from a disk trim operation.
+message DiskTrimResponse {
+    // Human-readable result summary (e.g. bytes trimmed per mount).
+    string result = 1;
 }
 
 // Notification that a container's published port bindings changed.

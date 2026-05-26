@@ -25,6 +25,9 @@
 //! correctly even when the user has switched to another Docker backend.
 //! This means `docker compose` keeps working after `abctl docker disable`
 //! — it just talks to whichever backend the user switched to.
+//!
+//! The Docker config directory is resolved via `DOCKER_CONFIG` (matching
+//! upstream `docker` CLI behaviour), falling back to `~/.docker`.
 
 use std::path::{Path, PathBuf};
 
@@ -52,8 +55,21 @@ pub struct RegistrationStatus {
     pub extra_dirs_entry_present: bool,
 }
 
-/// Resolves `~/.docker/` for the current user.
+/// Resolves the user's Docker config directory.
+///
+/// Honours the `DOCKER_CONFIG` environment variable (matching the
+/// upstream `docker` CLI). Falls back to `~/.docker` when the variable
+/// is unset or empty.
 pub fn default_docker_config_dir() -> Result<PathBuf> {
+    resolve_docker_config_dir(std::env::var_os("DOCKER_CONFIG"))
+}
+
+fn resolve_docker_config_dir(env_override: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(value) = env_override {
+        if !value.is_empty() {
+            return Ok(PathBuf::from(value));
+        }
+    }
     dirs::home_dir()
         .map(|h| h.join(".docker"))
         .context("could not determine home directory")
@@ -116,7 +132,7 @@ pub async fn register(user_bin: &Path, docker_config_dir: &Path) -> Result<Outco
                     if existing == target {
                         continue;
                     }
-                    if !is_arcbox_bin_target(&existing, user_bin) {
+                    if !is_arcbox_bin_target(&existing, user_bin, &link) {
                         // Foreign symlink (e.g. Docker Desktop). Leave it
                         // alone — extraDirs below still makes ArcBox win at
                         // resolution time.
@@ -179,7 +195,7 @@ pub async fn unregister(user_bin: &Path, docker_config_dir: &Path) -> Result<Out
             let Ok(target) = tokio::fs::read_link(&link).await else {
                 continue;
             };
-            if !is_arcbox_bin_target(&target, user_bin) {
+            if !is_arcbox_bin_target(&target, user_bin, &link) {
                 continue;
             }
             if tokio::fs::remove_file(&link).await.is_ok() {
@@ -203,7 +219,7 @@ pub async fn status(user_bin: &Path, docker_config_dir: &Path) -> RegistrationSt
     for plugin in DOCKER_CLI_PLUGINS {
         let link = plugins_dir.join(plugin);
         if let Ok(target) = tokio::fs::read_link(&link).await {
-            if is_arcbox_bin_target(&target, user_bin) {
+            if is_arcbox_bin_target(&target, user_bin, &link) {
                 result.symlinked.push((*plugin).to_string());
             }
         }
@@ -226,9 +242,40 @@ pub async fn status(user_bin: &Path, docker_config_dir: &Path) -> RegistrationSt
     result
 }
 
-/// True if `target` is a path inside `user_bin` (i.e. a symlink ArcBox owns).
-fn is_arcbox_bin_target(target: &Path, user_bin: &Path) -> bool {
-    target.starts_with(user_bin)
+/// True if `target` (the value returned by `read_link(link)`) resolves to a
+/// path inside `user_bin` — i.e. a symlink ArcBox owns.
+///
+/// `read_link` may return a relative path; we resolve it against the
+/// symlink's parent directory before comparing, and lexically normalize
+/// both sides so `..`/`.` components don't trip the check. We don't
+/// canonicalize because canonicalize follows further symlinks (including
+/// the app-bundle symlinks under `user_bin`), which would yield a path
+/// outside `user_bin` and produce false negatives.
+fn is_arcbox_bin_target(target: &Path, user_bin: &Path, link: &Path) -> bool {
+    let resolved = if target.is_absolute() {
+        target.to_path_buf()
+    } else if let Some(parent) = link.parent() {
+        parent.join(target)
+    } else {
+        return false;
+    };
+    lexical_normalize(&resolved).starts_with(lexical_normalize(user_bin))
+}
+
+/// Lexical path normalization: collapses `.` and `..` components without
+/// touching the filesystem. Does not resolve symlinks.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Reads `~/.docker/config.json`, adds or removes `user_bin` from the
@@ -262,9 +309,13 @@ async fn update_extra_dirs(config_path: &Path, user_bin: &str, insert: bool) -> 
         let entry = obj
             .entry("cliPluginsExtraDirs")
             .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-        let array = entry
-            .as_array_mut()
-            .context("cliPluginsExtraDirs is not an array")?;
+        let Some(array) = entry.as_array_mut() else {
+            // Pre-existing non-array value (string, number, …) is foreign
+            // state we did not create. Don't fail registration — the
+            // symlink-based discovery path is still in place, and the user
+            // is best served by leaving their oddly-shaped config alone.
+            return Ok(false);
+        };
         if array.iter().any(|v| v.as_str() == Some(user_bin)) {
             false
         } else {
@@ -297,10 +348,44 @@ async fn update_extra_dirs(config_path: &Path, user_bin: &str, insert: bool) -> 
     }
 
     let serialized = serde_json::to_string_pretty(&value)?;
-    tokio::fs::write(config_path, format!("{serialized}\n"))
-        .await
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    atomic_write(config_path, format!("{serialized}\n").as_bytes()).await?;
     Ok(true)
+}
+
+/// Write `contents` to `path` atomically: write into a sibling temp file
+/// in the same directory, then `rename` over the destination.
+///
+/// `tokio::fs::write` opens with `O_TRUNC`, so a crash between truncate
+/// and write completion would leave the destination empty — catastrophic
+/// for files like `~/.docker/config.json` that hold the user's registry
+/// credentials.
+async fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("arcbox-tmp");
+    // PID-scoped tmp name keeps concurrent processes from clobbering each
+    // other's in-flight writes. Same-directory tmp guarantees `rename` is
+    // atomic (same filesystem).
+    let tmp_name = format!(".{}.{}.tmp", file_name, std::process::id());
+    let tmp_path = path.with_file_name(tmp_name);
+
+    if let Err(e) = tokio::fs::write(&tmp_path, contents).await {
+        // Best-effort cleanup so a failed write doesn't leave a stale tmp.
+        tokio::fs::remove_file(&tmp_path).await.ok();
+        return Err(
+            anyhow::Error::from(e).context(format!("failed to write {}", tmp_path.display()))
+        );
+    }
+
+    tokio::fs::rename(&tmp_path, path).await.with_context(|| {
+        format!(
+            "failed to rename {} -> {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -569,5 +654,112 @@ mod tests {
         let after = status(&user_bin, &docker_cfg).await;
         assert_eq!(after.symlinked.len(), 2);
         assert!(after.extra_dirs_entry_present);
+    }
+
+    #[test]
+    fn resolve_docker_config_dir_honors_env_override() {
+        let custom = PathBuf::from("/tmp/custom-docker");
+        let resolved = resolve_docker_config_dir(Some(custom.as_os_str().to_os_string())).unwrap();
+        assert_eq!(resolved, custom);
+    }
+
+    #[test]
+    fn resolve_docker_config_dir_ignores_empty_env() {
+        let resolved = resolve_docker_config_dir(Some(std::ffi::OsString::new())).unwrap();
+        assert!(resolved.ends_with(".docker"));
+    }
+
+    #[tokio::test]
+    async fn atomic_write_leaves_no_tmp_files_on_success() {
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("config.json");
+        atomic_write(&target, b"{}\n").await.unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "{}\n");
+
+        // Nothing of the form `.config.json.<pid>.tmp` should remain.
+        let leftover = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover, "atomic_write must clean up its tmp file");
+    }
+
+    #[tokio::test]
+    async fn register_preserves_top_level_key_order() {
+        // With serde_json's `preserve_order` feature, round-tripping a
+        // config object through `Value::Object` keeps insertion order
+        // intact — so users diffing config.json see only the
+        // cliPluginsExtraDirs append, not a spurious alphabetic resort.
+        let tmp = tempdir().unwrap();
+        let user_bin = tmp.path().join("bin");
+        let docker_cfg = tmp.path().join("docker");
+        fs::create_dir_all(&user_bin).unwrap();
+        fs::create_dir_all(&docker_cfg).unwrap();
+        touch_exe(&user_bin, "docker-compose");
+
+        fs::write(
+            docker_cfg.join("config.json"),
+            r#"{"currentContext":"desktop","credsStore":"osxkeychain","auths":{}}"#,
+        )
+        .unwrap();
+
+        register(&user_bin, &docker_cfg).await.unwrap();
+
+        let rewritten = fs::read_to_string(docker_cfg.join("config.json")).unwrap();
+        let ctx = rewritten.find("currentContext").unwrap();
+        let creds = rewritten.find("credsStore").unwrap();
+        let auths = rewritten.find("auths").unwrap();
+        let extra = rewritten.find("cliPluginsExtraDirs").unwrap();
+        assert!(ctx < creds && creds < auths && auths < extra);
+    }
+
+    #[tokio::test]
+    async fn register_tolerates_non_array_extra_dirs() {
+        let tmp = tempdir().unwrap();
+        let user_bin = tmp.path().join("bin");
+        let docker_cfg = tmp.path().join("docker");
+        fs::create_dir_all(&user_bin).unwrap();
+        fs::create_dir_all(&docker_cfg).unwrap();
+        touch_exe(&user_bin, "docker-compose");
+
+        // Pre-existing config with cliPluginsExtraDirs as a string — foreign
+        // state we shouldn't blow up on.
+        fs::write(
+            docker_cfg.join("config.json"),
+            r#"{"cliPluginsExtraDirs":"/opt/plugins","auths":{"ghcr.io":{}}}"#,
+        )
+        .unwrap();
+
+        let outcome = register(&user_bin, &docker_cfg).await.unwrap();
+
+        // Symlink still gets created; only the config-side update is skipped.
+        assert_eq!(outcome.symlinks.len(), 1);
+        assert!(!outcome.config_updated);
+
+        // The original (foreign) value is preserved verbatim.
+        let cfg: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(docker_cfg.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(cfg["cliPluginsExtraDirs"].as_str(), Some("/opt/plugins"));
+        assert!(cfg["auths"]["ghcr.io"].is_object());
+    }
+
+    #[test]
+    fn is_arcbox_bin_target_recognizes_relative_symlinks() {
+        let user_bin = PathBuf::from("/home/u/.arcbox/bin");
+        let link = PathBuf::from("/home/u/.docker/cli-plugins/docker-compose");
+
+        // Relative target that traverses up into ~/.arcbox/bin/.
+        let relative = PathBuf::from("../../.arcbox/bin/docker-compose");
+        assert!(is_arcbox_bin_target(&relative, &user_bin, &link));
+
+        // Foreign relative target — different parent.
+        let foreign = PathBuf::from("../../somewhere/else/docker-compose");
+        assert!(!is_arcbox_bin_target(&foreign, &user_bin, &link));
+
+        // Absolute target inside user_bin still works.
+        let absolute = user_bin.join("docker-compose");
+        assert!(is_arcbox_bin_target(&absolute, &user_bin, &link));
     }
 }

@@ -15,7 +15,7 @@ use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio_util::sync::CancellationToken;
 
-use super::vmnet::Vmnet;
+use crate::interface::Vmnet;
 
 /// Maximum Ethernet frame size (jumbo frame capable).
 const MAX_FRAME_SIZE: usize = 9216;

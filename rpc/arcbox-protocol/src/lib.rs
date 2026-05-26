@@ -93,13 +93,13 @@ pub mod image {
 /// Re-exports all agent-related types for backward compatibility.
 pub mod agent {
     pub use super::v1::{
-        AgentPingRequest, AgentPingResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
-        KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
-        KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
-        KubernetesStopRequest, KubernetesStopResponse, MmapReadFileRequest, MmapReadFileResponse,
-        PortBindingsChanged, PortBindingsRemoved, RuntimeEnsureRequest, RuntimeEnsureResponse,
-        RuntimeStatusRequest, RuntimeStatusResponse, ServiceStatus, ShutdownRequest,
-        ShutdownResponse, SystemInfo,
+        AgentPingRequest, AgentPingResponse, DiskTrimRequest, DiskTrimResponse,
+        KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
+        KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
+        KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
+        KubernetesStopResponse, MmapReadFileRequest, MmapReadFileResponse, PortBindingsChanged,
+        PortBindingsRemoved, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
+        RuntimeStatusResponse, ServiceStatus, ShutdownRequest, ShutdownResponse, SystemInfo,
     };
 
     // Backward compatibility type aliases (short names without Agent prefix).

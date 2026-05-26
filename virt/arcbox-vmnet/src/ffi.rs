@@ -1,17 +1,17 @@
 //! vmnet.framework FFI bindings.
 //!
-//! This module provides low-level bindings to Apple's vmnet.framework
-//! for creating virtual network interfaces on macOS.
+//! Low-level bindings to Apple's vmnet.framework for creating virtual
+//! network interfaces on macOS.
 //!
 //! # Architecture
 //!
-//! vmnet.framework uses Grand Central Dispatch (GCD) for asynchronous operations.
-//! All callbacks are delivered on dispatch queues.
+//! vmnet.framework uses Grand Central Dispatch (GCD) for asynchronous
+//! operations. All callbacks are delivered on dispatch queues.
 //!
 //! # References
 //!
-//! - Apple vmnet documentation: https://developer.apple.com/documentation/vmnet
-//! - lima-vm/socket_vmnet: https://github.com/lima-vm/socket_vmnet
+//! - Apple vmnet documentation: <https://developer.apple.com/documentation/vmnet>
+//! - lima-vm/socket_vmnet: <https://github.com/lima-vm/socket_vmnet>
 
 use std::ffi::{c_char, c_void};
 use std::os::raw::c_int;
@@ -111,6 +111,7 @@ pub struct VmnetPacket {
 /// IO vector for scatter-gather I/O.
 #[repr(C)]
 #[derive(Debug)]
+#[allow(non_camel_case_types)]
 pub struct iovec {
     /// Pointer to data.
     pub iov_base: *mut c_void,

@@ -388,8 +388,7 @@ impl Vmm {
     /// Returns a `VirtioDeviceConfig` with the VZ-side raw fd.
     #[cfg(feature = "vmnet")]
     fn create_vmnet_bridge_nic(&mut self) -> Result<VirtioDeviceConfig> {
-        use arcbox_net::darwin::vmnet::{Vmnet, VmnetConfig};
-        use arcbox_net::darwin::vmnet_relay::VmnetRelay;
+        use arcbox_vmnet::{Vmnet, VmnetConfig, VmnetRelay};
 
         // Parse MAC from config.
         let config = if let Some(ref mac_str) = self.config.bridge_nic_mac {
