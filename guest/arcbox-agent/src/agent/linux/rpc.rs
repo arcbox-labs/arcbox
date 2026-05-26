@@ -17,6 +17,7 @@ use crate::rpc::{
     write_response,
 };
 
+use super::disk::handle_disk_trim;
 use super::kubernetes::{
     handle_delete_kubernetes, handle_kubernetes_kubeconfig, handle_kubernetes_status,
     handle_start_kubernetes, handle_stop_kubernetes,
@@ -117,6 +118,7 @@ async fn handle_request(request: RpcRequest) -> RequestResult {
         }
         RpcRequest::Shutdown(req) => RequestResult::Single(handle_shutdown(req)),
         RpcRequest::MmapReadFile(req) => RequestResult::Single(handle_mmap_read_file(req)),
+        RpcRequest::DiskTrim(_) => RequestResult::Single(handle_disk_trim().await),
     }
 }
 

@@ -45,6 +45,7 @@ pub fn resolve_grpc_socket_path() -> PathBuf {
 pub mod boot;
 pub mod cli_plugins;
 pub mod daemon;
+pub mod disk;
 #[cfg(target_os = "macos")]
 pub mod dns;
 pub mod docker;
@@ -127,6 +128,10 @@ pub enum Commands {
     /// Manage boot assets (kernel/rootfs)
     #[command(subcommand)]
     Boot(boot::BootCommands),
+
+    /// Manage Docker data disk
+    #[command(subcommand)]
+    Disk(disk::DiskCommands),
 
     /// Manage DNS resolver for *.arcbox.local
     #[cfg(target_os = "macos")]
