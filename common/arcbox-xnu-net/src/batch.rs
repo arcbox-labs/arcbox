@@ -3,8 +3,18 @@
 use std::io;
 use std::os::fd::RawFd;
 
-/// Maximum datagrams per batch call. Matches XNU's default
-/// `kern.ipc.maxrecvmsgx` sysctl (256).
+/// Maximum datagrams per batch call.
+///
+/// Matches the **default** `kern.ipc.maxrecvmsgx` / `kern.ipc.maxsendmsgx`
+/// sysctl values (256) on macOS. Both sysctls are tunable: an operator —
+/// or a hardened system image — can lower them, in which case calling
+/// `recvmsg_x`/`sendmsg_x` with `cnt > maxrecvmsgx` returns `EINVAL`
+/// rather than degrading to a smaller batch. Linux has no equivalent
+/// kernel cap on `recvmmsg`/`sendmmsg`, but this constant is shared for
+/// uniform buffer pre-allocation.
+///
+/// If you target hosts that may carry non-default sysctls, clamp your
+/// per-call `bufs.len()` to a value you know is safe.
 pub const MAX_BATCH: usize = 256;
 
 /// Result of a single datagram within a batch receive.
@@ -31,6 +41,21 @@ pub struct BatchDgram {
     iovecs: Vec<libc::iovec>,
     entries: Vec<RxEntry>,
 }
+
+// SAFETY: BatchDgram contains raw pointers in its iovec/msghdr arrays, which
+// is why the auto-impl of `Send` is denied. Those pointers are only valid
+// for the duration of a single recv_batch/send_batch call — they alias the
+// caller-supplied buffer slices, get filled in by `setup_recv`/`setup_send`,
+// and are passed to the kernel by the immediately-following syscall under
+// `&mut self`. Between calls they are stale and never dereferenced by Rust.
+// Moving the struct across threads therefore moves no live aliases. We
+// implement Send explicitly so the type is Send on both macOS and Linux
+// (the Linux `libc::mmsghdr` is otherwise `!Send`).
+#[allow(
+    clippy::non_send_fields_in_send_ty,
+    reason = "raw pointers in iovec/msghdr are stale between syscalls; see SAFETY above"
+)]
+unsafe impl Send for BatchDgram {}
 
 impl BatchDgram {
     /// Creates a new batch I/O context with pre-allocated arrays for up to
@@ -362,6 +387,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_batch_dgram_is_send() {
+        // Static assertion: BatchDgram must be Send on both macOS and
+        // Linux so callers can move it across `tokio::spawn`.
+        const fn require_send<T: Send>() {}
+        require_send::<BatchDgram>();
+    }
+
     fn write_datagram(fd: RawFd, data: &[u8]) {
         // SAFETY: writing to a valid socketpair fd.
         let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
@@ -502,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn test_max_batch_cap() {
+    fn test_recv_empty_socket_is_wouldblock() {
         let (_a, b) = socketpair();
 
         let mut buffers: Vec<Vec<u8>> = (0..300).map(|_| vec![0u8; 64]).collect();
@@ -511,6 +544,37 @@ mod tests {
         let mut batch = BatchDgram::new();
         let err = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn test_max_batch_cap() {
+        // With more queued datagrams than `MAX_BATCH` and a longer `bufs`
+        // slice, a single `recv_batch` should return exactly `MAX_BATCH`
+        // entries — not the full `bufs.len()` and not less.
+        let (a, b) = socketpair();
+
+        let extra = 10;
+        for _ in 0..MAX_BATCH + extra {
+            write_datagram(a.as_raw_fd(), &[0xAA; 8]);
+        }
+
+        let mut buffers: Vec<Vec<u8>> = (0..MAX_BATCH + extra * 2).map(|_| vec![0u8; 64]).collect();
+        let mut bufs: Vec<&mut [u8]> = buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
+
+        let mut batch = BatchDgram::new();
+        let entries = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+        assert_eq!(
+            entries.len(),
+            MAX_BATCH,
+            "first call must return exactly MAX_BATCH ({MAX_BATCH}) entries"
+        );
+        for entry in entries {
+            assert_eq!(entry.len, 8);
+        }
+
+        // The remaining `extra` datagrams stay queued for a follow-up call.
+        let entries = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+        assert_eq!(entries.len(), extra);
     }
 
     #[test]
