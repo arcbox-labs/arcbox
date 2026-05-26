@@ -103,8 +103,11 @@ pub struct CowHandle {
 /// Manages template loop devices and per-sandbox dm-snapshot lifecycle.
 pub struct CowManager {
     templates: Mutex<HashMap<PathBuf, TemplateEntry>>,
-    /// Serializes `losetup -f` + `losetup DEV FILE` to prevent TOCTOU races
-    /// where concurrent callers get the same free loop device.
+    /// Serializes the cache-miss attach+insert window so two concurrent
+    /// first-time setups for the same template converge on a single
+    /// `TemplateEntry` instead of each attaching its own loop device and
+    /// leaking the loser.  (TOCTOU on `losetup -f` itself is handled by
+    /// the kernel via `losetup --show`.)
     losetup_lock: AsyncMutex<()>,
     cow_dir: PathBuf,
     dmsetup_bin: Option<String>,
@@ -325,16 +328,18 @@ impl CowManager {
         info!(sandbox = %handle.dm_name, "dm-snapshot teardown complete");
     }
 
-    /// Remove orphaned dm-snapshot devices and COW files left over from a
-    /// previous crash.  Called once at startup before a tokio runtime is
-    /// guaranteed to exist, so this is intentionally synchronous.
+    /// Remove orphaned dm-snapshot devices, COW files, and template loop
+    /// devices left over from a previous crash.  Called once at startup
+    /// before a tokio runtime is guaranteed to exist, so this is
+    /// intentionally synchronous.
     fn cleanup_stale_sync(&self) {
         let dmsetup = match self.dmsetup_bin.as_deref() {
             Some(bin) => bin,
             None => return,
         };
 
-        // Remove stale dm devices.
+        // 1. Remove stale dm devices first — they pin the loop devices
+        //    underneath, so the loop detach below would fail otherwise.
         if let Ok(output) = Command::new(dmsetup)
             .args(["ls", "--target", "snapshot"])
             .output()
@@ -350,34 +355,80 @@ impl CowManager {
             }
         }
 
-        // Remove stale COW files and detach associated loop devices.
-        let entries = match std::fs::read_dir(&self.cow_dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("arcbox-cow-"))
-            {
-                if let Ok(output) = Command::new(BUSYBOX)
-                    .args(["losetup", "-j", path.to_str().unwrap_or("")])
-                    .output()
+        // 2. Detach loops backing stale COW files, then unlink the files.
+        if let Ok(entries) = std::fs::read_dir(&self.cow_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("arcbox-cow-"))
                 {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    for line in stdout.lines() {
-                        if let Some(dev) = line.split(':').next() {
-                            let _ = Command::new(BUSYBOX)
-                                .args(["losetup", "-d", dev.trim()])
-                                .output();
+                    if let Ok(output) = Command::new(BUSYBOX)
+                        .args(["losetup", "-j", path.to_str().unwrap_or("")])
+                        .output()
+                    {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        for line in stdout.lines() {
+                            if let Some(dev) = line.split(':').next() {
+                                let _ = Command::new(BUSYBOX)
+                                    .args(["losetup", "-d", dev.trim()])
+                                    .output();
+                            }
                         }
                     }
+                    debug!(file = %path.display(), "removing stale cow file");
+                    let _ = std::fs::remove_file(&path);
                 }
-                debug!(file = %path.display(), "removing stale cow file");
-                let _ = std::fs::remove_file(&path);
             }
+        }
+
+        // 3. Detach orphaned template loop devices.
+        //
+        // Template attaches are tracked only in the in-memory `templates`
+        // HashMap, which is empty at startup — without this pass, every
+        // crash+restart cycle would permanently leak one read-only loop
+        // device per unique rootfs template, eventually exhausting the
+        // 256-entry loop namespace.
+        //
+        // Signature: attached + read-only.  This module is the only thing
+        // in the guest that attaches loop devices read-only (COW loops are
+        // read-write and were handled above), so anything matching is
+        // ours and stale.
+        self.detach_stale_template_loops();
+    }
+
+    fn detach_stale_template_loops(&self) {
+        let Ok(entries) = std::fs::read_dir("/sys/block") else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Some(suffix) = name.strip_prefix("loop") else {
+                continue;
+            };
+            if !suffix.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            // Must be currently attached.
+            let backing = format!("/sys/block/{name}/loop/backing_file");
+            if !Path::new(&backing).exists() {
+                continue;
+            }
+            // Must be read-only.
+            let ro_path = format!("/sys/block/{name}/ro");
+            let is_ro = std::fs::read_to_string(&ro_path)
+                .ok()
+                .is_some_and(|s| s.trim() == "1");
+            if !is_ro {
+                continue;
+            }
+
+            let dev = format!("/dev/{name}");
+            debug!(dev = %dev, "detaching stale template loop device");
+            let _ = Command::new(BUSYBOX).args(["losetup", "-d", &dev]).output();
         }
     }
 
@@ -427,44 +478,36 @@ async fn run_cmd(mut cmd: Command) -> Result<std::process::Output> {
 
 /// Attach a file as a loop device.  Returns the device path (e.g. `/dev/loop0`).
 ///
-/// Uses busybox-compatible two-step approach: `busybox losetup -f` to find a
-/// free device, then `busybox losetup [-r] DEV FILE` to attach.
+/// Uses the atomic `losetup -f --show` form so the kernel allocates and
+/// attaches in a single `LOOP_CTL_GET_FREE`+`LOOP_SET_FD` call, avoiding
+/// the TOCTOU window of separate `-f` then `attach` invocations against
+/// other processes that might claim the same slot.  Supported by busybox
+/// >= 1.21 and util-linux >= 2.20.
 async fn losetup_attach(bin: &str, path: &Path, read_only: bool) -> Result<String> {
     let path_str = path
         .to_str()
         .ok_or_else(|| VmmError::DeviceMapper("non-UTF-8 path".into()))?;
 
-    // Step 1: find a free loop device.
-    let mut find_cmd = Command::new(bin);
-    find_cmd.args(["losetup", "-f"]);
-    let output = run_cmd(find_cmd).await?;
+    let mut cmd = Command::new(bin);
+    if read_only {
+        cmd.args(["losetup", "-r", "-f", "--show", path_str]);
+    } else {
+        cmd.args(["losetup", "-f", "--show", path_str]);
+    }
+    let output = run_cmd(cmd).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(VmmError::DeviceMapper(format!("losetup -f: {stderr}")));
+        return Err(VmmError::DeviceMapper(format!(
+            "losetup attach {}: {stderr}",
+            path.display()
+        )));
     }
     let dev = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if dev.is_empty() {
         return Err(VmmError::DeviceMapper(
-            "losetup -f returned empty device".into(),
+            "losetup --show returned empty device path".into(),
         ));
     }
-
-    // Step 2: attach the file to that device.
-    let mut attach_cmd = Command::new(bin);
-    if read_only {
-        attach_cmd.args(["losetup", "-r", &dev, path_str]);
-    } else {
-        attach_cmd.args(["losetup", &dev, path_str]);
-    }
-    let output = run_cmd(attach_cmd).await?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(VmmError::DeviceMapper(format!(
-            "losetup {dev} {}: {stderr}",
-            path.display()
-        )));
-    }
-
     Ok(dev)
 }
 
