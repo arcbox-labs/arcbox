@@ -246,7 +246,8 @@ impl BootAssetProvider {
         })
     }
 
-    /// Prepare host-side binaries (dockerd, containerd, shim, runc, k3s) into `dest_dir`.
+    /// Prepare host-side binaries (dockerd, containerd, shim, runc, docker-init, k3s)
+    /// into `dest_dir`.
     pub async fn prepare_binaries(
         &self,
         dest_dir: &Path,

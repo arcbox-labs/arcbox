@@ -33,8 +33,13 @@ use crate::rpc::RpcResponse;
 pub(super) const CONTAINERD_SOCKET_CANDIDATES: [&str; 2] =
     [CONTAINERD_SOCKET, "/var/run/containerd/containerd.sock"];
 
-const REQUIRED_RUNTIME_BINARIES: &[&str] =
-    &["dockerd", "containerd", "containerd-shim-runc-v2", "runc"];
+const REQUIRED_RUNTIME_BINARIES: &[&str] = &[
+    "dockerd",
+    "containerd",
+    "containerd-shim-runc-v2",
+    "runc",
+    "docker-init",
+];
 
 /// Minimum "sane" UNIX timestamp for TLS certificate validation.
 ///
@@ -225,12 +230,14 @@ async fn ensure_dockerd_ready(runtime_bin_dir: &Path, notes: &mut Vec<String>) {
 
     let path_env = runtime_path_env(runtime_bin_dir);
     let dockerd_bin = runtime_bin_dir.join("dockerd");
+    let init_bin = runtime_bin_dir.join("docker-init");
     let mut cmd = Command::new(&dockerd_bin);
     cmd.arg(format!("--host=unix://{DOCKER_API_UNIX_SOCKET}"))
         .arg(format!("--containerd={CONTAINERD_SOCKET}"))
         .arg("--exec-root=/var/run/docker")
         .arg(format!("--data-root={DOCKER_DATA_MOUNT_POINT}"))
         .arg("--userland-proxy=false")
+        .arg(format!("--init-path={}", init_bin.display()))
         .env("PATH", &path_env)
         .stdin(Stdio::null())
         .stdout(daemon_log_file("dockerd"))
