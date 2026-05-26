@@ -191,7 +191,10 @@ arcbox-constants = { version = "0.4.1", path = "common/arcbox-constants", featur
 arcbox-dns = { version = "0.4.1", path = "common/arcbox-dns" } # x-release-please-version
 arcbox-error = { version = "0.4.1", path = "common/arcbox-error" } # x-release-please-version
 arcbox-route = { version = "0.4.1", path = "common/arcbox-route" } # x-release-please-version
-arcbox-hv = { version = "0.3.20", path = "virt/arcbox-hv" } # x-release-please-version
+# arcbox-hv has its own release cadence (Apple Hypervisor.framework
+# bindings), so the workspace dep pin is bumped manually when arcbox-hv
+# itself is bumped — not by release-please.
+arcbox-hv = { version = "0.3.20", path = "virt/arcbox-hv" }
 arcbox-vz = { version = "0.4.1", path = "virt/arcbox-vz" } # x-release-please-version
 arcbox-hypervisor = { version = "0.4.1", path = "virt/arcbox-hypervisor" } # x-release-please-version
 arcbox-vmm = { version = "0.4.1", path = "virt/arcbox-vmm" } # x-release-please-version
