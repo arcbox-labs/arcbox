@@ -57,23 +57,21 @@ impl BatchDgram {
 
     /// Receives up to `bufs.len()` datagrams (capped at [`MAX_BATCH`]) from `fd`.
     ///
-    /// Returns `(entries, count)` where `count` is the number of datagrams
-    /// received and `entries[..count]` contains per-datagram metadata.
+    /// On success returns a slice of [`RxEntry`] whose length equals the
+    /// number of datagrams received; `entries[i].len` is the byte length
+    /// written into `bufs[i]`.
     ///
-    /// Returns `Ok((_, 0))` when the FD has no pending data (`WouldBlock`).
-    /// `EINTR` is retried internally.
+    /// `EINTR` is retried internally. Returns `Err(WouldBlock)` when the FD
+    /// has no pending data — callers integrating with a readiness reactor
+    /// rely on this to clear readiness.
     ///
     /// # Errors
     ///
-    /// Returns `io::Error` for syscall failures other than `WouldBlock`/`EINTR`.
-    pub fn recv_batch(
-        &mut self,
-        fd: RawFd,
-        bufs: &mut [&mut [u8]],
-    ) -> io::Result<(&[RxEntry], usize)> {
+    /// Returns `io::Error` for syscall failures, including `WouldBlock`.
+    pub fn recv_batch(&mut self, fd: RawFd, bufs: &mut [&mut [u8]]) -> io::Result<&[RxEntry]> {
         let count = bufs.len().min(MAX_BATCH);
         if count == 0 {
-            return Ok((&[], 0));
+            return Ok(&[]);
         }
 
         self.setup_recv(bufs, count);
@@ -82,18 +80,19 @@ impl BatchDgram {
 
         self.collect_recv(n);
 
-        Ok((&self.entries[..n], n))
+        Ok(&self.entries[..n])
     }
 
     /// Sends up to `bufs.len()` datagrams (capped at [`MAX_BATCH`]) on `fd`.
     ///
-    /// Returns the number of datagrams actually sent. Returns `Ok(0)` when
-    /// the FD's send buffer is full (`WouldBlock`). `EINTR` is retried
-    /// internally.
+    /// Returns the number of datagrams actually sent. `EINTR` is retried
+    /// internally. Returns `Err(WouldBlock)` when the FD's send buffer is
+    /// full — callers integrating with a readiness reactor rely on this to
+    /// clear readiness.
     ///
     /// # Errors
     ///
-    /// Returns `io::Error` for syscall failures other than `WouldBlock`/`EINTR`.
+    /// Returns `io::Error` for syscall failures, including `WouldBlock`.
     pub fn send_batch(&mut self, fd: RawFd, bufs: &[&[u8]]) -> io::Result<usize> {
         let count = bufs.len().min(MAX_BATCH);
         if count == 0 {
@@ -164,11 +163,11 @@ impl BatchDgram {
             if n >= 0 {
                 return Ok(n as usize);
             }
-            match io::Error::last_os_error().kind() {
-                io::ErrorKind::Interrupted => {}
-                io::ErrorKind::WouldBlock => return Ok(0),
-                _ => return Err(io::Error::last_os_error()),
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
             }
+            return Err(err);
         }
     }
 
@@ -187,11 +186,11 @@ impl BatchDgram {
             if n >= 0 {
                 return Ok(n as usize);
             }
-            match io::Error::last_os_error().kind() {
-                io::ErrorKind::Interrupted => {}
-                io::ErrorKind::WouldBlock => return Ok(0),
-                _ => return Err(io::Error::last_os_error()),
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
             }
+            return Err(err);
         }
     }
 
@@ -242,11 +241,11 @@ impl BatchDgram {
             if n >= 0 {
                 return Ok(n as usize);
             }
-            match io::Error::last_os_error().kind() {
-                io::ErrorKind::Interrupted => {}
-                io::ErrorKind::WouldBlock => return Ok(0),
-                _ => return Err(io::Error::last_os_error()),
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
             }
+            return Err(err);
         }
     }
 
@@ -265,11 +264,11 @@ impl BatchDgram {
             if n >= 0 {
                 return Ok(n as usize);
             }
-            match io::Error::last_os_error().kind() {
-                io::ErrorKind::Interrupted => {}
-                io::ErrorKind::WouldBlock => return Ok(0),
-                _ => return Err(io::Error::last_os_error()),
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
             }
+            return Err(err);
         }
     }
 
@@ -299,33 +298,55 @@ mod tests {
     /// buffers (1 MB each direction).
     fn socketpair() -> (OwnedFd, OwnedFd) {
         let mut fds: [i32; 2] = [0; 2];
+        // SAFETY: fds is a valid 2-element array; AF_UNIX SOCK_DGRAM is universally supported.
         let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
-        assert_eq!(ret, 0, "socketpair failed");
+        assert_eq!(ret, 0, "socketpair failed: {}", io::Error::last_os_error());
+        // SAFETY: fds[0]/fds[1] are freshly allocated by socketpair, owned by us.
         let (a, b) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
         // Enlarge socket buffers so tests with many/large datagrams don't
         // hit ENOBUFS or partial sends.
-        let buf_size: libc::c_int = 1024 * 1024;
         for fd in [a.as_raw_fd(), b.as_raw_fd()] {
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_SNDBUF,
-                    std::ptr::from_ref(&buf_size).cast(),
-                    std::mem::size_of_val(&buf_size) as libc::socklen_t,
-                );
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVBUF,
-                    std::ptr::from_ref(&buf_size).cast(),
-                    std::mem::size_of_val(&buf_size) as libc::socklen_t,
-                );
-                let flags = libc::fcntl(fd, libc::F_GETFL);
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
+            set_buf_size(fd, libc::SO_SNDBUF, 1024 * 1024);
+            set_buf_size(fd, libc::SO_RCVBUF, 1024 * 1024);
+            set_nonblocking(fd);
         }
         (a, b)
+    }
+
+    fn set_buf_size(fd: RawFd, name: libc::c_int, size: libc::c_int) {
+        // SAFETY: fd is valid for the duration of the setsockopt call.
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                name,
+                std::ptr::from_ref(&size).cast(),
+                std::mem::size_of_val(&size) as libc::socklen_t,
+            )
+        };
+        assert_eq!(
+            ret,
+            0,
+            "setsockopt(name={name}) failed for fd {fd}: {}",
+            io::Error::last_os_error()
+        );
+    }
+
+    fn set_nonblocking(fd: RawFd) {
+        // SAFETY: fd is valid; F_GETFL/F_SETFL are safe fcntl operations.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(
+            flags >= 0,
+            "fcntl(F_GETFL) failed for fd {fd}: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: same as above.
+        let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        assert!(
+            ret >= 0,
+            "fcntl(F_SETFL, O_NONBLOCK) failed for fd {fd}: {}",
+            io::Error::last_os_error()
+        );
     }
 
     fn write_datagram(fd: RawFd, data: &[u8]) {
@@ -351,9 +372,9 @@ mod tests {
         let mut batch = BatchDgram::new();
         let mut buf = vec![0u8; 128];
         let mut bufs: Vec<&mut [u8]> = vec![buf.as_mut_slice()];
-        let (entries, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+        let entries = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
 
-        assert_eq!(count, 1);
+        assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].len, payload.len());
         assert_eq!(&buf[..payload.len()], payload);
     }
@@ -370,9 +391,9 @@ mod tests {
         let mut buffers: Vec<Vec<u8>> = (0..10).map(|_| vec![0u8; 128]).collect();
         let mut bufs: Vec<&mut [u8]> = buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
 
-        let (entries, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+        let entries = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
 
-        assert_eq!(count, 10);
+        assert_eq!(entries.len(), 10);
         for i in 0..10u8 {
             assert_eq!(entries[i as usize].len, 64);
             assert_eq!(buffers[i as usize][0], i);
@@ -413,8 +434,8 @@ mod tests {
         let mut recv_bufs: Vec<&mut [u8]> =
             recv_buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
 
-        let (entries, count) = batch.recv_batch(b.as_raw_fd(), &mut recv_bufs).unwrap();
-        assert_eq!(count, 20);
+        let entries = batch.recv_batch(b.as_raw_fd(), &mut recv_bufs).unwrap();
+        assert_eq!(entries.len(), 20);
         for i in 0..20u8 {
             assert_eq!(entries[i as usize].len, 200);
             assert_eq!(recv_buffers[i as usize][0], i);
@@ -429,8 +450,8 @@ mod tests {
         let mut buf = vec![0u8; 128];
         let mut bufs: Vec<&mut [u8]> = vec![buf.as_mut_slice()];
 
-        let (_, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
-        assert_eq!(count, 0);
+        let err = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]
@@ -445,8 +466,8 @@ mod tests {
         let mut buffers: Vec<Vec<u8>> = (0..10).map(|_| vec![0u8; 128]).collect();
         let mut bufs: Vec<&mut [u8]> = buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
 
-        let (entries, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
-        assert_eq!(count, 3);
+        let entries = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+        assert_eq!(entries.len(), 3);
         for entry in entries.iter().take(3) {
             assert_eq!(entry.len, 50);
         }
@@ -462,8 +483,8 @@ mod tests {
         let mut buf = vec![0u8; 128];
         let mut bufs: Vec<&mut [u8]> = vec![buf.as_mut_slice()];
 
-        let (entries, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
-        assert_eq!(count, 1);
+        let entries = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+        assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].len, 0);
     }
 
@@ -475,8 +496,8 @@ mod tests {
         let mut bufs: Vec<&mut [u8]> = buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
 
         let mut batch = BatchDgram::new();
-        let (_, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
-        assert_eq!(count, 0);
+        let err = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]
@@ -493,8 +514,8 @@ mod tests {
         let mut buffers: Vec<Vec<u8>> = (0..4).map(|_| vec![0u8; 8192]).collect();
         let mut bufs: Vec<&mut [u8]> = buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
 
-        let (entries, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
-        assert_eq!(count, 4);
+        let entries = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+        assert_eq!(entries.len(), 4);
         for (i, &size) in sizes.iter().enumerate() {
             assert_eq!(entries[i].len, size, "datagram {i} size mismatch");
         }
@@ -506,8 +527,8 @@ mod tests {
 
         let mut batch = BatchDgram::new();
         let mut bufs: Vec<&mut [u8]> = vec![];
-        let (_, count) = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
-        assert_eq!(count, 0);
+        let entries = batch.recv_batch(b.as_raw_fd(), &mut bufs).unwrap();
+        assert!(entries.is_empty());
 
         let send_bufs: Vec<&[u8]> = vec![];
         let sent = batch.send_batch(b.as_raw_fd(), &send_bufs).unwrap();
@@ -533,6 +554,9 @@ mod tests {
                     match batch.send_batch(fd_a, &bufs) {
                         Ok(n) if n > 0 => break,
                         Ok(_) => std::thread::yield_now(),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::yield_now();
+                        }
                         Err(e) => panic!("send error: {e}"),
                     }
                 }
@@ -547,11 +571,14 @@ mod tests {
                 let mut bufs: Vec<&mut [u8]> =
                     buffers.iter_mut().map(|b| b.as_mut_slice()).collect();
                 match batch.recv_batch(fd_b, &mut bufs) {
-                    Ok((_, count)) => {
-                        if count == 0 {
+                    Ok(entries) => {
+                        if entries.is_empty() {
                             std::thread::yield_now();
                         }
-                        received += count;
+                        received += entries.len();
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now();
                     }
                     Err(e) => panic!("recv error: {e}"),
                 }
