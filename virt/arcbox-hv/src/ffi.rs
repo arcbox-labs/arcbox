@@ -83,6 +83,7 @@ pub const HV_REG_CPSR: u32 = 34;
 // Encoding: (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2
 // ---------------------------------------------------------------------------
 
+pub const HV_SYS_REG_MPIDR_EL1: u16 = 0xc005;
 pub const HV_SYS_REG_SCTLR_EL1: u16 = 0xc080;
 pub const HV_SYS_REG_TTBR0_EL1: u16 = 0xc100;
 pub const HV_SYS_REG_TTBR1_EL1: u16 = 0xc108;
@@ -190,18 +191,38 @@ unsafe extern "C" {
 // GICv3 APIs (macOS 15+). Gated behind the `gic` cargo feature because
 // they require a macOS 15+ SDK to link. Without the feature, the rest
 // of the crate (VM, vCPU, memory, exit parsing) compiles on macOS 11+.
+//
+// Xcode 26 SDK changed the GIC API: the VMM now explicitly sets
+// distributor/redistributor base addresses via a config object instead
+// of the framework choosing them.
 #[cfg(feature = "gic")]
 #[link(name = "Hypervisor", kind = "framework")]
 unsafe extern "C" {
+    // --- Config-based creation (Xcode 26 / macOS 15+) ---
+    pub fn hv_gic_config_create() -> *mut c_void; // Returns os_object (hv_gic_config_t)
+    pub fn hv_gic_config_set_distributor_base(
+        config: *mut c_void,
+        distributor_base: u64,
+    ) -> hv_return_t;
+    pub fn hv_gic_config_set_redistributor_base(
+        config: *mut c_void,
+        redistributor_base: u64,
+    ) -> hv_return_t;
+
     pub fn hv_gic_create(config: *mut c_void) -> hv_return_t;
     pub fn hv_gic_reset() -> hv_return_t;
     pub fn hv_gic_set_spi(intid: u32, level: bool) -> hv_return_t;
-    pub fn hv_gic_get_distributor_base(addr: *mut u64) -> hv_return_t;
-    pub fn hv_gic_get_distributor_size(size: *mut u64) -> hv_return_t;
+
+    // --- Size / alignment queries ---
+    pub fn hv_gic_get_distributor_size(size: *mut usize) -> hv_return_t;
+    pub fn hv_gic_get_distributor_base_alignment(alignment: *mut usize) -> hv_return_t;
     pub fn hv_gic_get_redistributor_base(vcpu: hv_vcpu_t, addr: *mut u64) -> hv_return_t;
-    pub fn hv_gic_get_redistributor_region_size(size: *mut u64) -> hv_return_t;
-    pub fn hv_gic_get_msi_region_base(addr: *mut u64) -> hv_return_t;
-    pub fn hv_gic_get_msi_region_size(size: *mut u64) -> hv_return_t;
-    pub fn hv_gic_get_state(data: *mut *mut c_void, size: *mut usize) -> hv_return_t;
+    pub fn hv_gic_get_redistributor_region_size(size: *mut usize) -> hv_return_t;
+    pub fn hv_gic_get_redistributor_size(size: *mut usize) -> hv_return_t;
+    pub fn hv_gic_get_msi_region_size(size: *mut usize) -> hv_return_t;
+    pub fn hv_gic_get_msi_region_base_alignment(alignment: *mut usize) -> hv_return_t;
+    pub fn hv_gic_get_spi_interrupt_range(base: *mut u32, count: *mut u32) -> hv_return_t;
+
+    // --- State save/restore ---
     pub fn hv_gic_set_state(data: *const c_void, size: usize) -> hv_return_t;
 }

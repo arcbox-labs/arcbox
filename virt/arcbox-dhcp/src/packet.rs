@@ -179,22 +179,18 @@ impl DhcpPacket {
             let option_data = &data[i + 2..i + 2 + option_len];
 
             match option_code {
-                53 => {
+                53 if !option_data.is_empty() => {
                     // DHCP Message Type
-                    if !option_data.is_empty() {
-                        packet.message_type = DhcpMessageType::try_from(option_data[0]).ok();
-                    }
+                    packet.message_type = DhcpMessageType::try_from(option_data[0]).ok();
                 }
-                50 => {
+                50 if option_data.len() >= 4 => {
                     // Requested IP Address
-                    if option_data.len() >= 4 {
-                        packet.requested_ip = Some(Ipv4Addr::new(
-                            option_data[0],
-                            option_data[1],
-                            option_data[2],
-                            option_data[3],
-                        ));
-                    }
+                    packet.requested_ip = Some(Ipv4Addr::new(
+                        option_data[0],
+                        option_data[1],
+                        option_data[2],
+                        option_data[3],
+                    ));
                 }
                 12 => {
                     // Hostname

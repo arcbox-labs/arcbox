@@ -164,15 +164,13 @@ impl HostToolManager {
                 let path = self.install_dir.join(name);
                 sha256_file(&path)
                     .await
-                    .map(|actual| actual == expected_sha)
-                    .unwrap_or(false)
+                    .is_ok_and(|actual| actual == expected_sha)
             }
             ArtifactFormat::Tgz => {
                 let sidecar = self.install_dir.join(format!("{name}.sha256"));
                 tokio::fs::read_to_string(&sidecar)
                     .await
-                    .map(|content| content.trim() == expected_sha)
-                    .unwrap_or(false)
+                    .is_ok_and(|content| content.trim() == expected_sha)
             }
         }
     }

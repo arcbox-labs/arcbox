@@ -7,19 +7,19 @@
 //!     ↕ VirtIO (VZ framework)
 //! VZFileHandleNetworkDeviceAttachment
 //!     ↕ socketpair FD (L2 Ethernet frames)
-//! SmoltcpDevice (frame classification)
-//!     ├─ ARP           → smoltcp Interface (automatic handling)
-//!     ├─ TCP           → smoltcp Interface → tcp::Socket pool (Phase 2)
-//!     ├─ UDP:67 (DHCP) → DhcpServer → reply to guest
-//!     ├─ UDP:53 to gw  → DnsForwarder → reply to guest
-//!     ├─ UDP (other)   → UdpProxy → reply to guest
-//!     └─ ICMP          → IcmpProxy → reply to guest
+//! FrameClassifier (demultiplexes by protocol)
+//!     ├─ ARP            → ArpResponder
+//!     ├─ TCP SYN        → TcpBridge::handle_outbound_syn
+//!     ├─ TCP (live)     → TcpBridge fast path / handshake-complete
+//!     ├─ UDP:67 (DHCP)  → DhcpServer → reply to guest
+//!     ├─ UDP:53 to gw   → DnsForwarder → reply to guest
+//!     ├─ UDP (other)    → UdpProxy → reply to guest
+//!     └─ ICMP           → IcmpProxy → reply to guest
 //! ```
 //!
-//! The smoltcp `Interface` handles ARP automatically and will manage TCP
-//! connections via its socket pool (Phase 2). DHCP, DNS, UDP, and ICMP are
-//! intercepted at the `SmoltcpDevice` layer before reaching smoltcp and
-//! handled by the existing proxy modules.
+//! There is no userspace TCP state machine. All TCP handshake work is done
+//! by the in-shim `TcpBridge`; data frames flow via the fast path or the
+//! zero-copy inline inject thread.
 
 use std::collections::VecDeque;
 use std::io;
@@ -27,17 +27,15 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
-use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::wire::{EthernetAddress, IpCidr};
-
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::darwin::classifier::{FrameClassifier, InterceptedKind};
 use crate::darwin::inbound_relay::InboundCommand;
-use crate::darwin::smoltcp_device::{InterceptedKind, SmoltcpDevice};
 use crate::darwin::socket_proxy::SocketProxy;
 use crate::darwin::tcp_bridge::TcpBridge;
+use crate::datapath::FrameBuf;
 use crate::dhcp::DhcpServer;
 use crate::dns::DnsForwarder;
 use crate::ethernet::{ETH_HEADER_LEN, build_udp_ip_ethernet};
@@ -46,11 +44,6 @@ use crate::ethernet::{ETH_HEADER_LEN, build_udp_ip_ethernet};
 /// unbounded memory growth when the guest FD is blocked (VM paused, VZ socket
 /// buffer full). Increased from 2048 to 8192 to match 8 MB socket buffers.
 const WRITE_QUEUE_HARD_CAP: usize = 8192;
-
-/// smoltcp poll interval. Controls how often the TCP/IP stack is polled for
-/// retransmissions, ARP cache aging, and connection state transitions.
-/// Reduced from 250ms (4 Hz) to 50ms (20 Hz) for faster window updates.
-const SMOLTCP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Wraps an `OwnedFd` so it can be registered with `AsyncFd`.
 struct FdWrapper(OwnedFd);
@@ -61,10 +54,12 @@ impl AsRawFd for FdWrapper {
     }
 }
 
-/// Async network datapath bridging guest ↔ host through smoltcp + socket proxying.
+/// Async network datapath bridging guest ↔ host via `FrameClassifier`
+/// demultiplexing and socket proxying.
 ///
-/// smoltcp handles ARP and TCP (Phase 2). DHCP, DNS, UDP, and ICMP are
-/// intercepted before reaching smoltcp and handled by existing proxy modules.
+/// `FrameClassifier` routes ARP (inline reply) and TCP (fast-path /
+/// handshake drains). DHCP, DNS, UDP, and ICMP are intercepted and handled
+/// by the corresponding proxy modules.
 pub struct NetworkDatapath {
     /// Host end of the socketpair (guest L2 Ethernet frames).
     pub guest_fd: OwnedFd,
@@ -84,10 +79,20 @@ pub struct NetworkDatapath {
     pub gateway_mac: [u8; 6],
     /// Gateway IP address.
     pub gateway_ip: Ipv4Addr,
-    /// Guest IP address (for inbound TCP connections via smoltcp).
+    /// Guest IP address (for inbound TCP connections).
     pub guest_ip: Ipv4Addr,
     /// Cancellation token for graceful shutdown.
     pub cancel: CancellationToken,
+    /// Negotiated MTU (from VZ `setMaximumTransmissionUnit:` result).
+    pub mtu: usize,
+    /// Frame sink for host-to-guest RX injection. When set, all frames
+    /// destined for the guest go through this sink (to the inject thread)
+    /// instead of the socketpair write_queue.
+    pub frame_sink: Option<std::sync::Arc<dyn crate::direct_rx::FrameSink>>,
+    /// Connection sink for promoted fast-path TCP connections. When set,
+    /// `TcpBridge` can send promoted connections to the RX inject thread
+    /// for inline (zero-copy) host→guest data transfer.
+    pub conn_sink: Option<std::sync::Arc<dyn crate::direct_rx::ConnSink>>,
 }
 
 impl NetworkDatapath {
@@ -108,6 +113,7 @@ impl NetworkDatapath {
         guest_ip: Ipv4Addr,
         gateway_mac: [u8; 6],
         cancel: CancellationToken,
+        mtu: usize,
     ) -> Self {
         Self {
             guest_fd,
@@ -121,7 +127,26 @@ impl NetworkDatapath {
             gateway_ip,
             guest_ip,
             cancel,
+            mtu,
+            frame_sink: None,
+            conn_sink: None,
         }
+    }
+
+    /// Attaches a frame sink for host-to-guest RX injection.
+    ///
+    /// When set, frames are delivered through the sink (typically a crossbeam
+    /// channel to the RX inject thread) instead of the socketpair write path.
+    pub fn set_frame_sink(&mut self, sink: std::sync::Arc<dyn crate::direct_rx::FrameSink>) {
+        self.frame_sink = Some(sink);
+    }
+
+    /// Attaches a connection sink for promoted fast-path TCP connections.
+    ///
+    /// When set, `TcpBridge` can send promoted connections to the RX inject
+    /// thread for inline (zero-copy) host-to-guest data transfer.
+    pub fn set_conn_sink(&mut self, sink: std::sync::Arc<dyn crate::direct_rx::ConnSink>) {
+        self.conn_sink = Some(sink);
     }
 
     /// Runs the event loop until the cancellation token fires.
@@ -145,43 +170,34 @@ impl NetworkDatapath {
             gateway_ip,
             guest_ip,
             cancel,
+            mtu,
+            frame_sink,
+            conn_sink,
         } = self;
 
         // Set guest_fd to non-blocking for AsyncFd.
         set_nonblocking(guest_fd.as_raw_fd())?;
 
-        // Create the smoltcp device wrapping the guest socketpair FD.
-        let mut device = SmoltcpDevice::new(guest_fd.as_raw_fd(), gateway_ip);
+        // Create the frame classifier wrapping the guest socketpair FD.
+        let mut device = FrameClassifier::new(guest_fd.as_raw_fd(), gateway_ip, mtu);
+        device.set_gateway_mac(gateway_mac);
 
-        // Create the smoltcp Interface with the gateway's MAC and IP.
-        let hw_addr = EthernetAddress(gateway_mac);
-        let config = Config::new(hw_addr.into());
-        let mut iface = Interface::new(config, &mut device, smoltcp::time::Instant::now());
-
-        // Configure the interface with the gateway IP address.
-        iface.update_ip_addrs(|addrs| {
-            addrs
-                .push(IpCidr::new(gateway_ip.into(), 24))
-                .expect("failed to add gateway IP to smoltcp interface");
-        });
-
-        // Enable any_ip so smoltcp accepts packets to any destination IP,
-        // which is required for the TCP listen pool.
-        iface.set_any_ip(true);
-
-        // Default route via gateway_ip (self).  smoltcp's any_ip acceptance
-        // check requires `has_ip_addr(next_hop)` to be true, so the route
-        // MUST point to an interface-owned address.
-        iface
-            .routes_mut()
-            .add_default_ipv4_route(gateway_ip)
-            .expect("failed to add default route to smoltcp interface");
-
-        // Create socket set (TCP sockets added dynamically by TcpBridge).
-        let mut sockets = SocketSet::new(vec![]);
-
-        // TCP bridge: manages smoltcp TCP socket pool and host connections.
+        // TCP shim: handshake synthesizer + fast-path data plane.
         let mut tcp_bridge = TcpBridge::new(gateway_ip);
+
+        // Enable large frame mode when using the channel-based FrameSink
+        // (no socketpair 2048-byte datagram limit). This sends entire
+        // read buffers (up to 32KB) as single frames, reducing per-frame
+        // overhead by 10-30x.
+        if frame_sink.is_some() {
+            tcp_bridge.enable_large_frames();
+        }
+
+        // Attach connection sink so promoted fast-path connections can be
+        // forwarded to the RX inject thread for inline transfer.
+        if let Some(ref sink) = conn_sink {
+            tcp_bridge.set_conn_sink(sink.clone());
+        }
 
         // Enable proxy-aware connections: detect host VPN/proxy environment
         // and share the DNS resolution log so TcpBridge can map IPs to domains.
@@ -197,7 +213,7 @@ impl NetworkDatapath {
 
         // Write queue: buffers frames that couldn't be written to the guest FD
         // due to EWOULDBLOCK. Drained when the FD becomes writable again.
-        let mut write_queue: VecDeque<Vec<u8>> = VecDeque::new();
+        let mut write_queue: VecDeque<FrameBuf> = VecDeque::new();
 
         // Unified timer wheel for flow timeout management (1s tick).
         // Replaces per-flow tokio::time::timeout() objects with a single
@@ -211,11 +227,7 @@ impl NetworkDatapath {
         let mut maintenance = tokio::time::interval(Duration::from_secs(30));
         maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // smoltcp poll timer: drives retransmissions and ARP cache expiry.
-        let mut smoltcp_timer = tokio::time::interval(SMOLTCP_POLL_INTERVAL);
-        smoltcp_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        tracing::info!("Network datapath started (smoltcp + socket proxy mode)");
+        tracing::info!("Network datapath started (TCP shim + socket proxy mode)");
 
         loop {
             let has_pending = !write_queue.is_empty();
@@ -265,18 +277,50 @@ impl NetworkDatapath {
                     // spinning on the biased readable arm.
                     guard.clear_ready();
 
-                    // Seed smoltcp neighbor cache as soon as guest MAC is learned.
+                    // Record guest MAC the first time we see it so outbound
+                    // shim-built frames carry the correct Ethernet destination.
                     if prev_mac.is_none() {
                         if let Some(gmac) = guest_mac {
-                            device.seed_gateway_neighbor(gateway_ip, gateway_mac, gmac);
+                            tcp_bridge.set_fast_path_macs(gateway_mac, gmac);
                         }
                     }
+
+                    // Fast-path intercept: extract TCP data frames for established
+                    // fast-path connections and synthesize ACKs inline.
+                    let fast_acks = device.drain_fast_path(|frame_data| {
+                        tcp_bridge.try_fast_path_intercept(frame_data)
+                    });
+                    for ack in fast_acks {
+                        send_to_guest(frame_sink.as_ref(), &guest_async, &ack, &mut write_queue);
+                    }
+
+                    // Handshake intercept: complete in-progress shim handshakes
+                    // (guest ACK → PassiveOpen promotion, guest SYN-ACK →
+                    // ActiveOpen promotion). Frames that match are consumed
+                    // here.
+                    let hs_replies = device.drain_handshake(|frame_data| {
+                        tcp_bridge.try_complete_handshake(frame_data)
+                    });
+                    for reply in hs_replies {
+                        send_to_guest(frame_sink.as_ref(), &guest_async, &reply, &mut write_queue);
+                    }
+
+                    // Flush ARP replies produced inline by the classifier.
+                    for reply in device.take_arp_replies() {
+                        send_to_guest(frame_sink.as_ref(), &guest_async, &reply, &mut write_queue);
+                    }
+
+                    // Discard any TCP frames left in the rx queue that didn't
+                    // match a fast-path or handshake entry — there is no
+                    // userspace TCP stack to consume them.
+                    device.clear_unmatched_rx();
 
                     // Process intercepted frames (DHCP, DNS, UDP, ICMP).
                     let intercepted = device.take_intercepted();
                     for intercepted_frame in &intercepted {
                         handle_intercepted_frame(
                             intercepted_frame,
+                            frame_sink.as_ref(),
                             &guest_async,
                             &mut write_queue,
                             &mut socket_proxy,
@@ -291,13 +335,15 @@ impl NetworkDatapath {
                         );
                     }
 
-                    // Gate TCP SYN frames: start host connect, hold SYN
-                    // until connect completes.
+                    // New outbound SYNs: route to the hand-rolled handshake
+                    // synthesizer. The shim owns this path end-to-end and
+                    // emits the SYN-ACK via poll_handshakes once the async
+                    // host connect resolves.
                     let gated_syns = device.take_gated_syns();
-                    if !gated_syns.is_empty() {
-                        let rst_frames = tcp_bridge.gate_syns(&gated_syns, gateway_mac);
-                        for rst in rst_frames {
-                            enqueue_or_write(&guest_async, rst, &mut write_queue);
+                    let gmac = guest_mac.unwrap_or([0xFF; 6]);
+                    for syn in &gated_syns {
+                        if let Some(rst) = tcp_bridge.handle_outbound_syn(&syn.frame, gateway_mac, gmac) {
+                            send_to_guest(frame_sink.as_ref(), &guest_async, &rst, &mut write_queue);
                         }
                     }
 
@@ -307,7 +353,7 @@ impl NetworkDatapath {
                 // Always poll — the bounded channel (256) provides natural backpressure
                 // to spawned tasks. Gating on write_queue depth starved DNS replies.
                 Some(reply_frame) = reply_rx.recv() => {
-                    enqueue_or_write(&guest_async, reply_frame, &mut write_queue);
+                    send_to_guest(frame_sink.as_ref(), &guest_async, &reply_frame, &mut write_queue);
                 }
 
                 // Inbound commands from InboundListenerManager.
@@ -316,18 +362,11 @@ impl NetworkDatapath {
                         cmd,
                         &mut tcp_bridge,
                         &mut socket_proxy,
-                        &mut iface,
-                        &mut sockets,
                         guest_ip,
                         gateway_ip,
                         guest_mac,
                     );
                 }
-
-                // Wakeup when no other events: drives retransmissions during
-                // idle periods. Under load, the readable arm triggers smoltcp
-                // poll via the common tail below.
-                _ = smoltcp_timer.tick() => {}
 
                 // Periodic maintenance.
                 _ = timer_wheel_tick.tick() => {
@@ -358,23 +397,19 @@ impl NetworkDatapath {
 
                 _ = maintenance.tick() => {
                     socket_proxy.maintenance();
-                    // Refresh the gateway → guest_mac neighbor cache entry
-                    // before it expires (ENTRY_LIFETIME = 60s, tick = 30s).
-                    if let Some(gmac) = guest_mac {
-                        device.seed_gateway_neighbor(gateway_ip, gateway_mac, gmac);
-                    }
                 }
             }
 
             // ── Common tail: run on every iteration regardless of which
-            //    branch fired. This ensures smoltcp retransmissions,
+            //    branch fired. This ensures handshake retransmissions,
             //    tcp_bridge relay, and frame flushing are never starved.
 
-            // 1. Poll pending SYN gate entries — may inject SYN frames into
-            //    device rx_queue and create listen sockets, or produce RST frames.
-            let rst_frames = tcp_bridge.poll_pending_syns(&mut device, &mut sockets, gateway_mac);
-            for rst in rst_frames {
-                enqueue_or_write(&guest_async, rst, &mut write_queue);
+            // 1. Drive the hand-rolled handshake synthesizer. Emits SYN-ACKs
+            //    when host connects complete (PassiveOpen), SYNs for
+            //    active-open (ActiveOpen), and retransmits under loss.
+            let hs_frames = tcp_bridge.poll_handshakes();
+            for frame in hs_frames {
+                send_to_guest(frame_sink.as_ref(), &guest_async, &frame, &mut write_queue);
             }
 
             // 1.5. Drain inbound listener commands so `cmd_rx.recv()` cannot be
@@ -383,32 +418,23 @@ impl NetworkDatapath {
                 &mut cmd_rx,
                 &mut tcp_bridge,
                 &mut socket_proxy,
-                &mut iface,
-                &mut sockets,
                 guest_ip,
                 gateway_ip,
                 guest_mac,
             );
 
-            // 2. smoltcp poll: processes injected SYN frames (from gate) +
-            //    retransmissions + ACKs.
-            let ts = smoltcp::time::Instant::now();
-            iface.poll(ts, &mut device, &mut sockets);
-
-            // 3. tcp_bridge relay: detect new connections, relay data,
-            //    cleanup closed.
-            tcp_bridge.poll(&mut sockets);
-
-            // 4. Re-poll to flush data pushed by tcp_bridge into TCP segments.
-            let ts = smoltcp::time::Instant::now();
-            iface.poll(ts, &mut device, &mut sockets);
-
-            // 5. Flush TX frames to guest.
-            for frame in device.take_tx_pending() {
-                enqueue_or_write(&guest_async, frame, &mut write_queue);
+            // 2. Poll fast-path host streams for inbound data and inject
+            //    constructed frames directly to guest.
+            for frame in tcp_bridge.poll_fast_path() {
+                send_to_guest(frame_sink.as_ref(), &guest_async, &frame, &mut write_queue);
             }
 
-            drain_reply_rx(&mut reply_rx, &guest_async, &mut write_queue);
+            drain_reply_rx(
+                &mut reply_rx,
+                frame_sink.as_ref(),
+                &guest_async,
+                &mut write_queue,
+            );
 
             // Yield to the tokio runtime so spawned tasks (e.g. host relay
             // read/write) get a chance to run on this worker thread. Without
@@ -428,9 +454,10 @@ impl NetworkDatapath {
 /// Dispatches an intercepted frame to the appropriate handler.
 #[allow(clippy::too_many_arguments)]
 fn handle_intercepted_frame(
-    intercepted: &crate::darwin::smoltcp_device::InterceptedFrame,
+    intercepted: &crate::darwin::classifier::InterceptedFrame,
+    frame_sink: Option<&std::sync::Arc<dyn crate::direct_rx::FrameSink>>,
     guest_async: &AsyncFd<FdWrapper>,
-    write_queue: &mut VecDeque<Vec<u8>>,
+    write_queue: &mut VecDeque<FrameBuf>,
     socket_proxy: &mut SocketProxy,
     dhcp_server: &mut DhcpServer,
     dns_forwarder: &DnsForwarder,
@@ -446,6 +473,7 @@ fn handle_intercepted_frame(
         InterceptedKind::Dhcp => {
             handle_dhcp(
                 frame,
+                frame_sink,
                 guest_async,
                 write_queue,
                 dhcp_server,
@@ -475,15 +503,12 @@ fn handle_intercepted_frame(
 
 /// Processes one inbound command from `InboundListenerManager`.
 ///
-/// TCP accepted streams are bridged via smoltcp active-connect; UDP datagrams
-/// are routed through the socket proxy inbound path.
-#[allow(clippy::too_many_arguments)]
+/// TCP accepted streams are registered with the handshake synthesizer; UDP
+/// datagrams are routed through the socket proxy inbound path.
 fn process_inbound_cmd(
     cmd: InboundCommand,
     tcp_bridge: &mut TcpBridge,
     socket_proxy: &mut SocketProxy,
-    iface: &mut Interface,
-    sockets: &mut SocketSet<'_>,
     guest_ip: Ipv4Addr,
     gateway_ip: Ipv4Addr,
     guest_mac: Option<[u8; 6]>,
@@ -497,7 +522,7 @@ fn process_inbound_cmd(
                 host_port,
                 stream.peer_addr().ok(),
             );
-            tcp_bridge.initiate_inbound(host_port, stream, guest_ip, gateway_ip, iface, sockets);
+            tcp_bridge.initiate_inbound(host_port, stream, guest_ip, gateway_ip);
         }
         cmd @ InboundCommand::UdpReceived { .. } => {
             let mac = guest_mac.unwrap_or([0xFF; 6]);
@@ -507,10 +532,12 @@ fn process_inbound_cmd(
 }
 
 /// Handles a DHCP packet from the guest.
+#[allow(clippy::too_many_arguments)]
 fn handle_dhcp(
     frame: &[u8],
+    frame_sink: Option<&std::sync::Arc<dyn crate::direct_rx::FrameSink>>,
     guest_async: &AsyncFd<FdWrapper>,
-    write_queue: &mut VecDeque<Vec<u8>>,
+    write_queue: &mut VecDeque<FrameBuf>,
     dhcp_server: &mut DhcpServer,
     gateway_ip: Ipv4Addr,
     gateway_mac: [u8; 6],
@@ -539,7 +566,7 @@ fn handle_dhcp(
                 guest_mac,
             );
             tracing::info!("Sending DHCP reply frame: {} bytes", reply_frame.len());
-            enqueue_or_write(guest_async, reply_frame, write_queue);
+            send_to_guest(frame_sink, guest_async, &reply_frame, write_queue);
         }
         Ok(None) => {
             tracing::info!("DHCP: no response needed");
@@ -759,12 +786,15 @@ const DRAIN_CMD_BATCH: usize = 64;
 /// `select!` branches.
 fn drain_reply_rx(
     reply_rx: &mut mpsc::Receiver<Vec<u8>>,
+    frame_sink: Option<&std::sync::Arc<dyn crate::direct_rx::FrameSink>>,
     guest_async: &AsyncFd<FdWrapper>,
-    write_queue: &mut VecDeque<Vec<u8>>,
+    write_queue: &mut VecDeque<FrameBuf>,
 ) {
     for _ in 0..DRAIN_REPLY_BATCH {
         match reply_rx.try_recv() {
-            Ok(reply_frame) => enqueue_or_write(guest_async, reply_frame, write_queue),
+            Ok(reply_frame) => {
+                send_to_guest(frame_sink, guest_async, &reply_frame, write_queue);
+            }
             Err(_) => break,
         }
     }
@@ -774,13 +804,10 @@ fn drain_reply_rx(
 ///
 /// Prevents starvation of `cmd_rx.recv()` in the biased `select!` loop when
 /// the guest FD readable branch is continuously ready.
-#[allow(clippy::too_many_arguments)]
 fn drain_cmd_rx(
     cmd_rx: &mut mpsc::Receiver<InboundCommand>,
     tcp_bridge: &mut TcpBridge,
     socket_proxy: &mut SocketProxy,
-    iface: &mut Interface,
-    sockets: &mut SocketSet<'_>,
     guest_ip: Ipv4Addr,
     gateway_ip: Ipv4Addr,
     guest_mac: Option<[u8; 6]>,
@@ -791,8 +818,6 @@ fn drain_cmd_rx(
                 cmd,
                 tcp_bridge,
                 socket_proxy,
-                iface,
-                sockets,
                 guest_ip,
                 gateway_ip,
                 guest_mac,
@@ -802,14 +827,39 @@ fn drain_cmd_rx(
     }
 }
 
+/// Sends a frame to the guest via the frame sink (if present) or falls
+/// back to the socketpair write path.
+///
+/// When `frame_sink` is `Some`, the frame is sent through the crossbeam
+/// channel to the RX injection thread, bypassing the socketpair entirely.
+/// When `None`, falls back to `enqueue_or_write` for VZ-backend or
+/// early-boot compatibility.
+fn send_to_guest(
+    frame_sink: Option<&std::sync::Arc<dyn crate::direct_rx::FrameSink>>,
+    guest_async: &AsyncFd<FdWrapper>,
+    frame_data: &[u8],
+    write_queue: &mut VecDeque<FrameBuf>,
+) {
+    if let Some(sink) = frame_sink {
+        let _ = sink.send(frame_data.to_vec());
+        return;
+    }
+    // Fallback: socketpair (VZ backend or during early boot).
+    enqueue_or_write(
+        guest_async,
+        FrameBuf::from(frame_data.to_vec()),
+        write_queue,
+    );
+}
+
 /// Attempts a direct non-blocking write; queues the frame on `WouldBlock`.
 ///
 /// If the write queue is non-empty, the frame is appended directly to
 /// preserve ordering.
 fn enqueue_or_write(
     guest_async: &AsyncFd<FdWrapper>,
-    frame: Vec<u8>,
-    write_queue: &mut VecDeque<Vec<u8>>,
+    frame: FrameBuf,
+    write_queue: &mut VecDeque<FrameBuf>,
 ) {
     if !write_queue.is_empty() {
         if write_queue.len() < WRITE_QUEUE_HARD_CAP {
@@ -973,14 +1023,18 @@ mod tests {
         let guest_async = AsyncFd::new(FdWrapper(a)).unwrap();
 
         let mut queue = VecDeque::new();
-        let frame = b"direct write frame".to_vec();
-        enqueue_or_write(&guest_async, frame.clone(), &mut queue);
+        let frame_data = b"direct write frame";
+        enqueue_or_write(
+            &guest_async,
+            FrameBuf::from(frame_data.to_vec()),
+            &mut queue,
+        );
 
         assert!(queue.is_empty(), "Queue should be empty after direct write");
 
         let mut buf = [0u8; 128];
         let n = fd_read(b.as_raw_fd(), &mut buf).unwrap();
-        assert_eq!(&buf[..n], frame.as_slice());
+        assert_eq!(&buf[..n], frame_data.as_slice());
     }
 
     #[tokio::test]
@@ -989,14 +1043,17 @@ mod tests {
         set_nonblocking(a.as_raw_fd()).unwrap();
         let guest_async = AsyncFd::new(FdWrapper(a)).unwrap();
 
-        let mut queue = VecDeque::new();
-        queue.push_back(b"already queued".to_vec());
+        let mut queue: VecDeque<FrameBuf> = VecDeque::new();
+        queue.push_back(FrameBuf::from(b"already queued".to_vec()));
 
-        let frame = b"new frame".to_vec();
-        enqueue_or_write(&guest_async, frame.clone(), &mut queue);
+        enqueue_or_write(
+            &guest_async,
+            FrameBuf::from(b"new frame".to_vec()),
+            &mut queue,
+        );
 
         assert_eq!(queue.len(), 2);
-        assert_eq!(queue[1], frame);
+        assert_eq!(&queue[1][..], b"new frame");
     }
 
     #[test]
@@ -1023,65 +1080,5 @@ mod tests {
         assert_eq!(&response[8..10], &0u16.to_be_bytes()); // NSCOUNT=0
         assert_eq!(&response[10..12], &0u16.to_be_bytes()); // ARCOUNT=0
         assert_eq!(&response[12..], &query[12..]); // Question echoed
-    }
-
-    #[test]
-    fn test_smoltcp_arp_response() {
-        let (host_fd, guest_fd) = socketpair();
-        set_nonblocking(host_fd.as_raw_fd()).unwrap();
-
-        let gateway_ip = Ipv4Addr::new(10, 0, 2, 1);
-        let gateway_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-        let guest_mac_addr = [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
-
-        // Create smoltcp device and interface.
-        let mut device = SmoltcpDevice::new(host_fd.as_raw_fd(), gateway_ip);
-        let hw_addr = EthernetAddress(gateway_mac);
-        let config = Config::new(hw_addr.into());
-        let mut iface = Interface::new(config, &mut device, smoltcp::time::Instant::now());
-        iface.update_ip_addrs(|addrs| {
-            addrs.push(IpCidr::new(gateway_ip.into(), 24)).unwrap();
-        });
-        let mut sockets = SocketSet::new(vec![]);
-
-        // Build an ARP request: "Who has 10.0.2.1? Tell 10.0.2.2"
-        let mut arp_request = Vec::with_capacity(42);
-        arp_request.extend_from_slice(&[0xFF; 6]); // dst=broadcast
-        arp_request.extend_from_slice(&guest_mac_addr); // src=guest
-        arp_request.extend_from_slice(&[0x08, 0x06]); // ARP
-        arp_request.extend_from_slice(&[0x00, 0x01]); // HW: Ethernet
-        arp_request.extend_from_slice(&[0x08, 0x00]); // Proto: IPv4
-        arp_request.push(6); // HLEN
-        arp_request.push(4); // PLEN
-        arp_request.extend_from_slice(&[0x00, 0x01]); // Op: Request
-        arp_request.extend_from_slice(&guest_mac_addr); // Sender MAC
-        arp_request.extend_from_slice(&[10, 0, 2, 2]); // Sender IP
-        arp_request.extend_from_slice(&[0x00; 6]); // Target MAC
-        arp_request.extend_from_slice(&[10, 0, 2, 1]); // Target IP
-
-        // Inject the ARP request directly into the device's rx_queue
-        // (bypassing the FD, which is tested separately in smoltcp_device tests).
-        device.inject_rx(arp_request);
-
-        let ts = smoltcp::time::Instant::now();
-        iface.poll(ts, &mut device, &mut sockets);
-
-        // smoltcp should generate an ARP reply.
-        let tx_frames = device.take_tx_pending();
-        assert!(
-            !tx_frames.is_empty(),
-            "smoltcp should generate an ARP reply"
-        );
-
-        let reply = &tx_frames[0];
-        assert!(reply.len() >= 42, "ARP reply should be at least 42 bytes");
-        assert_eq!(&reply[12..14], &[0x08, 0x06], "EtherType should be ARP");
-        assert_eq!(&reply[20..22], &[0x00, 0x02], "ARP opcode should be Reply");
-        assert_eq!(&reply[22..28], &gateway_mac, "Sender MAC should be gateway");
-        assert_eq!(
-            &reply[28..32],
-            &[10, 0, 2, 1],
-            "Sender IP should be gateway"
-        );
     }
 }

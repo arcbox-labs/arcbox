@@ -154,9 +154,10 @@ mod lifecycle {
         let start = Instant::now();
 
         while !completed.load(Ordering::SeqCst) {
-            if start.elapsed() > timeout {
-                panic!("vCPU run() did not complete within timeout");
-            }
+            assert!(
+                start.elapsed() <= timeout,
+                "vCPU run() did not complete within timeout"
+            );
             thread::sleep(Duration::from_millis(10));
         }
 
@@ -500,7 +501,8 @@ mod with_kernel {
 
         let _ = vcpu_handle.join();
 
-        if let Some(exit) = vcpu_exit.lock().unwrap().take() {
+        let value = vcpu_exit.lock().unwrap().take();
+        if let Some(exit) = value {
             println!("Final vCPU exit: {:?}", exit);
         }
 

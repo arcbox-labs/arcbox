@@ -148,7 +148,7 @@ async fn execute_setup_json(
             let (phase, downloaded_bytes, total_bytes, percent) = match &p.phase {
                 arcbox_asset::PreparePhase::Checking => ("checking", None, None, None),
                 arcbox_asset::PreparePhase::Downloading { downloaded, total } => {
-                    let pct = total.map(|t| if t > 0 { downloaded * 100 / t } else { 0 });
+                    let pct = total.map(|t| (downloaded * 100).checked_div(t).unwrap_or(0));
                     ("downloading", Some(*downloaded), *total, pct)
                 }
                 arcbox_asset::PreparePhase::Verifying => ("verifying", None, None, None),
@@ -210,9 +210,7 @@ async fn execute_setup_table(
                 eprint!("  [{}/{}] {} checking...", p.current, p.total, p.name);
             }
             arcbox_asset::PreparePhase::Downloading { downloaded, total } => {
-                let pct = total
-                    .map(|t| if t > 0 { downloaded * 100 / t } else { 0 })
-                    .unwrap_or(0);
+                let pct = total.map_or(0, |t| (downloaded * 100).checked_div(t).unwrap_or(0));
                 eprint!(
                     "\r  [{}/{}] {} downloading... {}%",
                     p.current, p.total, p.name, pct

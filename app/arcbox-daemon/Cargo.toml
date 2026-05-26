@@ -44,8 +44,9 @@ macos-resolver = { workspace = true }
 libproc = { workspace = true }
 
 [features]
-default = []
+default = ["gic"]
 vmnet = ["arcbox-core/vmnet"]
+gic = ["arcbox-core/gic"]
 
 [lints]
 workspace = true

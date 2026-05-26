@@ -1,0 +1,17 @@
+[package]
+name = "arcbox-virtio-balloon"
+description = "VirtIO traditional memory balloon device for ArcBox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-virtio-core = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

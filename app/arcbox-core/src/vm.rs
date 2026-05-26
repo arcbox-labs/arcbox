@@ -289,7 +289,13 @@ impl VmManager {
                 })
                 .collect(),
             bridge_nic_mac: Some(bridge_nic_mac_for_vm_id(&entry.info.id)),
-            use_custom_vmm: false,
+            // HV is the default on this branch — VZ path has separate bugs
+            // around proxy/fake-IP datapath; HV path is the target for the
+            // hv-vz-parity work (ABX-360..363). `VmBackend::default()` is
+            // `Auto`, which still dispatches to VZ when rosetta is enabled
+            // (default on Apple Silicon), so force HV explicitly until the
+            // rosetta default is resolved.
+            backend: arcbox_vmm::VmBackend::Hv,
         }
     }
 
@@ -716,7 +722,7 @@ impl VmManager {
     #[must_use]
     pub fn list_vm_snapshots(&self, id: &VmId) -> Vec<SnapshotInfo> {
         let mut snapshots = self.snapshot_manager.list(id.as_str());
-        snapshots.sort_by(|a, b| b.created.cmp(&a.created));
+        snapshots.sort_by_key(|s| std::cmp::Reverse(s.created));
         snapshots
     }
 
@@ -747,7 +753,7 @@ impl VmManager {
             return Ok(Vec::new());
         }
 
-        snapshots.sort_by(|a, b| b.created.cmp(&a.created));
+        snapshots.sort_by_key(|s| std::cmp::Reverse(s.created));
 
         let mut deleted = Vec::new();
         for snapshot in snapshots.into_iter().skip(keep) {

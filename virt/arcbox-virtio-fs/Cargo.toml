@@ -1,0 +1,19 @@
+[package]
+name = "arcbox-virtio-fs"
+description = "VirtIO filesystem device (virtio-fs) implementation for ArcBox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-virtio-core = { workspace = true }
+bytes = { workspace = true }
+libc = { workspace = true }
+rayon = "1.11.0"
+tracing = { workspace = true }
+
+[lints]
+workspace = true

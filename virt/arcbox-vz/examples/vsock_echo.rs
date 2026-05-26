@@ -117,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while start.elapsed() < Duration::from_secs(5) {
             let mut buf = [0u8; 1024];
             // SAFETY: fd is a valid non-blocking file descriptor. buf is a valid write target.
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
             if n > 0 {
                 let s = String::from_utf8_lossy(&buf[..n as usize]);
                 output.push_str(&s);

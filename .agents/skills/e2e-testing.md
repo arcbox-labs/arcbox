@@ -76,7 +76,7 @@ make run-daemon
 ```
 INFO  Creating VMM: vcpus=4, memory=4096MB
 INFO  Added bridge NIC (VZNATNetworkDeviceAttachment) for L3 routing
-INFO  Network datapath started (smoltcp + socket proxy mode)
+INFO  Network datapath started (TCP shim + socket proxy mode)
 INFO  VMM started
 INFO  Learned guest MAC: xx:xx:xx:xx:xx:xx
 INFO  DHCP lease acquired  interface="eth0"
@@ -140,7 +140,7 @@ Two NICs on the VM:
 |-------|-------|-----|
 | Listener not bound | `lsof -i :8080` | Check `setup_port_forwarding` in container handler |
 | Wrong port connected | Log: RST-ACK (flags=0x14) | Confirm `initiate_inbound` uses host_port |
-| SYN not reaching guest | No TCP frame in log | Check smoltcp device tx_pending |
+| SYN not reaching guest | No TCP frame in log | Check classifier `take_gated_syns` and TcpBridge handshake path |
 
 ### Code changes not taking effect
 

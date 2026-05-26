@@ -60,17 +60,33 @@
 //!
 //! vm.run().await?;
 //! ```
+pub mod blk_worker;
 pub mod boot;
 pub mod builder;
+pub mod dax;
 pub mod device;
+// Intentionally not `pub` — only used by darwin_hv to spawn the worker.
 pub mod error;
 pub mod event;
 pub mod fdt;
 pub mod irq;
 pub mod memory;
+#[cfg(target_os = "macos")]
+pub(crate) mod net_rx_worker;
 pub mod snapshot;
 pub mod vcpu;
+pub(crate) mod virtqueue_util;
 pub mod vmm;
+/// Back-compat re-export of `arcbox_virtio::vsock_manager`.
+///
+/// The module moved to `arcbox-virtio` so that
+/// `VirtioVsock::poll_rx_injection` can reach `RxOps` /
+/// `VsockConnection` internals without `arcbox-virtio` depending on
+/// `arcbox-vmm`. Existing `crate::vsock_manager::*` imports continue
+/// to work via this shim.
+pub mod vsock_manager {
+    pub use arcbox_virtio::vsock_manager::*;
+}
 
 pub use boot::{BootParams, KernelLoader, KernelType};
 pub use builder::{VmBuilder, VmInstance};
@@ -82,4 +98,6 @@ pub use snapshot::{
     SnapshotTargetType, VmRestoreData, VmSnapshotContext,
 };
 pub use vcpu::{DeviceManagerExitHandler, ExitHandler, VcpuManager};
-pub use vmm::{SharedDirConfig, Vmm, VmmConfig, VmmState};
+pub use vmm::{
+    BlockDeviceConfig, ResolvedBackend, SharedDirConfig, VmBackend, Vmm, VmmConfig, VmmState,
+};

@@ -1,0 +1,961 @@
+//! `VirtIO` queue (virtqueue) implementation.
+//!
+//! This module provides the core virtqueue data structures used for
+//! communication between the guest driver and host device.
+
+use virtio_bindings::virtio_ring;
+
+use crate::error::{Result, VirtioError};
+
+/// VirtIO available ring flag: guest requests no interrupt on used buffer consumption.
+const VRING_AVAIL_F_NO_INTERRUPT: u16 = virtio_ring::VRING_AVAIL_F_NO_INTERRUPT as u16;
+
+/// VirtIO feature bit for event index-based notification suppression (VirtIO spec 2.7.7).
+pub const VIRTIO_F_EVENT_IDX: u64 = 1 << virtio_ring::VIRTIO_RING_F_EVENT_IDX;
+
+/// Descriptor flags sourced from `virtio_bindings::virtio_ring`.
+pub mod flags {
+    use super::virtio_ring;
+
+    /// Descriptor continues via next field.
+    pub const NEXT: u16 = virtio_ring::VRING_DESC_F_NEXT as u16;
+    /// Buffer is write-only (for device).
+    pub const WRITE: u16 = virtio_ring::VRING_DESC_F_WRITE as u16;
+    /// Buffer contains a list of descriptors.
+    pub const INDIRECT: u16 = virtio_ring::VRING_DESC_F_INDIRECT as u16;
+}
+
+/// A single descriptor in the descriptor table.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct Descriptor {
+    /// Guest physical address of the buffer.
+    pub addr: u64,
+    /// Length of the buffer.
+    pub len: u32,
+    /// Descriptor flags.
+    pub flags: u16,
+    /// Next descriptor index (if NEXT flag is set).
+    pub next: u16,
+}
+
+impl Descriptor {
+    /// Checks if this descriptor has the NEXT flag.
+    #[must_use]
+    pub const fn has_next(&self) -> bool {
+        self.flags & flags::NEXT != 0
+    }
+
+    /// Checks if this descriptor is write-only.
+    #[must_use]
+    pub const fn is_write_only(&self) -> bool {
+        self.flags & flags::WRITE != 0
+    }
+
+    /// Checks if this descriptor is indirect.
+    #[must_use]
+    pub const fn is_indirect(&self) -> bool {
+        self.flags & flags::INDIRECT != 0
+    }
+}
+
+/// Available ring structure.
+#[derive(Debug)]
+pub struct AvailRing {
+    /// Flags (e.g., no interrupt).
+    pub flags: u16,
+    /// Index of the next entry to add.
+    pub idx: u16,
+    /// Ring of descriptor indices.
+    pub ring: Vec<u16>,
+    /// Used event (for event suppression).
+    pub used_event: u16,
+}
+
+impl AvailRing {
+    /// Creates a new available ring.
+    #[must_use]
+    pub fn new(size: u16) -> Self {
+        Self {
+            flags: 0,
+            idx: 0,
+            ring: vec![0; size as usize],
+            used_event: 0,
+        }
+    }
+}
+
+/// Used ring element.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct UsedElement {
+    /// Descriptor chain head index.
+    pub id: u32,
+    /// Number of bytes written to the descriptor chain.
+    pub len: u32,
+}
+
+/// Used ring structure.
+#[derive(Debug)]
+pub struct UsedRing {
+    /// Flags (e.g., no notify).
+    pub flags: u16,
+    /// Index of the next entry to add.
+    pub idx: u16,
+    /// Ring of used elements.
+    pub ring: Vec<UsedElement>,
+    /// Avail event (for event suppression).
+    pub avail_event: u16,
+}
+
+impl UsedRing {
+    /// Creates a new used ring.
+    #[must_use]
+    pub fn new(size: u16) -> Self {
+        Self {
+            flags: 0,
+            idx: 0,
+            ring: vec![UsedElement::default(); size as usize],
+            avail_event: 0,
+        }
+    }
+}
+
+/// `VirtIO` queue implementation.
+#[derive(Debug)]
+pub struct VirtQueue {
+    /// Queue size (number of descriptors).
+    size: u16,
+    /// Descriptor table.
+    desc_table: Vec<Descriptor>,
+    /// Available ring.
+    avail: AvailRing,
+    /// Used ring.
+    used: UsedRing,
+    /// Last seen available index.
+    last_avail_idx: u16,
+    /// Whether the queue is ready.
+    ready: bool,
+    /// Whether EVENT_IDX feature is negotiated.
+    event_idx_enabled: bool,
+}
+
+impl VirtQueue {
+    /// Creates a new virtqueue with the given size.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the size is not a power of 2 or exceeds limits.
+    pub fn new(size: u16) -> Result<Self> {
+        if size == 0 || !size.is_power_of_two() {
+            return Err(VirtioError::InvalidQueue(
+                "size must be a power of 2".to_string(),
+            ));
+        }
+
+        if size > 32768 {
+            return Err(VirtioError::InvalidQueue(
+                "size must not exceed 32768".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            size,
+            desc_table: vec![Descriptor::default(); size as usize],
+            avail: AvailRing::new(size),
+            used: UsedRing::new(size),
+            last_avail_idx: 0,
+            ready: false,
+            event_idx_enabled: false,
+        })
+    }
+
+    /// Returns the queue size.
+    #[must_use]
+    pub const fn size(&self) -> u16 {
+        self.size
+    }
+
+    /// Returns whether the queue is ready.
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    /// Sets the queue ready state.
+    pub const fn set_ready(&mut self, ready: bool) {
+        self.ready = ready;
+    }
+
+    /// Updates a descriptor entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index is out of range.
+    pub fn set_descriptor(&mut self, idx: u16, descriptor: Descriptor) -> Result<()> {
+        if idx >= self.size {
+            return Err(VirtioError::InvalidQueue(
+                "descriptor index out of bounds".to_string(),
+            ));
+        }
+
+        self.desc_table[idx as usize] = descriptor;
+        Ok(())
+    }
+
+    /// Adds a descriptor chain head to the available ring.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the descriptor index is out of range.
+    pub fn add_avail(&mut self, head_idx: u16) -> Result<()> {
+        if head_idx >= self.size {
+            return Err(VirtioError::InvalidQueue(
+                "available index out of bounds".to_string(),
+            ));
+        }
+
+        let ring_idx = (self.avail.idx % self.size) as usize;
+        self.avail.ring[ring_idx] = head_idx;
+        self.avail.idx = self.avail.idx.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Checks if there are available descriptors.
+    #[must_use]
+    pub const fn has_available(&self) -> bool {
+        self.avail.idx != self.last_avail_idx
+    }
+
+    /// Pops the next available descriptor chain.
+    ///
+    /// Returns the head descriptor index and the descriptor chain.
+    pub fn pop_avail(&mut self) -> Option<(u16, DescriptorChain)> {
+        if !self.has_available() {
+            return None;
+        }
+
+        let avail_idx = self.last_avail_idx;
+        let head_idx = self.avail.ring[(avail_idx % self.size) as usize];
+        self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
+
+        Some((
+            head_idx,
+            DescriptorChain {
+                queue: self,
+                current: Some(head_idx),
+                ttl: self.size,
+            },
+        ))
+    }
+
+    /// Enable or disable EVENT_IDX feature.
+    pub fn set_event_idx(&mut self, enabled: bool) {
+        self.event_idx_enabled = enabled;
+    }
+
+    /// Adds a used descriptor to the used ring.
+    ///
+    /// Returns `true` if the guest should be notified (interrupt required),
+    /// `false` if notification is suppressed (EVENT_IDX or NO_INTERRUPT flag).
+    pub fn push_used(&mut self, head_idx: u16, len: u32) -> bool {
+        let old_idx = self.used.idx;
+        self.used.ring[(old_idx % self.size) as usize] = UsedElement {
+            id: head_idx as u32,
+            len,
+        };
+        self.used.idx = self.used.idx.wrapping_add(1);
+        self.should_notify(old_idx)
+    }
+
+    /// Push a batch of completions to the used ring.
+    ///
+    /// More efficient than calling `push_used()` in a loop because
+    /// notification suppression is checked only once for the entire batch.
+    pub fn push_used_batch(&mut self, completions: &[(u16, u32)]) -> bool {
+        if completions.is_empty() {
+            return false;
+        }
+        let old_idx = self.used.idx;
+        for &(head_idx, len) in completions {
+            let slot = (self.used.idx % self.size) as usize;
+            self.used.ring[slot] = UsedElement {
+                id: head_idx as u32,
+                len,
+            };
+            self.used.idx = self.used.idx.wrapping_add(1);
+        }
+        self.should_notify(old_idx)
+    }
+
+    /// Set the avail_event index for kick suppression (device→guest direction).
+    pub fn set_avail_event(&mut self, event: u16) {
+        self.used.avail_event = event;
+    }
+
+    /// Check whether the guest should be notified after updating the used ring.
+    fn should_notify(&self, old_idx: u16) -> bool {
+        if self.event_idx_enabled {
+            Self::needs_notification(old_idx, self.used.idx, self.avail.used_event)
+        } else {
+            (self.avail.flags & VRING_AVAIL_F_NO_INTERRUPT) == 0
+        }
+    }
+
+    /// VirtIO spec 2.7.7.2: notify iff `used_event` is in (old_idx, new_idx].
+    fn needs_notification(old_idx: u16, new_idx: u16, used_event: u16) -> bool {
+        new_idx.wrapping_sub(used_event).wrapping_sub(1) < new_idx.wrapping_sub(old_idx)
+    }
+
+    /// Returns a reference to a descriptor.
+    #[must_use]
+    pub fn get_descriptor(&self, idx: u16) -> Option<&Descriptor> {
+        self.desc_table.get(idx as usize)
+    }
+}
+
+/// Iterator over a descriptor chain.
+///
+/// `ttl` bounds the walk to at most `queue.size` descriptors. A malformed
+/// or malicious guest can publish a chain whose `next` links form a cycle;
+/// without a cap the iterator would spin the host thread forever on every
+/// queue kick. Any legitimate chain has at most `queue.size` descriptors,
+/// so that's the tightest safe upper bound.
+pub struct DescriptorChain<'a> {
+    queue: &'a VirtQueue,
+    current: Option<u16>,
+    ttl: u16,
+}
+
+impl<'a> Iterator for DescriptorChain<'a> {
+    type Item = &'a Descriptor;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ttl == 0 {
+            return None;
+        }
+        let idx = self.current?;
+        let desc = self.queue.get_descriptor(idx)?;
+        self.ttl -= 1;
+
+        self.current = if desc.has_next() {
+            Some(desc.next)
+        } else {
+            None
+        };
+
+        Some(desc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==========================================================================
+    // Descriptor Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_descriptor_default() {
+        let desc = Descriptor::default();
+        assert_eq!(desc.addr, 0);
+        assert_eq!(desc.len, 0);
+        assert_eq!(desc.flags, 0);
+        assert_eq!(desc.next, 0);
+    }
+
+    #[test]
+    fn test_descriptor_has_next() {
+        let mut desc = Descriptor::default();
+        assert!(!desc.has_next());
+
+        desc.flags = flags::NEXT;
+        assert!(desc.has_next());
+    }
+
+    #[test]
+    fn test_descriptor_is_write_only() {
+        let mut desc = Descriptor::default();
+        assert!(!desc.is_write_only());
+
+        desc.flags = flags::WRITE;
+        assert!(desc.is_write_only());
+    }
+
+    #[test]
+    fn test_descriptor_is_indirect() {
+        let mut desc = Descriptor::default();
+        assert!(!desc.is_indirect());
+
+        desc.flags = flags::INDIRECT;
+        assert!(desc.is_indirect());
+    }
+
+    #[test]
+    fn test_descriptor_multiple_flags() {
+        let desc = Descriptor {
+            addr: 0x1000,
+            len: 512,
+            flags: flags::NEXT | flags::WRITE,
+            next: 1,
+        };
+
+        assert!(desc.has_next());
+        assert!(desc.is_write_only());
+        assert!(!desc.is_indirect());
+    }
+
+    #[test]
+    fn test_descriptor_clone_copy() {
+        let desc = Descriptor {
+            addr: 0xDEADBEEF,
+            len: 1234,
+            flags: flags::NEXT,
+            next: 42,
+        };
+
+        let cloned = desc;
+        let copied = desc; // Copy
+
+        assert_eq!(cloned.addr, 0xDEADBEEF);
+        assert_eq!(copied.addr, 0xDEADBEEF);
+    }
+
+    // ==========================================================================
+    // Flag Constants Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_flag_constants() {
+        assert_eq!(flags::NEXT, 1);
+        assert_eq!(flags::WRITE, 2);
+        assert_eq!(flags::INDIRECT, 4);
+    }
+
+    // ==========================================================================
+    // AvailRing Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_avail_ring_new() {
+        let ring = AvailRing::new(256);
+        assert_eq!(ring.flags, 0);
+        assert_eq!(ring.idx, 0);
+        assert_eq!(ring.ring.len(), 256);
+        assert_eq!(ring.used_event, 0);
+    }
+
+    #[test]
+    fn test_avail_ring_small() {
+        let ring = AvailRing::new(1);
+        assert_eq!(ring.ring.len(), 1);
+    }
+
+    // ==========================================================================
+    // UsedElement Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_used_element_default() {
+        let elem = UsedElement::default();
+        assert_eq!(elem.id, 0);
+        assert_eq!(elem.len, 0);
+    }
+
+    #[test]
+    fn test_used_element_clone_copy() {
+        let elem = UsedElement { id: 42, len: 1024 };
+        let cloned = elem;
+        let copied = elem; // Copy
+
+        assert_eq!(cloned.id, 42);
+        assert_eq!(copied.len, 1024);
+    }
+
+    // ==========================================================================
+    // UsedRing Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_used_ring_new() {
+        let ring = UsedRing::new(128);
+        assert_eq!(ring.flags, 0);
+        assert_eq!(ring.idx, 0);
+        assert_eq!(ring.ring.len(), 128);
+        assert_eq!(ring.avail_event, 0);
+    }
+
+    // ==========================================================================
+    // VirtQueue Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_virtqueue_new() {
+        let queue = VirtQueue::new(256).unwrap();
+        assert_eq!(queue.size(), 256);
+        assert!(!queue.is_ready());
+    }
+
+    #[test]
+    fn test_virtqueue_new_power_of_two() {
+        // Valid sizes
+        for size in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] {
+            assert!(VirtQueue::new(size).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_virtqueue_new_invalid_size_zero() {
+        let result = VirtQueue::new(0);
+        assert!(result.is_err());
+        if let Err(VirtioError::InvalidQueue(msg)) = result {
+            assert!(msg.contains("power of 2"));
+        }
+    }
+
+    #[test]
+    fn test_virtqueue_new_invalid_size_not_power_of_two() {
+        for size in [3, 5, 6, 7, 9, 100, 1000] {
+            let result = VirtQueue::new(size);
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn test_virtqueue_new_too_large() {
+        let result = VirtQueue::new(32768); // Max allowed
+        assert!(result.is_ok());
+
+        // This would need 65536 which exceeds u16 anyway
+        // Just test max size works
+    }
+
+    #[test]
+    fn test_virtqueue_ready_state() {
+        let mut queue = VirtQueue::new(16).unwrap();
+
+        assert!(!queue.is_ready());
+        queue.set_ready(true);
+        assert!(queue.is_ready());
+        queue.set_ready(false);
+        assert!(!queue.is_ready());
+    }
+
+    #[test]
+    fn test_virtqueue_has_available_empty() {
+        let queue = VirtQueue::new(16).unwrap();
+        assert!(!queue.has_available());
+    }
+
+    #[test]
+    fn test_virtqueue_pop_avail_empty() {
+        let mut queue = VirtQueue::new(16).unwrap();
+        assert!(queue.pop_avail().is_none());
+    }
+
+    #[test]
+    fn test_virtqueue_get_descriptor() {
+        let queue = VirtQueue::new(16).unwrap();
+
+        // Valid indices
+        assert!(queue.get_descriptor(0).is_some());
+        assert!(queue.get_descriptor(15).is_some());
+
+        // Invalid indices
+        assert!(queue.get_descriptor(16).is_none());
+        assert!(queue.get_descriptor(100).is_none());
+    }
+
+    #[test]
+    fn test_virtqueue_push_used() {
+        let mut queue = VirtQueue::new(16).unwrap();
+
+        let _notify = queue.push_used(0, 512);
+        assert_eq!(queue.used.idx, 1);
+        assert_eq!(queue.used.ring[0].id, 0);
+        assert_eq!(queue.used.ring[0].len, 512);
+
+        let _notify = queue.push_used(1, 1024);
+        assert_eq!(queue.used.idx, 2);
+        assert_eq!(queue.used.ring[1].id, 1);
+        assert_eq!(queue.used.ring[1].len, 1024);
+    }
+
+    #[test]
+    fn test_virtqueue_push_used_wrap() {
+        let mut queue = VirtQueue::new(4).unwrap();
+
+        // Push more than queue size to test wrapping
+        for i in 0..10 {
+            let _notify = queue.push_used(i, i as u32 * 100);
+        }
+
+        assert_eq!(queue.used.idx, 10);
+        // Ring index wraps: 10 % 4 = 2, so last entry is at index 1
+        assert_eq!(queue.used.ring[1].id, 9);
+    }
+
+    #[test]
+    fn test_virtqueue_simulated_transaction() {
+        let mut queue = VirtQueue::new(16).unwrap();
+        queue.set_ready(true);
+
+        // Simulate guest adding a descriptor to available ring
+        queue.avail.ring[0] = 0; // Descriptor index 0
+        queue.avail.idx = 1;
+
+        // Device should see available descriptor
+        assert!(queue.has_available());
+
+        // Pop the descriptor
+        let (head_idx, _chain) = queue.pop_avail().unwrap();
+        assert_eq!(head_idx, 0);
+
+        // No more available
+        assert!(!queue.has_available());
+
+        // Device adds to used ring
+        let _notify = queue.push_used(head_idx, 256);
+        assert_eq!(queue.used.idx, 1);
+    }
+
+    #[test]
+    fn test_virtqueue_multiple_descriptors() {
+        let mut queue = VirtQueue::new(16).unwrap();
+        queue.set_ready(true);
+
+        // Add multiple descriptors to available ring
+        for i in 0..5 {
+            queue.avail.ring[i] = i as u16;
+        }
+        queue.avail.idx = 5;
+
+        // Pop all
+        for i in 0..5 {
+            assert!(queue.has_available());
+            let (head_idx, _) = queue.pop_avail().unwrap();
+            assert_eq!(head_idx, i as u16);
+        }
+
+        assert!(!queue.has_available());
+    }
+
+    // ==========================================================================
+    // DescriptorChain Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_descriptor_chain_single() {
+        let mut queue = VirtQueue::new(16).unwrap();
+
+        // Set up a single descriptor (no chain)
+        queue.desc_table[0] = Descriptor {
+            addr: 0x1000,
+            len: 512,
+            flags: 0, // No NEXT flag
+            next: 0,
+        };
+
+        queue.avail.ring[0] = 0;
+        queue.avail.idx = 1;
+
+        let (head_idx, chain) = queue.pop_avail().unwrap();
+        assert_eq!(head_idx, 0);
+
+        let descs: Vec<_> = chain.collect();
+        assert_eq!(descs.len(), 1);
+        assert_eq!(descs[0].addr, 0x1000);
+        assert_eq!(descs[0].len, 512);
+    }
+
+    #[test]
+    fn test_descriptor_chain_multiple() {
+        let mut queue = VirtQueue::new(16).unwrap();
+
+        // Set up a chain: 0 -> 1 -> 2
+        queue.desc_table[0] = Descriptor {
+            addr: 0x1000,
+            len: 256,
+            flags: flags::NEXT,
+            next: 1,
+        };
+        queue.desc_table[1] = Descriptor {
+            addr: 0x2000,
+            len: 512,
+            flags: flags::NEXT,
+            next: 2,
+        };
+        queue.desc_table[2] = Descriptor {
+            addr: 0x3000,
+            len: 1024,
+            flags: 0, // End of chain
+            next: 0,
+        };
+
+        queue.avail.ring[0] = 0;
+        queue.avail.idx = 1;
+
+        let (_, chain) = queue.pop_avail().unwrap();
+        let descs: Vec<_> = chain.collect();
+
+        assert_eq!(descs.len(), 3);
+        assert_eq!(descs[0].addr, 0x1000);
+        assert_eq!(descs[1].addr, 0x2000);
+        assert_eq!(descs[2].addr, 0x3000);
+    }
+
+    #[test]
+    fn test_descriptor_chain_with_write_flags() {
+        let mut queue = VirtQueue::new(16).unwrap();
+
+        // Set up: read buffer -> write buffer
+        queue.desc_table[0] = Descriptor {
+            addr: 0x1000,
+            len: 256,
+            flags: flags::NEXT, // Read-only for device
+            next: 1,
+        };
+        queue.desc_table[1] = Descriptor {
+            addr: 0x2000,
+            len: 512,
+            flags: flags::WRITE, // Write-only for device
+            next: 0,
+        };
+
+        queue.avail.ring[0] = 0;
+        queue.avail.idx = 1;
+
+        let (_, chain) = queue.pop_avail().unwrap();
+        let descs: Vec<_> = chain.collect();
+
+        assert_eq!(descs.len(), 2);
+        assert!(!descs[0].is_write_only());
+        assert!(descs[1].is_write_only());
+    }
+
+    #[test]
+    fn test_descriptor_chain_cycle_terminates() {
+        // A malformed guest can publish a chain whose `next` links form a cycle.
+        // The iterator must terminate rather than spinning the host thread.
+        let mut queue = VirtQueue::new(16).unwrap();
+
+        // desc[0] -> desc[1] -> desc[0] (self-referential cycle)
+        queue.desc_table[0] = Descriptor {
+            addr: 0x1000,
+            len: 16,
+            flags: flags::NEXT,
+            next: 1,
+        };
+        queue.desc_table[1] = Descriptor {
+            addr: 0x2000,
+            len: 16,
+            flags: flags::NEXT,
+            next: 0,
+        };
+
+        queue.avail.ring[0] = 0;
+        queue.avail.idx = 1;
+
+        let (_, chain) = queue.pop_avail().unwrap();
+        let descs: Vec<_> = chain.collect();
+
+        // Walk is capped at queue.size (16); must not exceed.
+        assert!(
+            descs.len() <= 16,
+            "chain iteration exceeded queue size cap: got {}",
+            descs.len()
+        );
+    }
+
+    #[test]
+    fn test_descriptor_chain_self_loop_terminates() {
+        // Tightest cycle: a single descriptor whose next points at itself.
+        let mut queue = VirtQueue::new(8).unwrap();
+
+        queue.desc_table[0] = Descriptor {
+            addr: 0x1000,
+            len: 16,
+            flags: flags::NEXT,
+            next: 0,
+        };
+
+        queue.avail.ring[0] = 0;
+        queue.avail.idx = 1;
+
+        let (_, chain) = queue.pop_avail().unwrap();
+        let descs: Vec<_> = chain.collect();
+        assert!(descs.len() <= 8);
+    }
+
+    // ==========================================================================
+    // Edge Case Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_avail_idx_wrap() {
+        let mut queue = VirtQueue::new(4).unwrap();
+
+        // Simulate wrapping of avail.idx
+        queue.avail.idx = u16::MAX;
+        queue.last_avail_idx = u16::MAX - 1;
+        queue.avail.ring[(queue.last_avail_idx % 4) as usize] = 0;
+
+        assert!(queue.has_available());
+
+        let (head_idx, _) = queue.pop_avail().unwrap();
+        assert_eq!(head_idx, 0);
+        assert_eq!(queue.last_avail_idx, u16::MAX);
+
+        // Add one more
+        queue.avail.ring[(queue.avail.idx % 4) as usize] = 1;
+        queue.avail.idx = 0; // Wraps
+
+        assert!(queue.has_available());
+        let (head_idx, _) = queue.pop_avail().unwrap();
+        assert_eq!(head_idx, 1);
+    }
+
+    #[test]
+    fn test_used_idx_wrap() {
+        let mut queue = VirtQueue::new(4).unwrap();
+        queue.used.idx = u16::MAX;
+
+        let _notify = queue.push_used(0, 100);
+        assert_eq!(queue.used.idx, 0); // Wrapped
+
+        // Value should be at index (u16::MAX % 4) = 3
+        assert_eq!(queue.used.ring[3].id, 0);
+        assert_eq!(queue.used.ring[3].len, 100);
+    }
+
+    #[test]
+    fn test_queue_min_size() {
+        let queue = VirtQueue::new(1).unwrap();
+        assert_eq!(queue.size(), 1);
+        assert_eq!(queue.desc_table.len(), 1);
+        assert_eq!(queue.avail.ring.len(), 1);
+        assert_eq!(queue.used.ring.len(), 1);
+    }
+
+    #[test]
+    fn test_queue_max_size() {
+        let queue = VirtQueue::new(32768).unwrap();
+        assert_eq!(queue.size(), 32768);
+        assert_eq!(queue.desc_table.len(), 32768);
+    }
+
+    #[test]
+    fn test_descriptor_chain_out_of_bounds() {
+        let mut queue = VirtQueue::new(4).unwrap();
+
+        // Set up descriptor pointing to out-of-bounds next
+        queue.desc_table[0] = Descriptor {
+            addr: 0x1000,
+            len: 256,
+            flags: flags::NEXT,
+            next: 100, // Out of bounds
+        };
+
+        queue.avail.ring[0] = 0;
+        queue.avail.idx = 1;
+
+        let (_, chain) = queue.pop_avail().unwrap();
+        let descs: Vec<_> = chain.collect();
+
+        // Should only get first descriptor, chain stops at invalid next
+        assert_eq!(descs.len(), 1);
+    }
+
+    // ==========================================================================
+    // EVENT_IDX and Interrupt Suppression Tests
+    // ==========================================================================
+
+    #[test]
+    fn test_needs_notification_basic() {
+        // old=0, new=1, event=0 → just completed what guest wants → notify
+        assert!(VirtQueue::needs_notification(0, 1, 0));
+    }
+
+    #[test]
+    fn test_needs_notification_past_event() {
+        // old=5, new=6, event=3 → guest already saw past event → no notify
+        assert!(!VirtQueue::needs_notification(5, 6, 3));
+    }
+
+    #[test]
+    fn test_needs_notification_wrap() {
+        // Wrapping: old=65534, new=0 (wrapped), event=65535
+        assert!(VirtQueue::needs_notification(65534, 0, 65535));
+    }
+
+    #[test]
+    fn test_needs_notification_wrap_no_notify() {
+        // old=65534, new=65535, event=0 → not yet at event
+        assert!(!VirtQueue::needs_notification(65534, 65535, 0));
+    }
+
+    #[test]
+    fn test_push_used_no_interrupt_flag() {
+        let mut queue = VirtQueue::new(16).unwrap();
+        // Guest sets NO_INTERRUPT flag
+        queue.avail.flags = VRING_AVAIL_F_NO_INTERRUPT;
+        let notify = queue.push_used(0, 512);
+        assert!(!notify); // suppressed
+    }
+
+    #[test]
+    fn test_push_used_default_notifies() {
+        let mut queue = VirtQueue::new(16).unwrap();
+        let notify = queue.push_used(0, 512);
+        assert!(notify); // default: always notify
+    }
+
+    #[test]
+    fn test_push_used_event_idx_suppresses() {
+        let mut queue = VirtQueue::new(16).unwrap();
+        queue.set_event_idx(true);
+        // Guest sets used_event = 5 (notify me when you reach index 5)
+        queue.avail.used_event = 5;
+        // Push to idx 1 → not at event yet → suppress
+        let notify = queue.push_used(0, 512);
+        assert!(!notify);
+    }
+
+    #[test]
+    fn test_push_used_event_idx_triggers() {
+        let mut queue = VirtQueue::new(16).unwrap();
+        queue.set_event_idx(true);
+        queue.avail.used_event = 0;
+        // used.idx starts at 0, push moves it to 1 → event=0 is in (0,1] → notify
+        let notify = queue.push_used(0, 512);
+        assert!(notify);
+    }
+
+    #[test]
+    fn test_push_used_batch() {
+        let mut queue = VirtQueue::new(16).unwrap();
+        let completions = vec![(0, 256), (1, 512), (2, 1024)];
+        let notify = queue.push_used_batch(&completions);
+        assert!(notify); // default: always notify
+        assert_eq!(queue.used.idx, 3);
+        assert_eq!(queue.used.ring[0].id, 0);
+        assert_eq!(queue.used.ring[1].id, 1);
+        assert_eq!(queue.used.ring[2].id, 2);
+    }
+
+    #[test]
+    fn test_push_used_batch_empty() {
+        let mut queue = VirtQueue::new(16).unwrap();
+        let notify = queue.push_used_batch(&[]);
+        assert!(!notify); // empty batch → no-op, no spurious interrupt
+        assert_eq!(queue.used.idx, 0);
+    }
+
+    #[test]
+    fn test_set_avail_event() {
+        let mut queue = VirtQueue::new(16).unwrap();
+        queue.set_avail_event(42);
+        assert_eq!(queue.used.avail_event, 42);
+    }
+}

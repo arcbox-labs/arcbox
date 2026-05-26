@@ -1,0 +1,30 @@
+[package]
+name = "arcbox-vmnet"
+description = "Safe Rust bindings for Apple's vmnet.framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["vmnet", "macos", "apple", "network", "virtualization"]
+categories = ["os::macos-apis", "network-programming", "virtualization"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "io-util", "net"] }
+tokio-util = "0.7"
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+default = []
+# Enable the proper Objective-C completion-handler ABI for vmnet_start_interface.
+# Without this feature, the interface starts with a NULL handler and falls back
+# to default packet-size / generated MAC. The proper path requires the
+# `com.apple.vm.networking` entitlement (or root) at runtime.
+vmnet = []
+
+[lints]
+workspace = true

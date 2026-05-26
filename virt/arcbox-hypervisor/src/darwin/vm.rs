@@ -493,18 +493,11 @@ impl DarwinVm {
             HypervisorError::DeviceError("No vsock device configured".to_string())
         })?;
 
-        // Connect to the port using arcbox-vz's async connect
+        // Connect to the port using arcbox-vz's blocking connect.
         tracing::debug!("Connecting to vsock port {} on VM {}", port, self.id);
-
-        // Use tokio runtime to run async connect
-        let rt = tokio::runtime::Handle::try_current().map_err(|_| {
-            HypervisorError::DeviceError("No tokio runtime available for vsock connect".to_string())
-        })?;
-
-        // Use block_in_place to allow blocking in async context
-        let connection =
-            tokio::task::block_in_place(|| rt.block_on(socket_device.connect(port)))
-                .map_err(|e| HypervisorError::DeviceError(format!("vsock connect failed: {e}")))?;
+        let connection = socket_device
+            .connect_blocking(port, std::time::Duration::from_secs(10))
+            .map_err(|e| HypervisorError::DeviceError(format!("vsock connect failed: {e}")))?;
 
         // Get the raw fd and take ownership (prevents close on drop)
         let fd = connection.into_raw_fd();

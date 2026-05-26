@@ -49,8 +49,8 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| std::env::var("ARCBOX_CONFIG").ok())
         .unwrap_or_else(|| "config.toml".into());
 
-    let run_phase2 = std::env::var("ARCBOX_SMOKE_RUN").map_or(false, |v| v == "1");
-    let run_phase3 = std::env::var("ARCBOX_SMOKE_CHECKPOINT").map_or(false, |v| v == "1");
+    let run_phase2 = std::env::var("ARCBOX_SMOKE_RUN").is_ok_and(|v| v == "1");
+    let run_phase3 = std::env::var("ARCBOX_SMOKE_CHECKPOINT").is_ok_and(|v| v == "1");
 
     let config = VmmConfig::from_file(&config_path)
         .with_context(|| format!("load config from {config_path}"))?;
@@ -85,10 +85,7 @@ async fn main() -> anyhow::Result<()> {
         info.state,
         info.vcpus,
         info.memory_mib,
-        info.network
-            .as_ref()
-            .map(|n| n.ip_address.as_str())
-            .unwrap_or("-"),
+        info.network.as_ref().map_or("-", |n| n.ip_address.as_str()),
     );
 
     let list = manager.list_sandboxes(None, &HashMap::new());
@@ -202,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
         // Host→guest ping: guest has its IP configured, so host can now reach it.
         {
             let status = std::process::Command::new("ping")
-                .args(["-c", "1", "-W", "2", &net.ip_address.to_string()])
+                .args(["-c", "1", "-W", "2", &net.ip_address.clone()])
                 .status()
                 .context("spawn ping")?;
             if status.success() {
@@ -251,8 +248,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Phase 3 — Checkpoint
-    let mut snapshot_id_opt: Option<String> = None;
-    if run_phase3 {
+    let snapshot_id_opt: Option<String> = if run_phase3 {
         println!("\n=== Phase 3: Checkpoint ===");
         let ck = manager
             .checkpoint_sandbox(&id, "smoke-test".into())
@@ -260,8 +256,10 @@ async fn main() -> anyhow::Result<()> {
             .context("checkpoint_sandbox")?;
         println!("  [checkpoint] snapshot_id={}", ck.snapshot_id);
         println!("               dir={}", ck.snapshot_dir);
-        snapshot_id_opt = Some(ck.snapshot_id);
-    }
+        Some(ck.snapshot_id)
+    } else {
+        None
+    };
 
     // Phase 1 cleanup
     manager
@@ -301,8 +299,7 @@ async fn main() -> anyhow::Result<()> {
             rinfo
                 .network
                 .as_ref()
-                .map(|n| n.ip_address.as_str())
-                .unwrap_or("-"),
+                .map_or("-", |n| n.ip_address.as_str()),
         );
 
         manager
@@ -440,6 +437,5 @@ fn tap_exists(tap_name: &str) -> bool {
     std::process::Command::new("ip")
         .args(["link", "show", tap_name])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }

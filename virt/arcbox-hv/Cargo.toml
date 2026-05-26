@@ -12,6 +12,7 @@ license = "MIT OR Apache-2.0"
 gic = []
 
 [dependencies]
+libc = { workspace = true }
 thiserror = "2"
 tracing = "0.1"
 

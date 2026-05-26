@@ -38,6 +38,7 @@ mod agent {
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::os::unix::io::RawFd;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
 
@@ -67,6 +68,13 @@ mod agent {
     };
 
     const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+    /// Maximum number of concurrently active connection-handling threads.
+    /// Prevents memory exhaustion during exec bursts (e.g. health checks).
+    const MAX_ACTIVE_CONNECTIONS: usize = 64;
+
+    /// Stack size for connection-handling threads (1 MB instead of the default 8 MB).
+    const THREAD_STACK_SIZE: usize = 1 << 20;
 
     // -------------------------------------------------------------------------
     // Protocol types
@@ -494,7 +502,7 @@ mod agent {
 
         let _ = t_stdout.join();
         let _ = t_stderr.join();
-        let exit_code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+        let exit_code = child.wait().map_or(-1, |s| s.code().unwrap_or(-1));
         let _ = write_frame(
             &mut *writer.lock().unwrap(),
             MSG_EXIT,
@@ -751,6 +759,41 @@ mod agent {
         }
     }
 
+    /// Spawn a thread with a reduced stack size and a semaphore-style concurrency
+    /// limit.  If the limit is already reached the connection fd is closed and a
+    /// warning is logged — this is preferable to OOM-killing the guest.
+    fn spawn_bounded(active: &Arc<AtomicUsize>, name: &str, conn_fd: RawFd, handler: fn(RawFd)) {
+        let current = active.fetch_add(1, Ordering::Relaxed);
+        if current >= MAX_ACTIVE_CONNECTIONS {
+            active.fetch_sub(1, Ordering::Relaxed);
+            eprintln!(
+                "agent: {name}: connection limit reached ({MAX_ACTIVE_CONNECTIONS}), dropping fd {conn_fd}"
+            );
+            // SAFETY: conn_fd is a valid, freshly accepted socket fd that nobody
+            // else owns yet.
+            unsafe { libc::close(conn_fd) };
+            return;
+        }
+
+        let active_clone = Arc::clone(active);
+        let thread_name = format!("{name}-{conn_fd}");
+        let builder = thread::Builder::new()
+            .name(thread_name)
+            .stack_size(THREAD_STACK_SIZE);
+
+        if let Err(e) = builder.spawn(move || {
+            handler(conn_fd);
+            active_clone.fetch_sub(1, Ordering::Relaxed);
+        }) {
+            // The closure was consumed but never executed — release the slot
+            // using the original reference and close the fd.
+            active.fetch_sub(1, Ordering::Relaxed);
+            eprintln!("agent: {name}: failed to spawn thread: {e}");
+            // SAFETY: conn_fd is still valid; the closure never ran.
+            unsafe { libc::close(conn_fd) };
+        }
+    }
+
     pub fn run() {
         mount_filesystems();
         setup_dns();
@@ -760,18 +803,23 @@ mod agent {
         let exec_fd = create_vsock_listener(AGENT_PORT);
         let file_fd = create_vsock_listener(FILE_PORT);
 
+        // Shared counters for bounding active connection threads.
+        let file_active: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let exec_active: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
         // File I/O listener thread.
+        let file_active_clone = Arc::clone(&file_active);
         thread::spawn(move || {
             loop {
                 let conn_fd = accept_connection(file_fd);
-                thread::spawn(move || handle_file_connection(conn_fd));
+                spawn_bounded(&file_active_clone, "file", conn_fd, handle_file_connection);
             }
         });
 
         // Exec listener (main thread).
         loop {
             let conn_fd = accept_connection(exec_fd);
-            thread::spawn(move || handle_connection(conn_fd));
+            spawn_bounded(&exec_active, "exec", conn_fd, handle_connection);
         }
     }
 

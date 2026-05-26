@@ -530,7 +530,7 @@ mod tests {
     // Integration tests that require creating actual utun devices.
     // Run with: cargo test -p arcbox-net darwin::tun -- --ignored
     #[test]
-    #[ignore]
+    #[ignore = "requires macOS with utun device creation privileges"]
     fn test_create_utun() {
         let tun = DarwinTun::new().expect("Failed to create utun device");
         assert!(
@@ -543,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires macOS with utun device creation privileges"]
     fn test_configure_utun() {
         let tun = DarwinTun::new().expect("Failed to create utun device");
         let result = tun.configure(
@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires macOS with utun device creation privileges"]
     fn test_nonblocking_mode() {
         let tun = DarwinTun::new().expect("Failed to create utun device");
 
@@ -579,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires macOS with utun device creation privileges"]
     fn test_send_recv_loopback() {
         let tun = DarwinTun::new().expect("Failed to create utun device");
         tun.configure(

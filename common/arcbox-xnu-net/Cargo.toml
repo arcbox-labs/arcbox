@@ -1,0 +1,29 @@
+[package]
+name = "arcbox-xnu-net"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Batch datagram I/O via sendmsg_x/recvmsg_x (macOS) and sendmmsg/recvmmsg (Linux)"
+
+[dependencies]
+libc = { workspace = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+criterion = { workspace = true }
+
+[features]
+default = []
+tokio = ["dep:tokio"]
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[lints]
+workspace = true

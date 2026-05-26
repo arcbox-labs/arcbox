@@ -105,6 +105,21 @@ impl MemoryManager {
         }
     }
 
+    /// Creates a new memory manager with a custom MMIO base address.
+    ///
+    /// The custom Hypervisor.framework VMM path needs MMIO at `0x0900_0000`
+    /// (matching the FDT layout for ARM64 VirtIO MMIO devices), whereas the
+    /// default Linux/KVM path uses 3 GB.
+    #[must_use]
+    pub const fn with_mmio_base(mmio_base: u64, mmio_size: u64) -> Self {
+        Self {
+            regions: BTreeMap::new(),
+            total_ram: 0,
+            mmio_allocator: MmioAllocator::new(mmio_base, mmio_size),
+            initialized: false,
+        }
+    }
+
     /// Initializes the memory manager with the given RAM size.
     ///
     /// # Errors

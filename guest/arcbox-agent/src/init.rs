@@ -29,6 +29,14 @@ mod platform {
         // Docker Desktop and OrbStack both set 1048576 in their guest VMs.
         raise_fd_limits();
 
+        // Mount host /private for macOS symlink targets (/tmp, /var/folders).
+        // Must come before tmpfs mounts so /private is available as a VirtioFS
+        // target. Guest /tmp and /var remain isolated tmpfs.
+        mount_virtiofs_optional(
+            arcbox_constants::virtiofs::TAG_PRIVATE,
+            arcbox_constants::virtiofs::MOUNT_PRIVATE,
+        );
+
         // Writable layers on top of read-only EROFS.
         mount_tmpfs("/tmp");
         mount_tmpfs("/run");
@@ -79,7 +87,19 @@ mod platform {
         setup_networking();
 
         // Optional host /Users share (non-fatal if not configured).
-        mount_virtiofs_optional("users", "/Users");
+        mount_virtiofs_optional(
+            arcbox_constants::virtiofs::TAG_USERS,
+            arcbox_constants::virtiofs::MOUNT_USERS,
+        );
+
+        // Optional DAX fixture share for the hv_e2e harness. Mounted under
+        // `/run/arcbox-dax` because `/` is read-only EROFS — mkdir_p on a
+        // top-level path fails with EROFS. `/run` is tmpfs, created above.
+        // `dax=always` makes FUSE_SETUPMAPPING fire on every read,
+        // exercising the stage-2 mmap fast path end-to-end.
+        // Production VMs never attach this tag; the mount is a debug-level
+        // no-op when the share is absent.
+        mount_virtiofs_optional_dax("arcbox-dax", "/run/arcbox-dax");
 
         // Rosetta x86_64 translation (Apple Silicon only).
         // The host attaches a VirtioFS share containing the Rosetta binary.
@@ -223,6 +243,33 @@ mod platform {
         ) {
             // debug, not warn — this share is optional.
             tracing::debug!(tag, mountpoint, error = %e, "virtiofs share not available");
+        }
+    }
+
+    /// Like `mount_virtiofs_optional` but passes `dax=always`.
+    ///
+    /// Required for shares whose consumer depends on the FUSE DAX fast path
+    /// firing (e.g. the hv_e2e harness, which asserts `FUSE_SETUPMAPPING`
+    /// counters increment). Still non-fatal when the share is absent, so
+    /// production VMs that don't attach the tag pay only a debug log.
+    ///
+    /// `cache=` is NOT passed here: the Linux 6.12 virtiofs parameter spec
+    /// only accepts `source` and `dax`, so `cache=always` triggers
+    /// `virtiofs: Unknown parameter 'cache'` and the mount fails outright.
+    /// Caching behaviour is inherited from FUSE defaults.
+    fn mount_virtiofs_optional_dax(tag: &str, mountpoint: &str) {
+        if crate::mount::is_mounted(mountpoint) {
+            return;
+        }
+        mkdir_p(mountpoint);
+        if let Err(e) = mount(
+            Some(tag),
+            mountpoint,
+            Some("virtiofs"),
+            MsFlags::empty(),
+            Some("dax=always"),
+        ) {
+            tracing::debug!(tag, mountpoint, error = %e, "virtiofs DAX share not available");
         }
     }
 
@@ -655,7 +702,7 @@ exit 0
     /// Install iptables FORWARD rules for sandbox networking.
     ///
     /// Each sandbox has a point-to-point TAP — no bridge or MASQUERADE needed.
-    /// The host-side smoltcp TcpBridge/SocketProxy terminates connections and
+    /// The host-side TcpBridge / SocketProxy terminates connections and
     /// creates new host sockets, so the original sandbox src IP is irrelevant
     /// for reply routing.
     ///

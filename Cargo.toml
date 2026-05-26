@@ -10,6 +10,7 @@ members = [
     "common/arcbox-asset",
     "common/arcbox-logging",
     "common/arcbox-route",
+    "common/arcbox-xnu-net",
 
     # ============================================
     # L1-3: Virtualization (MIT OR Apache-2.0)
@@ -19,9 +20,18 @@ members = [
     "virt/arcbox-hypervisor",
     "virt/arcbox-vmm",
     "virt/arcbox-virtio",
+    "virt/arcbox-virtio-core",
+    "virt/arcbox-virtio-blk",
+    "virt/arcbox-virtio-console",
+    "virt/arcbox-virtio-fs",
+    "virt/arcbox-virtio-net",
+    "virt/arcbox-virtio-rng",
+    "virt/arcbox-virtio-vsock",
+    "virt/arcbox-virtio-balloon",
     "virt/arcbox-vm",
     "virt/arcbox-fs",
     "virt/arcbox-net",
+    "virt/arcbox-vmnet",
     "virt/arcbox-dhcp",
 
     # ============================================
@@ -53,11 +63,11 @@ members = [
     # ============================================
     # Guest Components (MIT OR Apache-2.0)
     # ============================================
-    "guest/arcbox-agent",
+    "guest/arcbox-agent", "virt/arcbox-net-inject",
 ]
 
 [workspace.package]
-version = "0.3.21" # x-release-please-version
+version = "0.4.4" # x-release-please-version
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -74,12 +84,13 @@ anyhow = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "tracing-log"] }
 tracing-appender = "0.2"
+tracing-log = "0.2"
 
 # Error reporting
 sentry = { version = "0.46", default-features = false, features = [
@@ -121,6 +132,9 @@ pin-project-lite = "0.2"
 
 # Terminal
 crossterm = "0.27"
+
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
 
 # Bytes and buffer
 bytes = "1"
@@ -167,8 +181,8 @@ ifbridge = "0.1"
 # Process identity (pidpath, bsdinfo)
 libproc = "0.14"
 
-arcbox-asset = { version = "0.3.21", path = "common/arcbox-asset", features = ["download"] } # x-release-please-version
-arcbox-docker-tools = { version = "0.3.21", path = "app/arcbox-docker-tools" } # x-release-please-version
+arcbox-asset = { version = "0.4.4", path = "common/arcbox-asset", features = ["download"] } # x-release-please-version
+arcbox-docker-tools = { version = "0.4.4", path = "app/arcbox-docker-tools" } # x-release-please-version
 
 # External crates
 arcbox-boot = { version = "0.5.1", features = ["download"] }
@@ -177,26 +191,43 @@ macos-resolver = "0.2.0"
 fc-sdk = "0.2.3"
 
 # Internal crates
-arcbox-constants = { version = "0.3.21", path = "common/arcbox-constants", features = ["std"] } # x-release-please-version
-arcbox-dns = { version = "0.3.21", path = "common/arcbox-dns" } # x-release-please-version
-arcbox-error = { version = "0.3.21", path = "common/arcbox-error" } # x-release-please-version
-arcbox-vz = { version = "0.3.21", path = "virt/arcbox-vz" } # x-release-please-version
-arcbox-hypervisor = { version = "0.3.21", path = "virt/arcbox-hypervisor" } # x-release-please-version
-arcbox-vmm = { version = "0.3.21", path = "virt/arcbox-vmm" } # x-release-please-version
-arcbox-virtio = { version = "0.3.21", path = "virt/arcbox-virtio" } # x-release-please-version
-arcbox-vm = { version = "0.3.21", path = "virt/arcbox-vm" } # x-release-please-version
-arcbox-fs = { version = "0.3.21", path = "virt/arcbox-fs" } # x-release-please-version
-arcbox-net = { version = "0.3.21", path = "virt/arcbox-net" } # x-release-please-version
-arcbox-dhcp = { version = "0.3.21", path = "virt/arcbox-dhcp" } # x-release-please-version
-arcbox-container = { version = "0.3.21", path = "runtime/arcbox-container" } # x-release-please-version
-arcbox-protocol = { version = "0.3.21", path = "rpc/arcbox-protocol" } # x-release-please-version
-arcbox-grpc = { version = "0.3.21", path = "rpc/arcbox-grpc" } # x-release-please-version
-arcbox-transport = { version = "0.3.21", path = "rpc/arcbox-transport" } # x-release-please-version
-arcbox-docker = { version = "0.3.21", path = "app/arcbox-docker" } # x-release-please-version
-arcbox-helper = { version = "0.3.21", path = "app/arcbox-helper" } # x-release-please-version
-arcbox-core = { version = "0.3.21", path = "app/arcbox-core" } # x-release-please-version
-arcbox-api = { version = "0.3.21", path = "app/arcbox-api" } # x-release-please-version
-arcbox-logging = { version = "0.3.21", path = "common/arcbox-logging", default-features = false } # x-release-please-version
+arcbox-constants = { version = "0.4.4", path = "common/arcbox-constants", features = ["std"] } # x-release-please-version
+arcbox-dns = { version = "0.4.4", path = "common/arcbox-dns" } # x-release-please-version
+arcbox-error = { version = "0.4.4", path = "common/arcbox-error" } # x-release-please-version
+arcbox-route = { version = "0.4.4", path = "common/arcbox-route" } # x-release-please-version
+# arcbox-hv has its own release cadence (Apple Hypervisor.framework
+# bindings), so the workspace dep pin is bumped manually when arcbox-hv
+# itself is bumped — not by release-please.
+arcbox-hv = { version = "0.3.20", path = "virt/arcbox-hv" }
+arcbox-vz = { version = "0.4.4", path = "virt/arcbox-vz" } # x-release-please-version
+arcbox-hypervisor = { version = "0.4.4", path = "virt/arcbox-hypervisor" } # x-release-please-version
+arcbox-vmm = { version = "0.4.4", path = "virt/arcbox-vmm" } # x-release-please-version
+arcbox-virtio = { version = "0.4.4", path = "virt/arcbox-virtio" } # x-release-please-version
+arcbox-virtio-core = { version = "0.4.4", path = "virt/arcbox-virtio-core" } # x-release-please-version
+arcbox-virtio-blk = { version = "0.4.4", path = "virt/arcbox-virtio-blk" } # x-release-please-version
+arcbox-virtio-console = { version = "0.4.4", path = "virt/arcbox-virtio-console" } # x-release-please-version
+arcbox-virtio-fs = { version = "0.4.4", path = "virt/arcbox-virtio-fs" } # x-release-please-version
+arcbox-virtio-net = { version = "0.4.4", path = "virt/arcbox-virtio-net" } # x-release-please-version
+arcbox-virtio-rng = { version = "0.4.4", path = "virt/arcbox-virtio-rng" } # x-release-please-version
+arcbox-virtio-vsock = { version = "0.4.4", path = "virt/arcbox-virtio-vsock" } # x-release-please-version
+arcbox-virtio-balloon = { version = "0.4.4", path = "virt/arcbox-virtio-balloon" } # x-release-please-version
+arcbox-vm = { version = "0.4.4", path = "virt/arcbox-vm" } # x-release-please-version
+arcbox-fs = { version = "0.4.4", path = "virt/arcbox-fs" } # x-release-please-version
+arcbox-net = { version = "0.4.4", path = "virt/arcbox-net" } # x-release-please-version
+arcbox-vmnet = { version = "0.4.4", path = "virt/arcbox-vmnet" } # x-release-please-version
+arcbox-net-inject = { version = "0.4.4", path = "virt/arcbox-net-inject" } # x-release-please-version
+arcbox-dhcp = { version = "0.4.4", path = "virt/arcbox-dhcp" } # x-release-please-version
+arcbox-container = { version = "0.4.4", path = "runtime/arcbox-container" } # x-release-please-version
+arcbox-oci = { version = "0.4.4", path = "runtime/arcbox-oci" } # x-release-please-version
+arcbox-protocol = { version = "0.4.4", path = "rpc/arcbox-protocol" } # x-release-please-version
+arcbox-grpc = { version = "0.4.4", path = "rpc/arcbox-grpc" } # x-release-please-version
+arcbox-transport = { version = "0.4.4", path = "rpc/arcbox-transport" } # x-release-please-version
+arcbox-docker = { version = "0.4.4", path = "app/arcbox-docker" } # x-release-please-version
+arcbox-helper = { version = "0.4.4", path = "app/arcbox-helper" } # x-release-please-version
+arcbox-core = { version = "0.4.4", path = "app/arcbox-core" } # x-release-please-version
+arcbox-api = { version = "0.4.4", path = "app/arcbox-api" } # x-release-please-version
+arcbox-migration = { version = "0.4.4", path = "app/arcbox-migration" } # x-release-please-version
+arcbox-logging = { version = "0.4.4", path = "common/arcbox-logging", default-features = false } # x-release-please-version
 
 # Test infrastructure
 tempfile = "3"

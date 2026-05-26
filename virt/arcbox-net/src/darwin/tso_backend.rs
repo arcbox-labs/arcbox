@@ -4,12 +4,12 @@
 //!
 //! - **TSO fast path**: when the guest emits a packet with `gso_type != NONE`,
 //!   the TCP payload is extracted and written directly to a host `TcpStream`.
-//!   No smoltcp, no L2 framing — just payload relay. This is the path that
-//!   enables 50 Gbps port forwarding.
+//!   No classifier, no L2 framing — just payload relay. This is the path
+//!   that enables 50 Gbps port forwarding.
 //!
 //! - **Slow path**: normal (non-TSO) packets — ARP, DHCP, DNS, UDP, small
-//!   TCP — are forwarded to the existing smoltcp-based `NetworkDatapath` via
-//!   a channel, preserving full protocol compatibility.
+//!   TCP — are forwarded to the existing `NetworkDatapath` via a channel,
+//!   preserving full protocol compatibility.
 //!
 //! # TSO TX Flow (Guest → Host)
 //!
@@ -20,7 +20,7 @@
 //!   → TsoNetBackend extracts (src_ip, src_port, dst_ip, dst_port)
 //!   → Looks up or creates host TcpStream for this flow
 //!   → Writes entire payload to TcpStream in one call
-//!   → No smoltcp, no NAT, no framing overhead
+//!   → No classifier, no NAT, no framing overhead
 //! ```
 //!
 //! # TSO RX Flow (Host → Guest)
@@ -70,14 +70,14 @@ struct HostTcpConn {
 /// TSO-aware network backend.
 ///
 /// Maintains a map of guest TCP flows to host `TcpStream` connections.
-/// TSO packets bypass smoltcp entirely; non-TSO packets are forwarded
-/// to the slow path channel.
+/// TSO packets bypass the classifier entirely; non-TSO packets are
+/// forwarded to the slow path channel.
 pub struct TsoNetBackend {
     /// Active TCP connections keyed by guest-side flow.
     connections: HashMap<TcpFlowKey, HostTcpConn>,
-    /// Channel to forward non-TSO packets to the smoltcp datapath.
+    /// Channel to forward non-TSO packets to the classifier datapath.
     slow_path_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    /// Channel to receive packets from the smoltcp datapath (RX path).
+    /// Channel to receive packets from the classifier datapath (RX path).
     slow_path_rx: std::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     /// Packets ready for guest injection.
     rx_pending: std::collections::VecDeque<Vec<u8>>,
@@ -86,8 +86,8 @@ pub struct TsoNetBackend {
 impl TsoNetBackend {
     /// Creates a new TSO backend.
     ///
-    /// - `slow_path_tx`: sends non-TSO frames to the smoltcp datapath.
-    /// - `slow_path_rx`: receives frames from the smoltcp datapath for
+    /// - `slow_path_tx`: sends non-TSO frames to the classifier datapath.
+    /// - `slow_path_rx`: receives frames from the classifier datapath for
     ///   injection into the guest.
     pub fn new(
         slow_path_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -227,7 +227,7 @@ impl TsoNetBackend {
 
 impl NetBackend for TsoNetBackend {
     fn send(&mut self, packet: &NetPacket) -> io::Result<usize> {
-        // Non-TSO packet: forward to smoltcp datapath via channel.
+        // Non-TSO packet: forward to classifier datapath via channel.
         let frame = packet.data.clone();
         self.slow_path_tx.try_send(frame).map_err(|e| {
             io::Error::new(

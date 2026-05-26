@@ -26,12 +26,15 @@ use crate::delegate::{
     unregister_listener,
 };
 use crate::error::{VZError, VZResult};
-use crate::ffi::block::{_Block_release, VsockResult, create_vsock_context_block};
+use crate::ffi::block::{
+    _Block_release, VsockResult, create_blocking_vsock_context_block, create_vsock_context_block,
+};
 use crate::ffi::get_class;
 use crate::msg_send;
 use objc2::runtime::AnyObject;
 use std::ffi::c_void;
 use std::os::unix::io::RawFd;
+use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -253,6 +256,95 @@ impl VirtioSocketDevice {
                 Err(VZError::Timeout(format!(
                     "Vsock connection to port {port} timed out"
                 )))
+            }
+        }
+    }
+
+    /// Connects to a guest port without using Tokio.
+    ///
+    /// This is used by synchronous host-side probe paths that already run on a
+    /// blocking thread and must not nest `Handle::block_on` or Tokio timers.
+    pub fn connect_blocking(
+        &self,
+        port: u32,
+        timeout: Duration,
+    ) -> VZResult<VirtioSocketConnection> {
+        tracing::debug!("VirtioSocketDevice::connect_blocking(port={})", port);
+
+        let (tx, rx) = std_mpsc::channel::<VsockResult>();
+        let block = create_blocking_vsock_context_block(tx);
+
+        let context = Box::new(ConnectContext {
+            device: self.inner,
+            port,
+            block,
+        });
+        let context_ptr = Box::into_raw(context);
+
+        unsafe {
+            tracing::debug!("Dispatching blocking connect to VM queue {:?}", self.queue);
+            dispatch_async_f(self.queue, context_ptr as *mut c_void, connect_work);
+        }
+
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(info)) => {
+                // SAFETY: block was heap-allocated by create_blocking_vsock_context_block
+                // via _Block_copy and the completion handler has already fired.
+                unsafe {
+                    _Block_release(block);
+                }
+                tracing::info!(
+                    "Vsock connected: fd={}, src_port={}, dst_port={}",
+                    info.fd,
+                    info.source_port,
+                    info.destination_port
+                );
+                Ok(VirtioSocketConnection {
+                    fd: info.fd,
+                    source_port: info.source_port,
+                    destination_port: info.destination_port,
+                })
+            }
+            Ok(Err(e)) => {
+                // SAFETY: block was heap-allocated by create_blocking_vsock_context_block
+                // via _Block_copy and the completion handler has already fired.
+                unsafe {
+                    _Block_release(block);
+                }
+                if is_transient_connect_error(&e.message) {
+                    tracing::debug!(
+                        port,
+                        error = %e.message,
+                        "Vsock connection not ready yet"
+                    );
+                } else {
+                    tracing::warn!(
+                        port,
+                        error = %e.message,
+                        "Vsock connection failed"
+                    );
+                }
+                Err(VZError::ConnectionFailed(e.message))
+            }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                // Do not release the block here. Virtualization.framework may
+                // still invoke the completion handler later, and the block owns
+                // the sender that callback will consume.
+                tracing::warn!("Vsock connection timed out after {:?}", timeout);
+                Err(VZError::Timeout(format!(
+                    "Vsock connection to port {port} timed out"
+                )))
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                // SAFETY: the sender side is already gone, so the block has
+                // completed or been disposed and our retained copy can be released.
+                unsafe {
+                    _Block_release(block);
+                }
+                Err(VZError::Internal {
+                    code: -1,
+                    message: "Connection channel closed unexpectedly".into(),
+                })
             }
         }
     }

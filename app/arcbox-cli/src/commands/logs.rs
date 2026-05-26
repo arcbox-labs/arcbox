@@ -184,7 +184,7 @@ async fn tail_follow(path: &Path, n: usize) -> Result<()> {
 #[cfg(unix)]
 fn file_inode(file: &std::fs::File) -> u64 {
     use std::os::unix::fs::MetadataExt;
-    file.metadata().map(|m| m.ino()).unwrap_or(0)
+    file.metadata().map_or(0, |m| m.ino())
 }
 
 #[cfg(not(unix))]

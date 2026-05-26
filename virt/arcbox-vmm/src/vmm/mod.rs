@@ -89,12 +89,12 @@ pub struct VmmConfig {
     pub block_devices: Vec<BlockDeviceConfig>,
     /// Optional MAC address for the bridge NAT NIC on macOS.
     pub bridge_nic_mac: Option<String>,
-    /// Use the custom Hypervisor.framework VMM instead of VZ framework.
+    /// VM backend selection (macOS only).
     ///
-    /// This enables custom VirtIO device emulation with TSO support for
-    /// higher network throughput. Experimental — requires macOS 15+ for
-    /// GIC and `com.apple.security.hypervisor` entitlement.
-    pub use_custom_vmm: bool,
+    /// Controls whether to use Hypervisor.framework (custom VMM with TSO
+    /// support) or Virtualization.framework (managed execution). Requires
+    /// macOS 15+ for HV backend. See [`VmBackend`] for details.
+    pub backend: VmBackend,
 }
 
 impl Default for VmmConfig {
@@ -115,7 +115,7 @@ impl Default for VmmConfig {
             balloon: true, // Enable balloon by default for memory optimization
             block_devices: Vec::new(),
             bridge_nic_mac: None,
-            use_custom_vmm: false,
+            backend: VmBackend::default(),
         }
     }
 }
@@ -136,6 +136,30 @@ impl VmmConfig {
 
         builder.build()
     }
+}
+
+/// VM backend selection for macOS.
+///
+/// Controls whether the VMM uses Apple's Virtualization.framework (managed
+/// execution) or Hypervisor.framework (custom VMM with manual execution).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VmBackend {
+    /// Auto-select: HV for native ARM64, VZ when Rosetta is needed.
+    #[default]
+    Auto,
+    /// Force Hypervisor.framework (custom VMM). Requires macOS 15+.
+    Hv,
+    /// Force Virtualization.framework (managed execution).
+    Vz,
+}
+
+/// Resolved backend after evaluating platform constraints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedBackend {
+    /// Hypervisor.framework (custom VMM with manual vCPU execution).
+    Hv,
+    /// Virtualization.framework (managed execution by Apple's runtime).
+    Vz,
 }
 
 /// VMM state.
@@ -221,15 +245,136 @@ pub struct Vmm {
     /// Shared DNS hosts table from NetworkManager.
     #[cfg(target_os = "macos")]
     shared_dns_hosts: Option<std::sync::Arc<arcbox_dns::LocalHostsTable>>,
+    /// Kernel entry address for the custom HV VMM path (stored during
+    /// `initialize_darwin_hv`, consumed by `start_darwin_hv`).
+    #[cfg(target_os = "macos")]
+    hv_kernel_entry: Option<u64>,
+    /// FDT load address for the custom HV VMM path.
+    #[cfg(target_os = "macos")]
+    hv_fdt_addr: Option<u64>,
+    /// vCPU thread join handles for the custom HV VMM path.
+    #[cfg(target_os = "macos")]
+    hv_vcpu_threads: Vec<std::thread::JoinHandle<()>>,
+    /// Shared vCPU thread handle registry for WFI unparking (custom HV).
+    #[cfg(target_os = "macos")]
+    hv_vcpu_thread_handles: Option<darwin_hv::VcpuThreadHandles>,
+    /// Shared registry of Hypervisor.framework vCPU IDs (custom HV).
+    /// Populated by each vCPU thread after it creates its `HvVcpu`. Used
+    /// by `pause`/`stop` to target `hv_vcpus_exit` correctly on arm64.
+    #[cfg(target_os = "macos")]
+    hv_vcpu_ids: Option<darwin_hv::HvVcpuIds>,
+    /// PSCI CPU_ON channel senders for secondary vCPUs (custom HV).
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::type_complexity)]
+    hv_cpu_on_senders: Option<
+        std::sync::Arc<
+            std::sync::Mutex<Vec<Option<std::sync::mpsc::Sender<darwin_hv::CpuOnRequest>>>>,
+        >,
+    >,
     /// vmnet bridge interface for the bridge NIC (`vmnet` feature only).
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
-    vmnet_bridge: Option<std::sync::Arc<arcbox_net::darwin::Vmnet>>,
+    vmnet_bridge: Option<std::sync::Arc<arcbox_vmnet::Vmnet>>,
     /// Cancellation token for the vmnet relay task.
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
     vmnet_relay_cancel: Option<tokio_util::sync::CancellationToken>,
     /// VZ-side fd for the vmnet bridge NIC attachment.
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
     vmnet_bridge_fd: Option<OwnedFd>,
+    /// Resolved backend choice for this VM instance.
+    #[cfg(target_os = "macos")]
+    resolved_backend: Option<ResolvedBackend>,
+    /// Shared DeviceManager reference for HV backend (set during start_darwin_hv).
+    /// Used by connect_vsock_hv to inject OP_REQUEST packets after VM starts.
+    ///
+    /// Declared before `hv_vm` so it drops first: `FsServer` inside the
+    /// DeviceManager holds `Arc<HvDaxMapper>` handles that call
+    /// `hv_vm_unmap` on drop. Those must complete before `hv_vm_destroy`.
+    #[cfg(target_os = "macos")]
+    hv_device_manager: Option<std::sync::Arc<DeviceManager>>,
+    /// HV-side network fd (NIC1). Paired with the NetworkDatapath fd.
+    /// Kept alive so the socketpair stays open while the VM runs.
+    #[cfg(target_os = "macos")]
+    hv_net_fd: Option<OwnedFd>,
+    /// HV-side bridge network fd (NIC2). Paired with the VmnetRelay fd.
+    /// Kept alive so the vmnet socketpair stays open while the VM runs.
+    #[cfg(target_os = "macos")]
+    hv_bridge_net_fd: Option<OwnedFd>,
+    /// Block device info captured during initialize for worker thread spawn.
+    /// (DeviceId, raw_fd, blk_size, read_only, device_id_string)
+    #[cfg(target_os = "macos")]
+    /// (DeviceId, raw_fd, blk_size, read_only, device_id_string, num_queues)
+    hv_blk_devices: Vec<(crate::device::DeviceId, i32, u32, bool, String, u16)>,
+    /// Block I/O worker thread handles for join on shutdown.
+    #[cfg(target_os = "macos")]
+    hv_blk_worker_threads: Vec<std::thread::JoinHandle<()>>,
+    /// HVC fast path: device_idx → (raw_fd, blk_size). Shared with vCPU threads.
+    #[cfg(target_os = "macos")]
+    hvc_blk_fds: Arc<Vec<(i32, u32)>>,
+    /// Per-VirtioFS-share DAX mappers (concrete type).
+    ///
+    /// One `Arc<HvDaxMapper>` per configured shared directory, in the
+    /// same order as `config.shared_dirs`. The mapper itself is also
+    /// handed to the `FsServer` as a `dyn DaxMapper` trait object —
+    /// both Arcs point to the same underlying counters, so
+    /// `dax_stats(share_idx)` reports live values as the guest issues
+    /// `FUSE_SETUPMAPPING` / `FUSE_REMOVEMAPPING` requests.
+    ///
+    /// Declared before `hv_vm` so implicit Drop order is safe: any
+    /// remaining `Arc<HvDaxMapper>` refs call `hv_vm_unmap` before
+    /// `hv_vm_destroy` runs. `stop_darwin_hv` explicitly calls
+    /// `drain_all` first, making implicit drop a no-op for the normal path.
+    #[cfg(target_os = "macos")]
+    hv_dax_mappers: Vec<std::sync::Arc<crate::dax::HvDaxMapper>>,
+    /// HV backend balloon device handle (ABX-363).
+    ///
+    /// `None` until `initialize_darwin_hv` registers the device (only
+    /// happens when `config.balloon` is true). Used by the HV dispatch
+    /// path in `darwin.rs` for `set_balloon_target` / `get_balloon_stats`.
+    #[cfg(target_os = "macos")]
+    hv_balloon: Option<std::sync::Arc<std::sync::Mutex<arcbox_virtio::balloon::VirtioBalloon>>>,
+    /// GICv3 handle (custom VMM path, macOS 15+).
+    ///
+    /// **Drop order — must be declared before `hv_vm`.**
+    /// Rust drops struct fields in declaration order (top to bottom). The GIC
+    /// interrupt controller holds internal references into the VM; its FFI
+    /// destroy/release routines must run while the VM is still alive.
+    /// Declaring `hv_gic` before `hv_vm` guarantees that on any exit path
+    /// (both the normal `stop_darwin_hv` and the panic / implicit-drop path),
+    /// the GIC is torn down before `hv_vm_destroy` is called.
+    #[cfg(all(target_os = "macos", feature = "gic"))]
+    hv_gic: Option<std::sync::Arc<arcbox_hv::Gic>>,
+    /// Hypervisor.framework VM handle (custom VMM path).
+    ///
+    /// **Drop order — must be declared after `hv_gic`, `hv_dax_mappers`,
+    /// and `hv_device_manager`.**
+    /// Rust drops fields in declaration order (top to bottom), so fields
+    /// declared above this one drop first. This ordering ensures:
+    ///   1. `hv_device_manager` (FsServer → Arc<HvDaxMapper> → hv_vm_unmap)
+    ///   2. `hv_dax_mappers` (remaining mapper refs → hv_vm_unmap)
+    ///   3. `hv_gic` (GIC FFI teardown referencing the live VM)
+    ///   4. `hv_vm` → `hv_vm_destroy`
+    ///   5. `hv_guest_mem` (mmap'd pages — must outlive the VM)
+    ///
+    /// `stop_darwin_hv` also calls `drain_all` explicitly for the normal
+    /// path; this declaration ordering is the safety net for panic paths.
+    #[cfg(target_os = "macos")]
+    hv_vm: Option<arcbox_hv::HvVm>,
+    /// Guest memory backing (vm-memory mmap, custom VMM path).
+    ///
+    /// **Drop order — must be declared after `hv_vm`.**
+    /// The mmap'd pages must remain accessible until after `hv_vm_destroy`
+    /// releases all stage-2 mappings. Declaring this last ensures the host
+    /// VA range is freed only after the VM no longer references it.
+    #[cfg(target_os = "macos")]
+    hv_guest_mem: Option<darwin_hv::HvGuestMem>,
+    /// Cooperative pause flag for the HV backend.
+    ///
+    /// When set to `true`, every vCPU thread parks itself after its next
+    /// `vcpu.run()` return instead of re-entering guest execution. `resume`
+    /// clears the flag and unparks the threads. Orthogonal to `running`
+    /// (which is a terminal stop signal).
+    #[cfg(target_os = "macos")]
+    hv_paused: Arc<AtomicBool>,
 }
 
 impl Vmm {
@@ -289,12 +434,49 @@ impl Vmm {
             inbound_listener_manager: None,
             #[cfg(target_os = "macos")]
             shared_dns_hosts: None,
+            #[cfg(target_os = "macos")]
+            hv_kernel_entry: None,
+            #[cfg(target_os = "macos")]
+            hv_fdt_addr: None,
+            #[cfg(target_os = "macos")]
+            hv_vcpu_threads: Vec::new(),
+            #[cfg(target_os = "macos")]
+            hv_vcpu_thread_handles: None,
+            #[cfg(target_os = "macos")]
+            hv_vcpu_ids: None,
+            #[cfg(target_os = "macos")]
+            hv_cpu_on_senders: None,
             #[cfg(all(target_os = "macos", feature = "vmnet"))]
             vmnet_bridge: None,
             #[cfg(all(target_os = "macos", feature = "vmnet"))]
             vmnet_relay_cancel: None,
             #[cfg(all(target_os = "macos", feature = "vmnet"))]
             vmnet_bridge_fd: None,
+            #[cfg(all(target_os = "macos", feature = "gic"))]
+            hv_gic: None,
+            #[cfg(target_os = "macos")]
+            hv_vm: None,
+            #[cfg(target_os = "macos")]
+            hv_guest_mem: None,
+            #[cfg(target_os = "macos")]
+            resolved_backend: None,
+            #[cfg(target_os = "macos")]
+            hv_device_manager: None,
+            #[cfg(target_os = "macos")]
+            hv_net_fd: None,
+            hv_bridge_net_fd: None,
+            #[cfg(target_os = "macos")]
+            hv_blk_devices: Vec::new(),
+            #[cfg(target_os = "macos")]
+            hv_blk_worker_threads: Vec::new(),
+            #[cfg(target_os = "macos")]
+            hvc_blk_fds: Arc::new(Vec::new()),
+            #[cfg(target_os = "macos")]
+            hv_dax_mappers: Vec::new(),
+            #[cfg(target_os = "macos")]
+            hv_balloon: None,
+            #[cfg(target_os = "macos")]
+            hv_paused: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -331,7 +513,7 @@ impl Vmm {
     /// Only populated when `vmnet` feature is enabled and interface started.
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
     #[must_use]
-    pub fn vmnet_interface_info(&self) -> Option<arcbox_net::darwin::VmnetInterfaceInfo> {
+    pub fn vmnet_interface_info(&self) -> Option<arcbox_vmnet::VmnetInterfaceInfo> {
         self.vmnet_bridge
             .as_ref()
             .and_then(|v| v.interface_info().cloned())
@@ -358,12 +540,17 @@ impl Vmm {
         // Platform-specific initialization
         #[cfg(target_os = "macos")]
         {
-            if self.config.use_custom_vmm {
-                tracing::info!("Using custom Hypervisor.framework VMM (experimental)");
-                self.initialize_darwin_hv()?;
-            } else {
-                self.initialize_darwin()?;
+            let resolved = resolve_backend(&self.config);
+            tracing::info!(
+                "VM backend resolved: {:?} (requested: {:?})",
+                resolved,
+                self.config.backend
+            );
+            match resolved {
+                ResolvedBackend::Hv => self.initialize_darwin_hv()?,
+                ResolvedBackend::Vz => self.initialize_darwin()?,
             }
+            self.resolved_backend = Some(resolved);
         }
 
         #[cfg(target_os = "linux")]
@@ -395,11 +582,14 @@ impl Vmm {
 
         tracing::info!("Starting VMM");
 
-        // Darwin: start the managed VM directly via Virtualization.framework.
+        // Darwin: dispatch to the resolved backend.
         // Linux: start vCPU threads for manual execution.
         #[cfg(target_os = "macos")]
         {
-            self.start_darwin_vm()?;
+            match self.resolved_backend {
+                Some(ResolvedBackend::Hv) => self.start_darwin_hv()?,
+                Some(ResolvedBackend::Vz) | None => self.start_darwin_vm()?,
+            }
         }
         #[cfg(target_os = "linux")]
         {
@@ -437,7 +627,10 @@ impl Vmm {
 
         #[cfg(target_os = "macos")]
         {
-            self.pause_darwin_vm()?;
+            match self.resolved_backend {
+                Some(ResolvedBackend::Hv) => self.pause_darwin_hv()?,
+                Some(ResolvedBackend::Vz) | None => self.pause_darwin_vm()?,
+            }
         }
         #[cfg(target_os = "linux")]
         if let Some(ref mut vcpu_manager) = self.vcpu_manager {
@@ -466,7 +659,10 @@ impl Vmm {
 
         #[cfg(target_os = "macos")]
         {
-            self.resume_darwin_vm()?;
+            match self.resolved_backend {
+                Some(ResolvedBackend::Hv) => self.resume_darwin_hv()?,
+                Some(ResolvedBackend::Vz) | None => self.resume_darwin_vm()?,
+            }
         }
         #[cfg(target_os = "linux")]
         if let Some(ref mut vcpu_manager) = self.vcpu_manager {
@@ -497,11 +693,14 @@ impl Vmm {
             event_loop.stop();
         }
 
-        // Darwin: stop the managed VM before canceling the network datapath.
+        // Darwin: stop the resolved backend before canceling the network datapath.
         // Linux: stop vCPU threads.
         #[cfg(target_os = "macos")]
         {
-            self.stop_darwin_vm()?;
+            match self.resolved_backend {
+                Some(ResolvedBackend::Hv) => self.stop_darwin_hv()?,
+                Some(ResolvedBackend::Vz) | None => self.stop_darwin_vm()?,
+            }
         }
         #[cfg(target_os = "linux")]
         {
@@ -533,6 +732,17 @@ impl Vmm {
         self.config.balloon
     }
 
+    /// Returns a snapshot of DAX counters for the given VirtioFS share
+    /// index (0-based, in the order of `config.shared_dirs`). Only
+    /// meaningful on the HV backend — the VZ path does not use
+    /// `HvDaxMapper`. Returns `None` if the index is out of range or
+    /// DAX mappers have not been initialized yet.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn dax_stats(&self, share_idx: usize) -> Option<crate::dax::DaxStats> {
+        self.hv_dax_mappers.get(share_idx).map(|m| m.stats())
+    }
+
     /// Captures a VM snapshot context from the running hypervisor VM.
     ///
     /// The returned context contains device state and full guest memory.
@@ -556,8 +766,15 @@ impl Vmm {
         }
 
         #[cfg(target_os = "macos")]
-        if let Some(result) = self.capture_snapshot_darwin() {
-            return result;
+        {
+            if matches!(self.resolved_backend, Some(ResolvedBackend::Hv)) {
+                return Err(VmmError::Unsupported(
+                    "snapshot capture is not yet implemented for the HV backend".to_string(),
+                ));
+            }
+            if let Some(result) = self.capture_snapshot_darwin() {
+                return result;
+            }
         }
 
         Err(VmmError::invalid_state(
@@ -602,8 +819,15 @@ impl Vmm {
         }
 
         #[cfg(target_os = "macos")]
-        if let Some(result) = self.restore_snapshot_darwin(restore_data) {
-            return result;
+        {
+            if matches!(self.resolved_backend, Some(ResolvedBackend::Hv)) {
+                return Err(VmmError::Unsupported(
+                    "snapshot restore is not yet implemented for the HV backend".to_string(),
+                ));
+            }
+            if let Some(result) = self.restore_snapshot_darwin(restore_data) {
+                return result;
+            }
         }
 
         Err(VmmError::invalid_state(
@@ -909,6 +1133,28 @@ impl Vmm {
     }
 }
 
+/// Resolves the backend selection based on platform constraints.
+///
+/// When `Auto` is selected, Rosetta requires VZ (Hypervisor.framework cannot
+/// translate x86_64 instructions). Otherwise, default to VZ until the HV
+/// backend is fully validated.
+#[cfg(target_os = "macos")]
+fn resolve_backend(config: &VmmConfig) -> ResolvedBackend {
+    match config.backend {
+        VmBackend::Vz => ResolvedBackend::Vz,
+        VmBackend::Hv => ResolvedBackend::Hv,
+        // Auto: Rosetta x86_64 translation requires VZ (Hypervisor.framework
+        // cannot translate instructions). For native ARM64 workloads, prefer HV.
+        VmBackend::Auto => {
+            if config.enable_rosetta {
+                ResolvedBackend::Vz
+            } else {
+                ResolvedBackend::Hv
+            }
+        }
+    }
+}
+
 fn placeholder_vcpu_snapshots(vcpu_count: u32) -> Vec<arcbox_hypervisor::VcpuSnapshot> {
     #[cfg(target_arch = "aarch64")]
     {
@@ -1026,5 +1272,30 @@ mod tests {
 
         // Can't resume before pausing
         assert!(vmm.resume().is_err());
+    }
+
+    /// With the HV backend resolved, `capture_snapshot_context` must return
+    /// `VmmError::Unsupported` rather than the old generic `invalid_state
+    /// ("hypervisor VM handle is unavailable")` error. This covers the
+    /// ABX-360 correctness gap: HV-backed VMs were silently hitting
+    /// VZ-only snapshot code paths.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_hv_snapshot_returns_unsupported() {
+        let config = VmmConfig {
+            guest_cid: Some(3),
+            ..Default::default()
+        };
+        let mut vmm = Vmm::new(config).unwrap();
+
+        // Simulate a started HV VM without actually booting one.
+        vmm.resolved_backend = Some(ResolvedBackend::Hv);
+        vmm.state = VmmState::Running;
+
+        match vmm.capture_snapshot_context() {
+            Err(VmmError::Unsupported(msg)) => assert!(msg.contains("HV backend")),
+            Err(other) => panic!("expected Unsupported for HV capture, got Err({other:?})"),
+            Ok(_) => panic!("expected Unsupported for HV capture, got Ok"),
+        }
     }
 }

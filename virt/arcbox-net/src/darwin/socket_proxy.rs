@@ -681,7 +681,9 @@ mod tests {
         proxy.flows.insert(
             key,
             UdpFlow {
-                last_active: Instant::now() - std::time::Duration::from_secs(120),
+                last_active: Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(120))
+                    .unwrap(),
                 payload_tx: mpsc::channel(1).0,
             },
         );

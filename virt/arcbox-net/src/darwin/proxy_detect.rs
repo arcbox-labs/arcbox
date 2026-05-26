@@ -291,6 +291,22 @@ fn parse_proxy_url(url: &str) -> Option<ProxyConfig> {
 mod tests {
     use super::*;
 
+    /// Test helper: parse proxy settings from text directly.
+    fn detect_system_proxy_from_text(
+        text: &str,
+    ) -> (
+        Option<ProxyConfig>,
+        Option<ProxyConfig>,
+        Option<ProxyConfig>,
+        Vec<String>,
+    ) {
+        let http = parse_proxy_block(text, "HTTPEnable", "HTTPProxy", "HTTPPort");
+        let https = parse_proxy_block(text, "HTTPSEnable", "HTTPSProxy", "HTTPSPort");
+        let socks = parse_proxy_block(text, "SOCKSEnable", "SOCKSProxy", "SOCKSPort");
+        let bypass = parse_exceptions_list(text);
+        (http, https, socks, bypass)
+    }
+
     #[test]
     fn is_fake_ip_range() {
         let env = ProxyEnvironment {
@@ -338,14 +354,14 @@ mod tests {
 
     #[test]
     fn parse_scutil_proxy_block() {
-        let text = r#"
+        let text = r"
 <dictionary> {
   HTTPSEnable : 1
   HTTPSPort : 6152
   HTTPSProxy : 127.0.0.1
   SOCKSEnable : 0
 }
-"#;
+";
         let (http, https, socks, _) = detect_system_proxy_from_text(text);
         assert!(http.is_none());
         assert!(socks.is_none());
@@ -353,21 +369,4 @@ mod tests {
         assert_eq!(https.host, "127.0.0.1");
         assert_eq!(https.port, 6152);
     }
-}
-
-/// Test helper: parse proxy settings from text directly.
-#[cfg(test)]
-fn detect_system_proxy_from_text(
-    text: &str,
-) -> (
-    Option<ProxyConfig>,
-    Option<ProxyConfig>,
-    Option<ProxyConfig>,
-    Vec<String>,
-) {
-    let http = parse_proxy_block(text, "HTTPEnable", "HTTPProxy", "HTTPPort");
-    let https = parse_proxy_block(text, "HTTPSEnable", "HTTPSProxy", "HTTPSPort");
-    let socks = parse_proxy_block(text, "SOCKSEnable", "SOCKSProxy", "SOCKSPort");
-    let bypass = parse_exceptions_list(text);
-    (http, https, socks, bypass)
 }

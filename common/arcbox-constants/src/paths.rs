@@ -64,6 +64,22 @@ pub const DOCKER_CLI_TOOLS: &[&str] = &[
     "docker-credential-osxkeychain",
 ];
 
+/// Subset of `DOCKER_CLI_TOOLS` that are Docker CLI plugins — binaries that
+/// upstream `docker` discovers via its plugin mechanism and invokes as
+/// `docker <name>` (e.g. `docker compose`, `docker buildx`).
+///
+/// Upstream Docker CLI searches these paths in order for plugin binaries:
+///   1. entries listed in `cliPluginsExtraDirs` in `~/.docker/config.json`
+///   2. `~/.docker/cli-plugins/`
+///   3. `/usr/local/lib/docker/cli-plugins/`
+///   4. `/usr/lib/docker/cli-plugins/`
+///
+/// Putting a plugin only in `$PATH` (as a standalone `docker-compose` binary)
+/// is *not* enough — `docker compose` (with a space) will fail to find it.
+/// Excludes the `docker` host binary itself and credential helpers (which
+/// are discovered via a different, credsStore-based mechanism).
+pub const DOCKER_CLI_PLUGINS: &[&str] = &["docker-buildx", "docker-compose"];
+
 /// Returns true if a symlink target looks like it belongs to an ArcBox app bundle.
 ///
 /// Used by multiple subsystems (privileged helper, brew hooks, setup install)

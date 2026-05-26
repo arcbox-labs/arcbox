@@ -42,8 +42,8 @@ mod block_device {
         blk.activate().unwrap();
 
         // Test request types exist
-        let _in_type = BlockRequestType::In;
-        let _out_type = BlockRequestType::Out;
+        let _ = BlockRequestType::In;
+        let _ = BlockRequestType::Out;
 
         // Reset and verify state
         blk.reset();

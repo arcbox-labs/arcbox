@@ -22,7 +22,6 @@ mod datapath {
         let ring: LockFreeRing<u32> = LockFreeRing::new(64);
 
         // Simulate allocating packet buffers and passing indices through ring
-        let mut allocated_indices = Vec::new();
 
         // Allocate several buffers
         for i in 0..10 {
@@ -31,7 +30,6 @@ mod datapath {
                 let buffer = unsafe { pool.get_mut(idx) };
                 buffer.as_full_mut_slice()[0..4].copy_from_slice(&[i as u8, 0, 0, 0]);
                 buffer.set_len(4);
-                allocated_indices.push(idx);
 
                 // Pass index through ring
                 ring.enqueue(idx).unwrap();

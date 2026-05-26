@@ -26,11 +26,13 @@
 //! - Packet pool allocation: O(1) constant time
 //! - Zero memory copies in hot path
 
+pub mod frame_buf;
 pub mod packet;
 pub mod pool;
 pub mod ring;
 pub mod stats;
 
+pub use frame_buf::FrameBuf;
 pub use packet::{PacketMetadata, Protocol, ZeroCopyPacket};
 pub use pool::{PacketBuffer, PacketPool, PacketRef};
 pub use ring::LockFreeRing;

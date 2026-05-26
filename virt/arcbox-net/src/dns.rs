@@ -921,14 +921,14 @@ mod tests {
 
     #[test]
     fn test_parse_resolv_conf_nameservers() {
-        let conf = r#"
+        let conf = r"
 # comment
 nameserver 10.0.0.2
 search local
 nameserver 2001:4860:4860::8888
 nameserver invalid
 nameserver 10.0.0.2
-"#;
+";
         let servers = parse_resolv_conf_nameservers(conf);
         // IPv6 servers are filtered because forward_dns_async binds 0.0.0.0:0.
         // The IPv4 server is preferred; duplicates are deduplicated.
@@ -948,10 +948,7 @@ nameserver 10.0.0.2
         let servers = parse_resolv_conf_nameservers(conf);
         assert_eq!(
             servers,
-            vec![SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                DNS_PORT
-            )]
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DNS_PORT)]
         );
     }
 

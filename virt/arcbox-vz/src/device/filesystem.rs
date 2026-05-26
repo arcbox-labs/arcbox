@@ -148,12 +148,6 @@ impl SharedDirectory {
         }
     }
 
-    /// Returns the raw pointer to the underlying object.
-    #[allow(dead_code)]
-    pub(crate) fn as_ptr(&self) -> *mut AnyObject {
-        self.inner
-    }
-
     /// Consumes the shared directory and returns the raw pointer.
     #[must_use]
     pub fn into_ptr(self) -> *mut AnyObject {
@@ -571,12 +565,6 @@ impl VirtioFileSystemDeviceConfiguration {
     #[must_use]
     pub fn tag(&self) -> &str {
         &self.tag
-    }
-
-    /// Returns the raw pointer to the underlying object.
-    #[allow(dead_code)]
-    pub(crate) fn as_ptr(&self) -> *mut AnyObject {
-        self.inner
     }
 
     /// Consumes the configuration and returns the raw pointer.

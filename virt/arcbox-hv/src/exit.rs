@@ -431,7 +431,7 @@ mod tests {
         //   bit [9:5]   = Rt = 5    → 5 << 5
         //   bit [4:1]   = CRm = 0   → 0
         //   bit [0]     = direction: 0 = write (MSR)
-        let iss: u64 = (3 << 20) | (0 << 17) | (1 << 10) | (5 << 5) | (0 << 1) | 0;
+        let iss: u64 = (3 << 20) | (1 << 10) | (5 << 5); // Op0=3 CRn=1 Rt=5 direction=write(0)
         let syndrome = (u64::from(EC_SYS_REG) << 26) | iss;
         let info = ffi::HvVcpuExitInfo {
             reason: ffi::HV_EXIT_REASON_EXCEPTION,
@@ -472,7 +472,7 @@ mod tests {
     fn parse_system_register_mrs() {
         // Encode MRS (read) for SCTLR_EL1: Op0=3 Op1=0 CRn=1 CRm=0 Op2=0, Rt=7
         // ISS: direction=1 (read) at bit 0
-        let iss: u64 = (3 << 20) | (0 << 17) | (1 << 10) | (7 << 5) | (0 << 1) | 1;
+        let iss: u64 = (3 << 20) | (1 << 10) | (7 << 5) | 1; // Op0=3 CRn=1 Rt=7 direction=read(1)
         let syndrome = (u64::from(EC_SYS_REG) << 26) | iss;
         let info = ffi::HvVcpuExitInfo {
             reason: ffi::HV_EXIT_REASON_EXCEPTION,

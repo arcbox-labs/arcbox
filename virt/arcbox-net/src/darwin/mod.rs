@@ -9,55 +9,32 @@
 //!
 //! - **Virtualization.framework**: High-level VM network attachment
 //!   (VZNATNetworkDeviceAttachment, VZBridgedNetworkDeviceAttachment)
-//! - **vmnet.framework**: Low-level packet I/O (for advanced use cases)
+//! - **vmnet.framework**: Low-level packet I/O — see the dedicated
+//!   [`arcbox_vmnet`] crate
 //!
 //! # Network Modes
 //!
 //! - **NAT (Shared)**: VMs share host's network connection via NAT
 //! - **Host-Only**: VMs can only communicate with host
 //! - **Bridged**: VMs appear as separate devices on the network
-//!
-//! # vmnet.framework
-//!
-//! The vmnet backend provides direct access to virtual network interfaces:
-//!
-//! ```ignore
-//! use arcbox_net::darwin::{Vmnet, VmnetConfig, VmnetMode};
-//!
-//! // Create a NAT (shared) network.
-//! let vmnet = Vmnet::new_shared()?;
-//!
-//! // Or create with custom configuration.
-//! let config = VmnetConfig::shared()
-//!     .with_mac([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])
-//!     .with_mtu(1500);
-//! let vmnet = Vmnet::new(config)?;
-//!
-//! // Read/write packets.
-//! let mut buf = [0u8; 1500];
-//! let n = vmnet.read_packet(&mut buf)?;
-//! vmnet.write_packet(&buf[..n])?;
-//! ```
 
+pub mod classifier;
 pub mod datapath_loop;
 pub mod dns_log;
 pub mod inbound_relay;
 pub mod nat;
 pub mod proxy_detect;
 pub mod proxy_tunnel;
-pub mod smoltcp_device;
 pub mod socket_proxy;
 pub mod tcp_bridge;
 pub mod tso_backend;
 pub mod tun;
-pub mod vmnet;
-pub mod vmnet_ffi;
-#[cfg(feature = "vmnet")]
-pub mod vmnet_relay;
 
+#[cfg(feature = "vmnet")]
+pub use arcbox_vmnet::VmnetRelay;
+pub use arcbox_vmnet::{Vmnet, VmnetConfig, VmnetInterfaceInfo, VmnetMode};
 pub use nat::DarwinNatNetwork;
 pub use tun::DarwinTun;
-pub use vmnet::{Vmnet, VmnetConfig, VmnetInterfaceInfo, VmnetMode};
 
 use std::net::Ipv4Addr;
 

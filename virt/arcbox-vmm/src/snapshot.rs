@@ -430,7 +430,7 @@ impl SnapshotManager {
             tracing::debug!(
                 "Wrote compressed memory dump ({} bytes -> {} bytes)",
                 memory_buffer.len(),
-                fs::metadata(&memory_file).map(|m| m.len()).unwrap_or(0)
+                fs::metadata(&memory_file).map_or(0, |m| m.len())
             );
         } else {
             fs::write(&memory_file, &memory_buffer)?;
@@ -907,7 +907,7 @@ impl SnapshotManager {
             }
 
             // Sort by creation time (newest first).
-            snapshots.sort_by(|a, b| b.created.cmp(&a.created));
+            snapshots.sort_by_key(|s| std::cmp::Reverse(s.created));
 
             // Delete old snapshots.
             for info in snapshots.into_iter().skip(keep) {
@@ -935,8 +935,7 @@ impl SnapshotManager {
     pub fn total_size(&self) -> u64 {
         self.snapshots
             .read()
-            .map(|s| s.values().map(|info| info.size).sum())
-            .unwrap_or(0)
+            .map_or(0, |s| s.values().map(|info| info.size).sum())
     }
 }
 

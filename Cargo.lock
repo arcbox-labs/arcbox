@@ -54,6 +54,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anes"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b46cbb362ab8752921c97e041f5e366ee6297bd428a31275b9fcf1e380f7299"
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -111,7 +117,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "arcbox"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "arcbox-container",
  "arcbox-core",
@@ -125,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-agent"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "arcbox-constants",
@@ -161,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-api"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "arcbox-core",
  "arcbox-docker",
@@ -182,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-asset"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "futures-util",
  "reqwest",
@@ -210,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-cli"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "arcbox-asset",
@@ -219,6 +225,7 @@ dependencies = [
  "arcbox-docker",
  "arcbox-docker-tools",
  "arcbox-grpc",
+ "arcbox-helper",
  "arcbox-protocol",
  "clap",
  "clap_complete",
@@ -243,14 +250,14 @@ dependencies = [
 
 [[package]]
 name = "arcbox-constants"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "dirs",
 ]
 
 [[package]]
 name = "arcbox-container"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "arcbox-error",
  "async-trait",
@@ -264,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-core"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "arcbox-boot",
  "arcbox-constants",
@@ -298,12 +305,13 @@ dependencies = [
  "tokio-util",
  "toml 0.8.23",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
 [[package]]
 name = "arcbox-daemon"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "arcbox-api",
@@ -335,7 +343,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-dhcp"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "thiserror",
  "tracing",
@@ -343,14 +351,14 @@ dependencies = [
 
 [[package]]
 name = "arcbox-dns"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "arcbox-docker"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "arcbox-core",
  "arcbox-error",
@@ -382,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-docker-tools"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "arcbox-asset",
  "flate2",
@@ -398,14 +406,14 @@ dependencies = [
 
 [[package]]
 name = "arcbox-error"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "arcbox-fs"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "arcbox-error",
  "arcbox-virtio",
@@ -421,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-grpc"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "arcbox-protocol",
  "prost",
@@ -435,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-helper"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "arcbox-constants",
  "arcbox-logging",
@@ -456,13 +464,14 @@ dependencies = [
 name = "arcbox-hv"
 version = "0.3.20"
 dependencies = [
+ "libc",
  "thiserror",
  "tracing",
 ]
 
 [[package]]
 name = "arcbox-hypervisor"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "arcbox-error",
  "arcbox-vz",
@@ -482,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-logging"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "parking_lot",
  "sentry",
@@ -494,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-migration"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "dirs",
  "serde",
@@ -507,14 +516,16 @@ dependencies = [
 
 [[package]]
 name = "arcbox-net"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "arcbox-dhcp",
  "arcbox-dns",
  "arcbox-error",
  "arcbox-virtio",
+ "arcbox-vmnet",
  "bytes",
  "chrono",
+ "crossbeam-channel",
  "crossbeam-utils",
  "hashbrown 0.14.5",
  "ipnetwork 0.20.0",
@@ -522,7 +533,6 @@ dependencies = [
  "nix 0.29.0",
  "serde",
  "serde_json",
- "smoltcp",
  "socket2 0.5.10",
  "thiserror",
  "tokio",
@@ -532,8 +542,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-net-inject"
+version = "0.4.4"
+dependencies = [
+ "arcbox-virtio",
+ "crossbeam-channel",
+ "tracing",
+]
+
+[[package]]
 name = "arcbox-oci"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "arcbox-error",
  "chrono",
@@ -548,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-protocol"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "prost",
  "prost-build",
@@ -561,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-route"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "libc",
  "tracing",
@@ -569,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-transport"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "arcbox-constants",
  "arcbox-error",
@@ -585,23 +604,117 @@ dependencies = [
 
 [[package]]
 name = "arcbox-virtio"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "arcbox-error",
  "arcbox-hypervisor",
+ "arcbox-virtio-balloon",
+ "arcbox-virtio-blk",
+ "arcbox-virtio-console",
+ "arcbox-virtio-core",
+ "arcbox-virtio-fs",
+ "arcbox-virtio-net",
+ "arcbox-virtio-rng",
+ "arcbox-virtio-vsock",
  "async-trait",
  "bytes",
+ "getrandom 0.2.17",
  "libc",
  "rayon",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "virtio-bindings",
+]
+
+[[package]]
+name = "arcbox-virtio-balloon"
+version = "0.4.4"
+dependencies = [
+ "arcbox-virtio-core",
+ "libc",
+ "tracing",
+]
+
+[[package]]
+name = "arcbox-virtio-blk"
+version = "0.4.4"
+dependencies = [
+ "arcbox-virtio-core",
+ "async-trait",
+ "libc",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "arcbox-virtio-console"
+version = "0.4.4"
+dependencies = [
+ "arcbox-virtio-core",
+ "async-trait",
+ "libc",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "arcbox-virtio-core"
+version = "0.4.4"
+dependencies = [
+ "arcbox-error",
+ "thiserror",
+ "tracing",
+ "virtio-bindings",
+]
+
+[[package]]
+name = "arcbox-virtio-fs"
+version = "0.4.4"
+dependencies = [
+ "arcbox-virtio-core",
+ "bytes",
+ "libc",
+ "rayon",
+ "tracing",
+]
+
+[[package]]
+name = "arcbox-virtio-net"
+version = "0.4.4"
+dependencies = [
+ "arcbox-virtio-core",
+ "async-trait",
+ "getrandom 0.2.17",
+ "libc",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "arcbox-virtio-rng"
+version = "0.4.4"
+dependencies = [
+ "arcbox-virtio-core",
+ "getrandom 0.2.17",
+ "tracing",
+]
+
+[[package]]
+name = "arcbox-virtio-vsock"
+version = "0.4.4"
+dependencies = [
+ "arcbox-virtio-core",
+ "libc",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
 name = "arcbox-vm"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -621,22 +734,43 @@ dependencies = [
 
 [[package]]
 name = "arcbox-vmm"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "arcbox-dns",
  "arcbox-error",
+ "arcbox-fs",
  "arcbox-hv",
  "arcbox-hypervisor",
  "arcbox-net",
+ "arcbox-net-inject",
  "arcbox-virtio",
+ "arcbox-vmnet",
  "bytes",
  "chrono",
+ "crossbeam-channel",
  "futures",
  "libc",
+ "linux-loader",
  "lz4_flex",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "vm-fdt",
+ "vm-memory",
+ "vm-superio",
+]
+
+[[package]]
+name = "arcbox-vmnet"
+version = "0.4.4"
+dependencies = [
+ "libc",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -646,7 +780,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-vz"
-version = "0.3.21"
+version = "0.4.4"
 dependencies = [
  "libc",
  "objc2",
@@ -654,6 +788,15 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "arcbox-xnu-net"
+version = "0.4.4"
+dependencies = [
+ "criterion",
+ "libc",
+ "tokio",
 ]
 
 [[package]]
@@ -912,16 +1055,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
 
 [[package]]
-name = "byteorder"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
-
-[[package]]
 name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
+
+[[package]]
+name = "cast"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "cc"
@@ -966,6 +1109,33 @@ dependencies = [
  "serde",
  "wasm-bindgen",
  "windows-link",
+]
+
+[[package]]
+name = "ciborium"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e"
+dependencies = [
+ "ciborium-io",
+ "ciborium-ll",
+ "serde",
+]
+
+[[package]]
+name = "ciborium-io"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757"
+
+[[package]]
+name = "ciborium-ll"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
+dependencies = [
+ "ciborium-io",
+ "half",
 ]
 
 [[package]]
@@ -1079,6 +1249,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "criterion"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2b12d017a929603d80db1831cd3a24082f8137ce19c69e6447f54f5fc8d692f"
+dependencies = [
+ "anes",
+ "cast",
+ "ciborium",
+ "clap",
+ "criterion-plot",
+ "is-terminal",
+ "itertools 0.10.5",
+ "num-traits",
+ "once_cell",
+ "oorandom",
+ "plotters",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "tinytemplate",
+ "walkdir",
+]
+
+[[package]]
+name = "criterion-plot"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b50826342786a51a89e2da3a28f1c32b06e387201bc2d19791f622c673706b1"
+dependencies = [
+ "cast",
+ "itertools 0.10.5",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1138,6 +1344,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "crunchy"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1183,47 +1395,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "defmt"
-version = "0.3.100"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0963443817029b2024136fc4dd07a5107eb8f977eaf18fcd1fdeb11306b64ad"
-dependencies = [
- "defmt 1.0.1",
-]
-
-[[package]]
-name = "defmt"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "548d977b6da32fa1d1fda2876453da1e7df63ad0304c8b3dae4dbe7b96f39b78"
-dependencies = [
- "bitflags 1.3.2",
- "defmt-macros",
-]
-
-[[package]]
-name = "defmt-macros"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d4fc12a85bcf441cfe44344c4b72d58493178ce635338a3f3b78943aceb258e"
-dependencies = [
- "defmt-parser",
- "proc-macro-error2",
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "defmt-parser"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1244,9 +1415,9 @@ dependencies = [
 
 [[package]]
 name = "dimicon"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b10b3601704f9f8b56bd6db73b1e3428262b9579b0968f55cb83f7c7a3420de"
+checksum = "daa6bd72b26b8c8f81ddea345f66059dd052ca4f85902af7733986f81bfca61e"
 dependencies = [
  "reqwest",
  "serde",
@@ -1674,12 +1845,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "hash32"
-version = "0.3.1"
+name = "half"
+version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
+checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
 dependencies = [
- "byteorder",
+ "cfg-if",
+ "crunchy",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1716,16 +1889,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
-]
-
-[[package]]
-name = "heapless"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
-dependencies = [
- "hash32",
- "stable_deref_trait",
 ]
 
 [[package]]
@@ -2133,10 +2296,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "is-terminal"
+version = "0.4.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
+dependencies = [
+ "hermit-abi",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "itertools"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
+dependencies = [
+ "either",
+]
 
 [[package]]
 name = "itertools"
@@ -2246,6 +2429,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "linux-loader"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de72cb02c55ecffcf75fe78295926f872eb6eb0a58d629c58a8c324dc26380f6"
+dependencies = [
+ "vm-memory",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2297,12 +2489,6 @@ dependencies = [
  "thiserror",
  "tracing",
 ]
-
-[[package]]
-name = "managed"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
 name = "matchers"
@@ -2721,6 +2907,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "oorandom"
+version = "11.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
+
+[[package]]
 name = "openapiv3"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2939,6 +3131,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "plotters"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5aeb6f403d7a4911efb1e33402027fc44f29b5bf6def3effcc22d7bb75f2b747"
+dependencies = [
+ "num-traits",
+ "plotters-backend",
+ "plotters-svg",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
+name = "plotters-backend"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df42e13c12958a16b3f7f4386b9ab1f3e7933914ecea48da7139435263a4172a"
+
+[[package]]
+name = "plotters-svg"
+version = "0.3.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51bae2ac328883f7acdfea3d66a7c35751187f870bc81f94563733a154d7a670"
+dependencies = [
+ "plotters-backend",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2969,28 +3189,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
- "syn",
-]
-
-[[package]]
-name = "proc-macro-error-attr2"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96de42df36bb9bba5542fe9f1a054b8cc87e172759a1868aa05c1f3acc89dfc5"
-dependencies = [
- "proc-macro2",
- "quote",
-]
-
-[[package]]
-name = "proc-macro-error2"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11ec05c52be0a07b08061f7dd003e7d7092e0472bc731b4af7bb1ef876109802"
-dependencies = [
- "proc-macro-error-attr2",
- "proc-macro2",
- "quote",
  "syn",
 ]
 
@@ -3740,6 +3938,7 @@ version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
+ "indexmap 2.13.0",
  "itoa",
  "memchr",
  "serde",
@@ -3887,21 +4086,6 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
-
-[[package]]
-name = "smoltcp"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dad095989c1533c1c266d9b1e8d70a1329dd3723c3edac6d03bbd67e7bf6f4bb"
-dependencies = [
- "bitflags 1.3.2",
- "byteorder",
- "cfg-if",
- "defmt 0.3.100",
- "heapless",
- "log",
- "managed",
-]
 
 [[package]]
 name = "socket2"
@@ -4127,6 +4311,16 @@ checksum = "42d3e9c45c09de15d06dd8acf5f4e0e399e85927b7f00711024eb7ae10fa4869"
 dependencies = [
  "displaydoc",
  "zerovec",
+]
+
+[[package]]
+name = "tinytemplate"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be4d6b5f19ff7664e8c98d03e2139cb510db9b0a60b55f8e8709b689d939b6bc"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4741,6 +4935,35 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtio-bindings"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "091f1f09cfbf2a78563b562e7a949465cce1aef63b6065645188d995162f8868"
+
+[[package]]
+name = "vm-fdt"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e21282841a059bb62627ce8441c491f09603622cd5a21c43bfedc85a2952f23"
+
+[[package]]
+name = "vm-memory"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f39348a049689cabd3377cdd9182bf526ec76a6f823b79903896452e9d7a7380"
+dependencies = [
+ "libc",
+ "thiserror",
+ "winapi",
+]
+
+[[package]]
+name = "vm-superio"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69c376a9b84afdf97bddd2628096cf3554208b2a676cf06b4532e0f433a54e02"
 
 [[package]]
 name = "vsock"

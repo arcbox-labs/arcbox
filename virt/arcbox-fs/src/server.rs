@@ -71,6 +71,14 @@ impl FsServer {
         &self.config.source
     }
 
+    /// Sets the DAX mapper for direct host page mapping.
+    /// Must be called after `start()`.
+    pub fn set_dax_mapper(&mut self, mapper: Arc<dyn crate::DaxMapper>) {
+        if let Some(ref mut dispatcher) = self.dispatcher {
+            dispatcher.set_dax_mapper(mapper);
+        }
+    }
+
     /// Starts the server.
     ///
     /// Initializes the passthrough filesystem and FUSE dispatcher.
@@ -92,10 +100,10 @@ impl FsServer {
             .map_err(|e| FsError::not_found(format!("Failed to initialize filesystem: {}", e)))?;
         let fs = Arc::new(fs);
 
-        // Initialize dispatcher
+        // Initialize dispatcher using cache profile timeouts
         let dispatcher_config = DispatcherConfig {
-            entry_timeout: self.config.cache_timeout,
-            attr_timeout: self.config.cache_timeout,
+            entry_timeout: self.config.cache_profile.entry_timeout().as_secs(),
+            attr_timeout: self.config.cache_profile.attr_timeout().as_secs(),
         };
         let dispatcher = FuseDispatcher::new(Arc::clone(&fs), dispatcher_config);
 
@@ -190,6 +198,7 @@ impl FuseRequestHandler for FsServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CacheProfile;
     use tempfile::TempDir;
 
     #[test]
@@ -200,6 +209,7 @@ mod tests {
             source: temp.path().to_string_lossy().to_string(),
             num_threads: 1,
             writeback_cache: false,
+            cache_profile: CacheProfile::Dynamic,
             cache_timeout: 1,
             negative_cache_ttl: 1,
         };
@@ -233,6 +243,7 @@ mod tests {
             source: temp.path().to_string_lossy().to_string(),
             num_threads: 1,
             writeback_cache: false,
+            cache_profile: CacheProfile::Dynamic,
             cache_timeout: 1,
             negative_cache_ttl: 1,
         };
@@ -260,9 +271,11 @@ mod tests {
         };
 
         let mut request = Vec::new();
+        #[allow(clippy::ptr_as_ptr, clippy::borrow_as_ptr, clippy::ref_as_ptr)]
         request.extend_from_slice(unsafe {
             std::slice::from_raw_parts(&header as *const _ as *const u8, FuseInHeader::SIZE)
         });
+        #[allow(clippy::ptr_as_ptr, clippy::borrow_as_ptr, clippy::ref_as_ptr)]
         request.extend_from_slice(unsafe {
             std::slice::from_raw_parts(&init_in as *const _ as *const u8, size_of::<FuseInitIn>())
         });
@@ -279,6 +292,7 @@ mod tests {
             source: "/tmp".to_string(),
             num_threads: 1,
             writeback_cache: false,
+            cache_profile: CacheProfile::Dynamic,
             cache_timeout: 1,
             negative_cache_ttl: 1,
         };

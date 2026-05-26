@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     fn unknown_code_preserved() {
-        let code = 0xdead_beef_u32 as i32;
+        let code = 0xdead_beef_u32.cast_signed();
         assert_eq!(check(code), Err(HvError::Unknown(0xdead_beef)));
     }
 

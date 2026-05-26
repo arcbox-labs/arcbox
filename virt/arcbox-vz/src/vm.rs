@@ -3,14 +3,14 @@
 use crate::device::{MemoryBalloonDevice, vm_memory_balloon_devices};
 use crate::error::{VZError, VZResult};
 use crate::ffi::{
-    _Block_copy, _NSConcreteStackBlock, BlockPtr, DispatchQueue, SIMPLE_BLOCK_DESCRIPTOR,
-    extract_nserror, nsstring_to_string,
+    _Block_copy, _Block_release, _NSConcreteStackBlock, BlockPtr, DispatchQueue,
+    SIMPLE_BLOCK_DESCRIPTOR, create_state_completion_block, nsstring_to_string,
 };
 use crate::socket::VirtioSocketDevice;
 use crate::{msg_send, msg_send_bool, msg_send_i64};
 use objc2::runtime::AnyObject;
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -126,76 +126,39 @@ impl VirtualMachine {
     /// This is an async operation that completes when the VM reaches
     /// the Running state.
     pub async fn start(&self) -> VZResult<()> {
-        let (tx, rx) = oneshot::channel::<VZResult<()>>();
-        static RESULT_TX: OnceLock<Arc<Mutex<Option<oneshot::Sender<VZResult<()>>>>>> =
-            OnceLock::new();
-        let result_tx = RESULT_TX.get_or_init(|| Arc::new(Mutex::new(None))).clone();
-        {
-            let mut guard = result_tx.lock().map_err(|_| VZError::Internal {
-                code: -1,
-                message: "failed to lock start completion sender".into(),
-            })?;
-            *guard = Some(tx);
-        }
+        // Per-call oneshot; the block captures the sender so multiple
+        // concurrent VM instances don't clobber each other's completion
+        // state (unlike the previous global-static approach).
+        let (tx, rx) = oneshot::channel::<crate::ffi::StateResult>();
+        let block_ptr = create_state_completion_block(tx);
 
-        // Create completion block
-        static START_BLOCK: OnceLock<BlockPtr> = OnceLock::new();
-
-        // SAFETY: Constructing a stack completion block with correct ABI layout, copied to heap
-        // via _Block_copy. The block is created once and stored in OnceLock.
-        let block_ptr = START_BLOCK.get_or_init(|| unsafe {
-            #[repr(C)]
-            struct CompletionBlock {
-                isa: *const c_void,
-                flags: i32,
-                reserved: i32,
-                invoke: unsafe extern "C" fn(*const c_void, *mut AnyObject),
-                descriptor: *const crate::ffi::BlockDescriptor,
-            }
-
-            unsafe extern "C" fn start_handler(_block: *const c_void, error: *mut AnyObject) {
-                let result = if error.is_null() {
-                    Ok(())
-                } else {
-                    Err(extract_nserror(error))
-                };
-
-                if let Some(tx_mutex) = RESULT_TX.get() {
-                    if let Ok(mut guard) = tx_mutex.lock() {
-                        if let Some(tx) = guard.take() {
-                            let _ = tx.send(result);
-                        }
-                    }
-                }
-            }
-
-            let stack_block = CompletionBlock {
-                isa: _NSConcreteStackBlock,
-                flags: 0,
-                reserved: 0,
-                invoke: start_handler,
-                descriptor: &SIMPLE_BLOCK_DESCRIPTOR,
-            };
-
-            let heap_block = _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
-            BlockPtr(heap_block)
-        });
-
-        // Dispatch start to VM queue
         let inner = self.inner;
-        // SAFETY: Sending startWithCompletionHandler: to a valid VZVirtualMachine on its dispatch queue.
+        // SAFETY: Sending startWithCompletionHandler: to a valid VZVirtualMachine on its
+        // dispatch queue; `block_ptr` is a freshly heap-copied block.
         self.queue.sync(|| unsafe {
             let sel = objc2::sel!(startWithCompletionHandler:);
             let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel, *const c_void) =
                 std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            func(inner as *const AnyObject, sel, block_ptr.0);
+            func(inner as *const AnyObject, sel, block_ptr);
         });
 
-        // Wait for completion
-        rx.await.map_err(|_| VZError::Internal {
+        // Wait for completion. The block will fire at most once; its dispose
+        // helper cleans up the captured sender on any remaining reference.
+        let result = rx.await.map_err(|_| VZError::Internal {
             code: -1,
             message: "Start operation cancelled".into(),
-        })?
+        })?;
+
+        // Release our reference. VZ has retained its own copy; the block will
+        // survive until VZ releases it too (normally right after invoke).
+        // SAFETY: block_ptr was returned by create_state_completion_block and
+        // has not been released elsewhere.
+        unsafe { _Block_release(block_ptr) };
+
+        result.map_err(|msg| VZError::Internal {
+            code: -1,
+            message: format!("VM start failed: {msg}"),
+        })
     }
 
     /// Stops the virtual machine.

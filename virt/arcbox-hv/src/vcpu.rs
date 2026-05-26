@@ -29,6 +29,17 @@ pub struct HvVcpu {
 }
 
 impl HvVcpu {
+    /// Returns the raw framework handle for use with `hv_vcpus_exit`.
+    ///
+    /// The handle is valid for the lifetime of this vCPU and can be
+    /// shared (as a `u64`) with other threads for targeted exit.
+    #[must_use]
+    pub fn raw_handle(&self) -> u64 {
+        self.id
+    }
+}
+
+impl HvVcpu {
     /// Creates a new vCPU with default configuration.
     ///
     /// Must be called from the thread that will run the vCPU.
@@ -124,13 +135,26 @@ impl HvVcpu {
     }
 }
 
+impl Drop for HvVcpu {
+    fn drop(&mut self) {
+        // SAFETY: `self.id` is valid and we are on the creation thread (enforced
+        // by `!Send`). After this call the handle is no longer usable.
+        let ret = unsafe { ffi::hv_vcpu_destroy(self.id) };
+        if let Err(e) = error::check(ret) {
+            tracing::warn!(vcpu_id = self.id, "hv_vcpu_destroy failed: {e}");
+        } else {
+            trace!(vcpu_id = self.id, "vCPU destroyed");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Requires `com.apple.security.hypervisor` entitlement.
     #[test]
-    #[ignore]
+    #[ignore = "requires com.apple.security.hypervisor entitlement"]
     fn create_vcpu_requires_vm() {
         // vCPU creation without a VM should fail.
         let result = HvVcpu::new();
@@ -138,43 +162,46 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires com.apple.security.hypervisor entitlement"]
     fn create_and_destroy_vcpu() {
-        let _vm = crate::HvVm::new().expect("VM create failed");
+        let vm = crate::HvVm::new().expect("VM create failed");
         let vcpu = HvVcpu::new().expect("vCPU create failed");
         let id = vcpu.id();
         assert!(id < u64::MAX, "vCPU should have a valid ID");
         drop(vcpu);
+        drop(vm);
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires com.apple.security.hypervisor entitlement"]
     fn set_and_get_register() {
-        let _vm = crate::HvVm::new().expect("VM create failed");
+        let vm = crate::HvVm::new().expect("VM create failed");
         let vcpu = HvVcpu::new().expect("vCPU create failed");
 
         vcpu.set_reg(ffi::HV_REG_X0, 0xDEAD_BEEF)
             .expect("set_reg failed");
         let val = vcpu.get_reg(ffi::HV_REG_X0).expect("get_reg failed");
         assert_eq!(val, 0xDEAD_BEEF);
+        drop(vm);
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires com.apple.security.hypervisor entitlement"]
     fn set_and_get_sys_register() {
-        let _vm = crate::HvVm::new().expect("VM create failed");
+        let vm = crate::HvVm::new().expect("VM create failed");
         let vcpu = HvVcpu::new().expect("vCPU create failed");
 
         // Read SCTLR_EL1 default value (should succeed even if value is 0).
-        let _val = vcpu
+        let _ = vcpu
             .get_sys_reg(ffi::HV_SYS_REG_SCTLR_EL1)
             .expect("get_sys_reg failed");
+        drop(vm);
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires com.apple.security.hypervisor entitlement"]
     fn run_wfi_exit() {
-        let _vm = crate::HvVm::new().expect("VM create failed");
+        let vm = crate::HvVm::new().expect("VM create failed");
 
         // Allocate a page and write a WFI instruction (0xD503207F).
         let size = 4096usize;
@@ -183,17 +210,17 @@ mod tests {
         let code = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!code.is_null());
 
-        // Write WFI (little-endian ARM64 encoding).
+        // Write WFI (little-endian ARM64 encoding) as raw bytes to avoid
+        // alignment lint — alloc guarantees 4096-byte alignment in practice.
         // SAFETY: code points to at least 4096 bytes.
         unsafe {
-            let wfi: u32 = 0xD503_207F;
-            std::ptr::write(code.cast::<u32>(), wfi);
+            std::slice::from_raw_parts_mut(code, 4).copy_from_slice(&0xD503_207Fu32.to_le_bytes());
         }
 
         let ram_base: u64 = 0x4000_0000;
         // SAFETY: code is valid 4KB-aligned allocation.
         unsafe {
-            _vm.map_memory(code, ram_base, size, crate::MemoryPermission::ALL)
+            vm.map_memory(code, ram_base, size, crate::MemoryPermission::ALL)
                 .expect("map failed");
         }
 
@@ -214,15 +241,15 @@ mod tests {
         }
 
         drop(vcpu);
-        _vm.unmap_memory(ram_base, size).expect("unmap failed");
+        vm.unmap_memory(ram_base, size).expect("unmap failed");
         // SAFETY: code was allocated with layout.
         unsafe { std::alloc::dealloc(code, layout) };
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires com.apple.security.hypervisor entitlement"]
     fn mmio_exit_on_unmapped_address() {
-        let _vm = crate::HvVm::new().expect("VM create failed");
+        let vm = crate::HvVm::new().expect("VM create failed");
 
         // Write instructions: STR X0, [X1] then WFI
         let size = 4096usize;
@@ -231,12 +258,14 @@ mod tests {
         let code = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!code.is_null());
 
+        // Write instruction bytes directly to avoid alignment lint.
         // SAFETY: code is at least 4096 bytes.
         unsafe {
+            let buf = std::slice::from_raw_parts_mut(code, 8);
             // STR W0, [X1]  (32-bit store) = 0xB9000020
-            std::ptr::write(code.cast::<u32>(), 0xB900_0020);
+            buf[0..4].copy_from_slice(&0xB900_0020u32.to_le_bytes());
             // WFI = 0xD503207F
-            std::ptr::write(code.add(4).cast::<u32>(), 0xD503_207F);
+            buf[4..8].copy_from_slice(&0xD503_207Fu32.to_le_bytes());
         }
 
         let ram_base: u64 = 0x4000_0000;
@@ -244,7 +273,7 @@ mod tests {
 
         // SAFETY: code is valid.
         unsafe {
-            _vm.map_memory(code, ram_base, size, crate::MemoryPermission::ALL)
+            vm.map_memory(code, ram_base, size, crate::MemoryPermission::ALL)
                 .expect("map failed");
         }
 
@@ -271,21 +300,8 @@ mod tests {
         }
 
         drop(vcpu);
-        _vm.unmap_memory(ram_base, size).expect("unmap failed");
+        vm.unmap_memory(ram_base, size).expect("unmap failed");
         // SAFETY: code was allocated with layout.
         unsafe { std::alloc::dealloc(code, layout) };
-    }
-}
-
-impl Drop for HvVcpu {
-    fn drop(&mut self) {
-        // SAFETY: `self.id` is valid and we are on the creation thread (enforced
-        // by `!Send`). After this call the handle is no longer usable.
-        let ret = unsafe { ffi::hv_vcpu_destroy(self.id) };
-        if let Err(e) = error::check(ret) {
-            tracing::warn!(vcpu_id = self.id, "hv_vcpu_destroy failed: {e}");
-        } else {
-            trace!(vcpu_id = self.id, "vCPU destroyed");
-        }
     }
 }

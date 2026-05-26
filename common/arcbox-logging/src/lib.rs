@@ -68,6 +68,8 @@ impl LogGuard {
 ///
 /// Panics if the log directory cannot be created.
 pub fn init(config: LogConfig) -> LogGuard {
+    // Bridge `log` crate → tracing so third-party dependencies emitting via
+    // `log` have their output captured by the tracing subscriber.
     std::fs::create_dir_all(&config.log_dir).expect("failed to create log directory");
 
     let rotating_writer = SizeRotatingWriter::new(

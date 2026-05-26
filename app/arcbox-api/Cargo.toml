@@ -24,7 +24,7 @@ tokio-stream = { workspace = true }
 async-stream = { workspace = true }
 libc = { workspace = true }
 uuid = { workspace = true }
-dimicon = { version = "0.1.0", features = ["devicon"] }
+dimicon = { version = "0.2.0", features = ["devicon", "simpleicon"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

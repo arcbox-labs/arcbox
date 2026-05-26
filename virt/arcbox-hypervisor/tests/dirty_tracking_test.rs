@@ -293,7 +293,7 @@ mod performance {
     ///
     /// Note: This test is marked #[ignore] because it takes longer to run.
     #[test]
-    #[ignore]
+    #[ignore = "long-running performance benchmark, run explicitly"]
     fn test_dirty_tracking_performance() {
         if !is_supported() {
             println!("Virtualization not supported, skipping");
@@ -356,7 +356,7 @@ mod performance {
     /// Measures the impact of having actual dirty pages on the tracking
     /// performance.
     #[test]
-    #[ignore]
+    #[ignore = "long-running performance benchmark, run explicitly"]
     fn test_dirty_tracking_performance_with_writes() {
         if !is_supported() {
             println!("Virtualization not supported, skipping");

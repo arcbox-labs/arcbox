@@ -149,7 +149,7 @@ impl BootAssets {
     /// Default kernel command line for EROFS rootfs boot.
     #[must_use]
     pub fn default_cmdline() -> String {
-        "console=hvc0 root=/dev/vda ro rootfstype=erofs earlycon".to_string()
+        "console=hvc0 root=/dev/vda ro rootfstype=erofs earlycon swiotlb=noforce".to_string()
     }
 }
 
@@ -246,7 +246,8 @@ impl BootAssetProvider {
         })
     }
 
-    /// Prepare host-side binaries (dockerd, containerd, shim, runc, k3s) into `dest_dir`.
+    /// Prepare host-side binaries (dockerd, containerd, shim, runc, docker-init, k3s)
+    /// into `dest_dir`.
     pub async fn prepare_binaries(
         &self,
         dest_dir: &Path,

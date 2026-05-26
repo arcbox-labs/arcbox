@@ -70,7 +70,9 @@ pub fn max_cpu_count() -> u64 {
     ensure_framework_loaded();
     // SAFETY: Sending maximumAllowedCPUCount to a valid VZVirtualMachineConfiguration class pointer.
     unsafe {
-        let cls = get_class("VZVirtualMachineConfiguration").unwrap();
+        let Some(cls) = get_class("VZVirtualMachineConfiguration") else {
+            return 0;
+        };
         msg_send_u64!(cls, maximumAllowedCPUCount)
     }
 }
@@ -80,7 +82,9 @@ pub fn min_cpu_count() -> u64 {
     ensure_framework_loaded();
     // SAFETY: Sending minimumAllowedCPUCount to a valid VZVirtualMachineConfiguration class pointer.
     unsafe {
-        let cls = get_class("VZVirtualMachineConfiguration").unwrap();
+        let Some(cls) = get_class("VZVirtualMachineConfiguration") else {
+            return 0;
+        };
         msg_send_u64!(cls, minimumAllowedCPUCount)
     }
 }
@@ -90,7 +94,9 @@ pub fn max_memory_size() -> u64 {
     ensure_framework_loaded();
     // SAFETY: Sending maximumAllowedMemorySize to a valid VZVirtualMachineConfiguration class pointer.
     unsafe {
-        let cls = get_class("VZVirtualMachineConfiguration").unwrap();
+        let Some(cls) = get_class("VZVirtualMachineConfiguration") else {
+            return 0;
+        };
         msg_send_u64!(cls, maximumAllowedMemorySize)
     }
 }
@@ -100,7 +106,9 @@ pub fn min_memory_size() -> u64 {
     ensure_framework_loaded();
     // SAFETY: Sending minimumAllowedMemorySize to a valid VZVirtualMachineConfiguration class pointer.
     unsafe {
-        let cls = get_class("VZVirtualMachineConfiguration").unwrap();
+        let Some(cls) = get_class("VZVirtualMachineConfiguration") else {
+            return 0;
+        };
         msg_send_u64!(cls, minimumAllowedMemorySize)
     }
 }

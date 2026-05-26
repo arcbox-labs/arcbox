@@ -150,8 +150,8 @@ async fn status(data_dir: PathBuf, args: StatusArgs, format: OutputFormat) -> an
     let assets = if cached {
         let kernel = version_dir.join("kernel");
         let rootfs = version_dir.join("rootfs.erofs");
-        let kernel_size = std::fs::metadata(&kernel).map(|m| m.len()).unwrap_or(0);
-        let rootfs_size = std::fs::metadata(&rootfs).map(|m| m.len()).unwrap_or(0);
+        let kernel_size = std::fs::metadata(&kernel).map_or(0, |m| m.len());
+        let rootfs_size = std::fs::metadata(&rootfs).map_or(0, |m| m.len());
         Some(AssetDetails {
             kernel_path: kernel.display().to_string(),
             kernel_size,
@@ -331,7 +331,7 @@ fn make_ndjson_progress_callback()
             let (phase, downloaded_bytes, total_bytes, percent) = match &progress.phase {
                 PreparePhase::Checking => ("checking".to_string(), None, None, None),
                 PreparePhase::Downloading { downloaded, total } => {
-                    let pct = total.map(|t| if t > 0 { downloaded * 100 / t } else { 0 });
+                    let pct = total.map(|t| (downloaded * 100).checked_div(t).unwrap_or(0));
                     ("downloading".to_string(), Some(*downloaded), *total, pct)
                 }
                 PreparePhase::Verifying => ("verifying".to_string(), None, None, None),

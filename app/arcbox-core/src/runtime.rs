@@ -34,11 +34,12 @@ const DEFAULT_GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 2);
 /// `(guest_ip, host_port, protocol)` tuples registered for that container.
 #[cfg(target_os = "macos")]
 type InboundRulesMap = Arc<TokioRwLock<HashMap<String, Vec<(Ipv4Addr, u16, InboundProtocol)>>>>;
-const REQUIRED_RUNTIME_ASSETS: [&str; 5] = [
+const REQUIRED_RUNTIME_ASSETS: [&str; 6] = [
     "dockerd",
     "containerd",
     "containerd-shim-runc-v2",
     "runc",
+    "docker-init",
     "k3s",
 ];
 const KUBERNETES_HOST_ENDPOINT: &str = "https://127.0.0.1:16443";
@@ -441,7 +442,8 @@ impl Runtime {
         tokio::fs::create_dir_all(self.config.data_dir.join("vms")).await?;
         tokio::fs::create_dir_all(self.config.data_dir.join("machines")).await?;
 
-        // Download runtime binaries (dockerd, containerd, shim, runc, k3s) if not cached.
+        // Download runtime binaries (dockerd, containerd, shim, runc, docker-init, k3s)
+        // if not cached.
         let runtime_bin_dir = self.config.data_dir.join("runtime/bin");
         tokio::fs::create_dir_all(&runtime_bin_dir).await?;
         self.vm_lifecycle
@@ -874,6 +876,7 @@ mod tests {
             "runtime/bin/containerd",
             "runtime/bin/containerd-shim-runc-v2",
             "runtime/bin/runc",
+            "runtime/bin/docker-init",
             "runtime/bin/k3s",
         ] {
             let path = data_dir.join(name);
@@ -924,7 +927,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_kubeconfig_server_updates_arcbox_refs() {
-        let kubeconfig = r#"apiVersion: v1
+        let kubeconfig = r"apiVersion: v1
 clusters:
 - cluster:
     server: https://127.0.0.1:6443
@@ -938,7 +941,7 @@ current-context: default
 users:
 - name: default
   user: {}
-"#;
+";
 
         let rewritten = super::rewrite_kubeconfig_server(kubeconfig);
         assert!(rewritten.contains("server: https://127.0.0.1:16443"));

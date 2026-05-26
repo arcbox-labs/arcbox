@@ -595,7 +595,7 @@ mod tests {
             mac_address: String::new(),
             dns_servers: vec![],
         };
-        assert_eq!(alloc.netmask(), Ipv4Addr::new(255, 255, 255, 255));
+        assert_eq!(alloc.netmask(), Ipv4Addr::BROADCAST);
     }
 
     #[test]
@@ -609,7 +609,7 @@ mod tests {
             dns_servers: vec![],
         };
         // prefix_len 33 should clamp to /32 → 255.255.255.255
-        assert_eq!(alloc.netmask(), Ipv4Addr::new(255, 255, 255, 255));
+        assert_eq!(alloc.netmask(), Ipv4Addr::BROADCAST);
     }
 
     #[test]
