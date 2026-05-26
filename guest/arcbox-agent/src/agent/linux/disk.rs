@@ -33,14 +33,14 @@ pub(super) async fn fstrim_loop() {
                     tracing::info!("fstrim {} completed", mount);
                 }
                 Ok(s) => {
-                    tracing::debug!(
+                    tracing::warn!(
                         "fstrim {} exited with code {}",
                         mount,
                         s.code().unwrap_or(-1)
                     );
                 }
                 Err(e) => {
-                    tracing::debug!("fstrim {} failed: {}", mount, e);
+                    tracing::warn!("fstrim {} failed: {}", mount, e);
                 }
             }
         }
