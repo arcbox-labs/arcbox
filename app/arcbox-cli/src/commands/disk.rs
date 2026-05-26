@@ -114,8 +114,9 @@ async fn execute_compact() -> Result<()> {
         return Ok(());
     }
 
-    println!("Automatic disk compaction is enabled by default.");
-    println!("The guest runs periodic fstrim and the host disk uses sparse allocation.");
+    println!("On-demand compaction via this command is not yet implemented.");
+    println!("The guest VM runs fstrim hourly and the host disk uses sparse allocation, so freed");
+    println!("blocks are reclaimed automatically — but this command itself triggers no trim.");
     println!();
     println!("To reclaim space inside the VM, run:");
     println!("  docker system prune --all --volumes");
