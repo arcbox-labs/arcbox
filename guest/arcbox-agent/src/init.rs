@@ -163,8 +163,9 @@ mod platform {
     }
 
     /// Like [`mount_tmpfs`] but without `nodev`, allowing device nodes to be
-    /// opened on this filesystem. Used for `/var` where the Firecracker jailer
-    /// creates block device nodes via `mknod` inside its chroot.
+    /// opened on this filesystem. Used for the Firecracker jailer subtree
+    /// where the jailer mknods a block device for the rootfs inside its
+    /// chroot.
     fn mount_tmpfs_dev(target: &str) {
         if crate::mount::is_mounted(target) {
             return;
