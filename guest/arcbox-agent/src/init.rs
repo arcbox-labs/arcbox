@@ -32,12 +32,16 @@ mod platform {
         // Writable layers on top of read-only EROFS.
         mount_tmpfs("/tmp");
         mount_tmpfs("/run");
-        // /var needs device nodes for the Firecracker jailer chroot:
-        // the jailer mknods a block device for the rootfs inside
-        // /var/lib/arcbox/jailer/, which requires the filesystem to
-        // allow device access (no `nodev`).
-        mount_tmpfs_dev("/var");
+        mount_tmpfs("/var");
         mount_tmpfs("/etc");
+
+        // The Firecracker jailer mknods a block device for the rootfs
+        // inside its chroot under /var/lib/arcbox/jailer/. That requires
+        // a filesystem mounted without `nodev`. Mount only the jailer
+        // subtree as a separate dev-allowing tmpfs to keep the rest of
+        // /var with the default safer flags.
+        mkdir_p("/var/lib/arcbox/jailer");
+        mount_tmpfs_dev("/var/lib/arcbox/jailer");
 
         // Populate /etc with files containerd/dockerd expect.
         write_etc_resolv_conf();
@@ -299,29 +303,52 @@ mod platform {
     /// Virtualization.framework exposes `level`, `type`, and `shared_cpu_map`
     /// for each cache index but omits `size`, `coherency_line_size`, and
     /// `number_of_sets`. The Firecracker jailer hard-panics when these files
-    /// are absent, so we fill them in with reasonable ARM64 defaults.
+    /// are absent, so we fill them in with placeholder values. Only the
+    /// jailer reads these files; the numbers are intentionally not accurate
+    /// (and will be wrong on x86_64 guests), but they're well-formed and
+    /// satisfy the existence/parse check the jailer performs before chroot.
     fn ensure_cpu_cache_topology() {
         const CACHE_BASE: &str = "/sys/devices/system/cpu/cpu0/cache";
         const FIXUP_BASE: &str = "/run/arcbox/cache-fixup";
+        const REQUIRED: &[&str] = &["size", "coherency_line_size", "number_of_sets"];
 
-        // If the first missing file already exists, nothing to do (either the
-        // hypervisor exposes full topology or a previous run already fixed up).
-        if Path::new(&format!("{CACHE_BASE}/index0/size")).exists() {
-            return;
-        }
-
-        // Default values per cache index — (size, coherency_line_size, number_of_sets).
+        // Placeholder values keyed by index — (size, coherency_line_size,
+        // number_of_sets). Any index not listed (e.g. index3 for L3) falls
+        // back to FALLBACK below.
         const DEFAULTS: &[(&str, &str, &str)] = &[
-            ("64K", "64", "256"),    // index0: L1 Data
-            ("64K", "64", "256"),    // index1: L1 Instruction
-            ("1024K", "64", "2048"), // index2: L2 Unified
+            ("64K", "64", "256"),    // index0: typically L1 Data
+            ("64K", "64", "256"),    // index1: typically L1 Instruction
+            ("1024K", "64", "2048"), // index2: typically L2 Unified
         ];
+        const FALLBACK: (&str, &str, &str) = ("8192K", "64", "8192");
 
-        for (idx, &(size, line_size, num_sets)) in DEFAULTS.iter().enumerate() {
+        let entries = match fs::read_dir(CACHE_BASE) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let mut indices: Vec<usize> = entries
+            .flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_prefix("index"))
+                    .and_then(|s| s.parse::<usize>().ok())
+            })
+            .collect();
+        indices.sort_unstable();
+
+        let mut applied = 0_usize;
+        for idx in indices {
             let sysfs_dir = format!("{CACHE_BASE}/index{idx}");
-            if !Path::new(&sysfs_dir).exists() {
-                break;
+            // Skip indices that already expose every required attribute.
+            if REQUIRED
+                .iter()
+                .all(|f| Path::new(&format!("{sysfs_dir}/{f}")).exists())
+            {
+                continue;
             }
+
+            let (size, line_size, num_sets) = DEFAULTS.get(idx).copied().unwrap_or(FALLBACK);
 
             let fixup_dir = format!("{FIXUP_BASE}/index{idx}");
             mkdir_p(&fixup_dir);
@@ -360,10 +387,17 @@ mod platform {
                 None::<&str>,
             ) {
                 tracing::warn!(index = idx, error = %e, "failed to bind-mount cache fixup");
+            } else {
+                applied += 1;
             }
         }
 
-        tracing::info!("CPU cache topology fixup applied for Firecracker jailer");
+        if applied > 0 {
+            tracing::info!(
+                count = applied,
+                "CPU cache topology fixup applied for Firecracker jailer"
+            );
+        }
     }
 
     fn setup_networking() {
