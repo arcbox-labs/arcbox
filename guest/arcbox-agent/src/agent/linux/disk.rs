@@ -7,6 +7,9 @@ use tokio::process::Command;
 use tokio::time::MissedTickBehavior;
 
 use arcbox_constants::paths::{CONTAINERD_DATA_MOUNT_POINT, DOCKER_DATA_MOUNT_POINT};
+use arcbox_protocol::agent::DiskTrimResponse;
+
+use crate::rpc::RpcResponse;
 
 /// Interval between successive periodic trims.
 const FSTRIM_INTERVAL: Duration = Duration::from_secs(3600);
@@ -42,4 +45,32 @@ pub(super) async fn fstrim_loop() {
             }
         }
     }
+}
+
+/// Runs `fstrim -v` once on each data mount, returning a per-mount summary.
+async fn run_fstrim_now() -> String {
+    let mut results = Vec::new();
+    for mount in FSTRIM_MOUNTS {
+        match Command::new("fstrim").arg("-v").arg(mount).output().await {
+            Ok(output) if output.status.success() => {
+                let msg = String::from_utf8_lossy(&output.stdout);
+                results.push(format!("{}: {}", mount, msg.trim()));
+            }
+            Ok(output) => {
+                let msg = String::from_utf8_lossy(&output.stderr);
+                results.push(format!("{}: failed ({})", mount, msg.trim()));
+            }
+            Err(e) => {
+                results.push(format!("{}: error ({})", mount, e));
+            }
+        }
+    }
+    results.join("; ")
+}
+
+/// Handles a `DiskTrim` RPC: triggers an immediate trim and returns the
+/// per-mount summary.
+pub(super) async fn handle_disk_trim() -> RpcResponse {
+    let result = run_fstrim_now().await;
+    RpcResponse::DiskTrim(DiskTrimResponse { result })
 }

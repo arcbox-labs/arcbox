@@ -1535,6 +1535,20 @@ pub struct RuntimeStatusResponse {
     #[prost(message, repeated, tag = "5")]
     pub services: ::prost::alloc::vec::Vec<ServiceStatus>,
 }
+/// Request to trigger an immediate fstrim on data mount points.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct DiskTrimRequest {}
+/// Response from a disk trim operation.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DiskTrimResponse {
+    /// Human-readable result summary (e.g. bytes trimmed per mount).
+    #[prost(string, tag = "1")]
+    pub result: ::prost::alloc::string::String,
+}
 /// Notification that a container's published port bindings changed.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
