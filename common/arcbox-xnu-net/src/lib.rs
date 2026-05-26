@@ -14,16 +14,15 @@
 //! # Example
 //!
 //! ```no_run
-//! use arcbox_xnu_net::{BatchDgram, MAX_BATCH};
-//! use std::os::fd::AsRawFd;
+//! use arcbox_xnu_net::BatchDgram;
 //!
 //! # fn example(fd: std::os::fd::RawFd) -> std::io::Result<()> {
 //! let mut batch = BatchDgram::new();
 //! let mut buf = vec![0u8; 4096];
 //! let mut bufs: Vec<&mut [u8]> = vec![buf.as_mut_slice()];
-//! let (entries, count) = batch.recv_batch(fd, &mut bufs)?;
-//! for i in 0..count {
-//!     println!("datagram {i}: {} bytes", entries[i].len);
+//! let entries = batch.recv_batch(fd, &mut bufs)?;
+//! for (i, entry) in entries.iter().enumerate() {
+//!     println!("datagram {i}: {} bytes", entry.len);
 //! }
 //! # Ok(())
 //! # }
