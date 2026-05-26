@@ -41,6 +41,13 @@ const DM_NAME_PREFIX: &str = "arcbox-snap-";
 /// Maximum length of a device-mapper name (DM_NAME_LEN - 1, from linux/dm-ioctl.h).
 const DM_NAME_MAX_LEN: usize = 127;
 
+/// Subdirectory of `cow_dir` holding template-loop marker files for
+/// crash recovery.  Each file is named after the loop's basename (e.g.
+/// `loop0`) and contains the absolute path of the backing template; on
+/// startup we use these to identify *our* attached read-only loops
+/// rather than every read-only loop on the system.
+const TEMPLATE_LOOP_DIR: &str = ".template-loops";
+
 /// Validate that `sandbox_id` can be used as the suffix of a dm-name.
 ///
 /// Device-mapper allows `[A-Za-z0-9_+.-]` (see kernel `validate_name`).
@@ -216,6 +223,10 @@ impl CowManager {
                     let _ = losetup_detach(BUSYBOX, &ld).await;
                 });
             })?;
+            // Persist a marker so cleanup_stale_sync can identify this loop
+            // as ours on a future restart.  Best-effort: a failure here only
+            // means a leak after crash, not a runtime failure.
+            self.write_template_marker(&loop_dev, &template);
             debug!(
                 template = %rootfs_path,
                 loop_dev = %loop_dev,
@@ -391,44 +402,79 @@ impl CowManager {
         // device per unique rootfs template, eventually exhausting the
         // 256-entry loop namespace.
         //
-        // Signature: attached + read-only.  This module is the only thing
-        // in the guest that attaches loop devices read-only (COW loops are
-        // read-write and were handled above), so anything matching is
-        // ours and stale.
-        self.detach_stale_template_loops();
+        // We use marker files written at attach time (under
+        // `{cow_dir}/.template-loops/`) rather than a system-wide "any
+        // RO loop" scan, so we never touch loops attached by other
+        // services in the guest (containerd snapshotter, squashfs mounts).
+        self.cleanup_stale_template_markers();
     }
 
-    fn detach_stale_template_loops(&self) {
-        let Ok(entries) = std::fs::read_dir("/sys/block") else {
+    /// Marker path for the template loop `loop_dev` (e.g.
+    /// `{cow_dir}/.template-loops/loop0`).  Returns `None` for a
+    /// malformed device path.
+    fn template_marker_path(&self, loop_dev: &str) -> Option<PathBuf> {
+        let basename = Path::new(loop_dev).file_name()?;
+        Some(self.cow_dir.join(TEMPLATE_LOOP_DIR).join(basename))
+    }
+
+    fn write_template_marker(&self, loop_dev: &str, template_path: &Path) {
+        let Some(marker) = self.template_marker_path(loop_dev) else {
+            warn!(
+                loop_dev,
+                "skipping template marker: unparseable loop device"
+            );
+            return;
+        };
+        if let Some(parent) = marker.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            warn!(error = %e, "failed to create template-loops dir");
+            return;
+        }
+        if let Err(e) = std::fs::write(&marker, template_path.to_string_lossy().as_bytes()) {
+            warn!(loop_dev, error = %e, "failed to write template-loop marker");
+        }
+    }
+
+    fn cleanup_stale_template_markers(&self) {
+        let dir = self.cow_dir.join(TEMPLATE_LOOP_DIR);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             return;
         };
         for entry in entries.flatten() {
-            let Ok(name) = entry.file_name().into_string() else {
+            let marker_path = entry.path();
+            let Some(loop_basename) = marker_path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let Some(suffix) = name.strip_prefix("loop") else {
-                continue;
-            };
-            if !suffix.chars().all(|c| c.is_ascii_digit()) {
-                continue;
-            }
-            // Must be currently attached.
-            let backing = format!("/sys/block/{name}/loop/backing_file");
-            if !Path::new(&backing).exists() {
-                continue;
-            }
-            // Must be read-only.
-            let ro_path = format!("/sys/block/{name}/ro");
-            let is_ro = std::fs::read_to_string(&ro_path)
+            let dev = format!("/dev/{loop_basename}");
+            let expected_backing = std::fs::read_to_string(&marker_path)
                 .ok()
-                .is_some_and(|s| s.trim() == "1");
-            if !is_ro {
-                continue;
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+
+            // Verify the loop is still attached AND still backs the
+            // expected template, so we never detach a /dev/loopN that
+            // was reused by another process after our crash.
+            let actual_backing =
+                std::fs::read_to_string(format!("/sys/block/{loop_basename}/loop/backing_file"))
+                    .ok()
+                    .map(|s| s.trim().to_string());
+
+            if !expected_backing.is_empty()
+                && actual_backing.as_deref() == Some(expected_backing.as_str())
+            {
+                debug!(dev = %dev, "detaching stale template loop");
+                let _ = Command::new(BUSYBOX).args(["losetup", "-d", &dev]).output();
+            } else {
+                debug!(
+                    dev = %dev,
+                    expected = %expected_backing,
+                    actual = ?actual_backing,
+                    "skipping stale template loop: backing mismatch"
+                );
             }
 
-            let dev = format!("/dev/{name}");
-            debug!(dev = %dev, "detaching stale template loop device");
-            let _ = Command::new(BUSYBOX).args(["losetup", "-d", &dev]).output();
+            let _ = std::fs::remove_file(&marker_path);
         }
     }
 
@@ -449,10 +495,18 @@ impl CowManager {
 
         if let Some(loop_dev) = should_detach {
             templates.remove(template_path);
+            drop(templates);
             // Fire-and-forget detach (we are under a sync Mutex, cannot await).
+            // The marker is removed only after a successful detach so a crash
+            // mid-detach still leaves a recoverable record on disk.
+            let marker = self.template_marker_path(&loop_dev);
             tokio::spawn(async move {
                 if let Err(e) = losetup_detach(BUSYBOX, &loop_dev).await {
                     warn!(loop_dev = %loop_dev, error = %e, "failed to detach template loop");
+                    return;
+                }
+                if let Some(marker) = marker {
+                    let _ = std::fs::remove_file(&marker);
                 }
             });
         }
@@ -689,6 +743,25 @@ mod tests {
         let table =
             format!("0 {sectors} snapshot /dev/loop0 /dev/loop1 P {SNAPSHOT_CHUNK_SECTORS}");
         assert_eq!(table, "0 2097152 snapshot /dev/loop0 /dev/loop1 P 8");
+    }
+
+    #[test]
+    fn template_marker_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = CowManager {
+            templates: Mutex::new(HashMap::new()),
+            losetup_lock: AsyncMutex::new(()),
+            cow_dir: tmp.path().to_path_buf(),
+            dmsetup_bin: None,
+        };
+
+        let template = PathBuf::from("/var/lib/arcbox/rootfs.ext4");
+        mgr.write_template_marker("/dev/loop7", &template);
+        let marker = mgr.template_marker_path("/dev/loop7").unwrap();
+        assert_eq!(marker.file_name().unwrap(), "loop7");
+        assert!(marker.exists());
+        let content = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(content, template.to_string_lossy());
     }
 
     #[tokio::test]
