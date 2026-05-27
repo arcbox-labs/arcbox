@@ -348,15 +348,22 @@ impl DhcpServer {
             return;
         }
 
-        // Remove the lease so the client can start fresh with DISCOVER.
-        // The IP stays allocated (via the allocate_specific call below) so
-        // the quarantine entry below is what gates re-offer.
-        self.leases.remove(&mac);
+        // Remove the lease only if it covers the declined IP. If the MAC
+        // holds a lease for a different IP (e.g. lease for IP-A, reservation
+        // for IP-B, DECLINE for IP-B), leave the unrelated lease alone so
+        // its IP isn't silently leaked from the allocator.
+        if lease_ip == Some(ip) {
+            self.leases.remove(&mac);
+        }
 
-        // Ensure the declined IP is marked as allocated so it cannot be
-        // handed out during the quarantine window. If it was already
-        // allocated (the common case), this is a no-op.
-        self.allocator.allocate_specific(ip);
+        // The IP is already in the allocator (it came from a lease or a
+        // reservation), so quarantine is what gates re-offer. The lease
+        // removal above doesn't release it; the reservation path doesn't
+        // either.
+        debug_assert!(
+            !self.allocator.is_available(ip),
+            "declined IP {ip} should already be allocated"
+        );
 
         // Record the quarantine start time.
         self.declined_ips.insert(ip, Instant::now());
@@ -470,13 +477,27 @@ mod tests {
         assert!(server.allocator.is_available(ip));
     }
 
-    /// Build a backdated quarantine timestamp without risking a panic on
-    /// freshly-booted CI runners where `Instant::now()` may be less than
-    /// `DECLINE_QUARANTINE` from the monotonic clock origin.
-    fn backdated_quarantine() -> Instant {
-        Instant::now()
-            .checked_sub(DECLINE_QUARANTINE + Duration::from_secs(1))
-            .unwrap_or_else(Instant::now)
+    /// Build a backdated quarantine timestamp, or skip the caller's test if
+    /// the system uptime is shorter than `DECLINE_QUARANTINE` (so `Instant`
+    /// subtraction can't reach the past). Returning `None` lets the caller
+    /// bail out cleanly instead of asserting against a non-expired timestamp.
+    fn backdated_quarantine() -> Option<Instant> {
+        Instant::now().checked_sub(DECLINE_QUARANTINE + Duration::from_secs(1))
+    }
+
+    macro_rules! backdate_or_skip {
+        () => {
+            match backdated_quarantine() {
+                Some(t) => t,
+                None => {
+                    eprintln!(
+                        "skipping: system uptime is shorter than DECLINE_QUARANTINE ({:?})",
+                        DECLINE_QUARANTINE
+                    );
+                    return;
+                }
+            }
+        };
     }
 
     fn make_decline(mac: [u8; 6], ip: Ipv4Addr) -> DhcpPacket {
@@ -522,7 +543,7 @@ mod tests {
         assert!(!server.allocator.is_available(ip));
 
         // Backdate the quarantine timestamp to simulate expiry.
-        server.declined_ips.insert(ip, backdated_quarantine());
+        server.declined_ips.insert(ip, backdate_or_skip!());
 
         server.cleanup_expired_leases();
 
@@ -581,7 +602,7 @@ mod tests {
         assert!(!server.allocator.is_available(ip));
 
         // Expire the quarantine and run cleanup.
-        server.declined_ips.insert(ip, backdated_quarantine());
+        server.declined_ips.insert(ip, backdate_or_skip!());
         server.cleanup_expired_leases();
 
         // The reservation stays — the allocator must still hold the IP so it
