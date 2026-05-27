@@ -973,6 +973,21 @@ impl SandboxManager {
 
         let fc_cfg = &self.config.firecracker;
 
+        // Track resources that need cleanup if anything between this point
+        // and the final instance registration fails:
+        //
+        // - `pending_cow`: a CowHandle has no Drop impl, so a `?` propagating
+        //   the error would silently leak the dm device + loop + COW file.
+        // - `pending_origin_dir` (direct mode only): we recreate the original
+        //   sandbox's vm_dir so the vmstate-recorded symlink + vsock paths
+        //   resolve.  Set as soon as the dir is created so any later failure
+        //   (CoW setup, fc_sdk::restore) cleans it up, not only the CoW Ok
+        //   branch.
+        //
+        // On success, both are moved onto the SandboxInstance.
+        let mut pending_cow: Option<CowHandle> = None;
+        let mut pending_origin_dir: Option<PathBuf> = None;
+
         // Determine the actual host-side vsock UDS path FC will bind to on restore
         // and ensure the socket path is clear before spawning.
         //
@@ -982,7 +997,7 @@ impl SandboxManager {
         // - Direct mode: the vmstate stores the ABSOLUTE host path from the original
         //   sandbox. We must recreate that directory and delete any stale socket so FC
         //   can bind successfully.
-        let (process, actual_vsock_path) = if let Some(ref jc) = fc_cfg.jailer {
+        let (mut process, actual_vsock_path) = if let Some(ref jc) = fc_cfg.jailer {
             let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
             let cr = chroot_root(&fc_cfg.binary, base, &new_id);
             // Ensure the `run/` directory exists inside the new chroot so FC can
@@ -1026,6 +1041,10 @@ impl SandboxManager {
             {
                 return Err(VmmError::Io(e));
             }
+            // Track the dir for cleanup — any failure past this point (FC spawn,
+            // CoW setup, fc_sdk::restore) must remove it, not only the CoW Ok
+            // branch.
+            pending_origin_dir = Some(original_vm_dir.clone());
 
             // Pre-create log/metrics files — Firecracker requires them to
             // exist at startup (same as the boot path in do_boot).
@@ -1037,19 +1056,6 @@ impl SandboxManager {
                 spawn_direct(fc_cfg, &new_id, &socket_path, &log_path, &metrics_path).await?;
             (proc, original_vsock_path)
         };
-
-        // Track resources that need cleanup if anything between
-        // `cow_manager.setup` and the final instance registration fails:
-        //
-        // - `pending_cow`: a CowHandle has no Drop impl, so a `?` propagating
-        //   the error would silently leak the dm device + loop + COW file.
-        // - `pending_origin_dir` (direct mode only): we recreate the original
-        //   sandbox's vm_dir so the vmstate-recorded symlink + vsock paths
-        //   resolve.  Without cleanup, every failed restore leaks one dir.
-        //
-        // On success, both are moved onto the SandboxInstance.
-        let mut pending_cow: Option<CowHandle> = None;
-        let mut pending_origin_dir: Option<PathBuf> = None;
 
         // In jailer mode the restored FC process also runs inside a chroot and
         // cannot access the catalog's host-absolute paths.  Copy the snapshot
@@ -1135,32 +1141,30 @@ impl SandboxManager {
                 // Direct mode: set up a fresh dm-snapshot for the restored sandbox
                 // and retarget the vmstate-recorded `{original_vm_dir}/rootfs.link`
                 // at the new device.  FC reopens the symlink path on restore.
-                if let Some(r) = snap_meta.rootfs_path.as_deref() {
-                    match self.cow_manager.setup(&new_id, r).await {
-                        Ok(handle) => {
-                            let original_vm_dir = PathBuf::from(&fc_cfg.data_dir)
-                                .join("sandboxes")
-                                .join(&snap_meta.vm_id);
-                            match create_rootfs_symlink(&original_vm_dir, &handle.dm_device) {
-                                Ok(_) => {
-                                    pending_cow = Some(handle);
-                                    pending_origin_dir = Some(original_vm_dir);
-                                }
-                                Err(e) => {
-                                    self.cow_manager.teardown(&handle).await;
-                                    return Err(e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            debug!(
-                                sandbox_id = %new_id,
-                                error = %e,
-                                "dm-snapshot unavailable for restore"
-                            );
-                        }
-                    }
+                //
+                // Unlike boot, direct-mode restore has no usable fallback:  the
+                // vmstate-recorded path is the symlink, so the only way for FC to
+                // open the rootfs is for that symlink to exist.  If dm-snapshot
+                // isn't available we fail explicitly rather than silently letting
+                // `fc_sdk::restore` fault on a missing file.
+                let rootfs = snap_meta.rootfs_path.as_deref().ok_or_else(|| {
+                    VmmError::Config(
+                        "snapshot has no rootfs_path; cannot restore in direct mode".into(),
+                    )
+                })?;
+                let handle = self.cow_manager.setup(&new_id, rootfs).await.map_err(|e| {
+                    VmmError::DeviceMapper(format!(
+                        "dm-snapshot setup failed during direct-mode restore: {e}"
+                    ))
+                })?;
+                let original_vm_dir = PathBuf::from(&fc_cfg.data_dir)
+                    .join("sandboxes")
+                    .join(&snap_meta.vm_id);
+                if let Err(e) = create_rootfs_symlink(&original_vm_dir, &handle.dm_device) {
+                    self.cow_manager.teardown(&handle).await;
+                    return Err(e);
                 }
+                pending_cow = Some(handle);
 
                 Ok((vmstate_str, mem_file))
             }
@@ -1170,6 +1174,10 @@ impl SandboxManager {
         let (effective_vmstate, effective_mem) = match setup_result {
             Ok(x) => x,
             Err(e) => {
+                // FC was spawned but hasn't yet been told to load the vmstate,
+                // so it shouldn't have the dm device open.  Kill it anyway
+                // before teardown so the cleanup is unconditionally safe.
+                kill_and_reap_fc(&mut process).await;
                 cleanup_pending_restore(
                     &self.cow_manager,
                     pending_cow,
@@ -1204,6 +1212,10 @@ impl SandboxManager {
         let vm = match fc_sdk::restore(effective_socket.to_str().unwrap(), load_params).await {
             Ok(v) => Arc::new(v),
             Err(e) => {
+                // FC has likely opened the dm-snapshot block device by now
+                // (vmstate load reopens all recorded drives).  Kill and wait
+                // before teardown so `dmsetup remove` doesn't hit EBUSY.
+                kill_and_reap_fc(&mut process).await;
                 cleanup_pending_restore(
                     &self.cow_manager,
                     pending_cow.take(),
@@ -1566,6 +1578,26 @@ async fn cleanup_pending_restore(
     }
 }
 
+/// SIGKILL Firecracker and wait for it to exit (bounded timeout).
+///
+/// Required before `cow_manager.teardown` on any failure path where FC may
+/// have opened the dm-snapshot block device: `dmsetup remove` returns EBUSY
+/// while a process still holds the device, leaking the dm device + loop +
+/// sparse COW file.  `FirecrackerProcess::drop` sends SIGKILL but never
+/// reaps, so by the time teardown runs FC may still be alive.
+async fn kill_and_reap_fc(process: &mut fc_sdk::FirecrackerProcess) {
+    if let Some(pid) = process.pid()
+        && pid > 0
+    {
+        let _ = nix::sys::signal::kill(
+            #[allow(clippy::cast_possible_wrap)]
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), process.wait()).await;
+}
+
 /// Perform the actual Firecracker boot: spawn process, configure, start VM.
 ///
 /// Returns `(FirecrackerProcess, Arc<Vm>, vsock_uds_path, Option<CowHandle>)`
@@ -1605,7 +1637,7 @@ async fn do_boot(
     }
 
     // Spawn the Firecracker process (direct or via Jailer).
-    let process = if let Some(ref jc) = fc_cfg.jailer {
+    let mut process = if let Some(ref jc) = fc_cfg.jailer {
         spawn_jailer(jc, fc_cfg, id).await?
     } else {
         spawn_direct(fc_cfg, id, &socket_path, &log_path, &metrics_path).await?
@@ -1770,6 +1802,10 @@ async fn do_boot(
         Err(e) => {
             // Clean up dm-snapshot if boot fails after setup.
             if let Some(ref handle) = cow_handle {
+                // FC has likely opened the dm-snapshot block device by this
+                // point.  Kill and wait before teardown so `dmsetup remove`
+                // doesn't hit EBUSY and leak the dm/loop/COW resources.
+                kill_and_reap_fc(&mut process).await;
                 cow_manager.teardown(handle).await;
                 // The rootfs.link symlink now points at a torn-down device.
                 // Remove it so subsequent retries see a clean slate.  Only
