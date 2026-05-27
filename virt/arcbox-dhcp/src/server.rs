@@ -327,33 +327,45 @@ impl DhcpServer {
     /// host on the network. We quarantine the address for [`DECLINE_QUARANTINE`]
     /// so it is not immediately re-offered, then release it back to the pool
     /// once the quarantine expires (handled by [`cleanup_expired_leases`]).
+    ///
+    /// Only IPs we actually offered to the declining MAC (via a lease or
+    /// reservation) are quarantined. A DECLINE for any other address —
+    /// out-of-pool, in use by another client, or never offered to this MAC —
+    /// is ignored, so a misbehaving client cannot trigger quarantine of an
+    /// address that belongs to someone else.
     fn handle_decline(&mut self, packet: &DhcpPacket) {
         let mac = packet.client_mac();
+        let Some(ip) = packet.requested_ip else {
+            return;
+        };
 
-        if let Some(ip) = packet.requested_ip {
-            // Remove the lease so the client can start fresh with DISCOVER.
-            if let Some(lease) = self.leases.remove(&mac) {
-                // If the declined IP differs from the lease IP (unusual, but
-                // possible), release the lease IP since the client won't use it.
-                if lease.ip != ip && !self.reservations.contains_key(&mac) {
-                    self.allocator.release(lease.ip);
-                }
-            }
+        let lease_ip = self.leases.get(&mac).map(|l| l.ip);
+        let reserved_ip = self.reservations.get(&mac).copied();
+        let offered_to_mac = lease_ip == Some(ip) || reserved_ip == Some(ip);
 
-            // Ensure the declined IP is marked as allocated so it cannot be
-            // handed out during the quarantine window. If it was already
-            // allocated (the common case), this is a no-op.
-            self.allocator.allocate_specific(ip);
-
-            // Record the quarantine start time.
-            self.declined_ips.insert(ip, Instant::now());
-
-            tracing::warn!(
-                "DHCPDECLINE: {} quarantined for {:?}",
-                ip,
-                DECLINE_QUARANTINE
-            );
+        if !offered_to_mac {
+            tracing::warn!("DHCPDECLINE: ignoring decline for {ip} not offered to this MAC");
+            return;
         }
+
+        // Remove the lease so the client can start fresh with DISCOVER.
+        // The IP stays allocated (via the allocate_specific call below) so
+        // the quarantine entry below is what gates re-offer.
+        self.leases.remove(&mac);
+
+        // Ensure the declined IP is marked as allocated so it cannot be
+        // handed out during the quarantine window. If it was already
+        // allocated (the common case), this is a no-op.
+        self.allocator.allocate_specific(ip);
+
+        // Record the quarantine start time.
+        self.declined_ips.insert(ip, Instant::now());
+
+        tracing::warn!(
+            "DHCPDECLINE: {} quarantined for {:?}",
+            ip,
+            DECLINE_QUARANTINE
+        );
     }
 
     /// Cleans up expired leases and quarantined declined IPs.
@@ -373,6 +385,10 @@ impl DhcpServer {
         }
 
         // Release quarantined declined IPs whose quarantine has elapsed.
+        // Skip the allocator release if the IP has since been reserved or
+        // re-leased (e.g. the declining client re-acquired it via a
+        // reservation between the decline and the cleanup tick), so the
+        // current owner keeps the address.
         let expired_declines: Vec<Ipv4Addr> = self
             .declined_ips
             .iter()
@@ -382,6 +398,16 @@ impl DhcpServer {
 
         for ip in expired_declines {
             self.declined_ips.remove(&ip);
+
+            let reserved = self.reservations.values().any(|&r| r == ip);
+            let leased = self.leases.values().any(|l| l.ip == ip);
+            if reserved || leased {
+                tracing::debug!(
+                    "Quarantine expired for {ip} but address is still in use (reserved={reserved}, leased={leased}); keeping allocated"
+                );
+                continue;
+            }
+
             self.allocator.release(ip);
             tracing::debug!("Released quarantined declined IP {}", ip);
         }
@@ -444,15 +470,34 @@ mod tests {
         assert!(server.allocator.is_available(ip));
     }
 
+    /// Build a backdated quarantine timestamp without risking a panic on
+    /// freshly-booted CI runners where `Instant::now()` may be less than
+    /// `DECLINE_QUARANTINE` from the monotonic clock origin.
+    fn backdated_quarantine() -> Instant {
+        Instant::now()
+            .checked_sub(DECLINE_QUARANTINE + Duration::from_secs(1))
+            .unwrap_or_else(Instant::now)
+    }
+
+    fn make_decline(mac: [u8; 6], ip: Ipv4Addr) -> DhcpPacket {
+        let mut pkt = DhcpPacket::new();
+        pkt.op = 1;
+        pkt.chaddr = [0; 16];
+        pkt.chaddr[..6].copy_from_slice(&mac);
+        pkt.message_type = Some(DhcpMessageType::Decline);
+        pkt.requested_ip = Some(ip);
+        pkt
+    }
+
     #[test]
     fn test_declined_ip_quarantine_and_expiry() {
         let config = DhcpConfig::new(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(255, 255, 255, 0));
         let mut server = DhcpServer::new(config);
 
         let ip = Ipv4Addr::new(10, 0, 0, 5);
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 
         // Simulate a lease for the IP, then a DECLINE.
-        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
         server.allocator.allocate_specific(ip);
         server.leases.insert(
             mac,
@@ -465,15 +510,7 @@ mod tests {
             },
         );
 
-        // Build a minimal DECLINE packet.
-        let mut decline_pkt = DhcpPacket::new();
-        decline_pkt.op = 1;
-        decline_pkt.chaddr = [0; 16];
-        decline_pkt.chaddr[..6].copy_from_slice(&mac);
-        decline_pkt.message_type = Some(DhcpMessageType::Decline);
-        decline_pkt.requested_ip = Some(ip);
-
-        server.handle_decline(&decline_pkt);
+        server.handle_decline(&make_decline(mac, ip));
 
         // The IP should be quarantined (unavailable) and the lease removed.
         assert!(!server.allocator.is_available(ip));
@@ -484,16 +521,73 @@ mod tests {
         server.cleanup_expired_leases();
         assert!(!server.allocator.is_available(ip));
 
-        // Manually backdate the quarantine timestamp to simulate expiry.
-        server.declined_ips.insert(
-            ip,
-            Instant::now() - DECLINE_QUARANTINE - Duration::from_secs(1),
-        );
+        // Backdate the quarantine timestamp to simulate expiry.
+        server.declined_ips.insert(ip, backdated_quarantine());
 
         server.cleanup_expired_leases();
 
         // Now the IP should be released back to the pool.
         assert!(server.allocator.is_available(ip));
         assert!(!server.declined_ips.contains_key(&ip));
+    }
+
+    #[test]
+    fn test_decline_for_unoffered_ip_is_ignored() {
+        let config = DhcpConfig::new(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(255, 255, 255, 0));
+        let mut server = DhcpServer::new(config);
+
+        // Victim holds a lease on 10.0.0.5.
+        let victim_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0xAA];
+        let victim_ip = Ipv4Addr::new(10, 0, 0, 5);
+        server.allocator.allocate_specific(victim_ip);
+        server.leases.insert(
+            victim_mac,
+            DhcpLease {
+                mac: victim_mac,
+                ip: victim_ip,
+                hostname: None,
+                lease_start: Instant::now(),
+                lease_duration: Duration::from_secs(3600),
+            },
+        );
+
+        // Attacker (different MAC, no lease/reservation) sends DECLINE for victim's IP.
+        let attacker_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0xBB];
+        server.handle_decline(&make_decline(attacker_mac, victim_ip));
+
+        // Victim's lease and allocation must be untouched, and nothing quarantined.
+        assert!(server.leases.contains_key(&victim_mac));
+        assert!(!server.allocator.is_available(victim_ip));
+        assert!(!server.declined_ips.contains_key(&victim_ip));
+
+        // Out-of-pool decline is also ignored.
+        let out_of_pool = Ipv4Addr::new(10, 0, 1, 1);
+        server.handle_decline(&make_decline(attacker_mac, out_of_pool));
+        assert!(!server.declined_ips.contains_key(&out_of_pool));
+    }
+
+    #[test]
+    fn test_quarantine_release_preserves_reservation() {
+        let config = DhcpConfig::new(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(255, 255, 255, 0));
+        let mut server = DhcpServer::new(config);
+
+        let mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0xCC];
+        let ip = Ipv4Addr::new(10, 0, 0, 7);
+        server.reserve_ip(mac, ip);
+
+        // Client declines its reserved IP. It should be quarantined.
+        server.handle_decline(&make_decline(mac, ip));
+        assert!(server.declined_ips.contains_key(&ip));
+        assert!(!server.allocator.is_available(ip));
+
+        // Expire the quarantine and run cleanup.
+        server.declined_ips.insert(ip, backdated_quarantine());
+        server.cleanup_expired_leases();
+
+        // The reservation stays — the allocator must still hold the IP so it
+        // isn't handed to another client.
+        assert!(!server.declined_ips.contains_key(&ip));
+        assert!(!server.allocator.is_available(ip));
+        assert_eq!(server.reservations.get(&mac), Some(&ip));
     }
 }
