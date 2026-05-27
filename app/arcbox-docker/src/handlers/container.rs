@@ -100,7 +100,7 @@ pub async fn stop_container(
 ) -> Result<Response> {
     // Resolve canonical ID before proxy — the name/short-id is still valid now
     // but may become stale after stop (e.g. --rm containers).
-    let canonical = resolve_canonical_from_uri(&state, &uri).await;
+    let canonical = resolve_or_raw_for_teardown(&state, &uri).await;
 
     let response = proxy(&state, &uri, req).await?;
 
@@ -128,7 +128,7 @@ pub async fn kill_container(
     req: Request<Body>,
 ) -> Result<Response> {
     // Resolve canonical ID before proxy — kill with --rm triggers auto-remove.
-    let canonical = resolve_canonical_from_uri(&state, &uri).await;
+    let canonical = resolve_or_raw_for_teardown(&state, &uri).await;
 
     let response = proxy(&state, &uri, req).await?;
 
@@ -184,7 +184,7 @@ pub async fn remove_container(
     req: Request<Body>,
 ) -> Result<Response> {
     // Resolve canonical ID before proxy — the name/short-id is still valid now.
-    let canonical = resolve_canonical_from_uri(&state, &uri).await;
+    let canonical = resolve_or_raw_for_teardown(&state, &uri).await;
 
     let response = proxy(&state, &uri, req).await?;
 
@@ -434,26 +434,51 @@ fn canonical_id_or_fallback(container_id: &str, inspect_json: &[u8]) -> String {
 }
 
 /// Extracts a container identifier from the URI and resolves it to the
-/// canonical full ID. Falls back to the raw URI-extracted ID when canonical
-/// resolution fails, so callers always attempt teardown instead of leaking
-/// port forwarding listeners and DNS entries.
+/// canonical full ID. Returns `None` (with a warning) when canonical
+/// resolution fails.
 ///
-/// Ensures VM readiness first, since [`resolve_canonical_id`] uses
-/// `proxy_to_guest` directly (which does not call `ensure_vm_ready`).
+/// Teardown handlers (stop/kill/remove) layer a raw-ID fallback on top
+/// of this via [`resolve_or_raw_for_teardown`] so transient inspect
+/// failures don't leak port forwarding listeners and DNS entries.
+/// Non-teardown callers (e.g. rename) must keep using the strict result:
+/// a raw URI token that is a name becomes stale after a successful
+/// rename, which would break DNS re-registration.
+///
+/// Best-effort wakes the VM before inspecting, since
+/// [`resolve_canonical_id`] uses `proxy_to_guest` directly and does not
+/// call `ensure_vm_ready` itself. Readiness failures are not fatal — the
+/// subsequent inspect will surface them as a `None` resolution.
 async fn resolve_canonical_from_uri(state: &AppState, uri: &Uri) -> Option<String> {
     let id = extract_container_id(uri)?;
-    // Ensure the VM is reachable before attempting the inspect call.
+    // Best-effort wake; if it fails, the inspect call below will too.
     let _ = state.runtime.ensure_vm_ready().await;
     match resolve_canonical_id(state, &id).await {
         Some(canonical) => Some(canonical),
         None => {
             tracing::warn!(
                 container_id = %id,
-                "Failed to resolve canonical container ID; using raw ID for teardown"
+                "Failed to resolve canonical container ID"
             );
-            Some(id)
+            None
         }
     }
+}
+
+/// Variant of [`resolve_canonical_from_uri`] for teardown handlers
+/// (stop/kill/remove): on canonical-resolution failure, falls back to
+/// the raw URI-extracted ID so cleanup of port forwarding + DNS still
+/// runs. A non-matching key is a no-op against the canonical-keyed maps
+/// — strictly better than skipping teardown entirely.
+async fn resolve_or_raw_for_teardown(state: &AppState, uri: &Uri) -> Option<String> {
+    if let Some(canonical) = resolve_canonical_from_uri(state, uri).await {
+        return Some(canonical);
+    }
+    let raw = extract_container_id(uri)?;
+    tracing::warn!(
+        container_id = %raw,
+        "Using raw URI-extracted ID for networking teardown"
+    );
+    Some(raw)
 }
 
 /// Resolves a container name, short ID, or full ID to the canonical full ID
