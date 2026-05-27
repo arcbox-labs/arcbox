@@ -19,6 +19,8 @@
             <integer>438</integer>
         </dict>
     </dict>
+    <!-- Keep a generous launchd SIGTERM-to-SIGKILL window for helper cleanup;
+         the daemon needs the full 45s for VM shutdown, while helper normally exits faster. -->
     <key>ExitTimeOut</key>
     <integer>45</integer>
 </dict>

@@ -229,6 +229,13 @@ fn register_daemon_service() -> Result<()> {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!--
+      ExitTimeOut: seconds launchd waits after SIGTERM before sending SIGKILL.
+      Default is 20s, but daemon shutdown needs ~35s (5s service drain + 30s VM
+      graceful stop). Set to 45s to avoid SIGKILL mid-shutdown.
+    -->
+    <key>ExitTimeOut</key>
+    <integer>45</integer>
 </dict>
 </plist>
 "#
