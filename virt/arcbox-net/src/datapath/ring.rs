@@ -620,31 +620,30 @@ mod tests {
         }
 
         // Spawn consumers — each drains until producers are done and ring is empty.
-        let consumer_handles: Vec<_> = (0..CONSUMERS)
-            .map(|_| {
-                let ring = Arc::clone(&ring);
-                let done = Arc::clone(&producers_done);
-                thread::spawn(move || {
-                    let mut collected = Vec::new();
-                    loop {
-                        match ring.dequeue() {
-                            Some(v) => collected.push(v),
-                            None => {
-                                if done.load(Ordering::Acquire) {
-                                    // Final drain after producers signaled done.
-                                    while let Some(v) = ring.dequeue() {
-                                        collected.push(v);
-                                    }
-                                    break;
+        let mut consumer_handles = Vec::new();
+        for _ in 0..CONSUMERS {
+            let ring = Arc::clone(&ring);
+            let done = Arc::clone(&producers_done);
+            consumer_handles.push(thread::spawn(move || {
+                let mut collected = Vec::new();
+                loop {
+                    match ring.dequeue() {
+                        Some(v) => collected.push(v),
+                        None => {
+                            if done.load(Ordering::Acquire) {
+                                // Final drain after producers signaled done.
+                                while let Some(v) = ring.dequeue() {
+                                    collected.push(v);
                                 }
-                                std::hint::spin_loop();
+                                break;
                             }
+                            std::hint::spin_loop();
                         }
                     }
-                    collected
-                })
-            })
-            .collect();
+                }
+                collected
+            }));
+        }
 
         // Wait for all producers to finish, then signal consumers.
         for h in producer_handles {

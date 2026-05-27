@@ -125,7 +125,10 @@ pub fn is_streaming_upload_request(method: &Method, uri: &Uri) -> bool {
     }
 
     let path = uri.path();
-    path == "/images/load" || path.ends_with("/images/load")
+    path == "/images/load"
+        || path.ends_with("/images/load")
+        || path == "/build"
+        || path.ends_with("/build")
 }
 
 async fn pump_upload_body(
@@ -302,6 +305,35 @@ mod tests {
         assert!(!is_streaming_upload_request(
             &Method::POST,
             &Uri::from_static("/v1.47/images/json")
+        ));
+    }
+
+    #[test]
+    fn detects_build_upload_requests() {
+        // Unversioned /build
+        assert!(is_streaming_upload_request(
+            &Method::POST,
+            &Uri::from_static("/build")
+        ));
+        // Versioned /build
+        assert!(is_streaming_upload_request(
+            &Method::POST,
+            &Uri::from_static("/v1.47/build")
+        ));
+        // With query parameters
+        assert!(is_streaming_upload_request(
+            &Method::POST,
+            &Uri::from_static("/v1.47/build?t=myimage:latest&dockerfile=Dockerfile")
+        ));
+        // GET should not match
+        assert!(!is_streaming_upload_request(
+            &Method::GET,
+            &Uri::from_static("/build")
+        ));
+        // /build/prune is NOT a streaming upload — it goes through the standard proxy
+        assert!(!is_streaming_upload_request(
+            &Method::POST,
+            &Uri::from_static("/build/prune")
         ));
     }
 

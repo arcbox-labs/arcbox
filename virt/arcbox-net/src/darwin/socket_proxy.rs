@@ -42,14 +42,18 @@ struct UdpProxy {
     flows: HashMap<(Ipv4Addr, u16, Ipv4Addr, u16), UdpFlow>,
     reply_tx: mpsc::Sender<Vec<u8>>,
     gateway_mac: [u8; 6],
+    /// Gateway IP — connections to this IP are translated to loopback
+    /// so they reach host services (host.docker.internal support).
+    gateway_ip: Ipv4Addr,
 }
 
 impl UdpProxy {
-    fn new(reply_tx: mpsc::Sender<Vec<u8>>, gateway_mac: [u8; 6]) -> Self {
+    fn new(reply_tx: mpsc::Sender<Vec<u8>>, gateway_mac: [u8; 6], gateway_ip: Ipv4Addr) -> Self {
         Self {
             flows: HashMap::new(),
             reply_tx,
             gateway_mac,
+            gateway_ip,
         }
     }
 
@@ -120,6 +124,12 @@ impl UdpProxy {
 
         let reply_tx = self.reply_tx.clone();
         let gateway_mac = self.gateway_mac;
+        // Translate gateway IP to loopback so host services are reachable.
+        let connect_ip = if dst_ip == self.gateway_ip {
+            Ipv4Addr::LOCALHOST
+        } else {
+            dst_ip
+        };
 
         tokio::spawn(async move {
             let socket = match UdpSocket::bind("0.0.0.0:0").await {
@@ -131,7 +141,7 @@ impl UdpProxy {
             };
 
             if let Err(e) = socket
-                .connect(SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port)))
+                .connect(SocketAddr::V4(SocketAddrV4::new(connect_ip, dst_port)))
                 .await
             {
                 tracing::warn!("UDP proxy: failed to connect: {}", e);
@@ -527,7 +537,7 @@ impl SocketProxy {
         );
         Self {
             icmp: IcmpProxy::new(reply_tx.clone(), gateway_mac),
-            udp: UdpProxy::new(reply_tx.clone(), gateway_mac),
+            udp: UdpProxy::new(reply_tx.clone(), gateway_mac, gateway_ip),
             inbound,
             reply_tx,
             cancel,
@@ -659,7 +669,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
         let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
-        let mut proxy = UdpProxy::new(tx, gw_mac);
+        let mut proxy = UdpProxy::new(tx, gw_mac, gw_ip);
 
         // Insert a flow that is already expired.
         let key = (
@@ -671,7 +681,9 @@ mod tests {
         proxy.flows.insert(
             key,
             UdpFlow {
-                last_active: Instant::now() - std::time::Duration::from_secs(120),
+                last_active: Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(120))
+                    .unwrap(),
                 payload_tx: mpsc::channel(1).0,
             },
         );
@@ -757,5 +769,71 @@ mod tests {
             before,
             "Non-Echo ICMP types must not have their identifier bytes patched"
         );
+    }
+
+    /// Builds a minimal Ethernet + IPv4 + UDP frame.
+    fn make_udp_frame(
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let udp_len = 8 + payload.len();
+        let ip_total = 20 + udp_len;
+        let mut frame = vec![0u8; ETH_HEADER_LEN + ip_total];
+
+        // Ethernet: EtherType = IPv4
+        frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        let ip = ETH_HEADER_LEN;
+        // IPv4: version=4, IHL=5, total length, protocol=17 (UDP)
+        frame[ip] = 0x45;
+        frame[ip + 2..ip + 4].copy_from_slice(&(ip_total as u16).to_be_bytes());
+        frame[ip + 8] = 64; // TTL
+        frame[ip + 9] = 17; // UDP
+        frame[ip + 12..ip + 16].copy_from_slice(&src_ip.octets());
+        frame[ip + 16..ip + 20].copy_from_slice(&dst_ip.octets());
+
+        let l4 = ip + 20;
+        frame[l4..l4 + 2].copy_from_slice(&src_port.to_be_bytes());
+        frame[l4 + 2..l4 + 4].copy_from_slice(&dst_port.to_be_bytes());
+        frame[l4 + 4..l4 + 6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        frame[l4 + 8..l4 + 8 + payload.len()].copy_from_slice(payload);
+        frame
+    }
+
+    /// Verifies that a UDP packet destined for the gateway IP is delivered
+    /// to a loopback listener via the gateway→localhost translation.
+    #[tokio::test]
+    async fn test_udp_proxy_gateway_translates_to_loopback() {
+        let (reply_tx, _reply_rx) = mpsc::channel(64);
+        let gw_ip = Ipv4Addr::new(10, 0, 2, 1);
+        let gw_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let mut proxy = UdpProxy::new(reply_tx, gw_mac, gw_ip);
+
+        // Bind a UDP listener on loopback.
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let payload = b"hello-host";
+        let frame = make_udp_frame(
+            Ipv4Addr::new(10, 0, 2, 15),
+            gw_ip, // targeting gateway, should be translated to 127.0.0.1
+            9999,
+            port,
+            payload,
+        );
+        let guest_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+
+        proxy.proxy_udp(&frame, guest_mac, CancellationToken::new());
+
+        // The proxy spawns a task — give it time to send.
+        let mut buf = [0u8; 64];
+        let len = tokio::time::timeout(std::time::Duration::from_secs(2), listener.recv(&mut buf))
+            .await
+            .expect("timed out waiting for UDP packet")
+            .expect("recv failed");
+
+        assert_eq!(&buf[..len], payload);
     }
 }

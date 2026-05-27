@@ -265,7 +265,7 @@ impl HostNetIO for LoopbackHostIO {
         !self.packets.borrow().is_empty()
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "loopback"
     }
 }

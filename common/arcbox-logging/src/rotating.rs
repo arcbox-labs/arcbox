@@ -147,7 +147,7 @@ fn open_log_file(path: &Path) -> (File, u64) {
         .open(path)
         .unwrap_or_else(|e| panic!("failed to open log file {}: {e}", path.display()));
 
-    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let size = file.metadata().map_or(0, |m| m.len());
     (file, size)
 }
 

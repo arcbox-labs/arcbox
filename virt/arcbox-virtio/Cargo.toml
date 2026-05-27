@@ -11,13 +11,23 @@ authors.workspace = true
 [dependencies]
 arcbox-error = { workspace = true }
 arcbox-hypervisor = { workspace = true }
+arcbox-virtio-core = { workspace = true }
+arcbox-virtio-blk = { workspace = true }
+arcbox-virtio-console = { workspace = true }
+arcbox-virtio-fs = { workspace = true }
+arcbox-virtio-net = { workspace = true }
+arcbox-virtio-rng = { workspace = true }
+arcbox-virtio-vsock = { workspace = true }
+arcbox-virtio-balloon = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 libc = { workspace = true }
 async-trait = "0.1"
+getrandom = "0.2"
 rayon = "1.11.0"
+virtio-bindings = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

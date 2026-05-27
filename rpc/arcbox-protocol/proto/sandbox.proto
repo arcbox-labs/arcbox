@@ -179,6 +179,8 @@ message CreateSandboxRequest {
     // --- Provisioning ---
     // SSH public key injected via MMDS (empty = no SSH).
     optional string ssh_public_key = 15;
+
+    reserved 16;
 }
 
 // Response to CreateSandbox.

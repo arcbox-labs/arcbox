@@ -1,122 +1,144 @@
 //! Container/sandbox name alias extraction for DNS registration.
 //!
 //! Provides compose-aware alias extraction used by `dns_server.rs` and
-//! `docker_events.rs` to register containers under both their full name
-//! and their compose service name.
+//! `docker_events.rs` to register containers under DNS names.
+//!
+//! Compose containers get a hierarchical service alias
+//! (`<service>.<project>.arcbox.local`) plus a flat container alias
+//! (`<container>.arcbox.local`). Plain containers only get the flat name.
 
-/// Collects all name aliases for a container.
+/// Compose metadata extracted from Docker container labels.
+pub struct ComposeInfo {
+    pub project: String,
+    pub service: String,
+}
+
+/// Extracts compose metadata from a Docker labels JSON object.
 ///
-/// For a compose container named `project-service-1`, this returns:
-/// `["project-service-1", "service"]`
+/// Looks for `com.docker.compose.project` and `com.docker.compose.service`.
+/// Returns `None` for non-compose containers.
+pub fn extract_compose_info(
+    labels: &serde_json::Map<String, serde_json::Value>,
+) -> Option<ComposeInfo> {
+    let project = labels
+        .get("com.docker.compose.project")?
+        .as_str()
+        .filter(|s| !s.is_empty())?;
+    let service = labels
+        .get("com.docker.compose.service")?
+        .as_str()
+        .filter(|s| !s.is_empty())?;
+    Some(ComposeInfo {
+        project: project.to_string(),
+        service: service.to_string(),
+    })
+}
+
+/// Collects all DNS name aliases for a container.
 ///
-/// For a plain container named `mycontainer`, this returns:
+/// For a compose container (project=`myproject`, service=`web`,
+/// name=`myproject-web-1`):
+/// `["web.myproject", "myproject-web-1"]`
+///
+/// - `web.myproject` → `web.myproject.arcbox.local` (service-level)
+/// - `myproject-web-1` → `myproject-web-1.arcbox.local` (container-level)
+///
+/// For a plain container named `mycontainer`:
 /// `["mycontainer"]`
-pub fn collect_aliases(container_name: &str) -> Vec<String> {
+pub fn collect_aliases(container_name: &str, compose: Option<&ComposeInfo>) -> Vec<String> {
     if container_name.is_empty() {
         return vec![];
     }
 
-    let mut names = vec![container_name.to_string()];
-
-    // Docker compose names containers as `project-service-N` (or
-    // `project_service_N` with older versions). Extract the service name
-    // by stripping the project prefix and the replica suffix.
-    if let Some(service) = extract_compose_service(container_name) {
-        if service != container_name {
-            names.push(service);
+    match compose {
+        Some(info) => {
+            let service_alias = format!("{}.{}", info.service, info.project);
+            vec![service_alias, container_name.to_string()]
         }
+        None => vec![container_name.to_string()],
     }
-
-    names
-}
-
-/// Extracts the compose service name from a container name.
-///
-/// Compose v2 names: `project-service-N` (hyphen separated)
-/// Compose v1 names: `project_service_N` (underscore separated)
-///
-/// Returns the middle segment (service name) if the pattern matches.
-fn extract_compose_service(name: &str) -> Option<String> {
-    // Try hyphen-separated pattern first (compose v2).
-    // Pattern: anything-SERVICE-digit(s)
-    if let Some(pos) = name.rfind('-') {
-        let suffix = &name[pos + 1..];
-        if suffix.chars().all(|c| c.is_ascii_digit()) && pos > 0 {
-            let prefix_and_service = &name[..pos];
-            if let Some(first_sep) = prefix_and_service.find('-') {
-                return Some(prefix_and_service[first_sep + 1..].to_string());
-            }
-        }
-    }
-
-    // Try underscore-separated pattern (compose v1).
-    if let Some(pos) = name.rfind('_') {
-        let suffix = &name[pos + 1..];
-        if suffix.chars().all(|c| c.is_ascii_digit()) && pos > 0 {
-            let prefix_and_service = &name[..pos];
-            if let Some(first_sep) = prefix_and_service.find('_') {
-                return Some(prefix_and_service[first_sep + 1..].to_string());
-            }
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn compose(project: &str, service: &str) -> ComposeInfo {
+        ComposeInfo {
+            project: project.to_string(),
+            service: service.to_string(),
+        }
+    }
+
     #[test]
-    fn test_extract_compose_service_v2() {
+    fn compose_container_aliases() {
+        let info = compose("myproject", "web");
+        let aliases = collect_aliases("myproject-web-1", Some(&info));
+        assert_eq!(aliases, vec!["web.myproject", "myproject-web-1"]);
+    }
+
+    #[test]
+    fn compose_multi_segment_service() {
+        let info = compose("myproject", "api-server");
+        let aliases = collect_aliases("myproject-api-server-2", Some(&info));
         assert_eq!(
-            extract_compose_service("myproject-web-1"),
-            Some("web".to_string())
-        );
-        assert_eq!(
-            extract_compose_service("myproject-api-server-2"),
-            Some("api-server".to_string())
+            aliases,
+            vec!["api-server.myproject", "myproject-api-server-2"]
         );
     }
 
     #[test]
-    fn test_extract_compose_service_v1() {
-        assert_eq!(
-            extract_compose_service("myproject_web_1"),
-            Some("web".to_string())
-        );
-        assert_eq!(
-            extract_compose_service("myproject_api_server_2"),
-            Some("api_server".to_string())
-        );
+    fn compose_v1_underscore() {
+        let info = compose("myproject", "web");
+        let aliases = collect_aliases("myproject_web_1", Some(&info));
+        assert_eq!(aliases, vec!["web.myproject", "myproject_web_1"]);
     }
 
     #[test]
-    fn test_extract_compose_service_plain() {
-        assert_eq!(extract_compose_service("mycontainer"), None);
-        assert_eq!(extract_compose_service("web"), None);
-    }
-
-    #[test]
-    fn test_extract_compose_service_edge_cases() {
-        assert_eq!(extract_compose_service("a-b-1"), Some("b".to_string()));
-        assert_eq!(extract_compose_service("project-web-abc"), None);
-        assert_eq!(extract_compose_service("1"), None);
-        assert_eq!(extract_compose_service("-1"), None);
-    }
-
-    #[test]
-    fn test_collect_aliases() {
-        let aliases = collect_aliases("myproject-web-1");
-        assert_eq!(aliases, vec!["myproject-web-1", "web"]);
-
-        let aliases = collect_aliases("mycontainer");
+    fn plain_container_no_compose() {
+        let aliases = collect_aliases("mycontainer", None);
         assert_eq!(aliases, vec!["mycontainer"]);
     }
 
     #[test]
-    fn test_collect_aliases_empty() {
-        let aliases = collect_aliases("");
+    fn empty_name() {
+        let aliases = collect_aliases("", None);
         assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn extract_compose_info_from_labels() {
+        let mut labels = serde_json::Map::new();
+        labels.insert(
+            "com.docker.compose.project".to_string(),
+            serde_json::Value::String("myproject".to_string()),
+        );
+        labels.insert(
+            "com.docker.compose.service".to_string(),
+            serde_json::Value::String("web".to_string()),
+        );
+        let info = extract_compose_info(&labels).unwrap();
+        assert_eq!(info.project, "myproject");
+        assert_eq!(info.service, "web");
+    }
+
+    #[test]
+    fn extract_compose_info_missing_labels() {
+        let labels = serde_json::Map::new();
+        assert!(extract_compose_info(&labels).is_none());
+    }
+
+    #[test]
+    fn extract_compose_info_empty_values() {
+        let mut labels = serde_json::Map::new();
+        labels.insert(
+            "com.docker.compose.project".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+        labels.insert(
+            "com.docker.compose.service".to_string(),
+            serde_json::Value::String("web".to_string()),
+        );
+        assert!(extract_compose_info(&labels).is_none());
     }
 }

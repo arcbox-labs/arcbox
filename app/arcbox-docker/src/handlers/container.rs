@@ -19,7 +19,31 @@ crate::handlers::proxy_handler!(container_top);
 crate::handlers::proxy_handler!(container_stats);
 crate::handlers::proxy_handler!(container_changes);
 crate::handlers::proxy_handler!(prune_containers);
-crate::handlers::proxy_handler!(create_container);
+
+/// Create a container, resolving macOS symlinks in bind-mount source paths.
+///
+/// On macOS, `/tmp` → `/private/tmp` and `/var` → `/private/var`. The guest
+/// mounts host `/private` via VirtioFS while its `/tmp` and `/var` are
+/// isolated tmpfs. This handler resolves the top-level symlink so
+/// bind-mount paths land on the VirtioFS share.
+pub async fn create_container(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    req: Request<Body>,
+) -> Result<Response> {
+    let (parts, body) = req.into_parts();
+    let body_bytes = http_body_util::BodyExt::collect(body)
+        .await
+        .map_err(|e| crate::error::DockerError::Server(format!("failed to read body: {e}")))?
+        .to_bytes();
+
+    let body_bytes = crate::host_path::rewrite_create_body(body_bytes);
+    let mut req = Request::from_parts(parts, Body::from(body_bytes));
+    // Body may have changed size; remove Content-Length so the proxy
+    // recomputes framing from the actual body.
+    req.headers_mut().remove(axum::http::header::CONTENT_LENGTH);
+    proxy(&state, &uri, req).await
+}
 
 /// Extract container ID from URI path.
 ///
@@ -76,7 +100,7 @@ pub async fn stop_container(
 ) -> Result<Response> {
     // Resolve canonical ID before proxy — the name/short-id is still valid now
     // but may become stale after stop (e.g. --rm containers).
-    let canonical = resolve_canonical_from_uri(&state, &uri).await;
+    let canonical = resolve_or_raw_for_teardown(&state, &uri).await;
 
     let response = proxy(&state, &uri, req).await?;
 
@@ -104,7 +128,7 @@ pub async fn kill_container(
     req: Request<Body>,
 ) -> Result<Response> {
     // Resolve canonical ID before proxy — kill with --rm triggers auto-remove.
-    let canonical = resolve_canonical_from_uri(&state, &uri).await;
+    let canonical = resolve_or_raw_for_teardown(&state, &uri).await;
 
     let response = proxy(&state, &uri, req).await?;
 
@@ -139,8 +163,8 @@ pub async fn restart_container(
             let _ = state.runtime.ensure_vm_ready().await;
             if let Some(body_bytes) = inspect_container_body(&state, &id).await {
                 let canonical = canonical_id_or_fallback(&id, &body_bytes);
-                if let Some((name, ip)) = extract_container_dns_info(&body_bytes) {
-                    state.runtime.register_dns(&canonical, &name, ip).await;
+                if let Some((aliases, ip)) = extract_container_dns_info(&body_bytes) {
+                    state.runtime.register_dns(&canonical, &aliases, ip).await;
                 }
             }
         }
@@ -160,7 +184,7 @@ pub async fn remove_container(
     req: Request<Body>,
 ) -> Result<Response> {
     // Resolve canonical ID before proxy — the name/short-id is still valid now.
-    let canonical = resolve_canonical_from_uri(&state, &uri).await;
+    let canonical = resolve_or_raw_for_teardown(&state, &uri).await;
 
     let response = proxy(&state, &uri, req).await?;
 
@@ -196,8 +220,11 @@ async fn setup_container_networking(state: &AppState, container_id: &str) {
     setup_port_forwarding_from_inspect(state, &canonical_id, &body_bytes).await;
 
     // DNS registration.
-    if let Some((name, ip)) = extract_container_dns_info(&body_bytes) {
-        state.runtime.register_dns(&canonical_id, &name, ip).await;
+    if let Some((aliases, ip)) = extract_container_dns_info(&body_bytes) {
+        state
+            .runtime
+            .register_dns(&canonical_id, &aliases, ip)
+            .await;
     }
 }
 
@@ -290,11 +317,17 @@ async fn setup_port_forwarding_from_inspect(
     }
 }
 
-/// Extracts container name and IP address from Docker inspect JSON.
+/// Extracts DNS aliases and IP address from Docker inspect JSON.
 ///
-/// Returns `(name, ip)` where `name` is the container name without leading `/`.
+/// For compose containers (with `com.docker.compose.project` and
+/// `com.docker.compose.service` labels), returns:
+/// `["service.project", "container_name"]` — a hierarchical service alias
+/// plus the flat container name.
+///
+/// For plain containers, returns `["container_name"]`.
+///
 /// Falls back through `/NetworkSettings/IPAddress` → per-network IPs.
-pub fn extract_container_dns_info(inspect_json: &[u8]) -> Option<(String, IpAddr)> {
+pub fn extract_container_dns_info(inspect_json: &[u8]) -> Option<(Vec<String>, IpAddr)> {
     let v: serde_json::Value = serde_json::from_slice(inspect_json).ok()?;
     let name = v.get("Name")?.as_str()?.trim_start_matches('/').to_string();
 
@@ -315,7 +348,29 @@ pub fn extract_container_dns_info(inspect_json: &[u8]) -> Option<(String, IpAddr
                 .find_map(|net| net.get("IPAddress")?.as_str().filter(|s| !s.is_empty()))
         })?;
 
-    Some((name, ip_str.parse().ok()?))
+    // Build DNS aliases from compose labels when available.
+    let aliases = match v.pointer("/Config/Labels").and_then(|l| l.as_object()) {
+        Some(labels) => {
+            let project = labels
+                .get("com.docker.compose.project")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let service = labels
+                .get("com.docker.compose.service")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            match (project, service) {
+                // Compose: service-level hierarchical + flat container name.
+                (Some(proj), Some(svc)) => {
+                    vec![format!("{svc}.{proj}"), name]
+                }
+                _ => vec![name],
+            }
+        }
+        None => vec![name],
+    };
+
+    Some((aliases, ip_str.parse().ok()?))
 }
 
 /// Rename a container and update its DNS entry.
@@ -343,8 +398,8 @@ pub async fn rename_container(
             // 2. Inspect (using canonical ID which survives rename) to get
             //    new name + IP, then register.
             if let Some(body_bytes) = inspect_container_body(&state, canonical).await {
-                if let Some((new_name, ip)) = extract_container_dns_info(&body_bytes) {
-                    state.runtime.register_dns(canonical, &new_name, ip).await;
+                if let Some((aliases, ip)) = extract_container_dns_info(&body_bytes) {
+                    state.runtime.register_dns(canonical, &aliases, ip).await;
                 }
             }
         }
@@ -380,25 +435,50 @@ fn canonical_id_or_fallback(container_id: &str, inspect_json: &[u8]) -> String {
 
 /// Extracts a container identifier from the URI and resolves it to the
 /// canonical full ID. Returns `None` (with a warning) when canonical
-/// resolution fails, so callers skip teardown rather than using a
-/// potentially wrong key (name/short-id).
+/// resolution fails.
 ///
-/// Ensures VM readiness first, since [`resolve_canonical_id`] uses
-/// `proxy_to_guest` directly (which does not call `ensure_vm_ready`).
+/// Teardown handlers (stop/kill/remove) layer a raw-ID fallback on top
+/// of this via [`resolve_or_raw_for_teardown`] so transient inspect
+/// failures don't leak port forwarding listeners and DNS entries.
+/// Non-teardown callers (e.g. rename) must keep using the strict result:
+/// a raw URI token that is a name becomes stale after a successful
+/// rename, which would break DNS re-registration.
+///
+/// Best-effort wakes the VM before inspecting, since
+/// [`resolve_canonical_id`] uses `proxy_to_guest` directly and does not
+/// call `ensure_vm_ready` itself. Readiness failures are not fatal — the
+/// subsequent inspect will surface them as a `None` resolution.
 async fn resolve_canonical_from_uri(state: &AppState, uri: &Uri) -> Option<String> {
     let id = extract_container_id(uri)?;
-    // Ensure the VM is reachable before attempting the inspect call.
+    // Best-effort wake; if it fails, the inspect call below will too.
     let _ = state.runtime.ensure_vm_ready().await;
     match resolve_canonical_id(state, &id).await {
         Some(canonical) => Some(canonical),
         None => {
             tracing::warn!(
                 container_id = %id,
-                "Failed to resolve canonical container ID; skipping networking teardown"
+                "Failed to resolve canonical container ID"
             );
             None
         }
     }
+}
+
+/// Variant of [`resolve_canonical_from_uri`] for teardown handlers
+/// (stop/kill/remove): on canonical-resolution failure, falls back to
+/// the raw URI-extracted ID so cleanup of port forwarding + DNS still
+/// runs. A non-matching key is a no-op against the canonical-keyed maps
+/// — strictly better than skipping teardown entirely.
+async fn resolve_or_raw_for_teardown(state: &AppState, uri: &Uri) -> Option<String> {
+    if let Some(canonical) = resolve_canonical_from_uri(state, uri).await {
+        return Some(canonical);
+    }
+    let raw = extract_container_id(uri)?;
+    tracing::warn!(
+        container_id = %raw,
+        "Using raw URI-extracted ID for networking teardown"
+    );
+    Some(raw)
 }
 
 /// Resolves a container name, short ID, or full ID to the canonical full ID
@@ -509,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_container_dns_info_basic() {
+    fn test_extract_container_dns_info_plain() {
         let json = serde_json::json!({
             "Id": "abc123",
             "Name": "/my-nginx",
@@ -519,8 +599,30 @@ mod tests {
             }
         });
         let bytes = serde_json::to_vec(&json).unwrap();
-        let (name, ip) = extract_container_dns_info(&bytes).unwrap();
-        assert_eq!(name, "my-nginx");
+        let (aliases, ip) = extract_container_dns_info(&bytes).unwrap();
+        assert_eq!(aliases, vec!["my-nginx"]);
+        assert_eq!(ip, "172.17.0.2".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_extract_container_dns_info_compose() {
+        let json = serde_json::json!({
+            "Id": "abc123",
+            "Name": "/myproject-web-1",
+            "Config": {
+                "Labels": {
+                    "com.docker.compose.project": "myproject",
+                    "com.docker.compose.service": "web"
+                }
+            },
+            "NetworkSettings": {
+                "IPAddress": "172.17.0.2",
+                "Networks": {}
+            }
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let (aliases, ip) = extract_container_dns_info(&bytes).unwrap();
+        assert_eq!(aliases, vec!["web.myproject", "myproject-web-1"]);
         assert_eq!(ip, "172.17.0.2".parse::<IpAddr>().unwrap());
     }
 
@@ -539,8 +641,8 @@ mod tests {
             }
         });
         let bytes = serde_json::to_vec(&json).unwrap();
-        let (name, ip) = extract_container_dns_info(&bytes).unwrap();
-        assert_eq!(name, "web-app");
+        let (aliases, ip) = extract_container_dns_info(&bytes).unwrap();
+        assert_eq!(aliases, vec!["web-app"]);
         assert_eq!(ip, "172.18.0.3".parse::<IpAddr>().unwrap());
     }
 

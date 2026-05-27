@@ -36,13 +36,9 @@ use crate::boot_assets::BootAssetProvider;
 use crate::error::{CoreError, Result};
 use crate::event::{Event, EventBus};
 use crate::machine::{MachineConfig, MachineInfo, MachineManager, MachineState};
-use arcbox_constants::cmdline::{
-    DOCKER_DATA_DEVICE_KEY as DOCKER_DATA_DEVICE_CMDLINE_KEY, GUEST_DOCKER_VSOCK_PORT_KEY,
-};
+use arcbox_constants::cmdline::GUEST_DOCKER_VSOCK_PORT_KEY;
 use arcbox_error::CommonError;
 use std::fs::OpenOptions;
-use std::io::Seek;
-use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,8 +69,13 @@ const BALLOON_SHRINK_DELAY_SECS: u64 = 10;
 
 /// Persistent guest dockerd data image name.
 const DOCKER_DATA_IMAGE_NAME: &str = "docker.img";
-/// Persistent guest dockerd data image size (64 GiB sparse file).
-const DOCKER_DATA_IMAGE_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Persistent guest dockerd data image size (8 TiB sparse file).
+///
+/// This is the virtual size of the block device. The host file is sparse and
+/// only consumes actual disk space for written blocks. 8 TiB matches OrbStack
+/// and prevents users from hitting artificial limits.
+const DOCKER_DATA_IMAGE_SIZE_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
+
 /// Extended VM lifecycle state.
 ///
 /// This extends the basic `MachineState` with additional states
@@ -229,9 +230,7 @@ pub struct DefaultVmConfig {
 
 impl Default for DefaultVmConfig {
     fn default() -> Self {
-        let host_cpus = std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
-            .unwrap_or(4);
+        let host_cpus = std::thread::available_parallelism().map_or(4, |n| n.get() as u32);
 
         Self {
             cpus: (host_cpus / 2).max(2),
@@ -293,15 +292,6 @@ pub struct VmLifecycleManager {
 }
 
 impl VmLifecycleManager {
-    fn virtio_block_device_path(index: usize) -> Result<String> {
-        if index >= 26 {
-            return Err(CoreError::config(format!(
-                "too many block devices configured: {index}"
-            )));
-        }
-        Ok(format!("/dev/vd{}", (b'a' + index as u8) as char))
-    }
-
     fn ensure_sparse_block_image(path: &std::path::Path, size_bytes: u64) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -314,7 +304,7 @@ impl VmLifecycleManager {
         }
 
         let file_exists = path.exists();
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -337,6 +327,55 @@ impl VmLifecycleManager {
         })?;
 
         if current_len.len() < size_bytes {
+            // Pre-allocate a bounded initial chunk on macOS (APFS) to reduce
+            // double-CoW amplification (Btrfs CoW + APFS CoW) for the working
+            // set. The full virtual size is set via `set_len` below, but we
+            // never ask APFS to physically reserve all of it — at 8 TiB that
+            // would either fail outright or, on a large disk, consume the
+            // entire requested capacity. The bounded cap matches the previous
+            // default working set and is best-effort; failures are ignored.
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::unix::io::AsRawFd;
+                /// Upper bound on initial APFS preallocation, in bytes.
+                const APFS_PREALLOC_CAP_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+                let prealloc_target = size_bytes.min(APFS_PREALLOC_CAP_BYTES);
+                if current_len.len() < prealloc_target {
+                    let fd = file.as_raw_fd();
+                    // fstore_t: fst_flags, fst_posmode, fst_offset, fst_length, fst_bytesalloc
+                    #[repr(C)]
+                    #[allow(clippy::struct_field_names)] // mirrors macOS fstore_t C struct
+                    struct FStore {
+                        fst_flags: u32,
+                        fst_posmode: i32,
+                        fst_offset: i64,
+                        fst_length: i64,
+                        fst_bytesalloc: i64,
+                    }
+                    const F_ALLOCATEALL: u32 = 0x00000004;
+                    const F_PEOFPOSMODE: i32 = 3;
+                    const F_PREALLOCATE: libc::c_int = 42;
+                    let mut store = FStore {
+                        fst_flags: F_ALLOCATEALL,
+                        fst_posmode: F_PEOFPOSMODE,
+                        fst_offset: 0,
+                        #[allow(clippy::cast_possible_wrap)]
+                        fst_length: prealloc_target as i64,
+                        fst_bytesalloc: 0,
+                    };
+                    // Best-effort: if pre-allocation fails (e.g. not enough disk
+                    // space), fall through to ftruncate which creates a sparse file.
+                    let ret = unsafe { libc::fcntl(fd, F_PREALLOCATE, &mut store) };
+                    if ret == 0 {
+                        tracing::info!(
+                            path = %path.display(),
+                            allocated_bytes = store.fst_bytesalloc,
+                            "pre-allocated docker data image (APFS)"
+                        );
+                    }
+                }
+            }
+
             file.set_len(size_bytes).map_err(|e| {
                 CoreError::config(format!(
                     "failed to resize block image '{}': {}",
@@ -344,7 +383,6 @@ impl VmLifecycleManager {
                     e
                 ))
             })?;
-            let _ = file.seek(SeekFrom::Start(size_bytes.saturating_sub(1)));
         }
 
         if !file_exists {
@@ -699,15 +737,9 @@ impl VmLifecycleManager {
             .join(DOCKER_DATA_IMAGE_NAME);
         Self::ensure_sparse_block_image(&docker_data_image, DOCKER_DATA_IMAGE_SIZE_BYTES)?;
 
-        let docker_data_guest_device = Self::virtio_block_device_path(block_devices.len())?;
-        if !cmdline
-            .split_whitespace()
-            .any(|token| token.starts_with(DOCKER_DATA_DEVICE_CMDLINE_KEY))
-        {
-            cmdline.push(' ');
-            cmdline.push_str(DOCKER_DATA_DEVICE_CMDLINE_KEY);
-            cmdline.push_str(&docker_data_guest_device);
-        }
+        // Don't inject docker_data_device into cmdline — let the agent
+        // auto-detect. It prefers /dev/arcboxhvc1 (HVC fast path) when
+        // available, falling back to /dev/vdb (VirtIO block).
 
         block_devices.push(crate::vm::BlockDeviceConfig {
             path: docker_data_image.to_string_lossy().to_string(),
@@ -741,60 +773,60 @@ impl VmLifecycleManager {
 
     /// Waits for the agent to become ready.
     async fn wait_for_agent(&self, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let poll_interval = Duration::from_millis(100);
-
         tracing::debug!("Waiting for agent to become ready...");
 
-        while tokio::time::Instant::now() < deadline {
-            #[cfg(target_os = "macos")]
-            match self
-                .machine_manager
-                .read_console_output(DEFAULT_MACHINE_NAME)
-            {
-                Ok(output) => {
+        let mm = Arc::clone(&self.machine_manager);
+
+        // Run the entire probe loop on a blocking thread. On macOS HV backend,
+        // the agent transport is AF_UNIX socketpair → BlockingVsockTransport.
+        // Rapid connect/teardown of these fds stalls the tokio kqueue reactor's
+        // timer wheel, so neither tokio::time::sleep nor tokio::time::timeout
+        // can be used reliably inside this loop. spawn_blocking isolates the
+        // probe from the async runtime entirely.
+        let probe_result = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + timeout;
+            let poll_interval = Duration::from_millis(100);
+
+            while std::time::Instant::now() < deadline {
+                // Console output (best-effort, non-blocking).
+                #[cfg(target_os = "macos")]
+                if let Ok(output) = mm.read_console_output(DEFAULT_MACHINE_NAME) {
                     let trimmed = output.trim_matches('\0');
                     if !trimmed.is_empty() {
-                        tracing::info!("Guest console: {}", trimmed.trim_end());
+                        tracing::info!("{}", trimmed.trim_end());
                     }
                 }
-                Err(e) => {
-                    tracing::debug!("Console read failed: {}", e);
+
+                // connect_agent → AF_UNIX detected → BlockingVsockTransport.
+                // ping_blocking uses libc::poll with 5s deadline — no tokio.
+                match mm.connect_agent(DEFAULT_MACHINE_NAME) {
+                    Ok(mut agent) => match agent.ping_blocking() {
+                        Ok(_) => return Ok(()),
+                        Err(e) => tracing::debug!("Agent ping failed: {e}"),
+                    },
+                    Err(e) => tracing::debug!("Agent connection failed: {e}"),
                 }
+
+                std::thread::sleep(poll_interval);
             }
 
-            // Try to connect to agent
-            match self.machine_manager.connect_agent(DEFAULT_MACHINE_NAME) {
-                Ok(mut agent) => {
-                    // Try to ping agent
-                    match agent.ping().await {
-                        Ok(_response) => {
-                            tracing::info!("Agent is ready");
-                            self.health_monitor.record_success();
-                            #[cfg(target_os = "macos")]
-                            {
-                                // Spawn a single adaptive read loop for both serial ports.
-                                // Uses exponential backoff (100ms active → 1600ms idle)
-                                // to minimize wakeups when no output is being produced.
-                                let mm = Arc::clone(&self.machine_manager);
-                                tokio::spawn(serial::serial_read_adaptive(mm));
-                            }
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            tracing::debug!("Agent ping failed: {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("Agent connection failed: {}", e);
-                }
-            }
+            Err(CoreError::Vm("timeout waiting for agent".to_string()))
+        })
+        .await
+        .map_err(|e| CoreError::Vm(format!("probe task panicked: {e}")))?;
 
-            tokio::time::sleep(poll_interval).await;
+        probe_result?;
+
+        // Back on async context — do async follow-up work.
+        tracing::info!("Agent is ready");
+        self.health_monitor.record_success();
+        #[cfg(target_os = "macos")]
+        {
+            let mm = Arc::clone(&self.machine_manager);
+            tokio::spawn(serial::serial_read_adaptive(mm));
         }
 
-        Err(CoreError::Vm("timeout waiting for agent".to_string()))
+        Ok(())
     }
 
     /// Records activity, updating the last-activity timestamp.

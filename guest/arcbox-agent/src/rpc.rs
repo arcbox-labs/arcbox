@@ -14,12 +14,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub use arcbox_constants::wire::MessageType;
 use arcbox_protocol::Empty;
 use arcbox_protocol::agent::{
-    KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
-    KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
-    KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
-    KubernetesStopResponse, PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved,
-    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
-    ShutdownRequest, ShutdownResponse, SystemInfo,
+    DiskTrimRequest, DiskTrimResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
+    KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
+    KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
+    KubernetesStopRequest, KubernetesStopResponse, MmapReadFileRequest, MmapReadFileResponse,
+    PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved, RuntimeEnsureRequest,
+    RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, ShutdownRequest,
+    ShutdownResponse, SystemInfo,
 };
 
 /// Agent version string.
@@ -77,6 +78,8 @@ pub enum RpcRequest {
     KubernetesStatus(KubernetesStatusRequest),
     KubernetesKubeconfig(KubernetesKubeconfigRequest),
     Shutdown(ShutdownRequest),
+    MmapReadFile(MmapReadFileRequest),
+    DiskTrim(DiskTrimRequest),
 }
 
 /// RPC response envelope.
@@ -92,10 +95,12 @@ pub enum RpcResponse {
     KubernetesStatus(KubernetesStatusResponse),
     KubernetesKubeconfig(KubernetesKubeconfigResponse),
     Shutdown(ShutdownResponse),
+    DiskTrim(DiskTrimResponse),
     Empty,
     PortBindingsChanged(PortBindingsChanged),
     PortBindingsRemoved(PortBindingsRemoved),
     Error(ErrorResponse),
+    MmapReadFile(MmapReadFileResponse),
 }
 
 impl RpcResponse {
@@ -112,10 +117,12 @@ impl RpcResponse {
             Self::KubernetesStatus(_) => MessageType::KubernetesStatusResponse,
             Self::KubernetesKubeconfig(_) => MessageType::KubernetesKubeconfigResponse,
             Self::Shutdown(_) => MessageType::ShutdownResponse,
+            Self::DiskTrim(_) => MessageType::DiskTrimResponse,
             Self::Empty => MessageType::Empty,
             Self::PortBindingsChanged(_) => MessageType::PortBindingsChanged,
             Self::PortBindingsRemoved(_) => MessageType::PortBindingsRemoved,
             Self::Error(_) => MessageType::Error,
+            Self::MmapReadFile(_) => MessageType::MmapReadFileResponse,
         }
     }
 
@@ -132,10 +139,12 @@ impl RpcResponse {
             Self::KubernetesStatus(msg) => msg.encode_to_vec(),
             Self::KubernetesKubeconfig(msg) => msg.encode_to_vec(),
             Self::Shutdown(msg) => msg.encode_to_vec(),
+            Self::DiskTrim(msg) => msg.encode_to_vec(),
             Self::Empty => Empty::default().encode_to_vec(),
             Self::PortBindingsChanged(msg) => msg.encode_to_vec(),
             Self::PortBindingsRemoved(msg) => msg.encode_to_vec(),
             Self::Error(err) => err.encode(),
+            Self::MmapReadFile(msg) => msg.encode_to_vec(),
         }
     }
 }
@@ -298,6 +307,14 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
         MessageType::ShutdownRequest => {
             let req = ShutdownRequest::decode(payload)?;
             Ok(RpcRequest::Shutdown(req))
+        }
+        MessageType::MmapReadFileRequest => {
+            let req = MmapReadFileRequest::decode(payload)?;
+            Ok(RpcRequest::MmapReadFile(req))
+        }
+        MessageType::DiskTrimRequest => {
+            let req = DiskTrimRequest::decode(payload)?;
+            Ok(RpcRequest::DiskTrim(req))
         }
         _ => anyhow::bail!("unexpected message type: {:?}", msg_type),
     }

@@ -24,3 +24,14 @@ tests/resources/boot-assets-arm64-*
 # Scratch notes
 perf-issue.md
 issues.net.md
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml

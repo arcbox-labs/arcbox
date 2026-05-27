@@ -49,6 +49,7 @@ fn main() {
         balloon: false,
         block_devices: Vec::new(),
         bridge_nic_mac: None,
+        backend: arcbox_vmm::VmBackend::default(),
     };
 
     println!("VMM Configuration:");

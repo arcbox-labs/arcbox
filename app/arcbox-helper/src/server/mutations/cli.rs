@@ -7,14 +7,8 @@ use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::Path;
 
+use arcbox_constants::paths::is_arcbox_owned;
 use arcbox_helper::validate::{CliName, CliTarget};
-
-/// Returns true if a symlink target looks like an ArcBox bundle path.
-fn is_arcbox_owned(target: &Path) -> bool {
-    target
-        .to_string_lossy()
-        .contains(".app/Contents/MacOS/xbin/")
-}
 
 /// Creates `/usr/local/bin/{name}` → `target`.
 ///

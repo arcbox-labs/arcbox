@@ -1,0 +1,18 @@
+[package]
+name = "arcbox-virtio-core"
+description = "Foundational types and traits for ArcBox VirtIO devices"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-error = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+virtio-bindings = "0.2"
+
+[lints]
+workspace = true

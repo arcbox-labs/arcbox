@@ -26,7 +26,7 @@ thiserror = { workspace = true }
 libc = { workspace = true }
 arcbox-constants.workspace = true
 arcbox-logging.workspace = true
-arcbox-route = { path = "../../common/arcbox-route" }
+arcbox-route = { workspace = true }
 tracing = { workspace = true }
 tokio-util = "0.7"
 ipnetwork = "0.21.1"

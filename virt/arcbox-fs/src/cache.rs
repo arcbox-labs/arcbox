@@ -89,6 +89,75 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> MetadataCache<K, V> {
     }
 }
 
+/// Configuration for adaptive negative cache TTLs.
+///
+/// Different path patterns have different rates of change. Build artifacts
+/// and dependency directories are relatively stable during a work session,
+/// while source files change frequently. This allows the negative cache to
+/// use longer TTLs for stable paths and shorter TTLs for volatile ones.
+#[derive(Debug, Clone)]
+pub struct AdaptiveTtlConfig {
+    /// Rules evaluated in order; first match wins.
+    pub rules: Vec<TtlRule>,
+    /// Default TTL for paths matching no rule.
+    pub default_ttl: Duration,
+}
+
+/// A single path-pattern-to-TTL mapping for the adaptive negative cache.
+#[derive(Debug, Clone)]
+pub struct TtlRule {
+    /// Path substring to match (e.g., "/node_modules/").
+    pub prefix: String,
+    /// TTL for ENOENT results matching this pattern.
+    pub ttl: Duration,
+}
+
+impl Default for AdaptiveTtlConfig {
+    fn default() -> Self {
+        Self {
+            rules: vec![
+                TtlRule {
+                    prefix: "/node_modules/".into(),
+                    ttl: Duration::from_secs(30),
+                },
+                TtlRule {
+                    prefix: "/.git/".into(),
+                    ttl: Duration::from_secs(60),
+                },
+                TtlRule {
+                    prefix: "/.pnpm/".into(),
+                    ttl: Duration::from_secs(30),
+                },
+                TtlRule {
+                    prefix: "/target/".into(),
+                    ttl: Duration::from_secs(30),
+                },
+                TtlRule {
+                    prefix: "/__pycache__/".into(),
+                    ttl: Duration::from_secs(30),
+                },
+            ],
+            default_ttl: Duration::from_secs(5),
+        }
+    }
+}
+
+impl AdaptiveTtlConfig {
+    /// Returns the TTL for a given path by matching against the rule list.
+    ///
+    /// Rules are evaluated in order; the first matching rule's TTL is returned.
+    /// If no rule matches, `default_ttl` is used.
+    #[must_use]
+    pub fn ttl_for(&self, path: &str) -> Duration {
+        for rule in &self.rules {
+            if path.contains(&rule.prefix) {
+                return rule.ttl;
+            }
+        }
+        self.default_ttl
+    }
+}
+
 /// Configuration for the negative cache.
 ///
 /// Negative caching stores "file not found" results to avoid repeated
@@ -103,8 +172,13 @@ pub struct NegativeCacheConfig {
 
     /// Time-to-live for cache entries.
     /// Entries older than this are considered stale.
-    /// Default: 1 second
+    /// Default: 5 seconds
     pub timeout: Duration,
+
+    /// Adaptive TTL configuration for path-pattern-based timeouts.
+    /// When set, `insert_with_path` uses per-path TTLs instead of the
+    /// global `timeout` value.
+    pub adaptive_ttl: Option<AdaptiveTtlConfig>,
 }
 
 impl Default for NegativeCacheConfig {
@@ -116,10 +190,21 @@ impl Default for NegativeCacheConfig {
 impl NegativeCacheConfig {
     /// Creates a new configuration with default values.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             max_entries: 10_000,
             timeout: Duration::from_secs(5),
+            adaptive_ttl: Some(AdaptiveTtlConfig::default()),
+        }
+    }
+
+    /// Creates a configuration with no adaptive TTL (fixed timeout only).
+    #[must_use]
+    pub const fn fixed(timeout: Duration, max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            timeout,
+            adaptive_ttl: None,
         }
     }
 }
@@ -150,10 +235,36 @@ impl NegativeCacheStats {
     }
 }
 
+/// Per-entry data stored in the negative cache.
+///
+/// Each entry records when it was inserted and when it expires, allowing
+/// different entries to have different TTLs based on their path pattern.
+#[derive(Debug, Clone, Copy)]
+struct NegativeCacheEntry {
+    /// When this entry expires.
+    expires_at: Instant,
+}
+
+impl NegativeCacheEntry {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            expires_at: Instant::now() + ttl,
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        Instant::now() >= self.expires_at
+    }
+}
+
 /// Thread-safe negative cache for filesystem lookups.
 ///
 /// Caches paths that are known to not exist, avoiding repeated system calls
 /// for non-existent files. Uses lock-free concurrent access via `DashMap`.
+///
+/// When adaptive TTL is configured, different paths receive different cache
+/// durations based on pattern matching. For example, lookups inside
+/// `/node_modules/` get a 30s TTL while source files default to 5s.
 ///
 /// # Example
 ///
@@ -165,6 +276,7 @@ impl NegativeCacheStats {
 /// let config = NegativeCacheConfig {
 ///     max_entries: 1000,
 ///     timeout: Duration::from_millis(500),
+///     adaptive_ttl: None,
 /// };
 /// let cache = NegativeCache::new(config);
 ///
@@ -179,8 +291,8 @@ impl NegativeCacheStats {
 /// assert!(!cache.contains(&PathBuf::from("/app/node_modules/missing-package")));
 /// ```
 pub struct NegativeCache {
-    /// Map from path to insertion timestamp.
-    entries: DashMap<PathBuf, Instant>,
+    /// Map from path to cache entry with per-entry expiration.
+    entries: DashMap<PathBuf, NegativeCacheEntry>,
     /// Cache configuration.
     config: NegativeCacheConfig,
     /// Number of cache hits.
@@ -201,10 +313,24 @@ impl NegativeCache {
         }
     }
 
-    /// Creates a new negative cache with default configuration.
+    /// Creates a new negative cache with default configuration (adaptive TTL enabled).
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(NegativeCacheConfig::default())
+    }
+
+    /// Returns the effective TTL for a given path.
+    ///
+    /// If adaptive TTL is configured, the path is matched against the rule
+    /// list. Otherwise, the global `timeout` is returned.
+    fn ttl_for_path(&self, path: &Path) -> Duration {
+        if let Some(ref adaptive) = self.config.adaptive_ttl {
+            // Use lossy conversion for pattern matching; the path prefixes
+            // we match against are pure ASCII.
+            adaptive.ttl_for(&path.to_string_lossy())
+        } else {
+            self.config.timeout
+        }
     }
 
     /// Checks if the path is in the negative cache and not expired.
@@ -213,8 +339,7 @@ impl NegativeCache {
     /// and the cache entry has not expired.
     pub fn contains(&self, path: &Path) -> bool {
         if let Some(entry) = self.entries.get(path) {
-            let inserted_at = *entry;
-            if inserted_at.elapsed() < self.config.timeout {
+            if !entry.is_expired() {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
@@ -228,6 +353,9 @@ impl NegativeCache {
 
     /// Adds a path to the negative cache.
     ///
+    /// The TTL is determined by adaptive TTL rules if configured, or by the
+    /// global `timeout` value otherwise.
+    ///
     /// If the cache is at capacity, expired entries are evicted first.
     pub fn insert(&self, path: PathBuf) {
         // Check capacity and evict if necessary
@@ -235,7 +363,8 @@ impl NegativeCache {
             self.evict_expired();
         }
 
-        self.entries.insert(path, Instant::now());
+        let ttl = self.ttl_for_path(&path);
+        self.entries.insert(path, NegativeCacheEntry::new(ttl));
     }
 
     /// Invalidates a path in the negative cache.
@@ -259,9 +388,7 @@ impl NegativeCache {
     /// This is called automatically when the cache reaches capacity,
     /// but can also be called manually for maintenance.
     pub fn evict_expired(&self) {
-        let timeout = self.config.timeout;
-        self.entries
-            .retain(|_, inserted_at| inserted_at.elapsed() < timeout);
+        self.entries.retain(|_, entry| !entry.is_expired());
     }
 
     /// Returns current cache statistics.
@@ -323,6 +450,7 @@ mod tests {
         let config = NegativeCacheConfig {
             max_entries: 100,
             timeout: Duration::from_millis(50),
+            adaptive_ttl: None,
         };
         let cache = NegativeCache::new(config);
         let path = PathBuf::from("/test/expiring");
@@ -395,6 +523,7 @@ mod tests {
         let config = NegativeCacheConfig {
             max_entries: 10,
             timeout: Duration::from_millis(10), // Short timeout for eviction
+            adaptive_ttl: None,
         };
         let cache = NegativeCache::new(config);
 
@@ -475,6 +604,7 @@ mod tests {
         let config = NegativeCacheConfig {
             max_entries: 100,
             timeout: Duration::from_millis(30),
+            adaptive_ttl: None,
         };
         let cache = NegativeCache::new(config);
 
@@ -496,5 +626,125 @@ mod tests {
 
         // Only new entries should remain
         assert_eq!(cache.len(), 5);
+    }
+
+    // ========================================================================
+    // Adaptive TTL Tests
+    // ========================================================================
+
+    #[test]
+    fn test_adaptive_ttl_node_modules() {
+        let config = AdaptiveTtlConfig::default();
+        let ttl = config.ttl_for("/app/node_modules/lodash/index.js");
+        assert_eq!(ttl, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_adaptive_ttl_git() {
+        let config = AdaptiveTtlConfig::default();
+        let ttl = config.ttl_for("/repo/.git/objects/ab/cd1234");
+        assert_eq!(ttl, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_adaptive_ttl_pnpm() {
+        let config = AdaptiveTtlConfig::default();
+        let ttl = config.ttl_for("/app/.pnpm/some-package@1.0.0/node_modules/dep");
+        // .pnpm rule matches first (earlier in the list)
+        assert_eq!(ttl, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_adaptive_ttl_target() {
+        let config = AdaptiveTtlConfig::default();
+        let ttl = config.ttl_for("/project/target/debug/build/something");
+        assert_eq!(ttl, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_adaptive_ttl_pycache() {
+        let config = AdaptiveTtlConfig::default();
+        let ttl = config.ttl_for("/app/__pycache__/module.cpython-311.pyc");
+        assert_eq!(ttl, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_adaptive_ttl_source_file_uses_default() {
+        let config = AdaptiveTtlConfig::default();
+        let ttl = config.ttl_for("/app/src/main.rs");
+        assert_eq!(ttl, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_adaptive_ttl_custom_rules() {
+        let config = AdaptiveTtlConfig {
+            rules: vec![TtlRule {
+                prefix: "/vendor/".into(),
+                ttl: Duration::from_secs(120),
+            }],
+            default_ttl: Duration::from_secs(2),
+        };
+        assert_eq!(
+            config.ttl_for("/project/vendor/github.com/foo"),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            config.ttl_for("/project/src/main.go"),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn test_adaptive_ttl_first_match_wins() {
+        let config = AdaptiveTtlConfig {
+            rules: vec![
+                TtlRule {
+                    prefix: "/a/".into(),
+                    ttl: Duration::from_secs(10),
+                },
+                TtlRule {
+                    prefix: "/a/b/".into(),
+                    ttl: Duration::from_secs(20),
+                },
+            ],
+            default_ttl: Duration::from_secs(1),
+        };
+        // "/a/" matches first even though "/a/b/" is also a match
+        assert_eq!(config.ttl_for("/a/b/c"), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_negative_cache_adaptive_ttl_integration() {
+        // Use a short adaptive TTL for a specific pattern and verify that
+        // the entry expires according to its path-specific TTL.
+        let config = NegativeCacheConfig {
+            max_entries: 100,
+            timeout: Duration::from_secs(60), // Long default (shouldn't be used)
+            adaptive_ttl: Some(AdaptiveTtlConfig {
+                rules: vec![TtlRule {
+                    prefix: "/fast/".into(),
+                    ttl: Duration::from_millis(50),
+                }],
+                default_ttl: Duration::from_secs(60),
+            }),
+        };
+        let cache = NegativeCache::new(config);
+
+        // Path matching /fast/ rule gets 50ms TTL
+        let fast_path = PathBuf::from("/fast/file.txt");
+        cache.insert(fast_path.clone());
+        assert!(cache.contains(&fast_path));
+
+        // Path not matching any rule gets 60s TTL
+        let slow_path = PathBuf::from("/slow/file.txt");
+        cache.insert(slow_path.clone());
+        assert!(cache.contains(&slow_path));
+
+        // Wait for the fast path to expire
+        thread::sleep(Duration::from_millis(80));
+
+        // Fast path should have expired, slow path should still be valid
+        assert!(!cache.contains(&fast_path));
+        assert!(cache.contains(&slow_path));
     }
 }

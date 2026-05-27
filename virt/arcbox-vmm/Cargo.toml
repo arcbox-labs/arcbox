@@ -26,15 +26,33 @@ tokio-util = "0.7"
 lz4_flex = "0.11"
 libc.workspace = true
 arcbox-dns = { workspace = true }
+arcbox-hv = { workspace = true }
+vm-memory = { version = "0.17", features = ["backend-mmap"] }
+linux-loader = { version = "0.13", features = ["elf", "pe"] }
+vm-fdt = "0.3"
+vm-superio = "0.8"
+arcbox-fs = { workspace = true }
+arcbox-net-inject = { workspace = true }
+crossbeam-channel = "0.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+arcbox-vmnet = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
-default = []
+# `gic` is on by default so every binary linking arcbox-vmm
+# (daemon, hv_e2e example, tests) gets the hv_gic_* emulation.
+# Without it, Linux boot dies in arch_timer / GIC probe because
+# no distributor answers MMIO at 0x0800_0000 — same symptom as
+# building with `default-features = false`.
+default = ["gic"]
 criu = []
-vmnet = ["arcbox-net/vmnet"]
+gic = ["arcbox-hv/gic"]
+vmnet = ["arcbox-net/vmnet", "arcbox-vmnet/vmnet"]
 
 [lints]
 workspace = true

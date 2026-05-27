@@ -12,4 +12,6 @@ pub mod dns_server;
 #[cfg(target_os = "linux")]
 pub mod error;
 #[cfg(target_os = "linux")]
+pub mod rootfs_builder;
+#[cfg(target_os = "linux")]
 pub mod sandbox;

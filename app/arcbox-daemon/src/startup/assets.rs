@@ -10,16 +10,26 @@ use tracing::info;
 
 /// Returns the `Contents/` directory if the daemon is running inside an app bundle.
 ///
-/// Layout: `ArcBox.app/Contents/Helpers/com.arcboxlabs.desktop.daemon`
-/// → returns `ArcBox.app/Contents/`
+/// Finds the main app bundle's `Contents/` directory by walking up from the
+/// daemon executable. Handles both legacy (`Contents/Helpers/`) and current
+/// (`Contents/Frameworks/daemon.app/Contents/MacOS/`) layouts.
 pub fn find_bundle_contents() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    // exe = .../Contents/Helpers/com.arcboxlabs.desktop.daemon
-    let contents = exe.parent()?.parent()?;
-    if contents.join("Resources").is_dir() && contents.join("Info.plist").exists() {
-        Some(contents.to_path_buf())
-    } else {
-        None
+    // Walk up from the daemon executable to find the main app's Contents/.
+    // Two possible layouts:
+    //   Legacy:  .app/Contents/Helpers/com.arcboxlabs.desktop.daemon
+    //   Current: .app/Contents/Frameworks/daemon.app/Contents/MacOS/daemon
+    let mut dir = exe.parent()?;
+    loop {
+        let contents = dir;
+        if contents.join("Resources").is_dir() && contents.join("Info.plist").exists() {
+            // Make sure this is the *main* app's Contents, not the daemon
+            // bundle's own Contents (which has no Resources/assets/).
+            if contents.join("MacOS").join("ArcBox").exists() {
+                return Some(contents.to_path_buf());
+            }
+        }
+        dir = contents.parent()?;
     }
 }
 

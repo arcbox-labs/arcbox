@@ -34,11 +34,12 @@ const DEFAULT_GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 2);
 /// `(guest_ip, host_port, protocol)` tuples registered for that container.
 #[cfg(target_os = "macos")]
 type InboundRulesMap = Arc<TokioRwLock<HashMap<String, Vec<(Ipv4Addr, u16, InboundProtocol)>>>>;
-const REQUIRED_RUNTIME_ASSETS: [&str; 5] = [
+const REQUIRED_RUNTIME_ASSETS: [&str; 6] = [
     "dockerd",
     "containerd",
     "containerd-shim-runc-v2",
     "runc",
+    "docker-init",
     "k3s",
 ];
 const KUBERNETES_HOST_ENDPOINT: &str = "https://127.0.0.1:16443";
@@ -147,8 +148,8 @@ pub struct Runtime {
     /// Port forwarders for each container (non-macOS fallback).
     #[cfg(not(target_os = "macos"))]
     port_forwarders: Arc<TokioRwLock<HashMap<String, PortForwarder>>>,
-    /// Tracks DNS registrations: canonical container ID → hostname.
-    dns_entries: Arc<TokioRwLock<HashMap<String, String>>>,
+    /// Tracks DNS registrations: canonical container ID → hostnames.
+    dns_entries: Arc<TokioRwLock<HashMap<String, Vec<String>>>>,
 }
 
 impl Runtime {
@@ -441,7 +442,8 @@ impl Runtime {
         tokio::fs::create_dir_all(self.config.data_dir.join("vms")).await?;
         tokio::fs::create_dir_all(self.config.data_dir.join("machines")).await?;
 
-        // Download runtime binaries (dockerd, containerd, shim, runc, k3s) if not cached.
+        // Download runtime binaries (dockerd, containerd, shim, runc, docker-init, k3s)
+        // if not cached.
         let runtime_bin_dir = self.config.data_dir.join("runtime/bin");
         tokio::fs::create_dir_all(&runtime_bin_dir).await?;
         self.vm_lifecycle
@@ -784,34 +786,47 @@ impl Runtime {
         }
     }
 
-    /// Registers a DNS entry for a container.
+    /// Registers DNS entries for a container.
     ///
-    /// Maps `hostname.<local_dns_domain>` → `ip` so the host can reach the
-    /// container by name. Also tracks the `container_id → hostname` mapping
+    /// Maps each hostname in `hostnames` to `ip` so the host can reach the
+    /// container by name. Also tracks the `container_id → hostnames` mapping
     /// for cleanup.
-    pub async fn register_dns(&self, container_id: &str, hostname: &str, ip: IpAddr) {
-        self.network_manager.register_dns(hostname, ip);
+    pub async fn register_dns(&self, container_id: &str, hostnames: &[String], ip: IpAddr) {
+        for hostname in hostnames {
+            self.network_manager.register_dns(hostname, ip);
+        }
         self.dns_entries
             .write()
             .await
-            .insert(container_id.to_string(), hostname.to_string());
+            .insert(container_id.to_string(), hostnames.to_vec());
         tracing::info!(
             container_id,
-            hostname,
+            ?hostnames,
             %ip,
-            "DNS entry registered",
+            "DNS entries registered",
         );
     }
 
-    /// Removes a DNS entry for a container by its canonical ID.
+    /// Removes DNS entries for a container by its canonical ID.
     ///
-    /// Returns the old hostname if an entry existed (used by rename to know
-    /// which name to deregister from the forwarder).
-    pub async fn deregister_dns_by_id(&self, container_id: &str) -> Option<String> {
-        let hostname = self.dns_entries.write().await.remove(container_id)?;
-        self.network_manager.deregister_dns(&hostname);
-        tracing::info!(container_id, hostname, "DNS entry deregistered");
-        Some(hostname)
+    /// Shared aliases (e.g. compose service-level names used by multiple
+    /// replicas) are only removed from the network manager when no other
+    /// container still references them.
+    pub async fn deregister_dns_by_id(&self, container_id: &str) {
+        let mut entries = self.dns_entries.write().await;
+        let Some(hostnames) = entries.remove(container_id) else {
+            return;
+        };
+
+        // Only deregister hostnames not referenced by any remaining container.
+        for hostname in &hostnames {
+            let still_in_use = entries.values().any(|names| names.contains(hostname));
+            if !still_in_use {
+                self.network_manager.deregister_dns(hostname);
+            }
+        }
+        drop(entries);
+        tracing::info!(container_id, ?hostnames, "DNS entries deregistered");
     }
 
     /// Stops all active port forwarders.
@@ -861,6 +876,7 @@ mod tests {
             "runtime/bin/containerd",
             "runtime/bin/containerd-shim-runc-v2",
             "runtime/bin/runc",
+            "runtime/bin/docker-init",
             "runtime/bin/k3s",
         ] {
             let path = data_dir.join(name);
@@ -911,7 +927,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_kubeconfig_server_updates_arcbox_refs() {
-        let kubeconfig = r#"apiVersion: v1
+        let kubeconfig = r"apiVersion: v1
 clusters:
 - cluster:
     server: https://127.0.0.1:6443
@@ -925,7 +941,7 @@ current-context: default
 users:
 - name: default
   user: {}
-"#;
+";
 
         let rewritten = super::rewrite_kubeconfig_server(kubeconfig);
         assert!(rewritten.contains("server: https://127.0.0.1:16443"));

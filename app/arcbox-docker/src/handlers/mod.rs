@@ -68,6 +68,7 @@ pub(crate) async fn proxy_upgrade(
     proxy::proxy_with_upgrade(state.connector.as_ref(), req, uri).await
 }
 
+mod build;
 mod container;
 mod events;
 mod exec;
@@ -76,6 +77,7 @@ mod network;
 mod system;
 mod volume;
 
+pub use build::{build_image, build_prune, session};
 pub use container::{
     attach_container, container_changes, container_logs, container_stats, container_top,
     create_container, extract_container_dns_info, inspect_container, kill_container,

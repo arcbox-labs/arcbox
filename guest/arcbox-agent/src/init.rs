@@ -29,11 +29,27 @@ mod platform {
         // Docker Desktop and OrbStack both set 1048576 in their guest VMs.
         raise_fd_limits();
 
+        // Mount host /private for macOS symlink targets (/tmp, /var/folders).
+        // Must come before tmpfs mounts so /private is available as a VirtioFS
+        // target. Guest /tmp and /var remain isolated tmpfs.
+        mount_virtiofs_optional(
+            arcbox_constants::virtiofs::TAG_PRIVATE,
+            arcbox_constants::virtiofs::MOUNT_PRIVATE,
+        );
+
         // Writable layers on top of read-only EROFS.
         mount_tmpfs("/tmp");
         mount_tmpfs("/run");
         mount_tmpfs("/var");
         mount_tmpfs("/etc");
+
+        // The Firecracker jailer mknods a block device for the rootfs
+        // inside its chroot under /var/lib/arcbox/jailer/. That requires
+        // a filesystem mounted without `nodev`. Mount only the jailer
+        // subtree as a separate dev-allowing tmpfs to keep the rest of
+        // /var with the default safer flags.
+        mkdir_p("/var/lib/arcbox/jailer");
+        mount_tmpfs_dev("/var/lib/arcbox/jailer");
 
         // Populate /etc with files containerd/dockerd expect.
         write_etc_resolv_conf();
@@ -60,11 +76,36 @@ mod platform {
         mount_devpts();
         mount_shm();
 
+        // Virtualization.framework does not expose complete CPU cache topology
+        // in sysfs — `size`, `coherency_line_size`, and `number_of_sets` are
+        // missing. The Firecracker jailer reads these files before chrooting
+        // and panics when they are absent. Synthesise them via bind mounts so
+        // that jailer mode works inside this VM.
+        ensure_cpu_cache_topology();
+
         // Network.
         setup_networking();
 
         // Optional host /Users share (non-fatal if not configured).
-        mount_virtiofs_optional("users", "/Users");
+        mount_virtiofs_optional(
+            arcbox_constants::virtiofs::TAG_USERS,
+            arcbox_constants::virtiofs::MOUNT_USERS,
+        );
+
+        // Optional DAX fixture share for the hv_e2e harness. Mounted under
+        // `/run/arcbox-dax` because `/` is read-only EROFS — mkdir_p on a
+        // top-level path fails with EROFS. `/run` is tmpfs, created above.
+        // `dax=always` makes FUSE_SETUPMAPPING fire on every read,
+        // exercising the stage-2 mmap fast path end-to-end.
+        // Production VMs never attach this tag; the mount is a debug-level
+        // no-op when the share is absent.
+        mount_virtiofs_optional_dax("arcbox-dax", "/run/arcbox-dax");
+
+        // Rosetta x86_64 translation (Apple Silicon only).
+        // The host attaches a VirtioFS share containing the Rosetta binary.
+        // We mount it and register via binfmt_misc so x86_64 ELF binaries
+        // are transparently translated at near-native speed.
+        setup_rosetta();
 
         tracing::info!("PID 1 system initialization complete");
     }
@@ -118,6 +159,26 @@ mod platform {
             None::<&str>,
         ) {
             tracing::warn!(target, error = %e, "failed to mount tmpfs");
+        }
+    }
+
+    /// Like [`mount_tmpfs`] but without `nodev`, allowing device nodes to be
+    /// opened on this filesystem. Used for the Firecracker jailer subtree
+    /// where the jailer mknods a block device for the rootfs inside its
+    /// chroot.
+    fn mount_tmpfs_dev(target: &str) {
+        if crate::mount::is_mounted(target) {
+            return;
+        }
+        mkdir_p(target);
+        if let Err(e) = mount(
+            Some("tmpfs"),
+            target,
+            Some("tmpfs"),
+            MsFlags::MS_NOSUID,
+            None::<&str>,
+        ) {
+            tracing::warn!(target, error = %e, "failed to mount tmpfs (dev)");
         }
     }
 
@@ -183,6 +244,207 @@ mod platform {
         ) {
             // debug, not warn — this share is optional.
             tracing::debug!(tag, mountpoint, error = %e, "virtiofs share not available");
+        }
+    }
+
+    /// Like `mount_virtiofs_optional` but passes `dax=always`.
+    ///
+    /// Required for shares whose consumer depends on the FUSE DAX fast path
+    /// firing (e.g. the hv_e2e harness, which asserts `FUSE_SETUPMAPPING`
+    /// counters increment). Still non-fatal when the share is absent, so
+    /// production VMs that don't attach the tag pay only a debug log.
+    ///
+    /// `cache=` is NOT passed here: the Linux 6.12 virtiofs parameter spec
+    /// only accepts `source` and `dax`, so `cache=always` triggers
+    /// `virtiofs: Unknown parameter 'cache'` and the mount fails outright.
+    /// Caching behaviour is inherited from FUSE defaults.
+    fn mount_virtiofs_optional_dax(tag: &str, mountpoint: &str) {
+        if crate::mount::is_mounted(mountpoint) {
+            return;
+        }
+        mkdir_p(mountpoint);
+        if let Err(e) = mount(
+            Some(tag),
+            mountpoint,
+            Some("virtiofs"),
+            MsFlags::empty(),
+            Some("dax=always"),
+        ) {
+            tracing::debug!(tag, mountpoint, error = %e, "virtiofs DAX share not available");
+        }
+    }
+
+    /// Mounts the Rosetta VirtioFS share and registers binfmt_misc for x86_64.
+    ///
+    /// This is a best-effort operation — if the host did not attach a Rosetta
+    /// share (Intel Mac, Rosetta not installed, or config disabled), the
+    /// VirtioFS mount fails silently and we skip registration.
+    fn setup_rosetta() {
+        const ROSETTA_MOUNT: &str = "/media/rosetta";
+        const ROSETTA_TAG: &str = "rosetta";
+        const ROSETTA_BINARY: &str = "/media/rosetta/rosetta";
+
+        // Mount the Rosetta VirtioFS share (skip if already mounted).
+        if !crate::mount::is_mounted(ROSETTA_MOUNT) {
+            mkdir_p(ROSETTA_MOUNT);
+            if let Err(e) = mount(
+                Some(ROSETTA_TAG),
+                ROSETTA_MOUNT,
+                Some("virtiofs"),
+                MsFlags::MS_RDONLY,
+                None::<&str>,
+            ) {
+                tracing::debug!(error = %e, "Rosetta VirtioFS share not available — x86_64 translation disabled");
+                return;
+            }
+        }
+
+        // Verify the Rosetta binary exists in the share.
+        if !Path::new(ROSETTA_BINARY).exists() {
+            tracing::warn!("Rosetta share mounted but binary not found at {ROSETTA_BINARY}");
+            return;
+        }
+
+        // Mount binfmt_misc if not already mounted.
+        if !Path::new("/proc/sys/fs/binfmt_misc/status").exists() {
+            mkdir_p("/proc/sys/fs/binfmt_misc");
+            if let Err(e) = mount(
+                Some("binfmt_misc"),
+                "/proc/sys/fs/binfmt_misc",
+                Some("binfmt_misc"),
+                MsFlags::empty(),
+                None::<&str>,
+            ) {
+                tracing::warn!(error = %e, "failed to mount binfmt_misc — Rosetta registration skipped");
+                return;
+            }
+        }
+
+        // Skip if already registered (idempotent re-entry).
+        if Path::new("/proc/sys/fs/binfmt_misc/rosetta").exists() {
+            tracing::debug!("Rosetta binfmt_misc handler already registered");
+            return;
+        }
+
+        // Register Rosetta as the x86_64 ELF interpreter.
+        //
+        // Magic: 20-byte x86_64 ELF header (EI_CLASS=64, e_machine=EM_X86_64).
+        // Mask: allows both ET_EXEC (0x02) and ET_DYN (0x03) via 0xfe on byte 16.
+        // Flags: C = credentials from binary, F = fix-binary (keep fd open across
+        //        mount namespaces so containers can use Rosetta without mounting it).
+        let registration = format!(
+            ":rosetta:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:{ROSETTA_BINARY}:CF"
+        );
+
+        match fs::write("/proc/sys/fs/binfmt_misc/register", registration.as_bytes()) {
+            Ok(()) => {
+                tracing::info!("Rosetta x86_64 translation registered via binfmt_misc");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to register Rosetta binfmt_misc handler");
+            }
+        }
+    }
+
+    /// Synthesises missing CPU cache sysfs attributes via bind mounts.
+    ///
+    /// Virtualization.framework exposes `level`, `type`, and `shared_cpu_map`
+    /// for each cache index but omits `size`, `coherency_line_size`, and
+    /// `number_of_sets`. The Firecracker jailer hard-panics when these files
+    /// are absent, so we fill them in with placeholder values. Only the
+    /// jailer reads these files; the numbers are intentionally not accurate
+    /// (and will be wrong on x86_64 guests), but they're well-formed and
+    /// satisfy the existence/parse check the jailer performs before chroot.
+    fn ensure_cpu_cache_topology() {
+        const CACHE_BASE: &str = "/sys/devices/system/cpu/cpu0/cache";
+        const FIXUP_BASE: &str = "/run/arcbox/cache-fixup";
+        const REQUIRED: &[&str] = &["size", "coherency_line_size", "number_of_sets"];
+
+        // Placeholder values keyed by index — (size, coherency_line_size,
+        // number_of_sets). Any index not listed (e.g. index3 for L3) falls
+        // back to FALLBACK below.
+        const DEFAULTS: &[(&str, &str, &str)] = &[
+            ("64K", "64", "256"),    // index0: typically L1 Data
+            ("64K", "64", "256"),    // index1: typically L1 Instruction
+            ("1024K", "64", "2048"), // index2: typically L2 Unified
+        ];
+        const FALLBACK: (&str, &str, &str) = ("8192K", "64", "8192");
+
+        let entries = match fs::read_dir(CACHE_BASE) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let mut indices: Vec<usize> = entries
+            .flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_prefix("index"))
+                    .and_then(|s| s.parse::<usize>().ok())
+            })
+            .collect();
+        indices.sort_unstable();
+
+        let mut applied = 0_usize;
+        for idx in indices {
+            let sysfs_dir = format!("{CACHE_BASE}/index{idx}");
+            // Skip indices that already expose every required attribute.
+            if REQUIRED
+                .iter()
+                .all(|f| Path::new(&format!("{sysfs_dir}/{f}")).exists())
+            {
+                continue;
+            }
+
+            let (size, line_size, num_sets) = DEFAULTS.get(idx).copied().unwrap_or(FALLBACK);
+
+            let fixup_dir = format!("{FIXUP_BASE}/index{idx}");
+            mkdir_p(&fixup_dir);
+
+            // Copy existing files from sysfs into the fixup directory.
+            for name in &[
+                "level",
+                "type",
+                "shared_cpu_map",
+                "shared_cpu_list",
+                "uevent",
+            ] {
+                let src = format!("{sysfs_dir}/{name}");
+                if let Ok(content) = fs::read_to_string(&src) {
+                    let _ = fs::write(format!("{fixup_dir}/{name}"), content);
+                }
+            }
+
+            // Write the missing attributes.
+            let _ = fs::write(format!("{fixup_dir}/size"), format!("{size}\n"));
+            let _ = fs::write(
+                format!("{fixup_dir}/coherency_line_size"),
+                format!("{line_size}\n"),
+            );
+            let _ = fs::write(
+                format!("{fixup_dir}/number_of_sets"),
+                format!("{num_sets}\n"),
+            );
+
+            // Bind-mount the completed directory over the sysfs entry.
+            if let Err(e) = mount(
+                Some(&fixup_dir as &str),
+                sysfs_dir.as_str(),
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            ) {
+                tracing::warn!(index = idx, error = %e, "failed to bind-mount cache fixup");
+            } else {
+                applied += 1;
+            }
+        }
+
+        if applied > 0 {
+            tracing::info!(
+                count = applied,
+                "CPU cache topology fixup applied for Firecracker jailer"
+            );
         }
     }
 
@@ -441,7 +703,7 @@ exit 0
     /// Install iptables FORWARD rules for sandbox networking.
     ///
     /// Each sandbox has a point-to-point TAP — no bridge or MASQUERADE needed.
-    /// The host-side smoltcp TcpBridge/SocketProxy terminates connections and
+    /// The host-side TcpBridge / SocketProxy terminates connections and
     /// creates new host sockets, so the original sandbox src IP is irrelevant
     /// for reply routing.
     ///
@@ -587,13 +849,17 @@ const NOFILE_LIMIT: u64 = 1_048_576;
 /// Returns the Docker daemon.json content as a string.
 ///
 /// Extracted as a pure function so the output contract (DNS + default
-/// ulimits) is testable independently of the filesystem and platform.
+/// ulimits + containerd image store) is testable independently of the
+/// filesystem and platform.
 #[cfg(any(target_os = "linux", test))]
 fn docker_daemon_json() -> String {
     serde_json::json!({
         "dns": ["10.0.2.1"],
         "default-ulimits": {
             "nofile": { "Name": "nofile", "Soft": NOFILE_LIMIT, "Hard": NOFILE_LIMIT }
+        },
+        "features": {
+            "containerd-snapshotter": true
         }
     })
     .to_string()
@@ -626,5 +892,12 @@ mod tests {
         let json = docker_daemon_json();
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["dns"][0], "10.0.2.1");
+    }
+
+    #[test]
+    fn daemon_json_enables_containerd_snapshotter() {
+        let json = docker_daemon_json();
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["features"]["containerd-snapshotter"], true);
     }
 }

@@ -10,10 +10,11 @@ use std::sync::{
 use std::time::Duration;
 
 use arcbox_vz::{
-    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, MemoryBalloonDeviceConfiguration,
-    NetworkDeviceConfiguration, SerialPortConfiguration, SharedDirectory, SingleDirectoryShare,
-    SocketDeviceConfiguration, StorageDeviceConfiguration, VirtioFileSystemDeviceConfiguration,
-    VirtualMachineConfiguration, VirtualMachineState,
+    EntropyDeviceConfiguration, GenericPlatform, LinuxBootLoader, LinuxRosettaDirectoryShare,
+    MemoryBalloonDeviceConfiguration, NetworkDeviceConfiguration, RosettaAvailability,
+    SerialPortConfiguration, SharedDirectory, SingleDirectoryShare, SocketDeviceConfiguration,
+    StorageDeviceConfiguration, VirtioFileSystemDeviceConfiguration, VirtualMachineConfiguration,
+    VirtualMachineState,
 };
 
 use crate::{
@@ -492,18 +493,11 @@ impl DarwinVm {
             HypervisorError::DeviceError("No vsock device configured".to_string())
         })?;
 
-        // Connect to the port using arcbox-vz's async connect
+        // Connect to the port using arcbox-vz's blocking connect.
         tracing::debug!("Connecting to vsock port {} on VM {}", port, self.id);
-
-        // Use tokio runtime to run async connect
-        let rt = tokio::runtime::Handle::try_current().map_err(|_| {
-            HypervisorError::DeviceError("No tokio runtime available for vsock connect".to_string())
-        })?;
-
-        // Use block_in_place to allow blocking in async context
-        let connection =
-            tokio::task::block_in_place(|| rt.block_on(socket_device.connect(port)))
-                .map_err(|e| HypervisorError::DeviceError(format!("vsock connect failed: {e}")))?;
+        let connection = socket_device
+            .connect_blocking(port, std::time::Duration::from_secs(10))
+            .map_err(|e| HypervisorError::DeviceError(format!("vsock connect failed: {e}")))?;
 
         // Get the raw fd and take ownership (prevents close on drop)
         let fd = connection.into_raw_fd();
@@ -799,6 +793,59 @@ impl DarwinVm {
     #[must_use]
     pub const fn configured_memory_size(&self) -> u64 {
         self.config.memory_size
+    }
+
+    /// Adds a Rosetta x86_64 translation directory share to the VM.
+    ///
+    /// Exposes Apple's Rosetta binary as a VirtioFS share (tag: "rosetta").
+    /// The guest mounts this and registers the binary via binfmt_misc to
+    /// transparently run x86_64 ELF binaries at near-native speed.
+    ///
+    /// No-op (with warning) if Rosetta is not available on the host.
+    pub fn add_rosetta_share(&mut self) -> Result<(), HypervisorError> {
+        let availability = LinuxRosettaDirectoryShare::availability();
+        match availability {
+            RosettaAvailability::NotSupported => {
+                tracing::warn!("Rosetta not supported on this platform (Intel Mac or macOS < 13)");
+                return Ok(());
+            }
+            RosettaAvailability::NotInstalled => {
+                tracing::warn!(
+                    "Rosetta not installed — run `softwareupdate --install-rosetta` to enable x86_64 support"
+                );
+                return Ok(());
+            }
+            RosettaAvailability::Supported => {}
+        }
+
+        let vz_config = self
+            .vz_config
+            .as_mut()
+            .ok_or_else(|| HypervisorError::VmStateError {
+                expected: "Created (config available)".to_string(),
+                actual: "config already consumed".to_string(),
+            })?;
+
+        let rosetta_share = match LinuxRosettaDirectoryShare::new() {
+            Ok(share) => share,
+            Err(e) => {
+                tracing::warn!("Failed to create Rosetta directory share: {e}");
+                return Ok(());
+            }
+        };
+
+        let mut fs_device = match VirtioFileSystemDeviceConfiguration::new("rosetta") {
+            Ok(device) => device,
+            Err(e) => {
+                tracing::warn!("Failed to create Rosetta VirtioFS device: {e}");
+                return Ok(());
+            }
+        };
+        fs_device.set_share(rosetta_share);
+        vz_config.add_directory_share(fs_device);
+
+        tracing::info!("Added Rosetta x86_64 translation share (tag: rosetta)");
+        Ok(())
     }
 }
 

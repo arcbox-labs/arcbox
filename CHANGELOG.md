@@ -5,6 +5,375 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4](https://github.com/arcboxlabs/arcbox/compare/v0.4.3...v0.4.4) (2026-05-26)
+
+
+### Features
+
+* **xnu-net:** add batch datagram I/O crate ([11842bf](https://github.com/arcboxlabs/arcbox/commit/11842bf4100bf36d8ae77467f0c21660a0f60302))
+
+
+### Bug Fixes
+
+* **xnu-net:** loop until all sent in AsyncBatchDgram::send_batch ([495762d](https://github.com/arcboxlabs/arcbox/commit/495762dd92a58ff0c766ac0c4267b340aa6bc14d))
+* **xnu-net:** propagate WouldBlock from BatchDgram and capture errno once ([c60b99f](https://github.com/arcboxlabs/arcbox/commit/c60b99fef5e4d2f3415c891ce1b78f1ae85990ac))
+
+
+### Performance Improvements
+
+* **xnu-net:** add criterion benchmarks for batch vs single I/O ([caf067c](https://github.com/arcboxlabs/arcbox/commit/caf067ce96639363890bcb2d3adf640a8a752fcc))
+* **xnu-net:** interleave bench send/recv, hoist allocations, retry EAGAIN ([4e69855](https://github.com/arcboxlabs/arcbox/commit/4e6985536f3fd1c28aa50a02303377b512a57097))
+
+
+### Code Refactoring
+
+* **xnu-net:** drop FdWrapper, expose RxEntry from async wrapper, compile async tests by default ([dde99ba](https://github.com/arcboxlabs/arcbox/commit/dde99ba3a43bc8fd9dcb1ef56942c8bdd9cee561))
+* **xnu-net:** impl Send for BatchDgram, document MAX_BATCH, test the cap ([60d063c](https://github.com/arcboxlabs/arcbox/commit/60d063c7ef9e0616c02563df4b57c35e10094fe4))
+
+
+### Tests
+
+* **xnu-net:** add test suite for BatchDgram and AsyncBatchDgram ([e64388d](https://github.com/arcboxlabs/arcbox/commit/e64388d470490ceb35556a904b015c9d517ea70a))
+
+
+### Documentation
+
+* **xnu-net:** align lib doctest with new recv_batch return type ([1b5e785](https://github.com/arcboxlabs/arcbox/commit/1b5e785b172533577b9dc14f8e967ed995b62b46))
+
+
+### Miscellaneous Chores
+
+* update Cargo.lock after master merge ([308fe31](https://github.com/arcboxlabs/arcbox/commit/308fe3182003fd61134e429c39f5a352333b9949))
+
+## [0.4.3](https://github.com/arcboxlabs/arcbox/compare/v0.4.2...v0.4.3) (2026-05-26)
+
+
+### Bug Fixes
+
+* **storage:** increase data disk to 8 TiB and add btrfs auto-resize ([314fe5a](https://github.com/arcboxlabs/arcbox/commit/314fe5ac4f4012896102c2a2187acd3c3b8b92a5))
+
+## [0.4.2](https://github.com/arcboxlabs/arcbox/compare/v0.4.1...v0.4.2) (2026-05-26)
+
+
+### Bug Fixes
+
+* **agent:** redact docker proxy payload from logs ([e1933b9](https://github.com/arcboxlabs/arcbox/commit/e1933b9f6a350b75ca6e05a720efbf70ce09ee2f))
+* **agent:** use is_peer_closed_error for RPC EOF detection ([0b9d446](https://github.com/arcboxlabs/arcbox/commit/0b9d4465c920266a691290bc6e6a5632f2208e36))
+* **brew:** drop redundant unprivileged /usr/local/bin link (ABXD-75) ([5c716b0](https://github.com/arcboxlabs/arcbox/commit/5c716b0053b789372aad605ef569fe84f8ff299b))
+* **brew:** unlink /usr/local/bin/docker* via helper on brew-uninstall ([acd1229](https://github.com/arcboxlabs/arcbox/commit/acd1229e92bbde868fb1987cbc2e6252c1beb6ad))
+* **cli:** consider any plugin binary when assessing setup status ([9e625e1](https://github.com/arcboxlabs/arcbox/commit/9e625e104d8de4f996dc649eb8c305155dbfee4b))
+* **cli:** honour DOCKER_CONFIG when locating Docker plugin config ([5ea790a](https://github.com/arcboxlabs/arcbox/commit/5ea790a7773ea19fc61f7feed6058b1d79c8162f))
+* **cli:** recognise relative symlink targets in plugin ownership check ([515405e](https://github.com/arcboxlabs/arcbox/commit/515405e8d2ba7e9824e7ea62eaa08d943a224cc9))
+* **cli:** surface plugin register/unregister errors in setup output ([6621f74](https://github.com/arcboxlabs/arcbox/commit/6621f7483a88ac740b45322ed244f67673c677ee))
+* **cli:** tolerate non-array cliPluginsExtraDirs as foreign state ([331db06](https://github.com/arcboxlabs/arcbox/commit/331db068e998931a0d265d4452c6a9c8744e342d))
+* **cli:** write ~/.docker/config.json atomically ([0a51b7b](https://github.com/arcboxlabs/arcbox/commit/0a51b7ba9f32094d563d85db3c9cd12079c0ff14))
+* **daemon:** surface total cli_link failure in CliTools::apply ([3367ce9](https://github.com/arcboxlabs/arcbox/commit/3367ce9005e2f5df349a1b11a0fce22a25b0b2c2))
+* **release-please:** stop bumping arcbox-hv workspace dep pin ([01835a8](https://github.com/arcboxlabs/arcbox/commit/01835a896cd568e2e007080b773a0578dd6600c0))
+
+
+### Code Refactoring
+
+* **agent:** extract agent + rpc modules and finish the split ([e571706](https://github.com/arcboxlabs/arcbox/commit/e571706b5289b078ac5784afa440110055c307cf))
+* **agent:** extract kubernetes module (k3s lifecycle + RPC) ([b907690](https://github.com/arcboxlabs/arcbox/commit/b907690d3188da23231590aafac57a7076add87e))
+* **agent:** extract leaf modules (cmdline/vsock/probe/btrfs) ([52a9b76](https://github.com/arcboxlabs/arcbox/commit/52a9b76981f794b1179208053f3428ec90076ad5))
+* **agent:** extract linux/stub mods into separate files ([6215cbd](https://github.com/arcboxlabs/arcbox/commit/6215cbdd2281cc190cbc61f12b7f2e788f0adcf5))
+* **agent:** extract proxy / sandbox / system_info modules ([c0cee46](https://github.com/arcboxlabs/arcbox/commit/c0cee46406803c0de0049432b80d07cbd8ff885e))
+* **agent:** extract runtime module (containerd + dockerd lifecycle) ([51a7c75](https://github.com/arcboxlabs/arcbox/commit/51a7c75629b5c13be87d79eaf8f452570e647397))
+* **net:** extract vmnet bindings into arcbox-vmnet crate ([33be013](https://github.com/arcboxlabs/arcbox/commit/33be013120800d2bc280add2b10faf7651b4a25a))
+* **vmnet:** tighten public API and harden error paths ([00d665b](https://github.com/arcboxlabs/arcbox/commit/00d665b5ed8850f3acfecdaa6d8774ab01c155dd))
+
+
+### Tests
+
+* **vmnet:** add integration test suite for public API ([52d1951](https://github.com/arcboxlabs/arcbox/commit/52d1951090959082dc073566f330f60713965cd7))
+
+
+### Miscellaneous Chores
+
+* bump `dimicon` and enable `simpleicon` ([#277](https://github.com/arcboxlabs/arcbox/issues/277)) ([a045b52](https://github.com/arcboxlabs/arcbox/commit/a045b52b32e9c3f5d27a58641f18d58484b79871))
+* bump `dimicon` to `0.2.0` and enable `simpleicon` ([a045b52](https://github.com/arcboxlabs/arcbox/commit/a045b52b32e9c3f5d27a58641f18d58484b79871))
+* **deps:** enable serde_json preserve_order ([ff05fcf](https://github.com/arcboxlabs/arcbox/commit/ff05fcfcaf49360bb6260f9652b73b6ffd553eee))
+* **workspace:** promote internal path deps to workspace.dependencies ([cfeffd8](https://github.com/arcboxlabs/arcbox/commit/cfeffd80da6ed26825a9f46096931ea0b5bfa384))
+
+## [0.4.1](https://github.com/arcboxlabs/arcbox/compare/v0.4.0...v0.4.1) (2026-04-24)
+
+
+### Miscellaneous Chores
+
+* pin pstramp v0.2.0 in assets.lock ([#206](https://github.com/arcboxlabs/arcbox/issues/206)) ([6201014](https://github.com/arcboxlabs/arcbox/commit/620101474b5f99a447f9944ee0f7445cb1103818))
+
+## [0.4.0](https://github.com/arcboxlabs/arcbox/compare/v0.3.21...v0.4.0) (2026-04-24)
+
+
+### Features
+
+* **agent:** add MmapReadFile RPC to exercise DAX path E2E (ABX-362) ([7f11502](https://github.com/arcboxlabs/arcbox/commit/7f11502b0980e06ca0605eabdc2c9d5341a4751f))
+* **bench:** add VirtioFS benchmark suite for M4 performance tracking ([8d893da](https://github.com/arcboxlabs/arcbox/commit/8d893da2e03149646228f0df72bcec4d7b2cf925))
+* **cli:** register docker compose/buildx as Docker CLI plugins ([483ab8b](https://github.com/arcboxlabs/arcbox/commit/483ab8b61fb5bd157e10fe62fec06b6795dba15b))
+* **constants:** add DOCKER_CLI_PLUGINS constant ([563aeb7](https://github.com/arcboxlabs/arcbox/commit/563aeb728d6a9a176301336c822960c3d97b5b10))
+* custom VMM with TSO support via Hypervisor.framework ([#190](https://github.com/arcboxlabs/arcbox/issues/190)) ([0469191](https://github.com/arcboxlabs/arcbox/commit/04691913d910e449ebd47e1249a79d5c96090ca3))
+* custom VMM with TSO support via Hypervisor.framework ([#190](https://github.com/arcboxlabs/arcbox/issues/190)) ([c58e6d9](https://github.com/arcboxlabs/arcbox/commit/c58e6d956f14c99c7f9d9b1e6677a258ea6de189))
+* **ethernet:** add SYN-ACK and SYN frame builders with option parsing ([6fab71b](https://github.com/arcboxlabs/arcbox/commit/6fab71b4c2b717ea4cc70461618c486a4e50fe40))
+* **fs:** VirtioFS DAX support (protocol + window + mapper) ([8864eed](https://github.com/arcboxlabs/arcbox/commit/8864eed668f4c2b19fad422f339c9de7f5b66044))
+* **fs:** wire VirtioFS DAX end-to-end ([75e631e](https://github.com/arcboxlabs/arcbox/commit/75e631e1a53750d260f87af6a485589bb98b6b4d))
+* **hv:** add arcbox-hv crate with Hypervisor.framework FFI bindings ([#185](https://github.com/arcboxlabs/arcbox/issues/185)) ([b310e89](https://github.com/arcboxlabs/arcbox/commit/b310e8996825a1e01121f3c8685af6b12aff653f))
+* **net:** add vmnet bridge NIC (NIC2) to HV backend for container IP routing ([7bebd9a](https://github.com/arcboxlabs/arcbox/commit/7bebd9a8413ab58dd56721513c058e7c9790efa8))
+* **net:** crate split + zero-copy RX injection via channel (ABX-352) ([a6edbb8](https://github.com/arcboxlabs/arcbox/commit/a6edbb80e38b58ee6663f1e4bdf13db0fbd7d02b))
+* **net:** GSO offload with NEEDS_CSUM for RX injection ([39470db](https://github.com/arcboxlabs/arcbox/commit/39470db5e1f989cc32560a8d7cd665b675b6b642))
+* **net:** inline vhost framework + GSO NEEDS_CSUM (10.3 Gbps) ([6075f46](https://github.com/arcboxlabs/arcbox/commit/6075f46c0e1fa0c0ed584fe8e9b1c778304bbd45))
+* **sandbox:** support creating sandboxes from Dockerfiles ([#158](https://github.com/arcboxlabs/arcbox/issues/158)) ([23508a3](https://github.com/arcboxlabs/arcbox/commit/23508a35cb3da12a948e28287baa93f15d591854))
+* **tcp_bridge:** activate inline inject thread up-front when SEQ is known ([a623714](https://github.com/arcboxlabs/arcbox/commit/a623714f17e2a8751f1998340e8ef73468ee8cd4))
+* **tcp_bridge:** add hand-rolled TCP handshake synthesizer ([48e91e1](https://github.com/arcboxlabs/arcbox/commit/48e91e1d97d9a1ca4ce44c1335d42d8dd0978763))
+* **virtio-blk:** implement DISCARD + WRITE_ZEROES, delete dead backend ([475e58e](https://github.com/arcboxlabs/arcbox/commit/475e58e5460af9760ac64bd18e8eb0505b2c1788))
+* **virtio:** add virtio-balloon device + HV backend wiring (ABX-363) ([d1fc01c](https://github.com/arcboxlabs/arcbox/commit/d1fc01cf70860bdab6a4627ca6b266db5b796ea5))
+* **virtio:** connect VirtIO devices to MMIO transport for HV backend (ABX-287) ([bf92a7d](https://github.com/arcboxlabs/arcbox/commit/bf92a7d3a595f280894bf8b0a2ffaa0ce9dd4cf3))
+* **virtio:** implement vsock packet processing for HV backend (M2) ([39829a0](https://github.com/arcboxlabs/arcbox/commit/39829a08f4c1ff8e8b0763427cb9fb6c0fe51de3))
+* **vmm+agent:** fully enable HVC fast-path block I/O ([4502123](https://github.com/arcboxlabs/arcbox/commit/450212365314f9f3c07d45559713f082a6739e43))
+* **vmm:** add DAX mapping counters + per-share stats accessor (ABX-362) ([d0b95b9](https://github.com/arcboxlabs/arcbox/commit/d0b95b92400aced4163934e9947c31dda55342c6))
+* **vmm:** add vsock connect_vsock_hv with socketpair + backend dispatch ([b9a6c96](https://github.com/arcboxlabs/arcbox/commit/b9a6c969d91f4dffa8f2d7c26259fa1bc7b55fca))
+* **vmm:** async block I/O worker + vsock multi-connection + boot fixes ([9b4dc51](https://github.com/arcboxlabs/arcbox/commit/9b4dc5193c64c575f5432fca894e62585aaa6233))
+* **vmm:** dedicated net-io thread for RX injection (ABX-350) ([ed10469](https://github.com/arcboxlabs/arcbox/commit/ed10469bb9168ef8e06226a3037697291657822f))
+* **vmm:** deferred vsock OP_REQUEST injection + per-iteration RX poll ([6bf0d4f](https://github.com/arcboxlabs/arcbox/commit/6bf0d4f8d402c8df694c710a88400a195fcda18b))
+* **vmm:** enable HV backend in daemon — full boot path through arcbox-daemon ([52a0119](https://github.com/arcboxlabs/arcbox/commit/52a0119956f54a8df176f9b10654a2f99dc0a90d))
+* **vmm:** EVENT_IDX notification suppression for net RX (ABX-351) ([5e753c8](https://github.com/arcboxlabs/arcbox/commit/5e753c8d34bade8f649f5ca19ed02232bd45cffe))
+* **vmm:** HVC fast-path block read handler ([7f65535](https://github.com/arcboxlabs/arcbox/commit/7f655359732d7177e8bc740dcabb16a5d02dbd5a))
+* **vmm:** implement HV backend boot path and dual-backend switching (ABX-286, ABX-288) ([f89d865](https://github.com/arcboxlabs/arcbox/commit/f89d86564d33b96705912e727ad6eea9ea3977ea))
+* **vmm:** implement PSCI CPU_ON secondary vCPU spawning and WFI blocking (M3) ([0e983a8](https://github.com/arcboxlabs/arcbox/commit/0e983a8b51c8d93c9f8ac1a8a0791bae632f14cb))
+* **vmm:** rewrite HV boot path to use rust-vmm crates (vm-memory, linux-loader, vm-fdt) ([402bad2](https://github.com/arcboxlabs/arcbox/commit/402bad29b219aeb7b5f705668443c959c4fc2232))
+* **vmm:** switch E2E test to production boot path (rootfs.erofs block device) ([14211a4](https://github.com/arcboxlabs/arcbox/commit/14211a440b933375a7272e22cf0f6344fa3ce5d2))
+* **vmm:** VirtIO console TX processing + console=hvc0 — init output visible ([cde2abd](https://github.com/arcboxlabs/arcbox/commit/cde2abd51480cd16bd78d1703b8a1363b3cfb151))
+* **vmm:** VirtIO-blk multi-queue + DNS fix + flush barrier ([6d26d38](https://github.com/arcboxlabs/arcbox/commit/6d26d38677777fcbb4e4caa7cf97ccb2be1f9451))
+* **vmm:** vsock data forwarding infrastructure (TX direction) ([0045246](https://github.com/arcboxlabs/arcbox/commit/004524632c214e34befde03eeb464bf2468ec0cf))
+* **vmm:** vsock RX injection via poll_vsock_rx in WFI handler ([821c73c](https://github.com/arcboxlabs/arcbox/commit/821c73cde2e41cdf89e00d8f92fac986de7de8ba))
+* **vmm:** vsock TX queue polling + connection state tracking ([4e4aa95](https://github.com/arcboxlabs/arcbox/commit/4e4aa9556b718ede46a5570f8c461b75c4a7088c))
+* **vmm:** wire VirtIO device instances into HV backend for guest I/O [M1] ([85d4ae4](https://github.com/arcboxlabs/arcbox/commit/85d4ae4592e441080153d9b6d1998874cc1b25b0))
+* **vsock:** port vhost-device-vsock connection state machine ([5afe8fc](https://github.com/arcboxlabs/arcbox/commit/5afe8fcdb6ff03732297101744ee6f5e8d87f7af))
+
+
+### Bug Fixes
+
+* **agent,cli:** address PR [#267](https://github.com/arcboxlabs/arcbox/issues/267) review comments ([7aac968](https://github.com/arcboxlabs/arcbox/commit/7aac9686868cae81b5eae853363fb8348b8cc688))
+* **agent:** cast FS_IOC_* constants to libc::Ioctl for target portability ([a1294fd](https://github.com/arcboxlabs/arcbox/commit/a1294fdaff88c9cbd70b29f30631edd27dda7dae))
+* **agent:** make ensure_runtime non-blocking to avoid daemon RPC timeout ([f606369](https://github.com/arcboxlabs/arcbox/commit/f6063695249c6d1bb54b9fb63d198b1da2c1db17))
+* **agent:** mount arcbox-dax under /run, drop rejected cache= option ([123b35d](https://github.com/arcboxlabs/arcbox/commit/123b35d2926f59cc97c0609e611d5e605284c707))
+* **fs:** per-VirtioFS DAX window allocation ([458a242](https://github.com/arcboxlabs/arcbox/commit/458a242dec956c34b8a786bc25f5397cfda7e15c))
+* **fs:** VirtioFS DAX end-to-end working ([9cb08fd](https://github.com/arcboxlabs/arcbox/commit/9cb08fd5e221c8122e67e20b426156e1f36da8cc))
+* **guest:** bound thread spawns and reduce stack size in vm-agent ([34abc8a](https://github.com/arcboxlabs/arcbox/commit/34abc8a97c454c5bd49d918727f5b771581ddbc2))
+* **hv:** add exit_all_vcpus wrapper, fix GIC state memory leak, export register constants ([758cb36](https://github.com/arcboxlabs/arcbox/commit/758cb365333a9d2f87572e8a7b98f6a1a8a4357d))
+* **hv:** clamp vsock fd dup target below RLIMIT_NOFILE ([4cf3ec2](https://github.com/arcboxlabs/arcbox/commit/4cf3ec275be799dec2bb7d0d8cca361115381d79))
+* **hv:** join net RX worker on shutdown + release fence on avail_event ([78da37b](https://github.com/arcboxlabs/arcbox/commit/78da37b89f615ffa18bd72c206fc9eece7a89efa))
+* **hv:** pass vCPU IDs to hv_vcpus_exit on arm64 (ABX-367 root cause) ([4a48d2a](https://github.com/arcboxlabs/arcbox/commit/4a48d2a85c701ebaa9009bdb5733ab862003de57))
+* **hv:** re-export check, typed ignore reasons, safer GIC test drop ([99a8b69](https://github.com/arcboxlabs/arcbox/commit/99a8b69af5ae76f1ab4c6db1bb9e023f89efeebe))
+* **hv:** update GIC API for Xcode 26 SDK and fix RAM base address layout ([cbf4fd4](https://github.com/arcboxlabs/arcbox/commit/cbf4fd41830f9fb2e8ad9974757f0f69ddbfb6d2))
+* **net-inject:** advertise TCPV4 GSO for oversized inline frames ([dab689f](https://github.com/arcboxlabs/arcbox/commit/dab689f88973334b7ddc2b49864aece700225ee4))
+* **net-inject:** drop GSO for RX-injected fast-path frames ([75b1230](https://github.com/arcboxlabs/arcbox/commit/75b123023e4b01ad6e6851c4a44d47383dc7c244))
+* **net-inject:** relay FIN+ACK to guest on host EOF ([6cfb69d](https://github.com/arcboxlabs/arcbox/commit/6cfb69d4f54c38ef578109585c8efcfffd9db734))
+* **net,vmm:** address AI code-review comments on PR [#259](https://github.com/arcboxlabs/arcbox/issues/259) ([4923d27](https://github.com/arcboxlabs/arcbox/commit/4923d270c8ef77269c970e0ceeca3d6f9cd6dbb9))
+* **net,vmm:** resolve P0 release blockers from code review ([ef95419](https://github.com/arcboxlabs/arcbox/commit/ef95419ae4250c4831dec75f02da1366272e826f))
+* **net:** address AI code-review comments on PR [#260](https://github.com/arcboxlabs/arcbox/issues/260) ([c2246f8](https://github.com/arcboxlabs/arcbox/commit/c2246f88f61c8c7e7553e29335351da0127cf700))
+* **net:** complete hot-path log level downgrade (ABX-324) ([597dc2e](https://github.com/arcboxlabs/arcbox/commit/597dc2ed58170fbba6bd1eea8d2ae3b1fe4e25ef))
+* **net:** defer inline fast-path promotion until SEQ/ACK sync ([d4cdf9f](https://github.com/arcboxlabs/arcbox/commit/d4cdf9fcad7833eb2eded84e21ca7e9cf64fe5df))
+* **net:** fix fast-path promotion panic, EMSGSIZE, and workspace clippy errors ([52e7233](https://github.com/arcboxlabs/arcbox/commit/52e72330cab4b922186dd1dd38b1544e28769c2b))
+* **net:** route fake-IP TCP connections through proxy before domain lookup ([0f3c6d4](https://github.com/arcboxlabs/arcbox/commit/0f3c6d49c38403b5681de63dd7933746e43d6914))
+* **net:** share our_seq atomic between inject thread and intercept ACKs ([6dba9d0](https://github.com/arcboxlabs/arcbox/commit/6dba9d0121aa81d4edb32d44b8377e57f1c2bda4))
+* **net:** skip retransmits and drain on Broken pipe in fast-path TX ([5315647](https://github.com/arcboxlabs/arcbox/commit/53156474d6b18ce987dc7b9433a79f2d83844081))
+* **net:** use device ID for primary NIC lookup instead of HashMap scan ([ddbb49a](https://github.com/arcboxlabs/arcbox/commit/ddbb49a3d403d0f2d740dc12cbae8e266d60b131))
+* **net:** use device ID for primary NIC lookup instead of HashMap scan ([056b14e](https://github.com/arcboxlabs/arcbox/commit/056b14eae0f8e328f8b807f7a93cf02f9b0233de))
+* **net:** use full TCP checksum for fast-path frames under MTU ([287f272](https://github.com/arcboxlabs/arcbox/commit/287f272d1efd32ddfd57295a6257304574e325b8))
+* **transport:** blocking vsock transport for HV agent control plane ([198e2e7](https://github.com/arcboxlabs/arcbox/commit/198e2e7a6785093b043fb290b2ae9d3a3f862bbe))
+* **transport:** clean up blocking transport warnings, add block_in_place ([853cbc3](https://github.com/arcboxlabs/arcbox/commit/853cbc344bd7800c07a6212faa70294634250c3c))
+* **transport:** use tokio::net::UnixStream for HV socketpair connections ([069b226](https://github.com/arcboxlabs/arcbox/commit/069b2266861a863d62c02dd833823db41ed16a91))
+* **virtio-core:** cap descriptor-chain iteration at queue size ([0a43be1](https://github.com/arcboxlabs/arcbox/commit/0a43be17ceb0e9e8acfeca5eec0f3a9dadaed0f4))
+* **virtio-fs:** exercise DAX fast path end-to-end on HV (ABX-366) ([33341ba](https://github.com/arcboxlabs/arcbox/commit/33341bad4f73d8a34ca5308390e5a2b9f7eec71e))
+* **virtio-fs:** FUSE 7.36+ DAX layout, TOCTOU-safe inode open ([6bc9f03](https://github.com/arcboxlabs/arcbox/commit/6bc9f030203c72cf5fcfab339c6342aa9a801d28))
+* **virtio-net:** configure TAP offload after feature negotiation ([9164bef](https://github.com/arcboxlabs/arcbox/commit/9164befb17c93e0aa80ef41c3561a7117401c12b))
+* **virtio-net:** implement MRG_RXBUF multi-chain RX delivery ([cb707cd](https://github.com/arcboxlabs/arcbox/commit/cb707cd2098c61d7d0006efde66d63e996006fc4))
+* **virtio-net:** retry-on-ENOBUFS in guest TX write path ([b9f69aa](https://github.com/arcboxlabs/arcbox/commit/b9f69aadfb263fadaceb0c081dc86d56ab9a3dee))
+* **virtio-rng:** drop zero-fill fallback on getrandom failure ([7ce3dfd](https://github.com/arcboxlabs/arcbox/commit/7ce3dfd2e5caba8c213c61bf0edbb3822068b468))
+* **virtio-vsock:** handle OP_SHUTDOWN half-close flags per spec ([ea41173](https://github.com/arcboxlabs/arcbox/commit/ea41173bffdb8fd065969722bc560039e73f56d0))
+* **virtio-vsock:** lower credit-update threshold 48 KB → 4 KB ([98a591d](https://github.com/arcboxlabs/arcbox/commit/98a591ddc1f783512d367b2fc08fdb58ef86fea7))
+* **virtio-vsock:** proactive CREDIT_REQUEST at half-window ([e00e97d](https://github.com/arcboxlabs/arcbox/commit/e00e97d4157aec2e6d9e38b9a847aa9add6d69aa))
+* **virtio-vsock:** retry partial writes + bump socketpair SO_SNDBUF (ABX-365) ([683d616](https://github.com/arcboxlabs/arcbox/commit/683d6161cf261138378fb308d8591dc46d7e6c39))
+* **virtio:** add VIRTIO_F_VERSION_1 to vsock and fs devices ([fb831d8](https://github.com/arcboxlabs/arcbox/commit/fb831d8e2a161052d7219a7a49e7b96683b9a9a4))
+* **virtio:** address P2 review findings — u16 wrapping, EVENT_IDX, backend ([e30ce9c](https://github.com/arcboxlabs/arcbox/commit/e30ce9c617618ffa3ee8b7e2cfa54e42fa73cdaf))
+* **virtio:** rewrite VirtioFs process_queue to read from guest memory ([35f78fc](https://github.com/arcboxlabs/arcbox/commit/35f78fc888498572ae3f80d22e3c4f8386196bb0))
+* **virtio:** set avail_event in used ring for EVENT_IDX notification ([3766428](https://github.com/arcboxlabs/arcbox/commit/3766428a3e336a6445fc79d99a4bf06982000f2c))
+* **vm-agent:** replace map().unwrap_or() with map_or() on Result ([8651caf](https://github.com/arcboxlabs/arcbox/commit/8651caf6537296984f53e77d542c8802349c5264))
+* **vmm:** address P0/P1 review findings — overflow, flush ordering, DAX, GSO ([106a6ca](https://github.com/arcboxlabs/arcbox/commit/106a6ca968667a7729b6442477dd466507cb462c))
+* **vmm:** advance PC on unhandled sysreg traps so Linux boot progresses ([f2cf0cf](https://github.com/arcboxlabs/arcbox/commit/f2cf0cfd950c2821ad815955d8e1baa21fe333d3))
+* **vmm:** attach FsServer handler to VirtioFS device for FUSE processing ([12cfb16](https://github.com/arcboxlabs/arcbox/commit/12cfb16e4a8ea9af4531cf6b656f652770afc4a5))
+* **vmm:** bounded-time Vmm::stop() on HV via cancel+unpark loop (ABX-367) ([eed7ff0](https://github.com/arcboxlabs/arcbox/commit/eed7ff0f0e4f6d0172c392fe93a53d8dd5b1251f))
+* **vmm:** complete virtio-net checksum offload in HV TX path ([cfed9fe](https://github.com/arcboxlabs/arcbox/commit/cfed9fed42d409e6b689b7fab4881d6e7f3b9c21))
+* **vmm:** correct GIC SPI INTID numbering in FDT + add write barrier ([18270c5](https://github.com/arcboxlabs/arcbox/commit/18270c5eb1e098338e901c281094606c1aa18617))
+* **vmm:** DAX TOCTOU race + checked_sub for all GPA translations ([1d7786b](https://github.com/arcboxlabs/arcbox/commit/1d7786b9268a8b9c49a8d42441203e138672a279))
+* **vmm:** dispatch pause/resume/snapshot on backend (ABX-360) ([4706b9e](https://github.com/arcboxlabs/arcbox/commit/4706b9ed2abfd5d0762f823ffabf2c9093c5ca68))
+* **vmm:** eliminate memory safety UB and harden DAX mapper ([8cf4c68](https://github.com/arcboxlabs/arcbox/commit/8cf4c68dd78a35fa97abfbdeb1181d907d44704b))
+* **vmm:** enable `gic` feature by default ([d16bcb5](https://github.com/arcboxlabs/arcbox/commit/d16bcb554965d81a514f8f94085fd488a7b3cd01))
+* **vmm:** fix GPA-to-offset translation for VirtQueue memory access ([e4bad37](https://github.com/arcboxlabs/arcbox/commit/e4bad378f19182e9cefd4e2f70fab7b023c47c90))
+* **vmm:** harden VirtIO queue index wrapping, DAX lifecycle, and error checking ([ecfb773](https://github.com/arcboxlabs/arcbox/commit/ecfb77307939e58e8268a09314ee7cec6b2da510))
+* **vmm:** HV Drop order, DAX drain, vCPU registry sequencing ([f2ea4f6](https://github.com/arcboxlabs/arcbox/commit/f2ea4f661c355358e4ce4596ec6e9570c4596e7f))
+* **vmm:** Phase 3 — fix VirtIO MMIO address, initrd placement, reach /init ([423688a](https://github.com/arcboxlabs/arcbox/commit/423688ad876837d44ce2a32566dcc1505c7657b8))
+* **vmm:** remove double PC advance on HVC exit ([9e9d44b](https://github.com/arcboxlabs/arcbox/commit/9e9d44b83dd172459209c06dc6ee53b5ccf52770))
+* **vmm:** replace cast suppress with try_from for vsock host_port → RawFd ([20c625b](https://github.com/arcboxlabs/arcbox/commit/20c625b116d8bc4d444fb934ee6200687d5dc16e))
+* **vmm:** single OP_REQUEST injection per port, remove debug noise ([9056346](https://github.com/arcboxlabs/arcbox/commit/905634658e168665fba5674ce44f2961fb902ef2))
+* **vmm:** size peer-side SO_RCVBUF on HV network socketpairs ([55763d7](https://github.com/arcboxlabs/arcbox/commit/55763d79062534c50b531b0d9aa3e2deab75918c))
+* **vmm:** stop_darwin_hv drops worker senders so joins return (ABX-364) ([97b8048](https://github.com/arcboxlabs/arcbox/commit/97b8048657a786bea437260bfbfa961704c3ddb5))
+* **vmm:** trigger IRQ after vsock OP_REQUEST injection + ephemeral src_port ([d71ceb0](https://github.com/arcboxlabs/arcbox/commit/d71ceb03ac65a6a3bdea2adffbfb492db0dccfba))
+* **vmm:** vsock OP_REQUEST injection + IOMMU/DMA address analysis ([1d66cff](https://github.com/arcboxlabs/arcbox/commit/1d66cffd7ed4e37fe0dc5cd84f773eba139893bf))
+* **vmm:** XZR register handling + IRQ GSI mapping for ARM64 ([279fdc0](https://github.com/arcboxlabs/arcbox/commit/279fdc067220b7654c52e36ef59aceee38486073))
+* **vmnet:** use XPC dictionary instead of CFDictionary for vmnet_start_interface ([7dfb785](https://github.com/arcboxlabs/arcbox/commit/7dfb7854c3965190f48b332ddcdfd3b50afc5d66))
+* **vsock:** async handshake wait for HV vsock connections ([a7f5fbf](https://github.com/arcboxlabs/arcbox/commit/a7f5fbf94bd5840ce0dc4d1d24785a10c82a80ba))
+* **vsock:** propagate guest OP_SHUTDOWN F_SEND as socketpair SHUT_WR ([493ffe9](https://github.com/arcboxlabs/arcbox/commit/493ffe9cda208f1b790efee711708bab89259add))
+* **vsock:** remove cross-thread poll_vsock_rx from inject_vsock_connect ([ddbb49a](https://github.com/arcboxlabs/arcbox/commit/ddbb49a3d403d0f2d740dc12cbae8e266d60b131))
+* **vsock:** restore direct OP_REQUEST injection with deferred fallback ([fa33c5b](https://github.com/arcboxlabs/arcbox/commit/fa33c5b82cb0085c813915204412b27eb5d496e7))
+* **vsock:** swallow EINVAL alongside ENOTCONN on F_SEND shutdown ([c79121a](https://github.com/arcboxlabs/arcbox/commit/c79121a663601139036106bf2a65cd4d86353985))
+* **vz:** three real bugs — start() race, panics on framework probes ([11d44a1](https://github.com/arcboxlabs/arcbox/commit/11d44a1d057e7c0b0bb24081e186d33c37585244))
+
+
+### Performance Improvements
+
+* **fs:** VirtioFS tuning — adaptive negative cache TTL, cache profiles, READDIRPLUS (ABX-289) ([8b28bb2](https://github.com/arcboxlabs/arcbox/commit/8b28bb2d361d25249e29bbaab4f3be5861e4239b))
+* **net-inject:** drain each inline conn per pass, cap fairness per conn ([86ca055](https://github.com/arcboxlabs/arcbox/commit/86ca055e6dc1369ab5c3c27cc09063434ac07791))
+* **net-inject:** implement VIRTIO_F_EVENT_IDX IRQ suppression ([0b29229](https://github.com/arcboxlabs/arcbox/commit/0b29229159444831d44896f6f91adef59101b269))
+* **net-inject:** mergeable RX via readv — 22.7 Gbps Host→VM ([19997e1](https://github.com/arcboxlabs/arcbox/commit/19997e1ec2e4022339469dbb2f9d0654c18cdf40))
+* **net:** enable MRG_RXBUF + large frames — 10.4 Gbps receiver ([436b810](https://github.com/arcboxlabs/arcbox/commit/436b810126a95425246df4f09b78da09721804a8))
+* **net:** increase VZ network MTU from 1500 to 4000 ([#198](https://github.com/arcboxlabs/arcbox/issues/198)) ([d94359d](https://github.com/arcboxlabs/arcbox/commit/d94359d4ab61e8a770265237fe0a7c3798e9289f))
+* **net:** raise rx-inject batch size from 64 to 256 ([834a36e](https://github.com/arcboxlabs/arcbox/commit/834a36e891e7f6c38ad68a171e808113166b9844))
+* **net:** raise rx-inject COALESCE_TIMEOUT from 50 µs to 200 µs ([a047150](https://github.com/arcboxlabs/arcbox/commit/a047150ad24aa6cb73290f4a59de7d240851e6e4))
+* **net:** TCP fast path — bypass smoltcp for established connections ([#203](https://github.com/arcboxlabs/arcbox/issues/203)) ([bb29e21](https://github.com/arcboxlabs/arcbox/commit/bb29e21e749ce9d3475eb05fa5b4b15f687660a9))
+* **net:** tune buffer sizes and poll interval for higher throughput ([#191](https://github.com/arcboxlabs/arcbox/issues/191)) ([0469191](https://github.com/arcboxlabs/arcbox/commit/04691913d910e449ebd47e1249a79d5c96090ca3))
+* **net:** tune SO_RCVBUF/SO_SNDBUF to 4 MiB on inbound TCP streams ([c4a80ac](https://github.com/arcboxlabs/arcbox/commit/c4a80ac579afad115053b86e80628f2687bfaaa8))
+* **virtio-net:** reuse persistent RX scratch buffer ([950d6bb](https://github.com/arcboxlabs/arcbox/commit/950d6bb68879c5bc7b4057bc9afc651521d9a35c))
+* **vmm:** I/O request merging with preadv/pwritev ([c6ccda3](https://github.com/arcboxlabs/arcbox/commit/c6ccda311e666227cc7b3abf31b855d57514202a))
+* **vmm:** increase virtio-net RX queue size from 256 to 1024 ([3c64232](https://github.com/arcboxlabs/arcbox/commit/3c64232710e56f46e5aac1af9483fd57adf1e762))
+* **vmm:** tune net-io backoff and descriptor exhaustion handling ([874fbeb](https://github.com/arcboxlabs/arcbox/commit/874fbeb27b0677ecc6ff6f6e59c9d6db72a88719))
+
+
+### Reverts
+
+* disable GSO header fields — guest drops packets ([aba44a4](https://github.com/arcboxlabs/arcbox/commit/aba44a46d562ebd16e8a7f5489a9a8267eefa63e))
+
+
+### Code Refactoring
+
+* **agent:** sync probe helpers + spawn_blocking for agent readiness ([d698472](https://github.com/arcboxlabs/arcbox/commit/d698472a515049f64c091aeb31650003cfcf137e))
+* **dax:** 128MB per-share DAX window, scales with share count ([5ec7993](https://github.com/arcboxlabs/arcbox/commit/5ec799389b098178dc1775d28dd19a63e14af468))
+* **net:** delete smoltcp TCP stack from tcp_bridge + datapath ([4237e0a](https://github.com/arcboxlabs/arcbox/commit/4237e0a6552ca51f41464d53fe1c24748b6eea8b))
+* **net:** remove smoltcp dependency entirely ([1fd1fe5](https://github.com/arcboxlabs/arcbox/commit/1fd1fe5468bc2dcdcee3d1c0cbdfcb4a37c883c0))
+* **net:** rename SmoltcpDevice → FrameClassifier ([663d61a](https://github.com/arcboxlabs/arcbox/commit/663d61ae2433bdd43f5e81d8a254422cfea52be9))
+* **net:** route TCP handshake through shim, retire smoltcp paths ([06058a5](https://github.com/arcboxlabs/arcbox/commit/06058a575c0994c76cf6f6c15d43b651ce482143))
+* Phase 2 — virtio-bindings, PL011 address fix, vm-superio dep ([715031a](https://github.com/arcboxlabs/arcbox/commit/715031a9ddfbca7d43669da770bb3a8835d5028f))
+* **virtio-blk:** split monolithic lib.rs into modules ([ea0630d](https://github.com/arcboxlabs/arcbox/commit/ea0630db0a1f379281cf72114512c15620f057cd))
+* **virtio-console:** split monolithic lib.rs into modules ([45be3e5](https://github.com/arcboxlabs/arcbox/commit/45be3e516cd69b41dad5b7498dd6f2b42f67bf09))
+* **virtio-fs:** make protocol module private ([a8473d2](https://github.com/arcboxlabs/arcbox/commit/a8473d216ecebad366eb42cc567d926c571aa9ca))
+* **virtio-fs:** split monolithic lib.rs into modules ([5b0c7a3](https://github.com/arcboxlabs/arcbox/commit/5b0c7a3c597289cc52256f222cdfa7268d8e8176))
+* **virtio-net:** split monolithic lib.rs into modules ([b3f2f3e](https://github.com/arcboxlabs/arcbox/commit/b3f2f3e8fb54f9867b40cfb994b414b922d8d186))
+* **virtio-vsock:** split monolithic lib.rs into modules ([217fdbf](https://github.com/arcboxlabs/arcbox/commit/217fdbf3538eba18c9fc98cc61d496bc3c6b9203))
+* **virtio:** drop unnecessary pub(crate) on private fields ([27d58fa](https://github.com/arcboxlabs/arcbox/commit/27d58faeb2a1615d67c0afe5491d2a09251cb629))
+* **virtio:** extract arcbox-virtio-rng as a per-device crate ([2bce171](https://github.com/arcboxlabs/arcbox/commit/2bce171bc6f8d36f1c70694776e1f8245064d32b))
+* **virtio:** extract console + blk crates; move queue to core ([42d1e05](https://github.com/arcboxlabs/arcbox/commit/42d1e05f299916b0128fb055d319ddabe3f8eb40))
+* **virtio:** extract foundational types into arcbox-virtio-core ([85e14e8](https://github.com/arcboxlabs/arcbox/commit/85e14e863b79fce8bf8e0e284add720e7e46bbf2))
+* **virtio:** extract net + fs + vsock crates — pattern-1 split done ([63f1b42](https://github.com/arcboxlabs/arcbox/commit/63f1b42a6e1d6a52c383a81ab8351864981070a0))
+* **virtio:** promote GuestMemWriter to arcbox-virtio + add DeviceCtx ([5d31a95](https://github.com/arcboxlabs/arcbox/commit/5d31a952df4ba218ac302689a70b19d2110b211f))
+* **virtio:** replace hand-written VirtIO constants with virtio-bindings ([270c0f7](https://github.com/arcboxlabs/arcbox/commit/270c0f71a4268ec83374a1a1e2f31be4ac28bb21))
+* **vmm:** extract bridge NIC handlers into device/bridge_nic submodule ([83d8ea4](https://github.com/arcboxlabs/arcbox/commit/83d8ea450682c6c0c23a6bae643e955b8cee429b))
+* **vmm:** extract HVC block I/O into darwin_hv/hvc_blk submodule ([faca9b9](https://github.com/arcboxlabs/arcbox/commit/faca9b9d0f7d9d00d118b6af47b1b078759737ce))
+* **vmm:** extract InlineConnSinkAdapter into its own submodule ([7f27873](https://github.com/arcboxlabs/arcbox/commit/7f278739759f8ab47200c98a97a41564eb3536ca))
+* **vmm:** extract net worker lifecycle and blk dispatch from DeviceManager ([7bccbdd](https://github.com/arcboxlabs/arcbox/commit/7bccbdd0ab460808758ab55eb4eb0f670edf7e38))
+* **vmm:** extract PSCI handler into darwin_hv/psci submodule ([e8118b1](https://github.com/arcboxlabs/arcbox/commit/e8118b158bfd88ade0b0dc5adc9aa2a8b3c4e23f))
+* **vmm:** extract vCPU run loop into darwin_hv/vcpu_loop submodule ([98a0c3f](https://github.com/arcboxlabs/arcbox/commit/98a0c3f2f6797e98a5c85115a11106b301d7b3fa))
+* **vmm:** extract VirtIO MMIO state into device/mmio_state submodule ([bcdb8cd](https://github.com/arcboxlabs/arcbox/commit/bcdb8cd008462a350f26067dba1844a5b1438729))
+* **vmm:** finish vsock — move vsock_manager + port poll_rx_injection ([837fa55](https://github.com/arcboxlabs/arcbox/commit/837fa552931de635b06ef077d50cf6a1f9abba8d))
+* **vmm:** migrate bridge NIC (TX+RX) onto VirtioNet ([1daf66e](https://github.com/arcboxlabs/arcbox/commit/1daf66e766209ff02b147ca2f5b67879606dceb1))
+* **vmm:** migrate primary NIC TX onto VirtioNet, drop dead methods ([72210cf](https://github.com/arcboxlabs/arcbox/commit/72210cfc709a7010ab69578d9cfe71e6223a45ad))
+* **vmm:** split darwin_hv — extract Pl011, GuestRam, network, VcpuContext ([bc87f45](https://github.com/arcboxlabs/arcbox/commit/bc87f45c4d8fc3785036a280714f672961ae2c73))
+* **vmm:** split device.rs — extract checksum finalizer submodule ([bd0e4c4](https://github.com/arcboxlabs/arcbox/commit/bd0e4c4be904e69ca170c67e8aa10292ded6af65))
+* **vmm:** vsock device owns its connections — drop QueueConfig wart ([32835fb](https://github.com/arcboxlabs/arcbox/commit/32835fb87e2c5d0097ee26a401715c70a70e167c))
+* **vsock:** simplify connect path — pure deferred injection ([15b82b4](https://github.com/arcboxlabs/arcbox/commit/15b82b4b3f02aa7728d65164a9bfaa562ff5e478))
+* **vz:** remove unused FFI constants, struct, and inherent methods ([223725c](https://github.com/arcboxlabs/arcbox/commit/223725c6f0cfc9c4d3f859e1606aad5a3d98cbd9))
+
+
+### Tests
+
+* **core:** add hv_e2e example with ping + pause/resume round-trip (ABX-361) ([4e16315](https://github.com/arcboxlabs/arcbox/commit/4e16315e6f528916fc2ae74e898ddc9afa97795e))
+* **core:** hv_e2e DAX mount wiring + TempDir fixture hygiene ([a2dfc8b](https://github.com/arcboxlabs/arcbox/commit/a2dfc8b43593ccff7537ab6b11167045126d5b8d))
+* **core:** wire hv_e2e against real data_dir so guest boots (ABX-361/362) ([d98af5c](https://github.com/arcboxlabs/arcbox/commit/d98af5c39cbc12f4abd26a472929fffdc054a1a3))
+* **net:** adapt to NetworkDatapath/SmoltcpDevice mtu parameter ([acbc728](https://github.com/arcboxlabs/arcbox/commit/acbc728e825b59dcb139b63195232d6f9b7d94a8))
+* **net:** add DHCP full-cycle and frame classification datapath tests ([462a2ea](https://github.com/arcboxlabs/arcbox/commit/462a2ead31a459c550b4344972798724aace81df))
+* **net:** add mock guest NIC and frame builder test helpers ([d6d68e4](https://github.com/arcboxlabs/arcbox/commit/d6d68e4749a28fc8c854d8a6ce2cdd206baf8492))
+* **net:** assert ARP reply content in frame classification test ([0827060](https://github.com/arcboxlabs/arcbox/commit/0827060928aad0f59a7a71614adcf362513defa5))
+* **net:** drain poll_fast_path with deadline to deprsk CI flake ([990b8db](https://github.com/arcboxlabs/arcbox/commit/990b8db35749ddfd3a640ae7f79c4d3e93286a4a))
+
+
+### Documentation
+
+* add HV backend architecture plan with rust-vmm ecosystem evaluation ([5936246](https://github.com/arcboxlabs/arcbox/commit/59362461bba245e31cee0376f47970d36edbb243))
+* **agent:** drop stale cache=always reference from DAX mount comment ([0481b36](https://github.com/arcboxlabs/arcbox/commit/0481b36462c72adb7a67bb440cbd502f8ab1a02b))
+* **net:** diagnostic results rule out multi-queue as the fix ([26db0dd](https://github.com/arcboxlabs/arcbox/commit/26db0dd698ad829b0ef0a36b4660e624441cb826))
+* **net:** host-side profile pinpoints IRQ delivery, not ACK intercept ([b961d64](https://github.com/arcboxlabs/arcbox/commit/b961d64fa9642664d55ff940137d7407c015370b))
+* **net:** record measured perf and multi-flow collapse limit ([71f7774](https://github.com/arcboxlabs/arcbox/commit/71f77741626e95ed7d2ec0ab20409c71d31a4556))
+* **virtio:** align ASCII diagram boxes in umbrella crate doc ([fa108f1](https://github.com/arcboxlabs/arcbox/commit/fa108f1ffc06bd8db0dfa1642b47a968de5d7e55))
+* **virtio:** fix rustdoc intra-doc link warnings in per-device crates ([b82206a](https://github.com/arcboxlabs/arcbox/commit/b82206ab062e05e2cdeb93cdef743a14892f930a))
+* **virtio:** mark Phase 2.1 CREDIT_REQUEST as landed ([1e16503](https://github.com/arcboxlabs/arcbox/commit/1e16503abfb924ead0aea9a2b9c2032d5e8f88d3))
+* **virtio:** mark Phase 2.2 half-close as landed; note deferred richer state enum ([76b48a7](https://github.com/arcboxlabs/arcbox/commit/76b48a78a6dabe91d7f82bbd3abd5033d1093451))
+* **virtio:** mark Phase 3 complete; scope 3.3 to scratch-reuse fix ([ea180f9](https://github.com/arcboxlabs/arcbox/commit/ea180f96ea42f92617530d12d1472729194a69c5))
+* **virtio:** mark Phase 3.1 + 3.2 as landed; lock Phase 3.3 design ([31d3da7](https://github.com/arcboxlabs/arcbox/commit/31d3da73284c0ac8aded5b8049aeb5c40a9de235))
+* **virtio:** rewrite improvements plan around reasoning, not references ([94b95e3](https://github.com/arcboxlabs/arcbox/commit/94b95e36d85b9630f84ff8538ab299792625617b))
+* **vmm:** add SAFETY comments to unsafe blocks in HV backend ([bd38511](https://github.com/arcboxlabs/arcbox/commit/bd38511a682252f576146eb8a9ca944225171329))
+* **vmm:** tighten DeviceManager module doc + SAFETY block ([79a8c3e](https://github.com/arcboxlabs/arcbox/commit/79a8c3e169920af2f84c52cd232d9da2d0351e8f))
+
+
+### Miscellaneous Chores
+
+* **core:** force HV backend until rosetta default is resolved ([c658501](https://github.com/arcboxlabs/arcbox/commit/c658501642fc7c2cfc80a09636df5a8996b140b2))
+* fix clippy 1.95 lints workspace-wide ([fb7f1ca](https://github.com/arcboxlabs/arcbox/commit/fb7f1ca8658513b1933bbd2d6d603919874b3f23))
+* **net-inject:** align Cargo.toml with workspace inheritance ([cd9fc68](https://github.com/arcboxlabs/arcbox/commit/cd9fc6869ca36bee0722150b488d8ebb1042601e))
+* pin boot assets to v0.5.3 (kernel v0.0.12 with HVC driver) ([b496d96](https://github.com/arcboxlabs/arcbox/commit/b496d96b107713f0d608a41964719c7009a24869))
+* pin boot assets to v0.5.4 (kernel v0.0.13 with FUSE DAX config) ([9cf67b8](https://github.com/arcboxlabs/arcbox/commit/9cf67b8d5441639476a300a28498bd2b2186f362))
+* **virtio-net:** delete dead SocketBackend; refresh plan status ([90b05da](https://github.com/arcboxlabs/arcbox/commit/90b05dac4363e2625fb603b3ad124c842925a160))
+* **vmm:** clean up debug diagnostics, dead code, and stale docs ([4d85766](https://github.com/arcboxlabs/arcbox/commit/4d85766d7178357e874c1b310edffd14b4c7dff7))
+* **vmm:** move legacy code to #[cfg(test)], remove all dead_code suppressions ([8f774ae](https://github.com/arcboxlabs/arcbox/commit/8f774aeeae2f97410de7076b966ded3cc0725812))
+* **vmm:** relax drained atomic ordering, reword drain_all comment ([2a32154](https://github.com/arcboxlabs/arcbox/commit/2a32154c2b8958fac0ac8e0d8a9b11d1308d9d1b))
+* **vmm:** retire dead vsock inject path, harden DAX/transport lifecycle ([eb18284](https://github.com/arcboxlabs/arcbox/commit/eb1828437aa8db4d81fdb9b418c88a63b74870eb))
+
+## [0.3.21](https://github.com/arcboxlabs/arcbox/compare/v0.3.20...v0.3.21) (2026-04-06)
+
+
+### Features
+
+* bump Docker toolchain to 29.3.1 and add VirtioFS cache=always ([#164](https://github.com/arcboxlabs/arcbox/issues/164)) ([f53dc24](https://github.com/arcboxlabs/arcbox/commit/f53dc24b2c0b8103c03fd976c4a2b87aad46f724))
+* **cli:** link Docker tools in abctl setup install ([2b552cd](https://github.com/arcboxlabs/arcbox/commit/2b552cd9bacb1ef5caa95ca541dff61c38c9e016))
+* **docker:** add explicit /build, /build/prune, and /session routes ([#163](https://github.com/arcboxlabs/arcbox/issues/163)) ([b0039a3](https://github.com/arcboxlabs/arcbox/commit/b0039a33755d98238b3fd377854efe6ee17ade39))
+* **guest:** enable multi-platform builds and persistent build cache ([#162](https://github.com/arcboxlabs/arcbox/issues/162)) ([f748d7d](https://github.com/arcboxlabs/arcbox/commit/f748d7d724656ea3cf9c607563b980e3261034ab))
+* **virt:** integrate Rosetta x86_64 translation for Apple Silicon VMs ([#160](https://github.com/arcboxlabs/arcbox/issues/160)) ([63d6e78](https://github.com/arcboxlabs/arcbox/commit/63d6e784016e40dc344c91a6035a65591f684d6e))
+
+
+### Bug Fixes
+
+* **cli:** link and unlink docker CLI tools in brew hooks ([#148](https://github.com/arcboxlabs/arcbox/issues/148)) ([c6c0266](https://github.com/arcboxlabs/arcbox/commit/c6c0266b94af0fdd549b03b04d9c2dc9addf9ffa))
+* **cli:** link Docker tools in brew hooks + shared symlink module ([c6c0266](https://github.com/arcboxlabs/arcbox/commit/c6c0266b94af0fdd549b03b04d9c2dc9addf9ffa))
+
+## [0.3.20](https://github.com/arcboxlabs/arcbox/compare/v0.3.19...v0.3.20) (2026-04-05)
+
+
+### Bug Fixes
+
+* find_bundle_contents walks up to main app Contents ([c9ec890](https://github.com/arcboxlabs/arcbox/commit/c9ec890e66c111271d7c9f3923801652b5011208))
+* **net:** spin-retry pool free to prevent silent buffer leak ([fe57f0a](https://github.com/arcboxlabs/arcbox/commit/fe57f0aca510e8897b806bd6dba878e33d9ee27b))
+
+## [0.3.19](https://github.com/arcboxlabs/arcbox/compare/v0.3.18...v0.3.19) (2026-04-01)
+
+
+### Features
+
+* **dns:** hierarchical compose DNS names matching OrbStack scheme ([#156](https://github.com/arcboxlabs/arcbox/issues/156)) ([6c54184](https://github.com/arcboxlabs/arcbox/commit/6c541840da4c7e4be468f911a80af04222508299))
+* **net:** support host.docker.internal DNS and gateway-to-localhost translation ([#157](https://github.com/arcboxlabs/arcbox/issues/157)) ([925897d](https://github.com/arcboxlabs/arcbox/commit/925897d563716745acc24d98870345b0162888a3))
+
+
+### Bug Fixes
+
+* **net:** replace aliasing UB in PacketPool::alloc with owned PacketRef wrapper ([#147](https://github.com/arcboxlabs/arcbox/issues/147)) ([43a2947](https://github.com/arcboxlabs/arcbox/commit/43a2947c7ebcd3faf3dc7bfd99be9b43b915c88f))
+
 ## [0.3.18](https://github.com/arcboxlabs/arcbox/compare/v0.3.17...v0.3.18) (2026-03-31)
 
 

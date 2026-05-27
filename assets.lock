@@ -1,41 +1,58 @@
 # ArcBox asset lock — pins versions and checksums for reproducible builds.
+#
+# The [[tools]] section pins third-party and internal binaries:
+#   - group "docker"/"kubernetes": downloaded to ~/.arcbox/runtime/bin/ and
+#     exposed to the VM via VirtioFS. Used by both host CLI and guest daemon.
+#   - group "desktop": host-only binaries embedded in the app bundle
+#     (e.g. pstramp for PTY session isolation).
+#
+# Because both paths read from this single lockfile, the Docker CLI and the
+# guest dockerd are always the same version — there is no CLI/daemon version
+# skew to worry about when upgrading.
 
 [boot]
-version = "0.5.1"
+version = "0.5.7"
 cdn = "https://boot.arcboxcdn.com"
-manifest_sha256 = ""
+manifest_sha256 = "66c0113b9f8537da22b3ecf53d6c3cdd0d89383b7a2294758285cdd44b0a069d"
 
 [[tools]]
 name = "docker"
 group = "docker"
-version = "27.5.1"
-arch.arm64.sha256 = "b0366bf473b9b97b0c5556c4c2fd6d92ea63e4848af2f869c93a98d2e2e1d3fa"
-arch.x86_64.sha256 = "425560a99d1231433ae4b7149a4d1235461cb28783af32481741a367bd1a9f6a"
+version = "29.3.1"
+arch.arm64.sha256 = "7a448b9d948157f4bcf29369755389049746297d1289a0607ea3d0a811d20e75"
+arch.x86_64.sha256 = "e3c8b6b87399e58080263a7294fdd5c7d1fb8cbc1712f99d3f6de20acee949cb"
 
 [[tools]]
 name = "docker-buildx"
 group = "docker"
-version = "0.21.1"
-arch.arm64.sha256 = "ae147cfa0c56b8d86d7358962c31ff810f1d943a011dd74a643a5fbdfdd5aa19"
-arch.x86_64.sha256 = "2e8f454062d21f2bf877f5b364c22d00d6c3346fad5b810efd7e1ceb8eb264e4"
+version = "0.33.0"
+arch.arm64.sha256 = "35dc3303d2ddb20b9490be4f658eb4b08ee6c9b2a5b5a56797f6c8fb20f5f52b"
+arch.x86_64.sha256 = "b1b5a38f78311cfed70a0e68096df0e9ed7dd1b1fcd09adbb117d74e3bad6f32"
 
 [[tools]]
 name = "docker-compose"
 group = "docker"
-version = "2.33.1"
-arch.arm64.sha256 = "0577710624554abe3c357be069205321751f8d429d75f93de993be0de2e27107"
-arch.x86_64.sha256 = "17c05c6a42cab2302efed50e837aac099a52b10f9fc90dab04929496449b22ef"
+version = "5.1.1"
+arch.arm64.sha256 = "7b10566e09366d1c22222eb0726805b8c488b4109e63689fd6c543d0006504e2"
+arch.x86_64.sha256 = "2d1845ad583a08095b469547dc1bee2a985d1db3b62bc478f88361b85c8ff0e9"
 
 [[tools]]
 name = "docker-credential-osxkeychain"
 group = "docker"
-version = "0.9.1"
-arch.arm64.sha256 = "564552e7d97eb236956f1fc8040f816463667da32db187eccc16c7fb51a089af"
-arch.x86_64.sha256 = "34d7dcabc4630b2b2c2861c230b4f65a6499448d4cd1a129175ebbc54642928b"
+version = "0.9.5"
+arch.arm64.sha256 = "bc216761bc10e5a707f52d4e5b4050dd7ee7a2daae63c35a97ed7fed2ea64822"
+arch.x86_64.sha256 = "578294a426d86322a17f998cf814258fe7aa764bf505354fcebee51a7456266c"
+
+[[tools]]
+name = "pstramp"
+group = "desktop"
+version = "0.2.0"
+arch.arm64.sha256 = "48448a426bb994e45b603588b19b62629f07d6040f1501235e969c07ecc57413"
+arch.x86_64.sha256 = "eb3cc921de1aed02348821f4a653705a33b012b6a1da7466e577673c5ce80609"
 
 [[tools]]
 name = "kubectl"
 group = "kubernetes"
-version = "1.34.3"
-arch.arm64.sha256 = "e51367d2107d605f4edd7c2fb25897b0c0695a7de1a9f9d04cd6c9356b890b14"
-arch.x86_64.sha256 = "657afbd0e653c4ce3af1b5a645a4eaba282cf8eb2bcda7191ff60866e50e4d7f"
+version = "1.35.3"
+arch.arm64.sha256 = "280651239d84bab214ba83403666bf6976a5fa0dbdb41404f26eb6f276d34963"
+arch.x86_64.sha256 = "2f339b1eae2e1792ec08da281b37afbeee94f70bed6b7398e7efd81ba08f8d37"

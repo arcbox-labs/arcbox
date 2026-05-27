@@ -1,0 +1,17 @@
+[package]
+name = "arcbox-net-inject"
+description = "Guest memory RX injection engine for ArcBox VirtIO-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-virtio = { workspace = true }
+crossbeam-channel = "0.5"
+tracing = "0.1"
+
+[lints]
+workspace = true

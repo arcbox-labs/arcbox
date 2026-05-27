@@ -48,7 +48,15 @@ impl DispatchQueue {
     /// Creates a new serial dispatch queue with the given label.
     #[must_use]
     pub fn new(label: &str) -> Self {
-        let label_cstr = std::ffi::CString::new(label).unwrap();
+        // Interior NUL bytes would make CString::new return Err; a panic on
+        // a bad label is not worth crashing the daemon. Substitute NULs with
+        // '_' so any caller-supplied label round-trips safely.
+        let sanitized: String = label
+            .chars()
+            .map(|c| if c == '\0' { '_' } else { c })
+            .collect();
+        // SAFETY: `sanitized` contains no NUL bytes, so CString::new cannot fail.
+        let label_cstr = std::ffi::CString::new(sanitized).expect("NULs already stripped");
         // SAFETY: dispatch_queue_create with a valid C string label and null attr (DISPATCH_QUEUE_SERIAL) always returns a valid queue.
         let queue = unsafe {
             dispatch_queue_create(

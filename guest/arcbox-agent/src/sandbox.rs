@@ -65,13 +65,26 @@ impl SandboxService {
     // =========================================================================
 
     /// Create a sandbox.
+    ///
+    /// When the rootfs path points to a directory (overlay2 layer), the agent
+    /// converts it to ext4 via `oci2rootfs` and injects `vm-agent` before
+    /// booting. Ext4 images are used directly.
     pub async fn create(
         &self,
         payload: &[u8],
     ) -> Result<sandbox_v1::CreateSandboxResponse, SandboxError> {
         let req = sandbox_v1::CreateSandboxRequest::decode(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
-        let spec = proto_to_spec(req);
+        let mut spec = proto_to_spec(req);
+
+        // Auto-detect: directory → overlay2 layer needing conversion.
+        if !spec.rootfs.is_empty() && std::path::Path::new(&spec.rootfs).is_dir() {
+            let ext4_path = crate::rootfs_builder::convert_layer_to_rootfs(&spec.rootfs)
+                .await
+                .map_err(|e| SandboxError::Internal(format!("rootfs build failed: {e}")))?;
+            spec.rootfs = ext4_path;
+        }
+
         let (id, ip_address) = self
             .manager
             .create_sandbox(spec)

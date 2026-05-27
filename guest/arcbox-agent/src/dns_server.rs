@@ -42,12 +42,21 @@ pub fn sandbox_registry() -> &'static SandboxRegistry {
 /// Upstream forwarding timeout.
 const FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Shared container registry: container name → IPv4 address.
+/// Shared container registry: alias → IPv4 address (resolved view).
 pub type ContainerRegistry = Arc<RwLock<HashMap<String, Ipv4Addr>>>;
+
+/// Tracks which containers own each alias: alias → (owner → IP).
+///
+/// When multiple replicas register the same service alias, each owns a
+/// separate entry. The resolved `ContainerRegistry` always points to the
+/// most recently registered IP for that alias.
+type AliasOwners = Arc<RwLock<HashMap<String, HashMap<String, Ipv4Addr>>>>;
 
 /// Guest DNS server.
 pub struct GuestDnsServer {
     containers: ContainerRegistry,
+    /// Owner tracking for shared aliases (e.g. compose service names).
+    alias_owners: AliasOwners,
     sandboxes: SandboxRegistry,
     cancel: CancellationToken,
 }
@@ -60,6 +69,7 @@ impl GuestDnsServer {
     pub fn new(cancel: CancellationToken) -> Self {
         Self {
             containers: Arc::new(RwLock::new(HashMap::new())),
+            alias_owners: Arc::new(RwLock::new(HashMap::new())),
             sandboxes: Arc::clone(sandbox_registry()),
             cancel,
         }
@@ -77,18 +87,46 @@ impl GuestDnsServer {
         Arc::clone(&self.sandboxes)
     }
 
-    /// Registers a container name → IP mapping.
-    pub async fn register_container(&self, name: &str, ip: Ipv4Addr) {
-        let key = name.to_lowercase();
-        tracing::debug!(name = %key, %ip, "dns: register container");
+    /// Registers a container alias → IP mapping.
+    ///
+    /// `owner` identifies the container that owns this alias (typically the
+    /// container name). Multiple owners can share the same alias — the
+    /// resolved IP always reflects the most recently registered owner.
+    pub async fn register_container(&self, alias: &str, owner: &str, ip: Ipv4Addr) {
+        let key = alias.to_lowercase();
+        let owner_key = owner.to_lowercase();
+        tracing::debug!(alias = %key, owner = %owner_key, %ip, "dns: register container");
+
+        self.alias_owners
+            .write()
+            .await
+            .entry(key.clone())
+            .or_default()
+            .insert(owner_key, ip);
         self.containers.write().await.insert(key, ip);
     }
 
-    /// Deregisters a container by name.
-    pub async fn deregister_container(&self, name: &str) {
-        let key = name.to_lowercase();
-        tracing::debug!(name = %key, "dns: deregister container");
-        self.containers.write().await.remove(&key);
+    /// Deregisters a single owner from an alias.
+    ///
+    /// The alias is only removed from the resolved registry when no owners
+    /// remain. If other owners exist, the resolved IP is updated to an
+    /// arbitrary remaining owner's IP.
+    pub async fn deregister_container(&self, alias: &str, owner: &str) {
+        let key = alias.to_lowercase();
+        let owner_key = owner.to_lowercase();
+        tracing::debug!(alias = %key, owner = %owner_key, "dns: deregister container");
+
+        let mut owners = self.alias_owners.write().await;
+        if let Some(map) = owners.get_mut(&key) {
+            map.remove(&owner_key);
+            if map.is_empty() {
+                owners.remove(&key);
+                self.containers.write().await.remove(&key);
+            } else if let Some(&remaining_ip) = map.values().next() {
+                // Re-point to an arbitrary remaining replica.
+                self.containers.write().await.insert(key, remaining_ip);
+            }
+        }
     }
 
     /// Registers a sandbox ID → IP mapping.

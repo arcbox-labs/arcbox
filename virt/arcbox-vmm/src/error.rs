@@ -41,6 +41,10 @@ pub enum VmmError {
     /// Event loop error.
     #[error("event loop error: {0}")]
     EventLoop(String),
+
+    /// Operation not supported on the current backend.
+    #[error("operation not supported: {0}")]
+    Unsupported(String),
 }
 
 impl VmmError {

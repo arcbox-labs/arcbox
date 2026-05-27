@@ -86,9 +86,15 @@ pub struct CreateArgs {
     /// Kernel image path (empty = daemon default)
     #[arg(long)]
     pub kernel: Option<String>,
-    /// Root filesystem image path (empty = daemon default)
-    #[arg(long)]
+    /// Root filesystem ext4 image path (empty = daemon default)
+    #[arg(long, conflicts_with_all = ["from_dockerfile", "from_image"])]
     pub rootfs: Option<String>,
+    /// Build sandbox rootfs from a Dockerfile
+    #[arg(long, conflicts_with_all = ["rootfs", "from_image"])]
+    pub from_dockerfile: Option<String>,
+    /// Build sandbox rootfs from an existing Docker image
+    #[arg(long, conflicts_with_all = ["rootfs", "from_dockerfile"])]
+    pub from_image: Option<String>,
     /// Number of vCPUs (0 = daemon default)
     #[arg(long, default_value = "0")]
     pub cpus: u32,
@@ -248,11 +254,25 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
     let mut client = SandboxServiceClient::new(channel);
 
     let labels = parse_labels(&args.label)?;
+
+    // Resolve rootfs from whichever flag was provided.
+    let rootfs = if let Some(path) = &args.from_dockerfile {
+        arcbox_cli::rootfs_builder::resolve_from_dockerfile(path)
+            .await
+            .context("Failed to build Docker image from Dockerfile")?
+    } else if let Some(image_ref) = &args.from_image {
+        arcbox_cli::rootfs_builder::resolve_from_image(image_ref)
+            .await
+            .context("Failed to resolve Docker image")?
+    } else {
+        args.rootfs.clone().unwrap_or_default()
+    };
+
     let req = CreateSandboxRequest {
         id: args.id.unwrap_or_default(),
         labels,
         kernel: args.kernel.unwrap_or_default(),
-        rootfs: args.rootfs.unwrap_or_default(),
+        rootfs,
         limits: Some(ResourceLimits {
             vcpus: args.cpus,
             memory_mib: args.memory,

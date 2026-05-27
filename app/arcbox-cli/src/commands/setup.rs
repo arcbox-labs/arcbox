@@ -55,6 +55,7 @@ struct StatusOutput {
     shell_init: ComponentStatus,
     profile_injected: ComponentStatus,
     completions: ComponentStatus,
+    docker_plugins: ComponentStatus,
 }
 
 /// Per-component installation status.
@@ -139,6 +140,31 @@ async fn install(format: OutputFormat) -> Result<()> {
         create_or_update_symlink(&placeholder_exe, &placeholder_symlink).await?;
     }
 
+    // 2b. Symlink Docker CLI tools → ~/.arcbox/bin/ if available.
+    //     Tools may be in the app bundle (xbin/) or ~/.arcbox/runtime/bin/.
+    let docker_tools_linked = link_docker_tools_to_user_bin(&exe, &bin).await;
+
+    // 2c. Register docker-compose / docker-buildx as Docker CLI plugins so
+    //     `docker compose` (space-separated) and `docker buildx` resolve
+    //     the same binaries as `docker-compose` / `docker-buildx` do on
+    //     $PATH. See `cli_plugins` module docs for the rationale.
+    //     Non-fatal: a failure here doesn't block the rest of install, but
+    //     we capture the error so the user can see why plugins are missing
+    //     instead of silently reporting 0 registered.
+    let (plugins_registered, plugin_error) = match super::cli_plugins::default_docker_config_dir() {
+        Ok(docker_cfg) => match super::cli_plugins::register(&bin, &docker_cfg).await {
+            Ok(o) => (o, None),
+            Err(e) => (
+                super::cli_plugins::Outcome::default(),
+                Some(format!("{e:#}")),
+            ),
+        },
+        Err(e) => (
+            super::cli_plugins::Outcome::default(),
+            Some(format!("{e:#}")),
+        ),
+    };
+
     // 3. Write shell init scripts.
     write_shell_init_scripts(&shell).await?;
 
@@ -156,6 +182,9 @@ async fn install(format: OutputFormat) -> Result<()> {
                 serde_json::to_string(&serde_json::json!({
                     "installed": true,
                     "bin": symlink_path.display().to_string(),
+                    "docker_tools": docker_tools_linked,
+                    "docker_plugins": plugins_registered,
+                    "docker_plugins_error": plugin_error,
                     "shell_init": shell.display().to_string(),
                     "completions": comp.display().to_string(),
                     "profile": profile_path.as_ref().map(|p| p.display().to_string()),
@@ -172,6 +201,21 @@ async fn install(format: OutputFormat) -> Result<()> {
                 symlink_path.display(),
                 exe.display()
             );
+            if docker_tools_linked > 0 {
+                println!(
+                    "  Docker:      {docker_tools_linked} tools linked to {}",
+                    bin.display()
+                );
+            }
+            let plugin_count = plugins_registered.symlinks.len();
+            if plugin_count > 0 || plugins_registered.config_updated {
+                println!(
+                    "  CLI plugins: {plugin_count} registered (`docker compose` / `docker buildx`)"
+                );
+            }
+            if let Some(ref err) = plugin_error {
+                println!("  CLI plugins: WARN: {err}");
+            }
             println!("  Shell init:  {}", shell.display());
             println!("  Completions: {}", comp.display());
             if let Some(ref p) = profile_path {
@@ -195,6 +239,24 @@ async fn uninstall(format: OutputFormat) -> Result<()> {
     let shell = shell_dir()?;
     let comp = completions_dir()?;
 
+    // Unregister Docker CLI plugins first — while `bin` still exists, so the
+    // symlink-target ownership check can resolve. Idempotent and non-fatal,
+    // but we capture any error so it surfaces in output rather than vanishing.
+    let (plugins_unregistered, plugin_error) = match super::cli_plugins::default_docker_config_dir()
+    {
+        Ok(docker_cfg) => match super::cli_plugins::unregister(&bin, &docker_cfg).await {
+            Ok(o) => (o, None),
+            Err(e) => (
+                super::cli_plugins::Outcome::default(),
+                Some(format!("{e:#}")),
+            ),
+        },
+        Err(e) => (
+            super::cli_plugins::Outcome::default(),
+            Some(format!("{e:#}")),
+        ),
+    };
+
     // Remove directories.
     remove_dir_if_exists(&bin).await;
     remove_dir_if_exists(&shell).await;
@@ -210,6 +272,8 @@ async fn uninstall(format: OutputFormat) -> Result<()> {
                 "{}",
                 serde_json::to_string(&serde_json::json!({
                     "uninstalled": true,
+                    "docker_plugins": plugins_unregistered,
+                    "docker_plugins_error": plugin_error,
                     "profile_cleaned": removed_from.as_ref().map(|p| p.display().to_string()),
                 }))?
             );
@@ -217,6 +281,15 @@ async fn uninstall(format: OutputFormat) -> Result<()> {
         OutputFormat::Quiet => {}
         OutputFormat::Table => {
             println!("ArcBox CLI shell integration removed.");
+            if !plugins_unregistered.symlinks.is_empty() || plugins_unregistered.config_updated {
+                println!(
+                    "  CLI plugins:  {} symlinks removed",
+                    plugins_unregistered.symlinks.len()
+                );
+            }
+            if let Some(ref err) = plugin_error {
+                println!("  CLI plugins:  WARN: {err}");
+            }
             if let Some(ref p) = removed_from {
                 println!("  Cleaned profile: {}", p.display());
             }
@@ -263,7 +336,37 @@ async fn status(format: OutputFormat) -> Result<()> {
     let zsh_comp = comp.join("zsh/_abctl");
     let comp_ok = tokio::fs::metadata(&zsh_comp).await.is_ok();
 
-    let all_ok = symlink_ok && init_ok && profile_injected && comp_ok;
+    // Docker CLI plugin registration — only considered "ok" if at least
+    // one of our plugin binaries is on disk and is actually registered. If
+    // none are present (e.g. developer CLI-only build), report as
+    // not-applicable rather than failing.
+    let any_plugin_present = arcbox_constants::paths::DOCKER_CLI_PLUGINS
+        .iter()
+        .any(|p| bin.join(p).exists());
+    let (plugin_status, plugin_detail) = match super::cli_plugins::default_docker_config_dir() {
+        Ok(docker_cfg) => {
+            let st = super::cli_plugins::status(&bin, &docker_cfg).await;
+            let ok =
+                !any_plugin_present || (!st.symlinked.is_empty() || st.extra_dirs_entry_present);
+            let detail = if any_plugin_present {
+                Some(format!(
+                    "{} symlinks, extraDirs: {}",
+                    st.symlinked.len(),
+                    if st.extra_dirs_entry_present {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                ))
+            } else {
+                Some("skipped (no Docker CLI plugin binaries present)".to_string())
+            };
+            (ok, detail)
+        }
+        Err(_) => (true, Some("skipped (no home directory)".to_string())),
+    };
+
+    let all_ok = symlink_ok && init_ok && profile_injected && comp_ok && plugin_status;
 
     match format {
         OutputFormat::Json => {
@@ -289,6 +392,11 @@ async fn status(format: OutputFormat) -> Result<()> {
                     path: Some(comp.display().to_string()),
                     detail: None,
                 },
+                docker_plugins: ComponentStatus {
+                    ok: plugin_status,
+                    path: None,
+                    detail: plugin_detail,
+                },
             };
             println!("{}", serde_json::to_string(&output)?);
         }
@@ -312,6 +420,11 @@ async fn status(format: OutputFormat) -> Result<()> {
                     .unwrap_or_default(),
             );
             print_check("Completions", comp_ok, &comp.display().to_string());
+            print_check(
+                "Docker plugins",
+                plugin_status,
+                plugin_detail.as_deref().unwrap_or(""),
+            );
             println!();
             if all_ok {
                 println!("Status: installed");
@@ -457,8 +570,7 @@ fn source_line(shell: ShellKind) -> String {
 async fn check_profile_injected(path: &Path) -> bool {
     tokio::fs::read_to_string(path)
         .await
-        .map(|content| content.contains(PROFILE_MARKER))
-        .unwrap_or(false)
+        .is_ok_and(|content| content.contains(PROFILE_MARKER))
 }
 
 /// Inject the source line into the user's shell profile. Returns the path if
@@ -523,6 +635,66 @@ async fn remove_profile_injection(shell: ShellKind) -> Result<Option<PathBuf>> {
     tokio::fs::write(&path, result).await?;
 
     Ok(Some(path))
+}
+
+/// Links Docker tools into `~/.arcbox/bin/` (user-space, no root).
+///
+/// The system-wide `/usr/local/bin/*` path is handled by `arcbox-helper` with
+/// ownership checks. Here we write into `~/.arcbox/bin/` which is ArcBox-owned,
+/// so `create_or_update_symlink` (unconditional replace) is safe.
+///
+/// Searches xbin (app bundle) first, then `~/.arcbox/runtime/bin/` (daemon).
+async fn link_docker_tools_to_user_bin(abctl_exe: &Path, user_bin: &Path) -> usize {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // 1. App bundle xbin (reuses shared detection logic).
+    if let Some(xbin) = super::symlink::detect_bundle_xbin() {
+        candidates.push(xbin);
+    } else if let Some(bin_dir) = abctl_exe.parent() {
+        // Fallback: derive from exe path (e.g. Homebrew layout).
+        if let Some(xbin) = bin_dir.parent().map(|p| p.join("xbin")) {
+            if xbin.is_dir() {
+                candidates.push(xbin);
+            }
+        }
+    }
+
+    // 2. Runtime bin: ~/.arcbox/runtime/bin/ (populated by daemon).
+    if let Some(home) = dirs::home_dir() {
+        let runtime_bin = home.join(".arcbox/runtime/bin");
+        if runtime_bin.is_dir() {
+            candidates.push(runtime_bin);
+        }
+    }
+
+    let mut linked = 0usize;
+    for tool_name in arcbox_constants::paths::DOCKER_CLI_TOOLS {
+        let link = user_bin.join(tool_name);
+
+        // Skip if already a valid symlink pointing to an existing target.
+        if let Ok(meta) = tokio::fs::symlink_metadata(&link).await {
+            if meta.file_type().is_symlink() {
+                if let Ok(target) = tokio::fs::read_link(&link).await {
+                    if target.exists() {
+                        linked += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        for src_dir in &candidates {
+            let src = src_dir.join(tool_name);
+            if src.is_file() {
+                if create_or_update_symlink(&src, &link).await.is_ok() {
+                    linked += 1;
+                }
+                break;
+            }
+        }
+    }
+
+    linked
 }
 
 // =============================================================================

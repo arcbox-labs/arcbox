@@ -311,6 +311,7 @@ impl VmBuilder {
                 })
                 .collect(),
             bridge_nic_mac: None,
+            backend: crate::VmBackend::default(),
         };
 
         tracing::info!(

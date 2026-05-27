@@ -36,6 +36,7 @@ pub mod file_io;
 pub mod network;
 pub mod sandbox;
 pub mod snapshot;
+pub mod snapshot_cow;
 pub mod spawn;
 pub mod store;
 pub mod vsock;

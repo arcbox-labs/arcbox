@@ -858,7 +858,7 @@ mod vcpu_arch {
             rflags: 0x0202,
         };
 
-        let snapshot = VcpuSnapshot::new_x86(0, regs.clone());
+        let snapshot = VcpuSnapshot::new_x86(0, regs);
 
         assert_eq!(snapshot.id, 0);
         assert_eq!(snapshot.arch, CpuArch::X86_64);
@@ -886,7 +886,7 @@ mod vcpu_arch {
         arm_regs.sp = 0x7FFF_F000;
         arm_regs.pstate = 0x3C5;
 
-        let snapshot = VcpuSnapshot::new_arm64(1, arm_regs.clone());
+        let snapshot = VcpuSnapshot::new_arm64(1, arm_regs);
 
         assert_eq!(snapshot.id, 1);
         assert_eq!(snapshot.arch, CpuArch::Aarch64);

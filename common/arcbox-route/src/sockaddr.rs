@@ -142,10 +142,7 @@ mod tests {
     fn netmask_prefix_32() {
         let net: Ipv4Net = "10.0.0.1/32".parse().unwrap();
         let sin = make_netmask(net);
-        assert_eq!(
-            sin.sin_addr.s_addr,
-            u32::from(Ipv4Addr::new(255, 255, 255, 255)).to_be()
-        );
+        assert_eq!(sin.sin_addr.s_addr, u32::from(Ipv4Addr::BROADCAST).to_be());
     }
 
     #[test]

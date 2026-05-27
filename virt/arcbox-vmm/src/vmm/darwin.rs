@@ -42,6 +42,15 @@ impl Vmm {
             );
         }
 
+        // Add Rosetta x86_64 translation share if enabled (best-effort).
+        if self.config.enable_rosetta {
+            if let Err(e) = vm.add_rosetta_share() {
+                tracing::warn!(
+                    "Rosetta share setup failed, continuing without x86_64 translation: {e}"
+                );
+            }
+        }
+
         // Add block devices
         for block_dev in &self.config.block_devices {
             let device_config =
@@ -262,8 +271,9 @@ impl Vmm {
         let host_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
 
         // Set a large socket buffer for the VZ side to avoid drops.
+        // 8 MB accommodates burst traffic (increased from 2 MB).
         // SAFETY: setsockopt with valid fd and parameters.
-        let buf_size: libc::c_int = 2 * 1024 * 1024;
+        let buf_size: libc::c_int = 8 * 1024 * 1024;
         unsafe {
             if libc::setsockopt(
                 vz_fd.as_raw_fd(),
@@ -298,8 +308,8 @@ impl Vmm {
         self.net_cancel = Some(cancel.clone());
 
         // 3. Create the socket proxy, reply channel, and inbound command channel.
-        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(64);
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(256);
         let socket_proxy =
             SocketProxy::new(gateway_ip, gateway_mac, guest_ip, reply_tx, cancel.clone());
 
@@ -327,6 +337,17 @@ impl Vmm {
 
         // 5. Build the datapath and spawn it on the tokio runtime.
 
+        // NOTE(MTU): Hardcoded to 4000 intentionally — our platform target is
+        // macOS 14+ Apple Silicon (P0) where VZ's setMaximumTransmissionUnit:
+        // always succeeds. On macOS <14 the VZ setter is skipped via
+        // respondsToSelector: (see arcbox-vz/device/network.rs), and the VZ
+        // device stays at 1500 while the classifier gets 4000. This mismatch
+        // would cause frames >1500 to be dropped — acceptable since macOS <14
+        // is not a supported target. If macOS <14 support is ever needed,
+        // plumb the actual MTU from NetworkDeviceConfiguration::mtu() through
+        // the hypervisor abstraction layer.
+        let net_mtu = arcbox_net::darwin::classifier::ENHANCED_ETHERNET_MTU;
+
         let datapath = NetworkDatapath::new(
             host_fd,
             socket_proxy,
@@ -338,6 +359,7 @@ impl Vmm {
             guest_ip,
             gateway_mac,
             cancel,
+            net_mtu,
         );
 
         let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
@@ -366,8 +388,7 @@ impl Vmm {
     /// Returns a `VirtioDeviceConfig` with the VZ-side raw fd.
     #[cfg(feature = "vmnet")]
     fn create_vmnet_bridge_nic(&mut self) -> Result<VirtioDeviceConfig> {
-        use arcbox_net::darwin::vmnet::{Vmnet, VmnetConfig};
-        use arcbox_net::darwin::vmnet_relay::VmnetRelay;
+        use arcbox_vmnet::{Vmnet, VmnetConfig, VmnetRelay};
 
         // Parse MAC from config.
         let config = if let Some(ref mac_str) = self.config.bridge_nic_mac {
@@ -413,8 +434,8 @@ impl Vmm {
         // SAFETY: fds are valid from socketpair.
         let relay_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
 
-        // Set large buffers on the VZ side.
-        let buf_size: libc::c_int = 2 * 1024 * 1024;
+        // Set large buffers on the VZ side (8 MB, matching primary NIC).
+        let buf_size: libc::c_int = 8 * 1024 * 1024;
         // SAFETY: setsockopt with valid fd and parameters.
         unsafe {
             if libc::setsockopt(
@@ -461,6 +482,9 @@ impl Vmm {
 
         tracing::info!("vmnet relay task spawned");
 
+        // Extract MAC string before moving vmnet (info borrows the Arc).
+        let mac_str = arcbox_net::darwin::format_mac(&info.mac);
+
         // Store state for cleanup.
         let vz_raw_fd = vz_fd.as_raw_fd();
         self.vmnet_bridge = Some(vmnet);
@@ -468,7 +492,6 @@ impl Vmm {
         self.vmnet_bridge_fd = Some(vz_fd);
 
         // Pass the vmnet MAC to the VZ-side NIC so bridge FDB lookups match.
-        let mac_str = arcbox_net::darwin::format_mac(&info.mac);
         Ok(VirtioDeviceConfig::network_file_handle_with_mac(
             vz_raw_fd, mac_str,
         ))
@@ -519,6 +542,7 @@ impl Vmm {
             cancel.cancel();
         }
         let _ = self.net_vz_fd.take();
+        let _ = self.hv_bridge_net_fd.take();
 
         // Stop vmnet relay and bridge interface.
         #[cfg(feature = "vmnet")]
@@ -553,6 +577,13 @@ impl Vmm {
     }
 
     /// Connects to a vsock port on the guest VM.
+    ///
+    /// For the HV backend, this blocks until the vCPU thread has injected
+    /// the OP_REQUEST into guest memory (up to 30s). After return, the guest
+    /// will respond with RST or RESPONSE — the caller handles both via
+    /// read() returning EOF (RST) or data (RESPONSE + subsequent OP_RW).
+    ///
+    /// For the VZ backend, the fd is immediately usable.
     pub fn connect_vsock(&self, port: u32) -> Result<std::os::unix::io::RawFd> {
         if self.state != VmmState::Running {
             return Err(VmmError::invalid_state(format!(
@@ -561,12 +592,16 @@ impl Vmm {
             )));
         }
 
-        let vm = self
-            .darwin_vm
-            .as_ref()
-            .ok_or_else(|| VmmError::invalid_state("no DarwinVm".to_string()))?;
-
-        vm.connect_vsock(port).map_err(VmmError::Hypervisor)
+        match self.resolved_backend {
+            Some(ResolvedBackend::Hv) => self.connect_vsock_hv(port),
+            _ => {
+                let vm = self
+                    .darwin_vm
+                    .as_ref()
+                    .ok_or_else(|| VmmError::invalid_state("no DarwinVm".to_string()))?;
+                vm.connect_vsock(port).map_err(VmmError::Hypervisor)
+            }
+        }
     }
 
     /// Reads console output (hvc0) from the VM.
@@ -592,6 +627,9 @@ impl Vmm {
     /// The balloon device will inflate or deflate to reach the target:
     /// - **Smaller target**: Balloon inflates, reclaiming memory from guest
     /// - **Larger target**: Balloon deflates, returning memory to guest
+    ///
+    /// Dispatches to VZ's `VZVirtioTraditionalMemoryBalloonDevice` on the VZ
+    /// backend, or to the in-tree `arcbox-virtio-balloon` device on HV.
     pub fn set_balloon_target(&self, target_bytes: u64) -> Result<()> {
         if self.state != VmmState::Running {
             return Err(VmmError::invalid_state(format!(
@@ -600,13 +638,29 @@ impl Vmm {
             )));
         }
 
-        let vm = self
-            .darwin_vm
-            .as_ref()
-            .ok_or_else(|| VmmError::invalid_state("no DarwinVm".to_string()))?;
-
-        vm.set_balloon_target_memory(target_bytes)
-            .map_err(VmmError::Hypervisor)
+        match self.resolved_backend {
+            Some(ResolvedBackend::Hv) => {
+                let balloon = self
+                    .hv_balloon
+                    .as_ref()
+                    .ok_or_else(|| VmmError::invalid_state("HV balloon not configured"))?;
+                // Convert bytes → 4 KiB pages, saturating at u32::MAX.
+                let pages = u32::try_from(target_bytes / 4096).unwrap_or(u32::MAX);
+                let guard = balloon
+                    .lock()
+                    .map_err(|e| VmmError::Device(format!("balloon lock poisoned: {e}")))?;
+                guard.set_num_pages(pages);
+                Ok(())
+            }
+            Some(ResolvedBackend::Vz) | None => {
+                let vm = self
+                    .darwin_vm
+                    .as_ref()
+                    .ok_or_else(|| VmmError::invalid_state("no DarwinVm".to_string()))?;
+                vm.set_balloon_target_memory(target_bytes)
+                    .map_err(VmmError::Hypervisor)
+            }
+        }
     }
 
     /// Gets the current target memory size from the balloon device.
@@ -619,9 +673,15 @@ impl Vmm {
             return 0;
         }
 
-        self.darwin_vm
-            .as_ref()
-            .map_or(0, DarwinVm::get_balloon_target_memory)
+        match self.resolved_backend {
+            Some(ResolvedBackend::Hv) => self.hv_balloon.as_ref().map_or(0, |b| {
+                b.lock().map_or(0, |g| u64::from(g.num_pages()) * 4096)
+            }),
+            Some(ResolvedBackend::Vz) | None => self
+                .darwin_vm
+                .as_ref()
+                .map_or(0, DarwinVm::get_balloon_target_memory),
+        }
     }
 
     /// Gets balloon statistics.
@@ -629,9 +689,20 @@ impl Vmm {
     /// Returns current balloon stats including target, current, and configured memory sizes.
     #[must_use]
     pub fn get_balloon_stats(&self) -> arcbox_hypervisor::BalloonStats {
+        let (target_bytes, current_bytes) = match self.resolved_backend {
+            Some(ResolvedBackend::Hv) => self.hv_balloon.as_ref().map_or((0, 0), |b| {
+                b.lock().map_or((0, 0), |g| {
+                    (
+                        u64::from(g.num_pages()) * 4096,
+                        u64::from(g.actual()) * 4096,
+                    )
+                })
+            }),
+            Some(ResolvedBackend::Vz) | None => (self.get_balloon_target(), 0),
+        };
         arcbox_hypervisor::BalloonStats {
-            target_bytes: self.get_balloon_target(),
-            current_bytes: 0, // macOS doesn't expose current balloon size
+            target_bytes,
+            current_bytes,
             configured_bytes: self.config.memory_size,
         }
     }

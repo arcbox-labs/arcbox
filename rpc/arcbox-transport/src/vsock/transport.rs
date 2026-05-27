@@ -128,6 +128,13 @@ impl VsockTransport {
     /// # Arguments
     /// * `fd` - A connected vsock file descriptor from the hypervisor
     /// * `addr` - The vsock address (for tracking purposes)
+    ///
+    /// Creates a transport from a raw file descriptor (macOS).
+    ///
+    /// For HV backend, the fd is a Unix SOCK_STREAM socketpair end. We wrap
+    /// it in `tokio::net::UnixStream` (well-tested async I/O) rather than
+    /// our custom `VsockStream` (which uses raw `AsyncFd` and has intermittent
+    /// timeout cancellation issues with fd reuse across connection retries).
     #[cfg(target_os = "macos")]
     pub fn from_raw_fd(fd: RawFd, addr: VsockAddr) -> Result<Self> {
         if fd < 0 {
@@ -136,9 +143,15 @@ impl VsockTransport {
                 "invalid raw vsock file descriptor",
             )));
         }
-        // SAFETY: fd has been validated to be non-negative and is expected to
-        // be a valid connected vsock file descriptor from VZVirtioSocketDevice.
-        let stream = unsafe { VsockStream::from_raw_fd(fd) }.map_err(TransportError::io)?;
+        // SAFETY: fd is a valid socketpair fd from connect_vsock_hv.
+        use std::os::unix::io::FromRawFd as _;
+        let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        std_stream
+            .set_nonblocking(true)
+            .map_err(TransportError::io)?;
+        let tokio_stream =
+            tokio::net::UnixStream::from_std(std_stream).map_err(TransportError::io)?;
+        let stream = VsockStream::from_unix_stream(tokio_stream);
         Ok(Self {
             addr,
             stream: Some(stream),

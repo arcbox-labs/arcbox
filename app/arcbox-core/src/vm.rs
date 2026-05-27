@@ -144,6 +144,12 @@ pub struct VmConfig {
     /// The balloon device allows dynamic memory management by inflating
     /// (reclaiming memory from guest) or deflating (returning memory).
     pub balloon: bool,
+    /// Enable Rosetta x86_64 translation (Apple Silicon only).
+    ///
+    /// When enabled, the VM exposes a VirtioFS share containing Apple's
+    /// Rosetta binary and registers it via binfmt_misc in the guest.
+    /// This allows near-native execution of x86_64 Linux binaries.
+    pub rosetta: bool,
 }
 
 impl Default for VmConfig {
@@ -159,6 +165,7 @@ impl Default for VmConfig {
             vsock: true,
             guest_cid: None,
             balloon: true, // Enable balloon by default
+            rosetta: cfg!(all(target_os = "macos", target_arch = "aarch64")),
         }
     }
 }
@@ -264,7 +271,7 @@ impl VmManager {
                 .unwrap_or_default(),
             kernel_cmdline: entry.config.cmdline.clone().unwrap_or_default(),
             initrd_path: None,
-            enable_rosetta: false,
+            enable_rosetta: entry.config.rosetta,
             serial_console: true,
             virtio_console: true,
             shared_dirs,
@@ -282,6 +289,13 @@ impl VmManager {
                 })
                 .collect(),
             bridge_nic_mac: Some(bridge_nic_mac_for_vm_id(&entry.info.id)),
+            // HV is the default on this branch — VZ path has separate bugs
+            // around proxy/fake-IP datapath; HV path is the target for the
+            // hv-vz-parity work (ABX-360..363). `VmBackend::default()` is
+            // `Auto`, which still dispatches to VZ when rosetta is enabled
+            // (default on Apple Silicon), so force HV explicitly until the
+            // rosetta default is resolved.
+            backend: arcbox_vmm::VmBackend::Hv,
         }
     }
 
@@ -708,7 +722,7 @@ impl VmManager {
     #[must_use]
     pub fn list_vm_snapshots(&self, id: &VmId) -> Vec<SnapshotInfo> {
         let mut snapshots = self.snapshot_manager.list(id.as_str());
-        snapshots.sort_by(|a, b| b.created.cmp(&a.created));
+        snapshots.sort_by_key(|s| std::cmp::Reverse(s.created));
         snapshots
     }
 
@@ -739,7 +753,7 @@ impl VmManager {
             return Ok(Vec::new());
         }
 
-        snapshots.sort_by(|a, b| b.created.cmp(&a.created));
+        snapshots.sort_by_key(|s| std::cmp::Reverse(s.created));
 
         let mut deleted = Vec::new();
         for snapshot in snapshots.into_iter().skip(keep) {

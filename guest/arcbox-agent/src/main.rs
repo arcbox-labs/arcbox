@@ -28,6 +28,8 @@ mod mount;
 #[cfg(target_os = "linux")]
 mod config;
 #[cfg(target_os = "linux")]
+mod rootfs_builder;
+#[cfg(target_os = "linux")]
 mod sandbox;
 
 // DNS: legacy /etc/hosts management (being replaced by dns_server).
@@ -59,7 +61,7 @@ async fn main() -> Result<()> {
                 tracing_subscriber::registry()
                     .with(
                         tracing_subscriber::EnvFilter::try_from_default_env()
-                            .unwrap_or_else(|_| "arcbox_agent=info".into()),
+                            .unwrap_or_else(|_| "arcbox_agent=info,arcbox_vm=info".into()),
                     )
                     .with(
                         tracing_subscriber::fmt::layer()
@@ -80,7 +82,7 @@ async fn main() -> Result<()> {
                 tracing_subscriber::registry()
                     .with(
                         tracing_subscriber::EnvFilter::try_from_default_env()
-                            .unwrap_or_else(|_| "arcbox_agent=info".into()),
+                            .unwrap_or_else(|_| "arcbox_agent=info,arcbox_vm=info".into()),
                     )
                     .with(
                         tracing_subscriber::fmt::layer()
@@ -96,7 +98,7 @@ async fn main() -> Result<()> {
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "arcbox_agent=info".into()),
+                    .unwrap_or_else(|_| "arcbox_agent=info,arcbox_vm=info".into()),
             )
             .with(
                 tracing_subscriber::fmt::layer()

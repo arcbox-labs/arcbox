@@ -365,9 +365,13 @@ impl PacketPool {
         let idx = buffer.index;
         debug_assert!((idx as usize) < self.capacity);
         buffer.reset();
-        // MpmcRing::enqueue cannot fail here: the ring was sized to hold all
-        // indices, and each index is returned at most once.
-        let _ = self.free_indices.enqueue(idx);
+        // Spin-retry: under high contention the Vyukov MPMC ring may
+        // transiently report full while another producer's sequence-store
+        // is still in flight. The ring is sized to hold all indices, so
+        // this will always succeed after a brief spin.
+        while self.free_indices.enqueue(idx).is_err() {
+            std::hint::spin_loop();
+        }
     }
 
     /// Returns a buffer to the pool by index.

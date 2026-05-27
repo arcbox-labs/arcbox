@@ -57,7 +57,7 @@ impl SandboxService for SandboxServiceImpl {
         if let Ok(ip) = resp.ip_address.parse() {
             self.runtime
                 .ready()?
-                .register_dns(&resp.id, &resp.id, ip)
+                .register_dns(&resp.id, std::slice::from_ref(&resp.id), ip)
                 .await;
         }
 

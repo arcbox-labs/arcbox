@@ -40,7 +40,7 @@ use crate::error::{Result, VmmError};
 use crate::vsock::{MAX_FRAME_SIZE, connect_to_port, read_frame, write_frame};
 
 /// Per-operation timeout for file I/O over vsock.
-const FILE_IO_TIMEOUT: Duration = Duration::from_secs(60);
+const FILE_IO_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// File I/O protocol constants shared between the host-side client and the
 /// guest vm-agent binary.  The vm-agent should import these from

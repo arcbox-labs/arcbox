@@ -91,38 +91,38 @@ mod tests {
 
     #[test]
     fn docker_url_arm64() {
-        let url = download_url("docker", "27.5.1", "arm64");
+        let url = download_url("docker", "29.3.1", "arm64");
         assert_eq!(
             url,
-            "https://download.docker.com/mac/static/stable/aarch64/docker-27.5.1.tgz"
+            "https://download.docker.com/mac/static/stable/aarch64/docker-29.3.1.tgz"
         );
     }
 
     #[test]
     fn docker_url_x86() {
-        let url = download_url("docker", "27.5.1", "x86_64");
+        let url = download_url("docker", "29.3.1", "x86_64");
         assert_eq!(
             url,
-            "https://download.docker.com/mac/static/stable/x86_64/docker-27.5.1.tgz"
+            "https://download.docker.com/mac/static/stable/x86_64/docker-29.3.1.tgz"
         );
     }
 
     #[test]
     fn buildx_url() {
-        let url = download_url("docker-buildx", "0.21.1", "arm64");
-        assert!(url.contains("buildx-v0.21.1.darwin-arm64"));
+        let url = download_url("docker-buildx", "0.33.0", "arm64");
+        assert!(url.contains("buildx-v0.33.0.darwin-arm64"));
     }
 
     #[test]
     fn compose_url() {
-        let url = download_url("docker-compose", "2.33.1", "arm64");
+        let url = download_url("docker-compose", "5.1.1", "arm64");
         assert!(url.contains("docker-compose-darwin-aarch64"));
     }
 
     #[test]
     fn credential_url() {
-        let url = download_url("docker-credential-osxkeychain", "0.9.1", "x86_64");
-        assert!(url.contains("docker-credential-osxkeychain-v0.9.1.darwin-amd64"));
+        let url = download_url("docker-credential-osxkeychain", "0.9.5", "x86_64");
+        assert!(url.contains("docker-credential-osxkeychain-v0.9.5.darwin-amd64"));
     }
 
     #[test]
@@ -134,10 +134,10 @@ mod tests {
 
     #[test]
     fn kubectl_url_arm64() {
-        let url = download_url("kubectl", "1.34.3", "arm64");
+        let url = download_url("kubectl", "1.35.3", "arm64");
         assert_eq!(
             url,
-            "https://dl.k8s.io/release/v1.34.3/bin/darwin/arm64/kubectl"
+            "https://dl.k8s.io/release/v1.35.3/bin/darwin/arm64/kubectl"
         );
     }
 }

@@ -42,8 +42,8 @@ mod block_device {
         blk.activate().unwrap();
 
         // Test request types exist
-        let _in_type = BlockRequestType::In;
-        let _out_type = BlockRequestType::Out;
+        let _ = BlockRequestType::In;
+        let _ = BlockRequestType::Out;
 
         // Reset and verify state
         blk.reset();
@@ -266,6 +266,70 @@ mod network_device {
         }
 
         assert_eq!(received, PACKET_COUNT);
+    }
+
+    #[test]
+    fn test_tso_feature_lifecycle() {
+        let mut net = VirtioNet::new(NetConfig::default());
+
+        // TSO not advertised by default.
+        let base_features = net.features();
+        assert_eq!(base_features & VirtioNet::FEATURE_GUEST_TSO4, 0);
+        assert_eq!(base_features & VirtioNet::FEATURE_HOST_TSO4, 0);
+        assert!(!net.tso_negotiated());
+
+        // Enable TSO features.
+        net.enable_tso_features();
+        let tso_features = net.features();
+        assert_ne!(tso_features & VirtioNet::FEATURE_GUEST_TSO4, 0);
+        assert_ne!(tso_features & VirtioNet::FEATURE_HOST_TSO4, 0);
+        assert_ne!(tso_features & VirtioNet::FEATURE_GUEST_TSO6, 0);
+        assert_ne!(tso_features & VirtioNet::FEATURE_HOST_TSO6, 0);
+
+        // Guest acks TSO.
+        net.ack_features(
+            VirtioNet::FEATURE_MAC
+                | VirtioNet::FEATURE_GUEST_TSO4
+                | VirtioNet::FEATURE_HOST_TSO4
+                | VirtioNet::FEATURE_VERSION_1,
+        );
+        assert!(net.tso_negotiated());
+
+        // Activate with TSO.
+        net.activate().unwrap();
+
+        // Reset clears TSO negotiation.
+        net.reset();
+        assert!(!net.tso_negotiated());
+    }
+
+    #[test]
+    fn test_tso_feature_read_config() {
+        // Verify that TSO-enabled device reports the correct MTU in config space.
+        let config = NetConfig {
+            mac: [0x52, 0x54, 0xAB, 0x00, 0x00, 0x01],
+            mtu: 9000, // Jumbo frames for TSO
+            num_queues: 1,
+            tap_name: None,
+        };
+        let mut net = VirtioNet::new(config);
+        net.enable_tso_features();
+
+        // Read MTU from config space (offset 10, 2 bytes).
+        let mut mtu_buf = [0u8; 2];
+        net.read_config(10, &mut mtu_buf);
+        let mtu = u16::from_le_bytes(mtu_buf);
+        assert_eq!(mtu, 9000);
+
+        // Verify TSO features are in the advertised feature set.
+        let features = net.features();
+        assert_ne!(features & VirtioNet::FEATURE_GUEST_TSO4, 0);
+        assert_ne!(features & VirtioNet::FEATURE_HOST_TSO4, 0);
+
+        // Ack and activate with TSO.
+        net.ack_features(features);
+        net.activate().unwrap();
+        assert!(net.tso_negotiated());
     }
 }
 

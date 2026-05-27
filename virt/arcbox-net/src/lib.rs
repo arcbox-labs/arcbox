@@ -41,6 +41,7 @@
 pub mod backend;
 pub mod datapath;
 pub mod dhcp;
+pub mod direct_rx;
 pub mod dns;
 pub mod error;
 pub mod ethernet;

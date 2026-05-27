@@ -65,6 +65,7 @@ fn main() -> Result<()> {
                 Commands::Docker(cmd) => commands::docker::execute(cmd, cli.format).await,
                 Commands::Kubernetes(cmd) => commands::kubernetes::execute(cmd).await,
                 Commands::Boot(cmd) => commands::boot::execute(cmd, cli.format).await,
+                Commands::Disk(cmd) => commands::disk::execute(cmd).await,
                 #[cfg(target_os = "macos")]
                 Commands::Dns(cmd) => commands::dns::execute(cmd).await,
                 Commands::Daemon(args) => commands::daemon::execute(args).await,
@@ -90,9 +91,7 @@ async fn execute_info() -> Result<()> {
     println!("Arch: {}", std::env::consts::ARCH);
     println!(
         "CPUs: {}",
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
+        std::thread::available_parallelism().map_or(1, |n| n.get())
     );
 
     match commands::machine::machine_count().await {

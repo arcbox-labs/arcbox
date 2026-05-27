@@ -125,6 +125,11 @@ fn api_routes() -> Router<AppState> {
         .route("/exec/{id}/start", post(handlers::exec_start))
         .route("/exec/{id}/resize", post(handlers::exec_resize))
         .route("/exec/{id}/json", get(handlers::exec_inspect))
+        // Build
+        .route("/build", post(handlers::build_image))
+        .route("/build/prune", post(handlers::build_prune))
+        .route("/session", post(handlers::session))
+        // Images
         .route("/images/json", get(handlers::list_images))
         .route("/images/create", post(handlers::pull_image))
         .route("/images/load", post(handlers::load_image))

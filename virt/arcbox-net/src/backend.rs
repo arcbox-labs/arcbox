@@ -114,12 +114,12 @@ impl NetworkBackend for TapBackend {
 
 /// vmnet backend for macOS.
 ///
-/// This is a wrapper around the low-level `Vmnet` implementation that
-/// conforms to the `NetworkBackend` trait.
+/// Wraps `arcbox_vmnet::Vmnet` so it conforms to the `NetworkBackend` trait
+/// and surfaces vmnet errors as [`crate::NetError`].
 #[cfg(target_os = "macos")]
 pub struct VmnetBackend {
     /// Inner vmnet interface.
-    inner: crate::darwin::Vmnet,
+    inner: arcbox_vmnet::Vmnet,
 }
 
 #[cfg(target_os = "macos")]
@@ -131,10 +131,10 @@ impl VmnetBackend {
     /// Returns an error if the vmnet interface cannot be created.
     /// This typically requires root privileges or appropriate entitlements.
     pub fn new(mac: [u8; 6], mtu: u16) -> Result<Self> {
-        let config = crate::darwin::VmnetConfig::shared()
+        let config = arcbox_vmnet::VmnetConfig::shared()
             .with_mac(mac)
             .with_mtu(mtu);
-        let inner = crate::darwin::Vmnet::new(config)?;
+        let inner = arcbox_vmnet::Vmnet::new(config)?;
         Ok(Self { inner })
     }
 
@@ -143,8 +143,8 @@ impl VmnetBackend {
     /// # Errors
     ///
     /// Returns an error if the vmnet interface cannot be created.
-    pub fn with_config(config: crate::darwin::VmnetConfig) -> Result<Self> {
-        let inner = crate::darwin::Vmnet::new(config)?;
+    pub fn with_config(config: arcbox_vmnet::VmnetConfig) -> Result<Self> {
+        let inner = arcbox_vmnet::Vmnet::new(config)?;
         Ok(Self { inner })
     }
 
@@ -154,7 +154,7 @@ impl VmnetBackend {
     ///
     /// Returns an error if the vmnet interface cannot be created.
     pub fn new_shared() -> Result<Self> {
-        let inner = crate::darwin::Vmnet::new_shared()?;
+        let inner = arcbox_vmnet::Vmnet::new_shared()?;
         Ok(Self { inner })
     }
 
@@ -164,7 +164,7 @@ impl VmnetBackend {
     ///
     /// Returns an error if the vmnet interface cannot be created.
     pub fn new_host_only() -> Result<Self> {
-        let inner = crate::darwin::Vmnet::new_host_only()?;
+        let inner = arcbox_vmnet::Vmnet::new_host_only()?;
         Ok(Self { inner })
     }
 
@@ -174,7 +174,7 @@ impl VmnetBackend {
     ///
     /// Returns an error if the vmnet interface cannot be created.
     pub fn new_bridged(interface: &str) -> Result<Self> {
-        let inner = crate::darwin::Vmnet::new_bridged(interface)?;
+        let inner = arcbox_vmnet::Vmnet::new_bridged(interface)?;
         Ok(Self { inner })
     }
 
@@ -199,11 +199,11 @@ impl VmnetBackend {
 #[cfg(target_os = "macos")]
 impl NetworkBackend for VmnetBackend {
     fn send(&self, data: &[u8]) -> Result<usize> {
-        self.inner.write_packet(data)
+        Ok(self.inner.write_packet(data)?)
     }
 
     fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-        self.inner.read_packet(buf)
+        Ok(self.inner.read_packet(buf)?)
     }
 
     fn mac(&self) -> [u8; 6] {

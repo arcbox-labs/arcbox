@@ -84,6 +84,18 @@ impl From<std::io::Error> for NetError {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl From<arcbox_vmnet::VmnetError> for NetError {
+    fn from(err: arcbox_vmnet::VmnetError) -> Self {
+        match err {
+            arcbox_vmnet::VmnetError::Config(msg) => {
+                Self::Common(CommonError::config(format!("vmnet: {msg}")))
+            }
+            arcbox_vmnet::VmnetError::Io(io) => Self::Common(CommonError::from(io)),
+        }
+    }
+}
+
 impl NetError {
     /// Creates a configuration error.
     #[must_use]
@@ -95,5 +107,31 @@ impl NetError {
     #[must_use]
     pub fn io(err: std::io::Error) -> Self {
         Self::Common(CommonError::from(err))
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vmnet_config_error_keeps_origin_prefix() {
+        let err: NetError =
+            arcbox_vmnet::VmnetError::config("bridge mode requires interface name").into();
+        let s = err.to_string();
+        assert!(
+            s.contains("vmnet: bridge mode requires interface name"),
+            "missing origin prefix: {s}"
+        );
+    }
+
+    #[test]
+    fn vmnet_io_error_passes_through() {
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let err: NetError = arcbox_vmnet::VmnetError::Io(io).into();
+        match err {
+            NetError::Common(common) if common.is_io() => {}
+            other => panic!("expected Common(io), got {other:?}"),
+        }
     }
 }

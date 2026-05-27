@@ -154,9 +154,15 @@ fn register_host_dns(runtime: &Arc<Runtime>) {
         .and_then(|s| s.parse::<Ipv4Addr>().ok())
         .or_else(|| first_address_in_subnet(&network_cfg.subnet))
         .unwrap_or(Ipv4Addr::new(10, 0, 2, 1));
+    let ip = IpAddr::V4(gateway_ip);
+    runtime.network_manager().register_dns("host", ip);
+    // Docker compatibility: containers use these to reach host services.
     runtime
         .network_manager()
-        .register_dns("host", IpAddr::V4(gateway_ip));
+        .register_dns("host.docker.internal", ip);
+    runtime
+        .network_manager()
+        .register_dns("gateway.docker.internal", ip);
 }
 
 fn first_address_in_subnet(subnet: &str) -> Option<Ipv4Addr> {

@@ -10,7 +10,7 @@ Each release contains per-architecture artifacts plus a unified multi-target man
 - `kernel` — pre-built Linux kernel (all drivers built-in, `CONFIG_MODULES=n`)
 - `rootfs.erofs` — minimal read-only EROFS rootfs (busybox + mkfs.btrfs + iptables-legacy + ebtables + ethtool + socat + CA certs)
 - `manifest.json` — manifest with SHA256 checksums and kernel cmdline (`schema_version` = major of `asset_version`)
-- Runtime binaries — dockerd, containerd, containerd-shim-runc-v2, runc (from Docker 27.5.1 static package) plus k3s
+- Runtime binaries — dockerd, containerd, containerd-shim-runc-v2, runc (from Docker 29.3.1 static package) plus k3s
 
 No initramfs. The kernel boots directly into the EROFS rootfs (`root=/dev/vda ro rootfstype=erofs`).
 Agent and runtime binaries are distributed via VirtioFS from the host.
@@ -28,7 +28,7 @@ Agent and runtime binaries are distributed via VirtioFS from the host.
 
 1. Build EROFS rootfs from Alpine static binaries
 2. Download pre-built kernels from `arcboxlabs/kernel`
-3. Sync upstream runtime binaries (Docker 27.5.1 static package)
+3. Sync upstream runtime binaries (Docker 29.3.1 static package)
 4. Package tarball + checksum + manifest
 5. Publish to GitHub Releases and Cloudflare R2 CDN
 

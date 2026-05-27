@@ -1,0 +1,22 @@
+[package]
+name = "arcbox-virtio-blk"
+description = "VirtIO block device implementation for ArcBox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-virtio-core = { workspace = true }
+async-trait = "0.1"
+libc = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

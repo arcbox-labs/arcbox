@@ -126,7 +126,7 @@ async fn wait_for_event(
 /// Create a sandbox, wait for it to become ready, stop it, then remove it.
 /// Uses network mode `"none"` so no TAP interface is required.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires FC_BINARY/FC_KERNEL/FC_ROOTFS environment variables"]
 async fn e2e_sandbox_basic_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
     let Some(cfg) = try_config(dir.path().to_str().unwrap()) else {
@@ -160,7 +160,7 @@ async fn e2e_sandbox_basic_lifecycle() {
 /// Subscribe to events, create a sandbox, and verify the `"ready"` event
 /// arrives on the broadcast channel.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires FC_BINARY/FC_KERNEL/FC_ROOTFS environment variables"]
 async fn e2e_event_broadcast_ready() {
     let dir = tempfile::tempdir().unwrap();
     let Some(cfg) = try_config(dir.path().to_str().unwrap()) else {
@@ -183,7 +183,7 @@ async fn e2e_event_broadcast_ready() {
 /// Create two sandboxes with TAP networking and verify they receive distinct
 /// IP addresses.  Requires root for TAP interface creation.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires FC_BINARY/FC_KERNEL/FC_ROOTFS environment variables and root"]
 async fn e2e_two_sandboxes_distinct_ips() {
     #[cfg(target_os = "linux")]
     if !common::is_root() {
@@ -225,7 +225,7 @@ async fn e2e_two_sandboxes_distinct_ips() {
 /// it is running, then verify it is removed after `remove_sandbox`.
 /// Requires root.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires FC_BINARY/FC_KERNEL/FC_ROOTFS environment variables and root"]
 async fn e2e_sandbox_with_tap_network() {
     #[cfg(target_os = "linux")]
     if !common::is_root() {
@@ -275,7 +275,7 @@ async fn e2e_sandbox_with_tap_network() {
 ///
 /// Requires the rootfs to have `vm-agent` at `/sbin/vm-agent`.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires FC_BINARY/FC_KERNEL/FC_ROOTFS environment variables and vm-agent in rootfs"]
 async fn e2e_run_command() {
     let dir = tempfile::tempdir().unwrap();
     let Some(cfg) = try_config(dir.path().to_str().unwrap()) else {

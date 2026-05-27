@@ -211,9 +211,10 @@ async fn recover_container_networking(
             Err(_) => continue,
         };
 
-        if let Some((name, ip)) = arcbox_docker::handlers::extract_container_dns_info(&inspect_body)
+        if let Some((aliases, ip)) =
+            arcbox_docker::handlers::extract_container_dns_info(&inspect_body)
         {
-            runtime.register_dns(id, &name, ip).await;
+            runtime.register_dns(id, &aliases, ip).await;
             recovered_dns += 1;
         }
 
