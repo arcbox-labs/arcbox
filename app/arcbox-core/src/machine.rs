@@ -320,7 +320,10 @@ impl MachineManager {
     pub async fn create(&self, config: MachineConfig) -> Result<String> {
         // Hold the write lock for the entire create operation to prevent TOCTOU
         // races: without this, two concurrent creates with the same name could
-        // both pass the existence check before either inserts.
+        // both pass the existence check before either inserts. `create` is rare
+        // and user-driven, so the alternative (insert a `Creating` sentinel,
+        // drop the lock for I/O, then finalize/rollback) is not worth its
+        // orphan-state failure mode.
         let mut machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
 
         if machines.contains_key(&config.name) {
