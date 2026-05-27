@@ -119,6 +119,56 @@ mod tests {
         ];
         assert_eq!(select_routable_ip(&ips), Some("2001:db8::42".to_string()));
     }
+
+    /// Two concurrent `create` calls with the same name must not both succeed.
+    /// One wins, the other returns `AlreadyExists`, and only one machine is
+    /// registered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_create_concurrent_same_name_no_duplicate() {
+        let temp_dir = tempdir().unwrap();
+        let machine_manager = Arc::new(test_machine_manager(temp_dir.path()));
+
+        let name = "race-test";
+        let mm1 = machine_manager.clone();
+        let mm2 = machine_manager.clone();
+
+        let t1 = tokio::spawn(async move {
+            mm1.create(MachineConfig {
+                name: name.to_string(),
+                ..Default::default()
+            })
+            .await
+        });
+        let t2 = tokio::spawn(async move {
+            mm2.create(MachineConfig {
+                name: name.to_string(),
+                ..Default::default()
+            })
+            .await
+        });
+
+        let r1 = t1.await.unwrap();
+        let r2 = t2.await.unwrap();
+
+        let (winner, loser) = match (r1, r2) {
+            (Ok(n), Err(e)) | (Err(e), Ok(n)) => (n, e),
+            (Ok(_), Ok(_)) => panic!("both creates succeeded — TOCTOU regression"),
+            (Err(e1), Err(e2)) => panic!("both creates failed: {e1:?} / {e2:?}"),
+        };
+        assert_eq!(winner, name);
+        match loser {
+            CoreError::Common(ref c) if c.is_already_exists() => {}
+            other => panic!("loser should be AlreadyExists, got {other:?}"),
+        }
+
+        let machines = machine_manager.list();
+        assert_eq!(
+            machines.len(),
+            1,
+            "exactly one machine should be registered"
+        );
+        assert_eq!(machines[0].name, name);
+    }
 }
 
 /// Machine information.
