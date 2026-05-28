@@ -127,6 +127,27 @@ pub(crate) async fn resolve_exec_role(state: &AppState, uri: &Uri) -> UtilityVmR
         .unwrap_or(UtilityVmRole::Native)
 }
 
+/// Resolves the utility VM role for any Docker request URI that may carry a
+/// workload identity (container or exec). Used by the catch-all proxy
+/// fallback so unrouted endpoints like `/containers/{id}/archive` still
+/// land on the role that owns the container.
+///
+/// Returns `Native` only when neither a container nor an exec ID is found
+/// in the URI, or when neither lookup hits the registry.
+pub(crate) async fn resolve_role_from_uri(state: &AppState, uri: &Uri) -> UtilityVmRole {
+    if let Some(id) = extract_container_id(uri)
+        && let Some(role) = state.workload_roles.lookup(&id).await
+    {
+        return role;
+    }
+    if let Some(id) = extract_exec_id(uri)
+        && let Some(role) = state.workload_roles.lookup(&id).await
+    {
+        return role;
+    }
+    UtilityVmRole::Native
+}
+
 /// Forward a request to guest dockerd, ensuring the VM is running first.
 pub(crate) async fn proxy(state: &AppState, uri: &Uri, req: Request<Body>) -> Result<Response> {
     proxy_to_role(state, UtilityVmRole::Native, uri, req).await
