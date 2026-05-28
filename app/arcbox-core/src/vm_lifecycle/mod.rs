@@ -265,6 +265,15 @@ pub use recovery::{BackoffStrategy, RecoveryAction, RecoveryPolicy};
 /// agent.create_container(...).await?;
 /// ```
 pub struct VmLifecycleManager {
+    /// Machine name this manager operates on. Set at construction time.
+    /// Defaults to [`DEFAULT_MACHINE_NAME`] for the native utility VM;
+    /// dual-VM setups override it (e.g. `"rosetta"`).
+    machine_name: String,
+    /// Filename used for this machine's persistent dockerd data image,
+    /// relative to `<data_dir>/<DATA>/`. Defaults to `docker.img`; the
+    /// rosetta lifecycle uses `docker-rosetta.img` to keep its image
+    /// strictly separate.
+    data_image_filename: String,
     /// Machine manager for VM operations.
     machine_manager: Arc<MachineManager>,
     /// Event bus.
@@ -396,8 +405,30 @@ impl VmLifecycleManager {
         Ok(())
     }
 
-    /// Creates a new VM lifecycle manager.
+    /// Creates a new VM lifecycle manager for the default native machine.
     pub fn new(
+        machine_manager: Arc<MachineManager>,
+        event_bus: EventBus,
+        data_dir: PathBuf,
+        config: VmLifecycleConfig,
+    ) -> Result<Self> {
+        Self::for_machine(
+            String::from(DEFAULT_MACHINE_NAME),
+            String::from(DOCKER_DATA_IMAGE_NAME),
+            machine_manager,
+            event_bus,
+            data_dir,
+            config,
+        )
+    }
+
+    /// Creates a new VM lifecycle manager bound to a specific machine name
+    /// and persistent data image. Used to build per-role lifecycles (e.g.
+    /// the secondary VZ Rosetta VM) that must not share state with the
+    /// default native machine.
+    pub fn for_machine(
+        machine_name: String,
+        data_image_filename: String,
         machine_manager: Arc<MachineManager>,
         event_bus: EventBus,
         data_dir: PathBuf,
@@ -415,8 +446,7 @@ impl VmLifecycleManager {
 
         let recovery = RecoveryPolicy::new(config.max_retries, BackoffStrategy::default());
 
-        // Check if default machine already exists
-        let initial_state = if let Some(info) = machine_manager.get(DEFAULT_MACHINE_NAME) {
+        let initial_state = if let Some(info) = machine_manager.get(&machine_name) {
             VmLifecycleState::from(info.state)
         } else {
             VmLifecycleState::NotExist
@@ -428,6 +458,8 @@ impl VmLifecycleManager {
             .as_millis() as u64;
 
         Ok(Self {
+            machine_name,
+            data_image_filename,
             machine_manager,
             event_bus,
             state: RwLock::new(initial_state),
@@ -441,6 +473,21 @@ impl VmLifecycleManager {
             balloon_shrunk: std::sync::atomic::AtomicBool::new(false),
             kubernetes_hold: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Returns the machine name this lifecycle manager owns.
+    #[must_use]
+    pub fn machine_name(&self) -> &str {
+        &self.machine_name
+    }
+
+    /// Returns the absolute path of this machine's persistent dockerd
+    /// data image.
+    #[must_use]
+    pub fn data_image_path(&self) -> PathBuf {
+        self.data_dir
+            .join(arcbox_constants::paths::host::DATA)
+            .join(&self.data_image_filename)
     }
 
     /// Returns the current lifecycle state.
@@ -480,7 +527,7 @@ impl VmLifecycleManager {
             // Register a mock machine so that container operations work.
             let mock_cid = 3;
             self.machine_manager
-                .register_mock_machine(DEFAULT_MACHINE_NAME, mock_cid)?;
+                .register_mock_machine(&self.machine_name, mock_cid)?;
             // Return a mock CID for testing.
             return Ok(mock_cid);
         }
@@ -524,14 +571,14 @@ impl VmLifecycleManager {
     /// Gets the CID for the default machine.
     async fn get_cid(&self) -> Result<u32> {
         self.machine_manager
-            .get_cid(DEFAULT_MACHINE_NAME)
+            .get_cid(&self.machine_name)
             .ok_or_else(|| CoreError::Machine("default machine has no CID".to_string()))
     }
 
     /// Starts the default VM.
     async fn start_default_vm(&self, timeout: Duration) -> Result<()> {
         let current_state = *self.state.read().await;
-        let existing_machine = self.machine_manager.get(DEFAULT_MACHINE_NAME);
+        let existing_machine = self.machine_manager.get(&self.machine_name);
         let machine_exists = existing_machine.is_some();
 
         // Detect stale persisted machine whose cpus/memory no longer matches
@@ -556,7 +603,7 @@ impl VmLifecycleManager {
                 boot_version = %boot_version,
                 "default machine config drifted from desired defaults; recreating"
             );
-            let _ = self.machine_manager.remove(DEFAULT_MACHINE_NAME, true);
+            let _ = self.machine_manager.remove(&self.machine_name, true);
         }
 
         // Recreate if state says "not exist", machine record is missing, or
@@ -574,7 +621,7 @@ impl VmLifecycleManager {
                 Ok(()) => {
                     *self.state.write().await = VmLifecycleState::Created;
                     self.event_bus.publish(Event::MachineCreated {
-                        name: DEFAULT_MACHINE_NAME.to_string(),
+                        name: self.machine_name.clone(),
                     });
                 }
                 Err(e) => {
@@ -590,20 +637,19 @@ impl VmLifecycleManager {
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
-            match self.machine_manager.start(DEFAULT_MACHINE_NAME).await {
+            match self.machine_manager.start(&self.machine_name).await {
                 Ok(()) => {
                     tracing::info!("Default VM started successfully");
                     *self.state.write().await = VmLifecycleState::Running;
                     self.event_bus.publish(Event::MachineStarted {
-                        name: DEFAULT_MACHINE_NAME.to_string(),
+                        name: self.machine_name.clone(),
                     });
 
                     // Install host route for container subnets via bridge NIC.
                     // Non-blocking: retries transient failures (helper not ready,
                     // bridge FDB not populated) but does not gate VM readiness.
                     #[cfg(all(target_os = "macos", feature = "vmnet"))]
-                    if let Some(bridge) =
-                        self.machine_manager.vmnet_bridge_name(DEFAULT_MACHINE_NAME)
+                    if let Some(bridge) = self.machine_manager.vmnet_bridge_name(&self.machine_name)
                     {
                         // vmnet path: bridge name is known instantly, only need
                         // helper retry (1-2 attempts for XPC readiness).
@@ -617,7 +663,7 @@ impl VmLifecycleManager {
                     }
 
                     #[cfg(all(target_os = "macos", not(feature = "vmnet")))]
-                    if let Some(mac) = self.machine_manager.bridge_mac(DEFAULT_MACHINE_NAME) {
+                    if let Some(mac) = self.machine_manager.bridge_mac(&self.machine_name) {
                         // Non-vmnet path: scan kernel FDB to discover bridge
                         // (retries up to ~10s for FDB learning).
                         drop(tokio::spawn(async move {
@@ -641,7 +687,7 @@ impl VmLifecycleManager {
                             Ok(()) => {
                                 *self.state.write().await = VmLifecycleState::Created;
                                 self.event_bus.publish(Event::MachineCreated {
-                                    name: DEFAULT_MACHINE_NAME.to_string(),
+                                    name: self.machine_name.clone(),
                                 });
                                 continue;
                             }
@@ -731,10 +777,7 @@ impl VmLifecycleManager {
         }];
 
         // Attach persistent Docker data disk.
-        let docker_data_image = self
-            .data_dir
-            .join(arcbox_constants::paths::host::DATA)
-            .join(DOCKER_DATA_IMAGE_NAME);
+        let docker_data_image = self.data_image_path();
         Self::ensure_sparse_block_image(&docker_data_image, DOCKER_DATA_IMAGE_SIZE_BYTES)?;
 
         // Don't inject docker_data_device into cmdline — let the agent
@@ -747,7 +790,7 @@ impl VmLifecycleManager {
         });
 
         let config = MachineConfig {
-            name: DEFAULT_MACHINE_NAME.to_string(),
+            name: self.machine_name.clone(),
             cpus: self.config.default_vm.cpus,
             memory_mb: self.config.default_vm.memory_mb,
             disk_gb: self.config.default_vm.disk_gb,
@@ -776,6 +819,7 @@ impl VmLifecycleManager {
         tracing::debug!("Waiting for agent to become ready...");
 
         let mm = Arc::clone(&self.machine_manager);
+        let machine_name = self.machine_name.clone();
 
         // Run the entire probe loop on a blocking thread. On macOS HV backend,
         // the agent transport is AF_UNIX socketpair → BlockingVsockTransport.
@@ -790,7 +834,7 @@ impl VmLifecycleManager {
             while std::time::Instant::now() < deadline {
                 // Console output (best-effort, non-blocking).
                 #[cfg(target_os = "macos")]
-                if let Ok(output) = mm.read_console_output(DEFAULT_MACHINE_NAME) {
+                if let Ok(output) = mm.read_console_output(&machine_name) {
                     let trimmed = output.trim_matches('\0');
                     if !trimmed.is_empty() {
                         tracing::info!("{}", trimmed.trim_end());
@@ -799,7 +843,7 @@ impl VmLifecycleManager {
 
                 // connect_agent → AF_UNIX detected → BlockingVsockTransport.
                 // ping_blocking uses libc::poll with 5s deadline — no tokio.
-                match mm.connect_agent(DEFAULT_MACHINE_NAME) {
+                match mm.connect_agent(&machine_name) {
                     Ok(mut agent) => match agent.ping_blocking() {
                         Ok(_) => return Ok(()),
                         Err(e) => tracing::debug!("Agent ping failed: {e}"),
@@ -873,7 +917,7 @@ impl VmLifecycleManager {
         }
 
         let target_bytes = IDLE_BALLOON_TARGET_MB * 1024 * 1024;
-        if let Some(info) = self.machine_manager.get(DEFAULT_MACHINE_NAME) {
+        if let Some(info) = self.machine_manager.get(&self.machine_name) {
             match self
                 .machine_manager
                 .vm_manager()
@@ -899,7 +943,7 @@ impl VmLifecycleManager {
             return;
         }
 
-        if let Some(info) = self.machine_manager.get(DEFAULT_MACHINE_NAME) {
+        if let Some(info) = self.machine_manager.get(&self.machine_name) {
             let full_bytes = info.memory_mb * 1024 * 1024;
             match self
                 .machine_manager
@@ -954,7 +998,7 @@ impl VmLifecycleManager {
                     this.shrink_balloon();
                     tracing::info!("VM entered idle state after {}s of inactivity", idle_secs);
                     this.event_bus.publish(Event::MachineIdle {
-                        name: DEFAULT_MACHINE_NAME.to_string(),
+                        name: this.machine_name.clone(),
                     });
                 }
             }
@@ -991,7 +1035,7 @@ impl VmLifecycleManager {
                     "Graceful stop timed out for '{}', falling back to force stop",
                     DEFAULT_MACHINE_NAME
                 );
-                self.machine_manager.stop(DEFAULT_MACHINE_NAME)
+                self.machine_manager.stop(&self.machine_name)
             }
             Err(e) => {
                 tracing::warn!(
@@ -999,7 +1043,7 @@ impl VmLifecycleManager {
                     DEFAULT_MACHINE_NAME,
                     e
                 );
-                self.machine_manager.stop(DEFAULT_MACHINE_NAME)
+                self.machine_manager.stop(&self.machine_name)
             }
         };
 
@@ -1008,7 +1052,7 @@ impl VmLifecycleManager {
                 *self.state.write().await = VmLifecycleState::Stopped;
                 tracing::info!("Default VM stopped");
                 self.event_bus.publish(Event::MachineStopped {
-                    name: DEFAULT_MACHINE_NAME.to_string(),
+                    name: self.machine_name.clone(),
                 });
                 Ok(())
             }
@@ -1029,11 +1073,11 @@ impl VmLifecycleManager {
     pub async fn force_stop(&self) -> Result<()> {
         self.health_monitor.stop();
 
-        let _ = self.machine_manager.remove(DEFAULT_MACHINE_NAME, true);
+        let _ = self.machine_manager.remove(&self.machine_name, true);
 
         *self.state.write().await = VmLifecycleState::NotExist;
         self.event_bus.publish(Event::MachineStopped {
-            name: DEFAULT_MACHINE_NAME.to_string(),
+            name: self.machine_name.clone(),
         });
 
         Ok(())
@@ -1062,7 +1106,7 @@ impl VmLifecycleManager {
 
     /// Returns the machine info for the default machine.
     pub fn default_machine_info(&self) -> Option<MachineInfo> {
-        self.machine_manager.get(DEFAULT_MACHINE_NAME)
+        self.machine_manager.get(&self.machine_name)
     }
 }
 
