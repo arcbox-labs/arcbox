@@ -5,6 +5,7 @@
 
 use super::{GuestConnector, HANDSHAKE_TIMEOUT};
 use crate::error::{DockerError, Result};
+use crate::routing::UtilityVmRole;
 use arcbox_error::CommonError;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, Uri, header};
@@ -134,7 +135,22 @@ pub async fn proxy_to_guest_stream(
     original_uri: &Uri,
     req: Request<Body>,
 ) -> Result<Response<Body>> {
-    let io = connector.connect().await?;
+    proxy_to_guest_stream_for_role(connector, UtilityVmRole::Native, original_uri, req).await
+}
+
+/// Forward an HTTP request to a selected utility VM's guest dockerd without buffering.
+///
+/// # Errors
+///
+/// Returns an error if guest connection, handshake, request forwarding,
+/// or response mapping fails.
+pub async fn proxy_to_guest_stream_for_role(
+    connector: &dyn GuestConnector,
+    role: UtilityVmRole,
+    original_uri: &Uri,
+    req: Request<Body>,
+) -> Result<Response<Body>> {
+    let io = connector.connect_for(role).await?;
 
     let (mut sender, conn) =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, http1::Builder::new().handshake(io))

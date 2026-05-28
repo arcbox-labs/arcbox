@@ -7,6 +7,7 @@
 use crate::api::AppState;
 use crate::error::{DockerError, Result};
 use crate::proxy;
+use crate::routing::UtilityVmRole;
 use axum::body::Body;
 use axum::http::{Request, Uri};
 use axum::response::Response;
@@ -32,17 +33,13 @@ pub(crate) use proxy_handler;
 
 /// Forward a request to guest dockerd, ensuring the VM is running first.
 pub(crate) async fn proxy(state: &AppState, uri: &Uri, req: Request<Body>) -> Result<Response> {
-    state
-        .runtime
-        .ensure_vm_ready()
-        .await
-        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {e}")))?;
-    proxy::proxy_to_guest_stream(state.connector.as_ref(), uri, req).await
+    proxy_to_role(state, UtilityVmRole::Native, uri, req).await
 }
 
-/// Forward an upload request to guest dockerd, ensuring the VM is running first.
-pub(crate) async fn proxy_upload(
+/// Forward a request to a selected utility VM's guest dockerd.
+pub(crate) async fn proxy_to_role(
     state: &AppState,
+    role: UtilityVmRole,
     uri: &Uri,
     req: Request<Body>,
 ) -> Result<Response> {
@@ -51,7 +48,31 @@ pub(crate) async fn proxy_upload(
         .ensure_vm_ready()
         .await
         .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {e}")))?;
-    proxy::proxy_streaming_upload(state.connector.as_ref(), uri, req).await
+    proxy::proxy_to_guest_stream_for_role(state.connector.as_ref(), role, uri, req).await
+}
+
+/// Forward an upload request to guest dockerd, ensuring the VM is running first.
+pub(crate) async fn proxy_upload(
+    state: &AppState,
+    uri: &Uri,
+    req: Request<Body>,
+) -> Result<Response> {
+    proxy_upload_to_role(state, UtilityVmRole::Native, uri, req).await
+}
+
+/// Forward an upload request to a selected utility VM's guest dockerd.
+pub(crate) async fn proxy_upload_to_role(
+    state: &AppState,
+    role: UtilityVmRole,
+    uri: &Uri,
+    req: Request<Body>,
+) -> Result<Response> {
+    state
+        .runtime
+        .ensure_vm_ready()
+        .await
+        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {e}")))?;
+    proxy::proxy_streaming_upload_for_role(state.connector.as_ref(), role, uri, req).await
 }
 
 /// Forward an upgraded request to guest dockerd, ensuring the VM is running first.

@@ -9,7 +9,13 @@ pub async fn build_image(
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     req: axum::http::Request<axum::body::Body>,
 ) -> crate::error::Result<axum::response::Response> {
-    crate::handlers::proxy_upload(&state, &uri, req).await
+    let route = crate::routing::route_build(&uri);
+    tracing::debug!(
+        utility_vm = route.utility_vm.as_str(),
+        platform = ?route.platform,
+        "routing Docker build request"
+    );
+    crate::handlers::proxy_upload_to_role(&state, route.utility_vm, &uri, req).await
 }
 
 // Forwards `POST /build/prune` (prune build cache) to guest dockerd.

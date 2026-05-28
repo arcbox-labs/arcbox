@@ -2,6 +2,7 @@ use super::{proxy, proxy_upgrade};
 use crate::api::AppState;
 use crate::error::Result;
 use crate::proxy::{parse_port_bindings, proxy_to_guest};
+use crate::routing::route_container_create;
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, Method, Request, Uri};
@@ -38,11 +39,17 @@ pub async fn create_container(
         .to_bytes();
 
     let body_bytes = crate::host_path::rewrite_create_body(body_bytes);
+    let route = route_container_create(&uri, &body_bytes);
+    tracing::debug!(
+        utility_vm = route.utility_vm.as_str(),
+        platform = ?route.platform,
+        "routing Docker container create request"
+    );
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
     // Body may have changed size; remove Content-Length so the proxy
     // recomputes framing from the actual body.
     req.headers_mut().remove(axum::http::header::CONTENT_LENGTH);
-    proxy(&state, &uri, req).await
+    super::proxy_to_role(&state, route.utility_vm, &uri, req).await
 }
 
 /// Extract container ID from URI path.
