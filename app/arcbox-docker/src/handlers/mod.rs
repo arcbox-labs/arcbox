@@ -151,7 +151,21 @@ pub(crate) async fn resolve_role_from_uri(state: &AppState, uri: &Uri) -> Utilit
 /// Ensures the utility VM hosting `role` is up before any request reaches
 /// the connector. Surfaces the role in the error message so a Rosetta-VM
 /// failure can't be confused with a native-VM failure.
+///
+/// Refuses requests for a role that is not configured on this host
+/// (e.g. `Rosetta` on non-Apple-Silicon) with a clear platform-specific
+/// error rather than silently routing to native — silently degrading
+/// would land an `amd64` container on the HV native VM that cannot
+/// translate x86.
 pub(crate) async fn ensure_role_ready(state: &AppState, role: UtilityVmRole) -> Result<()> {
+    if !state.runtime.role_is_distinct(role) && role != UtilityVmRole::Native {
+        return Err(DockerError::Server(format!(
+            "{} utility VM is not available on this host; \
+             {} workloads require macOS Apple Silicon",
+            role.as_str(),
+            role.as_str(),
+        )));
+    }
     state
         .runtime
         .ensure_role_ready(role)
