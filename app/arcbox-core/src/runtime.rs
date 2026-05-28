@@ -123,6 +123,22 @@ fn rewrite_kubeconfig_server(kubeconfig: &str) -> String {
         .join("\n")
 }
 
+/// Per-role lifecycle + dockerd plumbing owned by a [`Runtime`].
+///
+/// Each enabled [`UtilityVmRole`] gets its own slot so the connector
+/// registry, port-forwarding setup, and ensure-ready paths can address the
+/// VMs independently.
+struct RoleSlot {
+    /// Lifecycle manager that owns this role's VM.
+    lifecycle: Arc<VmLifecycleManager>,
+    /// Container backend that drives ensure-ready on this role.
+    container_backend: DynContainerBackend,
+    /// Machine name this role's VM is registered under.
+    machine_name: String,
+    /// Vsock port the guest dockerd listens on inside this role's VM.
+    guest_docker_vsock_port: u32,
+}
+
 pub struct Runtime {
     /// Configuration.
     config: Config,
@@ -132,10 +148,18 @@ pub struct Runtime {
     vm_manager: Arc<VmManager>,
     /// Machine manager.
     machine_manager: Arc<MachineManager>,
-    /// VM lifecycle manager (automatic VM management).
+    /// VM lifecycle manager for the native (default) machine.
+    ///
+    /// Kept for the daemon-wide lifecycle methods (Kubernetes, shutdown)
+    /// that operate on the primary VM. Role-aware paths should go through
+    /// [`Self::ensure_role_ready`] instead.
     vm_lifecycle: Arc<VmLifecycleManager>,
-    /// Selected container backend implementation.
+    /// Container backend implementation for the native role.
     container_backend: DynContainerBackend,
+    /// Per-role utility VM slots. Always contains
+    /// [`UtilityVmRole::Native`]; [`UtilityVmRole::Rosetta`] is present
+    /// only on platforms where the VZ + Rosetta utility VM is supported.
+    role_slots: HashMap<UtilityVmRole, RoleSlot>,
     /// Network manager.
     network_manager: Arc<NetworkManager>,
     /// Host-side runtime migration manager.
@@ -151,6 +175,17 @@ pub struct Runtime {
     port_forwarders: Arc<TokioRwLock<HashMap<String, PortForwarder>>>,
     /// Tracks DNS registrations: canonical container ID → hostnames.
     dns_entries: Arc<TokioRwLock<HashMap<String, Vec<String>>>>,
+}
+
+/// Machine name used for the rosetta utility VM.
+const ROSETTA_MACHINE_NAME: &str = "rosetta";
+/// Filename of the persistent dockerd data image for the rosetta utility VM.
+const ROSETTA_DATA_IMAGE_NAME: &str = "docker-rosetta.img";
+
+/// Returns `true` on platforms where the VZ + Rosetta utility VM is
+/// supported.
+const fn rosetta_role_supported() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
 
 impl Runtime {
@@ -201,19 +236,65 @@ impl Runtime {
             shared_dns_table,
         ));
 
-        // Create VM lifecycle manager with the machine manager.
-        let vm_lifecycle = Arc::new(VmLifecycleManager::new(
+        // Build the per-role utility VM slots. The native slot is always
+        // present; the rosetta slot exists only on macOS Apple Silicon
+        // and stays cold until the first amd64 workload triggers it.
+        let mut role_slots: HashMap<UtilityVmRole, RoleSlot> = HashMap::new();
+
+        // Native (HV) slot — the existing default machine.
+        let native_lifecycle = Arc::new(VmLifecycleManager::new(
             machine_manager.clone(),
             event_bus.clone(),
             config.data_dir.clone(),
-            vm_lifecycle_config,
+            vm_lifecycle_config.clone(),
         )?);
-        let container_backend = create_backend(
+        let native_backend = create_backend(
             &config.container,
-            Arc::clone(&vm_lifecycle),
+            Arc::clone(&native_lifecycle),
             Arc::clone(&machine_manager),
             DEFAULT_MACHINE_NAME,
         );
+        role_slots.insert(
+            UtilityVmRole::Native,
+            RoleSlot {
+                lifecycle: Arc::clone(&native_lifecycle),
+                container_backend: native_backend.clone(),
+                machine_name: DEFAULT_MACHINE_NAME.to_string(),
+                guest_docker_vsock_port: config.container.guest_docker_vsock_port,
+            },
+        );
+
+        // Rosetta (VZ) slot — lazy. The lifecycle is constructed now so
+        // its state, persistence and event topic are available, but the
+        // VM only boots when `ensure_role_ready(Rosetta)` is first called.
+        if rosetta_role_supported() {
+            let mut rosetta_config = vm_lifecycle_config;
+            rosetta_config.backend = arcbox_vmm::VmBackend::Vz;
+            rosetta_config.default_vm.rosetta = true;
+            let rosetta_lifecycle = Arc::new(VmLifecycleManager::for_machine(
+                ROSETTA_MACHINE_NAME.to_string(),
+                ROSETTA_DATA_IMAGE_NAME.to_string(),
+                machine_manager.clone(),
+                event_bus.clone(),
+                config.data_dir.clone(),
+                rosetta_config,
+            )?);
+            let rosetta_backend = create_backend(
+                &config.container,
+                Arc::clone(&rosetta_lifecycle),
+                Arc::clone(&machine_manager),
+                ROSETTA_MACHINE_NAME,
+            );
+            role_slots.insert(
+                UtilityVmRole::Rosetta,
+                RoleSlot {
+                    lifecycle: rosetta_lifecycle,
+                    container_backend: rosetta_backend,
+                    machine_name: ROSETTA_MACHINE_NAME.to_string(),
+                    guest_docker_vsock_port: config.container.guest_docker_vsock_port,
+                },
+            );
+        }
 
         let migration_manager = Arc::new(MigrationManager::new(config.docker.socket_path.clone()));
 
@@ -222,8 +303,9 @@ impl Runtime {
             event_bus,
             vm_manager,
             machine_manager,
-            vm_lifecycle,
-            container_backend,
+            vm_lifecycle: native_lifecycle,
+            container_backend: native_backend,
+            role_slots,
             network_manager,
             migration_manager,
             #[cfg(target_os = "macos")]
@@ -307,19 +389,18 @@ impl Runtime {
 
     /// Ensures the utility VM for `role` is running and ready.
     ///
-    /// Today both roles resolve to the single default utility VM; the
-    /// independent VZ Rosetta VM is wired up in a later workstream slice.
-    /// The method exists so callers (the Docker layer's connector
-    /// registry, port forwarding setup, future scheduler decisions) can
-    /// already address VMs by role and have the dual-VM lifecycle plugged
-    /// in beneath them without churning every caller.
+    /// Drives the per-role lifecycle so the native and rosetta VMs are
+    /// reachable independently. If `role` is not configured on this host
+    /// (e.g. rosetta on non-Apple-Silicon) the native slot answers as a
+    /// degradation path — the dockerd connector still works, but the
+    /// workload runs on HV instead of VZ+Rosetta.
     ///
     /// # Errors
     ///
     /// Returns an error if the underlying VM cannot be started or becomes
     /// unhealthy.
-    pub async fn ensure_role_ready(&self, _role: UtilityVmRole) -> Result<u32> {
-        self.ensure_vm_ready().await
+    pub async fn ensure_role_ready(&self, role: UtilityVmRole) -> Result<u32> {
+        self.slot_for(role).container_backend.ensure_ready().await
     }
 
     /// Returns the default machine name used for automatic VM lifecycle.
@@ -330,24 +411,47 @@ impl Runtime {
 
     /// Returns the machine name that hosts `role`.
     ///
-    /// During the routing-seam slice both roles resolve to
-    /// [`DEFAULT_MACHINE_NAME`]; once a dedicated VZ Rosetta machine is
-    /// configured this returns a role-specific name (e.g. `"rosetta"`).
-    /// Callers that proxy or address VMs should consult this rather than
-    /// hard-coding [`Self::default_machine_name`].
+    /// Resolves through the per-role registry. Roles not configured on
+    /// this host fall back to the native machine name so existing callers
+    /// keep working in single-VM deployments.
     #[must_use]
-    pub const fn machine_name_for_role(&self, _role: UtilityVmRole) -> &'static str {
-        DEFAULT_MACHINE_NAME
+    pub fn machine_name_for_role(&self, role: UtilityVmRole) -> &str {
+        self.slot_for(role).machine_name.as_str()
     }
 
     /// Returns the guest dockerd vsock port for `role`.
     ///
-    /// Today every role exposes dockerd on the same port; once the
-    /// secondary VM is wired this returns the rosetta-side port without
-    /// changing the caller signature.
+    /// Both roles currently expose dockerd on the configured global port;
+    /// the seam exists so we can split ports per role later without a
+    /// downstream API churn.
     #[must_use]
-    pub const fn guest_docker_vsock_port_for_role(&self, _role: UtilityVmRole) -> u32 {
-        self.guest_docker_vsock_port()
+    pub fn guest_docker_vsock_port_for_role(&self, role: UtilityVmRole) -> u32 {
+        self.slot_for(role).guest_docker_vsock_port
+    }
+
+    /// Returns the lifecycle manager for `role`, falling back to native.
+    #[must_use]
+    pub fn lifecycle_for_role(&self, role: UtilityVmRole) -> &Arc<VmLifecycleManager> {
+        &self.slot_for(role).lifecycle
+    }
+
+    /// Returns `true` if `role` has a dedicated slot wired in this runtime.
+    /// Used by diagnostics to surface which roles are actually distinct vs
+    /// aliased onto the native fallback.
+    #[must_use]
+    pub fn role_is_distinct(&self, role: UtilityVmRole) -> bool {
+        self.role_slots.contains_key(&role)
+    }
+
+    /// Returns the role slot, falling back to native if `role` is not
+    /// configured on this host.
+    fn slot_for(&self, role: UtilityVmRole) -> &RoleSlot {
+        if let Some(slot) = self.role_slots.get(&role) {
+            return slot;
+        }
+        self.role_slots
+            .get(&UtilityVmRole::Native)
+            .expect("Native role slot must always be present")
     }
 
     /// Gets an agent client for a machine.
