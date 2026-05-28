@@ -95,24 +95,38 @@ pub async fn acquire_lock(early: EarlyContext) -> Result<DaemonContext> {
 /// Wait for residual resource holders (e.g. docker.img) to release.
 ///
 /// Must complete before [`init_runtime`] — on macOS, orphaned
-/// Virtualization.framework XPC helpers may still hold the disk image.
-/// Reports the `CleaningUp` phase so gRPC clients can show progress.
+/// Virtualization.framework XPC helpers may still hold a previous
+/// daemon's disk images. Reports the `CleaningUp` phase so gRPC clients
+/// can show progress.
+///
+/// Scans every persistent dockerd image owned by a configured utility
+/// VM role (native `docker.img`, rosetta `docker-rosetta.img`) so a
+/// stale VZ holder on either side does not block daemon startup.
 ///
 /// On non-macOS this is a no-op (no XPC helpers).
 #[cfg(target_os = "macos")]
 pub async fn wait_for_resources(ctx: &DaemonContext) -> Result<()> {
-    let docker_img = ctx.layout.data_subdir.join("docker.img");
+    let candidates = ["docker.img", "docker-rosetta.img"];
+    let docker_imgs: Vec<std::path::PathBuf> = candidates
+        .iter()
+        .map(|name| ctx.layout.data_subdir.join(name))
+        .filter(|path| path.exists())
+        .collect();
 
-    if !docker_img.exists() {
+    if docker_imgs.is_empty() {
         return Ok(());
     }
 
     ctx.setup_state
         .set_phase(SetupPhase::CleaningUp, "Waiting for resource release…");
 
-    tokio::task::spawn_blocking(move || cleanup::wait_for_docker_img_holders(&docker_img))
-        .await
-        .context("resource wait task panicked")?;
+    tokio::task::spawn_blocking(move || {
+        for path in docker_imgs {
+            cleanup::wait_for_docker_img_holders(&path);
+        }
+    })
+    .await
+    .context("resource wait task panicked")?;
 
     ctx.setup_state.set_phase(
         SetupPhase::Initializing,
