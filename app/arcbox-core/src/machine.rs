@@ -132,7 +132,17 @@ mod tests {
         let mm1 = machine_manager.clone();
         let mm2 = machine_manager.clone();
 
+        // `create` has no `.await` points, so without a barrier the
+        // first-polled task can run to completion before the second is even
+        // scheduled — defeating the contention scenario we want to cover.
+        // The barrier guarantees both tasks reach the `create` call before
+        // either acquires the write lock.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let b1 = barrier.clone();
+        let b2 = barrier.clone();
+
         let t1 = tokio::spawn(async move {
+            b1.wait().await;
             mm1.create(MachineConfig {
                 name: name.to_string(),
                 ..Default::default()
@@ -140,6 +150,7 @@ mod tests {
             .await
         });
         let t2 = tokio::spawn(async move {
+            b2.wait().await;
             mm2.create(MachineConfig {
                 name: name.to_string(),
                 ..Default::default()
