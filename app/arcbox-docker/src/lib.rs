@@ -47,6 +47,7 @@ pub mod error;
 pub mod handlers;
 pub(crate) mod host_path;
 pub mod proxy;
+pub mod routing;
 pub mod server;
 pub mod trace;
 // Docker API compatibility layer contains many spec fields only serialized/deserialized.

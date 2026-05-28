@@ -6,6 +6,7 @@
 use super::forward::forwarded_request_headers;
 use super::{GuestConnector, HANDSHAKE_TIMEOUT};
 use crate::error::{DockerError, Result};
+use crate::routing::UtilityVmRole;
 use arcbox_error::CommonError;
 use axum::body::{Body, BodyDataStream};
 use axum::http::{HeaderValue, Method, Uri, header};
@@ -34,7 +35,22 @@ pub async fn proxy_streaming_upload(
     original_uri: &Uri,
     req: axum::http::Request<Body>,
 ) -> Result<axum::http::Response<Body>> {
-    let io = connector.connect().await?;
+    proxy_streaming_upload_for_role(connector, UtilityVmRole::Native, original_uri, req).await
+}
+
+/// Forward a large upload request to a selected utility VM's guest dockerd.
+///
+/// # Errors
+///
+/// Returns an error if guest connection, handshake, request forwarding,
+/// or response mapping fails.
+pub async fn proxy_streaming_upload_for_role(
+    connector: &dyn GuestConnector,
+    role: UtilityVmRole,
+    original_uri: &Uri,
+    req: axum::http::Request<Body>,
+) -> Result<axum::http::Response<Body>> {
+    let io = connector.connect_for(role).await?;
 
     let had_expect = req.headers().contains_key(header::EXPECT);
     let had_content_length = req.headers().contains_key(header::CONTENT_LENGTH);

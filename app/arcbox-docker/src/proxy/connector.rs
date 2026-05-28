@@ -3,6 +3,7 @@
 use super::GuestConnector;
 use super::stream::RawFdStream;
 use crate::error::{DockerError, Result};
+use crate::routing::UtilityVmRole;
 use arcbox_core::Runtime;
 use arcbox_error::CommonError;
 use hyper_util::rt::TokioIo;
@@ -39,6 +40,13 @@ impl VsockConnector {
 
 impl GuestConnector for VsockConnector {
     fn connect(&self) -> Pin<Box<dyn Future<Output = Result<TokioIo<RawFdStream>>> + Send + '_>> {
+        self.connect_for(UtilityVmRole::Native)
+    }
+
+    fn connect_for(
+        &self,
+        role: UtilityVmRole,
+    ) -> Pin<Box<dyn Future<Output = Result<TokioIo<RawFdStream>>> + Send + '_>> {
         Box::pin(async move {
             let _permit = CONNECT_SEMAPHORE
                 .acquire()
@@ -49,6 +57,12 @@ impl GuestConnector for VsockConnector {
             let machine_name = self.runtime.default_machine_name();
             let manager = self.runtime.machine_manager().clone();
             let name = machine_name.to_string();
+            tracing::debug!(
+                utility_vm = role.as_str(),
+                machine = %name,
+                port,
+                "connecting to guest dockerd"
+            );
 
             let handle = tokio::task::spawn_blocking(move || {
                 let fd = manager.connect_vsock_port(&name, port)?;
