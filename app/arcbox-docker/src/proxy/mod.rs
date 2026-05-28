@@ -13,10 +13,12 @@ mod upload;
 
 pub use connector::VsockConnector;
 pub use fallback::proxy_fallback;
-pub use forward::{proxy_to_guest, proxy_to_guest_stream, proxy_to_guest_stream_for_role};
+pub use forward::{
+    proxy_to_guest, proxy_to_guest_for_role, proxy_to_guest_stream, proxy_to_guest_stream_for_role,
+};
 pub use port_bindings::{PortBindingInfo, parse_port_bindings};
 pub use stream::RawFdStream;
-pub use upgrade::proxy_with_upgrade;
+pub use upgrade::{proxy_with_upgrade, proxy_with_upgrade_for_role};
 pub use upload::{proxy_streaming_upload, proxy_streaming_upload_for_role};
 
 use crate::error::Result;

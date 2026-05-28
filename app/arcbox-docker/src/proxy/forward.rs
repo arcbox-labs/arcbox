@@ -82,7 +82,36 @@ pub async fn proxy_to_guest(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>> {
-    let io = connector.connect().await?;
+    proxy_to_guest_for_role(
+        connector,
+        UtilityVmRole::Native,
+        method,
+        path_and_query,
+        headers,
+        body,
+    )
+    .await
+}
+
+/// Forward an HTTP request to a selected utility VM's guest dockerd.
+///
+/// Mirrors [`proxy_to_guest`] but lets the caller pick the role for
+/// programmatic internal lookups (e.g. canonical-ID resolution during
+/// lifecycle teardown).
+///
+/// # Errors
+///
+/// Returns an error if guest connection, handshake, request forwarding,
+/// or response mapping fails.
+pub async fn proxy_to_guest_for_role(
+    connector: &dyn GuestConnector,
+    role: UtilityVmRole,
+    method: Method,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>> {
+    let io = connector.connect_for(role).await?;
 
     let (mut sender, conn) =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, http1::Builder::new().handshake(io))
