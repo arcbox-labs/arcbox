@@ -24,7 +24,7 @@ pub async fn proxy_fallback(
     OriginalUri(uri): OriginalUri,
     req: axum::http::Request<Body>,
 ) -> Result<Response<Body>> {
-    let role = resolve_role_from_uri(&state, &uri).await;
+    let role = resolve_role_from_uri(&state, &uri).await?;
     tracing::debug!(
         method = %req.method(),
         uri = %uri,
