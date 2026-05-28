@@ -101,17 +101,30 @@ fn extract_id_after_segment(uri: &Uri, segment: &str, skip_tokens: &[&str]) -> O
     None
 }
 
-/// Resolves the utility VM role for a `/containers/{id}/...` URI from the
-/// in-process workload registry, falling back to `native`.
+/// Resolves the utility VM role for a `/containers/{id}/...` URI.
+///
+/// First consults the in-process [`WorkloadRoleRegistry`]. On a miss
+/// (e.g. an `arcbox-daemon` restart between create and the follow-up
+/// call), probes each configured role's guest dockerd to find which one
+/// owns the container, caches the result, and returns it. Falls back to
+/// `native` when no probe succeeds.
 pub(crate) async fn resolve_container_role(state: &AppState, uri: &Uri) -> UtilityVmRole {
     let Some(id) = extract_container_id(uri) else {
         return UtilityVmRole::Native;
     };
-    state
-        .workload_roles
-        .lookup(&id)
-        .await
-        .unwrap_or(UtilityVmRole::Native)
+    if let Some(role) = state.workload_roles.lookup(&id).await {
+        return role;
+    }
+    if let Some(role) = rebuild_container_role_from_guests(state, &id).await {
+        state.workload_roles.record(id.clone(), role).await;
+        tracing::debug!(
+            container_id = %id,
+            utility_vm = role.as_str(),
+            "rebuilt workload role from guest dockerd",
+        );
+        return role;
+    }
+    UtilityVmRole::Native
 }
 
 /// Resolves the utility VM role for an `/exec/{id}/...` URI from the
@@ -132,13 +145,17 @@ pub(crate) async fn resolve_exec_role(state: &AppState, uri: &Uri) -> UtilityVmR
 /// fallback so unrouted endpoints like `/containers/{id}/archive` still
 /// land on the role that owns the container.
 ///
-/// Returns `Native` only when neither a container nor an exec ID is found
-/// in the URI, or when neither lookup hits the registry.
+/// Falls back to a guest-probe rebuild on registry miss for container
+/// URIs so unrouted endpoints survive an `arcbox-daemon` restart.
 pub(crate) async fn resolve_role_from_uri(state: &AppState, uri: &Uri) -> UtilityVmRole {
-    if let Some(id) = extract_container_id(uri)
-        && let Some(role) = state.workload_roles.lookup(&id).await
-    {
-        return role;
+    if let Some(id) = extract_container_id(uri) {
+        if let Some(role) = state.workload_roles.lookup(&id).await {
+            return role;
+        }
+        if let Some(role) = rebuild_container_role_from_guests(state, &id).await {
+            state.workload_roles.record(id.clone(), role).await;
+            return role;
+        }
     }
     if let Some(id) = extract_exec_id(uri)
         && let Some(role) = state.workload_roles.lookup(&id).await
@@ -146,6 +163,62 @@ pub(crate) async fn resolve_role_from_uri(state: &AppState, uri: &Uri) -> Utilit
         return role;
     }
     UtilityVmRole::Native
+}
+
+/// Probes each configured utility VM's guest dockerd for a container
+/// matching `container_id`. Returns the role whose dockerd accepts the
+/// inspect, or `None` if no guest knows the container.
+///
+/// Only runs in roles that have a distinct slot configured for this
+/// host. The Native probe is essentially free (the VM is already up);
+/// the Rosetta probe will trigger lazy startup if the VM is not yet
+/// running — that's exactly the recovery behavior we want when a
+/// rosetta workload survives a daemon restart.
+async fn rebuild_container_role_from_guests(
+    state: &AppState,
+    container_id: &str,
+) -> Option<UtilityVmRole> {
+    use arcbox_core::workload::UtilityVmRole as Role;
+
+    for role in [Role::Native, Role::Rosetta] {
+        // Skip roles that have no distinct slot on this host — there is
+        // nothing to recover from, and probing would just retest Native.
+        if role != Role::Native && !state.runtime.role_is_distinct(role) {
+            continue;
+        }
+        if probe_container_exists(state, role, container_id).await {
+            return Some(role);
+        }
+    }
+    None
+}
+
+/// Returns `true` if `container_id` exists on `role`'s guest dockerd.
+///
+/// Uses the same vsock connector + buffered HTTP/1.1 client as the rest
+/// of the proxy stack, so a probe failure surfaces the same way as any
+/// other guest-side error.
+async fn probe_container_exists(state: &AppState, role: UtilityVmRole, container_id: &str) -> bool {
+    use axum::http::{HeaderMap, Method};
+    use bytes::Bytes;
+
+    if ensure_role_ready(state, role).await.is_err() {
+        return false;
+    }
+    let path = format!("/containers/{container_id}/json");
+    match crate::proxy::proxy_to_guest_for_role(
+        state.connector.as_ref(),
+        role,
+        Method::GET,
+        &path,
+        &HeaderMap::new(),
+        Bytes::new(),
+    )
+    .await
+    {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
 }
 
 /// Ensures the utility VM hosting `role` is up before any request reaches
@@ -213,15 +286,6 @@ pub(crate) async fn proxy_upload_to_role(
 ) -> Result<Response> {
     ensure_role_ready(state, role).await?;
     proxy::proxy_streaming_upload_for_role(state.connector.as_ref(), role, uri, req).await
-}
-
-/// Forward an upgraded request to guest dockerd, ensuring the VM is running first.
-pub(crate) async fn proxy_upgrade(
-    state: &AppState,
-    uri: &Uri,
-    req: Request<Body>,
-) -> Result<Response> {
-    proxy_upgrade_to_role(state, UtilityVmRole::Native, uri, req).await
 }
 
 /// Forward an upgraded request to a selected utility VM's guest dockerd.
