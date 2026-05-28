@@ -31,10 +31,18 @@ use tokio::sync::RwLock as TokioRwLock;
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 2);
 
-/// Inbound port-forwarding rules per container: maps container ID to a list of
-/// `(guest_ip, host_port, protocol)` tuples registered for that container.
+/// Inbound port-forwarding rules per container.
+///
+/// Maps the canonical container ID to the machine that holds the rules and
+/// the list of `(host_ip, host_port, protocol)` tuples registered on that
+/// machine. The machine name is needed so teardown reaches the right
+/// inbound listener when both utility VMs are active concurrently.
 #[cfg(target_os = "macos")]
-type InboundRulesMap = Arc<TokioRwLock<HashMap<String, Vec<(Ipv4Addr, u16, InboundProtocol)>>>>;
+type InboundRulesMap =
+    Arc<TokioRwLock<HashMap<String, (String, Vec<(Ipv4Addr, u16, InboundProtocol)>)>>>;
+/// Per-machine inbound listener managers, keyed by machine name.
+#[cfg(target_os = "macos")]
+type InboundListenerMap = Arc<TokioRwLock<HashMap<String, InboundListenerManager>>>;
 const REQUIRED_RUNTIME_ASSETS: [&str; 6] = [
     "dockerd",
     "containerd",
@@ -164,10 +172,14 @@ pub struct Runtime {
     network_manager: Arc<NetworkManager>,
     /// Host-side runtime migration manager.
     migration_manager: Arc<MigrationManager>,
-    /// Inbound listener manager for port forwarding via L2 frame injection (macOS).
+    /// Inbound listener managers keyed by machine name, for port
+    /// forwarding via L2 frame injection (macOS). Each utility VM owns its
+    /// own bridge interface and therefore its own listener.
     #[cfg(target_os = "macos")]
-    inbound_listener: Arc<TokioRwLock<Option<InboundListenerManager>>>,
-    /// Tracks which inbound rules belong to each container for cleanup (macOS).
+    inbound_listeners: InboundListenerMap,
+    /// Tracks which inbound rules belong to each container, plus the
+    /// machine those rules live on, so teardown reaches the right
+    /// listener (macOS).
     #[cfg(target_os = "macos")]
     inbound_rules: InboundRulesMap,
     /// Port forwarders for each container (non-macOS fallback).
@@ -309,7 +321,7 @@ impl Runtime {
             network_manager,
             migration_manager,
             #[cfg(target_os = "macos")]
-            inbound_listener: Arc::new(TokioRwLock::new(None)),
+            inbound_listeners: Arc::new(TokioRwLock::new(HashMap::new())),
             #[cfg(target_os = "macos")]
             inbound_rules: Arc::new(TokioRwLock::new(HashMap::new())),
             #[cfg(not(target_os = "macos"))]
@@ -760,7 +772,7 @@ impl Runtime {
         }
     }
 
-    /// macOS: add inbound rules via `InboundListenerManager`.
+    /// macOS: add inbound rules via the machine's `InboundListenerManager`.
     #[cfg(target_os = "macos")]
     async fn start_port_forwarding_macos(
         &self,
@@ -768,31 +780,34 @@ impl Runtime {
         container_id: &str,
         bindings: &[(String, u16, u16, String)],
     ) -> Result<()> {
-        // Keep the cached manager fresh across VM restarts.
+        // Keep the cached manager for this machine fresh across VM restarts.
         {
-            let mut guard = self.inbound_listener.write().await;
+            let mut guard = self.inbound_listeners.write().await;
             if let Some(manager) = self
                 .machine_manager
                 .take_inbound_listener_manager(machine_name)
             {
-                *guard = Some(manager);
+                guard.insert(machine_name.to_string(), manager);
             }
-            if guard.is_none() {
-                return Err(CoreError::Machine(
-                    "inbound listener manager not available".to_string(),
-                ));
+            if !guard.contains_key(machine_name) {
+                return Err(CoreError::Machine(format!(
+                    "inbound listener manager not available for machine '{machine_name}'",
+                )));
             }
         }
 
         // Remove previously tracked listeners for this container before
-        // applying new bindings, so stale ports do not leak.
-        let previous_rules = {
+        // applying new bindings, so stale ports do not leak. Cleanup
+        // routes to the machine the rules were originally bound to —
+        // which may differ from the requested machine if the container
+        // was previously on a different role.
+        let previous = {
             let mut rules = self.inbound_rules.write().await;
             rules.remove(container_id)
         };
-        if let Some(previous_rules) = previous_rules {
-            let mut guard = self.inbound_listener.write().await;
-            if let Some(manager) = guard.as_mut() {
+        if let Some((prev_machine, previous_rules)) = previous {
+            let mut guard = self.inbound_listeners.write().await;
+            if let Some(manager) = guard.get_mut(&prev_machine) {
                 for (host_ip, host_port, proto) in previous_rules {
                     manager.remove_rule(host_ip, host_port, proto);
                 }
@@ -821,8 +836,10 @@ impl Runtime {
                 continue;
             };
 
-            let mut guard = self.inbound_listener.write().await;
-            let manager = guard.as_mut().expect("checked above");
+            let mut guard = self.inbound_listeners.write().await;
+            let manager = guard
+                .get_mut(machine_name)
+                .expect("checked machine_name presence above");
             if let Err(e) = manager
                 .add_rule(host_ip, *host_port, *container_port, proto)
                 .await
@@ -841,7 +858,10 @@ impl Runtime {
 
         if !added_rules.is_empty() {
             let mut rules = self.inbound_rules.write().await;
-            rules.insert(container_id.to_string(), added_rules);
+            rules.insert(
+                container_id.to_string(),
+                (machine_name.to_string(), added_rules),
+            );
         }
 
         Ok(())
@@ -909,14 +929,18 @@ impl Runtime {
                 let mut guard = self.inbound_rules.write().await;
                 guard.remove(container_id)
             };
-            if let Some(rules) = rules {
-                let mut guard = self.inbound_listener.write().await;
-                if let Some(manager) = guard.as_mut() {
+            if let Some((machine_name, rules)) = rules {
+                let mut guard = self.inbound_listeners.write().await;
+                if let Some(manager) = guard.get_mut(&machine_name) {
                     for (host_ip, host_port, proto) in rules {
                         manager.remove_rule(host_ip, host_port, proto);
                     }
                 }
-                tracing::debug!("Stopped port forwarding for container {}", container_id);
+                tracing::debug!(
+                    machine = %machine_name,
+                    container_id,
+                    "Stopped port forwarding for container",
+                );
             }
         }
 
@@ -973,14 +997,14 @@ impl Runtime {
         tracing::info!(container_id, ?hostnames, "DNS entries deregistered");
     }
 
-    /// Stops all active port forwarders.
+    /// Stops all active port forwarders across every machine.
     pub async fn stop_port_forwarding_all(&self) {
         #[cfg(target_os = "macos")]
         {
-            let mut guard = self.inbound_listener.write().await;
-            // Use take() so that the next start_port_forwarding_macos() call
-            // fetches a fresh manager from the VMM (with a live cmd_tx).
-            if let Some(mut manager) = guard.take() {
+            let mut guard = self.inbound_listeners.write().await;
+            // Drain so the next start_port_forwarding_macos() call fetches
+            // fresh managers from the VMM (with live cmd_tx values).
+            for (_, mut manager) in guard.drain() {
                 manager.stop_all();
             }
             self.inbound_rules.write().await.clear();

@@ -108,7 +108,8 @@ pub async fn start_container(
     // Proxy start request to guest.
     let response = proxy_to_role(&state, role, &uri, req).await?;
 
-    // On success, inspect the container and set up port forwarding + DNS.
+    // On success, inspect the container and set up port forwarding + DNS
+    // against the role's utility VM so host ports land on the right bridge.
     if response.status().is_success() {
         if let Some(ref id) = container_id {
             setup_container_networking(&state, role, id).await;
@@ -254,8 +255,8 @@ async fn setup_container_networking(state: &AppState, role: UtilityVmRole, conta
     // may be a name or short ID) so that stop/remove can reliably match the key.
     let canonical_id = canonical_id_or_fallback(container_id, &body_bytes);
 
-    // Port forwarding.
-    setup_port_forwarding_from_inspect(state, &canonical_id, &body_bytes).await;
+    // Port forwarding (against this role's utility VM).
+    setup_port_forwarding_from_inspect(state, role, &canonical_id, &body_bytes).await;
 
     // DNS registration.
     if let Some((aliases, ip)) = extract_container_dns_info(&body_bytes) {
@@ -308,9 +309,12 @@ async fn inspect_container_body(
     }
 }
 
-/// Configures port forwarding from pre-fetched inspect JSON.
+/// Configures port forwarding from pre-fetched inspect JSON. The `role`
+/// selects which utility VM's bridge (and inbound listener manager) owns
+/// the resulting host port bindings.
 async fn setup_port_forwarding_from_inspect(
     state: &AppState,
+    role: UtilityVmRole,
     canonical_id: &str,
     body_bytes: &[u8],
 ) {
@@ -347,16 +351,17 @@ async fn setup_port_forwarding_from_inspect(
         })
         .collect();
 
-    let machine_name = state.runtime.default_machine_name();
+    let machine_name = state.runtime.machine_name_for_role(role);
     if let Err(e) = state
         .runtime
         .start_port_forwarding_for(machine_name, canonical_id, &rules)
         .await
     {
         tracing::warn!(
+            utility_vm = role.as_str(),
             "Failed to start port forwarding for {}: {}",
             canonical_id,
-            e
+            e,
         );
     }
 }
