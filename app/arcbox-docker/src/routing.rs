@@ -101,14 +101,17 @@ pub fn route_build(uri: &Uri) -> RoutingDecision {
 }
 
 fn platform_from_query(uri: &Uri) -> Option<WorkloadPlatform> {
-    uri.query()
-        .and_then(|query| query.split('&').find_map(platform_pair_value))
-        .map(WorkloadPlatform::parse)
+    query_param(uri, "platform").map(WorkloadPlatform::parse)
 }
 
-fn platform_pair_value(pair: &str) -> Option<&str> {
-    let (key, value) = pair.split_once('=')?;
-    (key.eq_ignore_ascii_case("platform") && !value.is_empty()).then_some(value)
+/// Returns the value of the first non-empty `key` parameter in `uri`'s
+/// query string, matched case-insensitively.
+#[must_use]
+pub fn query_param<'a>(uri: &'a Uri, key: &str) -> Option<&'a str> {
+    uri.query()?.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k.eq_ignore_ascii_case(key) && !v.is_empty()).then_some(v)
+    })
 }
 
 fn platform_from_create_body(body: &Bytes) -> Option<WorkloadPlatform> {

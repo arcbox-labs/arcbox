@@ -2,7 +2,7 @@ use super::{extract_container_id, proxy_to_role, proxy_upgrade_to_role, resolve_
 use crate::api::AppState;
 use crate::error::{DockerError, Result};
 use crate::proxy::{parse_port_bindings, proxy_to_guest_for_role};
-use crate::routing::{UtilityVmRole, route_container_create};
+use crate::routing::{UtilityVmRole, query_param, route_container_create};
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, Method, Request, Uri};
@@ -45,9 +45,11 @@ pub async fn create_container(
     let body_bytes = crate::host_path::rewrite_create_body(body_bytes);
     let route = route_container_create(&uri, &body_bytes);
     let role = route.utility_vm;
+    let requested_name = query_param(&uri, "name").map(str::to_string);
     tracing::debug!(
         utility_vm = role.as_str(),
         platform = ?route.platform,
+        name = requested_name.as_deref().unwrap_or(""),
         "routing Docker container create request"
     );
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
@@ -73,9 +75,13 @@ pub async fn create_container(
         tracing::debug!(
             utility_vm = role.as_str(),
             container_id = %id,
+            name = requested_name.as_deref().unwrap_or(""),
             "recorded container role binding",
         );
-        state.workload_roles.record(id, role).await;
+        state.workload_roles.record(id.clone(), role).await;
+        if let Some(name) = requested_name {
+            state.workload_roles.add_alias(&id, name).await;
+        }
     } else {
         tracing::warn!(
             utility_vm = role.as_str(),
@@ -425,6 +431,7 @@ pub async fn rename_container(
     // Resolve canonical ID BEFORE proxy — the old name/short-id is still valid
     // now but will be invalid after a successful rename.
     let canonical = resolve_canonical_from_uri(&state, role, &uri).await;
+    let new_name = query_param(&uri, "name").map(str::to_string);
 
     // Proxy rename to guest.
     let response = proxy_to_role(&state, role, &uri, req).await?;
@@ -434,7 +441,16 @@ pub async fn rename_container(
             // 1. Remove old DNS entry.
             state.runtime.deregister_dns_by_id(canonical).await;
 
-            // 2. Inspect (using canonical ID which survives rename) to get
+            // 2. Update the registry alias so future lookups by the new name
+            //    keep landing on the same role.
+            if let Some(ref new_name) = new_name {
+                state
+                    .workload_roles
+                    .rename_alias(canonical, new_name.clone())
+                    .await;
+            }
+
+            // 3. Inspect (using canonical ID which survives rename) to get
             //    new name + IP, then register.
             if let Some(body_bytes) = inspect_container_body(&state, role, canonical).await
                 && let Some((aliases, ip)) = extract_container_dns_info(&body_bytes)
