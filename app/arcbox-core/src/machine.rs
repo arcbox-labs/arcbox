@@ -179,6 +179,20 @@ pub struct MachineConfig {
     pub distro: Option<String>,
     /// Distribution version (e.g., "3.21", "24.04").
     pub distro_version: Option<String>,
+    /// macOS hypervisor backend for this machine.
+    ///
+    /// `Hv` runs ArcBox's custom HV-framework VMM (fast path for
+    /// `linux/arm64` workloads); `Vz` runs Apple's
+    /// Virtualization.framework managed execution (required for Rosetta).
+    /// Defaults to `Hv` so the existing single-VM behavior is preserved.
+    pub backend: arcbox_vmm::VmBackend,
+    /// Whether to expose Apple Rosetta inside the guest for `linux/amd64`
+    /// translation.
+    ///
+    /// Only honored when [`Self::backend`] is `Vz`; the HV path silently
+    /// drops it because Hypervisor.framework does not host the Rosetta
+    /// share. Defaults to `false`.
+    pub enable_rosetta: bool,
 }
 
 impl Default for MachineConfig {
@@ -193,6 +207,8 @@ impl Default for MachineConfig {
             block_devices: Vec::new(),
             distro: None,
             distro_version: None,
+            backend: arcbox_vmm::VmBackend::Hv,
+            enable_rosetta: false,
         }
     }
 }
@@ -358,6 +374,8 @@ impl MachineManager {
             cmdline: config.cmdline.clone(),
             shared_dirs,
             block_devices: config.block_devices.clone(),
+            rosetta: config.enable_rosetta,
+            backend: config.backend,
             ..Default::default()
         };
         let vm_id = self.vm_manager.create(vm_config)?;

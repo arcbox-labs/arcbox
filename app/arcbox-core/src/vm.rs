@@ -150,6 +150,12 @@ pub struct VmConfig {
     /// Rosetta binary and registers it via binfmt_misc in the guest.
     /// This allows near-native execution of x86_64 Linux binaries.
     pub rosetta: bool,
+    /// macOS hypervisor backend selection.
+    ///
+    /// `Hv` (default) drives the custom HV-framework VMM; `Vz` drives
+    /// Apple's Virtualization.framework managed execution and is the only
+    /// backend that can host the Rosetta share.
+    pub backend: arcbox_vmm::VmBackend,
 }
 
 impl Default for VmConfig {
@@ -166,6 +172,7 @@ impl Default for VmConfig {
             guest_cid: None,
             balloon: true, // Enable balloon by default
             rosetta: cfg!(all(target_os = "macos", target_arch = "aarch64")),
+            backend: arcbox_vmm::VmBackend::Hv,
         }
     }
 }
@@ -289,13 +296,11 @@ impl VmManager {
                 })
                 .collect(),
             bridge_nic_mac: Some(bridge_nic_mac_for_vm_id(&entry.info.id)),
-            // HV is the default on this branch — VZ path has separate bugs
-            // around proxy/fake-IP datapath; HV path is the target for the
-            // hv-vz-parity work (ABX-360..363). `VmBackend::default()` is
-            // `Auto`, which still dispatches to VZ when rosetta is enabled
-            // (default on Apple Silicon), so force HV explicitly until the
-            // rosetta default is resolved.
-            backend: arcbox_vmm::VmBackend::Hv,
+            // Backend is now set per-machine on the `VmConfig`. The native
+            // utility VM defaults to `Hv` so behavior matches the previous
+            // hardcoded path; the rosetta utility VM sets `Vz` explicitly
+            // so it can host the Rosetta share.
+            backend: entry.config.backend,
         }
     }
 

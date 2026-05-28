@@ -194,6 +194,12 @@ pub struct VmLifecycleConfig {
     pub skip_vm_check: bool,
     /// Guest docker API vsock port propagated via kernel cmdline.
     pub guest_docker_vsock_port: Option<u32>,
+    /// macOS hypervisor backend this lifecycle's machine will use.
+    ///
+    /// Defaults to `Hv` so the native utility VM keeps running on the
+    /// custom HV-framework path. The rosetta utility VM overrides this
+    /// to `Vz` so it can host the Rosetta share.
+    pub backend: arcbox_vmm::VmBackend,
 }
 
 impl Default for VmLifecycleConfig {
@@ -207,6 +213,7 @@ impl Default for VmLifecycleConfig {
             default_vm: DefaultVmConfig::default(),
             skip_vm_check: false,
             guest_docker_vsock_port: None,
+            backend: arcbox_vmm::VmBackend::Hv,
         }
     }
 }
@@ -799,6 +806,8 @@ impl VmLifecycleManager {
             block_devices,
             distro: None,
             distro_version: None,
+            backend: self.config.backend,
+            enable_rosetta: self.config.default_vm.rosetta,
         };
 
         tracing::info!(
