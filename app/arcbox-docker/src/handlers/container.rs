@@ -1,8 +1,8 @@
-use super::{proxy, proxy_upgrade};
+use super::{extract_container_id, proxy_to_role, proxy_upgrade_to_role, resolve_container_role};
 use crate::api::AppState;
-use crate::error::Result;
-use crate::proxy::{parse_port_bindings, proxy_to_guest};
-use crate::routing::route_container_create;
+use crate::error::{DockerError, Result};
+use crate::proxy::{parse_port_bindings, proxy_to_guest_for_role};
+use crate::routing::{UtilityVmRole, route_container_create};
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, Method, Request, Uri};
@@ -11,15 +11,15 @@ use bytes::Bytes;
 use std::net::IpAddr;
 
 crate::handlers::proxy_handler!(list_containers);
-crate::handlers::proxy_handler!(inspect_container);
-crate::handlers::proxy_handler!(container_logs);
-crate::handlers::proxy_handler!(wait_container);
-crate::handlers::proxy_handler!(pause_container);
-crate::handlers::proxy_handler!(unpause_container);
-crate::handlers::proxy_handler!(container_top);
-crate::handlers::proxy_handler!(container_stats);
-crate::handlers::proxy_handler!(container_changes);
 crate::handlers::proxy_handler!(prune_containers);
+crate::handlers::container_proxy_handler!(inspect_container);
+crate::handlers::container_proxy_handler!(container_logs);
+crate::handlers::container_proxy_handler!(wait_container);
+crate::handlers::container_proxy_handler!(pause_container);
+crate::handlers::container_proxy_handler!(unpause_container);
+crate::handlers::container_proxy_handler!(container_top);
+crate::handlers::container_proxy_handler!(container_stats);
+crate::handlers::container_proxy_handler!(container_changes);
 
 /// Create a container, resolving macOS symlinks in bind-mount source paths.
 ///
@@ -27,6 +27,10 @@ crate::handlers::proxy_handler!(prune_containers);
 /// mounts host `/private` via VirtioFS while its `/tmp` and `/var` are
 /// isolated tmpfs. This handler resolves the top-level symlink so
 /// bind-mount paths land on the VirtioFS share.
+///
+/// On a successful response, the canonical container ID is recorded against
+/// the chosen utility VM role so every follow-up lifecycle call is routed
+/// to the same role.
 pub async fn create_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -35,13 +39,14 @@ pub async fn create_container(
     let (parts, body) = req.into_parts();
     let body_bytes = http_body_util::BodyExt::collect(body)
         .await
-        .map_err(|e| crate::error::DockerError::Server(format!("failed to read body: {e}")))?
+        .map_err(|e| DockerError::Server(format!("failed to read body: {e}")))?
         .to_bytes();
 
     let body_bytes = crate::host_path::rewrite_create_body(body_bytes);
     let route = route_container_create(&uri, &body_bytes);
+    let role = route.utility_vm;
     tracing::debug!(
-        utility_vm = route.utility_vm.as_str(),
+        utility_vm = role.as_str(),
         platform = ?route.platform,
         "routing Docker container create request"
     );
@@ -49,25 +54,36 @@ pub async fn create_container(
     // Body may have changed size; remove Content-Length so the proxy
     // recomputes framing from the actual body.
     req.headers_mut().remove(axum::http::header::CONTENT_LENGTH);
-    super::proxy_to_role(&state, route.utility_vm, &uri, req).await
-}
 
-/// Extract container ID from URI path.
-///
-/// Matches patterns like `/containers/{id}/start`, `/v1.43/containers/{id}/stop`,
-/// or `/containers/{id}` (for DELETE).
-fn extract_container_id(uri: &Uri) -> Option<String> {
-    let segments: Vec<&str> = uri.path().split('/').filter(|s| !s.is_empty()).collect();
-    for (i, seg) in segments.iter().enumerate() {
-        if *seg == "containers" && i + 1 < segments.len() {
-            let id = segments[i + 1];
-            // Skip collection endpoints (no container ID).
-            if !matches!(id, "json" | "create" | "prune") {
-                return Some(id.to_string());
-            }
-        }
+    let response = proxy_to_role(&state, role, &uri, req).await?;
+    if !response.status().is_success() {
+        return Ok(response);
     }
-    None
+
+    // Buffer the create response so the canonical container ID can be
+    // recorded. Create responses are small JSON (just `Id` + `Warnings`),
+    // so this does not affect streaming or memory behavior.
+    let (parts, body) = response.into_parts();
+    let body_bytes = http_body_util::BodyExt::collect(body)
+        .await
+        .map_err(|e| DockerError::Server(format!("failed to read create response: {e}")))?
+        .to_bytes();
+
+    if let Some(id) = parse_create_response_id(&body_bytes) {
+        tracing::debug!(
+            utility_vm = role.as_str(),
+            container_id = %id,
+            "recorded container role binding",
+        );
+        state.workload_roles.record(id, role).await;
+    } else {
+        tracing::warn!(
+            utility_vm = role.as_str(),
+            "create response missing container ID; lifecycle ops will fall back to native"
+        );
+    }
+
+    Ok(Response::from_parts(parts, Body::from(body_bytes)))
 }
 
 /// Start a container, then set up host-side port forwarding and DNS.
@@ -81,14 +97,15 @@ pub async fn start_container(
     req: Request<Body>,
 ) -> Result<Response> {
     let container_id = extract_container_id(&uri);
+    let role = resolve_container_role(&state, &uri).await;
 
     // Proxy start request to guest.
-    let response = proxy(&state, &uri, req).await?;
+    let response = proxy_to_role(&state, role, &uri, req).await?;
 
     // On success, inspect the container and set up port forwarding + DNS.
     if response.status().is_success() {
         if let Some(ref id) = container_id {
-            setup_container_networking(&state, id).await;
+            setup_container_networking(&state, role, id).await;
         }
     }
 
@@ -105,11 +122,12 @@ pub async fn stop_container(
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
+    let role = resolve_container_role(&state, &uri).await;
     // Resolve canonical ID before proxy — the name/short-id is still valid now
     // but may become stale after stop (e.g. --rm containers).
-    let canonical = resolve_or_raw_for_teardown(&state, &uri).await;
+    let canonical = resolve_or_raw_for_teardown(&state, role, &uri).await;
 
-    let response = proxy(&state, &uri, req).await?;
+    let response = proxy_to_role(&state, role, &uri, req).await?;
 
     // Tear down networking after a terminal stop response.
     // Docker returns 204 on success and 304 when already stopped.
@@ -134,10 +152,11 @@ pub async fn kill_container(
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
+    let role = resolve_container_role(&state, &uri).await;
     // Resolve canonical ID before proxy — kill with --rm triggers auto-remove.
-    let canonical = resolve_or_raw_for_teardown(&state, &uri).await;
+    let canonical = resolve_or_raw_for_teardown(&state, role, &uri).await;
 
-    let response = proxy(&state, &uri, req).await?;
+    let response = proxy_to_role(&state, role, &uri, req).await?;
 
     // Docker kill returns 204 on success.
     if response.status().as_u16() == 204 {
@@ -160,7 +179,8 @@ pub async fn restart_container(
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
-    let response = proxy(&state, &uri, req).await?;
+    let role = resolve_container_role(&state, &uri).await;
+    let response = proxy_to_role(&state, role, &uri, req).await?;
 
     // Docker restart returns 204 on success. Refresh DNS (container may get
     // a new IP) with a single inspect call for both canonical ID and DNS info.
@@ -168,7 +188,7 @@ pub async fn restart_container(
     if response.status().as_u16() == 204 {
         if let Some(id) = extract_container_id(&uri) {
             let _ = state.runtime.ensure_vm_ready().await;
-            if let Some(body_bytes) = inspect_container_body(&state, &id).await {
+            if let Some(body_bytes) = inspect_container_body(&state, role, &id).await {
                 let canonical = canonical_id_or_fallback(&id, &body_bytes);
                 if let Some((aliases, ip)) = extract_container_dns_info(&body_bytes) {
                     state.runtime.register_dns(&canonical, &aliases, ip).await;
@@ -190,16 +210,19 @@ pub async fn remove_container(
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
+    let role = resolve_container_role(&state, &uri).await;
     // Resolve canonical ID before proxy — the name/short-id is still valid now.
-    let canonical = resolve_or_raw_for_teardown(&state, &uri).await;
+    let canonical = resolve_or_raw_for_teardown(&state, role, &uri).await;
 
-    let response = proxy(&state, &uri, req).await?;
+    let response = proxy_to_role(&state, role, &uri, req).await?;
 
     // Only tear down networking after a successful remove.
     if response.status().is_success() {
         if let Some(canonical) = canonical {
             state.runtime.stop_port_forwarding_by_id(&canonical).await;
             state.runtime.deregister_dns_by_id(&canonical).await;
+            // Drop the workload→role binding once the container is gone.
+            state.workload_roles.forget(&canonical).await;
         }
     }
 
@@ -208,9 +231,11 @@ pub async fn remove_container(
 
 /// Inspect a started container and configure port forwarding + DNS registration.
 ///
-/// Shares a single inspect call for both port forwarding and DNS setup.
-async fn setup_container_networking(state: &AppState, container_id: &str) {
-    let Some(body_bytes) = inspect_container_body(state, container_id).await else {
+/// Shares a single inspect call for both port forwarding and DNS setup. The
+/// `role` selects which utility VM hosts the container so the inspect lands
+/// on the right guest dockerd.
+async fn setup_container_networking(state: &AppState, role: UtilityVmRole, container_id: &str) {
+    let Some(body_bytes) = inspect_container_body(state, role, container_id).await else {
         tracing::warn!(
             container_id,
             "Failed to inspect container for networking setup; \
@@ -235,11 +260,17 @@ async fn setup_container_networking(state: &AppState, container_id: &str) {
     }
 }
 
-/// Fetches the inspect JSON body for a container from guest dockerd.
-async fn inspect_container_body(state: &AppState, container_id: &str) -> Option<Bytes> {
+/// Fetches the inspect JSON body for a container from the selected role's
+/// guest dockerd.
+async fn inspect_container_body(
+    state: &AppState,
+    role: UtilityVmRole,
+    container_id: &str,
+) -> Option<Bytes> {
     let inspect_path = format!("/containers/{container_id}/json");
-    let inspect_resp = match proxy_to_guest(
+    let inspect_resp = match proxy_to_guest_for_role(
         state.connector.as_ref(),
+        role,
         Method::GET,
         &inspect_path,
         &HeaderMap::new(),
@@ -390,12 +421,13 @@ pub async fn rename_container(
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
+    let role = resolve_container_role(&state, &uri).await;
     // Resolve canonical ID BEFORE proxy — the old name/short-id is still valid
     // now but will be invalid after a successful rename.
-    let canonical = resolve_canonical_from_uri(&state, &uri).await;
+    let canonical = resolve_canonical_from_uri(&state, role, &uri).await;
 
     // Proxy rename to guest.
-    let response = proxy(&state, &uri, req).await?;
+    let response = proxy_to_role(&state, role, &uri, req).await?;
 
     if response.status().is_success() {
         if let Some(ref canonical) = canonical {
@@ -404,10 +436,10 @@ pub async fn rename_container(
 
             // 2. Inspect (using canonical ID which survives rename) to get
             //    new name + IP, then register.
-            if let Some(body_bytes) = inspect_container_body(&state, canonical).await {
-                if let Some((aliases, ip)) = extract_container_dns_info(&body_bytes) {
-                    state.runtime.register_dns(canonical, &aliases, ip).await;
-                }
+            if let Some(body_bytes) = inspect_container_body(&state, role, canonical).await
+                && let Some((aliases, ip)) = extract_container_dns_info(&body_bytes)
+            {
+                state.runtime.register_dns(canonical, &aliases, ip).await;
             }
         }
     }
@@ -425,7 +457,8 @@ pub async fn attach_container(
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
-    proxy_upgrade(&state, &uri, req).await
+    let role = resolve_container_role(&state, &uri).await;
+    proxy_upgrade_to_role(&state, role, &uri, req).await
 }
 
 /// Extracts the canonical full container ID from a Docker inspect JSON response.
@@ -441,8 +474,8 @@ fn canonical_id_or_fallback(container_id: &str, inspect_json: &[u8]) -> String {
 }
 
 /// Extracts a container identifier from the URI and resolves it to the
-/// canonical full ID. Returns `None` (with a warning) when canonical
-/// resolution fails.
+/// canonical full ID via an inspect against the selected utility VM.
+/// Returns `None` (with a warning) when canonical resolution fails.
 ///
 /// Teardown handlers (stop/kill/remove) layer a raw-ID fallback on top
 /// of this via [`resolve_or_raw_for_teardown`] so transient inspect
@@ -452,18 +485,23 @@ fn canonical_id_or_fallback(container_id: &str, inspect_json: &[u8]) -> String {
 /// rename, which would break DNS re-registration.
 ///
 /// Best-effort wakes the VM before inspecting, since
-/// [`resolve_canonical_id`] uses `proxy_to_guest` directly and does not
-/// call `ensure_vm_ready` itself. Readiness failures are not fatal — the
-/// subsequent inspect will surface them as a `None` resolution.
-async fn resolve_canonical_from_uri(state: &AppState, uri: &Uri) -> Option<String> {
+/// [`resolve_canonical_id`] uses `proxy_to_guest_for_role` directly and
+/// does not call `ensure_vm_ready` itself. Readiness failures are not
+/// fatal — the subsequent inspect will surface them as a `None` resolution.
+async fn resolve_canonical_from_uri(
+    state: &AppState,
+    role: UtilityVmRole,
+    uri: &Uri,
+) -> Option<String> {
     let id = extract_container_id(uri)?;
     // Best-effort wake; if it fails, the inspect call below will too.
     let _ = state.runtime.ensure_vm_ready().await;
-    match resolve_canonical_id(state, &id).await {
+    match resolve_canonical_id(state, role, &id).await {
         Some(canonical) => Some(canonical),
         None => {
             tracing::warn!(
                 container_id = %id,
+                utility_vm = role.as_str(),
                 "Failed to resolve canonical container ID"
             );
             None
@@ -476,24 +514,30 @@ async fn resolve_canonical_from_uri(state: &AppState, uri: &Uri) -> Option<Strin
 /// the raw URI-extracted ID so cleanup of port forwarding + DNS still
 /// runs. A non-matching key is a no-op against the canonical-keyed maps
 /// — strictly better than skipping teardown entirely.
-async fn resolve_or_raw_for_teardown(state: &AppState, uri: &Uri) -> Option<String> {
-    if let Some(canonical) = resolve_canonical_from_uri(state, uri).await {
+async fn resolve_or_raw_for_teardown(
+    state: &AppState,
+    role: UtilityVmRole,
+    uri: &Uri,
+) -> Option<String> {
+    if let Some(canonical) = resolve_canonical_from_uri(state, role, uri).await {
         return Some(canonical);
     }
     let raw = extract_container_id(uri)?;
     tracing::warn!(
         container_id = %raw,
+        utility_vm = role.as_str(),
         "Using raw URI-extracted ID for networking teardown"
     );
     Some(raw)
 }
 
 /// Resolves a container name, short ID, or full ID to the canonical full ID
-/// by inspecting the container on the guest.
-async fn resolve_canonical_id(state: &AppState, id: &str) -> Option<String> {
+/// by inspecting the container on the selected utility VM.
+async fn resolve_canonical_id(state: &AppState, role: UtilityVmRole, id: &str) -> Option<String> {
     let inspect_path = format!("/containers/{id}/json");
-    let resp = proxy_to_guest(
+    let resp = proxy_to_guest_for_role(
         state.connector.as_ref(),
+        role,
         Method::GET,
         &inspect_path,
         &HeaderMap::new(),
@@ -512,6 +556,12 @@ async fn resolve_canonical_id(state: &AppState, id: &str) -> Option<String> {
         .to_bytes();
 
     extract_canonical_id_from_inspect(&body_bytes)
+}
+
+/// Parses the `Id` field from a `POST /containers/create` JSON response.
+fn parse_create_response_id(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value.get("Id")?.as_str().map(String::from)
 }
 
 #[cfg(test)]
@@ -570,6 +620,21 @@ mod tests {
     #[test]
     fn extract_canonical_id_invalid_json() {
         assert_eq!(extract_canonical_id_from_inspect(b"not json"), None);
+    }
+
+    #[test]
+    fn parses_id_from_create_response() {
+        let json = br#"{"Id":"abc123def456","Warnings":null}"#;
+        assert_eq!(
+            parse_create_response_id(json).as_deref(),
+            Some("abc123def456"),
+        );
+    }
+
+    #[test]
+    fn returns_none_when_create_response_missing_id() {
+        assert_eq!(parse_create_response_id(b"{}"), None);
+        assert_eq!(parse_create_response_id(b"not json"), None);
     }
 
     #[test]
