@@ -9,23 +9,27 @@
 //!
 //! Scope:
 //!
-//! - The registry is **in-process** and not durable. After an `arcbox-daemon`
-//!   restart, lookups for pre-existing workloads return `None` and callers
-//!   fall back to the native default. Surviving role bindings across daemon
-//!   restarts will require either persistent storage or rebuilding the map by
-//!   inspecting each role's guest dockerd at startup, and is part of a later
-//!   workstream.
+//! - The registry itself is **in-process**. After an `arcbox-daemon`
+//!   restart it starts empty; durability across restarts is recovered
+//!   *lazily*: the docker handler probes each role's guest dockerd on a
+//!   lookup miss and re-records the role for the affected workload.
+//!   See `rebuild_container_role_from_guests` in `handlers/mod.rs`.
 //! - Container and exec IDs share the same key namespace because Docker's
 //!   ID generator makes them globally distinct.
 //! - For containers, the canonical 64-char ID, the user-supplied name (e.g.
 //!   `--name web`), and any subsequent rename are all registered. Lookup by
 //!   short hex prefix (≥ 4 chars) is also supported so `docker logs ab12c3`
 //!   resolves to the same role as the canonical entry.
+//! - For BuildKit, [`WorkloadRoleRegistry::wait_for_role`] lets `/session`
+//!   block until the matching `/build` declares its role under the same
+//!   `X-Docker-Expose-Session-Uuid`, so the upgraded gRPC stream and the
+//!   build land on the same utility VM.
 
 use crate::routing::UtilityVmRole;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+use tokio::sync::{Notify, RwLock};
 
 /// Tracks Docker workload IDs (container, exec, BuildKit session) and the
 /// utility VM role they were created on. See module docs for scope and
@@ -33,6 +37,10 @@ use tokio::sync::RwLock;
 #[derive(Debug, Default)]
 pub struct WorkloadRoleRegistry {
     inner: RwLock<RegistryInner>,
+    /// Broadcast signal fired whenever a new role binding is recorded.
+    /// Used by [`Self::wait_for_role`] so a BuildKit `/session` request
+    /// can block until the matching `/build` declares the role.
+    role_recorded: Notify,
 }
 
 #[derive(Debug, Default)]
@@ -81,6 +89,43 @@ impl WorkloadRoleRegistry {
                 new = role.as_str(),
                 "workload role record replaced with a different role",
             );
+        }
+        // Wake any `wait_for_role` callers (e.g. BuildKit `/session`
+        // handlers parked waiting for the matching `/build` to declare
+        // the role). False wake-ups are filtered by the re-check loop.
+        self.role_recorded.notify_waiters();
+    }
+
+    /// Waits until `key` has a recorded role binding, or `max_wait`
+    /// elapses, whichever comes first.
+    ///
+    /// Returns the role once recorded; returns `None` on timeout.
+    /// Designed for BuildKit `/session` requests that arrive before the
+    /// matching `/build` declares the session's utility VM role.
+    pub async fn wait_for_role(&self, key: &str, max_wait: Duration) -> Option<UtilityVmRole> {
+        let deadline = Instant::now() + max_wait;
+        loop {
+            if let Some(role) = self.lookup(key).await {
+                return Some(role);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            // Subscribe to the next signal *before* re-checking so we
+            // can't lose a concurrent `record` that fires between the
+            // miss above and the await below.
+            let notified = self.role_recorded.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(role) = self.lookup(key).await {
+                return Some(role);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            tokio::select! {
+                () = notified => {}
+                () = tokio::time::sleep(remaining) => return None,
+            }
         }
     }
 
@@ -510,6 +555,43 @@ mod tests {
             registry.project_role("proj").await,
             Some(UtilityVmRole::Rosetta),
         );
+    }
+
+    #[tokio::test]
+    async fn wait_for_role_returns_existing_binding_immediately() {
+        let registry = WorkloadRoleRegistry::new();
+        registry
+            .record("session-uuid", UtilityVmRole::Rosetta)
+            .await;
+        let role = registry
+            .wait_for_role("session-uuid", Duration::from_secs(1))
+            .await;
+        assert_eq!(role, Some(UtilityVmRole::Rosetta));
+    }
+
+    #[tokio::test]
+    async fn wait_for_role_wakes_when_record_arrives_later() {
+        let registry = WorkloadRoleRegistry::new();
+        let registry2 = Arc::clone(&registry);
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            registry2.record("late-uuid", UtilityVmRole::Rosetta).await;
+        });
+
+        let role = registry
+            .wait_for_role("late-uuid", Duration::from_secs(2))
+            .await;
+        writer.await.unwrap();
+        assert_eq!(role, Some(UtilityVmRole::Rosetta));
+    }
+
+    #[tokio::test]
+    async fn wait_for_role_returns_none_after_timeout() {
+        let registry = WorkloadRoleRegistry::new();
+        let role = registry
+            .wait_for_role("never-recorded", Duration::from_millis(50))
+            .await;
+        assert!(role.is_none());
     }
 
     #[tokio::test]
