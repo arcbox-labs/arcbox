@@ -53,8 +53,12 @@ impl GuestConnector for VsockConnector {
                 .await
                 .map_err(|_| DockerError::Server("connect semaphore closed".into()))?;
 
-            let port = self.runtime.guest_docker_vsock_port();
-            let machine_name = self.runtime.default_machine_name();
+            // Resolve role → machine/port via the runtime. Today both
+            // roles still alias to the default machine; once the dual VM
+            // lifecycle lands the rosetta branch returns its own machine
+            // name and dockerd port without any change here.
+            let port = self.runtime.guest_docker_vsock_port_for_role(role);
+            let machine_name = self.runtime.machine_name_for_role(role);
             let manager = self.runtime.machine_manager().clone();
             let name = machine_name.to_string();
             tracing::debug!(

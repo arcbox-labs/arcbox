@@ -8,6 +8,7 @@ use crate::machine::{MachineManager, MachineState};
 use crate::migration::MigrationManager;
 use crate::vm::VmManager;
 use crate::vm_lifecycle::{DEFAULT_MACHINE_NAME, VmLifecycleConfig, VmLifecycleManager};
+use crate::workload::UtilityVmRole;
 use arcbox_net::NetworkManager;
 #[cfg(target_os = "macos")]
 use arcbox_net::darwin::inbound_relay::{InboundListenerManager, InboundProtocol};
@@ -304,10 +305,49 @@ impl Runtime {
         self.container_backend.ensure_ready().await
     }
 
+    /// Ensures the utility VM for `role` is running and ready.
+    ///
+    /// Today both roles resolve to the single default utility VM; the
+    /// independent VZ Rosetta VM is wired up in a later workstream slice.
+    /// The method exists so callers (the Docker layer's connector
+    /// registry, port forwarding setup, future scheduler decisions) can
+    /// already address VMs by role and have the dual-VM lifecycle plugged
+    /// in beneath them without churning every caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying VM cannot be started or becomes
+    /// unhealthy.
+    pub async fn ensure_role_ready(&self, _role: UtilityVmRole) -> Result<u32> {
+        self.ensure_vm_ready().await
+    }
+
     /// Returns the default machine name used for automatic VM lifecycle.
     #[must_use]
     pub const fn default_machine_name(&self) -> &'static str {
         DEFAULT_MACHINE_NAME
+    }
+
+    /// Returns the machine name that hosts `role`.
+    ///
+    /// During the routing-seam slice both roles resolve to
+    /// [`DEFAULT_MACHINE_NAME`]; once a dedicated VZ Rosetta machine is
+    /// configured this returns a role-specific name (e.g. `"rosetta"`).
+    /// Callers that proxy or address VMs should consult this rather than
+    /// hard-coding [`Self::default_machine_name`].
+    #[must_use]
+    pub const fn machine_name_for_role(&self, _role: UtilityVmRole) -> &'static str {
+        DEFAULT_MACHINE_NAME
+    }
+
+    /// Returns the guest dockerd vsock port for `role`.
+    ///
+    /// Today every role exposes dockerd on the same port; once the
+    /// secondary VM is wired this returns the rosetta-side port without
+    /// changing the caller signature.
+    #[must_use]
+    pub const fn guest_docker_vsock_port_for_role(&self, _role: UtilityVmRole) -> u32 {
+        self.guest_docker_vsock_port()
     }
 
     /// Gets an agent client for a machine.
