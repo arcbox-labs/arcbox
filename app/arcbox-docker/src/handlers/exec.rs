@@ -21,7 +21,7 @@ pub async fn exec_create(
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
-    let role = resolve_container_role(&state, &uri).await;
+    let role = resolve_container_role(&state, &uri).await?;
     let response = proxy_to_role(&state, role, &uri, req).await?;
     if !response.status().is_success() {
         return Ok(response);
@@ -62,7 +62,7 @@ pub async fn exec_start(
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
-    let role = resolve_exec_role(&state, &uri).await;
+    let role = resolve_exec_role(&state, &uri).await?;
     let wants_upgrade = req.headers().get(header::UPGRADE).is_some()
         || req
             .headers()

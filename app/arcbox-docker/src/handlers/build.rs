@@ -50,21 +50,27 @@ crate::handlers::proxy_handler!(build_prune);
 /// The Docker CLI opens `/session` and the matching `/build` concurrently,
 /// and the session itself carries no platform metadata — the role must
 /// come from `/build`. We resolve the session's role via
-/// [`WorkloadRoleRegistry::wait_for_role`], keyed by the BuildKit
-/// `X-Docker-Expose-Session-Uuid` header:
+/// [`crate::workload::WorkloadRoleRegistry::wait_for_role`], keyed by the
+/// BuildKit `X-Docker-Expose-Session-Uuid` header:
 ///
 /// 1. If `/build` already recorded the UUID, we forward immediately to
 ///    that role.
 /// 2. If `/session` arrives first, we wait up to
 ///    [`SESSION_ROLE_WAIT_TIMEOUT`] for `/build` to declare the role.
-/// 3. On timeout we forward to native so the session at least completes
-///    its upgrade — the user gets a BuildKit-level error rather than a
-///    hanging request.
+/// 3. On timeout (no matching `/build` arrived) we fail closed with a
+///    400, instead of routing to native: silently forwarding to the
+///    wrong VM would leave the BuildKit gRPC session attached to a guest
+///    that doesn't know about the upcoming amd64 build, producing
+///    hard-to-diagnose secrets/mounts/ssh failures partway through.
+/// 4. An ambiguous binding (multiple roles recorded for the same UUID —
+///    a registry corruption case that should never happen in practice)
+///    is also a 409.
 pub async fn session(
     axum::extract::State(state): axum::extract::State<crate::api::AppState>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     req: axum::http::Request<axum::body::Body>,
 ) -> crate::error::Result<axum::response::Response> {
+    use crate::workload::WorkloadRoleLookup;
     let session_uuid = req
         .headers()
         .get("x-docker-expose-session-uuid")
@@ -76,7 +82,7 @@ pub async fn session(
             .wait_for_role(&uuid, SESSION_ROLE_WAIT_TIMEOUT)
             .await
         {
-            Some(role) => {
+            WorkloadRoleLookup::Found(role) => {
                 tracing::debug!(
                     session_uuid = %uuid,
                     utility_vm = role.as_str(),
@@ -84,13 +90,18 @@ pub async fn session(
                 );
                 role
             }
-            None => {
-                tracing::warn!(
-                    session_uuid = %uuid,
-                    timeout_secs = SESSION_ROLE_WAIT_TIMEOUT.as_secs(),
-                    "no matching /build arrived; routing /session to native",
-                );
-                crate::routing::UtilityVmRole::Native
+            WorkloadRoleLookup::Missing => {
+                return Err(crate::error::DockerError::BadRequest(format!(
+                    "BuildKit /session UUID '{uuid}' timed out after {}s waiting \
+                     for the matching /build to declare a utility VM role; \
+                     refusing to forward the session blind",
+                    SESSION_ROLE_WAIT_TIMEOUT.as_secs(),
+                )));
+            }
+            WorkloadRoleLookup::Ambiguous => {
+                return Err(crate::error::DockerError::Conflict(format!(
+                    "BuildKit /session UUID '{uuid}' resolves to multiple utility VMs",
+                )));
             }
         },
         None => {

@@ -9,27 +9,64 @@
 //!
 //! Scope:
 //!
+//! - Lookups return [`WorkloadRoleLookup`], a tri-state of
+//!   `Found(role)` / `Missing` / `Ambiguous`. Ambiguity (a short ID that
+//!   matches canonical workloads on more than one utility VM) is a
+//!   first-class outcome so the handler layer can fail closed with a 409
+//!   instead of silently picking native.
 //! - The registry itself is **in-process**. After an `arcbox-daemon`
 //!   restart it starts empty; durability across restarts is recovered
-//!   *lazily*: the docker handler probes each role's guest dockerd on a
-//!   lookup miss and re-records the role for the affected workload.
-//!   See `rebuild_container_role_from_guests` in `handlers/mod.rs`.
+//!   *lazily*: the docker handler probes every configured role's guest
+//!   dockerd on a `Missing` lookup, accepts exactly one match, and
+//!   re-records the binding. Multiple matches across guests are
+//!   reported as `Ambiguous`. See `rebuild_container_role_from_guests`
+//!   in `handlers/mod.rs`.
 //! - Container and exec IDs share the same key namespace because Docker's
 //!   ID generator makes them globally distinct.
 //! - For containers, the canonical 64-char ID, the user-supplied name (e.g.
 //!   `--name web`), and any subsequent rename are all registered. Lookup by
 //!   short hex prefix (≥ 4 chars) is also supported so `docker logs ab12c3`
-//!   resolves to the same role as the canonical entry.
+//!   resolves to the same role as the canonical entry, except when the
+//!   prefix is ambiguous across roles (handled per above).
 //! - For BuildKit, [`WorkloadRoleRegistry::wait_for_role`] lets `/session`
 //!   block until the matching `/build` declares its role under the same
 //!   `X-Docker-Expose-Session-Uuid`, so the upgraded gRPC stream and the
-//!   build land on the same utility VM.
+//!   build land on the same utility VM. On timeout `/session` fails
+//!   closed at the handler layer rather than forwarding blind.
 
 use crate::routing::UtilityVmRole;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock};
+
+/// Result of a registry lookup. Distinguishes "no role known" from
+/// "multiple roles could claim this identifier" so the caller can fail
+/// closed on ambiguity rather than silently defaulting to native.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadRoleLookup {
+    /// Exactly one role is associated with the identifier.
+    Found(UtilityVmRole),
+    /// No role binding exists. The caller decides whether to rebuild,
+    /// fall back to a default, or surface an error.
+    Missing,
+    /// Multiple distinct roles claim this identifier — typically a short
+    /// hex prefix that matches canonical container IDs on more than one
+    /// utility VM. Routing must refuse to pick one without explicit
+    /// disambiguation by the user.
+    Ambiguous,
+}
+
+impl WorkloadRoleLookup {
+    /// Returns the role for a [`Self::Found`] result, otherwise `None`.
+    #[must_use]
+    pub const fn role(self) -> Option<UtilityVmRole> {
+        match self {
+            Self::Found(role) => Some(role),
+            _ => None,
+        }
+    }
+}
 
 /// Tracks Docker workload IDs (container, exec, BuildKit session) and the
 /// utility VM role they were created on. See module docs for scope and
@@ -99,18 +136,23 @@ impl WorkloadRoleRegistry {
     /// Waits until `key` has a recorded role binding, or `max_wait`
     /// elapses, whichever comes first.
     ///
-    /// Returns the role once recorded; returns `None` on timeout.
-    /// Designed for BuildKit `/session` requests that arrive before the
-    /// matching `/build` declares the session's utility VM role.
-    pub async fn wait_for_role(&self, key: &str, max_wait: Duration) -> Option<UtilityVmRole> {
+    /// Returns [`WorkloadRoleLookup::Found`] once recorded,
+    /// [`WorkloadRoleLookup::Missing`] on timeout, or
+    /// [`WorkloadRoleLookup::Ambiguous`] in the (pathological) case where
+    /// the key resolves to multiple roles. Designed for BuildKit
+    /// `/session` requests that arrive before the matching `/build`
+    /// declares the session's utility VM role.
+    pub async fn wait_for_role(&self, key: &str, max_wait: Duration) -> WorkloadRoleLookup {
         let deadline = Instant::now() + max_wait;
         loop {
-            if let Some(role) = self.lookup(key).await {
-                return Some(role);
+            match self.lookup(key).await {
+                WorkloadRoleLookup::Found(role) => return WorkloadRoleLookup::Found(role),
+                WorkloadRoleLookup::Ambiguous => return WorkloadRoleLookup::Ambiguous,
+                WorkloadRoleLookup::Missing => {}
             }
             let now = Instant::now();
             if now >= deadline {
-                return None;
+                return WorkloadRoleLookup::Missing;
             }
             // Subscribe to the next signal *before* re-checking so we
             // can't lose a concurrent `record` that fires between the
@@ -118,13 +160,15 @@ impl WorkloadRoleRegistry {
             let notified = self.role_recorded.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some(role) = self.lookup(key).await {
-                return Some(role);
+            match self.lookup(key).await {
+                WorkloadRoleLookup::Found(role) => return WorkloadRoleLookup::Found(role),
+                WorkloadRoleLookup::Ambiguous => return WorkloadRoleLookup::Ambiguous,
+                WorkloadRoleLookup::Missing => {}
             }
             let remaining = deadline.saturating_duration_since(now);
             tokio::select! {
                 () = notified => {}
-                () = tokio::time::sleep(remaining) => return None,
+                () = tokio::time::sleep(remaining) => return WorkloadRoleLookup::Missing,
             }
         }
     }
@@ -197,16 +241,16 @@ impl WorkloadRoleRegistry {
     /// 1. Direct hits in the canonical/alias map.
     /// 2. Hex short-ID prefix matches against canonical entries: if every
     ///    match agrees on a single role that role is returned; if matches
-    ///    disagree on role (cross-VM ambiguity) `None` is returned so the
-    ///    caller falls back to the native default rather than silently
-    ///    picking the wrong VM.
-    pub async fn lookup(&self, id: &str) -> Option<UtilityVmRole> {
+    ///    disagree on role the result is
+    ///    [`WorkloadRoleLookup::Ambiguous`] so the caller fails closed
+    ///    instead of guessing.
+    pub async fn lookup(&self, id: &str) -> WorkloadRoleLookup {
         let guard = self.inner.read().await;
         if let Some(role) = guard.roles.get(id).copied() {
-            return Some(role);
+            return WorkloadRoleLookup::Found(role);
         }
         if !is_hex_short_id(id) {
-            return None;
+            return WorkloadRoleLookup::Missing;
         }
         let mut resolved: Option<UtilityVmRole> = None;
         for (key, role) in &guard.roles {
@@ -220,12 +264,15 @@ impl WorkloadRoleRegistry {
                         prefix = %id,
                         "short ID prefix matches workloads on multiple roles; refusing to guess",
                     );
-                    return None;
+                    return WorkloadRoleLookup::Ambiguous;
                 }
                 _ => {}
             }
         }
-        resolved
+        match resolved {
+            Some(role) => WorkloadRoleLookup::Found(role),
+            None => WorkloadRoleLookup::Missing,
+        }
     }
 
     /// Returns the utility VM role recorded for a Compose project, if any.
@@ -326,14 +373,20 @@ mod tests {
     #[tokio::test]
     async fn lookup_returns_none_for_unknown_id() {
         let registry = WorkloadRoleRegistry::new();
-        assert!(registry.lookup("missing").await.is_none());
+        assert_eq!(
+            registry.lookup("missing").await,
+            WorkloadRoleLookup::Missing
+        );
     }
 
     #[tokio::test]
     async fn record_then_lookup_returns_stored_role() {
         let registry = WorkloadRoleRegistry::new();
         registry.record("abc", UtilityVmRole::Rosetta).await;
-        assert_eq!(registry.lookup("abc").await, Some(UtilityVmRole::Rosetta));
+        assert_eq!(
+            registry.lookup("abc").await,
+            WorkloadRoleLookup::Found(UtilityVmRole::Rosetta)
+        );
     }
 
     #[tokio::test]
@@ -341,7 +394,7 @@ mod tests {
         let registry = WorkloadRoleRegistry::new();
         registry.record("abc", UtilityVmRole::Native).await;
         assert_eq!(registry.forget("abc").await, Some(UtilityVmRole::Native));
-        assert!(registry.lookup("abc").await.is_none());
+        assert_eq!(registry.lookup("abc").await, WorkloadRoleLookup::Missing);
     }
 
     #[tokio::test]
@@ -349,7 +402,10 @@ mod tests {
         let registry = WorkloadRoleRegistry::new();
         registry.record("abc", UtilityVmRole::Native).await;
         registry.record("abc", UtilityVmRole::Rosetta).await;
-        assert_eq!(registry.lookup("abc").await, Some(UtilityVmRole::Rosetta));
+        assert_eq!(
+            registry.lookup("abc").await,
+            WorkloadRoleLookup::Found(UtilityVmRole::Rosetta)
+        );
     }
 
     #[tokio::test]
@@ -357,14 +413,17 @@ mod tests {
         let registry = WorkloadRoleRegistry::new();
         registry.record(CANONICAL_A, UtilityVmRole::Rosetta).await;
         registry.add_alias(CANONICAL_A, "web").await;
-        assert_eq!(registry.lookup("web").await, Some(UtilityVmRole::Rosetta));
+        assert_eq!(
+            registry.lookup("web").await,
+            WorkloadRoleLookup::Found(UtilityVmRole::Rosetta)
+        );
     }
 
     #[tokio::test]
     async fn add_alias_is_noop_without_canonical_record() {
         let registry = WorkloadRoleRegistry::new();
         registry.add_alias(CANONICAL_A, "ghost").await;
-        assert!(registry.lookup("ghost").await.is_none());
+        assert_eq!(registry.lookup("ghost").await, WorkloadRoleLookup::Missing);
     }
 
     #[tokio::test]
@@ -377,8 +436,11 @@ mod tests {
             registry.forget(CANONICAL_A).await,
             Some(UtilityVmRole::Rosetta)
         );
-        assert!(registry.lookup("web").await.is_none());
-        assert!(registry.lookup("frontend").await.is_none());
+        assert_eq!(registry.lookup("web").await, WorkloadRoleLookup::Missing);
+        assert_eq!(
+            registry.lookup("frontend").await,
+            WorkloadRoleLookup::Missing
+        );
     }
 
     #[tokio::test]
@@ -387,14 +449,17 @@ mod tests {
         registry.record(CANONICAL_A, UtilityVmRole::Native).await;
         registry.add_alias(CANONICAL_A, "old-name").await;
         registry.rename_alias(CANONICAL_A, "new-name").await;
-        assert!(registry.lookup("old-name").await.is_none());
+        assert_eq!(
+            registry.lookup("old-name").await,
+            WorkloadRoleLookup::Missing
+        );
         assert_eq!(
             registry.lookup("new-name").await,
-            Some(UtilityVmRole::Native)
+            WorkloadRoleLookup::Found(UtilityVmRole::Native)
         );
         assert_eq!(
             registry.lookup(CANONICAL_A).await,
-            Some(UtilityVmRole::Native)
+            WorkloadRoleLookup::Found(UtilityVmRole::Native)
         );
     }
 
@@ -405,12 +470,12 @@ mod tests {
         // 12-char Docker short ID.
         assert_eq!(
             registry.lookup(&CANONICAL_A[..12]).await,
-            Some(UtilityVmRole::Rosetta),
+            WorkloadRoleLookup::Found(UtilityVmRole::Rosetta)
         );
         // 4-char minimum.
         assert_eq!(
             registry.lookup(&CANONICAL_A[..4]).await,
-            Some(UtilityVmRole::Rosetta),
+            WorkloadRoleLookup::Found(UtilityVmRole::Rosetta)
         );
     }
 
@@ -419,7 +484,7 @@ mod tests {
         let registry = WorkloadRoleRegistry::new();
         // 4-char hex string that isn't a canonical 64-char ID — must not match.
         registry.record("abcd", UtilityVmRole::Rosetta).await;
-        assert!(registry.lookup("abc").await.is_none());
+        assert_eq!(registry.lookup("abc").await, WorkloadRoleLookup::Missing);
     }
 
     #[tokio::test]
@@ -429,11 +494,11 @@ mod tests {
         registry.record(CANONICAL_B, UtilityVmRole::Rosetta).await;
         assert_eq!(
             registry.lookup(&CANONICAL_B[..8]).await,
-            Some(UtilityVmRole::Rosetta),
+            WorkloadRoleLookup::Found(UtilityVmRole::Rosetta)
         );
         assert_eq!(
             registry.lookup(&CANONICAL_A[..8]).await,
-            Some(UtilityVmRole::Native),
+            WorkloadRoleLookup::Found(UtilityVmRole::Native)
         );
     }
 
@@ -442,21 +507,21 @@ mod tests {
         let registry = WorkloadRoleRegistry::new();
         registry.record(CANONICAL_A, UtilityVmRole::Rosetta).await;
         // `alpine` contains non-hex characters; prefix scan must not fire.
-        assert!(registry.lookup("alpine").await.is_none());
+        assert_eq!(registry.lookup("alpine").await, WorkloadRoleLookup::Missing);
     }
 
     /// Two canonicals share the same hex prefix but live on different VMs.
     /// Returning either role would be a silent misroute, so the registry
-    /// must refuse to resolve the prefix.
+    /// reports the prefix as ambiguous and the caller must fail closed.
     #[tokio::test]
-    async fn cross_role_prefix_collision_returns_none() {
+    async fn cross_role_prefix_collision_is_ambiguous() {
         let prefix = "abcd";
         let canonical_x = format!("{prefix}{}", "1".repeat(60));
         let canonical_y = format!("{prefix}{}", "2".repeat(60));
         let registry = WorkloadRoleRegistry::new();
         registry.record(canonical_x, UtilityVmRole::Native).await;
         registry.record(canonical_y, UtilityVmRole::Rosetta).await;
-        assert!(registry.lookup(prefix).await.is_none());
+        assert_eq!(registry.lookup(prefix).await, WorkloadRoleLookup::Ambiguous);
     }
 
     /// Two canonicals share the same hex prefix but are on the same role.
@@ -470,7 +535,10 @@ mod tests {
         let registry = WorkloadRoleRegistry::new();
         registry.record(canonical_x, UtilityVmRole::Rosetta).await;
         registry.record(canonical_y, UtilityVmRole::Rosetta).await;
-        assert_eq!(registry.lookup(prefix).await, Some(UtilityVmRole::Rosetta),);
+        assert_eq!(
+            registry.lookup(prefix).await,
+            WorkloadRoleLookup::Found(UtilityVmRole::Rosetta)
+        );
     }
 
     /// Reassigning the same alias from canonical A to canonical B must:
@@ -484,11 +552,17 @@ mod tests {
         registry.add_alias(CANONICAL_A, "web").await;
         registry.record(CANONICAL_B, UtilityVmRole::Rosetta).await;
         registry.add_alias(CANONICAL_B, "web").await;
-        assert_eq!(registry.lookup("web").await, Some(UtilityVmRole::Rosetta));
+        assert_eq!(
+            registry.lookup("web").await,
+            WorkloadRoleLookup::Found(UtilityVmRole::Rosetta)
+        );
 
         // Forgetting A must not drop the binding now owned by B.
         registry.forget(CANONICAL_A).await;
-        assert_eq!(registry.lookup("web").await, Some(UtilityVmRole::Rosetta));
+        assert_eq!(
+            registry.lookup("web").await,
+            WorkloadRoleLookup::Found(UtilityVmRole::Rosetta)
+        );
     }
 
     /// Renaming canonical A's alias to one currently owned by B steals the
@@ -503,11 +577,17 @@ mod tests {
 
         // A is renamed to "web", stealing the alias from B.
         registry.rename_alias(CANONICAL_A, "web").await;
-        assert_eq!(registry.lookup("web").await, Some(UtilityVmRole::Native));
+        assert_eq!(
+            registry.lookup("web").await,
+            WorkloadRoleLookup::Found(UtilityVmRole::Native)
+        );
 
         // forget(B) must not undo A's claim on "web".
         registry.forget(CANONICAL_B).await;
-        assert_eq!(registry.lookup("web").await, Some(UtilityVmRole::Native));
+        assert_eq!(
+            registry.lookup("web").await,
+            WorkloadRoleLookup::Found(UtilityVmRole::Native)
+        );
     }
 
     /// Adding the same alias to the same canonical twice should not produce
@@ -522,8 +602,11 @@ mod tests {
         registry.add_alias(CANONICAL_A, "web").await;
         // A single forget must clear the alias cleanly.
         registry.forget(CANONICAL_A).await;
-        assert!(registry.lookup("web").await.is_none());
-        assert!(registry.lookup(CANONICAL_A).await.is_none());
+        assert_eq!(registry.lookup("web").await, WorkloadRoleLookup::Missing);
+        assert_eq!(
+            registry.lookup(CANONICAL_A).await,
+            WorkloadRoleLookup::Missing
+        );
     }
 
     /// Forgetting an alias key should leave the canonical untouched but
@@ -535,10 +618,10 @@ mod tests {
         registry.record(CANONICAL_A, UtilityVmRole::Native).await;
         registry.add_alias(CANONICAL_A, "web").await;
         assert_eq!(registry.forget("web").await, Some(UtilityVmRole::Native));
-        assert!(registry.lookup("web").await.is_none());
+        assert_eq!(registry.lookup("web").await, WorkloadRoleLookup::Missing);
         assert_eq!(
             registry.lookup(CANONICAL_A).await,
-            Some(UtilityVmRole::Native),
+            WorkloadRoleLookup::Found(UtilityVmRole::Native)
         );
         // forget(canonical) still succeeds after the alias was already gone.
         registry.forget(CANONICAL_A).await;
@@ -566,7 +649,7 @@ mod tests {
         let role = registry
             .wait_for_role("session-uuid", Duration::from_secs(1))
             .await;
-        assert_eq!(role, Some(UtilityVmRole::Rosetta));
+        assert_eq!(role, WorkloadRoleLookup::Found(UtilityVmRole::Rosetta));
     }
 
     #[tokio::test]
@@ -582,16 +665,16 @@ mod tests {
             .wait_for_role("late-uuid", Duration::from_secs(2))
             .await;
         writer.await.unwrap();
-        assert_eq!(role, Some(UtilityVmRole::Rosetta));
+        assert_eq!(role, WorkloadRoleLookup::Found(UtilityVmRole::Rosetta));
     }
 
     #[tokio::test]
-    async fn wait_for_role_returns_none_after_timeout() {
+    async fn wait_for_role_returns_missing_after_timeout() {
         let registry = WorkloadRoleRegistry::new();
         let role = registry
             .wait_for_role("never-recorded", Duration::from_millis(50))
             .await;
-        assert!(role.is_none());
+        assert_eq!(role, WorkloadRoleLookup::Missing);
     }
 
     #[tokio::test]

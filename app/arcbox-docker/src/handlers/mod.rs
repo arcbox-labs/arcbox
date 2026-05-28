@@ -8,6 +8,7 @@ use crate::api::AppState;
 use crate::error::{DockerError, Result};
 use crate::proxy;
 use crate::routing::UtilityVmRole;
+use crate::workload::WorkloadRoleLookup;
 use axum::body::Body;
 use axum::http::{Request, Uri};
 use axum::response::Response;
@@ -33,41 +34,45 @@ macro_rules! proxy_handler {
 }
 
 /// Forwards a `/containers/{id}/...` request to the utility VM role
-/// recorded for that container, falling back to `native` when no record
-/// exists (pre-existing or post-restart workloads).
+/// recorded for that container. Returns a 409 Conflict if the URI
+/// resolves to multiple utility VMs (ambiguous short ID); falls back to
+/// native only when no role can be determined at all.
 macro_rules! container_proxy_handler {
     ($name:ident) => {
         /// Forwards the request to the container's utility VM.
         ///
         /// # Errors
         ///
-        /// Returns an error if VM readiness fails or proxying to guest dockerd fails.
+        /// Returns an error if the URI is ambiguous across utility VMs,
+        /// if VM readiness fails, or if proxying to guest dockerd fails.
         pub async fn $name(
             axum::extract::State(state): axum::extract::State<crate::api::AppState>,
             axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
             req: axum::http::Request<axum::body::Body>,
         ) -> crate::error::Result<axum::response::Response> {
-            let role = $crate::handlers::resolve_container_role(&state, &uri).await;
+            let role = $crate::handlers::resolve_container_role(&state, &uri).await?;
             $crate::handlers::proxy_to_role(&state, role, &uri, req).await
         }
     };
 }
 
 /// Forwards an `/exec/{id}/...` request to the utility VM role recorded for
-/// the originating container, falling back to `native` when no record exists.
+/// the originating container. Returns a 409 Conflict if the URI resolves
+/// to multiple utility VMs.
 macro_rules! exec_proxy_handler {
     ($name:ident) => {
         /// Forwards the request to the exec instance's utility VM.
         ///
         /// # Errors
         ///
-        /// Returns an error if VM readiness fails or proxying to guest dockerd fails.
+        /// Returns an error if the URI is ambiguous across utility VMs,
+        /// if VM readiness fails, or if proxying to guest dockerd fails.
         pub async fn $name(
             axum::extract::State(state): axum::extract::State<crate::api::AppState>,
             axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
             req: axum::http::Request<axum::body::Body>,
         ) -> crate::error::Result<axum::response::Response> {
-            let role = $crate::handlers::resolve_exec_role(&state, &uri).await;
+            let role = $crate::handlers::resolve_exec_role(&state, &uri).await?;
             $crate::handlers::proxy_to_role(&state, role, &uri, req).await
         }
     };
@@ -103,41 +108,54 @@ fn extract_id_after_segment(uri: &Uri, segment: &str, skip_tokens: &[&str]) -> O
 
 /// Resolves the utility VM role for a `/containers/{id}/...` URI.
 ///
-/// First consults the in-process [`WorkloadRoleRegistry`]. On a miss
-/// (e.g. an `arcbox-daemon` restart between create and the follow-up
-/// call), probes each configured role's guest dockerd to find which one
-/// owns the container, caches the result, and returns it. Falls back to
-/// `native` when no probe succeeds.
-pub(crate) async fn resolve_container_role(state: &AppState, uri: &Uri) -> UtilityVmRole {
+/// Lookup order:
+///
+/// 1. Consult the in-process [`WorkloadRoleRegistry`]. A
+///    [`WorkloadRoleLookup::Found`] returns the role directly. A
+///    [`WorkloadRoleLookup::Ambiguous`] short ID surfaces as a 409
+///    Conflict so we never silently pick a VM.
+/// 2. On [`WorkloadRoleLookup::Missing`] (e.g. after a daemon restart),
+///    probe every configured role's guest dockerd. Exactly one match is
+///    recorded and returned; multiple matches surface as a 409 Conflict.
+///    Zero matches falls back to `native` so the request still reaches a
+///    guest that can return the appropriate `404 No such container`.
+pub(crate) async fn resolve_container_role(state: &AppState, uri: &Uri) -> Result<UtilityVmRole> {
     let Some(id) = extract_container_id(uri) else {
-        return UtilityVmRole::Native;
+        return Ok(UtilityVmRole::Native);
     };
-    if let Some(role) = state.workload_roles.lookup(&id).await {
-        return role;
+    match state.workload_roles.lookup(&id).await {
+        WorkloadRoleLookup::Found(role) => Ok(role),
+        WorkloadRoleLookup::Ambiguous => Err(ambiguous_workload_error(&id)),
+        WorkloadRoleLookup::Missing => match rebuild_container_role_from_guests(state, &id).await {
+            WorkloadRoleLookup::Found(role) => {
+                state.workload_roles.record(id.clone(), role).await;
+                tracing::debug!(
+                    container_id = %id,
+                    utility_vm = role.as_str(),
+                    "rebuilt workload role from guest dockerd",
+                );
+                Ok(role)
+            }
+            WorkloadRoleLookup::Ambiguous => Err(ambiguous_workload_error(&id)),
+            WorkloadRoleLookup::Missing => Ok(UtilityVmRole::Native),
+        },
     }
-    if let Some(role) = rebuild_container_role_from_guests(state, &id).await {
-        state.workload_roles.record(id.clone(), role).await;
-        tracing::debug!(
-            container_id = %id,
-            utility_vm = role.as_str(),
-            "rebuilt workload role from guest dockerd",
-        );
-        return role;
-    }
-    UtilityVmRole::Native
 }
 
-/// Resolves the utility VM role for an `/exec/{id}/...` URI from the
-/// in-process workload registry, falling back to `native`.
-pub(crate) async fn resolve_exec_role(state: &AppState, uri: &Uri) -> UtilityVmRole {
+/// Resolves the utility VM role for an `/exec/{id}/...` URI.
+///
+/// Returns the recorded role on hit, fails closed with 409 on an
+/// ambiguous short ID, and falls back to `native` only when no role is
+/// known at all.
+pub(crate) async fn resolve_exec_role(state: &AppState, uri: &Uri) -> Result<UtilityVmRole> {
     let Some(id) = extract_exec_id(uri) else {
-        return UtilityVmRole::Native;
+        return Ok(UtilityVmRole::Native);
     };
-    state
-        .workload_roles
-        .lookup(&id)
-        .await
-        .unwrap_or(UtilityVmRole::Native)
+    match state.workload_roles.lookup(&id).await {
+        WorkloadRoleLookup::Found(role) => Ok(role),
+        WorkloadRoleLookup::Ambiguous => Err(ambiguous_workload_error(&id)),
+        WorkloadRoleLookup::Missing => Ok(UtilityVmRole::Native),
+    }
 }
 
 /// Resolves the utility VM role for any Docker request URI that may carry a
@@ -145,52 +163,83 @@ pub(crate) async fn resolve_exec_role(state: &AppState, uri: &Uri) -> UtilityVmR
 /// fallback so unrouted endpoints like `/containers/{id}/archive` still
 /// land on the role that owns the container.
 ///
-/// Falls back to a guest-probe rebuild on registry miss for container
-/// URIs so unrouted endpoints survive an `arcbox-daemon` restart.
-pub(crate) async fn resolve_role_from_uri(state: &AppState, uri: &Uri) -> UtilityVmRole {
+/// Surfaces ambiguity as a 409 the same way the per-handler resolvers do;
+/// rebuilds from guest dockerds on registry miss for container URIs.
+pub(crate) async fn resolve_role_from_uri(state: &AppState, uri: &Uri) -> Result<UtilityVmRole> {
     if let Some(id) = extract_container_id(uri) {
-        if let Some(role) = state.workload_roles.lookup(&id).await {
-            return role;
+        match state.workload_roles.lookup(&id).await {
+            WorkloadRoleLookup::Found(role) => return Ok(role),
+            WorkloadRoleLookup::Ambiguous => return Err(ambiguous_workload_error(&id)),
+            WorkloadRoleLookup::Missing => {}
         }
-        if let Some(role) = rebuild_container_role_from_guests(state, &id).await {
-            state.workload_roles.record(id.clone(), role).await;
-            return role;
+        match rebuild_container_role_from_guests(state, &id).await {
+            WorkloadRoleLookup::Found(role) => {
+                state.workload_roles.record(id.clone(), role).await;
+                return Ok(role);
+            }
+            WorkloadRoleLookup::Ambiguous => return Err(ambiguous_workload_error(&id)),
+            WorkloadRoleLookup::Missing => {}
         }
     }
-    if let Some(id) = extract_exec_id(uri)
-        && let Some(role) = state.workload_roles.lookup(&id).await
-    {
-        return role;
+    if let Some(id) = extract_exec_id(uri) {
+        match state.workload_roles.lookup(&id).await {
+            WorkloadRoleLookup::Found(role) => return Ok(role),
+            WorkloadRoleLookup::Ambiguous => return Err(ambiguous_workload_error(&id)),
+            WorkloadRoleLookup::Missing => {}
+        }
     }
-    UtilityVmRole::Native
+    Ok(UtilityVmRole::Native)
 }
 
-/// Probes each configured utility VM's guest dockerd for a container
-/// matching `container_id`. Returns the role whose dockerd accepts the
-/// inspect, or `None` if no guest knows the container.
+/// Probes **every** configured utility VM's guest dockerd for a container
+/// matching `container_id` and reports whether zero, one, or multiple
+/// guests claim it.
 ///
-/// Only runs in roles that have a distinct slot configured for this
-/// host. The Native probe is essentially free (the VM is already up);
-/// the Rosetta probe will trigger lazy startup if the VM is not yet
-/// running — that's exactly the recovery behavior we want when a
-/// rosetta workload survives a daemon restart.
+/// Returning on the first match would re-introduce the silent-misroute
+/// bug for cross-VM short-ID collisions: a 12-char prefix might match
+/// canonical IDs on both VMs. We always probe both and treat a
+/// double-hit as ambiguous so the caller fails closed.
+///
+/// The Native probe is essentially free (its VM is already up); the
+/// Rosetta probe triggers lazy VZ startup on first miss, which is the
+/// recovery behavior we want when a rosetta workload survives an
+/// `arcbox-daemon` restart.
 async fn rebuild_container_role_from_guests(
     state: &AppState,
     container_id: &str,
-) -> Option<UtilityVmRole> {
-    use arcbox_core::workload::UtilityVmRole as Role;
-
-    for role in [Role::Native, Role::Rosetta] {
-        // Skip roles that have no distinct slot on this host — there is
-        // nothing to recover from, and probing would just retest Native.
-        if role != Role::Native && !state.runtime.role_is_distinct(role) {
+) -> WorkloadRoleLookup {
+    let mut hits: Vec<UtilityVmRole> = Vec::new();
+    for role in [UtilityVmRole::Native, UtilityVmRole::Rosetta] {
+        if role != UtilityVmRole::Native && !state.runtime.role_is_distinct(role) {
             continue;
         }
         if probe_container_exists(state, role, container_id).await {
-            return Some(role);
+            hits.push(role);
         }
     }
-    None
+    match hits.as_slice() {
+        [] => WorkloadRoleLookup::Missing,
+        [only] => WorkloadRoleLookup::Found(*only),
+        _ => {
+            tracing::warn!(
+                container_id,
+                ?hits,
+                "container identifier resolves on multiple utility VMs",
+            );
+            WorkloadRoleLookup::Ambiguous
+        }
+    }
+}
+
+/// Returns a 409 Conflict describing an ambiguous workload identifier.
+///
+/// Used both for in-registry prefix collisions and for guest-probe
+/// rebuilds that find the same name/short-ID on more than one VM.
+fn ambiguous_workload_error(id: &str) -> DockerError {
+    DockerError::Conflict(format!(
+        "workload identifier '{id}' is ambiguous: it matches workloads on \
+         multiple utility VMs. Use the full canonical container ID."
+    ))
 }
 
 /// Returns `true` if `container_id` exists on `role`'s guest dockerd.

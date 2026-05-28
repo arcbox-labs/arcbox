@@ -49,12 +49,29 @@ pub async fn create_container(
     let requested_name = query_param(&uri, "name").map(str::to_string);
     let compose_project = extract_compose_project(&body_bytes);
 
-    // If the create is part of a Compose project that already has a role
-    // binding, every service in the project must run on that role. If the
-    // requested platform cannot run on the project's role (e.g. an amd64
-    // service joining a native-bound project) the request is rejected
-    // with a clear error rather than silently splitting the project
-    // across utility VMs.
+    // Compose-project scheduling — the honest semantics.
+    //
+    // PLAN.md step 7 asks for "any amd64 service → whole project
+    // rosetta", which requires reading the full compose file before any
+    // service is created. We only see per-service `POST
+    // /containers/create` requests, so true pre-resolution would need a
+    // Compose-aware layer above the Docker API. What we do here instead
+    // is the strongest correctness guarantee achievable from per-service
+    // creates:
+    //
+    // 1. The first service in a project binds the project to the role
+    //    its platform implies (`amd64` → rosetta; otherwise native).
+    // 2. Every subsequent service must be hostable on that role. An
+    //    incompatible service (e.g. an amd64 service joining a
+    //    native-bound project) is rejected with a 400 so the user sees
+    //    the conflict immediately rather than getting a silently
+    //    misrouted container.
+    //
+    // The known consequence: a project whose first service is arm64
+    // followed by an amd64 service will be rejected, even though PLAN's
+    // ideal would have promoted the whole project to rosetta. The fix
+    // is full compose-file inspection and is intentionally out of scope
+    // for the per-API-request routing layer.
     let role = if let Some(ref project) = compose_project {
         match state.workload_roles.project_role(project).await {
             Some(project_role) => {
@@ -139,7 +156,7 @@ pub async fn start_container(
     req: Request<Body>,
 ) -> Result<Response> {
     let container_id = extract_container_id(&uri);
-    let role = resolve_container_role(&state, &uri).await;
+    let role = resolve_container_role(&state, &uri).await?;
 
     // Proxy start request to guest.
     let response = proxy_to_role(&state, role, &uri, req).await?;
@@ -165,7 +182,7 @@ pub async fn stop_container(
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
-    let role = resolve_container_role(&state, &uri).await;
+    let role = resolve_container_role(&state, &uri).await?;
     // Resolve canonical ID before proxy — the name/short-id is still valid now
     // but may become stale after stop (e.g. --rm containers).
     let canonical = resolve_or_raw_for_teardown(&state, role, &uri).await;
@@ -195,7 +212,7 @@ pub async fn kill_container(
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
-    let role = resolve_container_role(&state, &uri).await;
+    let role = resolve_container_role(&state, &uri).await?;
     // Resolve canonical ID before proxy — kill with --rm triggers auto-remove.
     let canonical = resolve_or_raw_for_teardown(&state, role, &uri).await;
 
@@ -222,7 +239,7 @@ pub async fn restart_container(
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
-    let role = resolve_container_role(&state, &uri).await;
+    let role = resolve_container_role(&state, &uri).await?;
     let response = proxy_to_role(&state, role, &uri, req).await?;
 
     // Docker restart returns 204 on success. Refresh DNS (container may get
@@ -253,7 +270,7 @@ pub async fn remove_container(
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
-    let role = resolve_container_role(&state, &uri).await;
+    let role = resolve_container_role(&state, &uri).await?;
     // Resolve canonical ID before proxy — the name/short-id is still valid now.
     let canonical = resolve_or_raw_for_teardown(&state, role, &uri).await;
 
@@ -468,7 +485,7 @@ pub async fn rename_container(
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
-    let role = resolve_container_role(&state, &uri).await;
+    let role = resolve_container_role(&state, &uri).await?;
     // Resolve canonical ID BEFORE proxy — the old name/short-id is still valid
     // now but will be invalid after a successful rename.
     let canonical = resolve_canonical_from_uri(&state, role, &uri).await;
@@ -514,7 +531,7 @@ pub async fn attach_container(
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
-    let role = resolve_container_role(&state, &uri).await;
+    let role = resolve_container_role(&state, &uri).await?;
     proxy_upgrade_to_role(&state, role, &uri, req).await
 }
 
