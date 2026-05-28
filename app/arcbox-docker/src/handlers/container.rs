@@ -2,7 +2,9 @@ use super::{extract_container_id, proxy_to_role, proxy_upgrade_to_role, resolve_
 use crate::api::AppState;
 use crate::error::{DockerError, Result};
 use crate::proxy::{parse_port_bindings, proxy_to_guest_for_role};
-use crate::routing::{UtilityVmRole, query_param, route_container_create};
+use crate::routing::{
+    UtilityVmRole, UtilityVmRoleExt, extract_compose_project, query_param, route_container_create,
+};
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, Method, Request, Uri};
@@ -44,11 +46,45 @@ pub async fn create_container(
 
     let body_bytes = crate::host_path::rewrite_create_body(body_bytes);
     let route = route_container_create(&uri, &body_bytes);
-    let role = route.utility_vm;
     let requested_name = query_param(&uri, "name").map(str::to_string);
+    let compose_project = extract_compose_project(&body_bytes);
+
+    // If the create is part of a Compose project that already has a role
+    // binding, every service in the project must run on that role. If the
+    // requested platform cannot run on the project's role (e.g. an amd64
+    // service joining a native-bound project) the request is rejected
+    // with a clear error rather than silently splitting the project
+    // across utility VMs.
+    let role = if let Some(ref project) = compose_project {
+        match state.workload_roles.project_role(project).await {
+            Some(project_role) => {
+                if !project_role.can_host(route.platform) {
+                    return Err(DockerError::BadRequest(format!(
+                        "compose project '{project}' is bound to the {} utility VM but \
+                         this service requires {:?}; mixed-backend compose projects \
+                         are not supported",
+                        project_role.as_str(),
+                        route.platform,
+                    )));
+                }
+                project_role
+            }
+            None => {
+                state
+                    .workload_roles
+                    .record_project(project.clone(), route.utility_vm)
+                    .await;
+                route.utility_vm
+            }
+        }
+    } else {
+        route.utility_vm
+    };
+
     tracing::debug!(
         utility_vm = role.as_str(),
         platform = ?route.platform,
+        compose_project = compose_project.as_deref().unwrap_or(""),
         name = requested_name.as_deref().unwrap_or(""),
         "routing Docker container create request"
     );

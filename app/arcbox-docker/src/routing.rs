@@ -6,6 +6,25 @@ use serde_json::Value;
 
 pub use arcbox_core::UtilityVmRole;
 
+/// Extension methods on [`UtilityVmRole`] specific to Docker routing.
+pub trait UtilityVmRoleExt {
+    /// Returns `true` if the utility VM for this role is capable of
+    /// hosting workloads of `platform`.
+    fn can_host(self, platform: WorkloadPlatform) -> bool;
+}
+
+impl UtilityVmRoleExt for UtilityVmRole {
+    fn can_host(self, platform: WorkloadPlatform) -> bool {
+        match self {
+            // VZ + Rosetta hosts both arm64 and amd64.
+            Self::Rosetta => true,
+            // HV runs native ARM64 only; amd64 needs translation only
+            // available via VZ + Rosetta.
+            Self::Native => !matches!(platform, WorkloadPlatform::LinuxAmd64),
+        }
+    }
+}
+
 /// Parsed workload platform from Docker API request metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkloadPlatform {
@@ -107,6 +126,23 @@ fn platform_from_create_body(body: &Bytes) -> Option<WorkloadPlatform> {
     Some(WorkloadPlatform::parse(platform))
 }
 
+/// Extracts the `com.docker.compose.project` label from a
+/// container-create body.
+///
+/// Compose-managed containers carry this label so all services in a
+/// project can be scheduled onto a single utility VM role.
+#[must_use]
+pub fn extract_compose_project(body: &Bytes) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let project = value
+        .pointer("/Labels/com.docker.compose.project")?
+        .as_str()?;
+    if project.is_empty() {
+        return None;
+    }
+    Some(project.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +220,42 @@ mod tests {
         let route = route_build(&uri);
         assert_eq!(route.platform, WorkloadPlatform::LinuxAmd64);
         assert_eq!(route.utility_vm, UtilityVmRole::Rosetta);
+    }
+
+    #[test]
+    fn extracts_compose_project_from_labels() {
+        let body = Bytes::from_static(
+            br#"{"Image":"alpine","Labels":{"com.docker.compose.project":"myproj"}}"#,
+        );
+        assert_eq!(extract_compose_project(&body).as_deref(), Some("myproj"));
+    }
+
+    #[test]
+    fn returns_none_when_no_compose_project_label() {
+        let body = Bytes::from_static(br#"{"Image":"alpine"}"#);
+        assert!(extract_compose_project(&body).is_none());
+        let body = Bytes::from_static(br#"{"Image":"alpine","Labels":{"foo":"bar"}}"#);
+        assert!(extract_compose_project(&body).is_none());
+    }
+
+    #[test]
+    fn returns_none_when_compose_project_is_empty() {
+        let body =
+            Bytes::from_static(br#"{"Image":"alpine","Labels":{"com.docker.compose.project":""}}"#);
+        assert!(extract_compose_project(&body).is_none());
+    }
+
+    #[test]
+    fn native_can_host_arm64_and_unspecified_only() {
+        assert!(UtilityVmRole::Native.can_host(WorkloadPlatform::LinuxArm64));
+        assert!(UtilityVmRole::Native.can_host(WorkloadPlatform::Unspecified));
+        assert!(!UtilityVmRole::Native.can_host(WorkloadPlatform::LinuxAmd64));
+    }
+
+    #[test]
+    fn rosetta_can_host_every_platform() {
+        assert!(UtilityVmRole::Rosetta.can_host(WorkloadPlatform::LinuxAmd64));
+        assert!(UtilityVmRole::Rosetta.can_host(WorkloadPlatform::LinuxArm64));
+        assert!(UtilityVmRole::Rosetta.can_host(WorkloadPlatform::Unspecified));
     }
 }

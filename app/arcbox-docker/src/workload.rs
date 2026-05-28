@@ -46,6 +46,13 @@ struct RegistryInner {
     /// reassigning an alias (or forgetting the previous owner) cannot leave
     /// the alias list and the role binding out of sync.
     alias_owner: HashMap<String, String>,
+    /// Compose project name → the utility VM role that owns the project.
+    ///
+    /// Recorded on the first container created for a project so every
+    /// subsequent service in the same project lands on the same role.
+    /// Entries persist for the daemon's lifetime to keep group routing
+    /// coherent across `docker-compose down`/`up` cycles.
+    projects: HashMap<String, UtilityVmRole>,
 }
 
 impl WorkloadRoleRegistry {
@@ -174,6 +181,38 @@ impl WorkloadRoleRegistry {
             }
         }
         resolved
+    }
+
+    /// Returns the utility VM role recorded for a Compose project, if any.
+    pub async fn project_role(&self, project: &str) -> Option<UtilityVmRole> {
+        self.inner.read().await.projects.get(project).copied()
+    }
+
+    /// Records that `project` is bound to `role`. Subsequent services in
+    /// the same project must match (or be compatible with) this role.
+    ///
+    /// Replacing an existing binding with a different role logs a warning
+    /// and the new value wins; callers should normally consult
+    /// [`Self::project_role`] first and reject incompatible services
+    /// rather than silently re-pinning the project.
+    pub async fn record_project(&self, project: impl Into<String>, role: UtilityVmRole) {
+        let project = project.into();
+        let previous = self
+            .inner
+            .write()
+            .await
+            .projects
+            .insert(project.clone(), role);
+        if let Some(previous) = previous
+            && previous != role
+        {
+            tracing::warn!(
+                project = %project,
+                previous = previous.as_str(),
+                new = role.as_str(),
+                "compose project role binding replaced with a different role",
+            );
+        }
     }
 
     /// Removes the record for `id` and keeps the alias bookkeeping
@@ -458,5 +497,33 @@ mod tests {
         );
         // forget(canonical) still succeeds after the alias was already gone.
         registry.forget(CANONICAL_A).await;
+    }
+
+    #[tokio::test]
+    async fn project_role_returns_none_until_recorded() {
+        let registry = WorkloadRoleRegistry::new();
+        assert!(registry.project_role("proj").await.is_none());
+        registry
+            .record_project("proj", UtilityVmRole::Rosetta)
+            .await;
+        assert_eq!(
+            registry.project_role("proj").await,
+            Some(UtilityVmRole::Rosetta),
+        );
+    }
+
+    #[tokio::test]
+    async fn project_roles_are_independent_of_container_aliases() {
+        let registry = WorkloadRoleRegistry::new();
+        registry.record(CANONICAL_A, UtilityVmRole::Native).await;
+        registry.add_alias(CANONICAL_A, "web").await;
+        registry.record_project("proj", UtilityVmRole::Native).await;
+        // Forgetting the only container of a project does not invalidate
+        // the project binding (we keep it sticky across compose up/down).
+        registry.forget(CANONICAL_A).await;
+        assert_eq!(
+            registry.project_role("proj").await,
+            Some(UtilityVmRole::Native),
+        );
     }
 }
