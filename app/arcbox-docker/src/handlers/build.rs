@@ -26,10 +26,29 @@ crate::handlers::proxy_handler!(build_prune);
 /// BuildKit uses HTTP/1.1 upgrade to establish a gRPC multiplexed session
 /// for features like build mounts, secrets, and SSH forwarding. The upgrade
 /// proxy handles bidirectional stream bridging between client and guest.
+///
+/// Routing limitation: the Docker CLI opens `/session` *before* it sends
+/// the matching `/build` that carries platform metadata, so the role
+/// cannot be derived from the session itself. We forward `/session` to
+/// the native (HV) utility VM by default; an amd64 build that needs
+/// Rosetta-side BuildKit features will not see this session and the
+/// build's side channels will fail. Routing both endpoints requires
+/// lazy session forwarding keyed by `X-Docker-Expose-Session-Uuid`,
+/// which is tracked as a follow-up to this PR.
 pub async fn session(
     axum::extract::State(state): axum::extract::State<crate::api::AppState>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     req: axum::http::Request<axum::body::Body>,
 ) -> crate::error::Result<axum::response::Response> {
+    if let Some(uuid) = req
+        .headers()
+        .get("x-docker-expose-session-uuid")
+        .and_then(|v| v.to_str().ok())
+    {
+        tracing::debug!(
+            session_uuid = %uuid,
+            "forwarding BuildKit /session to the native utility VM",
+        );
+    }
     crate::handlers::proxy_upgrade(&state, &uri, req).await
 }
