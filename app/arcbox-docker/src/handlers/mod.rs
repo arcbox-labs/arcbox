@@ -148,6 +148,23 @@ pub(crate) async fn resolve_role_from_uri(state: &AppState, uri: &Uri) -> Utilit
     UtilityVmRole::Native
 }
 
+/// Ensures the utility VM hosting `role` is up before any request reaches
+/// the connector. Surfaces the role in the error message so a Rosetta-VM
+/// failure can't be confused with a native-VM failure.
+pub(crate) async fn ensure_role_ready(state: &AppState, role: UtilityVmRole) -> Result<()> {
+    state
+        .runtime
+        .ensure_role_ready(role)
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            DockerError::Server(format!(
+                "failed to ensure {} utility VM is ready: {e}",
+                role.as_str(),
+            ))
+        })
+}
+
 /// Forward a request to guest dockerd, ensuring the VM is running first.
 pub(crate) async fn proxy(state: &AppState, uri: &Uri, req: Request<Body>) -> Result<Response> {
     proxy_to_role(state, UtilityVmRole::Native, uri, req).await
@@ -160,11 +177,7 @@ pub(crate) async fn proxy_to_role(
     uri: &Uri,
     req: Request<Body>,
 ) -> Result<Response> {
-    state
-        .runtime
-        .ensure_vm_ready()
-        .await
-        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {e}")))?;
+    ensure_role_ready(state, role).await?;
     proxy::proxy_to_guest_stream_for_role(state.connector.as_ref(), role, uri, req).await
 }
 
@@ -184,11 +197,7 @@ pub(crate) async fn proxy_upload_to_role(
     uri: &Uri,
     req: Request<Body>,
 ) -> Result<Response> {
-    state
-        .runtime
-        .ensure_vm_ready()
-        .await
-        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {e}")))?;
+    ensure_role_ready(state, role).await?;
     proxy::proxy_streaming_upload_for_role(state.connector.as_ref(), role, uri, req).await
 }
 
@@ -208,11 +217,7 @@ pub(crate) async fn proxy_upgrade_to_role(
     uri: &Uri,
     req: Request<Body>,
 ) -> Result<Response> {
-    state
-        .runtime
-        .ensure_vm_ready()
-        .await
-        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {e}")))?;
+    ensure_role_ready(state, role).await?;
     proxy::proxy_with_upgrade_for_role(state.connector.as_ref(), role, req, uri).await
 }
 

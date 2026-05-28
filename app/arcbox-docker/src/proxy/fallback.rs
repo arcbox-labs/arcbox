@@ -2,8 +2,8 @@
 
 use super::{forward, upgrade, upload};
 use crate::api::AppState;
-use crate::error::{DockerError, Result};
-use crate::handlers::resolve_role_from_uri;
+use crate::error::Result;
+use crate::handlers::{ensure_role_ready, resolve_role_from_uri};
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
 use axum::http::{Response, header};
@@ -31,11 +31,7 @@ pub async fn proxy_fallback(
         utility_vm = role.as_str(),
         "proxy_fallback dispatch",
     );
-    state
-        .runtime
-        .ensure_vm_ready()
-        .await
-        .map_err(|e| DockerError::Server(format!("failed to ensure VM is ready: {e}")))?;
+    ensure_role_ready(&state, role).await?;
 
     // Detect upgrade requests (attach, exec, BuildKit gRPC/session).
     let wants_upgrade = req.headers().get(header::UPGRADE).is_some()

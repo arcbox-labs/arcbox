@@ -4,25 +4,7 @@ use axum::http::Uri;
 use bytes::Bytes;
 use serde_json::Value;
 
-/// Guest utility VM role selected for a Docker workload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UtilityVmRole {
-    /// Native fast path backed by the HV utility VM.
-    Native,
-    /// Rosetta compatibility path backed by the VZ utility VM.
-    Rosetta,
-}
-
-impl UtilityVmRole {
-    /// Stable diagnostic label for this utility VM role.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Native => "native",
-            Self::Rosetta => "rosetta",
-        }
-    }
-}
+pub use arcbox_core::UtilityVmRole;
 
 /// Parsed workload platform from Docker API request metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
