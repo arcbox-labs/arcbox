@@ -42,6 +42,10 @@ struct RegistryInner {
     /// Canonical ID → aliases registered for it, so a single `forget` or
     /// `rename_alias` call can update every binding atomically.
     aliases: HashMap<String, Vec<String>>,
+    /// Alias key → the canonical it currently belongs to. Required so that
+    /// reassigning an alias (or forgetting the previous owner) cannot leave
+    /// the alias list and the role binding out of sync.
+    alias_owner: HashMap<String, String>,
 }
 
 impl WorkloadRoleRegistry {
@@ -77,6 +81,12 @@ impl WorkloadRoleRegistry {
     /// shares the role binding of `canonical`. The alias is tracked so that
     /// [`Self::forget`] or [`Self::rename_alias`] can drop it cleanly.
     ///
+    /// If the alias is currently owned by a different canonical (e.g. a
+    /// previous container with the same name that has not yet been
+    /// forgotten), the alias is detached from the previous owner first so
+    /// the old owner's alias list never points to a key that now resolves
+    /// to a different role.
+    ///
     /// Does nothing if `canonical` has no recorded role yet — callers should
     /// always [`Self::record`] the canonical first.
     pub async fn add_alias(&self, canonical: &str, alias: impl Into<String>) {
@@ -93,12 +103,15 @@ impl WorkloadRoleRegistry {
             );
             return;
         };
+        detach_alias_from_previous_owner(&mut guard, &alias);
         guard.roles.insert(alias.clone(), role);
         guard
-            .aliases
-            .entry(canonical.to_string())
-            .or_default()
-            .push(alias);
+            .alias_owner
+            .insert(alias.clone(), canonical.to_string());
+        let entry = guard.aliases.entry(canonical.to_string()).or_default();
+        if !entry.iter().any(|existing| existing == &alias) {
+            entry.push(alias);
+        }
     }
 
     /// Replaces every alias previously registered against `canonical` with a
@@ -113,17 +126,28 @@ impl WorkloadRoleRegistry {
         if let Some(old_aliases) = guard.aliases.remove(canonical) {
             for old in old_aliases {
                 guard.roles.remove(&old);
+                guard.alias_owner.remove(&old);
             }
         }
         if new_alias.is_empty() || new_alias == canonical {
             return;
         }
+        detach_alias_from_previous_owner(&mut guard, &new_alias);
         guard.roles.insert(new_alias.clone(), role);
+        guard
+            .alias_owner
+            .insert(new_alias.clone(), canonical.to_string());
         guard.aliases.insert(canonical.to_string(), vec![new_alias]);
     }
 
-    /// Returns the recorded role for `id`, considering exact matches and
-    /// hex short-ID prefix matches against canonical entries.
+    /// Returns the recorded role for `id`. Considers, in order:
+    ///
+    /// 1. Direct hits in the canonical/alias map.
+    /// 2. Hex short-ID prefix matches against canonical entries: if every
+    ///    match agrees on a single role that role is returned; if matches
+    ///    disagree on role (cross-VM ambiguity) `None` is returned so the
+    ///    caller falls back to the native default rather than silently
+    ///    picking the wrong VM.
     pub async fn lookup(&self, id: &str) -> Option<UtilityVmRole> {
         let guard = self.inner.read().await;
         if let Some(role) = guard.roles.get(id).copied() {
@@ -132,25 +156,65 @@ impl WorkloadRoleRegistry {
         if !is_hex_short_id(id) {
             return None;
         }
-        guard
-            .roles
-            .iter()
-            .find(|(key, _)| is_canonical_id(key) && key.starts_with(id))
-            .map(|(_, role)| *role)
+        let mut resolved: Option<UtilityVmRole> = None;
+        for (key, role) in &guard.roles {
+            if !is_canonical_id(key) || !key.starts_with(id) {
+                continue;
+            }
+            match resolved {
+                None => resolved = Some(*role),
+                Some(existing) if existing != *role => {
+                    tracing::warn!(
+                        prefix = %id,
+                        "short ID prefix matches workloads on multiple roles; refusing to guess",
+                    );
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        resolved
     }
 
-    /// Removes the record for `id`. If `id` is a canonical with tracked
-    /// aliases, the aliases are dropped as well. Returns the role that was
-    /// associated with `id`, if any.
+    /// Removes the record for `id` and keeps the alias bookkeeping
+    /// consistent. Returns the role that was associated with `id`, if any.
+    ///
+    /// - If `id` is a canonical with tracked aliases, every alias still
+    ///   owned by this canonical is dropped from `roles` and `alias_owner`.
+    ///   Aliases that have since been reassigned to another canonical are
+    ///   left intact.
+    /// - If `id` is itself an alias, it is removed from its owner's alias
+    ///   list and from `alias_owner`.
     pub async fn forget(&self, id: &str) -> Option<UtilityVmRole> {
         let mut guard = self.inner.write().await;
         let role = guard.roles.remove(id);
-        if let Some(aliases) = guard.aliases.remove(id) {
-            for alias in aliases {
-                guard.roles.remove(&alias);
+        if let Some(alias_list) = guard.aliases.remove(id) {
+            for alias in alias_list {
+                if guard.alias_owner.get(&alias).map(String::as_str) == Some(id) {
+                    guard.roles.remove(&alias);
+                    guard.alias_owner.remove(&alias);
+                }
             }
         }
+        if let Some(owner) = guard.alias_owner.remove(id)
+            && let Some(owner_aliases) = guard.aliases.get_mut(&owner)
+        {
+            owner_aliases.retain(|a| a != id);
+        }
         role
+    }
+}
+
+/// If `alias` currently belongs to a different canonical, drop it from that
+/// canonical's alias list so a later `forget`/`rename_alias` against the old
+/// owner can't accidentally remove the binding that now points to the new
+/// owner.
+fn detach_alias_from_previous_owner(inner: &mut RegistryInner, alias: &str) {
+    let Some(previous_owner) = inner.alias_owner.remove(alias) else {
+        return;
+    };
+    if let Some(previous_list) = inner.aliases.get_mut(&previous_owner) {
+        previous_list.retain(|existing| existing != alias);
     }
 }
 
@@ -295,5 +359,104 @@ mod tests {
         registry.record(CANONICAL_A, UtilityVmRole::Rosetta).await;
         // `alpine` contains non-hex characters; prefix scan must not fire.
         assert!(registry.lookup("alpine").await.is_none());
+    }
+
+    /// Two canonicals share the same hex prefix but live on different VMs.
+    /// Returning either role would be a silent misroute, so the registry
+    /// must refuse to resolve the prefix.
+    #[tokio::test]
+    async fn cross_role_prefix_collision_returns_none() {
+        let prefix = "abcd";
+        let canonical_x = format!("{prefix}{}", "1".repeat(60));
+        let canonical_y = format!("{prefix}{}", "2".repeat(60));
+        let registry = WorkloadRoleRegistry::new();
+        registry.record(canonical_x, UtilityVmRole::Native).await;
+        registry.record(canonical_y, UtilityVmRole::Rosetta).await;
+        assert!(registry.lookup(prefix).await.is_none());
+    }
+
+    /// Two canonicals share the same hex prefix but are on the same role.
+    /// The user's prefix is ambiguous for *which container* but unambiguous
+    /// for routing, so the registry returns the agreed role.
+    #[tokio::test]
+    async fn same_role_prefix_collision_resolves() {
+        let prefix = "deed";
+        let canonical_x = format!("{prefix}{}", "1".repeat(60));
+        let canonical_y = format!("{prefix}{}", "2".repeat(60));
+        let registry = WorkloadRoleRegistry::new();
+        registry.record(canonical_x, UtilityVmRole::Rosetta).await;
+        registry.record(canonical_y, UtilityVmRole::Rosetta).await;
+        assert_eq!(registry.lookup(prefix).await, Some(UtilityVmRole::Rosetta),);
+    }
+
+    /// Reassigning the same alias from canonical A to canonical B must:
+    ///   (a) make the alias resolve to B's role,
+    ///   (b) survive a subsequent `forget(A)` — A's alias list should no
+    ///       longer claim ownership of the alias.
+    #[tokio::test]
+    async fn alias_reassignment_survives_old_owner_forget() {
+        let registry = WorkloadRoleRegistry::new();
+        registry.record(CANONICAL_A, UtilityVmRole::Native).await;
+        registry.add_alias(CANONICAL_A, "web").await;
+        registry.record(CANONICAL_B, UtilityVmRole::Rosetta).await;
+        registry.add_alias(CANONICAL_B, "web").await;
+        assert_eq!(registry.lookup("web").await, Some(UtilityVmRole::Rosetta));
+
+        // Forgetting A must not drop the binding now owned by B.
+        registry.forget(CANONICAL_A).await;
+        assert_eq!(registry.lookup("web").await, Some(UtilityVmRole::Rosetta));
+    }
+
+    /// Renaming canonical A's alias to one currently owned by B steals the
+    /// alias from B's bookkeeping rather than leaving a dangling entry that
+    /// a later `forget(B)` would drop incorrectly.
+    #[tokio::test]
+    async fn rename_alias_steals_from_previous_owner() {
+        let registry = WorkloadRoleRegistry::new();
+        registry.record(CANONICAL_A, UtilityVmRole::Native).await;
+        registry.record(CANONICAL_B, UtilityVmRole::Rosetta).await;
+        registry.add_alias(CANONICAL_B, "web").await;
+
+        // A is renamed to "web", stealing the alias from B.
+        registry.rename_alias(CANONICAL_A, "web").await;
+        assert_eq!(registry.lookup("web").await, Some(UtilityVmRole::Native));
+
+        // forget(B) must not undo A's claim on "web".
+        registry.forget(CANONICAL_B).await;
+        assert_eq!(registry.lookup("web").await, Some(UtilityVmRole::Native));
+    }
+
+    /// Adding the same alias to the same canonical twice should not produce
+    /// duplicate entries in the canonical's alias list — otherwise the next
+    /// `forget` would attempt redundant cleanup and any future reassignment
+    /// would mis-account.
+    #[tokio::test]
+    async fn duplicate_alias_for_same_canonical_is_deduped() {
+        let registry = WorkloadRoleRegistry::new();
+        registry.record(CANONICAL_A, UtilityVmRole::Native).await;
+        registry.add_alias(CANONICAL_A, "web").await;
+        registry.add_alias(CANONICAL_A, "web").await;
+        // A single forget must clear the alias cleanly.
+        registry.forget(CANONICAL_A).await;
+        assert!(registry.lookup("web").await.is_none());
+        assert!(registry.lookup(CANONICAL_A).await.is_none());
+    }
+
+    /// Forgetting an alias key should leave the canonical untouched but
+    /// remove the alias from `roles` and `alias_owner` so a later
+    /// `forget(canonical)` does not try to scrub it twice.
+    #[tokio::test]
+    async fn forget_alias_only_removes_alias() {
+        let registry = WorkloadRoleRegistry::new();
+        registry.record(CANONICAL_A, UtilityVmRole::Native).await;
+        registry.add_alias(CANONICAL_A, "web").await;
+        assert_eq!(registry.forget("web").await, Some(UtilityVmRole::Native));
+        assert!(registry.lookup("web").await.is_none());
+        assert_eq!(
+            registry.lookup(CANONICAL_A).await,
+            Some(UtilityVmRole::Native),
+        );
+        // forget(canonical) still succeeds after the alias was already gone.
+        registry.forget(CANONICAL_A).await;
     }
 }

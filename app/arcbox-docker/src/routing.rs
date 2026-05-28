@@ -106,6 +106,11 @@ fn platform_from_query(uri: &Uri) -> Option<WorkloadPlatform> {
 
 /// Returns the value of the first non-empty `key` parameter in `uri`'s
 /// query string, matched case-insensitively.
+///
+/// The value is returned **raw** — percent-encoding is not decoded. Current
+/// callers only use this for ASCII-safe identifiers (`platform`, `name`),
+/// so this is acceptable; introducing values that could plausibly carry
+/// percent-encoded bytes would require decoding first.
 #[must_use]
 pub fn query_param<'a>(uri: &'a Uri, key: &str) -> Option<&'a str> {
     uri.query()?.split('&').find_map(|pair| {
