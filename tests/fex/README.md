@@ -18,7 +18,8 @@ where the daemon cannot boot a VM.
 3. The FEX64 interpreter provisioned in the guest runtime assets and registered
    via `binfmt_misc` (see "What must be in the guest" below).
 4. The `arcbox` Docker context active, or pass `--context arcbox` (the script
-   does this automatically).
+   does this automatically). The context endpoint is
+   `unix:///<home>/.arcbox/run/docker.sock`.
 
 ## Run
 
