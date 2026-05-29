@@ -26,19 +26,19 @@
 //! - For containers, the canonical 64-char ID, the user-supplied name (e.g.
 //!   `--name web`), and any subsequent rename are all registered. Lookup by
 //!   short hex prefix (≥ 4 chars) is also supported so `docker logs ab12c3`
-//!   resolves to the same role as the canonical entry, except when the
-//!   prefix is ambiguous across roles (handled per above).
-//! - For BuildKit, [`WorkloadRoleRegistry::wait_for_role`] lets `/session`
-//!   block until the matching `/build` declares its role under the same
-//!   `X-Docker-Expose-Session-Uuid`, so the upgraded gRPC stream and the
-//!   build land on the same utility VM. On timeout `/session` fails
-//!   closed at the handler layer rather than forwarding blind.
+//!   resolves to the same canonical entry, except when the prefix is
+//!   ambiguous (handled per above).
+//!
+//! ABX-375 runs a single HV utility VM, so every recorded role is
+//! [`UtilityVmRole::Native`]. The registry is retained (rather than removed)
+//! because it still maps short IDs / `--name` aliases to canonical IDs and
+//! fails closed on ambiguity; the role field is the seam that the demoted
+//! VZ/Rosetta build backend and the ABX-374 fallback continue to rely on.
 
 use crate::routing::UtilityVmRole;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::RwLock;
 
 /// Result of a registry lookup. Distinguishes "no role known" from
 /// "multiple roles could claim this identifier" so the caller can fail
@@ -74,10 +74,6 @@ impl WorkloadRoleLookup {
 #[derive(Debug, Default)]
 pub struct WorkloadRoleRegistry {
     inner: RwLock<RegistryInner>,
-    /// Broadcast signal fired whenever a new role binding is recorded.
-    /// Used by [`Self::wait_for_role`] so a BuildKit `/session` request
-    /// can block until the matching `/build` declares the role.
-    role_recorded: Notify,
 }
 
 #[derive(Debug, Default)]
@@ -91,13 +87,6 @@ struct RegistryInner {
     /// reassigning an alias (or forgetting the previous owner) cannot leave
     /// the alias list and the role binding out of sync.
     alias_owner: HashMap<String, String>,
-    /// Compose project name → the utility VM role that owns the project.
-    ///
-    /// Recorded on the first container created for a project so every
-    /// subsequent service in the same project lands on the same role.
-    /// Entries persist for the daemon's lifetime to keep group routing
-    /// coherent across `docker-compose down`/`up` cycles.
-    projects: HashMap<String, UtilityVmRole>,
 }
 
 impl WorkloadRoleRegistry {
@@ -107,8 +96,7 @@ impl WorkloadRoleRegistry {
         Arc::new(Self::default())
     }
 
-    /// Records a role binding for `id` (a canonical container ID, exec ID,
-    /// or BuildKit session UUID).
+    /// Records a role binding for `id` (a canonical container ID or exec ID).
     ///
     /// Replacing an existing binding with a different role indicates the
     /// caller is mixing roles for the same ID, which would corrupt routing
@@ -126,50 +114,6 @@ impl WorkloadRoleRegistry {
                 new = role.as_str(),
                 "workload role record replaced with a different role",
             );
-        }
-        // Wake any `wait_for_role` callers (e.g. BuildKit `/session`
-        // handlers parked waiting for the matching `/build` to declare
-        // the role). False wake-ups are filtered by the re-check loop.
-        self.role_recorded.notify_waiters();
-    }
-
-    /// Waits until `key` has a recorded role binding, or `max_wait`
-    /// elapses, whichever comes first.
-    ///
-    /// Returns [`WorkloadRoleLookup::Found`] once recorded,
-    /// [`WorkloadRoleLookup::Missing`] on timeout, or
-    /// [`WorkloadRoleLookup::Ambiguous`] in the (pathological) case where
-    /// the key resolves to multiple roles. Designed for BuildKit
-    /// `/session` requests that arrive before the matching `/build`
-    /// declares the session's utility VM role.
-    pub async fn wait_for_role(&self, key: &str, max_wait: Duration) -> WorkloadRoleLookup {
-        let deadline = Instant::now() + max_wait;
-        loop {
-            match self.lookup(key).await {
-                WorkloadRoleLookup::Found(role) => return WorkloadRoleLookup::Found(role),
-                WorkloadRoleLookup::Ambiguous => return WorkloadRoleLookup::Ambiguous,
-                WorkloadRoleLookup::Missing => {}
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return WorkloadRoleLookup::Missing;
-            }
-            // Subscribe to the next signal *before* re-checking so we
-            // can't lose a concurrent `record` that fires between the
-            // miss above and the await below.
-            let notified = self.role_recorded.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            match self.lookup(key).await {
-                WorkloadRoleLookup::Found(role) => return WorkloadRoleLookup::Found(role),
-                WorkloadRoleLookup::Ambiguous => return WorkloadRoleLookup::Ambiguous,
-                WorkloadRoleLookup::Missing => {}
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            tokio::select! {
-                () = notified => {}
-                () = tokio::time::sleep(remaining) => return WorkloadRoleLookup::Missing,
-            }
         }
     }
 
@@ -272,38 +216,6 @@ impl WorkloadRoleRegistry {
         match resolved {
             Some(role) => WorkloadRoleLookup::Found(role),
             None => WorkloadRoleLookup::Missing,
-        }
-    }
-
-    /// Returns the utility VM role recorded for a Compose project, if any.
-    pub async fn project_role(&self, project: &str) -> Option<UtilityVmRole> {
-        self.inner.read().await.projects.get(project).copied()
-    }
-
-    /// Records that `project` is bound to `role`. Subsequent services in
-    /// the same project must match (or be compatible with) this role.
-    ///
-    /// Replacing an existing binding with a different role logs a warning
-    /// and the new value wins; callers should normally consult
-    /// [`Self::project_role`] first and reject incompatible services
-    /// rather than silently re-pinning the project.
-    pub async fn record_project(&self, project: impl Into<String>, role: UtilityVmRole) {
-        let project = project.into();
-        let previous = self
-            .inner
-            .write()
-            .await
-            .projects
-            .insert(project.clone(), role);
-        if let Some(previous) = previous
-            && previous != role
-        {
-            tracing::warn!(
-                project = %project,
-                previous = previous.as_str(),
-                new = role.as_str(),
-                "compose project role binding replaced with a different role",
-            );
         }
     }
 
@@ -625,70 +537,5 @@ mod tests {
         );
         // forget(canonical) still succeeds after the alias was already gone.
         registry.forget(CANONICAL_A).await;
-    }
-
-    #[tokio::test]
-    async fn project_role_returns_none_until_recorded() {
-        let registry = WorkloadRoleRegistry::new();
-        assert!(registry.project_role("proj").await.is_none());
-        registry
-            .record_project("proj", UtilityVmRole::Rosetta)
-            .await;
-        assert_eq!(
-            registry.project_role("proj").await,
-            Some(UtilityVmRole::Rosetta),
-        );
-    }
-
-    #[tokio::test]
-    async fn wait_for_role_returns_existing_binding_immediately() {
-        let registry = WorkloadRoleRegistry::new();
-        registry
-            .record("session-uuid", UtilityVmRole::Rosetta)
-            .await;
-        let role = registry
-            .wait_for_role("session-uuid", Duration::from_secs(1))
-            .await;
-        assert_eq!(role, WorkloadRoleLookup::Found(UtilityVmRole::Rosetta));
-    }
-
-    #[tokio::test]
-    async fn wait_for_role_wakes_when_record_arrives_later() {
-        let registry = WorkloadRoleRegistry::new();
-        let registry2 = Arc::clone(&registry);
-        let writer = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            registry2.record("late-uuid", UtilityVmRole::Rosetta).await;
-        });
-
-        let role = registry
-            .wait_for_role("late-uuid", Duration::from_secs(2))
-            .await;
-        writer.await.unwrap();
-        assert_eq!(role, WorkloadRoleLookup::Found(UtilityVmRole::Rosetta));
-    }
-
-    #[tokio::test]
-    async fn wait_for_role_returns_missing_after_timeout() {
-        let registry = WorkloadRoleRegistry::new();
-        let role = registry
-            .wait_for_role("never-recorded", Duration::from_millis(50))
-            .await;
-        assert_eq!(role, WorkloadRoleLookup::Missing);
-    }
-
-    #[tokio::test]
-    async fn project_roles_are_independent_of_container_aliases() {
-        let registry = WorkloadRoleRegistry::new();
-        registry.record(CANONICAL_A, UtilityVmRole::Native).await;
-        registry.add_alias(CANONICAL_A, "web").await;
-        registry.record_project("proj", UtilityVmRole::Native).await;
-        // Forgetting the only container of a project does not invalidate
-        // the project binding (we keep it sticky across compose up/down).
-        registry.forget(CANONICAL_A).await;
-        assert_eq!(
-            registry.project_role("proj").await,
-            Some(UtilityVmRole::Native),
-        );
     }
 }

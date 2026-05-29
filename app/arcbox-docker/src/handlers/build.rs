@@ -1,41 +1,28 @@
+use crate::routing::{UtilityVmRole, route_build};
+
 /// Forwards `POST /build` to guest dockerd through the upload-specific proxy
 /// path, which applies backpressure via a bounded channel so large build
 /// contexts (monorepos, node_modules) don't OOM the proxy.
 ///
-/// All build options (tags, target, build-args, platform, etc.) are passed as
-/// query parameters and forwarded verbatim to guest dockerd's BuildKit.
-///
-/// Also records the BuildKit session UUID (carried by the
-/// `X-Docker-Expose-Session-Uuid` header) so a parallel `/session`
-/// request on the same UUID can be routed to the same utility VM. The
-/// Docker CLI sends the two endpoints concurrently, and `/session` may
-/// arrive first; the UUID binding lets that handler park on
-/// [`WorkloadRoleRegistry::wait_for_role`] until this `/build` declares
-/// the role.
+/// ABX-375: builds run in the single HV utility VM. `--platform linux/amd64`
+/// build steps execute via FEX64 inside that VM; if FEX64 is not provisioned
+/// the build fails closed (no silent VZ/Rosetta or QEMU fallback). All build
+/// options (tags, target, build-args, platform, etc.) are forwarded verbatim
+/// to guest dockerd's BuildKit.
 pub async fn build_image(
     axum::extract::State(state): axum::extract::State<crate::api::AppState>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     req: axum::http::Request<axum::body::Body>,
 ) -> crate::error::Result<axum::response::Response> {
-    let route = crate::routing::route_build(&uri);
-    let session_uuid = req
-        .headers()
-        .get("x-docker-expose-session-uuid")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let route = route_build(&uri);
+    crate::handlers::require_amd64_runtime(&state, route).await?;
     tracing::debug!(
-        utility_vm = route.utility_vm.as_str(),
+        backend = "hv",
+        translator = route.translator.as_str(),
         platform = ?route.platform,
-        session_uuid = session_uuid.as_deref().unwrap_or(""),
         "routing Docker build request"
     );
-    if let Some(ref uuid) = session_uuid {
-        state
-            .workload_roles
-            .record(uuid.clone(), route.utility_vm)
-            .await;
-    }
-    crate::handlers::proxy_upload_to_role(&state, route.utility_vm, &uri, req).await
+    crate::handlers::proxy_upload_to_role(&state, route.utility_vm(), &uri, req).await
 }
 
 // Forwards `POST /build/prune` (prune build cache) to guest dockerd.
@@ -44,78 +31,16 @@ crate::handlers::proxy_handler!(build_prune);
 /// Forwards `POST /session` to guest dockerd via the upgrade proxy.
 ///
 /// BuildKit uses HTTP/1.1 upgrade to establish a gRPC multiplexed session
-/// for features like build mounts, secrets, and SSH forwarding. The upgrade
-/// proxy handles bidirectional stream bridging between client and guest.
+/// for build mounts, secrets, and SSH forwarding. The upgrade proxy bridges
+/// the bidirectional stream between client and guest.
 ///
-/// The Docker CLI opens `/session` and the matching `/build` concurrently,
-/// and the session itself carries no platform metadata — the role must
-/// come from `/build`. We resolve the session's role via
-/// [`crate::workload::WorkloadRoleRegistry::wait_for_role`], keyed by the
-/// BuildKit `X-Docker-Expose-Session-Uuid` header:
-///
-/// 1. If `/build` already recorded the UUID, we forward immediately to
-///    that role.
-/// 2. If `/session` arrives first, we wait up to
-///    [`SESSION_ROLE_WAIT_TIMEOUT`] for `/build` to declare the role.
-/// 3. On timeout (no matching `/build` arrived) we fail closed with a
-///    400, instead of routing to native: silently forwarding to the
-///    wrong VM would leave the BuildKit gRPC session attached to a guest
-///    that doesn't know about the upcoming amd64 build, producing
-///    hard-to-diagnose secrets/mounts/ssh failures partway through.
-/// 4. An ambiguous binding (multiple roles recorded for the same UUID —
-///    a registry corruption case that should never happen in practice)
-///    is also a 409.
+/// ABX-375: there is a single HV utility VM, so the session always targets
+/// it — no cross-VM `/session` role synchronization is required (unlike the
+/// dual-VM ABX-374 path).
 pub async fn session(
     axum::extract::State(state): axum::extract::State<crate::api::AppState>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     req: axum::http::Request<axum::body::Body>,
 ) -> crate::error::Result<axum::response::Response> {
-    use crate::workload::WorkloadRoleLookup;
-    let session_uuid = req
-        .headers()
-        .get("x-docker-expose-session-uuid")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let role = match session_uuid {
-        Some(uuid) => match state
-            .workload_roles
-            .wait_for_role(&uuid, SESSION_ROLE_WAIT_TIMEOUT)
-            .await
-        {
-            WorkloadRoleLookup::Found(role) => {
-                tracing::debug!(
-                    session_uuid = %uuid,
-                    utility_vm = role.as_str(),
-                    "routing BuildKit /session to recorded role",
-                );
-                role
-            }
-            WorkloadRoleLookup::Missing => {
-                return Err(crate::error::DockerError::BadRequest(format!(
-                    "BuildKit /session UUID '{uuid}' timed out after {}s waiting \
-                     for the matching /build to declare a utility VM role; \
-                     refusing to forward the session blind",
-                    SESSION_ROLE_WAIT_TIMEOUT.as_secs(),
-                )));
-            }
-            WorkloadRoleLookup::Ambiguous => {
-                return Err(crate::error::DockerError::Conflict(format!(
-                    "BuildKit /session UUID '{uuid}' resolves to multiple utility VMs",
-                )));
-            }
-        },
-        None => {
-            tracing::debug!("BuildKit /session without UUID; defaulting to native");
-            crate::routing::UtilityVmRole::Native
-        }
-    };
-    crate::handlers::proxy_upgrade_to_role(&state, role, &uri, req).await
+    crate::handlers::proxy_upgrade_to_role(&state, UtilityVmRole::Native, &uri, req).await
 }
-
-/// Maximum time `/session` parks waiting for `/build` to declare the
-/// role for the same `X-Docker-Expose-Session-Uuid`.
-///
-/// 30 seconds matches BuildKit's own session-handshake timeout and
-/// covers the worst-case CLI scheduling delay between the parallel
-/// `/session` and `/build` connections.
-const SESSION_ROLE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
