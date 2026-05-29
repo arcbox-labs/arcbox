@@ -113,12 +113,15 @@ fn extract_id_after_segment(uri: &Uri, segment: &str, skip_tokens: &[&str]) -> O
 /// 1. Consult the in-process [`WorkloadRoleRegistry`]. A
 ///    [`WorkloadRoleLookup::Found`] returns the role directly. A
 ///    [`WorkloadRoleLookup::Ambiguous`] short ID surfaces as a 409
-///    Conflict so we never silently pick a VM.
+///    Conflict so we never silently pick a workload.
 /// 2. On [`WorkloadRoleLookup::Missing`] (e.g. after a daemon restart),
-///    probe every configured role's guest dockerd. Exactly one match is
-///    recorded and returned; multiple matches surface as a 409 Conflict.
-///    Zero matches falls back to `native` so the request still reaches a
-///    guest that can return the appropriate `404 No such container`.
+///    probe the single HV guest dockerd. A hit is recorded and returned;
+///    a miss falls back to `native` so the request still reaches the HV
+///    guest, which returns the appropriate `404 No such container`.
+///
+/// ABX-375 runs one runtime VM, so the resolved role is always
+/// [`UtilityVmRole::Native`]; the registry still disambiguates short
+/// IDs / names within that VM.
 pub(crate) async fn resolve_container_role(state: &AppState, uri: &Uri) -> Result<UtilityVmRole> {
     let Some(id) = extract_container_id(uri) else {
         return Ok(UtilityVmRole::Native);
@@ -191,55 +194,57 @@ pub(crate) async fn resolve_role_from_uri(state: &AppState, uri: &Uri) -> Result
     Ok(UtilityVmRole::Native)
 }
 
-/// Probes **every** configured utility VM's guest dockerd for a container
-/// matching `container_id` and reports whether zero, one, or multiple
-/// guests claim it.
+/// Recovers the role for a container whose binding is missing from the
+/// in-process registry (e.g. after an `arcbox-daemon` restart) by probing
+/// the runtime guest dockerd.
 ///
-/// Returning on the first match would re-introduce the silent-misroute
-/// bug for cross-VM short-ID collisions: a 12-char prefix might match
-/// canonical IDs on both VMs. We always probe both and treat a
-/// double-hit as ambiguous so the caller fails closed.
-///
-/// The Native probe is essentially free (its VM is already up); the
-/// Rosetta probe triggers lazy VZ startup on first miss, which is the
-/// recovery behavior we want when a rosetta workload survives an
-/// `arcbox-daemon` restart.
+/// ABX-375: runtime is single-VM, so this probes **only** the HV (Native)
+/// VM. It must never probe the VZ/Rosetta build backend — doing so would
+/// boot a VZ VM that the runtime path is required never to start.
 async fn rebuild_container_role_from_guests(
     state: &AppState,
     container_id: &str,
 ) -> WorkloadRoleLookup {
-    let mut hits: Vec<UtilityVmRole> = Vec::new();
-    for role in [UtilityVmRole::Native, UtilityVmRole::Rosetta] {
-        if role != UtilityVmRole::Native && !state.runtime.role_is_distinct(role) {
-            continue;
-        }
-        if probe_container_exists(state, role, container_id).await {
-            hits.push(role);
-        }
-    }
-    match hits.as_slice() {
-        [] => WorkloadRoleLookup::Missing,
-        [only] => WorkloadRoleLookup::Found(*only),
-        _ => {
-            tracing::warn!(
-                container_id,
-                ?hits,
-                "container identifier resolves on multiple utility VMs",
-            );
-            WorkloadRoleLookup::Ambiguous
-        }
+    if probe_container_exists(state, UtilityVmRole::Native, container_id).await {
+        WorkloadRoleLookup::Found(UtilityVmRole::Native)
+    } else {
+        WorkloadRoleLookup::Missing
     }
 }
 
 /// Returns a 409 Conflict describing an ambiguous workload identifier.
 ///
-/// Used both for in-registry prefix collisions and for guest-probe
-/// rebuilds that find the same name/short-ID on more than one VM.
+/// Surfaced when a short ID / name resolves to more than one binding in the
+/// registry. Runtime is single-VM, so ambiguity comes from prefix collisions
+/// within the one VM, not cross-VM.
 fn ambiguous_workload_error(id: &str) -> DockerError {
     DockerError::Conflict(format!(
-        "workload identifier '{id}' is ambiguous: it matches workloads on \
-         multiple utility VMs. Use the full canonical container ID."
+        "workload identifier '{id}' is ambiguous: it matches multiple workloads. \
+         Use the full canonical container ID."
     ))
+}
+
+/// Fail-closed admission for a routed runtime workload.
+///
+/// `linux/amd64` containers run via FEX64 inside the HV guest. If FEX64 is
+/// not provisioned (`<data_dir>/bin/FEX` absent → no x86_64 `binfmt_misc`
+/// handler in the guest), this returns a clear error instead of letting the
+/// request silently route to VZ/Rosetta or QEMU, or fail later with a
+/// cryptic `exec format error`. Native (arm64) workloads are always admitted.
+pub(crate) async fn require_amd64_runtime(
+    state: &AppState,
+    route: crate::routing::RoutingDecision,
+) -> Result<()> {
+    if crate::routing::is_admissible(route, state.runtime.amd64_runtime_supported()) {
+        return Ok(());
+    }
+    Err(DockerError::NotImplemented(format!(
+        "linux/amd64 runtime requires FEX64 in the HV guest, which is not provisioned \
+         (expected /arcbox/bin/FEX). amd64 runtime containers are served by FEX64 inside \
+         the single HV utility VM; ArcBox does not fall back to a VZ/Rosetta runtime VM. \
+         Requested platform: {:?}.",
+        route.platform,
+    )))
 }
 
 /// Returns `true` if `container_id` exists on `role`'s guest dockerd.

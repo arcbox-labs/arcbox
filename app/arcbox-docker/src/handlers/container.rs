@@ -1,10 +1,11 @@
-use super::{extract_container_id, proxy_to_role, proxy_upgrade_to_role, resolve_container_role};
+use super::{
+    extract_container_id, proxy_to_role, proxy_upgrade_to_role, require_amd64_runtime,
+    resolve_container_role,
+};
 use crate::api::AppState;
 use crate::error::{DockerError, Result};
 use crate::proxy::{parse_port_bindings, proxy_to_guest_for_role};
-use crate::routing::{
-    UtilityVmRole, UtilityVmRoleExt, extract_compose_project, query_param, route_container_create,
-};
+use crate::routing::{UtilityVmRole, query_param, route_container_create};
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, Method, Request, Uri};
@@ -30,9 +31,14 @@ crate::handlers::container_proxy_handler!(container_changes);
 /// isolated tmpfs. This handler resolves the top-level symlink so
 /// bind-mount paths land on the VirtioFS share.
 ///
-/// On a successful response, the canonical container ID is recorded against
-/// the chosen utility VM role so every follow-up lifecycle call is routed
-/// to the same role.
+/// ABX-375: every runtime container runs in the single HV utility VM.
+/// `linux/amd64` is executed via FEX64 inside that VM; if FEX64 is not
+/// provisioned in the guest, the request fails closed with a clear error
+/// rather than silently routing to VZ/Rosetta or QEMU. Compose projects need
+/// no cross-VM scheduling — all services share the one HV VM.
+///
+/// On a successful response the canonical container ID (and any `--name`) is
+/// recorded so follow-up lifecycle calls resolve to the same VM.
 pub async fn create_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -47,61 +53,17 @@ pub async fn create_container(
     let body_bytes = crate::host_path::rewrite_create_body(body_bytes);
     let route = route_container_create(&uri, &body_bytes);
     let requested_name = query_param(&uri, "name").map(str::to_string);
-    let compose_project = extract_compose_project(&body_bytes);
 
-    // Compose-project scheduling — the honest semantics.
-    //
-    // PLAN.md step 7 asks for "any amd64 service → whole project
-    // rosetta", which requires reading the full compose file before any
-    // service is created. We only see per-service `POST
-    // /containers/create` requests, so true pre-resolution would need a
-    // Compose-aware layer above the Docker API. What we do here instead
-    // is the strongest correctness guarantee achievable from per-service
-    // creates:
-    //
-    // 1. The first service in a project binds the project to the role
-    //    its platform implies (`amd64` → rosetta; otherwise native).
-    // 2. Every subsequent service must be hostable on that role. An
-    //    incompatible service (e.g. an amd64 service joining a
-    //    native-bound project) is rejected with a 400 so the user sees
-    //    the conflict immediately rather than getting a silently
-    //    misrouted container.
-    //
-    // The known consequence: a project whose first service is arm64
-    // followed by an amd64 service will be rejected, even though PLAN's
-    // ideal would have promoted the whole project to rosetta. The fix
-    // is full compose-file inspection and is intentionally out of scope
-    // for the per-API-request routing layer.
-    let role = if let Some(ref project) = compose_project {
-        match state.workload_roles.project_role(project).await {
-            Some(project_role) => {
-                if !project_role.can_host(route.platform) {
-                    return Err(DockerError::BadRequest(format!(
-                        "compose project '{project}' is bound to the {} utility VM but \
-                         this service requires {:?}; mixed-backend compose projects \
-                         are not supported",
-                        project_role.as_str(),
-                        route.platform,
-                    )));
-                }
-                project_role
-            }
-            None => {
-                state
-                    .workload_roles
-                    .record_project(project.clone(), route.utility_vm)
-                    .await;
-                route.utility_vm
-            }
-        }
-    } else {
-        route.utility_vm
-    };
+    // Fail closed: amd64 runtime requires FEX64 in the HV guest. Never fall
+    // back to a VZ/Rosetta runtime VM for a default amd64 container.
+    require_amd64_runtime(&state, route).await?;
 
+    // Runtime is single-VM; the workload always lands on the native HV VM.
+    let role = route.utility_vm();
     tracing::debug!(
-        utility_vm = role.as_str(),
+        backend = "hv",
+        translator = route.translator.as_str(),
         platform = ?route.platform,
-        compose_project = compose_project.as_deref().unwrap_or(""),
         name = requested_name.as_deref().unwrap_or(""),
         "routing Docker container create request"
     );
@@ -126,20 +88,17 @@ pub async fn create_container(
 
     if let Some(id) = parse_create_response_id(&body_bytes) {
         tracing::debug!(
-            utility_vm = role.as_str(),
+            translator = route.translator.as_str(),
             container_id = %id,
             name = requested_name.as_deref().unwrap_or(""),
-            "recorded container role binding",
+            "recorded container binding",
         );
         state.workload_roles.record(id.clone(), role).await;
         if let Some(name) = requested_name {
             state.workload_roles.add_alias(&id, name).await;
         }
     } else {
-        tracing::warn!(
-            utility_vm = role.as_str(),
-            "create response missing container ID; lifecycle ops will fall back to native"
-        );
+        tracing::warn!("create response missing container ID; lifecycle ops fall back to HV");
     }
 
     Ok(Response::from_parts(parts, Body::from(body_bytes)))

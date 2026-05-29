@@ -1,4 +1,16 @@
-//! Docker workload routing decisions for ArcBox utility VMs.
+//! Docker workload runtime placement decisions for ArcBox.
+//!
+//! ABX-375: all runtime containers run in the single HV utility VM. The
+//! routing decision no longer selects between utility VMs — it selects the
+//! in-guest *translator* for the workload's platform:
+//!
+//! - `linux/arm64` and unspecified → [`RuntimeTranslator::Native`] (no translation).
+//! - `linux/amd64` → [`RuntimeTranslator::Fex64`] (x86-64 via FEX `binfmt_misc`
+//!   inside the HV guest).
+//!
+//! VZ/Rosetta is no longer a default runtime target. It is retained only as an
+//! explicit, opt-in `docker build` backend (see PLAN.md step 7); the runtime
+//! path never selects it and never boots the VZ VM.
 
 use axum::http::Uri;
 use bytes::Bytes;
@@ -6,21 +18,24 @@ use serde_json::Value;
 
 pub use arcbox_core::UtilityVmRole;
 
-/// Extension methods on [`UtilityVmRole`] specific to Docker routing.
-pub trait UtilityVmRoleExt {
-    /// Returns `true` if the utility VM for this role is capable of
-    /// hosting workloads of `platform`.
-    fn can_host(self, platform: WorkloadPlatform) -> bool;
+/// In-guest execution path for a workload's platform inside the HV utility VM.
+///
+/// Surfaced in diagnostics as PLAN.md's `translator` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeTranslator {
+    /// Native arm64 execution — no translation.
+    Native,
+    /// x86-64 execution through FEX (`binfmt_misc`) inside the HV guest.
+    Fex64,
 }
 
-impl UtilityVmRoleExt for UtilityVmRole {
-    fn can_host(self, platform: WorkloadPlatform) -> bool {
+impl RuntimeTranslator {
+    /// Stable diagnostic label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
-            // VZ + Rosetta hosts both arm64 and amd64.
-            Self::Rosetta => true,
-            // HV runs native ARM64 only; amd64 needs translation only
-            // available via VZ + Rosetta.
-            Self::Native => !matches!(platform, WorkloadPlatform::LinuxAmd64),
+            Self::Native => "native",
+            Self::Fex64 => "fex64",
         }
     }
 }
@@ -48,23 +63,28 @@ impl WorkloadPlatform {
         }
     }
 
-    /// Returns the default utility VM role for this platform.
+    /// Returns the in-guest translator required to run this platform in the
+    /// single HV utility VM. `amd64` needs FEX64; everything else runs
+    /// natively.
     #[must_use]
-    pub const fn utility_vm_role(self) -> UtilityVmRole {
+    pub const fn runtime_translator(self) -> RuntimeTranslator {
         match self {
-            Self::LinuxAmd64 => UtilityVmRole::Rosetta,
-            Self::LinuxArm64 | Self::Unspecified => UtilityVmRole::Native,
+            Self::LinuxAmd64 => RuntimeTranslator::Fex64,
+            Self::LinuxArm64 | Self::Unspecified => RuntimeTranslator::Native,
         }
     }
 }
 
-/// Routing decision for a Docker workload.
+/// Runtime placement decision for a Docker workload.
+///
+/// Runtime always targets the single HV utility VM ([`UtilityVmRole::Native`]);
+/// [`Self::translator`] says how the platform executes inside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutingDecision {
     /// Requested or inferred platform.
     pub platform: WorkloadPlatform,
-    /// Selected utility VM role.
-    pub utility_vm: UtilityVmRole,
+    /// In-guest translator selected for the platform.
+    pub translator: RuntimeTranslator,
 }
 
 impl RoutingDecision {
@@ -73,7 +93,7 @@ impl RoutingDecision {
     pub const fn from_platform(platform: WorkloadPlatform) -> Self {
         Self {
             platform,
-            utility_vm: platform.utility_vm_role(),
+            translator: platform.runtime_translator(),
         }
     }
 
@@ -81,6 +101,34 @@ impl RoutingDecision {
     #[must_use]
     pub const fn native_default() -> Self {
         Self::from_platform(WorkloadPlatform::Unspecified)
+    }
+
+    /// The utility VM that serves this workload. Always the single HV VM —
+    /// runtime no longer routes across utility VMs.
+    #[must_use]
+    pub const fn utility_vm(self) -> UtilityVmRole {
+        UtilityVmRole::Native
+    }
+
+    /// Whether this workload requires FEX64 in the HV guest to run.
+    #[must_use]
+    pub const fn needs_fex64(self) -> bool {
+        matches!(self.translator, RuntimeTranslator::Fex64)
+    }
+}
+
+/// Returns whether a routing decision can be admitted given FEX64 availability
+/// in the HV guest.
+///
+/// Native (arm64) workloads are always admissible. amd64 workloads are
+/// admitted only when FEX64 is available; otherwise the caller must fail
+/// closed (PLAN.md error behavior) rather than silently falling back to
+/// VZ/Rosetta or QEMU.
+#[must_use]
+pub const fn is_admissible(decision: RoutingDecision, fex64_available: bool) -> bool {
+    match decision.translator {
+        RuntimeTranslator::Native => true,
+        RuntimeTranslator::Fex64 => fex64_available,
     }
 }
 
@@ -126,23 +174,6 @@ fn platform_from_create_body(body: &Bytes) -> Option<WorkloadPlatform> {
     Some(WorkloadPlatform::parse(platform))
 }
 
-/// Extracts the `com.docker.compose.project` label from a
-/// container-create body.
-///
-/// Compose-managed containers carry this label so all services in a
-/// project can be scheduled onto a single utility VM role.
-#[must_use]
-pub fn extract_compose_project(body: &Bytes) -> Option<String> {
-    let value: Value = serde_json::from_slice(body).ok()?;
-    let project = value
-        .pointer("/Labels/com.docker.compose.project")?
-        .as_str()?;
-    if project.is_empty() {
-        return None;
-    }
-    Some(project.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,21 +211,41 @@ mod tests {
     }
 
     #[test]
-    fn routes_amd64_to_rosetta_role() {
+    fn amd64_selects_fex64_translator_on_hv() {
         let route = RoutingDecision::from_platform(WorkloadPlatform::LinuxAmd64);
-        assert_eq!(route.utility_vm, UtilityVmRole::Rosetta);
+        assert_eq!(route.translator, RuntimeTranslator::Fex64);
+        // Runtime never leaves the single HV VM.
+        assert_eq!(route.utility_vm(), UtilityVmRole::Native);
+        assert!(route.needs_fex64());
     }
 
     #[test]
-    fn routes_arm64_and_unspecified_to_native_role() {
-        assert_eq!(
-            RoutingDecision::from_platform(WorkloadPlatform::LinuxArm64).utility_vm,
-            UtilityVmRole::Native
+    fn arm64_and_unspecified_select_native_translator() {
+        for platform in [WorkloadPlatform::LinuxArm64, WorkloadPlatform::Unspecified] {
+            let route = RoutingDecision::from_platform(platform);
+            assert_eq!(route.translator, RuntimeTranslator::Native);
+            assert_eq!(route.utility_vm(), UtilityVmRole::Native);
+            assert!(!route.needs_fex64());
+        }
+    }
+
+    #[test]
+    fn amd64_admitted_only_when_fex64_available() {
+        let amd64 = RoutingDecision::from_platform(WorkloadPlatform::LinuxAmd64);
+        assert!(
+            !is_admissible(amd64, false),
+            "amd64 must fail closed without FEX64"
         );
-        assert_eq!(
-            RoutingDecision::native_default().utility_vm,
-            UtilityVmRole::Native
-        );
+        assert!(is_admissible(amd64, true));
+    }
+
+    #[test]
+    fn native_workloads_always_admissible() {
+        let arm64 = RoutingDecision::from_platform(WorkloadPlatform::LinuxArm64);
+        let unspec = RoutingDecision::native_default();
+        // Native execution does not depend on FEX64.
+        assert!(is_admissible(arm64, false));
+        assert!(is_admissible(unspec, false));
     }
 
     #[test]
@@ -203,7 +254,7 @@ mod tests {
         let body = Bytes::from_static(br#"{"Image":"alpine","Platform":"linux/arm64"}"#);
         let route = route_container_create(&uri, &body);
         assert_eq!(route.platform, WorkloadPlatform::LinuxAmd64);
-        assert_eq!(route.utility_vm, UtilityVmRole::Rosetta);
+        assert_eq!(route.translator, RuntimeTranslator::Fex64);
     }
 
     #[test]
@@ -211,7 +262,7 @@ mod tests {
         let uri = "/containers/create".parse().unwrap();
         let body = Bytes::from_static(br#"{"Image":"alpine","Platform":"linux/amd64"}"#);
         let route = route_container_create(&uri, &body);
-        assert_eq!(route.utility_vm, UtilityVmRole::Rosetta);
+        assert_eq!(route.translator, RuntimeTranslator::Fex64);
     }
 
     #[test]
@@ -219,43 +270,6 @@ mod tests {
         let uri = "/build?t=image&platform=linux%2Famd64".parse().unwrap();
         let route = route_build(&uri);
         assert_eq!(route.platform, WorkloadPlatform::LinuxAmd64);
-        assert_eq!(route.utility_vm, UtilityVmRole::Rosetta);
-    }
-
-    #[test]
-    fn extracts_compose_project_from_labels() {
-        let body = Bytes::from_static(
-            br#"{"Image":"alpine","Labels":{"com.docker.compose.project":"myproj"}}"#,
-        );
-        assert_eq!(extract_compose_project(&body).as_deref(), Some("myproj"));
-    }
-
-    #[test]
-    fn returns_none_when_no_compose_project_label() {
-        let body = Bytes::from_static(br#"{"Image":"alpine"}"#);
-        assert!(extract_compose_project(&body).is_none());
-        let body = Bytes::from_static(br#"{"Image":"alpine","Labels":{"foo":"bar"}}"#);
-        assert!(extract_compose_project(&body).is_none());
-    }
-
-    #[test]
-    fn returns_none_when_compose_project_is_empty() {
-        let body =
-            Bytes::from_static(br#"{"Image":"alpine","Labels":{"com.docker.compose.project":""}}"#);
-        assert!(extract_compose_project(&body).is_none());
-    }
-
-    #[test]
-    fn native_can_host_arm64_and_unspecified_only() {
-        assert!(UtilityVmRole::Native.can_host(WorkloadPlatform::LinuxArm64));
-        assert!(UtilityVmRole::Native.can_host(WorkloadPlatform::Unspecified));
-        assert!(!UtilityVmRole::Native.can_host(WorkloadPlatform::LinuxAmd64));
-    }
-
-    #[test]
-    fn rosetta_can_host_every_platform() {
-        assert!(UtilityVmRole::Rosetta.can_host(WorkloadPlatform::LinuxAmd64));
-        assert!(UtilityVmRole::Rosetta.can_host(WorkloadPlatform::LinuxArm64));
-        assert!(UtilityVmRole::Rosetta.can_host(WorkloadPlatform::Unspecified));
+        assert_eq!(route.translator, RuntimeTranslator::Fex64);
     }
 }
