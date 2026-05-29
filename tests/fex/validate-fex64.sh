@@ -26,6 +26,9 @@ CONTEXT="${ARCBOX_DOCKER_CONTEXT:-arcbox}"
 DC=("$DOCKER" "--context" "$CONTEXT")
 
 pass=0 fail=0 unsupported=0 infra=0
+# Set when the amd64 path is unreachable because FEX64 is not provisioned —
+# a BLOCKED (decision-pending) state, distinct from a FEX64 gate FAIL.
+amd64_blocked=0
 
 tag() { # tag LEVEL "message"
   local level="$1"; shift
@@ -74,12 +77,25 @@ case "$arch" in
   *)             tag FAIL "arm64 container reported '$arch', expected aarch64" ;;
 esac
 
-arch="$("${DC[@]}" run --rm --platform linux/amd64 alpine uname -m 2>/dev/null)"
-case "$arch" in
-  x86_64) tag PASS "amd64 container reports x86_64 via HV/FEX64 (GATE A CORE)" ;;
-  "")     tag FAIL "amd64 alpine produced no output — FEX64 not serving amd64 in HV (GATE A FAIL → STOP, resume ABX-374)" ;;
-  *)      tag FAIL "amd64 container reported '$arch', expected x86_64 (GATE A FAIL → STOP, resume ABX-374)" ;;
-esac
+# Distinguish three outcomes, because they lead to OPPOSITE decisions:
+#   - x86_64                       → PASS (FEX64 served amd64)
+#   - FEX64 not provisioned        → INFRA/BLOCKED, decision pending. This is
+#     "exec format error" (no x86_64 binfmt handler), the ABX-375 fail-closed
+#     error, or a missing interpreter. Per PLAN this is the *unavailable*
+#     state, NOT a gate failure — it must NOT trigger "resume ABX-374".
+#   - FEX64 ran but wrong/garbled  → real Gate A FAIL → STOP, resume ABX-374.
+amd64_out="$("${DC[@]}" run --rm --platform linux/amd64 alpine uname -m 2>&1)"
+if [ "$amd64_out" = "x86_64" ]; then
+  tag PASS "amd64 container reports x86_64 via HV/FEX64 (GATE A CORE)"
+elif printf '%s' "$amd64_out" | grep -qiE 'exec format error|requires fex64|binfmt|no such file or directory|not provisioned'; then
+  amd64_blocked=1
+  tag INFRA "amd64 not served: FEX64 not provisioned in the HV guest (no x86_64 binfmt handler). Provision /arcbox/bin/FEX and run a daemon with ABX-375 routing. This is NOT a Gate A FAIL."
+elif [ -z "$amd64_out" ]; then
+  amd64_blocked=1
+  tag INFRA "amd64 produced no output (image pull / daemon issue)"
+else
+  tag FAIL "amd64 reported '$amd64_out', expected x86_64 — FEX64 ran but mis-executed (GATE A FAIL → STOP, resume ABX-374)"
+fi
 
 # No VZ runtime VM may be started for default amd64 runtime. The daemon should
 # expose this; until a diag endpoint exists, README.md documents the manual
@@ -103,9 +119,15 @@ run_amd64() { # run_amd64 "label" image cmd...
   local rc=$?
   if [ $rc -eq 0 ]; then
     tag PASS "$label: ran ($image)"
-  elif echo "$out" | grep -qi 'no such image\|pull access\|manifest unknown\|network'; then
+  elif echo "$out" | grep -qiE 'no such image|pull access|manifest unknown|network'; then
     tag INFRA "$label: image unavailable ($image)"
+  elif echo "$out" | grep -qiE 'exec format error|requires fex64|binfmt|not provisioned'; then
+    # FEX64 absent — provisioning gap, not a compatibility failure.
+    amd64_blocked=1
+    tag INFRA "$label: FEX64 not provisioned (no x86_64 binfmt handler)"
   else
+    # FEX64 is present and ran the binary, but the workload failed: a genuine
+    # compatibility gap to record in PLAN.md known-incompatibilities.
     tag UNSUPPORTED "$label: failed under FEX64 — $(echo "$out" | tail -1)"
   fi
 }
@@ -165,9 +187,17 @@ fi
 section "Summary"
 printf 'PASS=%d  FAIL=%d  UNSUPPORTED=%d  INFRA=%d\n' "$pass" "$fail" "$unsupported" "$infra"
 if [ "$fail" -gt 0 ]; then
-  echo "RESULT: FAIL — at least one required behavior did not hold."
+  echo "RESULT: FAIL — FEX64 ran but a required behavior did not hold."
   echo "If a Gate A line FAILED, STOP ABX-375 and resume ABX-374 (dual-runtime)."
   exit 1
+fi
+if [ "$amd64_blocked" -ne 0 ]; then
+  echo "RESULT: BLOCKED — FEX64 is not provisioned in the HV guest, so the amd64"
+  echo "path could not be validated. This is NOT a FEX64 gate failure: do not"
+  echo "resume ABX-374 on this basis. Provision /arcbox/bin/FEX (boot-assets"
+  echo "rootfs init registers the x86_64 binfmt handler when present) and run a"
+  echo "daemon with ABX-375 routing, then re-run. arm64 results above still apply."
+  exit 2
 fi
 if [ "$pass" -eq 0 ]; then
   echo "RESULT: BLOCKED — only INFRA results; nothing was actually validated."
