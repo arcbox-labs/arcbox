@@ -444,17 +444,24 @@ impl Runtime {
     /// Returns whether the HV guest can run `linux/amd64` workloads via FEX64.
     ///
     /// ABX-375 fail-closed gate. amd64 runtime requires the FEX64 interpreter
-    /// provisioned at `<data_dir>/bin/FEX`, which the `arcbox` VirtioFS share
-    /// surfaces to the guest as `/arcbox/bin/FEX`. The guest rootfs init
-    /// registers the x86_64 `binfmt_misc` handler iff that binary is present,
-    /// so the same artifact presence is the authoritative host-side signal.
+    /// provisioned as a runtime binary at `<data_dir>/runtime/bin/FEX` — the
+    /// same `runtime/bin` set as `dockerd`/`containerd`, which the `arcbox`
+    /// VirtioFS share surfaces to the guest as `/arcbox/runtime/bin/FEX`. The
+    /// guest rootfs init registers the x86_64 `binfmt_misc` handler iff that
+    /// binary is present, so its presence is the authoritative host-side
+    /// signal.
     ///
     /// When it is absent, callers must fail closed: amd64 runtime requests
     /// return a clear FEX64 error instead of silently falling back to
     /// VZ/Rosetta or QEMU.
     #[must_use]
     pub fn amd64_runtime_supported(&self) -> bool {
-        self.config.data_dir.join("bin").join("FEX").is_file()
+        self.config
+            .data_dir
+            .join("runtime")
+            .join("bin")
+            .join("FEX")
+            .is_file()
     }
 
     /// Returns the lifecycle manager for `role`, falling back to native.
