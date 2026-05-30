@@ -621,8 +621,9 @@ impl Runtime {
         tokio::fs::create_dir_all(self.config.data_dir.join("vms")).await?;
         tokio::fs::create_dir_all(self.config.data_dir.join("machines")).await?;
 
-        // Download runtime binaries (dockerd, containerd, shim, runc, docker-init, k3s)
-        // if not cached.
+        // Download every runtime binary in the boot manifest if not cached:
+        // dockerd, containerd, containerd-shim-runc-v2, runc, docker-init, k3s,
+        // and the optional FEX64 interpreter (FEX/FEXServer) for linux/amd64.
         let runtime_bin_dir = self.config.data_dir.join("runtime/bin");
         tokio::fs::create_dir_all(&runtime_bin_dir).await?;
         self.vm_lifecycle

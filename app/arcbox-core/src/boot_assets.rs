@@ -246,8 +246,11 @@ impl BootAssetProvider {
         })
     }
 
-    /// Prepare host-side binaries (dockerd, containerd, shim, runc, docker-init, k3s)
-    /// into `dest_dir`.
+    /// Prepare host-side runtime binaries into `dest_dir` — every binary in the
+    /// boot manifest for the guest arch: dockerd, containerd,
+    /// containerd-shim-runc-v2, runc, docker-init, k3s, and (when the release
+    /// ships it) the optional FEX64 x86_64 interpreter (FEX/FEXServer) used for
+    /// `linux/amd64` workloads.
     pub async fn prepare_binaries(
         &self,
         dest_dir: &Path,
