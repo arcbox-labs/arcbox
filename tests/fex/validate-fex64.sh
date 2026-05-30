@@ -89,7 +89,7 @@ if [ "$amd64_out" = "x86_64" ]; then
   tag PASS "amd64 container reports x86_64 via HV/FEX64 (GATE A CORE)"
 elif printf '%s' "$amd64_out" | grep -qiE 'exec format error|requires fex64|binfmt|no such file or directory|not provisioned'; then
   amd64_blocked=1
-  tag INFRA "amd64 not served: FEX64 not provisioned in the HV guest (no x86_64 binfmt handler). Provision /arcbox/bin/FEX and run a daemon with ABX-375 routing. This is NOT a Gate A FAIL."
+  tag INFRA "amd64 not served: FEX64 not provisioned in the HV guest (no x86_64 binfmt handler). Provision /arcbox/runtime/bin/FEX and run a daemon with ABX-375 routing. This is NOT a Gate A FAIL."
 elif [ -z "$amd64_out" ]; then
   amd64_blocked=1
   tag INFRA "amd64 produced no output (image pull / daemon issue)"
@@ -106,6 +106,18 @@ if command -v arcbox >/dev/null 2>&1; then
   else
     tag PASS "no VZ/Rosetta runtime VM active for default amd64 runtime"
   fi
+fi
+
+# If amd64 is unprovisioned, the runtime/build/compose gates cannot run; emitting
+# their amd64 sub-checks would produce misleading FAIL lines. Report BLOCKED and
+# stop here so the verdict stays "decision pending", not "FEX failed".
+if [ "$amd64_blocked" -ne 0 ]; then
+  section "Summary"
+  printf 'PASS=%d  FAIL=%d  UNSUPPORTED=%d  INFRA=%d\n' "$pass" "$fail" "$unsupported" "$infra"
+  echo "RESULT: BLOCKED — FEX64 not provisioned in the HV guest; amd64 gates (B/C) skipped."
+  echo "Provision /arcbox/runtime/bin/FEX and run a daemon with ABX-375 routing, then re-run."
+  echo "This is NOT a FEX64 gate failure: do not resume ABX-374 on this basis."
+  exit 2
 fi
 
 # --- Gate B: runtime default viability -------------------------------------
@@ -194,7 +206,7 @@ fi
 if [ "$amd64_blocked" -ne 0 ]; then
   echo "RESULT: BLOCKED — FEX64 is not provisioned in the HV guest, so the amd64"
   echo "path could not be validated. This is NOT a FEX64 gate failure: do not"
-  echo "resume ABX-374 on this basis. Provision /arcbox/bin/FEX (boot-assets"
+  echo "resume ABX-374 on this basis. Provision /arcbox/runtime/bin/FEX (boot-assets"
   echo "rootfs init registers the x86_64 binfmt handler when present) and run a"
   echo "daemon with ABX-375 routing, then re-run. arm64 results above still apply."
   exit 2
