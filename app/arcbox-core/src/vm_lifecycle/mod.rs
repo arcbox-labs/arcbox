@@ -765,6 +765,20 @@ impl VmLifecycleManager {
             cmdline.push_str(" earlycon");
         }
 
+        // Disable SVE/SME in the guest. Apple Silicon under HVF advertises SVE
+        // feature bits to the guest (e.g. the M5's SME2 surfaces as `sve2p1` in
+        // /proc/cpuinfo) that the CPU cannot execute outside streaming mode — any
+        // plain SVE instruction SIGILLs. Userspace that trusts HWCAP_SVE then
+        // crashes: glibc's ifunc-selected SVE `memcpy`/`str*` and FEX64's
+        // SVE-using paths. `arm64.nosve`/`arm64.nosme` make the kernel ignore the
+        // phantom features so userspace falls back to NEON.
+        for param in ["arm64.nosve", "arm64.nosme"] {
+            if !cmdline.split_whitespace().any(|t| t == param) {
+                cmdline.push(' ');
+                cmdline.push_str(param);
+            }
+        }
+
         // Inject guest docker vsock port if configured.
         if let Some(port) = self.config.guest_docker_vsock_port {
             if !cmdline
