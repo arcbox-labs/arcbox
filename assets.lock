@@ -11,9 +11,9 @@
 # skew to worry about when upgrading.
 
 [boot]
-version = "0.5.9"
+version = "0.5.10"
 cdn = "https://boot.arcboxcdn.com"
-manifest_sha256 = "468cd00d654cfd67268240f57a076e0e40c7808d9e7d7f6d9fc81b421d798265"
+manifest_sha256 = "fb1e2f1f002fbdb55616b6d2a9592e43b820e285dcc6011efdd045d657482619"
 
 [[tools]]
 name = "docker"
