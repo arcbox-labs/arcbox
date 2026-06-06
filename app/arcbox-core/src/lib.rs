@@ -37,6 +37,8 @@ pub mod container_backend;
 pub mod error;
 pub mod event;
 pub mod machine;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod migration;
 pub mod persistence;
 #[cfg(target_os = "macos")]
@@ -55,6 +57,8 @@ pub use boot_assets::{
 pub use config::{Config, ContainerRuntimeConfig};
 pub use error::{CoreError, Result};
 pub use machine::MachineManager;
+#[cfg(target_os = "macos")]
+pub use macos::{MacImage, MacImageManager, MacImageMeta, MacInstanceDisks};
 pub use migration::MigrationManager;
 pub use runtime::{Runtime, SandboxPortExposure};
 pub use vm::{SharedDirConfig, VmConfig, VmManager};
