@@ -8,17 +8,20 @@
 
 use std::ffi::c_void;
 use std::path::Path;
+use std::time::Duration;
 
 use objc2::runtime::{AnyClass, AnyObject};
 use tokio::sync::oneshot;
+use tokio::time::sleep;
 
 use crate::configuration::MacHardwareModel;
 use crate::error::{VZError, VZResult};
 use crate::ffi::{
-    _Block_release, ObjectResult, create_object_completion_block, get_class, nsurl_file_path,
-    release,
+    _Block_release, ObjectResult, StateResult, create_object_completion_block,
+    create_state_completion_block, get_class, nsurl_file_path, release,
 };
-use crate::{msg_send, msg_send_u64};
+use crate::vm::VirtualMachine;
+use crate::{msg_send, msg_send_u64, msg_send_void};
 
 /// The most-featureful configuration a restore image supports.
 pub struct MacOSConfigurationRequirements {
@@ -145,6 +148,124 @@ impl MacOSRestoreImage {
 }
 
 impl Drop for MacOSRestoreImage {
+    fn drop(&mut self) {
+        if !self.inner.is_null() {
+            release(self.inner);
+        }
+    }
+}
+
+/// Installs macOS from a restore image onto a virtual machine's disk.
+///
+/// Wraps `VZMacOSInstaller`. Create it with the VM built for installation and a
+/// local restore image (IPSW), then drive [`install`](Self::install) — a long
+/// operation (tens of minutes) that reports progress as it runs.
+pub struct MacOSInstaller {
+    inner: *mut AnyObject,
+    progress: *mut AnyObject,
+}
+
+// SAFETY: Inner ObjC pointers are only used via msg_send! which dispatches to the ObjC runtime.
+unsafe impl Send for MacOSInstaller {}
+
+impl MacOSInstaller {
+    /// Creates an installer for `virtual_machine` from a local restore image.
+    ///
+    /// `restore_image_path` must be a local file (an IPSW); a restore image fetched
+    /// via [`MacOSRestoreImage::latest_supported`] must be downloaded first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `VZMacOSInstaller` is unavailable or cannot be created.
+    pub fn new(
+        virtual_machine: &VirtualMachine,
+        restore_image_path: impl AsRef<Path>,
+    ) -> VZResult<Self> {
+        let path_str = restore_image_path.as_ref().to_string_lossy();
+        // SAFETY: alloc/initWithVirtualMachine:restoreImageURL: on VZMacOSInstaller with a
+        // valid VM pointer and an NSURL from a local path. Result checked non-null.
+        unsafe {
+            let cls = get_class("VZMacOSInstaller").ok_or_else(|| VZError::Internal {
+                code: -1,
+                message: "VZMacOSInstaller class not found".into(),
+            })?;
+            let url = nsurl_file_path(&path_str);
+            let alloc = msg_send!(cls, alloc);
+            let obj = msg_send!(
+                alloc,
+                initWithVirtualMachine: virtual_machine.as_ptr(),
+                restoreImageURL: url
+            );
+            if obj.is_null() {
+                return Err(VZError::InvalidConfiguration(
+                    "failed to create VZMacOSInstaller".into(),
+                ));
+            }
+            let progress = msg_send!(obj, progress);
+            Ok(Self {
+                inner: obj,
+                progress,
+            })
+        }
+    }
+
+    /// Returns installation progress as a fraction in `0.0..=1.0`.
+    #[must_use]
+    pub fn fraction_completed(&self) -> f64 {
+        if self.progress.is_null() {
+            return 0.0;
+        }
+        // SAFETY: fractionCompleted returns a double from a valid NSProgress.
+        unsafe {
+            let sel = objc2::sel!(fractionCompleted);
+            let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel) -> f64 =
+                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
+            func(self.progress as *const AnyObject, sel)
+        }
+    }
+
+    /// Installs macOS, invoking `on_progress` with the current fraction as it runs.
+    ///
+    /// `virtual_machine` must be the VM passed to [`new`](Self::new); the install is
+    /// dispatched on that VM's queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if installation fails.
+    pub async fn install(
+        &self,
+        virtual_machine: &VirtualMachine,
+        mut on_progress: impl FnMut(f64),
+    ) -> VZResult<()> {
+        let (tx, mut rx) = oneshot::channel::<StateResult>();
+        let block = create_state_completion_block(tx);
+        let installer = self.inner;
+        // Kick off the install on the VM's queue: the call returns immediately and the
+        // completion handler fires when installation finishes.
+        // SAFETY: installWithCompletionHandler: takes a heap-copied (NSError *) block.
+        virtual_machine.dispatch_sync(|| unsafe {
+            msg_send_void!(installer, installWithCompletionHandler: block);
+        });
+
+        let result = loop {
+            match rx.try_recv() {
+                Ok(result) => break result,
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    on_progress(self.fraction_completed());
+                    sleep(Duration::from_secs(2)).await;
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    break Err("install completion handler dropped".to_string());
+                }
+            }
+        };
+        // SAFETY: `block` was returned by create_state_completion_block and not released elsewhere.
+        unsafe { _Block_release(block) };
+        result.map_err(|message| VZError::Internal { code: -1, message })
+    }
+}
+
+impl Drop for MacOSInstaller {
     fn drop(&mut self) {
         if !self.inner.is_null() {
             release(self.inner);
