@@ -321,6 +321,7 @@ dependencies = [
  "arcbox-transport",
  "arcbox-virtio",
  "arcbox-vmm",
+ "arcbox-vz",
  "async-trait",
  "bytes",
  "chrono",
