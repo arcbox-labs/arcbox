@@ -3,5 +3,9 @@
 
 mod image;
 mod install;
+mod machine;
+mod vm;
 
 pub use image::{MacImage, MacImageManager, MacImageMeta, MacInstanceDisks};
+pub use machine::{MacMachineConfig, MacMachineInfo, MacMachineManager};
+pub use vm::MacVm;
