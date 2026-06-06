@@ -201,32 +201,35 @@ impl MacOSInstaller {
         virtual_machine: &VirtualMachine,
         restore_image_path: impl AsRef<Path>,
     ) -> VZResult<Self> {
-        let path_str = restore_image_path.as_ref().to_string_lossy();
-        // SAFETY: alloc/initWithVirtualMachine:restoreImageURL: on VZMacOSInstaller with a
-        // valid VM pointer and an NSURL from a local path. Result checked non-null.
-        unsafe {
-            let cls = get_class("VZMacOSInstaller").ok_or_else(|| VZError::Internal {
-                code: -1,
-                message: "VZMacOSInstaller class not found".into(),
-            })?;
-            let url = nsurl_file_path(&path_str);
-            let alloc = msg_send!(cls, alloc);
-            let obj = msg_send!(
-                alloc,
-                initWithVirtualMachine: virtual_machine.as_ptr(),
-                restoreImageURL: url
-            );
-            if obj.is_null() {
-                return Err(VZError::InvalidConfiguration(
-                    "failed to create VZMacOSInstaller".into(),
-                ));
+        let path_str = restore_image_path.as_ref().to_string_lossy().into_owned();
+        let vm_ptr = virtual_machine.as_ptr();
+        // VZMacOSInstaller's initializer asserts (dispatch_assert_queue) that it runs on
+        // the VM's dispatch queue, so construct it there.
+        let (inner, progress) = virtual_machine.dispatch_sync(|| {
+            // SAFETY: alloc/initWithVirtualMachine:restoreImageURL: on VZMacOSInstaller with
+            // a valid VM pointer and an NSURL from a local path. Result checked non-null.
+            unsafe {
+                let cls = get_class("VZMacOSInstaller").ok_or_else(|| VZError::Internal {
+                    code: -1,
+                    message: "VZMacOSInstaller class not found".into(),
+                })?;
+                let url = nsurl_file_path(&path_str);
+                let alloc = msg_send!(cls, alloc);
+                let obj = msg_send!(
+                    alloc,
+                    initWithVirtualMachine: vm_ptr,
+                    restoreImageURL: url
+                );
+                if obj.is_null() {
+                    return Err(VZError::InvalidConfiguration(
+                        "failed to create VZMacOSInstaller".into(),
+                    ));
+                }
+                let progress = msg_send!(obj, progress);
+                Ok((obj, progress))
             }
-            let progress = msg_send!(obj, progress);
-            Ok(Self {
-                inner: obj,
-                progress,
-            })
-        }
+        })?;
+        Ok(Self { inner, progress })
     }
 
     /// Returns installation progress as a fraction in `0.0..=1.0`.
