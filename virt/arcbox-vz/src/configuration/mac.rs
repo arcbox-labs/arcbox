@@ -14,7 +14,7 @@ use objc2::runtime::AnyObject;
 
 use crate::error::{VZError, VZResult};
 use crate::ffi::{
-    extract_nserror, get_class, nsdata_from_bytes, nsdata_to_vec, nsurl_file_path, release,
+    extract_nserror, get_class, nsdata_from_bytes, nsdata_to_vec, nsurl_file_path, release, retain,
 };
 use crate::{msg_send, msg_send_bool};
 
@@ -71,6 +71,16 @@ impl MacHardwareModel {
         // SAFETY: dataRepresentation returns an NSData owned by the model; nsdata_to_vec only reads it.
         let data = unsafe { msg_send!(self.inner, dataRepresentation) };
         nsdata_to_vec(data)
+    }
+
+    /// Wraps a hardware-model pointer borrowed from the framework (for example a
+    /// restore image's requirements), retaining it so it outlives its source.
+    pub(crate) fn from_retained_ptr(ptr: *mut AnyObject) -> Option<Self> {
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: ptr is a valid VZMacHardwareModel; retain balances the release in Drop.
+        Some(Self { inner: retain(ptr) })
     }
 
     pub(crate) fn as_ptr(&self) -> *mut AnyObject {
