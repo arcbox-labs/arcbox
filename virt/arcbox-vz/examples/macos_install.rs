@@ -16,9 +16,9 @@ use std::error::Error;
 use std::path::PathBuf;
 
 use arcbox_vz::{
-    MacAuxiliaryStorage, MacMachineIdentifier, MacOSBootLoader, MacOSInstaller, MacOSRestoreImage,
-    MacPlatform, StorageDeviceConfiguration, VirtualMachineConfiguration, VirtualMachineState,
-    min_cpu_count, min_memory_size,
+    MacAuxiliaryStorage, MacGraphicsDeviceConfiguration, MacMachineIdentifier, MacOSBootLoader,
+    MacOSInstaller, MacOSRestoreImage, MacPlatform, StorageDeviceConfiguration,
+    VirtualMachineConfiguration, VirtualMachineState, min_cpu_count, min_memory_size,
 };
 
 /// Size of the sparse macOS system disk image.
@@ -50,7 +50,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err("restore image hardware model is not supported on this host".into());
     }
     let cpus = usize::try_from(reqs.minimum_cpu_count.max(min_cpu_count())).unwrap_or(1);
-    let memory = reqs.minimum_memory_size.max(min_memory_size());
+    // macOS installation/personalization is memory-hungry; use at least 8 GiB.
+    let memory = reqs
+        .minimum_memory_size
+        .max(8 * 1024 * 1024 * 1024)
+        .max(min_memory_size());
 
     // Create the system disk image (sparse) and fresh auxiliary storage.
     println!(
@@ -72,7 +76,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .set_memory_size(memory)
         .set_platform(platform)
         .set_boot_loader(MacOSBootLoader::new()?)
-        .add_storage_device(StorageDeviceConfiguration::disk_image(&disk_path, false)?);
+        .add_storage_device(StorageDeviceConfiguration::disk_image(&disk_path, false)?)
+        .add_graphics_device(MacGraphicsDeviceConfiguration::new(1920, 1080, 80)?);
     config.validate()?;
     let vm = config.build()?;
 
@@ -88,9 +93,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         })
         .await?;
-    println!("Install complete. Booting installed macOS ...");
+    println!("Install complete.");
 
-    vm.start().await?;
+    // VZMacOSInstaller leaves the VM running (booted into the installed OS); only
+    // issue a start if it came back stopped.
+    if vm.state() == VirtualMachineState::Stopped {
+        println!("Booting installed macOS ...");
+        vm.start().await?;
+    }
+
     let mut waited = 0;
     while vm.state() != VirtualMachineState::Running && waited < 60 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
