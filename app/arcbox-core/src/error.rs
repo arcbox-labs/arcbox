@@ -55,6 +55,10 @@ pub enum CoreError {
     /// Network error.
     #[error("network error: {0}")]
     Net(#[from] arcbox_net::NetError),
+
+    /// macOS guest image / clone error.
+    #[error("macOS image error: {0}")]
+    Macos(String),
 }
 
 impl CoreError {
@@ -80,6 +84,12 @@ impl CoreError {
     #[must_use]
     pub fn invalid_state(msg: impl Into<String>) -> Self {
         Self::Common(CommonError::invalid_state(msg))
+    }
+
+    /// Creates a new macOS image error.
+    #[must_use]
+    pub fn macos(msg: impl Into<String>) -> Self {
+        Self::Macos(msg.into())
     }
 }
 
