@@ -6,6 +6,7 @@
 mod balloon;
 mod entropy;
 mod filesystem;
+mod graphics;
 mod network;
 mod serial;
 mod socket;
@@ -18,6 +19,7 @@ pub use filesystem::{
     DirectoryShare, LinuxRosettaDirectoryShare, MultipleDirectoryShare, RosettaAvailability,
     SharedDirectory, SingleDirectoryShare, VirtioFileSystemDeviceConfiguration,
 };
+pub use graphics::MacGraphicsDeviceConfiguration;
 pub use network::NetworkDeviceConfiguration;
 pub use serial::SerialPortConfiguration;
 pub use socket::SocketDeviceConfiguration;

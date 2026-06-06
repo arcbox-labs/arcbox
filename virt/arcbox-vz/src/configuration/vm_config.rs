@@ -1,9 +1,9 @@
 //! Virtual machine configuration.
 
 use crate::device::{
-    EntropyDeviceConfiguration, MemoryBalloonDeviceConfiguration, NetworkDeviceConfiguration,
-    SerialPortConfiguration, SocketDeviceConfiguration, StorageDeviceConfiguration,
-    VirtioFileSystemDeviceConfiguration,
+    EntropyDeviceConfiguration, MacGraphicsDeviceConfiguration, MemoryBalloonDeviceConfiguration,
+    NetworkDeviceConfiguration, SerialPortConfiguration, SocketDeviceConfiguration,
+    StorageDeviceConfiguration, VirtioFileSystemDeviceConfiguration,
 };
 use crate::error::{VZError, VZResult};
 use crate::ffi::{DispatchQueue, get_class, nsarray, release};
@@ -27,6 +27,7 @@ pub struct VirtualMachineConfiguration {
     entropy_devices: Vec<*mut AnyObject>,
     directory_sharing_devices: Vec<*mut AnyObject>,
     memory_balloon_devices: Vec<*mut AnyObject>,
+    graphics_devices: Vec<*mut AnyObject>,
 }
 
 // SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
@@ -61,6 +62,7 @@ impl VirtualMachineConfiguration {
                 entropy_devices: Vec::new(),
                 directory_sharing_devices: Vec::new(),
                 memory_balloon_devices: Vec::new(),
+                graphics_devices: Vec::new(),
             })
         }
     }
@@ -128,6 +130,14 @@ impl VirtualMachineConfiguration {
     /// Adds a storage device to the VM.
     pub fn add_storage_device(&mut self, device: StorageDeviceConfiguration) -> &mut Self {
         self.storage_devices.push(device.into_ptr());
+        self
+    }
+
+    /// Adds a macOS graphics device to the VM.
+    ///
+    /// A macOS guest requires at least one graphics device to start.
+    pub fn add_graphics_device(&mut self, device: MacGraphicsDeviceConfiguration) -> &mut Self {
+        self.graphics_devices.push(device.into_ptr());
         self
     }
 
@@ -271,6 +281,11 @@ impl VirtualMachineConfiguration {
             if !self.memory_balloon_devices.is_empty() {
                 let array = nsarray(&self.memory_balloon_devices);
                 msg_send_void!(self.inner, setMemoryBalloonDevices: array);
+            }
+
+            if !self.graphics_devices.is_empty() {
+                let array = nsarray(&self.graphics_devices);
+                msg_send_void!(self.inner, setGraphicsDevices: array);
             }
         }
     }
