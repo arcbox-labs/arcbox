@@ -11,6 +11,8 @@ use crate::container_backend::{DynContainerBackend, create_backend};
 use crate::error::{CoreError, Result};
 use crate::event::EventBus;
 use crate::machine::{MachineManager, MachineState};
+#[cfg(target_os = "macos")]
+use crate::macos::MacMachineManager;
 use crate::migration::MigrationManager;
 use crate::vm::VmManager;
 use crate::vm_lifecycle::{DEFAULT_MACHINE_NAME, VmLifecycleConfig, VmLifecycleManager};
@@ -84,6 +86,9 @@ pub struct Runtime {
     network_manager: Arc<NetworkManager>,
     /// Host-side runtime migration manager.
     migration_manager: Arc<MigrationManager>,
+    /// macOS guest machine manager (Apple Silicon only).
+    #[cfg(target_os = "macos")]
+    mac_machine_manager: Arc<MacMachineManager>,
     /// Inbound listener managers keyed by machine name, for port
     /// forwarding via L2 frame injection (macOS). Each utility VM owns its
     /// own bridge interface and therefore its own listener.
@@ -193,6 +198,9 @@ impl Runtime {
 
         let migration_manager = Arc::new(MigrationManager::new(config.docker.socket_path.clone()));
 
+        #[cfg(target_os = "macos")]
+        let mac_machine_manager = Arc::new(MacMachineManager::new(&config.data_dir));
+
         Ok(Self {
             config,
             event_bus,
@@ -202,6 +210,8 @@ impl Runtime {
             container_backend: system_backend,
             network_manager,
             migration_manager,
+            #[cfg(target_os = "macos")]
+            mac_machine_manager,
             #[cfg(target_os = "macos")]
             inbound_listeners: Arc::new(TokioRwLock::new(HashMap::new())),
             #[cfg(target_os = "macos")]
@@ -248,6 +258,13 @@ impl Runtime {
     #[must_use]
     pub const fn migration_manager(&self) -> &Arc<MigrationManager> {
         &self.migration_manager
+    }
+
+    /// Returns the macOS guest machine manager (Apple Silicon only).
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub const fn mac_machine_manager(&self) -> &Arc<MacMachineManager> {
+        &self.mac_machine_manager
     }
 
     /// Returns the VM lifecycle manager.
