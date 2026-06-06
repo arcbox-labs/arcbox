@@ -4,6 +4,7 @@
 //! safe API. Most users should not need to use this module directly.
 
 pub mod block;
+pub mod data;
 pub mod dispatch;
 pub mod foundation;
 pub mod memory;
@@ -11,6 +12,7 @@ pub mod runloop;
 pub mod runtime;
 
 pub use block::*;
+pub use data::*;
 pub use dispatch::*;
 pub use foundation::*;
 pub use memory::*;
