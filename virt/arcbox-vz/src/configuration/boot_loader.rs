@@ -108,3 +108,58 @@ impl Drop for LinuxBootLoader {
         }
     }
 }
+
+/// A boot loader for macOS guests.
+///
+/// The boot loader is parameterless; a macOS guest's identity lives in its
+/// [`MacPlatform`](crate::MacPlatform) (hardware model, machine identifier, and
+/// auxiliary storage). Pair this with a `MacPlatform` on the VM configuration.
+pub struct MacOSBootLoader {
+    inner: *mut AnyObject,
+}
+
+// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+unsafe impl Send for MacOSBootLoader {}
+
+impl MacOSBootLoader {
+    /// Creates a new macOS boot loader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `VZMacOSBootLoader` is unavailable (non-Apple-Silicon hosts
+    /// or macOS versions without macOS-guest support) or cannot be created.
+    pub fn new() -> VZResult<Self> {
+        // SAFETY: ObjC alloc/init pattern on the VZMacOSBootLoader class. Result checked non-null.
+        unsafe {
+            let cls = get_class("VZMacOSBootLoader").ok_or_else(|| VZError::Internal {
+                code: -1,
+                message: "VZMacOSBootLoader class not found".into(),
+            })?;
+            let alloc = msg_send!(cls, alloc);
+            let obj = msg_send!(alloc, init);
+
+            if obj.is_null() {
+                return Err(VZError::Internal {
+                    code: -1,
+                    message: "Failed to create VZMacOSBootLoader".into(),
+                });
+            }
+
+            Ok(Self { inner: obj })
+        }
+    }
+}
+
+impl BootLoader for MacOSBootLoader {
+    fn as_ptr(&self) -> *mut AnyObject {
+        self.inner
+    }
+}
+
+impl Drop for MacOSBootLoader {
+    fn drop(&mut self) {
+        if !self.inner.is_null() {
+            release(self.inner);
+        }
+    }
+}
