@@ -496,6 +496,109 @@ pub fn create_state_completion_block(sender: oneshot::Sender<StateResult>) -> *c
     }
 }
 
+/// Result of an async call that yields a retained object pointer or an error.
+///
+/// On success the pointer bits (`usize`) of the result object are returned; the
+/// object is retained in the invoke handler so it outlives the callback, and the
+/// receiver owns that `+1` reference.
+pub type ObjectResult = Result<usize, String>;
+
+/// Block for completion handlers shaped `(id result, NSError *error)`.
+///
+/// Captures a oneshot sender; on invoke it retains a non-null result object and
+/// sends its pointer bits, or sends the error's localized description.
+#[repr(C)]
+pub struct ObjectContextBlock {
+    /// ISA pointer.
+    pub isa: *const c_void,
+    /// Block flags.
+    pub flags: i32,
+    /// Reserved.
+    pub reserved: i32,
+    /// Invoke function pointer — matches `(id, NSError *)` completion handlers.
+    pub invoke: unsafe extern "C" fn(*mut Self, *mut AnyObject, *mut AnyObject),
+    /// Block descriptor.
+    pub descriptor: *const BlockDescriptorWithHelpers,
+    /// Captured context: raw pointer to Box<`oneshot::Sender`<ObjectResult>>.
+    pub sender_ptr: *mut c_void,
+}
+
+unsafe extern "C" fn object_block_copy(_dst: *mut c_void, _src: *const c_void) {
+    // sender_ptr is a raw pointer; ownership transfers with the block copy.
+}
+
+unsafe extern "C" fn object_block_dispose(block: *mut c_void) {
+    // SAFETY: `block` is an `ObjectContextBlock` from the block runtime; `sender_ptr`
+    // is null (already consumed) or a valid Box pointer from create_object_completion_block.
+    unsafe {
+        let block = block as *mut ObjectContextBlock;
+        let sender_ptr = (*block).sender_ptr;
+        if !sender_ptr.is_null() {
+            let _ = Box::from_raw(sender_ptr as *mut oneshot::Sender<ObjectResult>);
+        }
+    }
+}
+
+unsafe extern "C" fn object_block_invoke(
+    block: *mut ObjectContextBlock,
+    object: *mut AnyObject,
+    error: *mut AnyObject,
+) {
+    // SAFETY: `block` is a valid `ObjectContextBlock` invoked by VZ. We take ownership
+    // of the boxed sender and null the pointer so dispose can't double-free. A non-null
+    // result object is retained so it outlives this callback.
+    unsafe {
+        let sender_ptr = (*block).sender_ptr;
+        if sender_ptr.is_null() {
+            return;
+        }
+        let sender = Box::from_raw(sender_ptr as *mut oneshot::Sender<ObjectResult>);
+        (*block).sender_ptr = ptr::null_mut();
+
+        let result = if !error.is_null() {
+            let desc: *mut AnyObject = crate::msg_send!(error, localizedDescription);
+            Err(crate::ffi::nsstring_to_string(desc))
+        } else if !object.is_null() {
+            let _: *mut AnyObject = crate::msg_send!(object, retain);
+            Ok(object as usize)
+        } else {
+            Err("completion handler received neither result nor error".to_string())
+        };
+        let _ = sender.send(result);
+    }
+}
+
+/// Descriptor for `ObjectContextBlock`.
+static OBJECT_CONTEXT_BLOCK_DESCRIPTOR: BlockDescriptorWithHelpers = BlockDescriptorWithHelpers {
+    reserved: 0,
+    size: std::mem::size_of::<ObjectContextBlock>() as u64,
+    copy_helper: object_block_copy,
+    dispose_helper: object_block_dispose,
+};
+
+/// Creates an `(id, NSError *)` completion block with a captured sender.
+///
+/// On invoke, a non-null result object is retained and its pointer bits are sent
+/// through `sender`; the receiver owns that `+1` reference.
+#[must_use]
+pub fn create_object_completion_block(sender: oneshot::Sender<ObjectResult>) -> *const c_void {
+    let sender_box = Box::new(sender);
+    let sender_ptr = Box::into_raw(sender_box) as *mut c_void;
+
+    // SAFETY: Stack block with the correct ABI layout; `_Block_copy` heap-copies it.
+    unsafe {
+        let stack_block = ObjectContextBlock {
+            isa: _NSConcreteStackBlock,
+            flags: BLOCK_HAS_COPY_DISPOSE,
+            reserved: 0,
+            invoke: object_block_invoke,
+            descriptor: &OBJECT_CONTEXT_BLOCK_DESCRIPTOR,
+            sender_ptr,
+        };
+        _Block_copy(&stack_block as *const ObjectContextBlock as *const c_void)
+    }
+}
+
 // ============================================================================
 // Block Runtime FFI
 // ============================================================================

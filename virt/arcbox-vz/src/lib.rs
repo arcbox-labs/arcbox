@@ -65,6 +65,7 @@ pub mod ffi;
 pub mod configuration;
 pub(crate) mod delegate;
 pub mod device;
+pub mod restore;
 pub mod socket;
 pub mod vm;
 
@@ -84,6 +85,8 @@ pub use device::{
 };
 
 pub use socket::{VirtioSocketConnection, VirtioSocketDevice, VirtioSocketListener};
+
+pub use restore::{MacOSConfigurationRequirements, MacOSRestoreImage};
 
 pub use vm::{VirtualMachine, VirtualMachineState};
 
