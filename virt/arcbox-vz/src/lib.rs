@@ -78,10 +78,11 @@ pub use configuration::{
 };
 
 pub use device::{
-    DirectoryShare, EntropyDeviceConfiguration, LinuxRosettaDirectoryShare, MemoryBalloonDevice,
-    MemoryBalloonDeviceConfiguration, MultipleDirectoryShare, NetworkDeviceConfiguration,
-    RosettaAvailability, SerialPortConfiguration, SharedDirectory, SingleDirectoryShare,
-    SocketDeviceConfiguration, StorageDeviceConfiguration, VirtioFileSystemDeviceConfiguration,
+    DirectoryShare, EntropyDeviceConfiguration, LinuxRosettaDirectoryShare,
+    MacGraphicsDeviceConfiguration, MemoryBalloonDevice, MemoryBalloonDeviceConfiguration,
+    MultipleDirectoryShare, NetworkDeviceConfiguration, RosettaAvailability,
+    SerialPortConfiguration, SharedDirectory, SingleDirectoryShare, SocketDeviceConfiguration,
+    StorageDeviceConfiguration, VirtioFileSystemDeviceConfiguration,
 };
 
 pub use socket::{VirtioSocketConnection, VirtioSocketDevice, VirtioSocketListener};
