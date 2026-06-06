@@ -44,6 +44,7 @@ tempfile = "3"
 statig = "0.4.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+arcbox-vz.workspace = true
 ifbridge = { workspace = true }
 
 [dev-dependencies]

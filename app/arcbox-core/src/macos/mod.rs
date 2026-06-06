@@ -2,5 +2,6 @@
 //! machine lifecycle. Apple Silicon only.
 
 mod image;
+mod install;
 
 pub use image::{MacImage, MacImageManager, MacImageMeta, MacInstanceDisks};
