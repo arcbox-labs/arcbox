@@ -5,7 +5,8 @@ use std::pin::Pin;
 use arcbox_grpc::v1::machine_service_server;
 use arcbox_protocol::v1::{
     CreateMachineRequest, CreateMachineResponse, Empty, InspectMachineRequest, ListMachinesRequest,
-    ListMachinesResponse, MachineAgentRequest, MachineExecOutput, MachineExecRequest, MachineInfo,
+    ListMachinesResponse, MacImageListResponse, MacImagePullRequest, MacImageRemoveRequest,
+    MacImageSummary, MachineAgentRequest, MachineExecOutput, MachineExecRequest, MachineInfo,
     MachineNetwork, MachinePingResponse, MachineSummary, MachineSystemInfo, RemoveMachineRequest,
     StartMachineRequest, StopMachineRequest,
 };
@@ -13,6 +14,32 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 use super::{SharedRuntime, SharedRuntimeExt};
+
+/// Drives a `!Send` macOS VM future to completion on a dedicated blocking thread.
+///
+/// Virtualization.framework operations hold ObjC handles (and the VM's dispatch
+/// queue) across await and are not `Send`, but tonic requires handler futures to be
+/// `Send`. Running the future via a transient current-thread runtime inside
+/// `spawn_blocking` keeps that `!Send` state off the gRPC worker threads; the booted
+/// VM (which is `Send + Sync`) outlives the transient runtime.
+#[cfg(target_os = "macos")]
+async fn run_macos_blocking<T, Fut, F>(f: F) -> Result<T, Status>
+where
+    T: Send + 'static,
+    Fut: std::future::Future<Output = arcbox_core::Result<T>>,
+    F: FnOnce() -> Fut + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| Status::internal(format!("macOS runtime: {e}")))?
+            .block_on(f())
+            .map_err(|e| Status::internal(e.to_string()))
+    })
+    .await
+    .map_err(|e| Status::internal(format!("macOS task join: {e}")))?
+}
 
 /// Machine service implementation.
 pub struct MachineServiceImpl {
@@ -35,6 +62,27 @@ impl machine_service_server::MachineService for MachineServiceImpl {
     ) -> Result<Response<CreateMachineResponse>, Status> {
         let req = request.into_inner();
         let runtime = self.runtime.ready()?;
+
+        if req.guest_os == "macos" {
+            #[cfg(target_os = "macos")]
+            {
+                self.runtime
+                    .ready()?
+                    .mac_machine_manager()
+                    .create(arcbox_core::MacMachineConfig {
+                        name: req.name.clone(),
+                        image: req.macos_image,
+                        cpus: req.cpus,
+                        memory_mib: req.memory / (1024 * 1024),
+                    })
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                return Ok(Response::new(CreateMachineResponse { id: req.name }));
+            }
+            #[cfg(not(target_os = "macos"))]
+            return Err(Status::unimplemented(
+                "macOS guests require an Apple Silicon host",
+            ));
+        }
 
         // Convert bytes to MB for internal config.
         let memory_mb = req.memory / (1024 * 1024);
@@ -89,9 +137,17 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         request: Request<StartMachineRequest>,
     ) -> Result<Response<Empty>, Status> {
         let id = request.into_inner().id;
+        let runtime = self.runtime.ready()?;
 
-        self.runtime
-            .ready()?
+        #[cfg(target_os = "macos")]
+        if runtime.mac_machine_manager().get(&id).is_some() {
+            let mgr = std::sync::Arc::clone(runtime.mac_machine_manager());
+            let name = id.clone();
+            run_macos_blocking(move || async move { mgr.start(&name).await }).await?;
+            return Ok(Response::new(Empty {}));
+        }
+
+        runtime
             .machine_manager()
             .start(&id)
             .await
@@ -102,9 +158,17 @@ impl machine_service_server::MachineService for MachineServiceImpl {
 
     async fn stop(&self, request: Request<StopMachineRequest>) -> Result<Response<Empty>, Status> {
         let id = request.into_inner().id;
+        let runtime = self.runtime.ready()?;
 
-        self.runtime
-            .ready()?
+        #[cfg(target_os = "macos")]
+        if runtime.mac_machine_manager().get(&id).is_some() {
+            let mgr = std::sync::Arc::clone(runtime.mac_machine_manager());
+            let name = id.clone();
+            run_macos_blocking(move || async move { mgr.stop(&name).await }).await?;
+            return Ok(Response::new(Empty {}));
+        }
+
+        runtime
             .machine_manager()
             .stop(&id)
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -117,9 +181,18 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         request: Request<RemoveMachineRequest>,
     ) -> Result<Response<Empty>, Status> {
         let req = request.into_inner();
+        let runtime = self.runtime.ready()?;
 
-        self.runtime
-            .ready()?
+        #[cfg(target_os = "macos")]
+        if runtime.mac_machine_manager().get(&req.id).is_some() {
+            let mgr = std::sync::Arc::clone(runtime.mac_machine_manager());
+            let name = req.id.clone();
+            let force = req.force;
+            run_macos_blocking(move || async move { mgr.remove(&name, force).await }).await?;
+            return Ok(Response::new(Empty {}));
+        }
+
+        runtime
             .machine_manager()
             .remove(&req.id, req.force)
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -131,9 +204,31 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         &self,
         _request: Request<ListMachinesRequest>,
     ) -> Result<Response<ListMachinesResponse>, Status> {
-        let machines = self.runtime.ready()?.machine_manager().list();
+        let runtime = self.runtime.ready()?;
 
-        let summaries: Vec<_> = machines
+        #[cfg(target_os = "macos")]
+        let mac: Vec<MachineSummary> = runtime
+            .mac_machine_manager()
+            .list()
+            .into_iter()
+            .map(|m| MachineSummary {
+                id: m.name.clone(),
+                name: m.name,
+                state: format!("{:?}", m.state).to_lowercase(),
+                cpus: m.cpus,
+                memory: m.memory_mib * 1024 * 1024,
+                disk_size: 0,
+                ip_address: String::new(),
+                created: m.created_at.timestamp(),
+                guest_os: "macos".to_string(),
+            })
+            .collect();
+        #[cfg(not(target_os = "macos"))]
+        let mac: Vec<MachineSummary> = Vec::new();
+
+        let summaries: Vec<MachineSummary> = runtime
+            .machine_manager()
+            .list()
             .into_iter()
             .map(|m| MachineSummary {
                 id: m.name.clone(),
@@ -144,7 +239,9 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 disk_size: m.disk_gb * 1024 * 1024 * 1024,
                 ip_address: m.ip_address.unwrap_or_default(),
                 created: m.created_at.timestamp(),
+                guest_os: "linux".to_string(),
             })
+            .chain(mac)
             .collect();
 
         Ok(Response::new(ListMachinesResponse {
@@ -298,5 +395,91 @@ impl machine_service_server::MachineService for MachineServiceImpl {
     ) -> Result<Response<arcbox_protocol::v1::SshInfoResponse>, Status> {
         // TODO: Implement SSH info.
         Err(Status::unimplemented("ssh_info not implemented"))
+    }
+
+    async fn mac_image_pull(
+        &self,
+        request: Request<MacImagePullRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let req = request.into_inner();
+        #[cfg(target_os = "macos")]
+        {
+            let mgr = std::sync::Arc::clone(self.runtime.ready()?.mac_machine_manager());
+            let name = req.name.clone();
+            let ipsw = req.ipsw_path.clone();
+            let disk_gb = (req.disk_size / (1024 * 1024 * 1024)).max(64);
+            run_macos_blocking(move || async move {
+                let mut last = String::new();
+                mgr.images()
+                    .install_from_ipsw(std::path::Path::new(&ipsw), &name, disk_gb, |frac| {
+                        let pct = format!("{:.0}", frac * 100.0);
+                        if pct != last {
+                            tracing::info!("macOS image install: {pct}%");
+                            last = pct;
+                        }
+                    })
+                    .await
+            })
+            .await?;
+            Ok(Response::new(Empty {}))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = req;
+            Err(Status::unimplemented(
+                "macOS images require an Apple Silicon host",
+            ))
+        }
+    }
+
+    async fn mac_image_list(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<MacImageListResponse>, Status> {
+        #[cfg(target_os = "macos")]
+        let images: Vec<MacImageSummary> = self
+            .runtime
+            .ready()?
+            .mac_machine_manager()
+            .images()
+            .list()
+            .into_iter()
+            .map(|i| MacImageSummary {
+                name: i.meta.name,
+                minimum_cpu_count: i.meta.minimum_cpu_count,
+                minimum_memory_mib: i.meta.minimum_memory_mib,
+                disk_gb: i.meta.disk_gb,
+                created: i.meta.created_at.timestamp(),
+                source: i.meta.source.unwrap_or_default(),
+            })
+            .collect();
+        #[cfg(not(target_os = "macos"))]
+        let images: Vec<MacImageSummary> = Vec::new();
+
+        Ok(Response::new(MacImageListResponse { images }))
+    }
+
+    async fn mac_image_remove(
+        &self,
+        request: Request<MacImageRemoveRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let name = request.into_inner().name;
+        #[cfg(target_os = "macos")]
+        {
+            self.runtime
+                .ready()?
+                .mac_machine_manager()
+                .images()
+                .remove(&name)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            Ok(Response::new(Empty {}))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = name;
+            Err(Status::unimplemented(
+                "macOS images require an Apple Silicon host",
+            ))
+        }
     }
 }
