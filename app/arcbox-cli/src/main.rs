@@ -67,6 +67,8 @@ fn main() -> Result<()> {
         .block_on(async {
             match cli.command {
                 Commands::Machine(cmd) => commands::machine::execute(cmd).await,
+                #[cfg(target_os = "macos")]
+                Commands::Macos(cmd) => commands::macos::execute(cmd).await,
                 Commands::Migrate(cmd) => commands::migrate::execute(cmd).await,
                 Commands::Sandbox(cmd) => commands::sandbox::execute(cmd).await,
                 Commands::Docker(cmd) => commands::docker::execute(cmd, cli.format).await,

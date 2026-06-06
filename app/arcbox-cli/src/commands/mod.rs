@@ -57,6 +57,8 @@ pub mod internal;
 pub mod kubernetes;
 pub mod logs;
 pub mod machine;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod migrate;
 pub mod sandbox;
 pub mod setup;
@@ -113,6 +115,11 @@ pub enum Commands {
     /// Manage Linux machines
     #[command(subcommand)]
     Machine(machine::MachineCommands),
+
+    /// Manage macOS guests (Apple Silicon only)
+    #[cfg(target_os = "macos")]
+    #[command(subcommand)]
+    Macos(macos::MacosCommands),
 
     /// Import workloads from Docker Desktop or OrbStack
     #[command(subcommand)]

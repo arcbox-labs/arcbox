@@ -156,6 +156,12 @@ pub struct CreateArgs {
     /// Custom kernel command line (for advanced users / testing)
     #[arg(long)]
     pub cmdline: Option<String>,
+    /// Guest OS: "linux" (default) or "macos" (Apple Silicon only).
+    #[arg(long, default_value = "linux")]
+    pub os: String,
+    /// macOS base image to clone (required when --os macos).
+    #[arg(long)]
+    pub image: Option<String>,
 }
 
 #[derive(Args)]
@@ -255,6 +261,10 @@ pub async fn execute(cmd: MachineCommands) -> Result<()> {
 }
 
 async fn execute_create(args: CreateArgs) -> Result<()> {
+    if args.os == "macos" && args.image.is_none() {
+        anyhow::bail!("--image <base> is required when --os macos");
+    }
+
     let mut client = machine_client().await?;
     let mounts = args
         .mount
@@ -276,6 +286,8 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
             ssh_public_key: String::new(),
             kernel: args.kernel.clone().unwrap_or_default(),
             cmdline: args.cmdline.clone().unwrap_or_default(),
+            guest_os: args.os.clone(),
+            macos_image: args.image.clone().unwrap_or_default(),
         }))
         .await
         .context("Failed to create machine")?;
@@ -405,15 +417,21 @@ async fn execute_list(args: ListArgs) -> Result<()> {
 
     // Print header
     println!(
-        "{:<20} {:<12} {:<6} {:<12} {:<10}",
-        "NAME", "STATE", "CPUS", "MEMORY", "DISK"
+        "{:<20} {:<7} {:<12} {:<6} {:<12} {:<10}",
+        "NAME", "OS", "STATE", "CPUS", "MEMORY", "DISK"
     );
 
     // Print machines
     for machine in &machines {
+        let os = if machine.guest_os.is_empty() {
+            "linux"
+        } else {
+            machine.guest_os.as_str()
+        };
         println!(
-            "{:<20} {:<12} {:<6} {:<12} {:<10}",
+            "{:<20} {:<7} {:<12} {:<6} {:<12} {:<10}",
             machine.name,
+            os,
             title_case_state(&machine.state),
             machine.cpus,
             format!("{} MB", machine.memory / (1024 * 1024)),
