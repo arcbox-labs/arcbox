@@ -456,8 +456,7 @@ unsafe extern "C" fn state_block_invoke(block: *mut StateContextBlock, error: *m
         let result = if error.is_null() {
             Ok(())
         } else {
-            let desc: *mut AnyObject = crate::msg_send!(error, localizedDescription);
-            Err(crate::ffi::nsstring_to_string(desc))
+            Err(crate::ffi::describe_nserror(error))
         };
         let _ = sender.send(result);
     }
