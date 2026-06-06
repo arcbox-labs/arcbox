@@ -88,6 +88,23 @@ impl VirtualMachine {
         Self { inner: ptr, queue }
     }
 
+    /// Returns the underlying `VZVirtualMachine` pointer.
+    pub(crate) fn as_ptr(&self) -> *mut AnyObject {
+        self.inner
+    }
+
+    /// Runs `f` synchronously on the VM's dispatch queue.
+    ///
+    /// All operations on a `VZVirtualMachine` must be issued on the queue it was
+    /// created with; this lets associated objects (such as the macOS installer)
+    /// dispatch onto it.
+    pub(crate) fn dispatch_sync<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        self.queue.sync(f)
+    }
+
     /// Returns the current state of the VM.
     pub fn state(&self) -> VirtualMachineState {
         // SAFETY: self.inner is a valid VZVirtualMachine pointer; dispatched
