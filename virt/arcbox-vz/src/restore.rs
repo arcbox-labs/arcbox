@@ -54,10 +54,10 @@ impl MacOSRestoreImage {
         })?;
         let (tx, rx) = oneshot::channel::<ObjectResult>();
         let block = create_object_completion_block(tx);
-        // SAFETY: +latestSupportedWithCompletionHandler: takes one block argument and
-        // returns void; `block` is a heap-copied block released after the await.
+        // SAFETY: +fetchLatestSupportedWithCompletionHandler: takes one block argument
+        // and returns void; `block` is a heap-copied block released after the await.
         unsafe {
-            let sel = objc2::sel!(latestSupportedWithCompletionHandler:);
+            let sel = objc2::sel!(fetchLatestSupportedWithCompletionHandler:);
             let func: unsafe extern "C" fn(*const AnyClass, objc2::runtime::Sel, *const c_void) =
                 std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
             func(cls, sel, block);
@@ -82,11 +82,11 @@ impl MacOSRestoreImage {
         })?;
         let (tx, rx) = oneshot::channel::<ObjectResult>();
         let block = create_object_completion_block(tx);
-        // SAFETY: +loadFromURL:completionHandler: takes an NSURL and a block and returns
+        // SAFETY: +loadFileURL:completionHandler: takes an NSURL and a block and returns
         // void; `block` is a heap-copied block released after the await.
         unsafe {
             let url = nsurl_file_path(&path_str);
-            let sel = objc2::sel!(loadFromURL:completionHandler:);
+            let sel = objc2::sel!(loadFileURL:completionHandler:);
             let func: unsafe extern "C" fn(
                 *const AnyClass,
                 objc2::runtime::Sel,
