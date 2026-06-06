@@ -18,7 +18,7 @@ use crate::configuration::MacHardwareModel;
 use crate::error::{VZError, VZResult};
 use crate::ffi::{
     _Block_release, ObjectResult, StateResult, create_object_completion_block,
-    create_state_completion_block, get_class, nsurl_file_path, release,
+    create_state_completion_block, get_class, nsstring_to_string, nsurl_file_path, release,
 };
 use crate::vm::VirtualMachine;
 use crate::{msg_send, msg_send_u64, msg_send_void};
@@ -143,6 +143,26 @@ impl MacOSRestoreImage {
                 minimum_cpu_count,
                 minimum_memory_size,
             })
+        }
+    }
+
+    /// Returns the restore image URL.
+    ///
+    /// For an image fetched via [`latest_supported`](Self::latest_supported) this is
+    /// the remote IPSW download URL; for one loaded via
+    /// [`load_from_url`](Self::load_from_url) it is the local file URL.
+    #[must_use]
+    pub fn url(&self) -> Option<String> {
+        // SAFETY: URL is a readonly property returning an NSURL owned by the image;
+        // absoluteString returns an NSString that nsstring_to_string only reads.
+        unsafe {
+            let url = msg_send!(self.inner, URL);
+            if url.is_null() {
+                return None;
+            }
+            let s = msg_send!(url, absoluteString);
+            let out = nsstring_to_string(s);
+            if out.is_empty() { None } else { Some(out) }
         }
     }
 }
