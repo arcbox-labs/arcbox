@@ -138,6 +138,35 @@ pub fn extract_nserror(error: *mut AnyObject) -> VZError {
     }
 }
 
+/// Builds a detailed description of an `NSError`.
+///
+/// Includes the domain, code, and `userInfo` dictionary, which surfaces the
+/// underlying error and failure reason that `localizedDescription` alone hides.
+#[must_use]
+pub fn describe_nserror(error: *mut AnyObject) -> String {
+    if error.is_null() {
+        return "unknown error".to_string();
+    }
+    // SAFETY: error is non-null; localizedDescription/domain/userInfo and the userInfo
+    // dictionary's description return objects owned by the error or autoreleased; read-only.
+    unsafe {
+        let desc = nsstring_to_string(msg_send!(error, localizedDescription));
+        let code: i64 = msg_send_i64!(error, code);
+        let domain = nsstring_to_string(msg_send!(error, domain));
+        let info = msg_send!(error, userInfo);
+        let info_str = if info.is_null() {
+            String::new()
+        } else {
+            nsstring_to_string(msg_send!(info, description))
+        };
+        if info_str.is_empty() {
+            format!("{desc} (domain={domain}, code={code})")
+        } else {
+            format!("{desc} (domain={domain}, code={code}); userInfo={info_str}")
+        }
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
