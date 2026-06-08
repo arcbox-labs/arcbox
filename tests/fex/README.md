@@ -59,9 +59,13 @@ boot-asset runtime bin set at `/arcbox/runtime/bin/FEX` (sibling `boot-assets`
 repo + `assets.lock`; this is a coordinated two-repo change, not a local edit).
 ArcBox's FEX carries a small patch making it **binfmt-only**: it drops the
 FEXServer requirement, so nothing else needs to be running in the guest — no
-daemon to reach across container mount namespaces. On boot, the guest agent `setup_fex()` registers
-the x86_64 ELF handler in `binfmt_misc` with the `F` (fix-binary) flag so
-containers inherit it across mount namespaces.
+daemon to reach across container mount namespaces. On boot, the rootfs
+`/sbin/init` trampoline mounts the `arcbox` VirtioFS share, checks for
+`/arcbox/runtime/bin/FEX`, and — if present — registers the x86_64 ELF handler
+in `binfmt_misc` with `POCF` flags. The `F` (fix-binary) flag loads the
+interpreter at registration time so containers inherit it across mount
+namespaces. (This registration lives in the `boot-assets` rootfs init, not the
+ArcBox guest agent.)
 
 Manual guest-side confirmation (until `arcbox exec` diag is wired):
 
@@ -99,7 +103,8 @@ FEX64/HV vs Rosetta/VZ vs QEMU, plus single-HV vs dual-HV+VZ idle memory.
 
 This directory provides the **reproducible procedure and pass/fail contract**.
 The live gate execution requires Apple Silicon hardware and a signed, bootable
-daemon. The ArcBox-side routing change (amd64 → HV/FEX, fail-closed) and the
-guest `setup_fex()` registration are implemented and unit/compile-tested in the
-repo; the FEX binary provisioning (boot-assets) and the live A/B/C runs are the
-remaining hardware/sibling-repo steps.
+daemon. The ArcBox-side routing change (amd64 → HV/FEX, fail-closed) is
+implemented and unit/compile-tested in this repo; the FEX binary provisioning
+and the rootfs `/sbin/init` binfmt registration live in the sibling
+`boot-assets` repo. The FEX binary provisioning (boot-assets) and the live
+A/B/C runs are the remaining hardware/sibling-repo steps.
