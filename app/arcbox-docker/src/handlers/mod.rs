@@ -227,7 +227,7 @@ fn ambiguous_workload_error(id: &str) -> DockerError {
 /// Fail-closed admission for a routed runtime workload.
 ///
 /// `linux/amd64` containers run via FEX64 inside the HV guest. If FEX64 is
-/// not provisioned (`<data_dir>/bin/FEX` absent → no x86_64 `binfmt_misc`
+/// not provisioned (`<data_dir>/runtime/bin/FEX` absent → no x86_64 `binfmt_misc`
 /// handler in the guest), this returns a clear error instead of letting the
 /// request silently route to VZ/Rosetta or QEMU, or fail later with a
 /// cryptic `exec format error`. Native (arm64) workloads are always admitted.
