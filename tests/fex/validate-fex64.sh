@@ -57,7 +57,7 @@ printf 'docker context    %s\n' "$CONTEXT"
 # it here; otherwise these are documented manual checks in README.md.
 if command -v arcbox >/dev/null 2>&1; then
   printf 'guest kernel      %s\n' "$(arcbox exec -- uname -r 2>/dev/null || echo '? (run manually in guest)')"
-  printf 'fex version       %s\n' "$(arcbox exec -- FEXInterpreter --version 2>/dev/null || echo '? (run manually in guest)')"
+  printf 'fex version       %s\n' "$(arcbox exec -- /arcbox/runtime/bin/FEX --version 2>/dev/null || echo '? (run manually in guest)')"
   printf 'binfmt x86_64     %s\n' "$(arcbox exec -- sh -c 'cat /proc/sys/fs/binfmt_misc/FEX-x86_64 2>/dev/null | head -1' 2>/dev/null || echo '? (run manually in guest)')"
 fi
 

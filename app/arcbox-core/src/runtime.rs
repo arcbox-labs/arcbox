@@ -623,7 +623,8 @@ impl Runtime {
 
         // Download every runtime binary in the boot manifest if not cached:
         // dockerd, containerd, containerd-shim-runc-v2, runc, docker-init, k3s,
-        // and the optional FEX64 interpreter (FEX/FEXServer) for linux/amd64.
+        // and the optional FEX64 interpreter (FEX) for linux/amd64. ArcBox's
+        // FEX carries a small patch making it binfmt-only — no FEXServer.
         let runtime_bin_dir = self.config.data_dir.join("runtime/bin");
         tokio::fs::create_dir_all(&runtime_bin_dir).await?;
         self.vm_lifecycle
