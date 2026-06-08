@@ -54,18 +54,21 @@ Exit status: `0` no FAIL, `1` any FAIL, `2` only INFRA (nothing validated).
 ## What must be in the guest
 
 ABX-375 provisions FEX64 like the other guest runtime binaries (dockerd,
-containerd, runc): the `FEXInterpreter` aarch64 static-PIE binary ships in the
-boot-asset runtime bin set (sibling `boot-assets` repo + `assets.lock`; this is
-a coordinated two-repo change, not a local edit). On boot, the guest agent
-`setup_fex()` registers the x86_64 ELF handler in `binfmt_misc` with the `F`
-(fix-binary) flag so containers inherit it across mount namespaces.
+containerd, runc): a single aarch64 static-PIE `FEX` binary ships in the
+boot-asset runtime bin set at `/arcbox/runtime/bin/FEX` (sibling `boot-assets`
+repo + `assets.lock`; this is a coordinated two-repo change, not a local edit).
+ArcBox's FEX carries a small patch making it **binfmt-only**: it drops the
+FEXServer requirement, so nothing else needs to be running in the guest — no
+daemon to reach across container mount namespaces. On boot, the guest agent `setup_fex()` registers
+the x86_64 ELF handler in `binfmt_misc` with the `F` (fix-binary) flag so
+containers inherit it across mount namespaces.
 
 Manual guest-side confirmation (until `arcbox exec` diag is wired):
 
 ```bash
 # inside the HV guest:
 cat /proc/sys/fs/binfmt_misc/FEX-x86_64     # handler present + enabled
-/usr/bin/FEXInterpreter --version           # FEX version
+/arcbox/runtime/bin/FEX --version           # FEX version
 # direct x86_64 exec (no Docker):
 ./some-x86_64-binary                         # runs via FEX
 ```
