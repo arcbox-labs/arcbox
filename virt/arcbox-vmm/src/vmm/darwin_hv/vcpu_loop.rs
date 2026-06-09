@@ -145,35 +145,6 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
         tracing::warn!("vCPU {vcpu_id}: set SCTLR_EL1 failed: {e}");
     }
 
-    // Mask SVE out of the guest's ID_AA64PFR0_EL1. Apple SME-only cores (e.g.
-    // M4 Pro) implement streaming SVE via SME but cannot execute plain
-    // (non-streaming) SVE — `rdvl` and friends SIGILL on the bare host. HVF's
-    // default guest ID_AA64PFR0_EL1 carries that SME-implied SVE bit, so Linux
-    // advertises HWCAP_SVE and userspace (glibc ifuncs, FEX's x86 JIT) emits
-    // non-streaming SVE that traps. Clearing the SVE field [35:32] makes the
-    // guest present NEON-only, matching what Virtualization.framework exposes.
-    // `arm64.nosve` alone is insufficient — it clears HWCAP but not the ID
-    // register that FEX reads directly.
-    // Mask SME out of the guest's ID_AA64PFR1_EL1. Apple SME cores (e.g. M4 Pro)
-    // expose SME — and SME-derived SVE — to the guest, but plain non-streaming
-    // SVE can't execute on this silicon (a bare `rdvl` SIGILLs on the host).
-    // FEX's x86-64 JIT detects the feature from this register and emits SVE that
-    // traps, so amd64 containers SIGILL; `arm64.nosve` doesn't help because it
-    // only clears HWCAP, which FEX ignores. Clearing the SME field [27:24]
-    // presents a NEON-only guest, via the get/modify/set_sys_reg pattern QEMU's
-    // HVF backend uses to sanitize guest ID registers.
-    const ID_AA64PFR1_SME_MASK: u64 = 0xF << 24;
-    let pfr1_reg = arcbox_hv::sys_reg::HV_SYS_REG_ID_AA64PFR1_EL1;
-    match vcpu.get_sys_reg(pfr1_reg) {
-        Ok(pfr1) if pfr1 & ID_AA64PFR1_SME_MASK != 0 => {
-            if let Err(e) = vcpu.set_sys_reg(pfr1_reg, pfr1 & !ID_AA64PFR1_SME_MASK) {
-                tracing::warn!("vCPU {vcpu_id}: failed to mask guest SME: {e}");
-            }
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!("vCPU {vcpu_id}: read ID_AA64PFR1_EL1 failed: {e}"),
-    }
-
     // Register this vCPU's framework ID and this thread's handle after all
     // register-setup calls succeed. If any setup call fails above, the
     // early return drops `HvVcpu` (triggering `hv_vcpu_destroy`) and the

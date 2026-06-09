@@ -93,12 +93,6 @@ pub const HV_SYS_REG_VBAR_EL1: u16 = 0xc600;
 pub const HV_SYS_REG_SP_EL1: u16 = 0xe208;
 pub const HV_SYS_REG_SPSR_EL1: u16 = 0xe200;
 pub const HV_SYS_REG_ELR_EL1: u16 = 0xe201;
-/// `ID_AA64PFR1_EL1` (op0=3, op1=0, CRn=0, CRm=4, op2=1): processor feature register 1.
-///
-/// Carries the SME field [27:24]. On Apple SME cores the guest's SVE HWCAPs are
-/// derived from SME, so masking SME here is the lever for presenting a NEON-only
-/// guest (plain SVE can't execute on this silicon).
-pub const HV_SYS_REG_ID_AA64PFR1_EL1: u16 = 0xc021;
 
 // ---------------------------------------------------------------------------
 // Interrupt types for hv_vcpu_set_pending_interrupt
