@@ -250,6 +250,47 @@ impl Default for DefaultVmConfig {
     }
 }
 
+/// Boot parameters for the default VM, resolved from config + boot assets.
+///
+/// Produced by [`VmLifecycleManager::resolve_desired_boot`] and consumed both
+/// when creating the machine and when checking an existing machine for drift,
+/// so the two paths can never disagree about the desired kernel/cmdline.
+struct DesiredBoot {
+    /// Resolved kernel image path.
+    kernel: String,
+    /// Final kernel command line (after quiet-strip, earlycon, and vsock port).
+    cmdline: String,
+    /// EROFS rootfs image path (read-only vda).
+    rootfs_image: PathBuf,
+}
+
+/// Returns the first daemon-overridable field that differs between a persisted
+/// machine and the desired default-VM config, or `None` if it is up to date.
+///
+/// Centralizing drift detection keeps every overridable field checked in one
+/// place and in sync with what [`VmLifecycleManager::create_default_machine`]
+/// produces: kernel and cmdline are compared against the same resolved
+/// [`DesiredBoot`] the machine would be created with, so a change to `--kernel`
+/// or any cmdline-injected override (e.g. the guest docker vsock port) forces a
+/// recreate instead of silently reusing a stale VM.
+fn machine_drift_reason(
+    persisted: &MachineInfo,
+    want: &DefaultVmConfig,
+    boot: &DesiredBoot,
+) -> Option<&'static str> {
+    if persisted.cpus != want.cpus {
+        Some("cpus")
+    } else if persisted.memory_mb != want.memory_mb {
+        Some("memory_mb")
+    } else if persisted.kernel.as_deref() != Some(boot.kernel.as_str()) {
+        Some("kernel")
+    } else if persisted.cmdline.as_deref() != Some(boot.cmdline.as_str()) {
+        Some("cmdline")
+    } else {
+        None
+    }
+}
+
 // Note: BootAssetProvider and BootAssets are now in crate::boot_assets module.
 
 pub use health::HealthMonitor;
@@ -588,41 +629,38 @@ impl VmLifecycleManager {
         let existing_machine = self.machine_manager.get(&self.machine_name);
         let machine_exists = existing_machine.is_some();
 
-        // Detect a stale persisted machine whose cpus/memory or kernel no
-        // longer matches the desired default_vm config. The kernel comparison
-        // is against the resolved desired kernel path — the custom `--kernel`
-        // override if set, otherwise the versioned boot-asset cache path — not
-        // merely the boot-asset version string. Comparing only the version
-        // string let a `--kernel` override that kept the same boot-asset
-        // version slip through, silently reusing the old VM with the stale
-        // persisted kernel.
-        let desired_kernel = self
-            .boot_assets
-            .config()
-            .custom_kernel
-            .clone()
-            .unwrap_or_else(|| self.boot_assets.config().version_cache_dir().join("kernel"));
-        let desired_kernel = desired_kernel.to_string_lossy();
-        let config_drifted = existing_machine.as_ref().is_some_and(|m| {
-            let hw_changed = m.cpus != self.config.default_vm.cpus
-                || m.memory_mb != self.config.default_vm.memory_mb;
-            let kernel_changed = m.kernel.as_deref() != Some(desired_kernel.as_ref());
-            hw_changed || kernel_changed
-        });
-
-        if config_drifted {
+        // Recreate the persisted machine if any daemon-overridable field has
+        // drifted from the desired config. The desired kernel + cmdline are
+        // resolved through the same `resolve_desired_boot` path that
+        // `create_default_machine` uses, so drift detection can never disagree
+        // with what would actually be created. (An earlier version compared
+        // only cpus/memory plus a kernel-version substring, which silently
+        // reused a stale VM when `--kernel` or the cmdline changed.)
+        let desired_boot = match self.resolve_desired_boot().await {
+            Ok(boot) => Some(boot),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not resolve desired boot params; skipping drift check");
+                None
+            }
+        };
+        let drift_reason = match (existing_machine.as_ref(), desired_boot.as_ref()) {
+            (Some(m), Some(boot)) => machine_drift_reason(m, &self.config.default_vm, boot),
+            _ => None,
+        };
+        if let Some(field) = drift_reason {
             let m = existing_machine.as_ref().unwrap();
             tracing::warn!(
+                drifted_field = field,
                 persisted_cpus = m.cpus,
                 persisted_memory = m.memory_mb,
                 persisted_kernel = m.kernel.as_deref().unwrap_or("none"),
                 desired_cpus = self.config.default_vm.cpus,
                 desired_memory = self.config.default_vm.memory_mb,
-                desired_kernel = %desired_kernel,
                 "default machine config drifted from desired defaults; recreating"
             );
             let _ = self.machine_manager.remove(&self.machine_name, true);
         }
+        let config_drifted = drift_reason.is_some();
 
         // Recreate if state says "not exist", machine record is missing, or
         // the persisted config drifted from desired defaults.
@@ -753,6 +791,63 @@ impl VmLifecycleManager {
     /// - vda: rootfs.erofs (read-only)
     /// - vdb: docker-data.img (read-write)
     async fn create_default_machine(&self) -> Result<()> {
+        let boot = self.resolve_desired_boot().await?;
+        let rootfs_path = boot.rootfs_image.to_string_lossy().to_string();
+
+        // Block devices: vda = EROFS rootfs (read-only), vdb = Docker data (read-write).
+        let mut block_devices = vec![crate::vm::BlockDeviceConfig {
+            path: rootfs_path.clone(),
+            read_only: true,
+        }];
+
+        // Attach persistent Docker data disk.
+        let docker_data_image = self.data_image_path();
+        Self::ensure_sparse_block_image(&docker_data_image, DOCKER_DATA_IMAGE_SIZE_BYTES)?;
+
+        // Don't inject docker_data_device into cmdline — let the agent
+        // auto-detect. It prefers /dev/arcboxhvc1 (HVC fast path) when
+        // available, falling back to /dev/vdb (VirtIO block).
+        block_devices.push(crate::vm::BlockDeviceConfig {
+            path: docker_data_image.to_string_lossy().to_string(),
+            read_only: false,
+        });
+
+        let config = MachineConfig {
+            name: self.machine_name.clone(),
+            cpus: self.config.default_vm.cpus,
+            memory_mb: self.config.default_vm.memory_mb,
+            disk_gb: self.config.default_vm.disk_gb,
+            kernel: Some(boot.kernel),
+            cmdline: Some(boot.cmdline),
+            block_devices,
+            distro: None,
+            distro_version: None,
+            backend: self.config.backend,
+            enable_rosetta: self.config.default_vm.rosetta,
+        };
+
+        tracing::info!(
+            "Creating default machine: cpus={}, memory={}MB, kernel={}, rootfs={}",
+            config.cpus,
+            config.memory_mb,
+            config.kernel.as_deref().unwrap_or("default"),
+            rootfs_path,
+        );
+
+        self.machine_manager.create(config).await?;
+
+        Ok(())
+    }
+
+    /// Resolves the default VM's boot parameters (kernel image, final kernel
+    /// command line, and rootfs image) from config + boot assets.
+    ///
+    /// Shared by [`Self::create_default_machine`] and the drift check in
+    /// [`Self::start_default_vm`] so machine creation and drift detection
+    /// always agree on the desired kernel and cmdline. The cmdline is the base
+    /// (explicit override or the boot manifest default) with `quiet` stripped,
+    /// `earlycon` ensured, and the guest docker vsock port injected.
+    async fn resolve_desired_boot(&self) -> Result<DesiredBoot> {
         let assets = self.boot_assets.get_assets().await?;
         let mut cmdline = self
             .config
@@ -788,50 +883,11 @@ impl VmLifecycleManager {
             }
         }
 
-        // Block devices: vda = EROFS rootfs (read-only), vdb = Docker data (read-write).
-        let mut block_devices = vec![crate::vm::BlockDeviceConfig {
-            path: assets.rootfs_image.to_string_lossy().to_string(),
-            read_only: true,
-        }];
-
-        // Attach persistent Docker data disk.
-        let docker_data_image = self.data_image_path();
-        Self::ensure_sparse_block_image(&docker_data_image, DOCKER_DATA_IMAGE_SIZE_BYTES)?;
-
-        // Don't inject docker_data_device into cmdline — let the agent
-        // auto-detect. It prefers /dev/arcboxhvc1 (HVC fast path) when
-        // available, falling back to /dev/vdb (VirtIO block).
-
-        block_devices.push(crate::vm::BlockDeviceConfig {
-            path: docker_data_image.to_string_lossy().to_string(),
-            read_only: false,
-        });
-
-        let config = MachineConfig {
-            name: self.machine_name.clone(),
-            cpus: self.config.default_vm.cpus,
-            memory_mb: self.config.default_vm.memory_mb,
-            disk_gb: self.config.default_vm.disk_gb,
-            kernel: Some(assets.kernel.to_string_lossy().to_string()),
-            cmdline: Some(cmdline),
-            block_devices,
-            distro: None,
-            distro_version: None,
-            backend: self.config.backend,
-            enable_rosetta: self.config.default_vm.rosetta,
-        };
-
-        tracing::info!(
-            "Creating default machine: cpus={}, memory={}MB, kernel={}, rootfs={}",
-            config.cpus,
-            config.memory_mb,
-            config.kernel.as_deref().unwrap_or("default"),
-            assets.rootfs_image.display(),
-        );
-
-        self.machine_manager.create(config).await?;
-
-        Ok(())
+        Ok(DesiredBoot {
+            kernel: assets.kernel.to_string_lossy().to_string(),
+            cmdline,
+            rootfs_image: assets.rootfs_image,
+        })
     }
 
     /// Waits for the agent to become ready.
@@ -1181,5 +1237,63 @@ mod tests {
         assert!(config.memory_mb >= 512);
         assert!(config.memory_mb <= 16384);
         assert_eq!(config.disk_gb, 50);
+    }
+
+    fn sample_machine(cpus: u32, memory_mb: u64, kernel: &str, cmdline: &str) -> MachineInfo {
+        MachineInfo {
+            name: "default".to_string(),
+            state: MachineState::Created,
+            vm_id: crate::vm::VmId::new(),
+            cid: None,
+            cpus,
+            memory_mb,
+            disk_gb: 50,
+            kernel: Some(kernel.to_string()),
+            cmdline: Some(cmdline.to_string()),
+            block_devices: Vec::new(),
+            distro: None,
+            distro_version: None,
+            disk_path: None,
+            ssh_key_path: None,
+            ip_address: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn machine_drift_detects_each_overridable_field() {
+        let want = DefaultVmConfig {
+            cpus: 4,
+            memory_mb: 4096,
+            ..DefaultVmConfig::default()
+        };
+        let boot = DesiredBoot {
+            kernel: "/k".to_string(),
+            cmdline: "console=hvc0 earlycon".to_string(),
+            rootfs_image: std::path::PathBuf::from("/rootfs.erofs"),
+        };
+        let current = sample_machine(want.cpus, want.memory_mb, &boot.kernel, &boot.cmdline);
+
+        // Matching machine: no drift.
+        assert_eq!(machine_drift_reason(&current, &want, &boot), None);
+
+        // Each overridable field, changed independently, is detected.
+        let mut m = current.clone();
+        m.cpus = want.cpus + 1;
+        assert_eq!(machine_drift_reason(&m, &want, &boot), Some("cpus"));
+
+        let mut m = current.clone();
+        m.memory_mb = want.memory_mb + 1;
+        assert_eq!(machine_drift_reason(&m, &want, &boot), Some("memory_mb"));
+
+        let mut m = current.clone();
+        m.kernel = Some("/other-kernel".to_string());
+        assert_eq!(machine_drift_reason(&m, &want, &boot), Some("kernel"));
+
+        // The cmdline gap that previously slipped through (e.g. arm64.nosve
+        // added/removed without bumping the boot-asset version).
+        let mut m = current.clone();
+        m.cmdline = Some("console=hvc0 earlycon arm64.nosve".to_string());
+        assert_eq!(machine_drift_reason(&m, &want, &boot), Some("cmdline"));
     }
 }
