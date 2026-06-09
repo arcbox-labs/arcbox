@@ -588,15 +588,26 @@ impl VmLifecycleManager {
         let existing_machine = self.machine_manager.get(&self.machine_name);
         let machine_exists = existing_machine.is_some();
 
-        // Detect stale persisted machine whose cpus/memory no longer matches
-        // the current default_vm config, or whose kernel path references an
-        // outdated boot asset version.
-        let boot_version = &self.boot_assets.config().version;
+        // Detect a stale persisted machine whose cpus/memory or kernel no
+        // longer matches the desired default_vm config. The kernel comparison
+        // is against the resolved desired kernel path — the custom `--kernel`
+        // override if set, otherwise the versioned boot-asset cache path — not
+        // merely the boot-asset version string. Comparing only the version
+        // string let a `--kernel` override that kept the same boot-asset
+        // version slip through, silently reusing the old VM with the stale
+        // persisted kernel.
+        let desired_kernel = self
+            .boot_assets
+            .config()
+            .custom_kernel
+            .clone()
+            .unwrap_or_else(|| self.boot_assets.config().version_cache_dir().join("kernel"));
+        let desired_kernel = desired_kernel.to_string_lossy();
         let config_drifted = existing_machine.as_ref().is_some_and(|m| {
             let hw_changed = m.cpus != self.config.default_vm.cpus
                 || m.memory_mb != self.config.default_vm.memory_mb;
-            let kernel_stale = m.kernel.as_ref().is_some_and(|k| !k.contains(boot_version));
-            hw_changed || kernel_stale
+            let kernel_changed = m.kernel.as_deref() != Some(desired_kernel.as_ref());
+            hw_changed || kernel_changed
         });
 
         if config_drifted {
@@ -607,7 +618,7 @@ impl VmLifecycleManager {
                 persisted_kernel = m.kernel.as_deref().unwrap_or("none"),
                 desired_cpus = self.config.default_vm.cpus,
                 desired_memory = self.config.default_vm.memory_mb,
-                boot_version = %boot_version,
+                desired_kernel = %desired_kernel,
                 "default machine config drifted from desired defaults; recreating"
             );
             let _ = self.machine_manager.remove(&self.machine_name, true);
