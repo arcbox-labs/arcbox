@@ -32,7 +32,7 @@ crate::handlers::container_proxy_handler!(container_changes);
 /// bind-mount paths land on the VirtioFS share.
 ///
 /// ABX-375: every runtime container runs in the single HV utility VM.
-/// `linux/amd64` is executed via FEX64 inside that VM; if FEX64 is not
+/// `linux/amd64` is executed via FEX inside that VM; if FEX is not
 /// provisioned in the guest, the request fails closed with a clear error
 /// rather than silently routing to VZ/Rosetta or QEMU. Compose projects need
 /// no cross-VM scheduling — all services share the one HV VM.
@@ -54,7 +54,7 @@ pub async fn create_container(
     let route = route_container_create(&uri, &body_bytes);
     let requested_name = query_param(&uri, "name").map(str::to_string);
 
-    // Fail closed: amd64 runtime requires FEX64 in the HV guest. Never fall
+    // Fail closed: amd64 runtime requires FEX in the HV guest. Never fall
     // back to a VZ/Rosetta runtime VM for a default amd64 container.
     require_amd64_runtime(&state, route).await?;
 

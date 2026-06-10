@@ -1,6 +1,6 @@
-# ABX-375 FEX64 validation harness
+# ABX-375 FEX validation harness
 
-Reproducible validation for running `linux/amd64` containers through **FEX64**
+Reproducible validation for running `linux/amd64` containers through **FEX**
 inside the single HV utility VM (ABX-375), instead of routing them to a
 VZ/Rosetta runtime VM (ABX-374).
 
@@ -15,7 +15,7 @@ where the daemon cannot boot a VM.
    "Performance / TSO" below.
 2. A Developer-ID-signed `arcbox-daemon` running (ad-hoc signing is killed by
    the restricted entitlements — see root `CLAUDE.md`).
-3. The FEX64 interpreter provisioned in the guest runtime assets and registered
+3. The FEX interpreter provisioned in the guest runtime assets and registered
    via `binfmt_misc` (see "What must be in the guest" below).
 4. The `arcbox` Docker context active, or pass `--context arcbox` (the script
    does this automatically). The context endpoint is
@@ -24,18 +24,18 @@ where the daemon cannot boot a VM.
 ## Run
 
 ```bash
-./tests/fex/validate-fex64.sh
+./tests/fex/validate-fex.sh
 ```
 
 Result tags:
 
 - `PASS` — required behavior held.
-- `FAIL` — a real FEX64/routing failure. **Per PLAN.md, a Gate A `FAIL` means
+- `FAIL` — a real FEX/routing failure. **Per PLAN.md, a Gate A `FAIL` means
   stop ABX-375 and resume ABX-374.**
-- `UNSUPPORTED` — a known FEX64 compatibility gap. Record it in
+- `UNSUPPORTED` — a known FEX compatibility gap. Record it in
   `PLAN.md` "known incompatibilities" before merging; it is not a harness bug.
 - `INFRA` — the harness could not run the check (daemon down, image pull
-  failed). Not a verdict on FEX64.
+  failed). Not a verdict on FEX.
 
 Exit status: `0` no FAIL, `1` any FAIL, `2` only INFRA (nothing validated).
 
@@ -48,12 +48,12 @@ Exit status: `0` no FAIL, `1` any FAIL, `2` only INFRA (nothing validated).
   run; networking, bind mounts, DNS, ports, stdout/stderr, exit status, and
   signals behave.
 - **Gate C — build/compose viability:** `docker build --platform linux/amd64`
-  works through HV/FEX64 with no `/session` cross-VM routing, and a mixed
+  works through HV/FEX with no `/session` cross-VM routing, and a mixed
   arm64/amd64 Compose project stays inside the single HV VM.
 
 ## What must be in the guest
 
-ABX-375 provisions FEX64 like the other guest runtime binaries (dockerd,
+ABX-375 provisions FEX like the other guest runtime binaries (dockerd,
 containerd, runc): a single aarch64 static-PIE `FEX` binary ships in the
 boot-asset runtime bin set at `/arcbox/runtime/bin/FEX` (sibling `boot-assets`
 repo + `assets.lock`; this is a coordinated two-repo change, not a local edit).
@@ -97,7 +97,7 @@ Go/no-go TSO probe (records A vs B scenario):
 If `HV_SYS_REG_ACTLR_EL1` returns `HV_BAD_ARGUMENT` on the target macOS,
 FEX runs software-TSO (still well ahead of QEMU, behind Rosetta). Record
 startup latency, steady-state runtime, build time, CPU, and memory for
-FEX64/HV vs Rosetta/VZ vs QEMU, plus single-HV vs dual-HV+VZ idle memory.
+FEX/HV vs Rosetta/VZ vs QEMU, plus single-HV vs dual-HV+VZ idle memory.
 
 ## Honest scope of this harness
 
