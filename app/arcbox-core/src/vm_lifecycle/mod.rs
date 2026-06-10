@@ -1292,7 +1292,7 @@ mod tests {
 
         // The cmdline gap that previously slipped through (e.g. arm64.nosve
         // added/removed without bumping the boot-asset version).
-        let mut m = current.clone();
+        let mut m = current;
         m.cmdline = Some("console=hvc0 earlycon arm64.nosve".to_string());
         assert_eq!(machine_drift_reason(&m, &want, &boot), Some("cmdline"));
     }
