@@ -5,6 +5,91 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.5](https://github.com/arcboxlabs/arcbox/compare/v0.4.4...v0.4.5) (2026-06-10)
+
+
+### Features
+
+* **core:** own a VM lifecycle per utility VM role ([64fa38d](https://github.com/arcboxlabs/arcbox/commit/64fa38dadcdf0c83f58ac06a24dbe441e326c0ce))
+* **core:** role-aware runtime lookups and connector dispatch ([8eb86af](https://github.com/arcboxlabs/arcbox/commit/8eb86afce529c5fbe7808479c80b2b448d9ddf92))
+* **daemon,docker:** fan-out resource wait + fail-closed unsupported roles ([03530ca](https://github.com/arcboxlabs/arcbox/commit/03530ca424ce9f46dd82d0d764757543766d5e0d))
+* **docker:** add utility VM routing seam ([05aaa9d](https://github.com/arcboxlabs/arcbox/commit/05aaa9d81c4f0978568e4700eabb60987a6e3cfb))
+* **docker:** persist workload-to-role bindings for lifecycle routing ([3a7fc34](https://github.com/arcboxlabs/arcbox/commit/3a7fc34faaf5671757e92c60bdcb07683804cbfd))
+* **docker:** resolve BuildKit /session role + lazy-recover bindings after daemon restart ([e7a91d6](https://github.com/arcboxlabs/arcbox/commit/e7a91d6f8448a941b8bb71b248ebd36075839d03))
+* **docker:** route amd64 runtime to HV/FEX64, fail closed, demote VZ (ABX-375) ([9c85662](https://github.com/arcboxlabs/arcbox/commit/9c8566247d14957f594778ab36568c30ae9d0caa))
+* **docker:** schedule Compose projects on a single utility VM role ([588d217](https://github.com/arcboxlabs/arcbox/commit/588d21710ecfb72ebe3e785d4661148dc3fb80d6))
+* **net,docker:** fan out host port forwarding per utility VM ([87f27d7](https://github.com/arcboxlabs/arcbox/commit/87f27d712ed9fb5e3a54c0685243af29bb06107c))
+* **net:** mount host /private via VirtioFS and rewrite Docker bind paths ([94578ac](https://github.com/arcboxlabs/arcbox/commit/94578ac9d8b5f60407c762cbf1308de29612c6be))
+* **vm:** dm-snapshot CoW with jailer mode support ([#208](https://github.com/arcboxlabs/arcbox/issues/208)) ([7e740a1](https://github.com/arcboxlabs/arcbox/commit/7e740a161d851bdfa62e4c214e72a855fee39504))
+* **vm:** symlink indirection for dm-snapshot checkpoint/restore ([#209](https://github.com/arcboxlabs/arcbox/issues/209)) ([19dfcbf](https://github.com/arcboxlabs/arcbox/commit/19dfcbffc0165e6b61170d6bffa151619af07db2))
+
+
+### Bug Fixes
+
+* **core:** check FEX64 at runtime/bin/FEX, matching boot-assets binfmt path ([9efa368](https://github.com/arcboxlabs/arcbox/commit/9efa368f3d367d34ded8ad7f1b95353b00f1f571))
+* **core:** eliminate TOCTOU in MachineManager::create by holding write lock ([42f3e3f](https://github.com/arcboxlabs/arcbox/commit/42f3e3fb4b60ffbeeab9233e792f8e1216971b15))
+* **daemon:** add ExitTimeOut to launchd plists to prevent SIGKILL during shutdown ([bef9051](https://github.com/arcboxlabs/arcbox/commit/bef90518dcf8baebee1c92142d24190ac58970c5))
+* **daemon:** include ExitTimeOut in installed plist ([d423f5a](https://github.com/arcboxlabs/arcbox/commit/d423f5a2f631680a442363b65891168ed6e66694))
+* **dhcp:** add expiry for declined IPs to prevent pool exhaustion ([d677941](https://github.com/arcboxlabs/arcbox/commit/d677941c90f9aec8db47c1a34e56f31fc9b38c52))
+* **dhcp:** guard lease removal on declined IP and skip quarantine test on low uptime ([526bd71](https://github.com/arcboxlabs/arcbox/commit/526bd71622d32497c894665f359177ec2708a639))
+* **dhcp:** only quarantine offered IPs and preserve reservations on release ([de30a8e](https://github.com/arcboxlabs/arcbox/commit/de30a8ee6e09a35317b91994902142c5f2fe63e7))
+* **docker:** cfg-gate resolve() to macOS, remove stale Content-Length ([7622347](https://github.com/arcboxlabs/arcbox/commit/7622347c67eecac3cbc774204fe4e9b9888b6da6))
+* **docker:** fail closed on ambiguous workload identifiers ([a3fc08c](https://github.com/arcboxlabs/arcbox/commit/a3fc08ceb6990bf338b8b2b0d5a8850aa4b79f9f))
+* **docker:** refuse to guess on prefix collisions and keep alias ownership consistent ([937e188](https://github.com/arcboxlabs/arcbox/commit/937e188ae6d2f4192a762b07603613f94767b87f))
+* **docker:** track workload aliases and route catch-all by URI role ([2977b3c](https://github.com/arcboxlabs/arcbox/commit/2977b3cdfcf36516d5f317b2fd31afe8a30ee093))
+* **docker:** use raw container ID as fallback for networking teardown ([#155](https://github.com/arcboxlabs/arcbox/issues/155)) ([c9bd1a6](https://github.com/arcboxlabs/arcbox/commit/c9bd1a60666606682cb0d221978e0398f6425a9c))
+* use virtiofs constants in init.rs, make host_path pub(crate) ([d2350df](https://github.com/arcboxlabs/arcbox/commit/d2350dffd9fdf749d65058bdd840f8056ba1526a))
+* **vmm:** disable guest SVE/SME on Apple Silicon (phantom SVE traps) ([7be30d7](https://github.com/arcboxlabs/arcbox/commit/7be30d75d6376f3f6fa3fa44a3d20e2e5b2cab7c))
+* **vmm:** mask guest SME so FEX amd64 doesn't SIGILL on Apple SME cores ([8f2c8a7](https://github.com/arcboxlabs/arcbox/commit/8f2c8a7c799038938d8852878f12eb3ba6b805d2))
+* **vmm:** recreate default VM when the desired kernel path changes ([82b96a4](https://github.com/arcboxlabs/arcbox/commit/82b96a46c4bf6b51f8eb6b15194ae60fb3254f80))
+
+
+### Reverts
+
+* **vmm:** drop guest SVE/SME disable (misdiagnosed cause) ([b46b2a6](https://github.com/arcboxlabs/arcbox/commit/b46b2a6d5a40be97564615de4d2ca07a49675520))
+
+
+### Code Refactoring
+
+* **core:** parameterize VmLifecycleManager on machine name ([36cb538](https://github.com/arcboxlabs/arcbox/commit/36cb5381150c765e1fd65574f0db258ee059785f))
+* **core:** pick the hypervisor backend per machine ([77e0952](https://github.com/arcboxlabs/arcbox/commit/77e09527cf72622e8eabdb78643228d159e6cf62))
+* **fex:** rename mistaken FEX64 naming to FEX ([f0ddbfb](https://github.com/arcboxlabs/arcbox/commit/f0ddbfb0b179940d7fd60b926a8b5dec03516b9b))
+* **vmm:** generalize default-VM drift detection to all overridable fields ([fbde372](https://github.com/arcboxlabs/arcbox/commit/fbde3727f2a35285b646c6ae17fbb2656a81f56e))
+
+
+### Tests
+
+* **core:** cover MachineManager::create concurrent same-name race ([35d2d23](https://github.com/arcboxlabs/arcbox/commit/35d2d233a290b01c6c5356154e8673a030016164))
+* **core:** gate concurrent create tasks on a Barrier ([2686255](https://github.com/arcboxlabs/arcbox/commit/26862550973d15eded6ad9cf9cc125a76df9e465))
+* **fex:** add reproducible FEX64 validation harness (ABX-375 step 1) ([158fbce](https://github.com/arcboxlabs/arcbox/commit/158fbceddd4ff3de81d465b19f929ae5743f4626))
+* **fex:** classify unprovisioned FEX64 as BLOCKED, not a Gate-A FAIL ([ed3c561](https://github.com/arcboxlabs/arcbox/commit/ed3c5615906b225f14b72035699283972811f26a))
+* **fex:** point harness at /arcbox/runtime/bin/FEX; skip B/C when unprovisioned ([0e59700](https://github.com/arcboxlabs/arcbox/commit/0e597008bfb08f31c3433d96fc0e94cf87f5a8b3))
+
+
+### Documentation
+
+* **docker:** document the BuildKit /session routing limitation ([6c3b2f3](https://github.com/arcboxlabs/arcbox/commit/6c3b2f3bd0ca158a6bb80a9b9e06889c16c76329))
+* **docker:** fix stale FEX path in require_amd64_runtime comment ([682d956](https://github.com/arcboxlabs/arcbox/commit/682d956ba1e79865332b6137538b62a955a3bf19))
+* **fex:** correct binfmt registration to rootfs /sbin/init, not a guest setup_fex() ([8840336](https://github.com/arcboxlabs/arcbox/commit/8840336bb33883b6eceb413bd0c2209280b84033))
+* **fex:** FEX is binfmt-only via a small patch, ships no FEXServer ([dacc25a](https://github.com/arcboxlabs/arcbox/commit/dacc25a88a7a7948dd4e3ef24f90942e9c1caefa))
+* **machine:** explain why create holds the write lock across I/O ([8b8ac58](https://github.com/arcboxlabs/arcbox/commit/8b8ac589a129652af7b435d3ae6061613a738a7f))
+* **mount:** update mount_standard_shares doc to include /private share ([6e414f7](https://github.com/arcboxlabs/arcbox/commit/6e414f7b595a74d70d9cd5e2c47d068b744d5f25))
+
+
+### Continuous Integration
+
+* **release:** pass release-please PR JSON via env, not inline interpolation ([#295](https://github.com/arcboxlabs/arcbox/issues/295)) ([d16228a](https://github.com/arcboxlabs/arcbox/commit/d16228a0a1ecaeae18010ce9bfc7140f433b9161))
+
+
+### Miscellaneous Chores
+
+* **assets:** bump boot assets to 0.5.11 ([45d60e3](https://github.com/arcboxlabs/arcbox/commit/45d60e3f8c8ba2e1d72b76efb6d4a0a6ffd6098c))
+* **assets:** bump boot assets to 0.5.13 ([46b45f0](https://github.com/arcboxlabs/arcbox/commit/46b45f0475dc6c2d3960726dc35258d17d4baba2))
+* **assets:** bump boot assets to v0.5.10 (working FEX64 runtime) ([89df9a7](https://github.com/arcboxlabs/arcbox/commit/89df9a70ae1fa91ae06cd67c92444e4308edb457))
+* **assets:** pin boot assets v0.5.9 with static FEX64 runtime ([7c5c641](https://github.com/arcboxlabs/arcbox/commit/7c5c641695bce70a5390dbf079dbeaa383ebed20))
+* **devenv:** add devenv-based reproducible dev shell ([25d3836](https://github.com/arcboxlabs/arcbox/commit/25d383671532fcd76450eadab1ec1cd9442376f3))
+* **vmm:** drop redundant clone in drift-detection test ([684ce18](https://github.com/arcboxlabs/arcbox/commit/684ce18a78194751126487a1ba3747a5faae6afe))
+
 ## [0.4.4](https://github.com/arcboxlabs/arcbox/compare/v0.4.3...v0.4.4) (2026-05-26)
 
 
