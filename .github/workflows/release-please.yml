@@ -34,8 +34,11 @@ jobs:
         if: steps.release.outputs.pr
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # Passed via env, not inline interpolation: the JSON contains the
+          # changelog body, whose quotes would break the shell script.
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
         run: |
-          PR_BRANCH=$(echo '${{ steps.release.outputs.pr }}' | jq -r '.headBranchName')
+          PR_BRANCH=$(jq -r '.headBranchName' <<< "$RELEASE_PR")
           git clone --depth 1 --branch "$PR_BRANCH" \
             "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" /tmp/release-pr
           cd /tmp/release-pr
