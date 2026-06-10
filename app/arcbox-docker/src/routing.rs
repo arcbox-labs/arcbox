@@ -5,7 +5,7 @@
 //! in-guest *translator* for the workload's platform:
 //!
 //! - `linux/arm64` and unspecified → [`RuntimeTranslator::Native`] (no translation).
-//! - `linux/amd64` → [`RuntimeTranslator::Fex64`] (x86-64 via FEX `binfmt_misc`
+//! - `linux/amd64` → [`RuntimeTranslator::Fex`] (x86-64 via FEX `binfmt_misc`
 //!   inside the HV guest).
 //!
 //! VZ/Rosetta is no longer a default runtime target. It is retained only as an
@@ -26,7 +26,7 @@ pub enum RuntimeTranslator {
     /// Native arm64 execution — no translation.
     Native,
     /// x86-64 execution through FEX (`binfmt_misc`) inside the HV guest.
-    Fex64,
+    Fex,
 }
 
 impl RuntimeTranslator {
@@ -35,7 +35,7 @@ impl RuntimeTranslator {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Native => "native",
-            Self::Fex64 => "fex64",
+            Self::Fex => "fex",
         }
     }
 }
@@ -64,12 +64,12 @@ impl WorkloadPlatform {
     }
 
     /// Returns the in-guest translator required to run this platform in the
-    /// single HV utility VM. `amd64` needs FEX64; everything else runs
+    /// single HV utility VM. `amd64` needs FEX; everything else runs
     /// natively.
     #[must_use]
     pub const fn runtime_translator(self) -> RuntimeTranslator {
         match self {
-            Self::LinuxAmd64 => RuntimeTranslator::Fex64,
+            Self::LinuxAmd64 => RuntimeTranslator::Fex,
             Self::LinuxArm64 | Self::Unspecified => RuntimeTranslator::Native,
         }
     }
@@ -110,25 +110,25 @@ impl RoutingDecision {
         UtilityVmRole::Native
     }
 
-    /// Whether this workload requires FEX64 in the HV guest to run.
+    /// Whether this workload requires FEX in the HV guest to run.
     #[must_use]
-    pub const fn needs_fex64(self) -> bool {
-        matches!(self.translator, RuntimeTranslator::Fex64)
+    pub const fn needs_fex(self) -> bool {
+        matches!(self.translator, RuntimeTranslator::Fex)
     }
 }
 
-/// Returns whether a routing decision can be admitted given FEX64 availability
+/// Returns whether a routing decision can be admitted given FEX availability
 /// in the HV guest.
 ///
 /// Native (arm64) workloads are always admissible. amd64 workloads are
-/// admitted only when FEX64 is available; otherwise the caller must fail
+/// admitted only when FEX is available; otherwise the caller must fail
 /// closed (PLAN.md error behavior) rather than silently falling back to
 /// VZ/Rosetta or QEMU.
 #[must_use]
-pub const fn is_admissible(decision: RoutingDecision, fex64_available: bool) -> bool {
+pub const fn is_admissible(decision: RoutingDecision, fex_available: bool) -> bool {
     match decision.translator {
         RuntimeTranslator::Native => true,
-        RuntimeTranslator::Fex64 => fex64_available,
+        RuntimeTranslator::Fex => fex_available,
     }
 }
 
@@ -211,12 +211,12 @@ mod tests {
     }
 
     #[test]
-    fn amd64_selects_fex64_translator_on_hv() {
+    fn amd64_selects_fex_translator_on_hv() {
         let route = RoutingDecision::from_platform(WorkloadPlatform::LinuxAmd64);
-        assert_eq!(route.translator, RuntimeTranslator::Fex64);
+        assert_eq!(route.translator, RuntimeTranslator::Fex);
         // Runtime never leaves the single HV VM.
         assert_eq!(route.utility_vm(), UtilityVmRole::Native);
-        assert!(route.needs_fex64());
+        assert!(route.needs_fex());
     }
 
     #[test]
@@ -225,16 +225,16 @@ mod tests {
             let route = RoutingDecision::from_platform(platform);
             assert_eq!(route.translator, RuntimeTranslator::Native);
             assert_eq!(route.utility_vm(), UtilityVmRole::Native);
-            assert!(!route.needs_fex64());
+            assert!(!route.needs_fex());
         }
     }
 
     #[test]
-    fn amd64_admitted_only_when_fex64_available() {
+    fn amd64_admitted_only_when_fex_available() {
         let amd64 = RoutingDecision::from_platform(WorkloadPlatform::LinuxAmd64);
         assert!(
             !is_admissible(amd64, false),
-            "amd64 must fail closed without FEX64"
+            "amd64 must fail closed without FEX"
         );
         assert!(is_admissible(amd64, true));
     }
@@ -243,7 +243,7 @@ mod tests {
     fn native_workloads_always_admissible() {
         let arm64 = RoutingDecision::from_platform(WorkloadPlatform::LinuxArm64);
         let unspec = RoutingDecision::native_default();
-        // Native execution does not depend on FEX64.
+        // Native execution does not depend on FEX.
         assert!(is_admissible(arm64, false));
         assert!(is_admissible(unspec, false));
     }
@@ -254,7 +254,7 @@ mod tests {
         let body = Bytes::from_static(br#"{"Image":"alpine","Platform":"linux/arm64"}"#);
         let route = route_container_create(&uri, &body);
         assert_eq!(route.platform, WorkloadPlatform::LinuxAmd64);
-        assert_eq!(route.translator, RuntimeTranslator::Fex64);
+        assert_eq!(route.translator, RuntimeTranslator::Fex);
     }
 
     #[test]
@@ -262,7 +262,7 @@ mod tests {
         let uri = "/containers/create".parse().unwrap();
         let body = Bytes::from_static(br#"{"Image":"alpine","Platform":"linux/amd64"}"#);
         let route = route_container_create(&uri, &body);
-        assert_eq!(route.translator, RuntimeTranslator::Fex64);
+        assert_eq!(route.translator, RuntimeTranslator::Fex);
     }
 
     #[test]
@@ -270,6 +270,6 @@ mod tests {
         let uri = "/build?t=image&platform=linux%2Famd64".parse().unwrap();
         let route = route_build(&uri);
         assert_eq!(route.platform, WorkloadPlatform::LinuxAmd64);
-        assert_eq!(route.translator, RuntimeTranslator::Fex64);
+        assert_eq!(route.translator, RuntimeTranslator::Fex);
     }
 }

@@ -5,7 +5,7 @@ use crate::routing::{UtilityVmRole, route_build};
 /// contexts (monorepos, node_modules) don't OOM the proxy.
 ///
 /// ABX-375: builds run in the single HV utility VM. `--platform linux/amd64`
-/// build steps execute via FEX64 inside that VM; if FEX64 is not provisioned
+/// build steps execute via FEX inside that VM; if FEX is not provisioned
 /// the build fails closed (no silent VZ/Rosetta or QEMU fallback). All build
 /// options (tags, target, build-args, platform, etc.) are forwarded verbatim
 /// to guest dockerd's BuildKit.

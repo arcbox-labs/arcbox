@@ -441,9 +441,9 @@ impl Runtime {
         self.slot_for(role).guest_docker_vsock_port
     }
 
-    /// Returns whether the HV guest can run `linux/amd64` workloads via FEX64.
+    /// Returns whether the HV guest can run `linux/amd64` workloads via FEX.
     ///
-    /// ABX-375 fail-closed gate. amd64 runtime requires the FEX64 interpreter
+    /// ABX-375 fail-closed gate. amd64 runtime requires the FEX interpreter
     /// provisioned as a runtime binary at `<data_dir>/runtime/bin/FEX` — the
     /// same `runtime/bin` set as `dockerd`/`containerd`, which the `arcbox`
     /// VirtioFS share surfaces to the guest as `/arcbox/runtime/bin/FEX`. The
@@ -452,7 +452,7 @@ impl Runtime {
     /// signal.
     ///
     /// When it is absent, callers must fail closed: amd64 runtime requests
-    /// return a clear FEX64 error instead of silently falling back to
+    /// return a clear FEX error instead of silently falling back to
     /// VZ/Rosetta or QEMU.
     #[must_use]
     pub fn amd64_runtime_supported(&self) -> bool {
@@ -623,7 +623,7 @@ impl Runtime {
 
         // Download every runtime binary in the boot manifest if not cached:
         // dockerd, containerd, containerd-shim-runc-v2, runc, docker-init, k3s,
-        // and the optional FEX64 interpreter (FEX) for linux/amd64. ArcBox's
+        // and the optional FEX x86_64 interpreter for linux/amd64. ArcBox's
         // FEX carries a small patch making it binfmt-only — no FEXServer.
         let runtime_bin_dir = self.config.data_dir.join("runtime/bin");
         tokio::fs::create_dir_all(&runtime_bin_dir).await?;

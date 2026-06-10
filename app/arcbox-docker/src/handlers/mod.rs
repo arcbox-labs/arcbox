@@ -226,7 +226,7 @@ fn ambiguous_workload_error(id: &str) -> DockerError {
 
 /// Fail-closed admission for a routed runtime workload.
 ///
-/// `linux/amd64` containers run via FEX64 inside the HV guest. If FEX64 is
+/// `linux/amd64` containers run via FEX inside the HV guest. If FEX is
 /// not provisioned (`<data_dir>/runtime/bin/FEX` absent → no x86_64 `binfmt_misc`
 /// handler in the guest), this returns a clear error instead of letting the
 /// request silently route to VZ/Rosetta or QEMU, or fail later with a
@@ -239,8 +239,8 @@ pub(crate) async fn require_amd64_runtime(
         return Ok(());
     }
     Err(DockerError::NotImplemented(format!(
-        "linux/amd64 runtime requires FEX64 in the HV guest, which is not provisioned \
-         (expected /arcbox/runtime/bin/FEX). amd64 runtime containers are served by FEX64 \
+        "linux/amd64 runtime requires FEX in the HV guest, which is not provisioned \
+         (expected /arcbox/runtime/bin/FEX). amd64 runtime containers are served by FEX \
          inside the single HV utility VM; ArcBox does not fall back to a VZ/Rosetta runtime \
          VM. Requested platform: {:?}.",
         route.platform,
