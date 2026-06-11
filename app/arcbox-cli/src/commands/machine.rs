@@ -133,7 +133,7 @@ pub struct CreateArgs {
     /// Machine name
     pub name: String,
     /// Number of CPUs (default: host core count, decided by the daemon)
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub cpus: Option<u32>,
     /// Memory in MB
     #[arg(long, default_value = "4096")]
