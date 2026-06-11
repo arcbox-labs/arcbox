@@ -94,7 +94,7 @@ pub struct CreateMachineRequest {
     /// Machine name.
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    /// Number of CPUs.
+    /// Number of CPUs (0 = use the daemon default: host core count).
     #[prost(uint32, tag = "2")]
     pub cpus: u32,
     /// Memory in bytes.

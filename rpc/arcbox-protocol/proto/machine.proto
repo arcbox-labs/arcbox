@@ -50,7 +50,7 @@ service MachineService {
 message CreateMachineRequest {
     // Machine name.
     string name = 1;
-    // Number of CPUs.
+    // Number of CPUs (0 = use the daemon default: host core count).
     uint32 cpus = 2;
     // Memory in bytes.
     uint64 memory = 3;
