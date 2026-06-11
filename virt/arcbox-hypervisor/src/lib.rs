@@ -62,7 +62,7 @@ pub use traits::{GuestMemory, Hypervisor, Vcpu, VirtualMachine};
 pub use types::{
     Arm64Registers, BalloonStats, CpuArch, DeviceSnapshot, DirtyPageInfo, MemoryRegionSnapshot,
     PlatformCapabilities, Registers, VcpuExit, VcpuSnapshot, VirtioDeviceConfig, VirtioDeviceType,
-    VmSnapshot, default_vm_memory_size, host_memory_size,
+    VmSnapshot, default_vm_cpu_count, default_vm_memory_size, host_memory_size,
 };
 
 /// Creates the appropriate hypervisor for the current platform.
