@@ -161,7 +161,7 @@ pub struct VmConfig {
 impl Default for VmConfig {
     fn default() -> Self {
         Self {
-            cpus: 4,
+            cpus: arcbox_hypervisor::default_vm_cpu_count(),
             memory_mb: 4096,
             kernel: None,
             cmdline: None,
