@@ -260,7 +260,7 @@ impl Default for MachineConfig {
     fn default() -> Self {
         Self {
             name: "default".to_string(),
-            cpus: 4,
+            cpus: arcbox_hypervisor::default_vm_cpu_count(),
             memory_mb: 4096,
             disk_gb: 50,
             kernel: None,
@@ -1006,7 +1006,7 @@ impl MachineManager {
             state: MachineState::Running,
             vm_id: VmId::new(), // Fake VM ID
             cid: Some(cid),
-            cpus: 4,
+            cpus: arcbox_hypervisor::default_vm_cpu_count(),
             memory_mb: 4096,
             disk_gb: 50,
             kernel: None,

@@ -221,7 +221,7 @@ impl Default for VmLifecycleConfig {
 /// Default VM configuration.
 #[derive(Debug, Clone)]
 pub struct DefaultVmConfig {
-    /// Number of vCPUs (default: host cores / 2, min: 2).
+    /// Number of vCPUs (default: host core count).
     pub cpus: u32,
     /// Memory in MB (default: half of host RAM, clamped to 512–16384).
     pub memory_mb: u64,
@@ -237,10 +237,8 @@ pub struct DefaultVmConfig {
 
 impl Default for DefaultVmConfig {
     fn default() -> Self {
-        let host_cpus = std::thread::available_parallelism().map_or(4, |n| n.get() as u32);
-
         Self {
-            cpus: (host_cpus / 2).max(2),
+            cpus: arcbox_hypervisor::default_vm_cpu_count(),
             memory_mb: arcbox_hypervisor::default_vm_memory_size() / (1024 * 1024),
             disk_gb: 50,
             kernel: None,
@@ -1230,7 +1228,7 @@ mod tests {
     #[test]
     fn test_default_vm_config() {
         let config = DefaultVmConfig::default();
-        assert!(config.cpus >= 2);
+        assert_eq!(config.cpus, arcbox_hypervisor::default_vm_cpu_count());
         // Default memory is half of host RAM, clamped to [512, 16384] MB.
         let expected_mb = arcbox_hypervisor::default_vm_memory_size() / (1024 * 1024);
         assert_eq!(config.memory_mb, expected_mb);

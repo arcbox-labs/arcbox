@@ -13,7 +13,7 @@
 //! data_dir = "~/.arcbox"
 //!
 //! [vm]
-//! cpus = 4
+//! # cpus = 8         # default: host core count
 //! # memory_mb = 8192  # default: half of host RAM (512–16384)
 //!
 //! [machine]
@@ -168,7 +168,7 @@ impl Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VmDefaults {
-    /// Default number of CPUs.
+    /// Default number of CPUs (default: host core count).
     pub cpus: u32,
     /// Default memory in MB.
     pub memory_mb: u64,
@@ -179,7 +179,7 @@ pub struct VmDefaults {
 impl Default for VmDefaults {
     fn default() -> Self {
         Self {
-            cpus: 4,
+            cpus: arcbox_hypervisor::default_vm_cpu_count(),
             memory_mb: arcbox_hypervisor::default_vm_memory_size() / (1024 * 1024),
             kernel_path: None,
         }
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.vm.cpus, 4);
+        assert_eq!(config.vm.cpus, arcbox_hypervisor::default_vm_cpu_count());
         // Default memory is half of host RAM, clamped to [512, 16384] MB.
         let expected_mb = arcbox_hypervisor::default_vm_memory_size() / (1024 * 1024);
         assert_eq!(config.vm.memory_mb, expected_mb);
