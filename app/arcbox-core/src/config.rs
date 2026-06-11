@@ -176,6 +176,23 @@ pub struct VmDefaults {
     pub kernel_path: Option<PathBuf>,
 }
 
+impl VmDefaults {
+    /// Returns the effective CPU count, resolving `0` to the host core
+    /// count default.
+    ///
+    /// `0` means "use the default" both on the wire (gRPC
+    /// `CreateMachineRequest.cpus`) and in `config.toml`, so callers must
+    /// never propagate it into a VM configuration verbatim.
+    #[must_use]
+    pub fn effective_cpus(&self) -> u32 {
+        if self.cpus == 0 {
+            arcbox_hypervisor::default_vm_cpu_count()
+        } else {
+            self.cpus
+        }
+    }
+}
+
 impl Default for VmDefaults {
     fn default() -> Self {
         Self {
@@ -362,6 +379,27 @@ mod tests {
             config.container.guest_docker_vsock_port,
             DOCKER_API_VSOCK_PORT
         );
+    }
+
+    #[test]
+    fn test_effective_cpus_zero_resolves_to_default() {
+        let vm = VmDefaults {
+            cpus: 0,
+            ..VmDefaults::default()
+        };
+        assert_eq!(
+            vm.effective_cpus(),
+            arcbox_hypervisor::default_vm_cpu_count()
+        );
+    }
+
+    #[test]
+    fn test_effective_cpus_explicit_passes_through() {
+        let vm = VmDefaults {
+            cpus: 3,
+            ..VmDefaults::default()
+        };
+        assert_eq!(vm.effective_cpus(), 3);
     }
 
     #[test]

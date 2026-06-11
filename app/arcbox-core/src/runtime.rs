@@ -211,7 +211,7 @@ impl Runtime {
 
         // Propagate config.vm defaults into VM lifecycle so every entry
         // point (daemon, machine, diagnose, API server) uses the same values.
-        vm_lifecycle_config.default_vm.cpus = config.vm.cpus;
+        vm_lifecycle_config.default_vm.cpus = config.vm.effective_cpus();
         vm_lifecycle_config.default_vm.memory_mb = config.vm.memory_mb;
         if let Some(ref kernel) = config.vm.kernel_path {
             vm_lifecycle_config.default_vm.kernel = Some(kernel.clone());

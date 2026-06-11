@@ -48,7 +48,6 @@ pub mod vm_lifecycle;
 pub mod workload;
 
 pub use agent_client::AgentClient;
-pub use arcbox_hypervisor::default_vm_cpu_count;
 pub use arcbox_vmm::VmBackend;
 pub use boot_assets::{
     BootAssetConfig, BootAssetManifest, BootAssetProvider, BootAssets, DownloadProgress,
