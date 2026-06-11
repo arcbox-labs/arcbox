@@ -13,7 +13,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arcbox_api::{SetupPhase, SetupState};
 use arcbox_constants::paths::HostLayout;
-use arcbox_core::{Config, Runtime, VmLifecycleConfig};
+use arcbox_core::{Config, Runtime};
 use macos_resolver::to_env_prefix;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -156,14 +156,10 @@ pub async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
     }
     let selected_guest_docker_port = config.container.guest_docker_vsock_port;
 
-    let mut vm_lifecycle_config = VmLifecycleConfig::default();
-    vm_lifecycle_config.default_vm.cpus = config.vm.cpus;
-    vm_lifecycle_config.default_vm.memory_mb = config.vm.memory_mb;
-    if let Some(ref kernel) = config.vm.kernel_path {
-        vm_lifecycle_config.default_vm.kernel = Some(kernel.clone());
-    }
+    // The --kernel CLI flag wins over the config file; Runtime::new
+    // propagates config.vm.* into the VM lifecycle config.
     if let Some(ref kernel) = ctx.vm_args.kernel {
-        vm_lifecycle_config.default_vm.kernel = Some(kernel.clone());
+        config.vm.kernel_path = Some(kernel.clone());
     }
 
     // Seed boot assets from app bundle if available, otherwise download.
@@ -181,10 +177,7 @@ pub async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
     ctx.setup_state
         .set_phase(SetupPhase::AssetsReady, "Boot assets ready");
 
-    let runtime = Arc::new(
-        Runtime::with_vm_lifecycle_config(config, vm_lifecycle_config)
-            .context("Failed to create runtime")?,
-    );
+    let runtime = Arc::new(Runtime::new(config).context("Failed to create runtime")?);
     runtime
         .init()
         .await
