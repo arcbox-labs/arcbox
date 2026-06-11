@@ -16,7 +16,7 @@ use arcbox_constants::paths::HostLayout;
 use arcbox_core::{Config, Runtime};
 use macos_resolver::to_env_prefix;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::DaemonArgs;
 use crate::context::{DaemonContext, EarlyContext, VmArgs};
@@ -147,10 +147,13 @@ pub async fn wait_for_resources(_ctx: &DaemonContext) -> Result<()> {
 /// can observe DOWNLOADING_ASSETS → ASSETS_READY progression.
 /// Returns the initialized runtime.
 pub async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
-    let mut config = Config {
-        data_dir: ctx.layout.data_dir.clone(),
-        ..Default::default()
-    };
+    let mut config = Config::load().unwrap_or_else(|err| {
+        warn!(error = %err, "Failed to load config file; falling back to defaults");
+        Config::default()
+    });
+    // The daemon's layout (sockets, lock file) was already resolved from
+    // --data-dir, so it must win over any data_dir in the config file.
+    config.data_dir = ctx.layout.data_dir.clone();
     if let Some(port) = ctx.vm_args.guest_docker_vsock_port {
         config.container.guest_docker_vsock_port = port;
     }
