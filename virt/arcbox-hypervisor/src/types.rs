@@ -161,6 +161,14 @@ pub fn default_vm_memory_size() -> u64 {
     size & !(MIB - 1)
 }
 
+/// Returns a sensible default VM vCPU count: the host's logical core count.
+///
+/// Falls back to 4 if host CPU detection fails.
+#[must_use]
+pub fn default_vm_cpu_count() -> u32 {
+    std::thread::available_parallelism().map_or(4, |n| n.get() as u32)
+}
+
 /// Emits a warning if `memory_size` exceeds 50% of host RAM.
 ///
 /// Shared by Darwin and KVM `validate_config()` to keep the threshold
