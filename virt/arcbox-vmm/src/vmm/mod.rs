@@ -100,7 +100,7 @@ pub struct VmmConfig {
 impl Default for VmmConfig {
     fn default() -> Self {
         Self {
-            vcpu_count: 1,
+            vcpu_count: arcbox_hypervisor::default_vm_cpu_count(),
             memory_size: arcbox_hypervisor::default_vm_memory_size(),
             kernel_path: PathBuf::new(),
             kernel_cmdline: String::new(),

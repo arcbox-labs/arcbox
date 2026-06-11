@@ -103,7 +103,7 @@ impl VmBuilder {
     pub fn new() -> Self {
         Self {
             name: "arcbox-vm".to_string(),
-            cpus: 1,
+            cpus: arcbox_hypervisor::default_vm_cpu_count(),
             memory_size: arcbox_hypervisor::default_vm_memory_size(),
             kernel_path: None,
             kernel_cmdline: String::new(),
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn test_builder_defaults() {
         let builder = VmBuilder::new();
-        assert_eq!(builder.cpus, 1);
+        assert_eq!(builder.cpus, arcbox_hypervisor::default_vm_cpu_count());
         assert_eq!(
             builder.memory_size,
             arcbox_hypervisor::default_vm_memory_size()
