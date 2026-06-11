@@ -166,7 +166,7 @@ pub fn default_vm_memory_size() -> u64 {
 /// Falls back to 4 if host CPU detection fails.
 #[must_use]
 pub fn default_vm_cpu_count() -> u32 {
-    std::thread::available_parallelism().map_or(4, |n| n.get() as u32)
+    std::thread::available_parallelism().map_or(4, |n| u32::try_from(n.get()).unwrap_or(u32::MAX))
 }
 
 /// Emits a warning if `memory_size` exceeds 50% of host RAM.
