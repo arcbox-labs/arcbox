@@ -132,9 +132,9 @@ pub enum MachineCommands {
 pub struct CreateArgs {
     /// Machine name
     pub name: String,
-    /// Number of CPUs
-    #[arg(long, default_value = "4")]
-    pub cpus: u32,
+    /// Number of CPUs (default: host core count, decided by the daemon)
+    #[arg(long)]
+    pub cpus: Option<u32>,
     /// Memory in MB
     #[arg(long, default_value = "4096")]
     pub memory: u64,
@@ -265,7 +265,8 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
     client
         .create(tonic::Request::new(CreateMachineRequest {
             name: args.name.clone(),
-            cpus: args.cpus,
+            // 0 = let the daemon apply its default (host core count).
+            cpus: args.cpus.unwrap_or(0),
             memory: args.memory.saturating_mul(1024_u64 * 1024),
             disk_size: args.disk.saturating_mul(1024_u64 * 1024 * 1024),
             distro: args.distro.clone().unwrap_or_default(),
@@ -280,7 +281,10 @@ async fn execute_create(args: CreateArgs) -> Result<()> {
         .context("Failed to create machine")?;
 
     println!("Machine '{}' created successfully", args.name);
-    println!("  CPUs:   {}", args.cpus);
+    match args.cpus {
+        Some(cpus) => println!("  CPUs:   {cpus}"),
+        None => println!("  CPUs:   default (host core count)"),
+    }
     println!("  Memory: {} MB", args.memory);
     println!("  Disk:   {} GB", args.disk);
     println!();
