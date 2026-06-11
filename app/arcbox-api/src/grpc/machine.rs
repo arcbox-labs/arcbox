@@ -14,16 +14,6 @@ use tonic::{Request, Response, Status};
 
 use super::{SharedRuntime, SharedRuntimeExt};
 
-/// Resolves a requested CPU count: `0` means "use the daemon default"
-/// (host core count).
-fn resolve_cpus(requested: u32) -> u32 {
-    if requested == 0 {
-        arcbox_core::default_vm_cpu_count()
-    } else {
-        requested
-    }
-}
-
 /// Machine service implementation.
 pub struct MachineServiceImpl {
     runtime: SharedRuntime,
@@ -44,6 +34,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         request: Request<CreateMachineRequest>,
     ) -> Result<Response<CreateMachineResponse>, Status> {
         let req = request.into_inner();
+        let runtime = self.runtime.ready()?;
 
         // Convert bytes to MB for internal config.
         let memory_mb = req.memory / (1024 * 1024);
@@ -51,7 +42,12 @@ impl machine_service_server::MachineService for MachineServiceImpl {
 
         let config = arcbox_core::machine::MachineConfig {
             name: req.name.clone(),
-            cpus: resolve_cpus(req.cpus),
+            // 0 on the wire means "use the daemon-configured default".
+            cpus: if req.cpus == 0 {
+                runtime.config().vm.effective_cpus()
+            } else {
+                req.cpus
+            },
             memory_mb,
             disk_gb,
             kernel: if req.kernel.is_empty() {
@@ -79,8 +75,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             enable_rosetta: false,
         };
 
-        self.runtime
-            .ready()?
+        runtime
             .machine_manager()
             .create(config)
             .await
@@ -276,20 +271,5 @@ impl machine_service_server::MachineService for MachineServiceImpl {
     ) -> Result<Response<arcbox_protocol::v1::SshInfoResponse>, Status> {
         // TODO: Implement SSH info.
         Err(Status::unimplemented("ssh_info not implemented"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::resolve_cpus;
-
-    #[test]
-    fn resolve_cpus_zero_uses_daemon_default() {
-        assert_eq!(resolve_cpus(0), arcbox_core::default_vm_cpu_count());
-    }
-
-    #[test]
-    fn resolve_cpus_explicit_value_passes_through() {
-        assert_eq!(resolve_cpus(3), 3);
     }
 }
