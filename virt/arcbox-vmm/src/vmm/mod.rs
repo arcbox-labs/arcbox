@@ -291,6 +291,10 @@ pub struct Vmm {
     /// `hv_vm_unmap` on drop. Those must complete before `hv_vm_destroy`.
     #[cfg(target_os = "macos")]
     hv_device_manager: Option<std::sync::Arc<DeviceManager>>,
+    /// vsock-io worker thread handle (custom HV). Owns host→guest vsock
+    /// injection; joined in `stop_darwin_hv` before guest memory drops.
+    #[cfg(target_os = "macos")]
+    hv_vsock_worker: Option<std::thread::JoinHandle<()>>,
     /// HV-side network fd (NIC1). Paired with the NetworkDatapath fd.
     /// Kept alive so the socketpair stays open while the VM runs.
     #[cfg(target_os = "macos")]
@@ -462,6 +466,8 @@ impl Vmm {
             resolved_backend: None,
             #[cfg(target_os = "macos")]
             hv_device_manager: None,
+            #[cfg(target_os = "macos")]
+            hv_vsock_worker: None,
             #[cfg(target_os = "macos")]
             hv_net_fd: None,
             hv_bridge_net_fd: None,

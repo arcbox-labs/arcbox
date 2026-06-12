@@ -77,6 +77,8 @@ pub mod snapshot;
 pub mod vcpu;
 pub(crate) mod virtqueue_util;
 pub mod vmm;
+#[cfg(target_os = "macos")]
+pub(crate) mod vsock_rx_worker;
 /// Back-compat re-export of `arcbox_virtio::vsock_manager`.
 ///
 /// The module moved to `arcbox-virtio` so that

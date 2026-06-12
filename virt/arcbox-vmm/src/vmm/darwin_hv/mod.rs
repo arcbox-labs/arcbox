@@ -160,6 +160,36 @@ fn fdt_err(e: vm_fdt::Error) -> VmmError {
     VmmError::Memory(format!("FDT error: {e}"))
 }
 
+/// Builds a thread-safe closure that force-exits every registered vCPU out
+/// of `hv_vcpu_run`, used by io-worker threads (net-rx, vsock-io) to wake a
+/// guest that is idle in WFI for interrupt delivery.
+///
+/// On arm64 `hv_vcpus_exit` requires a concrete list of vCPU IDs; NULL/0 is
+/// a silent no-op. The registry is snapshotted on each invocation so
+/// late-arriving secondaries (PSCI CPU_ON) are picked up. Safe to call from
+/// any thread. See ABX-367.
+fn make_exit_vcpus_fn(ids: HvVcpuIds) -> Arc<dyn Fn() + Send + Sync> {
+    Arc::new(move || {
+        let ids_snapshot: Vec<u64> = ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if ids_snapshot.is_empty() {
+            return;
+        }
+        // SAFETY: `ids_snapshot` is a live Vec owned by this closure for
+        // the duration of the FFI call; the pointer and length are
+        // consistent.
+        #[allow(clippy::cast_possible_truncation)]
+        let ret = unsafe {
+            arcbox_hv::ffi::hv_vcpus_exit(ids_snapshot.as_ptr(), ids_snapshot.len() as u32)
+        };
+        if let Err(e) = arcbox_hv::check(ret) {
+            tracing::warn!("exit_vcpus: hv_vcpus_exit failed: {e}");
+        }
+    })
+}
+
 impl Vmm {
     /// Duplicates a daemon-facing socketpair fd into a monotonically increasing
     /// descriptor range derived from the connection's host port.
@@ -1021,38 +1051,13 @@ impl Vmm {
                         }
                         Ok(())
                     });
-                // Force-exit all vCPUs closure used by the net-rx worker to
-                // wake a guest that is idle in WFI for interrupt delivery.
-                // On arm64 `hv_vcpus_exit` requires a concrete list of vCPU
-                // IDs; NULL/0 is a silent no-op. Snapshot `hv_vcpu_ids` each
-                // invocation so late-arriving secondaries (PSCI CPU_ON) are
-                // picked up. Safe to call from any thread. See ABX-367.
-                let exit_ids = self
-                    .hv_vcpu_ids
-                    .clone()
-                    .expect("hv_vcpu_ids asserted Some above");
-                let exit_fn: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                    let ids_snapshot: Vec<u64> = exit_ids
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
-                    if ids_snapshot.is_empty() {
-                        return;
-                    }
-                    // SAFETY: `ids_snapshot` is a live Vec owned by this
-                    // closure for the duration of the FFI call; the pointer
-                    // and length are consistent.
-                    #[allow(clippy::cast_possible_truncation)]
-                    let ret = unsafe {
-                        arcbox_hv::ffi::hv_vcpus_exit(
-                            ids_snapshot.as_ptr(),
-                            ids_snapshot.len() as u32,
-                        )
-                    };
-                    if let Err(e) = arcbox_hv::check(ret) {
-                        tracing::warn!("net-rx exit_fn: hv_vcpus_exit failed: {e}");
-                    }
-                });
+                // Force-exit closure used by the net-rx worker to wake a
+                // guest that is idle in WFI for interrupt delivery (ABX-367).
+                let exit_fn = make_exit_vcpus_fn(
+                    self.hv_vcpu_ids
+                        .clone()
+                        .expect("hv_vcpu_ids asserted Some above"),
+                );
                 dm.set_net_rx_hooks(net_irq_cb, exit_fn);
             }
 
@@ -1061,6 +1066,14 @@ impl Vmm {
 
         // Store a shared reference for connect_vsock_hv to use after start.
         self.hv_device_manager = Some(Arc::clone(&device_manager));
+
+        // --- vsock-io worker: event-driven host→guest injection ---
+        // Without it, packets enqueued by the daemon wait for the BSP's
+        // next natural VM exit (~100 ms on an idle guest). The doorbell
+        // pipe is rung by the connection manager on new RX work; the
+        // worker also watches every connected socketpair fd for data.
+        self.spawn_vsock_rx_worker(&device_manager)?;
+
         let running = self.running.clone();
         let paused = self.hv_paused.clone();
         // Ensure a fresh start always begins unpaused, even if a prior
@@ -1295,6 +1308,15 @@ impl Vmm {
             }
         }
 
+        // Join the vsock-io worker for the same reason: it injects into
+        // guest memory via the DeviceManager. It observes `running=false`
+        // within its kevent backstop timeout (10 ms).
+        if let Some(t) = self.hv_vsock_worker.take() {
+            if let Err(e) = t.join() {
+                tracing::warn!("vsock-io worker thread join failed: {e:?}");
+            }
+        }
+
         // Cleanup in correct order: DAX → GIC → VM → guest memory.
         //
         // DAX mappers must be drained first because `hv_vm_unmap` must be
@@ -1387,6 +1409,88 @@ impl Vmm {
         Ok(())
     }
 
+    /// Creates the vsock doorbell pipe, installs the ring callback into the
+    /// connection manager, and spawns the vsock-io worker thread.
+    ///
+    /// The worker owns host→guest vsock injection from here on; the vCPU
+    /// loop no longer polls vsock. Joined in `stop_darwin_hv` before guest
+    /// memory is released.
+    fn spawn_vsock_rx_worker(&mut self, device_manager: &Arc<DeviceManager>) -> Result<()> {
+        let mut pipe_fds: [libc::c_int; 2] = [0; 2];
+        // SAFETY: `pipe_fds` is a valid 2-element array; pipe writes two
+        // fds into it on success.
+        let ret = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+        if ret != 0 {
+            return Err(VmmError::Device(format!(
+                "vsock doorbell pipe failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: both fds are fresh from pipe above with sole ownership.
+        let doorbell_rd = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        // SAFETY: same as above for the write end.
+        let doorbell_wr = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+
+        // Both ends non-blocking + cloexec. The write end must never block
+        // a producer (a full pipe already guarantees a pending wakeup); the
+        // worker drains the read end with a non-blocking loop.
+        for fd in [doorbell_rd.as_raw_fd(), doorbell_wr.as_raw_fd()] {
+            // SAFETY: `fd` is a live fd owned by the OwnedFds above.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            // SAFETY: same fd; setting O_NONBLOCK is side-effect-only.
+            if flags == -1
+                || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+            {
+                return Err(VmmError::Device(format!(
+                    "vsock doorbell O_NONBLOCK failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            // SAFETY: same fd; FD_CLOEXEC is side-effect-only.
+            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if fd_flags != -1 {
+                // SAFETY: same fd as above.
+                let _ = unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) };
+            }
+        }
+
+        let doorbell: crate::vsock_manager::VsockDoorbell = Arc::new(move || {
+            let byte = [1u8];
+            // SAFETY: the write end is owned by this closure and stays open
+            // for its lifetime. EAGAIN on a full pipe is fine — a wakeup is
+            // already pending.
+            let _ = unsafe {
+                libc::write(
+                    doorbell_wr.as_raw_fd(),
+                    byte.as_ptr().cast::<libc::c_void>(),
+                    1,
+                )
+            };
+        });
+        device_manager
+            .vsock_connections()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_doorbell(doorbell);
+
+        let ctx = crate::vsock_rx_worker::VsockRxWorkerContext {
+            device_manager: Arc::clone(device_manager),
+            doorbell_rd,
+            running: self.running.clone(),
+            exit_vcpus: make_exit_vcpus_fn(
+                self.hv_vcpu_ids
+                    .clone()
+                    .expect("hv_vcpu_ids asserted Some above"),
+            ),
+        };
+        let handle = std::thread::Builder::new()
+            .name("vsock-io".to_string())
+            .spawn(move || crate::vsock_rx_worker::vsock_rx_worker_loop(ctx))
+            .map_err(|e| VmmError::Device(format!("spawn vsock-io worker: {e}")))?;
+        self.hv_vsock_worker = Some(handle);
+        Ok(())
+    }
+
     /// Connects to a vsock port on the guest VM (HV backend).
     ///
     /// Creates a Unix `SOCK_STREAM` socketpair; one end is returned to the
@@ -1395,10 +1499,10 @@ impl Vmm {
     /// between the socketpair and the guest's RX/TX queues.
     ///
     /// Returns immediately after allocating and enqueueing the connection —
-    /// OP_REQUEST injection into the guest RX queue is deferred to
-    /// `poll_vsock_rx` running on the vCPU thread. The returned fd is
-    /// usable right away; the guest responds with OP_RESPONSE or OP_RST
-    /// within one vCPU cycle of injection.
+    /// `allocate` rings the vsock-io worker's doorbell, which injects the
+    /// OP_REQUEST into the guest RX queue right away. The returned fd is
+    /// usable immediately; the guest responds with OP_RESPONSE or OP_RST
+    /// as soon as it services the interrupt.
     #[allow(clippy::unnecessary_wraps)]
     pub(super) fn connect_vsock_hv(&self, port: u32) -> Result<std::os::unix::io::RawFd> {
         // Create a Unix SOCK_STREAM socketpair for bidirectional data.
@@ -1521,9 +1625,9 @@ impl Vmm {
             host_fd.as_raw_fd(),
         );
 
-        // OP_REQUEST is in backend_rxq. The vCPU BSP thread's poll_vsock_rx
-        // will inject it and fire injected_notify. We do NOT block here —
-        // the daemon's ping().await handles the timing:
+        // OP_REQUEST is in backend_rxq and the vsock-io worker's doorbell
+        // has been rung; it injects and fires injected_notify. We do NOT
+        // block here — the daemon's ping().await handles the timing:
         // - If REQUEST not yet injected: ping timeout (2s) → retry
         // - If injected + RST: read returns EOF → retry
         // - If injected + RESPONSE: read returns data → success

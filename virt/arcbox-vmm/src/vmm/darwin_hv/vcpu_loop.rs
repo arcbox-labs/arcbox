@@ -200,19 +200,12 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
             break;
         }
 
-        // BSP (vCPU 0) handles all device polling to avoid lock contention.
-        if vcpu_id == 0 {
-            if device_manager.poll_vsock_rx() {
-                device_manager.raise_interrupt_for(
-                    crate::device::DeviceType::VirtioVsock,
-                    1, // INT_VRING
-                );
-            }
-            // poll_net_rx removed — handled by net-io worker thread.
-            if device_manager.poll_bridge_rx() {
-                if let Some(bid) = device_manager.bridge_device_id() {
-                    device_manager.raise_interrupt_for_device(bid, 1);
-                }
+        // BSP (vCPU 0) handles bridge polling to avoid lock contention.
+        // poll_net_rx removed — handled by net-io worker thread.
+        // poll_vsock_rx removed — handled by vsock-io worker thread.
+        if vcpu_id == 0 && device_manager.poll_bridge_rx() {
+            if let Some(bid) = device_manager.bridge_device_id() {
+                device_manager.raise_interrupt_for_device(bid, 1);
             }
         }
 
@@ -337,24 +330,13 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                 ..
             } => {
                 // Guest executed WFI — it is idle and waiting for an interrupt.
-                // Before parking, poll vsock host fds for incoming data.
-                // If data arrives, inject into RX queue and trigger interrupt
-                // so the guest wakes up to process it.
-                let wfi_has_vsock = device_manager.poll_vsock_rx();
-                if wfi_has_vsock {
-                    device_manager.raise_interrupt_for(crate::device::DeviceType::VirtioVsock, 1);
-                }
-
-                // poll_net_rx removed — handled by net-io worker thread.
-
+                // Before parking, poll the bridge for incoming data. vsock and
+                // net injection are handled by their dedicated worker threads.
                 let wfi_has_bridge = device_manager.poll_bridge_rx();
                 if wfi_has_bridge {
                     if let Some(bid) = device_manager.bridge_device_id() {
                         device_manager.raise_interrupt_for_device(bid, 1);
                     }
-                }
-
-                if wfi_has_vsock || wfi_has_bridge {
                     continue; // Re-enter run loop immediately.
                 }
                 // No pending data — park with timeout.
