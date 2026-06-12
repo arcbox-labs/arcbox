@@ -6,6 +6,7 @@ use crate::vm_lifecycle::VmLifecycleManager;
 use async_trait::async_trait;
 use std::os::fd::FromRawFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Guest Docker backend (dockerd/containerd/runc inside VM).
@@ -14,6 +15,9 @@ pub struct GuestDockerBackend {
     machine_manager: Arc<MachineManager>,
     machine_name: &'static str,
     config: ContainerRuntimeConfig,
+    /// Set once the guest endpoint has been verified; collapses the
+    /// per-request readiness check to a single vsock connect probe.
+    endpoint_verified: AtomicBool,
 }
 
 impl GuestDockerBackend {
@@ -29,10 +33,38 @@ impl GuestDockerBackend {
             machine_manager,
             machine_name,
             config,
+            endpoint_verified: AtomicBool::new(false),
         }
     }
 
+    /// Probes the guest dockerd endpoint with one vsock connect.
+    fn probe_guest_endpoint(&self) -> Result<()> {
+        let fd = self
+            .machine_manager
+            .connect_vsock_port(self.machine_name, self.config.guest_docker_vsock_port)?;
+        // SAFETY: connect_vsock_port returns a freshly created fd owned by
+        // the caller; wrapping it transfers that ownership so it closes.
+        let _owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        Ok(())
+    }
+
     async fn wait_guest_endpoint_ready(&self) -> Result<()> {
+        // Fast path: the endpoint was verified earlier in this VM's
+        // lifetime. One connect probe replaces the agent RPC round trips;
+        // if dockerd died (or the VM restarted underneath us), the probe
+        // fails and we fall through to the full ensure-runtime loop,
+        // which restarts dockerd via the agent.
+        if self.endpoint_verified.load(Ordering::Relaxed) {
+            match self.probe_guest_endpoint() {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    self.endpoint_verified.store(false, Ordering::Relaxed);
+                    tracing::debug!(
+                        "guest endpoint failed cached probe ({e}); re-running full readiness"
+                    );
+                }
+            }
+        }
         const INITIAL_DELAY_MS: u64 = 120;
         const MAX_DELAY_MS: u64 = 1200;
 
@@ -88,7 +120,11 @@ impl GuestDockerBackend {
                     .connect_vsock_port(self.machine_name, port)
                 {
                     Ok(fd) => {
+                        // SAFETY: connect_vsock_port returns a freshly
+                        // created fd owned by the caller; wrapping it
+                        // transfers that ownership so it closes.
                         let _owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+                        self.endpoint_verified.store(true, Ordering::Relaxed);
                         tracing::debug!(port, "guest docker endpoint is ready");
                         return Ok(());
                     }
