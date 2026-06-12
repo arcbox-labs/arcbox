@@ -95,15 +95,21 @@ pub enum VmnetInterfaceEvent {
 }
 
 /// Packet descriptor for vmnet read/write operations.
+///
+/// Field order and types must match `struct vmpktdesc` in
+/// `<vmnet/vmnet.h>` exactly: `vm_pkt_size` is a `size_t` and comes
+/// first. Any deviation shifts every field offset and makes
+/// `vmnet_read`/`vmnet_write` fail with `VMNET_INVALID_ARGUMENT`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct VmnetPacket {
+    /// Packet size in bytes (`size_t`). On read: in = buffer capacity,
+    /// out = actual packet length.
+    pub vm_pkt_size: usize,
     /// Pointer to packet data.
     pub vm_pkt_iov: *mut iovec,
     /// Number of iovec entries.
     pub vm_pkt_iovcnt: u32,
-    /// Packet size in bytes.
-    pub vm_pkt_size: u32,
     /// Flags.
     pub vm_flags: u32,
 }
@@ -552,5 +558,21 @@ mod tests {
         assert_eq!(VmnetOperatingMode::Host as i32, 1000);
         assert_eq!(VmnetOperatingMode::Shared as i32, 1001);
         assert_eq!(VmnetOperatingMode::Bridged as i32, 1002);
+    }
+
+    /// Pins `VmnetPacket` to the ABI of `struct vmpktdesc` in
+    /// `<vmnet/vmnet.h>` (arm64/x86_64 macOS): `size_t` first, then the
+    /// iovec pointer, then two `uint32_t`s. A layout drift shifts every
+    /// field offset and makes vmnet_read/vmnet_write reject the
+    /// descriptor with VMNET_INVALID_ARGUMENT.
+    #[test]
+    fn vmnet_packet_matches_vmpktdesc_abi() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(size_of::<VmnetPacket>(), 24);
+        assert_eq!(offset_of!(VmnetPacket, vm_pkt_size), 0);
+        assert_eq!(offset_of!(VmnetPacket, vm_pkt_iov), 8);
+        assert_eq!(offset_of!(VmnetPacket, vm_pkt_iovcnt), 16);
+        assert_eq!(offset_of!(VmnetPacket, vm_flags), 20);
     }
 }
