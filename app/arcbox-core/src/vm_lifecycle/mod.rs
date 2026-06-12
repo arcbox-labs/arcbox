@@ -707,11 +707,16 @@ impl VmLifecycleManager {
                     {
                         // vmnet path: bridge name is known instantly, only need
                         // helper retry (1-2 attempts for XPC readiness).
+                        let event_bus = self.event_bus.clone();
+                        let name = self.machine_name.clone();
                         drop(tokio::spawn(async move {
-                            if let Err(e) =
-                                crate::route_reconciler::ensure_route_for_bridge(&bridge).await
-                            {
-                                tracing::warn!(error = %e, "failed to install container route (vmnet)");
+                            match crate::route_reconciler::ensure_route_for_bridge(&bridge).await {
+                                Ok(()) => {
+                                    event_bus.publish(Event::ContainerRouteInstalled { name });
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "failed to install container route (vmnet)");
+                                }
                             }
                         }));
                     }
@@ -720,11 +725,16 @@ impl VmLifecycleManager {
                     if let Some(mac) = self.machine_manager.bridge_mac(&self.machine_name) {
                         // Non-vmnet path: scan kernel FDB to discover bridge
                         // (retries up to ~10s for FDB learning).
+                        let event_bus = self.event_bus.clone();
+                        let name = self.machine_name.clone();
                         drop(tokio::spawn(async move {
-                            if let Err(e) =
-                                crate::route_reconciler::ensure_route_with_retry(&mac).await
-                            {
-                                tracing::warn!(error = %e, "failed to install container route");
+                            match crate::route_reconciler::ensure_route_with_retry(&mac).await {
+                                Ok(()) => {
+                                    event_bus.publish(Event::ContainerRouteInstalled { name });
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "failed to install container route");
+                                }
                             }
                         }));
                     }
