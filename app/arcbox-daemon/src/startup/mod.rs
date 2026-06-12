@@ -97,9 +97,11 @@ async fn acquire_lock(early: EarlyContext) -> Result<DaemonContext> {
 /// Wait for residual resource holders (e.g. docker.img) to release.
 ///
 /// Must complete before [`init_runtime`] — on macOS, orphaned
-/// Virtualization.framework XPC helpers may still hold a previous
-/// daemon's disk images. Reports the `CleaningUp` phase so gRPC clients
-/// can show progress.
+/// Virtualization.framework XPC helpers of a just-displaced daemon may
+/// still hold a previous daemon's disk images. Only runs when lock
+/// acquisition actually displaced a stale daemon; clean starts skip the
+/// (expensive) scan. Reports the `CleaningUp` phase so gRPC clients can
+/// show progress.
 ///
 /// Scans every persistent dockerd image owned by a configured utility
 /// VM role (native `docker.img`, rosetta `docker-rosetta.img`) so a
@@ -116,6 +118,17 @@ async fn wait_for_resources(ctx: &DaemonContext) -> Result<()> {
         .collect();
 
     if docker_imgs.is_empty() {
+        return Ok(());
+    }
+
+    // Residual holders only exist when an old daemon was displaced during
+    // lock acquisition (its XPC helpers may outlive the flock release).
+    // On a clean start, skip the scan: `pids_by_path` walks every
+    // process's fd table and costs ~100ms. A crashed daemon's helpers can
+    // in principle linger past the kernel's flock release, but the scan
+    // was always best-effort (10s cap, then proceed with a warning) and
+    // VM start reports its own error if the image is still held.
+    if !ctx.daemon_lock.displaced_stale_daemon() {
         return Ok(());
     }
 

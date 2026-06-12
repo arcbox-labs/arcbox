@@ -14,6 +14,7 @@ use super::cleanup::{is_arcbox_daemon, terminate_stale_daemon};
 /// stores the current PID for diagnostics and signalling.
 pub struct DaemonLock {
     _file: std::fs::File,
+    displaced_stale: bool,
 }
 
 impl DaemonLock {
@@ -36,7 +37,8 @@ impl DaemonLock {
             .context("Failed to open daemon lock")?;
 
         // Try non-blocking lock first.
-        if try_flock_exclusive(&file) {
+        let displaced_stale = !try_flock_exclusive(&file);
+        if !displaced_stale {
             // No stale daemon — we got the lock immediately.
             info!("Daemon lock acquired (no stale daemon)");
         } else {
@@ -69,7 +71,20 @@ impl DaemonLock {
             warn!(%e, "Failed to write PID to daemon.lock");
         }
 
-        Ok(Self { _file: file })
+        Ok(Self {
+            _file: file,
+            displaced_stale,
+        })
+    }
+
+    /// Whether acquisition had to wait for a previous lock holder to exit.
+    ///
+    /// `true` means an old daemon was alive moments ago and its resources
+    /// (e.g. Virtualization.framework XPC helpers holding the disk image)
+    /// may still be releasing.
+    #[must_use]
+    pub const fn displaced_stale_daemon(&self) -> bool {
+        self.displaced_stale
     }
 }
 
