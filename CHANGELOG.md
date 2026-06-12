@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.6](https://github.com/arcboxlabs/arcbox/compare/v0.4.5...v0.4.6) (2026-06-12)
+
+
+### Features
+
+* **cli,api:** make --cpus optional, daemon resolves 0 to host core count ([2935a90](https://github.com/arcboxlabs/arcbox/commit/2935a90a495cf787445c7371656cef4587e4e1e8))
+* **hypervisor:** add default_vm_cpu_count() helper ([0c14ba1](https://github.com/arcboxlabs/arcbox/commit/0c14ba1bc8d0677a1ccea6ee203b2964f231084f))
+
+
+### Bug Fixes
+
+* **cli,rpc,hypervisor:** reject --cpus 0, unbake default policy from proto contract ([eaab3a4](https://github.com/arcboxlabs/arcbox/commit/eaab3a446b29a5e10821e05cf728e59c7dc3d4e9))
+* **core,api:** resolve cpus=0 through daemon-configured default ([be452b5](https://github.com/arcboxlabs/arcbox/commit/be452b5781d68f3ce9e234b4684db32405ca03f8))
+* **daemon,core:** sync route_installed when vm_lifecycle installs the route ([501dfc4](https://github.com/arcboxlabs/arcbox/commit/501dfc48bd04916a4d0ca0ded98062a33312caff))
+* **daemon:** enable vmnet bridge NIC by default ([684b045](https://github.com/arcboxlabs/arcbox/commit/684b04581302956c841f5ff4f16bae536156b0e5))
+* **daemon:** load config file and env in init_runtime ([aaf4baf](https://github.com/arcboxlabs/arcbox/commit/aaf4baf476cb93feae9a1810b5cd98871037f18c))
+
+
+### Code Refactoring
+
+* **core:** unify CPU defaults on default_vm_cpu_count() ([b6d30bb](https://github.com/arcboxlabs/arcbox/commit/b6d30bbefd0345cffa875b34382615c78786e6e3))
+* **daemon:** consolidate VM config propagation into Runtime::new ([41c5ebe](https://github.com/arcboxlabs/arcbox/commit/41c5ebebadd8e8566789a6f30f02edb4c2b0f942))
+* **vmm:** default vCPU counts to host core count ([1db6226](https://github.com/arcboxlabs/arcbox/commit/1db6226b0c1477292eac279ed6c48c30db2cc8dd))
+
 ## [0.4.5](https://github.com/arcboxlabs/arcbox/compare/v0.4.4...v0.4.5) (2026-06-10)
 
 
