@@ -15,9 +15,18 @@ use std::num::Wrapping;
 #[cfg(test)]
 use std::os::unix::io::FromRawFd;
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::VsockHostConnections;
+
+/// Wakeup hook invoked when host→guest RX work appears from outside the
+/// injection driver (new connection, handshake completion, credit grants).
+///
+/// The VMM installs a callback that wakes its vsock-io worker so injection
+/// runs immediately instead of waiting for the next natural vCPU exit —
+/// without it, an idle guest adds ~100 ms per host→guest leg.
+pub type VsockDoorbell = Arc<dyn Fn() + Send + Sync>;
 
 // ============================================================================
 // RxOps: Per-connection pending RX operation bitmask
@@ -304,6 +313,12 @@ pub struct VsockConnectionManager {
     pub backend_rxq: VecDeque<VsockConnectionId>,
     /// Monotonically increasing counter for ephemeral host port allocation.
     next_host_port: AtomicU32,
+    /// Rung when RX work appears from producer paths (allocate, handshake
+    /// completion, credit grants). NOT rung from the injection driver's own
+    /// enqueues (`enqueue_rw`/`enqueue_reset` and in-loop re-pushes) — the
+    /// driver is already awake there, and ringing on its re-pushes would
+    /// spin it while the guest catches up.
+    doorbell: Option<VsockDoorbell>,
 }
 
 impl VsockConnectionManager {
@@ -316,6 +331,18 @@ impl VsockConnectionManager {
             connections: HashMap::new(),
             backend_rxq: VecDeque::new(),
             next_host_port: AtomicU32::new(Self::EPHEMERAL_PORT_BASE),
+            doorbell: None,
+        }
+    }
+
+    /// Installs the doorbell rung when new host→guest RX work appears.
+    pub fn set_doorbell(&mut self, doorbell: VsockDoorbell) {
+        self.doorbell = Some(doorbell);
+    }
+
+    fn ring_doorbell(&self) {
+        if let Some(doorbell) = &self.doorbell {
+            doorbell();
         }
     }
 
@@ -351,6 +378,7 @@ impl VsockConnectionManager {
         self.connections.insert(id, conn);
         // Signal that this connection has a pending RX op (OP_REQUEST).
         self.backend_rxq.push_back(id);
+        self.ring_doorbell();
         tracing::info!(
             "VsockConnectionManager: allocated connection guest_port={} host_port={} — \
              OP_REQUEST enqueued",
@@ -461,6 +489,10 @@ impl VsockHostConnections for VsockConnectionManager {
         };
         if let Some(conn) = self.connections.get_mut(&id) {
             conn.connect = true;
+            // The daemon may already have written request data into the
+            // socketpair while the handshake was in flight; wake the
+            // injection driver so it starts watching this fd now.
+            self.ring_doorbell();
             tracing::info!("VsockConnectionManager: connection {:?} now Connected", id,);
         } else {
             tracing::warn!(
@@ -505,6 +537,7 @@ impl VsockHostConnections for VsockConnectionManager {
             conn.advance_fwd_cnt(bytes);
             if conn.rx_queue.pending() {
                 self.backend_rxq.push_back(id);
+                self.ring_doorbell();
                 return true;
             }
         }
@@ -519,6 +552,7 @@ impl VsockHostConnections for VsockConnectionManager {
         if let Some(conn) = self.connections.get_mut(&id) {
             conn.rx_queue.enqueue(RxOps::CREDIT_UPDATE);
             self.backend_rxq.push_back(id);
+            self.ring_doorbell();
         }
     }
 
@@ -892,6 +926,69 @@ mod tests {
         daemon_stream
             .write_all(b"still-alive")
             .expect("daemon→internal write should still succeed");
+    }
+
+    #[test]
+    fn doorbell_rings_on_producer_paths() {
+        use std::sync::atomic::AtomicUsize;
+
+        let rings = Arc::new(AtomicUsize::new(0));
+        let mut mgr = VsockConnectionManager::new();
+        let rings_cb = Arc::clone(&rings);
+        mgr.set_doorbell(Arc::new(move || {
+            rings_cb.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let (_, internal) = make_socketpair();
+        let (id, _rx) = mgr.allocate(1024, 3, internal);
+        assert_eq!(rings.load(Ordering::SeqCst), 1, "allocate rings");
+
+        mgr.mark_connected(id.guest_port, id.host_port);
+        assert_eq!(rings.load(Ordering::SeqCst), 2, "mark_connected rings");
+
+        mgr.enqueue_credit_update(id.guest_port, id.host_port);
+        assert_eq!(
+            rings.load(Ordering::SeqCst),
+            3,
+            "enqueue_credit_update rings"
+        );
+
+        // advance_fwd_cnt rings only when it actually enqueues RX work.
+        assert!(mgr.advance_fwd_cnt(id.guest_port, id.host_port, CREDIT_UPDATE_THRESHOLD));
+        assert_eq!(
+            rings.load(Ordering::SeqCst),
+            4,
+            "advance_fwd_cnt rings on push"
+        );
+    }
+
+    #[test]
+    fn doorbell_silent_on_injection_driver_paths() {
+        use std::sync::atomic::AtomicUsize;
+
+        let rings = Arc::new(AtomicUsize::new(0));
+        let mut mgr = VsockConnectionManager::new();
+
+        let (_, internal) = make_socketpair();
+        let (id, _rx) = mgr.allocate(1024, 3, internal);
+        // Drain the initial REQUEST so rx_queue is empty for the checks below.
+        mgr.get_mut(&id).unwrap().rx_queue.dequeue();
+
+        // Install the doorbell after allocate so only the calls below count.
+        let rings_cb = Arc::clone(&rings);
+        mgr.set_doorbell(Arc::new(move || {
+            rings_cb.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        // Sub-threshold fwd_cnt advance enqueues nothing → no ring.
+        assert!(!mgr.advance_fwd_cnt(id.guest_port, id.host_port, 1));
+        assert_eq!(rings.load(Ordering::SeqCst), 0);
+
+        // Phase-1 enqueues come from the injection driver itself — it is
+        // already awake, so these must not self-wake it.
+        mgr.enqueue_rw(id);
+        mgr.enqueue_reset(id);
+        assert_eq!(rings.load(Ordering::SeqCst), 0);
     }
 
     #[test]
