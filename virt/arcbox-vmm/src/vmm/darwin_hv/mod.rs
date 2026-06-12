@@ -918,6 +918,13 @@ impl Vmm {
             ));
         }
 
+        // `running` gates every thread spawned below (vsock-io worker, vCPU
+        // loops, blk/net workers). The generic `Vmm::start` only stores it
+        // after this function returns, which is too late: a freshly spawned
+        // thread that checks the flag before then exits immediately.
+        self.running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
         let mut device_manager = Arc::new(
             self.device_manager
                 .take()
@@ -1416,6 +1423,11 @@ impl Vmm {
     /// loop no longer polls vsock. Joined in `stop_darwin_hv` before guest
     /// memory is released.
     fn spawn_vsock_rx_worker(&mut self, device_manager: &Arc<DeviceManager>) -> Result<()> {
+        // Spawn once per VMM lifecycle; `stop_darwin_hv` joins and clears.
+        if self.hv_vsock_worker.is_some() {
+            return Ok(());
+        }
+
         let mut pipe_fds: [libc::c_int; 2] = [0; 2];
         // SAFETY: `pipe_fds` is a valid 2-element array; pipe writes two
         // fds into it on success.
