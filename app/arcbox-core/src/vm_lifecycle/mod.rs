@@ -917,7 +917,10 @@ impl VmLifecycleManager {
         // probe from the async runtime entirely.
         let probe_result = tokio::task::spawn_blocking(move || {
             let deadline = std::time::Instant::now() + timeout;
-            let poll_interval = Duration::from_millis(100);
+            // Failed probes are ~1ms (vsock RST via the event-driven RX
+            // path), so a tight interval costs little and bounds the
+            // discovery overshoot once the agent starts listening.
+            let poll_interval = Duration::from_millis(25);
 
             while std::time::Instant::now() < deadline {
                 // Console output (best-effort, non-blocking).

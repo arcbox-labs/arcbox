@@ -534,22 +534,28 @@ impl MachineManager {
     /// stalls from rapid socketpair fd teardown (same rationale as
     /// `wait_for_agent` in `vm_lifecycle`).
     async fn wait_for_machine_ready(&self, name: &str) -> Result<()> {
-        const MAX_ATTEMPTS: u32 = 20;
-        const INITIAL_DELAY_MS: u64 = 500;
-        const MAX_DELAY_MS: u64 = 3000;
+        const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        const INITIAL_DELAY_MS: u64 = 50;
+        const MAX_DELAY_MS: u64 = 500;
 
         tracing::info!("Waiting for machine '{}' agent to become ready...", name);
 
         // block_in_place is used here (instead of spawn_blocking) because
         // MachineManager is not Clone/Arc at this call site. block_in_place
-        // is acceptable: the total blocking time is bounded by
-        // MAX_ATTEMPTS * MAX_DELAY_MS ≈ 60s, and the blocking RPC uses
+        // is acceptable: the total blocking time is bounded by PROBE_TIMEOUT
+        // (plus one backoff interval), and the blocking RPC uses
         // BlockingVsockTransport (libc::poll) — no tokio reactor interaction.
+        //
+        // Probe before the first sleep: failed probes are ~1ms (vsock RST
+        // via the event-driven RX path), while sleeping first puts a full
+        // backoff interval on every start even when the agent is already up.
         let probe_result: Result<String> = tokio::task::block_in_place(|| {
+            let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
             let mut delay_ms = INITIAL_DELAY_MS;
+            let mut attempt: u32 = 0;
 
-            for attempt in 1..=MAX_ATTEMPTS {
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            loop {
+                attempt += 1;
 
                 match self.connect_agent(name) {
                     Ok(mut agent) if agent.is_blocking() => match agent.ping_blocking() {
@@ -596,12 +602,14 @@ impl MachineManager {
                     ),
                 }
 
+                if std::time::Instant::now() >= deadline {
+                    return Err(CoreError::Machine(format!(
+                        "Machine '{name}' agent did not report a routable IP within timeout"
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 delay_ms = (delay_ms * 3 / 2).min(MAX_DELAY_MS);
             }
-
-            Err(CoreError::Machine(format!(
-                "Machine '{name}' agent did not report a routable IP within timeout"
-            )))
         });
 
         let ip = probe_result?;
