@@ -32,8 +32,13 @@ impl GuestDockerBackend {
     }
 
     async fn wait_guest_endpoint_ready(&self) -> Result<()> {
-        const INITIAL_DELAY_MS: u64 = 120;
-        const MAX_DELAY_MS: u64 = 1200;
+        // Each attempt is a handful of ~1ms vsock RPCs, so the backoff cap
+        // (which bounds how late we notice dockerd became ready) matters
+        // far more than the per-attempt cost. dockerd typically comes up a
+        // few hundred ms after the agent; with the old 120→1200ms backoff
+        // the discovery overshoot alone averaged ~200ms per cold boot.
+        const INITIAL_DELAY_MS: u64 = 25;
+        const MAX_DELAY_MS: u64 = 250;
 
         let port = self.config.guest_docker_vsock_port;
         let timeout = Duration::from_millis(self.config.startup_timeout_ms);
