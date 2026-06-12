@@ -74,7 +74,7 @@ impl SetupState {
     }
 
     /// Returns the current status snapshot.
-    fn current(&self) -> SetupStatus {
+    pub fn current(&self) -> SetupStatus {
         self.tx.borrow().clone()
     }
 }

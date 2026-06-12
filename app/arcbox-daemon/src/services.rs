@@ -134,6 +134,17 @@ pub async fn start_services(
     // Kubernetes API proxy (TCP 127.0.0.1:16443 → guest vsock).
     let kubernetes_proxy = crate::kubernetes_proxy::start(Arc::clone(runtime)).await;
 
+    // Mirror route-install events into SetupStatus. VM (re)starts install
+    // the container route from vm_lifecycle, outside the cold-start
+    // recovery path that sets the flag directly — without this bridge,
+    // route_installed would stay stale until the next daemon restart.
+    let route_events = runtime.event_bus().subscribe();
+    let route_state = Arc::clone(&ctx.setup_state);
+    let route_shutdown = ctx.shutdown.clone();
+    drop(tokio::spawn(async move {
+        route_status_loop(route_events, route_state, route_shutdown).await;
+    }));
+
     Ok(ServiceHandles {
         dns,
         docker,
@@ -145,6 +156,38 @@ pub async fn start_services(
 // =============================================================================
 // Helpers
 // =============================================================================
+
+/// Mirrors VM lifecycle events into `SetupState.route_installed`.
+///
+/// `ContainerRouteInstalled` sets the flag; `MachineStopped` clears it
+/// (the bridge interface — and with it the host route — dies with the VM).
+async fn route_status_loop(
+    mut events: tokio::sync::broadcast::Receiver<arcbox_core::event::Event>,
+    setup_state: Arc<arcbox_api::SetupState>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    use arcbox_core::event::Event;
+    use tokio::sync::broadcast::error::RecvError;
+
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            event = events.recv() => match event {
+                Ok(Event::ContainerRouteInstalled { .. }) => {
+                    setup_state.set_route_installed(true);
+                }
+                Ok(Event::MachineStopped { .. }) => {
+                    setup_state.set_route_installed(false);
+                }
+                Ok(_) => {}
+                // Missed events under load; state converges on the next
+                // route-install or stop event.
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break,
+            },
+        }
+    }
+}
 
 fn register_host_dns(runtime: &Arc<Runtime>) {
     let network_cfg = &runtime.config().network;
@@ -180,5 +223,65 @@ fn first_address_in_subnet(subnet: &str) -> Option<Ipv4Addr> {
         None
     } else {
         Some(Ipv4Addr::from(first))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use arcbox_api::SetupState;
+    use arcbox_core::event::{Event, EventBus};
+
+    use super::*;
+
+    /// Polls until `route_installed` matches `want` or times out.
+    async fn wait_for_route_installed(state: &SetupState, want: bool) -> bool {
+        for _ in 0..200 {
+            if state.current().route_installed == want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn route_status_loop_mirrors_events_into_setup_state() {
+        let bus = EventBus::new();
+        let setup_state = Arc::new(SetupState::new());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        let task = tokio::spawn(route_status_loop(
+            bus.subscribe(),
+            Arc::clone(&setup_state),
+            shutdown.clone(),
+        ));
+
+        assert!(!setup_state.current().route_installed);
+
+        bus.publish(Event::ContainerRouteInstalled {
+            name: "default".into(),
+        });
+        assert!(wait_for_route_installed(&setup_state, true).await);
+
+        // Unrelated events leave the flag untouched.
+        bus.publish(Event::MachineIdle {
+            name: "default".into(),
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(setup_state.current().route_installed);
+
+        // The bridge dies with the VM, so MachineStopped clears the flag.
+        bus.publish(Event::MachineStopped {
+            name: "default".into(),
+        });
+        assert!(wait_for_route_installed(&setup_state, false).await);
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("loop exits on shutdown")
+            .expect("loop task panicked");
     }
 }
