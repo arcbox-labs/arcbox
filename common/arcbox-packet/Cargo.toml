@@ -1,0 +1,12 @@
+[package]
+name = "arcbox-packet"
+description = "Zero-copy packet parsing, Ethernet/ARP framing, and Internet checksums for the ArcBox datapath"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true

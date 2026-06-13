@@ -521,6 +521,7 @@ dependencies = [
  "arcbox-dhcp",
  "arcbox-dns",
  "arcbox-error",
+ "arcbox-packet",
  "arcbox-virtio",
  "arcbox-vmnet",
  "bytes",
@@ -564,6 +565,10 @@ dependencies = [
  "tracing",
  "uuid",
 ]
+
+[[package]]
+name = "arcbox-packet"
+version = "0.4.6"
 
 [[package]]
 name = "arcbox-protocol"
