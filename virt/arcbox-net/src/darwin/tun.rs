@@ -475,7 +475,7 @@ impl std::fmt::Debug for DarwinTun {
     }
 }
 
-impl crate::nat_backend::HostNetIO for DarwinTun {
+impl crate::nat_engine::HostNetIO for DarwinTun {
     fn send_packet(&self, packet: &[u8]) -> io::Result<usize> {
         self.send_packet(packet)
     }
