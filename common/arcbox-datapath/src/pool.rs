@@ -8,7 +8,7 @@ use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::error::{NetError, Result};
+use crate::error::{Error, Result};
 
 use super::ring::MpmcRing;
 use super::{DEFAULT_POOL_CAPACITY, MAX_PACKET_SIZE};
@@ -141,7 +141,7 @@ impl PacketBuffer {
     /// Returns an error if the data is too large.
     pub fn copy_from_slice(&mut self, data: &[u8]) -> Result<()> {
         if data.len() > MAX_PACKET_SIZE {
-            return Err(NetError::PacketPool(format!(
+            return Err(Error::PacketPool(format!(
                 "data too large: {} > {}",
                 data.len(),
                 MAX_PACKET_SIZE
@@ -347,7 +347,7 @@ impl PacketPool {
     pub fn alloc_with_data(&self, data: &[u8]) -> Result<PacketRef<'_>> {
         let mut pkt = self
             .alloc()
-            .ok_or_else(|| NetError::PacketPool("pool exhausted".to_string()))?;
+            .ok_or_else(|| Error::PacketPool("pool exhausted".to_string()))?;
         pkt.copy_from_slice(data)?;
         Ok(pkt)
     }

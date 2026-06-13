@@ -342,6 +342,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-datapath"
+version = "0.4.6"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "arcbox-dhcp"
 version = "0.4.6"
 dependencies = [
@@ -518,6 +525,7 @@ dependencies = [
 name = "arcbox-net"
 version = "0.4.6"
 dependencies = [
+ "arcbox-datapath",
  "arcbox-dhcp",
  "arcbox-dns",
  "arcbox-error",

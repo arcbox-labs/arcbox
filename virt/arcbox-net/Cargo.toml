@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+arcbox-datapath = { workspace = true }
 arcbox-dhcp = { workspace = true }
 arcbox-error = { workspace = true }
 arcbox-packet = { workspace = true }
