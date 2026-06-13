@@ -84,6 +84,14 @@ impl From<std::io::Error> for NetError {
     }
 }
 
+impl From<arcbox_datapath::Error> for NetError {
+    fn from(err: arcbox_datapath::Error) -> Self {
+        match err {
+            arcbox_datapath::Error::PacketPool(msg) => Self::PacketPool(msg),
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 impl From<arcbox_vmnet::VmnetError> for NetError {
     fn from(err: arcbox_vmnet::VmnetError) -> Self {

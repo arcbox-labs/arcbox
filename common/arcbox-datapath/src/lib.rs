@@ -1,24 +1,9 @@
-//! High-performance datapath for network packet processing.
+//! Lock-free datapath primitives for high-performance packet processing.
 //!
-//! This module provides zero-copy packet handling with lock-free data structures
-//! optimized for high throughput and low latency.
-//!
-//! # Architecture
-//!
-//! ```text
-//! ┌──────────────────────────────────────────────────────────────┐
-//! │                     High-Performance Datapath                 │
-//! │                                                               │
-//! │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐   │
-//! │  │ Zero-Copy    │    │ Lock-Free    │    │ Performance  │   │
-//! │  │ Packet Pool  │ ─→ │ Ring Buffer  │ ─→ │ Statistics   │   │
-//! │  └──────────────┘    └──────────────┘    └──────────────┘   │
-//! │         ↑                   ↑                   ↑            │
-//! │         │                   │                   │            │
-//! │    Pre-allocated       SPSC design        Cache-line        │
-//! │    buffers             No locks           aligned           │
-//! └──────────────────────────────────────────────────────────────┘
-//! ```
+//! Zero-copy buffer pools, SPSC/MPMC ring buffers, cache-line-aligned
+//! statistics, and the [`CachePadded`] primitive — pure, with no VM, VirtIO,
+//! or I/O dependencies. Extracted from `arcbox-net` so any high-throughput
+//! consumer (host-side proxy, VM datapath, packet tools) can reuse them.
 //!
 //! # Performance Targets
 //!
@@ -26,16 +11,14 @@
 //! - Packet pool allocation: O(1) constant time
 //! - Zero memory copies in hot path
 
+pub mod error;
 pub mod frame_buf;
-// `packet` is extracted to `arcbox-packet`; re-exported so the
-// `datapath::packet` path (and `super::packet` in sibling modules) is unchanged.
-pub use arcbox_packet::packet;
 pub mod pool;
 pub mod ring;
 pub mod stats;
 
+pub use error::{Error, Result};
 pub use frame_buf::FrameBuf;
-pub use packet::{PacketMetadata, Protocol, ZeroCopyPacket};
 pub use pool::{PacketBuffer, PacketPool, PacketRef};
 pub use ring::LockFreeRing;
 pub use stats::DatapathStats;

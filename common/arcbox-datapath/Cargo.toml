@@ -1,0 +1,15 @@
+[package]
+name = "arcbox-datapath"
+description = "Lock-free packet buffer pool, SPSC/MPMC ring buffers, and cache-aligned datapath primitives for ArcBox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
