@@ -34,6 +34,7 @@ members = [
     "virt/arcbox-vm",
     "virt/arcbox-fs",
     "virt/arcbox-net",
+    "virt/arcbox-net-virtio",
     "virt/arcbox-vmnet",
     "virt/arcbox-dhcp",
 
@@ -220,6 +221,7 @@ arcbox-virtio-balloon = { version = "0.4.6", path = "virt/arcbox-virtio-balloon"
 arcbox-vm = { version = "0.4.6", path = "virt/arcbox-vm" } # x-release-please-version
 arcbox-fs = { version = "0.4.6", path = "virt/arcbox-fs" } # x-release-please-version
 arcbox-net = { version = "0.4.6", path = "virt/arcbox-net" } # x-release-please-version
+arcbox-net-virtio = { version = "0.4.6", path = "virt/arcbox-net-virtio" } # x-release-please-version
 arcbox-vmnet = { version = "0.4.6", path = "virt/arcbox-vmnet" } # x-release-please-version
 arcbox-net-inject = { version = "0.4.6", path = "virt/arcbox-net-inject" } # x-release-please-version
 arcbox-dhcp = { version = "0.4.6", path = "virt/arcbox-dhcp" } # x-release-please-version

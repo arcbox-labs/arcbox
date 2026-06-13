@@ -27,7 +27,6 @@ pub mod proxy_detect;
 pub mod proxy_tunnel;
 pub mod socket_proxy;
 pub mod tcp_bridge;
-pub mod tso_backend;
 pub mod tun;
 
 #[cfg(feature = "vmnet")]

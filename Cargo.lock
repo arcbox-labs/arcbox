@@ -540,7 +540,6 @@ dependencies = [
  "arcbox-dns",
  "arcbox-error",
  "arcbox-packet",
- "arcbox-virtio",
  "arcbox-vmnet",
  "bytes",
  "chrono",
@@ -565,6 +564,16 @@ version = "0.4.6"
 dependencies = [
  "arcbox-virtio",
  "crossbeam-channel",
+ "tracing",
+]
+
+[[package]]
+name = "arcbox-net-virtio"
+version = "0.4.6"
+dependencies = [
+ "arcbox-conntrack",
+ "arcbox-virtio",
+ "tokio",
  "tracing",
 ]
 

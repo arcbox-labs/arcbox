@@ -52,7 +52,6 @@ pub mod linux;
 pub mod mdns;
 pub mod mdns_protocol;
 pub mod nat;
-pub mod nat_backend;
 pub mod nat_engine;
 pub mod port_forward;
 pub mod timer_wheel;

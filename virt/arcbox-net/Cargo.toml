@@ -14,7 +14,6 @@ arcbox-datapath = { workspace = true }
 arcbox-dhcp = { workspace = true }
 arcbox-error = { workspace = true }
 arcbox-packet = { workspace = true }
-arcbox-virtio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
