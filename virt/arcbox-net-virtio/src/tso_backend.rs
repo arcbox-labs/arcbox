@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 
-use arcbox_virtio::net::{NetBackend, NetPacket, VirtioNetHeader};
+use arcbox_virtio::net::{NetBackend, NetPacket};
 
 /// Ethernet header length.
 const ETH_HDR_LEN: usize = 14;

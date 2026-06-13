@@ -24,7 +24,7 @@ use std::net::Ipv4Addr;
 
 use arcbox_virtio::net::{NetBackend, NetPacket};
 
-use crate::nat_engine::{HostNetIO, NatDirection, NatEngine, NatEngineConfig, NatResult};
+use arcbox_conntrack::{HostNetIO, NatDirection, NatEngine, NatEngineConfig, NatResult};
 
 /// NAT network backend configuration.
 #[derive(Debug, Clone)]
