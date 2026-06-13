@@ -27,7 +27,9 @@
 //! - Zero memory copies in hot path
 
 pub mod frame_buf;
-pub mod packet;
+// `packet` is extracted to `arcbox-packet`; re-exported so the
+// `datapath::packet` path (and `super::packet` in sibling modules) is unchanged.
+pub use arcbox_packet::packet;
 pub mod pool;
 pub mod ring;
 pub mod stats;

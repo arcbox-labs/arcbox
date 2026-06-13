@@ -41,7 +41,9 @@
 //! - Connection tracking: O(1) lookup
 //! - Incremental checksum: <10ns per update
 
-pub mod checksum;
+// `checksum` is extracted to `arcbox-packet`; re-exported so the
+// `nat_engine::checksum` path (and `super::checksum` in `translate`) is unchanged.
+pub use arcbox_packet::checksum;
 pub mod conntrack;
 pub mod translate;
 

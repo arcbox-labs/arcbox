@@ -44,7 +44,9 @@ pub mod dhcp;
 pub mod direct_rx;
 pub mod dns;
 pub mod error;
-pub mod ethernet;
+// `ethernet` is extracted to `arcbox-packet`; re-exported here so the
+// `arcbox_net::ethernet` path is unchanged for callers.
+pub use arcbox_packet::ethernet;
 #[cfg(target_os = "linux")]
 pub mod linux;
 pub mod mdns;
