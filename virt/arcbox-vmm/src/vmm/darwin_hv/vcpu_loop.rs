@@ -203,10 +203,10 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
         // BSP (vCPU 0) handles bridge polling to avoid lock contention.
         // poll_net_rx removed — handled by net-io worker thread.
         // poll_vsock_rx removed — handled by vsock-io worker thread.
-        if vcpu_id == 0 && device_manager.poll_bridge_rx() {
-            if let Some(bid) = device_manager.bridge_device_id() {
-                device_manager.raise_interrupt_for_device(bid, 1);
-            }
+        // poll_bridge_rx raises the interrupt internally only when
+        // EVENT_IDX suppression allows it.
+        if vcpu_id == 0 {
+            device_manager.poll_bridge_rx();
         }
 
         // ABX-367 instrumentation: retained at trace level for future
@@ -332,11 +332,10 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                 // Guest executed WFI — it is idle and waiting for an interrupt.
                 // Before parking, poll the bridge for incoming data. vsock and
                 // net injection are handled by their dedicated worker threads.
+                // poll_bridge_rx raises the interrupt internally only when
+                // EVENT_IDX suppression allows it.
                 let wfi_has_bridge = device_manager.poll_bridge_rx();
                 if wfi_has_bridge {
-                    if let Some(bid) = device_manager.bridge_device_id() {
-                        device_manager.raise_interrupt_for_device(bid, 1);
-                    }
                     continue; // Re-enter run loop immediately.
                 }
                 // No pending data — park with timeout.

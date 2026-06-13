@@ -1112,6 +1112,13 @@ impl DeviceManager {
                                 } else {
                                     self.primary_net.as_ref()
                                 };
+                                // Feature bits are stable while the queue is active.
+                                let driver_features = {
+                                    let mmio_state = state.read().map_err(|e| {
+                                        VmmError::Device(format!("Failed to lock state: {e}"))
+                                    })?;
+                                    mmio_state.driver_features
+                                };
                                 let net_completions = match typed {
                                     Some(arc) => arc
                                         .lock()
@@ -1138,10 +1145,11 @@ impl DeviceManager {
                                     };
                                     let q_size = qcfg.size as usize;
                                     let used_idx_off = used_off + 2;
-                                    let mut used_idx = u16::from_le_bytes([
+                                    let old_used = u16::from_le_bytes([
                                         guest_mem[used_idx_off],
                                         guest_mem[used_idx_off + 1],
                                     ]);
+                                    let mut used_idx = old_used;
                                     for &(head, len) in &net_completions {
                                         let entry =
                                             used_off + 4 + ((used_idx as usize) % q_size) * 8;
@@ -1163,7 +1171,7 @@ impl DeviceManager {
                                     // vring_need_event(avail_event, new, old) before
                                     // kicking. Setting avail_event = current avail_idx
                                     // ensures the guest kicks on the next submission.
-                                    if let Some(avail_off) =
+                                    let should_notify = if let Some(avail_off) =
                                         (qcfg.avail_addr as usize).checked_sub(gpa_base)
                                     {
                                         let avail_idx = u16::from_le_bytes([
@@ -1175,18 +1183,37 @@ impl DeviceManager {
                                             guest_mem[avail_event_off..avail_event_off + 2]
                                                 .copy_from_slice(&avail_idx.to_le_bytes());
                                         }
-                                    }
 
-                                    if let Some(_irq) = device.info.irq {
+                                        // With VIRTIO_F_EVENT_IDX the guest suppresses
+                                        // interrupts by writing used_event at the tail of
+                                        // the avail ring. Only notify if used_event falls
+                                        // within (old_used, used_idx] (VirtIO 2.7.7.2).
+                                        if (driver_features
+                                            & arcbox_virtio::queue::VIRTIO_F_EVENT_IDX)
+                                            != 0
                                         {
-                                            let mut s = state.write().map_err(|e| {
-                                                VmmError::Device(format!(
-                                                    "Failed to lock state: {e}"
-                                                ))
-                                            })?;
-                                            s.trigger_interrupt(virtio_mmio::INT_VRING);
+                                            crate::virtqueue_util::should_notify_slice(
+                                                guest_mem, avail_off, qcfg.size, old_used, used_idx,
+                                            )
+                                        } else {
+                                            true
                                         }
-                                        self.sync_irq_level(device_id);
+                                    } else {
+                                        true
+                                    };
+
+                                    if should_notify {
+                                        if let Some(_irq) = device.info.irq {
+                                            {
+                                                let mut s = state.write().map_err(|e| {
+                                                    VmmError::Device(format!(
+                                                        "Failed to lock state: {e}"
+                                                    ))
+                                                })?;
+                                                s.trigger_interrupt(virtio_mmio::INT_VRING);
+                                            }
+                                            self.sync_irq_level(device_id);
+                                        }
                                     }
                                 }
                             } else {
@@ -1309,10 +1336,10 @@ impl DeviceManager {
     }
 
     /// Polls the bridge (vmnet) host fd for inbound frames and injects
-    /// them into the bridge VirtioNet RX queue. Thin shim that reads the
-    /// device's current MMIO-transport queue configuration, hands it to
-    /// `VirtioNet::poll_rx`, and returns whether any frame was injected.
-    /// Caller fires the used-ring interrupt on `true`.
+    /// them into the bridge VirtioNet RX queue. Reads the device's current
+    /// MMIO-transport queue configuration, hands it to `VirtioNet::poll_rx`,
+    /// and raises the used-ring interrupt only when EVENT_IDX suppression
+    /// allows it. Returns whether any frame was injected.
     pub fn poll_bridge_rx(&self) -> bool {
         let Some(bridge_arc) = self.bridge_net.as_ref() else {
             return false;
@@ -1346,10 +1373,69 @@ impl DeviceManager {
             }
         };
 
-        let Ok(dev) = bridge_arc.lock() else {
-            return false;
+        let event_idx_enabled = {
+            let Ok(mmio) = mmio_arc.read() else {
+                return false;
+            };
+            (mmio.driver_features & arcbox_virtio::queue::VIRTIO_F_EVENT_IDX) != 0
         };
-        dev.poll_rx(&rx_qcfg)
+
+        let old_used = {
+            let Some(ram_base) = self.guest_ram_base else {
+                return false;
+            };
+            // SAFETY: `ram_base` is the host mapping returned by the platform
+            // hypervisor and is valid for `self.guest_ram_size` bytes for the
+            // lifetime of the DeviceManager.
+            let guest_mem = unsafe {
+                crate::blk_worker::GuestMemWriter::new(
+                    ram_base,
+                    self.guest_ram_size,
+                    self.guest_ram_gpa as usize,
+                )
+            };
+            guest_mem.read_u16(rx_qcfg.used_addr as usize + 2)
+        };
+
+        let injected = {
+            let Ok(dev) = bridge_arc.lock() else {
+                return false;
+            };
+            dev.poll_rx(&rx_qcfg)
+        };
+
+        if injected {
+            let Some(ram_base) = self.guest_ram_base else {
+                return true;
+            };
+            // SAFETY: same VM-lifetime mapping as above.
+            let guest_mem = unsafe {
+                crate::blk_worker::GuestMemWriter::new(
+                    ram_base,
+                    self.guest_ram_size,
+                    self.guest_ram_gpa as usize,
+                )
+            };
+            let new_used = guest_mem.read_u16(rx_qcfg.used_addr as usize + 2);
+
+            let should_notify = if event_idx_enabled {
+                crate::virtqueue_util::should_notify(
+                    &guest_mem,
+                    rx_qcfg.avail_addr,
+                    rx_qcfg.size,
+                    old_used,
+                    new_used,
+                )
+            } else {
+                true
+            };
+
+            if should_notify {
+                self.raise_interrupt_for_device(bridge_id, 1);
+            }
+        }
+
+        injected
     }
 
     /// Called from the vCPU run loop during WFI (guest idle). Returns
