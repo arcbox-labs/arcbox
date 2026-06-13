@@ -14,7 +14,7 @@ static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 use hashbrown::HashMap;
 
-use crate::datapath::CachePadded;
+use arcbox_datapath::CachePadded;
 
 /// Connection state.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]

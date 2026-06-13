@@ -13,6 +13,7 @@ members = [
     "common/arcbox-xnu-net",
     "common/arcbox-packet",
     "common/arcbox-datapath",
+    "common/arcbox-conntrack",
 
     # ============================================
     # L1-3: Virtualization (MIT OR Apache-2.0)
@@ -199,6 +200,7 @@ arcbox-error = { version = "0.4.7", path = "common/arcbox-error" } # x-release-p
 arcbox-route = { version = "0.4.7", path = "common/arcbox-route" } # x-release-please-version
 arcbox-packet = { version = "0.4.7", path = "common/arcbox-packet" } # x-release-please-version
 arcbox-datapath = { version = "0.4.7", path = "common/arcbox-datapath" } # x-release-please-version
+arcbox-conntrack = { version = "0.4.7", path = "common/arcbox-conntrack" } # x-release-please-version
 # arcbox-hv has its own release cadence (Apple Hypervisor.framework
 # bindings), so the workspace dep pin is bumped manually when arcbox-hv
 # itself is bumped — not by release-please.

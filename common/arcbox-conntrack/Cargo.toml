@@ -1,0 +1,17 @@
+[package]
+name = "arcbox-conntrack"
+description = "Stateful NAT connection tracking and zero-copy packet translation for ArcBox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-datapath = { workspace = true }
+arcbox-packet = { workspace = true }
+hashbrown = "0.14"
+
+[lints]
+workspace = true
