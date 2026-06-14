@@ -12,6 +12,7 @@ authors.workspace = true
 arcbox-datapath = { workspace = true }
 arcbox-fakeip = { workspace = true }
 arcbox-packet = { workspace = true }
+arcbox-proxy = { workspace = true }
 crossbeam-channel = "0.5"
 libc = { workspace = true }
 tokio = { workspace = true }

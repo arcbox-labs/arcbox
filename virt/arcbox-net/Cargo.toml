@@ -38,7 +38,11 @@ arcbox-tcpstack.workspace = true
 arcbox-vmnet = { workspace = true }
 
 [dev-dependencies]
+anyhow.workspace = true
+arcbox-route.workspace = true
+clap.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
 
 [features]
 default = []
