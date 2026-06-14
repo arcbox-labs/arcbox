@@ -200,8 +200,120 @@ pub async fn connect_via_socks5(proxy: &str, host: &str, port: u16) -> io::Resul
 
 #[cfg(test)]
 mod tests {
-    // Integration tests require a running proxy server. These are tested
-    // manually against Surge/Clash in development.
-    //
-    // TODO: Add mock proxy server tests.
+    use super::*;
+    use tokio::net::TcpListener;
+
+    /// Minimal no-auth SOCKS5 server: validates the client's greeting and
+    /// domain-ATYP CONNECT request, replies success, then echoes one message
+    /// back through the established tunnel.
+    async fn mock_socks5(listener: TcpListener, expect_host: &'static str, expect_port: u16) {
+        let (mut s, _) = listener.accept().await.unwrap();
+
+        // Greeting: VER=5, NMETHODS=1, METHODS=[0x00].
+        let mut greeting = [0u8; 3];
+        s.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [0x05, 0x01, 0x00], "client greeting");
+        s.write_all(&[0x05, 0x00]).await.unwrap(); // choose no-auth
+
+        // Connect request: VER, CMD=CONNECT, RSV, ATYP=domain.
+        let mut hdr = [0u8; 4];
+        s.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(hdr, [0x05, 0x01, 0x00, 0x03], "connect request header");
+        let mut len = [0u8; 1];
+        s.read_exact(&mut len).await.unwrap();
+        let mut host = vec![0u8; len[0] as usize];
+        s.read_exact(&mut host).await.unwrap();
+        let mut port = [0u8; 2];
+        s.read_exact(&mut port).await.unwrap();
+        assert_eq!(host, expect_host.as_bytes(), "CONNECT host (by name)");
+        assert_eq!(u16::from_be_bytes(port), expect_port, "CONNECT port");
+
+        // Reply: success, ATYP=IPv4, BND.ADDR=0.0.0.0, BND.PORT=0.
+        s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+
+        // Tunnel is now end-to-end; echo one payload.
+        let mut buf = [0u8; 5];
+        s.read_exact(&mut buf).await.unwrap();
+        s.write_all(&buf).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_connects_by_domain_and_tunnels() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(mock_socks5(listener, "example.com", 443));
+
+        let mut stream = connect_via_socks5(&addr.to_string(), "example.com", 443)
+            .await
+            .expect("SOCKS5 handshake should complete");
+
+        // The returned stream is an end-to-end tunnel through the proxy.
+        stream.write_all(b"hello").await.unwrap();
+        let mut got = [0u8; 5];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hello", "payload round-trips through the tunnel");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_propagates_server_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            s.read_exact(&mut greeting).await.unwrap();
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            // Drain the connect request, then reply REP=0x05 (connection refused).
+            let mut hdr = [0u8; 4];
+            s.read_exact(&mut hdr).await.unwrap();
+            let mut len = [0u8; 1];
+            s.read_exact(&mut len).await.unwrap();
+            let mut rest = vec![0u8; len[0] as usize + 2];
+            s.read_exact(&mut rest).await.unwrap();
+            s.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        });
+
+        let err = connect_via_socks5(&addr.to_string(), "blocked.example", 443)
+            .await
+            .expect_err("server failure must surface as an error");
+        assert!(err.to_string().contains("connection refused"), "{err}");
+    }
+
+    /// Minimal HTTP CONNECT proxy: validates the request line and replies 200.
+    #[tokio::test]
+    async fn http_connect_establishes_tunnel() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") {
+                s.read_exact(&mut byte).await.unwrap();
+                buf.push(byte[0]);
+            }
+            let req = String::from_utf8_lossy(&buf);
+            assert!(req.starts_with("CONNECT example.com:443 HTTP/1.1"), "{req}");
+            s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut echo = [0u8; 3];
+            s.read_exact(&mut echo).await.unwrap();
+            s.write_all(&echo).await.unwrap();
+        });
+
+        let mut stream = connect_via_http_proxy(&addr.to_string(), "example.com", 443)
+            .await
+            .expect("HTTP CONNECT should establish");
+        stream.write_all(b"abc").await.unwrap();
+        let mut got = [0u8; 3];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"abc");
+        server.await.unwrap();
+    }
 }
