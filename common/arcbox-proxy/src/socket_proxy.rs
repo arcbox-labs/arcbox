@@ -26,7 +26,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
-use crate::ethernet::{ETH_HEADER_LEN, build_udp_ip_ethernet, prepend_ethernet_header};
+use arcbox_packet::ethernet::{ETH_HEADER_LEN, build_udp_ip_ethernet};
 
 /// Per-flow UDP state.
 struct UdpFlow {
@@ -578,7 +578,7 @@ impl SocketProxy {
     }
 
     /// Handles an inbound UDP command from the listener manager.
-    pub(crate) fn handle_inbound_command(
+    pub fn handle_inbound_command(
         &mut self,
         cmd: super::inbound_relay::InboundCommand,
         guest_mac: [u8; 6],

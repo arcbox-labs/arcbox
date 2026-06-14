@@ -35,7 +35,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::ethernet::{ETH_HEADER_LEN, build_udp_ip_ethernet};
+use arcbox_packet::ethernet::{ETH_HEADER_LEN, build_udp_ip_ethernet};
 
 /// Socket buffer size applied to accepted inbound TCP streams.
 ///
