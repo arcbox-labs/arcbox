@@ -31,6 +31,8 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use arcbox_tcpstack::{FdFrameSource, FrameSource};
+
 use crate::darwin::classifier::{FrameClassifier, InterceptedKind};
 use crate::darwin::inbound_relay::InboundCommand;
 use crate::darwin::socket_proxy::SocketProxy;
@@ -176,10 +178,16 @@ impl NetworkDatapath {
         } = self;
 
         // Set guest_fd to non-blocking for AsyncFd.
-        set_nonblocking(guest_fd.as_raw_fd())?;
+        let guest_raw_fd = guest_fd.as_raw_fd();
+        set_nonblocking(guest_raw_fd)?;
 
-        // Create the frame classifier wrapping the guest socketpair FD.
-        let mut device = FrameClassifier::new(guest_fd.as_raw_fd(), gateway_ip, mtu);
+        // Ingest seam: an FdFrameSource over the (now non-blocking) socketpair
+        // feeds raw frames to the classifier. The same fd is owned by the
+        // AsyncFd below for readiness; FdFrameSource holds it non-owning.
+        let mut source = FdFrameSource::new(guest_raw_fd);
+
+        // Frame classifier — fed frames via the source; it owns no fd.
+        let mut device = FrameClassifier::new(gateway_ip, mtu);
         device.set_gateway_mac(gateway_mac);
 
         // TCP shim: handshake synthesizer + fast-path data plane.
@@ -271,8 +279,10 @@ impl NetworkDatapath {
                 readable = guest_async.readable() => {
                     let mut guard = readable?;
                     let prev_mac = guest_mac;
-                    // Drain all available frames from the FD, classifying each.
-                    device.drain_guest_fd(&mut guest_mac);
+                    // Drain all available frames from the source, classifying each.
+                    // This is the FdFrameSource + classify_frame composition that
+                    // replaced the classifier's old fd-owning drain_guest_fd.
+                    source.drain(|frame| device.classify_frame(frame, &mut guest_mac));
                     // We drained until WouldBlock; clear readiness to avoid
                     // spinning on the biased readable arm.
                     guard.clear_ready();

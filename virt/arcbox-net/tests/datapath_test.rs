@@ -21,6 +21,7 @@ use arcbox_dhcp::DhcpConfig;
 use arcbox_net::darwin::datapath_loop::NetworkDatapath;
 use arcbox_net::darwin::socket_proxy::SocketProxy;
 use arcbox_net::dns::{DnsConfig, DnsForwarder};
+use arcbox_tcpstack::{FdFrameSource, FrameSource};
 
 use helpers::frames::{
     build_arp_request, build_dhcp_discover, build_dhcp_request, build_icmp_echo, build_tcp_syn,
@@ -181,7 +182,8 @@ async fn test_frame_classification_arp() {
     let (host_fd, guest_fd) = mock_guest_nic();
     set_nonblocking(host_fd.as_raw_fd());
 
-    let mut device = FrameClassifier::new(host_fd.as_raw_fd(), GATEWAY_IP, 1500);
+    let mut device = FrameClassifier::new(GATEWAY_IP, 1500);
+    let mut source = FdFrameSource::new(host_fd.as_raw_fd());
     // Inline ARP responder needs the gateway MAC to synthesize a reply;
     // without it the request is silently dropped.
     device.set_gateway_mac(GATEWAY_MAC);
@@ -191,7 +193,7 @@ async fn test_frame_classification_arp() {
     let arp = build_arp_request(CLIENT_MAC, GUEST_IP, GATEWAY_IP);
     fd_write(guest_fd.as_raw_fd(), &arp).expect("write ARP");
 
-    device.drain_guest_fd(&mut guest_mac);
+    source.drain(|frame| device.classify_frame(frame, &mut guest_mac));
 
     // ARP is handled inline — not queued as an intercepted frame.
     let intercepted = device.take_intercepted();
@@ -246,7 +248,8 @@ async fn test_frame_classification_tcp_syn() {
     let (host_fd, guest_fd) = mock_guest_nic();
     set_nonblocking(host_fd.as_raw_fd());
 
-    let mut device = FrameClassifier::new(host_fd.as_raw_fd(), GATEWAY_IP, 1500);
+    let mut device = FrameClassifier::new(GATEWAY_IP, 1500);
+    let mut source = FdFrameSource::new(host_fd.as_raw_fd());
     let mut guest_mac = None;
 
     let syn = build_tcp_syn(
@@ -259,7 +262,7 @@ async fn test_frame_classification_tcp_syn() {
     );
     fd_write(guest_fd.as_raw_fd(), &syn).expect("write SYN");
 
-    device.drain_guest_fd(&mut guest_mac);
+    source.drain(|frame| device.classify_frame(frame, &mut guest_mac));
 
     let gated = device.take_gated_syns();
     assert_eq!(gated.len(), 1, "TCP SYN should be gated");
@@ -276,7 +279,8 @@ async fn test_frame_classification_icmp() {
     let (host_fd, guest_fd) = mock_guest_nic();
     set_nonblocking(host_fd.as_raw_fd());
 
-    let mut device = FrameClassifier::new(host_fd.as_raw_fd(), GATEWAY_IP, 1500);
+    let mut device = FrameClassifier::new(GATEWAY_IP, 1500);
+    let mut source = FdFrameSource::new(host_fd.as_raw_fd());
     let mut guest_mac = None;
 
     let icmp = build_icmp_echo(
@@ -289,7 +293,7 @@ async fn test_frame_classification_icmp() {
     );
     fd_write(guest_fd.as_raw_fd(), &icmp).expect("write ICMP");
 
-    device.drain_guest_fd(&mut guest_mac);
+    source.drain(|frame| device.classify_frame(frame, &mut guest_mac));
 
     let intercepted = device.take_intercepted();
     assert_eq!(intercepted.len(), 1);
@@ -305,13 +309,14 @@ async fn test_frame_classification_dhcp() {
     let (host_fd, guest_fd) = mock_guest_nic();
     set_nonblocking(host_fd.as_raw_fd());
 
-    let mut device = FrameClassifier::new(host_fd.as_raw_fd(), GATEWAY_IP, 1500);
+    let mut device = FrameClassifier::new(GATEWAY_IP, 1500);
+    let mut source = FdFrameSource::new(host_fd.as_raw_fd());
     let mut guest_mac = None;
 
     let discover = build_dhcp_discover(CLIENT_MAC, 0x1234);
     fd_write(guest_fd.as_raw_fd(), &discover).expect("write DHCP DISCOVER");
 
-    device.drain_guest_fd(&mut guest_mac);
+    source.drain(|frame| device.classify_frame(frame, &mut guest_mac));
 
     let intercepted = device.take_intercepted();
     assert_eq!(intercepted.len(), 1);

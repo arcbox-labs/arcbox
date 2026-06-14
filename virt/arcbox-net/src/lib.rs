@@ -41,7 +41,10 @@
 pub mod backend;
 pub mod datapath;
 pub mod dhcp;
-pub mod direct_rx;
+// `direct_rx` (FrameSink/ConnSink/PromotedConn) is extracted to
+// `arcbox-tcpstack`; re-exported so the `arcbox_net::direct_rx` path is
+// unchanged for the VMM layer and the inject crate.
+pub use arcbox_tcpstack::direct_rx;
 pub mod dns;
 pub mod error;
 // `ethernet` is extracted to `arcbox-packet`; re-exported here so the

@@ -18,8 +18,9 @@ use std::time::Instant as StdInstant;
 
 use tokio::sync::oneshot;
 
+use arcbox_packet::checksum;
+
 use crate::ethernet::ETH_HEADER_LEN;
-use crate::nat_engine::checksum;
 
 const UNIX_DGRAM_MAX_FRAME_LEN: usize = 2048;
 const TCP_IPV4_ETH_OVERHEAD: usize = ETH_HEADER_LEN + 20 + 20;
@@ -149,9 +150,9 @@ pub struct TcpBridge {
     next_ephemeral: u16,
     /// DNS resolution log for mapping IPs back to domain names (used by
     /// the proxy resolver).
-    dns_log: Option<super::dns_log::DnsResolutionLog>,
+    dns_log: Option<arcbox_fakeip::dns_log::DnsResolutionLog>,
     /// Detected proxy environment on the host.
-    proxy_env: Option<super::proxy_detect::ProxyEnvironment>,
+    proxy_env: Option<arcbox_fakeip::proxy_detect::ProxyEnvironment>,
     /// Gateway IP used by the guest. Connections targeting this IP are
     /// translated to `127.0.0.1` so they reach the host's loopback
     /// (enables `host.docker.internal` support).
@@ -1194,8 +1195,8 @@ impl TcpBridge {
     /// `TcpStream::connect`.
     pub fn set_proxy_awareness(
         &mut self,
-        dns_log: super::dns_log::DnsResolutionLog,
-        proxy_env: super::proxy_detect::ProxyEnvironment,
+        dns_log: arcbox_fakeip::dns_log::DnsResolutionLog,
+        proxy_env: arcbox_fakeip::proxy_detect::ProxyEnvironment,
     ) {
         self.dns_log = Some(dns_log);
         self.proxy_env = Some(proxy_env);

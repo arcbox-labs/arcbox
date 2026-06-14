@@ -16,6 +16,7 @@ members = [
     "common/arcbox-conntrack",
     "common/arcbox-fakeip",
     "common/arcbox-proxy",
+    "common/arcbox-tcpstack",
 
     # ============================================
     # L1-3: Virtualization (MIT OR Apache-2.0)
@@ -206,6 +207,7 @@ arcbox-datapath = { version = "0.4.7", path = "common/arcbox-datapath" } # x-rel
 arcbox-conntrack = { version = "0.4.7", path = "common/arcbox-conntrack" } # x-release-please-version
 arcbox-fakeip = { version = "0.4.7", path = "common/arcbox-fakeip" } # x-release-please-version
 arcbox-proxy = { version = "0.4.7", path = "common/arcbox-proxy" } # x-release-please-version
+arcbox-tcpstack = { version = "0.4.7", path = "common/arcbox-tcpstack" } # x-release-please-version
 # arcbox-hv has its own release cadence (Apple Hypervisor.framework
 # bindings), so the workspace dep pin is bumped manually when arcbox-hv
 # itself is bumped — not by release-please.

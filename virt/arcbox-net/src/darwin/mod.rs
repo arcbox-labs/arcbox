@@ -18,10 +18,8 @@
 //! - **Host-Only**: VMs can only communicate with host
 //! - **Bridged**: VMs appear as separate devices on the network
 
-pub mod classifier;
 pub mod datapath_loop;
 pub mod nat;
-pub mod tcp_bridge;
 pub mod tun;
 
 // `dns_log` and `proxy_detect` are extracted to `arcbox-fakeip`; re-exported
@@ -32,6 +30,10 @@ pub use arcbox_fakeip::{dns_log, proxy_detect};
 // `arcbox-proxy`; re-exported here so the `crate::darwin::{proxy_tunnel,
 // socket_proxy, inbound_relay}` paths are unchanged for callers.
 pub use arcbox_proxy::{inbound_relay, proxy_tunnel, socket_proxy};
+// `classifier` and `tcp_bridge` are extracted to `arcbox-tcpstack`; re-exported
+// here so the `crate::darwin::{classifier, tcp_bridge}` paths are unchanged for
+// the datapath loop and the VMM layer.
+pub use arcbox_tcpstack::{classifier, tcp_bridge};
 
 #[cfg(feature = "vmnet")]
 pub use arcbox_vmnet::VmnetRelay;
