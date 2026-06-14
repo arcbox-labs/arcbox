@@ -549,6 +549,7 @@ dependencies = [
  "arcbox-fakeip",
  "arcbox-packet",
  "arcbox-proxy",
+ "arcbox-tcpstack",
  "arcbox-vmnet",
  "bytes",
  "chrono",
@@ -635,6 +636,19 @@ name = "arcbox-route"
 version = "0.4.6"
 dependencies = [
  "libc",
+ "tracing",
+]
+
+[[package]]
+name = "arcbox-tcpstack"
+version = "0.4.6"
+dependencies = [
+ "arcbox-datapath",
+ "arcbox-fakeip",
+ "arcbox-packet",
+ "crossbeam-channel",
+ "libc",
+ "tokio",
  "tracing",
 ]
 

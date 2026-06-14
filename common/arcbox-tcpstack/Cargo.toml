@@ -1,0 +1,21 @@
+[package]
+name = "arcbox-tcpstack"
+description = "Userspace TCP termination shim, Ethernet frame classifier with a pluggable frame source, and L3<->L2 tunnel shim for the ArcBox datapath"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-datapath = { workspace = true }
+arcbox-fakeip = { workspace = true }
+arcbox-packet = { workspace = true }
+crossbeam-channel = "0.5"
+libc = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

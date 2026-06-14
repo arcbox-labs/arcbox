@@ -1,6 +1,9 @@
-//! Ethernet frame classifier for the guest VM socketpair FD.
+//! Ethernet frame classifier for the datapath.
 //!
-//! Reads frames from the guest FD and routes them by protocol:
+//! Demultiplexes inbound Ethernet frames by protocol. Frames are *fed* to
+//! [`FrameClassifier::classify_frame`] — typically by an
+//! [`FdFrameSource`](crate::frame_source::FdFrameSource) draining the guest
+//! socketpair (VM) or a `utun` (host tunnel) — and routed:
 //!
 //! - **ARP** → [`ArpResponder`] — synthesizes the reply inline
 //! - **TCP SYN** → gated for `TcpBridge::handle_outbound_syn`
@@ -13,13 +16,12 @@
 //! module is purely a demultiplexer.
 
 use std::collections::VecDeque;
-use std::io;
 use std::net::Ipv4Addr;
-use std::os::fd::RawFd;
 use std::sync::Arc;
 
-use crate::datapath::FrameBuf;
-use crate::datapath::pool::PacketPool;
+use arcbox_datapath::FrameBuf;
+use arcbox_datapath::pool::PacketPool;
+
 use crate::ethernet::{ArpResponder, ETH_HEADER_LEN};
 
 /// Default Ethernet MTU (excludes Ethernet header).
@@ -30,9 +32,6 @@ const DEFAULT_ETHERNET_MTU: usize = 1500;
 /// Enhanced MTU for VZ framework with `maximumTransmissionUnit` (macOS 14+).
 /// Reduces frame count by ~2.7x vs 1500.
 pub const ENHANCED_ETHERNET_MTU: usize = 4000;
-
-/// Maximum Ethernet frame size we handle.
-const MAX_FRAME_SIZE: usize = 65535;
 
 /// Protocol numbers.
 const PROTO_ICMP: u8 = 1;
@@ -74,13 +73,13 @@ pub enum InterceptedKind {
     Icmp,
 }
 
-/// Frame classifier for the guest VM's socketpair FD.
+/// Frame classifier.
 ///
-/// Reads Ethernet frames, responds to ARP inline, and routes TCP / UDP /
-/// ICMP into the appropriate queues for downstream handlers.
+/// Fed Ethernet frames via [`classify_frame`](Self::classify_frame), it
+/// responds to ARP inline and routes TCP / UDP / ICMP into the appropriate
+/// queues for downstream handlers. It owns no fd — the ingest source (see
+/// [`FrameSource`](crate::frame_source::FrameSource)) is the caller's.
 pub struct FrameClassifier {
-    /// Raw FD of the host end of the socketpair.
-    fd: RawFd,
     /// Gateway IP for DNS interception.
     gateway_ip: Ipv4Addr,
     /// Gateway MAC — captured at construction so ARP replies use it.
@@ -99,8 +98,6 @@ pub struct FrameClassifier {
     pending_arp_replies: Vec<Vec<u8>>,
     /// ARP responder (gateway IP only).
     arp: ArpResponder,
-    /// Reusable read buffer to avoid per-call allocation in `drain_guest_fd`.
-    read_buf: Vec<u8>,
     /// Pre-allocated packet pool for zero-alloc frame ownership.
     pool: Arc<PacketPool>,
     /// Negotiated MTU (excludes Ethernet header). Set at construction time
@@ -118,19 +115,18 @@ impl FrameClassifier {
     /// - At ~300K frames/sec (10 Gbps / 4000 MTU), 4096 gives ~13 ms burst headroom
     const POOL_CAPACITY: usize = 4096;
 
-    /// Creates a new classifier for the given socketpair FD.
+    /// Creates a new classifier.
     ///
-    /// `mtu` should match the VZ device's configured MTU. Use
+    /// `mtu` should match the device's configured MTU. Use
     /// `ENHANCED_ETHERNET_MTU` (4000) when VZ `setMaximumTransmissionUnit:`
     /// succeeded, or 1500 otherwise.
     ///
-    /// `gateway_mac` is needed to synthesize ARP replies. For older callers
-    /// that don't have it at construction time, use `set_gateway_mac` later.
-    pub fn new(fd: RawFd, gateway_ip: Ipv4Addr, mtu: usize) -> Self {
+    /// The gateway MAC (needed to synthesize ARP replies) is set later via
+    /// [`set_gateway_mac`](Self::set_gateway_mac), once it is known.
+    pub fn new(gateway_ip: Ipv4Addr, mtu: usize) -> Self {
         // PacketPool::new only fails on zero capacity, which POOL_CAPACITY is not.
         let pool = Arc::new(PacketPool::new(Self::POOL_CAPACITY).expect("pool allocation"));
         Self {
-            fd,
             gateway_ip,
             gateway_mac: [0; 6],
             rx_queue: VecDeque::new(),
@@ -138,7 +134,6 @@ impl FrameClassifier {
             gated_syns: Vec::new(),
             pending_arp_replies: Vec::new(),
             arp: ArpResponder::new(gateway_ip, [0; 6]),
-            read_buf: vec![0u8; MAX_FRAME_SIZE],
             pool,
             mtu,
         }
@@ -162,30 +157,6 @@ impl FrameClassifier {
     /// if needed.)
     pub fn clear_unmatched_rx(&mut self) {
         self.rx_queue.clear();
-    }
-
-    /// Drains all available frames from the guest FD, classifying each
-    /// into its downstream queue (ARP reply / TCP rx_queue / intercepted).
-    ///
-    /// Must be called at the top of each datapath loop tick.
-    /// Also learns the guest MAC address from frame source addresses.
-    pub fn drain_guest_fd(&mut self, guest_mac: &mut Option<[u8; 6]>) {
-        loop {
-            match fd_read(self.fd, &mut self.read_buf) {
-                Ok(n) if n > 0 => {
-                    tracing::debug!("drain_guest_fd: read {n} bytes");
-                    let frame = FrameBuf::from_pool(&self.pool, &self.read_buf[..n]);
-                    self.classify_frame(frame, guest_mac);
-                }
-                Ok(_) => break,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => {
-                    tracing::warn!("Guest FD read error: {}", e);
-                    break;
-                }
-            }
-        }
     }
 
     /// Takes all intercepted frames, leaving the internal buffer empty.
@@ -258,7 +229,13 @@ impl FrameClassifier {
     }
 
     /// Classifies a frame and routes it to the appropriate queue.
-    fn classify_frame(&mut self, frame: FrameBuf, guest_mac: &mut Option<[u8; 6]>) {
+    ///
+    /// The frame is a raw Ethernet frame borrowed from the ingest source (see
+    /// [`FrameSource::drain`](crate::frame_source::FrameSource::drain)). Only
+    /// the branches that retain a frame (TCP rx queue, intercepted UDP/ICMP,
+    /// gated SYNs) copy it into a pooled [`FrameBuf`]; ARP and dropped frames
+    /// never touch the pool. Also learns the guest MAC from the source address.
+    pub fn classify_frame(&mut self, frame: &[u8], guest_mac: &mut Option<[u8; 6]>) {
         if frame.len() < ETH_HEADER_LEN {
             return;
         }
@@ -272,7 +249,7 @@ impl FrameClassifier {
         match ethertype {
             // ARP → inline responder (replies only for the gateway IP)
             0x0806 => {
-                if let Some(reply) = self.arp.handle_arp(&frame) {
+                if let Some(reply) = self.arp.handle_arp(frame) {
                     self.pending_arp_replies.push(reply);
                 }
             }
@@ -292,7 +269,7 @@ impl FrameClassifier {
     }
 
     /// Classifies an IPv4 frame by L4 protocol.
-    fn classify_ipv4(&mut self, frame: FrameBuf) {
+    fn classify_ipv4(&mut self, frame: &[u8]) {
         let ip_start = ETH_HEADER_LEN;
         if frame.len() < ip_start + 20 {
             return;
@@ -357,7 +334,10 @@ impl FrameClassifier {
                         return;
                     }
                 }
-                self.rx_queue.push_back(frame);
+                // Retained for the fast-path / handshake drains: copy into a
+                // pooled buffer the queue can own.
+                let buf = FrameBuf::from_pool(&self.pool, frame);
+                self.rx_queue.push_back(buf);
             }
             // UDP → check for DHCP/DNS interception
             PROTO_UDP => {
@@ -378,13 +358,15 @@ impl FrameClassifier {
                         InterceptedKind::Udp
                     };
 
-                    self.intercepted.push(InterceptedFrame { frame, kind });
+                    let buf = FrameBuf::from_pool(&self.pool, frame);
+                    self.intercepted.push(InterceptedFrame { frame: buf, kind });
                 }
             }
             // ICMP → intercept
             PROTO_ICMP => {
+                let buf = FrameBuf::from_pool(&self.pool, frame);
                 self.intercepted.push(InterceptedFrame {
-                    frame,
+                    frame: buf,
                     kind: InterceptedKind::Icmp,
                 });
             }
@@ -392,18 +374,6 @@ impl FrameClassifier {
                 tracing::debug!("Dropping IPv4 protocol {}", protocol);
             }
         }
-    }
-}
-
-/// Reads from a file descriptor into `buf`, returning number of bytes read.
-fn fd_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    // SAFETY: reading into our buffer from a valid fd.
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-    if n < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        #[allow(clippy::cast_sign_loss)]
-        Ok(n as usize)
     }
 }
 
@@ -430,7 +400,9 @@ fn learn_guest_mac(mac: [u8; 6], guest_mac: &mut Option<[u8; 6]>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::FromRawFd;
+    use std::os::fd::{FromRawFd, RawFd};
+
+    use crate::frame_source::{FdFrameSource, FrameSource};
 
     fn socketpair() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
         use std::os::fd::OwnedFd;
@@ -536,11 +508,11 @@ mod tests {
     #[test]
     fn classify_arp_generates_reply() {
         let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
-        let mut device = FrameClassifier::new(0, gateway_ip, DEFAULT_ETHERNET_MTU);
+        let mut device = FrameClassifier::new(gateway_ip, DEFAULT_ETHERNET_MTU);
         device.set_gateway_mac([0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x01]);
         let mut guest_mac = None;
 
-        device.classify_frame(FrameBuf::from(make_arp_frame()), &mut guest_mac);
+        device.classify_frame(&make_arp_frame(), &mut guest_mac);
 
         assert!(device.rx_queue.is_empty(), "ARP must not queue");
         assert_eq!(
@@ -553,10 +525,10 @@ mod tests {
     #[test]
     fn classify_tcp_goes_to_rx_queue() {
         let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
-        let mut device = FrameClassifier::new(0, gateway_ip, DEFAULT_ETHERNET_MTU);
+        let mut device = FrameClassifier::new(gateway_ip, DEFAULT_ETHERNET_MTU);
         let mut guest_mac = None;
 
-        device.classify_frame(FrameBuf::from(make_tcp_frame()), &mut guest_mac);
+        device.classify_frame(&make_tcp_frame(), &mut guest_mac);
 
         assert_eq!(device.rx_queue.len(), 1);
         assert!(device.intercepted.is_empty());
@@ -565,13 +537,10 @@ mod tests {
     #[test]
     fn classify_dhcp_intercepted() {
         let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
-        let mut device = FrameClassifier::new(0, gateway_ip, DEFAULT_ETHERNET_MTU);
+        let mut device = FrameClassifier::new(gateway_ip, DEFAULT_ETHERNET_MTU);
         let mut guest_mac = None;
 
-        device.classify_frame(
-            FrameBuf::from(make_udp_frame([255, 255, 255, 255], 67)),
-            &mut guest_mac,
-        );
+        device.classify_frame(&make_udp_frame([255, 255, 255, 255], 67), &mut guest_mac);
 
         assert!(device.rx_queue.is_empty());
         assert_eq!(device.intercepted.len(), 1);
@@ -581,13 +550,10 @@ mod tests {
     #[test]
     fn classify_dns_to_gateway_intercepted() {
         let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
-        let mut device = FrameClassifier::new(0, gateway_ip, DEFAULT_ETHERNET_MTU);
+        let mut device = FrameClassifier::new(gateway_ip, DEFAULT_ETHERNET_MTU);
         let mut guest_mac = None;
 
-        device.classify_frame(
-            FrameBuf::from(make_udp_frame([192, 168, 64, 1], 53)),
-            &mut guest_mac,
-        );
+        device.classify_frame(&make_udp_frame([192, 168, 64, 1], 53), &mut guest_mac);
 
         assert!(device.rx_queue.is_empty());
         assert_eq!(device.intercepted.len(), 1);
@@ -597,14 +563,11 @@ mod tests {
     #[test]
     fn classify_dns_to_external_is_udp() {
         let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
-        let mut device = FrameClassifier::new(0, gateway_ip, DEFAULT_ETHERNET_MTU);
+        let mut device = FrameClassifier::new(gateway_ip, DEFAULT_ETHERNET_MTU);
         let mut guest_mac = None;
 
         // DNS to 8.8.8.8 is regular UDP, not intercepted as DNS.
-        device.classify_frame(
-            FrameBuf::from(make_udp_frame([8, 8, 8, 8], 53)),
-            &mut guest_mac,
-        );
+        device.classify_frame(&make_udp_frame([8, 8, 8, 8], 53), &mut guest_mac);
 
         assert!(device.rx_queue.is_empty());
         assert_eq!(device.intercepted.len(), 1);
@@ -614,10 +577,10 @@ mod tests {
     #[test]
     fn classify_icmp_intercepted() {
         let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
-        let mut device = FrameClassifier::new(0, gateway_ip, DEFAULT_ETHERNET_MTU);
+        let mut device = FrameClassifier::new(gateway_ip, DEFAULT_ETHERNET_MTU);
         let mut guest_mac = None;
 
-        device.classify_frame(FrameBuf::from(make_icmp_frame()), &mut guest_mac);
+        device.classify_frame(&make_icmp_frame(), &mut guest_mac);
 
         assert!(device.rx_queue.is_empty());
         assert_eq!(device.intercepted.len(), 1);
@@ -627,13 +590,10 @@ mod tests {
     #[test]
     fn classify_regular_udp_intercepted() {
         let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
-        let mut device = FrameClassifier::new(0, gateway_ip, DEFAULT_ETHERNET_MTU);
+        let mut device = FrameClassifier::new(gateway_ip, DEFAULT_ETHERNET_MTU);
         let mut guest_mac = None;
 
-        device.classify_frame(
-            FrameBuf::from(make_udp_frame([1, 1, 1, 1], 443)),
-            &mut guest_mac,
-        );
+        device.classify_frame(&make_udp_frame([1, 1, 1, 1], 443), &mut guest_mac);
 
         assert!(device.rx_queue.is_empty());
         assert_eq!(device.intercepted.len(), 1);
@@ -641,22 +601,23 @@ mod tests {
     }
 
     #[test]
-    fn drain_guest_fd_reads_and_classifies() {
+    fn fd_source_drain_reads_and_classifies() {
         use std::os::fd::AsRawFd;
         let (host_fd, guest_fd) = socketpair();
         set_nonblocking(host_fd.as_raw_fd());
 
         let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
-        let mut device =
-            FrameClassifier::new(host_fd.as_raw_fd(), gateway_ip, DEFAULT_ETHERNET_MTU);
+        let mut device = FrameClassifier::new(gateway_ip, DEFAULT_ETHERNET_MTU);
         device.set_gateway_mac([0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x01]);
+        let mut source = FdFrameSource::new(host_fd.as_raw_fd());
         let mut guest_mac = None;
 
         // Write an ARP request and an ICMP frame via the guest side.
         fd_write_raw(guest_fd.as_raw_fd(), &make_arp_frame());
         fd_write_raw(guest_fd.as_raw_fd(), &make_icmp_frame());
 
-        device.drain_guest_fd(&mut guest_mac);
+        // This is the exact ingest composition the datapath loop performs.
+        source.drain(|frame| device.classify_frame(frame, &mut guest_mac));
 
         assert!(device.rx_queue.is_empty(), "ARP must not queue");
         assert_eq!(
@@ -685,7 +646,7 @@ mod tests {
     #[test]
     fn classify_tcp_syn_is_gated() {
         let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
-        let mut device = FrameClassifier::new(0, gateway_ip, DEFAULT_ETHERNET_MTU);
+        let mut device = FrameClassifier::new(gateway_ip, DEFAULT_ETHERNET_MTU);
         let mut guest_mac = None;
 
         // Build a TCP SYN frame (flags = 0x02).
@@ -699,7 +660,7 @@ mod tests {
         // Set seq = 1000
         frame[l4 + 4..l4 + 8].copy_from_slice(&1000u32.to_be_bytes());
 
-        device.classify_frame(FrameBuf::from(frame), &mut guest_mac);
+        device.classify_frame(&frame, &mut guest_mac);
 
         assert!(device.rx_queue.is_empty(), "SYN should NOT go to rx_queue");
         assert_eq!(device.gated_syns.len(), 1);
@@ -713,7 +674,7 @@ mod tests {
     #[test]
     fn classify_tcp_non_syn_goes_to_rx_queue() {
         let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
-        let mut device = FrameClassifier::new(0, gateway_ip, DEFAULT_ETHERNET_MTU);
+        let mut device = FrameClassifier::new(gateway_ip, DEFAULT_ETHERNET_MTU);
         let mut guest_mac = None;
 
         // Build a TCP ACK frame (flags = 0x10).
@@ -722,7 +683,7 @@ mod tests {
         let l4 = ip + 20;
         frame[l4 + 13] = 0x10; // ACK flag
 
-        device.classify_frame(FrameBuf::from(frame), &mut guest_mac);
+        device.classify_frame(&frame, &mut guest_mac);
 
         assert_eq!(
             device.rx_queue.len(),
