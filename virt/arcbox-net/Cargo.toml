@@ -30,6 +30,7 @@ arcbox-dns = { workspace = true }
 serde_json.workspace = true
 serde = { workspace = true, features = ["derive"] }
 crossbeam-channel = "0.5"
+arcbox-fakeip.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 arcbox-vmnet = { workspace = true }

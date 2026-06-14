@@ -1,0 +1,15 @@
+[package]
+name = "arcbox-fakeip"
+description = "Fake-IP <-> domain resolution log and system proxy/VPN environment detection for ArcBox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+
+[lints]
+workspace = true

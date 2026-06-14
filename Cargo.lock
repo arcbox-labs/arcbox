@@ -428,6 +428,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-fakeip"
+version = "0.4.6"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "arcbox-fs"
 version = "0.4.6"
 dependencies = [
@@ -539,6 +546,7 @@ dependencies = [
  "arcbox-dhcp",
  "arcbox-dns",
  "arcbox-error",
+ "arcbox-fakeip",
  "arcbox-packet",
  "arcbox-vmnet",
  "bytes",

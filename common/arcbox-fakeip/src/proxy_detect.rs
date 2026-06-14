@@ -1,12 +1,15 @@
-//! Host VPN/proxy environment detection (macOS).
+//! Host VPN/proxy environment detection.
 //!
 //! Detects whether the host is running a VPN or proxy that intercepts network
 //! traffic, and extracts configuration details (system proxy, fake-ip ranges).
 //!
-//! This information is used by [`TcpBridge`] to choose the optimal connection
-//! strategy: direct connect, HTTP CONNECT tunnel, or SOCKS5 tunnel.
+//! This information is used by the TCP shim to choose the optimal connection
+//! strategy: direct connect, HTTP CONNECT tunnel, or SOCKS5 tunnel. The
+//! `scutil`/`ifconfig` probes are macOS-specific and `cfg`-gated; on other
+//! targets `detect()` returns the environment-variable-only result.
 
 use std::net::Ipv4Addr;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 /// Proxy server configuration.
@@ -137,6 +140,7 @@ impl ProxyEnvironment {
 /// Detects fake-ip VPN by checking for utun interfaces with 198.18.x.x addresses.
 ///
 /// Surge and Clash create a utun with address 198.18.0.1 when in fake-ip mode.
+#[cfg(target_os = "macos")]
 fn detect_fake_ip_utun() -> bool {
     let Ok(output) = Command::new("ifconfig").output() else {
         return false;
@@ -158,7 +162,15 @@ fn detect_fake_ip_utun() -> bool {
     false
 }
 
+/// On non-macOS targets there is no `scutil`/`ifconfig` Fake-IP probe; the
+/// environment is derived from environment variables only (see `detect`).
+#[cfg(not(target_os = "macos"))]
+fn detect_fake_ip_utun() -> bool {
+    false
+}
+
 /// Parses system proxy settings from `scutil --proxy`.
+#[cfg(target_os = "macos")]
 fn detect_system_proxy() -> (
     Option<ProxyConfig>,
     Option<ProxyConfig>,
@@ -178,6 +190,18 @@ fn detect_system_proxy() -> (
     (http, https, socks, bypass)
 }
 
+/// On non-macOS targets there is no `scutil`; the system proxy is unknown and
+/// `detect` relies on the environment-variable fallback instead.
+#[cfg(not(target_os = "macos"))]
+fn detect_system_proxy() -> (
+    Option<ProxyConfig>,
+    Option<ProxyConfig>,
+    Option<ProxyConfig>,
+    Vec<String>,
+) {
+    (None, None, None, Vec::new())
+}
+
 /// Parses a proxy block from scutil output.
 ///
 /// Format:
@@ -186,6 +210,7 @@ fn detect_system_proxy() -> (
 ///   HTTPSProxy : 127.0.0.1
 ///   HTTPSPort : 6152
 /// ```
+#[cfg(target_os = "macos")]
 fn parse_proxy_block(
     text: &str,
     enable_key: &str,
@@ -234,6 +259,7 @@ fn parse_proxy_block(
 }
 
 /// Parses the ExceptionsList from scutil output.
+#[cfg(target_os = "macos")]
 fn parse_exceptions_list(text: &str) -> Vec<String> {
     let mut domains = Vec::new();
     let mut in_exceptions = false;
@@ -292,6 +318,7 @@ mod tests {
     use super::*;
 
     /// Test helper: parse proxy settings from text directly.
+    #[cfg(target_os = "macos")]
     fn detect_system_proxy_from_text(
         text: &str,
     ) -> (
@@ -352,6 +379,7 @@ mod tests {
         assert!(super::parse_proxy_url("no-port").is_none());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn parse_scutil_proxy_block() {
         let text = r"
