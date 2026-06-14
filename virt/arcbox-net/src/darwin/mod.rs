@@ -20,10 +20,7 @@
 
 pub mod classifier;
 pub mod datapath_loop;
-pub mod inbound_relay;
 pub mod nat;
-pub mod proxy_tunnel;
-pub mod socket_proxy;
 pub mod tcp_bridge;
 pub mod tun;
 
@@ -31,6 +28,10 @@ pub mod tun;
 // here so the `crate::darwin::{dns_log, proxy_detect}` paths are unchanged for
 // callers (datapath loop, TCP shim, the VMM layer).
 pub use arcbox_fakeip::{dns_log, proxy_detect};
+// `proxy_tunnel`, `socket_proxy`, and `inbound_relay` are extracted to
+// `arcbox-proxy`; re-exported here so the `crate::darwin::{proxy_tunnel,
+// socket_proxy, inbound_relay}` paths are unchanged for callers.
+pub use arcbox_proxy::{inbound_relay, proxy_tunnel, socket_proxy};
 
 #[cfg(feature = "vmnet")]
 pub use arcbox_vmnet::VmnetRelay;

@@ -548,6 +548,7 @@ dependencies = [
  "arcbox-error",
  "arcbox-fakeip",
  "arcbox-packet",
+ "arcbox-proxy",
  "arcbox-vmnet",
  "bytes",
  "chrono",
@@ -615,6 +616,18 @@ dependencies = [
  "thiserror",
  "tonic",
  "tonic-build",
+]
+
+[[package]]
+name = "arcbox-proxy"
+version = "0.4.6"
+dependencies = [
+ "arcbox-packet",
+ "libc",
+ "socket2 0.5.10",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -2096,7 +2109,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -3384,7 +3397,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror",
  "tokio",
  "tracing",
@@ -3421,7 +3434,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -4138,9 +4151,9 @@ dependencies = [
 
 [[package]]
 name = "socket2"
-version = "0.6.3"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
+checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
@@ -4389,7 +4402,7 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2 0.6.3",
+ "socket2 0.6.4",
  "tokio-macros",
  "tracing",
  "windows-sys 0.61.2",

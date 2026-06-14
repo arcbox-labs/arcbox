@@ -1,0 +1,20 @@
+[package]
+name = "arcbox-proxy"
+description = "Host-socket egress (UDP/ICMP), SOCKS5/HTTP-CONNECT tunnels, and inbound L2 relay for the ArcBox proxy datapath"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+arcbox-packet = { workspace = true }
+libc = { workspace = true }
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { workspace = true }
+tokio-util = "0.7"
+tracing = { workspace = true }
+
+[lints]
+workspace = true
