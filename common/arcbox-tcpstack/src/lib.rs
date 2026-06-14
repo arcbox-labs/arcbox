@@ -17,6 +17,8 @@
 //! - [`shim`] — an L3 ↔ L2 shim that wraps a host's `utun` IP packets in a
 //!   synthetic Ethernet header so the L2 classifier and TCP shim run unmodified
 //!   over an L3 link.
+//! - [`utun`] (macOS) — a [`FrameSource`](frame_source::FrameSource) and sink
+//!   over a host `utun` fd, stripping/prepending the device's 4-byte AF header.
 //!
 //! Extracted from `arcbox-net` so a host-level proxy can reuse the same TCP
 //! termination and classification plane as the VM datapath.
@@ -26,6 +28,8 @@ pub mod direct_rx;
 pub mod frame_source;
 pub mod shim;
 pub mod tcp_bridge;
+#[cfg(target_os = "macos")]
+pub mod utun;
 
 pub use frame_source::{FdFrameSource, FrameSource};
 

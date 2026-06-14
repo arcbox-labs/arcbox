@@ -727,7 +727,15 @@ impl TcpBridge {
         let peer_sack = opts.sack_permitted;
         let peer_mss = opts.mss.unwrap_or(536);
 
-        // Resolve connect target. Gateway IP → loopback for host.docker.internal.
+        // Decide egress: via the configured upstream proxy (connecting by
+        // hostname, so Fake-IP destinations resolve on the proxy's side) or a
+        // direct connect. The hostname is recovered from the destination IP via
+        // the DNS resolution log; `resolve_proxy_target` applies the bypass list
+        // and "is a proxy configured" policy.
+        let domain = self.dns_log.as_ref().and_then(|log| log.lookup(dst_ip));
+        let proxy_target = self.resolve_proxy_target(dst_ip, dst_port, domain.as_deref());
+
+        // Direct connect target. Gateway IP → loopback for host.docker.internal.
         let target_ip = if dst_ip == self.gateway_ip {
             Ipv4Addr::LOCALHOST
         } else {
@@ -739,9 +747,25 @@ impl TcpBridge {
         // Spawn host connect. Result is delivered via oneshot.
         let (result_tx, result_rx) = oneshot::channel();
         tokio::spawn(async move {
+            let connect = async {
+                match proxy_target {
+                    // SOCKS5 (preferred): the proxy resolves the hostname.
+                    Some((authority, host, port, "socks5")) => {
+                        arcbox_proxy::proxy_tunnel::connect_via_socks5(&authority, &host, port)
+                            .await
+                    }
+                    // HTTP CONNECT (https/http system proxy).
+                    Some((authority, host, port, _)) => {
+                        arcbox_proxy::proxy_tunnel::connect_via_http_proxy(&authority, &host, port)
+                            .await
+                    }
+                    // No proxy configured / bypassed → direct.
+                    None => tokio::net::TcpStream::connect(connect_addr).await,
+                }
+            };
             let stream = tokio::time::timeout(
                 std::time::Duration::from_secs(SYN_GATE_CONNECT_TIMEOUT_SECS),
-                tokio::net::TcpStream::connect(connect_addr),
+                connect,
             )
             .await
             .ok()
@@ -1122,7 +1146,6 @@ impl TcpBridge {
     /// proxy should be used, or `None` for direct connection. The proxy authority
     /// is a `"host:port"` string that `TcpStream::connect` can resolve (supports
     /// both IP addresses and hostnames like `proxy.corp.com`).
-    #[allow(dead_code)] // reintegrated into handle_outbound_syn in a follow-up
     fn resolve_proxy_target(
         &self,
         dst_ip: Ipv4Addr,

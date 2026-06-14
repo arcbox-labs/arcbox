@@ -541,6 +541,7 @@ dependencies = [
 name = "arcbox-net"
 version = "0.4.7"
 dependencies = [
+ "anyhow",
  "arcbox-conntrack",
  "arcbox-datapath",
  "arcbox-dhcp",
@@ -549,10 +550,12 @@ dependencies = [
  "arcbox-fakeip",
  "arcbox-packet",
  "arcbox-proxy",
+ "arcbox-route",
  "arcbox-tcpstack",
  "arcbox-vmnet",
  "bytes",
  "chrono",
+ "clap",
  "crossbeam-channel",
  "crossbeam-utils",
  "ipnetwork 0.20.0",
@@ -565,6 +568,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -646,6 +650,7 @@ dependencies = [
  "arcbox-datapath",
  "arcbox-fakeip",
  "arcbox-packet",
+ "arcbox-proxy",
  "crossbeam-channel",
  "libc",
  "tokio",
