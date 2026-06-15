@@ -12,6 +12,12 @@
     cargo-about
   ] ++ lib.optionals pkgs.stdenv.isDarwin [
     pkgs.libiconv
+    # arcbox-vmm links macOS 15+ Hypervisor GIC APIs (hv_gic_*). The nix darwin
+    # stdenv defaults to the 14.4 SDK, whose Hypervisor.tbd lacks those symbols,
+    # so `cargo build -p arcbox-daemon` fails to link locally. Pin a 15+ SDK to
+    # match CI (system Xcode 26 SDK). The setup hook makes this the active
+    # DEVELOPER_DIR/SDKROOT since it is the highest-versioned SDK in scope.
+    pkgs.apple-sdk_26
   ];
 
   languages.rust = {
