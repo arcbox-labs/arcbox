@@ -160,6 +160,11 @@ make run-daemon
 | `codesign` reports `errSecInternalComponent` | Private key missing (only cert imported) | Re-export `.p12` with both cert **and** private key selected |
 | Daemon starts but `--options runtime` was omitted | Restricted entitlements silently ignored | Always include `--options runtime` in the codesign command |
 
+> [!NOTE]
+> For deeper diagnostics — chain-to-self-signed-root errors, manual trust
+> overrides, and suppressing the per-sign keychain password prompt — see
+> [`docs/code-signing-troubleshooting.md`](docs/code-signing-troubleshooting.md).
+
 > [!WARNING]
 > The `--options runtime` flag enables Hardened Runtime, which is **required**
 > for restricted entitlements to take effect. Without it, macOS accepts the
