@@ -49,7 +49,11 @@ use tokio::sync::{Mutex, RwLock};
 pub const DEFAULT_MACHINE_NAME: &str = "default";
 
 /// Default startup timeout in seconds.
-const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 30;
+///
+/// Generous enough to cover a cold guest boot (erofs rootfs + large docker.img
+/// mount) even when the host daemon is CPU/I/O constrained. A tight 30s budget
+/// raced the cold-boot path and produced "timeout waiting for agent" loops.
+const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 90;
 
 /// Default health check interval in seconds.
 const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
