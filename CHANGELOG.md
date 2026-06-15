@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.7](https://github.com/arcboxlabs/arcbox/compare/v0.4.6...v0.4.7) (2026-06-15)
+
+
+### Features
+
+* **vmm:** vsock-io worker for event-driven host-to-guest injection ([2c987e1](https://github.com/arcboxlabs/arcbox/commit/2c987e1c8791a2a022220de3146681c15909c73d))
+* **vsock:** doorbell hook on host-to-guest RX work in connection manager ([9f6814b](https://github.com/arcboxlabs/arcbox/commit/9f6814b001c4c9c33e922278b619548d64e6af36))
+
+
+### Bug Fixes
+
+* **core:** raise agent-wait startup timeout to 90s ([#304](https://github.com/arcboxlabs/arcbox/issues/304)) ([1a74b8c](https://github.com/arcboxlabs/arcbox/commit/1a74b8c9285b58ae4a66dc1cd2092f30becec9fa))
+* **vmm:** set running before spawning HV worker threads ([e23bdb7](https://github.com/arcboxlabs/arcbox/commit/e23bdb7f3a45986697fbe12c7710948dc5e67034))
+
 ## [0.4.6](https://github.com/arcboxlabs/arcbox/compare/v0.4.5...v0.4.6) (2026-06-12)
 
 
