@@ -36,7 +36,9 @@ pub fn find_bundle_contents() -> Option<PathBuf> {
 /// Seeds all assets from the app bundle to `~/.arcbox/` if available.
 ///
 /// Copies boot assets, runtime binaries, and the agent binary from the
-/// bundle so the daemon can start without network on first launch.
+/// bundle so the daemon can start without network on first launch. Files are
+/// refreshed whenever the bundle's copy differs (see [`copy_if_changed`]), so a
+/// staged binary can't go stale across an app update.
 ///
 /// Bundle layout:
 /// ```text
@@ -73,33 +75,49 @@ pub(super) fn seed_from_bundle(data_dir: &Path) {
     // 3. Agent binary.
     let agent_src = contents.join("Resources/bin/arcbox-agent");
     let agent_dst = data_dir.join("bin/arcbox-agent");
-    if agent_src.exists() && !agent_dst.exists() {
-        if let Err(e) = (|| -> std::io::Result<()> {
-            std::fs::create_dir_all(agent_dst.parent().unwrap())?;
-            std::fs::copy(&agent_src, &agent_dst)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&agent_dst, std::fs::Permissions::from_mode(0o755))?;
-            }
-            Ok(())
-        })() {
-            tracing::warn!("Failed to seed agent from bundle: {e}");
-        } else {
-            tracing::info!("Seeded arcbox-agent from bundle");
+    if agent_src.exists() {
+        match copy_if_changed(&agent_src, &agent_dst) {
+            Ok(true) => tracing::info!("Seeded arcbox-agent from bundle"),
+            Ok(false) => tracing::debug!("arcbox-agent already up to date"),
+            Err(e) => tracing::warn!("Failed to seed agent from bundle: {e}"),
         }
     }
 }
 
-/// Copies specific files from `src` to `dst`, skipping those already present.
+/// Copies `src` to `dst` when `dst` is missing or differs from `src` by size or
+/// modification time, returning whether a copy occurred.
+///
+/// The source mtime is mirrored onto the destination so a subsequent run can
+/// recognise an up-to-date copy with a cheap `stat` instead of reading file
+/// contents — important because the runtime tree is hundreds of MB and seeding
+/// runs on every daemon start. `std::fs::copy` carries over the source's
+/// permission bits (including the executable bit), so binaries stay runnable.
+fn copy_if_changed(src: &Path, dst: &Path) -> std::io::Result<bool> {
+    let src_meta = std::fs::metadata(src)?;
+    let src_mtime = filetime::FileTime::from_last_modification_time(&src_meta);
+    if let Ok(dst_meta) = std::fs::metadata(dst) {
+        if dst_meta.len() == src_meta.len()
+            && filetime::FileTime::from_last_modification_time(&dst_meta) == src_mtime
+        {
+            return Ok(false);
+        }
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(src, dst)?;
+    filetime::set_file_mtime(dst, src_mtime)?;
+    Ok(true)
+}
+
+/// Copies specific files from `src` to `dst`, refreshing any that changed.
 fn seed_dir_files(src: &Path, dst: &Path, files: &[&str], label: &str) {
     if let Err(e) = (|| -> std::io::Result<()> {
         std::fs::create_dir_all(dst)?;
         for name in files {
             let s = src.join(name);
-            let d = dst.join(name);
-            if s.exists() && !d.exists() {
-                std::fs::copy(&s, &d)?;
+            if s.exists() {
+                copy_if_changed(&s, &dst.join(name))?;
             }
         }
         Ok(())
@@ -110,7 +128,7 @@ fn seed_dir_files(src: &Path, dst: &Path, files: &[&str], label: &str) {
     }
 }
 
-/// Recursively copies a directory tree, skipping files already present.
+/// Recursively copies a directory tree, refreshing any files that changed.
 fn seed_dir_recursive(src: &Path, dst: &Path, label: &str) {
     let result = (|| -> std::io::Result<u32> {
         let mut count = 0u32;
@@ -119,22 +137,7 @@ fn seed_dir_recursive(src: &Path, dst: &Path, label: &str) {
             let d = dst.join(&rel);
             if is_dir {
                 std::fs::create_dir_all(&d)?;
-            } else if !d.exists() {
-                if let Some(parent) = d.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::copy(src.join(&rel), &d)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    // Preserve source executable bits without broadening.
-                    let src_mode = std::fs::metadata(src.join(&rel))?.permissions().mode();
-                    if src_mode & 0o111 != 0 {
-                        let dst_mode = std::fs::metadata(&d)?.permissions().mode();
-                        let new_mode = (dst_mode & !0o111) | (src_mode & 0o111);
-                        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(new_mode))?;
-                    }
-                }
+            } else if copy_if_changed(&src.join(&rel), &d)? {
                 count += 1;
             }
         }
@@ -142,7 +145,7 @@ fn seed_dir_recursive(src: &Path, dst: &Path, label: &str) {
     })();
 
     match result {
-        Ok(0) => tracing::debug!("{label}: already seeded"),
+        Ok(0) => tracing::debug!("{label}: already up to date"),
         Ok(n) => tracing::info!("Seeded {n} {label} from bundle"),
         Err(e) => tracing::warn!("Failed to seed {label} from bundle: {e}"),
     }
@@ -213,13 +216,11 @@ pub(super) async fn ensure_boot_assets(
     Ok(())
 }
 
-/// Copies the arcbox-agent binary from the boot asset cache to the daemon's
-/// bin directory if it is not already present.
+/// Installs the arcbox-agent binary from the downloaded boot cache, refreshing
+/// it if the cached copy differs. This is the fallback path for non-bundle
+/// installs; bundle installs are handled by [`seed_from_bundle`].
 pub(super) fn ensure_agent_binary(data_dir: &Path) -> Result<()> {
     let agent_dest = data_dir.join("bin/arcbox-agent");
-    if agent_dest.exists() {
-        return Ok(());
-    }
 
     let version = arcbox_core::boot_asset_version();
     let agent_src = data_dir.join(format!("boot/{version}/arcbox-agent"));
@@ -231,17 +232,66 @@ pub(super) fn ensure_agent_binary(data_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    std::fs::create_dir_all(agent_dest.parent().unwrap())
-        .context("Failed to create agent bin directory")?;
-    std::fs::copy(&agent_src, &agent_dest).context("Failed to copy agent binary")?;
+    if copy_if_changed(&agent_src, &agent_dest).context("Failed to install agent binary")? {
+        info!("Agent binary installed from boot cache");
+    }
+    Ok(())
+}
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&agent_dest, std::fs::Permissions::from_mode(0o755))
-            .context("Failed to set agent binary permissions")?;
+#[cfg(test)]
+mod tests {
+    use super::copy_if_changed;
+    use std::fs;
+
+    #[test]
+    fn copies_when_missing_then_skips_when_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("nested/dst");
+        fs::write(&src, b"v1").unwrap();
+
+        // Destination missing → copied.
+        assert!(copy_if_changed(&src, &dst).unwrap());
+        assert_eq!(fs::read(&dst).unwrap(), b"v1");
+
+        // Unchanged source → skipped (mtime mirrored on the first copy).
+        assert!(!copy_if_changed(&src, &dst).unwrap());
     }
 
-    info!("Agent binary installed from boot cache");
-    Ok(())
+    #[test]
+    fn recopies_when_source_content_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        fs::write(&src, b"v1").unwrap();
+        assert!(copy_if_changed(&src, &dst).unwrap());
+
+        // A different build differs in size and/or mtime → refreshed.
+        fs::write(&src, b"v2-larger").unwrap();
+        let newer = filetime::FileTime::from_unix_time(
+            filetime::FileTime::from_last_modification_time(&fs::metadata(&src).unwrap())
+                .unix_seconds()
+                + 5,
+            0,
+        );
+        filetime::set_file_mtime(&src, newer).unwrap();
+        assert!(copy_if_changed(&src, &dst).unwrap());
+        assert_eq!(fs::read(&dst).unwrap(), b"v2-larger");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("bin");
+        let dst = dir.path().join("bin-copy");
+        fs::write(&src, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
+
+        copy_if_changed(&src, &dst).unwrap();
+
+        let mode = fs::metadata(&dst).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "executable bit should be preserved");
+    }
 }
