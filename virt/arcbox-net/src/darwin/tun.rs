@@ -362,20 +362,8 @@ impl DarwinTun {
             return Ok(0);
         }
 
-        // Determine the address family from the IP version field.
-        let af: u32 = match packet[0] >> 4 {
-            4 => libc::AF_INET as u32,
-            6 => libc::AF_INET6 as u32,
-            v => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unsupported IP version: {}", v),
-                ));
-            }
-        };
-
         // Build the buffer: 4-byte AF header + IP packet.
-        let mut af_bytes = af.to_ne_bytes();
+        let mut af_bytes = utun_af_header(packet)?;
         let iov = [
             libc::iovec {
                 iov_base: af_bytes.as_mut_ptr().cast::<libc::c_void>(),
@@ -466,6 +454,27 @@ impl DarwinTun {
     }
 }
 
+/// Returns the 4-byte `utun` protocol-family header for an IP packet, in
+/// network (big-endian) byte order.
+///
+/// macOS reads this header with `ntohl()`, so host byte order makes the kernel
+/// see an unknown family (e.g. `0x02000000` on little-endian) and silently drop
+/// the injected packet. The read side never parses it, so only writes are
+/// affected.
+fn utun_af_header(packet: &[u8]) -> io::Result<[u8; 4]> {
+    let af: u32 = match packet.first().map(|first| first >> 4) {
+        Some(4) => libc::AF_INET as u32,
+        Some(6) => libc::AF_INET6 as u32,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported IP version: {other:?}"),
+            ));
+        }
+    };
+    Ok(af.to_be_bytes())
+}
+
 impl std::fmt::Debug for DarwinTun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DarwinTun")
@@ -525,6 +534,21 @@ mod tests {
         assert_eq!(sin.sin_len, std::mem::size_of::<libc::sockaddr_in>() as u8);
         // 192.168.64.1 in network byte order = 0xC0A84001
         assert_eq!(sin.sin_addr.s_addr, u32::from(addr).to_be());
+    }
+
+    #[test]
+    fn utun_af_header_is_network_byte_order() {
+        // macOS reads the family with ntohl(), so the header must be big-endian.
+        assert_eq!(
+            utun_af_header(&[0x45]).unwrap(),
+            (libc::AF_INET as u32).to_be_bytes()
+        );
+        assert_eq!(
+            utun_af_header(&[0x60]).unwrap(),
+            (libc::AF_INET6 as u32).to_be_bytes()
+        );
+        assert!(utun_af_header(&[0x00]).is_err(), "non-IP version rejected");
+        assert!(utun_af_header(&[]).is_err(), "empty packet rejected");
     }
 
     // Integration tests that require creating actual utun devices.
