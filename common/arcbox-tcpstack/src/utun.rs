@@ -17,7 +17,7 @@ use crate::frame_source::FrameSource;
 use crate::shim::l2_to_l3;
 
 /// The 4-byte address-family header macOS prepends to each `utun` packet.
-const AF_HEADER_SIZE: usize = 4;
+pub const AF_HEADER_SIZE: usize = 4;
 
 /// Largest IP packet we read from the device in one shot.
 const MAX_IP_PACKET: usize = 65535;
@@ -117,27 +117,38 @@ fn utun_read(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     Ok((n as usize).saturating_sub(AF_HEADER_SIZE))
 }
 
+/// Returns the 4-byte `utun` address-family header for an IP packet, in network
+/// (big-endian) byte order — the single source of truth for both this host
+/// endpoint and the VM-side `DarwinTun`.
+///
+/// macOS reads this header with `ntohl()`, so host byte order makes the kernel
+/// see an unknown family (e.g. `0x02000000` on little-endian) and silently drop
+/// the injected packet. The read path strips these bytes without parsing them,
+/// so only writes care.
+///
+/// # Errors
+///
+/// Returns an error if `ip_packet` is empty or its version nibble is not 4 or 6.
+pub fn utun_af_header(ip_packet: &[u8]) -> io::Result<[u8; AF_HEADER_SIZE]> {
+    let af: u32 = match ip_packet.first().map(|first| first >> 4) {
+        Some(4) => libc::AF_INET as u32,
+        Some(6) => libc::AF_INET6 as u32,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("not an IP packet (version nibble {other:?})"),
+            ));
+        }
+    };
+    Ok(af.to_be_bytes())
+}
+
 /// `writev` `[AF(4) | IP]` to the device, returning the IP byte count.
 fn utun_write(fd: RawFd, ip_packet: &[u8]) -> io::Result<usize> {
     if ip_packet.is_empty() {
         return Ok(0);
     }
-    let af: u32 = match ip_packet[0] >> 4 {
-        4 => libc::AF_INET as u32,
-        6 => libc::AF_INET6 as u32,
-        v => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("not an IP packet (version nibble {v})"),
-            ));
-        }
-    };
-    // macOS reads the utun protocol-family header with ntohl(), so it must be
-    // network (big-endian) byte order. (Writing host order makes the kernel see
-    // an unknown family, e.g. 0x02000000 on little-endian, and silently drop the
-    // injected packet — ingress is unaffected since the read path strips these 4
-    // bytes without parsing them.)
-    let mut af_bytes = af.to_be_bytes();
+    let mut af_bytes = utun_af_header(ip_packet)?;
     let iov = [
         libc::iovec {
             iov_base: af_bytes.as_mut_ptr().cast(),
@@ -253,5 +264,20 @@ mod tests {
             !sink.send_l2_frame(&frame).unwrap(),
             "ARP has no L3 form and must be dropped, not written"
         );
+    }
+
+    #[test]
+    fn utun_af_header_is_network_byte_order() {
+        // macOS reads the family with ntohl(), so the header must be big-endian.
+        assert_eq!(
+            utun_af_header(&[0x45]).unwrap(),
+            (libc::AF_INET as u32).to_be_bytes()
+        );
+        assert_eq!(
+            utun_af_header(&[0x60]).unwrap(),
+            (libc::AF_INET6 as u32).to_be_bytes()
+        );
+        assert!(utun_af_header(&[0x00]).is_err(), "non-IP version rejected");
+        assert!(utun_af_header(&[]).is_err(), "empty packet rejected");
     }
 }
