@@ -74,6 +74,11 @@ mod macos {
         /// Upstream DNS resolver for queries routed through the utun.
         #[arg(long, default_value = "1.1.1.1:53")]
         dns: SocketAddr,
+        /// Pre-seed an IP -> domain mapping into the resolution log (repeatable),
+        /// e.g. `--map 198.51.100.7=example.test`. Lets a routed destination be
+        /// tunnelled by name without a live DNS round-trip through the utun.
+        #[arg(long = "map", value_name = "IP=DOMAIN")]
+        maps: Vec<String>,
     }
 
     pub fn run() -> Result<()> {
@@ -142,6 +147,14 @@ mod macos {
         // the one we were given. resolve_proxy_target then routes Fake-IP / named
         // destinations through it (by hostname, recovered via the DNS log).
         let dns_log = DnsResolutionLog::new();
+        for m in &args.maps {
+            if let Some((ip, domain)) = m.split_once('=') {
+                if let Ok(ip) = ip.parse::<Ipv4Addr>() {
+                    dns_log.record(domain, &[ip]);
+                    tracing::info!(%ip, domain, "seeded IP->domain mapping");
+                }
+            }
+        }
         let proxy_env = ProxyEnvironment {
             fake_ip_active: true,
             socks_proxy: Some(ProxyConfig {
@@ -165,6 +178,15 @@ mod macos {
         let async_fd = AsyncFd::new(RawFdWrapper(fd)).context("register utun with reactor")?;
         let dns_upstream = args.dns;
         let mut maintenance = tokio::time::interval(Duration::from_secs(30));
+        // Drive the common tail (handshake completion + fast-path reads)
+        // continuously. Unlike the VM datapath there is no inject thread and no
+        // steady guest traffic to keep the loop spinning, so a host SOCKS5
+        // connect resolving — or response data arriving on a host socket —
+        // would otherwise wait for the next utun packet. A short tick keeps the
+        // proof harness responsive (a productized version would make the host
+        // sockets async instead of polling).
+        let mut poll = tokio::time::interval(Duration::from_millis(2));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         tracing::info!("tun_proxy datapath running; Ctrl-C to stop");
 
@@ -216,6 +238,7 @@ mod macos {
                 Some(reply) = reply_rx.recv() => {
                     write_frame(&sink, &reply);
                 }
+                _ = poll.tick() => {}
                 _ = maintenance.tick() => {
                     socket_proxy.maintenance();
                 }
@@ -237,8 +260,10 @@ mod macos {
     /// Writes one L2 frame to the utun (best-effort: ARP/non-IP is dropped by
     /// the sink, WouldBlock/errors are logged — this harness has no write queue).
     fn write_frame(sink: &UtunSink, frame: &[u8]) {
-        if let Err(e) = sink.send_l2_frame(frame) {
-            tracing::debug!("utun write dropped: {e}");
+        match sink.send_l2_frame(frame) {
+            Ok(true) => tracing::debug!("utun TX {} bytes", frame.len()),
+            Ok(false) => tracing::debug!("utun TX SKIPPED (non-IP/ARP) {} bytes", frame.len()),
+            Err(e) => tracing::debug!("utun TX error: {e}"),
         }
     }
 

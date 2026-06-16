@@ -132,8 +132,12 @@ fn utun_write(fd: RawFd, ip_packet: &[u8]) -> io::Result<usize> {
             ));
         }
     };
-    // The AF header is host byte order (matches arcbox_net::darwin::DarwinTun).
-    let mut af_bytes = af.to_ne_bytes();
+    // macOS reads the utun protocol-family header with ntohl(), so it must be
+    // network (big-endian) byte order. (Writing host order makes the kernel see
+    // an unknown family, e.g. 0x02000000 on little-endian, and silently drop the
+    // injected packet — ingress is unaffected since the read path strips these 4
+    // bytes without parsing them.)
+    let mut af_bytes = af.to_be_bytes();
     let iov = [
         libc::iovec {
             iov_base: af_bytes.as_mut_ptr().cast(),
@@ -196,7 +200,7 @@ mod tests {
         let mut ip = vec![0u8; 20];
         ip[0] = 0x45;
         ip[9] = 6; // TCP
-        let mut datagram = (libc::AF_INET as u32).to_ne_bytes().to_vec();
+        let mut datagram = (libc::AF_INET as u32).to_be_bytes().to_vec();
         datagram.extend_from_slice(&ip);
         write_raw(b.as_raw_fd(), &datagram);
 
@@ -229,7 +233,8 @@ mod tests {
         let n = unsafe { libc::read(b.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         assert!(n > 0);
         let n = n as usize;
-        assert_eq!(&buf[..4], &(libc::AF_INET as u32).to_ne_bytes());
+        // macOS utun protocol family is network byte order.
+        assert_eq!(&buf[..4], &(libc::AF_INET as u32).to_be_bytes());
         assert_eq!(
             &buf[4..n],
             &ip[..],
