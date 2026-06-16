@@ -21,8 +21,9 @@
 //! # Protocol
 //!
 //! The utun device on macOS uses a 4-byte address family header prepended
-//! to each IP packet. For IPv4, this header is `AF_INET` (2) in host
-//! byte order as a `u32`.
+//! to each IP packet, in **network (big-endian) byte order** (the kernel reads
+//! it with `ntohl()`). The encode lives in
+//! [`arcbox_tcpstack::utun::utun_af_header`], shared with the host endpoint.
 //!
 //! # Requirements
 //!
@@ -33,8 +34,9 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-/// 4-byte AF header size prepended to each packet on the utun device.
-const AF_HEADER_SIZE: usize = 4;
+// The utun 4-byte AF-header framing (size + network-byte-order encode) is shared
+// with the host endpoint so the load-bearing byte order lives in one place.
+use arcbox_tcpstack::utun::{AF_HEADER_SIZE, utun_af_header};
 
 /// Maximum reasonable MTU including the AF header.
 #[allow(dead_code)]
@@ -454,27 +456,6 @@ impl DarwinTun {
     }
 }
 
-/// Returns the 4-byte `utun` protocol-family header for an IP packet, in
-/// network (big-endian) byte order.
-///
-/// macOS reads this header with `ntohl()`, so host byte order makes the kernel
-/// see an unknown family (e.g. `0x02000000` on little-endian) and silently drop
-/// the injected packet. The read side never parses it, so only writes are
-/// affected.
-fn utun_af_header(packet: &[u8]) -> io::Result<[u8; 4]> {
-    let af: u32 = match packet.first().map(|first| first >> 4) {
-        Some(4) => libc::AF_INET as u32,
-        Some(6) => libc::AF_INET6 as u32,
-        other => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unsupported IP version: {other:?}"),
-            ));
-        }
-    };
-    Ok(af.to_be_bytes())
-}
-
 impl std::fmt::Debug for DarwinTun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DarwinTun")
@@ -521,11 +502,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_af_header_size() {
-        assert_eq!(AF_HEADER_SIZE, 4);
-    }
-
-    #[test]
     fn test_make_sockaddr_in() {
         let addr = Ipv4Addr::new(192, 168, 64, 1);
         let sin = DarwinTun::make_sockaddr_in(addr);
@@ -534,21 +510,6 @@ mod tests {
         assert_eq!(sin.sin_len, std::mem::size_of::<libc::sockaddr_in>() as u8);
         // 192.168.64.1 in network byte order = 0xC0A84001
         assert_eq!(sin.sin_addr.s_addr, u32::from(addr).to_be());
-    }
-
-    #[test]
-    fn utun_af_header_is_network_byte_order() {
-        // macOS reads the family with ntohl(), so the header must be big-endian.
-        assert_eq!(
-            utun_af_header(&[0x45]).unwrap(),
-            (libc::AF_INET as u32).to_be_bytes()
-        );
-        assert_eq!(
-            utun_af_header(&[0x60]).unwrap(),
-            (libc::AF_INET6 as u32).to_be_bytes()
-        );
-        assert!(utun_af_header(&[0x00]).is_err(), "non-IP version rejected");
-        assert!(utun_af_header(&[]).is_err(), "empty packet rejected");
     }
 
     // Integration tests that require creating actual utun devices.
