@@ -3,12 +3,17 @@
 <!--
     LOCAL DEVELOPMENT ONLY. Do not use for release signing.
 
-    Superset of bundle/arcbox.entitlements that additionally disables
-    library validation. devenv builds link against nix-store libiconv,
-    which carries a different Team ID than the Developer ID signature;
-    without disabling library validation the hardened runtime refuses to
-    load it. Release builds link system libraries only and keep validation
-    enabled, so they use bundle/arcbox.entitlements.
+    Mirrors bundle/arcbox.entitlements but additionally disables library
+    validation. devenv builds link against nix-store libiconv, which carries
+    a different Team ID than the Developer ID signature; without disabling
+    library validation the hardened runtime refuses to load it. Release builds
+    link system libraries only and keep validation enabled, so they use
+    bundle/arcbox.entitlements.
+
+    com.apple.vm.networking is intentionally omitted: this file is also used
+    by the CI smoke test, which ad-hoc signs the daemon (`codesign -s -`).
+    That restricted entitlement requires an Apple provisioning profile, so an
+    ad-hoc signature claiming it is killed by AMFI on launch.
 
     Keep the shared keys below in sync with bundle/arcbox.entitlements.
 -->
@@ -27,10 +32,6 @@
     <true/>
 
     <key>com.apple.security.network.server</key>
-    <true/>
-
-    <!-- vmnet.framework direct access (bridge NIC without root) -->
-    <key>com.apple.vm.networking</key>
     <true/>
 
     <!-- Allow unsigned executable memory (for JIT in containers) -->
