@@ -5,70 +5,85 @@
 `arcbox-tcpstack` can power a **Surge-class host proxy**, not just the VM
 datapath. It opens a macOS `utun`, runs host egress traffic through the *same*
 `FrameClassifier` + `TcpBridge` + `SocketProxy` the VM uses, and forwards TCP to
-an upstream SOCKS5 proxy by hostname (recovered from Fake-IP via the DNS log).
+an upstream SOCKS5 proxy by hostname (recovered from a Fake-IP via the DNS log).
+
+This has been **verified end-to-end** (Gate C): a host HTTP flow over a `utun`
+was classified, TCP-terminated by `TcpBridge`, promoted to the fast path, and
+tunnelled **by domain** to an upstream SOCKS5 — response and clean teardown
+included.
 
 It is a **proof harness, not a product**: best-effort writes (no backpressure
-queue), no Fake-IP DNS server of its own, root-only, macOS-only. The signed
-`NEPacketTunnelProvider` packaging and encrypted remote protocols are explicit
-non-goals (see `PLAN.md`).
+queue), host sockets are polled rather than async, root-only, macOS-only. The
+signed `NEPacketTunnelProvider` packaging and encrypted remote protocols are
+explicit non-goals (see `PLAN.md`).
 
 ## Requirements
 
-- Apple Silicon / macOS, **root** (utun addressing + routes).
-- An upstream SOCKS5 listener — e.g. `ssh -D 1080 …`, `sing-box`, or Surge in
-  SOCKS mode. (Without one, TCP connects fail at the proxy hop.)
+- Apple Silicon / macOS, **root** (utun creation, addressing, and routes all
+  require root on macOS 15+).
+- An upstream SOCKS5 listener — e.g. `ssh -N -D 1080 <host>`, `sing-box`, or
+  Surge in SOCKS mode.
+- If a Fake-IP proxy (Surge/ClashX) is already running, it owns `198.18.0.0/15`
+  and the conventional gateway `198.18.0.1`. Give the harness a **private** utun
+  address (`--addr 10.99.0.1 --peer 10.99.0.2`) so it cannot collide.
 
-## Run
+## Options
+
+| flag | meaning |
+| --- | --- |
+| `--socks host:port` | upstream SOCKS5 authority (required) |
+| `--addr` / `--peer` | utun local / peer address (default `198.18.0.1` / `.2`) |
+| `--route CIDR` | route `CIDR` onto the utun; removed on exit |
+| `--dns resolver:53` | upstream resolver for DNS queries that traverse the utun |
+| `--map IP=DOMAIN` | pre-seed an IP→domain mapping (repeatable) so a routed IP is tunnelled by name without a live DNS round-trip |
+
+## Reproducible self-contained proof
+
+This is the verified Gate C run. It needs no internet: a local SOCKS5 proxy maps
+the destination to a local HTTP server, and a seeded `--map` supplies the domain.
 
 ```sh
-# Terminal 1: an upstream SOCKS5 (example: ssh dynamic forward)
-ssh -N -D 1080 somehost
+# 1) a local SOCKS5 proxy + HTTP test server, and 2) the harness:
+#    private utun address (no Fake-IP collision), seeded IP->domain mapping.
+sudo cargo run -p arcbox-net --example tun_proxy -- \
+    --socks 127.0.0.1:1080 --addr 10.99.0.1 --peer 10.99.0.2 \
+    --map 198.51.100.7=example.test &
 
-# Terminal 2: the harness (creates utunN, assigns 198.18.0.1, raises MTU)
-sudo cargo run -p arcbox-net --example tun_proxy -- --socks 127.0.0.1:1080
+# 3) route the (TEST-NET-2) destination onto the harness's utunN, then drive a flow:
+sudo route add -host 198.51.100.7 -interface utunN
+curl --resolve example.test:80:198.51.100.7 http://example.test/
 ```
 
-It logs the assigned interface (e.g. `utun7`). Two ways to send traffic through it:
+Expected: the body comes back, and the harness logs the full lifecycle —
+`SYN gated` → `passive-open registered` → `SOCKS5 tunnel established
+target=example.test` → fast-path promotion → response → FIN. The SOCKS5 proxy
+logs `CONNECT example.test:80`, i.e. the destination was tunnelled **by name**.
 
-- **Scoped interface (safest — no routing table change):**
+(A ready-to-run script that wires the local proxy/test-server, picks the utun,
+adds and removes the route, and prints a `PASS`/`FAIL` verdict is the simplest
+way to reproduce this.)
 
-  ```sh
-  curl --interface utun7 https://example.com
-  ```
+## Real-world usage
 
-- **Scoped route (opt-in):** pass `--route` and the harness installs the route
-  via `arcbox-route` and removes it on normal exit and on Ctrl-C. Run in the
-  default dev profile (as below) so a panic still unwinds and tears the route
-  down. A hard kill (`SIGKILL`) or a `--release` build (`panic = "abort"`) skips
-  the cleanup and can leave the route pointed at a dead `utun` — remove it
-  manually with `sudo route -n delete -net 198.18.0.0/15` if that happens:
+Point it at a real upstream SOCKS5 and route real traffic through the utun:
 
-  ```sh
-  sudo cargo run -p arcbox-net --example tun_proxy -- \
-      --socks 127.0.0.1:1080 --route 198.18.0.0/15
-  ```
+```sh
+ssh -N -D 1080 <host>                                   # upstream SOCKS5
+sudo cargo run -p arcbox-net --example tun_proxy -- \
+    --socks 127.0.0.1:1080 --addr 10.99.0.1 --peer 10.99.0.2 &
+# force a flow onto the utun (scoped to the interface; no routing-table change):
+curl --interface utunN https://example.com
+```
 
-For destination **domains** to be recovered (and tunnelled by name), the DNS
-query must also traverse the utun so the harness can record `domain → IP`; pass
-`--dns <resolver:53>` (default `1.1.1.1:53`). Traffic to the Fake-IP range
-(`198.18.0.0/15`) is tunnelled by IP string even without a recorded domain.
+For a destination domain to be tunnelled **by name** (instead of by raw IP), its
+DNS query must traverse the utun so the harness records `domain → IP`: send it to
+the utun's gateway (`--peer`) address, e.g. `dig example.com @10.99.0.2`. A
+destination in the Fake-IP range (`198.18.0.0/15`) is tunnelled by IP string even
+without a recorded domain.
 
-## Manual verification (Gate C)
-
-This gate is functional, not a throughput target. With the upstream SOCKS5
-running and traffic routed through `utunN`:
-
-1. A host TCP flow reaches its destination **through the upstream proxy** (verify
-   on the proxy side — e.g. the `ssh -D` connection log, or `sing-box` access log).
-2. The harness logs `recorded DNS resolution` for the domain and the `TcpBridge`
-   `SOCKS5 tunnel established` line naming `host:port` — i.e. the destination was
-   tunnelled **by hostname**, not by raw Fake-IP.
-3. A UDP flow (e.g. `dig @<addr-on-utun>`) round-trips via `SocketProxy`.
-
-If TCP termination or domain recovery fails on the L3 path, the L3↔L2 shim or the
-synthetic-MAC assumptions are wrong — diagnose against the working VM datapath
-(`virt/arcbox-net/tests/datapath_test.rs`, which exercises the same stack over a
-socketpair).
+> Routes are removed on normal exit and on Ctrl-C (dev profile / unwind). A hard
+> kill (`SIGKILL`) or a `--release` build (`panic = "abort"`) skips Drop and can
+> leave a `--route` pointed at a dead `utun`; remove it with `sudo route delete`.
 
 ## How it maps to the VM datapath
 
