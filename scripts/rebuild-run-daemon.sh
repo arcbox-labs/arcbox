@@ -12,7 +12,10 @@ DATA_DIR="${DATA_DIR:-/tmp/arcbox-data}"
 GUEST_DOCKER_VSOCK_PORT="${GUEST_DOCKER_VSOCK_PORT:-2375}"
 HELPER_SOCKET="${HELPER_SOCKET:-${ARCBOX_HELPER_SOCKET:-/tmp/arcbox-helper.sock}}"
 SIGN="${SIGN:-1}"
-ENTITLEMENTS="${ENTITLEMENTS:-$ROOT/bundle/arcbox.entitlements}"
+# Local dev signing: dev entitlements disable library validation for the
+# nix-store libiconv that devenv builds link against. Release signing uses
+# bundle/arcbox.entitlements (validation enabled).
+ENTITLEMENTS="${ENTITLEMENTS:-$ROOT/bundle/arcbox.dev.entitlements}"
 
 cd "$ROOT"
 

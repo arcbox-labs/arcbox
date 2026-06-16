@@ -1,5 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    LOCAL DEVELOPMENT ONLY. Do not use for release signing.
+
+    Superset of bundle/arcbox.entitlements that additionally disables
+    library validation. devenv builds link against nix-store libiconv,
+    which carries a different Team ID than the Developer ID signature;
+    without disabling library validation the hardened runtime refuses to
+    load it. Release builds link system libraries only and keep validation
+    enabled, so they use bundle/arcbox.entitlements.
+
+    Keep the shared keys below in sync with bundle/arcbox.entitlements.
+-->
 <plist version="1.0">
 <dict>
     <!-- Virtualization.framework access (required for VMs on macOS) -->
@@ -17,8 +29,17 @@
     <key>com.apple.security.network.server</key>
     <true/>
 
+    <!-- vmnet.framework direct access (bridge NIC without root) -->
+    <key>com.apple.vm.networking</key>
+    <true/>
+
     <!-- Allow unsigned executable memory (for JIT in containers) -->
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- DEV ONLY: load non-Apple/non-Team-ID dylibs (nix-store libiconv)
+         under the hardened runtime. Never enabled in release builds. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
     <true/>
 </dict>
 </plist>

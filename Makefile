@@ -1,7 +1,10 @@
 # ArcBox Development Makefile
 
 PROFILE ?= debug
-ENTITLEMENTS := bundle/arcbox.entitlements
+# Local dev signing uses the dev entitlements (disables library validation
+# for nix-store libiconv). The release path (.github/workflows/release.yml)
+# signs with bundle/arcbox.entitlements, which keeps validation enabled.
+ENTITLEMENTS := bundle/arcbox.dev.entitlements
 AGENT_TARGET := aarch64-unknown-linux-musl
 
 # Signing identity: auto-detect "Developer ID Application: ArcBox, Inc."
