@@ -17,7 +17,7 @@
 
 use std::os::fd::RawFd;
 
-use arcbox_packet::ethernet::ETH_HEADER_LEN;
+use arcbox_packet::ethernet::{ETH_HEADER_LEN, EtherType, EthernetHeader, strip_ethernet_header};
 
 use crate::frame_source::FrameSource;
 
@@ -27,9 +27,6 @@ pub const GATEWAY_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 /// Synthetic host MAC — the "guest" side of the L3 link (the utun peer).
 pub const HOST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 
-/// EtherType for IPv4.
-const ETHERTYPE_IPV4: [u8; 2] = [0x08, 0x00];
-
 /// Wraps an L3 [`FrameSource`] so the L2 classifier sees Ethernet frames.
 ///
 /// Each inbound IP packet from `inner` is prefixed with a synthetic Ethernet
@@ -38,6 +35,8 @@ const ETHERTYPE_IPV4: [u8; 2] = [0x08, 0x00];
 /// `utun` only carries IP; IPv6 is out of scope for this shim).
 pub struct L3ToL2Source<S: FrameSource> {
     inner: S,
+    /// Synthetic Ethernet header (`HOST_MAC` → `GATEWAY_MAC`, IPv4), built once.
+    header: [u8; ETH_HEADER_LEN],
     /// Reused frame buffer: synthetic Ethernet header + IP packet.
     buf: Vec<u8>,
 }
@@ -46,8 +45,15 @@ impl<S: FrameSource> L3ToL2Source<S> {
     /// Wraps an L3 frame source.
     #[must_use]
     pub fn new(inner: S) -> Self {
+        let header = EthernetHeader {
+            dst_mac: GATEWAY_MAC,
+            src_mac: HOST_MAC,
+            ethertype: EtherType::Ipv4,
+        }
+        .to_bytes();
         Self {
             inner,
+            header,
             buf: vec![0u8; ETH_HEADER_LEN + 65535],
         }
     }
@@ -64,9 +70,10 @@ impl<S: FrameSource> FrameSource for L3ToL2Source<S> {
     }
 
     fn drain(&mut self, mut f: impl FnMut(&[u8])) {
-        // Split the borrow so the inner source and the scratch buffer can be
-        // used together inside the closure.
-        let Self { inner, buf } = self;
+        // Snapshot the constant header, then split the borrow so the inner
+        // source and the scratch buffer can be used together in the closure.
+        let header = self.header;
+        let Self { inner, buf, .. } = self;
         inner.drain(|ip_packet| {
             // Only IPv4 (version nibble == 4); drop everything else.
             if ip_packet.is_empty() || (ip_packet[0] >> 4) != 4 {
@@ -76,9 +83,7 @@ impl<S: FrameSource> FrameSource for L3ToL2Source<S> {
             if total > buf.len() {
                 return;
             }
-            buf[0..6].copy_from_slice(&GATEWAY_MAC);
-            buf[6..12].copy_from_slice(&HOST_MAC);
-            buf[12..14].copy_from_slice(&ETHERTYPE_IPV4);
+            buf[..ETH_HEADER_LEN].copy_from_slice(&header);
             buf[ETH_HEADER_LEN..total].copy_from_slice(ip_packet);
             f(&buf[..total]);
         });
@@ -92,13 +97,10 @@ impl<S: FrameSource> FrameSource for L3ToL2Source<S> {
 /// classifier may synthesize, or any non-IPv4 EtherType.
 #[must_use]
 pub fn l2_to_l3(frame: &[u8]) -> Option<&[u8]> {
-    if frame.len() < ETH_HEADER_LEN {
+    if EthernetHeader::parse(frame)?.ethertype != EtherType::Ipv4 {
         return None;
     }
-    if [frame[12], frame[13]] != ETHERTYPE_IPV4 {
-        return None;
-    }
-    Some(&frame[ETH_HEADER_LEN..])
+    Some(strip_ethernet_header(frame))
 }
 
 #[cfg(test)]
@@ -143,7 +145,7 @@ mod tests {
         assert_eq!(frame.len(), ETH_HEADER_LEN + 20);
         assert_eq!(&frame[0..6], &GATEWAY_MAC);
         assert_eq!(&frame[6..12], &HOST_MAC);
-        assert_eq!(&frame[12..14], &ETHERTYPE_IPV4);
+        assert_eq!(&frame[12..14], &EtherType::Ipv4.to_raw().to_be_bytes());
         // The IP packet survives intact after the header.
         assert_eq!(frame[ETH_HEADER_LEN], 0x45);
     }
@@ -162,7 +164,7 @@ mod tests {
     #[test]
     fn l2_to_l3_strips_header_for_ipv4() {
         let mut frame = vec![0u8; ETH_HEADER_LEN + 20];
-        frame[12..14].copy_from_slice(&ETHERTYPE_IPV4);
+        frame[12..14].copy_from_slice(&EtherType::Ipv4.to_raw().to_be_bytes());
         frame[ETH_HEADER_LEN] = 0x45;
         let ip = l2_to_l3(&frame).expect("IPv4 frame should yield an IP packet");
         assert_eq!(ip.len(), 20);
