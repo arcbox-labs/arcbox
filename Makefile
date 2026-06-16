@@ -26,6 +26,7 @@ else
 endif
 
 .PHONY: build build-release build-cli build-daemon build-helper build-agent \
+        build-fleet-agent fleet-proto-sync \
         test check fmt clean \
         setup-boot-assets sign sign-daemon sign-all verify run-daemon \
         run-helper install-helper reload-helper
@@ -49,6 +50,13 @@ build-helper:
 
 build-agent:
 	cargo build -p arcbox-agent --target $(AGENT_TARGET) --release
+
+build-fleet-agent:
+	cargo build -p arcbox-fleet-agent $(CARGO_FLAGS)
+
+# Refresh the vendored Fleet proto from the published BSR module.
+fleet-proto-sync:
+	buf export buf.build/arcboxlabs/fleet -o fleet/arcbox-fleet-proto/proto
 
 ## ── Quality ────────────────────────────────────────────
 

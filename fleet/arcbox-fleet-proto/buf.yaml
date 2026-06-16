@@ -1,0 +1,7 @@
+# Provenance for the vendored proto under proto/. Not a build dependency:
+# the crate compiles the vendored file with tonic-build. Refresh the vendored
+# copy from the registry with `make fleet-proto-sync`
+# (buf export buf.build/arcboxlabs/fleet -o proto).
+version: v2
+deps:
+  - buf.build/arcboxlabs/fleet

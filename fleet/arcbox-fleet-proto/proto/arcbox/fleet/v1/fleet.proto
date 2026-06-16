@@ -1,0 +1,114 @@
+syntax = "proto3";
+
+package arcbox.fleet.v1;
+
+// BYOC edge: terminates the outbound connection of NAT'd Fleet machines.
+// Machines dial out; nothing ever connects in to them.
+service FleetGatewayService {
+  // Exchange a single-use enrollment token for the machine's long-lived
+  // credential. Creates the machine row and its capacity pools.
+  // Unauthenticated: the enrollment token is the proof.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+
+  // Long-lived bidirectional stream. Authenticated with the machine
+  // credential in the `x-arcbox-machine-token` metadata key.
+  // (Named Attach because tonic reserves `connect` on generated clients.)
+  rpc Attach(stream AttachRequest) returns (stream AttachResponse);
+}
+
+message EnrollRequest {
+  string enrollment_token = 1;
+  string machine_name = 2;
+  // Host CPU architecture (e.g. `arm64`).
+  string host_arch = 3;
+  uint32 cpu_cores = 4;
+  uint64 mem_mib = 5;
+  // Capacity pools the host serves, e.g. darwin/arm64 max 2 + linux/arm64.
+  repeated RuntimeCapacity capacities = 6;
+  // Free-form host facts as JSON (macOS version, chip, ...).
+  string host_info_json = 7;
+}
+
+message EnrollResponse {
+  // Prefixed machine id (`fltm_...`).
+  string machine_id = 1;
+  // Long-lived machine credential; transmitted exactly once, only its
+  // hash is stored server-side.
+  string machine_token = 2;
+}
+
+// One (os, arch) capacity pool of a host.
+message RuntimeCapacity {
+  // `darwin` | `linux` | `windows` (lowercase RunnerOs).
+  string os = 1;
+  // `arm64` | `amd64` (lowercase RunnerArch).
+  string arch = 2;
+  int32 max_concurrent = 3;
+}
+
+message AttachRequest {
+  oneof msg {
+    Heartbeat heartbeat = 1;
+    RunnerAccepted runner_accepted = 2;
+    RunnerStarted runner_started = 3;
+    RunnerFinished runner_finished = 4;
+    RunnerFailed runner_failed = 5;
+  }
+}
+
+// Periodic capacity + liveness report. Capacity pools are declarative: the
+// reported set replaces what is stored.
+message Heartbeat {
+  repeated RuntimeCapacity capacities = 1;
+  string host_info_json = 2;
+}
+
+message RunnerAccepted {
+  // Prefixed runner job id (`rjob_...`), echoing ProvisionRunner.
+  string job_id = 1;
+}
+
+message RunnerStarted {
+  string job_id = 1;
+}
+
+message RunnerFinished {
+  string job_id = 1;
+  bool success = 2;
+  // Human-readable detail (exit status, GitHub conclusion, ...).
+  string detail = 3;
+}
+
+message RunnerFailed {
+  string job_id = 1;
+  string reason = 2;
+}
+
+message AttachResponse {
+  oneof msg {
+    ProvisionRunner provision_runner = 1;
+    CancelRunner cancel = 2;
+    Drain drain = 3;
+  }
+}
+
+// Order to start one JIT runner for one job.
+message ProvisionRunner {
+  string job_id = 1;
+  string os = 2;
+  string arch = 3;
+  // Single-use GitHub JIT runner config (base64), passed through verbatim.
+  string encoded_jit_config = 4;
+  // Base image for the guest; empty means the fleet default.
+  string image = 5;
+  uint32 cpus = 6;
+  uint64 mem_mib = 7;
+}
+
+// Stop a runner before it picks up work (job canceled on GitHub).
+message CancelRunner {
+  string job_id = 1;
+}
+
+// Stop accepting new work ahead of removal.
+message Drain {}

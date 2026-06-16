@@ -74,6 +74,12 @@ members = [
     "tests/e2e",
     "virt/arcbox-net-inject",
     "xtask",
+
+    # ============================================
+    # Fleet (cross-platform runner agent, MIT OR Apache-2.0)
+    # ============================================
+    "fleet/arcbox-fleet-proto",
+    "fleet/arcbox-fleet-agent",
 ]
 
 [workspace.package]
@@ -168,6 +174,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # Hostname
 hostname = "0.4"
 
+# System facts (memory, OS version) — cross-platform
+sysinfo = "0.33"
+
 # Nix (Unix APIs)
 nix = { version = "0.29", features = [
     "fs",
@@ -236,6 +245,7 @@ arcbox-container = { version = "0.4.13", path = "runtime/arcbox-container" } # x
 arcbox-protocol = { version = "0.4.13", path = "rpc/arcbox-protocol" } # x-release-please-version
 arcbox-grpc = { version = "0.4.13", path = "rpc/arcbox-grpc" } # x-release-please-version
 arcbox-transport = { version = "0.4.13", path = "rpc/arcbox-transport" } # x-release-please-version
+arcbox-fleet-proto = { version = "0.4.13", path = "fleet/arcbox-fleet-proto" } # x-release-please-version
 arcbox-docker = { version = "0.4.13", path = "app/arcbox-docker" } # x-release-please-version
 arcbox-helper = { version = "0.4.13", path = "app/arcbox-helper" } # x-release-please-version
 arcbox-core = { version = "0.4.13", path = "app/arcbox-core" } # x-release-please-version
