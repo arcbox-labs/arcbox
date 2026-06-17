@@ -39,11 +39,11 @@ mod macos {
     use arcbox_fakeip::proxy_detect::{ProxyConfig, ProxyEnvironment};
     use arcbox_proxy::socket_proxy::SocketProxy;
     use arcbox_route::Ipv4Net;
-    use arcbox_tcpstack::FrameSource;
-    use arcbox_tcpstack::classifier::{FrameClassifier, InterceptedKind};
-    use arcbox_tcpstack::shim::{GATEWAY_MAC, HOST_MAC, L3ToL2Source};
-    use arcbox_tcpstack::tcp_bridge::TcpBridge;
-    use arcbox_tcpstack::utun::{UtunFrameSource, UtunSink};
+    use splicetcp::FrameSource;
+    use splicetcp::classifier::{FrameClassifier, InterceptedKind};
+    use splicetcp::shim::{GATEWAY_MAC, HOST_MAC, L3ToL2Source};
+    use splicetcp::tcp_bridge::TcpBridge;
+    use splicetcp::utun::{UtunFrameSource, UtunSink};
 
     use arcbox_net::darwin::DarwinTun;
 

@@ -31,7 +31,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use arcbox_tcpstack::{FdFrameSource, FrameSource};
+use splicetcp::{FdFrameSource, FrameSource};
 
 use crate::darwin::classifier::{FrameClassifier, InterceptedKind};
 use crate::darwin::inbound_relay::InboundCommand;

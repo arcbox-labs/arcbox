@@ -21,7 +21,7 @@ use arcbox_dhcp::DhcpConfig;
 use arcbox_net::darwin::datapath_loop::NetworkDatapath;
 use arcbox_net::darwin::socket_proxy::SocketProxy;
 use arcbox_net::dns::{DnsConfig, DnsForwarder};
-use arcbox_tcpstack::{FdFrameSource, FrameSource};
+use splicetcp::{FdFrameSource, FrameSource};
 
 use helpers::frames::{
     build_arp_request, build_dhcp_discover, build_dhcp_request, build_icmp_echo, build_tcp_syn,
