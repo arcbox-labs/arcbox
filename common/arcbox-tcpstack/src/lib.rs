@@ -25,12 +25,14 @@
 
 pub mod classifier;
 pub mod direct_rx;
+pub mod egress;
 pub mod frame_source;
 pub mod shim;
 pub mod tcp_bridge;
 #[cfg(target_os = "macos")]
 pub mod utun;
 
+pub use egress::{AsyncReadWrite, DefaultEgress, EgressConn, EgressResolver, FlowMeta};
 pub use frame_source::{FdFrameSource, FrameSource};
 
 // `tcp_bridge` and `classifier` reference `crate::ethernet::*` pervasively;

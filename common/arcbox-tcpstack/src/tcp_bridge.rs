@@ -124,7 +124,7 @@ struct HandshakeConn {
     host_stream: Option<std::net::TcpStream>,
     /// Oneshot receiver for async host connect (PassiveOpen only).
     /// Consumed when connect resolves.
-    connect_rx: Option<oneshot::Receiver<Option<tokio::net::TcpStream>>>,
+    connect_rx: Option<oneshot::Receiver<Option<crate::egress::EgressConn>>>,
     /// Peer's TCP options, mirrored in our SYN-ACK (PassiveOpen) or
     /// captured from their SYN-ACK (ActiveOpen).
     peer_wscale: Option<u8>,
@@ -151,8 +151,10 @@ pub struct TcpBridge {
     /// DNS resolution log for mapping IPs back to domain names (used by
     /// the proxy resolver).
     dns_log: Option<arcbox_fakeip::dns_log::DnsResolutionLog>,
-    /// Detected proxy environment on the host.
-    proxy_env: Option<arcbox_fakeip::proxy_detect::ProxyEnvironment>,
+    /// Egress resolver: decides + dials the upstream transport for each
+    /// outbound SYN. Injectable so a consumer can replace the policy; the
+    /// default reproduces the historical inline proxy-aware connect.
+    egress: std::sync::Arc<dyn crate::egress::EgressResolver>,
     /// Gateway IP used by the guest. Connections targeting this IP are
     /// translated to `127.0.0.1` so they reach the host's loopback
     /// (enables `host.docker.internal` support).
@@ -225,7 +227,11 @@ impl TcpBridge {
         Self {
             next_ephemeral: INBOUND_EPHEMERAL_START,
             dns_log: None,
-            proxy_env: None,
+            egress: std::sync::Arc::new(crate::egress::DefaultEgress::new(
+                gateway_ip,
+                None,
+                SYN_GATE_CONNECT_TIMEOUT_SECS,
+            )),
             gateway_ip,
             fast_path_conns: HashMap::new(),
             fast_path_gateway_mac: [0; 6],
@@ -727,50 +733,19 @@ impl TcpBridge {
         let peer_sack = opts.sack_permitted;
         let peer_mss = opts.mss.unwrap_or(536);
 
-        // Decide egress: via the configured upstream proxy (connecting by
-        // hostname, so Fake-IP destinations resolve on the proxy's side) or a
-        // direct connect. The hostname is recovered from the destination IP via
-        // the DNS resolution log; `resolve_proxy_target` applies the bypass list
-        // and "is a proxy configured" policy.
+        // Decide + dial egress via the injected resolver. The default
+        // reproduces the historical inline behavior: route via the configured
+        // upstream proxy (connecting by hostname, so Fake-IP destinations
+        // resolve on the proxy's side) or a direct connect, with the
+        // gateway→loopback translation and a connect timeout. The hostname is
+        // recovered from the destination IP via the DNS resolution log.
         let domain = self.dns_log.as_ref().and_then(|log| log.lookup(dst_ip));
-        let proxy_target = self.resolve_proxy_target(dst_ip, dst_port, domain.as_deref());
-
-        // Direct connect target. Gateway IP → loopback for host.docker.internal.
-        let target_ip = if dst_ip == self.gateway_ip {
-            Ipv4Addr::LOCALHOST
-        } else {
-            dst_ip
-        };
-        let connect_addr =
-            std::net::SocketAddr::V4(std::net::SocketAddrV4::new(target_ip, dst_port));
-
-        // Spawn host connect. Result is delivered via oneshot.
-        let (result_tx, result_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let connect = async {
-                match proxy_target {
-                    // SOCKS5 (preferred): the proxy resolves the hostname.
-                    Some((authority, host, port, "socks5")) => {
-                        arcbox_proxy::proxy_tunnel::connect_via_socks5(&authority, &host, port)
-                            .await
-                    }
-                    // HTTP CONNECT (https/http system proxy).
-                    Some((authority, host, port, _)) => {
-                        arcbox_proxy::proxy_tunnel::connect_via_http_proxy(&authority, &host, port)
-                            .await
-                    }
-                    // No proxy configured / bypassed → direct.
-                    None => tokio::net::TcpStream::connect(connect_addr).await,
-                }
-            };
-            let stream = tokio::time::timeout(
-                std::time::Duration::from_secs(SYN_GATE_CONNECT_TIMEOUT_SECS),
-                connect,
-            )
-            .await
-            .ok()
-            .and_then(Result::ok);
-            let _ = result_tx.send(stream);
+        let result_rx = self.egress.resolve(crate::egress::FlowMeta {
+            src_ip,
+            src_port,
+            dst_ip,
+            dst_port,
+            domain,
         });
 
         let our_isn = next_isn();
@@ -875,21 +850,30 @@ impl TcpBridge {
                             continue;
                         };
                         match rx.try_recv() {
-                            Ok(Some(tokio_stream)) => match tokio_stream.into_std() {
-                                Ok(std_stream) => {
-                                    std_stream.set_nonblocking(true).ok();
-                                    std_stream.set_nodelay(true).ok();
-                                    conn.host_stream = Some(std_stream);
-                                    conn.connect_rx = None;
+                            Ok(Some(crate::egress::EgressConn::Tcp(tokio_stream))) => {
+                                match tokio_stream.into_std() {
+                                    Ok(std_stream) => {
+                                        std_stream.set_nonblocking(true).ok();
+                                        std_stream.set_nodelay(true).ok();
+                                        conn.host_stream = Some(std_stream);
+                                        conn.connect_rx = None;
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "Handshake shim: into_std failed for {key:?}: {e}"
+                                        );
+                                        to_abort.push(*key);
+                                        continue;
+                                    }
                                 }
-                                Err(e) => {
-                                    tracing::debug!(
-                                        "Handshake shim: into_std failed for {key:?}: {e}"
-                                    );
-                                    to_abort.push(*key);
-                                    continue;
-                                }
-                            },
+                            }
+                            Ok(Some(crate::egress::EgressConn::Stream(_))) => {
+                                tracing::error!(
+                                    "Handshake shim: relay (Stream) egress not yet supported for {key:?}"
+                                );
+                                to_abort.push(*key);
+                                continue;
+                            }
                             Ok(None) => {
                                 // Host connect refused / timed out. Emit
                                 // RST|ACK toward the guest so the originating
@@ -1140,89 +1124,30 @@ impl TcpBridge {
         }
     }
 
-    /// Determines whether to connect via a proxy tunnel for the given destination.
-    ///
-    /// Returns `Some((proxy_authority, target_host, target_port, protocol))` if a
-    /// proxy should be used, or `None` for direct connection. The proxy authority
-    /// is a `"host:port"` string that `TcpStream::connect` can resolve (supports
-    /// both IP addresses and hostnames like `proxy.corp.com`).
-    fn resolve_proxy_target(
-        &self,
-        dst_ip: Ipv4Addr,
-        dst_port: u16,
-        domain: Option<&str>,
-    ) -> Option<(String, String, u16, &'static str)> {
-        let env = self.proxy_env.as_ref()?;
-
-        // No proxy configured → always direct.
-        if !env.has_usable_proxy() {
-            return None;
-        }
-
-        // Check fake-ip BEFORE requiring a domain name. Fake-IP destinations
-        // (198.18.0.0/15 from Surge/ClashX) always need proxy routing, even
-        // if the DNS log hasn't recorded the domain yet (race between DNS
-        // response and TCP SYN). Use the IP as fallback CONNECT target.
-        let is_fake = env.is_fake_ip(dst_ip);
-
-        // Resolve the host for the CONNECT/SOCKS5 tunnel target.
-        // For fake-IP without domain, fall back to the IP string — the proxy
-        // will resolve it on its end (Surge handles this correctly).
-        let host = match domain {
-            Some(d) => d.to_string(),
-            None if is_fake => dst_ip.to_string(),
-            None => return None,
-        };
-
-        // Check bypass list.
-        if env.should_bypass(&host) {
-            return None;
-        }
-
-        // Proxy fake-ip destinations and traffic when an explicit system proxy
-        // is configured (corporate proxy environments).
-        let need_proxy = is_fake
-            || env.http_proxy.is_some()
-            || env.https_proxy.is_some()
-            || env.socks_proxy.is_some();
-        if !need_proxy {
-            return None;
-        }
-
-        // Prefer SOCKS5 (supports all protocols and avoids TLS issues),
-        // then HTTPS proxy (HTTP CONNECT works on any port, not just 443),
-        // then HTTP proxy as last resort.
-        if let Some(ref socks) = env.socks_proxy {
-            let authority = format!("{}:{}", socks.host, socks.port);
-            return Some((authority, host, dst_port, "socks5"));
-        }
-
-        if let Some(ref https) = env.https_proxy {
-            let authority = format!("{}:{}", https.host, https.port);
-            return Some((authority, host, dst_port, "http-connect"));
-        }
-
-        if let Some(ref http) = env.http_proxy {
-            let authority = format!("{}:{}", http.host, http.port);
-            return Some((authority, host, dst_port, "http-connect"));
-        }
-
-        None
-    }
-
     /// Configures proxy-aware connection support.
     ///
     /// When set, `handle_outbound_syn` uses the DNS log to resolve destination
     /// IPs to domain names and connect via system proxy (HTTP CONNECT / SOCKS5)
     /// when available. Without this, all connections use direct
-    /// `TcpStream::connect`.
+    /// `TcpStream::connect`. Installs a `DefaultEgress` resolver carrying the
+    /// detected proxy environment.
     pub fn set_proxy_awareness(
         &mut self,
         dns_log: arcbox_fakeip::dns_log::DnsResolutionLog,
         proxy_env: arcbox_fakeip::proxy_detect::ProxyEnvironment,
     ) {
         self.dns_log = Some(dns_log);
-        self.proxy_env = Some(proxy_env);
+        self.egress = std::sync::Arc::new(crate::egress::DefaultEgress::new(
+            self.gateway_ip,
+            Some(proxy_env),
+            SYN_GATE_CONNECT_TIMEOUT_SECS,
+        ));
+    }
+
+    /// Replaces the egress resolver with a custom policy. Lets a consumer
+    /// (e.g. an Inbound/Router/Outbound host) inject its own decide+dial logic.
+    pub fn set_egress_resolver(&mut self, egress: std::sync::Arc<dyn crate::egress::EgressResolver>) {
+        self.egress = egress;
     }
 
     /// Allocates the next inbound ephemeral port, wrapping at the end of
