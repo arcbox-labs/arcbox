@@ -34,8 +34,8 @@ use tokio_util::sync::CancellationToken;
 use splicetcp::{FdFrameSource, FrameSource};
 
 use crate::darwin::classifier::{FrameClassifier, InterceptedKind};
+use crate::darwin::egress::HostEgress;
 use crate::darwin::inbound_relay::InboundCommand;
-use crate::darwin::socket_proxy::SocketProxy;
 use crate::darwin::tcp_bridge::TcpBridge;
 use crate::datapath::FrameBuf;
 use crate::dhcp::DhcpServer;
@@ -66,7 +66,7 @@ pub struct NetworkDatapath {
     /// Host end of the socketpair (guest L2 Ethernet frames).
     pub guest_fd: OwnedFd,
     /// Socket proxy for ICMP/UDP/TCP traffic.
-    pub socket_proxy: SocketProxy,
+    pub egress: HostEgress,
     /// Channel receiving L2 reply frames from the socket proxy.
     pub reply_rx: mpsc::Receiver<Vec<u8>>,
     /// Channel receiving inbound commands from `InboundListenerManager`.
@@ -101,12 +101,12 @@ impl NetworkDatapath {
     /// Creates a new datapath.
     ///
     /// `guest_fd` is the host side of the socketpair passed to VZ.
-    /// `socket_proxy` and `reply_rx` are created via `SocketProxy::new()`.
+    /// `egress` and `reply_rx` are created via `HostEgress::new()`.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         guest_fd: OwnedFd,
-        socket_proxy: SocketProxy,
+        egress: HostEgress,
         reply_rx: mpsc::Receiver<Vec<u8>>,
         cmd_rx: mpsc::Receiver<InboundCommand>,
         dhcp_server: DhcpServer,
@@ -119,7 +119,7 @@ impl NetworkDatapath {
     ) -> Self {
         Self {
             guest_fd,
-            socket_proxy,
+            egress,
             reply_rx,
             cmd_rx,
             dhcp_server,
@@ -162,7 +162,7 @@ impl NetworkDatapath {
     pub async fn run(self) -> io::Result<()> {
         let Self {
             guest_fd,
-            mut socket_proxy,
+            mut egress,
             mut reply_rx,
             mut cmd_rx,
             mut dhcp_server,
@@ -214,13 +214,13 @@ impl NetworkDatapath {
         // + proxy env so the UDP path reverses fake-IPs and honours the SOCKS
         // proxy + bypass list, mirroring the TCP bridge below. (HTTP proxies can't
         // carry UDP, so only a SOCKS proxy actually routes UDP.)
-        socket_proxy.set_proxy_awareness(dns_log.clone(), proxy_env.clone());
+        egress.set_proxy_awareness(dns_log.clone(), proxy_env.clone());
         tcp_bridge.set_proxy_awareness(dns_log.clone(), proxy_env);
 
         let guest_async = AsyncFd::new(FdWrapper(guest_fd))?;
 
         // Clone the reply sender for async DNS forwarding tasks.
-        let dns_reply_tx = socket_proxy.reply_sender();
+        let dns_reply_tx = egress.reply_sender();
 
         let mut guest_mac: Option<[u8; 6]> = None;
 
@@ -338,7 +338,7 @@ impl NetworkDatapath {
                             frame_sink.as_ref(),
                             &guest_async,
                             &mut write_queue,
-                            &mut socket_proxy,
+                            &mut egress,
                             &mut dhcp_server,
                             &dns_forwarder,
                             &dns_reply_tx,
@@ -376,7 +376,7 @@ impl NetworkDatapath {
                     process_inbound_cmd(
                         cmd,
                         &mut tcp_bridge,
-                        &mut socket_proxy,
+                        &mut egress,
                         guest_ip,
                         gateway_ip,
                         guest_mac,
@@ -386,7 +386,7 @@ impl NetworkDatapath {
                 // Periodic maintenance.
                 _ = timer_wheel_tick.tick() => {
                     // Advance the timer wheel and handle expired flow timers.
-                    // TODO: Migrate tcp_bridge SYN gate and socket_proxy UDP/ICMP
+                    // TODO: Migrate tcp_bridge SYN gate and egress UDP/ICMP
                     // per-flow timeouts to use timer_wheel.register() instead of
                     // spawning independent tokio::time::timeout() tasks. For now
                     // the wheel is wired but consumers are not yet migrated.
@@ -398,12 +398,12 @@ impl NetworkDatapath {
                             entry.action
                         );
                     }
-                    // Feed expired entries back to socket_proxy for cleanup
+                    // Feed expired entries back to egress for cleanup
                     for entry in expired {
                         use crate::timer_wheel::TimerAction;
                         match entry.action {
                             TimerAction::UdpFlowExpiry | TimerAction::IcmpTimeout => {
-                                socket_proxy.expire_flow(entry.key);
+                                egress.expire_flow(entry.key);
                             }
                             _ => {}
                         }
@@ -411,7 +411,7 @@ impl NetworkDatapath {
                 }
 
                 _ = maintenance.tick() => {
-                    socket_proxy.maintenance();
+                    egress.maintenance();
                 }
             }
 
@@ -432,7 +432,7 @@ impl NetworkDatapath {
             drain_cmd_rx(
                 &mut cmd_rx,
                 &mut tcp_bridge,
-                &mut socket_proxy,
+                &mut egress,
                 guest_ip,
                 gateway_ip,
                 guest_mac,
@@ -473,7 +473,7 @@ fn handle_intercepted_frame(
     frame_sink: Option<&std::sync::Arc<dyn crate::direct_rx::FrameSink>>,
     guest_async: &AsyncFd<FdWrapper>,
     write_queue: &mut VecDeque<FrameBuf>,
-    socket_proxy: &mut SocketProxy,
+    egress: &mut HostEgress,
     dhcp_server: &mut DhcpServer,
     dns_forwarder: &DnsForwarder,
     dns_reply_tx: &mpsc::Sender<Vec<u8>>,
@@ -511,7 +511,7 @@ fn handle_intercepted_frame(
         }
         InterceptedKind::Udp | InterceptedKind::Icmp => {
             // Route through socket proxy (UDP/ICMP).
-            socket_proxy.handle_outbound(frame, guest_mac);
+            egress.handle_outbound(frame, guest_mac);
         }
     }
 }
@@ -523,7 +523,7 @@ fn handle_intercepted_frame(
 fn process_inbound_cmd(
     cmd: InboundCommand,
     tcp_bridge: &mut TcpBridge,
-    socket_proxy: &mut SocketProxy,
+    egress: &mut HostEgress,
     guest_ip: Ipv4Addr,
     gateway_ip: Ipv4Addr,
     guest_mac: Option<[u8; 6]>,
@@ -541,7 +541,7 @@ fn process_inbound_cmd(
         }
         cmd @ InboundCommand::UdpReceived { .. } => {
             let mac = guest_mac.unwrap_or([0xFF; 6]);
-            socket_proxy.handle_inbound_command(cmd, mac);
+            egress.handle_inbound_command(cmd, mac);
         }
     }
 }
@@ -822,21 +822,16 @@ fn drain_reply_rx(
 fn drain_cmd_rx(
     cmd_rx: &mut mpsc::Receiver<InboundCommand>,
     tcp_bridge: &mut TcpBridge,
-    socket_proxy: &mut SocketProxy,
+    egress: &mut HostEgress,
     guest_ip: Ipv4Addr,
     gateway_ip: Ipv4Addr,
     guest_mac: Option<[u8; 6]>,
 ) {
     for _ in 0..DRAIN_CMD_BATCH {
         match cmd_rx.try_recv() {
-            Ok(cmd) => process_inbound_cmd(
-                cmd,
-                tcp_bridge,
-                socket_proxy,
-                guest_ip,
-                gateway_ip,
-                guest_mac,
-            ),
+            Ok(cmd) => {
+                process_inbound_cmd(cmd, tcp_bridge, egress, guest_ip, gateway_ip, guest_mac);
+            }
             Err(_) => break,
         }
     }

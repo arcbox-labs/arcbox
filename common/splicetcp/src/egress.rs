@@ -142,12 +142,11 @@ impl EgressResolver for DefaultEgress {
                 match proxy_target {
                     // SOCKS5 (preferred): the proxy resolves the hostname.
                     Some((authority, host, port, "socks5")) => {
-                        arcbox_proxy::proxy_tunnel::connect_via_socks5(&authority, &host, port)
-                            .await
+                        arcbox_proxy::socks5::connect_via_socks5(&authority, &host, port).await
                     }
                     // HTTP CONNECT (https/http system proxy).
                     Some((authority, host, port, _)) => {
-                        arcbox_proxy::proxy_tunnel::connect_via_http_proxy(&authority, &host, port)
+                        arcbox_proxy::http_connect::connect_via_http_proxy(&authority, &host, port)
                             .await
                     }
                     // No proxy configured / bypassed → direct.

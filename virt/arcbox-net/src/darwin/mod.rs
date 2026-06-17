@@ -26,10 +26,10 @@ pub mod tun;
 // here so the `crate::darwin::{dns_log, proxy_detect}` paths are unchanged for
 // callers (datapath loop, TCP shim, the VMM layer).
 pub use arcbox_fakeip::{dns_log, proxy_detect};
-// `proxy_tunnel`, `socket_proxy`, and `inbound_relay` are extracted to
-// `arcbox-proxy`; re-exported here so the `crate::darwin::{proxy_tunnel,
-// socket_proxy, inbound_relay}` paths are unchanged for callers.
-pub use arcbox_proxy::{inbound_relay, proxy_tunnel, socket_proxy};
+// `socks5`, `http_connect`, `egress`, and `inbound_relay` are extracted to
+// `arcbox-proxy`; re-exported here so the `crate::darwin::{egress, socks5,
+// http_connect, inbound_relay}` paths are available to callers.
+pub use arcbox_proxy::{egress, http_connect, inbound_relay, socks5};
 // `classifier` and `tcp_bridge` are extracted to `splicetcp`; re-exported
 // here so the `crate::darwin::{classifier, tcp_bridge}` paths are unchanged for
 // the datapath loop and the VMM layer.
