@@ -40,12 +40,11 @@ jobs:
   # ==========================================================================
   # Publish the splicetcp datapath cluster to crates.io
   # ==========================================================================
-  # These five crates are the only `publish = true` members of the workspace
-  # (everything else is `publish = false`): the reusable, open-source datapath
-  # core that downstream projects consume as published deps instead of a path
-  # into a local checkout. Independent of the binary builds — the library
-  # crates are their own deliverable and must not be gated on Apple signing.
-  # Skipped on workflow_dispatch (manual binary rebuilds must not republish).
+  # The reusable, open-source datapath core that downstream projects consume as
+  # published deps instead of a path into a local checkout. Independent of the
+  # binary builds — the library crates are their own deliverable and must not be
+  # gated on Apple signing. Skipped on workflow_dispatch (manual binary rebuilds
+  # must not republish).
   publish-crates:
     name: Publish crates to crates.io
     if: github.event_name == 'push'
@@ -56,6 +55,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Rust
+        # @stable resolves to the latest stable at run time; coordinated
+        # multi-package publishing needs cargo >= 1.90.
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -63,29 +64,20 @@ jobs:
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # One coordinated publish: cargo packages all five, verifies each
+        # against the others via a local temp registry (so the unpublished
+        # inter-deps resolve), then uploads in dependency order, waiting for
+        # the index between uploads. Listing order is irrelevant — cargo
+        # topo-sorts. `--workspace` is intentionally NOT used: it would also
+        # select the VM crates, which depend on `publish = false` members
+        # (e.g. arcbox-dns) and therefore can't be published.
         run: |
-          set -euo pipefail
-          # Dependency order — each crate is published only after everything it
-          # depends on. `cargo publish` waits for a crate to land in the index
-          # before returning, so a dependant can publish right after its dep:
-          #   arcbox-packet    (leaf)
-          #   arcbox-datapath  (leaf)
-          #   arcbox-fakeip    (leaf)
-          #   arcbox-proxy  -> arcbox-packet, arcbox-fakeip
-          #   splicetcp     -> arcbox-{packet,datapath,fakeip,proxy}
-          for crate in arcbox-packet arcbox-datapath arcbox-fakeip arcbox-proxy splicetcp; do
-            echo "::group::publish $crate"
-            if cargo publish -p "$crate" --locked 2>&1 | tee /tmp/publish.log; then
-              echo "$crate published"
-            elif grep -qiE 'already (uploaded|exists)' /tmp/publish.log; then
-              # Idempotent re-run: this version is already on crates.io.
-              echo "$crate is already on crates.io at this version — skipping"
-            else
-              echo "::error::failed to publish $crate"
-              exit 1
-            fi
-            echo "::endgroup::"
-          done
+          cargo publish --locked \
+            -p arcbox-packet \
+            -p arcbox-datapath \
+            -p arcbox-fakeip \
+            -p arcbox-proxy \
+            -p splicetcp
 
   # ==========================================================================
   # Build + sign macOS ARM64 host binaries
