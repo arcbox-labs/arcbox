@@ -10,6 +10,9 @@ authors.workspace = true
 
 [dependencies]
 arcbox-packet = { workspace = true }
+# ProxyEnvironment + DnsResolutionLog: the same proxy-awareness the TCP egress
+# uses, so the UDP path reverses fake-IPs and applies the bypass list identically.
+arcbox-fakeip = { workspace = true }
 libc = { workspace = true }
 socket2 = { version = "0.5", features = ["all"] }
 tokio = { workspace = true }

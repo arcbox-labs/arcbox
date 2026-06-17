@@ -28,6 +28,82 @@ use tokio::sync::mpsc;
 
 use arcbox_packet::ethernet::{ETH_HEADER_LEN, build_udp_ip_ethernet};
 
+use arcbox_fakeip::dns_log::DnsResolutionLog;
+use arcbox_fakeip::proxy_detect::ProxyEnvironment;
+
+use crate::socks5::Socks5UdpAssociation;
+
+/// The egress transport for one UDP flow: a direct host socket, or a SOCKS5 UDP
+/// association. Unifies the per-flow pump so the reply path is identical.
+enum UdpTransport {
+    Direct(UdpSocket),
+    Socks {
+        assoc: Socks5UdpAssociation,
+        host: String,
+        port: u16,
+    },
+}
+
+impl UdpTransport {
+    async fn send(&self, data: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Direct(s) => s.send(data).await.map(|_| ()),
+            Self::Socks { assoc, host, port } => assoc.send_to(data, host, *port).await.map(|_| ()),
+        }
+    }
+
+    /// `Ok(Some(n))` = a deliverable payload of `n` bytes in `buf`; `Ok(None)` =
+    /// a datagram that was received but isn't deliverable (fragmented / malformed)
+    /// and should be skipped without tearing the flow down; `Err` = fatal.
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+        match self {
+            Self::Direct(s) => s.recv(buf).await.map(Some),
+            Self::Socks { assoc, .. } => assoc.recv_from(buf).await.map(|o| o.map(|(n, _, _)| n)),
+        }
+    }
+}
+
+/// Builds a flow's egress transport. `socks` = `Some((authority, target_host))`
+/// routes via SOCKS5 UDP ASSOCIATE (the proxy resolves `target_host`); `None` is
+/// a direct host socket connected to `connect_ip:dst_port`. Returns `None` (after
+/// logging) on setup failure.
+async fn build_udp_transport(
+    socks: Option<(String, String)>,
+    connect_ip: Ipv4Addr,
+    dst_port: u16,
+) -> Option<UdpTransport> {
+    match socks {
+        Some((authority, host)) => match Socks5UdpAssociation::associate(&authority).await {
+            Ok(assoc) => Some(UdpTransport::Socks {
+                assoc,
+                host,
+                port: dst_port,
+            }),
+            Err(e) => {
+                tracing::warn!("UDP proxy: SOCKS5 UDP associate failed: {e}");
+                None
+            }
+        },
+        None => {
+            let socket = match UdpSocket::bind("0.0.0.0:0").await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("UDP proxy: failed to bind socket: {e}");
+                    return None;
+                }
+            };
+            if let Err(e) = socket
+                .connect(SocketAddr::V4(SocketAddrV4::new(connect_ip, dst_port)))
+                .await
+            {
+                tracing::warn!("UDP proxy: failed to connect: {e}");
+                return None;
+            }
+            Some(UdpTransport::Direct(socket))
+        }
+    }
+}
+
 /// Per-flow UDP state.
 struct UdpFlow {
     /// Last time traffic was seen on this flow.
@@ -45,6 +121,12 @@ struct UdpProxy {
     /// Gateway IP — connections to this IP are translated to loopback
     /// so they reach host services (host.docker.internal support).
     gateway_ip: Ipv4Addr,
+    /// Shared fake-IP → domain log; reverses a fake-IP destination before the
+    /// proxy decision so UDP routes by domain like TCP. `None` = no reversal.
+    dns_log: Option<DnsResolutionLog>,
+    /// Detected host proxy environment; a configured SOCKS proxy routes
+    /// non-gateway, non-bypassed flows through it. `None` = always direct.
+    proxy_env: Option<ProxyEnvironment>,
 }
 
 impl UdpProxy {
@@ -54,6 +136,8 @@ impl UdpProxy {
             reply_tx,
             gateway_mac,
             gateway_ip,
+            dns_log: None,
+            proxy_env: None,
         }
     }
 
@@ -131,52 +215,61 @@ impl UdpProxy {
             dst_ip
         };
 
+        // Domain-preferred (like the TCP path): reverse a fake-IP destination to
+        // its domain so the proxy can resolve it and domain bypass rules apply.
+        let host = self
+            .dns_log
+            .as_ref()
+            .and_then(|log| log.lookup(dst_ip))
+            .unwrap_or_else(|| dst_ip.to_string());
+        // Route via the SOCKS5 proxy when one applies: a usable SOCKS proxy is
+        // configured (HTTP can't carry UDP), the destination isn't gateway-local
+        // (host services stay direct), and it isn't on the bypass list. Reuses the
+        // same `should_bypass` policy the TCP egress uses.
+        let socks = self.proxy_env.as_ref().and_then(|env| {
+            if dst_ip == self.gateway_ip || env.should_bypass(&host) {
+                return None;
+            }
+            env.socks_proxy
+                .as_ref()
+                .map(|p| (format!("{}:{}", p.host, p.port), host.clone()))
+        });
+
         tokio::spawn(async move {
-            let socket = match UdpSocket::bind("0.0.0.0:0").await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("UDP proxy: failed to bind socket: {}", e);
+            // Race the whole flow — including the SOCKS handshake, which can hang
+            // on a slow proxy — against cancellation so a stalled setup never
+            // outlives shutdown.
+            let pump = async move {
+                let transport = match build_udp_transport(socks, connect_ip, dst_port).await {
+                    Some(t) => t,
+                    None => return, // setup failed (already logged)
+                };
+
+                // Send the initial payload.
+                if let Err(e) = transport.send(&payload).await {
+                    tracing::warn!("UDP proxy: send failed: {}", e);
                     return;
                 }
-            };
 
-            if let Err(e) = socket
-                .connect(SocketAddr::V4(SocketAddrV4::new(connect_ip, dst_port)))
-                .await
-            {
-                tracing::warn!("UDP proxy: failed to connect: {}", e);
-                return;
-            }
-
-            // Send the initial payload.
-            if let Err(e) = socket.send(&payload).await {
-                tracing::warn!("UDP proxy: send failed: {}", e);
-                return;
-            }
-
-            let mut buf = vec![0u8; 65535];
-            loop {
-                tokio::select! {
-                    () = cancel.cancelled() => break,
-                    // Subsequent payloads from the same flow.
-                    msg = payload_rx.recv() => {
-                        match msg {
+                let mut buf = vec![0u8; 65535];
+                loop {
+                    tokio::select! {
+                        // Subsequent payloads from the same flow.
+                        msg = payload_rx.recv() => match msg {
                             Some(data) => {
-                                if let Err(e) = socket.send(&data).await {
+                                if let Err(e) = transport.send(&data).await {
                                     tracing::trace!("UDP proxy: send failed: {e}");
-                                    break;
+                                    return;
                                 }
                             }
-                            None => break, // Channel closed, flow removed.
-                        }
-                    }
-                    // Replies from the remote host.
-                    recv = tokio::time::timeout(
-                        std::time::Duration::from_secs(60),
-                        socket.recv(&mut buf),
-                    ) => {
-                        match recv {
-                            Ok(Ok(n)) if n > 0 => {
+                            None => return, // Channel closed, flow removed.
+                        },
+                        // Replies from the remote host (or the proxy relay).
+                        recv = tokio::time::timeout(
+                            std::time::Duration::from_secs(60),
+                            transport.recv(&mut buf),
+                        ) => match recv {
+                            Ok(Ok(Some(n))) => {
                                 let reply_frame = build_udp_ip_ethernet(
                                     dst_ip,
                                     src_ip,
@@ -187,13 +280,22 @@ impl UdpProxy {
                                     guest_mac,
                                 );
                                 if reply_tx.send(reply_frame).await.is_err() {
-                                    break;
+                                    return;
                                 }
                             }
-                            _ => break, // Timeout or error
-                        }
+                            // A fragmented / malformed relay datagram: skip it (the
+                            // loop iterates), keeping the flow up.
+                            Ok(Ok(None)) => {}
+                            // Fatal socket error or the 60s idle timeout.
+                            Ok(Err(_)) | Err(_) => return,
+                        },
                     }
                 }
+            };
+
+            tokio::select! {
+                () = cancel.cancelled() => {}
+                () = pump => {}
             }
         });
     }
@@ -551,6 +653,17 @@ impl SocketProxy {
         self.reply_tx.clone()
     }
 
+    /// Makes the UDP path proxy-aware, mirroring `TcpBridge::set_proxy_awareness`:
+    /// shares the fake-IP `dns_log` (so a fake-IP destination is reversed to its
+    /// domain) and the detected `proxy_env` (so a configured SOCKS proxy routes
+    /// non-gateway, non-bypassed UDP flows). Opt-in and off by default, so the VMM
+    /// and existing callers are unaffected. HTTP proxies can't carry UDP, so only
+    /// a SOCKS proxy engages this.
+    pub fn set_proxy_awareness(&mut self, dns_log: DnsResolutionLog, proxy_env: ProxyEnvironment) {
+        self.udp.dns_log = Some(dns_log);
+        self.udp.proxy_env = Some(proxy_env);
+    }
+
     /// Dispatches an outbound IPv4 frame to the appropriate protocol proxy.
     ///
     /// Inbound reply frames (matching an active inbound connection) are
@@ -835,5 +948,79 @@ mod tests {
             .expect("recv failed");
 
         assert_eq!(&buf[..len], payload);
+    }
+
+    /// With a SOCKS proxy in the env, a non-gateway flow is relayed through the
+    /// SOCKS5 proxy (UDP ASSOCIATE) instead of a direct host socket; the echoed
+    /// reply still comes back to the guest as an L2 frame.
+    #[tokio::test]
+    async fn udp_proxy_routes_through_socks5_when_configured() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Mock SOCKS5 UDP proxy: control handshake + a UDP relay that echoes the
+        // datagram (header preserved) back to the client.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let relay_addr = relay.local_addr().unwrap();
+            let (mut ctrl, _) = listener.accept().await.unwrap();
+            let mut g = [0u8; 3];
+            ctrl.read_exact(&mut g).await.unwrap();
+            ctrl.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut req = [0u8; 4];
+            ctrl.read_exact(&mut req).await.unwrap();
+            let mut rest = [0u8; 6];
+            ctrl.read_exact(&mut rest).await.unwrap();
+            let mut reply = vec![0x05, 0x00, 0x00, 0x01];
+            match relay_addr.ip() {
+                std::net::IpAddr::V4(v4) => reply.extend_from_slice(&v4.octets()),
+                std::net::IpAddr::V6(_) => unreachable!("bound to v4"),
+            }
+            reply.extend_from_slice(&relay_addr.port().to_be_bytes());
+            ctrl.write_all(&reply).await.unwrap();
+
+            let mut buf = vec![0u8; 2048];
+            let (n, client) = relay.recv_from(&mut buf).await.unwrap();
+            relay.send_to(&buf[..n], client).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(ctrl);
+        });
+
+        let (reply_tx, mut reply_rx) = mpsc::channel(16);
+        let gw_ip = Ipv4Addr::new(10, 0, 2, 1);
+        let gw_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let mut proxy = UdpProxy::new(reply_tx, gw_mac, gw_ip);
+        let (phost, pport) = (proxy_addr.ip().to_string(), proxy_addr.port());
+        proxy.proxy_env = Some(ProxyEnvironment {
+            socks_proxy: Some(arcbox_fakeip::proxy_detect::ProxyConfig {
+                host: phost,
+                port: pport,
+            }),
+            ..Default::default()
+        });
+
+        // Non-gateway destination → routed through the SOCKS5 relay.
+        let payload = b"proxied-udp";
+        let frame = make_udp_frame(
+            Ipv4Addr::new(10, 0, 2, 15),
+            Ipv4Addr::new(1, 2, 3, 4),
+            5000,
+            9999,
+            payload,
+        );
+        let guest_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
+        proxy.proxy_udp(&frame, guest_mac, CancellationToken::new());
+
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx.recv())
+            .await
+            .expect("timed out waiting for the proxied reply")
+            .expect("reply frame");
+        assert!(
+            reply.ends_with(payload),
+            "echoed payload returns to the guest via the SOCKS5 relay"
+        );
+        server.await.unwrap();
     }
 }

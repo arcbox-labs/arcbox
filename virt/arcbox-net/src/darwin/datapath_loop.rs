@@ -210,6 +210,11 @@ impl NetworkDatapath {
         // Enable proxy-aware connections: detect host VPN/proxy environment
         // and share the DNS resolution log so TcpBridge can map IPs to domains.
         let proxy_env = super::proxy_detect::ProxyEnvironment::detect();
+        // Give guest UDP the same proxy enforcement as TCP: share the fake-IP log
+        // + proxy env so the UDP path reverses fake-IPs and honours the SOCKS
+        // proxy + bypass list, mirroring the TCP bridge below. (HTTP proxies can't
+        // carry UDP, so only a SOCKS proxy actually routes UDP.)
+        socket_proxy.set_proxy_awareness(dns_log.clone(), proxy_env.clone());
         tcp_bridge.set_proxy_awareness(dns_log.clone(), proxy_env);
 
         let guest_async = AsyncFd::new(FdWrapper(guest_fd))?;

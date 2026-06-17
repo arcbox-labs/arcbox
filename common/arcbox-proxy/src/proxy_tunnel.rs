@@ -93,102 +93,32 @@ pub async fn connect_via_http_proxy(proxy: &str, host: &str, port: u16) -> io::R
 /// Uses ATYP=0x03 (domain name) so the proxy resolves the hostname, avoiding
 /// fake-ip issues entirely.
 pub async fn connect_via_socks5(proxy: &str, host: &str, port: u16) -> io::Result<TcpStream> {
+    use crate::socks5::{self, VER};
+
     let mut stream = TcpStream::connect(proxy).await?;
 
-    // Phase 1: Greeting — version=5, 1 method (no auth).
-    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+    // Phase 1: no-auth greeting (shared with the UDP-ASSOCIATE client).
+    socks5::greet(&mut stream).await?;
 
-    let mut greeting_resp = [0u8; 2];
-    stream.read_exact(&mut greeting_resp).await?;
-
-    if greeting_resp[0] != 0x05 {
-        return Err(io::Error::other(format!(
-            "SOCKS5: unsupported version {}",
-            greeting_resp[0]
-        )));
-    }
-    if greeting_resp[1] != 0x00 {
-        return Err(io::Error::other(format!(
-            "SOCKS5: server chose unsupported auth method 0x{:02X} (expected 0x00 no-auth)",
-            greeting_resp[1]
-        )));
-    }
-
-    // Phase 2: Connect request — ATYP=0x03 (domain name).
-    let host_bytes = host.as_bytes();
-    if host_bytes.len() > 255 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "SOCKS5: domain name too long",
-        ));
-    }
-
-    let mut req = Vec::with_capacity(7 + host_bytes.len());
-    req.push(0x05); // version
-    req.push(0x01); // cmd: CONNECT
-    req.push(0x00); // reserved
-    req.push(0x03); // atyp: domain name
-    req.push(host_bytes.len() as u8);
-    req.extend_from_slice(host_bytes);
-    req.extend_from_slice(&port.to_be_bytes());
+    // Phase 2: CONNECT request. The shared codec sends a domain by name (so the
+    // proxy resolves it — no fake-ip leak) and IP literals as ATYP v4/v6.
+    let mut req = vec![VER, 0x01, 0x00]; // VER | CMD=CONNECT | RSV
+    socks5::encode_addr(&mut req, host, port);
     stream.write_all(&req).await?;
 
-    // Phase 3: Parse response incrementally.
-    // Read the 4-byte header: [VER, REP, RSV, ATYP].
-    let mut hdr = [0u8; 4];
+    // Phase 3: response — [VER, REP, RSV] then the bind address (discarded).
+    let mut hdr = [0u8; 3];
     stream.read_exact(&mut hdr).await?;
-
-    if hdr[0] != 0x05 {
+    if hdr[0] != VER {
         return Err(io::Error::other(format!(
             "SOCKS5: unexpected version in response: {}",
             hdr[0]
         )));
     }
-
     if hdr[1] != 0x00 {
-        let reason = match hdr[1] {
-            0x01 => "general SOCKS server failure",
-            0x02 => "connection not allowed by ruleset",
-            0x03 => "network unreachable",
-            0x04 => "host unreachable",
-            0x05 => "connection refused",
-            0x06 => "TTL expired",
-            0x07 => "command not supported",
-            0x08 => "address type not supported",
-            _ => "unknown error",
-        };
-        return Err(io::Error::other(format!(
-            "SOCKS5: connect failed: {reason} (code {})",
-            hdr[1]
-        )));
+        return Err(socks5::rep_error(hdr[1]));
     }
-
-    // Consume the bind address based on ATYP. We discard the data.
-    match hdr[3] {
-        0x01 => {
-            // IPv4: 4 bytes address + 2 bytes port.
-            let mut buf = [0u8; 6];
-            stream.read_exact(&mut buf).await?;
-        }
-        0x04 => {
-            // IPv6: 16 bytes address + 2 bytes port.
-            let mut buf = [0u8; 18];
-            stream.read_exact(&mut buf).await?;
-        }
-        0x03 => {
-            // Domain: 1 byte length, N bytes domain, 2 bytes port.
-            let mut len_buf = [0u8; 1];
-            stream.read_exact(&mut len_buf).await?;
-            let dlen = len_buf[0] as usize;
-            let mut domain_and_port = vec![0u8; dlen + 2];
-            stream.read_exact(&mut domain_and_port).await?;
-        }
-        atyp => {
-            return Err(io::Error::other(format!(
-                "SOCKS5: unsupported ATYP 0x{atyp:02X} in response"
-            )));
-        }
-    }
+    let _bind = socks5::read_addr(&mut stream).await?;
 
     tracing::debug!(
         proxy = %proxy,
