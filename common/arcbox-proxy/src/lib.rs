@@ -6,6 +6,8 @@
 //! - [`proxy_tunnel`] — establishes a TCP tunnel to a destination via an
 //!   upstream SOCKS5 or HTTP-CONNECT proxy, connecting by hostname so Fake-IP
 //!   destinations resolve on the proxy's side.
+//! - [`socks5`] — shared SOCKS5 (RFC 1928) primitives plus the UDP-ASSOCIATE
+//!   client ([`socks5::Socks5UdpAssociation`]), so guest UDP can be proxied too.
 //! - [`socket_proxy`] — proxies guest UDP/ICMP through real host sockets
 //!   (bypassing kernel routing / VPN interference) and dispatches inbound
 //!   datagrams via the [`inbound_relay`].
@@ -18,3 +20,4 @@
 pub mod inbound_relay;
 pub mod proxy_tunnel;
 pub mod socket_proxy;
+pub mod socks5;
