@@ -1,11 +1,11 @@
 //! SOCKS5 (RFC 1928) shared primitives + the UDP-ASSOCIATE client.
 //!
 //! The greeting and the ATYP address codec are the single source of truth for
-//! the SOCKS5 address wire format, shared by the TCP CONNECT client
-//! ([`crate::proxy_tunnel::connect_via_socks5`]), the UDP-ASSOCIATE client below,
+//! the SOCKS5 address wire format, shared by the CONNECT tunnel client
+//! ([`connect_via_socks5`]), the UDP-ASSOCIATE client ([`Socks5UdpAssociation`]),
 //! and (cross-crate) the downstream aroxy Shadowsocks / Trojan target encoders —
-//! all of which use the same `ATYP | ADDR | PORT` layout. [`Socks5UdpAssociation`]
-//! lets arcbox (and aroxy) route guest UDP through an upstream SOCKS5 proxy.
+//! all of which use the same `ATYP | ADDR | PORT` layout. The latter lets arcbox
+//! (and aroxy) route guest UDP through an upstream SOCKS5 proxy.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -118,8 +118,9 @@ pub async fn read_addr<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<(String
             r.read_exact(&mut len).await?;
             let mut name = vec![0u8; len[0] as usize];
             r.read_exact(&mut name).await?;
-            String::from_utf8(name)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SOCKS5: non-UTF8 domain"))?
+            String::from_utf8(name).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "SOCKS5: non-UTF8 domain")
+            })?
         }
         other => {
             return Err(io::Error::other(format!(
@@ -146,6 +147,44 @@ pub(crate) fn rep_error(code: u8) -> io::Error {
         _ => "unknown error",
     };
     io::Error::other(format!("SOCKS5: request failed: {reason} (code {code})"))
+}
+
+/// Establishes a TCP tunnel via a SOCKS5 proxy (RFC 1928 CONNECT, no-auth subset).
+///
+/// Hostnames are sent as ATYP=domain so the proxy resolves them (no fake-IP
+/// leak); IP literals use ATYP v4/v6. The returned stream is an end-to-end
+/// tunnel to `host:port`.
+pub async fn connect_via_socks5(proxy: &str, host: &str, port: u16) -> io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(proxy).await?;
+
+    // Phase 1: no-auth greeting (shared with the UDP-ASSOCIATE client).
+    greet(&mut stream).await?;
+
+    // Phase 2: CONNECT request via the shared address codec.
+    let mut req = vec![VER, 0x01, 0x00]; // VER | CMD=CONNECT | RSV
+    encode_addr(&mut req, host, port);
+    stream.write_all(&req).await?;
+
+    // Phase 3: response — [VER, REP, RSV] then the bind address (discarded).
+    let mut hdr = [0u8; 3];
+    stream.read_exact(&mut hdr).await?;
+    if hdr[0] != VER {
+        return Err(io::Error::other(format!(
+            "SOCKS5: unexpected version in response: {}",
+            hdr[0]
+        )));
+    }
+    if hdr[1] != 0x00 {
+        return Err(rep_error(hdr[1]));
+    }
+    let _bind = read_addr(&mut stream).await?;
+
+    tracing::debug!(
+        proxy = %proxy,
+        target = %format!("{host}:{port}"),
+        "SOCKS5 tunnel established"
+    );
+    Ok(stream)
 }
 
 /// Aborts the control-connection watcher task when the association is dropped,
@@ -183,7 +222,9 @@ impl Socks5UdpAssociation {
     pub async fn associate(proxy: &str) -> io::Result<Self> {
         tokio::time::timeout(HANDSHAKE_TIMEOUT, Self::handshake(proxy))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 UDP associate timed out"))?
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 UDP associate timed out")
+            })?
     }
 
     async fn handshake(proxy: &str) -> io::Result<Self> {
@@ -312,6 +353,87 @@ mod tests {
         }
     }
 
+    /// Minimal no-auth SOCKS5 server: validates the client's greeting and
+    /// domain-ATYP CONNECT request, replies success, then echoes one message
+    /// back through the established tunnel.
+    async fn mock_socks5(listener: TcpListener, expect_host: &'static str, expect_port: u16) {
+        let (mut s, _) = listener.accept().await.unwrap();
+
+        // Greeting: VER=5, NMETHODS=1, METHODS=[0x00].
+        let mut greeting = [0u8; 3];
+        s.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [0x05, 0x01, 0x00], "client greeting");
+        s.write_all(&[0x05, 0x00]).await.unwrap(); // choose no-auth
+
+        // Connect request: VER, CMD=CONNECT, RSV, ATYP=domain.
+        let mut hdr = [0u8; 4];
+        s.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(hdr, [0x05, 0x01, 0x00, 0x03], "connect request header");
+        let mut len = [0u8; 1];
+        s.read_exact(&mut len).await.unwrap();
+        let mut host = vec![0u8; len[0] as usize];
+        s.read_exact(&mut host).await.unwrap();
+        let mut port = [0u8; 2];
+        s.read_exact(&mut port).await.unwrap();
+        assert_eq!(host, expect_host.as_bytes(), "CONNECT host (by name)");
+        assert_eq!(u16::from_be_bytes(port), expect_port, "CONNECT port");
+
+        // Reply: success, ATYP=IPv4, BND.ADDR=0.0.0.0, BND.PORT=0.
+        s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+
+        // Tunnel is now end-to-end; echo one payload.
+        let mut buf = [0u8; 5];
+        s.read_exact(&mut buf).await.unwrap();
+        s.write_all(&buf).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_connects_by_domain_and_tunnels() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(mock_socks5(listener, "example.com", 443));
+
+        let mut stream = connect_via_socks5(&addr.to_string(), "example.com", 443)
+            .await
+            .expect("SOCKS5 handshake should complete");
+
+        // The returned stream is an end-to-end tunnel through the proxy.
+        stream.write_all(b"hello").await.unwrap();
+        let mut got = [0u8; 5];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hello", "payload round-trips through the tunnel");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_propagates_server_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            s.read_exact(&mut greeting).await.unwrap();
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            // Drain the connect request, then reply REP=0x05 (connection refused).
+            let mut hdr = [0u8; 4];
+            s.read_exact(&mut hdr).await.unwrap();
+            let mut len = [0u8; 1];
+            s.read_exact(&mut len).await.unwrap();
+            let mut rest = vec![0u8; len[0] as usize + 2];
+            s.read_exact(&mut rest).await.unwrap();
+            s.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        });
+
+        let err = connect_via_socks5(&addr.to_string(), "blocked.example", 443)
+            .await
+            .expect_err("server failure must surface as an error");
+        assert!(err.to_string().contains("connection refused"), "{err}");
+    }
+
     /// Mock SOCKS5 UDP relay: completes the control handshake, advertises a real
     /// UDP relay socket as BND, then echoes one datagram back (re-headered with
     /// the decoded target as the source).
@@ -373,7 +495,11 @@ mod tests {
             .unwrap()
             .expect("a deliverable datagram");
         assert_eq!(&buf[..n], b"ping", "payload round-trips through the relay");
-        assert_eq!((host.as_str(), port), ("example.com", 53), "target echoed back");
+        assert_eq!(
+            (host.as_str(), port),
+            ("example.com", 53),
+            "target echoed back"
+        );
         server.await.unwrap();
     }
 
@@ -437,6 +563,9 @@ mod tests {
         assoc.send_to(b"hi", "1.2.3.4", 9).await.unwrap();
         let mut buf = [0u8; 64];
         let got = assoc.recv_from(&mut buf).await.unwrap();
-        assert!(got.is_none(), "fragmented datagram is skipped, flow survives");
+        assert!(
+            got.is_none(),
+            "fragmented datagram is skipped, flow survives"
+        );
     }
 }

@@ -23,8 +23,8 @@ impl Vmm {
         primary_net_id: crate::device::DeviceId,
     ) -> Result<()> {
         use arcbox_net::darwin::datapath_loop::NetworkDatapath;
+        use arcbox_net::darwin::egress::HostEgress;
         use arcbox_net::darwin::inbound_relay::InboundListenerManager;
-        use arcbox_net::darwin::socket_proxy::SocketProxy;
         use arcbox_net::dhcp::{DhcpConfig, DhcpServer};
         use arcbox_net::dns::{DnsConfig, DnsForwarder};
         use std::net::Ipv4Addr;
@@ -143,8 +143,7 @@ impl Vmm {
         // 3. Create socket proxy and channels.
         let (reply_tx, reply_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(256);
-        let socket_proxy =
-            SocketProxy::new(gateway_ip, gateway_mac, guest_ip, reply_tx, cancel.clone());
+        let egress = HostEgress::new(gateway_ip, gateway_mac, guest_ip, reply_tx, cancel.clone());
 
         self.inbound_listener_manager = Some(InboundListenerManager::new(cmd_tx));
 
@@ -165,7 +164,7 @@ impl Vmm {
         let net_mtu = arcbox_net::darwin::classifier::ENHANCED_ETHERNET_MTU;
         let mut datapath = NetworkDatapath::new(
             host_fd,
-            socket_proxy,
+            egress,
             reply_rx,
             cmd_rx,
             dhcp_server,

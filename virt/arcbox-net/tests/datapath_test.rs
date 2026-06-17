@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use arcbox_dhcp::DhcpConfig;
 use arcbox_net::darwin::datapath_loop::NetworkDatapath;
-use arcbox_net::darwin::socket_proxy::SocketProxy;
+use arcbox_net::darwin::egress::HostEgress;
 use arcbox_net::dns::{DnsConfig, DnsForwarder};
 use splicetcp::{FdFrameSource, FrameSource};
 
@@ -48,8 +48,7 @@ fn create_test_datapath() -> (NetworkDatapath, std::os::fd::OwnedFd, Cancellatio
     let (reply_tx, reply_rx) = mpsc::channel(256);
     let (_cmd_tx, cmd_rx) = mpsc::channel(64);
 
-    let socket_proxy =
-        SocketProxy::new(GATEWAY_IP, GATEWAY_MAC, GUEST_IP, reply_tx, cancel.clone());
+    let egress = HostEgress::new(GATEWAY_IP, GATEWAY_MAC, GUEST_IP, reply_tx, cancel.clone());
 
     let dhcp_config = DhcpConfig::new(GATEWAY_IP, Ipv4Addr::new(255, 255, 255, 0));
     let dhcp_server = arcbox_dhcp::DhcpServer::new(dhcp_config);
@@ -59,7 +58,7 @@ fn create_test_datapath() -> (NetworkDatapath, std::os::fd::OwnedFd, Cancellatio
 
     let datapath = NetworkDatapath::new(
         host_fd,
-        socket_proxy,
+        egress,
         reply_rx,
         cmd_rx,
         dhcp_server,

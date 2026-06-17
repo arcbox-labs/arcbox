@@ -2,7 +2,7 @@
 //!
 //! Opens a macOS `utun` and drives real host egress traffic through the SAME
 //! stack the VM datapath uses — [`FrameClassifier`], [`TcpBridge`], and
-//! [`SocketProxy`] — forwarding TCP to an upstream SOCKS5 proxy by hostname
+//! [`HostEgress`] — forwarding TCP to an upstream SOCKS5 proxy by hostname
 //! (recovered from Fake-IP via the DNS log). It is the concrete proof that the
 //! ArcBox data plane can power a Surge-class host proxy.
 //!
@@ -37,7 +37,7 @@ mod macos {
 
     use arcbox_fakeip::dns_log::{DnsResolutionLog, parse_dns_response_a_records};
     use arcbox_fakeip::proxy_detect::{ProxyConfig, ProxyEnvironment};
-    use arcbox_proxy::socket_proxy::SocketProxy;
+    use arcbox_proxy::egress::HostEgress;
     use arcbox_route::Ipv4Net;
     use splicetcp::FrameSource;
     use splicetcp::classifier::{FrameClassifier, InterceptedKind};
@@ -167,7 +167,7 @@ mod macos {
 
         let cancel = CancellationToken::new();
         let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(256);
-        let mut socket_proxy = SocketProxy::new(
+        let mut egress = HostEgress::new(
             gateway_ip,
             GATEWAY_MAC,
             guest_ip,
@@ -222,7 +222,7 @@ mod macos {
                             ),
                             // No DHCP server on a host tunnel; treat as plain UDP.
                             InterceptedKind::Udp | InterceptedKind::Dhcp | InterceptedKind::Icmp => {
-                                socket_proxy.handle_outbound(&intercepted.frame, guest_mac.unwrap_or(HOST_MAC));
+                                egress.handle_outbound(&intercepted.frame, guest_mac.unwrap_or(HOST_MAC));
                             }
                         }
                     }
@@ -240,7 +240,7 @@ mod macos {
                 }
                 _ = poll.tick() => {}
                 _ = maintenance.tick() => {
-                    socket_proxy.maintenance();
+                    egress.maintenance();
                 }
             }
 

@@ -236,8 +236,8 @@ impl Vmm {
     /// Returns a `VirtioDeviceConfig` with the VZ-side FDs embedded.
     fn create_network_device(&mut self) -> Result<VirtioDeviceConfig> {
         use arcbox_net::darwin::datapath_loop::NetworkDatapath;
+        use arcbox_net::darwin::egress::HostEgress;
         use arcbox_net::darwin::inbound_relay::InboundListenerManager;
-        use arcbox_net::darwin::socket_proxy::SocketProxy;
         use arcbox_net::dhcp::{DhcpConfig, DhcpServer};
         use arcbox_net::dns::{DnsConfig, DnsForwarder};
         use std::net::Ipv4Addr;
@@ -310,8 +310,7 @@ impl Vmm {
         // 3. Create the socket proxy, reply channel, and inbound command channel.
         let (reply_tx, reply_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(256);
-        let socket_proxy =
-            SocketProxy::new(gateway_ip, gateway_mac, guest_ip, reply_tx, cancel.clone());
+        let egress = HostEgress::new(gateway_ip, gateway_mac, guest_ip, reply_tx, cancel.clone());
 
         // Create the inbound listener manager for port forwarding.
         self.inbound_listener_manager = Some(InboundListenerManager::new(cmd_tx));
@@ -350,7 +349,7 @@ impl Vmm {
 
         let datapath = NetworkDatapath::new(
             host_fd,
-            socket_proxy,
+            egress,
             reply_rx,
             cmd_rx,
             dhcp_server,
