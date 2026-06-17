@@ -65,7 +65,10 @@ pub fn l3_to_l2<'b>(
     header: &[u8; ETH_HEADER_LEN],
     buf: &'b mut [u8],
 ) -> Option<&'b [u8]> {
-    if ip_packet.is_empty() || (ip_packet[0] >> 4) != 4 {
+    // Reject anything too short to hold a minimal IPv4 header (20 bytes) or
+    // whose version nibble is not 4. The length guard also subsumes the empty
+    // case and rejects a lone version byte like `[0x40]`.
+    if ip_packet.len() < 20 || (ip_packet[0] >> 4) != 4 {
         return None;
     }
     let total = ETH_HEADER_LEN + ip_packet.len();
@@ -239,6 +242,11 @@ mod tests {
         v6[0] = 0x60;
         assert!(l3_to_l2(&v6, &header, &mut buf).is_none());
         assert!(l3_to_l2(&[], &header, &mut buf).is_none());
+
+        // A version-4 nibble but shorter than a minimal IPv4 header is dropped
+        // (`[0x40]` has IHL 0; 19 bytes is one short of the 20-byte minimum).
+        assert!(l3_to_l2(&[0x40], &header, &mut buf).is_none());
+        assert!(l3_to_l2(&[0x45u8; 19], &header, &mut buf).is_none());
 
         // Buffer too small for header + packet.
         let mut tiny = [0u8; ETH_HEADER_LEN + 4];
