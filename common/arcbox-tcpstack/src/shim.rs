@@ -7,6 +7,10 @@
 //! - [`L3ToL2Source`] wraps an L3 [`FrameSource`] (IP packets) so the
 //!   classifier sees Ethernet frames — each IP packet is prefixed with a fixed
 //!   synthetic Ethernet header.
+//! - [`synthetic_l2_header`] + [`l3_to_l2`] are the same wrapping as free
+//!   functions, for callers that drive the classifier directly from a callback
+//!   instead of an fd (e.g. a Network Extension's `NEPacketTunnelFlow`, which
+//!   has no pollable fd and so cannot implement [`FrameSource`]).
 //! - [`l2_to_l3`] is the egress filter: it strips the synthetic Ethernet header
 //!   from a frame the datapath wants to send "to the guest", yielding the IP
 //!   packet to write back to the `utun`. ARP and other non-IPv4 frames have no
@@ -27,6 +31,55 @@ pub const GATEWAY_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
 /// Synthetic host MAC — the "guest" side of the L3 link (the utun peer).
 pub const HOST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 
+/// Builds the synthetic Ethernet header (`HOST_MAC` → `GATEWAY_MAC`, IPv4) that
+/// the L2 classifier expects in front of a bare L3 packet.
+///
+/// Build it once and reuse it per frame with [`l3_to_l2`]. This is the
+/// ingest counterpart to [`l2_to_l3`] for callers that drive the classifier
+/// directly (e.g. a callback-based source such as a Network Extension's
+/// `NEPacketTunnelFlow`, which has no fd and so cannot implement
+/// [`FrameSource`]).
+#[must_use]
+pub fn synthetic_l2_header() -> [u8; ETH_HEADER_LEN] {
+    EthernetHeader {
+        dst_mac: GATEWAY_MAC,
+        src_mac: HOST_MAC,
+        ethertype: EtherType::Ipv4,
+    }
+    .to_bytes()
+}
+
+/// Prepends `header` to a bare IPv4 packet into `buf`, returning the framed
+/// slice ready for [`FrameClassifier::classify_frame`](crate::classifier::FrameClassifier::classify_frame).
+///
+/// `header` is a synthetic Ethernet header from [`synthetic_l2_header`].
+/// Returns `None` if `ip_packet` is not IPv4 (a `utun`/NE link only carries IP;
+/// IPv6 is out of scope) or if `buf` is too small to hold header + packet.
+///
+/// This is the standalone, push-friendly form of [`L3ToL2Source`]'s wrapping:
+/// a consumer that receives IP packets via a callback can frame each one
+/// without owning a pollable fd.
+#[must_use]
+pub fn l3_to_l2<'b>(
+    ip_packet: &[u8],
+    header: &[u8; ETH_HEADER_LEN],
+    buf: &'b mut [u8],
+) -> Option<&'b [u8]> {
+    // Reject anything too short to hold a minimal IPv4 header (20 bytes) or
+    // whose version nibble is not 4. The length guard also subsumes the empty
+    // case and rejects a lone version byte like `[0x40]`.
+    if ip_packet.len() < 20 || (ip_packet[0] >> 4) != 4 {
+        return None;
+    }
+    let total = ETH_HEADER_LEN + ip_packet.len();
+    if total > buf.len() {
+        return None;
+    }
+    buf[..ETH_HEADER_LEN].copy_from_slice(header);
+    buf[ETH_HEADER_LEN..total].copy_from_slice(ip_packet);
+    Some(&buf[..total])
+}
+
 /// Wraps an L3 [`FrameSource`] so the L2 classifier sees Ethernet frames.
 ///
 /// Each inbound IP packet from `inner` is prefixed with a synthetic Ethernet
@@ -45,15 +98,9 @@ impl<S: FrameSource> L3ToL2Source<S> {
     /// Wraps an L3 frame source.
     #[must_use]
     pub fn new(inner: S) -> Self {
-        let header = EthernetHeader {
-            dst_mac: GATEWAY_MAC,
-            src_mac: HOST_MAC,
-            ethertype: EtherType::Ipv4,
-        }
-        .to_bytes();
         Self {
             inner,
-            header,
+            header: synthetic_l2_header(),
             buf: vec![0u8; ETH_HEADER_LEN + 65535],
         }
     }
@@ -75,17 +122,9 @@ impl<S: FrameSource> FrameSource for L3ToL2Source<S> {
         let header = self.header;
         let Self { inner, buf, .. } = self;
         inner.drain(|ip_packet| {
-            // Only IPv4 (version nibble == 4); drop everything else.
-            if ip_packet.is_empty() || (ip_packet[0] >> 4) != 4 {
-                return;
+            if let Some(frame) = l3_to_l2(ip_packet, &header, buf) {
+                f(frame);
             }
-            let total = ETH_HEADER_LEN + ip_packet.len();
-            if total > buf.len() {
-                return;
-            }
-            buf[..ETH_HEADER_LEN].copy_from_slice(&header);
-            buf[ETH_HEADER_LEN..total].copy_from_slice(ip_packet);
-            f(&buf[..total]);
         });
     }
 }
@@ -176,5 +215,41 @@ mod tests {
         let mut frame = vec![0u8; ETH_HEADER_LEN + 28];
         frame[12..14].copy_from_slice(&[0x08, 0x06]); // ARP
         assert!(l2_to_l3(&frame).is_none(), "ARP has no L3 representation");
+    }
+
+    #[test]
+    fn l3_to_l2_frames_ipv4_and_matches_source() {
+        // The free function produces the same frame L3ToL2Source would, and the
+        // result round-trips back to the original IP packet through l2_to_l3.
+        let header = synthetic_l2_header();
+        let ip = ipv4_packet(6);
+        let mut buf = [0u8; ETH_HEADER_LEN + 64];
+        let frame = l3_to_l2(&ip, &header, &mut buf).expect("IPv4 frames");
+        assert_eq!(frame.len(), ETH_HEADER_LEN + ip.len());
+        assert_eq!(&frame[0..6], &GATEWAY_MAC);
+        assert_eq!(&frame[6..12], &HOST_MAC);
+        assert_eq!(&frame[12..14], &EtherType::Ipv4.to_raw().to_be_bytes());
+        assert_eq!(l2_to_l3(frame), Some(&ip[..]));
+    }
+
+    #[test]
+    fn l3_to_l2_rejects_non_ipv4_and_undersized_buf() {
+        let header = synthetic_l2_header();
+        let mut buf = [0u8; ETH_HEADER_LEN + 64];
+
+        // IPv6 (nibble 6) and empty packets are dropped.
+        let mut v6 = vec![0u8; 40];
+        v6[0] = 0x60;
+        assert!(l3_to_l2(&v6, &header, &mut buf).is_none());
+        assert!(l3_to_l2(&[], &header, &mut buf).is_none());
+
+        // A version-4 nibble but shorter than a minimal IPv4 header is dropped
+        // (`[0x40]` has IHL 0; 19 bytes is one short of the 20-byte minimum).
+        assert!(l3_to_l2(&[0x40], &header, &mut buf).is_none());
+        assert!(l3_to_l2(&[0x45u8; 19], &header, &mut buf).is_none());
+
+        // Buffer too small for header + packet.
+        let mut tiny = [0u8; ETH_HEADER_LEN + 4];
+        assert!(l3_to_l2(&ipv4_packet(6), &header, &mut tiny).is_none());
     }
 }
