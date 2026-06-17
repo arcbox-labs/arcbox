@@ -50,6 +50,7 @@ jobs:
     name: Publish crates to crates.io
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
