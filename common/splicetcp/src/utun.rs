@@ -1,7 +1,8 @@
 //! macOS `utun` endpoint: a [`FrameSource`] and sink over a host `utun` fd.
 //!
 //! macOS frames each `utun` packet with a 4-byte address-family header (the
-//! `AF_INET`/`AF_INET6` value in host byte order). [`UtunFrameSource`] strips
+//! `AF_INET`/`AF_INET6` value in network (big-endian) byte order — macOS reads
+//! it with `ntohl()`, see [`utun_af_header`]). [`UtunFrameSource`] strips
 //! it on read; [`UtunSink`] prepends it on write. Both operate on a raw,
 //! non-owning fd — open and configure the device with
 //! `arcbox_net::darwin::DarwinTun` (which requires no root to create, but root

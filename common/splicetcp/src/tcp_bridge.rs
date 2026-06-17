@@ -1139,7 +1139,10 @@ impl TcpBridge {
 
     /// Replaces the egress resolver with a custom policy. Lets a consumer
     /// (e.g. an Inbound/Router/Outbound host) inject its own decide+dial logic.
-    pub fn set_egress_resolver(&mut self, egress: std::sync::Arc<dyn crate::egress::EgressResolver>) {
+    pub fn set_egress_resolver(
+        &mut self,
+        egress: std::sync::Arc<dyn crate::egress::EgressResolver>,
+    ) {
         self.egress = egress;
     }
 

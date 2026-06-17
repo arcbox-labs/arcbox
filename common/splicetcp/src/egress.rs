@@ -142,7 +142,8 @@ impl EgressResolver for DefaultEgress {
                 match proxy_target {
                     // SOCKS5 (preferred): the proxy resolves the hostname.
                     Some((authority, host, port, "socks5")) => {
-                        arcbox_proxy::proxy_tunnel::connect_via_socks5(&authority, &host, port).await
+                        arcbox_proxy::proxy_tunnel::connect_via_socks5(&authority, &host, port)
+                            .await
                     }
                     // HTTP CONNECT (https/http system proxy).
                     Some((authority, host, port, _)) => {
@@ -153,10 +154,11 @@ impl EgressResolver for DefaultEgress {
                     None => tokio::net::TcpStream::connect(connect_addr).await,
                 }
             };
-            let stream = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), connect)
-                .await
-                .ok()
-                .and_then(Result::ok);
+            let stream =
+                tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), connect)
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
             let _ = tx.send(stream.map(EgressConn::Tcp));
         });
         rx
@@ -196,7 +198,12 @@ mod tests {
         let eg = egress(Some(env(false, false, true)));
         assert_eq!(
             eg.resolve_proxy_target(Ipv4Addr::new(1, 2, 3, 4), 443, None),
-            Some(("127.0.0.1:1080".to_string(), "1.2.3.4".to_string(), 443, "socks5")),
+            Some((
+                "127.0.0.1:1080".to_string(),
+                "1.2.3.4".to_string(),
+                443,
+                "socks5"
+            )),
         );
     }
 
@@ -206,13 +213,23 @@ mod tests {
         let eg = egress(Some(env(true, true, false)));
         assert_eq!(
             eg.resolve_proxy_target(Ipv4Addr::new(1, 2, 3, 4), 80, None),
-            Some(("127.0.0.1:3129".to_string(), "1.2.3.4".to_string(), 80, "http-connect")),
+            Some((
+                "127.0.0.1:3129".to_string(),
+                "1.2.3.4".to_string(),
+                80,
+                "http-connect"
+            )),
         );
         // HTTP only.
         let eg = egress(Some(env(true, false, false)));
         assert_eq!(
             eg.resolve_proxy_target(Ipv4Addr::new(1, 2, 3, 4), 80, None),
-            Some(("127.0.0.1:3128".to_string(), "1.2.3.4".to_string(), 80, "http-connect")),
+            Some((
+                "127.0.0.1:3128".to_string(),
+                "1.2.3.4".to_string(),
+                80,
+                "http-connect"
+            )),
         );
     }
 
