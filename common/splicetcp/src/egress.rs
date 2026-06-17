@@ -84,33 +84,20 @@ impl DefaultEgress {
             return None;
         }
 
-        // Check fake-ip BEFORE requiring a domain name. Fake-IP destinations
-        // (198.18.0.0/15 from Surge/ClashX) always need proxy routing, even
-        // if the DNS log hasn't recorded the domain yet (race between DNS
-        // response and TCP SYN). Use the IP as fallback CONNECT target.
-        let is_fake = env.is_fake_ip(dst_ip);
-
-        // Resolve the host for the CONNECT/SOCKS5 tunnel target.
-        // For fake-IP without domain, fall back to the IP string — the proxy
-        // will resolve it on its end (Surge handles this correctly).
+        // A usable proxy is configured (checked above), so every destination is
+        // tunnelled through it — including IP literals and DNS-log misses, not
+        // just Fake-IP. Resolve the CONNECT/SOCKS5 target host: the recovered
+        // domain when known, otherwise the destination IP string, which the
+        // proxy resolves on its end (Surge does this). Fake-IP destinations
+        // (198.18.0.0/15) without a recovered domain fall here too and are
+        // mapped back by the proxy.
         let host = match domain {
             Some(d) => d.to_string(),
-            None if is_fake => dst_ip.to_string(),
-            None => return None,
+            None => dst_ip.to_string(),
         };
 
-        // Check bypass list.
+        // Honor the bypass list (direct for excepted hosts).
         if env.should_bypass(&host) {
-            return None;
-        }
-
-        // Proxy fake-ip destinations and traffic when an explicit system proxy
-        // is configured (corporate proxy environments).
-        let need_proxy = is_fake
-            || env.http_proxy.is_some()
-            || env.https_proxy.is_some()
-            || env.socks_proxy.is_some();
-        if !need_proxy {
             return None;
         }
 
@@ -173,5 +160,81 @@ impl EgressResolver for DefaultEgress {
             let _ = tx.send(stream.map(EgressConn::Tcp));
         });
         rx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arcbox_fakeip::proxy_detect::ProxyConfig;
+
+    fn env(http: bool, https: bool, socks: bool) -> ProxyEnvironment {
+        let cfg = |port| {
+            Some(ProxyConfig {
+                host: "127.0.0.1".to_string(),
+                port,
+            })
+        };
+        ProxyEnvironment {
+            fake_ip_active: false,
+            http_proxy: if http { cfg(3128) } else { None },
+            https_proxy: if https { cfg(3129) } else { None },
+            socks_proxy: if socks { cfg(1080) } else { None },
+            bypass_domains: vec![],
+        }
+    }
+
+    fn egress(env: Option<ProxyEnvironment>) -> DefaultEgress {
+        DefaultEgress::new(Ipv4Addr::new(10, 0, 0, 1), env, 5)
+    }
+
+    // Regression: a domain-less, non-Fake-IP destination must still be proxied
+    // (via the IP literal) when a system proxy is configured, instead of
+    // bypassing to a direct connect.
+    #[test]
+    fn domainless_ip_dst_proxied_via_socks() {
+        let eg = egress(Some(env(false, false, true)));
+        assert_eq!(
+            eg.resolve_proxy_target(Ipv4Addr::new(1, 2, 3, 4), 443, None),
+            Some(("127.0.0.1:1080".to_string(), "1.2.3.4".to_string(), 443, "socks5")),
+        );
+    }
+
+    #[test]
+    fn domainless_ip_dst_proxied_via_https_then_http() {
+        // HTTPS preferred over HTTP.
+        let eg = egress(Some(env(true, true, false)));
+        assert_eq!(
+            eg.resolve_proxy_target(Ipv4Addr::new(1, 2, 3, 4), 80, None),
+            Some(("127.0.0.1:3129".to_string(), "1.2.3.4".to_string(), 80, "http-connect")),
+        );
+        // HTTP only.
+        let eg = egress(Some(env(true, false, false)));
+        assert_eq!(
+            eg.resolve_proxy_target(Ipv4Addr::new(1, 2, 3, 4), 80, None),
+            Some(("127.0.0.1:3128".to_string(), "1.2.3.4".to_string(), 80, "http-connect")),
+        );
+    }
+
+    // SOCKS5 wins when several proxies are present.
+    #[test]
+    fn socks_preferred_over_http_proxies() {
+        let eg = egress(Some(env(true, true, true)));
+        let got = eg.resolve_proxy_target(Ipv4Addr::new(1, 2, 3, 4), 443, None);
+        assert_eq!(got.unwrap().3, "socks5");
+    }
+
+    // No usable proxy → direct, regardless of domain.
+    #[test]
+    fn no_proxy_is_direct() {
+        let eg = egress(Some(env(false, false, false)));
+        assert_eq!(
+            eg.resolve_proxy_target(Ipv4Addr::new(1, 2, 3, 4), 443, Some("example.com")),
+            None,
+        );
+        assert_eq!(
+            egress(None).resolve_proxy_target(Ipv4Addr::new(1, 2, 3, 4), 443, None),
+            None,
+        );
     }
 }

@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-conntrack"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "arcbox-datapath",
  "arcbox-packet",
@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-datapath"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "thiserror",
 ]
@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-fakeip"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "tracing",
 ]
@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-net-virtio"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "arcbox-conntrack",
  "arcbox-virtio",
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-packet"
-version = "0.4.6"
+version = "0.4.7"
 
 [[package]]
 name = "arcbox-protocol"
@@ -625,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-proxy"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "arcbox-packet",
  "libc",
@@ -4166,7 +4166,7 @@ dependencies = [
 
 [[package]]
 name = "splicetcp"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "arcbox-datapath",
  "arcbox-fakeip",
