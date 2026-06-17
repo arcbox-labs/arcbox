@@ -12,12 +12,7 @@
 use std::net::Ipv4Addr;
 
 use arcbox_fakeip::proxy_detect::ProxyEnvironment;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
-
-/// Boxed bidirectional stream (for relay-path egress; see EgressConn::Stream).
-pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Send + Unpin + ?Sized> AsyncReadWrite for T {}
 
 /// The flow a SYN opened — everything a resolver needs to decide egress.
 #[derive(Clone, Debug)]
@@ -31,12 +26,14 @@ pub struct FlowMeta {
 }
 
 /// A resolved egress transport.
+///
+/// Currently always a real fd, which the bridge splices on the fast path. A
+/// boxed-stream variant for relayed (no-fd) encrypted protocols will be added
+/// together with its bridge relay implementation, rather than reserved ahead of
+/// a consumer.
 pub enum EgressConn {
     /// Has a real fd → the bridge splices it on the fast path.
     Tcp(tokio::net::TcpStream),
-    /// No fd (e.g. an in-process encrypted protocol) → relayed. NOT YET
-    /// IMPLEMENTED in the bridge (M4); the default resolver never returns it.
-    Stream(Box<dyn AsyncReadWrite>),
 }
 
 /// Decides + establishes egress for a flow. Injected into the bridge so a
