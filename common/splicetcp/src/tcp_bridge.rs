@@ -867,13 +867,6 @@ impl TcpBridge {
                                     }
                                 }
                             }
-                            Ok(Some(crate::egress::EgressConn::Stream(_))) => {
-                                tracing::error!(
-                                    "Handshake shim: relay (Stream) egress not yet supported for {key:?}"
-                                );
-                                to_abort.push(*key);
-                                continue;
-                            }
                             Ok(None) => {
                                 // Host connect refused / timed out. Emit
                                 // RST|ACK toward the guest so the originating
@@ -1148,6 +1141,19 @@ impl TcpBridge {
     /// (e.g. an Inbound/Router/Outbound host) inject its own decide+dial logic.
     pub fn set_egress_resolver(&mut self, egress: std::sync::Arc<dyn crate::egress::EgressResolver>) {
         self.egress = egress;
+    }
+
+    /// Attaches a DNS resolution log used to recover destination domains
+    /// (`FlowMeta::domain`), independently of the egress resolver. Lets a
+    /// consumer inject a custom resolver via [`set_egress_resolver`] while still
+    /// having the bridge populate domains from DNS observations — without going
+    /// through [`set_proxy_awareness`], which would also install a
+    /// `DefaultEgress` and overwrite the injected resolver.
+    ///
+    /// [`set_egress_resolver`]: Self::set_egress_resolver
+    /// [`set_proxy_awareness`]: Self::set_proxy_awareness
+    pub fn set_dns_log(&mut self, dns_log: arcbox_fakeip::dns_log::DnsResolutionLog) {
+        self.dns_log = Some(dns_log);
     }
 
     /// Allocates the next inbound ephemeral port, wrapping at the end of
