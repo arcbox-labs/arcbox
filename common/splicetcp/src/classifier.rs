@@ -107,15 +107,25 @@ pub struct FrameClassifier {
 }
 
 impl FrameClassifier {
-    /// Pool capacity: 4096 buffers. Each buffer is `MAX_PACKET_SIZE` (64 KiB)
-    /// in the pool, so total resident = ~256 MiB. This is acceptable because:
+    /// Default packet-pool capacity: 4096 buffers. Each buffer is
+    /// `MAX_PACKET_SIZE` (64 KiB), so resident pool memory is ~256 MiB. This is
+    /// acceptable for the VM datapath because:
     /// - One pool per VM (not per connection)
     /// - Idle pages are compressed by macOS memory compressor
     /// - Smaller pools increase heap fallback frequency, defeating the purpose
     /// - At ~300K frames/sec (10 Gbps / 4000 MTU), 4096 gives ~13 ms burst headroom
-    const POOL_CAPACITY: usize = 4096;
+    ///
+    /// Memory-constrained hosts (e.g. an iOS Network Extension) should construct
+    /// with [`with_pool_capacity`](Self::with_pool_capacity) and a smaller count.
+    ///
+    /// Note: this is deliberately distinct from `arcbox_datapath::DEFAULT_POOL_CAPACITY`
+    /// (8192) — it preserves the classifier's own historical pool size and is
+    /// unrelated to the datapath ring/pool default. Pass *this* constant to
+    /// [`with_pool_capacity`](Self::with_pool_capacity), not the `arcbox_datapath` one.
+    pub const DEFAULT_POOL_CAPACITY: usize = 4096;
 
-    /// Creates a new classifier.
+    /// Creates a new classifier with the
+    /// [default pool capacity](Self::DEFAULT_POOL_CAPACITY).
     ///
     /// `mtu` should match the device's configured MTU. Use
     /// `ENHANCED_ETHERNET_MTU` (4000) when VZ `setMaximumTransmissionUnit:`
@@ -124,8 +134,26 @@ impl FrameClassifier {
     /// The gateway MAC (needed to synthesize ARP replies) is set later via
     /// [`set_gateway_mac`](Self::set_gateway_mac), once it is known.
     pub fn new(gateway_ip: Ipv4Addr, mtu: usize) -> Self {
-        // PacketPool::new only fails on zero capacity, which POOL_CAPACITY is not.
-        let pool = Arc::new(PacketPool::new(Self::POOL_CAPACITY).expect("pool allocation"));
+        Self::with_pool_capacity(gateway_ip, mtu, Self::DEFAULT_POOL_CAPACITY)
+    }
+
+    /// Creates a classifier with an explicit packet-pool capacity (buffer count).
+    ///
+    /// Each pooled buffer is `MAX_PACKET_SIZE` (64 KiB), so resident pool memory
+    /// is `pool_capacity * 64 KiB`. The default
+    /// ([`DEFAULT_POOL_CAPACITY`](Self::DEFAULT_POOL_CAPACITY), 4096 ⇒ ~256 MiB)
+    /// suits the VM datapath but is far too large for a memory-constrained host
+    /// such as an iOS Network Extension (capped near 50 MiB) — pass a small count
+    /// there (e.g. 256 ⇒ ~16 MiB).
+    ///
+    /// The pool only bounds burst headroom: once it is exhausted the classifier
+    /// falls back to heap allocation, so a small pool trades throughput under
+    /// bursts for a bounded footprint, never correctness. `pool_capacity` is
+    /// clamped to a minimum of 1 by the pool.
+    pub fn with_pool_capacity(gateway_ip: Ipv4Addr, mtu: usize, pool_capacity: usize) -> Self {
+        // `PacketPool::new` is infallible in practice (it clamps capacity to ≥1);
+        // `expect` documents the `Result` contract.
+        let pool = Arc::new(PacketPool::new(pool_capacity).expect("packet pool allocation"));
         Self {
             gateway_ip,
             gateway_mac: [0; 6],
@@ -532,6 +560,30 @@ mod tests {
 
         assert_eq!(device.rx_queue.len(), 1);
         assert!(device.intercepted.is_empty());
+    }
+
+    #[test]
+    fn small_pool_capacity_classifies_and_falls_back_to_heap() {
+        // A memory-constrained classifier (e.g. an iOS Network Extension) built
+        // with a tiny pool must still classify, and must not drop frames once the
+        // pool is exhausted — the pool only bounds burst headroom, not
+        // correctness.
+        let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
+        let cap = 4;
+        let mut device = FrameClassifier::with_pool_capacity(gateway_ip, DEFAULT_ETHERNET_MTU, cap);
+        let mut guest_mac = None;
+
+        // Queue more frames than the pool holds (none are drained, so each holds
+        // a buffer); every frame must still land in the rx queue.
+        let n = cap + 2;
+        for _ in 0..n {
+            device.classify_frame(&make_tcp_frame(), &mut guest_mac);
+        }
+        assert_eq!(
+            device.rx_queue.len(),
+            n,
+            "small pool must not drop frames past capacity (heap fallback)",
+        );
     }
 
     #[test]
