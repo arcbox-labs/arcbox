@@ -23,7 +23,7 @@
 //! The utun device on macOS uses a 4-byte address family header prepended
 //! to each IP packet, in **network (big-endian) byte order** (the kernel reads
 //! it with `ntohl()`). The encode lives in
-//! [`arcbox_tcpstack::utun::utun_af_header`], shared with the host endpoint.
+//! [`splicetcp::utun::utun_af_header`], shared with the host endpoint.
 //!
 //! # Requirements
 //!
@@ -36,7 +36,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 // The utun 4-byte AF-header framing (size + network-byte-order encode) is shared
 // with the host endpoint so the load-bearing byte order lives in one place.
-use arcbox_tcpstack::utun::{AF_HEADER_SIZE, utun_af_header};
+use splicetcp::utun::{AF_HEADER_SIZE, utun_af_header};
 
 /// Maximum reasonable MTU including the AF header.
 #[allow(dead_code)]

@@ -32,7 +32,7 @@ serde = { workspace = true, features = ["derive"] }
 crossbeam-channel = "0.5"
 arcbox-fakeip.workspace = true
 arcbox-proxy.workspace = true
-arcbox-tcpstack.workspace = true
+splicetcp.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 arcbox-vmnet = { workspace = true }

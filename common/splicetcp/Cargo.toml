@@ -1,5 +1,5 @@
 [package]
-name = "arcbox-tcpstack"
+name = "splicetcp"
 description = "Userspace TCP termination shim, Ethernet frame classifier with a pluggable frame source, and L3<->L2 tunnel shim for the ArcBox datapath"
 version.workspace = true
 edition.workspace = true

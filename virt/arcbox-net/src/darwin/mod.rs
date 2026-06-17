@@ -30,10 +30,10 @@ pub use arcbox_fakeip::{dns_log, proxy_detect};
 // `arcbox-proxy`; re-exported here so the `crate::darwin::{proxy_tunnel,
 // socket_proxy, inbound_relay}` paths are unchanged for callers.
 pub use arcbox_proxy::{inbound_relay, proxy_tunnel, socket_proxy};
-// `classifier` and `tcp_bridge` are extracted to `arcbox-tcpstack`; re-exported
+// `classifier` and `tcp_bridge` are extracted to `splicetcp`; re-exported
 // here so the `crate::darwin::{classifier, tcp_bridge}` paths are unchanged for
 // the datapath loop and the VMM layer.
-pub use arcbox_tcpstack::{classifier, tcp_bridge};
+pub use splicetcp::{classifier, tcp_bridge};
 
 #[cfg(feature = "vmnet")]
 pub use arcbox_vmnet::VmnetRelay;

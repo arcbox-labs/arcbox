@@ -2,7 +2,7 @@
 
 `tun_proxy` proves that the data plane extracted into `arcbox-packet` /
 `arcbox-datapath` / `arcbox-conntrack` / `arcbox-fakeip` / `arcbox-proxy` /
-`arcbox-tcpstack` can power a **Surge-class host proxy**, not just the VM
+`splicetcp` can power a **Surge-class host proxy**, not just the VM
 datapath. It opens a macOS `utun`, runs host egress traffic through the *same*
 `FrameClassifier` + `TcpBridge` + `SocketProxy` the VM uses, and forwards TCP to
 an upstream SOCKS5 proxy by hostname (recovered from a Fake-IP via the DNS log).

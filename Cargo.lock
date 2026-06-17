@@ -551,7 +551,6 @@ dependencies = [
  "arcbox-packet",
  "arcbox-proxy",
  "arcbox-route",
- "arcbox-tcpstack",
  "arcbox-vmnet",
  "bytes",
  "chrono",
@@ -564,6 +563,7 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2 0.5.10",
+ "splicetcp",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -640,20 +640,6 @@ name = "arcbox-route"
 version = "0.4.7"
 dependencies = [
  "libc",
- "tracing",
-]
-
-[[package]]
-name = "arcbox-tcpstack"
-version = "0.4.6"
-dependencies = [
- "arcbox-datapath",
- "arcbox-fakeip",
- "arcbox-packet",
- "arcbox-proxy",
- "crossbeam-channel",
- "libc",
- "tokio",
  "tracing",
 ]
 
@@ -4176,6 +4162,20 @@ checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "splicetcp"
+version = "0.4.6"
+dependencies = [
+ "arcbox-datapath",
+ "arcbox-fakeip",
+ "arcbox-packet",
+ "arcbox-proxy",
+ "crossbeam-channel",
+ "libc",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
