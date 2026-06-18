@@ -62,8 +62,6 @@ jobs:
         # @stable resolves to the latest stable at run time; coordinated
         # multi-package publishing needs cargo >= 1.90.
         uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
 
       - name: Install Protobuf compiler
         # arcbox-protocol / arcbox-grpc run protoc in their build scripts.
