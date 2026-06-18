@@ -84,6 +84,10 @@ pub const DOCKER_CLI_PLUGINS: &[&str] = &["docker-buildx", "docker-compose"];
 ///
 /// Used by multiple subsystems (privileged helper, brew hooks, setup install)
 /// to decide whether an existing `/usr/local/bin/` symlink can be safely replaced.
+///
+/// Gated on the `std` feature: it takes a `std::path::Path`, so it is
+/// unavailable (and unusable) in `no_std` builds.
+#[cfg(feature = "std")]
 pub fn is_arcbox_owned(target: &std::path::Path) -> bool {
     target
         .to_string_lossy()

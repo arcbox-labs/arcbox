@@ -38,6 +38,60 @@ jobs:
           echo "Building version: $VERSION"
 
   # ==========================================================================
+  # Publish the library crates to crates.io
+  # ==========================================================================
+  # Publishes the reusable library crates (datapath, VM, and common libs).
+  # `publish = false` members are skipped automatically: the application
+  # binaries + app/runtime internals (arcbox, -cli, -daemon, -helper, -agent,
+  # -api, -core, -docker, -docker-tools, -container, -oci) and the internal
+  # gRPC crates (-grpc/-protocol/-transport, whose protos aren't self-contained
+  # for standalone packaging). `arcbox-hv` is excluded here: it has its own
+  # release cadence (manually pinned version, published separately), so a
+  # workspace run would try to re-upload an unchanged version and fail.
+  # `cargo publish --workspace` packages all publishable members, verifies each
+  # against the others via a local temp registry (so unpublished inter-deps
+  # resolve), and uploads in dependency order. Independent of the binary builds
+  # — the libraries are their own deliverable and must not be gated on Apple
+  # signing. Skipped on workflow_dispatch (manual binary rebuilds must not
+  # republish).
+  publish-crates:
+    name: Publish crates to crates.io
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        # @stable resolves to the latest stable at run time; coordinated
+        # multi-package publishing needs cargo >= 1.90.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-publish-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-publish-
+            ${{ runner.os }}-cargo-
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # One coordinated publish: cargo packages all publishable members,
+        # verifies each against the others via a local temp registry, then
+        # uploads in dependency order, waiting for the index between uploads.
+        # arcbox-hv is excluded (independent release cadence).
+        run: cargo publish --workspace --locked --exclude arcbox-hv
+
+  # ==========================================================================
   # Build + sign macOS ARM64 host binaries
   # ==========================================================================
   build-macos-arm64:

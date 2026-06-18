@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+description = "Shared logic for migrating Docker objects (images, containers, networks) from Docker Desktop or OrbStack into ArcBox."
 
 [dependencies]
 dirs.workspace = true

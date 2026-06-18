@@ -1,6 +1,5 @@
 [package]
 name = "arcbox-logging"
-publish = false
 description = "Shared logging infrastructure: tracing init, size-based rotation, JSON + human-readable output"
 version.workspace = true
 edition.workspace = true
