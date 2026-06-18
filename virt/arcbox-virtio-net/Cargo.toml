@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-virtio-net"
+publish = false
 description = "VirtIO network device implementation for ArcBox"
 version.workspace = true
 edition.workspace = true

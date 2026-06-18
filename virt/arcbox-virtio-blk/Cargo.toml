@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-virtio-blk"
+publish = false
 description = "VirtIO block device implementation for ArcBox"
 version.workspace = true
 edition.workspace = true

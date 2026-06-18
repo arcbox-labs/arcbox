@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-dhcp"
+publish = false
 description = "Lightweight DHCP server and IP allocator for ArcBox"
 version.workspace = true
 edition.workspace = true

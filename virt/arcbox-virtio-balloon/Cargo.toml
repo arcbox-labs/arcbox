@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-virtio-balloon"
+publish = false
 description = "VirtIO traditional memory balloon device for ArcBox"
 version.workspace = true
 edition.workspace = true

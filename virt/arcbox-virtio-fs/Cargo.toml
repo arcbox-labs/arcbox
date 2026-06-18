@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-virtio-fs"
+publish = false
 description = "VirtIO filesystem device (virtio-fs) implementation for ArcBox"
 version.workspace = true
 edition.workspace = true

@@ -40,24 +40,23 @@ jobs:
   # ==========================================================================
   # Publish the library crates to crates.io
   # ==========================================================================
-  # Publishes the reusable library crates (datapath, VM, and common libs).
-  # `publish = false` members are skipped automatically: the application
-  # binaries + app/runtime internals (arcbox, -cli, -daemon, -helper, -agent,
-  # -api, -core, -docker, -docker-tools, -container, -oci) and the internal
-  # gRPC crates (-grpc/-protocol/-transport, whose protos aren't self-contained
-  # for standalone packaging). `arcbox-hv` is excluded here: it has its own
-  # release cadence (manually pinned version, published separately), so a
-  # workspace run would try to re-upload an unchanged version and fail.
-  # `cargo publish --workspace` packages all publishable members, verifies each
-  # against the others via a local temp registry (so unpublished inter-deps
-  # resolve), and uploads in dependency order. Independent of the binary builds
-  # — the libraries are their own deliverable and must not be gated on Apple
-  # signing. Skipped on workflow_dispatch (manual binary rebuilds must not
-  # republish).
+  # Publishes the cross-platform reusable library crates (the datapath/common
+  # libs) to crates.io. Everything else is `publish = false` and skipped:
+  #   - the macOS host/VM crate family (all virt/* — arcbox-hv/-vz/-vmm/
+  #     -hypervisor/-vmnet/-virtio*/-vm/-fs/-net*/-dhcp) and arcbox-xnu-net,
+  #     which link Apple frameworks / XNU and don't build off-macOS;
+  #   - the application binaries + app/runtime internals and the internal gRPC
+  #     crates (-grpc/-protocol/-transport).
+  # Runs on macOS (like the CI build job) — these are Apple-platform crates, so
+  # the publish verify build must run where they compile. `cargo publish
+  # --workspace` packages all publishable members, verifies each against the
+  # others via a local temp registry, and uploads in dependency order.
+  # Independent of the binary builds. Skipped on workflow_dispatch (manual
+  # binary rebuilds must not republish).
   publish-crates:
     name: Publish crates to crates.io
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: macos-26
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -88,8 +87,7 @@ jobs:
         # One coordinated publish: cargo packages all publishable members,
         # verifies each against the others via a local temp registry, then
         # uploads in dependency order, waiting for the index between uploads.
-        # arcbox-hv is excluded (independent release cadence).
-        run: cargo publish --workspace --locked --exclude arcbox-hv
+        run: cargo publish --workspace --locked
 
   # ==========================================================================
   # Build + sign macOS ARM64 host binaries

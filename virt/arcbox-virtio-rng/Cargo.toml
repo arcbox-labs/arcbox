@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-virtio-rng"
+publish = false
 description = "VirtIO entropy device implementation for ArcBox"
 version.workspace = true
 edition.workspace = true

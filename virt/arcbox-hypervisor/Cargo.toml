@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-hypervisor"
+publish = false
 description = "Cross-platform hypervisor abstraction layer for ArcBox"
 version.workspace = true
 edition.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-virtio-core"
+publish = false
 description = "Foundational types and traits for ArcBox VirtIO devices"
 version.workspace = true
 edition.workspace = true
