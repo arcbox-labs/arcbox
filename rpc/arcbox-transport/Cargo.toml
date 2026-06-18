@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-transport"
+publish = false
 description = "Transport layer abstractions for ArcBox (Unix socket, vsock)"
 version.workspace = true
 edition.workspace = true

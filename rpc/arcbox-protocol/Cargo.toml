@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-protocol"
+publish = false
 description = "Protocol definitions for ArcBox (ttrpc/protobuf)"
 version.workspace = true
 edition.workspace = true

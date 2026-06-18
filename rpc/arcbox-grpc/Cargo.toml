@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-grpc"
+publish = false
 description = "gRPC service clients and servers for ArcBox (tonic + prost)"
 version.workspace = true
 edition.workspace = true
