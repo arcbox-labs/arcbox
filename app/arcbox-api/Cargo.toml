@@ -1,6 +1,5 @@
 [package]
 name = "arcbox-api"
-publish = false
 description = "API server for ArcBox (gRPC + REST)"
 version.workspace = true
 edition.workspace = true

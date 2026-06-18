@@ -1,6 +1,5 @@
 [package]
 name = "arcbox-cli"
-publish = false
 description = "Command-line interface for ArcBox"
 version.workspace = true
 edition.workspace = true

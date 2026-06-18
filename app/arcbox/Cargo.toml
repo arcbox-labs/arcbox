@@ -9,7 +9,6 @@ repository.workspace = true
 authors.workspace = true
 keywords = ["container", "vm", "virtualization", "docker", "runtime"]
 categories = ["virtualization", "development-tools"]
-publish = false
 
 [dependencies]
 arcbox-hypervisor = { workspace = true }

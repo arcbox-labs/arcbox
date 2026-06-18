@@ -1,6 +1,5 @@
 [package]
 name = "arcbox-container"
-publish = false
 description = "Container runtime for ArcBox"
 version.workspace = true
 edition.workspace = true

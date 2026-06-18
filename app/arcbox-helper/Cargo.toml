@@ -1,6 +1,5 @@
 [package]
 name = "arcbox-helper"
-publish = false
 description = "Privileged helper daemon for host mutations (routes, DNS, sockets)"
 version.workspace = true
 edition.workspace = true

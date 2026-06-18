@@ -1,6 +1,5 @@
 [package]
 name = "arcbox-docker"
-publish = false
 description = "Docker REST API compatibility layer for ArcBox"
 version.workspace = true
 edition.workspace = true

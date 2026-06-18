@@ -1,6 +1,5 @@
 [package]
 name = "arcbox-core"
-publish = false
 description = "Core orchestration layer for ArcBox"
 version.workspace = true
 edition.workspace = true

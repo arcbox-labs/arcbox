@@ -38,22 +38,23 @@ jobs:
           echo "Building version: $VERSION"
 
   # ==========================================================================
-  # Publish the library crates to crates.io
+  # Publish every workspace crate to crates.io
   # ==========================================================================
-  # Publishes the reusable library crates (datapath, VM, and common libs).
-  # `publish = false` members are skipped automatically: the application
-  # binaries + app/runtime internals (arcbox, -cli, -daemon, -helper, -agent,
-  # -api, -core, -docker, -docker-tools, -container, -oci) and the internal
-  # gRPC crates (-grpc/-protocol/-transport, whose protos aren't self-contained
-  # for standalone packaging). `arcbox-hv` is excluded here: it has its own
-  # release cadence (manually pinned version, published separately), so a
-  # workspace run would try to re-upload an unchanged version and fail.
-  # `cargo publish --workspace` packages all publishable members, verifies each
-  # against the others via a local temp registry (so unpublished inter-deps
-  # resolve), and uploads in dependency order. Independent of the binary builds
-  # — the libraries are their own deliverable and must not be gated on Apple
-  # signing. Skipped on workflow_dispatch (manual binary rebuilds must not
-  # republish).
+  # Publishes ALL workspace members — the reusable libraries, the Apple-platform
+  # VM family, the app binaries, and the rpc crates. Run with `--no-verify`:
+  # four crates embed files that live outside their own package directory, so
+  # the isolated per-crate verify build can't see them —
+  #   - arcbox-core / -cli / -daemon `include_str!` the repo-root `assets.lock`
+  #     (and -cli also the helper `.plist` under bundle/);
+  #   - arcbox-grpc's build.rs reads `../arcbox-protocol/proto`.
+  # `--no-verify` skips that build and packages + uploads the source as-is — the
+  # same way arcbox-grpc was already published. The whole workspace is compiled
+  # green by the CI build job, so the per-crate verify build is redundant safety
+  # here, not new coverage. cargo still resolves the dependency graph and uploads
+  # in dependency order via a local temp registry, so unpublished inter-deps
+  # (including arcbox-hv at its own 0.3.20) resolve — nothing is excluded.
+  # Platform-agnostic (no compilation happens), so it runs on ubuntu. Skipped on
+  # workflow_dispatch (manual binary rebuilds must not republish).
   publish-crates:
     name: Publish crates to crates.io
     if: github.event_name == 'push'
@@ -85,11 +86,11 @@ jobs:
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        # One coordinated publish: cargo packages all publishable members,
-        # verifies each against the others via a local temp registry, then
-        # uploads in dependency order, waiting for the index between uploads.
-        # arcbox-hv is excluded (independent release cadence).
-        run: cargo publish --workspace --locked --exclude arcbox-hv
+        # One coordinated publish of the whole workspace: cargo packages every
+        # member, resolves inter-deps via a local temp registry, then uploads in
+        # dependency order, waiting for the index between uploads. --no-verify:
+        # see the note above (crates that embed out-of-tree workspace files).
+        run: cargo publish --workspace --no-verify --locked
 
   # ==========================================================================
   # Build + sign macOS ARM64 host binaries
