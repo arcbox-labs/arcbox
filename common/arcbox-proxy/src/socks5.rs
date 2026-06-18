@@ -60,10 +60,17 @@ pub fn encode_addr(out: &mut Vec<u8>, host: &str, port: u16) {
         }
         Err(_) => {
             out.push(ATYP_DOMAIN);
-            // DNS names are ≤253 bytes, so the 1-byte length field always fits; a
-            // longer `host` is malformed and cannot occur for a real destination,
-            // so the cap is a defensive no-op rather than a silent corruption.
+            // DNS names are ≤253 bytes, so the 1-byte length field always fits.
+            // A longer `host` is malformed and cannot occur for a real
+            // destination, so assert it loudly in dev/test rather than silently
+            // truncating (which would misroute to a different name); clamp
+            // defensively in release.
             let bytes = host.as_bytes();
+            debug_assert!(
+                bytes.len() <= 255,
+                "SOCKS5 domain exceeds 255 bytes ({} bytes): {host}",
+                bytes.len()
+            );
             let len = bytes.len().min(255);
             out.push(len as u8);
             out.extend_from_slice(&bytes[..len]);
@@ -147,6 +154,17 @@ pub(crate) fn rep_error(code: u8) -> io::Error {
         _ => "unknown error",
     };
     io::Error::other(format!("SOCKS5: request failed: {reason} (code {code})"))
+}
+
+/// The wildcard bind address (`0.0.0.0:0` or `[::]:0`) in the same address
+/// family as `addr`. A local UDP socket must match the relay's family — an
+/// IPv4 socket cannot `connect` to an IPv6 relay (and vice versa).
+fn unspecified_in_family(addr: SocketAddr) -> SocketAddr {
+    if addr.is_ipv6() {
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    }
 }
 
 /// Establishes a TCP tunnel via a SOCKS5 proxy (RFC 1928 CONNECT, no-auth subset).
@@ -268,7 +286,9 @@ impl Socks5UdpAssociation {
                 })?,
         };
 
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        // Bind the local socket in the relay's address family — an IPv4 `0.0.0.0`
+        // socket cannot `connect` to an IPv6 relay (e.g. a proxy on `::1`).
+        let socket = UdpSocket::bind(unspecified_in_family(relay)).await?;
         socket.connect(relay).await?;
 
         // The control stream carries nothing after the handshake; a read that
@@ -298,7 +318,13 @@ impl Socks5UdpAssociation {
         let mut dgram = vec![0x00, 0x00, 0x00]; // RSV(2) | FRAG(0)
         encode_addr(&mut dgram, host, port);
         dgram.extend_from_slice(payload);
-        self.socket.send(&dgram).await?;
+        let sent = self.socket.send(&dgram).await?;
+        debug_assert_eq!(
+            sent,
+            dgram.len(),
+            "UDP short-send: {sent} of {} bytes",
+            dgram.len()
+        );
         Ok(payload.len())
     }
 
@@ -351,6 +377,21 @@ mod tests {
             let (h, p, used) = decode_addr(&buf).expect("decodes");
             assert_eq!((h.as_str(), p, used), (host, port, buf.len()));
         }
+    }
+
+    #[test]
+    fn bind_family_matches_relay() {
+        // The local UDP socket must share the relay's family, else `connect` fails.
+        let v6: SocketAddr = "[::1]:9".parse().unwrap();
+        let v4: SocketAddr = "1.2.3.4:9".parse().unwrap();
+        assert!(
+            unspecified_in_family(v6).is_ipv6(),
+            "IPv6 relay → IPv6 bind"
+        );
+        assert!(
+            unspecified_in_family(v4).is_ipv4(),
+            "IPv4 relay → IPv4 bind"
+        );
     }
 
     /// Minimal no-auth SOCKS5 server: validates the client's greeting and
