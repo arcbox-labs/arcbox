@@ -1,6 +1,5 @@
 [package]
 name = "arcbox-xnu-net"
-publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
