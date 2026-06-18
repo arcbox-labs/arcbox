@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.8](https://github.com/arcboxlabs/arcbox/compare/v0.4.7...v0.4.8) (2026-06-18)
+
+
+### Features
+
+* **net:** host-tunnel endpoint — UtunFrameSource/Sink + SOCKS5-aware tcp_bridge + tun_proxy harness ([814bba9](https://github.com/arcboxlabs/arcbox/commit/814bba97545a8634a1ce3df0f5da94bf13e94743))
+* **proxy:** SOCKS5 UDP ASSOCIATE client + route guest UDP through it ([e844538](https://github.com/arcboxlabs/arcbox/commit/e8445389681c71bad0333d0b53d5365347ad821d))
+* **splicetcp:** parameterize FrameClassifier packet-pool capacity ([#316](https://github.com/arcboxlabs/arcbox/issues/316)) ([ec34f16](https://github.com/arcboxlabs/arcbox/commit/ec34f16da21eea129bb36653062683cdc9d2bca5))
+* **tcpstack:** standalone l3_to_l2 for callback-driven (no-fd) ingest ([#313](https://github.com/arcboxlabs/arcbox/issues/313)) ([283716f](https://github.com/arcboxlabs/arcbox/commit/283716f5e0e3617166b92b39c14c1957f875494d))
+
+
+### Bug Fixes
+
+* **bundle:** drop vm.networking from dev entitlements ([8913c02](https://github.com/arcboxlabs/arcbox/commit/8913c02aff4ac6242dfa277144cb01b3a7ef1103))
+* **devenv:** pin apple-sdk_26 so arcbox-daemon links locally ([#305](https://github.com/arcboxlabs/arcbox/issues/305)) ([f43baec](https://github.com/arcboxlabs/arcbox/commit/f43baecbf1406502ad41b52e729328d5d5658d51))
+* **net:** correct DarwinTun utun AF-header byte order ([a0ec942](https://github.com/arcboxlabs/arcbox/commit/a0ec942f721fc7f22dc4ded08fde62fa7bbaa733))
+* **proxy:** harden SOCKS5 UDP client per review ([dedb863](https://github.com/arcboxlabs/arcbox/commit/dedb8630cbded6e64dcc1bcaf38d4e19fc0f86b2))
+* **splicetcp:** apply rustfmt + correct utun AF-header byte-order module doc ([1358fcc](https://github.com/arcboxlabs/arcbox/commit/1358fcc05b08521e235160af3e1d2cccd02ade3a))
+* **tcpstack:** proxy IP-literal / domain-less dsts when a system proxy is set ([236fb30](https://github.com/arcboxlabs/arcbox/commit/236fb305da18a2954671841de712970f889b2d0e))
+* **tcpstack:** utun AF-header byte order; make tun_proxy functional (Gate C verified) ([88b230a](https://github.com/arcboxlabs/arcbox/commit/88b230a21d474bb46d0cfc4cce7591db8dee44af))
+
+
+### Code Refactoring
+
+* **net:** extract datapath pool/ring/frame-buf/stats into arcbox-datapath crate ([1f92e3f](https://github.com/arcboxlabs/arcbox/commit/1f92e3f77553d6115abf5dedc98d50f703c04d0e))
+* **net:** extract dns_log/proxy_detect into arcbox-fakeip crate ([49c26d3](https://github.com/arcboxlabs/arcbox/commit/49c26d3b6da3af574fce7478679147615ded974e))
+* **net:** extract NAT engine into arcbox-conntrack crate (Gate A) ([c9a5465](https://github.com/arcboxlabs/arcbox/commit/c9a5465582f9252c00c18c4d12432dedf5f5678b))
+* **net:** extract packet/ethernet/checksum into arcbox-packet crate ([7e70b33](https://github.com/arcboxlabs/arcbox/commit/7e70b3301199e2b6ecfa67dfc0fd2b0089370dc9))
+* **net:** extract proxy_tunnel/socket_proxy/inbound_relay into arcbox-proxy crate ([5caa5b5](https://github.com/arcboxlabs/arcbox/commit/5caa5b52c0417889dcf9c2e67cd5ed7309625f20))
+* **net:** extract tcp_bridge/classifier/direct_rx into arcbox-tcpstack + FrameSource ingest seam ([b68ffa3](https://github.com/arcboxlabs/arcbox/commit/b68ffa388c0be4766a2b112f8b636908b7079159))
+* **net:** rename arcbox-tcpstack crate to splicetcp ([57f0f6d](https://github.com/arcboxlabs/arcbox/commit/57f0f6d5a83249963a0d332b9050c412c176e7c1))
+* **net:** sever arcbox-virtio dependency via arcbox-net-virtio crate (Gate B) ([8358bed](https://github.com/arcboxlabs/arcbox/commit/8358bedc949955c735a83789abb64f67c9677147))
+* **net:** share utun AF-header framing across endpoints ([e835cdd](https://github.com/arcboxlabs/arcbox/commit/e835cddff434fe9fb646ded2417891d326870ccf))
+* **proxy:** split proxy_tunnel + socket_proxy into focused modules ([e2505f4](https://github.com/arcboxlabs/arcbox/commit/e2505f44fd6965b66eec8b54faefd1f7a4899985))
+* **tcpstack:** address [#314](https://github.com/arcboxlabs/arcbox/issues/314) review (set_dns_log + Tcp-only EgressConn) ([8836cfc](https://github.com/arcboxlabs/arcbox/commit/8836cfc48682dff7103742fc1f98d136332ed246))
+* **tcpstack:** build synthetic Ethernet via arcbox-packet helpers ([b36e429](https://github.com/arcboxlabs/arcbox/commit/b36e429d504beab7fc291513c07f6f8511246cb7))
+* **tcpstack:** extract EgressResolver seam from tcp_bridge (behavior-preserving) ([e66723e](https://github.com/arcboxlabs/arcbox/commit/e66723e09937fdd1d99cd13a59f146fc6a6bde5f))
+
+
+### Tests
+
+* **proxy:** mock SOCKS5 / HTTP-CONNECT round-trips for proxy_tunnel ([0b6739f](https://github.com/arcboxlabs/arcbox/commit/0b6739fa132c2f6df16178d7289d25c1db332bc4))
+* small_pool_capacity_classifies_and_falls_back_to_heap. ([ec34f16](https://github.com/arcboxlabs/arcbox/commit/ec34f16da21eea129bb36653062683cdc9d2bca5))
+
+
+### Continuous Integration
+
+* **release:** publish the library crates to crates.io ([#321](https://github.com/arcboxlabs/arcbox/issues/321)) ([14d73d7](https://github.com/arcboxlabs/arcbox/commit/14d73d78671e85d86aba03f5d5f2488e1c26db44))
+
 ## [0.4.7](https://github.com/arcboxlabs/arcbox/compare/v0.4.6...v0.4.7) (2026-06-15)
 
 
