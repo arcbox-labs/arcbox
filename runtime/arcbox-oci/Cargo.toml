@@ -1,6 +1,5 @@
 [package]
 name = "arcbox-oci"
-publish = false
 description = "OCI runtime specification support for ArcBox"
 version.workspace = true
 edition.workspace = true

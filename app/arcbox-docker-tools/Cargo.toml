@@ -1,6 +1,5 @@
 [package]
 name = "arcbox-docker-tools"
-publish = false
 description = "Docker CLI tool download, installation, and management"
 version.workspace = true
 edition.workspace = true
