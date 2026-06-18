@@ -41,9 +41,15 @@ impl AgentConfig {
         let runner_dir = std::env::var_os(ENV_RUNNER_DIR).map(PathBuf::from);
 
         let max_concurrent = match std::env::var(ENV_MAX_CONCURRENT) {
-            Ok(v) => v
-                .parse()
-                .with_context(|| format!("{ENV_MAX_CONCURRENT} must be a positive integer"))?,
+            Ok(v) => {
+                let n: usize = v
+                    .parse()
+                    .with_context(|| format!("{ENV_MAX_CONCURRENT} must be a positive integer"))?;
+                if n == 0 {
+                    anyhow::bail!("{ENV_MAX_CONCURRENT} must be a positive integer, got 0");
+                }
+                n
+            }
             Err(_) => DEFAULT_MAX_CONCURRENT,
         };
 

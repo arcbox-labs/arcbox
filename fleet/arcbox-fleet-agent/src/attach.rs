@@ -30,13 +30,10 @@ pub async fn run(config: AgentConfig, credential: Credential) -> Result<()> {
     let mut backoff = INITIAL_BACKOFF;
 
     loop {
-        match attach_once(&config, &credential, runner_dir.clone()).await {
-            Ok(()) => {
-                info!("attach stream closed by gateway; reconnecting");
-                backoff = INITIAL_BACKOFF;
-            }
+        match attach_once(&config, &credential, runner_dir.clone(), &mut backoff).await {
+            Ok(()) => info!("attach stream closed by gateway; reconnecting"),
             Err(e) => {
-                warn!(error = %e, backoff_secs = backoff.as_secs(), "attach failed; retrying")
+                warn!(error = %e, backoff_secs = backoff.as_secs(), "attach failed; retrying");
             }
         }
         tokio::time::sleep(backoff).await;
@@ -44,11 +41,15 @@ pub async fn run(config: AgentConfig, credential: Credential) -> Result<()> {
     }
 }
 
-/// One connect + stream lifetime. Returns `Ok(())` on a clean close.
+/// One connect + stream lifetime. Returns `Ok(())` on a clean close. Resets
+/// `backoff` once the stream is established, so a connection that succeeds and
+/// later drops reconnects promptly instead of inheriting the escalated delay
+/// from earlier connect failures.
 async fn attach_once(
     config: &AgentConfig,
     credential: &Credential,
     runner_dir: PathBuf,
+    backoff: &mut Duration,
 ) -> Result<()> {
     let channel = config
         .endpoint()?
@@ -73,6 +74,7 @@ async fn attach_once(
         .await
         .context("Attach RPC failed")?
         .into_inner();
+    *backoff = INITIAL_BACKOFF;
     info!("attached to gateway");
 
     let outcome = loop {

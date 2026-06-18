@@ -49,9 +49,15 @@ impl CredentialStore {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let json = serde_json::to_vec_pretty(cred).context("serializing credential")?;
-        std::fs::write(&self.path, &json)
-            .with_context(|| format!("writing {}", self.path.display()))?;
-        restrict_permissions(&self.path)?;
+        // Write-then-rename so a crash mid-write can't leave a truncated
+        // credentials.json that fails to parse and strands the host unenrolled.
+        // Permissions are restricted on the temp file before the rename, so the
+        // final path is never briefly world-readable.
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json).with_context(|| format!("writing {}", tmp.display()))?;
+        restrict_permissions(&tmp)?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), self.path.display()))?;
         Ok(())
     }
 }
