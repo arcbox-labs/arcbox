@@ -707,11 +707,9 @@ mod tests {
 
     #[test]
     fn remove_closes_fd() {
-        use std::io::Read;
-        use std::os::fd::IntoRawFd;
-
         let mut mgr = VsockConnectionManager::new();
-        let (peer, internal) = make_socketpair();
+        let (_, internal) = make_socketpair();
+        let fd_raw = internal.as_raw_fd();
         let (id, _rx) = mgr.allocate(1024, 3, internal);
 
         mgr.mark_connected(id.guest_port, id.host_port);
@@ -721,23 +719,9 @@ mod tests {
         assert!(mgr.fd_for(1024, id.host_port).is_none());
         assert_eq!(mgr.len(), 0);
 
-        // Dropping the connection must close the internal socketpair end, which
-        // the peer observes as EOF. Asserting EOF on the peer end is robust
-        // against FD-reuse races that a raw fcntl(F_GETFD) check would lose to
-        // under parallel test threads.
-        let mut peer_stream =
-            unsafe { std::os::unix::net::UnixStream::from_raw_fd(peer.into_raw_fd()) };
-        peer_stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-            .unwrap();
-        let mut buf = [0u8; 8];
-        let n = peer_stream
-            .read(&mut buf)
-            .expect("read on peer fd should not error");
-        assert_eq!(
-            n, 0,
-            "peer fd must read EOF after the connection is removed"
-        );
+        // Verify fd is actually closed (write should fail with EBADF).
+        let ret = unsafe { libc::fcntl(fd_raw, libc::F_GETFD) };
+        assert_eq!(ret, -1);
     }
 
     #[test]
