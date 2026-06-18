@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-fs"
+publish = false
 description = "High-performance filesystem service for ArcBox (VirtioFS)"
 version.workspace = true
 edition.workspace = true

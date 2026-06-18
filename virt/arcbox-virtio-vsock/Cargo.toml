@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-virtio-vsock"
+publish = false
 description = "VirtIO vsock device + connection manager for ArcBox"
 version.workspace = true
 edition.workspace = true

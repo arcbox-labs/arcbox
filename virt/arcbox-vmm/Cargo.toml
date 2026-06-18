@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-vmm"
+publish = false
 description = "Virtual Machine Monitor for ArcBox"
 version.workspace = true
 edition.workspace = true

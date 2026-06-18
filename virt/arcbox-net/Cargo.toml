@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-net"
+publish = false
 description = "High-performance network stack for ArcBox"
 version.workspace = true
 edition.workspace = true

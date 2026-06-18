@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-net-virtio"
+publish = false
 description = "VirtIO-net backends (NAT bridge, TSO fast path) connecting the ArcBox datapath to arcbox-virtio"
 version.workspace = true
 edition.workspace = true

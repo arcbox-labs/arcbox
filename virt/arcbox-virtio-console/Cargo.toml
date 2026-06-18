@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-virtio-console"
+publish = false
 description = "VirtIO console device implementation for ArcBox"
 version.workspace = true
 edition.workspace = true

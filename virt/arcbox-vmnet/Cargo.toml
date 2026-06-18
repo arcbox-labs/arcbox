@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-vmnet"
+publish = false
 description = "Safe Rust bindings for Apple's vmnet.framework"
 version.workspace = true
 edition.workspace = true

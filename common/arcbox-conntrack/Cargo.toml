@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-conntrack"
+publish = false
 description = "Stateful NAT connection tracking and zero-copy packet translation for ArcBox"
 version.workspace = true
 edition.workspace = true

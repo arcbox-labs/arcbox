@@ -1,5 +1,6 @@
 [package]
 name = "arcbox-net-inject"
+publish = false
 description = "Guest memory RX injection engine for ArcBox VirtIO-net"
 version.workspace = true
 edition.workspace = true
