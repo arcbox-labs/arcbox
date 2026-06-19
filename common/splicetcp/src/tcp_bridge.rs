@@ -173,6 +173,10 @@ pub struct TcpBridge {
     /// Connection sink for sending promoted fast-path connections to the
     /// RX inject thread for inline (zero-copy) host→guest data transfer.
     conn_sink: Option<std::sync::Arc<dyn crate::direct_rx::ConnSink>>,
+    /// Per-flow byte accounting sink: fired once per fast-path flow at teardown
+    /// with its up/down totals. Injectable (like `egress`) so a consumer can
+    /// account traffic the bridge spliced. `None` ⇒ no accounting.
+    observer: Option<std::sync::Arc<dyn crate::egress::FlowObserver>>,
     /// TCP handshakes being synthesized. Each entry is promoted to
     /// `fast_path_conns` once the 3-way completes.
     handshake_conns: HashMap<SynFlowKey, HandshakeConn>,
@@ -210,6 +214,13 @@ struct FastPathConn {
     /// poll_fast_path() skips connections with this flag — the inject
     /// thread reads directly from the cloned socket.
     inline_owned: bool,
+    /// Guest→host (client→server) bytes forwarded on this flow.
+    up_bytes: u64,
+    /// Host→guest (server→client) bytes counted on the non-inline poll path.
+    /// Inline flows count downstream in `down_shared` (poll_fast_path skips them).
+    down_bytes: u64,
+    /// Host→guest bytes counted by the inline inject thread, when `inline_owned`.
+    down_shared: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl FastPathConn {
@@ -238,6 +249,7 @@ impl TcpBridge {
             fast_path_guest_mac: None,
             large_frames_enabled: false,
             conn_sink: None,
+            observer: None,
             handshake_conns: HashMap::new(),
         }
     }
@@ -318,7 +330,7 @@ impl TcpBridge {
         if flags & 0x04 != 0 {
             // RST: close host stream immediately, no response needed.
             tracing::debug!("Fast path: RST from guest {src_ip}:{src_port}→{dst_ip}:{dst_port}");
-            self.fast_path_conns.remove(&key);
+            self.close_fast_path(&key);
             return Some(Vec::new()); // Intercepted, no reply frame.
         }
         // Extract payload using IPv4 total_length to exclude Ethernet padding.
@@ -347,6 +359,7 @@ impl TcpBridge {
                 let payload = &frame[payload_start..payload_start + payload_len];
                 match conn.stream.write(payload) {
                     Ok(_n) => {
+                        conn.up_bytes += payload_len as u64;
                         conn.set_last_ack(seq_end);
                         tracing::trace!(
                             "Fast path TX: {src_ip}:{src_port}→{dst_ip}:{dst_port} wrote {payload_len} bytes"
@@ -368,7 +381,7 @@ impl TcpBridge {
                     }
                     Err(e) => {
                         tracing::warn!("Fast path TX write error: {e}");
-                        self.fast_path_conns.remove(&key);
+                        self.close_fast_path(&key);
                         return None;
                     }
                 }
@@ -399,7 +412,7 @@ impl TcpBridge {
                 src_mac: self.fast_path_gateway_mac,
                 dst_mac: guest_mac,
             });
-            self.fast_path_conns.remove(&key);
+            self.close_fast_path(&key);
             return Some(fin_ack);
         }
 
@@ -468,6 +481,7 @@ impl TcpBridge {
                     // see the FIN flag and clean up).
                 }
                 Ok(n) => {
+                    conn.down_bytes += n as u64;
                     // Channel/inject path: send the entire read as one large
                     // frame (the inject thread's GSO hint lets the guest
                     // re-segment at MSS).
@@ -541,10 +555,35 @@ impl TcpBridge {
         }
 
         for key in to_remove {
-            self.fast_path_conns.remove(&key);
+            self.close_fast_path(&key);
         }
 
         frames
+    }
+
+    /// Removes a fast-path flow and reports its byte totals to the observer
+    /// (exactly once). The single choke point for fast-path teardown.
+    fn close_fast_path(&mut self, key: &SynFlowKey) {
+        let Some(conn) = self.fast_path_conns.remove(key) else {
+            return;
+        };
+        if let Some(ref obs) = self.observer {
+            let down = conn.down_bytes
+                + conn
+                    .down_shared
+                    .as_ref()
+                    .map_or(0, |a| a.load(std::sync::atomic::Ordering::Relaxed));
+            obs.on_flow_close(
+                crate::egress::FlowKey {
+                    src_ip: key.src_ip,
+                    src_port: key.src_port,
+                    dst_ip: key.dst_ip,
+                    dst_port: key.dst_port,
+                },
+                conn.up_bytes,
+                down,
+            );
+        }
     }
 
     /// Promotes a connection to the fast path.
@@ -565,6 +604,14 @@ impl TcpBridge {
 
         let last_ack_atomic = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(last_ack));
         let our_seq_atomic = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(our_seq));
+        // Shared host→guest byte counter — allocated ONLY when a flow observer is
+        // installed, so an un-observed consumer (e.g. the VMM datapath) pays no
+        // per-connection allocation or atomic. The inline inject thread increments
+        // it; the bridge reads it at teardown.
+        let down_shared = self
+            .observer
+            .is_some()
+            .then(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)));
 
         // Shim-synthesized handshakes know exact SEQ/ACK at promotion
         // time, so hand the cloned stream to the inject thread
@@ -584,6 +631,7 @@ impl TcpBridge {
                         guest_port: key.src_port,
                         our_seq: std::sync::Arc::clone(&our_seq_atomic),
                         last_ack: std::sync::Arc::clone(&last_ack_atomic),
+                        down_bytes: down_shared.clone(),
                         gw_mac,
                         guest_mac,
                     };
@@ -634,6 +682,9 @@ impl TcpBridge {
                 },
                 host_eof: false,
                 inline_owned,
+                up_bytes: 0,
+                down_bytes: 0,
+                down_shared: if inline_owned { down_shared } else { None },
             },
         );
     }
@@ -1148,6 +1199,15 @@ impl TcpBridge {
         egress: std::sync::Arc<dyn crate::egress::EgressResolver>,
     ) {
         self.egress = egress;
+    }
+
+    /// Installs a per-flow byte accounting observer, fired once per fast-path
+    /// flow at teardown with its up/down totals (mirrors [`set_egress_resolver`]).
+    /// Lets a consumer account the traffic the bridge spliced.
+    ///
+    /// [`set_egress_resolver`]: Self::set_egress_resolver
+    pub fn set_flow_observer(&mut self, observer: std::sync::Arc<dyn crate::egress::FlowObserver>) {
+        self.observer = Some(observer);
     }
 
     /// Attaches a DNS resolution log used to recover destination domains

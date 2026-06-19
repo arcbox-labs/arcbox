@@ -32,7 +32,7 @@ pub mod tcp_bridge;
 #[cfg(target_os = "macos")]
 pub mod utun;
 
-pub use egress::{DefaultEgress, EgressConn, EgressResolver, FlowMeta};
+pub use egress::{DefaultEgress, EgressConn, EgressResolver, FlowKey, FlowMeta, FlowObserver};
 pub use frame_source::{FdFrameSource, FrameSource};
 
 // `tcp_bridge` and `classifier` reference `crate::ethernet::*` pervasively;

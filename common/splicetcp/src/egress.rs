@@ -42,6 +42,28 @@ pub trait EgressResolver: Send + Sync {
     fn resolve(&self, flow: FlowMeta) -> oneshot::Receiver<Option<EgressConn>>;
 }
 
+/// A terminated fast-path flow's 4-tuple — the key handed to a [`FlowObserver`].
+/// A public mirror of the bridge's internal flow key (whose fields are private).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FlowKey {
+    pub src_ip: Ipv4Addr,
+    pub src_port: u16,
+    pub dst_ip: Ipv4Addr,
+    pub dst_port: u16,
+}
+
+/// Observes the byte totals of fast-path flows the bridge spliced.
+///
+/// Those bytes are otherwise invisible to the [`EgressResolver`] host, which only
+/// hands in the egress stream and never sees what transits it. Injected into the
+/// bridge (mirroring [`EgressResolver`]) so a consumer can account per-flow traffic.
+pub trait FlowObserver: Send + Sync {
+    /// Called once when a fast-path flow is torn down (guest FIN/RST, host EOF,
+    /// or an I/O error). `up_bytes` = guest→host (client→server), `down_bytes` =
+    /// host→guest (server→client).
+    fn on_flow_close(&self, key: FlowKey, up_bytes: u64, down_bytes: u64);
+}
+
 /// Default egress policy reproducing the TCP bridge's historical inline behavior.
 ///
 /// Resolves a system-proxy CONNECT/SOCKS5 target (or direct), translates the

@@ -78,6 +78,11 @@ pub struct PromotedConn {
     /// Last ACK from guest (shared with the datapath via atomic so the
     /// inject thread and fast-path intercept stay in sync).
     pub last_ack: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Host→guest byte counter, present only when a flow observer is installed —
+    /// `None` ⇒ no accounting and no per-connection allocation. The inline inject
+    /// path reads the host socket outside the bridge's `poll_fast_path`, so this
+    /// shared counter is how the bridge learns inline downstream totals at teardown.
+    pub down_bytes: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// Gateway MAC for Ethernet source.
     pub gw_mac: [u8; 6],
     /// Guest MAC for Ethernet destination.
@@ -138,6 +143,7 @@ impl ConnSink for TokioFrameConnSink {
             guest_port,
             our_seq,
             last_ack,
+            down_bytes,
             gw_mac,
             guest_mac,
         } = conn;
@@ -151,6 +157,7 @@ impl ConnSink for TokioFrameConnSink {
             guest_port,
             our_seq,
             last_ack,
+            down_bytes,
             gw_mac,
             guest_mac,
         };
@@ -167,6 +174,7 @@ struct AsyncPromotedConn {
     guest_port: u16,
     our_seq: Arc<std::sync::atomic::AtomicU32>,
     last_ack: Arc<std::sync::atomic::AtomicU32>,
+    down_bytes: Option<Arc<std::sync::atomic::AtomicU64>>,
     gw_mac: [u8; 6],
     guest_mac: [u8; 6],
 }
@@ -198,6 +206,9 @@ async fn read_promoted_conn(
                 return;
             }
             Ok(n) => {
+                if let Some(c) = &conn.down_bytes {
+                    c.fetch_add(n as u64, Ordering::Relaxed);
+                }
                 let data = &buf[..n];
                 let mut offset = 0;
                 while offset < data.len() {
@@ -235,7 +246,7 @@ async fn read_promoted_conn(
 mod tests {
     use super::*;
 
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
 
     use tokio::io::AsyncWriteExt;
 
@@ -251,6 +262,7 @@ mod tests {
         let (sink, mut rx) = TokioFrameConnSink::channel(4);
         let our_seq = Arc::new(AtomicU32::new(1000));
         let last_ack = Arc::new(AtomicU32::new(2000));
+        let down = Arc::new(AtomicU64::new(0));
         let std_stream = accepted.into_std().unwrap();
         let accepted_conn = PromotedConn {
             stream: std_stream,
@@ -260,6 +272,7 @@ mod tests {
             guest_port: 50000,
             our_seq: our_seq.clone(),
             last_ack,
+            down_bytes: Some(down.clone()),
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
         };
@@ -272,6 +285,11 @@ mod tests {
             .expect("frame channel should stay open");
 
         assert_eq!(our_seq.load(Ordering::Relaxed), 1004);
+        assert_eq!(
+            down.load(Ordering::Relaxed),
+            4,
+            "inline downstream bytes counted into the shared counter"
+        );
         let ip = ETH_HEADER_LEN;
         let tcp = ip + 20;
         assert_eq!(&frame[ip + 12..ip + 16], &[203, 0, 113, 10]);
