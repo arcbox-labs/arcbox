@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.10](https://github.com/arcboxlabs/arcbox/compare/v0.4.9...v0.4.10) (2026-06-19)
+
+
+### Features
+
+* **splicetcp:** add FlowObserver seam for per-flow byte accounting ([95d0fe8](https://github.com/arcboxlabs/arcbox/commit/95d0fe843c29f4e30e6231829873c37dad2c659f))
+* **splicetcp:** add tokio fast-path frame sink ([394670d](https://github.com/arcboxlabs/arcbox/commit/394670d6e54072340608123310ace33c425313f6))
+
+
+### Bug Fixes
+
+* **splicetcp:** harden tokio frame sink ([cdd5072](https://github.com/arcboxlabs/arcbox/commit/cdd50723fa057b4a7cc44c4fde5a9ec32cfff128))
+
 ## [0.4.9](https://github.com/arcboxlabs/arcbox/compare/v0.4.8...v0.4.9) (2026-06-18)
 
 
