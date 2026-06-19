@@ -4,6 +4,27 @@
 //! a [`FrameSink`]. The implementation (typically a crossbeam channel)
 //! delivers them to the RX injection thread which writes to guest memory.
 
+#[cfg(feature = "tokio-frame-sink")]
+use std::sync::Arc;
+#[cfg(feature = "tokio-frame-sink")]
+use std::sync::atomic::Ordering;
+
+#[cfg(feature = "tokio-frame-sink")]
+use arcbox_packet::ethernet::{
+    ETH_HEADER_LEN, TcpFrameParams, build_tcp_data_frame, build_tcp_fin_frame,
+};
+#[cfg(feature = "tokio-frame-sink")]
+use tokio::io::AsyncReadExt;
+#[cfg(feature = "tokio-frame-sink")]
+use tokio::sync::mpsc;
+
+#[cfg(feature = "tokio-frame-sink")]
+const UNIX_DGRAM_MAX_FRAME_LEN: usize = 2048;
+#[cfg(feature = "tokio-frame-sink")]
+const TCP_IPV4_ETH_OVERHEAD: usize = ETH_HEADER_LEN + 20 + 20;
+#[cfg(feature = "tokio-frame-sink")]
+const FAST_PATH_GUEST_MSS: usize = UNIX_DGRAM_MAX_FRAME_LEN - TCP_IPV4_ETH_OVERHEAD;
+
 /// Sends raw Ethernet frames from the producer (datapath loop) to the
 /// consumer (RX injection thread).
 pub trait FrameSink: Send + Sync {
@@ -70,4 +91,188 @@ pub trait ConnSink: Send + Sync {
     /// Sends a promoted connection. Returns `true` if accepted, `false`
     /// if the channel is full (connection stays on the slow path).
     fn send_conn(&self, conn: PromotedConn) -> bool;
+}
+
+/// A [`ConnSink`] that turns promoted connections into Tokio-read tasks and
+/// emits guest-bound Ethernet frames through a bounded channel.
+///
+/// This is the event-driven counterpart to `TcpBridge::poll_fast_path`: host-side
+/// socket readability wakes the task, the task builds the same TCP data/FIN
+/// frames the bridge would have built synchronously, and backpressure on the
+/// channel pauses socket reads instead of growing memory without bound.
+#[cfg(feature = "tokio-frame-sink")]
+pub struct TokioFrameConnSink {
+    tx: mpsc::Sender<Vec<u8>>,
+}
+
+#[cfg(feature = "tokio-frame-sink")]
+impl TokioFrameConnSink {
+    /// Creates a sink from the sending half of a bounded frame channel.
+    #[must_use]
+    pub fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
+        Self { tx }
+    }
+
+    /// Convenience constructor returning an `Arc<dyn ConnSink>` plus the receiving
+    /// half that a datapath loop can await and write to its guest-facing sink.
+    #[must_use]
+    pub fn channel(capacity: usize) -> (Arc<dyn ConnSink>, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel(capacity.max(1));
+        (Arc::new(Self::new(tx)), rx)
+    }
+}
+
+#[cfg(feature = "tokio-frame-sink")]
+impl ConnSink for TokioFrameConnSink {
+    fn send_conn(&self, conn: PromotedConn) -> bool {
+        let PromotedConn {
+            stream,
+            remote_ip,
+            guest_ip,
+            remote_port,
+            guest_port,
+            our_seq,
+            last_ack,
+            gw_mac,
+            guest_mac,
+        } = conn;
+        let Ok(stream) = tokio::net::TcpStream::from_std(stream) else {
+            return false;
+        };
+        let conn = AsyncPromotedConn {
+            remote_ip,
+            guest_ip,
+            remote_port,
+            guest_port,
+            our_seq,
+            last_ack,
+            gw_mac,
+            guest_mac,
+        };
+        tokio::spawn(read_promoted_conn(stream, conn, self.tx.clone()));
+        true
+    }
+}
+
+#[cfg(feature = "tokio-frame-sink")]
+struct AsyncPromotedConn {
+    remote_ip: std::net::Ipv4Addr,
+    guest_ip: std::net::Ipv4Addr,
+    remote_port: u16,
+    guest_port: u16,
+    our_seq: Arc<std::sync::atomic::AtomicU32>,
+    last_ack: Arc<std::sync::atomic::AtomicU32>,
+    gw_mac: [u8; 6],
+    guest_mac: [u8; 6],
+}
+
+#[cfg(feature = "tokio-frame-sink")]
+async fn read_promoted_conn(
+    mut stream: tokio::net::TcpStream,
+    conn: AsyncPromotedConn,
+    frames: mpsc::Sender<Vec<u8>>,
+) {
+    let mut buf = vec![0u8; 32 * 1024];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) => {
+                let seq_now = conn.our_seq.load(Ordering::Relaxed);
+                let fin = build_tcp_fin_frame(&TcpFrameParams {
+                    src_ip: conn.remote_ip,
+                    dst_ip: conn.guest_ip,
+                    src_port: conn.remote_port,
+                    dst_port: conn.guest_port,
+                    seq: seq_now,
+                    ack: conn.last_ack.load(Ordering::Relaxed),
+                    window: 65535,
+                    src_mac: conn.gw_mac,
+                    dst_mac: conn.guest_mac,
+                });
+                conn.our_seq.fetch_add(1, Ordering::Relaxed);
+                let _ = frames.send(fin).await;
+                return;
+            }
+            Ok(n) => {
+                let data = &buf[..n];
+                let mut offset = 0;
+                while offset < data.len() {
+                    let chunk_end = (offset + FAST_PATH_GUEST_MSS).min(data.len());
+                    let chunk = &data[offset..chunk_end];
+                    let seq_now = conn.our_seq.load(Ordering::Relaxed);
+                    let frame = build_tcp_data_frame(
+                        &TcpFrameParams {
+                            src_ip: conn.remote_ip,
+                            dst_ip: conn.guest_ip,
+                            src_port: conn.remote_port,
+                            dst_port: conn.guest_port,
+                            seq: seq_now,
+                            ack: conn.last_ack.load(Ordering::Relaxed),
+                            window: 65535,
+                            src_mac: conn.gw_mac,
+                            dst_mac: conn.guest_mac,
+                        },
+                        chunk,
+                    );
+                    conn.our_seq
+                        .fetch_add(chunk.len() as u32, Ordering::Relaxed);
+                    if frames.send(frame).await.is_err() {
+                        return;
+                    }
+                    offset = chunk_end;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "tokio-frame-sink"))]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::AtomicU32;
+
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn tokio_frame_conn_sink_emits_data_frame_on_socket_readiness() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut upstream, accepted) = tokio::join!(async { client }, async {
+            listener.accept().await.unwrap().0
+        },);
+
+        let (sink, mut rx) = TokioFrameConnSink::channel(4);
+        let our_seq = Arc::new(AtomicU32::new(1000));
+        let last_ack = Arc::new(AtomicU32::new(2000));
+        let std_stream = accepted.into_std().unwrap();
+        let accepted_conn = PromotedConn {
+            stream: std_stream,
+            remote_ip: std::net::Ipv4Addr::new(203, 0, 113, 10),
+            guest_ip: std::net::Ipv4Addr::new(192, 168, 64, 2),
+            remote_port: 443,
+            guest_port: 50000,
+            our_seq: our_seq.clone(),
+            last_ack,
+            gw_mac: [0x02, 0, 0, 0, 0, 1],
+            guest_mac: [0x02, 0, 0, 0, 0, 2],
+        };
+        assert!(sink.send_conn(accepted_conn));
+
+        upstream.write_all(b"pong").await.unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("frame should be emitted by socket readiness")
+            .expect("frame channel should stay open");
+
+        assert_eq!(our_seq.load(Ordering::Relaxed), 1004);
+        let ip = ETH_HEADER_LEN;
+        let tcp = ip + 20;
+        assert_eq!(&frame[ip + 12..ip + 16], &[203, 0, 113, 10]);
+        assert_eq!(&frame[ip + 16..ip + 20], &[192, 168, 64, 2]);
+        assert_eq!(u16::from_be_bytes([frame[tcp], frame[tcp + 1]]), 443);
+        assert_eq!(u16::from_be_bytes([frame[tcp + 2], frame[tcp + 3]]), 50000);
+        assert_eq!(&frame[tcp + 20..tcp + 24], b"pong");
+    }
 }

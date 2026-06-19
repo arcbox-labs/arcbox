@@ -18,5 +18,12 @@ libc = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+default = []
+# Tokio-backed ConnSink that emits promoted fast-path TCP frames through a bounded
+# mpsc channel. Consumers that already drive a Tokio runtime (e.g. host utun
+# datapaths) can enable this instead of polling `TcpBridge::poll_fast_path`.
+tokio-frame-sink = []
+
 [lints]
 workspace = true
