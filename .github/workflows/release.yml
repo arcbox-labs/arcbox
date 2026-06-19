@@ -52,7 +52,8 @@ jobs:
   # green by the CI build job, so the per-crate verify build is redundant safety
   # here, not new coverage. cargo still resolves the dependency graph and uploads
   # in dependency order via a local temp registry, so unpublished inter-deps
-  # (including arcbox-hv at its own 0.3.20) resolve — nothing is excluded.
+  # resolve. arcbox-hv has its own release cadence and may already exist at
+  # its pinned version, so exclude it from the coordinated workspace publish.
   # Platform-agnostic (no compilation happens), so it runs on ubuntu. Skipped on
   # workflow_dispatch (manual binary rebuilds must not republish).
   publish-crates:
@@ -90,7 +91,7 @@ jobs:
         # member, resolves inter-deps via a local temp registry, then uploads in
         # dependency order, waiting for the index between uploads. --no-verify:
         # see the note above (crates that embed out-of-tree workspace files).
-        run: cargo publish --workspace --no-verify --locked
+        run: cargo publish --workspace --exclude arcbox-hv --no-verify --locked
 
   # ==========================================================================
   # Build + sign macOS ARM64 host binaries
