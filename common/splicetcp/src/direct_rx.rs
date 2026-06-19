@@ -100,6 +100,11 @@ pub trait ConnSink: Send + Sync {
 /// socket readability wakes the task, the task builds the same TCP data/FIN
 /// frames the bridge would have built synchronously, and backpressure on the
 /// channel pauses socket reads instead of growing memory without bound.
+///
+/// `send_conn` must be called from within a Tokio runtime because accepted
+/// connections are driven by spawned read tasks. The emitted frames mirror the
+/// standard-MTU segmentation path; this sink does not support the bridge's large
+/// frame mode.
 #[cfg(feature = "tokio-frame-sink")]
 pub struct TokioFrameConnSink {
     tx: mpsc::Sender<Vec<u8>>,

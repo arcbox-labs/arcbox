@@ -627,7 +627,11 @@ impl TcpBridge {
                 guest_ip: key.src_ip,
                 remote_port: key.dst_port,
                 guest_port: key.src_port,
-                read_buf: vec![0u8; 32768],
+                read_buf: if inline_owned {
+                    Vec::new()
+                } else {
+                    vec![0u8; 32768]
+                },
                 host_eof: false,
                 inline_owned,
             },
