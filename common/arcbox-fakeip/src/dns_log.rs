@@ -93,6 +93,40 @@ impl DnsResolutionLog {
             None
         }
     }
+
+    /// Removes the entry for `ip`, returning the domain it mapped to (if any).
+    ///
+    /// For targeted invalidation (e.g. a single re-pointed mapping). A full flush
+    /// should use [`clear`](Self::clear) so the reverse log can't be left
+    /// partially in sync with a fake-IP allocator.
+    pub fn remove(&self, ip: Ipv4Addr) -> Option<String> {
+        let mut inner = self.inner.lock().ok()?;
+        inner.entries.remove(&ip).map(|e| e.domain)
+    }
+
+    /// Clears every IP → domain entry — a full DNS-resolution-log flush.
+    ///
+    /// Pairs with the consumer's fake-IP allocator reset: clearing the reverse log
+    /// without the allocator (or vice versa) can desync them, so a flush clears
+    /// both together.
+    pub fn clear(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.entries.clear();
+        }
+    }
+
+    /// Number of live entries (recorded, not yet evicted). For diagnostics and
+    /// post-flush assertions.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.lock().map(|i| i.entries.len()).unwrap_or(0)
+    }
+
+    /// Whether the log holds no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl Default for DnsResolutionLog {
@@ -239,6 +273,35 @@ mod tests {
         log.record("old.example.com", &[ip]);
         log.record("new.example.com", &[ip]);
         assert_eq!(log.lookup(ip).as_deref(), Some("new.example.com"));
+    }
+
+    #[test]
+    fn remove_drops_a_single_entry() {
+        let log = DnsResolutionLog::new();
+        let a = Ipv4Addr::new(10, 0, 0, 1);
+        let b = Ipv4Addr::new(10, 0, 0, 2);
+        log.record("a.example.com", &[a]);
+        log.record("b.example.com", &[b]);
+        assert_eq!(log.remove(a).as_deref(), Some("a.example.com"));
+        assert!(log.lookup(a).is_none(), "removed entry is gone");
+        assert_eq!(
+            log.lookup(b).as_deref(),
+            Some("b.example.com"),
+            "other kept"
+        );
+        assert!(log.remove(a).is_none(), "removing again is a no-op");
+    }
+
+    #[test]
+    fn clear_empties_the_log() {
+        let log = DnsResolutionLog::new();
+        log.record("a.example.com", &[Ipv4Addr::new(10, 0, 0, 1)]);
+        log.record("b.example.com", &[Ipv4Addr::new(10, 0, 0, 2)]);
+        assert_eq!(log.len(), 2);
+        assert!(!log.is_empty());
+        log.clear();
+        assert!(log.is_empty(), "flush empties the log");
+        assert!(log.lookup(Ipv4Addr::new(10, 0, 0, 1)).is_none());
     }
 
     #[test]
