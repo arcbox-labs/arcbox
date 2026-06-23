@@ -17,6 +17,19 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tracing::{info, warn};
 
+/// Outcome of the admission check for an incoming `ProvisionRunner`.
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    /// Accept the job and start a runner.
+    Accept,
+    /// The job is already in flight; ignore the redelivered order.
+    Duplicate,
+    /// The host is draining and rejects new work.
+    Draining,
+    /// The host is at its concurrency cap.
+    AtCapacity,
+}
+
 /// Spawns and tracks runner processes, emitting lifecycle events to the gateway.
 #[derive(Clone)]
 pub struct RunnerSupervisor {
@@ -57,21 +70,29 @@ impl RunnerSupervisor {
         }
     }
 
-    /// Start a runner for `order`, unless draining or at capacity.
+    /// Start a runner for `order`. A redelivered order for a job already in
+    /// flight is ignored; otherwise the job is rejected if draining or at
+    /// capacity.
     pub async fn handle_provision(&self, order: ProvisionRunner) {
         let job_id = order.job_id.clone();
 
-        if self
-            .inner
-            .draining
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            self.fail(&job_id, "host is draining").await;
-            return;
-        }
-        if self.inner.in_flight.len() >= self.inner.max_concurrent {
-            self.fail(&job_id, "host at capacity").await;
-            return;
+        match self.admit(&job_id) {
+            Admission::Duplicate => {
+                // The gateway's dispatch is at-least-once, so a redelivered
+                // order for a running job must be a no-op — never a second
+                // runner process for the same job.
+                info!(job_id, "duplicate provision ignored");
+                return;
+            }
+            Admission::Draining => {
+                self.fail(&job_id, "host is draining").await;
+                return;
+            }
+            Admission::AtCapacity => {
+                self.fail(&job_id, "host at capacity").await;
+                return;
+            }
+            Admission::Accept => {}
         }
 
         // Reserve the slot synchronously so a follow-up dispatch sees it.
@@ -80,6 +101,29 @@ impl RunnerSupervisor {
         let sup = self.clone();
         let handle = tokio::spawn(async move { sup.run_job(order).await });
         self.inner.cancels.insert(job_id, handle.abort_handle());
+    }
+
+    /// Decide whether to start a runner for `job_id`. `Duplicate` takes
+    /// precedence over `Draining`/`AtCapacity`: a redelivery of an
+    /// already-running job is a no-op regardless of host state. The
+    /// `contains`/`insert` gap back in [`Self::handle_provision`] is safe
+    /// because the attach loop dispatches orders one at a time, with no
+    /// `.await` between this check and the reservation.
+    fn admit(&self, job_id: &str) -> Admission {
+        if self.inner.in_flight.contains(job_id) {
+            return Admission::Duplicate;
+        }
+        if self
+            .inner
+            .draining
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Admission::Draining;
+        }
+        if self.inner.in_flight.len() >= self.inner.max_concurrent {
+            return Admission::AtCapacity;
+        }
+        Admission::Accept
     }
 
     /// Cancel an in-flight job: aborting the task drops the child (kill-on-drop).
@@ -188,5 +232,44 @@ fn runner_command(runner_dir: &Path, encoded_jit_config: &str) -> tokio::process
         let mut command = tokio::process::Command::new(script);
         command.arg("--jitconfig").arg(encoded_jit_config);
         command
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn supervisor(max_concurrent: usize) -> RunnerSupervisor {
+        // `admit` never sends, so the dropped receiver is irrelevant here.
+        let (events, _rx) = mpsc::channel(1);
+        RunnerSupervisor::new(events, PathBuf::from("/nonexistent"), max_concurrent)
+    }
+
+    #[test]
+    fn admits_until_capacity_then_rejects() {
+        let sup = supervisor(2);
+        assert_eq!(sup.admit("rjob_a"), Admission::Accept);
+
+        sup.inner.in_flight.insert("rjob_a".to_string());
+        // A redelivery of a running job is a duplicate, never a fresh slot.
+        assert_eq!(sup.admit("rjob_a"), Admission::Duplicate);
+        assert_eq!(sup.admit("rjob_b"), Admission::Accept);
+
+        sup.inner.in_flight.insert("rjob_b".to_string());
+        assert_eq!(sup.admit("rjob_c"), Admission::AtCapacity);
+    }
+
+    #[test]
+    fn duplicate_takes_precedence_over_drain_and_capacity() {
+        let sup = supervisor(1);
+        sup.inner.in_flight.insert("rjob_a".to_string());
+        sup.inner
+            .draining
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Already running, host draining and at capacity: still a duplicate.
+        assert_eq!(sup.admit("rjob_a"), Admission::Duplicate);
+        // A different job while draining is rejected for draining.
+        assert_eq!(sup.admit("rjob_b"), Admission::Draining);
     }
 }
