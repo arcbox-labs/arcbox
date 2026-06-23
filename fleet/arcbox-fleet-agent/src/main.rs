@@ -34,7 +34,8 @@ struct Cli {
 enum Command {
     /// Exchange an enrollment token for the machine credential and persist it.
     Enroll {
-        /// Single-use enrollment token issued by the control plane.
+        /// Fleet enrollment token issued by the control plane (a multi-use
+        /// join token valid until it expires or is rotated).
         #[arg(long)]
         token: String,
     },
