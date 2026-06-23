@@ -5,7 +5,7 @@ package arcbox.fleet.v1;
 // BYOC edge: terminates the outbound connection of NAT'd Fleet machines.
 // Machines dial out; nothing ever connects in to them.
 service FleetGatewayService {
-  // Exchange a single-use enrollment token for the machine's long-lived
+  // Exchange a fleet enrollment token for the machine's long-lived
   // credential. Creates the machine row and its capacity pools.
   // Unauthenticated: the enrollment token is the proof.
   rpc Enroll(EnrollRequest) returns (EnrollResponse);
@@ -17,6 +17,8 @@ service FleetGatewayService {
 }
 
 message EnrollRequest {
+  // Multi-use fleet join token: valid for any machine in the fleet until it
+  // expires or is rotated (one active token per fleet).
   string enrollment_token = 1;
   string machine_name = 2;
   // Host CPU architecture (e.g. `arm64`).
