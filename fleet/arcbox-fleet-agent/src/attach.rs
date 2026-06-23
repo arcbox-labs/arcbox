@@ -1,7 +1,11 @@
 //! The durable outbound `Attach` stream: heartbeats out, dispatch in, with
 //! exponential-backoff reconnect.
+//!
+//! The [`RunnerSupervisor`] and the egress queue of runner lifecycle events are
+//! created once and reused across every reconnect. A job dispatched before a
+//! reconnect keeps running, and its terminal event is forwarded to whichever
+//! stream is live instead of being lost into the dropped connection's channel.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -25,12 +29,36 @@ const OUTBOUND_CAPACITY: usize = 64;
 const MACHINE_TOKEN_HEADER: &str = "x-arcbox-machine-token";
 
 /// Connect and serve the attach stream forever, reconnecting on any failure.
+///
+/// The supervisor and the egress queue carrying runner lifecycle events are
+/// built once and reused across reconnects, so in-flight jobs survive a dropped
+/// connection and their terminal events reach the next live stream.
 pub async fn run(config: AgentConfig, credential: Credential) -> Result<()> {
     let runner_dir = config.require_runner_dir()?.to_path_buf();
+
+    // Runner lifecycle events flow through this queue, which outlives any single
+    // connection. Each connection drains it into that connection's request
+    // stream; events produced during a brief disconnect simply wait here.
+    let (egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
+    let supervisor = RunnerSupervisor::new(egress_tx, runner_dir, config.max_concurrent);
+
     let mut backoff = INITIAL_BACKOFF;
+    // An event pulled from the egress queue but not yet delivered when the
+    // connection dropped; re-sent first on the next connection so a terminal
+    // event is never lost to a closed stream.
+    let mut pending: Option<AttachRequest> = None;
 
     loop {
-        match attach_once(&config, &credential, runner_dir.clone(), &mut backoff).await {
+        match connect_and_serve(
+            &config,
+            &credential,
+            &supervisor,
+            &mut egress_rx,
+            &mut pending,
+            &mut backoff,
+        )
+        .await
+        {
             Ok(()) => info!("attach stream closed by gateway; reconnecting"),
             Err(e) => {
                 warn!(error = %e, backoff_secs = backoff.as_secs(), "attach failed; retrying");
@@ -45,10 +73,17 @@ pub async fn run(config: AgentConfig, credential: Credential) -> Result<()> {
 /// `backoff` once the stream is established, so a connection that succeeds and
 /// later drops reconnects promptly instead of inheriting the escalated delay
 /// from earlier connect failures.
-async fn attach_once(
+///
+/// Outbound traffic is multiplexed onto a fresh per-connection request channel:
+/// connection-scoped heartbeats are sent directly, while runner lifecycle
+/// events are forwarded from the shared egress queue. Inbound orders are routed
+/// to the persistent `supervisor`.
+async fn connect_and_serve(
     config: &AgentConfig,
     credential: &Credential,
-    runner_dir: PathBuf,
+    supervisor: &RunnerSupervisor,
+    egress_rx: &mut mpsc::Receiver<AttachRequest>,
+    pending: &mut Option<AttachRequest>,
     backoff: &mut Duration,
 ) -> Result<()> {
     let channel = config
@@ -58,11 +93,9 @@ async fn attach_once(
         .with_context(|| format!("connecting to {}", config.gateway))?;
     let mut client = FleetGatewayServiceClient::new(channel);
 
-    let (outbound, rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
-    let supervisor = RunnerSupervisor::new(outbound.clone(), runner_dir, config.max_concurrent);
-    let heartbeat = spawn_heartbeat(outbound, config.max_concurrent);
+    let (req_tx, req_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
 
-    let mut request = Request::new(ReceiverStream::new(rx));
+    let mut request = Request::new(ReceiverStream::new(req_rx));
     let token: MetadataValue<_> = credential
         .machine_token
         .parse()
@@ -77,11 +110,35 @@ async fn attach_once(
     *backoff = INITIAL_BACKOFF;
     info!("attached to gateway");
 
+    // Re-send the event stranded by the previous connection before anything else.
+    if let Some(msg) = pending.take() {
+        if let Err(err) = req_tx.send(msg).await {
+            *pending = Some(err.0);
+            anyhow::bail!("request stream closed before the pending event could be re-sent");
+        }
+    }
+
+    let heartbeat = spawn_heartbeat(req_tx.clone(), config.max_concurrent);
+
     let outcome = loop {
-        match inbound.message().await {
-            Ok(Some(message)) => dispatch(&supervisor, message.msg).await,
-            Ok(None) => break Ok(()),
-            Err(status) => break Err(anyhow::Error::from(status)),
+        tokio::select! {
+            event = egress_rx.recv() => match event {
+                Some(msg) => {
+                    if let Err(err) = req_tx.send(msg).await {
+                        // Stream is gone; hold the event for the next connection.
+                        *pending = Some(err.0);
+                        break Err(anyhow::anyhow!("request stream closed while forwarding event"));
+                    }
+                }
+                // The supervisor holds the only egress sender, so this cannot
+                // happen while the agent runs; treat it as a clean shutdown.
+                None => break Ok(()),
+            },
+            message = inbound.message() => match message {
+                Ok(Some(message)) => dispatch(supervisor, message.msg).await,
+                Ok(None) => break Ok(()),
+                Err(status) => break Err(anyhow::Error::from(status)),
+            },
         }
     };
 
@@ -102,6 +159,10 @@ async fn dispatch(supervisor: &RunnerSupervisor, msg: Option<attach_response::Ms
 }
 
 /// Periodically push a declarative capacity heartbeat until the channel closes.
+///
+/// Heartbeats are connection-scoped: the task is spawned per connection and
+/// aborted when it drops, so a momentary disconnect does not leave stale
+/// heartbeats queued for the next stream.
 fn spawn_heartbeat(
     outbound: mpsc::Sender<AttachRequest>,
     max_concurrent: usize,
