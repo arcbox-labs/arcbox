@@ -12,6 +12,8 @@ anyhow.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 tempfile.workspace = true
 toml_edit = "0.25.12"
+tracing.workspace = true
+tracing-subscriber.workspace = true
 xshell = "0.2.7"
 
 [lints]
