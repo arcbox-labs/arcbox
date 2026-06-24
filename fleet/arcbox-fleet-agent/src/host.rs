@@ -2,6 +2,8 @@
 
 use arcbox_fleet_proto::v1::RuntimeCapacity;
 
+use crate::docker::DockerCapabilities;
+
 /// Map Rust's `target_os` to the gateway's lowercase `RunnerOs` naming.
 pub fn map_os(os: &str) -> &str {
     match os {
@@ -60,14 +62,35 @@ pub fn host_info_json() -> String {
     info.to_string()
 }
 
-/// The single capacity pool this host serves. With no isolation in v1, the
-/// host advertises its own `(os, arch)` with the configured concurrency.
-pub fn capacities(max_concurrent: usize) -> Vec<RuntimeCapacity> {
-    vec![RuntimeCapacity {
+/// Build the capacity pools to advertise: the host's native pool plus any
+/// Linux pools Docker can serve.
+pub fn capacities(
+    max_concurrent: usize,
+    docker: Option<&DockerCapabilities>,
+) -> Vec<RuntimeCapacity> {
+    let mut pools = vec![RuntimeCapacity {
         os: host_os(),
         arch: host_arch(),
         max_concurrent: i32::try_from(max_concurrent).unwrap_or(i32::MAX),
-    }]
+    }];
+
+    if let Some(caps) = docker {
+        let cap = i32::try_from(caps.max_concurrent).unwrap_or(i32::MAX);
+        pools.push(RuntimeCapacity {
+            os: "linux".to_owned(),
+            arch: caps.native_arch.clone(),
+            max_concurrent: cap,
+        });
+        if let Some(emulated) = &caps.emulated_arch {
+            pools.push(RuntimeCapacity {
+                os: "linux".to_owned(),
+                arch: emulated.clone(),
+                max_concurrent: cap,
+            });
+        }
+    }
+
+    pools
 }
 
 #[cfg(test)]
@@ -80,5 +103,42 @@ mod tests {
         assert_eq!(map_os("linux"), "linux");
         assert_eq!(map_arch("aarch64"), "arm64");
         assert_eq!(map_arch("x86_64"), "amd64");
+    }
+
+    #[test]
+    fn capacities_without_docker_returns_host_pool_only() {
+        let pools = capacities(4, None);
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].max_concurrent, 4);
+    }
+
+    #[test]
+    fn capacities_with_docker_adds_linux_pools() {
+        let caps = DockerCapabilities {
+            native_arch: "arm64".to_owned(),
+            emulated_arch: Some("amd64".to_owned()),
+            max_concurrent: 3,
+        };
+        let pools = capacities(2, Some(&caps));
+        assert_eq!(pools.len(), 3);
+        assert_eq!(pools[1].os, "linux");
+        assert_eq!(pools[1].arch, "arm64");
+        assert_eq!(pools[1].max_concurrent, 3);
+        assert_eq!(pools[2].os, "linux");
+        assert_eq!(pools[2].arch, "amd64");
+        assert_eq!(pools[2].max_concurrent, 3);
+    }
+
+    #[test]
+    fn capacities_with_docker_no_emulation() {
+        let caps = DockerCapabilities {
+            native_arch: "amd64".to_owned(),
+            emulated_arch: None,
+            max_concurrent: 2,
+        };
+        let pools = capacities(2, Some(&caps));
+        assert_eq!(pools.len(), 2);
+        assert_eq!(pools[1].os, "linux");
+        assert_eq!(pools[1].arch, "amd64");
     }
 }

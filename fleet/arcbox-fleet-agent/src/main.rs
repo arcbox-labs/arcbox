@@ -13,6 +13,7 @@
 mod attach;
 mod config;
 mod credentials;
+mod docker;
 mod enroll;
 mod host;
 mod runner;
@@ -25,8 +26,9 @@ use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, DockerMode};
 use crate::credentials::CredentialStore;
+use crate::docker::DockerRunner;
 
 #[derive(Debug, Parser)]
 #[command(name = "arcbox-fleet-agent", author, version, about)]
@@ -79,10 +81,15 @@ fn main() -> Result<()> {
 }
 
 async fn run(command: Command, config: AgentConfig) -> Result<()> {
+    let docker = init_docker(&config).await?;
+
     match command {
         Command::Enroll { token_file, token } => {
             let token = resolve_enrollment_token(token_file, token)?;
-            enroll::enroll(&config, token).await?;
+            let docker_caps = docker
+                .as_ref()
+                .map(|d| d.capabilities(config.max_concurrent));
+            enroll::enroll(&config, token, docker_caps.as_ref()).await?;
             Ok(())
         }
         Command::Run => {
@@ -103,7 +110,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 signal_token.cancel();
             });
 
-            attach::run(config, credential, shutdown).await
+            attach::run(config, credential, docker, shutdown).await
         }
     }
 }
@@ -166,6 +173,24 @@ fn resolve_enrollment_token(token_file: Option<PathBuf>, token: Option<String>) 
         anyhow::bail!("enrollment token is empty");
     }
     Ok(token)
+}
+
+/// Probe Docker availability according to the configured [`DockerMode`].
+async fn init_docker(config: &AgentConfig) -> Result<Option<DockerRunner>> {
+    match config.docker.mode {
+        DockerMode::Disabled => Ok(None),
+        DockerMode::Enabled => {
+            let runner = DockerRunner::new(config.docker.runner_image.clone()).await?;
+            Ok(Some(runner))
+        }
+        DockerMode::Auto => match DockerRunner::new(config.docker.runner_image.clone()).await {
+            Ok(runner) => Ok(Some(runner)),
+            Err(e) => {
+                warn!(error = %e, "docker not available; linux pools will not be advertised");
+                Ok(None)
+            }
+        },
+    }
 }
 
 #[cfg(test)]

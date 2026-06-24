@@ -7,10 +7,15 @@ use tracing::info;
 
 use crate::config::AgentConfig;
 use crate::credentials::{Credential, CredentialStore};
+use crate::docker::DockerCapabilities;
 use crate::host;
 
 /// Call `Enroll` on the gateway and persist the returned credential.
-pub async fn enroll(config: &AgentConfig, token: String) -> Result<Credential> {
+pub async fn enroll(
+    config: &AgentConfig,
+    token: String,
+    docker_caps: Option<&DockerCapabilities>,
+) -> Result<Credential> {
     let channel = config
         .endpoint()?
         .connect()
@@ -24,7 +29,7 @@ pub async fn enroll(config: &AgentConfig, token: String) -> Result<Credential> {
         host_arch: host::host_arch(),
         cpu_cores: host::cpu_cores(),
         mem_mib: host::mem_mib(),
-        capacities: host::capacities(config.max_concurrent),
+        capacities: host::capacities(config.max_concurrent, docker_caps),
         host_info_json: host::host_info_json(),
     };
 
