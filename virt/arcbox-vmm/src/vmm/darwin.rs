@@ -4,6 +4,8 @@
 
 use super::*;
 
+use crate::irq::{Gsi, IrqTriggerCallback};
+use arcbox_hypervisor::VirtioDeviceConfig;
 use arcbox_hypervisor::darwin::DarwinVm;
 use arcbox_hypervisor::traits::VirtualMachine;
 use tokio_util::sync::CancellationToken;
