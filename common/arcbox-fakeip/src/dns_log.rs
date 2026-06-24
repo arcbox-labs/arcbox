@@ -119,7 +119,7 @@ impl DnsResolutionLog {
     /// post-flush assertions.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().map(|i| i.entries.len()).unwrap_or(0)
+        self.inner.lock().map_or(0, |i| i.entries.len())
     }
 
     /// Whether the log holds no entries.
