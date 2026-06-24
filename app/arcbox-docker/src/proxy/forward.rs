@@ -5,14 +5,13 @@
 
 use super::GuestConnector;
 use super::headers::{ForwardedHeaderMode, HeaderMapProxyExt};
-use super::session::{GuestHttpPool, GuestHttpSession};
+use super::session::{GuestHttpClient, GuestHttpSession};
 use super::uri::GuestPath;
 use crate::error::{DockerError, Result};
 use crate::routing::UtilityVmRole;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, Uri, header};
 use bytes::Bytes;
-use std::sync::Arc;
 
 /// Forward an HTTP request to guest dockerd and return the response.
 ///
@@ -81,22 +80,20 @@ pub async fn proxy_to_guest_for_role(
 
 /// Forward an HTTP request using a reusable guest HTTP session when possible.
 ///
-/// The session is returned to `pool` only after the response body reaches EOF;
-/// if the body is dropped early or errors, the session is discarded.
+/// The underlying hyper-util client returns the connection to its pool only
+/// after the response body reaches EOF; if the body is dropped early or errors,
+/// the connection is discarded.
 pub async fn proxy_to_guest_for_role_pooled(
-    connector: &dyn GuestConnector,
-    pool: Arc<GuestHttpPool>,
+    client: &GuestHttpClient,
     role: UtilityVmRole,
     method: Method,
     path_and_query: &str,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>> {
-    let mut session = pooled_session(connector, &pool, role).await?;
-
     let mut req = hyper::Request::builder()
         .method(method)
-        .uri(path_and_query)
+        .uri(GuestHttpClient::uri(role, path_and_query)?)
         .body(Body::from(body))
         .map_err(|e| DockerError::Server(format!("failed to build guest request: {e}")))?;
 
@@ -105,12 +102,9 @@ pub async fn proxy_to_guest_for_role_pooled(
     req.headers_mut()
         .insert(header::HOST, HeaderValue::from_static("localhost"));
 
-    let response = session.send_request(req, "request").await?;
+    let response = client.request(req).await?;
     let (parts, incoming) = response.into_parts();
-    Ok(Response::from_parts(
-        parts,
-        session.reusable_body(incoming, pool, role),
-    ))
+    Ok(Response::from_parts(parts, Body::new(incoming)))
 }
 
 /// Forward an HTTP request to guest dockerd without buffering the request body.
@@ -170,17 +164,15 @@ pub async fn proxy_to_guest_stream_for_role(
 
 /// Forward a streaming HTTP request using a reusable guest HTTP session when possible.
 ///
-/// The session is returned to `pool` only after the response body reaches EOF;
-/// if the body is dropped early or errors, the session is discarded.
+/// The underlying hyper-util client returns the connection to its pool only
+/// after the response body reaches EOF; if the body is dropped early or errors,
+/// the connection is discarded.
 pub async fn proxy_to_guest_stream_for_role_pooled(
-    connector: &dyn GuestConnector,
-    pool: Arc<GuestHttpPool>,
+    client: &GuestHttpClient,
     role: UtilityVmRole,
     original_uri: &Uri,
     req: Request<Body>,
 ) -> Result<Response<Body>> {
-    let mut session = pooled_session(connector, &pool, role).await?;
-
     let path_and_query = GuestPath::from(original_uri);
     let method = req.method().clone();
     let forwarded_headers = req
@@ -190,7 +182,7 @@ pub async fn proxy_to_guest_stream_for_role_pooled(
 
     let mut guest_req = hyper::Request::builder()
         .method(method)
-        .uri(path_and_query.as_ref())
+        .uri(GuestHttpClient::uri(role, path_and_query.as_ref())?)
         .body(body)
         .map_err(|e| DockerError::Server(format!("failed to build guest request: {e}")))?;
 
@@ -199,25 +191,8 @@ pub async fn proxy_to_guest_stream_for_role_pooled(
         .headers_mut()
         .insert(header::HOST, HeaderValue::from_static("localhost"));
 
-    let response = session.send_request(guest_req, "request").await?;
+    let response = client.request(guest_req).await?;
 
     let (parts, incoming) = response.into_parts();
-    Ok(Response::from_parts(
-        parts,
-        session.reusable_body(incoming, pool, role),
-    ))
-}
-
-async fn pooled_session(
-    connector: &dyn GuestConnector,
-    pool: &GuestHttpPool,
-    role: UtilityVmRole,
-) -> Result<GuestHttpSession> {
-    if let Some(mut session) = pool.take(role)
-        && session.ready().await
-    {
-        return Ok(session);
-    }
-
-    GuestHttpSession::connect(connector, role).await
+    Ok(Response::from_parts(parts, Body::new(incoming)))
 }

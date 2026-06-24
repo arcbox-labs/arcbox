@@ -288,8 +288,7 @@ async fn inspect_container_body(
 ) -> Option<Bytes> {
     let inspect_path = format!("/containers/{container_id}/json");
     let inspect_resp = match crate::proxy::proxy_to_guest_for_role_pooled(
-        state.connector.as_ref(),
-        std::sync::Arc::clone(&state.guest_http_pool),
+        &state.guest_http_client,
         role,
         Method::GET,
         &inspect_path,
@@ -570,8 +569,7 @@ async fn resolve_or_raw_for_teardown(
 async fn resolve_canonical_id(state: &AppState, role: UtilityVmRole, id: &str) -> Option<String> {
     let inspect_path = format!("/containers/{id}/json");
     let resp = crate::proxy::proxy_to_guest_for_role_pooled(
-        state.connector.as_ref(),
-        std::sync::Arc::clone(&state.guest_http_pool),
+        &state.guest_http_client,
         role,
         Method::GET,
         &inspect_path,

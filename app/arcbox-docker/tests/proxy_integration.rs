@@ -8,7 +8,7 @@ mod support;
 use support::mock_guest::{self, MockGuest};
 
 use arcbox_docker::proxy::{
-    GuestConnector, GuestHttpPool, VsockShutdown, VsockStream, proxy_to_guest,
+    GuestConnector, GuestHttpClient, VsockShutdown, VsockStream, proxy_to_guest,
     proxy_to_guest_for_role_pooled, proxy_to_guest_stream, proxy_to_guest_stream_for_role_pooled,
     proxy_with_upgrade,
 };
@@ -29,6 +29,7 @@ use tempfile::TempDir;
 // UnixSocketConnector — test connector that connects to mock guest
 // =============================================================================
 
+#[derive(Clone)]
 struct UnixSocketConnector {
     socket_path: PathBuf,
     connect_count: Arc<AtomicUsize>,
@@ -112,12 +113,11 @@ async fn proxy_to_guest_empty_body() {
 #[tokio::test]
 async fn pooled_proxy_reuses_http_session_after_body_eof() {
     let (connector, guest, _tmp) = setup().await;
-    let pool = Arc::new(GuestHttpPool::default());
+    let client = GuestHttpClient::new(Arc::new(connector.clone()));
 
     for path in ["/containers/json", "/images/json"] {
         let resp = proxy_to_guest_for_role_pooled(
-            &connector,
-            Arc::clone(&pool),
+            &client,
             UtilityVmRole::Native,
             Method::GET,
             path,
@@ -138,16 +138,15 @@ async fn pooled_proxy_reuses_http_session_after_body_eof() {
 #[tokio::test]
 async fn pooled_proxy_discards_session_when_body_is_dropped_early() {
     let (connector, guest, _tmp) = setup().await;
-    let pool = Arc::new(GuestHttpPool::default());
+    let client = GuestHttpClient::new(Arc::new(connector.clone()));
 
     let resp = proxy_to_guest_for_role_pooled(
-        &connector,
-        Arc::clone(&pool),
+        &client,
         UtilityVmRole::Native,
         Method::POST,
         "/containers/create",
         &HeaderMap::new(),
-        Bytes::from_static(br#"{"Image":"alpine"}"#),
+        Bytes::from(vec![b'x'; 1024 * 1024]),
     )
     .await
     .unwrap();
@@ -155,8 +154,7 @@ async fn pooled_proxy_discards_session_when_body_is_dropped_early() {
     drop(resp);
 
     let resp = proxy_to_guest_for_role_pooled(
-        &connector,
-        Arc::clone(&pool),
+        &client,
         UtilityVmRole::Native,
         Method::GET,
         "/containers/json",
@@ -199,7 +197,7 @@ async fn proxy_stream_forwards_body() {
 #[tokio::test]
 async fn pooled_proxy_stream_reuses_http_session_after_body_eof() {
     let (connector, guest, _tmp) = setup().await;
-    let pool = Arc::new(GuestHttpPool::default());
+    let client = GuestHttpClient::new(Arc::new(connector.clone()));
 
     for path in ["/volumes", "/networks"] {
         let uri: Uri = path.parse().unwrap();
@@ -209,15 +207,9 @@ async fn pooled_proxy_stream_reuses_http_session_after_body_eof() {
             .body(Body::empty())
             .unwrap();
 
-        let resp = proxy_to_guest_stream_for_role_pooled(
-            &connector,
-            Arc::clone(&pool),
-            UtilityVmRole::Native,
-            &uri,
-            req,
-        )
-        .await
-        .unwrap();
+        let resp = proxy_to_guest_stream_for_role_pooled(&client, UtilityVmRole::Native, &uri, req)
+            .await
+            .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         let _ = resp.into_body().collect().await.unwrap();
