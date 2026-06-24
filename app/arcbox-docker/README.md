@@ -38,12 +38,16 @@ docker CLI ──► Unix socket ──► Axum router ──► local handlers
 ```
 
 The router strips Docker API version prefixes before route matching and stores
-the original URI for proxy forwarding. Requests then take one of three paths:
+the original URI for proxy forwarding. A request-context middleware derives the
+target utility VM role once from the URI and stores it in request extensions.
+Requests then take one of three paths:
 
 - **Local handlers** implement ArcBox-owned behavior such as host path
-  normalization, workload role tracking, and lifecycle orchestration.
-- **Ordinary proxy forwarding** relays non-upgrade HTTP/1.1 requests to guest
-  `dockerd` through a pooled hyper client.
+  normalization, workload role tracking, and lifecycle orchestration. The route
+  table intentionally contains only these endpoints.
+- **Ordinary pass-through** uses the Axum fallback for endpoints that do not
+  need ArcBox-specific behavior, then relays non-upgrade HTTP/1.1 requests to
+  guest `dockerd` through a pooled hyper client.
 - **Special proxy forwarding** handles streaming uploads and HTTP upgrades with
   dedicated connection lifecycles instead of the ordinary pool.
 

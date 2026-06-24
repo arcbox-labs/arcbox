@@ -1,13 +1,10 @@
-use super::{proxy_to_role, proxy_upgrade_to_role, resolve_container_role, resolve_exec_role};
+use super::{proxy_to_role, resolve_container_role};
 use crate::api::AppState;
 use crate::error::{DockerError, Result};
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
-use axum::http::{Request, header};
+use axum::http::Request;
 use axum::response::Response;
-
-crate::handlers::exec_proxy_handler!(exec_resize);
-crate::handlers::exec_proxy_handler!(exec_inspect);
 
 /// Create an exec instance on a container, recording the resulting exec ID
 /// against the container's utility VM role so follow-up
@@ -50,31 +47,6 @@ pub async fn exec_create(
     }
 
     Ok(Response::from_parts(parts, Body::from(body_bytes)))
-}
-
-/// Start exec instance (proxy + upgrade for interactive mode).
-///
-/// # Errors
-///
-/// Returns an error if upgrade proxying or request proxying fails.
-pub async fn exec_start(
-    State(state): State<AppState>,
-    OriginalUri(uri): OriginalUri,
-    req: Request<Body>,
-) -> Result<Response> {
-    let role = resolve_exec_role(&state, &uri).await?;
-    let wants_upgrade = req.headers().get(header::UPGRADE).is_some()
-        || req
-            .headers()
-            .get(header::CONNECTION)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.to_ascii_lowercase().contains("upgrade"));
-
-    if wants_upgrade {
-        proxy_upgrade_to_role(&state, role, &uri, req).await
-    } else {
-        proxy_to_role(&state, role, &uri, req).await
-    }
 }
 
 /// Parses the `Id` field from a `POST /containers/{id}/exec` JSON response.

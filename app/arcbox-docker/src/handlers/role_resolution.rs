@@ -47,22 +47,6 @@ pub async fn resolve_container_role(state: &AppState, uri: &Uri) -> Result<Utili
     }
 }
 
-/// Resolves the utility VM role for an `/exec/{id}/...` URI.
-///
-/// Returns the recorded role on hit, fails closed with 409 on an
-/// ambiguous short ID, and falls back to `native` only when no role is
-/// known at all.
-pub async fn resolve_exec_role(state: &AppState, uri: &Uri) -> Result<UtilityVmRole> {
-    let Some(id) = extract_exec_id(uri) else {
-        return Ok(UtilityVmRole::Native);
-    };
-    match state.workload_roles.lookup(&id).await {
-        WorkloadRoleLookup::Found(role) => Ok(role),
-        WorkloadRoleLookup::Ambiguous => Err(ambiguous_workload_error(&id)),
-        WorkloadRoleLookup::Missing => Ok(UtilityVmRole::Native),
-    }
-}
-
 /// Resolves the utility VM role for any Docker request URI that may carry a
 /// workload identity (container or exec). Used by the catch-all proxy
 /// fallback so unrouted endpoints like `/containers/{id}/archive` still

@@ -9,13 +9,14 @@
 use crate::handlers;
 use crate::proxy;
 use crate::proxy::{GuestConnector, GuestHttpClient};
+use crate::request_context::proxy_request_context_middleware;
 use crate::trace::trace_id_middleware;
 use crate::workload::WorkloadRoleRegistry;
 use arcbox_core::Runtime;
 use axum::extract::OriginalUri;
 use axum::{
     Router, middleware,
-    routing::{delete, get, head, post},
+    routing::{delete, post},
 };
 use std::sync::Arc;
 
@@ -66,8 +67,14 @@ pub fn create_router(runtime: Arc<Runtime>, connector: Arc<dyn GuestConnector>) 
         workload_roles: WorkloadRoleRegistry::new(),
     };
 
+    let router_state = state.clone();
+
     api_routes()
         .fallback(proxy::proxy_fallback)
+        .layer(middleware::from_fn_with_state(
+            router_state,
+            proxy_request_context_middleware,
+        ))
         .layer(middleware::from_fn(trace_id_middleware))
         .with_state(state)
 }
@@ -133,19 +140,11 @@ fn api_routes() -> Router<AppState> {
 
 fn system_routes() -> Router<AppState> {
     Router::new()
-        .route("/version", get(handlers::get_version))
-        .route("/info", get(handlers::get_info))
-        .route("/_ping", get(handlers::ping))
-        .route("/_ping", head(handlers::ping))
-        .route("/events", get(handlers::events))
 }
 
 fn container_routes() -> Router<AppState> {
     Router::new()
-        .route("/containers/json", get(handlers::list_containers))
         .route("/containers/create", post(handlers::create_container))
-        .route("/containers/prune", post(handlers::prune_containers))
-        .route("/containers/{id}/json", get(handlers::inspect_container))
         .route("/containers/{id}/start", post(handlers::start_container))
         .route("/containers/{id}/stop", post(handlers::stop_container))
         .route(
@@ -153,61 +152,28 @@ fn container_routes() -> Router<AppState> {
             post(handlers::restart_container),
         )
         .route("/containers/{id}/kill", post(handlers::kill_container))
-        .route("/containers/{id}/pause", post(handlers::pause_container))
-        .route(
-            "/containers/{id}/unpause",
-            post(handlers::unpause_container),
-        )
         .route("/containers/{id}/rename", post(handlers::rename_container))
-        .route("/containers/{id}/wait", post(handlers::wait_container))
-        .route("/containers/{id}/logs", get(handlers::container_logs))
-        .route("/containers/{id}/top", get(handlers::container_top))
-        .route("/containers/{id}/stats", get(handlers::container_stats))
-        .route("/containers/{id}/changes", get(handlers::container_changes))
-        .route("/containers/{id}/attach", post(handlers::attach_container))
         .route("/containers/{id}", delete(handlers::remove_container))
 }
 
 fn exec_routes() -> Router<AppState> {
-    Router::new()
-        .route("/containers/{id}/exec", post(handlers::exec_create))
-        .route("/exec/{id}/start", post(handlers::exec_start))
-        .route("/exec/{id}/resize", post(handlers::exec_resize))
-        .route("/exec/{id}/json", get(handlers::exec_inspect))
+    Router::new().route("/containers/{id}/exec", post(handlers::exec_create))
 }
 
 fn build_routes() -> Router<AppState> {
-    Router::new()
-        .route("/build", post(handlers::build_image))
-        .route("/build/prune", post(handlers::build_prune))
-        .route("/session", post(handlers::session))
+    Router::new().route("/build", post(handlers::build_image))
 }
 
 fn image_routes() -> Router<AppState> {
     Router::new()
-        .route("/images/json", get(handlers::list_images))
-        .route("/images/create", post(handlers::pull_image))
-        .route("/images/load", post(handlers::load_image))
-        .route("/images/{id}/json", get(handlers::inspect_image))
-        .route("/images/{id}", delete(handlers::remove_image))
-        .route("/images/{id}/tag", post(handlers::tag_image))
 }
 
 fn network_routes() -> Router<AppState> {
     Router::new()
-        .route("/networks", get(handlers::list_networks))
-        .route("/networks/create", post(handlers::create_network))
-        .route("/networks/{id}", get(handlers::inspect_network))
-        .route("/networks/{id}", delete(handlers::remove_network))
 }
 
 fn volume_routes() -> Router<AppState> {
     Router::new()
-        .route("/volumes", get(handlers::list_volumes))
-        .route("/volumes/create", post(handlers::create_volume))
-        .route("/volumes/prune", post(handlers::prune_volumes))
-        .route("/volumes/{name}", get(handlers::inspect_volume))
-        .route("/volumes/{name}", delete(handlers::remove_volume))
 }
 
 #[cfg(test)]

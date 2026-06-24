@@ -1,28 +1,15 @@
-use super::{
-    extract_container_id, proxy_to_role, proxy_upgrade_to_role, require_amd64_runtime,
-    resolve_container_role,
-};
+use super::{extract_container_id, proxy_to_role, require_amd64_runtime};
 use crate::api::AppState;
 use crate::error::{DockerError, Result};
 use crate::port_bindings::parse_port_bindings;
+use crate::request_context::ProxyRequestContext;
 use crate::routing::{UtilityVmRole, query_param, route_container_create};
 use axum::body::Body;
-use axum::extract::{OriginalUri, State};
+use axum::extract::{Extension, OriginalUri, State};
 use axum::http::{HeaderMap, Method, Request, Uri};
 use axum::response::Response;
 use bytes::Bytes;
 use std::net::IpAddr;
-
-crate::handlers::proxy_handler!(list_containers);
-crate::handlers::proxy_handler!(prune_containers);
-crate::handlers::container_proxy_handler!(inspect_container);
-crate::handlers::container_proxy_handler!(container_logs);
-crate::handlers::container_proxy_handler!(wait_container);
-crate::handlers::container_proxy_handler!(pause_container);
-crate::handlers::container_proxy_handler!(unpause_container);
-crate::handlers::container_proxy_handler!(container_top);
-crate::handlers::container_proxy_handler!(container_stats);
-crate::handlers::container_proxy_handler!(container_changes);
 
 /// Create a container, resolving macOS symlinks in bind-mount source paths.
 ///
@@ -112,10 +99,11 @@ pub async fn create_container(
 pub async fn start_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    Extension(proxy_context): Extension<ProxyRequestContext>,
     req: Request<Body>,
 ) -> Result<Response> {
     let container_id = extract_container_id(&uri);
-    let role = resolve_container_role(&state, &uri).await?;
+    let role = proxy_context.role;
 
     // Proxy start request to guest.
     let response = proxy_to_role(&state, role, &uri, req).await?;
@@ -139,9 +127,10 @@ pub async fn start_container(
 pub async fn stop_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    Extension(proxy_context): Extension<ProxyRequestContext>,
     req: Request<Body>,
 ) -> Result<Response> {
-    let role = resolve_container_role(&state, &uri).await?;
+    let role = proxy_context.role;
     // Resolve canonical ID before proxy — the name/short-id is still valid now
     // but may become stale after stop (e.g. --rm containers).
     let canonical = resolve_or_raw_for_teardown(&state, role, &uri).await;
@@ -169,9 +158,10 @@ pub async fn stop_container(
 pub async fn kill_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    Extension(proxy_context): Extension<ProxyRequestContext>,
     req: Request<Body>,
 ) -> Result<Response> {
-    let role = resolve_container_role(&state, &uri).await?;
+    let role = proxy_context.role;
     // Resolve canonical ID before proxy — kill with --rm triggers auto-remove.
     let canonical = resolve_or_raw_for_teardown(&state, role, &uri).await;
 
@@ -196,9 +186,10 @@ pub async fn kill_container(
 pub async fn restart_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    Extension(proxy_context): Extension<ProxyRequestContext>,
     req: Request<Body>,
 ) -> Result<Response> {
-    let role = resolve_container_role(&state, &uri).await?;
+    let role = proxy_context.role;
     let response = proxy_to_role(&state, role, &uri, req).await?;
 
     // Docker restart returns 204 on success. Refresh DNS (container may get
@@ -227,9 +218,10 @@ pub async fn restart_container(
 pub async fn remove_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    Extension(proxy_context): Extension<ProxyRequestContext>,
     req: Request<Body>,
 ) -> Result<Response> {
-    let role = resolve_container_role(&state, &uri).await?;
+    let role = proxy_context.role;
     // Resolve canonical ID before proxy — the name/short-id is still valid now.
     let canonical = resolve_or_raw_for_teardown(&state, role, &uri).await;
 
@@ -442,9 +434,10 @@ pub fn extract_container_dns_info(inspect_json: &[u8]) -> Option<(Vec<String>, I
 pub async fn rename_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    Extension(proxy_context): Extension<ProxyRequestContext>,
     req: Request<Body>,
 ) -> Result<Response> {
-    let role = resolve_container_role(&state, &uri).await?;
+    let role = proxy_context.role;
     // Resolve canonical ID BEFORE proxy — the old name/short-id is still valid
     // now but will be invalid after a successful rename.
     let canonical = resolve_canonical_from_uri(&state, role, &uri).await;
@@ -478,20 +471,6 @@ pub async fn rename_container(
     }
 
     Ok(response)
-}
-
-/// Attach to a container.
-///
-/// # Errors
-///
-/// Returns an error if upgrade proxying to guest dockerd fails.
-pub async fn attach_container(
-    State(state): State<AppState>,
-    OriginalUri(uri): OriginalUri,
-    req: Request<Body>,
-) -> Result<Response> {
-    let role = resolve_container_role(&state, &uri).await?;
-    proxy_upgrade_to_role(&state, role, &uri, req).await
 }
 
 /// Extracts the canonical full container ID from a Docker inspect JSON response.

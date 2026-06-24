@@ -4,7 +4,8 @@ use super::headers::HeaderMapProxyExt;
 use super::{forward, upgrade, upload};
 use crate::api::AppState;
 use crate::error::Result;
-use crate::handlers::{ensure_role_ready, resolve_role_from_uri};
+use crate::handlers::ensure_role_ready;
+use crate::request_context::ProxyRequestContext;
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
 use axum::http::Response;
@@ -25,7 +26,10 @@ pub async fn proxy_fallback(
     OriginalUri(uri): OriginalUri,
     req: axum::http::Request<Body>,
 ) -> Result<Response<Body>> {
-    let role = resolve_role_from_uri(&state, &uri).await?;
+    let role = req
+        .extensions()
+        .get::<ProxyRequestContext>()
+        .map_or_else(|| crate::routing::UtilityVmRole::Native, |ctx| ctx.role);
     tracing::debug!(
         method = %req.method(),
         uri = %uri,
