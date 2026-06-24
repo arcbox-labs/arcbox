@@ -1,45 +1,146 @@
-//! HTTP/1.1 guest dockerd sessions.
+//! HTTP/1.1 guest dockerd sessions and pooled clients.
 
 use super::{GuestConnector, HANDSHAKE_TIMEOUT};
 use crate::error::{DockerError, Result};
 use crate::routing::UtilityVmRole;
 use arcbox_error::CommonError;
 use axum::body::Body;
-use bytes::Bytes;
-use http_body::Frame;
+use hyper::Uri;
 use hyper::client::conn::http1;
+use hyper::rt::{Read, ReadBufCursor, Write};
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::{Connected, Connection};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use std::future::Future;
+use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
+use tower::Service;
 
 const MAX_IDLE_SESSIONS_PER_ROLE: usize = 8;
+const IDLE_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+const NATIVE_AUTHORITY: &str = "native.arcbox.internal";
+const ROSETTA_AUTHORITY: &str = "rosetta.arcbox.internal";
 
-/// Idle guest HTTP/1.1 sessions keyed by utility VM role.
-#[derive(Default)]
-pub struct GuestHttpPool {
-    native: Mutex<Vec<GuestHttpSession>>,
-    rosetta: Mutex<Vec<GuestHttpSession>>,
+/// Pooled HTTP/1.1 client for ordinary guest dockerd requests.
+pub struct GuestHttpClient {
+    client: Client<GuestClientConnector, Body>,
 }
 
-impl GuestHttpPool {
-    pub(super) fn take(&self, role: UtilityVmRole) -> Option<GuestHttpSession> {
-        self.sessions(role).lock().ok()?.pop()
+impl GuestHttpClient {
+    pub fn new(connector: Arc<dyn GuestConnector>) -> Self {
+        let mut builder = Client::builder(TokioExecutor::new());
+        builder
+            .pool_max_idle_per_host(MAX_IDLE_SESSIONS_PER_ROLE)
+            .pool_idle_timeout(IDLE_SESSION_TIMEOUT)
+            .pool_timer(TokioTimer::new());
+
+        Self {
+            client: builder.build(GuestClientConnector { connector }),
+        }
     }
 
-    fn put(&self, role: UtilityVmRole, session: GuestHttpSession) {
-        let Ok(mut sessions) = self.sessions(role).lock() else {
-            return;
+    pub(super) async fn request(
+        &self,
+        req: hyper::Request<Body>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>> {
+        self.client
+            .request(req)
+            .await
+            .map_err(|e| DockerError::Server(format!("guest docker request failed: {e}")))
+    }
+
+    pub(super) fn uri(role: UtilityVmRole, path_and_query: &str) -> Result<Uri> {
+        let authority = match role {
+            UtilityVmRole::Native => NATIVE_AUTHORITY,
+            UtilityVmRole::Rosetta => ROSETTA_AUTHORITY,
         };
-        if sessions.len() < MAX_IDLE_SESSIONS_PER_ROLE {
-            sessions.push(session);
-        }
+        format!("http://{authority}{path_and_query}")
+            .parse()
+            .map_err(|e| DockerError::Server(format!("failed to build guest request uri: {e}")))
+    }
+}
+
+#[derive(Clone)]
+struct GuestClientConnector {
+    connector: Arc<dyn GuestConnector>,
+}
+
+impl Service<Uri> for GuestClientConnector {
+    type Response = GuestIo;
+    type Error = DockerError;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<GuestIo, DockerError>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 
-    fn sessions(&self, role: UtilityVmRole) -> &Mutex<Vec<GuestHttpSession>> {
-        match role {
-            UtilityVmRole::Native => &self.native,
-            UtilityVmRole::Rosetta => &self.rosetta,
-        }
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let connector = Arc::clone(&self.connector);
+        Box::pin(async move {
+            let role = role_from_uri(&uri);
+            let io = connector.connect_for(role).await?;
+            Ok(GuestIo(io))
+        })
+    }
+}
+
+fn role_from_uri(uri: &Uri) -> UtilityVmRole {
+    match uri.authority().map(|authority| authority.as_str()) {
+        Some(ROSETTA_AUTHORITY) => UtilityVmRole::Rosetta,
+        _ => UtilityVmRole::Native,
+    }
+}
+
+struct GuestIo(TokioIo<super::VsockStream>);
+
+impl Unpin for GuestIo {}
+
+impl Connection for GuestIo {
+    fn connected(&self) -> Connected {
+        Connected::new()
+    }
+}
+
+impl Read for GuestIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl Write for GuestIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
     }
 }
 
@@ -86,74 +187,5 @@ impl GuestHttpSession {
             .send_request(req)
             .await
             .map_err(|e| DockerError::Server(format!("guest docker {context} failed: {e}")))
-    }
-
-    pub(super) async fn ready(&mut self) -> bool {
-        !self.sender.is_closed() && self.sender.ready().await.is_ok()
-    }
-
-    pub(super) fn reusable_body(
-        self,
-        incoming: hyper::body::Incoming,
-        pool: Arc<GuestHttpPool>,
-        role: UtilityVmRole,
-    ) -> Body {
-        Body::new(ReusableIncoming {
-            incoming,
-            session: Some(self),
-            pool,
-            role,
-        })
-    }
-}
-
-struct ReusableIncoming {
-    incoming: hyper::body::Incoming,
-    session: Option<GuestHttpSession>,
-    pool: Arc<GuestHttpPool>,
-    role: UtilityVmRole,
-}
-
-impl ReusableIncoming {
-    fn return_session(&mut self) {
-        if let Some(session) = self.session.take() {
-            self.pool.put(self.role, session);
-        }
-    }
-}
-
-impl http_body::Body for ReusableIncoming {
-    type Data = Bytes;
-    type Error = hyper::Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
-        match Pin::new(&mut self.incoming).poll_frame(cx) {
-            Poll::Ready(None) => {
-                self.return_session();
-                Poll::Ready(None)
-            }
-            Poll::Ready(Some(Err(err))) => {
-                self.session.take();
-                Poll::Ready(Some(Err(err)))
-            }
-            Poll::Ready(Some(Ok(frame))) => {
-                if self.incoming.is_end_stream() {
-                    self.return_session();
-                }
-                Poll::Ready(Some(Ok(frame)))
-            }
-            other => other,
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.incoming.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.incoming.size_hint()
     }
 }
