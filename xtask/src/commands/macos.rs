@@ -12,7 +12,7 @@ pub fn run(args: MacosArgs) -> Result<()> {
 
 fn run_dev(args: crate::MacosDevArgs) -> Result<()> {
     let shell = xshell::Shell::new()?;
-    let root = repo_root();
+    let root = repo_root()?;
     shell.change_dir(&root);
     let release = args.profile == "release";
     if args.profile != "debug" && !release {

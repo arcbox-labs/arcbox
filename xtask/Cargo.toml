@@ -19,6 +19,7 @@ sha2.workspace = true
 tar = "0.4.46"
 toml_edit = "0.25.12"
 xshell = "0.2.7"
+xtask-kit = { version = "0.1.2", package = "xtask", features = ["github-actions"] }
 
 [lints]
 workspace = true

@@ -1,11 +1,11 @@
-use std::{fs, fs::OpenOptions, io::Write, path::Path};
+use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
 use flate2::{Compression, write::GzEncoder};
-use sha2::{Digest, Sha256};
 use tar::Builder;
+use xtask_kit::{fs::copy_file, github_actions, hash::sha256_file};
 
-use crate::{PackageTarballArgs, support::fs::copy_file};
+use crate::PackageTarballArgs;
 
 pub fn run(args: PackageTarballArgs) -> Result<()> {
     fs::create_dir_all(&args.output_dir)
@@ -19,30 +19,29 @@ pub fn run(args: PackageTarballArgs) -> Result<()> {
     }
 
     copy_file(
-        &args.host_artifacts.join("target/release/abctl"),
-        &staging.join("abctl"),
+        args.host_artifacts.join("target/release/abctl"),
+        staging.join("abctl"),
     )?;
     copy_file(
-        &args.host_artifacts.join("target/release/arcbox-daemon"),
-        &staging.join("arcbox-daemon"),
+        args.host_artifacts.join("target/release/arcbox-daemon"),
+        staging.join("arcbox-daemon"),
     )?;
     copy_file(
-        &args.host_artifacts.join("target/release/arcbox-helper"),
-        &staging.join("arcbox-helper"),
+        args.host_artifacts.join("target/release/arcbox-helper"),
+        staging.join("arcbox-helper"),
     )?;
     copy_file(
-        &args.agent_artifacts.join("arcbox-agent"),
-        &staging.join("arcbox-agent"),
+        args.agent_artifacts.join("arcbox-agent"),
+        staging.join("arcbox-agent"),
     )?;
     copy_file(
-        &args.host_artifacts.join("bundle/arcbox.entitlements"),
-        &staging.join("bundle/arcbox.entitlements"),
+        args.host_artifacts.join("bundle/arcbox.entitlements"),
+        staging.join("bundle/arcbox.entitlements"),
     )?;
     copy_file(
-        &args
-            .host_artifacts
+        args.host_artifacts
             .join("bundle/com.arcboxlabs.desktop.helper.plist"),
-        &staging.join("bundle/com.arcboxlabs.desktop.helper.plist"),
+        staging.join("bundle/com.arcboxlabs.desktop.helper.plist"),
     )?;
 
     let tarball_name = format!("{staging_name}.tar.gz");
@@ -67,20 +66,10 @@ pub fn run(args: PackageTarballArgs) -> Result<()> {
     println!("{}", checksum.display());
 
     if let Some(github_output) = args.github_output {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&github_output)
-            .with_context(|| format!("opening {}", github_output.display()))?;
-        writeln!(file, "tarball={tarball_name}")?;
+        github_actions::append_output(&github_output, "tarball", &tarball_name)?;
     }
 
     Ok(())
-}
-
-fn sha256_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 fn print_tree(dir: &Path, prefix: &str) -> Result<()> {
