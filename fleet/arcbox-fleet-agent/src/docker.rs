@@ -40,6 +40,8 @@ pub struct DockerRunner {
     client: Docker,
     /// Image used when the platform sends no image override.
     default_image: String,
+    /// Linux arches verified pullable at startup, advertised as capacity pools.
+    linux_arches: Vec<String>,
 }
 
 /// ArcBox's Docker-compatible socket path on macOS (`~/.arcbox/docker.sock`).
@@ -55,12 +57,32 @@ fn arcbox_socket_path() -> Option<String> {
     })
 }
 
+/// Linux arches this host could serve, before verifying they can be pulled.
+///
+/// The native arch always, plus amd64 on Apple Silicon macOS, where ArcBox's
+/// runtime provides Rosetta-backed emulation.
+fn candidate_arches() -> Vec<String> {
+    let native = host::map_arch(std::env::consts::ARCH);
+    let mut arches = vec![native.to_owned()];
+    if std::env::consts::OS == "macos" && native == "arm64" {
+        arches.push("amd64".to_owned());
+    }
+    arches
+}
+
 impl DockerRunner {
-    /// Connect to the Docker-compatible runtime and verify reachability.
+    /// Connect to the Docker-compatible runtime and prove it works by pulling
+    /// the default runner image for each candidate arch.
     ///
-    /// On macOS, connects to ArcBox's own socket (`~/.arcbox/docker.sock`).
-    /// On other platforms, uses the system default (e.g. `/var/run/docker.sock`
-    /// on Linux, named pipe on Windows).
+    /// On macOS, connects to ArcBox's own socket (`~/.arcbox/docker.sock`); on
+    /// other platforms the system default (e.g. `/var/run/docker.sock` on
+    /// Linux, named pipe on Windows).
+    ///
+    /// The pull is the readiness check: an arch is advertised only if its image
+    /// pulls, so a host that cannot realize `linux/amd64` (no working emulation)
+    /// never advertises it. Docker counts as available only if at least one arch
+    /// pulls; otherwise this returns an error and the caller proceeds without it
+    /// (`Auto`) or fails startup (`Enabled`).
     pub async fn new(default_image: String) -> Result<Self> {
         let client = if let Some(addr) = arcbox_socket_path() {
             Docker::connect_with_unix(&addr, 120, bollard::API_DEFAULT_VERSION)
@@ -72,26 +94,30 @@ impl DockerRunner {
             .ping()
             .await
             .context("Docker-compatible runtime is not reachable (ping failed)")?;
-        info!("docker runtime available");
+
+        let mut linux_arches = Vec::new();
+        for arch in candidate_arches() {
+            let platform = format!("linux/{arch}");
+            match Self::pull_image(&client, &default_image, &platform).await {
+                Ok(()) => linux_arches.push(arch),
+                Err(e) => warn!(arch, error = %e, "skipping arch: default image pull failed"),
+            }
+        }
+        if linux_arches.is_empty() {
+            anyhow::bail!("docker reachable but could not pull {default_image} for any arch");
+        }
+
+        info!(?linux_arches, "docker runtime available");
         Ok(Self {
             client,
             default_image,
+            linux_arches,
         })
     }
 
-    /// Linux architectures this Docker host can run as containers.
-    ///
-    /// Always includes the host's native arch. On Linux this is the same pool
-    /// the host would otherwise serve directly, but Docker still runs it for
-    /// isolation. On Apple Silicon macOS, amd64 is also included because
-    /// ArcBox's runtime provides Rosetta-backed emulation.
+    /// Linux architectures this Docker host serves, verified pullable at startup.
     pub fn linux_arches(&self) -> Vec<String> {
-        let native = host::map_arch(std::env::consts::ARCH);
-        let mut arches = vec![native.to_owned()];
-        if std::env::consts::OS == "macos" && native == "arm64" {
-            arches.push("amd64".to_owned());
-        }
-        arches
+        self.linux_arches.clone()
     }
 
     /// Resolve the image for a job: prefer the platform-supplied value, fall
@@ -111,7 +137,7 @@ impl DockerRunner {
     pub async fn run_job(&self, spec: RunSpec<'_>) -> Result<DockerOutcome> {
         let platform = format!("linux/{}", spec.arch);
 
-        self.pull_image(spec.image, &platform).await?;
+        Self::pull_image(&self.client, spec.image, &platform).await?;
 
         let container_name = format!("arcbox-{}", spec.job_id);
         let config = ContainerCreateBody {
@@ -170,14 +196,14 @@ impl DockerRunner {
     }
 
     /// Pull an image for a specific platform.
-    async fn pull_image(&self, image: &str, platform: &str) -> Result<()> {
+    async fn pull_image(client: &Docker, image: &str, platform: &str) -> Result<()> {
         debug!(image, platform, "pulling image");
         let options = CreateImageOptions {
             from_image: Some(image.to_owned()),
             platform: platform.to_owned(),
             ..Default::default()
         };
-        let mut stream = self.client.create_image(Some(options), None, None);
+        let mut stream = client.create_image(Some(options), None, None);
         while let Some(info) = stream.next().await {
             info.with_context(|| format!("pulling {image} for {platform}"))?;
         }
