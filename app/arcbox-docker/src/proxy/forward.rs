@@ -59,23 +59,15 @@ pub async fn proxy_to_guest_for_role(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>> {
-    let mut session = GuestHttpSession::connect(connector, role).await?;
-
-    let mut req = hyper::Request::builder()
-        .method(method)
-        .uri(path_and_query)
-        .body(Body::from(body))
-        .map_err(|e| DockerError::Server(format!("failed to build guest request: {e}")))?;
-
-    req.headers_mut()
-        .extend(headers.forwarded_for_guest(ForwardedHeaderMode::Normal));
-    req.headers_mut()
-        .insert(header::HOST, HeaderValue::from_static("localhost"));
-
-    let response = session.send_request(req, "request").await?;
-
-    let (parts, incoming) = response.into_parts();
-    Ok(Response::from_parts(parts, Body::new(incoming)))
+    BufferedForward {
+        role,
+        method,
+        path_and_query,
+        headers,
+        body,
+    }
+    .send_direct(connector)
+    .await
 }
 
 /// Forward an HTTP request using a reusable guest HTTP session when possible.
@@ -91,20 +83,15 @@ pub async fn proxy_to_guest_for_role_pooled(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>> {
-    let mut req = hyper::Request::builder()
-        .method(method)
-        .uri(GuestHttpClient::uri(role, path_and_query)?)
-        .body(Body::from(body))
-        .map_err(|e| DockerError::Server(format!("failed to build guest request: {e}")))?;
-
-    req.headers_mut()
-        .extend(headers.forwarded_for_guest(ForwardedHeaderMode::Normal));
-    req.headers_mut()
-        .insert(header::HOST, HeaderValue::from_static("localhost"));
-
-    let response = client.request(req).await?;
-    let (parts, incoming) = response.into_parts();
-    Ok(Response::from_parts(parts, Body::new(incoming)))
+    BufferedForward {
+        role,
+        method,
+        path_and_query,
+        headers,
+        body,
+    }
+    .send_pooled(client)
+    .await
 }
 
 /// Forward an HTTP request to guest dockerd without buffering the request body.
@@ -136,30 +123,13 @@ pub async fn proxy_to_guest_stream_for_role(
     original_uri: &Uri,
     req: Request<Body>,
 ) -> Result<Response<Body>> {
-    let mut session = GuestHttpSession::connect(connector, role).await?;
-
-    let path_and_query = GuestPath::from(original_uri);
-    let method = req.method().clone();
-    let forwarded_headers = req
-        .headers()
-        .forwarded_for_guest(ForwardedHeaderMode::Normal);
-    let body = req.into_body();
-
-    let mut guest_req = hyper::Request::builder()
-        .method(method)
-        .uri(path_and_query.as_ref())
-        .body(body)
-        .map_err(|e| DockerError::Server(format!("failed to build guest request: {e}")))?;
-
-    guest_req.headers_mut().extend(forwarded_headers);
-    guest_req
-        .headers_mut()
-        .insert(header::HOST, HeaderValue::from_static("localhost"));
-
-    let response = session.send_request(guest_req, "request").await?;
-
-    let (parts, incoming) = response.into_parts();
-    Ok(Response::from_parts(parts, Body::new(incoming)))
+    StreamForward {
+        role,
+        original_uri,
+        req,
+    }
+    .send_direct(connector)
+    .await
 }
 
 /// Forward a streaming HTTP request using a reusable guest HTTP session when possible.
@@ -173,26 +143,103 @@ pub async fn proxy_to_guest_stream_for_role_pooled(
     original_uri: &Uri,
     req: Request<Body>,
 ) -> Result<Response<Body>> {
-    let path_and_query = GuestPath::from(original_uri);
-    let method = req.method().clone();
-    let forwarded_headers = req
-        .headers()
-        .forwarded_for_guest(ForwardedHeaderMode::Normal);
-    let body = req.into_body();
+    StreamForward {
+        role,
+        original_uri,
+        req,
+    }
+    .send_pooled(client)
+    .await
+}
 
-    let mut guest_req = hyper::Request::builder()
+struct BufferedForward<'a> {
+    role: UtilityVmRole,
+    method: Method,
+    path_and_query: &'a str,
+    headers: &'a HeaderMap,
+    body: Bytes,
+}
+
+impl BufferedForward<'_> {
+    async fn send_direct(self, connector: &dyn GuestConnector) -> Result<Response<Body>> {
+        let role = self.role;
+        let uri = parse_guest_uri(self.path_and_query)?;
+        let req = self.into_request(uri)?;
+        let mut session = GuestHttpSession::connect(connector, role).await?;
+        Ok(response_with_axum_body(
+            session.send_request(req, "request").await?,
+        ))
+    }
+
+    async fn send_pooled(self, client: &GuestHttpClient) -> Result<Response<Body>> {
+        let role = self.role;
+        let uri = GuestHttpClient::uri(role, self.path_and_query)?;
+        let req = self.into_request(uri)?;
+        Ok(response_with_axum_body(client.request(req).await?))
+    }
+
+    fn into_request(self, uri: Uri) -> Result<Request<Body>> {
+        build_guest_request(self.method, uri, self.headers, Body::from(self.body))
+    }
+}
+
+struct StreamForward<'a> {
+    role: UtilityVmRole,
+    original_uri: &'a Uri,
+    req: Request<Body>,
+}
+
+impl StreamForward<'_> {
+    async fn send_direct(self, connector: &dyn GuestConnector) -> Result<Response<Body>> {
+        let role = self.role;
+        let path_and_query = GuestPath::from(self.original_uri);
+        let uri = parse_guest_uri(path_and_query.as_ref())?;
+        let req = self.into_request(uri)?;
+        let mut session = GuestHttpSession::connect(connector, role).await?;
+        Ok(response_with_axum_body(
+            session.send_request(req, "request").await?,
+        ))
+    }
+
+    async fn send_pooled(self, client: &GuestHttpClient) -> Result<Response<Body>> {
+        let role = self.role;
+        let path_and_query = GuestPath::from(self.original_uri);
+        let uri = GuestHttpClient::uri(role, path_and_query.as_ref())?;
+        let req = self.into_request(uri)?;
+        Ok(response_with_axum_body(client.request(req).await?))
+    }
+
+    fn into_request(self, uri: Uri) -> Result<Request<Body>> {
+        let (parts, body) = self.req.into_parts();
+        build_guest_request(parts.method, uri, &parts.headers, body)
+    }
+}
+
+fn build_guest_request(
+    method: Method,
+    uri: Uri,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Request<Body>> {
+    let mut req = hyper::Request::builder()
         .method(method)
-        .uri(GuestHttpClient::uri(role, path_and_query.as_ref())?)
+        .uri(uri)
         .body(body)
         .map_err(|e| DockerError::Server(format!("failed to build guest request: {e}")))?;
 
-    guest_req.headers_mut().extend(forwarded_headers);
-    guest_req
-        .headers_mut()
+    req.headers_mut()
+        .extend(headers.forwarded_for_guest(ForwardedHeaderMode::Normal));
+    req.headers_mut()
         .insert(header::HOST, HeaderValue::from_static("localhost"));
+    Ok(req)
+}
 
-    let response = client.request(guest_req).await?;
+fn parse_guest_uri(uri: &str) -> Result<Uri> {
+    uri.parse()
+        .map_err(|e| DockerError::Server(format!("failed to build guest request uri: {e}")))
+}
 
+fn response_with_axum_body(response: hyper::Response<hyper::body::Incoming>) -> Response<Body> {
     let (parts, incoming) = response.into_parts();
-    Ok(Response::from_parts(parts, Body::new(incoming)))
+    Response::from_parts(parts, Body::new(incoming))
 }
