@@ -8,7 +8,8 @@ mod support;
 use support::mock_guest::{self, MockGuest};
 
 use arcbox_docker::proxy::{
-    GuestConnector, RawFdStream, proxy_to_guest, proxy_to_guest_stream, proxy_with_upgrade,
+    GuestConnector, VsockShutdown, VsockStream, proxy_to_guest, proxy_to_guest_stream,
+    proxy_with_upgrade,
 };
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri, header};
@@ -16,7 +17,6 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use std::future::Future;
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::pin::Pin;
 use tempfile::TempDir;
@@ -32,20 +32,16 @@ struct UnixSocketConnector {
 impl GuestConnector for UnixSocketConnector {
     fn connect(
         &self,
-    ) -> Pin<Box<dyn Future<Output = arcbox_docker::Result<TokioIo<RawFdStream>>> + Send + '_>>
+    ) -> Pin<Box<dyn Future<Output = arcbox_docker::Result<TokioIo<VsockStream>>> + Send + '_>>
     {
         Box::pin(async {
-            let std_stream = tokio::net::UnixStream::connect(&self.socket_path)
+            let stream = tokio::net::UnixStream::connect(&self.socket_path)
                 .await
-                .map_err(|e| arcbox_docker::DockerError::Server(e.to_string()))?
-                .into_std()
                 .map_err(|e| arcbox_docker::DockerError::Server(e.to_string()))?;
-            // SAFETY: into_raw_fd yields a valid, owned fd; wrap immediately
-            // in OwnedFd so it is closed on error.
-            let owned: OwnedFd = unsafe { OwnedFd::from_raw_fd(std_stream.into_raw_fd()) };
-            let stream = RawFdStream::new(owned)
-                .map_err(|e| arcbox_docker::DockerError::Server(e.to_string()))?;
-            Ok(TokioIo::new(stream))
+            Ok(TokioIo::new(VsockStream::from_unix_stream_with_shutdown(
+                stream,
+                VsockShutdown::CloseOnDropOnly,
+            )))
         })
     }
 }

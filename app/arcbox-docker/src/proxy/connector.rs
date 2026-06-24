@@ -1,11 +1,11 @@
 //! Production guest connector via vsock.
 
 use super::GuestConnector;
-use super::stream::RawFdStream;
 use crate::error::{DockerError, Result};
 use crate::routing::UtilityVmRole;
 use arcbox_core::Runtime;
 use arcbox_error::CommonError;
+use arcbox_transport::vsock::{VsockShutdown, VsockStream};
 use hyper_util::rt::TokioIo;
 use std::future::Future;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -39,14 +39,14 @@ impl VsockConnector {
 }
 
 impl GuestConnector for VsockConnector {
-    fn connect(&self) -> Pin<Box<dyn Future<Output = Result<TokioIo<RawFdStream>>> + Send + '_>> {
+    fn connect(&self) -> Pin<Box<dyn Future<Output = Result<TokioIo<VsockStream>>> + Send + '_>> {
         self.connect_for(UtilityVmRole::Native)
     }
 
     fn connect_for(
         &self,
         role: UtilityVmRole,
-    ) -> Pin<Box<dyn Future<Output = Result<TokioIo<RawFdStream>>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<TokioIo<VsockStream>>> + Send + '_>> {
         Box::pin(async move {
             let _permit = CONNECT_SEMAPHORE
                 .acquire()
@@ -94,8 +94,11 @@ impl GuestConnector for VsockConnector {
                 }
             };
 
-            let stream = RawFdStream::new(owned_fd)
-                .map_err(|e| DockerError::Server(format!("failed to create guest stream: {e}")))?;
+            let stream =
+                VsockStream::from_fd_with_shutdown(owned_fd, VsockShutdown::CloseOnDropOnly)
+                    .map_err(|e| {
+                        DockerError::Server(format!("failed to create guest stream: {e}"))
+                    })?;
             Ok(TokioIo::new(stream))
         })
     }

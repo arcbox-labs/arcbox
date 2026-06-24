@@ -1,12 +1,13 @@
 //! Catch-all proxy handler for unmatched Docker API routes.
 
+use super::headers::HeaderMapProxyExt;
 use super::{forward, upgrade, upload};
 use crate::api::AppState;
 use crate::error::Result;
 use crate::handlers::{ensure_role_ready, resolve_role_from_uri};
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
-use axum::http::{Response, header};
+use axum::http::Response;
 
 /// Catch-all handler that proxies unmatched requests to guest dockerd.
 ///
@@ -33,15 +34,7 @@ pub async fn proxy_fallback(
     );
     ensure_role_ready(&state, role).await?;
 
-    // Detect upgrade requests (attach, exec, BuildKit gRPC/session).
-    let wants_upgrade = req.headers().get(header::UPGRADE).is_some()
-        || req
-            .headers()
-            .get(header::CONNECTION)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.to_ascii_lowercase().contains("upgrade"));
-
-    if wants_upgrade {
+    if req.headers().wants_upgrade() {
         return upgrade::proxy_with_upgrade_for_role(state.connector.as_ref(), role, req, &uri)
             .await;
     }

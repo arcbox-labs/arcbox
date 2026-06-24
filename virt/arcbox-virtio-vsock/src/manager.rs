@@ -579,7 +579,7 @@ impl VsockHostConnections for VsockConnectionManager {
         // returns EOF. The reverse direction (daemon→guest writes) stays open
         // so the host can drain any in-flight bytes and finish the session.
         //
-        // Without this, the daemon's RawFdStream poll_read never observes the
+        // Without this, the daemon-side async fd stream never observes the
         // guest's half-close and `copy_bidirectional` stalls forever. This
         // manifests as `docker run <image>` (foreground attach) hanging after
         // the container exits: dockerd closes its end of attach, the guest

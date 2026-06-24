@@ -4,7 +4,8 @@ use super::{
 };
 use crate::api::AppState;
 use crate::error::{DockerError, Result};
-use crate::proxy::{parse_port_bindings, proxy_to_guest_for_role};
+use crate::port_bindings::parse_port_bindings;
+use crate::proxy::proxy_to_guest_for_role;
 use crate::routing::{UtilityVmRole, query_param, route_container_create};
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};

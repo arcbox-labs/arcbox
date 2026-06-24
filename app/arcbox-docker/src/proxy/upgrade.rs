@@ -3,19 +3,63 @@
 //! Uses a raw HTTP exchange for the guest side instead of hyper's
 //! `upgrade::on()` API. hyper's client-side upgrade transfers the IO
 //! through an internal oneshot channel that never delivers for
-//! `TokioIo<RawFdStream>`, leaving the bridge future permanently blocked.
+//! `TokioIo<VsockStream>`, leaving the bridge future permanently blocked.
 //! Writing the HTTP exchange directly keeps the vsock fd alive and owned
 //! by the caller for the entire bridge lifetime.
 
-use super::stream::RawFdStream;
+use super::uri::GuestPath;
 use super::{GuestConnector, HANDSHAKE_TIMEOUT};
 use crate::error::{DockerError, Result};
 use crate::routing::UtilityVmRole;
 use arcbox_error::CommonError;
+use arcbox_transport::vsock::VsockStream;
 use axum::body::Body;
-use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri, header};
+use bytes::Bytes;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const MAX_UPGRADE_RESPONSE_HEADERS: usize = 64;
+const MAX_UPGRADE_RESPONSE_HEAD_BYTES: usize = 8192;
+
+struct RawUpgradeRequest<'a> {
+    method: &'a Method,
+    path_and_query: &'a str,
+    headers: &'a HeaderMap,
+    body: &'a [u8],
+}
+
+impl RawUpgradeRequest<'_> {
+    fn encode(&self) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(256 + self.body.len());
+        raw.extend_from_slice(self.method.as_str().as_bytes());
+        raw.extend_from_slice(b" ");
+        raw.extend_from_slice(self.path_and_query.as_bytes());
+        raw.extend_from_slice(b" HTTP/1.1\r\nHost: localhost\r\n");
+
+        for (key, value) in self.headers {
+            // Skip headers we override or that conflict with the body we
+            // actually send (the body was already collected from the client,
+            // so chunked framing no longer applies).
+            if key == header::HOST
+                || key == header::CONTENT_LENGTH
+                || key == header::TRANSFER_ENCODING
+            {
+                continue;
+            }
+            raw.extend_from_slice(key.as_str().as_bytes());
+            raw.extend_from_slice(b": ");
+            raw.extend_from_slice(value.as_bytes());
+            raw.extend_from_slice(b"\r\n");
+        }
+
+        raw.extend_from_slice(b"content-length: ");
+        raw.extend_from_slice(self.body.len().to_string().as_bytes());
+        raw.extend_from_slice(b"\r\n\r\n");
+        raw.extend_from_slice(self.body);
+        raw
+    }
+}
 
 /// Send a raw HTTP/1.1 upgrade request to guest dockerd and read the
 /// response headers.
@@ -23,91 +67,100 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// After this returns successfully, the stream is positioned right after the
 /// response header block and is ready for direct bidirectional bridging.
 async fn send_raw_upgrade(
-    stream: &mut RawFdStream,
+    stream: &mut VsockStream,
     method: &Method,
     path_and_query: &str,
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<(StatusCode, HeaderMap)> {
-    // Build HTTP/1.1 request.
-    let mut raw = format!("{method} {path_and_query} HTTP/1.1\r\nHost: localhost\r\n");
-    for (key, value) in headers {
-        // Skip headers we override or that conflict with the body we
-        // actually send (the body was already collected from the client,
-        // so chunked framing no longer applies).
-        if key == header::HOST || key == header::CONTENT_LENGTH || key == header::TRANSFER_ENCODING
-        {
-            continue;
-        }
-        let Ok(v) = value.to_str() else { continue };
-        raw.push_str(key.as_str());
-        raw.push_str(": ");
-        raw.push_str(v);
-        raw.push_str("\r\n");
+) -> Result<(StatusCode, HeaderMap, Bytes)> {
+    let raw = RawUpgradeRequest {
+        method,
+        path_and_query,
+        headers,
+        body,
     }
-    // Always emit an accurate Content-Length for the collected body.
-    use std::fmt::Write as _;
-    write!(raw, "content-length: {}\r\n", body.len()).expect("write to String is infallible");
-    raw.push_str("\r\n");
+    .encode();
 
     stream
-        .write_all(raw.as_bytes())
+        .write_all(&raw)
         .await
         .map_err(|e| DockerError::Server(format!("failed to write upgrade request: {e}")))?;
-    if !body.is_empty() {
-        stream
-            .write_all(body)
-            .await
-            .map_err(|e| DockerError::Server(format!("failed to write upgrade body: {e}")))?;
-    }
 
-    // Read response headers byte-by-byte until the blank line delimiter.
-    // Upgrade responses are small (< 512 bytes), so this is fine.
-    let mut buf = Vec::with_capacity(512);
-    let mut byte = [0u8; 1];
-    loop {
-        stream
-            .read_exact(&mut byte)
+    // Read response headers in chunks. A chunked read may consume bytes that
+    // belong to the upgraded stream, so return the over-read tail to the
+    // bridge caller.
+    let mut buf = Vec::with_capacity(1024);
+    let header_end_index = loop {
+        let mut chunk = [0_u8; 1024];
+        let n = stream
+            .read(&mut chunk)
             .await
             .map_err(|e| DockerError::Server(format!("failed to read upgrade response: {e}")))?;
-        buf.push(byte[0]);
-        if buf.len() >= 4 && buf[buf.len() - 4..] == *b"\r\n\r\n" {
-            break;
+        if n == 0 {
+            return Err(DockerError::Server(
+                "guest closed connection before upgrade response".into(),
+            ));
         }
-        if buf.len() > 8192 {
+        buf.extend_from_slice(&chunk[..n]);
+
+        if let Some(pos) = parsed_response_head_len(&buf)? {
+            break pos;
+        }
+        if buf.len() > MAX_UPGRADE_RESPONSE_HEAD_BYTES {
             return Err(DockerError::Server(
                 "upgrade response headers too large".into(),
             ));
         }
-    }
+    };
 
-    // Parse "HTTP/1.1 101 Switching Protocols\r\n..."
-    let header_str = String::from_utf8_lossy(&buf);
-    let status_line = header_str
-        .lines()
-        .next()
-        .ok_or_else(|| DockerError::Server("empty upgrade response".into()))?;
-    let status_code: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| DockerError::Server(format!("invalid status line: {status_line}")))?;
-    let status = StatusCode::from_u16(status_code)
-        .map_err(|_| DockerError::Server(format!("invalid status code: {status_code}")))?;
+    let extra = Bytes::copy_from_slice(&buf[header_end_index..]);
+    let header_bytes = &buf[..header_end_index];
+    let (status, response_headers) = parse_response_head(header_bytes)?;
+
+    Ok((status, response_headers, extra))
+}
+
+fn parsed_response_head_len(buf: &[u8]) -> Result<Option<usize>> {
+    let mut headers = [httparse::EMPTY_HEADER; MAX_UPGRADE_RESPONSE_HEADERS];
+    let mut response = httparse::Response::new(&mut headers);
+    match response.parse(buf) {
+        Ok(httparse::Status::Complete(len)) => Ok(Some(len)),
+        Ok(httparse::Status::Partial) => Ok(None),
+        Err(err) => Err(DockerError::Server(format!(
+            "failed to parse upgrade response: {err}"
+        ))),
+    }
+}
+
+fn parse_response_head(buf: &[u8]) -> Result<(StatusCode, HeaderMap)> {
+    let mut headers = [httparse::EMPTY_HEADER; MAX_UPGRADE_RESPONSE_HEADERS];
+    let mut response = httparse::Response::new(&mut headers);
+    let status = match response.parse(buf) {
+        Ok(httparse::Status::Complete(_)) => response
+            .code
+            .ok_or_else(|| DockerError::Server("upgrade response missing status code".into()))?,
+        Ok(httparse::Status::Partial) => {
+            return Err(DockerError::Server("incomplete upgrade response".into()));
+        }
+        Err(err) => {
+            return Err(DockerError::Server(format!(
+                "failed to parse upgrade response: {err}"
+            )));
+        }
+    };
+
+    let status = StatusCode::from_u16(status)
+        .map_err(|_| DockerError::Server(format!("invalid status code: {status}")))?;
 
     let mut response_headers = HeaderMap::new();
-    for line in header_str.lines().skip(1) {
-        if line.is_empty() {
-            break;
-        }
-        if let Some((key, value)) = line.split_once(':') {
-            if let (Ok(name), Ok(val)) = (
-                header::HeaderName::from_bytes(key.trim().as_bytes()),
-                header::HeaderValue::from_str(value.trim()),
-            ) {
-                response_headers.insert(name, val);
-            }
-        }
+    for parsed in response.headers {
+        let Ok(name) = HeaderName::from_bytes(parsed.name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = HeaderValue::from_bytes(parsed.value) else {
+            continue;
+        };
+        response_headers.append(name, value);
     }
 
     Ok((status, response_headers))
@@ -152,9 +205,7 @@ pub async fn proxy_with_upgrade_for_role(
     // side manually so the fd stays alive throughout the bridge.
     let mut guest_stream = io.into_inner();
 
-    let path_and_query = original_uri
-        .path_and_query()
-        .map_or("/", hyper::http::uri::PathAndQuery::as_str);
+    let path_and_query = GuestPath::from(original_uri);
 
     // Collect the request body so it can be forwarded to the guest.
     // Upgrade request bodies (e.g. exec-start JSON) are small.
@@ -166,12 +217,12 @@ pub async fn proxy_with_upgrade_for_role(
             .to_bytes()
     };
 
-    let (status, response_headers) = tokio::time::timeout(
+    let (status, response_headers, upgraded_prefix) = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         send_raw_upgrade(
             &mut guest_stream,
             client_req.method(),
-            path_and_query,
+            path_and_query.as_ref(),
             client_req.headers(),
             &body_bytes,
         ),
@@ -187,9 +238,14 @@ pub async fn proxy_with_upgrade_for_role(
             builder = builder.header(key, value);
         }
         // Read whatever response body the guest sent (bounded).
-        let mut error_body = vec![0u8; 8192];
-        let n = guest_stream.read(&mut error_body).await.unwrap_or(0);
-        error_body.truncate(n);
+        let mut error_body = upgraded_prefix.to_vec();
+        error_body.resize(8192, 0);
+        let n = guest_stream
+            .read(&mut error_body[upgraded_prefix.len()..])
+            .await
+            .unwrap_or(0);
+        let total = upgraded_prefix.len() + n;
+        error_body.truncate(total);
         return builder
             .body(Body::from(error_body))
             .map_err(|e| DockerError::Server(format!("failed to build error response: {e}")));
@@ -230,6 +286,12 @@ pub async fn proxy_with_upgrade_for_role(
             }
         };
         let mut client_io = TokioIo::new(client_io);
+        if !upgraded_prefix.is_empty() {
+            if let Err(e) = client_io.write_all(&upgraded_prefix).await {
+                tracing::debug!("failed to forward buffered upgrade bytes: {}", e);
+                return;
+            }
+        }
         if let Err(e) = tokio::io::copy_bidirectional(&mut client_io, &mut guest_stream).await {
             let msg = e.to_string().to_lowercase();
             if !msg.contains("broken pipe")

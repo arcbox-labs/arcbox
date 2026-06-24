@@ -79,6 +79,7 @@ pub use blocking::BlockingVsockTransport;
 #[cfg(target_os = "macos")]
 pub use darwin::IncomingVsockConnection;
 pub use listener::VsockListener;
+pub use stream::{VsockShutdown, VsockStream};
 pub use transport::{VsockReceiver, VsockSender, VsockTransport};
 
 #[cfg(test)]
