@@ -366,6 +366,53 @@ impl AgentClient {
         Ok((resp_type, payload))
     }
 
+    fn decode_response<T: Message + Default>(payload: &[u8]) -> Result<T> {
+        T::decode(payload)
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+    }
+
+    fn expect_response_type(resp_type: u32, expected: MessageType) -> Result<()> {
+        if resp_type == expected as u32 {
+            Ok(())
+        } else {
+            Err(CoreError::Machine(format!(
+                "unexpected response type: 0x{resp_type:04x}"
+            )))
+        }
+    }
+
+    fn expect_ack_response_type(resp_type: u32, expected: MessageType) -> Result<()> {
+        if resp_type == expected as u32 || resp_type == MessageType::Empty as u32 {
+            Ok(())
+        } else {
+            Err(CoreError::Machine(format!(
+                "unexpected response type: 0x{resp_type:04x}"
+            )))
+        }
+    }
+
+    async fn unary_rpc<T: Message + Default>(
+        &mut self,
+        request_type: MessageType,
+        payload: &[u8],
+        response_type: MessageType,
+    ) -> Result<T> {
+        let (resp_type, resp_payload) = self.rpc_call(request_type, payload).await?;
+        Self::expect_response_type(resp_type, response_type)?;
+        Self::decode_response(&resp_payload)
+    }
+
+    fn unary_rpc_blocking<T: Message + Default>(
+        &mut self,
+        request_type: MessageType,
+        payload: &[u8],
+        response_type: MessageType,
+    ) -> Result<T> {
+        let (resp_type, resp_payload) = self.rpc_call_blocking(request_type, payload)?;
+        Self::expect_response_type(resp_type, response_type)?;
+        Self::decode_response(&resp_payload)
+    }
+
     /// Synchronous ping — uses blocking transport's native deadline.
     /// Call from `spawn_blocking` or any non-async context.
     pub fn ping_blocking(&mut self) -> Result<PingResponse> {
@@ -376,15 +423,11 @@ impl AgentClient {
                 .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0)),
         };
         let payload = req.encode_to_vec();
-        let (resp_type, resp_payload) =
-            self.rpc_call_blocking(MessageType::PingRequest, &payload)?;
-        if resp_type != MessageType::PingResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: {resp_type}"
-            )));
-        }
-        PingResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+        self.unary_rpc_blocking(
+            MessageType::PingRequest,
+            &payload,
+            MessageType::PingResponse,
+        )
     }
 
     /// Returns true if this client uses the blocking transport (AF_UNIX / HV).
@@ -418,17 +461,12 @@ impl AgentClient {
                 .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0)),
         };
         let payload = req.encode_to_vec();
-
-        let (resp_type, resp_payload) = self.rpc_call(MessageType::PingRequest, &payload).await?;
-
-        if resp_type != MessageType::PingResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: {resp_type}"
-            )));
-        }
-
-        PingResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+        self.unary_rpc(
+            MessageType::PingRequest,
+            &payload,
+            MessageType::PingResponse,
+        )
+        .await
     }
 
     /// Gets system information from the guest.
@@ -438,30 +476,20 @@ impl AgentClient {
     /// Returns an error if the request fails.
     /// Synchronous get_system_info for blocking transport.
     pub fn get_system_info_blocking(&mut self) -> Result<SystemInfo> {
-        let (resp_type, resp_payload) =
-            self.rpc_call_blocking(MessageType::GetSystemInfoRequest, &[])?;
-        if resp_type != MessageType::GetSystemInfoResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: {resp_type}"
-            )));
-        }
-        SystemInfo::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+        self.unary_rpc_blocking(
+            MessageType::GetSystemInfoRequest,
+            &[],
+            MessageType::GetSystemInfoResponse,
+        )
     }
 
     pub async fn get_system_info(&mut self) -> Result<SystemInfo> {
-        let (resp_type, resp_payload) = self
-            .rpc_call(MessageType::GetSystemInfoRequest, &[])
-            .await?;
-
-        if resp_type != MessageType::GetSystemInfoResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: {resp_type}"
-            )));
-        }
-
-        SystemInfo::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+        self.unary_rpc(
+            MessageType::GetSystemInfoRequest,
+            &[],
+            MessageType::GetSystemInfoResponse,
+        )
+        .await
     }
 
     /// Test-only: ask the guest to `mmap(MAP_SHARED)` a file and return its
@@ -485,15 +513,11 @@ impl AgentClient {
             length,
         };
         let payload = req.encode_to_vec();
-        let (resp_type, resp_payload) =
-            self.rpc_call_blocking(MessageType::MmapReadFileRequest, &payload)?;
-        if resp_type != MessageType::MmapReadFileResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: {resp_type}"
-            )));
-        }
-        MmapReadFileResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+        self.unary_rpc_blocking(
+            MessageType::MmapReadFileRequest,
+            &payload,
+            MessageType::MmapReadFileResponse,
+        )
     }
 
     /// Ensures guest runtime services are ready.
@@ -504,18 +528,12 @@ impl AgentClient {
     pub async fn ensure_runtime(&mut self, start_if_needed: bool) -> Result<RuntimeEnsureResponse> {
         let req = RuntimeEnsureRequest { start_if_needed };
         let payload = req.encode_to_vec();
-        let (resp_type, resp_payload) = self
-            .rpc_call(MessageType::EnsureRuntimeRequest, &payload)
-            .await?;
-
-        if resp_type != MessageType::EnsureRuntimeResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: {resp_type}"
-            )));
-        }
-
-        RuntimeEnsureResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+        self.unary_rpc(
+            MessageType::EnsureRuntimeRequest,
+            &payload,
+            MessageType::EnsureRuntimeResponse,
+        )
+        .await
     }
 
     /// Gets guest runtime status.
@@ -526,18 +544,12 @@ impl AgentClient {
     pub async fn get_runtime_status(&mut self) -> Result<RuntimeStatusResponse> {
         let req = RuntimeStatusRequest {};
         let payload = req.encode_to_vec();
-        let (resp_type, resp_payload) = self
-            .rpc_call(MessageType::RuntimeStatusRequest, &payload)
-            .await?;
-
-        if resp_type != MessageType::RuntimeStatusResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: {resp_type}"
-            )));
-        }
-
-        RuntimeStatusResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+        self.unary_rpc(
+            MessageType::RuntimeStatusRequest,
+            &payload,
+            MessageType::RuntimeStatusResponse,
+        )
+        .await
     }
 
     /// Watches guest readiness until the agent reports a terminal state.
@@ -672,18 +684,12 @@ impl AgentClient {
     /// Returns an error if the request fails.
     pub async fn start_kubernetes(&mut self) -> Result<KubernetesStartResponse> {
         let payload = KubernetesStartRequest {}.encode_to_vec();
-        let (resp_type, resp_payload) = self
-            .rpc_call(MessageType::KubernetesStartRequest, &payload)
-            .await?;
-
-        if resp_type != MessageType::KubernetesStartResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: {resp_type}"
-            )));
-        }
-
-        KubernetesStartResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+        self.unary_rpc(
+            MessageType::KubernetesStartRequest,
+            &payload,
+            MessageType::KubernetesStartResponse,
+        )
+        .await
     }
 
     /// Stops the native Kubernetes cluster in the guest VM.
@@ -693,18 +699,12 @@ impl AgentClient {
     /// Returns an error if the request fails.
     pub async fn stop_kubernetes(&mut self) -> Result<KubernetesStopResponse> {
         let payload = KubernetesStopRequest {}.encode_to_vec();
-        let (resp_type, resp_payload) = self
-            .rpc_call(MessageType::KubernetesStopRequest, &payload)
-            .await?;
-
-        if resp_type != MessageType::KubernetesStopResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: {resp_type}"
-            )));
-        }
-
-        KubernetesStopResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+        self.unary_rpc(
+            MessageType::KubernetesStopRequest,
+            &payload,
+            MessageType::KubernetesStopResponse,
+        )
+        .await
     }
 
     /// Deletes the native Kubernetes cluster state in the guest VM.
@@ -714,18 +714,12 @@ impl AgentClient {
     /// Returns an error if the request fails.
     pub async fn delete_kubernetes(&mut self) -> Result<KubernetesDeleteResponse> {
         let payload = KubernetesDeleteRequest {}.encode_to_vec();
-        let (resp_type, resp_payload) = self
-            .rpc_call(MessageType::KubernetesDeleteRequest, &payload)
-            .await?;
-
-        if resp_type != MessageType::KubernetesDeleteResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: {resp_type}"
-            )));
-        }
-
-        KubernetesDeleteResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+        self.unary_rpc(
+            MessageType::KubernetesDeleteRequest,
+            &payload,
+            MessageType::KubernetesDeleteResponse,
+        )
+        .await
     }
 
     /// Gets native Kubernetes cluster status from the guest VM.
@@ -735,18 +729,12 @@ impl AgentClient {
     /// Returns an error if the request fails.
     pub async fn get_kubernetes_status(&mut self) -> Result<KubernetesStatusResponse> {
         let payload = KubernetesStatusRequest {}.encode_to_vec();
-        let (resp_type, resp_payload) = self
-            .rpc_call(MessageType::KubernetesStatusRequest, &payload)
-            .await?;
-
-        if resp_type != MessageType::KubernetesStatusResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: {resp_type}"
-            )));
-        }
-
-        KubernetesStatusResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+        self.unary_rpc(
+            MessageType::KubernetesStatusRequest,
+            &payload,
+            MessageType::KubernetesStatusResponse,
+        )
+        .await
     }
 
     /// Gets the guest-exported kubeconfig payload.
@@ -756,18 +744,12 @@ impl AgentClient {
     /// Returns an error if the request fails.
     pub async fn get_kubeconfig(&mut self) -> Result<KubernetesKubeconfigResponse> {
         let payload = KubernetesKubeconfigRequest {}.encode_to_vec();
-        let (resp_type, resp_payload) = self
-            .rpc_call(MessageType::KubernetesKubeconfigRequest, &payload)
-            .await?;
-
-        if resp_type != MessageType::KubernetesKubeconfigResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: {resp_type}"
-            )));
-        }
-
-        KubernetesKubeconfigResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+        self.unary_rpc(
+            MessageType::KubernetesKubeconfigRequest,
+            &payload,
+            MessageType::KubernetesKubeconfigResponse,
+        )
+        .await
     }
 
     /// Triggers an immediate fstrim on guest data mount points.
@@ -777,18 +759,12 @@ impl AgentClient {
     /// Returns an error if the request fails.
     pub async fn disk_trim(&mut self) -> Result<DiskTrimResponse> {
         let payload = DiskTrimRequest {}.encode_to_vec();
-        let (resp_type, resp_payload) = self
-            .rpc_call(MessageType::DiskTrimRequest, &payload)
-            .await?;
-
-        if resp_type != MessageType::DiskTrimResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: {resp_type}"
-            )));
-        }
-
-        DiskTrimResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+        self.unary_rpc(
+            MessageType::DiskTrimRequest,
+            &payload,
+            MessageType::DiskTrimResponse,
+        )
+        .await
     }
 
     /// Creates a new sandbox in the guest VM.
@@ -801,19 +777,12 @@ impl AgentClient {
         req: CreateSandboxRequest,
     ) -> Result<CreateSandboxResponse> {
         let payload = req.encode_to_vec();
-        let (resp_type, resp_payload) = self
-            .rpc_call(MessageType::SandboxCreateRequest, &payload)
-            .await?;
-
-        if resp_type != MessageType::SandboxCreateResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: 0x{:04x}",
-                resp_type
-            )));
-        }
-
-        CreateSandboxResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+        self.unary_rpc(
+            MessageType::SandboxCreateRequest,
+            &payload,
+            MessageType::SandboxCreateResponse,
+        )
+        .await
     }
 
     /// Stops a sandbox in the guest VM.
@@ -826,17 +795,7 @@ impl AgentClient {
         let (resp_type, _) = self
             .rpc_call(MessageType::SandboxStopRequest, &payload)
             .await?;
-
-        if resp_type != MessageType::SandboxStopResponse as u32
-            && resp_type != MessageType::Empty as u32
-        {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: 0x{:04x}",
-                resp_type
-            )));
-        }
-
-        Ok(())
+        Self::expect_ack_response_type(resp_type, MessageType::SandboxStopResponse)
     }
 
     /// Removes a sandbox from the guest VM.
@@ -849,17 +808,7 @@ impl AgentClient {
         let (resp_type, _) = self
             .rpc_call(MessageType::SandboxRemoveRequest, &payload)
             .await?;
-
-        if resp_type != MessageType::SandboxRemoveResponse as u32
-            && resp_type != MessageType::Empty as u32
-        {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: 0x{:04x}",
-                resp_type
-            )));
-        }
-
-        Ok(())
+        Self::expect_ack_response_type(resp_type, MessageType::SandboxRemoveResponse)
     }
 
     /// Inspects a sandbox in the guest VM.
@@ -869,19 +818,12 @@ impl AgentClient {
     /// Returns an error if the request fails.
     pub async fn sandbox_inspect(&mut self, req: InspectSandboxRequest) -> Result<SandboxInfo> {
         let payload = req.encode_to_vec();
-        let (resp_type, resp_payload) = self
-            .rpc_call(MessageType::SandboxInspectRequest, &payload)
-            .await?;
-
-        if resp_type != MessageType::SandboxInspectResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: 0x{:04x}",
-                resp_type
-            )));
-        }
-
-        SandboxInfo::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+        self.unary_rpc(
+            MessageType::SandboxInspectRequest,
+            &payload,
+            MessageType::SandboxInspectResponse,
+        )
+        .await
     }
 
     /// Lists sandboxes in the guest VM.
@@ -894,19 +836,12 @@ impl AgentClient {
         req: ListSandboxesRequest,
     ) -> Result<ListSandboxesResponse> {
         let payload = req.encode_to_vec();
-        let (resp_type, resp_payload) = self
-            .rpc_call(MessageType::SandboxListRequest, &payload)
-            .await?;
-
-        if resp_type != MessageType::SandboxListResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: 0x{:04x}",
-                resp_type
-            )));
-        }
-
-        ListSandboxesResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+        self.unary_rpc(
+            MessageType::SandboxListRequest,
+            &payload,
+            MessageType::SandboxListResponse,
+        )
+        .await
     }
 
     /// Runs a command inside a sandbox and returns a channel of streaming output.
@@ -1180,19 +1115,12 @@ impl AgentClient {
         req: CheckpointRequest,
     ) -> Result<CheckpointResponse> {
         let payload = req.encode_to_vec();
-        let (resp_type, resp_payload) = self
-            .rpc_call(MessageType::SandboxCheckpointRequest, &payload)
-            .await?;
-
-        if resp_type != MessageType::SandboxCheckpointResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: 0x{:04x}",
-                resp_type
-            )));
-        }
-
-        CheckpointResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+        self.unary_rpc(
+            MessageType::SandboxCheckpointRequest,
+            &payload,
+            MessageType::SandboxCheckpointResponse,
+        )
+        .await
     }
 
     /// Restores a sandbox from a snapshot.
@@ -1202,19 +1130,12 @@ impl AgentClient {
     /// Returns an error if the request fails.
     pub async fn sandbox_restore(&mut self, req: RestoreRequest) -> Result<RestoreResponse> {
         let payload = req.encode_to_vec();
-        let (resp_type, resp_payload) = self
-            .rpc_call(MessageType::SandboxRestoreRequest, &payload)
-            .await?;
-
-        if resp_type != MessageType::SandboxRestoreResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: 0x{:04x}",
-                resp_type
-            )));
-        }
-
-        RestoreResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+        self.unary_rpc(
+            MessageType::SandboxRestoreRequest,
+            &payload,
+            MessageType::SandboxRestoreResponse,
+        )
+        .await
     }
 
     /// Lists snapshots for sandboxes in the guest VM.
@@ -1227,19 +1148,12 @@ impl AgentClient {
         req: ListSnapshotsRequest,
     ) -> Result<ListSnapshotsResponse> {
         let payload = req.encode_to_vec();
-        let (resp_type, resp_payload) = self
-            .rpc_call(MessageType::SandboxListSnapshotsRequest, &payload)
-            .await?;
-
-        if resp_type != MessageType::SandboxListSnapshotsResponse as u32 {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: 0x{:04x}",
-                resp_type
-            )));
-        }
-
-        ListSnapshotsResponse::decode(&resp_payload[..])
-            .map_err(|e| CoreError::Machine(format!("failed to decode response: {}", e)))
+        self.unary_rpc(
+            MessageType::SandboxListSnapshotsRequest,
+            &payload,
+            MessageType::SandboxListSnapshotsResponse,
+        )
+        .await
     }
 
     /// Deletes a snapshot.
@@ -1252,17 +1166,7 @@ impl AgentClient {
         let (resp_type, _) = self
             .rpc_call(MessageType::SandboxDeleteSnapshotRequest, &payload)
             .await?;
-
-        if resp_type != MessageType::SandboxDeleteSnapshotResponse as u32
-            && resp_type != MessageType::Empty as u32
-        {
-            return Err(CoreError::Machine(format!(
-                "unexpected response type: 0x{:04x}",
-                resp_type
-            )));
-        }
-
-        Ok(())
+        Self::expect_ack_response_type(resp_type, MessageType::SandboxDeleteSnapshotResponse)
     }
 }
 
