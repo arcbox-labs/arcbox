@@ -75,7 +75,7 @@ pub fn capacities(
     }];
 
     if let Some(caps) = docker {
-        let cap = i32::try_from(caps.max_concurrent).unwrap_or(i32::MAX);
+        let cap = i32::try_from(max_concurrent).unwrap_or(i32::MAX);
         pools.push(RuntimeCapacity {
             os: "linux".to_owned(),
             arch: caps.native_arch.clone(),
@@ -117,9 +117,8 @@ mod tests {
         let caps = DockerCapabilities {
             native_arch: "arm64".to_owned(),
             emulated_arch: Some("amd64".to_owned()),
-            max_concurrent: 3,
         };
-        let pools = capacities(2, Some(&caps));
+        let pools = capacities(3, Some(&caps));
         assert_eq!(pools.len(), 3);
         assert_eq!(pools[1].os, "linux");
         assert_eq!(pools[1].arch, "arm64");
@@ -134,7 +133,6 @@ mod tests {
         let caps = DockerCapabilities {
             native_arch: "amd64".to_owned(),
             emulated_arch: None,
-            max_concurrent: 2,
         };
         let pools = capacities(2, Some(&caps));
         assert_eq!(pools.len(), 2);

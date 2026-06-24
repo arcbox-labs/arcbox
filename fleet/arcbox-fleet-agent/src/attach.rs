@@ -49,9 +49,7 @@ pub async fn run(
     shutdown: CancellationToken,
 ) -> Result<()> {
     let runner_dir = config.runner_dir.clone();
-    let docker_caps = docker
-        .as_ref()
-        .map(|d| d.capabilities(config.max_concurrent));
+    let docker_caps = docker.as_ref().map(|d| d.capabilities());
 
     let (egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
     let supervisor = RunnerSupervisor::new(egress_tx, runner_dir, docker, config.max_concurrent);

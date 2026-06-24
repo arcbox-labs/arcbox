@@ -22,8 +22,6 @@ pub struct DockerCapabilities {
     pub native_arch: String,
     /// Cross-architecture via emulation, if available (e.g. `amd64` on arm64).
     pub emulated_arch: Option<String>,
-    /// Per-pool `max_concurrent` reported to the gateway.
-    pub max_concurrent: usize,
 }
 
 /// Everything the Docker runner needs to execute one job.
@@ -70,13 +68,12 @@ impl DockerRunner {
     }
 
     /// Detect which Linux architectures this Docker host can serve.
-    pub fn capabilities(&self, max_concurrent: usize) -> DockerCapabilities {
+    pub fn capabilities(&self) -> DockerCapabilities {
         let native_arch = host::map_arch(std::env::consts::ARCH).to_owned();
         let emulated_arch = (native_arch == "arm64").then(|| "amd64".to_owned());
         DockerCapabilities {
             native_arch,
             emulated_arch,
-            max_concurrent,
         }
     }
 

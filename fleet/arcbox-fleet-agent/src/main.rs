@@ -86,9 +86,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
     match command {
         Command::Enroll { token_file, token } => {
             let token = resolve_enrollment_token(token_file, token)?;
-            let docker_caps = docker
-                .as_ref()
-                .map(|d| d.capabilities(config.max_concurrent));
+            let docker_caps = docker.as_ref().map(|d| d.capabilities());
             enroll::enroll(&config, token, docker_caps.as_ref()).await?;
             Ok(())
         }
