@@ -1,7 +1,6 @@
 use std::{
     env,
     fs::{self, File},
-    io::Write,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -13,66 +12,31 @@ use tempfile::TempDir;
 use toml_edit::DocumentMut;
 use tracing::{error, info, warn};
 
-use crate::{BootAssetsArgs, repo_root};
+use crate::repo_root;
 
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Copy)]
-enum TestResult {
-    Pass,
-    Fail,
-    Skip,
+pub struct BootAssetsConfig {
+    skip_build: bool,
+    keep_test_dir: bool,
+    version: Option<String>,
+    guest_docker_vsock_port: u32,
 }
 
-impl TestResult {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pass => "PASS",
-            Self::Fail => "FAIL",
-            Self::Skip => "SKIP",
-        }
-    }
-}
-
-struct Results {
-    vm_boot: TestResult,
-    vsock: TestResult,
-    agent: TestResult,
-    container_create: TestResult,
-    container_run: TestResult,
-    background_container: TestResult,
-    docker_logs: TestResult,
-    docker_exec: TestResult,
-    stop_rm: TestResult,
-}
-
-impl Results {
-    fn new() -> Self {
-        Self {
-            vm_boot: TestResult::Skip,
-            vsock: TestResult::Skip,
-            agent: TestResult::Skip,
-            container_create: TestResult::Skip,
-            container_run: TestResult::Skip,
-            background_container: TestResult::Skip,
-            docker_logs: TestResult::Skip,
-            docker_exec: TestResult::Skip,
-            stop_rm: TestResult::Skip,
-        }
-    }
-
-    fn entries(&self) -> [(&'static str, TestResult); 9] {
-        [
-            ("VM Boot", self.vm_boot),
-            ("vsock", self.vsock),
-            ("Agent", self.agent),
-            ("Container Create", self.container_create),
-            ("Container Run", self.container_run),
-            ("Background Container", self.background_container),
-            ("Docker Logs", self.docker_logs),
-            ("Docker Exec", self.docker_exec),
-            ("Stop/Rm", self.stop_rm),
-        ]
+impl BootAssetsConfig {
+    pub fn from_env() -> Result<Self> {
+        Ok(Self {
+            skip_build: env_flag("SKIP_BUILD"),
+            keep_test_dir: env_flag("KEEP_TEST_DIR"),
+            version: env::var("ARCBOX_BOOT_ASSET_VERSION").ok(),
+            guest_docker_vsock_port: match env::var("ARCBOX_GUEST_DOCKER_VSOCK_PORT") {
+                Ok(value) => value
+                    .parse()
+                    .context("parsing ARCBOX_GUEST_DOCKER_VSOCK_PORT")?,
+                Err(env::VarError::NotPresent) => 2375,
+                Err(error) => return Err(error).context("reading ARCBOX_GUEST_DOCKER_VSOCK_PORT"),
+            },
+        })
     }
 }
 
@@ -88,9 +52,9 @@ struct TestContext {
 }
 
 impl TestContext {
-    fn new(args: BootAssetsArgs) -> Result<Self> {
+    fn new(config: BootAssetsConfig) -> Result<Self> {
         let root = repo_root();
-        let version = match args.version {
+        let version = match config.version {
             Some(version) => version,
             None => boot_version(&root.join("assets.lock"))?,
         };
@@ -107,8 +71,8 @@ impl TestContext {
             test_dir,
             version,
             label,
-            guest_docker_vsock_port: args.guest_docker_vsock_port,
-            keep_test_dir: args.keep_test_dir,
+            guest_docker_vsock_port: config.guest_docker_vsock_port,
+            keep_test_dir: config.keep_test_dir,
             daemon: None,
         })
     }
@@ -182,19 +146,10 @@ impl Drop for TestContext {
     }
 }
 
-pub fn run(args: BootAssetsArgs) -> Result<()> {
-    println!("==========================================");
-    println!("ArcBox Boot Assets Integration Test");
-    println!("==========================================");
-    println!();
+pub fn run(config: BootAssetsConfig) -> Result<()> {
+    info!("starting boot assets integration test");
 
-    let args = BootAssetsArgs {
-        skip_build: args.skip_build || env_flag("SKIP_BUILD"),
-        keep_test_dir: args.keep_test_dir || env_flag("KEEP_TEST_DIR"),
-        ..args
-    };
-
-    if !args.skip_build {
+    if !config.skip_build {
         info!("building latest release binaries");
         let shell = xshell::Shell::new()?;
         shell.change_dir(repo_root());
@@ -205,86 +160,21 @@ pub fn run(args: BootAssetsArgs) -> Result<()> {
         .run()?;
     }
 
-    let mut ctx = TestContext::new(args)?;
+    let mut ctx = TestContext::new(config)?;
     check_prerequisites(&ctx)?;
     setup_test_env(&ctx)?;
     start_daemon(&mut ctx)?;
 
-    let mut results = Results::new();
+    pull_alpine(&ctx)?;
+    trigger_vm_boot(&ctx)?;
 
-    info!("pulling alpine image");
-    match ctx.docker_output(&["pull", "alpine:latest"], Duration::from_secs(90)) {
-        Ok(output) => {
-            fs::write(ctx.test_dir.join("pull.log"), output)
-                .with_context(|| format!("writing {}", ctx.test_dir.join("pull.log").display()))?;
-            info!("docker pull completed");
-        }
-        Err(error) => {
-            fs::write(ctx.test_dir.join("pull.log"), format!("{error:#}"))
-                .with_context(|| format!("writing {}", ctx.test_dir.join("pull.log").display()))?;
-            error!("docker pull failed");
-            print_summary(&ctx, &results)?;
-            return Err(error);
-        }
-    }
+    test_container_run(&ctx).context("container run lifecycle test")?;
+    test_background_container(&ctx).context("background container lifecycle test")?;
+    test_docker_logs(&ctx).context("docker logs lifecycle test")?;
+    test_docker_exec(&ctx).context("docker exec lifecycle test")?;
+    test_stop_rm(&ctx).context("docker stop/rm lifecycle test")?;
 
-    info!("creating container to trigger VM boot");
-    let container_id_path = ctx.test_dir.join("container_id");
-    let container_err_path = ctx.test_dir.join("container_create.err");
-    let mut create = Command::new("docker")
-        .env("DOCKER_HOST", ctx.docker_host())
-        .args(["create", "--label", &ctx.label, "alpine", "echo", "test"])
-        .stdout(File::create(&container_id_path)?)
-        .stderr(File::create(&container_err_path)?)
-        .spawn()
-        .context("starting docker create")?;
-
-    if wait_for_agent(&ctx)? {
-        results.vm_boot = TestResult::Pass;
-        results.vsock = TestResult::Pass;
-        results.agent = TestResult::Pass;
-        if create.wait()?.success() {
-            let cid = fs::read_to_string(&container_id_path)
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
-            info!(
-                container_id = cid_prefix(&cid),
-                "container create completed"
-            );
-            results.container_create = TestResult::Pass;
-        } else {
-            warn!("container create failed");
-            results.container_create = TestResult::Fail;
-        }
-    } else {
-        results.vm_boot = TestResult::Fail;
-        results.vsock = TestResult::Fail;
-        results.agent = TestResult::Fail;
-        let _ = create.kill();
-        let _ = create.wait();
-        print_summary(&ctx, &results)?;
-        bail!("agent connection timeout");
-    }
-
-    println!();
-    info!("running container lifecycle tests (Phase 1.2 / 1.4)");
-    println!();
-
-    results.container_run = pass_fail(test_container_run(&ctx));
-    results.background_container = pass_fail(test_background_container(&ctx));
-    results.docker_logs = pass_fail(test_docker_logs(&ctx));
-    results.docker_exec = pass_fail(test_docker_exec(&ctx));
-    results.stop_rm = pass_fail(test_stop_rm(&ctx));
-
-    print_summary(&ctx, &results)?;
-    if results
-        .entries()
-        .iter()
-        .any(|(_, result)| matches!(result, TestResult::Fail))
-    {
-        bail!("boot assets integration test failed");
-    }
+    info!(daemon_log = %ctx.test_dir.join("daemon.log").display(), "boot assets integration test passed");
     Ok(())
 }
 
@@ -421,27 +311,75 @@ fn start_daemon(ctx: &mut TestContext) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_agent(ctx: &TestContext) -> Result<bool> {
+fn pull_alpine(ctx: &TestContext) -> Result<()> {
+    info!("pulling alpine image");
+    match ctx.docker_output(&["pull", "alpine:latest"], Duration::from_secs(90)) {
+        Ok(output) => {
+            fs::write(ctx.test_dir.join("pull.log"), output)
+                .with_context(|| format!("writing {}", ctx.test_dir.join("pull.log").display()))?;
+            info!("docker pull completed");
+            Ok(())
+        }
+        Err(error) => {
+            fs::write(ctx.test_dir.join("pull.log"), format!("{error:#}"))
+                .with_context(|| format!("writing {}", ctx.test_dir.join("pull.log").display()))?;
+            error!("docker pull failed");
+            Err(error)
+        }
+    }
+}
+
+fn trigger_vm_boot(ctx: &TestContext) -> Result<()> {
+    info!("creating container to trigger VM boot");
+    let container_id_path = ctx.test_dir.join("container_id");
+    let container_err_path = ctx.test_dir.join("container_create.err");
+    let mut create = Command::new("docker")
+        .env("DOCKER_HOST", ctx.docker_host())
+        .args(["create", "--label", &ctx.label, "alpine", "echo", "test"])
+        .stdout(File::create(&container_id_path)?)
+        .stderr(File::create(&container_err_path)?)
+        .spawn()
+        .context("starting docker create")?;
+
+    if !wait_for_agent(ctx) {
+        let _ = create.kill();
+        let _ = create.wait();
+        bail!("agent connection timeout");
+    }
+
+    if create.wait()?.success() {
+        let cid = fs::read_to_string(&container_id_path)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        info!(
+            container_id = cid_prefix(&cid),
+            "container create completed"
+        );
+        Ok(())
+    } else {
+        let stderr = fs::read_to_string(&container_err_path).unwrap_or_default();
+        bail!("container create failed: {stderr}");
+    }
+}
+
+fn wait_for_agent(ctx: &TestContext) -> bool {
     info!("waiting for agent connection");
     for elapsed in 0..60 {
         if fs::read_to_string(ctx.test_dir.join("daemon.log"))
             .unwrap_or_default()
             .contains("Agent is ready")
         {
-            println!();
             info!(elapsed_seconds = elapsed, "agent connected");
-            return Ok(true);
+            return true;
         }
         thread::sleep(Duration::from_secs(1));
-        print!(".");
-        std::io::stdout().flush()?;
     }
 
-    println!();
     error!("agent connection timeout");
     error!("daemon log follows");
     print_file(&ctx.test_dir.join("daemon.log"));
-    Ok(false)
+    false
 }
 
 fn test_container_run(ctx: &TestContext) -> Result<()> {
@@ -594,74 +532,8 @@ fn test_stop_rm(ctx: &TestContext) -> Result<()> {
     Ok(())
 }
 
-fn pass_fail(result: Result<()>) -> TestResult {
-    match result {
-        Ok(()) => TestResult::Pass,
-        Err(error) => {
-            error!(error = %format_args!("{error:#}"), "test failed");
-            TestResult::Fail
-        }
-    }
-}
-
 fn remove_container(ctx: &TestContext, cid: &str) {
     ctx.docker_ignore(&["rm".to_owned(), "-f".to_owned(), cid.to_owned()]);
-}
-
-fn print_summary(ctx: &TestContext, results: &Results) -> Result<()> {
-    println!();
-    println!("==========================================");
-    println!("Boot Assets Test Summary");
-    println!("==========================================");
-
-    println!(
-        "Kernel:     {}",
-        kernel_version(&ctx.test_dir.join("boot").join(&ctx.version).join("kernel"))?
-    );
-    let rootfs = ctx
-        .test_dir
-        .join("boot")
-        .join(&ctx.version)
-        .join("rootfs.erofs");
-    if let Ok(metadata) = fs::metadata(&rootfs) {
-        println!("Rootfs:     {} bytes", metadata.len());
-    } else {
-        println!("Rootfs:     N/A");
-    }
-    println!();
-
-    let mut pass = 0;
-    let mut fail = 0;
-    let mut skip = 0;
-    for (label, result) in results.entries() {
-        match result {
-            TestResult::Pass => pass += 1,
-            TestResult::Fail => fail += 1,
-            TestResult::Skip => skip += 1,
-        }
-        println!("  {label:<22} {}", result.as_str());
-    }
-    println!();
-    println!("Results: {pass} passed, {fail} failed, {skip} skipped / 9 total");
-    println!("Log: {}", ctx.test_dir.join("daemon.log").display());
-    println!("==========================================");
-    Ok(())
-}
-
-fn kernel_version(kernel: &Path) -> Result<String> {
-    if !kernel.is_file() {
-        return Ok("N/A".to_owned());
-    }
-    let output = Command::new("strings")
-        .arg(kernel)
-        .output()
-        .with_context(|| format!("reading strings from {}", kernel.display()))?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    Ok(text
-        .lines()
-        .find(|line| line.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
-        .unwrap_or("N/A")
-        .to_owned())
 }
 
 fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<std::process::Output> {

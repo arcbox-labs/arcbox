@@ -9,7 +9,6 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-clap = { workspace = true, features = ["derive", "env"] }
 tempfile.workspace = true
 toml_edit = "0.25.12"
 tracing.workspace = true

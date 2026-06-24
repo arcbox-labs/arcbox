@@ -425,7 +425,6 @@ name = "arcbox-e2e"
 version = "0.4.10"
 dependencies = [
  "anyhow",
- "clap",
  "tempfile",
  "toml_edit 0.25.12+spec-1.1.0",
  "tracing",
