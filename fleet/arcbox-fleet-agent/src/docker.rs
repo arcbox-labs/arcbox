@@ -15,15 +15,6 @@ use tracing::{debug, info, warn};
 
 use crate::host;
 
-/// Which Linux architectures Docker can serve on this host.
-#[derive(Debug, Clone)]
-pub struct DockerCapabilities {
-    /// Native architecture (e.g. `arm64` on Apple Silicon).
-    pub native_arch: String,
-    /// Cross-architecture via emulation, if available (e.g. `amd64` on arm64).
-    pub emulated_arch: Option<String>,
-}
-
 /// Everything the Docker runner needs to execute one job.
 pub struct RunSpec<'a> {
     /// Job identifier, used as the container name suffix.
@@ -67,14 +58,22 @@ impl DockerRunner {
         })
     }
 
-    /// Detect which Linux architectures this Docker host can serve.
-    pub fn capabilities(&self) -> DockerCapabilities {
-        let native_arch = host::map_arch(std::env::consts::ARCH).to_owned();
-        let emulated_arch = (native_arch == "arm64").then(|| "amd64".to_owned());
-        DockerCapabilities {
-            native_arch,
-            emulated_arch,
+    /// Linux architectures Docker can serve on this host.
+    ///
+    /// Returns an empty vec on Linux hosts — the host runner already serves
+    /// its native `linux/*` pool, and cross-arch emulation is not guaranteed.
+    /// On macOS, Docker Desktop provides the native arch plus Rosetta-backed
+    /// amd64 emulation on arm64 hosts.
+    pub fn linux_arches(&self) -> Vec<String> {
+        if std::env::consts::OS != "macos" {
+            return Vec::new();
         }
+        let native = host::map_arch(std::env::consts::ARCH).to_owned();
+        let mut arches = vec![native.clone()];
+        if native == "arm64" {
+            arches.push("amd64".to_owned());
+        }
+        arches
     }
 
     /// Resolve the image for a job: prefer the platform-supplied value, fall
