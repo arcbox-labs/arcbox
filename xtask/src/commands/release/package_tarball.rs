@@ -3,42 +3,38 @@ use std::{fs, path::Path};
 use anyhow::{Context, Result};
 use flate2::{Compression, write::GzEncoder};
 use tar::Builder;
-use xtask_kit::{fs::copy_file, github_actions, hash::sha256_file};
+use xtask_kit::{fs as xtask_fs, github_actions, hash::sha256_file};
 
 use crate::PackageTarballArgs;
 
 pub fn run(args: PackageTarballArgs) -> Result<()> {
-    fs::create_dir_all(&args.output_dir)
-        .with_context(|| format!("creating {}", args.output_dir.display()))?;
+    xtask_fs::create_dir_all(&args.output_dir)?;
 
     let staging_name = format!("arcbox-darwin-arm64-{}", args.version);
     let staging = args.output_dir.join(&staging_name);
-    if staging.exists() {
-        fs::remove_dir_all(&staging)
-            .with_context(|| format!("removing old staging dir {}", staging.display()))?;
-    }
+    xtask_fs::remove_path(&staging)?;
 
-    copy_file(
+    xtask_fs::copy_file(
         args.host_artifacts.join("target/release/abctl"),
         staging.join("abctl"),
     )?;
-    copy_file(
+    xtask_fs::copy_file(
         args.host_artifacts.join("target/release/arcbox-daemon"),
         staging.join("arcbox-daemon"),
     )?;
-    copy_file(
+    xtask_fs::copy_file(
         args.host_artifacts.join("target/release/arcbox-helper"),
         staging.join("arcbox-helper"),
     )?;
-    copy_file(
+    xtask_fs::copy_file(
         args.agent_artifacts.join("arcbox-agent"),
         staging.join("arcbox-agent"),
     )?;
-    copy_file(
+    xtask_fs::copy_file(
         args.host_artifacts.join("bundle/arcbox.entitlements"),
         staging.join("bundle/arcbox.entitlements"),
     )?;
-    copy_file(
+    xtask_fs::copy_file(
         args.host_artifacts
             .join("bundle/com.arcboxlabs.desktop.helper.plist"),
         staging.join("bundle/com.arcboxlabs.desktop.helper.plist"),
@@ -57,8 +53,7 @@ pub fn run(args: PackageTarballArgs) -> Result<()> {
 
     let digest = sha256_file(&tarball)?;
     let checksum = args.output_dir.join(format!("{tarball_name}.sha256"));
-    fs::write(&checksum, format!("{digest}  {tarball_name}\n"))
-        .with_context(|| format!("writing {}", checksum.display()))?;
+    xtask_fs::write_string(&checksum, format!("{digest}  {tarball_name}\n"))?;
 
     println!("=== Tarball contents ===");
     print_tree(&staging, &staging_name)?;

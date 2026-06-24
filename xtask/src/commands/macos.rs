@@ -1,8 +1,11 @@
 use std::{env, path::PathBuf, process::Command};
 
 use anyhow::{Context, Result, bail};
+#[cfg(target_os = "macos")]
+use xtask_kit::apple;
+use xtask_kit::{process, repo};
 
-use crate::{MacosArgs, MacosCommand, support::repo_root};
+use crate::{MacosArgs, MacosCommand};
 
 pub fn run(args: MacosArgs) -> Result<()> {
     match args.command {
@@ -11,8 +14,8 @@ pub fn run(args: MacosArgs) -> Result<()> {
 }
 
 fn run_dev(args: crate::MacosDevArgs) -> Result<()> {
-    let shell = xshell::Shell::new()?;
-    let root = repo_root()?;
+    let shell = process::shell()?;
+    let root = repo::root_from_xtask_manifest(env!("CARGO_MANIFEST_DIR"))?;
     shell.change_dir(&root);
     let release = args.profile == "release";
     if args.profile != "debug" && !release {
@@ -53,23 +56,7 @@ fn run_dev(args: crate::MacosDevArgs) -> Result<()> {
         let entitlements = args
             .entitlements
             .unwrap_or_else(|| root.join("bundle/arcbox.dev.entitlements"));
-        xshell::cmd!(
-            shell,
-            "codesign --force --options runtime --entitlements {entitlements} -s - {bin}"
-        )
-        .run()?;
-        let output = Command::new("codesign")
-            .args(["-d", "--entitlements", ":-"])
-            .arg(&bin)
-            .output()
-            .with_context(|| format!("reading entitlements from {}", bin.display()))?;
-        let entitlements_xml = String::from_utf8_lossy(&output.stderr);
-        if !entitlements_xml.contains("com.apple.security.virtualization") {
-            bail!(
-                "missing com.apple.security.virtualization entitlement on {}",
-                bin.display()
-            );
-        }
+        sign_daemon(&bin, &entitlements)?;
     }
 
     let helper_socket = args
@@ -96,4 +83,24 @@ fn run_dev(args: crate::MacosDevArgs) -> Result<()> {
         bail!("arcbox-daemon exited with {status}");
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn sign_daemon(bin: &std::path::Path, entitlements: &std::path::Path) -> Result<()> {
+    let mut codesign = apple::CodesignOptions::runtime("-", bin);
+    codesign.entitlements = Some(entitlements);
+    apple::codesign(&codesign)?;
+    let entitlements_xml = apple::entitlements_xml(bin)?;
+    if !entitlements_xml.contains("com.apple.security.virtualization") {
+        bail!(
+            "missing com.apple.security.virtualization entitlement on {}",
+            bin.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sign_daemon(_bin: &std::path::Path, _entitlements: &std::path::Path) -> Result<()> {
+    bail!("macOS signing is only available on macOS")
 }
