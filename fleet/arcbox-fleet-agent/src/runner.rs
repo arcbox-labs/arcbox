@@ -1,24 +1,35 @@
-//! Runner supervision: spawn the GitHub Actions runner per `ProvisionRunner`,
-//! track in-flight jobs, and report terminal state back over the stream.
+//! Runner supervision: start a runner per `ProvisionRunner`, track in-flight
+//! jobs per `(os, arch)` capacity pool, and report terminal state back over the
+//! stream.
 //!
-//! v1 has no isolation: the job runs directly on the host. `ProvisionRunner`'s
-//! `image`/`cpus`/`mem_mib` describe a sandbox that does not exist yet and are
-//! intentionally ignored.
+//! Linux jobs run inside a Docker container for isolation (using
+//! `ProvisionRunner.image`); all other jobs run directly on the host via the
+//! pre-installed runner. Admission gates each pool against the cap the agent
+//! advertised for it, so the gateway's per-pool reservations and the agent's
+//! local capacity never disagree.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arcbox_fleet_proto::v1::{
     AttachRequest, ProvisionRunner, RunnerAccepted, RunnerFailed, RunnerFinished, RunnerStarted,
-    attach_request,
+    RuntimeCapacity, attach_request,
 };
 use command_group::AsyncCommandGroup;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::docker::{DockerRunner, RunSpec};
+
+/// An `(os, arch)` capacity pool, mirroring the gateway's reservation key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Pool {
+    os: String,
+    arch: String,
+}
 
 /// Outcome of the admission check for an incoming `ProvisionRunner`.
 #[derive(Debug, PartialEq, Eq)]
@@ -29,8 +40,10 @@ enum Admission {
     Duplicate,
     /// The host is draining and rejects new work.
     Draining,
-    /// The host is at its concurrency cap.
+    /// The job's `(os, arch)` pool is at its concurrency cap.
     AtCapacity,
+    /// No advertised pool serves the job's `(os, arch)`.
+    Unservable,
 }
 
 /// Spawns and tracks runner processes, emitting lifecycle events to the gateway.
@@ -42,8 +55,8 @@ pub struct RunnerSupervisor {
 struct Inner {
     /// Outbound channel to the gateway (runner lifecycle events).
     events: mpsc::Sender<AttachRequest>,
-    /// Job ids currently in flight (drives local capacity).
-    in_flight: DashSet<String>,
+    /// In-flight jobs mapped to the pool each occupies; drives per-pool capacity.
+    in_flight: DashMap<String, Pool>,
     /// Cancel signals for in-flight jobs. Firing one makes the job's `run_job`
     /// kill the runner's whole process group; see [`RunnerSupervisor::handle_cancel`].
     cancels: DashMap<String, oneshot::Sender<()>>,
@@ -52,28 +65,43 @@ struct Inner {
     runner_dir: Option<PathBuf>,
     /// Docker runtime for Linux jobs, if available.
     docker: Option<DockerRunner>,
-    /// Local backpressure cap.
-    max_concurrent: usize,
+    /// Advertised capacity per `(os, arch)` pool. Admission gates each pool
+    /// against its own cap, mirroring the gateway's per-pool reservation.
+    pools: HashMap<Pool, i32>,
     /// Set once `Drain` is received; no new jobs are accepted.
     draining: std::sync::atomic::AtomicBool,
 }
 
 impl RunnerSupervisor {
-    /// Create a supervisor that emits events on `events`.
+    /// Create a supervisor that emits events on `events`. `pools` is the
+    /// advertised capacity set — the same list reported to the gateway, so
+    /// admission and advertisement can never disagree.
     pub fn new(
         events: mpsc::Sender<AttachRequest>,
         runner_dir: Option<PathBuf>,
         docker: Option<DockerRunner>,
-        max_concurrent: usize,
+        pools: Vec<RuntimeCapacity>,
     ) -> Self {
+        let pools = pools
+            .into_iter()
+            .map(|c| {
+                (
+                    Pool {
+                        os: c.os,
+                        arch: c.arch,
+                    },
+                    c.max_concurrent,
+                )
+            })
+            .collect();
         Self {
             inner: Arc::new(Inner {
                 events,
-                in_flight: DashSet::new(),
+                in_flight: DashMap::new(),
                 cancels: DashMap::new(),
                 runner_dir,
                 docker,
-                max_concurrent,
+                pools,
                 draining: std::sync::atomic::AtomicBool::new(false),
             }),
         }
@@ -84,8 +112,12 @@ impl RunnerSupervisor {
     /// capacity.
     pub async fn handle_provision(&self, order: ProvisionRunner) {
         let job_id = order.job_id.clone();
+        let pool = Pool {
+            os: order.os.clone(),
+            arch: order.arch.clone(),
+        };
 
-        match self.admit(&job_id) {
+        match self.admit(&job_id, &pool) {
             Admission::Duplicate => {
                 // The gateway's dispatch is at-least-once, so a redelivered
                 // order for a running job must be a no-op — never a second
@@ -101,11 +133,19 @@ impl RunnerSupervisor {
                 self.fail(&job_id, "host at capacity").await;
                 return;
             }
+            Admission::Unservable => {
+                self.fail(
+                    &job_id,
+                    &format!("no capacity pool for {}/{}", order.os, order.arch),
+                )
+                .await;
+                return;
+            }
             Admission::Accept => {}
         }
 
         // Reserve the slot synchronously so a follow-up dispatch sees it.
-        self.inner.in_flight.insert(job_id.clone());
+        self.inner.in_flight.insert(job_id.clone(), pool);
 
         // Cancellation is cooperative: `run_job` owns the runner process group
         // and tears it down on this signal, so `CancelRunner` never orphans the
@@ -117,14 +157,16 @@ impl RunnerSupervisor {
         tokio::spawn(async move { sup.run_job(order, cancel_rx).await });
     }
 
-    /// Decide whether to start a runner for `job_id`. `Duplicate` takes
-    /// precedence over `Draining`/`AtCapacity`: a redelivery of an
-    /// already-running job is a no-op regardless of host state. The
-    /// `contains`/`insert` gap back in [`Self::handle_provision`] is safe
-    /// because the attach loop dispatches orders one at a time, with no
-    /// `.await` between this check and the reservation.
-    fn admit(&self, job_id: &str) -> Admission {
-        if self.inner.in_flight.contains(job_id) {
+    /// Decide whether to start a runner for `job_id` in `pool`. `Duplicate`
+    /// takes precedence over the host-state checks: a redelivery of an
+    /// already-running job is a no-op regardless. Capacity is gated per pool —
+    /// each `(os, arch)` against its own advertised cap — so the agent admits
+    /// exactly what the gateway reserves. The `contains`/`insert` gap back in
+    /// [`Self::handle_provision`] is safe because the attach loop dispatches
+    /// orders one at a time, with no `.await` between this check and the
+    /// reservation.
+    fn admit(&self, job_id: &str, pool: &Pool) -> Admission {
+        if self.inner.in_flight.contains_key(job_id) {
             return Admission::Duplicate;
         }
         if self
@@ -134,10 +176,22 @@ impl RunnerSupervisor {
         {
             return Admission::Draining;
         }
-        if self.inner.in_flight.len() >= self.inner.max_concurrent {
+        let Some(&cap) = self.inner.pools.get(pool) else {
+            return Admission::Unservable;
+        };
+        if self.active_in(pool) >= cap.max(0) as usize {
             return Admission::AtCapacity;
         }
         Admission::Accept
+    }
+
+    /// Count jobs currently occupying `pool`.
+    fn active_in(&self, pool: &Pool) -> usize {
+        self.inner
+            .in_flight
+            .iter()
+            .filter(|entry| entry.value() == pool)
+            .count()
     }
 
     /// Cancel an in-flight job. Signals `run_job`, which tears down the runner
@@ -382,56 +436,94 @@ fn runner_command(runner_dir: &Path, encoded_jit_config: &str) -> tokio::process
 mod tests {
     use super::*;
 
-    fn supervisor(max_concurrent: usize) -> RunnerSupervisor {
+    fn cap(os: &str, arch: &str, max: i32) -> RuntimeCapacity {
+        RuntimeCapacity {
+            os: os.to_owned(),
+            arch: arch.to_owned(),
+            max_concurrent: max,
+        }
+    }
+
+    fn pool(os: &str, arch: &str) -> Pool {
+        Pool {
+            os: os.to_owned(),
+            arch: arch.to_owned(),
+        }
+    }
+
+    fn supervisor(pools: Vec<RuntimeCapacity>) -> RunnerSupervisor {
         let (events, _rx) = mpsc::channel(1);
-        RunnerSupervisor::new(
-            events,
-            Some(PathBuf::from("/nonexistent")),
-            None,
-            max_concurrent,
-        )
+        RunnerSupervisor::new(events, Some(PathBuf::from("/nonexistent")), None, pools)
     }
 
     #[test]
-    fn admits_until_capacity_then_rejects() {
-        let sup = supervisor(2);
-        assert_eq!(sup.admit("rjob_a"), Admission::Accept);
+    fn admits_until_pool_capacity_then_rejects() {
+        let sup = supervisor(vec![cap("darwin", "arm64", 2)]);
+        let p = pool("darwin", "arm64");
+        assert_eq!(sup.admit("rjob_a", &p), Admission::Accept);
 
-        sup.inner.in_flight.insert("rjob_a".to_string());
+        sup.inner.in_flight.insert("rjob_a".to_string(), p.clone());
         // A redelivery of a running job is a duplicate, never a fresh slot.
-        assert_eq!(sup.admit("rjob_a"), Admission::Duplicate);
-        assert_eq!(sup.admit("rjob_b"), Admission::Accept);
+        assert_eq!(sup.admit("rjob_a", &p), Admission::Duplicate);
+        assert_eq!(sup.admit("rjob_b", &p), Admission::Accept);
 
-        sup.inner.in_flight.insert("rjob_b".to_string());
-        assert_eq!(sup.admit("rjob_c"), Admission::AtCapacity);
+        sup.inner.in_flight.insert("rjob_b".to_string(), p.clone());
+        assert_eq!(sup.admit("rjob_c", &p), Admission::AtCapacity);
+    }
+
+    #[test]
+    fn pools_have_independent_capacity() {
+        let sup = supervisor(vec![cap("darwin", "arm64", 1), cap("linux", "amd64", 1)]);
+        let darwin = pool("darwin", "arm64");
+        let linux = pool("linux", "amd64");
+
+        sup.inner
+            .in_flight
+            .insert("rjob_a".to_string(), darwin.clone());
+        // The darwin pool is full...
+        assert_eq!(sup.admit("rjob_b", &darwin), Admission::AtCapacity);
+        // ...but the linux pool is unaffected.
+        assert_eq!(sup.admit("rjob_c", &linux), Admission::Accept);
+    }
+
+    #[test]
+    fn unadvertised_pool_is_unservable() {
+        let sup = supervisor(vec![cap("darwin", "arm64", 2)]);
+        assert_eq!(
+            sup.admit("rjob_a", &pool("linux", "amd64")),
+            Admission::Unservable
+        );
     }
 
     #[test]
     fn duplicate_takes_precedence_over_drain_and_capacity() {
-        let sup = supervisor(1);
-        sup.inner.in_flight.insert("rjob_a".to_string());
+        let sup = supervisor(vec![cap("darwin", "arm64", 1)]);
+        let p = pool("darwin", "arm64");
+        sup.inner.in_flight.insert("rjob_a".to_string(), p.clone());
         sup.inner
             .draining
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Already running, host draining and at capacity: still a duplicate.
-        assert_eq!(sup.admit("rjob_a"), Admission::Duplicate);
+        assert_eq!(sup.admit("rjob_a", &p), Admission::Duplicate);
         // A different job while draining is rejected for draining.
-        assert_eq!(sup.admit("rjob_b"), Admission::Draining);
+        assert_eq!(sup.admit("rjob_b", &p), Admission::Draining);
     }
 
     /// Register an in-flight job with a cancel signal, mirroring what
     /// `handle_provision` sets up before spawning `run_job`.
     fn register_in_flight(sup: &RunnerSupervisor, job_id: &str) -> oneshot::Receiver<()> {
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        sup.inner.in_flight.insert(job_id.to_string());
+        sup.inner
+            .in_flight
+            .insert(job_id.to_string(), pool("darwin", "arm64"));
         sup.inner.cancels.insert(job_id.to_string(), cancel_tx);
         cancel_rx
     }
 
     #[tokio::test]
     async fn shutdown_drains_cancels_and_waits_for_release() {
-        let sup = supervisor(4);
+        let sup = supervisor(vec![cap("darwin", "arm64", 4)]);
         let cancel_rx = register_in_flight(&sup, "rjob_a");
 
         // Stand in for `run_job`: release the slot once the cancel signal fires.
@@ -454,7 +546,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_returns_after_grace_when_a_job_will_not_release() {
-        let sup = supervisor(4);
+        let sup = supervisor(vec![cap("darwin", "arm64", 4)]);
         // Hold the receiver so the cancel send succeeds, but never release the
         // slot — shutdown must give up after the grace rather than hang.
         let _cancel_rx = register_in_flight(&sup, "rjob_a");

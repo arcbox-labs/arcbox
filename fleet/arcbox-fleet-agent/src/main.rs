@@ -1,9 +1,10 @@
 //! ArcBox Fleet runner agent.
 //!
 //! A standalone, cross-platform binary that enrolls a host with the Fleet
-//! gateway and, once attached, runs GitHub Actions jobs by invoking the
-//! pre-installed runner (`run.sh --jitconfig …`). v1 has no isolation: jobs run
-//! directly on the host.
+//! gateway and, once attached, runs GitHub Actions jobs. Linux jobs run in a
+//! Docker container for isolation when a Docker-compatible runtime is
+//! available; other jobs run via the pre-installed runner
+//! (`run.sh --jitconfig …`).
 //!
 //! Configuration is environment-driven (`ARCBOX_FLEET_*`). The `enroll`
 //! subcommand reads the fleet join token from a file (`--token-file`) or stdin
@@ -21,6 +22,7 @@ mod runner;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use arcbox_fleet_proto::v1::RuntimeCapacity;
 use arcbox_logging::LogConfig;
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
@@ -82,16 +84,12 @@ fn main() -> Result<()> {
 
 async fn run(command: Command, config: AgentConfig) -> Result<()> {
     let docker = init_docker(&config).await?;
-
-    let docker_arches = docker
-        .as_ref()
-        .map(|d| d.linux_arches())
-        .unwrap_or_default();
+    let pools = capacity_pools(&config, docker.as_ref());
 
     match command {
         Command::Enroll { token_file, token } => {
             let token = resolve_enrollment_token(token_file, token)?;
-            enroll::enroll(&config, token, &docker_arches).await?;
+            enroll::enroll(&config, token, pools).await?;
             Ok(())
         }
         Command::Run => {
@@ -112,7 +110,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 signal_token.cancel();
             });
 
-            attach::run(config, credential, docker, shutdown).await
+            attach::run(config, credential, docker, pools, shutdown).await
         }
     }
 }
@@ -175,6 +173,24 @@ fn resolve_enrollment_token(token_file: Option<PathBuf>, token: Option<String>) 
         anyhow::bail!("enrollment token is empty");
     }
     Ok(token)
+}
+
+/// Build the capacity pools this agent advertises and admits against: the
+/// host-runner pool (if a runner directory is set) plus any Docker-served Linux
+/// pools, the latter sharing a resource-derived budget.
+fn capacity_pools(config: &AgentConfig, docker: Option<&DockerRunner>) -> Vec<RuntimeCapacity> {
+    let docker_arches = docker.map(DockerRunner::linux_arches).unwrap_or_default();
+    let docker_budget = if docker_arches.is_empty() {
+        0
+    } else {
+        host::docker_budget()
+    };
+    host::capacities(
+        config.max_concurrent,
+        config.runner_dir.is_some(),
+        &docker_arches,
+        docker_budget,
+    )
 }
 
 /// Probe Docker availability according to the configured [`DockerMode`].

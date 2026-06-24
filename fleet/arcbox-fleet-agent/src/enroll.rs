@@ -1,8 +1,8 @@
 //! One-shot enrollment: exchange an enrollment token for the machine credential.
 
 use anyhow::{Context, Result};
-use arcbox_fleet_proto::v1::EnrollRequest;
 use arcbox_fleet_proto::v1::fleet_gateway_service_client::FleetGatewayServiceClient;
+use arcbox_fleet_proto::v1::{EnrollRequest, RuntimeCapacity};
 use tracing::info;
 
 use crate::config::AgentConfig;
@@ -13,7 +13,7 @@ use crate::host;
 pub async fn enroll(
     config: &AgentConfig,
     token: String,
-    docker_arches: &[String],
+    capacities: Vec<RuntimeCapacity>,
 ) -> Result<Credential> {
     let channel = config
         .endpoint()?
@@ -28,7 +28,7 @@ pub async fn enroll(
         host_arch: host::host_arch(),
         cpu_cores: host::cpu_cores(),
         mem_mib: host::mem_mib(),
-        capacities: host::capacities(config.max_concurrent, docker_arches),
+        capacities,
         host_info_json: host::host_info_json(),
     };
 

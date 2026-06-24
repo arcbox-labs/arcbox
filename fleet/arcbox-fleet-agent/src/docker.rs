@@ -79,21 +79,15 @@ impl DockerRunner {
         })
     }
 
-    /// Extra Linux architectures to advertise via Docker.
+    /// Linux architectures this Docker host can run as containers.
     ///
-    /// On Linux the host already serves its native `linux/*` pool, so Docker
-    /// adds no new pools (it is still used for job isolation at the routing
-    /// layer). On macOS and Windows the host has no native Linux pool, so
-    /// Docker adds them.
-    ///
-    /// On arm64 macOS, amd64 is included because ArcBox's runtime provides
-    /// Rosetta-backed emulation.
+    /// Always includes the host's native arch. On Linux this is the same pool
+    /// the host would otherwise serve directly, but Docker still runs it for
+    /// isolation. On Apple Silicon macOS, amd64 is also included because
+    /// ArcBox's runtime provides Rosetta-backed emulation.
     pub fn linux_arches(&self) -> Vec<String> {
-        if std::env::consts::OS == "linux" {
-            return Vec::new();
-        }
-        let native = host::map_arch(std::env::consts::ARCH).to_owned();
-        let mut arches = vec![native.clone()];
+        let native = host::map_arch(std::env::consts::ARCH);
+        let mut arches = vec![native.to_owned()];
         if std::env::consts::OS == "macos" && native == "arm64" {
             arches.push("amd64".to_owned());
         }

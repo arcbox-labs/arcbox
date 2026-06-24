@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arcbox_fleet_proto::v1::fleet_gateway_service_client::FleetGatewayServiceClient;
-use arcbox_fleet_proto::v1::{AttachRequest, Heartbeat, attach_request, attach_response};
+use arcbox_fleet_proto::v1::{
+    AttachRequest, Heartbeat, RuntimeCapacity, attach_request, attach_response,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -46,16 +48,13 @@ pub async fn run(
     config: AgentConfig,
     credential: Credential,
     docker: Option<docker::DockerRunner>,
+    pools: Vec<RuntimeCapacity>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let runner_dir = config.runner_dir.clone();
-    let docker_arches = docker
-        .as_ref()
-        .map(|d| d.linux_arches())
-        .unwrap_or_default();
 
     let (egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
-    let supervisor = RunnerSupervisor::new(egress_tx, runner_dir, docker, config.max_concurrent);
+    let supervisor = RunnerSupervisor::new(egress_tx, runner_dir, docker, pools.clone());
 
     let mut backoff = INITIAL_BACKOFF;
     // An event pulled from the egress queue but not yet delivered when the
@@ -71,8 +70,8 @@ pub async fn run(
             &mut egress_rx,
             &mut pending,
             &mut backoff,
+            &pools,
             &shutdown,
-            &docker_arches,
         )
         .await;
         // A shutdown during the connection is a clean exit, not a failure to log
@@ -108,6 +107,13 @@ pub async fn run(
 /// connection-scoped heartbeats are sent directly, while runner lifecycle
 /// events are forwarded from the shared egress queue. Inbound orders are routed
 /// to the persistent `supervisor`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one connection's lifecycle genuinely needs all of: endpoint config, \
+              credential, the persistent supervisor, the cross-reconnect egress queue \
+              and its pending slot, the mutable backoff, advertised pools, and the \
+              shutdown token"
+)]
 async fn connect_and_serve(
     config: &AgentConfig,
     credential: &Credential,
@@ -115,8 +121,8 @@ async fn connect_and_serve(
     egress_rx: &mut mpsc::Receiver<AttachRequest>,
     pending: &mut Option<AttachRequest>,
     backoff: &mut Duration,
+    pools: &[RuntimeCapacity],
     shutdown: &CancellationToken,
-    docker_arches: &[String],
 ) -> Result<()> {
     let channel = config
         .endpoint()?
@@ -150,11 +156,7 @@ async fn connect_and_serve(
         }
     }
 
-    let heartbeat = spawn_heartbeat(
-        req_tx.clone(),
-        config.max_concurrent,
-        docker_arches.to_vec(),
-    );
+    let heartbeat = spawn_heartbeat(req_tx.clone(), pools.to_vec());
 
     let outcome = loop {
         tokio::select! {
@@ -202,15 +204,14 @@ async fn dispatch(supervisor: &RunnerSupervisor, msg: Option<attach_response::Ms
 /// heartbeats queued for the next stream.
 fn spawn_heartbeat(
     outbound: mpsc::Sender<AttachRequest>,
-    max_concurrent: usize,
-    docker_arches: Vec<String>,
+    pools: Vec<RuntimeCapacity>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             ticker.tick().await;
             let msg = attach_request::Msg::Heartbeat(Heartbeat {
-                capacities: host::capacities(max_concurrent, &docker_arches),
+                capacities: pools.clone(),
                 host_info_json: host::host_info_json(),
             });
             if outbound
