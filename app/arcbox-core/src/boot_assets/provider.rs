@@ -1,133 +1,12 @@
-//! Boot asset management for VM startup.
-//!
-//! Thin wrapper around `arcbox_boot::AssetManager`.
-//! All downloading, caching, and verification logic lives in the
-//! `arcbox-boot` crate; this module provides daemon-specific
-//! configuration defaults, error mapping, and the `BootAssets` struct
-//! that `vm_lifecycle` consumes.
-
+use super::BootAssetManifest;
+use super::config::BootAssetConfig;
+use super::lockfile::boot_asset_manifest_sha256;
 use crate::error::{CoreError, Result};
 use arcbox_boot::asset_manager::{AssetManager, AssetManagerConfig};
 use arcbox_boot::download::{PrepareProgress, ProgressCallback as InnerProgressCallback};
 use arcbox_constants::cmdline::HV_EARLYCON_DIRECTIVE;
-use arcbox_constants::env::BOOT_ASSET_VERSION as BOOT_ASSET_VERSION_ENV;
 use sha2::Digest;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
-
-// Re-exports for consumers (CLI, lib.rs).
-pub use arcbox_boot::download::{PreparePhase, PrepareProgress as DownloadProgress};
-pub use arcbox_boot::manifest::Manifest as BootAssetManifest;
-
-// =============================================================================
-// Lockfile
-// =============================================================================
-
-/// Embedded lockfile (compiled-in from workspace root).
-const LOCK_TOML: &str = include_str!("../../../assets.lock");
-
-/// Top-level lockfile structure.
-#[derive(Debug, serde::Deserialize)]
-struct AssetsLock {
-    boot: BootSection,
-}
-
-/// The `[boot]` section of `assets.lock`.
-#[derive(Debug, serde::Deserialize)]
-struct BootSection {
-    version: String,
-    cdn: Option<String>,
-    manifest_sha256: Option<String>,
-}
-
-static LOCK: LazyLock<AssetsLock> =
-    LazyLock::new(|| toml::from_str(LOCK_TOML).expect("invalid assets.lock"));
-
-/// Default CDN base URL (fallback when lockfile omits `cdn`).
-const DEFAULT_CDN_BASE_URL: &str = "https://boot.arcboxcdn.com";
-
-/// Boot asset version pinned by this daemon release.
-#[must_use]
-pub fn boot_asset_version() -> &'static str {
-    &LOCK.boot.version
-}
-
-/// CDN base URL resolved from lockfile (or default).
-#[must_use]
-pub fn boot_asset_cdn() -> &'static str {
-    LOCK.boot.cdn.as_deref().unwrap_or(DEFAULT_CDN_BASE_URL)
-}
-
-// =============================================================================
-// Configuration
-// =============================================================================
-
-/// Boot asset configuration.
-#[derive(Debug, Clone)]
-pub struct BootAssetConfig {
-    /// Base URL for asset downloads.
-    pub cdn_base_url: String,
-    /// Asset version to download.
-    pub version: String,
-    /// Target architecture.
-    pub arch: String,
-    /// Cache directory for downloaded assets.
-    pub cache_dir: PathBuf,
-    /// Custom kernel path (skip download).
-    pub custom_kernel: Option<PathBuf>,
-}
-
-impl Default for BootAssetConfig {
-    fn default() -> Self {
-        let version = std::env::var(BOOT_ASSET_VERSION_ENV)
-            .unwrap_or_else(|_| boot_asset_version().to_string());
-
-        let arch = if cfg!(target_arch = "aarch64") {
-            "arm64"
-        } else {
-            "x86_64"
-        }
-        .to_string();
-
-        Self {
-            cdn_base_url: boot_asset_cdn().to_string(),
-            version,
-            arch,
-            cache_dir: dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".arcbox")
-                .join("boot"),
-            custom_kernel: None,
-        }
-    }
-}
-
-impl BootAssetConfig {
-    /// Creates config with an explicit cache directory.
-    #[must_use]
-    pub fn with_cache_dir(cache_dir: PathBuf) -> Self {
-        Self {
-            cache_dir,
-            ..Default::default()
-        }
-    }
-
-    /// Override asset version.
-    pub fn with_version(mut self, version: impl Into<String>) -> Self {
-        self.version = version.into();
-        self
-    }
-
-    /// Returns the versioned cache directory (e.g. `~/.arcbox/boot/0.2.0`).
-    #[must_use]
-    pub fn version_cache_dir(&self) -> PathBuf {
-        self.cache_dir.join(&self.version)
-    }
-}
-
-// =============================================================================
-// Boot Assets (consumed by vm_lifecycle)
-// =============================================================================
 
 /// Boot assets required for VM startup.
 ///
@@ -156,16 +35,8 @@ impl BootAssets {
     }
 }
 
-// =============================================================================
-// Progress Callback
-// =============================================================================
-
 /// Progress callback type.
 pub type ProgressCallback = Box<dyn Fn(PrepareProgress) + Send + Sync>;
-
-// =============================================================================
-// Boot Asset Provider
-// =============================================================================
 
 /// Boot asset provider — delegates to `arcbox_boot::AssetManager`.
 pub struct BootAssetProvider {
@@ -222,13 +93,7 @@ impl BootAssetProvider {
             .await
             .map_err(|e| CoreError::config(format!("boot asset error: {e}")))?;
 
-        // Verify manifest SHA256 if the lockfile specifies one.
-        if let Some(expected) = LOCK
-            .boot
-            .manifest_sha256
-            .as_deref()
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(expected) = boot_asset_manifest_sha256() {
             let manifest_path = self.config.version_cache_dir().join("manifest.json");
             let bytes = std::fs::read(&manifest_path)
                 .map_err(|e| CoreError::config(format!("read manifest: {e}")))?;
@@ -266,10 +131,6 @@ impl BootAssetProvider {
             .await
             .map_err(|e| CoreError::config(format!("binary prepare error: {e}")))
     }
-
-    // =========================================================================
-    // CLI convenience methods
-    // =========================================================================
 
     /// Returns true if the current version's boot assets are fully cached
     /// (manifest + kernel + rootfs all present).
@@ -353,10 +214,6 @@ impl BootAssetProvider {
             .map(String::from))
     }
 
-    // =========================================================================
-    // Internal helpers
-    // =========================================================================
-
     fn build_inner_config(config: &BootAssetConfig) -> AssetManagerConfig {
         AssetManagerConfig {
             cdn_base_url: config.cdn_base_url.clone(),
@@ -372,98 +229,5 @@ impl BootAssetProvider {
         self.manager = AssetManager::new(inner_config)
             .map_err(|e| CoreError::config(format!("invalid boot asset config: {e}")))?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn test_default_config() {
-        let config = BootAssetConfig::default();
-        assert!(!config.cdn_base_url.is_empty());
-        assert!(!config.version.is_empty());
-        assert!(!config.arch.is_empty());
-    }
-
-    #[test]
-    fn test_default_config_uses_boot_asset_version() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let original = std::env::var(BOOT_ASSET_VERSION_ENV).ok();
-        // SAFETY: Test code running under ENV_LOCK mutex.
-        unsafe { std::env::remove_var(BOOT_ASSET_VERSION_ENV) };
-
-        let config = BootAssetConfig::default();
-        assert_eq!(config.version, boot_asset_version());
-
-        restore_env(original);
-    }
-
-    #[test]
-    fn test_default_config_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let original = std::env::var(BOOT_ASSET_VERSION_ENV).ok();
-        // SAFETY: Test code running under ENV_LOCK mutex.
-        unsafe { std::env::set_var(BOOT_ASSET_VERSION_ENV, "9.9.9") };
-
-        let config = BootAssetConfig::default();
-        assert_eq!(config.version, "9.9.9");
-
-        restore_env(original);
-    }
-
-    #[test]
-    fn test_version_cache_dir() {
-        let config = BootAssetConfig {
-            version: "1.0.0".to_string(),
-            cache_dir: PathBuf::from("/tmp/boot"),
-            ..Default::default()
-        };
-        assert_eq!(config.version_cache_dir(), PathBuf::from("/tmp/boot/1.0.0"));
-    }
-
-    #[test]
-    fn test_is_cached_requires_all_assets() {
-        let temp = tempfile::tempdir().unwrap();
-        let cache_dir = temp.path().to_path_buf();
-        let version = "1.0.0".to_string();
-        let version_dir = cache_dir.join(&version);
-        std::fs::create_dir_all(&version_dir).unwrap();
-
-        let config = BootAssetConfig {
-            version,
-            cache_dir,
-            ..Default::default()
-        };
-        let provider = BootAssetProvider::with_config(config).unwrap();
-
-        // Empty dir: not cached.
-        assert!(!provider.is_cached());
-
-        // Manifest only: not cached.
-        std::fs::write(version_dir.join("manifest.json"), b"{}").unwrap();
-        assert!(!provider.is_cached());
-
-        // Manifest + kernel: not cached.
-        std::fs::write(version_dir.join("kernel"), b"vmlinux").unwrap();
-        assert!(!provider.is_cached());
-
-        // Manifest + kernel + rootfs: cached.
-        std::fs::write(version_dir.join("rootfs.erofs"), b"erofs").unwrap();
-        assert!(provider.is_cached());
-    }
-
-    fn restore_env(original: Option<String>) {
-        // SAFETY: Test code running under ENV_LOCK mutex.
-        unsafe {
-            match original {
-                Some(value) => std::env::set_var(BOOT_ASSET_VERSION_ENV, value),
-                None => std::env::remove_var(BOOT_ASSET_VERSION_ENV),
-            }
-        }
     }
 }
