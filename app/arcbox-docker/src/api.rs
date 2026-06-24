@@ -24,12 +24,33 @@ use std::sync::Arc;
 pub struct AppState {
     /// `ArcBox` runtime.
     pub runtime: Arc<Runtime>,
-    /// Guest connection factory (vsock in production, Unix socket in tests).
-    pub connector: Arc<dyn GuestConnector>,
-    /// Pooled HTTP client for ordinary proxied requests.
-    pub guest_http_client: Arc<GuestHttpClient>,
+    /// Guest proxy transport state.
+    pub proxy: Arc<ProxyState>,
     /// In-process mapping from container/exec IDs to their utility VM role.
     pub workload_roles: Arc<WorkloadRoleRegistry>,
+}
+
+/// Guest proxy transport state shared by handlers.
+pub struct ProxyState {
+    connector: Arc<dyn GuestConnector>,
+    guest_http_client: GuestHttpClient,
+}
+
+impl ProxyState {
+    fn new(connector: Arc<dyn GuestConnector>) -> Self {
+        Self {
+            guest_http_client: GuestHttpClient::new(Arc::clone(&connector)),
+            connector,
+        }
+    }
+
+    pub(crate) fn connector(&self) -> &dyn GuestConnector {
+        self.connector.as_ref()
+    }
+
+    pub(crate) fn client(&self) -> &GuestHttpClient {
+        &self.guest_http_client
+    }
 }
 
 /// Creates the Docker API router with all endpoints.
@@ -41,8 +62,7 @@ pub struct AppState {
 pub fn create_router(runtime: Arc<Runtime>, connector: Arc<dyn GuestConnector>) -> Router {
     let state = AppState {
         runtime,
-        guest_http_client: Arc::new(GuestHttpClient::new(Arc::clone(&connector))),
-        connector,
+        proxy: Arc::new(ProxyState::new(connector)),
         workload_roles: WorkloadRoleRegistry::new(),
     };
 

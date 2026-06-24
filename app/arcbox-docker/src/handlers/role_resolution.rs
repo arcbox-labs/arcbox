@@ -137,7 +137,7 @@ async fn probe_container_exists(state: &AppState, role: UtilityVmRole, container
     }
     let path = format!("/containers/{container_id}/json");
     match crate::proxy::proxy_to_guest_for_role_pooled(
-        &state.guest_http_client,
+        state.proxy.client(),
         role,
         Method::GET,
         &path,

@@ -35,14 +35,14 @@ pub async fn proxy_fallback(
     ensure_role_ready(&state, role).await?;
 
     if req.headers().wants_upgrade() {
-        return upgrade::proxy_with_upgrade_for_role(state.connector.as_ref(), role, req, &uri)
+        return upgrade::proxy_with_upgrade_for_role(state.proxy.connector(), role, req, &uri)
             .await;
     }
 
     if upload::is_streaming_upload_request(req.method(), &uri) {
-        return upload::proxy_streaming_upload_for_role(state.connector.as_ref(), role, &uri, req)
+        return upload::proxy_streaming_upload_for_role(state.proxy.connector(), role, &uri, req)
             .await;
     }
 
-    forward::proxy_to_guest_stream_for_role_pooled(&state.guest_http_client, role, &uri, req).await
+    forward::proxy_to_guest_stream_for_role_pooled(state.proxy.client(), role, &uri, req).await
 }
