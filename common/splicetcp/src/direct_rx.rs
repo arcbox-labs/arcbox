@@ -108,11 +108,13 @@ pub trait ConnSink: Send + Sync {
 ///
 /// `send_conn` must be called from within a Tokio runtime because accepted
 /// connections are driven by spawned read tasks. The emitted frames mirror the
-/// standard-MTU segmentation path; this sink does not support the bridge's large
-/// frame mode.
+/// configured guest MTU: by default it preserves the historical socketpair-safe
+/// segmentation, and callers with a high-MTU link can use
+/// [`channel_with_mtu`](Self::channel_with_mtu).
 #[cfg(feature = "tokio-frame-sink")]
 pub struct TokioFrameConnSink {
     tx: mpsc::Sender<Vec<u8>>,
+    guest_mss: usize,
 }
 
 #[cfg(feature = "tokio-frame-sink")]
@@ -120,7 +122,20 @@ impl TokioFrameConnSink {
     /// Creates a sink from the sending half of a bounded frame channel.
     #[must_use]
     pub fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            guest_mss: FAST_PATH_GUEST_MSS,
+        }
+    }
+
+    /// Creates a sink from the sending half of a bounded frame channel, segmenting
+    /// host→guest data so each emitted IPv4 packet fits within `mtu` bytes.
+    #[must_use]
+    pub fn new_with_mtu(tx: mpsc::Sender<Vec<u8>>, mtu: usize) -> Self {
+        Self {
+            tx,
+            guest_mss: guest_mss_for_mtu(mtu),
+        }
     }
 
     /// Convenience constructor returning an `Arc<dyn ConnSink>` plus the receiving
@@ -129,6 +144,17 @@ impl TokioFrameConnSink {
     pub fn channel(capacity: usize) -> (Arc<dyn ConnSink>, mpsc::Receiver<Vec<u8>>) {
         let (tx, rx) = mpsc::channel(capacity.max(1));
         (Arc::new(Self::new(tx)), rx)
+    }
+
+    /// Convenience constructor equivalent to [`channel`](Self::channel), but with
+    /// host→guest segmentation sized for a configured L3 MTU.
+    #[must_use]
+    pub fn channel_with_mtu(
+        capacity: usize,
+        mtu: usize,
+    ) -> (Arc<dyn ConnSink>, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel(capacity.max(1));
+        (Arc::new(Self::new_with_mtu(tx, mtu)), rx)
     }
 }
 
@@ -160,6 +186,7 @@ impl ConnSink for TokioFrameConnSink {
             down_bytes,
             gw_mac,
             guest_mac,
+            guest_mss: self.guest_mss,
         };
         tokio::spawn(read_promoted_conn(stream, conn, self.tx.clone()));
         true
@@ -177,6 +204,13 @@ struct AsyncPromotedConn {
     down_bytes: Option<Arc<std::sync::atomic::AtomicU64>>,
     gw_mac: [u8; 6],
     guest_mac: [u8; 6],
+    guest_mss: usize,
+}
+
+#[cfg(feature = "tokio-frame-sink")]
+fn guest_mss_for_mtu(mtu: usize) -> usize {
+    mtu.saturating_sub(20 + 20)
+        .clamp(1, u16::MAX as usize - 20 - 20)
 }
 
 #[cfg(feature = "tokio-frame-sink")]
@@ -212,7 +246,7 @@ async fn read_promoted_conn(
                 let data = &buf[..n];
                 let mut offset = 0;
                 while offset < data.len() {
-                    let chunk_end = (offset + FAST_PATH_GUEST_MSS).min(data.len());
+                    let chunk_end = (offset + conn.guest_mss).min(data.len());
                     let chunk = &data[offset..chunk_end];
                     let seq_now = conn.our_seq.load(Ordering::Relaxed);
                     let frame = build_tcp_data_frame(
@@ -297,5 +331,50 @@ mod tests {
         assert_eq!(u16::from_be_bytes([frame[tcp], frame[tcp + 1]]), 443);
         assert_eq!(u16::from_be_bytes([frame[tcp + 2], frame[tcp + 3]]), 50000);
         assert_eq!(&frame[tcp + 20..tcp + 24], b"pong");
+    }
+
+    #[tokio::test]
+    async fn tokio_frame_conn_sink_segments_to_configured_mtu() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut upstream, accepted) = tokio::join!(async { client }, async {
+            listener.accept().await.unwrap().0
+        },);
+
+        let (sink, mut rx) = TokioFrameConnSink::channel_with_mtu(4, 4000);
+        let our_seq = Arc::new(AtomicU32::new(1000));
+        let accepted_conn = PromotedConn {
+            stream: accepted.into_std().unwrap(),
+            remote_ip: std::net::Ipv4Addr::new(203, 0, 113, 10),
+            guest_ip: std::net::Ipv4Addr::new(192, 168, 64, 2),
+            remote_port: 443,
+            guest_port: 50000,
+            our_seq: our_seq.clone(),
+            last_ack: Arc::new(AtomicU32::new(2000)),
+            down_bytes: None,
+            gw_mac: [0x02, 0, 0, 0, 0, 1],
+            guest_mac: [0x02, 0, 0, 0, 0, 2],
+        };
+        assert!(sink.send_conn(accepted_conn));
+
+        let payload = vec![0xAB; 5000];
+        upstream.write_all(&payload).await.unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("first frame should be emitted")
+            .expect("frame channel should stay open");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("second frame should be emitted")
+            .expect("frame channel should stay open");
+
+        let first_ip_len =
+            u16::from_be_bytes([first[ETH_HEADER_LEN + 2], first[ETH_HEADER_LEN + 3]]);
+        let second_ip_len =
+            u16::from_be_bytes([second[ETH_HEADER_LEN + 2], second[ETH_HEADER_LEN + 3]]);
+        assert_eq!(first_ip_len, 4000);
+        assert_eq!(second_ip_len, 1080);
+        assert_eq!(our_seq.load(Ordering::Relaxed), 6000);
     }
 }
