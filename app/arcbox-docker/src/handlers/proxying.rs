@@ -52,7 +52,7 @@ pub async fn proxy_to_role(
     req: Request<Body>,
 ) -> Result<Response> {
     ensure_role_ready(state, role).await?;
-    proxy::proxy_to_guest_stream_for_role_pooled(&state.guest_http_client, role, uri, req).await
+    proxy::proxy_to_guest_stream_for_role_pooled(state.proxy.client(), role, uri, req).await
 }
 
 /// Forward an upload request to guest dockerd, ensuring the VM is running first.
@@ -68,7 +68,7 @@ pub async fn proxy_upload_to_role(
     req: Request<Body>,
 ) -> Result<Response> {
     ensure_role_ready(state, role).await?;
-    proxy::proxy_streaming_upload_for_role(state.connector.as_ref(), role, uri, req).await
+    proxy::proxy_streaming_upload_for_role(state.proxy.connector(), role, uri, req).await
 }
 
 /// Forward an upgraded request to a selected utility VM's guest dockerd.
@@ -79,5 +79,5 @@ pub async fn proxy_upgrade_to_role(
     req: Request<Body>,
 ) -> Result<Response> {
     ensure_role_ready(state, role).await?;
-    proxy::proxy_with_upgrade_for_role(state.connector.as_ref(), role, req, uri).await
+    proxy::proxy_with_upgrade_for_role(state.proxy.connector(), role, req, uri).await
 }
