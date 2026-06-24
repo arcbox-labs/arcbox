@@ -53,15 +53,9 @@ fn main() -> Result<()> {
     let args = DaemonArgs::parse();
 
     let _sentry_guard = sentry::init(sentry::ClientOptions {
-        dsn: std::env::var("ARCBOX_DAEMON_SENTRY_DSN")
-            .or_else(|_| std::env::var("SENTRY_DSN"))
-            .ok()
-            .and_then(|s| s.parse().ok()),
+        dsn: sentry_dsn().and_then(|s| s.parse().ok()),
         release: Some(env!("CARGO_PKG_VERSION").into()),
-        environment: std::env::var("ARCBOX_DAEMON_SENTRY_ENVIRONMENT")
-            .or_else(|_| std::env::var("SENTRY_ENVIRONMENT"))
-            .ok()
-            .map(Into::into),
+        environment: sentry_environment().map(Into::into),
         traces_sample_rate: 0.2,
         sample_rate: 1.0,
         attach_stacktrace: true,
@@ -88,6 +82,22 @@ fn main() -> Result<()> {
 
     log_guard.flush();
     result
+}
+
+fn sentry_dsn() -> Option<String> {
+    std::env::var("ARCBOX_DAEMON_SENTRY_DSN")
+        .or_else(|_| std::env::var("SENTRY_DSN"))
+        .ok()
+        .or_else(|| option_env!("ARCBOX_DAEMON_SENTRY_DSN").map(str::to_owned))
+        .or_else(|| option_env!("SENTRY_DSN").map(str::to_owned))
+}
+
+fn sentry_environment() -> Option<String> {
+    std::env::var("ARCBOX_DAEMON_SENTRY_ENVIRONMENT")
+        .or_else(|_| std::env::var("SENTRY_ENVIRONMENT"))
+        .ok()
+        .or_else(|| option_env!("ARCBOX_DAEMON_SENTRY_ENVIRONMENT").map(str::to_owned))
+        .or_else(|| option_env!("SENTRY_ENVIRONMENT").map(str::to_owned))
 }
 
 async fn run(args: DaemonArgs) -> Result<()> {
