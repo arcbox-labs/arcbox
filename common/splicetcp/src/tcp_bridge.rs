@@ -170,6 +170,9 @@ pub struct TcpBridge {
     /// When true, send entire read buffers as single large frames (up to 32KB).
     /// Enabled when the transport supports large frames (channel path, not socketpair).
     large_frames_enabled: bool,
+    /// Maximum TCP payload bytes per host→guest fast-path frame when
+    /// `large_frames_enabled` is false.
+    fast_path_guest_mss: usize,
     /// Connection sink for sending promoted fast-path connections to the
     /// RX inject thread for inline (zero-copy) host→guest data transfer.
     conn_sink: Option<std::sync::Arc<dyn crate::direct_rx::ConnSink>>,
@@ -248,6 +251,7 @@ impl TcpBridge {
             fast_path_gateway_mac: [0; 6],
             fast_path_guest_mac: None,
             large_frames_enabled: false,
+            fast_path_guest_mss: FAST_PATH_GUEST_MSS,
             conn_sink: None,
             observer: None,
             handshake_conns: HashMap::new(),
@@ -258,6 +262,15 @@ impl TcpBridge {
     /// Call when using the channel-based FrameSink path instead of socketpair.
     pub fn enable_large_frames(&mut self) {
         self.large_frames_enabled = true;
+    }
+
+    /// Sets the fast-path segmentation budget so each emitted IPv4 packet fits
+    /// within `mtu` bytes. This preserves normal per-packet checksums and is the
+    /// right mode for high-MTU L3 links such as host `utun` / Network Extension.
+    pub fn set_fast_path_mtu(&mut self, mtu: usize) {
+        self.fast_path_guest_mss = mtu
+            .saturating_sub(20 + 20)
+            .clamp(1, u16::MAX as usize - 20 - 20);
     }
 
     /// Attaches a connection sink for sending promoted fast-path connections
@@ -509,10 +522,11 @@ impl TcpBridge {
                             .fetch_add(data.len() as u32, std::sync::atomic::Ordering::Relaxed);
                         frames.push(data_frame);
                     } else {
-                        // Socketpair path: segment at FAST_PATH_GUEST_MSS.
+                        // Non-GSO path: segment at the configured guest MSS so
+                        // each emitted IP packet fits the consumer's MTU.
                         let mut offset = 0;
                         while offset < data.len() {
-                            let chunk_end = (offset + FAST_PATH_GUEST_MSS).min(data.len());
+                            let chunk_end = (offset + self.fast_path_guest_mss).min(data.len());
                             let chunk = &data[offset..chunk_end];
                             let seq_now = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
                             let data_frame = crate::ethernet::build_tcp_data_frame(
@@ -1757,5 +1771,59 @@ mod tests {
                 .all(|frame| frame.len() <= UNIX_DGRAM_MAX_FRAME_LEN),
             "fast-path frames must respect the AF_UNIX/SOCK_DGRAM datagram limit"
         );
+    }
+
+    #[tokio::test]
+    async fn poll_fast_path_segments_frames_for_configured_mtu() {
+        use tokio::io::AsyncWriteExt;
+
+        let mut bridge = TcpBridge::new(GW_IP);
+        bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+        bridge.set_fast_path_mtu(4000);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = tokio::net::TcpStream::connect(addr);
+        let (client, accepted) = tokio::join!(connect, listener.accept());
+        let client = client.unwrap();
+        let (mut accepted, _) = accepted.unwrap();
+
+        let key = SynFlowKey {
+            src_ip: GUEST_IP,
+            src_port: 12345,
+            dst_ip: Ipv4Addr::new(198, 18, 30, 95),
+            dst_port: 443,
+        };
+        bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1);
+
+        let payload = vec![0xAB; 5000];
+        accepted.write_all(&payload).await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let batch = bridge.poll_fast_path();
+            let had_new = !batch.is_empty();
+            frames.extend(batch);
+            let received: usize = frames
+                .iter()
+                .map(|frame| frame.len().saturating_sub(ETH_HEADER_LEN + 40))
+                .sum();
+            if received >= payload.len() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            if !had_new {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        assert_eq!(frames.len(), 2);
+
+        let first_ip_len =
+            u16::from_be_bytes([frames[0][ETH_HEADER_LEN + 2], frames[0][ETH_HEADER_LEN + 3]]);
+        let second_ip_len =
+            u16::from_be_bytes([frames[1][ETH_HEADER_LEN + 2], frames[1][ETH_HEADER_LEN + 3]]);
+        assert_eq!(first_ip_len, 4000);
+        assert_eq!(second_ip_len, 1080);
     }
 }
