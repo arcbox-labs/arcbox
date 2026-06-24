@@ -71,6 +71,7 @@ members = [
     # Guest Components (MIT OR Apache-2.0)
     # ============================================
     "guest/arcbox-agent",
+    "tests/e2e",
     "virt/arcbox-net-inject",
     "xtask",
 ]
