@@ -53,9 +53,6 @@ pub mod routing;
 pub mod server;
 pub mod trace;
 pub mod workload;
-// Docker API compatibility layer contains many spec fields only serialized/deserialized.
-#[allow(dead_code)]
-pub mod types;
 
 pub use context::{ContextStatus, DockerContextManager};
 pub use error::{DockerError, Result};
