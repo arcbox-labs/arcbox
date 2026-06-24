@@ -31,10 +31,35 @@ docker images
 
 ## Architecture
 
-```text
-docker CLI ──► Unix socket ──► Axum router ──► local handlers
-                                      │
-                                      └──────► proxy ──► vsock ──► guest dockerd
+```mermaid
+flowchart LR
+    cli[Docker CLI / API client]
+    socket[ArcBox Docker Unix socket]
+    version[Version prefix stripper<br/>/v1.xx removed for routing]
+    trace[Trace middleware<br/>X-Trace-Id + tracing span]
+    context[Request-context middleware<br/>resolve UtilityVmRole once]
+    router[Axum router]
+    handlers[ArcBox handlers<br/>only endpoints with host-side behavior]
+    fallback[Smart fallback<br/>ordinary pass-through]
+    proxy{Proxy protocol path}
+    forward[forward.rs<br/>pooled HTTP/1.1]
+    upload[upload.rs<br/>streamed uploads]
+    upgrade[upgrade.rs<br/>HTTP upgrade tunnel]
+    connector[connector.rs<br/>role → VM vsock]
+    dockerd[guest dockerd]
+
+    cli --> socket --> version --> trace --> context --> router
+    router -->|create/start/stop/remove/build/exec-create| handlers
+    router -->|all other Docker endpoints| fallback
+    handlers --> proxy
+    fallback --> proxy
+    proxy -->|ordinary HTTP| forward
+    proxy -->|build context / image load| upload
+    proxy -->|attach / exec / BuildKit session| upgrade
+    forward --> connector
+    upload --> connector
+    upgrade --> connector
+    connector --> dockerd
 ```
 
 The router strips Docker API version prefixes before route matching and stores
@@ -51,9 +76,40 @@ Requests then take one of three paths:
 - **Special proxy forwarding** handles streaming uploads and HTTP upgrades with
   dedicated connection lifecycles instead of the ordinary pool.
 
+Tracing spans are created at the request, routing, role-resolution, proxy, and
+guest-connection boundaries. When `arcbox-daemon` runs with Sentry enabled, the
+Sentry tracing layer receives these fields as context/breadcrumbs for Docker
+proxy failures without logging request bodies or sensitive headers.
+
 ## Proxy Design
 
 The proxy is split by protocol behavior rather than Docker endpoint category:
+
+```mermaid
+flowchart TB
+    fallback[fallback.rs<br/>protocol classifier]
+    direct[Explicit handlers<br/>host-side side effects]
+    pooled[forward.rs<br/>GuestHttpClient]
+    session[session.rs<br/>hyper-util pool]
+    upload[upload.rs<br/>bounded body pump]
+    upgrade[upgrade.rs<br/>raw upgrade handshake]
+    headers[headers.rs<br/>end-to-end header filtering]
+    uri[uri.rs<br/>guest path/query]
+    connector[connector.rs<br/>VsockConnector]
+
+    fallback -->|non-upgrade HTTP| pooled
+    direct -->|ordinary proxied subcalls| pooled
+    fallback -->|large upload| upload
+    fallback -->|Connection: Upgrade| upgrade
+    pooled --> session
+    pooled -. normalizes .-> uri
+    upload -. filters .-> headers
+    upload -. normalizes .-> uri
+    upgrade -. raw HTTP head .-> uri
+    session --> connector
+    upload --> connector
+    upgrade --> connector
+```
 
 | Module | Responsibility |
 | --- | --- |
@@ -80,9 +136,12 @@ Ordinary non-upgrade requests use `GuestHttpClient`, which wraps
 The pool key is the request URI authority, so ArcBox uses internal authorities
 to separate utility VM roles:
 
-```text
-http://native.arcbox.internal/...   ──► UtilityVmRole::Native
-http://rosetta.arcbox.internal/...  ──► UtilityVmRole::Rosetta
+```mermaid
+flowchart LR
+    native[http://native.arcbox.internal/...] --> nativeRole[UtilityVmRole::Native]
+    rosetta[http://rosetta.arcbox.internal/...] --> rosettaRole[UtilityVmRole::Rosetta]
+    nativeRole --> nativePool[Native idle connection pool]
+    rosettaRole --> rosettaPool[Rosetta idle connection pool]
 ```
 
 The internal authority is only for hyper-util pooling and role selection. The
