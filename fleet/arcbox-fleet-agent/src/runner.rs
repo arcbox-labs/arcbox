@@ -202,7 +202,8 @@ impl RunnerSupervisor {
 
     /// Drive one runner job end to end, emitting accept/start/terminal events.
     ///
-    /// Routes to Docker for Linux jobs, direct host execution otherwise.
+    /// Linux jobs are routed through Docker when available (for isolation);
+    /// all other jobs run directly on the host via the pre-installed runner.
     async fn run_job(&self, order: ProvisionRunner, cancel_rx: oneshot::Receiver<()>) {
         let job_id = order.job_id.clone();
         self.send(attach_request::Msg::RunnerAccepted(RunnerAccepted {
@@ -210,9 +211,9 @@ impl RunnerSupervisor {
         }))
         .await;
 
-        let is_docker = order.os == "linux" && self.inner.docker.is_some();
+        let use_docker = order.os == "linux" && self.inner.docker.is_some();
 
-        if is_docker {
+        if use_docker {
             self.run_docker_job(&job_id, &order, cancel_rx).await;
         } else {
             self.run_host_job(&job_id, &order, cancel_rx).await;
