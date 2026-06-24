@@ -169,9 +169,6 @@ jobs:
 
       - name: Build arcbox binaries (release)
         timeout-minutes: 15
-        env:
-          ARCBOX_DAEMON_SENTRY_DSN: ${{ secrets.ARCBOX_DAEMON_SENTRY_DSN }}
-          ARCBOX_DAEMON_SENTRY_ENVIRONMENT: production
         run: cargo build --release --locked -p arcbox-cli -p arcbox-daemon -p arcbox-helper
 
       - name: Codesign arcbox-daemon

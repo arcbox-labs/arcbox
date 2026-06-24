@@ -1,8 +1,9 @@
-use super::{proxy_to_role, resolve_container_role};
+use super::proxy_to_role;
 use crate::api::AppState;
 use crate::error::{DockerError, Result};
+use crate::request_context::ProxyRequestContext;
 use axum::body::Body;
-use axum::extract::{OriginalUri, State};
+use axum::extract::{Extension, OriginalUri, State};
 use axum::http::Request;
 use axum::response::Response;
 
@@ -22,9 +23,10 @@ use axum::response::Response;
 pub async fn exec_create(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    Extension(proxy_context): Extension<ProxyRequestContext>,
     req: Request<Body>,
 ) -> Result<Response> {
-    let role = resolve_container_role(&state, &uri).await?;
+    let role = proxy_context.role;
     tracing::Span::current().record("utility_vm", role.as_str());
     let response = proxy_to_role(&state, role, &uri, req).await?;
     if !response.status().is_success() {
