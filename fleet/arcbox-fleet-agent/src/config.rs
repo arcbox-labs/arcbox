@@ -3,7 +3,7 @@
 //! Everything is sourced from the environment — there are no positional config
 //! flags. The only CLI argument anywhere is the one-shot enrollment token.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use tonic::transport::{ClientTlsConfig, Endpoint};
@@ -16,8 +16,31 @@ const ENV_GATEWAY: &str = "ARCBOX_FLEET_GATEWAY";
 const ENV_RUNNER_DIR: &str = "ARCBOX_FLEET_RUNNER_DIR";
 const ENV_MAX_CONCURRENT: &str = "ARCBOX_FLEET_MAX_CONCURRENT";
 const ENV_DATA_DIR: &str = "ARCBOX_FLEET_DATA_DIR";
+const ENV_DOCKER: &str = "ARCBOX_FLEET_DOCKER";
+const ENV_RUNNER_IMAGE: &str = "ARCBOX_FLEET_RUNNER_IMAGE";
 
 const DEFAULT_MAX_CONCURRENT: usize = 2;
+const DEFAULT_RUNNER_IMAGE: &str = "ghcr.io/actions/runner:latest";
+
+/// Whether Docker-based Linux job execution is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerMode {
+    /// Probe the Docker socket at startup; proceed without Docker if unavailable.
+    Auto,
+    /// Require Docker; fail startup if the socket is unreachable.
+    Enabled,
+    /// Never use Docker, even if available.
+    Disabled,
+}
+
+/// Docker-specific configuration for running Linux jobs in containers.
+#[derive(Debug, Clone)]
+pub struct DockerConfig {
+    pub mode: DockerMode,
+    /// Container image used for Linux runner jobs when the platform sends no
+    /// image (empty `ProvisionRunner.image`).
+    pub runner_image: String,
+}
 
 /// Resolved agent configuration.
 #[derive(Debug, Clone)]
@@ -31,6 +54,8 @@ pub struct AgentConfig {
     pub max_concurrent: usize,
     /// Agent data directory (credentials, logs). Defaults to `~/.arcbox/fleet`.
     pub data_dir: PathBuf,
+    /// Docker runtime configuration for Linux jobs.
+    pub docker: DockerConfig,
 }
 
 impl AgentConfig {
@@ -58,18 +83,26 @@ impl AgentConfig {
             None => default_data_dir()?,
         };
 
+        let docker_mode = match std::env::var(ENV_DOCKER).as_deref() {
+            Ok("true") => DockerMode::Enabled,
+            Ok("false") => DockerMode::Disabled,
+            Ok("auto") | Err(_) => DockerMode::Auto,
+            Ok(other) => {
+                anyhow::bail!("{ENV_DOCKER} must be 'auto', 'true', or 'false', got '{other}'")
+            }
+        };
+        let runner_image =
+            std::env::var(ENV_RUNNER_IMAGE).unwrap_or_else(|_| DEFAULT_RUNNER_IMAGE.to_string());
+
         Ok(Self {
             gateway,
             runner_dir,
             max_concurrent,
             data_dir,
-        })
-    }
-
-    /// The runner directory, or a clear error instructing the operator to set it.
-    pub fn require_runner_dir(&self) -> Result<&Path> {
-        self.runner_dir.as_deref().with_context(|| {
-            format!("{ENV_RUNNER_DIR} is not set (path to the installed GitHub Actions runner)")
+            docker: DockerConfig {
+                mode: docker_mode,
+                runner_image,
+            },
         })
     }
 

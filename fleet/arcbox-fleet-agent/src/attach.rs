@@ -20,6 +20,7 @@ use tracing::{info, warn};
 
 use crate::config::AgentConfig;
 use crate::credentials::Credential;
+use crate::docker::{self, DockerCapabilities};
 use crate::host;
 use crate::runner::RunnerSupervisor;
 
@@ -39,20 +40,21 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 /// The supervisor and the egress queue carrying runner lifecycle events are
 /// built once and reused across reconnects, so in-flight jobs survive a dropped
 /// connection and their terminal events reach the next live stream. On shutdown
-/// the loop exits and hands off to [`RunnerSupervisor::shutdown`], which kills
-/// and reaps any in-flight runner process groups.
+/// the loop exits and hands off to [`RunnerSupervisor::shutdown`], which tears
+/// down any in-flight runners (host process groups and Docker containers).
 pub async fn run(
     config: AgentConfig,
     credential: Credential,
+    docker: Option<docker::DockerRunner>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let runner_dir = config.require_runner_dir()?.to_path_buf();
+    let runner_dir = config.runner_dir.clone();
+    let docker_caps = docker
+        .as_ref()
+        .map(|d| d.capabilities(config.max_concurrent));
 
-    // Runner lifecycle events flow through this queue, which outlives any single
-    // connection. Each connection drains it into that connection's request
-    // stream; events produced during a brief disconnect simply wait here.
     let (egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
-    let supervisor = RunnerSupervisor::new(egress_tx, runner_dir, config.max_concurrent);
+    let supervisor = RunnerSupervisor::new(egress_tx, runner_dir, docker, config.max_concurrent);
 
     let mut backoff = INITIAL_BACKOFF;
     // An event pulled from the egress queue but not yet delivered when the
@@ -69,6 +71,7 @@ pub async fn run(
             &mut pending,
             &mut backoff,
             &shutdown,
+            docker_caps.as_ref(),
         )
         .await;
         // A shutdown during the connection is a clean exit, not a failure to log
@@ -112,6 +115,7 @@ async fn connect_and_serve(
     pending: &mut Option<AttachRequest>,
     backoff: &mut Duration,
     shutdown: &CancellationToken,
+    docker_caps: Option<&DockerCapabilities>,
 ) -> Result<()> {
     let channel = config
         .endpoint()?
@@ -145,7 +149,7 @@ async fn connect_and_serve(
         }
     }
 
-    let heartbeat = spawn_heartbeat(req_tx.clone(), config.max_concurrent);
+    let heartbeat = spawn_heartbeat(req_tx.clone(), config.max_concurrent, docker_caps.cloned());
 
     let outcome = loop {
         tokio::select! {
@@ -194,15 +198,14 @@ async fn dispatch(supervisor: &RunnerSupervisor, msg: Option<attach_response::Ms
 fn spawn_heartbeat(
     outbound: mpsc::Sender<AttachRequest>,
     max_concurrent: usize,
+    docker_caps: Option<DockerCapabilities>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // `interval` fires its first tick immediately, so the gateway sees us
-        // online without waiting a full period.
         let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             ticker.tick().await;
             let msg = attach_request::Msg::Heartbeat(Heartbeat {
-                capacities: host::capacities(max_concurrent),
+                capacities: host::capacities(max_concurrent, docker_caps.as_ref()),
                 host_info_json: host::host_info_json(),
             });
             if outbound
