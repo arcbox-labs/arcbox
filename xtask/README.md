@@ -32,6 +32,8 @@ devenv shell -- cargo xtask <command>
   updates, compute SHA-256 checksums, and rewrite `assets.lock`.
 - `cargo xtask release package-tarball` — build the release `.tar.gz` from CI
   artifacts and write the matching `.sha256` file.
+- `cargo xtask test boot-assets` — run the boot assets VM and Docker lifecycle
+  integration test.
 
 ## Layout
 
@@ -48,6 +50,9 @@ xtask/
       release/
         check_tool_updates.rs
         package_tarball.rs
+      test.rs                # integration test dispatch
+      test/
+        boot_assets.rs
     support/
       mod.rs
       fs.rs                  # small cross-command filesystem support

@@ -21,6 +21,8 @@ enum Command {
     Macos(MacosArgs),
     /// Release metadata and artifact generation.
     Release(ReleaseArgs),
+    /// Integration test orchestration.
+    Test(TestArgs),
 }
 
 #[derive(Args)]
@@ -140,6 +142,34 @@ struct PackageTarballArgs {
     github_output: Option<PathBuf>,
 }
 
+#[derive(Args)]
+struct TestArgs {
+    #[command(subcommand)]
+    command: TestCommand,
+}
+
+#[derive(Subcommand)]
+enum TestCommand {
+    /// Run the boot assets VM and Docker lifecycle integration test.
+    BootAssets(BootAssetsTestArgs),
+}
+
+#[derive(Args)]
+struct BootAssetsTestArgs {
+    /// Skip rebuilding release binaries before the test.
+    #[arg(long, action = ArgAction::SetTrue)]
+    skip_build: bool,
+    /// Preserve the temporary test directory after the test exits.
+    #[arg(long, action = ArgAction::SetTrue)]
+    keep_test_dir: bool,
+    /// Boot asset version to test. Defaults to assets.lock [boot].version.
+    #[arg(long, env = "ARCBOX_BOOT_ASSET_VERSION")]
+    version: Option<String>,
+    /// Guest Docker vsock port to pass to arcbox-daemon.
+    #[arg(long, env = "ARCBOX_GUEST_DOCKER_VSOCK_PORT", default_value_t = 2375)]
+    guest_docker_vsock_port: u32,
+}
+
 fn main() {
     if let Err(error) = run() {
         if let Some(exit) = error.downcast_ref::<support::ExitCode>() {
@@ -155,5 +185,6 @@ fn run() -> Result<()> {
         Command::Dev(args) => commands::dev::run(args),
         Command::Macos(args) => commands::macos::run(args),
         Command::Release(args) => commands::release::run(args),
+        Command::Test(args) => commands::test::run(args),
     }
 }

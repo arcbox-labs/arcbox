@@ -17,6 +17,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 tar = "0.4.46"
+tempfile.workspace = true
 toml_edit = "0.25.12"
 xshell = "0.2.7"
 
