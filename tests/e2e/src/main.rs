@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{ArgAction, Args, Parser, Subcommand};
+use tracing::error;
+use tracing_subscriber::EnvFilter;
 
 mod boot_assets;
 
@@ -35,10 +37,21 @@ struct BootAssetsArgs {
 }
 
 fn main() {
+    init_tracing();
+
     if let Err(error) = run() {
-        eprintln!("Error: {error:#}");
+        error!(error = %format_args!("{error:#}"), "command failed");
         std::process::exit(1);
     }
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .compact()
+        .init();
 }
 
 fn run() -> Result<()> {

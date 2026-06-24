@@ -11,6 +11,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use tempfile::TempDir;
 use toml_edit::DocumentMut;
+use tracing::{error, info, warn};
 
 use crate::{BootAssetsArgs, repo_root};
 
@@ -148,7 +149,7 @@ impl TestContext {
 
 impl Drop for TestContext {
     fn drop(&mut self) {
-        println!("[INFO] Cleaning up...");
+        info!("cleaning up");
         if let Ok(output) = Command::new("docker")
             .env("DOCKER_HOST", self.docker_host())
             .args(["ps", "-aq", "--filter"])
@@ -175,7 +176,7 @@ impl Drop for TestContext {
         if self.keep_test_dir {
             if let Some(temp_dir) = self.temp_dir.take() {
                 let path = temp_dir.keep();
-                println!("[WARN] KEEP_TEST_DIR set, preserving: {}", path.display());
+                warn!(path = %path.display(), "KEEP_TEST_DIR set, preserving test directory");
             }
         }
     }
@@ -194,7 +195,7 @@ pub fn run(args: BootAssetsArgs) -> Result<()> {
     };
 
     if !args.skip_build {
-        println!("[INFO] Building latest release binaries...");
+        info!("building latest release binaries");
         let shell = xshell::Shell::new()?;
         shell.change_dir(repo_root());
         xshell::cmd!(
@@ -211,23 +212,23 @@ pub fn run(args: BootAssetsArgs) -> Result<()> {
 
     let mut results = Results::new();
 
-    println!("[INFO] Pulling alpine image...");
+    info!("pulling alpine image");
     match ctx.docker_output(&["pull", "alpine:latest"], Duration::from_secs(90)) {
         Ok(output) => {
             fs::write(ctx.test_dir.join("pull.log"), output)
                 .with_context(|| format!("writing {}", ctx.test_dir.join("pull.log").display()))?;
-            println!("[INFO] docker pull: OK");
+            info!("docker pull completed");
         }
         Err(error) => {
             fs::write(ctx.test_dir.join("pull.log"), format!("{error:#}"))
                 .with_context(|| format!("writing {}", ctx.test_dir.join("pull.log").display()))?;
-            println!("[ERROR] docker pull failed");
+            error!("docker pull failed");
             print_summary(&ctx, &results)?;
             return Err(error);
         }
     }
 
-    println!("[INFO] Creating container (triggers VM boot)...");
+    info!("creating container to trigger VM boot");
     let container_id_path = ctx.test_dir.join("container_id");
     let container_err_path = ctx.test_dir.join("container_create.err");
     let mut create = Command::new("docker")
@@ -247,10 +248,13 @@ pub fn run(args: BootAssetsArgs) -> Result<()> {
                 .unwrap_or_default()
                 .trim()
                 .to_owned();
-            println!("[INFO] container create: OK (ID: {})", cid_prefix(&cid));
+            info!(
+                container_id = cid_prefix(&cid),
+                "container create completed"
+            );
             results.container_create = TestResult::Pass;
         } else {
-            println!("[WARN] container create: FAILED");
+            warn!("container create failed");
             results.container_create = TestResult::Fail;
         }
     } else {
@@ -264,7 +268,7 @@ pub fn run(args: BootAssetsArgs) -> Result<()> {
     }
 
     println!();
-    println!("[INFO] === Container Lifecycle Tests (Phase 1.2 / 1.4) ===");
+    info!("running container lifecycle tests (Phase 1.2 / 1.4)");
     println!();
 
     results.container_run = pass_fail(test_container_run(&ctx));
@@ -307,7 +311,7 @@ fn boot_version(lockfile: &Path) -> Result<String> {
 }
 
 fn check_prerequisites(ctx: &TestContext) -> Result<()> {
-    println!("[INFO] Checking prerequisites...");
+    info!("checking prerequisites");
     let daemon = ctx.root.join("target/release/arcbox-daemon");
     if !daemon.is_file() {
         bail!("arcbox-daemon binary not found at {}", daemon.display());
@@ -320,7 +324,7 @@ fn check_prerequisites(ctx: &TestContext) -> Result<()> {
         .with_context(|| format!("reading entitlements from {}", daemon.display()))?;
     let entitlements = String::from_utf8_lossy(&output.stderr);
     if !entitlements.contains("com.apple.security.virtualization") {
-        println!("[WARN] Binary not signed with virtualization entitlement. Signing...");
+        warn!("binary not signed with virtualization entitlement; signing");
         let entitlements_file = ctx.root.join("bundle/arcbox.entitlements");
         let status = Command::new("codesign")
             .arg("--entitlements")
@@ -334,7 +338,7 @@ fn check_prerequisites(ctx: &TestContext) -> Result<()> {
         }
     }
 
-    println!("[INFO] Prerequisites OK");
+    info!("prerequisites OK");
     Ok(())
 }
 
@@ -357,10 +361,7 @@ fn copy_file(from: &Path, to: &Path) -> Result<()> {
 }
 
 fn setup_test_env(ctx: &TestContext) -> Result<()> {
-    println!(
-        "[INFO] Setting up test environment: {}",
-        ctx.test_dir.display()
-    );
+    info!(test_dir = %ctx.test_dir.display(), "setting up test environment");
     let test_boot_dir = ctx.test_dir.join("boot").join(&ctx.version);
     fs::create_dir_all(&test_boot_dir)
         .with_context(|| format!("creating {}", test_boot_dir.display()))?;
@@ -370,7 +371,7 @@ fn setup_test_env(ctx: &TestContext) -> Result<()> {
         || !dev_boot_dir.join("rootfs.erofs").is_file()
         || !dev_boot_dir.join("manifest.json").is_file()
     {
-        println!("[WARN] Development boot assets incomplete, refreshing...");
+        warn!("development boot assets incomplete; refreshing");
         prepare_dev_boot_assets(ctx)?;
     }
 
@@ -383,15 +384,12 @@ fn setup_test_env(ctx: &TestContext) -> Result<()> {
         &dev_boot_dir.join("manifest.json"),
         &test_boot_dir.join("manifest.json"),
     )?;
-    println!(
-        "[INFO] Using development boot assets from {}",
-        dev_boot_dir.display()
-    );
+    info!(dev_boot_dir = %dev_boot_dir.display(), "using development boot assets");
     Ok(())
 }
 
 fn start_daemon(ctx: &mut TestContext) -> Result<()> {
-    println!("[INFO] Starting daemon...");
+    info!("starting daemon");
     let log = File::create(ctx.test_dir.join("daemon.log"))?;
     let stderr = log.try_clone()?;
     let daemon = Command::new(ctx.root.join("target/release/arcbox-daemon"))
@@ -413,25 +411,25 @@ fn start_daemon(ctx: &mut TestContext) -> Result<()> {
 
     if let Some(daemon) = ctx.daemon.as_mut() {
         if let Some(status) = daemon.try_wait()? {
-            println!("[ERROR] Daemon failed to start");
+            error!("daemon failed to start");
             print_file(&ctx.test_dir.join("daemon.log"));
             bail!("arcbox-daemon exited with {status}");
         }
     }
 
-    println!("[INFO] Daemon started (PID: {pid})");
+    info!(pid, "daemon started");
     Ok(())
 }
 
 fn wait_for_agent(ctx: &TestContext) -> Result<bool> {
-    println!("[INFO] Waiting for agent connection...");
+    info!("waiting for agent connection");
     for elapsed in 0..60 {
         if fs::read_to_string(ctx.test_dir.join("daemon.log"))
             .unwrap_or_default()
             .contains("Agent is ready")
         {
             println!();
-            println!("[INFO] Agent connected in {elapsed}s");
+            info!(elapsed_seconds = elapsed, "agent connected");
             return Ok(true);
         }
         thread::sleep(Duration::from_secs(1));
@@ -440,14 +438,14 @@ fn wait_for_agent(ctx: &TestContext) -> Result<bool> {
     }
 
     println!();
-    println!("[ERROR] Agent connection timeout (60s)");
-    println!("[ERROR] Daemon log:");
+    error!("agent connection timeout");
+    error!("daemon log follows");
     print_file(&ctx.test_dir.join("daemon.log"));
     Ok(false)
 }
 
 fn test_container_run(ctx: &TestContext) -> Result<()> {
-    println!("[INFO] [test] Container run: docker run alpine echo hello");
+    info!("[test] container run: docker run alpine echo hello");
     let cid = ctx
         .docker_output(
             &["create", "--label", &ctx.label, "alpine", "echo", "hello"],
@@ -462,7 +460,7 @@ fn test_container_run(ctx: &TestContext) -> Result<()> {
     let output = ctx.docker_output(&["logs", &cid], Duration::from_secs(10))?;
     remove_container(ctx, &cid);
     if output.contains("hello") {
-        println!("[INFO] container run: OK");
+        info!("container run OK");
         Ok(())
     } else {
         bail!("expected 'hello' in output, got: {output}");
@@ -470,7 +468,7 @@ fn test_container_run(ctx: &TestContext) -> Result<()> {
 }
 
 fn test_background_container(ctx: &TestContext) -> Result<()> {
-    println!("[INFO] [test] Background container: docker run -d + docker ps");
+    info!("[test] background container: docker run -d + docker ps");
     let cid = ctx
         .docker_output(
             &["run", "-d", "--label", &ctx.label, "alpine", "sleep", "300"],
@@ -480,7 +478,10 @@ fn test_background_container(ctx: &TestContext) -> Result<()> {
         .next()
         .unwrap_or_default()
         .to_owned();
-    println!("[INFO] Started background container: {}", cid_prefix(&cid));
+    info!(
+        container_id = cid_prefix(&cid),
+        "started background container"
+    );
     thread::sleep(Duration::from_secs(2));
     let running = ctx.docker_output(
         &["inspect", "-f", "{{.State.Running}}", &cid],
@@ -488,7 +489,7 @@ fn test_background_container(ctx: &TestContext) -> Result<()> {
     )?;
     remove_container(ctx, &cid);
     if running.trim() == "true" {
-        println!("[INFO] background container is running: OK");
+        info!("background container is running");
         Ok(())
     } else {
         bail!("container is not running (inspect output: {running})");
@@ -496,7 +497,7 @@ fn test_background_container(ctx: &TestContext) -> Result<()> {
 }
 
 fn test_docker_logs(ctx: &TestContext) -> Result<()> {
-    println!("[INFO] [test] Docker logs: verify container output");
+    info!("[test] docker logs: verify container output");
     let cid = ctx
         .docker_output(
             &[
@@ -515,14 +516,17 @@ fn test_docker_logs(ctx: &TestContext) -> Result<()> {
         .next()
         .unwrap_or_default()
         .to_owned();
-    println!("[INFO] Started log-test container: {}", cid_prefix(&cid));
+    info!(
+        container_id = cid_prefix(&cid),
+        "started log-test container"
+    );
 
     let mut last_output = String::new();
     for _ in 0..10 {
         last_output = ctx.docker_output(&["logs", &cid], Duration::from_secs(10))?;
         if last_output.contains("log-output-test") {
             remove_container(ctx, &cid);
-            println!("[INFO] docker logs contains expected output: OK");
+            info!("docker logs contains expected output");
             return Ok(());
         }
         thread::sleep(Duration::from_secs(1));
@@ -533,7 +537,7 @@ fn test_docker_logs(ctx: &TestContext) -> Result<()> {
 }
 
 fn test_docker_exec(ctx: &TestContext) -> Result<()> {
-    println!("[INFO] [test] Docker exec: run command in running container");
+    info!("[test] docker exec: run command in running container");
     let cid = ctx
         .docker_output(
             &["run", "-d", "--label", &ctx.label, "alpine", "sleep", "300"],
@@ -543,12 +547,15 @@ fn test_docker_exec(ctx: &TestContext) -> Result<()> {
         .next()
         .unwrap_or_default()
         .to_owned();
-    println!("[INFO] Started exec-test container: {}", cid_prefix(&cid));
+    info!(
+        container_id = cid_prefix(&cid),
+        "started exec-test container"
+    );
     thread::sleep(Duration::from_secs(2));
     let output = ctx.docker_output(&["exec", &cid, "ls", "/"], Duration::from_secs(10))?;
     remove_container(ctx, &cid);
     if output.contains("bin") || output.contains("etc") || output.contains("usr") {
-        println!("[INFO] docker exec ls / succeeded: OK");
+        info!("docker exec ls / succeeded");
         Ok(())
     } else {
         bail!("docker exec ls / returned unexpected output: {output}");
@@ -556,7 +563,7 @@ fn test_docker_exec(ctx: &TestContext) -> Result<()> {
 }
 
 fn test_stop_rm(ctx: &TestContext) -> Result<()> {
-    println!("[INFO] [test] Stop/rm: graceful stop and remove");
+    info!("[test] stop/rm: graceful stop and remove");
     let cid = ctx
         .docker_output(
             &["run", "-d", "--label", &ctx.label, "alpine", "sleep", "300"],
@@ -566,12 +573,15 @@ fn test_stop_rm(ctx: &TestContext) -> Result<()> {
         .next()
         .unwrap_or_default()
         .to_owned();
-    println!("[INFO] Started stop-test container: {}", cid_prefix(&cid));
+    info!(
+        container_id = cid_prefix(&cid),
+        "started stop-test container"
+    );
     thread::sleep(Duration::from_secs(2));
     ctx.docker_output(&["stop", &cid], Duration::from_secs(15))?;
-    println!("[INFO] docker stop: OK");
+    info!("docker stop OK");
     ctx.docker_output(&["rm", &cid], Duration::from_secs(10))?;
-    println!("[INFO] docker rm: OK");
+    info!("docker rm OK");
     if Command::new("docker")
         .env("DOCKER_HOST", ctx.docker_host())
         .args(["inspect", &cid])
@@ -580,7 +590,7 @@ fn test_stop_rm(ctx: &TestContext) -> Result<()> {
     {
         bail!("container still exists after rm: {cid}");
     }
-    println!("[INFO] Container fully removed: OK");
+    info!("container fully removed");
     Ok(())
 }
 
@@ -588,7 +598,7 @@ fn pass_fail(result: Result<()>) -> TestResult {
     match result {
         Ok(()) => TestResult::Pass,
         Err(error) => {
-            println!("[ERROR] {error:#}");
+            error!(error = %format_args!("{error:#}"), "test failed");
             TestResult::Fail
         }
     }
