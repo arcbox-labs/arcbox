@@ -19,6 +19,11 @@ pub struct ProxyRequestContext {
 /// This keeps same-class routing decisions out of individual handlers. Explicit
 /// handlers still own endpoint-specific behavior, while ordinary pass-through
 /// requests and lifecycle handlers share the same URI-to-role decision.
+#[tracing::instrument(
+    name = "docker.request_context",
+    skip(state, request, next),
+    fields(uri = %uri, utility_vm = tracing::field::Empty)
+)]
 pub async fn proxy_request_context_middleware(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -27,6 +32,7 @@ pub async fn proxy_request_context_middleware(
 ) -> Response {
     match resolve_role_from_uri(&state, &uri).await {
         Ok(role) => {
+            tracing::Span::current().record("utility_vm", role.as_str());
             request
                 .extensions_mut()
                 .insert(ProxyRequestContext { role });

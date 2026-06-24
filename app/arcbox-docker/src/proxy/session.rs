@@ -42,6 +42,12 @@ impl GuestHttpClient {
         }
     }
 
+    #[tracing::instrument(
+        name = "docker.guest.client.request",
+        skip(self, req),
+        fields(uri = %req.uri()),
+        err
+    )]
     pub(super) async fn request(
         &self,
         req: hyper::Request<Body>,
@@ -157,6 +163,12 @@ pub(super) struct GuestHttpSession {
 
 impl GuestHttpSession {
     /// Connects to guest dockerd and starts the hyper connection driver.
+    #[tracing::instrument(
+        name = "docker.guest.session.connect",
+        skip(connector),
+        fields(utility_vm = role.as_str()),
+        err
+    )]
     pub(super) async fn connect(
         connector: &dyn GuestConnector,
         role: UtilityVmRole,
@@ -184,6 +196,12 @@ impl GuestHttpSession {
     }
 
     /// Sends a request over this session.
+    #[tracing::instrument(
+        name = "docker.guest.session.request",
+        skip(self, req),
+        fields(context = context),
+        err
+    )]
     pub(super) async fn send_request(
         &mut self,
         req: hyper::Request<Body>,

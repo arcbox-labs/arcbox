@@ -30,6 +30,12 @@ const UPLOAD_BODY_BUFFER: usize = 16;
 ///
 /// Returns an error if guest connection, handshake, request forwarding,
 /// or response mapping fails.
+#[tracing::instrument(
+    name = "docker.proxy.upload",
+    skip(connector, req),
+    fields(uri = %original_uri, utility_vm = UtilityVmRole::Native.as_str()),
+    err
+)]
 pub async fn proxy_streaming_upload(
     connector: &dyn GuestConnector,
     original_uri: &Uri,
@@ -44,6 +50,12 @@ pub async fn proxy_streaming_upload(
 ///
 /// Returns an error if guest connection, handshake, request forwarding,
 /// or response mapping fails.
+#[tracing::instrument(
+    name = "docker.proxy.upload",
+    skip(connector, req),
+    fields(uri = %original_uri, utility_vm = role.as_str()),
+    err
+)]
 pub async fn proxy_streaming_upload_for_role(
     connector: &dyn GuestConnector,
     role: UtilityVmRole,
@@ -56,7 +68,6 @@ pub async fn proxy_streaming_upload_for_role(
     let had_content_length = req.headers().contains_key(header::CONTENT_LENGTH);
     tracing::debug!(
         method = %req.method(),
-        uri = %original_uri,
         had_expect,
         had_content_length,
         "proxying Docker upload request to guest"

@@ -27,6 +27,15 @@ pub struct TraceId(pub String);
 /// - set on the response as the `X-Trace-Id` header
 /// - recorded in the current tracing span
 /// - stored in task-local for automatic propagation to guest RPC
+#[tracing::instrument(
+    name = "docker.request",
+    skip(request, next),
+    fields(
+        method = %request.method(),
+        uri = %request.uri(),
+        trace_id = tracing::field::Empty,
+    )
+)]
 pub async fn trace_id_middleware(mut request: Request, next: Next) -> Response {
     // Reuse caller-provided trace ID or generate a new one.
     let trace_id = request
@@ -38,7 +47,7 @@ pub async fn trace_id_middleware(mut request: Request, next: Next) -> Response {
 
     // Record in tracing for structured logs.
     tracing::Span::current().record("trace_id", trace_id.as_str());
-    tracing::debug!(trace_id = %trace_id, method = %request.method(), uri = %request.uri(), "request");
+    tracing::debug!("accepted Docker API request");
 
     // Store in request extensions so handlers can access it.
     request.extensions_mut().insert(TraceId(trace_id.clone()));

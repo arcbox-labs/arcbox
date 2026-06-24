@@ -13,12 +13,19 @@ use axum::response::Response;
 /// # Errors
 ///
 /// Returns an error if VM readiness fails or proxying to guest dockerd fails.
+#[tracing::instrument(
+    name = "docker.exec.create",
+    skip(state, req),
+    fields(uri = %uri, utility_vm = tracing::field::Empty, exec_id = tracing::field::Empty),
+    err
+)]
 pub async fn exec_create(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
     req: Request<Body>,
 ) -> Result<Response> {
     let role = resolve_container_role(&state, &uri).await?;
+    tracing::Span::current().record("utility_vm", role.as_str());
     let response = proxy_to_role(&state, role, &uri, req).await?;
     if !response.status().is_success() {
         return Ok(response);
@@ -33,6 +40,7 @@ pub async fn exec_create(
         .to_bytes();
 
     if let Some(exec_id) = parse_exec_create_response_id(&body_bytes) {
+        tracing::Span::current().record("exec_id", exec_id.as_str());
         tracing::debug!(
             utility_vm = role.as_str(),
             exec_id = %exec_id,

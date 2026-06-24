@@ -23,3 +23,5 @@ pub(crate) use container::{
     start_container, stop_container,
 };
 pub(crate) use exec::exec_create;
+
+pub use container::extract_container_dns_info;

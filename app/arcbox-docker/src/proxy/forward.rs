@@ -23,6 +23,12 @@ use bytes::Bytes;
 ///
 /// Returns an error if guest connection, handshake, request forwarding,
 /// or response mapping fails.
+#[tracing::instrument(
+    name = "docker.proxy.buffered",
+    skip(connector, headers, body),
+    fields(method = %method, path = path_and_query, utility_vm = UtilityVmRole::Native.as_str()),
+    err
+)]
 pub async fn proxy_to_guest(
     connector: &dyn GuestConnector,
     method: Method,
@@ -51,6 +57,12 @@ pub async fn proxy_to_guest(
 ///
 /// Returns an error if guest connection, handshake, request forwarding,
 /// or response mapping fails.
+#[tracing::instrument(
+    name = "docker.proxy.buffered",
+    skip(connector, headers, body),
+    fields(method = %method, path = path_and_query, utility_vm = role.as_str()),
+    err
+)]
 pub async fn proxy_to_guest_for_role(
     connector: &dyn GuestConnector,
     role: UtilityVmRole,
@@ -75,6 +87,12 @@ pub async fn proxy_to_guest_for_role(
 /// The underlying hyper-util client returns the connection to its pool only
 /// after the response body reaches EOF; if the body is dropped early or errors,
 /// the connection is discarded.
+#[tracing::instrument(
+    name = "docker.proxy.buffered_pooled",
+    skip(client, headers, body),
+    fields(method = %method, path = path_and_query, utility_vm = role.as_str()),
+    err
+)]
 pub async fn proxy_to_guest_for_role_pooled(
     client: &GuestHttpClient,
     role: UtilityVmRole,
@@ -103,6 +121,12 @@ pub async fn proxy_to_guest_for_role_pooled(
 ///
 /// Returns an error if guest connection, handshake, request forwarding,
 /// or response mapping fails.
+#[tracing::instrument(
+    name = "docker.proxy.stream",
+    skip(connector, req),
+    fields(uri = %original_uri, utility_vm = UtilityVmRole::Native.as_str()),
+    err
+)]
 pub async fn proxy_to_guest_stream(
     connector: &dyn GuestConnector,
     original_uri: &Uri,
@@ -117,6 +141,12 @@ pub async fn proxy_to_guest_stream(
 ///
 /// Returns an error if guest connection, handshake, request forwarding,
 /// or response mapping fails.
+#[tracing::instrument(
+    name = "docker.proxy.stream",
+    skip(connector, req),
+    fields(uri = %original_uri, utility_vm = role.as_str()),
+    err
+)]
 pub async fn proxy_to_guest_stream_for_role(
     connector: &dyn GuestConnector,
     role: UtilityVmRole,
@@ -137,6 +167,12 @@ pub async fn proxy_to_guest_stream_for_role(
 /// The underlying hyper-util client returns the connection to its pool only
 /// after the response body reaches EOF; if the body is dropped early or errors,
 /// the connection is discarded.
+#[tracing::instrument(
+    name = "docker.proxy.stream_pooled",
+    skip(client, req),
+    fields(uri = %original_uri, utility_vm = role.as_str()),
+    err
+)]
 pub async fn proxy_to_guest_stream_for_role_pooled(
     client: &GuestHttpClient,
     role: UtilityVmRole,
