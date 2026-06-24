@@ -118,10 +118,10 @@ verify:
 ## ── Dev Workflow ───────────────────────────────────────
 
 setup-boot-assets:
-	./scripts/setup-dev-boot-assets.sh
+	cargo xtask dev boot-assets
 
-run-daemon: sign-daemon
-	SIGN=0 ./scripts/rebuild-run-daemon.sh
+run-daemon:
+	cargo xtask macos dev --sign false
 
 # Run the helper in manual mode (no launchd). Uses /tmp socket by default
 # so the daemon can connect without launchd registration.

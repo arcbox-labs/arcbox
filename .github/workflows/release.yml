@@ -279,6 +279,12 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Download host binaries
         uses: actions/download-artifact@v4
         with:
@@ -293,31 +299,7 @@ jobs:
 
       - name: Create tarball
         id: tarball
-        run: |
-          VERSION="${{ needs.version.outputs.version }}"
-          TARBALL_NAME="arcbox-darwin-arm64-${VERSION}.tar.gz"
-          STAGING="arcbox-darwin-arm64-${VERSION}"
-
-          mkdir -p "$STAGING/bundle"
-          cp artifacts/host/target/release/abctl "$STAGING/"
-          cp artifacts/host/target/release/arcbox-daemon "$STAGING/"
-          cp artifacts/host/target/release/arcbox-helper "$STAGING/"
-          cp artifacts/agent/arcbox-agent "$STAGING/"
-          cp artifacts/host/bundle/arcbox.entitlements "$STAGING/bundle/"
-          cp artifacts/host/bundle/com.arcboxlabs.desktop.helper.plist "$STAGING/bundle/"
-
-          tar czf "$TARBALL_NAME" "$STAGING"
-          echo "tarball=$TARBALL_NAME" >> "$GITHUB_OUTPUT"
-
-          echo "=== Tarball contents ==="
-          tar tzf "$TARBALL_NAME"
-          ls -lh "$TARBALL_NAME"
-
-      - name: Generate SHA256 checksum
-        run: |
-          TARBALL="${{ steps.tarball.outputs.tarball }}"
-          shasum -a 256 "$TARBALL" > "${TARBALL}.sha256"
-          cat "${TARBALL}.sha256"
+        run: cargo xtask release package-tarball --version "${{ needs.version.outputs.version }}"
 
       - name: Upload assets to GitHub Release
         uses: softprops/action-gh-release@v2

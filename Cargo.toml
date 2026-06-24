@@ -70,7 +70,9 @@ members = [
     # ============================================
     # Guest Components (MIT OR Apache-2.0)
     # ============================================
-    "guest/arcbox-agent", "virt/arcbox-net-inject",
+    "guest/arcbox-agent",
+    "virt/arcbox-net-inject",
+    "xtask",
 ]
 
 [workspace.package]
@@ -97,7 +99,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "tracing-log"] }
 tracing-appender = "0.2"
-tracing-log = "0.2"
 
 # Error reporting
 sentry = { version = "0.46", default-features = false, features = [
@@ -227,12 +228,10 @@ arcbox-virtio-balloon = { version = "0.4.10", path = "virt/arcbox-virtio-balloon
 arcbox-vm = { version = "0.4.10", path = "virt/arcbox-vm" } # x-release-please-version
 arcbox-fs = { version = "0.4.10", path = "virt/arcbox-fs" } # x-release-please-version
 arcbox-net = { version = "0.4.10", path = "virt/arcbox-net" } # x-release-please-version
-arcbox-net-virtio = { version = "0.4.10", path = "virt/arcbox-net-virtio" } # x-release-please-version
 arcbox-vmnet = { version = "0.4.10", path = "virt/arcbox-vmnet" } # x-release-please-version
 arcbox-net-inject = { version = "0.4.10", path = "virt/arcbox-net-inject" } # x-release-please-version
 arcbox-dhcp = { version = "0.4.10", path = "virt/arcbox-dhcp" } # x-release-please-version
 arcbox-container = { version = "0.4.10", path = "runtime/arcbox-container" } # x-release-please-version
-arcbox-oci = { version = "0.4.10", path = "runtime/arcbox-oci" } # x-release-please-version
 arcbox-protocol = { version = "0.4.10", path = "rpc/arcbox-protocol" } # x-release-please-version
 arcbox-grpc = { version = "0.4.10", path = "rpc/arcbox-grpc" } # x-release-please-version
 arcbox-transport = { version = "0.4.10", path = "rpc/arcbox-transport" } # x-release-please-version
