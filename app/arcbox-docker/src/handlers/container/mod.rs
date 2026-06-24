@@ -26,6 +26,18 @@ use std::net::IpAddr;
 ///
 /// On a successful response the canonical container ID (and any `--name`) is
 /// recorded so follow-up lifecycle calls resolve to the same VM.
+#[tracing::instrument(
+    name = "docker.container.create",
+    skip(state, req),
+    fields(
+        uri = %uri,
+        utility_vm = tracing::field::Empty,
+        translator = tracing::field::Empty,
+        container_id = tracing::field::Empty,
+        name = tracing::field::Empty,
+    ),
+    err
+)]
 pub async fn create_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -40,6 +52,11 @@ pub async fn create_container(
     let body_bytes = crate::host_path::rewrite_create_body(body_bytes);
     let route = route_container_create(&uri, &body_bytes);
     let requested_name = query_param(&uri, "name").map(str::to_string);
+    tracing::Span::current().record("utility_vm", route.utility_vm().as_str());
+    tracing::Span::current().record("translator", route.translator.as_str());
+    if let Some(name) = requested_name.as_deref() {
+        tracing::Span::current().record("name", name);
+    }
 
     // Fail closed: amd64 runtime requires FEX in the HV guest. Never fall
     // back to a VZ/Rosetta runtime VM for a default amd64 container.
@@ -74,6 +91,7 @@ pub async fn create_container(
         .to_bytes();
 
     if let Some(id) = parse_create_response_id(&body_bytes) {
+        tracing::Span::current().record("container_id", id.as_str());
         tracing::debug!(
             translator = route.translator.as_str(),
             container_id = %id,
@@ -96,6 +114,12 @@ pub async fn create_container(
 /// # Errors
 ///
 /// Returns an error if VM readiness fails or proxying to guest dockerd fails.
+#[tracing::instrument(
+    name = "docker.container.start",
+    skip(state, proxy_context, req),
+    fields(uri = %uri, utility_vm = proxy_context.role.as_str(), container_id = tracing::field::Empty),
+    err
+)]
 pub async fn start_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -103,6 +127,9 @@ pub async fn start_container(
     req: Request<Body>,
 ) -> Result<Response> {
     let container_id = extract_container_id(&uri);
+    if let Some(id) = container_id.as_deref() {
+        tracing::Span::current().record("container_id", id);
+    }
     let role = proxy_context.role;
 
     // Proxy start request to guest.
@@ -124,6 +151,12 @@ pub async fn start_container(
 /// # Errors
 ///
 /// Returns an error if VM readiness fails or proxying to guest dockerd fails.
+#[tracing::instrument(
+    name = "docker.container.stop",
+    skip(state, proxy_context, req),
+    fields(uri = %uri, utility_vm = proxy_context.role.as_str(), container_id = tracing::field::Empty),
+    err
+)]
 pub async fn stop_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -131,6 +164,9 @@ pub async fn stop_container(
     req: Request<Body>,
 ) -> Result<Response> {
     let role = proxy_context.role;
+    if let Some(id) = extract_container_id(&uri) {
+        tracing::Span::current().record("container_id", id.as_str());
+    }
     // Resolve canonical ID before proxy — the name/short-id is still valid now
     // but may become stale after stop (e.g. --rm containers).
     let canonical = resolve_or_raw_for_teardown(&state, role, &uri).await;
@@ -155,6 +191,12 @@ pub async fn stop_container(
 /// # Errors
 ///
 /// Returns an error if VM readiness fails or proxying to guest dockerd fails.
+#[tracing::instrument(
+    name = "docker.container.kill",
+    skip(state, proxy_context, req),
+    fields(uri = %uri, utility_vm = proxy_context.role.as_str(), container_id = tracing::field::Empty),
+    err
+)]
 pub async fn kill_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -162,6 +204,9 @@ pub async fn kill_container(
     req: Request<Body>,
 ) -> Result<Response> {
     let role = proxy_context.role;
+    if let Some(id) = extract_container_id(&uri) {
+        tracing::Span::current().record("container_id", id.as_str());
+    }
     // Resolve canonical ID before proxy — kill with --rm triggers auto-remove.
     let canonical = resolve_or_raw_for_teardown(&state, role, &uri).await;
 
@@ -183,6 +228,12 @@ pub async fn kill_container(
 /// # Errors
 ///
 /// Returns an error if VM readiness fails or proxying to guest dockerd fails.
+#[tracing::instrument(
+    name = "docker.container.restart",
+    skip(state, proxy_context, req),
+    fields(uri = %uri, utility_vm = proxy_context.role.as_str(), container_id = tracing::field::Empty),
+    err
+)]
 pub async fn restart_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -190,6 +241,9 @@ pub async fn restart_container(
     req: Request<Body>,
 ) -> Result<Response> {
     let role = proxy_context.role;
+    if let Some(id) = extract_container_id(&uri) {
+        tracing::Span::current().record("container_id", id.as_str());
+    }
     let response = proxy_to_role(&state, role, &uri, req).await?;
 
     // Docker restart returns 204 on success. Refresh DNS (container may get
@@ -215,6 +269,12 @@ pub async fn restart_container(
 /// # Errors
 ///
 /// Returns an error if VM readiness fails or proxying to guest dockerd fails.
+#[tracing::instrument(
+    name = "docker.container.remove",
+    skip(state, proxy_context, req),
+    fields(uri = %uri, utility_vm = proxy_context.role.as_str(), container_id = tracing::field::Empty),
+    err
+)]
 pub async fn remove_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -222,6 +282,9 @@ pub async fn remove_container(
     req: Request<Body>,
 ) -> Result<Response> {
     let role = proxy_context.role;
+    if let Some(id) = extract_container_id(&uri) {
+        tracing::Span::current().record("container_id", id.as_str());
+    }
     // Resolve canonical ID before proxy — the name/short-id is still valid now.
     let canonical = resolve_or_raw_for_teardown(&state, role, &uri).await;
 
@@ -431,6 +494,17 @@ pub fn extract_container_dns_info(inspect_json: &[u8]) -> Option<(Vec<String>, I
 /// # Errors
 ///
 /// Returns an error if VM readiness fails or proxying to guest dockerd fails.
+#[tracing::instrument(
+    name = "docker.container.rename",
+    skip(state, proxy_context, req),
+    fields(
+        uri = %uri,
+        utility_vm = proxy_context.role.as_str(),
+        container_id = tracing::field::Empty,
+        new_name = tracing::field::Empty,
+    ),
+    err
+)]
 pub async fn rename_container(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -438,10 +512,16 @@ pub async fn rename_container(
     req: Request<Body>,
 ) -> Result<Response> {
     let role = proxy_context.role;
+    if let Some(id) = extract_container_id(&uri) {
+        tracing::Span::current().record("container_id", id.as_str());
+    }
     // Resolve canonical ID BEFORE proxy — the old name/short-id is still valid
     // now but will be invalid after a successful rename.
     let canonical = resolve_canonical_from_uri(&state, role, &uri).await;
     let new_name = query_param(&uri, "name").map(str::to_string);
+    if let Some(name) = new_name.as_deref() {
+        tracing::Span::current().record("new_name", name);
+    }
 
     // Proxy rename to guest.
     let response = proxy_to_role(&state, role, &uri, req).await?;

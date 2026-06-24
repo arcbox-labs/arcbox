@@ -21,6 +21,17 @@ use axum::http::Response;
 /// # Errors
 ///
 /// Returns an error if VM readiness fails or guest proxying fails.
+#[tracing::instrument(
+    name = "docker.proxy.fallback",
+    skip(state, req),
+    fields(
+        method = %req.method(),
+        uri = %uri,
+        utility_vm = tracing::field::Empty,
+        protocol = tracing::field::Empty,
+    ),
+    err
+)]
 pub async fn proxy_fallback(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -30,23 +41,21 @@ pub async fn proxy_fallback(
         .extensions()
         .get::<ProxyRequestContext>()
         .map_or_else(|| crate::routing::UtilityVmRole::Native, |ctx| ctx.role);
-    tracing::debug!(
-        method = %req.method(),
-        uri = %uri,
-        utility_vm = role.as_str(),
-        "proxy_fallback dispatch",
-    );
+    tracing::Span::current().record("utility_vm", role.as_str());
     ensure_role_ready(&state, role).await?;
 
     if req.headers().wants_upgrade() {
+        tracing::Span::current().record("protocol", "upgrade");
         return upgrade::proxy_with_upgrade_for_role(state.proxy.connector(), role, req, &uri)
             .await;
     }
 
     if upload::is_streaming_upload_request(req.method(), &uri) {
+        tracing::Span::current().record("protocol", "upload");
         return upload::proxy_streaming_upload_for_role(state.proxy.connector(), role, &uri, req)
             .await;
     }
 
+    tracing::Span::current().record("protocol", "http");
     forward::proxy_to_guest_stream_for_role_pooled(state.proxy.client(), role, &uri, req).await
 }

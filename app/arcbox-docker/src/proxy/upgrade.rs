@@ -175,6 +175,12 @@ fn parse_response_head(buf: &[u8]) -> Result<(StatusCode, HeaderMap)> {
 ///
 /// Returns an error if guest connection, upgrade handshake, or response
 /// construction fails.
+#[tracing::instrument(
+    name = "docker.proxy.upgrade",
+    skip(connector, client_req),
+    fields(uri = %original_uri, utility_vm = UtilityVmRole::Native.as_str()),
+    err
+)]
 pub async fn proxy_with_upgrade(
     connector: &dyn GuestConnector,
     client_req: axum::http::Request<Body>,
@@ -194,6 +200,12 @@ pub async fn proxy_with_upgrade(
 ///
 /// Returns an error if guest connection, upgrade handshake, or response
 /// construction fails.
+#[tracing::instrument(
+    name = "docker.proxy.upgrade",
+    skip(connector, client_req),
+    fields(uri = %original_uri, utility_vm = role.as_str()),
+    err
+)]
 pub async fn proxy_with_upgrade_for_role(
     connector: &dyn GuestConnector,
     role: UtilityVmRole,

@@ -77,6 +77,8 @@ fn main() -> Result<()> {
         .expect("Failed to build tokio runtime")
         .block_on(run(args));
     if let Err(ref e) = result {
+        let error: &(dyn std::error::Error + Send + Sync + 'static) = e.as_ref();
+        sentry::capture_error(error);
         tracing::error!("Daemon exited with error: {e:?}");
     }
 

@@ -9,12 +9,20 @@ use crate::routing::route_build;
 /// the build fails closed (no silent VZ/Rosetta or QEMU fallback). All build
 /// options (tags, target, build-args, platform, etc.) are forwarded verbatim
 /// to guest dockerd's BuildKit.
+#[tracing::instrument(
+    name = "docker.build",
+    skip(state, req),
+    fields(uri = %uri, utility_vm = tracing::field::Empty, translator = tracing::field::Empty),
+    err
+)]
 pub async fn build_image(
     axum::extract::State(state): axum::extract::State<crate::api::AppState>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     req: axum::http::Request<axum::body::Body>,
 ) -> crate::error::Result<axum::response::Response> {
     let route = route_build(&uri);
+    tracing::Span::current().record("utility_vm", route.utility_vm().as_str());
+    tracing::Span::current().record("translator", route.translator.as_str());
     crate::handlers::require_amd64_runtime(&state, route).await?;
     tracing::debug!(
         backend = "hv",

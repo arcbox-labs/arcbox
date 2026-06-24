@@ -24,15 +24,27 @@ use bytes::Bytes;
 /// ABX-375 runs one runtime VM, so the resolved role is always
 /// [`UtilityVmRole::Native`]; the registry still disambiguates short
 /// IDs / names within that VM.
+#[tracing::instrument(
+    name = "docker.role.container",
+    skip(state),
+    fields(uri = %uri, container_id = tracing::field::Empty, utility_vm = tracing::field::Empty),
+    err
+)]
 pub async fn resolve_container_role(state: &AppState, uri: &Uri) -> Result<UtilityVmRole> {
     let Some(id) = extract_container_id(uri) else {
+        tracing::Span::current().record("utility_vm", UtilityVmRole::Native.as_str());
         return Ok(UtilityVmRole::Native);
     };
+    tracing::Span::current().record("container_id", id.as_str());
     match state.workload_roles.lookup(&id).await {
-        WorkloadRoleLookup::Found(role) => Ok(role),
+        WorkloadRoleLookup::Found(role) => {
+            tracing::Span::current().record("utility_vm", role.as_str());
+            Ok(role)
+        }
         WorkloadRoleLookup::Ambiguous => Err(ambiguous_workload_error(&id)),
         WorkloadRoleLookup::Missing => match rebuild_container_role_from_guests(state, &id).await {
             WorkloadRoleLookup::Found(role) => {
+                tracing::Span::current().record("utility_vm", role.as_str());
                 state.workload_roles.record(id.clone(), role).await;
                 tracing::debug!(
                     container_id = %id,
@@ -42,7 +54,10 @@ pub async fn resolve_container_role(state: &AppState, uri: &Uri) -> Result<Utili
                 Ok(role)
             }
             WorkloadRoleLookup::Ambiguous => Err(ambiguous_workload_error(&id)),
-            WorkloadRoleLookup::Missing => Ok(UtilityVmRole::Native),
+            WorkloadRoleLookup::Missing => {
+                tracing::Span::current().record("utility_vm", UtilityVmRole::Native.as_str());
+                Ok(UtilityVmRole::Native)
+            }
         },
     }
 }
@@ -54,15 +69,31 @@ pub async fn resolve_container_role(state: &AppState, uri: &Uri) -> Result<Utili
 ///
 /// Surfaces ambiguity as a 409 the same way the per-handler resolvers do;
 /// rebuilds from guest dockerds on registry miss for container URIs.
+#[tracing::instrument(
+    name = "docker.role.request",
+    skip(state),
+    fields(
+        uri = %uri,
+        container_id = tracing::field::Empty,
+        exec_id = tracing::field::Empty,
+        utility_vm = tracing::field::Empty,
+    ),
+    err
+)]
 pub async fn resolve_role_from_uri(state: &AppState, uri: &Uri) -> Result<UtilityVmRole> {
     if let Some(id) = extract_container_id(uri) {
+        tracing::Span::current().record("container_id", id.as_str());
         match state.workload_roles.lookup(&id).await {
-            WorkloadRoleLookup::Found(role) => return Ok(role),
+            WorkloadRoleLookup::Found(role) => {
+                tracing::Span::current().record("utility_vm", role.as_str());
+                return Ok(role);
+            }
             WorkloadRoleLookup::Ambiguous => return Err(ambiguous_workload_error(&id)),
             WorkloadRoleLookup::Missing => {}
         }
         match rebuild_container_role_from_guests(state, &id).await {
             WorkloadRoleLookup::Found(role) => {
+                tracing::Span::current().record("utility_vm", role.as_str());
                 state.workload_roles.record(id.clone(), role).await;
                 return Ok(role);
             }
@@ -71,12 +102,17 @@ pub async fn resolve_role_from_uri(state: &AppState, uri: &Uri) -> Result<Utilit
         }
     }
     if let Some(id) = extract_exec_id(uri) {
+        tracing::Span::current().record("exec_id", id.as_str());
         match state.workload_roles.lookup(&id).await {
-            WorkloadRoleLookup::Found(role) => return Ok(role),
+            WorkloadRoleLookup::Found(role) => {
+                tracing::Span::current().record("utility_vm", role.as_str());
+                return Ok(role);
+            }
             WorkloadRoleLookup::Ambiguous => return Err(ambiguous_workload_error(&id)),
             WorkloadRoleLookup::Missing => {}
         }
     }
+    tracing::Span::current().record("utility_vm", UtilityVmRole::Native.as_str());
     Ok(UtilityVmRole::Native)
 }
 
