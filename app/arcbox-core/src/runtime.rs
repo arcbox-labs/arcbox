@@ -1,5 +1,11 @@
 //! `ArcBox` runtime.
 
+mod assets;
+mod kubeconfig;
+
+#[cfg(test)]
+mod tests;
+
 use crate::config::Config;
 use crate::container_backend::{DynContainerBackend, create_backend};
 use crate::error::{CoreError, Result};
@@ -18,11 +24,12 @@ use arcbox_protocol::agent::{
     KubernetesDeleteResponse, KubernetesKubeconfigResponse, KubernetesStartResponse,
     KubernetesStatusResponse, KubernetesStopResponse, ServiceStatus,
 };
+use assets::ensure_guest_binaries;
+use kubeconfig::{KUBERNETES_HOST_ENDPOINT, rewrite_kubeconfig_server};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 #[cfg(not(target_os = "macos"))]
 use std::net::{SocketAddr, SocketAddrV4};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock as TokioRwLock;
@@ -43,93 +50,6 @@ type InboundRulesMap =
 /// Per-machine inbound listener managers, keyed by machine name.
 #[cfg(target_os = "macos")]
 type InboundListenerMap = Arc<TokioRwLock<HashMap<String, InboundListenerManager>>>;
-const REQUIRED_RUNTIME_ASSETS: [&str; 6] = [
-    "dockerd",
-    "containerd",
-    "containerd-shim-runc-v2",
-    "runc",
-    "docker-init",
-    "k3s",
-];
-const KUBERNETES_HOST_ENDPOINT: &str = "https://127.0.0.1:16443";
-
-/// Checks that a file exists and has at least one executable permission bit set.
-fn check_executable(path: &Path, context: &str) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(path)
-        .map_err(|_| CoreError::config(format!("{} at {}", context, path.display())))?;
-    if !meta.is_file() {
-        return Err(CoreError::config(format!(
-            "{} is not a regular file",
-            path.display()
-        )));
-    }
-    if meta.permissions().mode() & 0o111 == 0 {
-        return Err(CoreError::config(format!(
-            "{} is not executable (chmod +x)",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-/// Ensures all guest binaries are present and executable in the VirtioFS-shared
-/// directories. Called before VM start. Fails fast if any binary is missing or
-/// not executable.
-///
-/// These binaries are provisioned by `arcbox boot prefetch` (release builds) or
-/// manually by developers (see `cargo xtask dev boot-assets`). This function
-/// only validates — it does not download or install anything.
-fn ensure_guest_binaries(data_dir: &Path) -> Result<()> {
-    let agent_path = data_dir.join("bin/arcbox-agent");
-    check_executable(
-        &agent_path,
-        &format!(
-            "agent binary not found at {}; run 'abctl boot prefetch' to download it",
-            agent_path.display()
-        ),
-    )?;
-
-    let runtime_dir = data_dir.join("runtime/bin");
-    for name in REQUIRED_RUNTIME_ASSETS {
-        check_executable(
-            &runtime_dir.join(name),
-            &format!(
-                "runtime binary '{name}' not found at {}; run 'abctl boot prefetch' to download runtime assets",
-                runtime_dir.join(name).display()
-            ),
-        )?;
-    }
-
-    tracing::info!(
-        "All guest binaries verified: agent + {} runtime assets",
-        REQUIRED_RUNTIME_ASSETS.len()
-    );
-    Ok(())
-}
-
-fn rewrite_kubeconfig_server(kubeconfig: &str) -> String {
-    kubeconfig
-        .lines()
-        .map(|line| {
-            let trimmed = line.trim_start();
-            let indent = " ".repeat(line.len() - trimmed.len());
-
-            match trimmed {
-                _ if trimmed.starts_with("server:") => {
-                    format!("{indent}server: {KUBERNETES_HOST_ENDPOINT}")
-                }
-                "name: default" => format!("{indent}name: arcbox"),
-                "- name: default" => format!("{indent}- name: arcbox"),
-                "cluster: default" => format!("{indent}cluster: arcbox"),
-                "user: default" => format!("{indent}user: arcbox"),
-                "current-context: default" => format!("{indent}current-context: arcbox"),
-                _ => line.to_string(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 /// Per-role lifecycle + dockerd plumbing owned by a [`Runtime`].
 ///
@@ -1043,142 +963,5 @@ impl Runtime {
                 forwarder.stop().await;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Runtime, check_executable, ensure_guest_binaries};
-    use crate::config::Config;
-    use std::path::PathBuf;
-
-    #[test]
-    fn test_ensure_guest_binaries_ok() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let data_dir = temp_dir.path();
-
-        let bin_dir = data_dir.join("bin");
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        let runtime_dir = data_dir.join("runtime/bin");
-        std::fs::create_dir_all(&runtime_dir).unwrap();
-
-        // Create all required binaries with executable permission.
-        for name in [
-            "bin/arcbox-agent",
-            "runtime/bin/dockerd",
-            "runtime/bin/containerd",
-            "runtime/bin/containerd-shim-runc-v2",
-            "runtime/bin/runc",
-            "runtime/bin/docker-init",
-            "runtime/bin/k3s",
-        ] {
-            let path = data_dir.join(name);
-            std::fs::write(&path, b"binary").unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-        }
-
-        let result = ensure_guest_binaries(data_dir);
-        assert!(result.is_ok(), "expected success, got {:?}", result);
-    }
-
-    #[test]
-    fn test_ensure_guest_binaries_missing_agent() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let data_dir = temp_dir.path();
-
-        // Don't create agent binary — should fail.
-        let err = ensure_guest_binaries(data_dir).unwrap_err();
-        assert!(
-            err.to_string().contains("agent binary not found"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_ensure_guest_binaries_missing_runtime() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let data_dir = temp_dir.path();
-
-        // Create agent but not runtime binaries.
-        let agent = data_dir.join("bin/arcbox-agent");
-        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
-        std::fs::write(&agent, b"agent").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let err = ensure_guest_binaries(data_dir).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("runtime binary"), "got: {msg}");
-    }
-
-    #[test]
-    fn test_rewrite_kubeconfig_server_updates_arcbox_refs() {
-        let kubeconfig = r"apiVersion: v1
-clusters:
-- cluster:
-    server: https://127.0.0.1:6443
-  name: default
-contexts:
-- context:
-    cluster: default
-    user: default
-  name: default
-current-context: default
-users:
-- name: default
-  user: {}
-";
-
-        let rewritten = super::rewrite_kubeconfig_server(kubeconfig);
-        assert!(rewritten.contains("server: https://127.0.0.1:16443"));
-        assert!(rewritten.contains("name: arcbox"));
-        assert!(rewritten.contains("- name: arcbox"));
-        assert!(rewritten.contains("cluster: arcbox"));
-        assert!(rewritten.contains("user: arcbox"));
-        assert!(rewritten.contains("current-context: arcbox"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_check_executable_not_executable() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("not-exec");
-        std::fs::write(&path, b"data").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        let err = check_executable(&path, "test").unwrap_err();
-        assert!(err.to_string().contains("not executable"), "got: {err}");
-    }
-
-    #[test]
-    fn test_runtime_new_propagates_config_vm_defaults() {
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        let mut config = Config {
-            data_dir: temp_dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        config.vm.cpus = 6;
-        config.vm.memory_mb = 3072;
-        config.vm.kernel_path = Some(PathBuf::from("/tmp/arcbox-test-kernel"));
-
-        let runtime = Runtime::new(config).expect("runtime init should succeed");
-        let default_vm = runtime.vm_lifecycle().default_vm_config();
-
-        assert_eq!(default_vm.cpus, 6);
-        assert_eq!(default_vm.memory_mb, 3072);
-        assert_eq!(
-            default_vm.kernel,
-            Some(PathBuf::from("/tmp/arcbox-test-kernel"))
-        );
     }
 }
