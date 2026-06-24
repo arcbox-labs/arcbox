@@ -78,7 +78,7 @@ fn check_executable(path: &Path, context: &str) -> Result<()> {
 /// not executable.
 ///
 /// These binaries are provisioned by `arcbox boot prefetch` (release builds) or
-/// manually by developers (see scripts/setup-dev-boot-assets.sh). This function
+/// manually by developers (see `cargo xtask dev boot-assets`). This function
 /// only validates — it does not download or install anything.
 fn ensure_guest_binaries(data_dir: &Path) -> Result<()> {
     let agent_path = data_dir.join("bin/arcbox-agent");

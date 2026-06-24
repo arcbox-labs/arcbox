@@ -97,7 +97,7 @@ setup_test_env() {
 
     if [[ ! -f "$dev_kernel" ]] || [[ ! -f "$dev_rootfs" ]] || [[ ! -f "$dev_manifest" ]]; then
         log_warn "Development boot assets incomplete, refreshing..."
-        (cd "$PROJECT_DIR" && ./scripts/setup-dev-boot-assets.sh)
+        (cd "$PROJECT_DIR" && cargo xtask dev boot-assets)
     fi
 
     if [[ -f "$dev_kernel" ]] && [[ -f "$dev_rootfs" ]] && [[ -f "$dev_manifest" ]]; then
@@ -108,7 +108,7 @@ setup_test_env() {
     else
         log_error "Development boot assets not found or incomplete at $dev_boot_dir"
         log_error "Required files: kernel, rootfs.erofs, manifest.json"
-        log_error "Run: ./scripts/setup-dev-boot-assets.sh"
+        log_error "Run: cargo xtask dev boot-assets"
         exit 1
     fi
 }
