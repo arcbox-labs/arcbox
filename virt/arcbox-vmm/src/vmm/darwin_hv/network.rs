@@ -7,7 +7,7 @@
 
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
-use super::InlineConnSinkAdapter;
+use super::inline_sink::InlineConnSinkAdapter;
 use crate::error::{Result, VmmError};
 use crate::vmm::Vmm;
 
