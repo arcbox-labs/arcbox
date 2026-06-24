@@ -20,7 +20,7 @@ const ENV_DOCKER: &str = "ARCBOX_FLEET_DOCKER";
 const ENV_RUNNER_IMAGE: &str = "ARCBOX_FLEET_RUNNER_IMAGE";
 
 const DEFAULT_MAX_CONCURRENT: usize = 2;
-const DEFAULT_RUNNER_IMAGE: &str = "ghcr.io/actions/runner:latest";
+const DEFAULT_RUNNER_IMAGE: &str = "ghcr.io/actions/actions-runner:latest";
 
 /// Whether Docker-based Linux job execution is enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
