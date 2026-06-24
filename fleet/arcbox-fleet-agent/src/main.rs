@@ -83,11 +83,15 @@ fn main() -> Result<()> {
 async fn run(command: Command, config: AgentConfig) -> Result<()> {
     let docker = init_docker(&config).await?;
 
+    let docker_arches = docker
+        .as_ref()
+        .map(|d| d.linux_arches())
+        .unwrap_or_default();
+
     match command {
         Command::Enroll { token_file, token } => {
             let token = resolve_enrollment_token(token_file, token)?;
-            let docker_caps = docker.as_ref().map(|d| d.capabilities());
-            enroll::enroll(&config, token, docker_caps.as_ref()).await?;
+            enroll::enroll(&config, token, &docker_arches).await?;
             Ok(())
         }
         Command::Run => {

@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use crate::config::AgentConfig;
 use crate::credentials::Credential;
-use crate::docker::{self, DockerCapabilities};
+use crate::docker;
 use crate::host;
 use crate::runner::RunnerSupervisor;
 
@@ -49,7 +49,10 @@ pub async fn run(
     shutdown: CancellationToken,
 ) -> Result<()> {
     let runner_dir = config.runner_dir.clone();
-    let docker_caps = docker.as_ref().map(|d| d.capabilities());
+    let docker_arches = docker
+        .as_ref()
+        .map(|d| d.linux_arches())
+        .unwrap_or_default();
 
     let (egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
     let supervisor = RunnerSupervisor::new(egress_tx, runner_dir, docker, config.max_concurrent);
@@ -69,7 +72,7 @@ pub async fn run(
             &mut pending,
             &mut backoff,
             &shutdown,
-            docker_caps.as_ref(),
+            &docker_arches,
         )
         .await;
         // A shutdown during the connection is a clean exit, not a failure to log
@@ -113,7 +116,7 @@ async fn connect_and_serve(
     pending: &mut Option<AttachRequest>,
     backoff: &mut Duration,
     shutdown: &CancellationToken,
-    docker_caps: Option<&DockerCapabilities>,
+    docker_arches: &[String],
 ) -> Result<()> {
     let channel = config
         .endpoint()?
@@ -147,7 +150,11 @@ async fn connect_and_serve(
         }
     }
 
-    let heartbeat = spawn_heartbeat(req_tx.clone(), config.max_concurrent, docker_caps.cloned());
+    let heartbeat = spawn_heartbeat(
+        req_tx.clone(),
+        config.max_concurrent,
+        docker_arches.to_vec(),
+    );
 
     let outcome = loop {
         tokio::select! {
@@ -196,14 +203,14 @@ async fn dispatch(supervisor: &RunnerSupervisor, msg: Option<attach_response::Ms
 fn spawn_heartbeat(
     outbound: mpsc::Sender<AttachRequest>,
     max_concurrent: usize,
-    docker_caps: Option<DockerCapabilities>,
+    docker_arches: Vec<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             ticker.tick().await;
             let msg = attach_request::Msg::Heartbeat(Heartbeat {
-                capacities: host::capacities(max_concurrent, docker_caps.as_ref()),
+                capacities: host::capacities(max_concurrent, &docker_arches),
                 host_info_json: host::host_info_json(),
             });
             if outbound
