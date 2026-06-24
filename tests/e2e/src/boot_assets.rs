@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tempfile::TempDir;
 use toml_edit::DocumentMut;
 
-use crate::{BootAssetsTestArgs, support::fs::copy_file, support::repo_root};
+use crate::{BootAssetsArgs, repo_root};
 
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -87,7 +87,7 @@ struct TestContext {
 }
 
 impl TestContext {
-    fn new(args: BootAssetsTestArgs) -> Result<Self> {
+    fn new(args: BootAssetsArgs) -> Result<Self> {
         let root = repo_root();
         let version = match args.version {
             Some(version) => version,
@@ -181,13 +181,13 @@ impl Drop for TestContext {
     }
 }
 
-pub fn run(args: BootAssetsTestArgs) -> Result<()> {
+pub fn run(args: BootAssetsArgs) -> Result<()> {
     println!("==========================================");
     println!("ArcBox Boot Assets Integration Test");
     println!("==========================================");
     println!();
 
-    let args = BootAssetsTestArgs {
+    let args = BootAssetsArgs {
         skip_build: args.skip_build || env_flag("SKIP_BUILD"),
         keep_test_dir: args.keep_test_dir || env_flag("KEEP_TEST_DIR"),
         ..args
@@ -338,6 +338,24 @@ fn check_prerequisites(ctx: &TestContext) -> Result<()> {
     Ok(())
 }
 
+fn prepare_dev_boot_assets(ctx: &TestContext) -> Result<()> {
+    let shell = xshell::Shell::new()?;
+    shell.change_dir(&ctx.root);
+    let version = &ctx.version;
+    xshell::cmd!(shell, "cargo xtask dev boot-assets --version {version}").run()?;
+    Ok(())
+}
+
+fn copy_file(from: &Path, to: &Path) -> Result<()> {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent directory {}", parent.display()))?;
+    }
+    fs::copy(from, to)
+        .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+    Ok(())
+}
+
 fn setup_test_env(ctx: &TestContext) -> Result<()> {
     println!(
         "[INFO] Setting up test environment: {}",
@@ -353,12 +371,7 @@ fn setup_test_env(ctx: &TestContext) -> Result<()> {
         || !dev_boot_dir.join("manifest.json").is_file()
     {
         println!("[WARN] Development boot assets incomplete, refreshing...");
-        crate::commands::dev::prepare_boot_assets(crate::BootAssetsArgs {
-            source: None,
-            version: Some(ctx.version.clone()),
-            data_dir: None,
-            kernel_dir: None,
-        })?;
+        prepare_dev_boot_assets(ctx)?;
     }
 
     copy_file(&dev_boot_dir.join("kernel"), &test_boot_dir.join("kernel"))?;

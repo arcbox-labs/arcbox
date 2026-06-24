@@ -421,6 +421,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-e2e"
+version = "0.4.10"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tempfile",
+ "toml_edit 0.25.12+spec-1.1.0",
+ "xshell",
+]
+
+[[package]]
 name = "arcbox-error"
 version = "0.4.10"
 dependencies = [
@@ -5713,7 +5724,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
- "tempfile",
  "toml_edit 0.25.12+spec-1.1.0",
  "xshell",
 ]
