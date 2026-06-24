@@ -8,9 +8,11 @@ mod support;
 use support::mock_guest::{self, MockGuest};
 
 use arcbox_docker::proxy::{
-    GuestConnector, VsockShutdown, VsockStream, proxy_to_guest, proxy_to_guest_stream,
+    GuestConnector, GuestHttpPool, VsockShutdown, VsockStream, proxy_to_guest,
+    proxy_to_guest_for_role_pooled, proxy_to_guest_stream, proxy_to_guest_stream_for_role_pooled,
     proxy_with_upgrade,
 };
+use arcbox_docker::routing::UtilityVmRole;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri, header};
 use bytes::Bytes;
@@ -19,6 +21,8 @@ use hyper_util::rt::TokioIo;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 
 // =============================================================================
@@ -27,6 +31,7 @@ use tempfile::TempDir;
 
 struct UnixSocketConnector {
     socket_path: PathBuf,
+    connect_count: Arc<AtomicUsize>,
 }
 
 impl GuestConnector for UnixSocketConnector {
@@ -35,6 +40,7 @@ impl GuestConnector for UnixSocketConnector {
     ) -> Pin<Box<dyn Future<Output = arcbox_docker::Result<TokioIo<VsockStream>>> + Send + '_>>
     {
         Box::pin(async {
+            self.connect_count.fetch_add(1, Ordering::Relaxed);
             let stream = tokio::net::UnixStream::connect(&self.socket_path)
                 .await
                 .map_err(|e| arcbox_docker::DockerError::Server(e.to_string()))?;
@@ -55,6 +61,7 @@ async fn setup() -> (UnixSocketConnector, MockGuest, TempDir) {
     let guest = mock_guest::start(tmp.path()).await;
     let connector = UnixSocketConnector {
         socket_path: guest.socket_path.clone(),
+        connect_count: Arc::new(AtomicUsize::new(0)),
     };
     (connector, guest, tmp)
 }
@@ -102,6 +109,68 @@ async fn proxy_to_guest_empty_body() {
     guest.cancel.cancel();
 }
 
+#[tokio::test]
+async fn pooled_proxy_reuses_http_session_after_body_eof() {
+    let (connector, guest, _tmp) = setup().await;
+    let pool = Arc::new(GuestHttpPool::default());
+
+    for path in ["/containers/json", "/images/json"] {
+        let resp = proxy_to_guest_for_role_pooled(
+            &connector,
+            Arc::clone(&pool),
+            UtilityVmRole::Native,
+            Method::GET,
+            path,
+            &HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = resp.into_body().collect().await.unwrap();
+    }
+
+    assert_eq!(connector.connect_count.load(Ordering::Relaxed), 1);
+    guest.cancel.cancel();
+}
+
+#[tokio::test]
+async fn pooled_proxy_discards_session_when_body_is_dropped_early() {
+    let (connector, guest, _tmp) = setup().await;
+    let pool = Arc::new(GuestHttpPool::default());
+
+    let resp = proxy_to_guest_for_role_pooled(
+        &connector,
+        Arc::clone(&pool),
+        UtilityVmRole::Native,
+        Method::POST,
+        "/containers/create",
+        &HeaderMap::new(),
+        Bytes::from_static(br#"{"Image":"alpine"}"#),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    drop(resp);
+
+    let resp = proxy_to_guest_for_role_pooled(
+        &connector,
+        Arc::clone(&pool),
+        UtilityVmRole::Native,
+        Method::GET,
+        "/containers/json",
+        &HeaderMap::new(),
+        Bytes::new(),
+    )
+    .await
+    .unwrap();
+    let _ = resp.into_body().collect().await.unwrap();
+
+    assert_eq!(connector.connect_count.load(Ordering::Relaxed), 2);
+    guest.cancel.cancel();
+}
+
 // =============================================================================
 // Tests — proxy_to_guest_stream (streaming forwarding)
 // =============================================================================
@@ -124,6 +193,37 @@ async fn proxy_stream_forwards_body() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body, payload.as_bytes());
+    guest.cancel.cancel();
+}
+
+#[tokio::test]
+async fn pooled_proxy_stream_reuses_http_session_after_body_eof() {
+    let (connector, guest, _tmp) = setup().await;
+    let pool = Arc::new(GuestHttpPool::default());
+
+    for path in ["/volumes", "/networks"] {
+        let uri: Uri = path.parse().unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = proxy_to_guest_stream_for_role_pooled(
+            &connector,
+            Arc::clone(&pool),
+            UtilityVmRole::Native,
+            &uri,
+            req,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = resp.into_body().collect().await.unwrap();
+    }
+
+    assert_eq!(connector.connect_count.load(Ordering::Relaxed), 1);
     guest.cancel.cancel();
 }
 

@@ -15,8 +15,10 @@ mod uri;
 pub use connector::VsockConnector;
 pub use fallback::proxy_fallback;
 pub use forward::{
-    proxy_to_guest, proxy_to_guest_for_role, proxy_to_guest_stream, proxy_to_guest_stream_for_role,
+    proxy_to_guest, proxy_to_guest_for_role, proxy_to_guest_for_role_pooled, proxy_to_guest_stream,
+    proxy_to_guest_stream_for_role, proxy_to_guest_stream_for_role_pooled,
 };
+pub use session::GuestHttpPool;
 pub use upgrade::{proxy_with_upgrade, proxy_with_upgrade_for_role};
 pub use upload::{proxy_streaming_upload, proxy_streaming_upload_for_role};
 
