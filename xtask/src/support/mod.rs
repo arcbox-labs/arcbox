@@ -1,6 +1,6 @@
 use std::{error::Error, fmt, path::PathBuf};
 
-pub mod fs;
+use anyhow::Result;
 
 #[derive(Debug)]
 pub struct ExitCode(i32);
@@ -23,9 +23,6 @@ impl fmt::Display for ExitCode {
 
 impl Error for ExitCode {}
 
-pub fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("xtask crate lives directly under the repository root")
-        .to_owned()
+pub fn repo_root() -> Result<PathBuf> {
+    xtask_kit::repo::root_from_xtask_manifest(env!("CARGO_MANIFEST_DIR"))
 }

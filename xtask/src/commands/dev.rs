@@ -2,8 +2,9 @@ use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use toml_edit::DocumentMut;
+use xtask_kit::fs::copy_file;
 
-use crate::{BootAssetSource, DevArgs, DevCommand, support::fs::copy_file, support::repo_root};
+use crate::{BootAssetSource, DevArgs, DevCommand, support::repo_root};
 
 pub fn run(args: DevArgs) -> Result<()> {
     match args.command {
@@ -12,7 +13,7 @@ pub fn run(args: DevArgs) -> Result<()> {
 }
 
 pub fn prepare_boot_assets(args: crate::BootAssetsArgs) -> Result<()> {
-    let root = repo_root();
+    let root = repo_root()?;
     let version = match args.version {
         Some(version) => version,
         None => boot_version(&root.join("assets.lock"))?,
@@ -102,30 +103,27 @@ fn copy_boot_assets(source: &std::path::Path, dev_boot_dir: &std::path::Path) ->
     if !source.is_dir() {
         bail!("boot asset source does not exist: {}", source.display());
     }
-    copy_file(&source.join("kernel"), &dev_boot_dir.join("kernel"))?;
+    copy_file(source.join("kernel"), dev_boot_dir.join("kernel"))?;
     copy_file(
-        &source.join("rootfs.erofs"),
-        &dev_boot_dir.join("rootfs.erofs"),
+        source.join("rootfs.erofs"),
+        dev_boot_dir.join("rootfs.erofs"),
     )?;
     copy_file(
-        &source.join("manifest.json"),
-        &dev_boot_dir.join("manifest.json"),
+        source.join("manifest.json"),
+        dev_boot_dir.join("manifest.json"),
     )?;
     Ok(())
 }
 
 fn copy_kernel_output(output_dir: &std::path::Path, dev_boot_dir: &std::path::Path) -> Result<()> {
+    copy_file(output_dir.join("kernel-arm64"), dev_boot_dir.join("kernel"))?;
     copy_file(
-        &output_dir.join("kernel-arm64"),
-        &dev_boot_dir.join("kernel"),
+        output_dir.join("rootfs.erofs"),
+        dev_boot_dir.join("rootfs.erofs"),
     )?;
     copy_file(
-        &output_dir.join("rootfs.erofs"),
-        &dev_boot_dir.join("rootfs.erofs"),
-    )?;
-    copy_file(
-        &output_dir.join("manifest.json"),
-        &dev_boot_dir.join("manifest.json"),
+        output_dir.join("manifest.json"),
+        dev_boot_dir.join("manifest.json"),
     )?;
     Ok(())
 }
