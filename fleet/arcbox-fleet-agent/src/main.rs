@@ -83,16 +83,21 @@ fn main() -> Result<()> {
 }
 
 async fn run(command: Command, config: AgentConfig) -> Result<()> {
-    let docker = init_docker(&config).await?;
-    let pools = capacity_pools(&config, docker.as_ref());
-
     match command {
         Command::Enroll { token_file, token } => {
             let token = resolve_enrollment_token(token_file, token)?;
+            // Enrollment is pure credential exchange — it never needs Docker, so
+            // an operator can enroll before the runtime is up. The capacities
+            // sent here are an initial hint, replaced wholesale by the first
+            // heartbeat once the agent attaches, so we advertise what we know
+            // without probing the runtime.
+            let pools = capacity_pools(&config, None);
             enroll::enroll(&config, token, pools).await?;
             Ok(())
         }
         Command::Run => {
+            let docker = init_docker(&config).await?;
+            let pools = capacity_pools(&config, docker.as_ref());
             let credential = CredentialStore::new(config.credentials_path())
                 .load()?
                 .context(
