@@ -46,6 +46,7 @@ pub mod context;
 pub mod error;
 pub mod handlers;
 pub(crate) mod host_path;
+pub mod port_bindings;
 pub mod proxy;
 pub mod routing;
 pub mod server;

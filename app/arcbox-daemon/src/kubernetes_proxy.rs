@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arcbox_constants::ports::{KUBERNETES_API_HOST_PORT, KUBERNETES_API_VSOCK_PORT};
 use arcbox_core::Runtime;
-use arcbox_docker::proxy::RawFdStream;
+use arcbox_docker::proxy::{VsockShutdown, VsockStream};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
@@ -51,13 +51,15 @@ pub async fn start(runtime: Arc<Runtime>) -> Option<tokio::task::JoinHandle<()>>
 
                 // SAFETY: fd is a valid, newly-opened vsock socket owned by us.
                 let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-                let mut guest_stream = match RawFdStream::new(owned) {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        tracing::debug!("failed to wrap Kubernetes API fd: {}", e);
-                        return;
-                    }
-                };
+                let mut guest_stream =
+                    match VsockStream::from_fd_with_shutdown(owned, VsockShutdown::CloseOnDropOnly)
+                    {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            tracing::debug!("failed to wrap Kubernetes API fd: {}", e);
+                            return;
+                        }
+                    };
 
                 if let Err(e) =
                     tokio::io::copy_bidirectional(&mut host_stream, &mut guest_stream).await

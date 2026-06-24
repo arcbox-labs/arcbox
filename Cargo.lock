@@ -387,6 +387,7 @@ dependencies = [
  "futures",
  "hex",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-util",
  "libc",

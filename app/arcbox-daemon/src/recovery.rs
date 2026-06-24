@@ -305,7 +305,7 @@ async fn recover_container_networking(
             recovered_dns += 1;
         }
 
-        let bindings = arcbox_docker::proxy::parse_port_bindings(&inspect_body);
+        let bindings = arcbox_docker::port_bindings::parse_port_bindings(&inspect_body);
         if !bindings.is_empty() {
             let rules: Vec<_> = bindings
                 .iter()

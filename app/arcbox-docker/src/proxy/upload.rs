@@ -3,16 +3,16 @@
 //! Used for endpoints like `POST /images/load` where the proxy must own
 //! `Expect` handling and request-body draining semantics.
 
-use super::forward::forwarded_request_headers;
-use super::{GuestConnector, HANDSHAKE_TIMEOUT};
+use super::GuestConnector;
+use super::headers::{ForwardedHeaderMode, HeaderMapProxyExt};
+use super::session::GuestHttpSession;
+use super::uri::GuestPath;
 use crate::error::{DockerError, Result};
 use crate::routing::UtilityVmRole;
-use arcbox_error::CommonError;
 use axum::body::{Body, BodyDataStream};
 use axum::http::{HeaderValue, Method, Uri, header};
 use bytes::Bytes;
 use futures::StreamExt as _;
-use hyper::client::conn::http1;
 use std::io;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -50,7 +50,7 @@ pub async fn proxy_streaming_upload_for_role(
     original_uri: &Uri,
     req: axum::http::Request<Body>,
 ) -> Result<axum::http::Response<Body>> {
-    let io = connector.connect_for(role).await?;
+    let mut session = GuestHttpSession::connect(connector, role).await?;
 
     let had_expect = req.headers().contains_key(header::EXPECT);
     let had_content_length = req.headers().contains_key(header::CONTENT_LENGTH);
@@ -62,36 +62,17 @@ pub async fn proxy_streaming_upload_for_role(
         "proxying Docker upload request to guest"
     );
 
-    let (mut sender, conn) =
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, http1::Builder::new().handshake(io))
-            .await
-            .map_err(|_| {
-                DockerError::from(CommonError::timeout("guest docker handshake timed out"))
-            })?
-            .map_err(|e| DockerError::Server(format!("guest docker handshake failed: {e}")))?;
-
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            let msg = e.to_string().to_lowercase();
-            if !msg.contains("canceled") && !msg.contains("incomplete") {
-                tracing::debug!("guest docker connection ended: {}", e);
-            }
-        }
-    });
-
-    let path_and_query = original_uri
-        .path_and_query()
-        .map_or("/", hyper::http::uri::PathAndQuery::as_str);
+    let path_and_query = GuestPath::from(original_uri);
     let method = req.method().clone();
-    let forwarded_headers = forwarded_request_headers(req.headers(), true);
-    let body_stream = req.into_body().into_data_stream();
+    let forwarded_headers = req
+        .headers()
+        .forwarded_for_guest(ForwardedHeaderMode::Upload);
     let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, io::Error>>(UPLOAD_BODY_BUFFER);
-    let body_pump = tokio::spawn(async move { pump_upload_body(body_stream, tx).await });
     let guest_body = Body::from_stream(ReceiverStream::new(rx));
 
     let mut guest_req = hyper::Request::builder()
         .method(method)
-        .uri(path_and_query)
+        .uri(path_and_query.as_ref())
         .body(guest_body)
         .map_err(|e| DockerError::Server(format!("failed to build guest request: {e}")))?;
 
@@ -100,34 +81,36 @@ pub async fn proxy_streaming_upload_for_role(
         .headers_mut()
         .insert(header::HOST, HeaderValue::from_static("localhost"));
 
-    let response = match sender.send_request(guest_req).await {
+    let body_stream = req.into_body().into_data_stream();
+    let body_pump = tokio::spawn(async move { pump_upload_body(body_stream, tx).await });
+
+    let response = match session.send_request(guest_req, "upload request").await {
         Ok(response) => response,
         Err(e) => {
-            let drain_result = join_upload_pump(body_pump).await;
-            tracing::debug!(
-                drain_ok = drain_result.is_ok(),
-                "guest upload request failed before response headers"
-            );
-            return Err(DockerError::Server(format!(
-                "guest docker upload request failed: {e}"
-            )));
+            body_pump.abort();
+            tracing::debug!("guest upload request failed before response headers");
+            return Err(e);
         }
     };
 
-    // Once response headers are available from guest dockerd, a pump failure
-    // (e.g. receiver dropped because the guest closed the request body early)
-    // should not prevent returning the response to the client.
-    match join_upload_pump(body_pump).await {
-        Ok(uploaded_bytes) => {
-            tracing::debug!(uploaded_bytes, "completed Docker upload body pump");
+    // Once response headers are available from guest dockerd, return them to
+    // the Docker client immediately. Some dockerd endpoints can reject or
+    // complete an upload before consuming the whole request body; waiting for
+    // the client-side tar stream to drain here turns that valid early response
+    // into a Docker CLI timeout.
+    tokio::spawn(async move {
+        match join_upload_pump(body_pump).await {
+            Ok(uploaded_bytes) => {
+                tracing::debug!(uploaded_bytes, "completed Docker upload body pump");
+            }
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "upload body pump ended with error after response headers; treating as non-fatal"
+                );
+            }
         }
-        Err(err) => {
-            tracing::debug!(
-                error = %err,
-                "upload body pump ended with error after response headers; treating as non-fatal"
-            );
-        }
-    }
+    });
 
     let (parts, incoming) = response.into_parts();
     Ok(axum::http::Response::from_parts(parts, Body::new(incoming)))
@@ -207,8 +190,8 @@ mod tests {
     use serde_json::Value;
     use tokio::net::TcpListener;
 
-    use super::super::forward::forwarded_request_headers;
-    use super::super::stream::RawFdStream;
+    use super::super::headers::{ForwardedHeaderMode, HeaderMapProxyExt};
+    use arcbox_transport::vsock::{VsockShutdown, VsockStream};
 
     /// Test connector that connects to a TCP address (used for unit tests).
     struct TcpTestConnector {
@@ -219,7 +202,7 @@ mod tests {
         fn connect(
             &self,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<TokioIo<RawFdStream>>> + Send + '_>,
+            Box<dyn std::future::Future<Output = Result<TokioIo<VsockStream>>> + Send + '_>,
         > {
             let addr = self.addr;
             Box::pin(async move {
@@ -234,7 +217,10 @@ mod tests {
                     // SAFETY: we just extracted this fd from a valid TcpStream.
                     unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }
                 };
-                Ok(TokioIo::new(RawFdStream::new(owned_fd)?))
+                Ok(TokioIo::new(VsockStream::from_fd_with_shutdown(
+                    owned_fd,
+                    VsockShutdown::CloseOnDropOnly,
+                )?))
             })
         }
     }
@@ -308,6 +294,54 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn proxy_streaming_upload_returns_guest_response_before_client_body_drains() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(|_request: hyper::Request<Incoming>| async {
+                let response = hyper::Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Full::new(Bytes::from_static(b"rejected early")))
+                    .unwrap();
+                Ok::<_, std::convert::Infallible>(response)
+            });
+
+            server_http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+
+        let connector = TcpTestConnector { addr };
+        let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, io::Error>>(1);
+        tx.send(Ok(Bytes::from_static(b"partial"))).await.unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/images/load")
+            .header(header::CONTENT_TYPE, "application/x-tar")
+            .body(Body::from_stream(ReceiverStream::new(rx)))
+            .unwrap();
+        let original_uri = Uri::from_static("/v1.47/images/load");
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            proxy_streaming_upload(&connector, &original_uri, request),
+        )
+        .await
+        .expect("proxy should return before the client body stream closes")
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&payload[..], b"rejected early");
+
+        drop(tx);
+        server.await.unwrap();
+    }
+
     #[test]
     fn detects_image_load_upload_requests() {
         assert!(is_streaming_upload_request(
@@ -375,7 +409,7 @@ mod tests {
             HeaderValue::from_static("yes"),
         );
 
-        let forwarded = forwarded_request_headers(&headers, false);
+        let forwarded = headers.forwarded_for_guest(ForwardedHeaderMode::Normal);
         assert_eq!(
             forwarded.get(header::CONTENT_TYPE).unwrap(),
             "application/x-tar"
@@ -396,7 +430,7 @@ mod tests {
             HeaderValue::from_static("application/x-tar"),
         );
 
-        let forwarded = forwarded_request_headers(&headers, true);
+        let forwarded = headers.forwarded_for_guest(ForwardedHeaderMode::Upload);
         assert!(forwarded.get(header::EXPECT).is_none());
         assert_eq!(
             forwarded.get(header::CONTENT_TYPE).unwrap(),

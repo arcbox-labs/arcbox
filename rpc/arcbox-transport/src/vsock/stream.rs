@@ -15,6 +15,20 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 ///   timeout cancellation issues with raw AsyncFd on reused fd numbers.
 pub struct VsockStream {
     inner: VsockStreamInner,
+    shutdown: VsockShutdown,
+}
+
+/// Shutdown behavior for [`VsockStream`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsockShutdown {
+    /// Call `shutdown(SHUT_WR)` when Tokio asks to shut down the write half.
+    HalfClose,
+    /// Treat Tokio shutdown as a no-op and close only when the fd is dropped.
+    ///
+    /// Some macOS vsock backends tear down the full connection on half-close,
+    /// which breaks HTTP upgrade tunnels that need to keep the fd alive after
+    /// the response handshake.
+    CloseOnDropOnly,
 }
 
 enum VsockStreamInner {
@@ -40,9 +54,16 @@ impl VsockStream {
 
     /// Creates a vsock stream from an [`OwnedFd`] (Fd mode).
     pub fn from_fd(fd: OwnedFd) -> io::Result<Self> {
+        Self::from_fd_with_shutdown(fd, VsockShutdown::HalfClose)
+    }
+
+    /// Creates a vsock stream from an [`OwnedFd`] (Fd mode) with explicit
+    /// shutdown behavior.
+    pub fn from_fd_with_shutdown(fd: OwnedFd, shutdown: VsockShutdown) -> io::Result<Self> {
         Self::set_nonblocking(fd.as_raw_fd())?;
         Ok(Self {
             inner: VsockStreamInner::Fd(AsyncFd::new(fd)?),
+            shutdown,
         })
     }
 
@@ -54,11 +75,33 @@ impl VsockStream {
         Self::from_fd(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
+    /// Creates a vsock stream from a raw file descriptor, taking ownership,
+    /// with explicit shutdown behavior.
+    ///
+    /// # Safety
+    /// The caller must ensure `fd` is a valid connected vsock file descriptor.
+    pub unsafe fn from_raw_fd_with_shutdown(
+        fd: RawFd,
+        shutdown: VsockShutdown,
+    ) -> io::Result<Self> {
+        Self::from_fd_with_shutdown(unsafe { OwnedFd::from_raw_fd(fd) }, shutdown)
+    }
+
     /// Creates a vsock stream wrapping a `tokio::net::UnixStream` (Unix mode).
     /// Used for HV backend socketpairs.
     pub fn from_unix_stream(stream: tokio::net::UnixStream) -> Self {
+        Self::from_unix_stream_with_shutdown(stream, VsockShutdown::HalfClose)
+    }
+
+    /// Creates a vsock stream wrapping a `tokio::net::UnixStream` (Unix mode)
+    /// with explicit shutdown behavior.
+    pub fn from_unix_stream_with_shutdown(
+        stream: tokio::net::UnixStream,
+        shutdown: VsockShutdown,
+    ) -> Self {
         Self {
             inner: VsockStreamInner::Unix(stream),
+            shutdown,
         }
     }
 
@@ -155,7 +198,12 @@ impl AsyncWrite for VsockStream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match &mut self.get_mut().inner {
+        let this = self.get_mut();
+        if this.shutdown == VsockShutdown::CloseOnDropOnly {
+            return Poll::Ready(Ok(()));
+        }
+
+        match &mut this.inner {
             VsockStreamInner::Unix(us) => Pin::new(us).poll_shutdown(cx),
             VsockStreamInner::Fd(inner) => loop {
                 let mut guard = ready!(inner.poll_write_ready(cx))?;
@@ -177,5 +225,43 @@ impl AsyncWrite for VsockStream {
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[tokio::test]
+    async fn half_close_shutdown_closes_write_half() {
+        let (stream, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let mut stream =
+            VsockStream::from_unix_stream_with_shutdown(stream, VsockShutdown::HalfClose);
+
+        stream.shutdown().await.unwrap();
+
+        let mut buf = [0_u8; 1];
+        let n = peer.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn close_on_drop_only_shutdown_keeps_connection_open_until_drop() {
+        let (stream, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let mut stream =
+            VsockStream::from_unix_stream_with_shutdown(stream, VsockShutdown::CloseOnDropOnly);
+
+        stream.shutdown().await.unwrap();
+
+        let mut buf = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_millis(20), peer.read(&mut buf)).await;
+        assert!(read.is_err(), "shutdown must not half-close the peer");
+
+        drop(stream);
+
+        let n = peer.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0);
     }
 }
