@@ -386,6 +386,7 @@ dependencies = [
  "dirs",
  "futures",
  "hex",
+ "http-body",
  "http-body-util",
  "httparse",
  "hyper",

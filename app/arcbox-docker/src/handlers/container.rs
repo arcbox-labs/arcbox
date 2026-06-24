@@ -5,7 +5,6 @@ use super::{
 use crate::api::AppState;
 use crate::error::{DockerError, Result};
 use crate::port_bindings::parse_port_bindings;
-use crate::proxy::proxy_to_guest_for_role;
 use crate::routing::{UtilityVmRole, query_param, route_container_create};
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
@@ -288,8 +287,9 @@ async fn inspect_container_body(
     container_id: &str,
 ) -> Option<Bytes> {
     let inspect_path = format!("/containers/{container_id}/json");
-    let inspect_resp = match proxy_to_guest_for_role(
+    let inspect_resp = match crate::proxy::proxy_to_guest_for_role_pooled(
         state.connector.as_ref(),
+        std::sync::Arc::clone(&state.guest_http_pool),
         role,
         Method::GET,
         &inspect_path,
@@ -569,8 +569,9 @@ async fn resolve_or_raw_for_teardown(
 /// by inspecting the container on the selected utility VM.
 async fn resolve_canonical_id(state: &AppState, role: UtilityVmRole, id: &str) -> Option<String> {
     let inspect_path = format!("/containers/{id}/json");
-    let resp = proxy_to_guest_for_role(
+    let resp = crate::proxy::proxy_to_guest_for_role_pooled(
         state.connector.as_ref(),
+        std::sync::Arc::clone(&state.guest_http_pool),
         role,
         Method::GET,
         &inspect_path,

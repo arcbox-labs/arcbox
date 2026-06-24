@@ -8,7 +8,7 @@
 
 use crate::handlers;
 use crate::proxy;
-use crate::proxy::GuestConnector;
+use crate::proxy::{GuestConnector, GuestHttpPool};
 use crate::trace::trace_id_middleware;
 use crate::workload::WorkloadRoleRegistry;
 use arcbox_core::Runtime;
@@ -26,6 +26,8 @@ pub struct AppState {
     pub runtime: Arc<Runtime>,
     /// Guest connection factory (vsock in production, Unix socket in tests).
     pub connector: Arc<dyn GuestConnector>,
+    /// Idle guest HTTP sessions for ordinary proxied requests.
+    pub guest_http_pool: Arc<GuestHttpPool>,
     /// In-process mapping from container/exec IDs to their utility VM role.
     pub workload_roles: Arc<WorkloadRoleRegistry>,
 }
@@ -40,6 +42,7 @@ pub fn create_router(runtime: Arc<Runtime>, connector: Arc<dyn GuestConnector>) 
     let state = AppState {
         runtime,
         connector,
+        guest_http_pool: Arc::new(GuestHttpPool::default()),
         workload_roles: WorkloadRoleRegistry::new(),
     };
 

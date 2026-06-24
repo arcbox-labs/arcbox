@@ -8,6 +8,7 @@ use crate::handlers::{ensure_role_ready, resolve_role_from_uri};
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
 use axum::http::Response;
+use std::sync::Arc;
 
 /// Catch-all handler that proxies unmatched requests to guest dockerd.
 ///
@@ -44,5 +45,12 @@ pub async fn proxy_fallback(
             .await;
     }
 
-    forward::proxy_to_guest_stream_for_role(state.connector.as_ref(), role, &uri, req).await
+    forward::proxy_to_guest_stream_for_role_pooled(
+        state.connector.as_ref(),
+        Arc::clone(&state.guest_http_pool),
+        role,
+        &uri,
+        req,
+    )
+    .await
 }

@@ -12,6 +12,7 @@ use crate::workload::WorkloadRoleLookup;
 use axum::body::Body;
 use axum::http::{Request, Uri};
 use axum::response::Response;
+use std::sync::Arc;
 
 /// Forwards a request that has no per-workload identity (e.g. `/_ping`,
 /// `/containers/json`, `/images/json`). These hit the native default role
@@ -260,8 +261,9 @@ async fn probe_container_exists(state: &AppState, role: UtilityVmRole, container
         return false;
     }
     let path = format!("/containers/{container_id}/json");
-    match crate::proxy::proxy_to_guest_for_role(
+    match crate::proxy::proxy_to_guest_for_role_pooled(
         state.connector.as_ref(),
+        Arc::clone(&state.guest_http_pool),
         role,
         Method::GET,
         &path,
@@ -319,7 +321,14 @@ pub(crate) async fn proxy_to_role(
     req: Request<Body>,
 ) -> Result<Response> {
     ensure_role_ready(state, role).await?;
-    proxy::proxy_to_guest_stream_for_role(state.connector.as_ref(), role, uri, req).await
+    proxy::proxy_to_guest_stream_for_role_pooled(
+        state.connector.as_ref(),
+        Arc::clone(&state.guest_http_pool),
+        role,
+        uri,
+        req,
+    )
+    .await
 }
 
 /// Forward an upload request to guest dockerd, ensuring the VM is running first.
