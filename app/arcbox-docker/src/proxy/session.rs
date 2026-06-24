@@ -80,17 +80,23 @@ impl Service<Uri> for GuestClientConnector {
     fn call(&mut self, uri: Uri) -> Self::Future {
         let connector = Arc::clone(&self.connector);
         Box::pin(async move {
-            let role = role_from_uri(&uri);
+            let role = role_from_uri(&uri)?;
             let io = connector.connect_for(role).await?;
             Ok(GuestIo(io))
         })
     }
 }
 
-fn role_from_uri(uri: &Uri) -> UtilityVmRole {
+fn role_from_uri(uri: &Uri) -> Result<UtilityVmRole> {
     match uri.authority().map(|authority| authority.as_str()) {
-        Some(ROSETTA_AUTHORITY) => UtilityVmRole::Rosetta,
-        _ => UtilityVmRole::Native,
+        Some(NATIVE_AUTHORITY) => Ok(UtilityVmRole::Native),
+        Some(ROSETTA_AUTHORITY) => Ok(UtilityVmRole::Rosetta),
+        Some(authority) => Err(DockerError::Server(format!(
+            "unknown guest docker authority: {authority}"
+        ))),
+        None => Err(DockerError::Server(
+            "guest docker request uri missing authority".into(),
+        )),
     }
 }
 
@@ -187,5 +193,37 @@ impl GuestHttpSession {
             .send_request(req)
             .await
             .map_err(|e| DockerError::Server(format!("guest docker {context} failed: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn role_from_uri_accepts_known_authorities() {
+        let native: Uri = "http://native.arcbox.internal/_ping".parse().unwrap();
+        let rosetta: Uri = "http://rosetta.arcbox.internal/_ping".parse().unwrap();
+
+        assert_eq!(role_from_uri(&native).unwrap(), UtilityVmRole::Native);
+        assert_eq!(role_from_uri(&rosetta).unwrap(), UtilityVmRole::Rosetta);
+    }
+
+    #[test]
+    fn role_from_uri_rejects_unknown_authority() {
+        let uri: Uri = "http://other.arcbox.internal/_ping".parse().unwrap();
+
+        let err = role_from_uri(&uri).unwrap_err().to_string();
+
+        assert!(err.contains("unknown guest docker authority"));
+    }
+
+    #[test]
+    fn role_from_uri_rejects_missing_authority() {
+        let uri = Uri::from_static("/_ping");
+
+        let err = role_from_uri(&uri).unwrap_err().to_string();
+
+        assert!(err.contains("missing authority"));
     }
 }
