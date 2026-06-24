@@ -140,6 +140,21 @@ impl DockerRunner {
         Self::pull_image(&self.client, spec.image, &platform).await?;
 
         let container_name = format!("arcbox-{}", spec.job_id);
+
+        // The name is deterministic per job, so a redelivery after a crash that
+        // left an orphan would otherwise collide on create. Remove any leftover
+        // first (remove-before-bind); a missing container is the normal case.
+        let _ = self
+            .client
+            .remove_container(
+                &container_name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
         let config = ContainerCreateBody {
             image: Some(spec.image.to_owned()),
             cmd: Some(vec![
