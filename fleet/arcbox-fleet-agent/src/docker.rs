@@ -1,8 +1,8 @@
-//! Docker-based execution of Linux runner jobs.
+//! Docker API-based execution of Linux runner jobs.
 //!
-//! When Docker is available, the agent can serve `linux/*` capacity pools even
-//! on macOS hosts. Each Linux job runs inside a container launched from the
-//! configured runner image (default: `ghcr.io/actions/runner:latest`).
+//! Talks to any Docker-compatible runtime (ArcBox on macOS, Docker Engine on
+//! Linux/Windows) via the local socket. Each Linux job runs inside a container
+//! launched from the configured runner image.
 
 use anyhow::{Context, Result};
 use bollard::Docker;
@@ -42,15 +42,36 @@ pub struct DockerRunner {
     default_image: String,
 }
 
+/// ArcBox's Docker-compatible socket path on macOS (`~/.arcbox/docker.sock`).
+fn arcbox_socket_path() -> Option<String> {
+    if std::env::consts::OS != "macos" {
+        return None;
+    }
+    dirs::home_dir().map(|home| {
+        home.join(".arcbox")
+            .join("docker.sock")
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
 impl DockerRunner {
-    /// Connect to the local Docker daemon and verify reachability.
+    /// Connect to the Docker-compatible runtime and verify reachability.
+    ///
+    /// On macOS, connects to ArcBox's own socket (`~/.arcbox/docker.sock`).
+    /// On other platforms, uses the system default (e.g. `/var/run/docker.sock`
+    /// on Linux, named pipe on Windows).
     pub async fn new(default_image: String) -> Result<Self> {
-        let client =
-            Docker::connect_with_local_defaults().context("connecting to Docker daemon")?;
+        let client = if let Some(addr) = arcbox_socket_path() {
+            Docker::connect_with_unix(&addr, 120, bollard::API_DEFAULT_VERSION)
+                .with_context(|| format!("connecting to ArcBox runtime at {addr}"))?
+        } else {
+            Docker::connect_with_local_defaults().context("connecting to Docker runtime")?
+        };
         client
             .ping()
             .await
-            .context("Docker daemon is not reachable (ping failed)")?;
+            .context("Docker-compatible runtime is not reachable (ping failed)")?;
         info!("docker runtime available");
         Ok(Self {
             client,
@@ -58,19 +79,22 @@ impl DockerRunner {
         })
     }
 
-    /// Linux architectures Docker can serve on this host.
+    /// Extra Linux architectures to advertise via Docker.
     ///
-    /// Returns an empty vec on Linux hosts — the host runner already serves
-    /// its native `linux/*` pool, and cross-arch emulation is not guaranteed.
-    /// On macOS, Docker Desktop provides the native arch plus Rosetta-backed
-    /// amd64 emulation on arm64 hosts.
+    /// On Linux the host already serves its native `linux/*` pool, so Docker
+    /// adds no new pools (it is still used for job isolation at the routing
+    /// layer). On macOS and Windows the host has no native Linux pool, so
+    /// Docker adds them.
+    ///
+    /// On arm64 macOS, amd64 is included because ArcBox's runtime provides
+    /// Rosetta-backed emulation.
     pub fn linux_arches(&self) -> Vec<String> {
-        if std::env::consts::OS != "macos" {
+        if std::env::consts::OS == "linux" {
             return Vec::new();
         }
         let native = host::map_arch(std::env::consts::ARCH).to_owned();
         let mut arches = vec![native.clone()];
-        if native == "arm64" {
+        if std::env::consts::OS == "macos" && native == "arm64" {
             arches.push("amd64".to_owned());
         }
         arches
