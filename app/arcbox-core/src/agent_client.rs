@@ -2,11 +2,13 @@
 //!
 //! Provides RPC communication with the arcbox-agent running inside guest VMs.
 
+mod transport;
+mod wire;
+
+use self::transport::{AgentTransport, BLOCKING_RPC_TIMEOUT};
 use crate::error::{CoreError, Result};
 use arcbox_constants::ports::AGENT_PORT;
-use arcbox_constants::wire::{
-    ERROR_HEADER_SIZE, FRAME_HEADER_SIZE, MessageType, TRACE_LEN_FIELD_SIZE, TYPE_FIELD_SIZE,
-};
+use arcbox_constants::wire::MessageType;
 use arcbox_protocol::agent::{
     DiskTrimRequest, DiskTrimResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
     KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
@@ -24,74 +26,10 @@ use arcbox_protocol::sandbox_v1::{
 };
 use arcbox_transport::Transport;
 use arcbox_transport::vsock::{BlockingVsockTransport, VsockAddr, VsockTransport};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use prost::Message;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-
-/// Transport backend for agent RPC.
-///
-/// `Async` is the default for Linux AF_VSOCK and macOS VZ backend (real vsock
-/// fds that tokio/kqueue handles correctly).
-///
-/// `Blocking` is used for macOS HV backend socketpair fds (AF_UNIX). These fds
-/// trigger a tokio/kqueue reactor stall when rapidly created and torn down in a
-/// retry loop, causing timer wakeups to stop firing. The blocking transport
-/// uses `libc::poll` + `std::os::unix::net::UnixStream` and never touches the
-/// tokio reactor.
-enum AgentTransport {
-    Async(VsockTransport),
-    Blocking(BlockingVsockTransport),
-}
-
-/// Default RPC deadline for blocking transport operations.
-const BLOCKING_RPC_TIMEOUT: Duration = Duration::from_secs(5);
-
-impl AgentTransport {
-    /// Async send — only valid for `Async` variant. Streaming RPCs that
-    /// consume `self` and spawn async tasks must go through the async path.
-    async fn async_send(
-        &mut self,
-        data: Bytes,
-    ) -> std::result::Result<(), arcbox_transport::error::TransportError> {
-        match self {
-            Self::Async(t) => t.send(data).await,
-            Self::Blocking(_) => Err(arcbox_transport::error::TransportError::Protocol(
-                "streaming RPCs not supported on blocking transport".into(),
-            )),
-        }
-    }
-
-    /// Async recv — only valid for `Async` variant.
-    async fn async_recv(
-        &mut self,
-    ) -> std::result::Result<Bytes, arcbox_transport::error::TransportError> {
-        match self {
-            Self::Async(t) => t.recv().await,
-            Self::Blocking(_) => Err(arcbox_transport::error::TransportError::Protocol(
-                "streaming RPCs not supported on blocking transport".into(),
-            )),
-        }
-    }
-
-    /// Split into send/recv halves — only valid for `Async` variant.
-    fn into_split(
-        self,
-    ) -> std::result::Result<
-        (
-            arcbox_transport::vsock::VsockSender,
-            arcbox_transport::vsock::VsockReceiver,
-        ),
-        arcbox_transport::error::TransportError,
-    > {
-        match self {
-            Self::Async(t) => t.into_split(),
-            Self::Blocking(_) => Err(arcbox_transport::error::TransportError::Protocol(
-                "split not supported on blocking transport".into(),
-            )),
-        }
-    }
-}
 
 /// Agent client for a single VM.
 pub struct AgentClient {
@@ -172,6 +110,11 @@ impl AgentClient {
         self.cid
     }
 
+    /// Builds a V2 wire message with an optional `trace_id`.
+    pub(crate) fn build_message(msg_type: MessageType, trace_id: &str, payload: &[u8]) -> Bytes {
+        wire::build_message(msg_type, trace_id, payload)
+    }
+
     /// Connects to the agent.
     ///
     /// # Errors
@@ -211,69 +154,6 @@ impl AgentClient {
         Ok(())
     }
 
-    /// Builds a V2 wire message with an optional `trace_id`.
-    ///
-    /// Wire format V2:
-    /// ```text
-    /// +----------------+----------------+------------------+----------------+
-    /// | Length (4B BE) | Type (4B BE)   | TraceLen (2B BE) | TraceID bytes  | Payload
-    /// +----------------+----------------+------------------+----------------+
-    /// ```
-    pub(crate) fn build_message(msg_type: MessageType, trace_id: &str, payload: &[u8]) -> Bytes {
-        let trace_bytes = trace_id.as_bytes();
-        let trace_len = trace_bytes.len().min(u16::MAX as usize);
-        // Length = type(4) + trace_len_field(2) + trace_bytes + payload
-        let length = TYPE_FIELD_SIZE + TRACE_LEN_FIELD_SIZE + trace_len + payload.len();
-        let mut buf = BytesMut::with_capacity(
-            FRAME_HEADER_SIZE + TRACE_LEN_FIELD_SIZE + trace_len + payload.len(),
-        );
-        buf.put_u32(length as u32);
-        buf.put_u32(msg_type as u32);
-        buf.put_u16(trace_len as u16);
-        if trace_len > 0 {
-            buf.extend_from_slice(&trace_bytes[..trace_len]);
-        }
-        buf.extend_from_slice(payload);
-        buf.freeze()
-    }
-
-    /// Parses a V2 wire response. Returns (`resp_type`, `trace_id`, payload).
-    fn parse_response(response: &[u8]) -> Result<(u32, String, Vec<u8>)> {
-        if response.len() < FRAME_HEADER_SIZE {
-            return Err(CoreError::Machine("response too short".to_string()));
-        }
-        let mut cursor = std::io::Cursor::new(response);
-        let length = cursor.get_u32() as usize;
-        let resp_type = cursor.get_u32();
-
-        let remaining = length.saturating_sub(TYPE_FIELD_SIZE);
-        let offset = FRAME_HEADER_SIZE;
-
-        if remaining < TRACE_LEN_FIELD_SIZE || response.len() < offset + TRACE_LEN_FIELD_SIZE {
-            // No trace_len field; treat the rest as payload.
-            return Ok((resp_type, String::new(), response[offset..].to_vec()));
-        }
-
-        let trace_len = u16::from_be_bytes([response[offset], response[offset + 1]]) as usize;
-        let trace_start = offset + TRACE_LEN_FIELD_SIZE;
-        let trace_end = trace_start + trace_len;
-        let payload_start = trace_end;
-
-        if response.len() < trace_end {
-            return Ok((resp_type, String::new(), response[trace_start..].to_vec()));
-        }
-
-        let trace_id =
-            String::from_utf8(response[trace_start..trace_end].to_vec()).unwrap_or_default();
-        let payload = if response.len() > payload_start {
-            response[payload_start..].to_vec()
-        } else {
-            Vec::new()
-        };
-
-        Ok((resp_type, trace_id, payload))
-    }
-
     /// Sends an RPC request and receives a response.
     ///
     /// Automatically picks up the trace ID from task-local storage (set by
@@ -295,7 +175,7 @@ impl AgentClient {
             self.connect().await?;
         }
 
-        let buf = Self::build_message(msg_type, trace_id, payload);
+        let buf = wire::build_message(msg_type, trace_id, payload);
 
         let response = match &mut self.transport {
             AgentTransport::Async(t) => {
@@ -322,11 +202,11 @@ impl AgentClient {
             }
         };
 
-        let (resp_type, _resp_trace, payload) = Self::parse_response(&response)?;
+        let (resp_type, _resp_trace, payload) = wire::parse_response(&response)?;
 
         // Check for error response.
         if resp_type == MessageType::Error as u32 {
-            let error_msg = parse_error_response(&payload)?;
+            let error_msg = wire::parse_error_response(&payload)?;
             return Err(CoreError::Machine(error_msg));
         }
 
@@ -341,7 +221,7 @@ impl AgentClient {
         payload: &[u8],
     ) -> Result<(u32, Vec<u8>)> {
         let trace_id = "";
-        let buf = Self::build_message(msg_type, trace_id, payload);
+        let buf = wire::build_message(msg_type, trace_id, payload);
 
         let response = match &mut self.transport {
             AgentTransport::Blocking(t) => {
@@ -358,9 +238,9 @@ impl AgentClient {
             }
         };
 
-        let (resp_type, _resp_trace, payload) = Self::parse_response(&response)?;
+        let (resp_type, _resp_trace, payload) = wire::parse_response(&response)?;
         if resp_type == MessageType::Error as u32 {
-            let error_msg = parse_error_response(&payload)?;
+            let error_msg = wire::parse_error_response(&payload)?;
             return Err(CoreError::Machine(error_msg));
         }
         Ok((resp_type, payload))
@@ -663,9 +543,9 @@ impl AgentClient {
     }
 
     fn decode_readiness_event(raw: &[u8]) -> Result<ReadinessEvent> {
-        let (resp_type, _, resp_payload) = Self::parse_response(raw)?;
+        let (resp_type, _, resp_payload) = wire::parse_response(raw)?;
         if resp_type == MessageType::Error as u32 {
-            let error_msg = parse_error_response(&resp_payload)?;
+            let error_msg = wire::parse_error_response(&resp_payload)?;
             return Err(CoreError::Machine(error_msg));
         }
         if resp_type != MessageType::ReadinessEvent as u32 {
@@ -860,7 +740,7 @@ impl AgentClient {
         }
 
         let payload = req.encode_to_vec();
-        let buf = Self::build_message(MessageType::SandboxRunRequest, "", &payload);
+        let buf = wire::build_message(MessageType::SandboxRunRequest, "", &payload);
         self.transport
             .async_send(buf)
             .await
@@ -877,7 +757,7 @@ impl AgentClient {
                     }
                 };
 
-                let (resp_type, _, resp_payload) = match Self::parse_response(&raw) {
+                let (resp_type, _, resp_payload) = match wire::parse_response(&raw) {
                     Ok(p) => p,
                     Err(e) => {
                         let _ = tx.send(Err(e));
@@ -886,7 +766,7 @@ impl AgentClient {
                 };
 
                 if resp_type == MessageType::Error as u32 {
-                    let msg = parse_error_response(&resp_payload)
+                    let msg = wire::parse_error_response(&resp_payload)
                         .unwrap_or_else(|_| "unknown error".to_string());
                     let _ = tx.send(Err(CoreError::Machine(msg)));
                     break;
@@ -935,7 +815,7 @@ impl AgentClient {
         }
 
         let payload = req.encode_to_vec();
-        let buf = Self::build_message(MessageType::SandboxEventsRequest, "", &payload);
+        let buf = wire::build_message(MessageType::SandboxEventsRequest, "", &payload);
         self.transport
             .async_send(buf)
             .await
@@ -952,7 +832,7 @@ impl AgentClient {
                     }
                 };
 
-                let (resp_type, _, resp_payload) = match Self::parse_response(&raw) {
+                let (resp_type, _, resp_payload) = match wire::parse_response(&raw) {
                     Ok(p) => p,
                     Err(e) => {
                         let _ = tx.send(Err(e));
@@ -961,7 +841,7 @@ impl AgentClient {
                 };
 
                 if resp_type == MessageType::Error as u32 {
-                    let msg = parse_error_response(&resp_payload)
+                    let msg = wire::parse_error_response(&resp_payload)
                         .unwrap_or_else(|_| "unknown error".to_string());
                     let _ = tx.send(Err(CoreError::Machine(msg)));
                     break;
@@ -1009,7 +889,7 @@ impl AgentClient {
         }
 
         let payload = req.encode_to_vec();
-        let buf = Self::build_message(MessageType::SandboxExecRequest, "", &payload);
+        let buf = wire::build_message(MessageType::SandboxExecRequest, "", &payload);
         self.transport
             .async_send(buf)
             .await
@@ -1027,7 +907,7 @@ impl AgentClient {
             loop {
                 match stdin_rx.recv().await {
                     Some(data) => {
-                        let frame = Self::build_message(MessageType::SandboxExecInput, "", &data);
+                        let frame = wire::build_message(MessageType::SandboxExecInput, "", &data);
                         if sender.send(frame).await.is_err() {
                             break;
                         }
@@ -1038,7 +918,7 @@ impl AgentClient {
                     None => {
                         // Channel closed without explicit EOF; send best-effort EOF frame
                         // so the guest-side exec session doesn't hang waiting on stdin.
-                        let eof = Self::build_message(MessageType::SandboxExecInput, "", &[]);
+                        let eof = wire::build_message(MessageType::SandboxExecInput, "", &[]);
                         let _ = sender.send(eof).await;
                         break;
                     }
@@ -1059,7 +939,7 @@ impl AgentClient {
                     }
                 };
 
-                let (resp_type, _, resp_payload) = match Self::parse_response(&raw) {
+                let (resp_type, _, resp_payload) = match wire::parse_response(&raw) {
                     Ok(p) => p,
                     Err(e) => {
                         let _ = out_tx.send(Err(e));
@@ -1068,7 +948,7 @@ impl AgentClient {
                 };
 
                 if resp_type == MessageType::Error as u32 {
-                    let msg = parse_error_response(&resp_payload)
+                    let msg = wire::parse_error_response(&resp_payload)
                         .unwrap_or_else(|_| "unknown error".to_string());
                     let _ = out_tx.send(Err(CoreError::Machine(msg)));
                     break;
@@ -1170,24 +1050,6 @@ impl AgentClient {
     }
 }
 
-/// Parses an error response from the agent.
-fn parse_error_response(payload: &[u8]) -> Result<String> {
-    if payload.len() < ERROR_HEADER_SIZE {
-        return Ok("unknown error".to_string());
-    }
-
-    let mut cursor = std::io::Cursor::new(payload);
-    let _code = cursor.get_i32();
-    let msg_len = cursor.get_u32() as usize;
-
-    if payload.len() < ERROR_HEADER_SIZE + msg_len {
-        return Ok("truncated error message".to_string());
-    }
-
-    String::from_utf8(payload[ERROR_HEADER_SIZE..ERROR_HEADER_SIZE + msg_len].to_vec())
-        .map_err(|_| CoreError::Machine("invalid error message encoding".to_string()))
-}
-
 fn readiness_event_is_terminal(event: &ReadinessEvent) -> bool {
     use arcbox_protocol::agent::readiness_event::Kind;
 
@@ -1196,7 +1058,6 @@ fn readiness_event_is_terminal(event: &ReadinessEvent) -> bool {
         Ok(Kind::RuntimeReady | Kind::RuntimeFailed)
     )
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
