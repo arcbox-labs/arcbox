@@ -2,9 +2,9 @@ use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use toml_edit::DocumentMut;
-use xtask_kit::fs::copy_file;
+use xtask_kit::{fs::copy_file, repo};
 
-use crate::{BootAssetSource, DevArgs, DevCommand, support::repo_root};
+use crate::{BootAssetSource, DevArgs, DevCommand};
 
 pub fn run(args: DevArgs) -> Result<()> {
     match args.command {
@@ -13,7 +13,7 @@ pub fn run(args: DevArgs) -> Result<()> {
 }
 
 pub fn prepare_boot_assets(args: crate::BootAssetsArgs) -> Result<()> {
-    let root = repo_root()?;
+    let root = repo::root_from_xtask_manifest(env!("CARGO_MANIFEST_DIR"))?;
     let version = match args.version {
         Some(version) => version,
         None => boot_version(&root.join("assets.lock"))?,

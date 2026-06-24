@@ -4,7 +4,6 @@ use anyhow::Result;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 mod commands;
-mod support;
 
 #[derive(Parser)]
 #[command(author, version, about = "ArcBox repository automation")]
@@ -142,7 +141,7 @@ struct PackageTarballArgs {
 
 fn main() {
     if let Err(error) = run() {
-        if let Some(exit) = error.downcast_ref::<support::ExitCode>() {
+        if let Some(exit) = error.downcast_ref::<xtask_kit::process::ExitCode>() {
             std::process::exit(exit.code());
         }
         eprintln!("Error: {error:#}");

@@ -5,8 +5,9 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use toml_edit::{DocumentMut, value};
+use xtask_kit::{fs::write_string, process::ExitCode};
 
-use crate::{CheckToolUpdatesArgs, support::ExitCode};
+use crate::CheckToolUpdatesArgs;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -94,8 +95,7 @@ pub fn run(args: CheckToolUpdatesArgs) -> Result<()> {
         return Err(ExitCode::new(2).into());
     }
 
-    fs::write(&args.lockfile, doc.to_string())
-        .with_context(|| format!("writing {}", args.lockfile.display()))?;
+    write_string(&args.lockfile, doc.to_string())?;
     println!("{}", updates.join("\n"));
     Ok(())
 }
