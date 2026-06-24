@@ -52,9 +52,14 @@ impl HeaderMapProxyExt for HeaderMap {
     fn wants_upgrade(&self) -> bool {
         self.get(header::UPGRADE).is_some()
             || self
-                .get(header::CONNECTION)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.to_ascii_lowercase().contains("upgrade"))
+                .get_all(header::CONNECTION)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|value| {
+                    value
+                        .split(',')
+                        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+                })
     }
 }
 
@@ -70,4 +75,30 @@ fn is_hop_by_hop_header(name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn detects_upgrade_across_all_connection_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        headers.append(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+
+        assert!(headers.wants_upgrade());
+    }
+
+    #[test]
+    fn detects_upgrade_token_in_comma_separated_connection_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONNECTION,
+            HeaderValue::from_static("keep-alive, upgrade"),
+        );
+
+        assert!(headers.wants_upgrade());
+    }
 }

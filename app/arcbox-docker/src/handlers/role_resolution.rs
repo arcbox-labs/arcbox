@@ -8,60 +8,6 @@ use crate::workload::WorkloadRoleLookup;
 use axum::http::{HeaderMap, Method, Uri};
 use bytes::Bytes;
 
-/// Resolves the utility VM role for a `/containers/{id}/...` URI.
-///
-/// Lookup order:
-///
-/// 1. Consult the in-process [`WorkloadRoleRegistry`]. A
-///    [`WorkloadRoleLookup::Found`] returns the role directly. A
-///    [`WorkloadRoleLookup::Ambiguous`] short ID surfaces as a 409
-///    Conflict so we never silently pick a workload.
-/// 2. On [`WorkloadRoleLookup::Missing`] (e.g. after a daemon restart),
-///    probe the single HV guest dockerd. A hit is recorded and returned;
-///    a miss falls back to `native` so the request still reaches the HV
-///    guest, which returns the appropriate `404 No such container`.
-///
-/// ABX-375 runs one runtime VM, so the resolved role is always
-/// [`UtilityVmRole::Native`]; the registry still disambiguates short
-/// IDs / names within that VM.
-#[tracing::instrument(
-    name = "docker.role.container",
-    skip(state),
-    fields(uri = %uri, container_id = tracing::field::Empty, utility_vm = tracing::field::Empty),
-    err
-)]
-pub async fn resolve_container_role(state: &AppState, uri: &Uri) -> Result<UtilityVmRole> {
-    let Some(id) = extract_container_id(uri) else {
-        tracing::Span::current().record("utility_vm", UtilityVmRole::Native.as_str());
-        return Ok(UtilityVmRole::Native);
-    };
-    tracing::Span::current().record("container_id", id.as_str());
-    match state.workload_roles.lookup(&id).await {
-        WorkloadRoleLookup::Found(role) => {
-            tracing::Span::current().record("utility_vm", role.as_str());
-            Ok(role)
-        }
-        WorkloadRoleLookup::Ambiguous => Err(ambiguous_workload_error(&id)),
-        WorkloadRoleLookup::Missing => match rebuild_container_role_from_guests(state, &id).await {
-            WorkloadRoleLookup::Found(role) => {
-                tracing::Span::current().record("utility_vm", role.as_str());
-                state.workload_roles.record(id.clone(), role).await;
-                tracing::debug!(
-                    container_id = %id,
-                    utility_vm = role.as_str(),
-                    "rebuilt workload role from guest dockerd",
-                );
-                Ok(role)
-            }
-            WorkloadRoleLookup::Ambiguous => Err(ambiguous_workload_error(&id)),
-            WorkloadRoleLookup::Missing => {
-                tracing::Span::current().record("utility_vm", UtilityVmRole::Native.as_str());
-                Ok(UtilityVmRole::Native)
-            }
-        },
-    }
-}
-
 /// Resolves the utility VM role for any Docker request URI that may carry a
 /// workload identity (container or exec). Used by the catch-all proxy
 /// fallback so unrouted endpoints like `/containers/{id}/archive` still

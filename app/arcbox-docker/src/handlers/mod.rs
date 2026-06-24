@@ -15,7 +15,7 @@ mod role_resolution;
 pub(crate) use admission::require_amd64_runtime;
 pub(crate) use identity::{extract_container_id, extract_exec_id};
 pub(crate) use proxying::{ensure_role_ready, proxy_to_role, proxy_upload_to_role};
-pub(crate) use role_resolution::{resolve_container_role, resolve_role_from_uri};
+pub(crate) use role_resolution::resolve_role_from_uri;
 
 pub(crate) use build::build_image;
 pub(crate) use container::{

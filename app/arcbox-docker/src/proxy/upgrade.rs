@@ -47,6 +47,9 @@ impl RawUpgradeRequest<'_> {
             {
                 continue;
             }
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
             raw.extend_from_slice(key.as_str().as_bytes());
             raw.extend_from_slice(b": ");
             raw.extend_from_slice(value.as_bytes());
@@ -90,7 +93,7 @@ async fn send_raw_upgrade(
     // belong to the upgraded stream, so return the over-read tail to the
     // bridge caller.
     let mut buf = Vec::with_capacity(1024);
-    let header_end_index = loop {
+    let (header_end_index, status, response_headers) = loop {
         let mut chunk = [0_u8; 1024];
         let n = stream
             .read(&mut chunk)
@@ -103,8 +106,8 @@ async fn send_raw_upgrade(
         }
         buf.extend_from_slice(&chunk[..n]);
 
-        if let Some(pos) = parsed_response_head_len(&buf)? {
-            break pos;
+        if let Some(parsed) = parse_response_head(&buf)? {
+            break parsed;
         }
         if buf.len() > MAX_UPGRADE_RESPONSE_HEAD_BYTES {
             return Err(DockerError::Server(
@@ -114,46 +117,30 @@ async fn send_raw_upgrade(
     };
 
     let extra = Bytes::copy_from_slice(&buf[header_end_index..]);
-    let header_bytes = &buf[..header_end_index];
-    let (status, response_headers) = parse_response_head(header_bytes)?;
 
     Ok((status, response_headers, extra))
 }
 
-fn parsed_response_head_len(buf: &[u8]) -> Result<Option<usize>> {
+fn parse_response_head(buf: &[u8]) -> Result<Option<(usize, StatusCode, HeaderMap)>> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_UPGRADE_RESPONSE_HEADERS];
     let mut response = httparse::Response::new(&mut headers);
-    match response.parse(buf) {
-        Ok(httparse::Status::Complete(len)) => Ok(Some(len)),
-        Ok(httparse::Status::Partial) => Ok(None),
+    let header_end_index = match response.parse(buf) {
+        Ok(httparse::Status::Complete(len)) => len,
+        Ok(httparse::Status::Partial) => return Ok(None),
         Err(err) => Err(DockerError::Server(format!(
             "failed to parse upgrade response: {err}"
-        ))),
-    }
-}
-
-fn parse_response_head(buf: &[u8]) -> Result<(StatusCode, HeaderMap)> {
-    let mut headers = [httparse::EMPTY_HEADER; MAX_UPGRADE_RESPONSE_HEADERS];
-    let mut response = httparse::Response::new(&mut headers);
-    let status = match response.parse(buf) {
-        Ok(httparse::Status::Complete(_)) => response
-            .code
-            .ok_or_else(|| DockerError::Server("upgrade response missing status code".into()))?,
-        Ok(httparse::Status::Partial) => {
-            return Err(DockerError::Server("incomplete upgrade response".into()));
-        }
-        Err(err) => {
-            return Err(DockerError::Server(format!(
-                "failed to parse upgrade response: {err}"
-            )));
-        }
+        )))?,
     };
+
+    let status = response
+        .code
+        .ok_or_else(|| DockerError::Server("upgrade response missing status code".into()))?;
 
     let status = StatusCode::from_u16(status)
         .map_err(|_| DockerError::Server(format!("invalid status code: {status}")))?;
 
     let mut response_headers = HeaderMap::new();
-    for parsed in response.headers {
+    for parsed in response.headers.iter() {
         let Ok(name) = HeaderName::from_bytes(parsed.name.as_bytes()) else {
             continue;
         };
@@ -163,7 +150,7 @@ fn parse_response_head(buf: &[u8]) -> Result<(StatusCode, HeaderMap)> {
         response_headers.append(name, value);
     }
 
-    Ok((status, response_headers))
+    Ok(Some((header_end_index, status, response_headers)))
 }
 
 /// Forward an HTTP request with upgrade support to guest dockerd.
@@ -316,4 +303,44 @@ pub async fn proxy_with_upgrade_for_role(
     });
 
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_upgrade_request_skips_non_utf8_header_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-good", HeaderValue::from_static("ok"));
+        headers.insert(
+            "x-binary",
+            HeaderValue::from_bytes(&[0xff]).expect("HeaderValue accepts opaque bytes"),
+        );
+
+        let raw = RawUpgradeRequest {
+            method: &Method::POST,
+            path_and_query: "/session",
+            headers: &headers,
+            body: b"{}",
+        }
+        .encode();
+        let raw = String::from_utf8(raw).expect("non-UTF-8 header should be omitted");
+
+        assert!(raw.contains("x-good: ok\r\n"));
+        assert!(!raw.contains("x-binary"));
+    }
+
+    #[test]
+    fn parse_response_head_returns_header_end_and_overread_boundary() {
+        let response = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: tcp\r\n\r\nextra";
+
+        let (len, status, headers) = parse_response_head(response)
+            .unwrap()
+            .expect("response head is complete");
+
+        assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(headers.get(header::UPGRADE).unwrap(), "tcp");
+        assert_eq!(&response[len..], b"extra");
+    }
 }
