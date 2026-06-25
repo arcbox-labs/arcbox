@@ -12,8 +12,8 @@ use arcbox_protocol::agent::{
     KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
     KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
     KubernetesStopRequest, KubernetesStopResponse, MmapReadFileRequest, MmapReadFileResponse,
-    PingRequest, PingResponse, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
-    RuntimeStatusResponse, SystemInfo,
+    PingRequest, PingResponse, ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse,
+    RuntimeStatusRequest, RuntimeStatusResponse, SystemInfo, WatchReadinessRequest,
 };
 use arcbox_protocol::sandbox_v1::{
     CheckpointRequest, CheckpointResponse, CreateSandboxRequest, CreateSandboxResponse,
@@ -525,6 +525,131 @@ impl AgentClient {
 
         RuntimeStatusResponse::decode(&resp_payload[..])
             .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+    }
+
+    /// Watches guest readiness until the agent reports a terminal state.
+    ///
+    /// Unlike the older host-side poll loop, this is one request on one
+    /// connection. The guest publishes readiness transitions as soon as it
+    /// observes them, which removes host retry overshoot from warm boot.
+    pub async fn watch_readiness(
+        mut self,
+        start_runtime_if_needed: bool,
+        timeout: Duration,
+    ) -> Result<ReadinessEvent> {
+        if !self.connected {
+            self.connect().await?;
+        }
+
+        let req = WatchReadinessRequest {
+            start_runtime_if_needed,
+            timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+        };
+        let payload = req.encode_to_vec();
+        let buf = Self::build_message(MessageType::WatchReadinessRequest, "", &payload);
+
+        match &mut self.transport {
+            AgentTransport::Async(t) => {
+                t.send(buf).await.map_err(|e| {
+                    CoreError::Machine(format!("failed to send readiness watch request: {e}"))
+                })?;
+
+                let deadline = tokio::time::Instant::now() + timeout;
+                loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(CoreError::Machine(
+                            "timeout waiting for guest readiness event".to_string(),
+                        ));
+                    }
+
+                    let raw = tokio::time::timeout(remaining, t.recv())
+                        .await
+                        .map_err(|_| {
+                            CoreError::Machine(
+                                "timeout waiting for guest readiness event".to_string(),
+                            )
+                        })?
+                        .map_err(|e| {
+                            CoreError::Machine(format!("failed to receive readiness event: {e}"))
+                        })?;
+
+                    let event = Self::decode_readiness_event(&raw)?;
+                    if readiness_event_is_terminal(&event) || !start_runtime_if_needed {
+                        return Ok(event);
+                    }
+                }
+            }
+            AgentTransport::Blocking(t) => tokio::task::block_in_place(|| {
+                let deadline = Instant::now() + timeout;
+                t.send(&buf, deadline).map_err(|e| {
+                    CoreError::Machine(format!("failed to send readiness watch request: {e}"))
+                })?;
+
+                loop {
+                    let raw = t.recv(deadline).map_err(|e| {
+                        CoreError::Machine(format!("failed to receive readiness event: {e}"))
+                    })?;
+                    let event = Self::decode_readiness_event(&raw)?;
+                    if readiness_event_is_terminal(&event) || !start_runtime_if_needed {
+                        return Ok(event);
+                    }
+                }
+            }),
+        }
+    }
+
+    /// Blocking readiness watch for the macOS HV socketpair transport.
+    ///
+    /// This is used from startup's blocking probe thread so HV readiness does
+    /// not touch tokio's kqueue reactor while the guest is still booting.
+    pub fn watch_readiness_blocking(
+        mut self,
+        start_runtime_if_needed: bool,
+        timeout: Duration,
+    ) -> Result<ReadinessEvent> {
+        let req = WatchReadinessRequest {
+            start_runtime_if_needed,
+            timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+        };
+        let payload = req.encode_to_vec();
+        let buf = Self::build_message(MessageType::WatchReadinessRequest, "", &payload);
+
+        let AgentTransport::Blocking(t) = &mut self.transport else {
+            return Err(CoreError::Machine(
+                "blocking readiness watch called on async transport".to_string(),
+            ));
+        };
+
+        let deadline = Instant::now() + timeout;
+        t.send(&buf, deadline).map_err(|e| {
+            CoreError::Machine(format!("failed to send readiness watch request: {e}"))
+        })?;
+
+        loop {
+            let raw = t.recv(deadline).map_err(|e| {
+                CoreError::Machine(format!("failed to receive readiness event: {e}"))
+            })?;
+            let event = Self::decode_readiness_event(&raw)?;
+            if readiness_event_is_terminal(&event) || !start_runtime_if_needed {
+                return Ok(event);
+            }
+        }
+    }
+
+    fn decode_readiness_event(raw: &[u8]) -> Result<ReadinessEvent> {
+        let (resp_type, _, resp_payload) = Self::parse_response(raw)?;
+        if resp_type == MessageType::Error as u32 {
+            let error_msg = parse_error_response(&resp_payload)?;
+            return Err(CoreError::Machine(error_msg));
+        }
+        if resp_type != MessageType::ReadinessEvent as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected readiness response type: 0x{resp_type:04x}"
+            )));
+        }
+        ReadinessEvent::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode readiness event: {e}")))
     }
 
     /// Starts the native Kubernetes cluster in the guest VM.
@@ -1144,6 +1269,15 @@ fn parse_error_response(payload: &[u8]) -> Result<String> {
 
     String::from_utf8(payload[ERROR_HEADER_SIZE..ERROR_HEADER_SIZE + msg_len].to_vec())
         .map_err(|_| CoreError::Machine("invalid error message encoding".to_string()))
+}
+
+fn readiness_event_is_terminal(event: &ReadinessEvent) -> bool {
+    use arcbox_protocol::agent::readiness_event::Kind;
+
+    matches!(
+        Kind::try_from(event.kind),
+        Ok(Kind::RuntimeReady | Kind::RuntimeFailed)
+    )
 }
 
 #[cfg(test)]

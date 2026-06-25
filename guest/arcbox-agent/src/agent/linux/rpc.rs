@@ -11,10 +11,11 @@ use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use arcbox_protocol::agent::PingResponse;
+use prost::Message as _;
 
 use crate::rpc::{
     AGENT_VERSION, ErrorResponse, RpcRequest, RpcResponse, parse_request, read_message,
-    write_response,
+    write_message, write_response,
 };
 
 use super::disk::handle_disk_trim;
@@ -76,6 +77,10 @@ where
 
         // Parse and handle the request.
         let result = match parse_request(msg_type, &payload) {
+            Ok(RpcRequest::WatchReadiness(req)) => {
+                handle_watch_readiness(&mut stream, req, &trace_id).await?;
+                continue;
+            }
             Ok(request) => handle_request(request).await,
             Err(e) => {
                 tracing::warn!(trace_id = %trace_id, "Failed to parse request: {}", e);
@@ -119,7 +124,135 @@ async fn handle_request(request: RpcRequest) -> RequestResult {
         RpcRequest::Shutdown(req) => RequestResult::Single(handle_shutdown(req)),
         RpcRequest::MmapReadFile(req) => RequestResult::Single(handle_mmap_read_file(req)),
         RpcRequest::DiskTrim(_) => RequestResult::Single(handle_disk_trim().await),
+        RpcRequest::WatchReadiness(_) => unreachable!("watch readiness is streaming"),
     }
+}
+
+async fn handle_watch_readiness<S>(
+    stream: &mut S,
+    req: arcbox_protocol::agent::WatchReadinessRequest,
+    trace_id: &str,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    use arcbox_protocol::agent::readiness_event::Kind;
+    use arcbox_protocol::agent::{ReadinessEvent, RuntimeEnsureRequest};
+
+    write_readiness_event(
+        stream,
+        trace_id,
+        ReadinessEvent {
+            kind: Kind::AgentReady as i32,
+            endpoint: String::new(),
+            detail: "agent ready".to_string(),
+            services: Vec::new(),
+        },
+    )
+    .await?;
+
+    if !req.start_runtime_if_needed {
+        return Ok(());
+    }
+
+    write_readiness_event(
+        stream,
+        trace_id,
+        ReadinessEvent {
+            kind: Kind::RuntimeStarting as i32,
+            endpoint: String::new(),
+            detail: "ensuring guest runtime".to_string(),
+            services: Vec::new(),
+        },
+    )
+    .await?;
+
+    let timeout = Duration::from_millis(u64::from(req.timeout_ms).max(1));
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        let response = match super::runtime::handle_ensure_runtime(RuntimeEnsureRequest {
+            start_if_needed: true,
+        })
+        .await
+        {
+            RpcResponse::RuntimeEnsure(response) => response,
+            other => {
+                anyhow::bail!("unexpected ensure runtime response: {:?}", other);
+            }
+        };
+        let response_message = response.message;
+
+        let status = match super::runtime::handle_runtime_status(
+            arcbox_protocol::agent::RuntimeStatusRequest {},
+        )
+        .await
+        {
+            RpcResponse::RuntimeStatus(status) => status,
+            other => {
+                anyhow::bail!("unexpected runtime status response: {:?}", other);
+            }
+        };
+
+        if response.ready || status.docker_ready {
+            return write_readiness_event(
+                stream,
+                trace_id,
+                ReadinessEvent {
+                    kind: Kind::RuntimeReady as i32,
+                    endpoint: if response.endpoint.is_empty() {
+                        status.endpoint
+                    } else {
+                        response.endpoint
+                    },
+                    detail: if response_message.is_empty() {
+                        status.detail
+                    } else {
+                        response_message
+                    },
+                    services: status.services,
+                },
+            )
+            .await;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return write_readiness_event(
+                stream,
+                trace_id,
+                ReadinessEvent {
+                    kind: Kind::RuntimeFailed as i32,
+                    endpoint: status.endpoint,
+                    detail: if response_message.is_empty() {
+                        status.detail
+                    } else {
+                        response_message
+                    },
+                    services: status.services,
+                },
+            )
+            .await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn write_readiness_event<S>(
+    stream: &mut S,
+    trace_id: &str,
+    event: arcbox_protocol::agent::ReadinessEvent,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    write_message(
+        stream,
+        crate::rpc::MessageType::ReadinessEvent,
+        trace_id,
+        &event.encode_to_vec(),
+    )
+    .await
 }
 
 /// Handles a Shutdown request.

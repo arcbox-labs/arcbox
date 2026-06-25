@@ -32,6 +32,8 @@ pub enum MessageType {
     /// Request the guest to run `fstrim` on data mount points so the host
     /// sparse image reclaims freed blocks.
     DiskTrimRequest = 0x000C,
+    /// Opens a guest-driven readiness event stream.
+    WatchReadinessRequest = 0x000D,
 
     // Sandbox CRUD request types (0x0020 - 0x0024).
     SandboxCreateRequest = 0x0020,
@@ -69,6 +71,8 @@ pub enum MessageType {
     MmapReadFileResponse = 0x100B,
     /// Response to `DiskTrimRequest` with per-mount trim summary.
     DiskTrimResponse = 0x100C,
+    /// Guest-driven readiness event frame.
+    ReadinessEvent = 0x100D,
     PortBindingsChanged = 0x1030,
     PortBindingsRemoved = 0x1031,
 
@@ -112,6 +116,7 @@ impl MessageType {
             0x000A => Some(Self::ShutdownRequest),
             0x000B => Some(Self::MmapReadFileRequest),
             0x000C => Some(Self::DiskTrimRequest),
+            0x000D => Some(Self::WatchReadinessRequest),
             // Sandbox CRUD requests.
             0x0020 => Some(Self::SandboxCreateRequest),
             0x0021 => Some(Self::SandboxStopRequest),
@@ -141,6 +146,7 @@ impl MessageType {
             0x100A => Some(Self::ShutdownResponse),
             0x100B => Some(Self::MmapReadFileResponse),
             0x100C => Some(Self::DiskTrimResponse),
+            0x100D => Some(Self::ReadinessEvent),
             0x1030 => Some(Self::PortBindingsChanged),
             0x1031 => Some(Self::PortBindingsRemoved),
             // Sandbox CRUD responses.
@@ -218,6 +224,7 @@ mod tests {
             (0x000A, MessageType::ShutdownRequest),
             (0x000B, MessageType::MmapReadFileRequest),
             (0x000C, MessageType::DiskTrimRequest),
+            (0x000D, MessageType::WatchReadinessRequest),
             (0x1001, MessageType::PingResponse),
             (0x1002, MessageType::GetSystemInfoResponse),
             (0x1003, MessageType::EnsureRuntimeResponse),
@@ -230,6 +237,7 @@ mod tests {
             (0x100A, MessageType::ShutdownResponse),
             (0x100B, MessageType::MmapReadFileResponse),
             (0x100C, MessageType::DiskTrimResponse),
+            (0x100D, MessageType::ReadinessEvent),
             (0x1030, MessageType::PortBindingsChanged),
             (0x1031, MessageType::PortBindingsRemoved),
             (0x0000, MessageType::Empty),

@@ -3,9 +3,10 @@ use crate::config::ContainerRuntimeConfig;
 use crate::error::{CoreError, Result};
 use crate::machine::MachineManager;
 use crate::vm_lifecycle::VmLifecycleManager;
+use arcbox_protocol::agent::readiness_event::Kind;
 use async_trait::async_trait;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Guest Docker backend (dockerd/containerd/runc inside VM).
 pub struct GuestDockerBackend {
@@ -32,80 +33,23 @@ impl GuestDockerBackend {
     }
 
     async fn wait_guest_endpoint_ready(&self) -> Result<()> {
-        // Each attempt is a handful of ~1ms vsock RPCs, so the backoff cap
-        // (which bounds how late we notice dockerd became ready) matters
-        // far more than the per-attempt cost. dockerd typically comes up a
-        // few hundred ms after the agent; with the old 120→1200ms backoff
-        // the discovery overshoot alone averaged ~200ms per cold boot.
-        const INITIAL_DELAY_MS: u64 = 25;
-        const MAX_DELAY_MS: u64 = 250;
-
         let port = self.config.guest_docker_vsock_port;
         let timeout = Duration::from_millis(self.config.startup_timeout_ms);
-        let deadline = Instant::now() + timeout;
-        let mut delay_ms = INITIAL_DELAY_MS;
-        let mut last_status_detail: Option<String> = None;
+        let agent = self.machine_manager.connect_agent(self.machine_name)?;
 
-        loop {
-            let mut docker_ready = false;
-
-            if let Ok(mut agent) = self.machine_manager.connect_agent(self.machine_name) {
-                match agent.ensure_runtime(true).await {
-                    Ok(resp) => {
-                        last_status_detail = Some(resp.message.clone());
-                        if resp.ready {
-                            validate_reported_vsock_endpoint(&resp.endpoint, port)?;
-                            docker_ready = true;
-                        }
-                        tracing::debug!(
-                            ready = resp.ready,
-                            endpoint = resp.endpoint,
-                            message = resp.message,
-                            status = resp.status,
-                            "requested guest runtime ensure"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::trace!("failed to request guest runtime ensure: {}", e);
-                    }
-                }
-
-                if !docker_ready {
-                    match agent.get_runtime_status().await {
-                        Ok(status) => {
-                            last_status_detail = Some(status.detail.clone());
-                            if status.docker_ready {
-                                validate_reported_vsock_endpoint(&status.endpoint, port)?;
-                                docker_ready = true;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::trace!("failed to get guest runtime status: {}", e);
-                        }
-                    }
-                }
-            }
-
-            if docker_ready {
+        match agent.watch_readiness(true, timeout).await {
+            Ok(event) if Kind::try_from(event.kind) == Ok(Kind::RuntimeReady) => {
+                validate_reported_vsock_endpoint(&event.endpoint, port)?;
                 tracing::debug!(port, "guest docker runtime is ready");
-                return Ok(());
-            } else if Instant::now() >= deadline {
-                return Err(CoreError::Machine(format!(
-                    "guest docker endpoint on vsock port {} not ready within {}ms: {}",
-                    port,
-                    self.config.startup_timeout_ms,
-                    last_status_detail.unwrap_or_else(|| "runtime status unavailable".to_string())
-                )));
-            } else {
-                tracing::trace!(
-                    port,
-                    retry_delay_ms = delay_ms,
-                    "guest runtime not ready yet"
-                );
+                Ok(())
             }
-
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            delay_ms = (delay_ms * 3 / 2).min(MAX_DELAY_MS);
+            Ok(event) => Err(CoreError::Machine(format!(
+                "guest docker endpoint on vsock port {} not ready within {}ms: {}",
+                port, self.config.startup_timeout_ms, event.detail
+            ))),
+            Err(e) => Err(CoreError::Machine(format!(
+                "guest readiness watch failed: {e}"
+            ))),
         }
     }
 }

@@ -906,6 +906,11 @@ impl VmLifecycleManager {
     async fn wait_for_agent(&self, timeout: Duration) -> Result<()> {
         tracing::debug!("Waiting for agent to become ready...");
 
+        enum AgentProbe {
+            Ready,
+            Watch(crate::agent_client::AgentClient),
+        }
+
         let mm = Arc::clone(&self.machine_manager);
         let machine_name = self.machine_name.clone();
 
@@ -932,13 +937,24 @@ impl VmLifecycleManager {
                     }
                 }
 
-                // connect_agent → AF_UNIX detected → BlockingVsockTransport.
-                // ping_blocking uses libc::poll with 5s deadline — no tokio.
+                // connect_agent discovers when the guest starts listening on
+                // the agent vsock port. After connection succeeds, use the
+                // agent's readiness event stream. The daemon and guest agent
+                // are bundle-locked, so a readiness-watch failure is a startup
+                // protocol error rather than a compatibility fallback signal.
+                // HV's AF_UNIX transport stays on this blocking thread; async
+                // transports are handed back to tokio below.
                 match mm.connect_agent(&machine_name) {
-                    Ok(mut agent) => match agent.ping_blocking() {
-                        Ok(_) => return Ok(()),
-                        Err(e) => tracing::debug!("Agent ping failed: {e}"),
-                    },
+                    Ok(agent) if agent.is_blocking() => {
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            return Err(CoreError::Vm("timeout waiting for agent".to_string()));
+                        }
+                        agent.watch_readiness_blocking(false, remaining)?;
+                        return Ok(AgentProbe::Ready);
+                    }
+                    Ok(agent) => return Ok(AgentProbe::Watch(agent)),
                     Err(e) => tracing::debug!("Agent connection failed: {e}"),
                 }
 
@@ -950,7 +966,12 @@ impl VmLifecycleManager {
         .await
         .map_err(|e| CoreError::Vm(format!("probe task panicked: {e}")))?;
 
-        probe_result?;
+        match probe_result? {
+            AgentProbe::Ready => {}
+            AgentProbe::Watch(agent) => {
+                agent.watch_readiness(false, timeout).await?;
+            }
+        }
 
         // Back on async context — do async follow-up work.
         tracing::info!("Agent is ready");
