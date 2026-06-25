@@ -947,12 +947,17 @@ impl VmLifecycleManager {
                 }
 
                 // connect_agent discovers when the guest starts listening on
-                // the agent vsock port. After connection succeeds, use the
-                // agent's readiness event stream. The daemon and guest agent
-                // are bundle-locked, so a readiness-watch failure is a startup
-                // protocol error rather than a compatibility fallback signal.
-                // HV's AF_UNIX transport stays on this blocking thread; async
-                // transports are handed back to tokio below.
+                // the agent vsock port, then the readiness event stream waits
+                // for the guest to report a terminal state.
+                //
+                // On the HV AF_UNIX socketpair, connect_agent can succeed
+                // optimistically *before* the guest agent is actually listening
+                // (the guest's /sbin/init has not even run yet at this point),
+                // so the readiness read then fails with EOF. That is a normal
+                // "not ready yet" race, not a fatal protocol error — keep
+                // polling until a genuine readiness event arrives or the
+                // deadline elapses. HV's AF_UNIX transport stays on this
+                // blocking thread; async transports are handed back to tokio.
                 match mm.connect_agent(&machine_name) {
                     Ok(agent) if agent.is_blocking() => {
                         let remaining =
@@ -960,8 +965,10 @@ impl VmLifecycleManager {
                         if remaining.is_zero() {
                             return Err(CoreError::Vm("timeout waiting for agent".to_string()));
                         }
-                        agent.watch_readiness_blocking(false, remaining)?;
-                        return Ok(AgentProbe::Ready);
+                        match agent.watch_readiness_blocking(false, remaining) {
+                            Ok(_) => return Ok(AgentProbe::Ready),
+                            Err(e) => tracing::debug!("agent not ready yet: {e}"),
+                        }
                     }
                     Ok(agent) => return Ok(AgentProbe::Watch(agent)),
                     Err(e) => tracing::debug!("Agent connection failed: {e}"),
@@ -977,8 +984,39 @@ impl VmLifecycleManager {
 
         match probe_result? {
             AgentProbe::Ready => {}
-            AgentProbe::Watch(agent) => {
-                agent.watch_readiness(false, timeout).await?;
+            AgentProbe::Watch(first_agent) => {
+                // Mirror the blocking path's tolerance: an async transport may
+                // also connect before the guest agent is listening, so retry
+                // both the connect and the readiness watch (reconnecting each
+                // round) until it yields a genuine event or the timeout elapses.
+                let deadline = tokio::time::Instant::now() + timeout;
+                let mut next_agent = Some(first_agent);
+                loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(CoreError::Vm("timeout waiting for agent".to_string()));
+                    }
+                    // Reuse the connection from the probe loop on the first
+                    // iteration, then reconnect on each retry.
+                    let agent = match next_agent.take() {
+                        Some(agent) => agent,
+                        None => match self.machine_manager.connect_agent(&self.machine_name) {
+                            Ok(agent) => agent,
+                            Err(e) => {
+                                tracing::debug!("agent reconnect failed: {e}");
+                                tokio::time::sleep(Duration::from_millis(25)).await;
+                                continue;
+                            }
+                        },
+                    };
+                    match agent.watch_readiness(false, remaining).await {
+                        Ok(_) => break,
+                        Err(e) => {
+                            tracing::debug!("agent not ready yet: {e}");
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                    }
+                }
             }
         }
 
