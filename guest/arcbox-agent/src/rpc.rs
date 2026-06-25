@@ -18,9 +18,9 @@ use arcbox_protocol::agent::{
     KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
     KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
     KubernetesStopRequest, KubernetesStopResponse, MmapReadFileRequest, MmapReadFileResponse,
-    PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved, RuntimeEnsureRequest,
-    RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, ShutdownRequest,
-    ShutdownResponse, SystemInfo,
+    PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved, ReadinessEvent,
+    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
+    ShutdownRequest, ShutdownResponse, SystemInfo, WatchReadinessRequest,
 };
 
 /// Agent version string.
@@ -80,6 +80,7 @@ pub enum RpcRequest {
     Shutdown(ShutdownRequest),
     MmapReadFile(MmapReadFileRequest),
     DiskTrim(DiskTrimRequest),
+    WatchReadiness(WatchReadinessRequest),
 }
 
 /// RPC response envelope.
@@ -99,6 +100,7 @@ pub enum RpcResponse {
     Empty,
     PortBindingsChanged(PortBindingsChanged),
     PortBindingsRemoved(PortBindingsRemoved),
+    ReadinessEvent(ReadinessEvent),
     Error(ErrorResponse),
     MmapReadFile(MmapReadFileResponse),
 }
@@ -121,6 +123,7 @@ impl RpcResponse {
             Self::Empty => MessageType::Empty,
             Self::PortBindingsChanged(_) => MessageType::PortBindingsChanged,
             Self::PortBindingsRemoved(_) => MessageType::PortBindingsRemoved,
+            Self::ReadinessEvent(_) => MessageType::ReadinessEvent,
             Self::Error(_) => MessageType::Error,
             Self::MmapReadFile(_) => MessageType::MmapReadFileResponse,
         }
@@ -143,6 +146,7 @@ impl RpcResponse {
             Self::Empty => Empty::default().encode_to_vec(),
             Self::PortBindingsChanged(msg) => msg.encode_to_vec(),
             Self::PortBindingsRemoved(msg) => msg.encode_to_vec(),
+            Self::ReadinessEvent(msg) => msg.encode_to_vec(),
             Self::Error(err) => err.encode(),
             Self::MmapReadFile(msg) => msg.encode_to_vec(),
         }
@@ -315,6 +319,10 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
         MessageType::DiskTrimRequest => {
             let req = DiskTrimRequest::decode(payload)?;
             Ok(RpcRequest::DiskTrim(req))
+        }
+        MessageType::WatchReadinessRequest => {
+            let req = WatchReadinessRequest::decode(payload)?;
+            Ok(RpcRequest::WatchReadiness(req))
         }
         _ => anyhow::bail!("unexpected message type: {:?}", msg_type),
     }

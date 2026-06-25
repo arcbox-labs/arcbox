@@ -44,6 +44,9 @@ service AgentService {
     // Triggers an immediate fstrim on data mount points to reclaim sparse
     // file space on the host.
     rpc DiskTrim(DiskTrimRequest) returns (DiskTrimResponse);
+
+    // Streams guest readiness events until the requested runtime is ready or failed.
+    rpc WatchReadiness(WatchReadinessRequest) returns (stream ReadinessEvent);
 }
 
 // Ping request.
@@ -108,6 +111,34 @@ message RuntimeEnsureResponse {
 
 // Request for runtime status.
 message RuntimeStatusRequest {}
+
+// Request for guest-driven readiness events.
+message WatchReadinessRequest {
+    // Whether the agent should start the runtime if it is not ready.
+    bool start_runtime_if_needed = 1;
+    // Maximum time to wait for runtime readiness before reporting failure.
+    uint32 timeout_ms = 2;
+}
+
+// Guest readiness event.
+message ReadinessEvent {
+    enum Kind {
+        KIND_UNSPECIFIED = 0;
+        AGENT_READY = 1;
+        RUNTIME_STARTING = 2;
+        RUNTIME_READY = 3;
+        RUNTIME_FAILED = 4;
+    }
+
+    // Event kind.
+    Kind kind = 1;
+    // Runtime endpoint exposed to host proxy when known.
+    string endpoint = 2;
+    // Human-readable detail for diagnostics.
+    string detail = 3;
+    // Per-service status entries for fine-grained observability.
+    repeated ServiceStatus services = 4;
+}
 
 // Runtime status report.
 message RuntimeStatusResponse {

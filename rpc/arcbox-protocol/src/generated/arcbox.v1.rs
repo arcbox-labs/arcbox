@@ -1514,6 +1514,76 @@ pub struct RuntimeEnsureResponse {
 #[serde(rename_all = "camelCase")]
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct RuntimeStatusRequest {}
+/// Request for guest-driven readiness events.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct WatchReadinessRequest {
+    /// Whether the agent should start the runtime if it is not ready.
+    #[prost(bool, tag = "1")]
+    pub start_runtime_if_needed: bool,
+    /// Maximum time to wait for runtime readiness before reporting failure.
+    #[prost(uint32, tag = "2")]
+    pub timeout_ms: u32,
+}
+/// Guest readiness event.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadinessEvent {
+    /// Event kind.
+    #[prost(enumeration = "readiness_event::Kind", tag = "1")]
+    pub kind: i32,
+    /// Runtime endpoint exposed to host proxy when known.
+    #[prost(string, tag = "2")]
+    pub endpoint: ::prost::alloc::string::String,
+    /// Human-readable detail for diagnostics.
+    #[prost(string, tag = "3")]
+    pub detail: ::prost::alloc::string::String,
+    /// Per-service status entries for fine-grained observability.
+    #[prost(message, repeated, tag = "4")]
+    pub services: ::prost::alloc::vec::Vec<ServiceStatus>,
+}
+/// Nested message and enum types in `ReadinessEvent`.
+pub mod readiness_event {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Kind {
+        Unspecified = 0,
+        AgentReady = 1,
+        RuntimeStarting = 2,
+        RuntimeReady = 3,
+        RuntimeFailed = 4,
+    }
+    impl Kind {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unspecified => "KIND_UNSPECIFIED",
+                Self::AgentReady => "AGENT_READY",
+                Self::RuntimeStarting => "RUNTIME_STARTING",
+                Self::RuntimeReady => "RUNTIME_READY",
+                Self::RuntimeFailed => "RUNTIME_FAILED",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "KIND_UNSPECIFIED" => Some(Self::Unspecified),
+                "AGENT_READY" => Some(Self::AgentReady),
+                "RUNTIME_STARTING" => Some(Self::RuntimeStarting),
+                "RUNTIME_READY" => Some(Self::RuntimeReady),
+                "RUNTIME_FAILED" => Some(Self::RuntimeFailed),
+                _ => None,
+            }
+        }
+    }
+}
 /// Runtime status report.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
