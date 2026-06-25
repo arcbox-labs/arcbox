@@ -350,6 +350,42 @@ pub struct VmLifecycleManager {
     kubernetes_hold: std::sync::atomic::AtomicBool,
 }
 
+/// Ensures an explicit `earlycon=` directive on the custom-HV backend.
+///
+/// A bare `earlycon` relies on the device-tree `stdout-path` and produces nothing
+/// on the custom-HV PL011 emulator, so on `Hv` it is upgraded to the pinned
+/// `earlycon=pl011,<base>` form. The `Vz` backend has no PL011 MMIO device (it
+/// uses a VirtIO console), so pointing the kernel at that address would break VZ
+/// early boot — its cmdline is left untouched. An explicit operator `earlycon=`
+/// is always respected.
+fn ensure_earlycon(cmdline: String, backend: arcbox_vmm::VmBackend) -> String {
+    if !matches!(backend, arcbox_vmm::VmBackend::Hv) {
+        return cmdline;
+    }
+    if cmdline
+        .split_whitespace()
+        .any(|t| t.starts_with("earlycon="))
+    {
+        return cmdline;
+    }
+    let mut tokens: Vec<&str> = cmdline
+        .split_whitespace()
+        .filter(|t| *t != "earlycon")
+        .collect();
+    tokens.push(HV_EARLYCON_DIRECTIVE);
+    tokens.join(" ")
+}
+
+/// Builds the "timeout waiting for agent" error, folding in the last observed
+/// readiness error so a genuine guest-reported failure isn't masked as a plain
+/// timeout (per-iteration errors are otherwise only logged at debug level).
+fn agent_timeout_error(last_error: Option<&str>) -> CoreError {
+    match last_error {
+        Some(e) => CoreError::Vm(format!("timeout waiting for agent (last error: {e})")),
+        None => CoreError::Vm("timeout waiting for agent".to_string()),
+    }
+}
+
 impl VmLifecycleManager {
     /// Ensures a sparse, thin-provisioned block image of `size_bytes` virtual
     /// size exists at `path`, creating parent directories as needed.
@@ -844,21 +880,10 @@ impl VmLifecycleManager {
             .join(" ");
 
         // Ensure an explicit earlycon directive so early boot output reaches the
-        // host `guest_serial` log. A bare `earlycon` relies on the device-tree
-        // `stdout-path` and produces nothing on the custom-HV PL011 emulator, so
-        // upgrade it to the pinned `earlycon=pl011,<base>` form. An operator who
-        // already supplied an explicit `earlycon=` is respected as-is.
-        if !cmdline
-            .split_whitespace()
-            .any(|t| t.starts_with("earlycon="))
-        {
-            let mut tokens: Vec<&str> = cmdline
-                .split_whitespace()
-                .filter(|t| *t != "earlycon")
-                .collect();
-            tokens.push(HV_EARLYCON_DIRECTIVE);
-            cmdline = tokens.join(" ");
-        }
+        // host `guest_serial` log — but only on the custom-HV backend, whose PL011
+        // emulator the directive targets (VZ has no such device). See
+        // `ensure_earlycon`.
+        cmdline = ensure_earlycon(cmdline, self.config.backend);
 
         // Inject guest docker vsock port if configured.
         if let Some(port) = self.config.guest_docker_vsock_port {
@@ -903,6 +928,10 @@ impl VmLifecycleManager {
             // path), so a tight interval costs little and bounds the
             // discovery overshoot once the agent starts listening.
             let poll_interval = Duration::from_millis(25);
+            // Remember the last genuine readiness error so an exhausted deadline
+            // surfaces it instead of a bare "timeout" (a guest-reported failure
+            // also arrives here as an Err).
+            let mut last_readiness_err: Option<String> = None;
 
             while std::time::Instant::now() < deadline {
                 // Console output (best-effort, non-blocking).
@@ -931,11 +960,14 @@ impl VmLifecycleManager {
                         let remaining =
                             deadline.saturating_duration_since(std::time::Instant::now());
                         if remaining.is_zero() {
-                            return Err(CoreError::Vm("timeout waiting for agent".to_string()));
+                            return Err(agent_timeout_error(last_readiness_err.as_deref()));
                         }
                         match agent.watch_readiness_blocking(false, remaining) {
                             Ok(_) => return Ok(AgentProbe::Ready),
-                            Err(e) => tracing::debug!("agent not ready yet: {e}"),
+                            Err(e) => {
+                                tracing::debug!("agent not ready yet: {e}");
+                                last_readiness_err = Some(e.to_string());
+                            }
                         }
                     }
                     Ok(agent) => return Ok(AgentProbe::Watch(agent)),
@@ -945,7 +977,7 @@ impl VmLifecycleManager {
                 std::thread::sleep(poll_interval);
             }
 
-            Err(CoreError::Vm("timeout waiting for agent".to_string()))
+            Err(agent_timeout_error(last_readiness_err.as_deref()))
         })
         .await
         .map_err(|e| CoreError::Vm(format!("probe task panicked: {e}")))?;
@@ -959,10 +991,11 @@ impl VmLifecycleManager {
                 // round) until it yields a genuine event or the timeout elapses.
                 let deadline = tokio::time::Instant::now() + timeout;
                 let mut next_agent = Some(first_agent);
+                let mut last_readiness_err: Option<String> = None;
                 loop {
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
-                        return Err(CoreError::Vm("timeout waiting for agent".to_string()));
+                        return Err(agent_timeout_error(last_readiness_err.as_deref()));
                     }
                     // Reuse the connection from the probe loop on the first
                     // iteration, then reconnect on each retry.
@@ -977,10 +1010,17 @@ impl VmLifecycleManager {
                             }
                         },
                     };
+                    // Recompute the budget after a potentially slow reconnect so
+                    // watch_readiness doesn't block past the deadline.
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(agent_timeout_error(last_readiness_err.as_deref()));
+                    }
                     match agent.watch_readiness(false, remaining).await {
                         Ok(_) => break,
                         Err(e) => {
                             tracing::debug!("agent not ready yet: {e}");
+                            last_readiness_err = Some(e.to_string());
                             tokio::time::sleep(Duration::from_millis(25)).await;
                         }
                     }
@@ -1269,6 +1309,44 @@ mod tests {
         assert!(!VmLifecycleState::Stopping.needs_start());
         assert!(VmLifecycleState::Stopped.needs_start());
         assert!(VmLifecycleState::Failed.needs_start());
+    }
+
+    #[test]
+    fn ensure_earlycon_upgrades_bare_on_hv() {
+        let out = ensure_earlycon(
+            "console=hvc0 earlycon root=/dev/vda".to_string(),
+            arcbox_vmm::VmBackend::Hv,
+        );
+        assert!(out.contains(HV_EARLYCON_DIRECTIVE));
+        // The bare token is replaced, not left dangling alongside the directive.
+        assert!(!out.split_whitespace().any(|t| t == "earlycon"));
+    }
+
+    #[test]
+    fn ensure_earlycon_leaves_vz_untouched() {
+        // VZ has no PL011 device; the cmdline must pass through verbatim.
+        let cmdline = "console=hvc0 earlycon root=/dev/vda".to_string();
+        let out = ensure_earlycon(cmdline.clone(), arcbox_vmm::VmBackend::Vz);
+        assert_eq!(out, cmdline);
+        assert!(!out.contains("pl011"));
+    }
+
+    #[test]
+    fn ensure_earlycon_respects_explicit_directive() {
+        let cmdline = "console=hvc0 earlycon=pl011,0x9000000 root=/dev/vda".to_string();
+        let out = ensure_earlycon(cmdline.clone(), arcbox_vmm::VmBackend::Hv);
+        assert_eq!(out, cmdline);
+    }
+
+    #[test]
+    fn agent_timeout_error_folds_last_error() {
+        let bare = agent_timeout_error(None).to_string();
+        assert!(bare.contains("timeout waiting for agent"));
+        assert!(!bare.contains("last error"));
+
+        let folded = agent_timeout_error(Some("guest reported: disk full")).to_string();
+        assert!(folded.contains("timeout waiting for agent"));
+        assert!(folded.contains("guest reported: disk full"));
     }
 
     #[test]

@@ -42,6 +42,12 @@ mod platform {
 
     /// Powers off the VM, dispatching on [`ShutdownStrategy`].
     ///
+    /// `grace` means different things per strategy: under `DirectReboot` it is the
+    /// SIGTERM→SIGKILL dwell time for individual processes; under `SignalInit` it
+    /// is how long to wait for busybox init's *entire* orderly teardown (stop all
+    /// children, sync, power off) before forcing a direct reboot. Callers should
+    /// size it to cover the full init shutdown, not just a SIGTERM window.
+    ///
     /// This function does not return on success.
     pub fn poweroff(grace: Duration) {
         match shutdown_strategy(std::process::id()) {
