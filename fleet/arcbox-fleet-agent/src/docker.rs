@@ -19,13 +19,55 @@ use crate::host;
 pub struct RunSpec<'a> {
     /// Job identifier, used as the container name suffix.
     pub job_id: &'a str,
-    /// Resolved container image (never empty — caller must fall back to the
-    /// default before constructing this).
-    pub image: &'a str,
     /// Base64-encoded JIT runner config, passed through to `run.sh`.
     pub encoded_jit_config: &'a str,
     /// Target CPU architecture (`arm64` or `amd64`).
     pub arch: &'a str,
+}
+
+/// A container that has been created and started. Held by the caller while the
+/// job runs; [`wait`](RunningContainer::wait) drives it to completion, and a
+/// drop before then (e.g. `CancelRunner` aborting the task) kills and removes it
+/// via the embedded [`ContainerGuard`].
+pub struct RunningContainer {
+    client: Docker,
+    id: String,
+    guard: ContainerGuard,
+}
+
+impl RunningContainer {
+    /// Block until the container exits, then remove it. The agent reports no
+    /// outcome upstream (the GitHub webhook is authoritative); the outcome here
+    /// is for logging only.
+    pub async fn wait(self) -> Result<DockerOutcome> {
+        let Self { client, id, guard } = self;
+        let wait = client
+            .wait_container(
+                &id,
+                Some(WaitContainerOptions {
+                    condition: "not-running".to_owned(),
+                }),
+            )
+            .next()
+            .await
+            .context("container wait stream ended unexpectedly")?
+            .with_context(|| format!("waiting on container {id}"))?;
+
+        let exit_code = wait.status_code;
+        guard.defuse();
+        let options = RemoveContainerOptions {
+            force: true,
+            ..Default::default()
+        };
+        if let Err(e) = client.remove_container(&id, Some(options)).await {
+            warn!(container = %id, error = %e, "failed to remove container");
+        }
+
+        Ok(DockerOutcome {
+            success: exit_code == 0,
+            detail: format!("container exited with code {exit_code}"),
+        })
+    }
 }
 
 /// Terminal outcome of a containerized job.
@@ -120,24 +162,16 @@ impl DockerRunner {
         self.linux_arches.clone()
     }
 
-    /// Resolve the image for a job: prefer the platform-supplied value, fall
-    /// back to the configured default.
-    pub fn resolve_image<'a>(&'a self, platform_image: &'a str) -> &'a str {
-        if platform_image.is_empty() {
-            &self.default_image
-        } else {
-            platform_image
-        }
-    }
-
-    /// Run a job inside a container. Returns the terminal outcome.
+    /// Create and start a container for `spec`, returning a handle to await.
     ///
-    /// If the future is canceled (e.g. `CancelRunner` aborting the task), the
-    /// [`ContainerGuard`] kills and removes the container on drop.
-    pub async fn run_job(&self, spec: RunSpec<'_>) -> Result<DockerOutcome> {
+    /// Returning `Ok` means the container is running — the caller can then
+    /// accept the offer. Any failure up to here (image pull, create, start) is
+    /// an error so the caller rejects and the platform re-offers. A failure
+    /// after the guard is armed kills and removes the container on drop.
+    pub async fn start(&self, spec: RunSpec<'_>) -> Result<RunningContainer> {
         let platform = format!("linux/{}", spec.arch);
 
-        Self::pull_image(&self.client, spec.image, &platform).await?;
+        Self::pull_image(&self.client, &self.default_image, &platform).await?;
 
         let container_name = format!("arcbox-{}", spec.job_id);
 
@@ -156,7 +190,7 @@ impl DockerRunner {
             .await;
 
         let config = ContainerCreateBody {
-            image: Some(spec.image.to_owned()),
+            image: Some(self.default_image.clone()),
             cmd: Some(vec![
                 "./run.sh".to_owned(),
                 "--jitconfig".to_owned(),
@@ -187,26 +221,10 @@ impl DockerRunner {
             .with_context(|| format!("starting container {id}"))?;
         debug!(job_id = spec.job_id, container = %id, "container started");
 
-        let wait = self
-            .client
-            .wait_container(
-                &id,
-                Some(WaitContainerOptions {
-                    condition: "not-running".to_owned(),
-                }),
-            )
-            .next()
-            .await
-            .context("container wait stream ended unexpectedly")?
-            .with_context(|| format!("waiting on container {id}"))?;
-
-        let exit_code = wait.status_code;
-        guard.defuse();
-        self.cleanup_container(&id).await;
-
-        Ok(DockerOutcome {
-            success: exit_code == 0,
-            detail: format!("container exited with code {exit_code}"),
+        Ok(RunningContainer {
+            client: self.client.clone(),
+            id,
+            guard,
         })
     }
 
@@ -224,17 +242,6 @@ impl DockerRunner {
         }
         info!(image, platform, "image ready");
         Ok(())
-    }
-
-    /// Best-effort container removal.
-    async fn cleanup_container(&self, id: &str) {
-        let options = RemoveContainerOptions {
-            force: true,
-            ..Default::default()
-        };
-        if let Err(e) = self.client.remove_container(id, Some(options)).await {
-            warn!(container = %id, error = %e, "failed to remove container");
-        }
     }
 }
 
