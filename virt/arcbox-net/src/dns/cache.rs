@@ -4,6 +4,9 @@ use hickory_proto::op::Message as DnsMessage;
 
 use super::{DnsClass, DnsForwarder, DnsQuery, DnsRecordType};
 
+const DNS_HEADER_LEN: usize = 12;
+const TYPE_OPT: u16 = 41;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct DnsCacheKey {
     name: String,
@@ -27,7 +30,7 @@ pub(super) struct CacheEntry {
     /// Complete upstream response bytes with the original transaction ID.
     response: Vec<u8>,
     /// When the entry was cached.
-    cached_at: Instant,
+    pub(super) cached_at: Instant,
     /// TTL from the response.
     pub(super) ttl: Duration,
 }
@@ -47,10 +50,18 @@ impl DnsForwarder {
         // Clean up expired entries.
         self.cache.retain(|_, v| !v.is_expired());
 
-        self.cache.get(&key).map(|entry| {
+        self.cache.get(&key).and_then(|entry| {
             let mut response = entry.response.clone();
             response[0..2].copy_from_slice(&query.raw_header[0..2]);
-            response
+            rewrite_question(&mut response, &query.raw_question)?;
+            rewrite_ttls(
+                &mut response,
+                entry
+                    .ttl
+                    .as_secs()
+                    .saturating_sub(entry.cached_at.elapsed().as_secs()),
+            )?;
+            Some(response)
         })
     }
 
@@ -83,4 +94,97 @@ impl DnsForwarder {
         }
         Some(Duration::from_secs(u64::from(min_answer_ttl)).min(self.config.cache_ttl))
     }
+}
+
+fn rewrite_question(response: &mut [u8], raw_question: &[u8]) -> Option<()> {
+    let question_end = skip_questions(response, DNS_HEADER_LEN, 1)?;
+    if question_end != DNS_HEADER_LEN + raw_question.len() {
+        return None;
+    }
+    response[DNS_HEADER_LEN..question_end].copy_from_slice(raw_question);
+    Some(())
+}
+
+fn rewrite_ttls(response: &mut [u8], remaining_ttl_secs: u64) -> Option<()> {
+    let qdcount = read_count(response, 4)?;
+    let ancount = read_count(response, 6)?;
+    let nscount = read_count(response, 8)?;
+    let arcount = read_count(response, 10)?;
+
+    let mut offset = skip_questions(response, DNS_HEADER_LEN, qdcount)?;
+    let remaining_secs = remaining_ttl_secs.min(u64::from(u32::MAX)) as u32;
+    for _ in 0..ancount + nscount + arcount {
+        offset = rewrite_record_ttl(response, offset, remaining_secs)?;
+    }
+    Some(())
+}
+
+fn read_count(response: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_be_bytes([
+        *response.get(offset)?,
+        *response.get(offset + 1)?,
+    ]))
+}
+
+fn skip_questions(response: &[u8], mut offset: usize, count: u16) -> Option<usize> {
+    for _ in 0..count {
+        offset = skip_name(response, offset)?;
+        offset = offset.checked_add(4)?;
+        if offset > response.len() {
+            return None;
+        }
+    }
+    Some(offset)
+}
+
+fn skip_name(response: &[u8], mut offset: usize) -> Option<usize> {
+    loop {
+        let len = *response.get(offset)?;
+        if len & 0xC0 == 0xC0 {
+            return offset.checked_add(2).filter(|end| *end <= response.len());
+        }
+        if len & 0xC0 != 0 {
+            return None;
+        }
+        offset = offset.checked_add(1)?;
+        if len == 0 {
+            return Some(offset);
+        }
+        offset = offset.checked_add(usize::from(len))?;
+        if offset > response.len() {
+            return None;
+        }
+    }
+}
+
+fn rewrite_record_ttl(response: &mut [u8], offset: usize, remaining_secs: u32) -> Option<usize> {
+    let record_header = skip_name(response, offset)?;
+    let record_type = u16::from_be_bytes([
+        *response.get(record_header)?,
+        *response.get(record_header + 1)?,
+    ]);
+    let ttl_offset = record_header.checked_add(4)?;
+    let rdlength_offset = record_header.checked_add(8)?;
+    let rdlength = u16::from_be_bytes([
+        *response.get(rdlength_offset)?,
+        *response.get(rdlength_offset + 1)?,
+    ]);
+    let rdata_offset = record_header.checked_add(10)?;
+    let next_record = rdata_offset.checked_add(usize::from(rdlength))?;
+    if next_record > response.len() {
+        return None;
+    }
+
+    if record_type != TYPE_OPT {
+        let original_ttl = u32::from_be_bytes([
+            *response.get(ttl_offset)?,
+            *response.get(ttl_offset + 1)?,
+            *response.get(ttl_offset + 2)?,
+            *response.get(ttl_offset + 3)?,
+        ]);
+        let ttl = original_ttl.min(remaining_secs);
+        response[ttl_offset..ttl_offset + 4].copy_from_slice(&ttl.to_be_bytes());
+    }
+
+    Some(next_record)
 }
