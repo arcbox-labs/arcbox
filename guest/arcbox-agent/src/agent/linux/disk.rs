@@ -9,7 +9,7 @@ use tokio::time::MissedTickBehavior;
 use arcbox_constants::paths::{CONTAINERD_DATA_MOUNT_POINT, DOCKER_DATA_MOUNT_POINT};
 use arcbox_protocol::agent::DiskTrimResponse;
 
-use crate::rpc::RpcResponse;
+use crate::rpc::{ErrorResponse, RpcResponse};
 
 /// Interval between successive periodic trims.
 const FSTRIM_INTERVAL: Duration = Duration::from_secs(3600);
@@ -47,9 +47,12 @@ pub(super) async fn fstrim_loop() {
     }
 }
 
-/// Runs `fstrim -v` once on each data mount, returning a per-mount summary.
-async fn run_fstrim_now() -> String {
+/// Runs `fstrim -v` once on each data mount. Returns `Ok(summary)` when every
+/// mount trimmed, or `Err(summary)` if any mount failed. The summary lists the
+/// per-mount outcome either way.
+async fn run_fstrim_now() -> Result<String, String> {
     let mut results = Vec::new();
+    let mut all_ok = true;
     for mount in FSTRIM_MOUNTS {
         match Command::new("fstrim").arg("-v").arg(mount).output().await {
             Ok(output) if output.status.success() => {
@@ -57,20 +60,30 @@ async fn run_fstrim_now() -> String {
                 results.push(format!("{}: {}", mount, msg.trim()));
             }
             Ok(output) => {
+                all_ok = false;
                 let msg = String::from_utf8_lossy(&output.stderr);
                 results.push(format!("{}: failed ({})", mount, msg.trim()));
             }
             Err(e) => {
+                all_ok = false;
                 results.push(format!("{}: error ({})", mount, e));
             }
         }
     }
-    results.join("; ")
+    let summary = results.join("; ");
+    if all_ok { Ok(summary) } else { Err(summary) }
 }
 
-/// Handles a `DiskTrim` RPC: triggers an immediate trim and returns the
-/// per-mount summary.
+/// Handles a `DiskTrim` RPC: triggers an immediate trim. Returns the per-mount
+/// summary on success, or a generic error response if any mount failed — so the
+/// daemon's `disk_trim()` surfaces a real `Err` rather than a success-looking
+/// summary string the caller would have to parse.
 pub(super) async fn handle_disk_trim() -> RpcResponse {
-    let result = run_fstrim_now().await;
-    RpcResponse::DiskTrim(DiskTrimResponse { result })
+    match run_fstrim_now().await {
+        Ok(result) => RpcResponse::DiskTrim(DiskTrimResponse { result }),
+        Err(summary) => RpcResponse::Error(ErrorResponse::new(
+            500,
+            format!("disk trim failed: {summary}"),
+        )),
+    }
 }
