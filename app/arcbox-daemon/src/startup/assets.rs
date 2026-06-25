@@ -179,8 +179,9 @@ fn seed_agent_from_bundle(agent_src: &Path, data_dir: &Path) -> Result<AgentSeed
 /// The source mtime is mirrored onto the destination so a subsequent run can
 /// recognise an up-to-date copy with a cheap `stat` instead of reading file
 /// contents — important because the runtime tree is hundreds of MB and seeding
-/// runs on every daemon start. `std::fs::copy` carries over the source's
-/// permission bits (including the executable bit), so binaries stay runnable.
+/// runs on every daemon start. Replacements are written to a temporary file in
+/// the destination directory and then atomically renamed into place, so a killed
+/// daemon cannot leave a partially-written staged binary at `dst`.
 fn copy_if_changed(src: &Path, dst: &Path) -> std::io::Result<bool> {
     let src_meta = std::fs::metadata(src)?;
     let src_mtime = filetime::FileTime::from_last_modification_time(&src_meta);
@@ -191,29 +192,59 @@ fn copy_if_changed(src: &Path, dst: &Path) -> std::io::Result<bool> {
             return Ok(false);
         }
     }
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::copy(src, dst)?;
-    filetime::set_file_mtime(dst, src_mtime)?;
+    copy_atomic(src, dst, src_mtime)?;
     Ok(true)
+}
+
+fn copy_atomic(src: &Path, dst: &Path, src_mtime: filetime::FileTime) -> std::io::Result<()> {
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+
+    let tmp = temp_path_for(dst);
+    let result = (|| -> std::io::Result<()> {
+        std::fs::copy(src, &tmp)?;
+        filetime::set_file_mtime(&tmp, src_mtime)?;
+        std::fs::rename(&tmp, dst)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn temp_path_for(dst: &Path) -> PathBuf {
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = dst
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("copy");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce))
 }
 
 /// Copies specific files from `src` to `dst`, refreshing any that changed.
 fn seed_dir_files(src: &Path, dst: &Path, files: &[&str], label: &str) {
-    if let Err(e) = (|| -> std::io::Result<()> {
+    let result = (|| -> std::io::Result<u32> {
+        let mut count = 0u32;
         std::fs::create_dir_all(dst)?;
         for name in files {
             let s = src.join(name);
-            if s.exists() {
-                copy_if_changed(&s, &dst.join(name))?;
+            if s.exists() && copy_if_changed(&s, &dst.join(name))? {
+                count += 1;
             }
         }
-        Ok(())
-    })() {
-        tracing::warn!("Failed to seed {label} from bundle: {e}");
-    } else {
-        tracing::info!("Seeded {label} from bundle");
+        Ok(count)
+    })();
+
+    match result {
+        Ok(0) => tracing::debug!("{label}: already up to date"),
+        Ok(n) => tracing::info!("Seeded {n} {label} from bundle"),
+        Err(e) => tracing::warn!("Failed to seed {label} from bundle: {e}"),
     }
 }
 
