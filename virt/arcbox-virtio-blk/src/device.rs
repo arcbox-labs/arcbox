@@ -8,7 +8,10 @@ use arcbox_virtio_core::error::{Result, VirtioError};
 use arcbox_virtio_core::queue::{Descriptor, VirtQueue};
 use arcbox_virtio_core::{QueueConfig, VirtioDevice, VirtioDeviceId, virtio_bindings};
 
-use crate::request::{BlockConfig, BlockRequestHeader, BlockRequestType, BlockStatus};
+use crate::request::{
+    BlockConfig, BlockRequestHeader, BlockRequestType, BlockStatus, WRITE_ZEROES_FLAG_UNMAP,
+    parse_range_list,
+};
 
 /// `VirtIO` block device.
 pub struct VirtioBlock {
@@ -169,6 +172,12 @@ impl VirtioBlock {
         self.config.capacity * u64::from(self.config.blk_size)
     }
 
+    /// Returns the disk capacity in 512-byte sectors.
+    #[must_use]
+    pub fn capacity_sectors(&self) -> u64 {
+        self.config.capacity
+    }
+
     /// Returns the raw fd for pread/pwrite (if activated).
     #[must_use]
     pub fn raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
@@ -326,7 +335,7 @@ impl VirtioBlock {
         let fd = self
             .raw_fd
             .ok_or_else(|| VirtioError::NotReady("Block device not activated".into()))?;
-        let block_size = u64::from(self.config.blk_size);
+        let block_size = self.config.blk_size;
 
         for range in parse_range_list(data)? {
             if u64::from(range.num_sectors) > u64::from(Self::MAX_DISCARD_SECTORS) {
@@ -343,8 +352,7 @@ impl VirtioBlock {
                 )));
             }
 
-            let start = range.sector * block_size;
-            let end = start + u64::from(range.num_sectors) * block_size;
+            let (start, end) = range.checked_byte_range(block_size, self.config.capacity)?;
             if let Some((offset, len)) = crate::punch::aligned_punch_range(start, end) {
                 if let Err(e) = crate::punch::punch_hole(fd, offset, len) {
                     tracing::warn!(
@@ -371,7 +379,7 @@ impl VirtioBlock {
         let fd = self
             .raw_fd
             .ok_or_else(|| VirtioError::NotReady("Block device not activated".into()))?;
-        let block_size = u64::from(self.config.blk_size);
+        let block_size = self.config.blk_size;
 
         for range in parse_range_list(data)? {
             if u64::from(range.num_sectors) > u64::from(Self::MAX_WRITE_ZEROES_SECTORS) {
@@ -381,29 +389,23 @@ impl VirtioBlock {
                     Self::MAX_WRITE_ZEROES_SECTORS
                 )));
             }
-            // Ignore the UNMAP flag: we advertise write_zeroes_may_unmap=0,
-            // so the guest must treat the range as zeroed regardless.
-            let bytes = u64::from(range.num_sectors) * block_size;
-            if bytes == 0 {
+            if range.flags & !WRITE_ZEROES_FLAG_UNMAP != 0 {
+                return Err(VirtioError::InvalidOperation(format!(
+                    "write_zeroes range has reserved flags set: 0x{:x}",
+                    range.flags
+                )));
+            }
+            // Ignore the UNMAP flag: we advertise write_zeroes_may_unmap=0, so
+            // the guest must treat the range as zeroed regardless of whether the
+            // host implementation chooses to keep it sparse.
+            let (start, end) = range.checked_byte_range(block_size, self.config.capacity)?;
+            if start == end {
                 continue;
             }
-            #[allow(clippy::cast_possible_wrap)]
-            let offset = (range.sector * block_size) as libc::off_t;
-            let zeros = vec![0u8; bytes as usize];
-            // SAFETY: fd is valid; zeros is a borrowed slice of length `bytes`.
-            let n = unsafe {
-                libc::pwrite(
-                    fd,
-                    zeros.as_ptr().cast::<libc::c_void>(),
-                    zeros.len(),
-                    offset,
-                )
-            };
-            if n < 0 {
+            if let Err(e) = crate::punch::zero_range(fd, start, end) {
                 return Err(VirtioError::Io(format!(
-                    "pwrite (write_zeroes) failed at sector {}: {}",
-                    range.sector,
-                    std::io::Error::last_os_error()
+                    "write_zeroes failed at sector {}: {}",
+                    range.sector, e
                 )));
             }
         }
@@ -536,36 +538,6 @@ impl VirtioBlock {
             }
         }
     }
-}
-
-/// One entry in a DISCARD / WRITE_ZEROES request's range list. The on-wire
-/// struct is `virtio_blk_discard_write_zeroes`: sector (le64), num_sectors
-/// (le32), flags (le32) — 16 bytes total.
-#[derive(Debug, Clone, Copy)]
-struct DiscardWriteZeroesRange {
-    sector: u64,
-    num_sectors: u32,
-    flags: u32,
-}
-
-const RANGE_ENTRY_SIZE: usize = 16;
-
-fn parse_range_list(bytes: &[u8]) -> Result<Vec<DiscardWriteZeroesRange>> {
-    if bytes.is_empty() || bytes.len() % RANGE_ENTRY_SIZE != 0 {
-        return Err(VirtioError::InvalidOperation(format!(
-            "range list size {} not a multiple of 16",
-            bytes.len()
-        )));
-    }
-    let mut ranges = Vec::with_capacity(bytes.len() / RANGE_ENTRY_SIZE);
-    for chunk in bytes.chunks_exact(RANGE_ENTRY_SIZE) {
-        ranges.push(DiscardWriteZeroesRange {
-            sector: u64::from_le_bytes(chunk[0..8].try_into().unwrap()),
-            num_sectors: u32::from_le_bytes(chunk[8..12].try_into().unwrap()),
-            flags: u32::from_le_bytes(chunk[12..16].try_into().unwrap()),
-        });
-    }
-    Ok(ranges)
 }
 
 impl VirtioDevice for VirtioBlock {

@@ -32,6 +32,91 @@ impl Default for BlockConfig {
     }
 }
 
+/// `virtio_blk_discard_write_zeroes.flags` bit requesting deallocation while
+/// zeroing. ArcBox advertises `write_zeroes_may_unmap=0`, so callers must still
+/// guarantee zero reads even when this bit is set.
+pub const WRITE_ZEROES_FLAG_UNMAP: u32 = 1;
+
+/// One entry in a DISCARD / WRITE_ZEROES request's range list.
+///
+/// The on-wire struct is `virtio_blk_discard_write_zeroes`: sector (le64),
+/// num_sectors (le32), flags (le32) — 16 bytes total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscardWriteZeroesRange {
+    /// Starting sector in the guest block device.
+    pub sector: u64,
+    /// Number of sectors covered by this range.
+    pub num_sectors: u32,
+    /// Request flags (`WRITE_ZEROES_FLAG_UNMAP` is valid for WRITE_ZEROES only).
+    pub flags: u32,
+}
+
+const RANGE_ENTRY_SIZE: usize = 16;
+
+/// Parses a DISCARD / WRITE_ZEROES range list.
+///
+/// # Errors
+///
+/// Returns an error if the list is empty or not composed of whole 16-byte
+/// entries.
+pub fn parse_range_list(
+    bytes: &[u8],
+) -> std::result::Result<Vec<DiscardWriteZeroesRange>, VirtioError> {
+    if bytes.is_empty() || bytes.len() % RANGE_ENTRY_SIZE != 0 {
+        return Err(VirtioError::InvalidOperation(format!(
+            "range list size {} not a multiple of 16",
+            bytes.len()
+        )));
+    }
+    let mut ranges = Vec::with_capacity(bytes.len() / RANGE_ENTRY_SIZE);
+    for chunk in bytes.chunks_exact(RANGE_ENTRY_SIZE) {
+        ranges.push(DiscardWriteZeroesRange {
+            sector: u64::from_le_bytes(chunk[0..8].try_into().unwrap()),
+            num_sectors: u32::from_le_bytes(chunk[8..12].try_into().unwrap()),
+            flags: u32::from_le_bytes(chunk[12..16].try_into().unwrap()),
+        });
+    }
+    Ok(ranges)
+}
+
+impl DiscardWriteZeroesRange {
+    /// Converts the sector range to a checked byte range `[start, end)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sector range overflows the configured block size
+    /// or extends past the device capacity.
+    pub fn checked_byte_range(
+        self,
+        blk_size: u32,
+        capacity_sectors: u64,
+    ) -> std::result::Result<(u64, u64), VirtioError> {
+        let sector_end = self
+            .sector
+            .checked_add(u64::from(self.num_sectors))
+            .ok_or_else(|| VirtioError::InvalidOperation("range sector overflow".into()))?;
+        if sector_end > capacity_sectors {
+            return Err(VirtioError::InvalidOperation(format!(
+                "range exceeds device capacity: {}..{} > {} sectors",
+                self.sector, sector_end, capacity_sectors
+            )));
+        }
+
+        let block_size = u64::from(blk_size);
+        let start = self
+            .sector
+            .checked_mul(block_size)
+            .ok_or_else(|| VirtioError::InvalidOperation("range byte offset overflow".into()))?;
+        let bytes = u64::from(self.num_sectors)
+            .checked_mul(block_size)
+            .ok_or_else(|| VirtioError::InvalidOperation("range byte length overflow".into()))?;
+        let end = start
+            .checked_add(bytes)
+            .ok_or_else(|| VirtioError::InvalidOperation("range byte end overflow".into()))?;
+        Ok((start, end))
+    }
+}
+
 /// `VirtIO` block request types.
 ///
 /// Values sourced from `virtio_bindings::virtio_blk::VIRTIO_BLK_T_*`.

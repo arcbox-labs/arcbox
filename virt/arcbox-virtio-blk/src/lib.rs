@@ -44,4 +44,7 @@ pub use device::VirtioBlock;
 pub use direct_io::DirectIoBackend;
 pub use mmap::MmapBackend;
 pub use punch::{PUNCH_HOLE_ALIGNMENT, aligned_punch_range, punch_hole, zero_range};
-pub use request::{BlockConfig, BlockRequestHeader, BlockRequestType, BlockStatus};
+pub use request::{
+    BlockConfig, BlockRequestHeader, BlockRequestType, BlockStatus, DiscardWriteZeroesRange,
+    WRITE_ZEROES_FLAG_UNMAP, parse_range_list,
+};

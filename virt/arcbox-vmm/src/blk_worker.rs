@@ -182,6 +182,8 @@ pub struct BlkWorkerContext {
     pub raw_fd: i32,
     /// Block size (typically 512).
     pub blk_size: u32,
+    /// Device capacity in 512-byte sectors.
+    pub capacity_sectors: u64,
     /// Whether the device is read-only.
     pub read_only: bool,
     /// Device ID string for GetId requests.
@@ -403,8 +405,13 @@ fn process_read(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
     if iovecs.is_empty() {
         return 0;
     }
+    let expected_len = iovecs.iter().map(|iov| iov.iov_len).sum::<usize>();
+    let Some(byte_offset) = item.sector.checked_mul(u64::from(ctx.blk_size)) else {
+        tracing::warn!("blk read: sector offset overflow: {}", item.sector);
+        return 1;
+    };
     #[allow(clippy::cast_possible_wrap)]
-    let offset = (item.sector * u64::from(ctx.blk_size)) as libc::off_t;
+    let offset = byte_offset as libc::off_t;
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let n = unsafe { libc::preadv(ctx.raw_fd, iovecs.as_ptr(), iovecs.len() as i32, offset) };
     if n < 0 {
@@ -412,6 +419,15 @@ fn process_read(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
             "blk preadv failed at sector {}: {}",
             item.sector,
             std::io::Error::last_os_error()
+        );
+        return 1;
+    }
+    if n as usize != expected_len {
+        tracing::warn!(
+            "blk preadv short read at sector {}: {} < {}",
+            item.sector,
+            n,
+            expected_len
         );
         return 1;
     }
@@ -440,8 +456,13 @@ fn process_write(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
     if iovecs.is_empty() {
         return 0;
     }
+    let expected_len = iovecs.iter().map(|iov| iov.iov_len).sum::<usize>();
+    let Some(byte_offset) = item.sector.checked_mul(u64::from(ctx.blk_size)) else {
+        tracing::warn!("blk write: sector offset overflow: {}", item.sector);
+        return 1;
+    };
     #[allow(clippy::cast_possible_wrap)]
-    let offset = (item.sector * u64::from(ctx.blk_size)) as libc::off_t;
+    let offset = byte_offset as libc::off_t;
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let n = unsafe { libc::pwritev(ctx.raw_fd, iovecs.as_ptr(), iovecs.len() as i32, offset) };
     if n < 0 {
@@ -449,6 +470,15 @@ fn process_write(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
             "blk pwritev failed at sector {}: {}",
             item.sector,
             std::io::Error::last_os_error()
+        );
+        return 1;
+    }
+    if n as usize != expected_len {
+        tracing::warn!(
+            "blk pwritev short write at sector {}: {} < {}",
+            item.sector,
+            n,
+            expected_len
         );
         return 1;
     }
@@ -498,8 +528,26 @@ fn process_merged(ctx: &BlkWorkerContext, items: &[BlkWorkItem]) {
     }
 
     // Single merged I/O syscall.
+    let expected_len = iovecs.iter().map(|iov| iov.iov_len).sum::<usize>();
+    let Some(byte_offset) = start_sector.checked_mul(u64::from(ctx.blk_size)) else {
+        tracing::warn!("blk merged: sector offset overflow: {}", start_sector);
+        for item in items {
+            ctx.guest_mem.write_byte(item.status_gpa as usize, 1);
+            write_used_entry(
+                &ctx.guest_mem,
+                item.used_addr,
+                item.queue_size,
+                item.head_idx,
+                1,
+            );
+        }
+        ctx.flush_barrier
+            .in_flight
+            .fetch_sub(items.len() as u32, Ordering::Release);
+        return;
+    };
     #[allow(clippy::cast_possible_wrap)]
-    let offset = (start_sector * u64::from(ctx.blk_size)) as libc::off_t;
+    let offset = byte_offset as libc::off_t;
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let n = if is_read {
         unsafe { libc::preadv(ctx.raw_fd, iovecs.as_ptr(), iovecs.len() as i32, offset) }
@@ -513,6 +561,15 @@ fn process_merged(ctx: &BlkWorkerContext, items: &[BlkWorkItem]) {
             if is_read { "preadv" } else { "pwritev" },
             start_sector,
             std::io::Error::last_os_error()
+        );
+        1
+    } else if n as usize != expected_len {
+        tracing::warn!(
+            "blk merged short {} at sector {}: {} < {}",
+            if is_read { "read" } else { "write" },
+            start_sector,
+            n,
+            expected_len
         );
         1
     } else {
@@ -585,7 +642,13 @@ fn process_get_id(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
 /// reported as a successful no-op rather than an I/O error.
 fn process_discard(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
     if !ctx.read_only {
-        punch_discard_ranges(&ctx.guest_mem, ctx.raw_fd, ctx.blk_size, &item.buffers);
+        return punch_discard_ranges(
+            &ctx.guest_mem,
+            ctx.raw_fd,
+            ctx.blk_size,
+            ctx.capacity_sectors,
+            &item.buffers,
+        );
     }
     0 // VIRTIO_BLK_S_OK
 }
@@ -597,36 +660,131 @@ fn process_write_zeroes(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
     if ctx.read_only {
         return 1; // VIRTIO_BLK_S_IOERR
     }
-    zero_ranges(&ctx.guest_mem, ctx.raw_fd, ctx.blk_size, &item.buffers)
+    zero_ranges(
+        &ctx.guest_mem,
+        ctx.raw_fd,
+        ctx.blk_size,
+        ctx.capacity_sectors,
+        &item.buffers,
+    )
 }
 
-/// Calls `f(start_byte, end_byte)` for each range in a DISCARD / WRITE_ZEROES
-/// request's read-only payload descriptors: 16-byte entries of (sector le64,
-/// num_sectors le32, flags le32). The device-writable 1-byte status descriptor
-/// is skipped.
-fn for_each_range(
+/// Parses a DISCARD / WRITE_ZEROES request's read-only payload descriptors. The
+/// device-writable 1-byte status descriptor is skipped. Payload descriptors are
+/// concatenated before parsing so legal scatter-gather layouts with a 16-byte
+/// range split across descriptors behave exactly like the generic path.
+fn parse_ranges_from_buffers(
     guest_mem: &GuestMemWriter,
-    blk_size: u32,
     buffers: &[(u64, u32, bool)],
-    mut f: impl FnMut(u64, u64),
-) {
-    let block_size = u64::from(blk_size);
+    log_context: &str,
+) -> Result<Vec<arcbox_virtio::blk::DiscardWriteZeroesRange>, ()> {
+    let mut payload = Vec::new();
     for &(gpa, len, is_write) in buffers {
         if is_write {
             continue;
         }
         let Some(bytes) = guest_mem.slice(gpa as usize, len as usize) else {
-            continue;
+            tracing::warn!("{log_context}: range payload GPA {gpa:#x} len {len} out of bounds");
+            return Err(());
         };
-        for entry in bytes.chunks_exact(16) {
-            let sector = u64::from_le_bytes(entry[0..8].try_into().unwrap());
-            let num_sectors = u32::from_le_bytes(entry[8..12].try_into().unwrap());
-            // entry[12..16] = flags (UNMAP/reserved); ignored.
-            let start = sector * block_size;
-            let end = start + u64::from(num_sectors) * block_size;
-            f(start, end);
-        }
+        payload.extend_from_slice(bytes);
     }
+    arcbox_virtio::blk::parse_range_list(&payload).map_err(|e| {
+        tracing::warn!(error = %e, "{log_context}: malformed range list");
+    })
+}
+
+fn checked_range_bytes(
+    range: arcbox_virtio::blk::DiscardWriteZeroesRange,
+    blk_size: u32,
+    capacity_sectors: u64,
+    max_sectors: u32,
+    log_context: &str,
+) -> Result<(u64, u64), ()> {
+    if range.num_sectors > max_sectors {
+        tracing::warn!(
+            sector = range.sector,
+            num_sectors = range.num_sectors,
+            max_sectors,
+            "{log_context}: range exceeds advertised maximum"
+        );
+        return Err(());
+    }
+    range
+        .checked_byte_range(blk_size, capacity_sectors)
+        .map_err(|e| {
+            tracing::warn!(sector = range.sector, num_sectors = range.num_sectors, error = %e, "{log_context}: invalid range");
+        })
+}
+
+fn validate_discard_flags(
+    range: arcbox_virtio::blk::DiscardWriteZeroesRange,
+    log_context: &str,
+) -> Result<(), ()> {
+    if range.flags != 0 {
+        tracing::warn!(
+            flags = range.flags,
+            "{log_context}: discard reserved flags set"
+        );
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_write_zeroes_flags(
+    range: arcbox_virtio::blk::DiscardWriteZeroesRange,
+    log_context: &str,
+) -> Result<(), ()> {
+    if range.flags & !arcbox_virtio::blk::WRITE_ZEROES_FLAG_UNMAP != 0 {
+        tracing::warn!(
+            flags = range.flags,
+            "{log_context}: write_zeroes reserved flags set"
+        );
+        return Err(());
+    }
+    Ok(())
+}
+
+fn discard_byte_ranges(
+    guest_mem: &GuestMemWriter,
+    blk_size: u32,
+    capacity_sectors: u64,
+    buffers: &[(u64, u32, bool)],
+) -> Result<Vec<(u64, u64)>, ()> {
+    let ranges = parse_ranges_from_buffers(guest_mem, buffers, "discard")?;
+    let mut byte_ranges = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        validate_discard_flags(range, "discard")?;
+        byte_ranges.push(checked_range_bytes(
+            range,
+            blk_size,
+            capacity_sectors,
+            arcbox_virtio::blk::VirtioBlock::MAX_DISCARD_SECTORS,
+            "discard",
+        )?);
+    }
+    Ok(byte_ranges)
+}
+
+fn write_zeroes_byte_ranges(
+    guest_mem: &GuestMemWriter,
+    blk_size: u32,
+    capacity_sectors: u64,
+    buffers: &[(u64, u32, bool)],
+) -> Result<Vec<(u64, u64)>, ()> {
+    let ranges = parse_ranges_from_buffers(guest_mem, buffers, "write_zeroes")?;
+    let mut byte_ranges = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        validate_write_zeroes_flags(range, "write_zeroes")?;
+        byte_ranges.push(checked_range_bytes(
+            range,
+            blk_size,
+            capacity_sectors,
+            arcbox_virtio::blk::VirtioBlock::MAX_WRITE_ZEROES_SECTORS,
+            "write_zeroes",
+        )?);
+    }
+    Ok(byte_ranges)
 }
 
 /// Punches holes for every DISCARD range. Factored out so it can be tested
@@ -635,11 +793,15 @@ fn punch_discard_ranges(
     guest_mem: &GuestMemWriter,
     raw_fd: i32,
     blk_size: u32,
+    capacity_sectors: u64,
     buffers: &[(u64, u32, bool)],
-) {
+) -> u8 {
     use arcbox_virtio::blk::{aligned_punch_range, punch_hole};
 
-    for_each_range(guest_mem, blk_size, buffers, |start, end| {
+    let Ok(ranges) = discard_byte_ranges(guest_mem, blk_size, capacity_sectors, buffers) else {
+        return 1;
+    };
+    for (start, end) in ranges {
         if let Some((offset, hole_len)) = aligned_punch_range(start, end) {
             if let Err(e) = punch_hole(raw_fd, offset, hole_len) {
                 tracing::warn!(
@@ -650,7 +812,8 @@ fn punch_discard_ranges(
                 );
             }
         }
-    });
+    }
+    0
 }
 
 /// Zeroes every WRITE_ZEROES range via the shared sparse-aware primitive
@@ -660,15 +823,20 @@ fn zero_ranges(
     guest_mem: &GuestMemWriter,
     raw_fd: i32,
     blk_size: u32,
+    capacity_sectors: u64,
     buffers: &[(u64, u32, bool)],
 ) -> u8 {
     let mut status = 0u8;
-    for_each_range(guest_mem, blk_size, buffers, |start, end| {
+    let Ok(ranges) = write_zeroes_byte_ranges(guest_mem, blk_size, capacity_sectors, buffers)
+    else {
+        return 1;
+    };
+    for (start, end) in ranges {
         if let Err(e) = arcbox_virtio::blk::zero_range(raw_fd, start, end) {
             tracing::warn!(start, end, error = %e, "write_zeroes failed (HV worker)");
             status = 1;
         }
-    });
+    }
     status
 }
 
@@ -922,7 +1090,7 @@ mod tests {
         // Descriptors: the read-only range list, then the write-only status byte
         // (which must be skipped, not parsed as a range).
         let buffers = vec![(0u64, 16u32, false), (16u64, 1u32, true)];
-        punch_discard_ranges(&gm, fd, 512, &buffers);
+        assert_eq!(punch_discard_ranges(&gm, fd, 512, 2048, &buffers), 0);
         temp.as_file().sync_all().unwrap();
 
         let after = std::fs::metadata(temp.path()).unwrap().blocks() * 512;
@@ -955,7 +1123,7 @@ mod tests {
         let gm = unsafe { GuestMemWriter::new(mem.as_mut_ptr(), mem.len(), 0) };
         let buffers = vec![(0u64, 16u32, false), (16u64, 1u32, true)];
 
-        assert_eq!(zero_ranges(&gm, fd, 512, &buffers), 0);
+        assert_eq!(zero_ranges(&gm, fd, 512, 32, &buffers), 0);
         temp.as_file().sync_all().unwrap();
 
         // The first 8 KiB now reads back as zeros; the rest is untouched.
@@ -976,5 +1144,52 @@ mod tests {
             rest.iter().all(|&b| b == 0xCD),
             "data past the range is intact"
         );
+    }
+
+    #[test]
+    fn range_parser_concatenates_split_payload_descriptors() {
+        let mut mem = vec![0u8; 4096];
+        mem[0..8].copy_from_slice(&8u64.to_le_bytes());
+        mem[8..12].copy_from_slice(&8u32.to_le_bytes());
+        mem[12..16].copy_from_slice(&0u32.to_le_bytes());
+        // SAFETY: `mem` outlives `gm`; gpa_base 0 means gpa == buffer offset.
+        let gm = unsafe { GuestMemWriter::new(mem.as_mut_ptr(), mem.len(), 0) };
+
+        let buffers = vec![
+            (0u64, 8u32, false),
+            (8u64, 8u32, false),
+            (16u64, 1u32, true),
+        ];
+        let ranges = discard_byte_ranges(&gm, 512, 32, &buffers).unwrap();
+
+        assert_eq!(ranges, vec![(4096, 8192)]);
+    }
+
+    #[test]
+    fn write_zeroes_rejects_trailing_payload_bytes() {
+        let mut mem = vec![0u8; 4096];
+        mem[0..8].copy_from_slice(&0u64.to_le_bytes());
+        mem[8..12].copy_from_slice(&8u32.to_le_bytes());
+        mem[12..16].copy_from_slice(&0u32.to_le_bytes());
+        // SAFETY: `mem` outlives `gm`; gpa_base 0 means gpa == buffer offset.
+        let gm = unsafe { GuestMemWriter::new(mem.as_mut_ptr(), mem.len(), 0) };
+
+        let buffers = vec![(0u64, 17u32, false), (17u64, 1u32, true)];
+
+        assert!(write_zeroes_byte_ranges(&gm, 512, 32, &buffers).is_err());
+    }
+
+    #[test]
+    fn write_zeroes_rejects_ranges_past_capacity() {
+        let mut mem = vec![0u8; 4096];
+        mem[0..8].copy_from_slice(&31u64.to_le_bytes());
+        mem[8..12].copy_from_slice(&2u32.to_le_bytes());
+        mem[12..16].copy_from_slice(&0u32.to_le_bytes());
+        // SAFETY: `mem` outlives `gm`; gpa_base 0 means gpa == buffer offset.
+        let gm = unsafe { GuestMemWriter::new(mem.as_mut_ptr(), mem.len(), 0) };
+
+        let buffers = vec![(0u64, 16u32, false), (16u64, 1u32, true)];
+
+        assert!(write_zeroes_byte_ranges(&gm, 512, 32, &buffers).is_err());
     }
 }

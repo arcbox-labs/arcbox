@@ -304,10 +304,9 @@ pub struct Vmm {
     #[cfg(target_os = "macos")]
     hv_bridge_net_fd: Option<OwnedFd>,
     /// Block device info captured during initialize for worker thread spawn.
-    /// (DeviceId, raw_fd, blk_size, read_only, device_id_string)
     #[cfg(target_os = "macos")]
-    /// (DeviceId, raw_fd, blk_size, read_only, device_id_string, num_queues)
-    hv_blk_devices: Vec<(crate::device::DeviceId, i32, u32, bool, String, u16)>,
+    /// (DeviceId, raw_fd, blk_size, capacity_sectors, read_only, device_id_string, num_queues)
+    hv_blk_devices: Vec<(crate::device::DeviceId, i32, u32, u64, bool, String, u16)>,
     /// Block I/O worker thread handles for join on shutdown.
     #[cfg(target_os = "macos")]
     hv_blk_worker_threads: Vec<std::thread::JoinHandle<()>>,

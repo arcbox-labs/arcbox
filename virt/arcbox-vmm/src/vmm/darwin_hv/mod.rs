@@ -526,6 +526,7 @@ impl Vmm {
             blk.set_num_queues(blk_num_queues);
             let raw_fd = blk.raw_fd().unwrap_or(-1);
             let blk_size = blk.blk_size();
+            let capacity_sectors = blk.capacity_sectors();
             let read_only = blk.is_read_only();
             let num_queues = blk.num_queues();
             let dev_id_str = blk.device_id_string().to_string();
@@ -539,7 +540,13 @@ impl Vmm {
             )?;
             if raw_fd >= 0 {
                 self.hv_blk_devices.push((
-                    device_id, raw_fd, blk_size, read_only, dev_id_str, num_queues,
+                    device_id,
+                    raw_fd,
+                    blk_size,
+                    capacity_sectors,
+                    read_only,
+                    dev_id_str,
+                    num_queues,
                 ));
             }
         }
@@ -550,7 +557,7 @@ impl Vmm {
             let fds: Vec<(i32, u32)> = self
                 .hv_blk_devices
                 .iter()
-                .map(|(_, raw_fd, blk_size, _, _, _)| (*raw_fd, *blk_size))
+                .map(|(_, raw_fd, blk_size, _, _, _, _)| (*raw_fd, *blk_size))
                 .collect();
             self.hvc_blk_fds = Arc::new(fds);
         }
@@ -950,20 +957,44 @@ impl Vmm {
             let blk_infos = std::mem::take(&mut self.hv_blk_devices)
                 .into_iter()
                 .filter_map(
-                    |(dev_id, raw_fd, blk_size, read_only, dev_id_str, num_queues)| {
+                    |(
+                        dev_id,
+                        raw_fd,
+                        blk_size,
+                        capacity_sectors,
+                        read_only,
+                        dev_id_str,
+                        num_queues,
+                    )| {
                         let dev = dm.get_registered_device(dev_id)?;
                         let irq = dev.info.irq?;
                         let mmio_state = dev.mmio_state.as_ref()?.clone();
                         Some((
-                            dev_id, raw_fd, blk_size, read_only, dev_id_str, num_queues, irq,
+                            dev_id,
+                            raw_fd,
+                            blk_size,
+                            capacity_sectors,
+                            read_only,
+                            dev_id_str,
+                            num_queues,
+                            irq,
                             mmio_state,
                         ))
                     },
                 )
                 .collect::<Vec<_>>();
 
-            for (dev_id, raw_fd, blk_size, read_only, dev_id_str, num_queues, irq, mmio_state) in
-                blk_infos
+            for (
+                dev_id,
+                raw_fd,
+                blk_size,
+                capacity_sectors,
+                read_only,
+                dev_id_str,
+                num_queues,
+                irq,
+                mmio_state,
+            ) in blk_infos
             {
                 let irq_cb = dm.irq_callback_clone().unwrap_or_else(|| {
                     Arc::new(|_: crate::irq::Irq, _: bool| -> crate::error::Result<()> { Ok(()) })
@@ -987,6 +1018,7 @@ impl Vmm {
                         },
                         raw_fd,
                         blk_size,
+                        capacity_sectors,
                         read_only,
                         device_id: dev_id_str.clone(),
                         mmio_state: mmio_state.clone(),
