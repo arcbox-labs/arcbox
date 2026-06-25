@@ -29,7 +29,7 @@ pub const DEFAULT_UPSTREAM: &[Ipv4Addr] = &[
 ];
 
 /// Default cache TTL.
-pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
+pub const DEFAULT_CACHE_TTL: Duration = Duration::from_mins(5);
 
 /// DNS configuration.
 #[derive(Debug, Clone)]

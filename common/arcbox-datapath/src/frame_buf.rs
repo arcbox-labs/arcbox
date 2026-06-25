@@ -37,16 +37,15 @@ impl FrameBuf {
     ///
     /// Falls back to `Heap` if the pool is exhausted.
     pub fn from_pool(pool: &Arc<PacketPool>, data: &[u8]) -> Self {
-        if let Some(mut pkt) = pool.alloc() {
-            if pkt.copy_from_slice(data).is_ok() {
-                let index = pkt.into_index();
-                return Self::Pooled {
-                    pool: Arc::clone(pool),
-                    index,
-                    len: data.len() as u32,
-                };
-            }
-            // copy_from_slice failed (data > MAX_PACKET_SIZE) — fall through.
+        if let Some(mut pkt) = pool.alloc()
+            && pkt.copy_from_slice(data).is_ok()
+        {
+            let index = pkt.into_index();
+            return Self::Pooled {
+                pool: Arc::clone(pool),
+                index,
+                len: data.len() as u32,
+            };
         }
         // Pool exhausted or frame too large — fall back to heap.
         Self::Heap(data.to_vec())

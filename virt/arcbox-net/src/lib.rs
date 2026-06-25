@@ -337,10 +337,10 @@ impl NetworkManager {
 
     /// Releases an IP address back to the pool.
     pub fn release_ip(&self, ip: std::net::Ipv4Addr) {
-        if let Ok(mut ip_alloc) = self.ip_allocator.write() {
-            if let Some(allocator) = ip_alloc.as_mut() {
-                allocator.release(ip);
-            }
+        if let Ok(mut ip_alloc) = self.ip_allocator.write()
+            && let Some(allocator) = ip_alloc.as_mut()
+        {
+            allocator.release(ip);
         }
     }
 

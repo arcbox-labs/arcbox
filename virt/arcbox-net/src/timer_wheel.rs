@@ -125,7 +125,7 @@ mod tests {
     fn test_register_and_advance() {
         let mut wheel = TimerWheel::<u32>::new(Duration::from_secs(1));
         wheel.register(1, Duration::from_millis(10), TimerAction::SynTimeout);
-        wheel.register(2, Duration::from_secs(60), TimerAction::UdpFlowExpiry);
+        wheel.register(2, Duration::from_mins(1), TimerAction::UdpFlowExpiry);
         assert_eq!(wheel.len(), 2);
 
         thread::sleep(Duration::from_millis(20));
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn test_cancel() {
         let mut wheel = TimerWheel::<u32>::new(Duration::from_secs(1));
-        wheel.register(1, Duration::from_secs(60), TimerAction::SynTimeout);
+        wheel.register(1, Duration::from_mins(1), TimerAction::SynTimeout);
         assert!(wheel.cancel(&1));
         assert!(!wheel.cancel(&1));
         assert!(wheel.is_empty());
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn test_update_existing() {
         let mut wheel = TimerWheel::<u32>::new(Duration::from_secs(1));
-        wheel.register(1, Duration::from_secs(60), TimerAction::SynTimeout);
+        wheel.register(1, Duration::from_mins(1), TimerAction::SynTimeout);
         wheel.register(1, Duration::from_millis(10), TimerAction::IcmpTimeout);
         assert_eq!(wheel.len(), 1);
 
@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn test_advance_no_expired() {
         let mut wheel = TimerWheel::<u32>::new(Duration::from_secs(1));
-        wheel.register(1, Duration::from_secs(60), TimerAction::SynTimeout);
+        wheel.register(1, Duration::from_mins(1), TimerAction::SynTimeout);
         let expired = wheel.advance();
         assert!(expired.is_empty());
         assert_eq!(wheel.len(), 1);
@@ -187,7 +187,7 @@ mod tests {
         let mut wheel = TimerWheel::<u32>::new(Duration::from_secs(1));
         wheel.register(1, Duration::from_millis(5), TimerAction::SynTimeout);
         wheel.register(2, Duration::from_millis(5), TimerAction::UdpFlowExpiry);
-        wheel.register(3, Duration::from_secs(60), TimerAction::InboundExpiry);
+        wheel.register(3, Duration::from_mins(1), TimerAction::InboundExpiry);
 
         thread::sleep(Duration::from_millis(15));
         let expired = wheel.advance();

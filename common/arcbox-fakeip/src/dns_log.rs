@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// TTL for resolution log entries. After this, entries are eligible for eviction.
-const ENTRY_TTL: Duration = Duration::from_secs(300);
+const ENTRY_TTL: Duration = Duration::from_mins(5);
 
 /// Maximum number of entries before LRU eviction kicks in.
 const MAX_ENTRIES: usize = 4096;
