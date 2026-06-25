@@ -3,13 +3,15 @@
 //! Each step consumes the previous state and returns the next one, so `main.rs`
 //! can show the startup order directly while Rust types enforce it.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use arcbox_api::SetupPhase;
 use arcbox_core::Runtime;
 use macos_resolver::FileResolver;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::context::{DaemonContext, EarlyContext, ServiceHandles};
 use crate::{DaemonArgs, recovery, services};
@@ -35,7 +37,7 @@ impl Startup {
     /// Prepares host directories and pre-lock context.
     pub async fn prepare_host(self) -> Result<HostPrepared> {
         info!("Starting ArcBox daemon...");
-        let early = init_early(self.args).await?;
+        let early = record_startup_phase("prepare_host", init_early(self.args)).await?;
         Ok(HostPrepared { early })
     }
 }
@@ -47,7 +49,7 @@ pub struct HostPrepared {
 impl HostPrepared {
     /// Acquires the exclusive daemon lease.
     pub async fn acquire_daemon_lease(self) -> Result<DaemonLeased> {
-        let ctx = acquire_lock(self.early).await?;
+        let ctx = record_startup_phase("acquire_daemon_lease", acquire_lock(self.early)).await?;
         Ok(DaemonLeased { ctx })
     }
 }
@@ -60,7 +62,11 @@ impl DaemonLeased {
     /// Starts gRPC before slow runtime phases so clients can observe progress.
     pub async fn start_control_plane(self) -> Result<ControlPlaneStarted> {
         let shared_runtime = Arc::clone(&self.ctx.shared_runtime);
-        let grpc = services::start_grpc(&self.ctx, shared_runtime).await?;
+        let grpc = record_startup_phase(
+            "start_control_plane",
+            services::start_grpc(&self.ctx, shared_runtime),
+        )
+        .await?;
         Ok(ControlPlaneStarted {
             ctx: self.ctx,
             grpc,
@@ -76,7 +82,7 @@ pub struct ControlPlaneStarted {
 impl ControlPlaneStarted {
     /// Waits for stale resource holders from a previous daemon to release.
     pub async fn release_stale_resources(self) -> Result<ResourcesReleased> {
-        wait_for_resources(&self.ctx).await?;
+        record_startup_phase("release_stale_resources", wait_for_resources(&self.ctx)).await?;
         Ok(ResourcesReleased {
             ctx: self.ctx,
             grpc: self.grpc,
@@ -92,7 +98,7 @@ pub struct ResourcesReleased {
 impl ResourcesReleased {
     /// Reconciles bundle, downloaded, and staged assets for this app version.
     pub async fn prepare_assets(self) -> Result<AssetsPrepared> {
-        let assets = prepare_assets(&self.ctx).await?;
+        let assets = record_startup_phase("prepare_assets", prepare_assets(&self.ctx)).await?;
         info!(agent = ?assets.agent(), "Startup assets prepared");
         Ok(AssetsPrepared {
             ctx: self.ctx,
@@ -111,7 +117,7 @@ pub struct AssetsPrepared {
 impl AssetsPrepared {
     /// Builds and initializes the ArcBox runtime.
     pub async fn boot_runtime(self) -> Result<RuntimeBooted> {
-        let runtime = init_runtime(&self.ctx).await?;
+        let runtime = record_startup_phase("boot_runtime", init_runtime(&self.ctx)).await?;
         Ok(RuntimeBooted {
             ctx: self.ctx,
             grpc: self.grpc,
@@ -129,8 +135,12 @@ pub struct RuntimeBooted {
 impl RuntimeBooted {
     /// Starts services that require an initialized runtime.
     pub async fn start_runtime_services(self) -> Result<RuntimeServicesStarted> {
-        let handles = services::start_services(&self.ctx, &self.runtime, self.grpc).await?;
-        recovery::run(&self.ctx, &self.runtime).await;
+        let handles = record_startup_phase("start_runtime_services", async {
+            let handles = services::start_services(&self.ctx, &self.runtime, self.grpc).await?;
+            recovery::run(&self.ctx, &self.runtime).await;
+            Ok(handles)
+        })
+        .await?;
         Ok(RuntimeServicesStarted {
             ctx: self.ctx,
             handles,
@@ -146,19 +156,24 @@ pub struct RuntimeServicesStarted {
 impl RuntimeServicesStarted {
     /// Marks startup complete and returns handles for the shutdown loop.
     pub async fn mark_ready(self) -> Result<ReadyDaemon> {
-        check_resolver_installed(&self.ctx.dns_domain);
-        self.ctx
-            .setup_state
-            .set_phase(SetupPhase::Ready, "Daemon ready");
+        record_startup_phase("mark_ready", async {
+            check_resolver_installed(&self.ctx.dns_domain);
+            self.ctx
+                .setup_state
+                .set_phase(SetupPhase::Ready, "Daemon ready");
 
-        println!("ArcBox daemon started");
-        println!("  Docker API: {}", self.ctx.layout.docker_socket.display());
-        println!("  gRPC API:   {}", self.ctx.layout.grpc_socket.display());
-        println!("  DNS:        127.0.0.1:{}", self.ctx.dns_port);
-        println!("  Data:       {}", self.ctx.layout.data_dir.display());
-        println!();
-        println!("Use 'arcbox docker enable' to configure Docker CLI integration.");
-        println!("Press Ctrl+C to stop.");
+            println!("ArcBox daemon started");
+            println!("  Docker API: {}", self.ctx.layout.docker_socket.display());
+            println!("  gRPC API:   {}", self.ctx.layout.grpc_socket.display());
+            println!("  DNS:        127.0.0.1:{}", self.ctx.dns_port);
+            println!("  Data:       {}", self.ctx.layout.data_dir.display());
+            println!();
+            println!("Use 'arcbox docker enable' to configure Docker CLI integration.");
+            println!("Press Ctrl+C to stop.");
+
+            Ok(())
+        })
+        .await?;
 
         Ok(ReadyDaemon {
             ctx: self.ctx,
@@ -172,4 +187,20 @@ fn check_resolver_installed(domain: &str) {
     if !resolver.is_registered(domain) {
         println!("Hint: Run 'sudo arcbox dns install' to enable *.{domain} DNS resolution.");
     }
+}
+
+async fn record_startup_phase<T, F>(phase: &'static str, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let started = Instant::now();
+    let result = future.await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    match &result {
+        Ok(_) => info!(startup_phase = phase, elapsed_ms, "Startup phase complete"),
+        Err(error) => warn!(startup_phase = phase, elapsed_ms, %error, "Startup phase failed"),
+    }
+
+    result
 }

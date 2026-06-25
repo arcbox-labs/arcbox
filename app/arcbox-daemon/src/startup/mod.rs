@@ -4,6 +4,7 @@ mod assets;
 mod cleanup;
 mod lock;
 mod pipeline;
+mod resource_cleanup;
 
 pub use assets::find_bundle_contents;
 pub use lock::DaemonLock;
@@ -97,11 +98,11 @@ async fn acquire_lock(early: EarlyContext) -> Result<DaemonContext> {
 /// Wait for residual resource holders (e.g. docker.img) to release.
 ///
 /// Must complete before [`init_runtime`] — on macOS, orphaned
-/// Virtualization.framework XPC helpers of a just-displaced daemon may
-/// still hold a previous daemon's disk images. Only runs when lock
-/// acquisition actually displaced a stale daemon; clean starts skip the
-/// (expensive) scan. Reports the `CleaningUp` phase so gRPC clients can
-/// show progress.
+/// Virtualization.framework XPC helpers of a just-displaced or crashed daemon
+/// may still hold a previous daemon's disk images. Clean starts skip the
+/// expensive scan unless persisted machine state shows the previous daemon was
+/// interrupted while a VM was running. Reports the `CleaningUp` phase so gRPC
+/// clients can show progress.
 ///
 /// Scans every persistent dockerd image owned by a configured utility
 /// VM role (native `docker.img`, rosetta `docker-rosetta.img`) so a
@@ -110,27 +111,27 @@ async fn acquire_lock(early: EarlyContext) -> Result<DaemonContext> {
 /// On non-macOS this is a no-op (no XPC helpers).
 #[cfg(target_os = "macos")]
 async fn wait_for_resources(ctx: &DaemonContext) -> Result<()> {
-    let candidates = ["docker.img", "docker-rosetta.img"];
-    let docker_imgs: Vec<std::path::PathBuf> = candidates
-        .iter()
-        .map(|name| ctx.layout.data_subdir.join(name))
-        .filter(|path| path.exists())
-        .collect();
+    let docker_imgs = resource_cleanup::disk_image_paths(&ctx.layout.data_subdir);
+    let decision = resource_cleanup::decide(
+        ctx.daemon_lock.displaced_stale_daemon(),
+        resource_cleanup::has_interrupted_running_machine(&ctx.layout.data_dir),
+        !docker_imgs.is_empty(),
+    );
 
-    if docker_imgs.is_empty() {
+    let resource_cleanup::ResourceCleanupDecision::ScanDiskImageHolders { reason } = decision
+    else {
+        info!(
+            decision = ?decision,
+            "Skipping startup resource-holder cleanup"
+        );
         return Ok(());
-    }
+    };
 
-    // Residual holders only exist when an old daemon was displaced during
-    // lock acquisition (its XPC helpers may outlive the flock release).
-    // On a clean start, skip the scan: `pids_by_path` walks every
-    // process's fd table and costs ~100ms. A crashed daemon's helpers can
-    // in principle linger past the kernel's flock release, but the scan
-    // was always best-effort (10s cap, then proceed with a warning) and
-    // VM start reports its own error if the image is still held.
-    if !ctx.daemon_lock.displaced_stale_daemon() {
-        return Ok(());
-    }
+    info!(
+        reason = ?reason,
+        image_count = docker_imgs.len(),
+        "Scanning disk-image holders before runtime startup"
+    );
 
     ctx.setup_state
         .set_phase(SetupPhase::CleaningUp, "Waiting for resource release…");
