@@ -392,6 +392,19 @@ impl AgentClient {
         matches!(self.transport, AgentTransport::Blocking(_))
     }
 
+    /// Test-only: asks the guest agent to exit so PID 1 (busybox init) respawns
+    /// it, exercising the supervision path. Returns once the agent acks; the
+    /// agent then exits shortly after. Blocking transport only (hv_e2e harness).
+    pub fn kill_agent_blocking(&mut self) -> Result<()> {
+        let (resp_type, _payload) = self.rpc_call_blocking(MessageType::KillAgentRequest, &[])?;
+        if resp_type != MessageType::KillAgentResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: {resp_type}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Pings the agent.
     ///
     /// # Errors

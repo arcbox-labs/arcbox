@@ -8,10 +8,13 @@
 //! 3. DAX E2E (ABX-362): drop a known file on the VirtioFS share, have the
 //!    guest `mmap(MAP_SHARED)` + read it, verify bytes match and the host's
 //!    `DaxStats::setup_count` incremented.
-//! 4. `Vmm::pause()` stops the guest — a ping during pause times out.
-//! 5. `Vmm::resume()` restarts the guest — the next ping succeeds.
+//! 4. Supervision: killing the agent makes PID 1 (busybox init) respawn it and
+//!    a ping recovers — proving an agent crash no longer panics the kernel.
+//!    Requires the busybox-init rootfs + an agent with the `KillAgent` handler.
+//! 5. `Vmm::pause()` stops the guest — a ping during pause times out.
+//! 6. `Vmm::resume()` restarts the guest — the next ping succeeds.
 //!    (Exercises ABX-360.)
-//! 6. `Vmm::stop()` shuts down cleanly.
+//! 7. `Vmm::stop()` shuts down cleanly.
 //!
 //! Usage:
 //!   cargo build --release --example hv_e2e -p arcbox-core
@@ -28,7 +31,8 @@
 //!   ARCBOX_DATA_DIR         override host data dir shared at /arcbox
 //!                           (default: ~/.arcbox). Must contain
 //!                           bin/arcbox-agent built with the matching
-//!                           `MmapReadFile` handler.
+//!                           `MmapReadFile` + `KillAgent` handlers (busybox-init
+//!                           build). Phase 4 also needs the busybox-init rootfs.
 //!
 //! Exit code 0 = all assertions passed. Non-zero = failure.
 
@@ -187,6 +191,9 @@ fn run() -> Result<(), String> {
 
     println!("[phase 4.5] DAX end-to-end (ABX-362)");
     dax_round_trip(&vmm, &dax_fixture)?;
+
+    println!("[phase 4.7] agent supervision — busybox init respawn");
+    supervision_round_trip(&vmm)?;
 
     println!("[phase 5] pause VM (ABX-360)");
     vmm.pause().map_err(|e| format!("Vmm::pause: {e}"))?;
@@ -433,6 +440,50 @@ fn get_system_info(vmm: &Vmm) -> Result<arcbox_protocol::SystemInfo, String> {
     client
         .get_system_info_blocking()
         .map_err(|e| format!("get_system_info_blocking: {e}"))
+}
+
+/// Proves the busybox-init supervision contract: killing the agent process makes
+/// PID 1 (busybox init) respawn it, without panicking the kernel.
+///
+/// The host asks the agent to exit (it acks, then exits ~100ms later), then a
+/// fresh ping must recover within the timeout. Under the old agent-as-PID-1
+/// model, killing the agent panics the kernel ("Attempted to kill init") and the
+/// whole VM dies — the recovery ping would never come back. So a successful ping
+/// after the kill is the supervision proof.
+///
+/// Requires the busybox-init rootfs (boot-assets#27) and an agent with the
+/// `KillAgent` handler; with the old rootfs this phase fails (kernel panic).
+fn supervision_round_trip(vmm: &Vmm) -> Result<(), String> {
+    // Precondition: the agent is up.
+    ping_once(vmm, Duration::from_secs(3)).map_err(|e| format!("agent not up before kill: {e}"))?;
+
+    // Ask the agent to exit; it acks, then exits shortly after.
+    kill_agent(vmm)?;
+    println!("          kill acked — agent will exit, expecting busybox-init respawn");
+
+    // The respawned agent must answer again. busybox init respawns it in well
+    // under a second on a healthy kernel; allow generous slack.
+    let t = Instant::now();
+    ping_with_timeout(vmm, Duration::from_secs(30)).map_err(|e| {
+        format!("agent did not respawn within 30s (kernel panic on PID-1 exit?): {e}")
+    })?;
+    println!(
+        "          agent respawned and answered after {:.1}s — supervision works",
+        t.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// Sends a `KillAgent` request over a fresh vsock connection.
+fn kill_agent(vmm: &Vmm) -> Result<(), String> {
+    let fd = vmm
+        .connect_vsock(AGENT_PORT)
+        .map_err(|e| format!("connect_vsock: {e}"))?;
+    let mut client =
+        AgentClient::from_fd(GUEST_CID, fd).map_err(|e| format!("AgentClient::from_fd: {e}"))?;
+    client
+        .kill_agent_blocking()
+        .map_err(|e| format!("kill_agent_blocking: {e}"))
 }
 
 fn resolve_data_dir() -> Result<PathBuf, String> {
