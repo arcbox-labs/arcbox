@@ -165,18 +165,28 @@ pub async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
         config.vm.kernel_path = Some(kernel.clone());
     }
 
-    // Seed boot assets from app bundle if available, otherwise download.
-    // Run on a blocking thread to avoid stalling the async runtime during
-    // large file copies (kernel + rootfs + runtime binaries).
+    // Seed boot assets from app bundle if available, then download anything
+    // still missing. Run bundle seeding on a blocking thread to avoid stalling
+    // the async runtime during large file copies (kernel + rootfs + runtime
+    // binaries). The agent fallback runs after boot assets are present so a
+    // fresh non-bundle install can stage the downloaded boot-cache agent.
+    let data_dir = ctx.layout.data_dir.clone();
+    let bundle_seed = tokio::task::spawn_blocking(move || assets::seed_from_bundle(&data_dir))
+        .await
+        .context("bundle seed task panicked")?
+        .context("bundle seed failed")?;
+
+    assets::ensure_boot_assets(&ctx.layout.data_dir, &ctx.setup_state).await?;
+
+    // Stage the boot-cache agent only when the app bundle did not already
+    // provide one. A bundle agent is authoritative for the launched app build.
     let data_dir = ctx.layout.data_dir.clone();
     tokio::task::spawn_blocking(move || {
-        assets::seed_from_bundle(&data_dir);
-        assets::ensure_agent_binary(&data_dir)
+        assets::ensure_agent_binary_fallback(&data_dir, bundle_seed)
     })
     .await
-    .context("seed task panicked")?
-    .context("seed failed")?;
-    assets::ensure_boot_assets(&ctx.layout.data_dir, &ctx.setup_state).await?;
+    .context("agent fallback task panicked")?
+    .context("agent fallback failed")?;
     ctx.setup_state
         .set_phase(SetupPhase::AssetsReady, "Boot assets ready");
 

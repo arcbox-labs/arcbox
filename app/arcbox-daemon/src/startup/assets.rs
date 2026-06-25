@@ -46,11 +46,12 @@ pub fn find_bundle_contents() -> Option<PathBuf> {
 /// Contents/Resources/runtime/           → ~/.arcbox/runtime/
 /// Contents/Resources/bin/arcbox-agent   → ~/.arcbox/bin/arcbox-agent
 /// ```
-pub(super) fn seed_from_bundle(data_dir: &Path) {
+pub(super) fn seed_from_bundle(data_dir: &Path) -> Result<BundleSeed> {
     let Some(contents) = find_bundle_contents() else {
-        return;
+        return Ok(BundleSeed::default());
     };
     tracing::info!("App bundle detected: {}", contents.display());
+    let mut seed = BundleSeed::default();
 
     // 1. Boot assets: kernel, rootfs, manifest.
     let version = arcbox_core::boot_asset_version();
@@ -74,14 +75,50 @@ pub(super) fn seed_from_bundle(data_dir: &Path) {
 
     // 3. Agent binary.
     let agent_src = contents.join("Resources/bin/arcbox-agent");
-    let agent_dst = data_dir.join("bin/arcbox-agent");
     if agent_src.exists() {
-        match copy_if_changed(&agent_src, &agent_dst) {
-            Ok(true) => tracing::info!("Seeded arcbox-agent from bundle"),
-            Ok(false) => tracing::debug!("arcbox-agent already up to date"),
-            Err(e) => tracing::warn!("Failed to seed agent from bundle: {e}"),
-        }
+        seed.agent = seed_agent_from_bundle(&agent_src, data_dir)
+            .context("Failed to seed arcbox-agent from bundle")?;
     }
+
+    Ok(seed)
+}
+
+/// Result of copying bundle-provided assets into the runtime data directory.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BundleSeed {
+    /// Whether the app bundle provided and successfully synced `arcbox-agent`.
+    agent: AgentSeed,
+}
+
+impl BundleSeed {
+    /// Returns whether the boot cache may be used to stage `arcbox-agent`.
+    ///
+    /// A bundle-provided agent is authoritative because it ships with the app
+    /// version that just launched. Falling back after that would let an older
+    /// boot cache overwrite the freshly staged bundle agent.
+    pub(super) fn needs_agent_fallback(self) -> bool {
+        self.agent == AgentSeed::Missing
+    }
+}
+
+/// Source state for the staged `~/.arcbox/bin/arcbox-agent`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum AgentSeed {
+    /// No bundle agent was available; the boot cache may be used as fallback.
+    #[default]
+    Missing,
+    /// The bundle agent is the staged copy's authoritative source.
+    Bundle,
+}
+
+fn seed_agent_from_bundle(agent_src: &Path, data_dir: &Path) -> Result<AgentSeed> {
+    let agent_dst = data_dir.join("bin/arcbox-agent");
+    match copy_if_changed(agent_src, &agent_dst) {
+        Ok(true) => tracing::info!("Seeded arcbox-agent from bundle"),
+        Ok(false) => tracing::debug!("arcbox-agent already up to date"),
+        Err(e) => return Err(e).context("failed to copy bundle arcbox-agent"),
+    }
+    Ok(AgentSeed::Bundle)
 }
 
 /// Copies `src` to `dst` when `dst` is missing or differs from `src` by size or
@@ -216,9 +253,22 @@ pub(super) async fn ensure_boot_assets(
     Ok(())
 }
 
-/// Installs the arcbox-agent binary from the downloaded boot cache, refreshing
-/// it if the cached copy differs. This is the fallback path for non-bundle
-/// installs; bundle installs are handled by [`seed_from_bundle`].
+/// Installs the boot-cache agent only when bundle seeding did not provide one.
+///
+/// This fallback path is only used when the daemon is not running from an app
+/// bundle or the bundle does not contain an agent. Bundle-provided agents are
+/// authoritative and must not be overwritten by a possibly older boot cache.
+pub(super) fn ensure_agent_binary_fallback(data_dir: &Path, bundle_seed: BundleSeed) -> Result<()> {
+    if bundle_seed.needs_agent_fallback() {
+        ensure_agent_binary(data_dir)?;
+    }
+    Ok(())
+}
+
+/// Installs the arcbox-agent binary from the downloaded boot cache.
+///
+/// Call [`ensure_agent_binary_fallback`] from startup code so bundle-provided
+/// agents keep precedence over the boot cache.
 pub(super) fn ensure_agent_binary(data_dir: &Path) -> Result<()> {
     let agent_dest = data_dir.join("bin/arcbox-agent");
 
@@ -240,7 +290,10 @@ pub(super) fn ensure_agent_binary(data_dir: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::copy_if_changed;
+    use super::{
+        AgentSeed, BundleSeed, copy_if_changed, ensure_agent_binary_fallback,
+        seed_agent_from_bundle,
+    };
     use std::fs;
 
     #[test]
@@ -293,5 +346,48 @@ mod tests {
 
         let mode = fs::metadata(&dst).unwrap().permissions().mode();
         assert_ne!(mode & 0o111, 0, "executable bit should be preserved");
+    }
+
+    #[test]
+    fn boot_cache_installs_agent_when_bundle_agent_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cached_agent = dir.path().join(format!(
+            "boot/{}/arcbox-agent",
+            arcbox_core::boot_asset_version()
+        ));
+        fs::create_dir_all(cached_agent.parent().unwrap()).unwrap();
+        fs::write(&cached_agent, b"boot-cache-agent").unwrap();
+
+        ensure_agent_binary_fallback(dir.path(), BundleSeed::default()).unwrap();
+
+        let staged_agent = dir.path().join("bin/arcbox-agent");
+        assert_eq!(fs::read(staged_agent).unwrap(), b"boot-cache-agent");
+    }
+
+    #[test]
+    fn boot_cache_does_not_overwrite_bundle_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_agent = dir.path().join("bundle-agent");
+        fs::write(&bundle_agent, b"bundle-agent").unwrap();
+        let agent = seed_agent_from_bundle(&bundle_agent, dir.path()).unwrap();
+        assert_eq!(agent, AgentSeed::Bundle);
+
+        let cached_agent = dir.path().join(format!(
+            "boot/{}/arcbox-agent",
+            arcbox_core::boot_asset_version()
+        ));
+        fs::create_dir_all(cached_agent.parent().unwrap()).unwrap();
+        fs::write(&cached_agent, b"older-boot-cache-agent").unwrap();
+
+        ensure_agent_binary_fallback(
+            dir.path(),
+            BundleSeed {
+                agent: AgentSeed::Bundle,
+            },
+        )
+        .unwrap();
+
+        let staged_agent = dir.path().join("bin/arcbox-agent");
+        assert_eq!(fs::read(staged_agent).unwrap(), b"bundle-agent");
     }
 }
