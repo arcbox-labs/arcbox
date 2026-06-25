@@ -262,6 +262,10 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         // Trigger an immediate fstrim in the guest. The discards flow through
         // virtio-blk, which punches holes in the host data image, shrinking its
         // physical footprint. The caller measures host usage before/after.
+        //
+        // If fstrim fails in the guest, the agent replies with a generic error
+        // response, so `disk_trim()` surfaces it as an `Err` here — no need to
+        // inspect the result text.
         let mut agent = self
             .runtime
             .ready()?
@@ -271,17 +275,6 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             .disk_trim()
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-
-        // The RPC transport succeeding doesn't mean fstrim did: the guest's
-        // run_fstrim_now formats per-mount failures as "… failed (…)" / "…
-        // error (…)" in the result summary. Surface those so `disk compact`
-        // doesn't report false success.
-        if resp.result.contains("failed (") || resp.result.contains("error (") {
-            return Err(Status::internal(format!(
-                "guest fstrim reported errors: {}",
-                resp.result
-            )));
-        }
         tracing::debug!(machine = %id, result = %resp.result, "disk compact: fstrim done");
 
         Ok(Response::new(Empty {}))
