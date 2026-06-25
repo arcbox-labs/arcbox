@@ -10,11 +10,8 @@ mod shutdown;
 mod startup;
 
 use anyhow::Result;
-use arcbox_api::SetupPhase;
 use arcbox_logging::LogConfig;
 use clap::Parser;
-use macos_resolver::FileResolver;
-use tracing::info;
 
 #[derive(Debug, Parser)]
 #[command(name = "arcbox-daemon")]
@@ -75,7 +72,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .expect("Failed to build tokio runtime")
-        .block_on(run(args));
+        .block_on(startup::Startup::from_args(args).run());
     if let Err(ref e) = result {
         let error: &(dyn std::error::Error + Send + Sync + 'static) = e.as_ref();
         sentry::capture_error(error);
@@ -96,59 +93,4 @@ fn sentry_environment() -> Option<String> {
     std::env::var("ARCBOX_DAEMON_SENTRY_ENVIRONMENT")
         .or_else(|_| std::env::var("SENTRY_ENVIRONMENT"))
         .ok()
-}
-
-async fn run(args: DaemonArgs) -> Result<()> {
-    info!("Starting ArcBox daemon...");
-
-    // Phase 1: directories, config, sockets — no runtime yet.
-    let early = startup::init_early(args).await?;
-
-    // Acquire exclusive daemon lock. Terminates any stale daemon that
-    // still holds the lock (up to ~30 s SIGTERM wait). Must complete
-    // before start_grpc because the old daemon may be listening on the
-    // same socket paths. Consumes EarlyContext, producing a
-    // DaemonContext with a guaranteed lock.
-    let ctx = startup::acquire_lock(early).await?;
-
-    // Start gRPC with all services. Machine/Sandbox return UNAVAILABLE
-    // until runtime is ready. SystemService works immediately so clients
-    // can observe the full startup progression (CLEANING_UP →
-    // INITIALIZING → DOWNLOADING_ASSETS → ASSETS_READY → …).
-    let shared_runtime = ctx.shared_runtime.clone();
-    let grpc = services::start_grpc(&ctx, shared_runtime).await?;
-
-    // Wait for residual resource holders (e.g. orphaned
-    // Virtualization.framework XPC helpers holding docker.img).
-    // Visible to gRPC clients as the CLEANING_UP phase.
-    startup::wait_for_resources(&ctx).await?;
-
-    // Phase 2: seed/download boot assets, build runtime, start VM.
-    // Progress is visible to gRPC clients via WatchSetupStatus.
-    let runtime = startup::init_runtime(&ctx).await?;
-
-    // Phase 3: start remaining services that require the runtime.
-    let handles = services::start_services(&ctx, &runtime, grpc).await?;
-    recovery::run(&ctx, &runtime).await;
-
-    check_resolver_installed(&ctx.dns_domain);
-    ctx.setup_state.set_phase(SetupPhase::Ready, "Daemon ready");
-
-    println!("ArcBox daemon started");
-    println!("  Docker API: {}", ctx.layout.docker_socket.display());
-    println!("  gRPC API:   {}", ctx.layout.grpc_socket.display());
-    println!("  DNS:        127.0.0.1:{}", ctx.dns_port);
-    println!("  Data:       {}", ctx.layout.data_dir.display());
-    println!();
-    println!("Use 'arcbox docker enable' to configure Docker CLI integration.");
-    println!("Press Ctrl+C to stop.");
-
-    shutdown::run(ctx, handles).await
-}
-
-fn check_resolver_installed(domain: &str) {
-    let resolver = FileResolver::new("arcbox");
-    if !resolver.is_registered(domain) {
-        println!("Hint: Run 'sudo arcbox dns install' to enable *.{domain} DNS resolution.");
-    }
 }
