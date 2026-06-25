@@ -47,6 +47,8 @@ pub enum VmnetReturnT {
     TooManyPackets = 1008,
     /// Sharing service busy.
     SharingServiceBusy = 1009,
+    /// The process is not authorized to use vmnet.
+    NotAuthorized = 1010,
 }
 
 impl VmnetReturnT {
@@ -70,6 +72,7 @@ impl VmnetReturnT {
             Self::BufferExhausted => "buffer exhausted",
             Self::TooManyPackets => "too many packets",
             Self::SharingServiceBusy => "sharing service busy",
+            Self::NotAuthorized => "not authorized",
         }
     }
 }
@@ -549,8 +552,16 @@ mod tests {
     fn test_vmnet_return_messages() {
         assert_eq!(VmnetReturnT::Success.message(), "success");
         assert_eq!(VmnetReturnT::Failure.message(), "operation failed");
+        assert_eq!(VmnetReturnT::NotAuthorized.message(), "not authorized");
         assert!(VmnetReturnT::Success.is_success());
         assert!(!VmnetReturnT::Failure.is_success());
+    }
+
+    #[test]
+    fn test_vmnet_return_values() {
+        assert_eq!(VmnetReturnT::Success as i32, 1000);
+        assert_eq!(VmnetReturnT::SharingServiceBusy as i32, 1009);
+        assert_eq!(VmnetReturnT::NotAuthorized as i32, 1010);
     }
 
     #[test]
@@ -565,6 +576,7 @@ mod tests {
     /// iovec pointer, then two `uint32_t`s. A layout drift shifts every
     /// field offset and makes vmnet_read/vmnet_write reject the
     /// descriptor with VMNET_INVALID_ARGUMENT.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn vmnet_packet_matches_vmpktdesc_abi() {
         use std::mem::{offset_of, size_of};
