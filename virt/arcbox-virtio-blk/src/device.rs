@@ -62,9 +62,9 @@ impl VirtioBlock {
     /// allocation + one `pwrite` syscall. The guest splits larger requests.
     pub const MAX_WRITE_ZEROES_SECTORS: u32 = 2048;
 
-    /// Largest range a single DISCARD request may cover. Since DISCARD is a
-    /// spec-compliant no-op on our backend (advisory hint), we accept any
-    /// reasonable cap — 16 MiB keeps the guest from fragmenting `fstrim`.
+    /// Largest range a single DISCARD request may cover, in 512-byte sectors.
+    /// 16 MiB keeps the guest from fragmenting `fstrim` into excessive requests
+    /// while bounding the work of a single hole-punch.
     pub const MAX_DISCARD_SECTORS: u32 = 32768;
 
     /// Creates a new block device.
@@ -301,12 +301,26 @@ impl VirtioBlock {
         Ok(len)
     }
 
-    /// DISCARD is an advisory hint under the virtio-blk spec — the device
-    /// "MAY" reclaim storage but is free to ignore it entirely. We accept the
-    /// request, validate the range list is well-formed, and return OK without
-    /// touching the backing file. Real hole-punching via `fallocate` /
-    /// `F_PUNCHHOLE` can slot in here later without a wire-protocol change.
+    /// DISCARD reclaims host disk for the named sector ranges by punching holes
+    /// in the backing file (`fallocate` PUNCH_HOLE on Linux, `F_PUNCHHOLE` on
+    /// macOS). This is what makes guest `fstrim` / `discard=async` actually
+    /// shrink the sparse data image instead of growing forever.
+    ///
+    /// Under the virtio-blk spec DISCARD is advisory — the device "MAY" reclaim
+    /// storage but the guest must not rely on it. So a punch *failure* is logged
+    /// and swallowed rather than failing the request: the blocks are already
+    /// logically free in the guest either way, and failing would only break the
+    /// guest's `fstrim`. Malformed requests still error.
     fn handle_discard_list(&self, data: &[u8]) -> Result<usize> {
+        if self.config.read_only {
+            return Err(VirtioError::InvalidOperation("Device is read-only".into()));
+        }
+
+        let fd = self
+            .raw_fd
+            .ok_or_else(|| VirtioError::NotReady("Block device not activated".into()))?;
+        let block_size = u64::from(self.config.blk_size);
+
         for range in parse_range_list(data)? {
             if u64::from(range.num_sectors) > u64::from(Self::MAX_DISCARD_SECTORS) {
                 return Err(VirtioError::InvalidOperation(format!(
@@ -320,6 +334,27 @@ impl VirtioBlock {
                     "discard range has reserved flags set: 0x{:x}",
                     range.flags
                 )));
+            }
+
+            let start = range.sector * block_size;
+            let end = start + u64::from(range.num_sectors) * block_size;
+            // Align inward to the host FS allocation unit: macOS `F_PUNCHHOLE`
+            // rejects unaligned ranges, and only fully-covered blocks are freed
+            // on Linux anyway. Punching just the aligned interior is always
+            // safe — the guest already considers the whole range free, and we
+            // lose at most one block of reclaim at each edge.
+            let aligned_start = (start + (PUNCH_HOLE_ALIGNMENT - 1)) & !(PUNCH_HOLE_ALIGNMENT - 1);
+            let aligned_end = end & !(PUNCH_HOLE_ALIGNMENT - 1);
+            if aligned_end <= aligned_start {
+                continue;
+            }
+            if let Err(e) = punch_hole(fd, aligned_start, aligned_end - aligned_start) {
+                tracing::warn!(
+                    sector = range.sector,
+                    num_sectors = range.num_sectors,
+                    error = %e,
+                    "discard hole-punch failed; range left allocated on host"
+                );
             }
         }
         Ok(0)
@@ -502,6 +537,54 @@ impl VirtioBlock {
             }
         }
     }
+}
+
+/// Host filesystem allocation unit used to align hole-punch ranges. APFS and
+/// modern ext4/btrfs all use 4 KiB blocks; macOS `F_PUNCHHOLE` requires the
+/// punch offset and length to be multiples of this, and Linux only frees
+/// fully-covered blocks regardless.
+const PUNCH_HOLE_ALIGNMENT: u64 = 4096;
+
+/// Deallocates `[offset, offset + len)` in the file behind `fd`, leaving a
+/// sparse hole without changing the file's logical size. `offset` and `len`
+/// must be `PUNCH_HOLE_ALIGNMENT`-aligned.
+#[cfg(target_os = "linux")]
+fn punch_hole(fd: std::os::unix::io::RawFd, offset: u64, len: u64) -> std::io::Result<()> {
+    // PUNCH_HOLE must be combined with KEEP_SIZE: free the range but keep EOF.
+    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+    #[allow(clippy::cast_possible_wrap)]
+    let (off, length) = (offset as libc::off_t, len as libc::off_t);
+    // SAFETY: `fd` is a valid writable descriptor; `off`/`length` are aligned,
+    // non-negative, and fit `off_t` (the backing file is at most 8 TiB).
+    let ret = unsafe { libc::fallocate(fd, mode, off, length) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn punch_hole(fd: std::os::unix::io::RawFd, offset: u64, len: u64) -> std::io::Result<()> {
+    #[allow(clippy::cast_possible_wrap)]
+    let mut ph = libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: offset as libc::off_t,
+        fp_length: len as libc::off_t,
+    };
+    // SAFETY: `fd` is a valid writable descriptor and `ph` is a fully
+    // initialized `fpunchhole_t` that outlives the `fcntl` call.
+    let ret = unsafe { libc::fcntl(fd, libc::F_PUNCHHOLE, &mut ph) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn punch_hole(_fd: std::os::unix::io::RawFd, _offset: u64, _len: u64) -> std::io::Result<()> {
+    // No portable hole-punch; leave the range allocated (DISCARD is advisory).
+    Ok(())
 }
 
 /// One entry in a DISCARD / WRITE_ZEROES request's range list. The on-wire
@@ -831,6 +914,69 @@ mod tests {
 
         let device = VirtioBlock::from_path(temp_file.path(), false).unwrap();
         assert_eq!(device.config.capacity, 8); // 4096 / 512
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn punch_hole_reclaims_physical_blocks() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+
+        let mut temp = NamedTempFile::new().unwrap();
+        // Allocate 1 MiB of real (non-zero) data so the host backs it with
+        // physical blocks rather than a hole.
+        temp.write_all(&vec![0xABu8; 1024 * 1024]).unwrap();
+        temp.as_file().sync_all().unwrap();
+
+        let before = std::fs::metadata(temp.path()).unwrap().blocks() * 512;
+        assert!(
+            before >= 1024 * 1024,
+            "expected ~1 MiB allocated before punch, got {before}"
+        );
+
+        punch_hole(temp.as_file().as_raw_fd(), 0, 1024 * 1024).unwrap();
+        temp.as_file().sync_all().unwrap();
+
+        let after = std::fs::metadata(temp.path()).unwrap().blocks() * 512;
+        assert!(
+            after < 64 * 1024,
+            "expected the hole-punch to free the blocks, still {after} allocated"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discard_punches_backing_file() {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut temp = NamedTempFile::new().unwrap();
+        temp.write_all(&vec![0xCDu8; 1024 * 1024]).unwrap();
+        temp.as_file().sync_all().unwrap();
+
+        let config = BlockConfig {
+            capacity: 2048, // 1 MiB / 512
+            blk_size: 512,
+            path: temp.path().to_path_buf(),
+            read_only: false,
+            num_queues: 1,
+        };
+        let mut device = VirtioBlock::new(config);
+        device.activate().unwrap();
+
+        // One discard range covering sectors [0, 2048) — the whole 1 MiB.
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&0u64.to_le_bytes()); // sector
+        entry.extend_from_slice(&2048u32.to_le_bytes()); // num_sectors
+        entry.extend_from_slice(&0u32.to_le_bytes()); // flags
+
+        device.handle_discard_list(&entry).unwrap();
+        temp.as_file().sync_all().unwrap();
+
+        let after = std::fs::metadata(temp.path()).unwrap().blocks() * 512;
+        assert!(
+            after < 64 * 1024,
+            "discard should have punched the backing file, still {after} allocated"
+        );
     }
 
     #[test]
