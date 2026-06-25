@@ -1,8 +1,7 @@
 //! Typed daemon startup pipeline.
 //!
-//! Each step consumes the previous state and returns the next one, so the
-//! load-bearing startup order is represented by Rust types instead of comments
-//! in `main.rs`.
+//! Each step consumes the previous state and returns the next one, so `main.rs`
+//! can show the startup order directly while Rust types enforce it.
 
 use std::sync::Arc;
 
@@ -13,7 +12,7 @@ use macos_resolver::FileResolver;
 use tracing::info;
 
 use crate::context::{DaemonContext, EarlyContext, ServiceHandles};
-use crate::{DaemonArgs, recovery, services, shutdown};
+use crate::{DaemonArgs, recovery, services};
 
 use super::{acquire_lock, assets, init_early, init_runtime, prepare_assets, wait_for_resources};
 
@@ -22,9 +21,9 @@ pub struct Startup {
     args: DaemonArgs,
 }
 
-struct ReadyDaemon {
-    ctx: DaemonContext,
-    handles: ServiceHandles,
+pub struct ReadyDaemon {
+    pub ctx: DaemonContext,
+    pub handles: ServiceHandles,
 }
 
 impl Startup {
@@ -33,55 +32,33 @@ impl Startup {
         Self { args }
     }
 
-    async fn run_until_ready(self) -> Result<ReadyDaemon> {
-        self.prepare_host()
-            .await?
-            .acquire_daemon_lease()
-            .await?
-            .start_control_plane()
-            .await?
-            .release_stale_resources()
-            .await?
-            .prepare_assets()
-            .await?
-            .boot_runtime()
-            .await?
-            .start_runtime_services()
-            .await?
-            .mark_ready()
-            .await
-    }
-
-    /// Runs startup and then enters the shutdown loop.
-    pub async fn run(self) -> Result<()> {
-        let ready = self.run_until_ready().await?;
-        shutdown::run(ready.ctx, ready.handles).await
-    }
-
-    async fn prepare_host(self) -> Result<HostPrepared> {
+    /// Prepares host directories and pre-lock context.
+    pub async fn prepare_host(self) -> Result<HostPrepared> {
         info!("Starting ArcBox daemon...");
         let early = init_early(self.args).await?;
         Ok(HostPrepared { early })
     }
 }
 
-struct HostPrepared {
+pub struct HostPrepared {
     early: EarlyContext,
 }
 
 impl HostPrepared {
-    async fn acquire_daemon_lease(self) -> Result<DaemonLeased> {
+    /// Acquires the exclusive daemon lease.
+    pub async fn acquire_daemon_lease(self) -> Result<DaemonLeased> {
         let ctx = acquire_lock(self.early).await?;
         Ok(DaemonLeased { ctx })
     }
 }
 
-struct DaemonLeased {
+pub struct DaemonLeased {
     ctx: DaemonContext,
 }
 
 impl DaemonLeased {
-    async fn start_control_plane(self) -> Result<ControlPlaneStarted> {
+    /// Starts gRPC before slow runtime phases so clients can observe progress.
+    pub async fn start_control_plane(self) -> Result<ControlPlaneStarted> {
         let shared_runtime = Arc::clone(&self.ctx.shared_runtime);
         let grpc = services::start_grpc(&self.ctx, shared_runtime).await?;
         Ok(ControlPlaneStarted {
@@ -91,13 +68,14 @@ impl DaemonLeased {
     }
 }
 
-struct ControlPlaneStarted {
+pub struct ControlPlaneStarted {
     ctx: DaemonContext,
     grpc: tokio::task::JoinHandle<()>,
 }
 
 impl ControlPlaneStarted {
-    async fn release_stale_resources(self) -> Result<ResourcesReleased> {
+    /// Waits for stale resource holders from a previous daemon to release.
+    pub async fn release_stale_resources(self) -> Result<ResourcesReleased> {
         wait_for_resources(&self.ctx).await?;
         Ok(ResourcesReleased {
             ctx: self.ctx,
@@ -106,13 +84,14 @@ impl ControlPlaneStarted {
     }
 }
 
-struct ResourcesReleased {
+pub struct ResourcesReleased {
     ctx: DaemonContext,
     grpc: tokio::task::JoinHandle<()>,
 }
 
 impl ResourcesReleased {
-    async fn prepare_assets(self) -> Result<AssetsPrepared> {
+    /// Reconciles bundle, downloaded, and staged assets for this app version.
+    pub async fn prepare_assets(self) -> Result<AssetsPrepared> {
         let assets = prepare_assets(&self.ctx).await?;
         info!(agent = ?assets.agent(), "Startup assets prepared");
         Ok(AssetsPrepared {
@@ -123,14 +102,15 @@ impl ResourcesReleased {
     }
 }
 
-struct AssetsPrepared {
+pub struct AssetsPrepared {
     ctx: DaemonContext,
     grpc: tokio::task::JoinHandle<()>,
     _assets: assets::PreparedAssets,
 }
 
 impl AssetsPrepared {
-    async fn boot_runtime(self) -> Result<RuntimeBooted> {
+    /// Builds and initializes the ArcBox runtime.
+    pub async fn boot_runtime(self) -> Result<RuntimeBooted> {
         let runtime = init_runtime(&self.ctx).await?;
         Ok(RuntimeBooted {
             ctx: self.ctx,
@@ -140,14 +120,15 @@ impl AssetsPrepared {
     }
 }
 
-struct RuntimeBooted {
+pub struct RuntimeBooted {
     ctx: DaemonContext,
     grpc: tokio::task::JoinHandle<()>,
     runtime: Arc<Runtime>,
 }
 
 impl RuntimeBooted {
-    async fn start_runtime_services(self) -> Result<RuntimeServicesStarted> {
+    /// Starts services that require an initialized runtime.
+    pub async fn start_runtime_services(self) -> Result<RuntimeServicesStarted> {
         let handles = services::start_services(&self.ctx, &self.runtime, self.grpc).await?;
         recovery::run(&self.ctx, &self.runtime).await;
         Ok(RuntimeServicesStarted {
@@ -157,13 +138,14 @@ impl RuntimeBooted {
     }
 }
 
-struct RuntimeServicesStarted {
+pub struct RuntimeServicesStarted {
     ctx: DaemonContext,
     handles: ServiceHandles,
 }
 
 impl RuntimeServicesStarted {
-    async fn mark_ready(self) -> Result<ReadyDaemon> {
+    /// Marks startup complete and returns handles for the shutdown loop.
+    pub async fn mark_ready(self) -> Result<ReadyDaemon> {
         check_resolver_installed(&self.ctx.dns_domain);
         self.ctx
             .setup_state

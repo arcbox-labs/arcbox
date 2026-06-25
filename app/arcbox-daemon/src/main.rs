@@ -72,7 +72,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .expect("Failed to build tokio runtime")
-        .block_on(startup::Startup::from_args(args).run());
+        .block_on(run(args));
     if let Err(ref e) = result {
         let error: &(dyn std::error::Error + Send + Sync + 'static) = e.as_ref();
         sentry::capture_error(error);
@@ -93,4 +93,26 @@ fn sentry_environment() -> Option<String> {
     std::env::var("ARCBOX_DAEMON_SENTRY_ENVIRONMENT")
         .or_else(|_| std::env::var("SENTRY_ENVIRONMENT"))
         .ok()
+}
+
+async fn run(args: DaemonArgs) -> Result<()> {
+    let ready = startup::Startup::from_args(args)
+        .prepare_host()
+        .await?
+        .acquire_daemon_lease()
+        .await?
+        .start_control_plane()
+        .await?
+        .release_stale_resources()
+        .await?
+        .prepare_assets()
+        .await?
+        .boot_runtime()
+        .await?
+        .start_runtime_services()
+        .await?
+        .mark_ready()
+        .await?;
+
+    shutdown::run(ready.ctx, ready.handles).await
 }
