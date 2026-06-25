@@ -9,6 +9,7 @@
 use crate::error::{CoreError, Result};
 use arcbox_boot::asset_manager::{AssetManager, AssetManagerConfig};
 use arcbox_boot::download::{PrepareProgress, ProgressCallback as InnerProgressCallback};
+use arcbox_constants::cmdline::HV_EARLYCON_DIRECTIVE;
 use arcbox_constants::env::BOOT_ASSET_VERSION as BOOT_ASSET_VERSION_ENV;
 use sha2::Digest;
 use std::path::{Path, PathBuf};
@@ -149,7 +150,9 @@ impl BootAssets {
     /// Default kernel command line for EROFS rootfs boot.
     #[must_use]
     pub fn default_cmdline() -> String {
-        "console=hvc0 root=/dev/vda ro rootfstype=erofs earlycon swiotlb=noforce".to_string()
+        format!(
+            "console=hvc0 root=/dev/vda ro rootfstype=erofs {HV_EARLYCON_DIRECTIVE} swiotlb=noforce"
+        )
     }
 }
 

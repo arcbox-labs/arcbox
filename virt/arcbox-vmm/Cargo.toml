@@ -42,6 +42,7 @@ arcbox-vmnet = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+arcbox-constants.workspace = true
 
 [features]
 # `gic` is on by default so every binary linking arcbox-vmm
