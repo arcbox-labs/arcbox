@@ -771,6 +771,59 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_hit_rewrites_question_case_for_current_query() {
+        let config = DnsConfig::default();
+        let mut forwarder = DnsForwarder::new(config);
+
+        let query = build_test_query("cached.test");
+        let parsed_query = DnsQuery::parse(&query).unwrap();
+        let response = build_test_response(&query, Ipv4Addr::new(10, 0, 0, 42), 60);
+        forwarder.cache_response(&parsed_query, &response);
+
+        let next_query = build_test_query("CaChEd.TeSt");
+        let next_query = DnsQuery::parse(&next_query).unwrap();
+        let cached = forwarder
+            .check_cache(&next_query)
+            .expect("response should be cached");
+
+        assert_eq!(
+            &cached[12..12 + next_query.raw_question.len()],
+            next_query.raw_question
+        );
+    }
+
+    #[test]
+    fn test_cache_hit_rewrites_ttl_to_remaining_lifetime() {
+        let config = DnsConfig::default();
+        let mut forwarder = DnsForwarder::new(config);
+
+        let query = build_test_query("ttl.test");
+        let parsed_query = DnsQuery::parse(&query).unwrap();
+        let response = build_test_response(&query, Ipv4Addr::new(10, 0, 0, 43), 60);
+        forwarder.cache_response(&parsed_query, &response);
+
+        let key =
+            cache::DnsCacheKey::new(&parsed_query.name, parsed_query.qtype, parsed_query.qclass);
+        let entry = forwarder
+            .cache
+            .get_mut(&key)
+            .expect("response should be cached");
+        entry.cached_at -= Duration::from_secs(10);
+
+        let cached = forwarder
+            .check_cache(&parsed_query)
+            .expect("response should be cached");
+        let ttl_offset = 12 + parsed_query.raw_question.len() + 2 + 2 + 2;
+        let ttl = u32::from_be_bytes([
+            cached[ttl_offset],
+            cached[ttl_offset + 1],
+            cached[ttl_offset + 2],
+            cached[ttl_offset + 3],
+        ]);
+        assert_eq!(ttl, 50);
+    }
+
+    #[test]
     fn test_cache_response_uses_response_ttl_capped_by_config() {
         let config = DnsConfig::default().with_cache_ttl(Duration::from_secs(30));
         let mut forwarder = DnsForwarder::new(config);

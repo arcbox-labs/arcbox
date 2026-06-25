@@ -286,6 +286,11 @@ struct_excessive_bools = "allow"
 manual_let_else = "allow"
 default_trait_access = "allow"
 wildcard_imports = "allow"
+# Rust 1.96 made these style lints noisy across hot-path systems code; keep
+# semantic changes separate from mechanical churn.
+collapsible_if = "allow"
+duration_suboptimal_units = "allow"
+manual_is_multiple_of = "allow"
 
 [workspace.lints.rust]
 
