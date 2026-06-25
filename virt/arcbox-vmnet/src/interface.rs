@@ -557,11 +557,14 @@ impl Vmnet {
             iov_len: buf.len(),
         };
 
-        // Create packet descriptor.
+        // Create packet descriptor. vmnet_read's input contract requires
+        // vm_pkt_size to hold the buffer capacity (it returns
+        // VMNET_INVALID_ARGUMENT for 0); on return it carries the actual
+        // packet length.
         let mut packet = VmnetPacket {
+            vm_pkt_size: buf.len(),
             vm_pkt_iov: &raw mut iov,
             vm_pkt_iovcnt: 1,
-            vm_pkt_size: 0,
             vm_flags: 0,
         };
 
@@ -582,7 +585,7 @@ impl Vmnet {
             return Ok(0);
         }
 
-        Ok(packet.vm_pkt_size as usize)
+        Ok(packet.vm_pkt_size)
     }
 
     /// Writes a packet to the vmnet interface.
@@ -613,9 +616,9 @@ impl Vmnet {
 
         // Create packet descriptor.
         let mut packet = VmnetPacket {
+            vm_pkt_size: data.len(),
             vm_pkt_iov: &raw mut iov,
             vm_pkt_iovcnt: 1,
-            vm_pkt_size: data.len() as u32,
             vm_flags: 0,
         };
 
