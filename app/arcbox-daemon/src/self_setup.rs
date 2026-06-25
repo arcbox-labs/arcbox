@@ -48,6 +48,20 @@ pub async fn run(tasks: &[&dyn SetupTask]) {
         }
     };
 
+    let expected_version = env!("CARGO_PKG_VERSION");
+    match client.version().await {
+        Ok(version) if version == expected_version => {}
+        Ok(version) => tracing::warn!(
+            helper_version = %version,
+            daemon_version = expected_version,
+            "arcbox-helper version differs from daemon; run 'sudo abctl _install --no-daemon --no-shell'"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "failed to check arcbox-helper version"
+        ),
+    }
+
     for task in tasks {
         let name = task.name();
 
