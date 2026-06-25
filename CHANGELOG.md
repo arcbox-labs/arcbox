@@ -5,6 +5,66 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.11](https://github.com/arcboxlabs/arcbox/compare/v0.4.10...v0.4.11) (2026-06-25)
+
+
+### Features
+
+* **fakeip:** add DnsResolutionLog clear / remove / len ([7ed5176](https://github.com/arcboxlabs/arcbox/commit/7ed5176c9fa41b32b5d9fde29f294db676d37f51))
+* **splicetcp:** support configurable fast-path mtu ([371f4a1](https://github.com/arcboxlabs/arcbox/commit/371f4a19674eea14aa3b6c2cbd449ce58785666b))
+
+
+### Bug Fixes
+
+* **daemon:** embed Sentry DSN in release builds ([919149d](https://github.com/arcboxlabs/arcbox/commit/919149ddeafbc23dc3710ca0e3d6bf83314cc9b9))
+* **daemon:** reconcile vmnet routes after restart ([#330](https://github.com/arcboxlabs/arcbox/issues/330)) ([d617ba3](https://github.com/arcboxlabs/arcbox/commit/d617ba3ceb7839262afc2b19c9fc7ff112de95a0))
+* **docker:** address proxy review feedback ([b323595](https://github.com/arcboxlabs/arcbox/commit/b323595da044880b18ce349073862bbf3323d621))
+* **fakeip:** use map_or in DnsResolutionLog::len ([531f2cf](https://github.com/arcboxlabs/arcbox/commit/531f2cf26f526e1b64e640800e31238725a33cd2))
+* **proxy:** reject unknown guest authorities ([273a401](https://github.com/arcboxlabs/arcbox/commit/273a401ac4cedd5bdd83cf0fab332f089c989c75))
+
+
+### Performance Improvements
+
+* **proxy:** reuse guest http sessions ([f684680](https://github.com/arcboxlabs/arcbox/commit/f684680e2f1386d24272e6509467ae63ed33570e))
+
+
+### Code Refactoring
+
+* **context:** move tests out of module ([f56592b](https://github.com/arcboxlabs/arcbox/commit/f56592bd7927feda1fc50d2b4dffa73d64f5f269))
+* **context:** split docker context types ([407fa9c](https://github.com/arcboxlabs/arcbox/commit/407fa9cc90afa7b4c290c034de84af86736b8ee1))
+* **docker:** centralize proxy pass-through routing ([5c3bb4b](https://github.com/arcboxlabs/arcbox/commit/5c3bb4bcb4fe86d2e34412f3f7c91f7fcbcba5e5))
+* **docker:** group api routes by resource ([1be1066](https://github.com/arcboxlabs/arcbox/commit/1be106632e80e0f0377fecf9440bb209ab7ec58a))
+* **docker:** group proxy state ([073963c](https://github.com/arcboxlabs/arcbox/commit/073963c92bf77ee1965e95865be2a7b245a90de8))
+* **docker:** remove unused api model types ([bc95c7c](https://github.com/arcboxlabs/arcbox/commit/bc95c7c5309e48009786226454abb23b895d5ba9))
+* **handlers:** prepare container module split ([728e9d4](https://github.com/arcboxlabs/arcbox/commit/728e9d48519bae02696bd1444097300b4d3df9ce))
+* **handlers:** split proxy role helpers ([0bb9913](https://github.com/arcboxlabs/arcbox/commit/0bb9913bd87bd206cbcc8120d6e75e71dea720d8))
+* **proxy:** model forward request shapes ([55d56ed](https://github.com/arcboxlabs/arcbox/commit/55d56ed091334b08acd16c8a4ee8cc8204ea9468))
+* **proxy:** share vsock stream transport ([e39f265](https://github.com/arcboxlabs/arcbox/commit/e39f26568277a99c8e489109f8cef8e5a10f46e0))
+* **proxy:** use hyper client pooling ([338ba48](https://github.com/arcboxlabs/arcbox/commit/338ba48fae14751fdb20b07d6d21d32754cf6fdf))
+* **tests:** move e2e runner out of xtask ([d6b5ce3](https://github.com/arcboxlabs/arcbox/commit/d6b5ce3fede02e4a146098ef81ceceb4a1501f21))
+* **tests:** split docker api integration suites ([046c797](https://github.com/arcboxlabs/arcbox/commit/046c79756533457e1413623f9367cb324c4e9276))
+* **tests:** use standard harness for e2e ([297cf64](https://github.com/arcboxlabs/arcbox/commit/297cf6419fe3868c18c722f452e901d1a1407a23))
+* **workload:** split registry internals ([e8cda2e](https://github.com/arcboxlabs/arcbox/commit/e8cda2ec913ecae8d9740be4d675551abb74e5f7))
+* **xtask:** migrate boot assets test ([b5b9791](https://github.com/arcboxlabs/arcbox/commit/b5b979171b5b8c2859c6c7e63afa48582b3b29ff))
+* **xtask:** migrate repo scripts into xtask ([07e90c4](https://github.com/arcboxlabs/arcbox/commit/07e90c4aee23b3d6e2db5089c1cfddbd1289b04e))
+
+
+### Documentation
+
+* **docker:** describe proxy architecture ([2aea78c](https://github.com/arcboxlabs/arcbox/commit/2aea78cbc92bdb950f98295c67595c24bce60bcf))
+* **docker:** diagram proxy routing ([7210248](https://github.com/arcboxlabs/arcbox/commit/7210248c3e150aac03a2c6de82c85e1641f9896d))
+
+
+### Continuous Integration
+
+* exclude arcbox-hv from workspace publish ([6c3c5df](https://github.com/arcboxlabs/arcbox/commit/6c3c5dff22fc45e5c8e0c0cb8311e5002fbce546))
+
+
+### Miscellaneous Chores
+
+* **docker:** add structured proxy tracing ([3e3c0a7](https://github.com/arcboxlabs/arcbox/commit/3e3c0a734a6fdd9ad28acbae297c1987bfe1d4bf))
+* **tests:** use tracing in e2e runner ([05be85e](https://github.com/arcboxlabs/arcbox/commit/05be85e316889a6825839569f5768b46b614eef4))
+
 ## [0.4.10](https://github.com/arcboxlabs/arcbox/compare/v0.4.9...v0.4.10) (2026-06-19)
 
 
