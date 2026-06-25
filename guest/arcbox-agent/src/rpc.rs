@@ -81,6 +81,8 @@ pub enum RpcRequest {
     MmapReadFile(MmapReadFileRequest),
     DiskTrim(DiskTrimRequest),
     WatchReadiness(WatchReadinessRequest),
+    /// Test-only: exit the agent so PID 1 (busybox init) respawns it.
+    KillAgent,
 }
 
 /// RPC response envelope.
@@ -103,6 +105,8 @@ pub enum RpcResponse {
     ReadinessEvent(ReadinessEvent),
     Error(ErrorResponse),
     MmapReadFile(MmapReadFileResponse),
+    /// Test-only: acknowledgement for [`RpcRequest::KillAgent`].
+    KillAgent,
 }
 
 impl RpcResponse {
@@ -126,6 +130,7 @@ impl RpcResponse {
             Self::ReadinessEvent(_) => MessageType::ReadinessEvent,
             Self::Error(_) => MessageType::Error,
             Self::MmapReadFile(_) => MessageType::MmapReadFileResponse,
+            Self::KillAgent => MessageType::KillAgentResponse,
         }
     }
 
@@ -149,6 +154,7 @@ impl RpcResponse {
             Self::ReadinessEvent(msg) => msg.encode_to_vec(),
             Self::Error(err) => err.encode(),
             Self::MmapReadFile(msg) => msg.encode_to_vec(),
+            Self::KillAgent => Empty::default().encode_to_vec(),
         }
     }
 }
@@ -324,6 +330,7 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
             let req = WatchReadinessRequest::decode(payload)?;
             Ok(RpcRequest::WatchReadiness(req))
         }
+        MessageType::KillAgentRequest => Ok(RpcRequest::KillAgent),
         _ => anyhow::bail!("unexpected message type: {:?}", msg_type),
     }
 }

@@ -124,6 +124,7 @@ async fn handle_request(request: RpcRequest) -> RequestResult {
         RpcRequest::Shutdown(req) => RequestResult::Single(handle_shutdown(req)),
         RpcRequest::MmapReadFile(req) => RequestResult::Single(handle_mmap_read_file(req)),
         RpcRequest::DiskTrim(_) => RequestResult::Single(handle_disk_trim().await),
+        RpcRequest::KillAgent => RequestResult::Single(handle_kill_agent()),
         RpcRequest::WatchReadiness(_) => unreachable!("watch readiness is streaming"),
     }
 }
@@ -276,6 +277,21 @@ fn handle_shutdown(req: arcbox_protocol::agent::ShutdownRequest) -> RpcResponse 
         crate::shutdown::poweroff(grace);
     });
     RpcResponse::Shutdown(arcbox_protocol::agent::ShutdownResponse { accepted: true })
+}
+
+/// Handles a `KillAgent` request (test-only).
+///
+/// Exits the agent process so PID 1 (busybox init) respawns it — used by the
+/// hv_e2e supervision harness to prove crash recovery without panicking the
+/// kernel. Acks first, then exits after a brief delay so the response frame
+/// flushes over vsock (mirrors [`handle_shutdown`]).
+fn handle_kill_agent() -> RpcResponse {
+    tracing::warn!("KillAgent requested by host (test-only); exiting for busybox-init respawn");
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(100));
+        std::process::exit(1);
+    });
+    RpcResponse::KillAgent
 }
 
 /// Sets CLOCK_REALTIME from the given timestamp (seconds since UNIX epoch).
