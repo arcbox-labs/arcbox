@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.12](https://github.com/arcboxlabs/arcbox/compare/v0.4.11...v0.4.12) (2026-06-25)
+
+
+### Bug Fixes
+
+* **daemon:** scan image holders after interrupted VM runs ([fdc38ea](https://github.com/arcboxlabs/arcbox/commit/fdc38eacd1c54cc78378950aa82acb2c7741d25d))
+* **docker:** cache guest HTTP readiness in proxy ([#302](https://github.com/arcboxlabs/arcbox/issues/302)) ([80d3318](https://github.com/arcboxlabs/arcbox/commit/80d331832c9be69971cd3b84e56c6791ca8e1690))
+* **vmnet:** match vmpktdesc ABI so vmnet_read/vmnet_write stop failing EINVAL ([#303](https://github.com/arcboxlabs/arcbox/issues/303)) ([685bab7](https://github.com/arcboxlabs/arcbox/commit/685bab7c87e92dc9a869073c601c549f87b70f24))
+
+
+### Performance Improvements
+
+* **boot:** stream guest readiness events ([a49ddeb](https://github.com/arcboxlabs/arcbox/commit/a49ddebbf29e2ebbaf0abd6c55614d49387719eb))
+* **core:** tighten boot readiness polling for fast vsock probes ([51d7123](https://github.com/arcboxlabs/arcbox/commit/51d7123e2a72fd55c370ad3f7bd88fad207a5d6e))
+* **daemon:** skip docker.img holder scan on clean lock acquisition ([742a788](https://github.com/arcboxlabs/arcbox/commit/742a788302cc93a4a79716644182c7094a92eee4))
+
 ## [0.4.11](https://github.com/arcboxlabs/arcbox/compare/v0.4.10...v0.4.11) (2026-06-25)
 
 
