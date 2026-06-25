@@ -45,7 +45,7 @@ pub async fn execute() -> Result<()> {
     {
         check!("Bridge NIC", check_bridge_nic());
         check!("Container route", check_container_route());
-        check!("ArcBoxHelper", check_helper());
+        check!("ArcBoxHelper", check_helper().await);
     }
 
     // -- Summary --
@@ -211,23 +211,21 @@ fn check_container_route() -> CheckResult {
     }
 }
 
-/// Check if ArcBoxHelper is running and reachable.
+/// Check if arcbox-helper is reachable through launchd socket activation.
 #[cfg(target_os = "macos")]
-fn check_helper() -> CheckResult {
-    let Ok(output) = Command::new("pgrep").args(["-f", "ArcBoxHelper"]).output() else {
-        return CheckResult::Fail("pgrep failed".into());
-    };
-    let pids = String::from_utf8_lossy(&output.stdout);
-    if pids.trim().is_empty() {
-        return CheckResult::Fail("ArcBoxHelper not running".into());
-    }
-
-    // Check binary exists in expected location.
-    let helper_path = "/Applications/ArcBox.app/Contents/Library/HelperTools/ArcBoxHelper";
-    if std::path::Path::new(helper_path).exists() {
-        CheckResult::Pass("running".into())
-    } else {
-        CheckResult::Warn("process running but binary not found in app bundle".into())
+async fn check_helper() -> CheckResult {
+    let expected = env!("CARGO_PKG_VERSION");
+    match arcbox_helper::client::Client::connect().await {
+        Ok(client) => match client.version().await {
+            Ok(version) if version == expected => {
+                CheckResult::Pass(format!("reachable (version {version})"))
+            }
+            Ok(version) => CheckResult::Fail(format!(
+                "version {version}, expected {expected}; run 'sudo abctl _install --no-daemon --no-shell'"
+            )),
+            Err(e) => CheckResult::Fail(format!("version check failed: {e}")),
+        },
+        Err(e) => CheckResult::Fail(format!("not reachable via launchd socket: {e}")),
     }
 }
 

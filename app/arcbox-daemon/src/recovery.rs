@@ -19,11 +19,29 @@ use crate::self_setup::SetupTask as _;
 pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
     recover_container_networking(runtime, &ctx.setup_state).await;
 
-    // Cold-start route reconcile (non-blocking).
-    #[cfg(target_os = "macos")]
+    // Cold-start route reconcile (non-blocking). This is load-bearing after
+    // app updates or daemon restarts where the VM survives but the host route
+    // may have been removed or stolen by another network service.
+    #[cfg(all(target_os = "macos", feature = "vmnet"))]
     {
         use arcbox_core::DEFAULT_MACHINE_NAME;
-        if let Some(mac) = runtime.machine_manager().bridge_mac(DEFAULT_MACHINE_NAME) {
+        if let Some(ColdStartRoutePlan::VmnetBridge(bridge)) = cold_start_route_plan(
+            runtime
+                .machine_manager()
+                .vmnet_bridge_name(DEFAULT_MACHINE_NAME),
+            None,
+        ) {
+            spawn_vmnet_route_reconcile(Arc::clone(&ctx.setup_state), bridge);
+        }
+    }
+
+    #[cfg(all(target_os = "macos", not(feature = "vmnet")))]
+    {
+        use arcbox_core::DEFAULT_MACHINE_NAME;
+        if let Some(ColdStartRoutePlan::BridgeMac(mac)) = cold_start_route_plan(
+            None,
+            runtime.machine_manager().bridge_mac(DEFAULT_MACHINE_NAME),
+        ) {
             let setup_state = Arc::clone(&ctx.setup_state);
             drop(tokio::spawn(async move {
                 match arcbox_core::route_reconciler::ensure_route_with_retry(&mac).await {
@@ -85,6 +103,75 @@ pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
                 }
             }
         });
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum ColdStartRoutePlan {
+    #[cfg(feature = "vmnet")]
+    VmnetBridge(String),
+    #[cfg(not(feature = "vmnet"))]
+    BridgeMac(String),
+}
+
+#[cfg(all(target_os = "macos", feature = "vmnet"))]
+fn cold_start_route_plan(
+    vmnet_bridge: Option<String>,
+    _bridge_mac: Option<String>,
+) -> Option<ColdStartRoutePlan> {
+    vmnet_bridge.map(ColdStartRoutePlan::VmnetBridge)
+}
+
+#[cfg(all(target_os = "macos", not(feature = "vmnet")))]
+fn cold_start_route_plan(
+    _vmnet_bridge: Option<String>,
+    bridge_mac: Option<String>,
+) -> Option<ColdStartRoutePlan> {
+    bridge_mac.map(ColdStartRoutePlan::BridgeMac)
+}
+
+#[cfg(all(target_os = "macos", feature = "vmnet"))]
+fn spawn_vmnet_route_reconcile(setup_state: Arc<arcbox_api::SetupState>, bridge: String) {
+    drop(tokio::spawn(async move {
+        match arcbox_core::route_reconciler::ensure_route_for_bridge(&bridge).await {
+            Ok(()) => setup_state.set_route_installed(true),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install container route on cold start (vmnet)");
+            }
+        }
+    }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(all(target_os = "macos", feature = "vmnet"))]
+    #[test]
+    fn cold_start_route_plan_uses_vmnet_bridge() {
+        let plan = cold_start_route_plan(Some("bridge100".to_string()), None);
+
+        assert_eq!(
+            plan,
+            Some(ColdStartRoutePlan::VmnetBridge("bridge100".to_string()))
+        );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "vmnet"))]
+    #[test]
+    fn cold_start_route_plan_skips_when_vmnet_bridge_is_unknown() {
+        let plan = cold_start_route_plan(None, Some("fe:b2:14:4d:a4:64".to_string()));
+
+        assert_eq!(plan, None);
+    }
+
+    #[cfg(all(target_os = "macos", not(feature = "vmnet")))]
+    #[test]
+    fn cold_start_route_plan_uses_bridge_mac_without_vmnet() {
+        let plan = cold_start_route_plan(Some("bridge100".to_string()), Some("mac".to_string()));
+
+        assert_eq!(plan, Some(ColdStartRoutePlan::BridgeMac("mac".to_string())));
     }
 }
 
