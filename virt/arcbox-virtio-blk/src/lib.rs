@@ -35,6 +35,7 @@ mod device;
 #[cfg(target_os = "linux")]
 mod direct_io;
 mod mmap;
+mod punch;
 mod request;
 
 pub use backend::AsyncBlockBackend;
@@ -42,4 +43,5 @@ pub use device::VirtioBlock;
 #[cfg(target_os = "linux")]
 pub use direct_io::DirectIoBackend;
 pub use mmap::MmapBackend;
+pub use punch::{PUNCH_HOLE_ALIGNMENT, aligned_punch_range, punch_hole};
 pub use request::{BlockConfig, BlockRequestHeader, BlockRequestType, BlockStatus};
