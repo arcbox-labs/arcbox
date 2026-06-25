@@ -52,7 +52,13 @@ pub fn zero_range(fd: RawFd, start: u64, end: u64) -> std::io::Result<()> {
     }
     match block_aligned_interior(start, end) {
         Some((aligned_start, aligned_end)) => {
-            punch_hole(fd, aligned_start, aligned_end - aligned_start)?;
+            // Hole-punch the aligned interior for sparseness. If the host fs
+            // rejects punching (e.g. EOPNOTSUPP), fall back to writing zeros:
+            // WRITE_ZEROES requires the range to read back as zero, and the
+            // sparse punch is only an optimization, not a requirement.
+            if punch_hole(fd, aligned_start, aligned_end - aligned_start).is_err() {
+                zero_pwrite(fd, aligned_start, aligned_end)?;
+            }
             zero_pwrite(fd, start, aligned_start)?; // head (may be empty)
             zero_pwrite(fd, aligned_end, end)?; // tail (may be empty)
         }
