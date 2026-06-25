@@ -36,7 +36,7 @@ use crate::boot_assets::BootAssetProvider;
 use crate::error::{CoreError, Result};
 use crate::event::{Event, EventBus};
 use crate::machine::{MachineConfig, MachineInfo, MachineManager, MachineState};
-use arcbox_constants::cmdline::GUEST_DOCKER_VSOCK_PORT_KEY;
+use arcbox_constants::cmdline::{GUEST_DOCKER_VSOCK_PORT_KEY, HV_EARLYCON_DIRECTIVE};
 use arcbox_error::CommonError;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -843,12 +843,21 @@ impl VmLifecycleManager {
             .collect::<Vec<_>>()
             .join(" ");
 
-        // Ensure earlycon is present for early boot diagnostics via virtio console.
+        // Ensure an explicit earlycon directive so early boot output reaches the
+        // host `guest_serial` log. A bare `earlycon` relies on the device-tree
+        // `stdout-path` and produces nothing on the custom-HV PL011 emulator, so
+        // upgrade it to the pinned `earlycon=pl011,<base>` form. An operator who
+        // already supplied an explicit `earlycon=` is respected as-is.
         if !cmdline
             .split_whitespace()
-            .any(|t| t.starts_with("earlycon"))
+            .any(|t| t.starts_with("earlycon="))
         {
-            cmdline.push_str(" earlycon");
+            let mut tokens: Vec<&str> = cmdline
+                .split_whitespace()
+                .filter(|t| *t != "earlycon")
+                .collect();
+            tokens.push(HV_EARLYCON_DIRECTIVE);
+            cmdline = tokens.join(" ");
         }
 
         // Inject guest docker vsock port if configured.

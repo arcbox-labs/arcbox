@@ -809,6 +809,7 @@ dependencies = [
 name = "arcbox-vmm"
 version = "0.4.12"
 dependencies = [
+ "arcbox-constants",
  "arcbox-dns",
  "arcbox-error",
  "arcbox-fs",

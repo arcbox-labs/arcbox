@@ -76,3 +76,19 @@ impl Pl011 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The kernel cmdline earlycon directive must point at this emulator's MMIO
+    /// base. If they drift, early boot output silently stops reaching the host
+    /// `guest_serial` log and boot failures become undiagnosable.
+    #[test]
+    fn earlycon_directive_matches_base() {
+        assert_eq!(
+            arcbox_constants::cmdline::HV_EARLYCON_DIRECTIVE,
+            format!("earlycon=pl011,0x{PL011_BASE:08x}")
+        );
+    }
+}

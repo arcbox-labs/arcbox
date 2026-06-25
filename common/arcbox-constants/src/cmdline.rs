@@ -3,3 +3,16 @@ pub const GUEST_DOCKER_VSOCK_PORT_KEY: &str = "arcbox.guest_docker_vsock_port=";
 
 /// Kernel cmdline key for guest Docker data block-device path.
 pub const DOCKER_DATA_DEVICE_KEY: &str = "arcbox.docker_data_device=";
+
+/// Explicit `earlycon` directive pinning the kernel's early console to the
+/// custom-HV PL011 UART emulator at `0x0B00_0000` (see
+/// `arcbox_vmm::vmm::darwin_hv::pl011::PL011_BASE`).
+///
+/// A bare `earlycon` relies on the device-tree `stdout-path`, which in practice
+/// produces no output on the HV backend — leaving every boot failure
+/// undiagnosable. Pinning the address routes early kernel messages through the
+/// emulator, which forwards them to the host `guest_serial` log.
+///
+/// The address is verified against `PL011_BASE` by a drift-guard test in
+/// `arcbox-vmm` (`darwin_hv::pl011`), the crate that owns the emulator.
+pub const HV_EARLYCON_DIRECTIVE: &str = "earlycon=pl011,0x0b000000";
