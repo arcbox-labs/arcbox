@@ -39,6 +39,10 @@ service MachineService {
     // Gets guest system information for a machine.
     rpc GetSystemInfo(MachineAgentRequest) returns (MachineSystemInfo);
 
+    // Compacts a machine's data disk by running fstrim in the guest, which
+    // discards free blocks so the host punches them out of the sparse image.
+    rpc CompactDisk(MachineAgentRequest) returns (Empty);
+
     // Executes a command in a machine.
     rpc Exec(MachineExecRequest) returns (stream MachineExecOutput);
 

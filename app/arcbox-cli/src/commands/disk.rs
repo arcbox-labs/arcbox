@@ -3,6 +3,7 @@
 //! Inspect and manage the Docker data disk image.
 
 use anyhow::{Context, Result};
+use arcbox_protocol::v1::MachineAgentRequest;
 use clap::Subcommand;
 
 /// Disk management commands.
@@ -105,6 +106,10 @@ async fn execute_usage() -> Result<()> {
     Ok(())
 }
 
+/// Machine whose data disk `disk compact` targets. The Docker data image
+/// belongs to the default native machine — the same one `disk usage` inspects.
+const DEFAULT_MACHINE: &str = "default";
+
 async fn execute_compact() -> Result<()> {
     let config = arcbox_core::Config::load().unwrap_or_default();
     let img_path = config.docker_img_path();
@@ -114,20 +119,29 @@ async fn execute_compact() -> Result<()> {
         return Ok(());
     }
 
-    println!("On-demand compaction via this command is not yet implemented.");
-    println!("The guest VM runs fstrim hourly and the host disk uses sparse allocation, so freed");
-    println!("blocks are reclaimed automatically — but this command itself triggers no trim.");
-    println!();
-    println!("To reclaim space inside the VM, run:");
-    println!("  docker system prune --all --volumes");
-    println!();
+    let before = read_disk_usage(&img_path)?;
 
-    let usage = read_disk_usage(&img_path)?;
+    // Ask the daemon to run fstrim in the guest. The resulting discards flow
+    // through virtio-blk, which punches holes in this sparse image, so the
+    // physical footprint we re-stat below shrinks by the freed amount.
+    println!("Compacting Docker data disk (running fstrim in the guest)...");
+    let mut client = super::machine::machine_client().await?;
+    client
+        .compact_disk(tonic::Request::new(MachineAgentRequest {
+            id: DEFAULT_MACHINE.to_string(),
+        }))
+        .await
+        .context("Failed to compact data disk via the daemon")?;
+
+    let after = read_disk_usage(&img_path)?;
+    let reclaimed = before.physical_bytes.saturating_sub(after.physical_bytes);
+
     println!(
-        "Current: {:.1} GiB physical / {:.1} GiB logical",
-        usage.physical_gib(),
-        usage.logical_gib(),
+        "  Physical: {:.1} GiB -> {:.1} GiB",
+        before.physical_gib(),
+        after.physical_gib(),
     );
+    println!("  Reclaimed: {:.1} GiB", reclaimed as f64 / BYTES_PER_GIB);
 
     Ok(())
 }

@@ -20,7 +20,7 @@ use tokio::net::UnixStream;
 use tonic::codegen::{Service, http::Uri};
 use tonic::transport::{Channel, Endpoint};
 
-async fn machine_client() -> Result<MachineServiceClient<Channel>> {
+pub async fn machine_client() -> Result<MachineServiceClient<Channel>> {
     let socket_path = super::resolve_grpc_socket_path();
 
     let channel = Endpoint::from_static("http://[::]:50051")

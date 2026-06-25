@@ -253,6 +253,28 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         }))
     }
 
+    async fn compact_disk(
+        &self,
+        request: Request<MachineAgentRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        let id = request.into_inner().id;
+
+        // Trigger an immediate fstrim in the guest. The discards flow through
+        // virtio-blk, which punches holes in the host data image, shrinking its
+        // physical footprint. The caller measures host usage before/after.
+        let mut agent = self
+            .runtime
+            .ready()?
+            .get_agent(&id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        agent
+            .disk_trim()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(Empty {}))
+    }
+
     type ExecStream =
         Pin<Box<dyn Stream<Item = Result<MachineExecOutput, Status>> + Send + 'static>>;
 
