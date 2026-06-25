@@ -46,16 +46,43 @@ pub async fn proxy_fallback(
 
     if req.headers().wants_upgrade() {
         tracing::Span::current().record("protocol", "upgrade");
-        return upgrade::proxy_with_upgrade_for_role(state.proxy.connector(), role, req, &uri)
-            .await;
+        return match upgrade::proxy_with_upgrade_for_role(state.proxy.connector(), role, req, &uri)
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                state.proxy.invalidate_endpoint(role);
+                Err(e)
+            }
+        };
     }
 
     if upload::is_streaming_upload_request(req.method(), &uri) {
         tracing::Span::current().record("protocol", "upload");
-        return upload::proxy_streaming_upload_for_role(state.proxy.connector(), role, &uri, req)
-            .await;
+        return match upload::proxy_streaming_upload_for_role(
+            state.proxy.connector(),
+            role,
+            &uri,
+            req,
+        )
+        .await
+        {
+            Ok(response) => Ok(response),
+            Err(e) => {
+                state.proxy.invalidate_endpoint(role);
+                Err(e)
+            }
+        };
     }
 
     tracing::Span::current().record("protocol", "http");
-    forward::proxy_to_guest_stream_for_role_pooled(state.proxy.client(), role, &uri, req).await
+    match forward::proxy_to_guest_stream_for_role_pooled(state.proxy.client(), role, &uri, req)
+        .await
+    {
+        Ok(response) => Ok(response),
+        Err(e) => {
+            state.proxy.invalidate_endpoint(role);
+            Err(e)
+        }
+    }
 }

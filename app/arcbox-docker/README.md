@@ -169,6 +169,38 @@ file descriptor is wrapped by `arcbox_transport::vsock::VsockStream`, giving
 the proxy one async stream abstraction for both production vsock and Unix-socket
 integration tests.
 
+### Guest Docker readiness
+
+`arcbox-core` owns the slow readiness path: starting the utility VM, asking the
+guest agent to ensure the container runtime, and validating the reported vsock
+endpoint. `arcbox-docker` owns Docker HTTP readiness because only the proxy can
+prove that guest `dockerd` accepted and answered a real Docker request.
+
+Before a request is forwarded, `ProxyState` asks `GuestDockerReadiness` to
+verify the selected `UtilityVmRole`. Readiness is tracked per role with an
+explicit state machine:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unverified
+    Unverified --> Verifying: prepare runtime + GET /_ping
+    Verifying --> Verified: success
+    Verifying --> Unverified: prepare or _ping failed
+    Verified --> Unverified: transport/proxy failure
+```
+
+Only one caller performs the runtime preparation and `_ping` while a role is in
+`Verifying`; concurrent callers wait for the state change and then reuse the
+result. Any forwarding, upload, or upgrade transport error invalidates that
+role's readiness so the next request re-runs the slow readiness path and then
+verifies guest `dockerd` with another `_ping`.
+
+This keeps the ownership boundary clear:
+
+- `arcbox-core`: VM lifecycle, guest agent runtime readiness, endpoint shape.
+- `arcbox-docker`: HTTP verification, readiness caching, transport-failure
+  invalidation.
+
 ## API Version
 
 - **Host route compatibility:** `/v1.24` through `/v1.43` plus unversioned routes
@@ -181,12 +213,14 @@ Focused proxy checks:
 ```bash
 cargo test -p arcbox-docker proxy::
 cargo test -p arcbox-docker --test proxy_integration
+cargo test -p arcbox-docker api::tests::readiness
 ```
 
 The integration tests run against a mock guest `dockerd` over a Unix socket, so
 they do not require a VM. They cover ordinary forwarding, pooled session reuse,
 early body-drop discard behavior, streaming forwarding, and HTTP upgrade
-handling.
+handling. The readiness unit tests cover the explicit state transitions,
+per-role isolation, invalidation, and concurrent verification serialization.
 
 ## License
 

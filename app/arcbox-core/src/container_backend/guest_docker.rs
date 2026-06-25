@@ -4,7 +4,6 @@ use crate::error::{CoreError, Result};
 use crate::machine::MachineManager;
 use crate::vm_lifecycle::VmLifecycleManager;
 use async_trait::async_trait;
-use std::os::fd::FromRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -83,32 +82,8 @@ impl GuestDockerBackend {
             }
 
             if docker_ready {
-                match self
-                    .machine_manager
-                    .connect_vsock_port(self.machine_name, port)
-                {
-                    Ok(fd) => {
-                        let _owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-                        tracing::debug!(port, "guest docker endpoint is ready");
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        if Instant::now() >= deadline {
-                            return Err(CoreError::Machine(format!(
-                                "guest docker endpoint on vsock port {} not ready within {}ms: {}",
-                                port,
-                                self.config.startup_timeout_ms,
-                                last_status_detail.unwrap_or_else(|| e.to_string())
-                            )));
-                        }
-                        tracing::trace!(
-                            port,
-                            retry_delay_ms = delay_ms,
-                            "guest docker endpoint not reachable yet: {}",
-                            e
-                        );
-                    }
-                }
+                tracing::debug!(port, "guest docker runtime is ready");
+                return Ok(());
             } else if Instant::now() >= deadline {
                 return Err(CoreError::Machine(format!(
                     "guest docker endpoint on vsock port {} not ready within {}ms: {}",

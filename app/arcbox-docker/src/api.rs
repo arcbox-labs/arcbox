@@ -10,15 +10,22 @@ use crate::handlers;
 use crate::proxy;
 use crate::proxy::{GuestConnector, GuestHttpClient};
 use crate::request_context::proxy_request_context_middleware;
+use crate::routing::UtilityVmRole;
 use crate::trace::trace_id_middleware;
 use crate::workload::WorkloadRoleRegistry;
 use arcbox_core::Runtime;
 use axum::extract::OriginalUri;
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::{
     Router, middleware,
     routing::{delete, post},
 };
+use bytes::Bytes;
+use http_body_util::BodyExt;
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::Mutex;
+use tokio::sync::Notify;
 
 /// Application state shared with handlers.
 #[derive(Clone)]
@@ -35,6 +42,7 @@ pub struct AppState {
 pub struct ProxyState {
     connector: Arc<dyn GuestConnector>,
     guest_http_client: GuestHttpClient,
+    endpoint_readiness: GuestDockerReadiness,
 }
 
 impl ProxyState {
@@ -42,6 +50,7 @@ impl ProxyState {
         Self {
             guest_http_client: GuestHttpClient::new(Arc::clone(&connector)),
             connector,
+            endpoint_readiness: GuestDockerReadiness::new(),
         }
     }
 
@@ -51,6 +60,179 @@ impl ProxyState {
 
     pub(crate) fn client(&self) -> &GuestHttpClient {
         &self.guest_http_client
+    }
+
+    /// Ensures guest dockerd is reachable at the Docker HTTP layer for `role`.
+    ///
+    /// The supplied `prepare_runtime` future owns the slow VM/agent/runtime
+    /// readiness path. This proxy state owns the cheaper HTTP `_ping`
+    /// verification and caches it until a transport failure invalidates it.
+    pub(crate) async fn ensure_endpoint_verified<F>(
+        &self,
+        role: UtilityVmRole,
+        prepare_runtime: F,
+    ) -> crate::error::Result<()>
+    where
+        F: Future<Output = crate::error::Result<()>>,
+    {
+        self.endpoint_readiness
+            .ensure_verified(role, prepare_runtime, || self.ping_guest(role))
+            .await
+    }
+
+    pub(crate) fn invalidate_endpoint(&self, role: UtilityVmRole) {
+        self.endpoint_readiness.invalidate(role);
+    }
+
+    async fn ping_guest(&self, role: UtilityVmRole) -> crate::error::Result<()> {
+        let response = proxy::proxy_to_guest_for_role_pooled(
+            &self.guest_http_client,
+            role,
+            Method::GET,
+            "/_ping",
+            &HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await?;
+
+        let status = response.status();
+        let body = BodyExt::collect(response.into_body())
+            .await
+            .map_err(|e| {
+                crate::error::DockerError::Server(format!(
+                    "failed to read guest docker _ping response: {e}"
+                ))
+            })?
+            .to_bytes();
+
+        if status == StatusCode::OK {
+            return Ok(());
+        }
+
+        Err(crate::error::DockerError::Server(format!(
+            "guest docker _ping returned {status}: {}",
+            String::from_utf8_lossy(&body).trim_end()
+        )))
+    }
+}
+
+struct GuestDockerReadiness {
+    native: RoleEndpointReadiness,
+    rosetta: RoleEndpointReadiness,
+}
+
+impl GuestDockerReadiness {
+    fn new() -> Self {
+        Self {
+            native: RoleEndpointReadiness::new(),
+            rosetta: RoleEndpointReadiness::new(),
+        }
+    }
+
+    async fn ensure_verified<Prepare, Verify, VerifyFuture>(
+        &self,
+        role: UtilityVmRole,
+        prepare_runtime: Prepare,
+        verify_endpoint: Verify,
+    ) -> crate::error::Result<()>
+    where
+        Prepare: Future<Output = crate::error::Result<()>>,
+        Verify: FnOnce() -> VerifyFuture,
+        VerifyFuture: Future<Output = crate::error::Result<()>>,
+    {
+        self.for_role(role)
+            .ensure_verified(prepare_runtime, verify_endpoint)
+            .await
+    }
+
+    fn invalidate(&self, role: UtilityVmRole) {
+        self.for_role(role).invalidate();
+    }
+
+    const fn for_role(&self, role: UtilityVmRole) -> &RoleEndpointReadiness {
+        match role {
+            UtilityVmRole::Native => &self.native,
+            UtilityVmRole::Rosetta => &self.rosetta,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointReadinessState {
+    Unverified,
+    Verifying,
+    Verified,
+}
+
+struct RoleEndpointReadiness {
+    state: Mutex<EndpointReadinessState>,
+    changed: Notify,
+}
+
+impl RoleEndpointReadiness {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(EndpointReadinessState::Unverified),
+            changed: Notify::new(),
+        }
+    }
+
+    async fn ensure_verified<Prepare, Verify, VerifyFuture>(
+        &self,
+        prepare_runtime: Prepare,
+        verify_endpoint: Verify,
+    ) -> crate::error::Result<()>
+    where
+        Prepare: Future<Output = crate::error::Result<()>>,
+        Verify: FnOnce() -> VerifyFuture,
+        VerifyFuture: Future<Output = crate::error::Result<()>>,
+    {
+        loop {
+            let wait_for_change = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                match *state {
+                    EndpointReadinessState::Verified => return Ok(()),
+                    EndpointReadinessState::Unverified => {
+                        *state = EndpointReadinessState::Verifying;
+                        None
+                    }
+                    EndpointReadinessState::Verifying => Some(self.changed.notified()),
+                }
+            };
+
+            if let Some(wait_for_change) = wait_for_change {
+                wait_for_change.await;
+                continue;
+            }
+
+            let result = async {
+                prepare_runtime.await?;
+                verify_endpoint().await
+            }
+            .await;
+
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            *state = if result.is_ok() {
+                EndpointReadinessState::Verified
+            } else {
+                EndpointReadinessState::Unverified
+            };
+            self.changed.notify_waiters();
+            return result;
+        }
+    }
+
+    fn invalidate(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if *state != EndpointReadinessState::Unverified {
+            *state = EndpointReadinessState::Unverified;
+            self.changed.notify_waiters();
+        }
+    }
+
+    #[cfg(test)]
+    fn state(&self) -> EndpointReadinessState {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -179,6 +361,9 @@ fn volume_routes() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::DockerError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::{Duration, sleep};
 
     #[test]
     fn strip_standard_version_prefix() {
@@ -248,5 +433,230 @@ mod tests {
         let req = strip_api_version_prefix(req);
         assert_eq!(req.uri().path(), "/containers/abc/start");
         assert!(req.extensions().get::<OriginalUri>().is_none());
+    }
+
+    #[tokio::test]
+    async fn readiness_transitions_unverified_to_verified_after_success() {
+        let readiness = GuestDockerReadiness::new();
+        let prepared = Arc::new(AtomicUsize::new(0));
+        let verified = Arc::new(AtomicUsize::new(0));
+
+        assert_eq!(
+            readiness.for_role(UtilityVmRole::Native).state(),
+            EndpointReadinessState::Unverified
+        );
+
+        let prepared_current = Arc::clone(&prepared);
+        let verified_current = Arc::clone(&verified);
+        readiness
+            .ensure_verified(
+                UtilityVmRole::Native,
+                async move {
+                    prepared_current.fetch_add(1, Ordering::Relaxed);
+                    Ok::<(), DockerError>(())
+                },
+                || async move {
+                    verified_current.fetch_add(1, Ordering::Relaxed);
+                    Ok::<(), DockerError>(())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            readiness.for_role(UtilityVmRole::Native).state(),
+            EndpointReadinessState::Verified
+        );
+        assert_eq!(prepared.load(Ordering::Relaxed), 1);
+        assert_eq!(verified.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn readiness_keeps_verified_state_on_cache_hit() {
+        let readiness = GuestDockerReadiness::new();
+        let prepared = Arc::new(AtomicUsize::new(0));
+        let verified = Arc::new(AtomicUsize::new(0));
+
+        let prepared_first = Arc::clone(&prepared);
+        let verified_first = Arc::clone(&verified);
+        readiness
+            .ensure_verified(
+                UtilityVmRole::Native,
+                async move {
+                    prepared_first.fetch_add(1, Ordering::Relaxed);
+                    Ok::<(), DockerError>(())
+                },
+                || async move {
+                    verified_first.fetch_add(1, Ordering::Relaxed);
+                    Ok::<(), DockerError>(())
+                },
+            )
+            .await
+            .unwrap();
+
+        let prepared_second = Arc::clone(&prepared);
+        let verified_second = Arc::clone(&verified);
+        readiness
+            .ensure_verified(
+                UtilityVmRole::Native,
+                async move {
+                    prepared_second.fetch_add(1, Ordering::Relaxed);
+                    Ok::<(), DockerError>(())
+                },
+                || async move {
+                    verified_second.fetch_add(1, Ordering::Relaxed);
+                    Ok::<(), DockerError>(())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.load(Ordering::Relaxed), 1);
+        assert_eq!(verified.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn readiness_transitions_back_to_unverified_after_failure() {
+        let readiness = GuestDockerReadiness::new();
+        let prepared = Arc::new(AtomicUsize::new(0));
+        let verified = Arc::new(AtomicUsize::new(0));
+
+        let prepared_current = Arc::clone(&prepared);
+        let verified_current = Arc::clone(&verified);
+        let err = readiness
+            .ensure_verified(
+                UtilityVmRole::Native,
+                async move {
+                    prepared_current.fetch_add(1, Ordering::Relaxed);
+                    Ok::<(), DockerError>(())
+                },
+                || async move {
+                    verified_current.fetch_add(1, Ordering::Relaxed);
+                    Err::<(), DockerError>(DockerError::Server("ping failed".into()))
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("ping failed"));
+        assert_eq!(
+            readiness.for_role(UtilityVmRole::Native).state(),
+            EndpointReadinessState::Unverified
+        );
+        assert_eq!(prepared.load(Ordering::Relaxed), 1);
+        assert_eq!(verified.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn readiness_invalidation_transitions_verified_to_unverified() {
+        let readiness = GuestDockerReadiness::new();
+        let verified = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..2 {
+            let verified_current = Arc::clone(&verified);
+            readiness
+                .ensure_verified(
+                    UtilityVmRole::Native,
+                    async { Ok::<(), DockerError>(()) },
+                    || async move {
+                        verified_current.fetch_add(1, Ordering::Relaxed);
+                        Ok::<(), DockerError>(())
+                    },
+                )
+                .await
+                .unwrap();
+            readiness.invalidate(UtilityVmRole::Native);
+        }
+
+        assert_eq!(verified.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            readiness.for_role(UtilityVmRole::Native).state(),
+            EndpointReadinessState::Unverified
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_is_isolated_per_utility_vm_role() {
+        let readiness = GuestDockerReadiness::new();
+
+        readiness
+            .ensure_verified(
+                UtilityVmRole::Native,
+                async { Ok::<(), DockerError>(()) },
+                || async { Ok::<(), DockerError>(()) },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            readiness.for_role(UtilityVmRole::Native).state(),
+            EndpointReadinessState::Verified
+        );
+        assert_eq!(
+            readiness.for_role(UtilityVmRole::Rosetta).state(),
+            EndpointReadinessState::Unverified
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_serializes_concurrent_verification() {
+        let readiness = Arc::new(GuestDockerReadiness::new());
+        let prepared = Arc::new(AtomicUsize::new(0));
+        let verified = Arc::new(AtomicUsize::new(0));
+
+        let first_readiness = Arc::clone(&readiness);
+        let first_prepared = Arc::clone(&prepared);
+        let first_verified = Arc::clone(&verified);
+        let first = tokio::spawn(async move {
+            first_readiness
+                .ensure_verified(
+                    UtilityVmRole::Native,
+                    async move {
+                        first_prepared.fetch_add(1, Ordering::Relaxed);
+                        sleep(Duration::from_millis(20)).await;
+                        Ok::<(), DockerError>(())
+                    },
+                    || async move {
+                        first_verified.fetch_add(1, Ordering::Relaxed);
+                        sleep(Duration::from_millis(20)).await;
+                        Ok::<(), DockerError>(())
+                    },
+                )
+                .await
+        });
+
+        while readiness.for_role(UtilityVmRole::Native).state() != EndpointReadinessState::Verifying
+        {
+            sleep(Duration::from_millis(1)).await;
+        }
+
+        let second_readiness = Arc::clone(&readiness);
+        let second_prepared = Arc::clone(&prepared);
+        let second_verified = Arc::clone(&verified);
+        let second = tokio::spawn(async move {
+            second_readiness
+                .ensure_verified(
+                    UtilityVmRole::Native,
+                    async move {
+                        second_prepared.fetch_add(1, Ordering::Relaxed);
+                        Ok::<(), DockerError>(())
+                    },
+                    || async move {
+                        second_verified.fetch_add(1, Ordering::Relaxed);
+                        Ok::<(), DockerError>(())
+                    },
+                )
+                .await
+        });
+
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+
+        assert_eq!(
+            readiness.for_role(UtilityVmRole::Native).state(),
+            EndpointReadinessState::Verified
+        );
+        assert_eq!(prepared.load(Ordering::Relaxed), 1);
+        assert_eq!(verified.load(Ordering::Relaxed), 1);
     }
 }
