@@ -267,10 +267,22 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             .ready()?
             .get_agent(&id)
             .map_err(|e| Status::internal(e.to_string()))?;
-        agent
+        let resp = agent
             .disk_trim()
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        // The RPC transport succeeding doesn't mean fstrim did: the guest's
+        // run_fstrim_now formats per-mount failures as "… failed (…)" / "…
+        // error (…)" in the result summary. Surface those so `disk compact`
+        // doesn't report false success.
+        if resp.result.contains("failed (") || resp.result.contains("error (") {
+            return Err(Status::internal(format!(
+                "guest fstrim reported errors: {}",
+                resp.result
+            )));
+        }
+        tracing::debug!(machine = %id, result = %resp.result, "disk compact: fstrim done");
 
         Ok(Response::new(Empty {}))
     }
