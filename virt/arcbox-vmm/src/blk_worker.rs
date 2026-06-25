@@ -45,6 +45,9 @@ pub enum BlkRequestType {
     /// DISCARD — deallocate (hole-punch) the listed ranges from the backing
     /// image. The range list travels in the read-only data descriptors.
     Discard,
+    /// WRITE_ZEROES — make the listed ranges read back as zeros. Same range-list
+    /// layout as DISCARD, but the device must guarantee the zero read.
+    WriteZeroes,
 }
 
 // ============================================================================
@@ -326,9 +329,11 @@ fn process_batch(ctx: &BlkWorkerContext, batch: &mut [BlkWorkItem]) {
 
 /// Processes a single block I/O work item.
 fn process_item(ctx: &BlkWorkerContext, item: &BlkWorkItem) {
+    // WRITE_ZEROES mutates data like a write, so a following Flush must wait for
+    // it. DISCARD is advisory and excluded from the flush barrier.
     let is_io = matches!(
         item.request_type,
-        BlkRequestType::Read | BlkRequestType::Write
+        BlkRequestType::Read | BlkRequestType::Write | BlkRequestType::WriteZeroes
     );
 
     if is_io {
@@ -349,6 +354,7 @@ fn process_item(ctx: &BlkWorkerContext, item: &BlkWorkItem) {
         }
         BlkRequestType::GetId => process_get_id(ctx, item),
         BlkRequestType::Discard => process_discard(ctx, item),
+        BlkRequestType::WriteZeroes => process_write_zeroes(ctx, item),
     };
 
     if is_io {
@@ -584,21 +590,27 @@ fn process_discard(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
     0 // VIRTIO_BLK_S_OK
 }
 
-/// Punches holes for every range in a DISCARD request's read-only payload
-/// descriptors. Factored out of [`process_discard`] so it can be tested without
-/// a full `BlkWorkerContext`.
-fn punch_discard_ranges(
+/// WRITE_ZEROES — make the listed ranges read back as zeros. Same range-list
+/// layout as DISCARD; unlike DISCARD it must be honored, so a read-only device
+/// is an I/O error (and we don't advertise the feature for one).
+fn process_write_zeroes(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
+    if ctx.read_only {
+        return 1; // VIRTIO_BLK_S_IOERR
+    }
+    zero_ranges(&ctx.guest_mem, ctx.raw_fd, ctx.blk_size, &item.buffers)
+}
+
+/// Calls `f(start_byte, end_byte)` for each range in a DISCARD / WRITE_ZEROES
+/// request's read-only payload descriptors: 16-byte entries of (sector le64,
+/// num_sectors le32, flags le32). The device-writable 1-byte status descriptor
+/// is skipped.
+fn for_each_range(
     guest_mem: &GuestMemWriter,
-    raw_fd: i32,
     blk_size: u32,
     buffers: &[(u64, u32, bool)],
+    mut f: impl FnMut(u64, u64),
 ) {
-    use arcbox_virtio::blk::{aligned_punch_range, punch_hole};
-
     let block_size = u64::from(blk_size);
-    // The range list travels in the read-only data descriptors: 16-byte entries
-    // of (sector le64, num_sectors le32, flags le32). The device-writable
-    // descriptor is the 1-byte status, which we skip.
     for &(gpa, len, is_write) in buffers {
         if is_write {
             continue;
@@ -609,21 +621,55 @@ fn punch_discard_ranges(
         for entry in bytes.chunks_exact(16) {
             let sector = u64::from_le_bytes(entry[0..8].try_into().unwrap());
             let num_sectors = u32::from_le_bytes(entry[8..12].try_into().unwrap());
-            // entry[12..16] = flags (UNMAP/reserved); ignored for advisory discard.
+            // entry[12..16] = flags (UNMAP/reserved); ignored.
             let start = sector * block_size;
             let end = start + u64::from(num_sectors) * block_size;
-            if let Some((offset, hole_len)) = aligned_punch_range(start, end) {
-                if let Err(e) = punch_hole(raw_fd, offset, hole_len) {
-                    tracing::warn!(
-                        sector,
-                        num_sectors,
-                        error = %e,
-                        "discard hole-punch failed (HV worker); range left allocated"
-                    );
-                }
-            }
+            f(start, end);
         }
     }
+}
+
+/// Punches holes for every DISCARD range. Factored out so it can be tested
+/// without a full `BlkWorkerContext`.
+fn punch_discard_ranges(
+    guest_mem: &GuestMemWriter,
+    raw_fd: i32,
+    blk_size: u32,
+    buffers: &[(u64, u32, bool)],
+) {
+    use arcbox_virtio::blk::{aligned_punch_range, punch_hole};
+
+    for_each_range(guest_mem, blk_size, buffers, |start, end| {
+        if let Some((offset, hole_len)) = aligned_punch_range(start, end) {
+            if let Err(e) = punch_hole(raw_fd, offset, hole_len) {
+                tracing::warn!(
+                    start,
+                    end,
+                    error = %e,
+                    "discard hole-punch failed (HV worker); range left allocated"
+                );
+            }
+        }
+    });
+}
+
+/// Zeroes every WRITE_ZEROES range via the shared sparse-aware primitive
+/// (hole-punch the aligned interior, write zeros on the edges). Returns the
+/// virtio status (0 = OK, 1 = an I/O error occurred on some range).
+fn zero_ranges(
+    guest_mem: &GuestMemWriter,
+    raw_fd: i32,
+    blk_size: u32,
+    buffers: &[(u64, u32, bool)],
+) -> u8 {
+    let mut status = 0u8;
+    for_each_range(guest_mem, blk_size, buffers, |start, end| {
+        if let Err(e) = arcbox_virtio::blk::zero_range(raw_fd, start, end) {
+            tracing::warn!(start, end, error = %e, "write_zeroes failed (HV worker)");
+            status = 1;
+        }
+    });
+    status
 }
 
 // Shared VirtIO queue helpers — extracted to virtqueue_util.rs.
@@ -762,6 +808,7 @@ impl BlkWorkerHandle {
                                 4 => BlkRequestType::Flush,
                                 8 => BlkRequestType::GetId,
                                 11 => BlkRequestType::Discard,
+                                13 => BlkRequestType::WriteZeroes,
                                 _ => BlkRequestType::Read,
                             };
                         }
@@ -882,6 +929,52 @@ mod tests {
         assert!(
             after < 64 * 1024,
             "worker discard should have punched the backing file, still {after} allocated"
+        );
+    }
+
+    /// The HV worker's WRITE_ZEROES path must actually zero the target sectors —
+    /// previously it fell through to a no-op `Read` and silently left stale data.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::cast_possible_wrap)] // pread-return comparison on a small test buffer
+    fn zero_ranges_zeroes_backing_file() {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        temp.write_all(&vec![0xCDu8; 16 * 1024]).unwrap();
+        temp.as_file().sync_all().unwrap();
+        let fd = temp.as_file().as_raw_fd();
+
+        // One write-zeroes entry for sectors [0, 16) — the first 8 KiB.
+        let mut mem = vec![0u8; 4096];
+        mem[0..8].copy_from_slice(&0u64.to_le_bytes()); // sector
+        mem[8..12].copy_from_slice(&16u32.to_le_bytes()); // num_sectors (8 KiB)
+        mem[12..16].copy_from_slice(&0u32.to_le_bytes()); // flags
+        // SAFETY: `mem` outlives `gm`; gpa_base 0 means gpa == buffer offset.
+        let gm = unsafe { GuestMemWriter::new(mem.as_mut_ptr(), mem.len(), 0) };
+        let buffers = vec![(0u64, 16u32, false), (16u64, 1u32, true)];
+
+        assert_eq!(zero_ranges(&gm, fd, 512, &buffers), 0);
+        temp.as_file().sync_all().unwrap();
+
+        // The first 8 KiB now reads back as zeros; the rest is untouched.
+        let mut buf = vec![0xFFu8; 8 * 1024];
+        // SAFETY: reading our own file into a sized buffer.
+        let n = unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        assert_eq!(n, buf.len() as isize);
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "write_zeroes range must read as zeros"
+        );
+
+        let mut rest = [0xFFu8; 512];
+        // SAFETY: reading our own file into a sized buffer.
+        let n = unsafe { libc::pread(fd, rest.as_mut_ptr().cast(), rest.len(), 8 * 1024) };
+        assert_eq!(n, 512);
+        assert!(
+            rest.iter().all(|&b| b == 0xCD),
+            "data past the range is intact"
         );
     }
 }
