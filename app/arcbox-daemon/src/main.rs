@@ -63,7 +63,12 @@ fn main() -> Result<()> {
     let log_guard = arcbox_logging::init_with_sentry(LogConfig {
         log_dir: data_dir.join(arcbox_constants::paths::host::LOG),
         file_name: arcbox_constants::paths::host::DAEMON_LOG.to_string(),
-        default_filter: "arcbox=info,arcbox_daemon=info".to_string(),
+        // `guest_serial` (PL011 earlycon) and `guest_console` (VirtioConsole
+        // hvc0) carry the in-VM kernel + agent boot output. Enable them by
+        // default so a stuck guest boot is diagnosable without a RUST_LOG
+        // override — they fall quiet once userspace is up.
+        default_filter: "arcbox=info,arcbox_daemon=info,guest_serial=info,guest_console=info"
+            .to_string(),
         foreground: args.foreground,
         ..LogConfig::default()
     });
