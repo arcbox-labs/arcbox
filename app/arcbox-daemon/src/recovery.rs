@@ -143,38 +143,6 @@ fn spawn_vmnet_route_reconcile(setup_state: Arc<arcbox_api::SetupState>, bridge:
     }));
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(all(target_os = "macos", feature = "vmnet"))]
-    #[test]
-    fn cold_start_route_plan_uses_vmnet_bridge() {
-        let plan = cold_start_route_plan(Some("bridge100".to_string()), None);
-
-        assert_eq!(
-            plan,
-            Some(ColdStartRoutePlan::VmnetBridge("bridge100".to_string()))
-        );
-    }
-
-    #[cfg(all(target_os = "macos", feature = "vmnet"))]
-    #[test]
-    fn cold_start_route_plan_skips_when_vmnet_bridge_is_unknown() {
-        let plan = cold_start_route_plan(None, Some("fe:b2:14:4d:a4:64".to_string()));
-
-        assert_eq!(plan, None);
-    }
-
-    #[cfg(all(target_os = "macos", not(feature = "vmnet")))]
-    #[test]
-    fn cold_start_route_plan_uses_bridge_mac_without_vmnet() {
-        let plan = cold_start_route_plan(Some("bridge100".to_string()), Some("mac".to_string()));
-
-        assert_eq!(plan, Some(ColdStartRoutePlan::BridgeMac("mac".to_string())));
-    }
-}
-
 // =============================================================================
 // Docker CLI tools
 // =============================================================================
@@ -334,5 +302,37 @@ async fn recover_container_networking(
             ports = recovered_ports,
             "Recovered networking for running containers"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(all(target_os = "macos", feature = "vmnet"))]
+    #[test]
+    fn cold_start_route_plan_uses_vmnet_bridge() {
+        let plan = cold_start_route_plan(Some("bridge100".to_string()), None);
+
+        assert_eq!(
+            plan,
+            Some(ColdStartRoutePlan::VmnetBridge("bridge100".to_string()))
+        );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "vmnet"))]
+    #[test]
+    fn cold_start_route_plan_skips_when_vmnet_bridge_is_unknown() {
+        let plan = cold_start_route_plan(None, Some("fe:b2:14:4d:a4:64".to_string()));
+
+        assert_eq!(plan, None);
+    }
+
+    #[cfg(all(target_os = "macos", not(feature = "vmnet")))]
+    #[test]
+    fn cold_start_route_plan_uses_bridge_mac_without_vmnet() {
+        let plan = cold_start_route_plan(Some("bridge100".to_string()), Some("mac".to_string()));
+
+        assert_eq!(plan, Some(ColdStartRoutePlan::BridgeMac("mac".to_string())));
     }
 }
