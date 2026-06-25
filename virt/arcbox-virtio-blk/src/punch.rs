@@ -77,11 +77,29 @@ fn zero_pwrite(fd: RawFd, start: u64, end: u64) -> std::io::Result<()> {
     }
     let zeros = vec![0u8; (end - start) as usize];
     #[allow(clippy::cast_possible_wrap)]
-    let off = start as libc::off_t;
-    // SAFETY: `zeros` is a valid buffer of `zeros.len()` bytes; `fd` is writable.
-    let n = unsafe { libc::pwrite(fd, zeros.as_ptr().cast::<libc::c_void>(), zeros.len(), off) };
-    if n < 0 {
-        return Err(std::io::Error::last_os_error());
+    let mut off = start as libc::off_t;
+    let mut written = 0usize;
+    while written < zeros.len() {
+        // SAFETY: `zeros[written..]` is a valid buffer; `fd` is writable.
+        let n = unsafe {
+            libc::pwrite(
+                fd,
+                zeros[written..].as_ptr().cast::<libc::c_void>(),
+                zeros.len() - written,
+                off,
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "pwrite made no progress while zeroing range",
+            ));
+        }
+        written += n as usize;
+        off += n as libc::off_t;
     }
     Ok(())
 }
