@@ -2,10 +2,10 @@
 
 use anyhow::{Context, Result};
 use arcbox_fleet_proto::v1::fleet_gateway_service_client::FleetGatewayServiceClient;
-use arcbox_fleet_proto::v1::{EnrollRequest, RuntimeCapacity};
+use arcbox_fleet_proto::v1::{Capability, EnrollRequest};
 use tracing::info;
 
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, PROTOCOL_VERSION};
 use crate::credentials::{Credential, CredentialStore};
 use crate::host;
 
@@ -13,7 +13,7 @@ use crate::host;
 pub async fn enroll(
     config: &AgentConfig,
     token: String,
-    capacities: Vec<RuntimeCapacity>,
+    capabilities: Vec<Capability>,
 ) -> Result<Credential> {
     let channel = config
         .endpoint()?
@@ -28,8 +28,9 @@ pub async fn enroll(
         host_arch: host::host_arch(),
         cpu_cores: host::cpu_cores(),
         mem_mib: host::mem_mib(),
-        capacities,
+        capabilities,
         host_info_json: host::host_info_json(),
+        protocol_version: PROTOCOL_VERSION,
     };
 
     let response = client

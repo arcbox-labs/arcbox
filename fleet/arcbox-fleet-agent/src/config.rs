@@ -14,13 +14,20 @@ pub const DEFAULT_GATEWAY: &str = "https://fleet.arcbox.dev";
 
 const ENV_GATEWAY: &str = "ARCBOX_FLEET_GATEWAY";
 const ENV_RUNNER_DIR: &str = "ARCBOX_FLEET_RUNNER_DIR";
-const ENV_MAX_CONCURRENT: &str = "ARCBOX_FLEET_MAX_CONCURRENT";
+const ENV_LOAD_CEILING: &str = "ARCBOX_FLEET_LOAD_CEILING";
+const ENV_MEM_FLOOR_MIB: &str = "ARCBOX_FLEET_MEM_FLOOR_MIB";
 const ENV_DATA_DIR: &str = "ARCBOX_FLEET_DATA_DIR";
 const ENV_DOCKER: &str = "ARCBOX_FLEET_DOCKER";
 const ENV_RUNNER_IMAGE: &str = "ARCBOX_FLEET_RUNNER_IMAGE";
 
-const DEFAULT_MAX_CONCURRENT: usize = 2;
+/// Reject an offer when 1-minute load average per core exceeds this.
+const DEFAULT_LOAD_CEILING: f64 = 0.9;
+/// Reject an offer when available memory is below this many MiB.
+const DEFAULT_MEM_FLOOR_MIB: u64 = 2048;
 const DEFAULT_RUNNER_IMAGE: &str = "ghcr.io/actions/actions-runner:latest";
+
+/// Wire-protocol version this agent speaks; the gateway rejects a mismatch.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Whether Docker-based Linux job execution is enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,8 +44,7 @@ pub enum DockerMode {
 #[derive(Debug, Clone)]
 pub struct DockerConfig {
     pub mode: DockerMode,
-    /// Container image used for Linux runner jobs when the platform sends no
-    /// image (empty `ProvisionRunner.image`).
+    /// Container image used for Linux runner jobs.
     pub runner_image: String,
 }
 
@@ -50,8 +56,10 @@ pub struct AgentConfig {
     /// Directory holding the pre-installed GitHub Actions runner (`run.sh`/`run.cmd`).
     /// `None` until set; required only by the `run` command.
     pub runner_dir: Option<PathBuf>,
-    /// Maximum number of concurrently executing runner jobs.
-    pub max_concurrent: usize,
+    /// Reject an offer when 1-minute load average per core exceeds this.
+    pub load_ceiling: f64,
+    /// Reject an offer when available memory (MiB) is below this.
+    pub mem_floor_mib: u64,
     /// Agent data directory (credentials, logs). Defaults to `~/.arcbox/fleet`.
     pub data_dir: PathBuf,
     /// Docker runtime configuration for Linux jobs.
@@ -65,17 +73,17 @@ impl AgentConfig {
 
         let runner_dir = std::env::var_os(ENV_RUNNER_DIR).map(PathBuf::from);
 
-        let max_concurrent = match std::env::var(ENV_MAX_CONCURRENT) {
-            Ok(v) => {
-                let n: usize = v
-                    .parse()
-                    .with_context(|| format!("{ENV_MAX_CONCURRENT} must be a positive integer"))?;
-                if n == 0 {
-                    anyhow::bail!("{ENV_MAX_CONCURRENT} must be a positive integer, got 0");
-                }
-                n
-            }
-            Err(_) => DEFAULT_MAX_CONCURRENT,
+        let load_ceiling = match std::env::var(ENV_LOAD_CEILING) {
+            Ok(v) => v
+                .parse()
+                .with_context(|| format!("{ENV_LOAD_CEILING} must be a number"))?,
+            Err(_) => DEFAULT_LOAD_CEILING,
+        };
+        let mem_floor_mib = match std::env::var(ENV_MEM_FLOOR_MIB) {
+            Ok(v) => v
+                .parse()
+                .with_context(|| format!("{ENV_MEM_FLOOR_MIB} must be a non-negative integer"))?,
+            Err(_) => DEFAULT_MEM_FLOOR_MIB,
         };
 
         let data_dir = match std::env::var_os(ENV_DATA_DIR) {
@@ -97,7 +105,8 @@ impl AgentConfig {
         Ok(Self {
             gateway,
             runner_dir,
-            max_concurrent,
+            load_ceiling,
+            mem_floor_mib,
             data_dir,
             docker: DockerConfig {
                 mode: docker_mode,

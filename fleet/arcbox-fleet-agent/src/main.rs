@@ -6,10 +6,8 @@
 //! available; other jobs run via the pre-installed runner
 //! (`run.sh --jitconfig …`).
 //!
-//! Configuration is environment-driven (`ARCBOX_FLEET_*`). The `enroll`
-//! subcommand reads the fleet join token from a file (`--token-file`) or stdin
-//! by default; `--token` is accepted for convenience but discouraged, as it
-//! leaks the token through the process argument list and shell history.
+//! Configuration is environment-driven (`ARCBOX_FLEET_*`); the only CLI
+//! argument is the one-shot enrollment token.
 
 mod attach;
 mod config;
@@ -19,13 +17,10 @@ mod enroll;
 mod host;
 mod runner;
 
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
-use arcbox_fleet_proto::v1::RuntimeCapacity;
+use arcbox_fleet_proto::v1::Capability;
 use arcbox_logging::LogConfig;
 use clap::{Parser, Subcommand};
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::config::{AgentConfig, DockerMode};
@@ -42,21 +37,11 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Exchange an enrollment token for the machine credential and persist it.
-    ///
-    /// The token is a multi-use fleet join token (valid until it expires or is
-    /// rotated). Provide it via `--token-file`, on stdin, or — discouraged —
-    /// `--token`.
     Enroll {
-        /// File holding the enrollment token (recommended). Keeps the token out
-        /// of the process argument list, shell history, and service logs.
-        #[arg(long, value_name = "PATH")]
-        token_file: Option<PathBuf>,
-
-        /// Enrollment token passed directly. Convenient but insecure: it leaks
-        /// via the process argument list and shell history. Prefer
-        /// `--token-file`, or pipe the token on stdin.
-        #[arg(long, conflicts_with = "token_file")]
-        token: Option<String>,
+        /// Fleet enrollment token issued by the control plane (a multi-use
+        /// join token valid until it expires or is rotated).
+        #[arg(long)]
+        token: String,
     },
     /// Attach to the gateway and run dispatched jobs until terminated.
     Run,
@@ -84,118 +69,34 @@ fn main() -> Result<()> {
 
 async fn run(command: Command, config: AgentConfig) -> Result<()> {
     match command {
-        Command::Enroll { token_file, token } => {
-            let token = resolve_enrollment_token(token_file, token)?;
+        Command::Enroll { token } => {
             // Enrollment is pure credential exchange — it never needs Docker, so
-            // an operator can enroll before the runtime is up. The capacities
+            // an operator can enroll before the runtime is up. The capabilities
             // sent here are an initial hint, replaced wholesale by the first
             // heartbeat once the agent attaches, so we advertise what we know
             // without probing the runtime.
-            let pools = capacity_pools(&config, None);
-            enroll::enroll(&config, token, pools).await?;
+            let capabilities = capabilities(&config, None);
+            enroll::enroll(&config, token, capabilities).await?;
             Ok(())
         }
         Command::Run => {
             let docker = init_docker(&config).await?;
-            let pools = capacity_pools(&config, docker.as_ref());
+            let capabilities = capabilities(&config, docker.as_ref());
             let credential = CredentialStore::new(config.credentials_path())
                 .load()?
-                .context(
-                    "no credential found — run `arcbox-fleet-agent enroll --token-file …` first",
-                )?;
+                .context("no credential found — run `arcbox-fleet-agent enroll --token …` first")?;
             info!(machine_id = %credential.machine_id, "starting fleet agent");
-
-            // Cancelled on the first termination signal; `attach::run` then
-            // stops accepting work and tears down in-flight runners.
-            let shutdown = CancellationToken::new();
-            let signal_token = shutdown.clone();
-            tokio::spawn(async move {
-                shutdown_signal().await;
-                info!("termination signal received; draining runners");
-                signal_token.cancel();
-            });
-
-            attach::run(config, credential, docker, pools, shutdown).await
+            attach::run(config, credential, docker, capabilities).await
         }
     }
 }
 
-/// Resolve when the process receives a termination signal: Ctrl-C on any
-/// platform, or SIGTERM on Unix (e.g. a service-manager stop). If a listener
-/// cannot be installed, that signal simply never fires rather than aborting
-/// startup.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            warn!(error = %e, "failed to listen for Ctrl-C; ignoring");
-            std::future::pending::<()>().await;
-        }
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                term.recv().await;
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to listen for SIGTERM; ignoring");
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        () = ctrl_c => {}
-        () = terminate => {}
-    }
-}
-
-/// Resolve the enrollment token from its chosen source: a file, an explicit
-/// `--token`, or stdin when neither is given (the two flags are mutually
-/// exclusive). Surrounding whitespace — a trailing newline from a file or
-/// `echo` — is trimmed.
-fn resolve_enrollment_token(token_file: Option<PathBuf>, token: Option<String>) -> Result<String> {
-    let raw = match (token_file, token) {
-        (Some(path), _) => std::fs::read_to_string(&path)
-            .with_context(|| format!("reading enrollment token from {}", path.display()))?,
-        (None, Some(token)) => token,
-        (None, None) => {
-            use std::io::Read;
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .context("reading enrollment token from stdin")?;
-            buf
-        }
-    };
-    let token = raw.trim().to_owned();
-    if token.is_empty() {
-        anyhow::bail!("enrollment token is empty");
-    }
-    Ok(token)
-}
-
-/// Build the capacity pools this agent advertises and admits against: the
-/// host-runner pool (if a runner directory is set) plus any Docker-served Linux
-/// pools, the latter sharing a resource-derived budget.
-fn capacity_pools(config: &AgentConfig, docker: Option<&DockerRunner>) -> Vec<RuntimeCapacity> {
+/// Build the capabilities this agent advertises: the native host-runner
+/// capability (if a runner directory is set) plus any Docker-served Linux
+/// capabilities. Capacity is decided per offer from live telemetry, not here.
+fn capabilities(config: &AgentConfig, docker: Option<&DockerRunner>) -> Vec<Capability> {
     let docker_arches = docker.map(DockerRunner::linux_arches).unwrap_or_default();
-    let docker_budget = if docker_arches.is_empty() {
-        0
-    } else {
-        host::docker_budget()
-    };
-    host::capacities(
-        config.max_concurrent,
-        config.runner_dir.is_some(),
-        &docker_arches,
-        docker_budget,
-    )
+    host::capabilities(config.runner_dir.is_some(), &docker_arches)
 }
 
 /// Probe Docker availability according to the configured [`DockerMode`].
@@ -209,35 +110,9 @@ async fn init_docker(config: &AgentConfig) -> Result<Option<DockerRunner>> {
         DockerMode::Auto => match DockerRunner::new(config.docker.runner_image.clone()).await {
             Ok(runner) => Ok(Some(runner)),
             Err(e) => {
-                warn!(error = %e, "docker not available; linux pools will not be advertised");
+                warn!(error = %e, "docker not available; linux capabilities will not be advertised");
                 Ok(None)
             }
         },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn direct_token_is_trimmed() {
-        let token = resolve_enrollment_token(None, Some("  flt_join_abc\n".to_owned())).unwrap();
-        assert_eq!(token, "flt_join_abc");
-    }
-
-    #[test]
-    fn blank_token_is_rejected() {
-        assert!(resolve_enrollment_token(None, Some("   \n".to_owned())).is_err());
-    }
-
-    #[test]
-    fn token_file_takes_precedence_and_is_trimmed() {
-        let path = std::env::temp_dir().join(format!("fleet-tok-{}", std::process::id()));
-        std::fs::write(&path, "flt_from_file\n").unwrap();
-        let token =
-            resolve_enrollment_token(Some(path.clone()), Some("ignored".to_owned())).unwrap();
-        assert_eq!(token, "flt_from_file");
-        let _ = std::fs::remove_file(path);
     }
 }
