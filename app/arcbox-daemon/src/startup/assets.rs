@@ -8,6 +8,58 @@ use arcbox_api::{SetupPhase, SetupState};
 use arcbox_core::BootAssetProvider;
 use tracing::info;
 
+/// Assets reconciled into the daemon data directory for this startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PreparedAssets {
+    agent: PreparedAgent,
+}
+
+impl PreparedAssets {
+    /// Returns where the staged `arcbox-agent` came from.
+    pub(super) fn agent(self) -> PreparedAgent {
+        self.agent
+    }
+}
+
+/// Source of the staged `~/.arcbox/bin/arcbox-agent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PreparedAgent {
+    /// The launched app bundle provided the staged agent.
+    Bundle,
+    /// The boot asset cache provided the staged agent because no bundle agent existed.
+    BootCache,
+    /// No agent was available from either source.
+    Unavailable,
+}
+
+/// Reconciles all startup assets into `data_dir`.
+///
+/// Bundle contents are seeded first so Sparkle app updates refresh staged
+/// binaries. Network/download fallback then fills any missing boot assets, and
+/// the boot-cache agent is staged only if the bundle did not provide one.
+pub(super) async fn prepare(
+    data_dir: &Path,
+    setup_state: &Arc<SetupState>,
+) -> Result<PreparedAssets> {
+    let seed_data_dir = data_dir.to_path_buf();
+    let bundle_seed = tokio::task::spawn_blocking(move || seed_from_bundle(&seed_data_dir))
+        .await
+        .context("bundle seed task panicked")?
+        .context("bundle seed failed")?;
+
+    ensure_boot_assets(data_dir, setup_state).await?;
+
+    let fallback_data_dir = data_dir.to_path_buf();
+    let agent = tokio::task::spawn_blocking(move || {
+        ensure_agent_binary_fallback(&fallback_data_dir, bundle_seed)
+    })
+    .await
+    .context("agent fallback task panicked")?
+    .context("agent fallback failed")?;
+
+    Ok(PreparedAssets { agent })
+}
+
 /// Returns the `Contents/` directory if the daemon is running inside an app bundle.
 ///
 /// Finds the main app bundle's `Contents/` directory by walking up from the
@@ -258,18 +310,26 @@ pub(super) async fn ensure_boot_assets(
 /// This fallback path is only used when the daemon is not running from an app
 /// bundle or the bundle does not contain an agent. Bundle-provided agents are
 /// authoritative and must not be overwritten by a possibly older boot cache.
-pub(super) fn ensure_agent_binary_fallback(data_dir: &Path, bundle_seed: BundleSeed) -> Result<()> {
-    if bundle_seed.needs_agent_fallback() {
-        ensure_agent_binary(data_dir)?;
+pub(super) fn ensure_agent_binary_fallback(
+    data_dir: &Path,
+    bundle_seed: BundleSeed,
+) -> Result<PreparedAgent> {
+    if !bundle_seed.needs_agent_fallback() {
+        return Ok(PreparedAgent::Bundle);
     }
-    Ok(())
+
+    if ensure_agent_binary(data_dir)? {
+        Ok(PreparedAgent::BootCache)
+    } else {
+        Ok(PreparedAgent::Unavailable)
+    }
 }
 
 /// Installs the arcbox-agent binary from the downloaded boot cache.
 ///
 /// Call [`ensure_agent_binary_fallback`] from startup code so bundle-provided
 /// agents keep precedence over the boot cache.
-pub(super) fn ensure_agent_binary(data_dir: &Path) -> Result<()> {
+pub(super) fn ensure_agent_binary(data_dir: &Path) -> Result<bool> {
     let agent_dest = data_dir.join("bin/arcbox-agent");
 
     let version = arcbox_core::boot_asset_version();
@@ -279,19 +339,19 @@ pub(super) fn ensure_agent_binary(data_dir: &Path) -> Result<()> {
             "Agent binary not found in boot cache at {}",
             agent_src.display()
         );
-        return Ok(());
+        return Ok(false);
     }
 
     if copy_if_changed(&agent_src, &agent_dest).context("Failed to install agent binary")? {
         info!("Agent binary installed from boot cache");
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentSeed, BundleSeed, copy_if_changed, ensure_agent_binary_fallback,
+        AgentSeed, BundleSeed, PreparedAgent, copy_if_changed, ensure_agent_binary_fallback,
         seed_agent_from_bundle,
     };
     use std::fs;
@@ -358,7 +418,8 @@ mod tests {
         fs::create_dir_all(cached_agent.parent().unwrap()).unwrap();
         fs::write(&cached_agent, b"boot-cache-agent").unwrap();
 
-        ensure_agent_binary_fallback(dir.path(), BundleSeed::default()).unwrap();
+        let agent = ensure_agent_binary_fallback(dir.path(), BundleSeed::default()).unwrap();
+        assert_eq!(agent, PreparedAgent::BootCache);
 
         let staged_agent = dir.path().join("bin/arcbox-agent");
         assert_eq!(fs::read(staged_agent).unwrap(), b"boot-cache-agent");
@@ -379,13 +440,14 @@ mod tests {
         fs::create_dir_all(cached_agent.parent().unwrap()).unwrap();
         fs::write(&cached_agent, b"older-boot-cache-agent").unwrap();
 
-        ensure_agent_binary_fallback(
+        let agent = ensure_agent_binary_fallback(
             dir.path(),
             BundleSeed {
                 agent: AgentSeed::Bundle,
             },
         )
         .unwrap();
+        assert_eq!(agent, PreparedAgent::Bundle);
 
         let staged_agent = dir.path().join("bin/arcbox-agent");
         assert_eq!(fs::read(staged_agent).unwrap(), b"bundle-agent");

@@ -3,9 +3,11 @@
 mod assets;
 mod cleanup;
 mod lock;
+mod pipeline;
 
 pub use assets::find_bundle_contents;
 pub use lock::DaemonLock;
+pub use pipeline::Startup;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,7 +31,7 @@ const DEFAULT_DNS_DOMAIN: &str = "arcbox.local";
 /// Returns an [`EarlyContext`] sufficient to start the gRPC
 /// SystemService so clients can observe the full startup progression.
 /// Call [`acquire_lock`] next to obtain a [`DaemonContext`].
-pub async fn init_early(args: DaemonArgs) -> Result<EarlyContext> {
+async fn init_early(args: DaemonArgs) -> Result<EarlyContext> {
     let setup_state = Arc::new(SetupState::new());
 
     let mut layout = HostLayout::resolve(args.data_dir.as_deref());
@@ -73,7 +75,7 @@ pub async fn init_early(args: DaemonArgs) -> Result<EarlyContext> {
 /// blocks on `flock(LOCK_EX)` until the lock is released. Must run
 /// before `start_grpc` because the old daemon may still be listening
 /// on the same socket paths.
-pub async fn acquire_lock(early: EarlyContext) -> Result<DaemonContext> {
+async fn acquire_lock(early: EarlyContext) -> Result<DaemonContext> {
     let lock_file = early.layout.lock_file.clone();
     let lock = tokio::task::spawn_blocking(move || DaemonLock::acquire(&lock_file))
         .await
@@ -105,7 +107,7 @@ pub async fn acquire_lock(early: EarlyContext) -> Result<DaemonContext> {
 ///
 /// On non-macOS this is a no-op (no XPC helpers).
 #[cfg(target_os = "macos")]
-pub async fn wait_for_resources(ctx: &DaemonContext) -> Result<()> {
+async fn wait_for_resources(ctx: &DaemonContext) -> Result<()> {
     let candidates = ["docker.img", "docker-rosetta.img"];
     let docker_imgs: Vec<std::path::PathBuf> = candidates
         .iter()
@@ -137,8 +139,20 @@ pub async fn wait_for_resources(ctx: &DaemonContext) -> Result<()> {
 
 /// No-op on non-macOS — no Virtualization.framework XPC helpers.
 #[cfg(not(target_os = "macos"))]
-pub async fn wait_for_resources(_ctx: &DaemonContext) -> Result<()> {
+async fn wait_for_resources(_ctx: &DaemonContext) -> Result<()> {
     Ok(())
+}
+
+/// Reconciles bundle, downloaded, and staged assets for this startup.
+///
+/// Called after gRPC is already listening so clients can observe download
+/// progress and before [`init_runtime`] so the runtime sees coherent artifacts
+/// for the launched app version.
+async fn prepare_assets(ctx: &DaemonContext) -> Result<assets::PreparedAssets> {
+    let prepared = assets::prepare(&ctx.layout.data_dir, &ctx.setup_state).await?;
+    ctx.setup_state
+        .set_phase(SetupPhase::AssetsReady, "Boot assets ready");
+    Ok(prepared)
 }
 
 /// Phase 2: seed/download boot assets, build runtime, start VM.
@@ -146,7 +160,7 @@ pub async fn wait_for_resources(_ctx: &DaemonContext) -> Result<()> {
 /// Called after gRPC SystemService is already listening so clients
 /// can observe DOWNLOADING_ASSETS → ASSETS_READY progression.
 /// Returns the initialized runtime.
-pub async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
+async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
     let mut config = Config::load().unwrap_or_else(|err| {
         warn!(error = %err, "Failed to load config file; falling back to defaults");
         Config::default()
@@ -164,31 +178,6 @@ pub async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
     if let Some(ref kernel) = ctx.vm_args.kernel {
         config.vm.kernel_path = Some(kernel.clone());
     }
-
-    // Seed boot assets from app bundle if available, then download anything
-    // still missing. Run bundle seeding on a blocking thread to avoid stalling
-    // the async runtime during large file copies (kernel + rootfs + runtime
-    // binaries). The agent fallback runs after boot assets are present so a
-    // fresh non-bundle install can stage the downloaded boot-cache agent.
-    let data_dir = ctx.layout.data_dir.clone();
-    let bundle_seed = tokio::task::spawn_blocking(move || assets::seed_from_bundle(&data_dir))
-        .await
-        .context("bundle seed task panicked")?
-        .context("bundle seed failed")?;
-
-    assets::ensure_boot_assets(&ctx.layout.data_dir, &ctx.setup_state).await?;
-
-    // Stage the boot-cache agent only when the app bundle did not already
-    // provide one. A bundle agent is authoritative for the launched app build.
-    let data_dir = ctx.layout.data_dir.clone();
-    tokio::task::spawn_blocking(move || {
-        assets::ensure_agent_binary_fallback(&data_dir, bundle_seed)
-    })
-    .await
-    .context("agent fallback task panicked")?
-    .context("agent fallback failed")?;
-    ctx.setup_state
-        .set_phase(SetupPhase::AssetsReady, "Boot assets ready");
 
     let runtime = Arc::new(Runtime::new(config).context("Failed to create runtime")?);
     runtime

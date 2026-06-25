@@ -3,9 +3,9 @@
 //! The startup sequence produces progressively richer context types:
 //!
 //! ```text
-//! init_early()   → EarlyContext      (no lock, no runtime)
-//! acquire_lock() → DaemonContext     (lock held, no runtime yet)
-//! init_runtime() → Arc<Runtime>      (also fills SharedRuntime for gRPC)
+//! Startup::prepare_host()          → EarlyContext   (no lock, no runtime)
+//! Startup::acquire_daemon_lease()  → DaemonContext  (lock held, no runtime yet)
+//! Startup::boot_runtime()          → Arc<Runtime>   (also fills SharedRuntime for gRPC)
 //! ```
 //!
 //! This encoding makes it a compile error to access the daemon lock
@@ -20,12 +20,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::startup::DaemonLock;
 
-/// Pre-lock context returned by [`startup::init_early`].
+/// Pre-lock context produced by the startup pipeline.
 ///
 /// Contains everything needed to start the gRPC SystemService (so
 /// clients can observe progress), but the daemon lock has not been
-/// acquired yet. Consumed by [`startup::acquire_lock`] to produce
-/// a [`DaemonContext`].
+/// acquired yet. Consumed by the daemon lease phase to produce a
+/// [`DaemonContext`].
 pub struct EarlyContext {
     pub layout: HostLayout,
     pub shared_runtime: SharedRuntime,
