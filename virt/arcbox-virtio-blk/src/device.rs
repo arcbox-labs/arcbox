@@ -74,13 +74,17 @@ impl VirtioBlock {
             | Self::FEATURE_SEG_MAX
             | Self::FEATURE_BLK_SIZE
             | Self::FEATURE_FLUSH
-            | Self::FEATURE_DISCARD
-            | Self::FEATURE_WRITE_ZEROES
             | Self::FEATURE_VERSION_1
             | arcbox_virtio_core::queue::VIRTIO_F_EVENT_IDX;
 
         if config.read_only {
             features |= Self::FEATURE_RO;
+        } else {
+            // DISCARD and WRITE_ZEROES both mutate the backing file, so only a
+            // writable device advertises them. (A read-only device that
+            // advertised DISCARD would force the handler to error on requests
+            // it cannot honor.)
+            features |= Self::FEATURE_DISCARD | Self::FEATURE_WRITE_ZEROES;
         }
         if config.num_queues > 1 {
             features |= Self::FEATURE_MQ;
@@ -313,7 +317,10 @@ impl VirtioBlock {
     /// guest's `fstrim`. Malformed requests still error.
     fn handle_discard_list(&self, data: &[u8]) -> Result<usize> {
         if self.config.read_only {
-            return Err(VirtioError::InvalidOperation("Device is read-only".into()));
+            // Read-only devices don't advertise FEATURE_DISCARD, so this is only
+            // reached by a misbehaving guest. DISCARD is advisory — answer OK
+            // (no-op) rather than failing the request.
+            return Ok(0);
         }
 
         let fd = self
@@ -338,23 +345,15 @@ impl VirtioBlock {
 
             let start = range.sector * block_size;
             let end = start + u64::from(range.num_sectors) * block_size;
-            // Align inward to the host FS allocation unit: macOS `F_PUNCHHOLE`
-            // rejects unaligned ranges, and only fully-covered blocks are freed
-            // on Linux anyway. Punching just the aligned interior is always
-            // safe — the guest already considers the whole range free, and we
-            // lose at most one block of reclaim at each edge.
-            let aligned_start = (start + (PUNCH_HOLE_ALIGNMENT - 1)) & !(PUNCH_HOLE_ALIGNMENT - 1);
-            let aligned_end = end & !(PUNCH_HOLE_ALIGNMENT - 1);
-            if aligned_end <= aligned_start {
-                continue;
-            }
-            if let Err(e) = punch_hole(fd, aligned_start, aligned_end - aligned_start) {
-                tracing::warn!(
-                    sector = range.sector,
-                    num_sectors = range.num_sectors,
-                    error = %e,
-                    "discard hole-punch failed; range left allocated on host"
-                );
+            if let Some((offset, len)) = crate::punch::aligned_punch_range(start, end) {
+                if let Err(e) = crate::punch::punch_hole(fd, offset, len) {
+                    tracing::warn!(
+                        sector = range.sector,
+                        num_sectors = range.num_sectors,
+                        error = %e,
+                        "discard hole-punch failed; range left allocated on host"
+                    );
+                }
             }
         }
         Ok(0)
@@ -539,54 +538,6 @@ impl VirtioBlock {
     }
 }
 
-/// Host filesystem allocation unit used to align hole-punch ranges. APFS and
-/// modern ext4/btrfs all use 4 KiB blocks; macOS `F_PUNCHHOLE` requires the
-/// punch offset and length to be multiples of this, and Linux only frees
-/// fully-covered blocks regardless.
-const PUNCH_HOLE_ALIGNMENT: u64 = 4096;
-
-/// Deallocates `[offset, offset + len)` in the file behind `fd`, leaving a
-/// sparse hole without changing the file's logical size. `offset` and `len`
-/// must be `PUNCH_HOLE_ALIGNMENT`-aligned.
-#[cfg(target_os = "linux")]
-fn punch_hole(fd: std::os::unix::io::RawFd, offset: u64, len: u64) -> std::io::Result<()> {
-    // PUNCH_HOLE must be combined with KEEP_SIZE: free the range but keep EOF.
-    let mode = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
-    #[allow(clippy::cast_possible_wrap)]
-    let (off, length) = (offset as libc::off_t, len as libc::off_t);
-    // SAFETY: `fd` is a valid writable descriptor; `off`/`length` are aligned,
-    // non-negative, and fit `off_t` (the backing file is at most 8 TiB).
-    let ret = unsafe { libc::fallocate(fd, mode, off, length) };
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn punch_hole(fd: std::os::unix::io::RawFd, offset: u64, len: u64) -> std::io::Result<()> {
-    #[allow(clippy::cast_possible_wrap)]
-    let mut ph = libc::fpunchhole_t {
-        fp_flags: 0,
-        reserved: 0,
-        fp_offset: offset as libc::off_t,
-        fp_length: len as libc::off_t,
-    };
-    // SAFETY: `fd` is a valid writable descriptor and `ph` is a fully
-    // initialized `fpunchhole_t` that outlives the `fcntl` call.
-    let ret = unsafe { libc::fcntl(fd, libc::F_PUNCHHOLE, &mut ph) };
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn punch_hole(_fd: std::os::unix::io::RawFd, _offset: u64, _len: u64) -> std::io::Result<()> {
-    // No portable hole-punch; leave the range allocated (DISCARD is advisory).
-    Ok(())
-}
-
 /// One entry in a DISCARD / WRITE_ZEROES request's range list. The on-wire
 /// struct is `virtio_blk_discard_write_zeroes`: sector (le64), num_sectors
 /// (le32), flags (le32) — 16 bytes total.
@@ -661,7 +612,7 @@ impl VirtioDevice for VirtioBlock {
             &self.config.num_queues.to_le_bytes(),
             &Self::MAX_DISCARD_SECTORS.to_le_bytes(),
             &1u32.to_le_bytes(), // max_discard_seg: one range per request
-            &1u32.to_le_bytes(), // discard_sector_alignment: any sector
+            &8u32.to_le_bytes(), // discard_sector_alignment: 4 KiB (8 × 512), matches host punch
             &Self::MAX_WRITE_ZEROES_SECTORS.to_le_bytes(),
             &1u32.to_le_bytes(), // max_write_zeroes_seg
             &[0u8; 4],           // write_zeroes_may_unmap=0 + 3 pad bytes
@@ -918,34 +869,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn punch_hole_reclaims_physical_blocks() {
-        use std::os::unix::fs::MetadataExt;
-        use std::os::unix::io::AsRawFd;
-
-        let mut temp = NamedTempFile::new().unwrap();
-        // Allocate 1 MiB of real (non-zero) data so the host backs it with
-        // physical blocks rather than a hole.
-        temp.write_all(&vec![0xABu8; 1024 * 1024]).unwrap();
-        temp.as_file().sync_all().unwrap();
-
-        let before = std::fs::metadata(temp.path()).unwrap().blocks() * 512;
-        assert!(
-            before >= 1024 * 1024,
-            "expected ~1 MiB allocated before punch, got {before}"
-        );
-
-        punch_hole(temp.as_file().as_raw_fd(), 0, 1024 * 1024).unwrap();
-        temp.as_file().sync_all().unwrap();
-
-        let after = std::fs::metadata(temp.path()).unwrap().blocks() * 512;
-        assert!(
-            after < 64 * 1024,
-            "expected the hole-punch to free the blocks, still {after} allocated"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn discard_punches_backing_file() {
         use std::os::unix::fs::MetadataExt;
 
@@ -991,6 +914,9 @@ mod tests {
 
         let device = VirtioBlock::new(ro_config);
         assert!(device.features() & VirtioBlock::FEATURE_RO != 0);
+        // A read-only device must not advertise mutating ops it cannot honor.
+        assert_eq!(device.features() & VirtioBlock::FEATURE_DISCARD, 0);
+        assert_eq!(device.features() & VirtioBlock::FEATURE_WRITE_ZEROES, 0);
     }
 
     #[test]
@@ -1150,6 +1076,9 @@ mod tests {
         device.read_config(36, &mut buf); // max_discard_sectors
         assert_eq!(u32::from_le_bytes(buf), VirtioBlock::MAX_DISCARD_SECTORS,);
 
+        device.read_config(44, &mut buf); // discard_sector_alignment
+        assert_eq!(u32::from_le_bytes(buf), 8); // 4 KiB / 512, matches host punch
+
         device.read_config(48, &mut buf); // max_write_zeroes_sectors
         assert_eq!(
             u32::from_le_bytes(buf),
@@ -1190,23 +1119,37 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_discard_accepts_valid_range() {
+    fn test_handle_discard_punches_aligned_range() {
         let mut temp_file = NamedTempFile::new().unwrap();
-        temp_file.write_all(&vec![0xAAu8; 4096]).unwrap();
+        temp_file.write_all(&vec![0xAAu8; 8192]).unwrap();
+        temp_file.as_file().sync_all().unwrap();
 
         let device = VirtioBlock::from_path(temp_file.path(), false).unwrap();
 
+        // Discard the first 4 KiB (8 × 512-byte sectors) — block-aligned, so it
+        // is actually punched.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0u64.to_le_bytes()); // sector
-        bytes.extend_from_slice(&4u32.to_le_bytes()); // num_sectors
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // num_sectors (4 KiB)
         bytes.extend_from_slice(&0u32.to_le_bytes()); // flags
 
         assert!(device.handle_discard_list(&bytes).is_ok());
 
-        // DISCARD is advisory — underlying bytes must be unchanged.
-        let mut buf = vec![0u8; 512];
-        device.handle_read(0, &mut buf).unwrap();
-        assert!(buf.iter().all(|&b| b == 0xAA));
+        // The punched range is now a hole and reads back as zeros; data beyond
+        // it (sector 8) is untouched.
+        let mut hole = vec![0xFFu8; 512];
+        device.handle_read(0, &mut hole).unwrap();
+        assert!(
+            hole.iter().all(|&b| b == 0),
+            "punched range should read as zeros"
+        );
+
+        let mut kept = vec![0u8; 512];
+        device.handle_read(8, &mut kept).unwrap();
+        assert!(
+            kept.iter().all(|&b| b == 0xAA),
+            "data past the range is intact"
+        );
     }
 
     #[test]
