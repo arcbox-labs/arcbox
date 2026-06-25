@@ -351,6 +351,19 @@ pub struct VmLifecycleManager {
 }
 
 impl VmLifecycleManager {
+    /// Ensures a sparse, thin-provisioned block image of `size_bytes` virtual
+    /// size exists at `path`, creating parent directories as needed.
+    ///
+    /// `set_len` extends only the logical size (EOF); it reserves no physical
+    /// blocks, so the host file stays sparse and consumes disk only for blocks
+    /// the guest actually writes — matching OrbStack's thin data image.
+    ///
+    /// We deliberately do NOT pre-allocate physical space. An upfront macOS
+    /// `F_PREALLOCATE` reservation (previously capped at 64 GiB) made a fresh
+    /// install report tens of GiB of disk usage with zero containers — wasteful
+    /// and a regression against OrbStack on idle footprint. APFS/Btrfs allocate
+    /// on write lazily, so the working set still benefits from CoW without the
+    /// upfront cost. An existing image is never shrunk.
     fn ensure_sparse_block_image(path: &std::path::Path, size_bytes: u64) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -385,56 +398,11 @@ impl VmLifecycleManager {
             ))
         })?;
 
+        // Extend the logical size only — `set_len` leaves the file sparse, so
+        // no physical disk is consumed until the guest writes. Never shrink an
+        // existing image (guards against a smaller `size_bytes` truncating
+        // user data).
         if current_len.len() < size_bytes {
-            // Pre-allocate a bounded initial chunk on macOS (APFS) to reduce
-            // double-CoW amplification (Btrfs CoW + APFS CoW) for the working
-            // set. The full virtual size is set via `set_len` below, but we
-            // never ask APFS to physically reserve all of it — at 8 TiB that
-            // would either fail outright or, on a large disk, consume the
-            // entire requested capacity. The bounded cap matches the previous
-            // default working set and is best-effort; failures are ignored.
-            #[cfg(target_os = "macos")]
-            {
-                use std::os::unix::io::AsRawFd;
-                /// Upper bound on initial APFS preallocation, in bytes.
-                const APFS_PREALLOC_CAP_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-                let prealloc_target = size_bytes.min(APFS_PREALLOC_CAP_BYTES);
-                if current_len.len() < prealloc_target {
-                    let fd = file.as_raw_fd();
-                    // fstore_t: fst_flags, fst_posmode, fst_offset, fst_length, fst_bytesalloc
-                    #[repr(C)]
-                    #[allow(clippy::struct_field_names)] // mirrors macOS fstore_t C struct
-                    struct FStore {
-                        fst_flags: u32,
-                        fst_posmode: i32,
-                        fst_offset: i64,
-                        fst_length: i64,
-                        fst_bytesalloc: i64,
-                    }
-                    const F_ALLOCATEALL: u32 = 0x00000004;
-                    const F_PEOFPOSMODE: i32 = 3;
-                    const F_PREALLOCATE: libc::c_int = 42;
-                    let mut store = FStore {
-                        fst_flags: F_ALLOCATEALL,
-                        fst_posmode: F_PEOFPOSMODE,
-                        fst_offset: 0,
-                        #[allow(clippy::cast_possible_wrap)]
-                        fst_length: prealloc_target as i64,
-                        fst_bytesalloc: 0,
-                    };
-                    // Best-effort: if pre-allocation fails (e.g. not enough disk
-                    // space), fall through to ftruncate which creates a sparse file.
-                    let ret = unsafe { libc::fcntl(fd, F_PREALLOCATE, &mut store) };
-                    if ret == 0 {
-                        tracing::info!(
-                            path = %path.display(),
-                            allocated_bytes = store.fst_bytesalloc,
-                            "pre-allocated docker data image (APFS)"
-                        );
-                    }
-                }
-            }
-
             file.set_len(size_bytes).map_err(|e| {
                 CoreError::config(format!(
                     "failed to resize block image '{}': {}",
@@ -1261,6 +1229,60 @@ mod tests {
         let config = VmLifecycleConfig::default();
         assert!(config.auto_stop);
         assert_eq!(config.max_retries, DEFAULT_MAX_RETRIES);
+    }
+
+    #[test]
+    fn ensure_sparse_block_image_is_thin_provisioned() {
+        // Regression guard (issue #244 / ABXD-95): a freshly created data image
+        // must be thin — report its full virtual size yet consume virtually no
+        // physical disk. A reintroduced upfront preallocation (e.g. macOS
+        // `F_PREALLOCATE`) would balloon the allocated block count and fail here.
+        let dir = tempfile::tempdir().unwrap();
+        // Nested path also exercises parent-directory creation.
+        let path = dir.path().join("data").join("docker.img");
+        let size_bytes = DOCKER_DATA_IMAGE_SIZE_BYTES; // 8 TiB virtual size
+
+        VmLifecycleManager::ensure_sparse_block_image(&path, size_bytes).unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            meta.len(),
+            size_bytes,
+            "logical size must match the requested virtual size"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // `blocks()` counts 512-byte blocks actually allocated on disk. A
+            // sparse file reserves none up front; 1 MiB of slack covers any
+            // filesystem metadata overhead while still catching a multi-GiB
+            // preallocation regression.
+            let physical_bytes = meta.blocks() * 512;
+            assert!(
+                physical_bytes < 1024 * 1024,
+                "image must be sparse: {physical_bytes} physical bytes allocated \
+                 for an empty {size_bytes}-byte image"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_sparse_block_image_never_shrinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docker.img");
+
+        VmLifecycleManager::ensure_sparse_block_image(&path, 8192).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+
+        // A call with a smaller virtual size must not truncate the existing
+        // image — that would discard guest data.
+        VmLifecycleManager::ensure_sparse_block_image(&path, 4096).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+
+        // A larger size grows it.
+        VmLifecycleManager::ensure_sparse_block_image(&path, 16384).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 16384);
     }
 
     #[test]
