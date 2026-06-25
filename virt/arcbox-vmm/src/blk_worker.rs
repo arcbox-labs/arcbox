@@ -42,6 +42,9 @@ pub enum BlkRequestType {
     Write,
     Flush,
     GetId,
+    /// DISCARD — deallocate (hole-punch) the listed ranges from the backing
+    /// image. The range list travels in the read-only data descriptors.
+    Discard,
 }
 
 // ============================================================================
@@ -345,6 +348,7 @@ fn process_item(ctx: &BlkWorkerContext, item: &BlkWorkItem) {
             process_flush(ctx)
         }
         BlkRequestType::GetId => process_get_id(ctx, item),
+        BlkRequestType::Discard => process_discard(ctx, item),
     };
 
     if is_io {
@@ -569,6 +573,59 @@ fn process_get_id(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
     0
 }
 
+/// DISCARD — punch holes for the listed ranges so the host reclaims disk for
+/// blocks the guest freed via `fstrim` / `discard=async`. DISCARD is advisory
+/// under the virtio-blk spec, so a read-only device or a punch failure is
+/// reported as a successful no-op rather than an I/O error.
+fn process_discard(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
+    if !ctx.read_only {
+        punch_discard_ranges(&ctx.guest_mem, ctx.raw_fd, ctx.blk_size, &item.buffers);
+    }
+    0 // VIRTIO_BLK_S_OK
+}
+
+/// Punches holes for every range in a DISCARD request's read-only payload
+/// descriptors. Factored out of [`process_discard`] so it can be tested without
+/// a full `BlkWorkerContext`.
+fn punch_discard_ranges(
+    guest_mem: &GuestMemWriter,
+    raw_fd: i32,
+    blk_size: u32,
+    buffers: &[(u64, u32, bool)],
+) {
+    use arcbox_virtio::blk::{aligned_punch_range, punch_hole};
+
+    let block_size = u64::from(blk_size);
+    // The range list travels in the read-only data descriptors: 16-byte entries
+    // of (sector le64, num_sectors le32, flags le32). The device-writable
+    // descriptor is the 1-byte status, which we skip.
+    for &(gpa, len, is_write) in buffers {
+        if is_write {
+            continue;
+        }
+        let Some(bytes) = guest_mem.slice(gpa as usize, len as usize) else {
+            continue;
+        };
+        for entry in bytes.chunks_exact(16) {
+            let sector = u64::from_le_bytes(entry[0..8].try_into().unwrap());
+            let num_sectors = u32::from_le_bytes(entry[8..12].try_into().unwrap());
+            // entry[12..16] = flags (UNMAP/reserved); ignored for advisory discard.
+            let start = sector * block_size;
+            let end = start + u64::from(num_sectors) * block_size;
+            if let Some((offset, hole_len)) = aligned_punch_range(start, end) {
+                if let Err(e) = punch_hole(raw_fd, offset, hole_len) {
+                    tracing::warn!(
+                        sector,
+                        num_sectors,
+                        error = %e,
+                        "discard hole-punch failed (HV worker); range left allocated"
+                    );
+                }
+            }
+        }
+    }
+}
+
 // Shared VirtIO queue helpers — extracted to virtqueue_util.rs.
 use crate::virtqueue_util::{read_used_idx, should_notify, write_used_entry};
 
@@ -704,6 +761,7 @@ impl BlkWorkerHandle {
                                 1 => BlkRequestType::Write,
                                 4 => BlkRequestType::Flush,
                                 8 => BlkRequestType::GetId,
+                                11 => BlkRequestType::Discard,
                                 _ => BlkRequestType::Read,
                             };
                         }
@@ -782,5 +840,48 @@ impl Default for FlushBarrier {
 impl FlushBarrier {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The HV worker's DISCARD path must actually reclaim host blocks — this is
+    /// the path the macOS backend uses, where DISCARD previously fell through to
+    /// a no-op `Read`.
+    #[cfg(unix)]
+    #[test]
+    fn punch_discard_ranges_reclaims_blocks() {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+
+        // Backing file with 1 MiB of real (non-zero) data.
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        temp.write_all(&vec![0xEEu8; 1024 * 1024]).unwrap();
+        temp.as_file().sync_all().unwrap();
+        let fd = temp.as_file().as_raw_fd();
+
+        // Guest memory holding one 16-byte discard entry for sectors [0, 2048)
+        // — the whole 1 MiB — followed by where the 1-byte status would live.
+        let mut mem = vec![0u8; 4096];
+        mem[0..8].copy_from_slice(&0u64.to_le_bytes()); // sector
+        mem[8..12].copy_from_slice(&2048u32.to_le_bytes()); // num_sectors (1 MiB)
+        mem[12..16].copy_from_slice(&0u32.to_le_bytes()); // flags
+        // SAFETY: `mem` outlives `gm`; gpa_base 0 means gpa == buffer offset.
+        let gm = unsafe { GuestMemWriter::new(mem.as_mut_ptr(), mem.len(), 0) };
+
+        // Descriptors: the read-only range list, then the write-only status byte
+        // (which must be skipped, not parsed as a range).
+        let buffers = vec![(0u64, 16u32, false), (16u64, 1u32, true)];
+        punch_discard_ranges(&gm, fd, 512, &buffers);
+        temp.as_file().sync_all().unwrap();
+
+        let after = std::fs::metadata(temp.path()).unwrap().blocks() * 512;
+        assert!(
+            after < 64 * 1024,
+            "worker discard should have punched the backing file, still {after} allocated"
+        );
     }
 }
