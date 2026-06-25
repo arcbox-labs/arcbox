@@ -77,7 +77,7 @@ impl DnsForwarder {
 
     fn cache_ttl_for_response(&self, response: &[u8]) -> Option<Duration> {
         let message = DnsMessage::from_vec(response).ok()?;
-        let min_answer_ttl = message.answers().iter().map(|record| record.ttl()).min()?;
+        let min_answer_ttl = message.answers.iter().map(|record| record.ttl).min()?;
         if min_answer_ttl == 0 || self.config.cache_ttl.is_zero() {
             return None;
         }

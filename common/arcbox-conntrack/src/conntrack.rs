@@ -367,11 +367,12 @@ impl ConnTrackTable {
         let hash = key.fast_hash();
         let cache_idx = (hash as usize) & self.fast_cache_mask;
 
-        if let Some(ref cache_entry) = self.fast_cache[cache_idx] {
-            if cache_entry.key_hash == hash && cache_entry.key == *key {
-                self.stats.fast_hits.0.fetch_add(1, Ordering::Relaxed);
-                return Some(Arc::clone(&cache_entry.entry));
-            }
+        if let Some(ref cache_entry) = self.fast_cache[cache_idx]
+            && cache_entry.key_hash == hash
+            && cache_entry.key == *key
+        {
+            self.stats.fast_hits.0.fetch_add(1, Ordering::Relaxed);
+            return Some(Arc::clone(&cache_entry.entry));
         }
 
         // Slow path: lookup in hash table
@@ -473,10 +474,10 @@ impl ConnTrackTable {
             // Invalidate fast cache
             let hash = key.fast_hash();
             let cache_idx = (hash as usize) & self.fast_cache_mask;
-            if let Some(ref cache_entry) = self.fast_cache[cache_idx] {
-                if cache_entry.key == *key {
-                    self.fast_cache[cache_idx] = None;
-                }
+            if let Some(ref cache_entry) = self.fast_cache[cache_idx]
+                && cache_entry.key == *key
+            {
+                self.fast_cache[cache_idx] = None;
             }
         }
     }

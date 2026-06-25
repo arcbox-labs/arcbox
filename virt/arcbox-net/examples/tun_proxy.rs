@@ -148,11 +148,11 @@ mod macos {
         // destinations through it (by hostname, recovered via the DNS log).
         let dns_log = DnsResolutionLog::new();
         for m in &args.maps {
-            if let Some((ip, domain)) = m.split_once('=') {
-                if let Ok(ip) = ip.parse::<Ipv4Addr>() {
-                    dns_log.record(domain, &[ip]);
-                    tracing::info!(%ip, domain, "seeded IP->domain mapping");
-                }
+            if let Some((ip, domain)) = m.split_once('=')
+                && let Ok(ip) = ip.parse::<Ipv4Addr>()
+            {
+                dns_log.record(domain, &[ip]);
+                tracing::info!(%ip, domain, "seeded IP->domain mapping");
             }
         }
         let proxy_env = ProxyEnvironment {

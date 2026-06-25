@@ -79,7 +79,7 @@ members = [
 [workspace.package]
 version = "0.4.12" # x-release-please-version
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arcboxlabs/arcbox"
 authors = ["ArcBox Labs <team@arcbox.dev>", "AprilNEA <dev@aprilnea.me> (https://aprilnea.me)"]

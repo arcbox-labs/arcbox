@@ -256,7 +256,7 @@ impl UdpProxy {
                         },
                         // Replies from the remote host (or the proxy relay).
                         recv = tokio::time::timeout(
-                            std::time::Duration::from_secs(60),
+                            std::time::Duration::from_mins(1),
                             transport.recv(&mut buf),
                         ) => match recv {
                             Ok(Ok(Some(n))) => {

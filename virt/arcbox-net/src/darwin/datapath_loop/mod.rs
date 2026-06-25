@@ -289,10 +289,10 @@ impl NetworkDatapath {
 
                     // Record guest MAC the first time we see it so outbound
                     // shim-built frames carry the correct Ethernet destination.
-                    if prev_mac.is_none() {
-                        if let Some(gmac) = guest_mac {
-                            tcp_bridge.set_fast_path_macs(gateway_mac, gmac);
-                        }
+                    if prev_mac.is_none()
+                        && let Some(gmac) = guest_mac
+                    {
+                        tcp_bridge.set_fast_path_macs(gateway_mac, gmac);
                     }
 
                     // Fast-path intercept: extract TCP data frames for established

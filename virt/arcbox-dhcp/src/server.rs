@@ -49,7 +49,7 @@ impl DhcpLease {
 /// How long a declined IP stays quarantined before being returned to the pool.
 /// ArcBox pools are typically small, so 5 minutes is enough to avoid handing
 /// out the same conflicting address immediately while not permanently losing it.
-const DECLINE_QUARANTINE: Duration = Duration::from_secs(300);
+const DECLINE_QUARANTINE: Duration = Duration::from_mins(5);
 
 /// DHCP server.
 ///

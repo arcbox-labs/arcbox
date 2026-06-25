@@ -398,7 +398,7 @@ pub fn build_tcp_syn_ack_frame(p: &SynAckParams) -> Vec<u8> {
         options.push(shift);
     }
 
-    while options.len() % 4 != 0 {
+    while !options.len().is_multiple_of(4) {
         options.push(1); // NOP padding
     }
 
@@ -479,7 +479,7 @@ pub fn build_tcp_syn_frame(p: &SynParams) -> Vec<u8> {
         options.push(shift);
     }
 
-    while options.len() % 4 != 0 {
+    while !options.len().is_multiple_of(4) {
         options.push(1);
     }
 

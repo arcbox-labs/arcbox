@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 /// Default DHCP lease duration (24 hours).
-pub const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+pub const DEFAULT_LEASE_DURATION: Duration = Duration::from_hours(24);
 
 /// DHCP server port.
 pub const DHCP_SERVER_PORT: u16 = 67;
