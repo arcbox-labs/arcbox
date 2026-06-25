@@ -39,6 +39,28 @@ mod dns;
 mod dns_server;
 mod docker_events;
 
+/// Startup mode selected from the process arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// One-shot system initialization (`arcbox-agent init`), run by busybox init's
+    /// sysinit (rcS) before the agent is respawned. Performs `init_system` and exits.
+    Init,
+    /// Long-running agent (default / `serve`): vsock RPC listener and background
+    /// services. busybox init respawns it if it exits.
+    Serve,
+}
+
+/// Selects the startup [`Mode`] from `args` (typically `std::env::args()`).
+///
+/// `arcbox-agent init` runs one-shot system initialization; anything else — no
+/// subcommand or `serve` — runs the long-running agent.
+fn parse_mode(args: &[String]) -> Mode {
+    match args.get(1).map(String::as_str) {
+        Some("init") => Mode::Init,
+        _ => Mode::Serve,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let is_pid1 = std::process::id() == 1;
@@ -109,7 +131,19 @@ async fn main() -> Result<()> {
         None
     };
 
-    // PID 1 path: agent was exec'd by busybox trampoline on EROFS rootfs.
+    // `arcbox-agent init` is the one-shot system-init entry that busybox init's
+    // sysinit (rcS) runs before respawning the long-running agent: it performs the
+    // system initialization and exits without starting the serving stack.
+    if parse_mode(&std::env::args().collect::<Vec<_>>()) == Mode::Init {
+        tracing::info!("Running one-shot system initialization");
+        init::init_system();
+        return Ok(());
+    }
+
+    // When the agent is run directly as PID 1 (legacy standalone boot, e.g. the
+    // e2e harness) it owns system init itself. Under busybox init the agent is not
+    // PID 1 — rcS already ran `arcbox-agent init` — so this block is skipped and
+    // PID 1 (busybox init) reaps orphaned grandchildren natively.
     if is_pid1 {
         tracing::info!("Running as PID 1, initializing system");
         init::init_system();
@@ -152,4 +186,36 @@ async fn main() -> Result<()> {
     let _ = tokio::join!(dns_handle, docker_handle);
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Mode, parse_mode};
+
+    fn argv(extra: &[&str]) -> Vec<String> {
+        std::iter::once("arcbox-agent")
+            .chain(extra.iter().copied())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn init_subcommand_selects_init_mode() {
+        assert_eq!(parse_mode(&argv(&["init"])), Mode::Init);
+    }
+
+    #[test]
+    fn no_subcommand_defaults_to_serve() {
+        assert_eq!(parse_mode(&argv(&[])), Mode::Serve);
+    }
+
+    #[test]
+    fn explicit_serve_subcommand_selects_serve() {
+        assert_eq!(parse_mode(&argv(&["serve"])), Mode::Serve);
+    }
+
+    #[test]
+    fn unknown_subcommand_defaults_to_serve() {
+        assert_eq!(parse_mode(&argv(&["wat"])), Mode::Serve);
+    }
 }
