@@ -7,9 +7,11 @@
 //!
 //! The implementation handles basic A and AAAA record queries.
 
+mod cache;
+
 use std::collections::HashMap;
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -217,7 +219,7 @@ impl TryFrom<u16> for DnsRecordType {
 }
 
 /// DNS query class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum DnsClass {
     /// Internet class.
@@ -242,52 +244,6 @@ pub enum DnsResponseCode {
     Refused = 5,
 }
 
-/// DNS record data.
-#[derive(Debug, Clone)]
-pub enum DnsRdata {
-    /// A record (IPv4).
-    A(Ipv4Addr),
-    /// AAAA record (IPv6).
-    Aaaa(Ipv6Addr),
-    /// CNAME record.
-    Cname(String),
-    /// Other (raw bytes).
-    Raw(Vec<u8>),
-}
-
-/// DNS record.
-#[derive(Debug, Clone)]
-pub struct DnsRecord {
-    /// Record name.
-    pub name: String,
-    /// Record type.
-    pub rtype: DnsRecordType,
-    /// Record class.
-    pub class: DnsClass,
-    /// TTL in seconds.
-    pub ttl: u32,
-    /// Record data.
-    pub rdata: DnsRdata,
-}
-
-/// DNS cache entry.
-#[derive(Debug, Clone)]
-struct CacheEntry {
-    /// Cached records.
-    records: Vec<DnsRecord>,
-    /// When the entry was cached.
-    cached_at: Instant,
-    /// TTL from the response.
-    ttl: Duration,
-}
-
-impl CacheEntry {
-    /// Checks if the entry is expired.
-    fn is_expired(&self) -> bool {
-        self.cached_at.elapsed() >= self.ttl
-    }
-}
-
 /// DNS forwarder.
 ///
 /// Forwards DNS queries to upstream servers and provides local hostname
@@ -300,7 +256,7 @@ pub struct DnsForwarder {
     /// Shared local hostname mappings (hostname -> IP).
     local_hosts: Arc<LocalHostsTable>,
     /// DNS cache (query -> response).
-    cache: HashMap<(String, DnsRecordType), CacheEntry>,
+    cache: HashMap<cache::DnsCacheKey, cache::CacheEntry>,
 }
 
 impl DnsForwarder {
@@ -459,23 +415,13 @@ impl DnsForwarder {
         }
 
         // Check cache
-        if let Some(cached) = self.check_cache(&query.name, query.qtype) {
-            return self.build_cached_response(&query, &cached);
+        if let Some(cached) = self.check_cache(&query) {
+            return Ok(cached);
         }
 
         // Forward to upstream (synchronous for simplicity)
         // In production, this would be async
         self.forward_query(data)
-    }
-
-    /// Checks the cache for a query.
-    fn check_cache(&mut self, name: &str, qtype: DnsRecordType) -> Option<Vec<DnsRecord>> {
-        let key = (name.to_lowercase(), qtype);
-
-        // Clean up expired entries
-        self.cache.retain(|_, v| !v.is_expired());
-
-        self.cache.get(&key).map(|e| e.records.clone())
     }
 
     /// Builds a response for a local hostname.
@@ -529,60 +475,6 @@ impl DnsForwarder {
         Ok(response)
     }
 
-    /// Builds a response from cached records.
-    #[allow(clippy::unnecessary_wraps)] // Result kept for consistent call-site interface
-    fn build_cached_response(&self, query: &DnsQuery, records: &[DnsRecord]) -> Result<Vec<u8>> {
-        let mut response = Vec::with_capacity(512);
-
-        // Copy header from query
-        response.extend_from_slice(&query.raw_header);
-
-        // Set response flags
-        response[2] = 0x81;
-        response[3] = 0x80;
-        response[6] = 0x00;
-        response[7] = records.len() as u8;
-
-        // Copy question section
-        response.extend_from_slice(&query.raw_question);
-
-        // Build answers
-        for record in records {
-            // Name pointer
-            response.extend_from_slice(&[0xc0, 0x0c]);
-
-            // Type
-            response.extend_from_slice(&(record.rtype as u16).to_be_bytes());
-
-            // Class
-            response.extend_from_slice(&[0x00, 0x01]);
-
-            // TTL
-            response.extend_from_slice(&record.ttl.to_be_bytes());
-
-            // RDATA
-            match &record.rdata {
-                DnsRdata::A(ip) => {
-                    response.extend_from_slice(&[0x00, 0x04]);
-                    response.extend_from_slice(&ip.octets());
-                }
-                DnsRdata::Aaaa(ip) => {
-                    response.extend_from_slice(&[0x00, 0x10]);
-                    response.extend_from_slice(&ip.octets());
-                }
-                DnsRdata::Raw(data) => {
-                    response.extend_from_slice(&(data.len() as u16).to_be_bytes());
-                    response.extend_from_slice(data);
-                }
-                DnsRdata::Cname(_) => {
-                    // Skip CNAME for simplicity
-                }
-            }
-        }
-
-        Ok(response)
-    }
-
     /// Forwards a query to upstream servers.
     fn forward_query(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         use std::net::UdpSocket;
@@ -607,7 +499,7 @@ impl DnsForwarder {
 
                 // Cache the response (simplified)
                 if let Ok(query) = DnsQuery::parse(data) {
-                    self.cache_response(&query.name, query.qtype, &response);
+                    self.cache_response(&query, &response);
                 }
 
                 return Ok(response);
@@ -615,18 +507,6 @@ impl DnsForwarder {
         }
 
         Err(NetError::Dns("all upstream servers failed".to_string()))
-    }
-
-    /// Caches a DNS response.
-    fn cache_response(&mut self, name: &str, qtype: DnsRecordType, _response: &[u8]) {
-        // Simplified caching - just store the query info
-        let key = (name.to_lowercase(), qtype);
-        let entry = CacheEntry {
-            records: Vec::new(), // Would parse from response in full implementation
-            cached_at: Instant::now(),
-            ttl: self.config.cache_ttl,
-        };
-        self.cache.insert(key, entry);
     }
 
     /// Clears the DNS cache.
@@ -826,6 +706,117 @@ mod tests {
         packet.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
         packet.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
         packet
+    }
+
+    fn build_test_response(query: &[u8], ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
+        build_test_response_with_additional(query, ip, ttl, false)
+    }
+
+    fn build_test_response_with_additional(
+        query: &[u8],
+        ip: Ipv4Addr,
+        ttl: u32,
+        include_additional: bool,
+    ) -> Vec<u8> {
+        let mut response = Vec::with_capacity(96);
+        response.extend_from_slice(&query[..12]);
+        response[2] = 0x81; // QR=1, RD=1
+        response[3] = 0x80; // RA=1, RCODE=0
+        response[6] = 0x00;
+        response[7] = 0x01; // ANCOUNT=1
+        response[10] = 0x00;
+        response[11] = u8::from(include_additional); // ARCOUNT
+        response.extend_from_slice(&query[12..]);
+
+        append_a_record(&mut response, ip, ttl);
+        if include_additional {
+            append_a_record(&mut response, Ipv4Addr::new(192, 0, 2, 53), ttl);
+        }
+
+        response
+    }
+
+    fn append_a_record(response: &mut Vec<u8>, ip: Ipv4Addr, ttl: u32) {
+        response.extend_from_slice(&[0xC0, 0x0C]); // name pointer to question
+        response.extend_from_slice(&[0x00, 0x01]); // TYPE=A
+        response.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
+        response.extend_from_slice(&ttl.to_be_bytes());
+        response.extend_from_slice(&[0x00, 0x04]); // RDLENGTH=4
+        response.extend_from_slice(&ip.octets());
+    }
+
+    #[test]
+    fn test_cache_hit_rewrites_transaction_id_and_preserves_response_bytes() {
+        let config = DnsConfig::default();
+        let mut forwarder = DnsForwarder::new(config);
+
+        let query = build_test_query("cached.test");
+        let parsed_query = DnsQuery::parse(&query).unwrap();
+        let response =
+            build_test_response_with_additional(&query, Ipv4Addr::new(10, 0, 0, 42), 60, true);
+        forwarder.cache_response(&parsed_query, &response);
+
+        let mut next_query = build_test_query("cached.test");
+        next_query[0] = 0x12;
+        next_query[1] = 0x34;
+        let next_query = DnsQuery::parse(&next_query).unwrap();
+        let cached = forwarder
+            .check_cache(&next_query)
+            .expect("response should be cached");
+
+        assert_eq!(&cached[0..2], &[0x12, 0x34]);
+        assert_eq!(&cached[2..], &response[2..]);
+        assert_eq!(cached[10], 0x00, "ARCOUNT high byte is preserved");
+        assert_eq!(cached[11], 0x01, "ARCOUNT low byte is preserved");
+    }
+
+    #[test]
+    fn test_cache_response_uses_response_ttl_capped_by_config() {
+        let config = DnsConfig::default().with_cache_ttl(Duration::from_secs(30));
+        let mut forwarder = DnsForwarder::new(config);
+
+        let query = build_test_query("ttl.test");
+        let parsed_query = DnsQuery::parse(&query).unwrap();
+        let response = build_test_response(&query, Ipv4Addr::new(10, 0, 0, 43), 120);
+        forwarder.cache_response(&parsed_query, &response);
+
+        let key =
+            cache::DnsCacheKey::new(&parsed_query.name, parsed_query.qtype, parsed_query.qclass);
+        let entry = forwarder
+            .cache
+            .get(&key)
+            .expect("response should be cached");
+        assert_eq!(entry.ttl, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_cache_response_skips_empty_answers() {
+        let config = DnsConfig::default();
+        let mut forwarder = DnsForwarder::new(config);
+
+        let query = build_test_query("empty.test");
+        let parsed_query = DnsQuery::parse(&query).unwrap();
+        let mut response = query;
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[6] = 0x00;
+        response[7] = 0x00; // ANCOUNT=0
+
+        forwarder.cache_response(&parsed_query, &response);
+
+        assert!(forwarder.check_cache(&parsed_query).is_none());
+    }
+
+    #[test]
+    fn test_cache_response_skips_malformed_response() {
+        let config = DnsConfig::default();
+        let mut forwarder = DnsForwarder::new(config);
+
+        let query = build_test_query("malformed.test");
+        let parsed_query = DnsQuery::parse(&query).unwrap();
+        forwarder.cache_response(&parsed_query, &[0x12, 0x34]);
+
+        assert!(forwarder.check_cache(&parsed_query).is_none());
     }
 
     #[test]
