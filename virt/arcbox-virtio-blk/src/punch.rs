@@ -1,9 +1,12 @@
-//! Cross-platform sparse-file hole punching.
+//! Cross-platform sparse-file zeroing primitives, shared across both block I/O
+//! paths (the generic `VirtioBlock::process_descriptor_chain` and the macOS HV
+//! `blk_worker`).
 //!
-//! Shared by the block device's DISCARD handling on both I/O paths: the generic
-//! `VirtioBlock::process_descriptor_chain` and the macOS HV `blk_worker`. A
-//! DISCARD that lands here deallocates the named range from the backing image,
-//! so guest `fstrim` / `discard=async` actually shrinks the sparse file.
+//! - [`punch_hole`] deallocates a range so guest `fstrim` / `discard=async`
+//!   shrinks the sparse image (DISCARD).
+//! - [`zero_range`] makes a range read back as zeros while staying as sparse as
+//!   possible — hole-punch the aligned interior, write zeros only on the
+//!   unaligned edges (WRITE_ZEROES).
 
 use std::os::unix::io::RawFd;
 
@@ -14,22 +17,67 @@ use std::os::unix::io::RawFd;
 /// only frees fully-covered blocks regardless.
 pub const PUNCH_HOLE_ALIGNMENT: u64 = 4096;
 
-/// Aligns the byte range `[start, end)` inward to [`PUNCH_HOLE_ALIGNMENT`] and
-/// returns the `(offset, len)` that may be safely punched, or `None` if nothing
-/// remains after alignment.
+/// The [`PUNCH_HOLE_ALIGNMENT`]-aligned interior `[aligned_start, aligned_end)`
+/// of `[start, end)`, or `None` if the range spans no whole block.
 ///
-/// Punching only the aligned interior is always correct: the guest already
-/// considers the whole range free, and we give up at most one block of reclaim
-/// at each edge. It also keeps macOS `F_PUNCHHOLE` (which rejects unaligned
-/// ranges) and Linux (which only frees fully-covered blocks) happy.
-#[must_use]
-pub fn aligned_punch_range(start: u64, end: u64) -> Option<(u64, u64)> {
+/// This is the portion that may be hole-punched; the unaligned head/tail are
+/// handled by the caller (DISCARD ignores them as advisory; WRITE_ZEROES zeros
+/// them). macOS `F_PUNCHHOLE` rejects unaligned ranges and Linux only frees
+/// fully-covered blocks, so punching just the interior is the safe maximum.
+fn block_aligned_interior(start: u64, end: u64) -> Option<(u64, u64)> {
     let aligned_start =
         start.saturating_add(PUNCH_HOLE_ALIGNMENT - 1) & !(PUNCH_HOLE_ALIGNMENT - 1);
     let aligned_end = end & !(PUNCH_HOLE_ALIGNMENT - 1);
-    // `.then(||…)` is lazy: the subtraction only runs when end > start, so it
-    // never underflows (e.g. a sub-block range where aligned_end < aligned_start).
-    (aligned_end > aligned_start).then(|| (aligned_start, aligned_end - aligned_start))
+    (aligned_end > aligned_start).then_some((aligned_start, aligned_end))
+}
+
+/// Aligns `[start, end)` inward and returns the `(offset, len)` that may be
+/// safely hole-punched (for DISCARD), or `None` if nothing remains.
+#[must_use]
+pub fn aligned_punch_range(start: u64, end: u64) -> Option<(u64, u64)> {
+    block_aligned_interior(start, end).map(|(s, e)| (s, e - s))
+}
+
+/// Makes `[start, end)` read back as zeros, kept as sparse as possible.
+///
+/// The block-aligned interior is hole-punched (zeroed *and* reclaimed), and
+/// only the unaligned head/tail are physically written with zeros. This is the
+/// WRITE_ZEROES primitive.
+///
+/// # Errors
+/// Propagates I/O errors from the underlying `punch`/`pwrite` syscalls.
+pub fn zero_range(fd: RawFd, start: u64, end: u64) -> std::io::Result<()> {
+    if end <= start {
+        return Ok(());
+    }
+    match block_aligned_interior(start, end) {
+        Some((aligned_start, aligned_end)) => {
+            punch_hole(fd, aligned_start, aligned_end - aligned_start)?;
+            zero_pwrite(fd, start, aligned_start)?; // head (may be empty)
+            zero_pwrite(fd, aligned_end, end)?; // tail (may be empty)
+        }
+        // No whole block inside the range (< 2 blocks): just write the zeros.
+        None => zero_pwrite(fd, start, end)?,
+    }
+    Ok(())
+}
+
+/// Writes zeros over `[start, end)` with a single `pwrite`. Only used for the
+/// unaligned edges of [`zero_range`] (each strictly smaller than one block) or
+/// ranges with no aligned interior, so the temporary buffer stays small.
+fn zero_pwrite(fd: RawFd, start: u64, end: u64) -> std::io::Result<()> {
+    if end <= start {
+        return Ok(());
+    }
+    let zeros = vec![0u8; (end - start) as usize];
+    #[allow(clippy::cast_possible_wrap)]
+    let off = start as libc::off_t;
+    // SAFETY: `zeros` is a valid buffer of `zeros.len()` bytes; `fd` is writable.
+    let n = unsafe { libc::pwrite(fd, zeros.as_ptr().cast::<libc::c_void>(), zeros.len(), off) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Deallocates `[offset, offset + len)` in the file behind `fd`, leaving a
@@ -119,6 +167,59 @@ mod tests {
         assert!(
             after < 64 * 1024,
             "expected the hole-punch to free the blocks, still {after} allocated"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::cast_possible_wrap)] // off_t / pread-return casts on small test sizes
+    fn zero_range_zeros_edges_and_reclaims_interior() {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+
+        // 2 MiB of real data so the ~1 MiB punched interior is well above any
+        // host allocation-clumping noise.
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        temp.write_all(&vec![0xCDu8; 2 * 1024 * 1024]).unwrap();
+        temp.as_file().sync_all().unwrap();
+        let fd = temp.as_file().as_raw_fd();
+        let before = std::fs::metadata(temp.path()).unwrap().blocks() * 512;
+
+        // Unaligned range [512, 1 MiB + 512): a head edge, a ~1 MiB aligned
+        // interior to punch, and a tail edge.
+        let (start, end) = (512u64, 1024 * 1024 + 512);
+        zero_range(fd, start, end).unwrap();
+        temp.as_file().sync_all().unwrap();
+
+        // The whole requested range reads back as zeros (edges + interior)...
+        let mut buf = vec![0xFFu8; (end - start) as usize];
+        // SAFETY: reading our own file into a sized buffer.
+        let n =
+            unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), start as libc::off_t) };
+        assert_eq!(n, buf.len() as isize);
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "zeroed range must read back as zeros"
+        );
+
+        // ...while data past the range is untouched.
+        let mut tail = [0xFFu8; 512];
+        // SAFETY: reading our own file into a sized buffer.
+        let n =
+            unsafe { libc::pread(fd, tail.as_mut_ptr().cast(), tail.len(), end as libc::off_t) };
+        assert_eq!(n, 512);
+        assert!(
+            tail.iter().all(|&b| b == 0xCD),
+            "data past the range is intact"
+        );
+
+        // The aligned interior was punched (not written), so usage drops by
+        // roughly the interior size.
+        let after = std::fs::metadata(temp.path()).unwrap().blocks() * 512;
+        assert!(
+            after < before,
+            "interior should be reclaimed: before={before} after={after}"
         );
     }
 }
