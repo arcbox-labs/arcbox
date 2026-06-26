@@ -117,7 +117,10 @@ pub async fn start_services(
 
     // Docker CLI integration (optional).
     if ctx.docker_integration {
-        match DockerContextManager::new(ctx.layout.docker_socket.clone()) {
+        match DockerContextManager::new_with_context_name(
+            ctx.layout.docker_socket.clone(),
+            ctx.profile.docker_context_name(),
+        ) {
             Ok(ctx_manager) => {
                 if let Err(e) = ctx_manager.enable() {
                     warn!("Failed to enable Docker integration: {}", e);

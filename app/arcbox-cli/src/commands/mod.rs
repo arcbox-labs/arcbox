@@ -39,7 +39,7 @@ pub fn resolve_grpc_socket_path() -> PathBuf {
         }
     }
 
-    arcbox_constants::paths::HostLayout::resolve(None).grpc_socket
+    arcbox_constants::paths::HostLayout::from_env_or_default().grpc_socket
 }
 
 pub mod boot;
@@ -80,6 +80,10 @@ pub struct Cli {
     /// Can also be set via ARCBOX_SOCKET or DOCKER_HOST environment variables.
     #[arg(long, global = true)]
     pub socket: Option<PathBuf>,
+
+    /// Runtime profile (production or development).
+    #[arg(long, global = true)]
+    pub profile: Option<arcbox_constants::paths::ArcboxProfile>,
 
     /// Output format
     #[arg(long, global = true, default_value = "table")]

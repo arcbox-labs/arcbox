@@ -35,6 +35,8 @@ pub use types::{
 pub struct DockerContextManager {
     /// `ArcBox` socket path.
     socket_path: PathBuf,
+    /// Docker context name managed by this instance.
+    context_name: String,
     /// Docker config directory (~/.docker).
     docker_config_dir: PathBuf,
 }
@@ -50,21 +52,45 @@ impl DockerContextManager {
     ///
     /// Returns an error if the home directory cannot be determined.
     pub fn new(socket_path: PathBuf) -> Result<Self> {
+        Self::new_with_context_name(socket_path, ARCBOX_CONTEXT_NAME)
+    }
+
+    /// Creates a new context manager for a specific Docker context name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the home directory cannot be determined.
+    pub fn new_with_context_name(
+        socket_path: PathBuf,
+        context_name: impl Into<String>,
+    ) -> Result<Self> {
         let docker_config_dir = dirs::home_dir()
             .ok_or_else(|| DockerError::Context("cannot find home directory".to_string()))?
             .join(".docker");
 
         Ok(Self {
             socket_path,
+            context_name: context_name.into(),
             docker_config_dir,
         })
     }
 
     /// Creates a new context manager with a custom Docker config directory.
     #[must_use]
-    pub const fn with_config_dir(socket_path: PathBuf, docker_config_dir: PathBuf) -> Self {
+    pub fn with_config_dir(socket_path: PathBuf, docker_config_dir: PathBuf) -> Self {
+        Self::with_context_name_and_config_dir(socket_path, ARCBOX_CONTEXT_NAME, docker_config_dir)
+    }
+
+    /// Creates a new context manager with a custom context name and Docker config directory.
+    #[must_use]
+    pub fn with_context_name_and_config_dir(
+        socket_path: PathBuf,
+        context_name: impl Into<String>,
+        docker_config_dir: PathBuf,
+    ) -> Self {
         Self {
             socket_path,
+            context_name: context_name.into(),
             docker_config_dir,
         }
     }
@@ -81,6 +107,12 @@ impl DockerContextManager {
         &self.docker_config_dir
     }
 
+    /// Returns the Docker context name managed by this instance.
+    #[must_use]
+    pub fn context_name(&self) -> &str {
+        &self.context_name
+    }
+
     /// Checks if the `ArcBox` context exists.
     #[must_use]
     pub fn context_exists(&self) -> bool {
@@ -94,7 +126,7 @@ impl DockerContextManager {
     /// Returns an error if Docker config cannot be read or parsed.
     pub fn is_default(&self) -> Result<bool> {
         let config = self.read_docker_config()?;
-        Ok(config.current_context.as_deref() == Some(ARCBOX_CONTEXT_NAME))
+        Ok(config.current_context.as_deref() == Some(self.context_name()))
     }
 
     /// Gets the current default context name.
@@ -121,7 +153,7 @@ impl DockerContextManager {
 
         // Create context metadata.
         let meta = ContextMeta {
-            name: ARCBOX_CONTEXT_NAME.to_string(),
+            name: self.context_name.clone(),
             metadata: ContextMetadata {
                 description: "ArcBox Container Runtime".to_string(),
             },
@@ -142,7 +174,7 @@ impl DockerContextManager {
         fs::write(&meta_path, meta_json)
             .map_err(|e| DockerError::Context(format!("failed to write context metadata: {e}")))?;
 
-        info!("Created Docker context '{ARCBOX_CONTEXT_NAME}'");
+        info!(context = %self.context_name, "Created Docker context");
         debug!(path = %meta_path.display(), "Context metadata written");
 
         Ok(())
@@ -166,7 +198,7 @@ impl DockerContextManager {
                 DockerError::Context(format!("failed to remove context directory: {e}"))
             })?;
 
-            info!("Removed Docker context '{ARCBOX_CONTEXT_NAME}'");
+            info!(context = %self.context_name, "Removed Docker context");
         } else {
             debug!("Context directory does not exist, nothing to remove");
         }
@@ -194,16 +226,16 @@ impl DockerContextManager {
 
         // Save previous context if it's not already arcbox.
         if let Some(ref current) = config.current_context {
-            if current != ARCBOX_CONTEXT_NAME {
+            if current != self.context_name() {
                 self.save_previous_context(current)?;
             }
         }
 
-        // Set arcbox as default.
-        config.current_context = Some(ARCBOX_CONTEXT_NAME.to_string());
+        // Set this context as default.
+        config.current_context = Some(self.context_name.clone());
         self.write_docker_config(&config)?;
 
-        info!("Set '{ARCBOX_CONTEXT_NAME}' as default Docker context");
+        info!(context = %self.context_name, "Set Docker context as default");
         Ok(())
     }
 
@@ -284,7 +316,7 @@ impl DockerContextManager {
 
     /// Returns path to the context directory.
     fn context_dir(&self) -> PathBuf {
-        let hash = Self::context_hash(ARCBOX_CONTEXT_NAME);
+        let hash = Self::context_hash(&self.context_name);
         self.docker_config_dir
             .join("contexts")
             .join("meta")
@@ -303,7 +335,8 @@ impl DockerContextManager {
 
     /// Returns path to the saved previous context file.
     fn previous_context_path(&self) -> PathBuf {
-        self.docker_config_dir.join(".arcbox-previous-context")
+        self.docker_config_dir
+            .join(format!(".{}-previous-context", self.context_name))
     }
 
     /// Reads the Docker config.json file.

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arcbox_api::{SetupPhase, SetupState};
-use arcbox_constants::paths::HostLayout;
+use arcbox_constants::paths::{ArcboxProfile, HostLayout};
 use arcbox_core::{Config, Runtime};
 use macos_resolver::to_env_prefix;
 use tokio_util::sync::CancellationToken;
@@ -35,7 +35,10 @@ const DEFAULT_DNS_DOMAIN: &str = "arcbox.local";
 async fn init_early(args: DaemonArgs) -> Result<EarlyContext> {
     let setup_state = Arc::new(SetupState::new());
 
-    let mut layout = HostLayout::resolve(args.data_dir.as_deref());
+    let profile = args
+        .profile
+        .unwrap_or_else(ArcboxProfile::from_env_or_default);
+    let mut layout = HostLayout::resolve_for_profile_from_env(profile, args.data_dir.as_deref());
 
     // CLI overrides for socket paths.
     if let Some(socket) = args.socket {
@@ -55,6 +58,7 @@ async fn init_early(args: DaemonArgs) -> Result<EarlyContext> {
     let dns_port = dns_port();
 
     Ok(EarlyContext {
+        profile,
         layout,
         shared_runtime: Arc::new(std::sync::OnceLock::new()),
         setup_state,
@@ -83,6 +87,7 @@ async fn acquire_lock(early: EarlyContext) -> Result<DaemonContext> {
         .context("lock task panicked")?
         .context("failed to acquire daemon lock")?;
     Ok(DaemonContext {
+        profile: early.profile,
         layout: early.layout,
         daemon_lock: lock,
         shared_runtime: early.shared_runtime,
@@ -175,13 +180,14 @@ async fn prepare_assets(ctx: &DaemonContext) -> Result<assets::PreparedAssets> {
 /// can observe DOWNLOADING_ASSETS → ASSETS_READY progression.
 /// Returns the initialized runtime.
 async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
-    let mut config = Config::load().unwrap_or_else(|err| {
+    let mut config = Config::load_for_profile(ctx.profile).unwrap_or_else(|err| {
         warn!(error = %err, "Failed to load config file; falling back to defaults");
-        Config::default()
+        Config::for_profile(ctx.profile)
     });
     // The daemon's layout (sockets, lock file) was already resolved from
-    // --data-dir, so it must win over any data_dir in the config file.
+    // --profile/--data-dir/--socket, so it must win over config files.
     config.data_dir = ctx.layout.data_dir.clone();
+    config.docker.socket_path = ctx.layout.docker_socket.clone();
     if let Some(port) = ctx.vm_args.guest_docker_vsock_port {
         config.container.guest_docker_vsock_port = port;
     }
@@ -218,8 +224,8 @@ async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
 ///
 /// Re-exported for use by `main.rs` (logging setup runs before
 /// `init_early`, so it needs the path independently).
-pub fn resolve_data_dir(data_dir: Option<&PathBuf>) -> PathBuf {
-    HostLayout::resolve(data_dir.map(PathBuf::as_path)).data_dir
+pub fn resolve_data_dir(profile: ArcboxProfile, data_dir: Option<&PathBuf>) -> PathBuf {
+    HostLayout::resolve_for_profile_from_env(profile, data_dir.map(PathBuf::as_path)).data_dir
 }
 
 fn dns_port() -> u16 {

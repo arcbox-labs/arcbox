@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arcbox_api::{SetupState, SharedRuntime};
-use arcbox_constants::paths::HostLayout;
+use arcbox_constants::paths::{ArcboxProfile, HostLayout};
 use tokio_util::sync::CancellationToken;
 
 use crate::startup::DaemonLock;
@@ -27,6 +27,7 @@ use crate::startup::DaemonLock;
 /// acquired yet. Consumed by the daemon lease phase to produce a
 /// [`DaemonContext`].
 pub struct EarlyContext {
+    pub profile: ArcboxProfile,
     pub layout: HostLayout,
     pub shared_runtime: SharedRuntime,
     pub setup_state: Arc<SetupState>,
@@ -42,6 +43,7 @@ pub struct EarlyContext {
 /// `daemon_lock` is guaranteed to be valid — there is no construction
 /// path that skips lock acquisition.
 pub struct DaemonContext {
+    pub profile: ArcboxProfile,
     pub layout: HostLayout,
     /// Exclusive lock held for the daemon's lifetime.
     /// Held via RAII — the flock is released when this value drops.

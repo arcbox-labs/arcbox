@@ -4,7 +4,7 @@ use std::str::FromStr;
 /// A validated socket target path (e.g. `/Users/alice/.arcbox/run/docker.sock`).
 ///
 /// Guarantees:
-/// - Under `/Users/<username>/.arcbox/`
+/// - Under `/Users/<username>/.arcbox/` or `/Users/<username>/.arcbox-dev/`
 /// - Ends with `.sock` (strict lowercase)
 /// - No `..` path traversal components
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,8 +34,10 @@ impl FromStr for SocketTarget {
             return Err(format!("socket target '{s}' has empty username"));
         }
 
-        if !after_user.starts_with(".arcbox/") {
-            return Err(format!("socket target '{s}' must be under ~/.arcbox/"));
+        if !after_user.starts_with(".arcbox/") && !after_user.starts_with(".arcbox-dev/") {
+            return Err(format!(
+                "socket target '{s}' must be under ~/.arcbox/ or ~/.arcbox-dev/"
+            ));
         }
 
         #[allow(clippy::case_sensitive_file_extension_comparisons)]

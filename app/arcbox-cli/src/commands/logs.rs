@@ -193,5 +193,10 @@ fn file_inode(_file: &std::fs::File) -> u64 {
 }
 
 fn resolve_data_dir(data_dir: Option<&PathBuf>) -> PathBuf {
-    arcbox_constants::paths::HostLayout::resolve(data_dir.map(PathBuf::as_path)).data_dir
+    let profile = arcbox_constants::paths::ArcboxProfile::from_env_or_default();
+    arcbox_constants::paths::HostLayout::resolve_for_profile_from_env(
+        profile,
+        data_dir.map(PathBuf::as_path),
+    )
+    .data_dir
 }

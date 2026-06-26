@@ -5,7 +5,7 @@
 //! privileged operations.
 
 use anyhow::{Context, Result};
-use arcbox_constants::paths::{DOCKER_CLI_TOOLS, privileged};
+use arcbox_constants::paths::{ArcboxProfile, DOCKER_CLI_TOOLS, HostLayout, privileged};
 use clap::Args;
 use std::io::Write;
 use std::process::Command;
@@ -24,7 +24,15 @@ pub struct UninstallArgs {
 
 pub async fn execute(args: UninstallArgs) -> Result<()> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
-    let data_dir = home.join(".arcbox");
+    let profile = ArcboxProfile::from_env_or_default();
+    let daemon_label = profile.daemon_label();
+    let docker_context = profile.docker_context_name();
+    let data_dir = HostLayout::from_env_or_default().data_dir;
+    let app_name = match profile {
+        ArcboxProfile::Production => "ArcBox",
+        ArcboxProfile::Development => "ArcBox Dev",
+    };
+    let app_path = format!("/Applications/{app_name}.app");
 
     println!("This will remove ArcBox and all its data:\n");
     println!("  • Stop and remove daemon (LaunchAgent)");
@@ -32,13 +40,19 @@ pub async fn execute(args: UninstallArgs) -> Result<()> {
     println!("  • Remove DNS resolver (/etc/resolver/arcbox.local) [sudo]");
     println!("  • Remove Docker socket (/var/run/docker.sock)    [sudo]");
     println!("  • Remove CLI symlinks (/usr/local/bin/docker...) [sudo]");
-    println!("  • Remove Docker context 'arcbox'");
+    println!("  • Remove Docker context '{docker_context}'");
     if args.keep_data {
-        println!("  • Remove app data (~/.arcbox) — keeping container data");
+        println!(
+            "  • Remove app data ({}) — keeping container data",
+            data_dir.display()
+        );
     } else {
-        println!("  • Remove ALL app data (~/.arcbox) including containers");
+        println!(
+            "  • Remove ALL app data ({}) including containers",
+            data_dir.display()
+        );
     }
-    println!("  • Remove app (/Applications/ArcBox.app)");
+    println!("  • Remove app ({app_path})");
     println!();
 
     if !args.yes {
@@ -82,7 +96,7 @@ pub async fn execute(args: UninstallArgs) -> Result<()> {
     //    termination handler, clearing the BTM / Login Items entry).
     step!("Quitting ArcBox...", {
         let _ = Command::new("osascript")
-            .args(["-e", r#"quit app "ArcBox""#])
+            .args(["-e", &format!(r#"quit app "{app_name}""#)])
             .output();
         // Wait for app to quit and daemon to stop.
         std::thread::sleep(std::time::Duration::from_secs(3));
@@ -92,21 +106,16 @@ pub async fn execute(args: UninstallArgs) -> Result<()> {
     step!("Stopping daemon...", {
         let uid = unsafe { libc::getuid() };
         let _ = Command::new("launchctl")
-            .args([
-                "bootout",
-                &format!("gui/{uid}/com.arcboxlabs.desktop.daemon"),
-            ])
+            .args(["bootout", &format!("gui/{uid}/{daemon_label}")])
             .output();
-        let _ = Command::new("pkill")
-            .args(["-f", "com.arcboxlabs.desktop.daemon"])
-            .output();
+        let _ = Command::new("pkill").args(["-f", daemon_label]).output();
         // Wait for VM processes to exit gracefully.
         std::thread::sleep(std::time::Duration::from_secs(3));
         let _ = Command::new("pkill")
             .args(["-f", "com.apple.Virtualization.VirtualMachine"])
             .output();
         // Remove the daemon launchd plist.
-        let plist = home.join("Library/LaunchAgents/com.arcboxlabs.desktop.daemon.plist");
+        let plist = home.join(format!("Library/LaunchAgents/{daemon_label}.plist"));
         let _ = std::fs::remove_file(plist);
     });
 
@@ -178,9 +187,9 @@ pub async fn execute(args: UninstallArgs) -> Result<()> {
     // 7. Remove Docker context.
     step!("Removing Docker context...", {
         let _ = Command::new("docker")
-            .args(["context", "rm", "arcbox"])
+            .args(["context", "rm", docker_context])
             .output();
-        // Restore default context if arcbox was active.
+        // Restore default context if ArcBox was active.
         let _ = Command::new("docker")
             .args(["context", "use", "default"])
             .output();
@@ -210,7 +219,7 @@ pub async fn execute(args: UninstallArgs) -> Result<()> {
 
     // 9. Remove app bundle.
     step!("Removing app...", {
-        let _ = std::fs::remove_dir_all("/Applications/ArcBox.app");
+        let _ = std::fs::remove_dir_all(&app_path);
     });
 
     println!("\nArcBox has been uninstalled.");

@@ -10,6 +10,7 @@ mod shutdown;
 mod startup;
 
 use anyhow::Result;
+use arcbox_constants::paths::ArcboxProfile;
 use arcbox_logging::LogConfig;
 use clap::Parser;
 
@@ -17,6 +18,10 @@ use clap::Parser;
 #[command(name = "arcbox-daemon")]
 #[command(author, version, about, long_about = None)]
 pub struct DaemonArgs {
+    /// Runtime profile (production or development).
+    #[arg(long)]
+    pub profile: Option<ArcboxProfile>,
+
     /// Unix socket path for Docker API (default: ~/.arcbox/run/docker.sock).
     #[arg(long)]
     pub socket: Option<std::path::PathBuf>,
@@ -59,7 +64,10 @@ fn main() -> Result<()> {
         ..Default::default()
     });
 
-    let data_dir = startup::resolve_data_dir(args.data_dir.as_ref());
+    let profile = args
+        .profile
+        .unwrap_or_else(ArcboxProfile::from_env_or_default);
+    let data_dir = startup::resolve_data_dir(profile, args.data_dir.as_ref());
     let log_guard = arcbox_logging::init_with_sentry(LogConfig {
         log_dir: data_dir.join(arcbox_constants::paths::host::LOG),
         file_name: arcbox_constants::paths::host::DAEMON_LOG.to_string(),
