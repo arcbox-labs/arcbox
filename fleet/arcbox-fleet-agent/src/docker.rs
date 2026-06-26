@@ -99,6 +99,43 @@ fn arcbox_socket_path() -> Option<String> {
     })
 }
 
+/// Connect to a Docker-compatible runtime and verify it answers a ping.
+///
+/// On macOS, prefers ArcBox's own socket and falls back to the system default
+/// if ArcBox is absent or its socket is unresponsive (the ping is what proves
+/// reachability — building the client does no I/O). On other platforms it uses
+/// the system default directly.
+async fn connect() -> Result<Docker> {
+    if let Some(addr) = arcbox_socket_path() {
+        match connect_arcbox(&addr).await {
+            Ok(client) => return Ok(client),
+            Err(e) => {
+                warn!(error = %e, "ArcBox runtime unavailable; falling back to local Docker");
+            }
+        }
+    }
+    let client = Docker::connect_with_local_defaults().context("connecting to Docker runtime")?;
+    client
+        .ping()
+        .await
+        .context("Docker-compatible runtime is not reachable (ping failed)")?;
+    Ok(client)
+}
+
+/// Connect to ArcBox's socket and confirm it responds to a ping.
+///
+/// A short timeout keeps a present-but-hung socket from stalling startup before
+/// the local-Docker fallback kicks in — a live socket answers a ping promptly.
+async fn connect_arcbox(addr: &str) -> Result<Docker> {
+    let client = Docker::connect_with_unix(addr, 15, bollard::API_DEFAULT_VERSION)
+        .with_context(|| format!("connecting to ArcBox runtime at {addr}"))?;
+    client
+        .ping()
+        .await
+        .with_context(|| format!("ArcBox runtime at {addr} is not reachable (ping failed)"))?;
+    Ok(client)
+}
+
 /// Linux arches this host could serve, before verifying they can be pulled.
 ///
 /// The native arch always, plus amd64 on Apple Silicon macOS, where ArcBox's
@@ -116,9 +153,10 @@ impl DockerRunner {
     /// Connect to the Docker-compatible runtime and prove it works by pulling
     /// the default runner image for each candidate arch.
     ///
-    /// On macOS, connects to ArcBox's own socket (`~/.arcbox/docker.sock`); on
-    /// other platforms the system default (e.g. `/var/run/docker.sock` on
-    /// Linux, named pipe on Windows).
+    /// On macOS, prefers ArcBox's own socket (`~/.arcbox/docker.sock`) and falls
+    /// back to the system default (Docker Desktop, Colima, …) when ArcBox is
+    /// absent or unresponsive. On other platforms it uses the system default
+    /// directly (e.g. `/var/run/docker.sock` on Linux, named pipe on Windows).
     ///
     /// The pull is the readiness check: an arch is advertised only if its image
     /// pulls, so a host that cannot realize `linux/amd64` (no working emulation)
@@ -126,16 +164,7 @@ impl DockerRunner {
     /// pulls; otherwise this returns an error and the caller proceeds without it
     /// (`Auto`) or fails startup (`Enabled`).
     pub async fn new(default_image: String) -> Result<Self> {
-        let client = if let Some(addr) = arcbox_socket_path() {
-            Docker::connect_with_unix(&addr, 120, bollard::API_DEFAULT_VERSION)
-                .with_context(|| format!("connecting to ArcBox runtime at {addr}"))?
-        } else {
-            Docker::connect_with_local_defaults().context("connecting to Docker runtime")?
-        };
-        client
-            .ping()
-            .await
-            .context("Docker-compatible runtime is not reachable (ping failed)")?;
+        let client = connect().await?;
 
         let mut linux_arches = Vec::new();
         for arch in candidate_arches() {
