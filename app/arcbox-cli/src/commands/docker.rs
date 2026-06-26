@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use arcbox_constants::paths::HostLayout;
 use arcbox_docker::DockerContextManager;
 use arcbox_docker_tools::{HostToolManager, ToolGroup, parse_tools_for_group};
 use clap::Subcommand;
@@ -37,9 +38,9 @@ pub enum DockerCommands {
 
     /// Download and install Docker CLI tools (docker, buildx, compose)
     ///
-    /// Downloads Docker CLI binaries to ~/.arcbox/runtime/bin/ and creates
-    /// symlinks in ~/.arcbox/bin/. Also generates shell completions for the
-    /// Docker CLI.
+    /// Downloads Docker CLI binaries to the selected profile's runtime/bin/
+    /// and creates symlinks in the profile's bin/. Also generates shell
+    /// completions for the Docker CLI.
     Setup,
 }
 
@@ -64,8 +65,10 @@ pub async fn execute(cmd: DockerCommands, format: OutputFormat) -> Result<()> {
 }
 
 pub(super) fn context_manager() -> Result<DockerContextManager> {
-    let socket = arcbox_constants::paths::HostLayout::resolve(None).docker_socket;
-    DockerContextManager::new(socket).context("Failed to initialize Docker context manager")
+    let profile = arcbox_constants::paths::ArcboxProfile::from_env_or_default();
+    let socket = arcbox_constants::paths::HostLayout::from_env_or_default().docker_socket;
+    DockerContextManager::new_with_context_name(socket, profile.docker_context_name())
+        .context("Failed to initialize Docker context manager")
 }
 
 // =============================================================================
@@ -105,9 +108,9 @@ fn emit_ndjson(p: SetupProgress) {
 
 /// Downloads and installs Docker CLI tools.
 async fn execute_setup(format: OutputFormat) -> Result<()> {
-    let home = dirs::home_dir().context("could not determine home directory")?;
-    let runtime_bin = home.join(".arcbox/runtime/bin");
-    let user_bin = home.join(".arcbox/bin");
+    let profile_dir = HostLayout::from_env_or_default().data_dir;
+    let runtime_bin = profile_dir.join("runtime/bin");
+    let user_bin = profile_dir.join("bin");
 
     // Parse tool entries from lockfile.
     let tools = parse_tools_for_group(LOCK_TOML, ToolGroup::Docker)
@@ -132,7 +135,7 @@ async fn execute_setup(format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json => execute_setup_json(&manager, &runtime_bin, &user_bin).await,
         OutputFormat::Table | OutputFormat::Quiet => {
-            execute_setup_table(&manager, &home, &runtime_bin, &user_bin).await
+            execute_setup_table(&manager, &profile_dir, &runtime_bin, &user_bin).await
         }
     }
 }
@@ -197,7 +200,7 @@ async fn execute_setup_json(
 /// Install Docker tools with human-readable table output.
 async fn execute_setup_table(
     manager: &HostToolManager,
-    home: &Path,
+    profile_dir: &Path,
     runtime_bin: &Path,
     user_bin: &Path,
 ) -> Result<()> {
@@ -255,7 +258,7 @@ async fn execute_setup_table(
     println!("Symlinks created in {}", user_bin.display());
 
     // Generate Docker shell completions.
-    generate_docker_completions(home, runtime_bin).await?;
+    generate_docker_completions(profile_dir, runtime_bin).await?;
 
     println!();
     println!("Restart your shell or re-source your profile to use Docker completions.");
@@ -268,8 +271,8 @@ async fn execute_setup_table(
 // =============================================================================
 
 /// Generate Docker CLI completions by running the installed docker binary.
-async fn generate_docker_completions(home: &Path, runtime_bin: &Path) -> Result<()> {
-    let comp_dir = home.join(".arcbox/completions");
+async fn generate_docker_completions(profile_dir: &Path, runtime_bin: &Path) -> Result<()> {
+    let comp_dir = profile_dir.join("completions");
 
     let docker_bin = runtime_bin.join("docker");
     if !docker_bin.exists() {

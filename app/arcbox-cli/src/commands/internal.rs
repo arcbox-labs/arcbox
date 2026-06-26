@@ -9,7 +9,7 @@
 //! whether the user opens the app first or installs via `brew`.
 
 use anyhow::{Context, Result};
-use arcbox_constants::paths::{DOCKER_CLI_TOOLS, HostLayout, labels};
+use arcbox_constants::paths::{DOCKER_CLI_TOOLS, HostLayout};
 use clap::Subcommand;
 
 use super::OutputFormat;
@@ -48,7 +48,7 @@ pub async fn execute(cmd: InternalCommands) -> Result<()> {
 /// Every step is idempotent — running after the app has already set up
 /// is harmless.
 async fn brew_postflight() -> Result<()> {
-    let layout = HostLayout::resolve(None);
+    let layout = HostLayout::from_env_or_default();
 
     // 1. Create data directories (same layout as daemon's init_early phase).
     for dir in [
@@ -87,25 +87,27 @@ async fn brew_postflight() -> Result<()> {
 /// sudo, removes the app bundle (Cask already does that), and deletes user
 /// data (belongs to `brew zap`).
 async fn brew_uninstall() -> Result<()> {
-    let layout = HostLayout::resolve(None);
+    let profile = arcbox_constants::paths::ArcboxProfile::from_env_or_default();
+    let daemon_label = profile.daemon_label();
+    let layout = HostLayout::from_env_or_default();
 
     // 1. Stop the daemon via launchctl, then best-effort pkill fallback.
     // SAFETY: getuid() is a trivial POSIX syscall.
     let uid = unsafe { libc::getuid() };
     let _ = std::process::Command::new("launchctl")
-        .args(["bootout", &format!("gui/{uid}/{}", labels::DAEMON)])
+        .args(["bootout", &format!("gui/{uid}/{daemon_label}")])
         .output();
     // bootout may not immediately stop an already-running process.
     // Mirror the `_uninstall` flow with a pkill fallback + short wait.
     let _ = std::process::Command::new("pkill")
-        .args(["-f", labels::DAEMON])
+        .args(["-f", daemon_label])
         .status();
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     // Remove the daemon plist so launchd doesn't try to restart.
     let plist_path = dirs::home_dir()
         .context("could not determine home directory")?
-        .join(format!("Library/LaunchAgents/{}.plist", labels::DAEMON));
+        .join(format!("Library/LaunchAgents/{daemon_label}.plist"));
     let _ = tokio::fs::remove_file(plist_path).await;
 
     // 2. Remove Docker context via DockerContextManager — `remove_context()`
@@ -211,7 +213,7 @@ mod tests {
 
     #[test]
     fn host_layout_directories_are_consistent() {
-        let layout = arcbox_constants::paths::HostLayout::resolve(None);
+        let layout = arcbox_constants::paths::HostLayout::from_env_or_default();
         assert!(layout.run_dir.ends_with("run"));
         assert!(layout.log_dir.ends_with("log"));
         assert!(layout.data_subdir.ends_with("data"));
@@ -231,7 +233,7 @@ mod tests {
     #[test]
     fn context_manager_constructs_with_default_socket() {
         // Verify the factory helper resolves a path (doesn't panic).
-        let socket = arcbox_constants::paths::HostLayout::resolve(None).docker_socket;
+        let socket = arcbox_constants::paths::HostLayout::from_env_or_default().docker_socket;
         assert!(socket.to_string_lossy().contains("docker.sock"));
     }
 

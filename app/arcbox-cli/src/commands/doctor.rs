@@ -237,7 +237,5 @@ fn daemon_socket() -> std::path::PathBuf {
     if let Ok(val) = std::env::var("ARCBOX_SOCKET") {
         return std::path::PathBuf::from(val);
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join(".arcbox/run/docker.sock")
+    arcbox_constants::paths::HostLayout::from_env_or_default().docker_socket
 }

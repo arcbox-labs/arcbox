@@ -38,6 +38,13 @@ fn main() -> Result<()> {
             std::env::set_var("ARCBOX_SOCKET", socket.as_os_str());
         }
     }
+    if let Some(profile) = cli.profile {
+        // SAFETY: This is called at the start of main(), before any threads are spawned,
+        // and we're the only ones modifying this environment variable.
+        unsafe {
+            std::env::set_var(arcbox_constants::env::PROFILE, profile.as_str());
+        }
+    }
 
     // Initialize logging based on debug flag
     let filter = if cli.debug {

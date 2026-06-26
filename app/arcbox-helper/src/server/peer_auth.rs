@@ -21,8 +21,10 @@ const TEAM_ID: &str = "422ACSY6Y5";
 /// Bundle identifiers allowed to connect to the helper.
 const ALLOWED_IDENTIFIERS: &[&str] = &[
     "com.arcboxlabs.desktop.daemon",
+    "com.arcboxlabs.desktop.dev.daemon",
     "com.arcboxlabs.desktop.cli",
     "com.arcboxlabs.desktop",
+    "com.arcboxlabs.desktop.dev",
 ];
 
 /// Returns `true` if the peer on the other end of `stream` is an

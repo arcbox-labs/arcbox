@@ -89,7 +89,7 @@ fn print_skipped() {
 // Step 1: Install helper binary + launchd service
 // =============================================================================
 
-use arcbox_constants::paths::privileged;
+use arcbox_constants::paths::{ArcboxProfile, privileged};
 
 /// Installs the arcbox-helper binary and registers it as a launchd system
 /// daemon with socket activation.
@@ -170,30 +170,35 @@ fn install_helper(custom_path: Option<&std::path::Path>) -> Result<()> {
 /// Under `sudo`, `dirs::home_dir()` returns `/var/root` and `getuid()`
 /// returns 0. We detect this via `SUDO_USER` / `SUDO_UID` and resolve
 /// the real user's home and UID instead.
-/// Daemon launchd label — must match uninstall.rs.
-const DAEMON_LABEL: &str = "com.arcboxlabs.desktop.daemon";
-
 fn register_daemon_service() -> Result<()> {
     let (home, uid) = resolve_real_user()?;
+    let profile = ArcboxProfile::from_env_or_default();
+    let daemon_label = profile.daemon_label();
+    let data_dir = std::env::var(arcbox_constants::env::DATA_DIR)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || match profile {
+                ArcboxProfile::Production => home.join(".arcbox"),
+                ArcboxProfile::Development => home.join(".arcbox-dev"),
+            },
+            PathBuf::from,
+        );
     let plist_dir = home.join("Library/LaunchAgents");
     std::fs::create_dir_all(&plist_dir).context("failed to create LaunchAgents directory")?;
 
     // Create log directory so launchd's stdout/stderr redirection works
-    // on fresh installs where ~/.arcbox/log/ doesn't exist yet.
-    let log_dir = home.join(".arcbox/log");
+    // on fresh installs where the profile log directory doesn't exist yet.
+    let log_dir = data_dir.join("log");
     std::fs::create_dir_all(&log_dir).context("failed to create log directory")?;
 
     // Under sudo, the directory is created as root. Chown to the real user
     // so the daemon (running as user) can write logs.
     let _ = Command::new("chown")
-        .args([
-            "-R",
-            &format!("{uid}:staff"),
-            &home.join(".arcbox").to_string_lossy(),
-        ])
+        .args(["-R", &format!("{uid}:staff"), &data_dir.to_string_lossy()])
         .status();
 
-    let plist_path = plist_dir.join(format!("{DAEMON_LABEL}.plist"));
+    let plist_path = plist_dir.join(format!("{daemon_label}.plist"));
 
     // Find the daemon binary.
     let exe = std::env::current_exe().context("could not determine current executable")?;
@@ -203,7 +208,7 @@ fn register_daemon_service() -> Result<()> {
     let daemon_path = if daemon_bin.exists() {
         daemon_bin.to_string_lossy().to_string()
     } else {
-        let alt = home.join(".arcbox/bin/arcbox-daemon");
+        let alt = data_dir.join("bin/arcbox-daemon");
         if alt.exists() {
             alt.to_string_lossy().to_string()
         } else {
@@ -220,10 +225,14 @@ fn register_daemon_service() -> Result<()> {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{DAEMON_LABEL}</string>
+    <string>{daemon_label}</string>
     <key>ProgramArguments</key>
     <array>
         <string>{daemon_path}</string>
+        <string>--profile</string>
+        <string>{profile}</string>
+        <string>--data-dir</string>
+        <string>{}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -238,7 +247,8 @@ fn register_daemon_service() -> Result<()> {
     <integer>45</integer>
 </dict>
 </plist>
-"#
+"#,
+        data_dir.display()
     );
 
     std::fs::write(&plist_path, plist_content)

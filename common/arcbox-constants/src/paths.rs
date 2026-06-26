@@ -52,8 +52,92 @@ pub mod privileged {
 pub mod labels {
     /// Daemon (user-level LaunchAgent).
     pub const DAEMON: &str = "com.arcboxlabs.desktop.daemon";
+    /// Development daemon (user-level LaunchAgent).
+    pub const DEVELOPMENT_DAEMON: &str = "com.arcboxlabs.desktop.dev.daemon";
     /// Helper (system-level LaunchDaemon).
     pub const HELPER: &str = "com.arcboxlabs.desktop.helper";
+}
+
+/// Runtime profile names and derived host identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ArcboxProfile {
+    /// Production profile using `~/.arcbox` and the `arcbox` Docker context.
+    #[default]
+    Production,
+    /// Development profile using `~/.arcbox-dev` and the `arcbox-dev` Docker context.
+    Development,
+}
+
+impl ArcboxProfile {
+    /// Returns the canonical profile name used in environment variables and CLIs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::Development => "development",
+        }
+    }
+
+    /// Returns the Docker context name for this profile.
+    #[must_use]
+    pub const fn docker_context_name(self) -> &'static str {
+        match self {
+            Self::Production => "arcbox",
+            Self::Development => "arcbox-dev",
+        }
+    }
+
+    /// Returns the launchd daemon label for this profile.
+    #[must_use]
+    pub const fn daemon_label(self) -> &'static str {
+        match self {
+            Self::Production => labels::DAEMON,
+            Self::Development => labels::DEVELOPMENT_DAEMON,
+        }
+    }
+
+    /// Returns the profile selected by `ARCBOX_PROFILE`, defaulting to production.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn from_env_or_default() -> Self {
+        std::env::var(crate::env::PROFILE)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default()
+    }
+
+    /// Returns this profile's default data directory.
+    #[cfg(feature = "std")]
+    #[must_use]
+    pub fn default_data_dir(self) -> std::path::PathBuf {
+        dirs::home_dir().map_or_else(
+            || std::path::PathBuf::from("/var/lib/arcbox"),
+            |home| match self {
+                Self::Production => home.join(".arcbox"),
+                Self::Development => home.join(".arcbox-dev"),
+            },
+        )
+    }
+}
+
+impl core::fmt::Display for ArcboxProfile {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl core::str::FromStr for ArcboxProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "production" | "prod" => Ok(Self::Production),
+            "development" | "dev" => Ok(Self::Development),
+            other => Err(format!(
+                "unknown ArcBox profile '{other}' (expected production or development)"
+            )),
+        }
+    }
 }
 
 /// Docker CLI tool names managed by the helper's cli_link.
@@ -94,7 +178,7 @@ pub fn is_arcbox_owned(target: &std::path::Path) -> bool {
         .contains(".app/Contents/MacOS/xbin/")
 }
 
-/// Host-side subdirectory names within `~/.arcbox/`.
+/// Host-side subdirectory names within the profile data directory.
 pub mod host {
     /// Runtime state (sockets, PID files, ephemeral markers).
     pub const RUN: &str = "run";
@@ -166,15 +250,54 @@ impl HostLayout {
         }
     }
 
+    /// Build a layout from a runtime profile.
+    #[must_use]
+    pub fn for_profile(profile: ArcboxProfile) -> Self {
+        Self::new(profile.default_data_dir())
+    }
+
     /// Resolve the data directory from an optional override, falling
-    /// back to `~/.arcbox` (or `/var/lib/arcbox` when `$HOME` is unset).
+    /// back to the production profile directory.
     #[must_use]
     pub fn resolve(data_dir: Option<&std::path::Path>) -> Self {
-        let data_dir = match data_dir {
-            Some(d) => d.to_path_buf(),
-            None => default_data_dir(),
-        };
-        Self::new(data_dir)
+        Self::resolve_for_profile(ArcboxProfile::Production, data_dir)
+    }
+
+    /// Resolve the data directory from an optional override, falling back to
+    /// the selected profile's default directory.
+    #[must_use]
+    pub fn resolve_for_profile(profile: ArcboxProfile, data_dir: Option<&std::path::Path>) -> Self {
+        match data_dir {
+            Some(d) => Self::new(d.to_path_buf()),
+            None => Self::for_profile(profile),
+        }
+    }
+
+    /// Resolve the data directory from an optional override, then
+    /// `ARCBOX_DATA_DIR`, then the selected profile's default directory.
+    #[must_use]
+    pub fn resolve_for_profile_from_env(
+        profile: ArcboxProfile,
+        data_dir: Option<&std::path::Path>,
+    ) -> Self {
+        if let Some(data_dir) = data_dir {
+            return Self::new(data_dir.to_path_buf());
+        }
+
+        if let Ok(data_dir) = std::env::var(crate::env::DATA_DIR) {
+            if !data_dir.is_empty() {
+                return Self::new(std::path::PathBuf::from(data_dir));
+            }
+        }
+
+        Self::for_profile(profile)
+    }
+
+    /// Resolve the layout from environment (`ARCBOX_DATA_DIR`, then
+    /// `ARCBOX_PROFILE`) or the production defaults.
+    #[must_use]
+    pub fn from_env_or_default() -> Self {
+        Self::resolve_for_profile_from_env(ArcboxProfile::from_env_or_default(), None)
     }
 }
 
@@ -186,10 +309,7 @@ impl HostLayout {
 #[cfg(feature = "std")]
 #[must_use]
 pub fn default_data_dir() -> std::path::PathBuf {
-    dirs::home_dir().map_or_else(
-        || std::path::PathBuf::from("/var/lib/arcbox"),
-        |home| home.join(".arcbox"),
-    )
+    ArcboxProfile::Production.default_data_dir()
 }
 
 /// Privileged log directory (root-owned, for arcbox-helper).
@@ -246,6 +366,42 @@ mod tests {
     fn host_layout_resolve_uses_default_when_none() {
         let layout = HostLayout::resolve(None);
         assert_eq!(layout.data_dir, default_data_dir());
+    }
+
+    #[test]
+    fn host_layout_resolve_for_profile_uses_explicit_dir() {
+        let dir = PathBuf::from("/custom/dev");
+        let layout = HostLayout::resolve_for_profile_from_env(
+            ArcboxProfile::Development,
+            Some(dir.as_path()),
+        );
+        assert_eq!(layout.data_dir, dir);
+    }
+
+    #[test]
+    fn development_profile_uses_dev_data_dir_and_context() {
+        let layout = HostLayout::for_profile(ArcboxProfile::Development);
+        assert!(layout.data_dir.ends_with(".arcbox-dev"));
+        assert_eq!(
+            ArcboxProfile::Development.docker_context_name(),
+            "arcbox-dev"
+        );
+        assert_eq!(
+            ArcboxProfile::Development.daemon_label(),
+            labels::DEVELOPMENT_DAEMON
+        );
+    }
+
+    #[test]
+    fn parses_profile_names_and_aliases() {
+        assert_eq!(
+            "production".parse::<ArcboxProfile>().unwrap(),
+            ArcboxProfile::Production
+        );
+        assert_eq!(
+            "dev".parse::<ArcboxProfile>().unwrap(),
+            ArcboxProfile::Development
+        );
     }
 
     #[test]

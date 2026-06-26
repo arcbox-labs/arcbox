@@ -34,6 +34,7 @@
 //! level = "info"
 //! ```
 
+use arcbox_constants::paths::{ArcboxProfile, HostLayout};
 use arcbox_constants::ports::DOCKER_API_VSOCK_PORT;
 use figment::{
     Figment,
@@ -66,20 +67,27 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        Self::for_profile(ArcboxProfile::Production)
+    }
+}
+
+impl Config {
+    /// Creates default configuration for a runtime profile.
+    #[must_use]
+    pub fn for_profile(profile: ArcboxProfile) -> Self {
+        let layout = HostLayout::for_profile(profile);
         Self {
-            data_dir: default_data_dir(),
+            data_dir: layout.data_dir,
             vm: VmDefaults::default(),
             machine: MachineDefaults::default(),
             network: NetworkConfig::default(),
-            docker: DockerConfig::default(),
+            docker: DockerConfig::for_profile(profile),
             container: ContainerRuntimeConfig::default(),
             logging: LoggingConfig::default(),
             storage: StorageConfig::default(),
         }
     }
-}
 
-impl Config {
     /// Loads configuration from files and environment.
     ///
     /// Configuration sources (in order of precedence):
@@ -92,8 +100,16 @@ impl Config {
     ///
     /// Returns an error if configuration cannot be loaded.
     pub fn load() -> Result<Self, Box<figment::Error>> {
+        Self::load_for_profile(ArcboxProfile::from_env_or_default())
+    }
+
+    /// Loads configuration for a runtime profile from files and environment.
+    ///
+    /// Explicit `ARCBOX_*` environment values and config file values override
+    /// profile defaults.
+    pub fn load_for_profile(profile: ArcboxProfile) -> Result<Self, Box<figment::Error>> {
         Figment::new()
-            .merge(Serialized::defaults(Self::default()))
+            .merge(Serialized::defaults(Self::for_profile(profile)))
             .merge(Toml::file(system_config_path()))
             .merge(Toml::file(user_config_path()))
             .merge(Env::prefixed("ARCBOX_").split("_"))
@@ -268,8 +284,16 @@ pub struct DockerConfig {
 
 impl Default for DockerConfig {
     fn default() -> Self {
+        Self::for_profile(ArcboxProfile::Production)
+    }
+}
+
+impl DockerConfig {
+    /// Creates default Docker configuration for a runtime profile.
+    #[must_use]
+    pub fn for_profile(profile: ArcboxProfile) -> Self {
         Self {
-            socket_path: default_docker_socket_path(),
+            socket_path: HostLayout::for_profile(profile).docker_socket,
             enabled: true,
         }
     }
@@ -292,14 +316,6 @@ impl Default for ContainerRuntimeConfig {
             startup_timeout_ms: 60_000,
         }
     }
-}
-
-fn default_docker_socket_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".arcbox")
-        .join(arcbox_constants::paths::host::RUN)
-        .join("docker.sock")
 }
 
 /// Logging configuration.
@@ -341,12 +357,6 @@ impl Default for StorageConfig {
             image_backend: "oci".to_string(),
         }
     }
-}
-
-fn default_data_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/var/lib"))
-        .join(".arcbox")
 }
 
 fn user_config_path() -> PathBuf {

@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use arcbox_constants::paths::{ArcboxProfile, HostLayout};
 use arcbox_docker_tools::{HostToolManager, ToolGroup, parse_tools_for_group};
 use arcbox_grpc::v1::kubernetes_service_client::KubernetesServiceClient;
 use arcbox_protocol::v1::{
@@ -17,7 +18,6 @@ use super::machine::UnixConnector;
 
 /// Embedded `assets.lock` (same copy used by Docker/Kubernetes host tools).
 const LOCK_TOML: &str = include_str!("../../../../assets.lock");
-const MANAGED_CONTEXT_NAME: &str = "arcbox";
 
 #[derive(Debug, Subcommand)]
 pub enum KubernetesCommands {
@@ -77,20 +77,28 @@ fn home_dir() -> Result<PathBuf> {
     dirs::home_dir().context("could not determine home directory")
 }
 
-fn managed_kubeconfig_path(home: &Path) -> PathBuf {
-    home.join(".arcbox").join("kube").join("arcbox.yaml")
+fn profile_dir() -> PathBuf {
+    HostLayout::from_env_or_default().data_dir
 }
 
-fn integration_state_path(home: &Path) -> PathBuf {
-    home.join(".arcbox").join("kube").join("state.json")
+fn managed_context_name() -> &'static str {
+    ArcboxProfile::from_env_or_default().docker_context_name()
+}
+
+fn managed_kubeconfig_path(_home: &Path) -> PathBuf {
+    profile_dir().join("kube").join("arcbox.yaml")
+}
+
+fn integration_state_path(_home: &Path) -> PathBuf {
+    profile_dir().join("kube").join("state.json")
 }
 
 fn user_kubeconfig_path(home: &Path) -> PathBuf {
     home.join(".kube").join("config")
 }
 
-fn runtime_bin_dir(home: &Path) -> PathBuf {
-    home.join(".arcbox").join("runtime").join("bin")
+fn runtime_bin_dir(_home: &Path) -> PathBuf {
+    profile_dir().join("runtime").join("bin")
 }
 
 fn kubectl_bin(home: &Path) -> PathBuf {
@@ -147,7 +155,7 @@ async fn install_kubernetes_tools(home: &Path) -> Result<()> {
         .await
         .context("failed to install kubectl")?;
 
-    let user_bin = home.join(".arcbox").join("bin");
+    let user_bin = profile_dir().join("bin");
     tokio::fs::create_dir_all(&user_bin).await?;
     let target = runtime_bin.join("kubectl");
     let link = user_bin.join("kubectl");
@@ -262,10 +270,11 @@ async fn delete_context_entries(home: &Path) -> Result<()> {
         return Ok(());
     }
 
+    let managed_context = managed_context_name();
     for args in [
-        vec!["config", "delete-context", MANAGED_CONTEXT_NAME],
-        vec!["config", "delete-cluster", MANAGED_CONTEXT_NAME],
-        vec!["config", "delete-user", MANAGED_CONTEXT_NAME],
+        vec!["config", "delete-context", managed_context],
+        vec!["config", "delete-cluster", managed_context],
+        vec!["config", "delete-user", managed_context],
     ] {
         let _ = tokio::process::Command::new(&kubectl)
             .args(&args)
@@ -302,7 +311,7 @@ async fn refresh_if_enabled(home: &Path) -> Result<()> {
 
     refresh_managed_kubeconfig(home).await?;
     merge_managed_kubeconfig(home).await?;
-    set_current_context(home, MANAGED_CONTEXT_NAME).await?;
+    set_current_context(home, managed_context_name()).await?;
     Ok(())
 }
 
@@ -418,23 +427,24 @@ async fn execute_enable() -> Result<()> {
     let home = home_dir()?;
     install_kubernetes_tools(&home).await?;
 
+    let managed_context = managed_context_name();
     let previous_context = current_context(&home).await?;
     refresh_managed_kubeconfig(&home).await?;
     delete_context_entries(&home).await?;
     merge_managed_kubeconfig(&home).await?;
-    set_current_context(&home, MANAGED_CONTEXT_NAME).await?;
+    set_current_context(&home, managed_context).await?;
 
     save_state(
         &home,
         &KubernetesIntegrationState {
             enabled: true,
-            previous_context: previous_context.filter(|ctx| ctx != MANAGED_CONTEXT_NAME),
+            previous_context: previous_context.filter(|ctx| ctx != managed_context),
         },
     )
     .await?;
 
     println!("Kubernetes integration enabled.");
-    println!("Current context: {}", MANAGED_CONTEXT_NAME);
+    println!("Current context: {managed_context}");
     println!("kubectl installed to {}", kubectl_bin(&home).display());
     Ok(())
 }

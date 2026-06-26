@@ -8,7 +8,7 @@
 
 use super::machine::UnixConnector;
 use anyhow::{Context, Result, bail};
-use arcbox_constants::paths::HostLayout;
+use arcbox_constants::paths::{ArcboxProfile, HostLayout};
 use clap::{Args, ValueEnum};
 use humantime::format_duration;
 use std::ffi::OsString;
@@ -39,6 +39,10 @@ pub struct DaemonArgs {
     /// Data directory for ArcBox.
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
+
+    /// Runtime profile (production or development).
+    #[arg(long)]
+    pub profile: Option<ArcboxProfile>,
 
     /// Custom kernel path for VM boot.
     #[arg(long)]
@@ -288,6 +292,10 @@ fn build_daemon_args(args: &DaemonArgs) -> Vec<OsString> {
         daemon_args.push(OsString::from("--data-dir"));
         daemon_args.push(data_dir.as_os_str().to_os_string());
     }
+    if let Some(profile) = args.profile {
+        daemon_args.push(OsString::from("--profile"));
+        daemon_args.push(OsString::from(profile.as_str()));
+    }
     if let Some(kernel) = &args.kernel {
         daemon_args.push(OsString::from("--kernel"));
         daemon_args.push(kernel.as_os_str().to_os_string());
@@ -306,7 +314,10 @@ fn build_daemon_args(args: &DaemonArgs) -> Vec<OsString> {
 }
 
 fn resolve_layout(args: &DaemonArgs) -> HostLayout {
-    let mut layout = HostLayout::resolve(args.data_dir.as_deref());
+    let profile = args
+        .profile
+        .unwrap_or_else(ArcboxProfile::from_env_or_default);
+    let mut layout = HostLayout::resolve_for_profile_from_env(profile, args.data_dir.as_deref());
     if let Some(socket) = &args.socket {
         layout.docker_socket.clone_from(socket);
     }
