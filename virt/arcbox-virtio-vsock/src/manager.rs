@@ -733,7 +733,10 @@ mod tests {
         let n = peer_stream
             .read(&mut buf)
             .expect("peer read should not error");
-        assert_eq!(n, 0, "peer fd must read EOF after the internal fd is closed");
+        assert_eq!(
+            n, 0,
+            "peer fd must read EOF after the internal fd is closed"
+        );
     }
 
     #[test]
