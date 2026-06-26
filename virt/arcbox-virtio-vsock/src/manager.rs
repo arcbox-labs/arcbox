@@ -724,11 +724,12 @@ mod tests {
         // Removing the connection drops the internal `OwnedFd`, closing it.
         // The peer end then observes EOF — an observable signal that avoids
         // the FD-reuse race of asserting on a raw fd number after close.
+        // The internal fd is already closed, so a non-blocking read reaches
+        // EOF immediately; `SO_RCVTIMEO` (set_read_timeout) is unusable here
+        // because macOS rejects it on `AF_UNIX` sockets with `EINVAL`.
         let mut peer_stream =
             unsafe { std::os::unix::net::UnixStream::from_raw_fd(peer_end.into_raw_fd()) };
-        peer_stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-            .unwrap();
+        peer_stream.set_nonblocking(true).unwrap();
         let mut buf = [0u8; 8];
         let n = peer_stream
             .read(&mut buf)
