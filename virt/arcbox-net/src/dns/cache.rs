@@ -113,7 +113,8 @@ fn rewrite_ttls(response: &mut [u8], remaining_ttl_secs: u64) -> Option<()> {
 
     let mut offset = skip_questions(response, DNS_HEADER_LEN, qdcount)?;
     let remaining_secs = remaining_ttl_secs.min(u64::from(u32::MAX)) as u32;
-    for _ in 0..ancount + nscount + arcount {
+    let total_records = u32::from(ancount) + u32::from(nscount) + u32::from(arcount);
+    for _ in 0..total_records {
         offset = rewrite_record_ttl(response, offset, remaining_secs)?;
     }
     Some(())
@@ -187,4 +188,30 @@ fn rewrite_record_ttl(response: &mut [u8], offset: usize, remaining_secs: u32) -
     }
 
     Some(next_record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_ttls_rejects_record_count_sum_above_u16_max() {
+        let mut response = vec![0; DNS_HEADER_LEN];
+        response[4..6].copy_from_slice(&1u16.to_be_bytes());
+        response[6..8].copy_from_slice(&1u16.to_be_bytes());
+        response[8..10].copy_from_slice(&u16::MAX.to_be_bytes());
+
+        response.push(0);
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+
+        response.extend_from_slice(&0xC00Cu16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&60u32.to_be_bytes());
+        response.extend_from_slice(&4u16.to_be_bytes());
+        response.extend_from_slice(&[192, 0, 2, 1]);
+
+        assert!(rewrite_ttls(&mut response, 30).is_none());
+    }
 }
