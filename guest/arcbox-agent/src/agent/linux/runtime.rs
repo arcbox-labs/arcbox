@@ -583,32 +583,46 @@ pub(super) fn daemon_log_file(name: &str) -> Stdio {
     let arcbox_path = format!("{}/{}.log", log_dir, name);
     let tmp_log_path = format!("/tmp/{}.log", name);
 
-    // Ensure the log directory exists inside the VirtioFS share.
-    if Path::new("/arcbox").exists() {
+    // Prefer the VirtioFS share so the host can read the log; warn loudly on each
+    // degradation so a virtiofs failure doesn't silently hide service logs.
+    let arcbox_available = Path::new("/arcbox").exists();
+    let primary = if arcbox_available {
         let _ = std::fs::create_dir_all(&log_dir);
-    }
-
-    let log_path = if Path::new("/arcbox").exists() {
         &arcbox_path
     } else {
+        tracing::warn!(
+            service = name,
+            "/arcbox VirtioFS share not mounted; {name} logs go to {tmp_log_path} (guest-local, not visible from the host)"
+        );
         &tmp_log_path
     };
 
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_path)
+        .open(primary)
     {
         Ok(f) => f.into(),
-        Err(_) => {
-            // Fallback to /tmp/ if /arcbox/log/ write fails.
+        Err(e) => {
+            tracing::warn!(
+                service = name,
+                error = %e,
+                "failed to open {primary} for {name} logs; falling back to {tmp_log_path}"
+            );
             match std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&tmp_log_path)
             {
                 Ok(f) => f.into(),
-                Err(_) => Stdio::null(),
+                Err(e2) => {
+                    tracing::error!(
+                        service = name,
+                        error = %e2,
+                        "failed to open {tmp_log_path} for {name} logs; discarding to /dev/null"
+                    );
+                    Stdio::null()
+                }
             }
         }
     }
