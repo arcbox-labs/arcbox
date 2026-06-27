@@ -1,7 +1,6 @@
 //! `VirtioBlock` device — request dispatch, queue handling, `VirtioDevice` impl.
 
 mod io;
-mod range;
 mod virtio_device;
 
 #[cfg(test)]

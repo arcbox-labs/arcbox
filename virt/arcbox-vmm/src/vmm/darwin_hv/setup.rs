@@ -300,6 +300,7 @@ impl Vmm {
             blk.set_num_queues(blk_num_queues);
             let raw_fd = blk.raw_fd().unwrap_or(-1);
             let blk_size = blk.blk_size();
+            let capacity_sectors = blk.capacity_bytes() / u64::from(blk_size);
             let read_only = blk.is_read_only();
             let num_queues = blk.num_queues();
             let dev_id_str = blk.device_id_string().to_string();
@@ -313,7 +314,13 @@ impl Vmm {
             )?;
             if raw_fd >= 0 {
                 self.hv_blk_devices.push((
-                    device_id, raw_fd, blk_size, read_only, dev_id_str, num_queues,
+                    device_id,
+                    raw_fd,
+                    blk_size,
+                    capacity_sectors,
+                    read_only,
+                    dev_id_str,
+                    num_queues,
                 ));
             }
         }
@@ -321,10 +328,12 @@ impl Vmm {
         // Build HVC fast-path fd table from all block devices.
         // device_idx 0 = first block device (vda), 1 = second (vdb), etc.
         {
-            let fds: Vec<(i32, u32)> = self
+            let fds: Vec<(i32, u32, u64)> = self
                 .hv_blk_devices
                 .iter()
-                .map(|(_, raw_fd, blk_size, _, _, _)| (*raw_fd, *blk_size))
+                .map(|(_, raw_fd, blk_size, capacity_sectors, _, _, _)| {
+                    (*raw_fd, *blk_size, *capacity_sectors)
+                })
                 .collect();
             self.hvc_blk_fds = Arc::new(fds);
         }

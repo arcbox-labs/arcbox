@@ -66,20 +66,44 @@ impl Vmm {
             let blk_infos = std::mem::take(&mut self.hv_blk_devices)
                 .into_iter()
                 .filter_map(
-                    |(dev_id, raw_fd, blk_size, read_only, dev_id_str, num_queues)| {
+                    |(
+                        dev_id,
+                        raw_fd,
+                        blk_size,
+                        capacity_sectors,
+                        read_only,
+                        dev_id_str,
+                        num_queues,
+                    )| {
                         let dev = dm.get_registered_device(dev_id)?;
                         let irq = dev.info.irq?;
                         let mmio_state = dev.mmio_state.as_ref()?.clone();
                         Some((
-                            dev_id, raw_fd, blk_size, read_only, dev_id_str, num_queues, irq,
+                            dev_id,
+                            raw_fd,
+                            blk_size,
+                            capacity_sectors,
+                            read_only,
+                            dev_id_str,
+                            num_queues,
+                            irq,
                             mmio_state,
                         ))
                     },
                 )
                 .collect::<Vec<_>>();
 
-            for (dev_id, raw_fd, blk_size, read_only, dev_id_str, num_queues, irq, mmio_state) in
-                blk_infos
+            for (
+                dev_id,
+                raw_fd,
+                blk_size,
+                capacity_sectors,
+                read_only,
+                dev_id_str,
+                num_queues,
+                irq,
+                mmio_state,
+            ) in blk_infos
             {
                 let irq_cb = dm.irq_callback_clone().unwrap_or_else(|| {
                     Arc::new(|_: crate::irq::Irq, _: bool| -> crate::error::Result<()> { Ok(()) })
@@ -103,6 +127,7 @@ impl Vmm {
                         },
                         raw_fd,
                         blk_size,
+                        capacity_sectors,
                         read_only,
                         device_id: dev_id_str.clone(),
                         mmio_state: mmio_state.clone(),

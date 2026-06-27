@@ -4,10 +4,9 @@ use std::path::PathBuf;
 use arcbox_virtio_core::VirtioDevice;
 use tempfile::NamedTempFile;
 
-use crate::request::BlockConfig;
+use crate::request::{BlockConfig, parse_range_list};
 
 use super::VirtioBlock;
-use super::range::parse_range_list;
 
 #[test]
 fn test_block_device_creation() {
