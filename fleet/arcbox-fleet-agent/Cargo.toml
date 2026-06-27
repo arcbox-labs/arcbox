@@ -32,6 +32,7 @@ dashmap = { workspace = true }
 dirs = { workspace = true }
 hostname = { workspace = true }
 sysinfo = { workspace = true }
+command-group = { version = "5.0.1", features = ["with-tokio"] }
 
 [lints]
 workspace = true
