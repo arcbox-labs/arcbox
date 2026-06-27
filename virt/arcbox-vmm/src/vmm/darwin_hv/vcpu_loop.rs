@@ -63,7 +63,7 @@ pub(super) struct VcpuContext {
     /// `hv_vcpus_exit` (which on arm64 requires a concrete list, not NULL).
     pub hv_vcpu_ids: HvVcpuIds,
     /// Per-block-device file descriptors and sector sizes for HVC fast path.
-    pub hvc_blk_fds: Arc<Vec<(i32, u32)>>,
+    pub hvc_blk_fds: Arc<Vec<(i32, u32, u64)>>,
 }
 
 /// Reads the value of an MMIO write source register, handling the ARM64

@@ -310,9 +310,9 @@ pub struct Vmm {
     /// Block I/O worker thread handles for join on shutdown.
     #[cfg(target_os = "macos")]
     hv_blk_worker_threads: Vec<std::thread::JoinHandle<()>>,
-    /// HVC fast path: device_idx → (raw_fd, blk_size). Shared with vCPU threads.
+    /// HVC fast path: device_idx → (raw_fd, blk_size, capacity_sectors). Shared with vCPU threads.
     #[cfg(target_os = "macos")]
-    hvc_blk_fds: Arc<Vec<(i32, u32)>>,
+    hvc_blk_fds: Arc<Vec<(i32, u32, u64)>>,
     /// Per-VirtioFS-share DAX mappers (concrete type).
     ///
     /// One `Arc<HvDaxMapper>` per configured shared directory, in the
