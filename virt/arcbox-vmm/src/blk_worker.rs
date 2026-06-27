@@ -1064,7 +1064,7 @@ impl FlushBarrier {
 mod tests {
     use super::*;
 
-    fn test_context<'a>(mem: &'a mut [u8], raw_fd: i32, capacity_sectors: u64) -> BlkWorkerContext {
+    fn test_context(mem: &mut [u8], raw_fd: i32, capacity_sectors: u64) -> BlkWorkerContext {
         BlkWorkerContext {
             // SAFETY: test memory outlives the returned context.
             guest_mem: unsafe { GuestMemWriter::new(mem.as_mut_ptr(), mem.len(), 0) },

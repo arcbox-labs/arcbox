@@ -37,8 +37,12 @@ impl VirtioBlock {
             .raw_fd
             .ok_or_else(|| VirtioError::NotReady("Block device not activated".into()))?;
 
-        let (offset, _) =
-            checked_io_byte_range(sector, data.len(), self.config.blk_size, self.config.capacity)?;
+        let (offset, _) = checked_io_byte_range(
+            sector,
+            data.len(),
+            self.config.blk_size,
+            self.config.capacity,
+        )?;
         #[allow(clippy::cast_possible_wrap)]
         let mut off = offset as libc::off_t;
         let mut read = 0usize;
@@ -80,8 +84,12 @@ impl VirtioBlock {
             .raw_fd
             .ok_or_else(|| VirtioError::NotReady("Block device not activated".into()))?;
 
-        let (offset, _) =
-            checked_io_byte_range(sector, data.len(), self.config.blk_size, self.config.capacity)?;
+        let (offset, _) = checked_io_byte_range(
+            sector,
+            data.len(),
+            self.config.blk_size,
+            self.config.capacity,
+        )?;
         #[allow(clippy::cast_possible_wrap)]
         let mut off = offset as libc::off_t;
         let mut written = 0usize;
