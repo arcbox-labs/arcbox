@@ -451,12 +451,13 @@ dependencies = [
 
 [[package]]
 name = "arcbox-fleet-agent"
-version = "0.4.12"
+version = "0.4.13"
 dependencies = [
  "anyhow",
  "arcbox-fleet-proto",
  "arcbox-logging",
  "clap",
+ "command-group",
  "dashmap",
  "dirs",
  "hostname",
@@ -472,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-fleet-proto"
-version = "0.4.12"
+version = "0.4.13"
 dependencies = [
  "prost",
  "tonic",
@@ -1328,6 +1329,18 @@ checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
  "memchr",
+]
+
+[[package]]
+name = "command-group"
+version = "5.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a68fa787550392a9d58f44c21a3022cfb3ea3e2458b7f85d3b399d0ceeccf409"
+dependencies = [
+ "async-trait",
+ "nix 0.27.1",
+ "tokio",
+ "winapi",
 ]
 
 [[package]]

@@ -12,9 +12,9 @@ use arcbox_fleet_proto::v1::{
     AttachRequest, ProvisionRunner, RunnerAccepted, RunnerFailed, RunnerFinished, RunnerStarted,
     attach_request,
 };
+use command_group::AsyncCommandGroup;
 use dashmap::{DashMap, DashSet};
-use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 /// Outcome of the admission check for an incoming `ProvisionRunner`.
@@ -41,8 +41,9 @@ struct Inner {
     events: mpsc::Sender<AttachRequest>,
     /// Job ids currently in flight (drives local capacity).
     in_flight: DashSet<String>,
-    /// Abort handles for in-flight jobs, for `CancelRunner`.
-    cancels: DashMap<String, AbortHandle>,
+    /// Cancel signals for in-flight jobs. Firing one makes the job's `run_job`
+    /// kill the runner's whole process group; see [`RunnerSupervisor::handle_cancel`].
+    cancels: DashMap<String, oneshot::Sender<()>>,
     /// Directory holding the installed runner (`run.sh` / `run.cmd`).
     runner_dir: PathBuf,
     /// Local backpressure cap.
@@ -98,9 +99,14 @@ impl RunnerSupervisor {
         // Reserve the slot synchronously so a follow-up dispatch sees it.
         self.inner.in_flight.insert(job_id.clone());
 
+        // Cancellation is cooperative: `run_job` owns the runner process group
+        // and tears it down on this signal, so `CancelRunner` never orphans the
+        // runner's child processes (a task abort would kill only the immediate
+        // `run.sh`/`cmd` child, not the runner and job it spawns).
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        self.inner.cancels.insert(job_id, cancel_tx);
         let sup = self.clone();
-        let handle = tokio::spawn(async move { sup.run_job(order).await });
-        self.inner.cancels.insert(job_id, handle.abort_handle());
+        tokio::spawn(async move { sup.run_job(order, cancel_rx).await });
     }
 
     /// Decide whether to start a runner for `job_id`. `Duplicate` takes
@@ -126,12 +132,13 @@ impl RunnerSupervisor {
         Admission::Accept
     }
 
-    /// Cancel an in-flight job: aborting the task drops the child (kill-on-drop).
+    /// Cancel an in-flight job. Signals `run_job`, which kills the runner's
+    /// whole process group and releases the slot — the slot is dropped there,
+    /// not here, so local capacity tracks the real process lifetime.
     pub fn handle_cancel(&self, job_id: &str) {
-        if let Some((_, handle)) = self.inner.cancels.remove(job_id) {
-            handle.abort();
-            self.inner.in_flight.remove(job_id);
-            warn!(job_id, "runner canceled");
+        if let Some((_, cancel)) = self.inner.cancels.remove(job_id) {
+            let _ = cancel.send(());
+            warn!(job_id, "runner cancel requested");
         }
     }
 
@@ -143,8 +150,10 @@ impl RunnerSupervisor {
         info!("draining: no new runners will be accepted");
     }
 
-    /// Drive one runner process end to end, emitting accept/start/terminal events.
-    async fn run_job(&self, order: ProvisionRunner) {
+    /// Drive one runner process end to end, emitting accept/start/terminal
+    /// events. The runner is spawned as a process group so cancellation can take
+    /// down `run.sh` and every process it spawned, not just the immediate child.
+    async fn run_job(&self, order: ProvisionRunner, mut cancel_rx: oneshot::Receiver<()>) {
         let job_id = order.job_id.clone();
         self.send(attach_request::Msg::RunnerAccepted(RunnerAccepted {
             job_id: job_id.clone(),
@@ -152,7 +161,7 @@ impl RunnerSupervisor {
         .await;
 
         let mut command = runner_command(&self.inner.runner_dir, &order.encoded_jit_config);
-        let mut child = match command.kill_on_drop(true).spawn() {
+        let mut child = match command.group_spawn() {
             Ok(child) => child,
             Err(e) => {
                 self.fail(&job_id, &format!("failed to spawn runner: {e}"))
@@ -167,18 +176,28 @@ impl RunnerSupervisor {
         .await;
         info!(job_id, "runner started");
 
-        match child.wait().await {
-            Ok(status) => {
-                self.send(attach_request::Msg::RunnerFinished(RunnerFinished {
-                    job_id: job_id.clone(),
-                    success: status.success(),
-                    detail: format!("exit status: {status}"),
-                }))
-                .await;
-                info!(job_id, success = status.success(), "runner finished");
-                self.release(&job_id);
+        tokio::select! {
+            result = child.wait() => match result {
+                Ok(status) => {
+                    self.send(attach_request::Msg::RunnerFinished(RunnerFinished {
+                        job_id: job_id.clone(),
+                        success: status.success(),
+                        detail: format!("exit status: {status}"),
+                    }))
+                    .await;
+                    info!(job_id, success = status.success(), "runner finished");
+                    self.release(&job_id);
+                }
+                Err(e) => self.fail(&job_id, &format!("waiting on runner: {e}")).await,
+            },
+            // CancelRunner: SIGKILL the whole process group (run.sh and the
+            // runner/job processes it spawned) and reap it, then report terminal.
+            _ = &mut cancel_rx => {
+                if let Err(e) = child.kill().await {
+                    warn!(job_id, error = %e, "killing runner process group failed");
+                }
+                self.fail(&job_id, "canceled by gateway").await;
             }
-            Err(e) => self.fail(&job_id, &format!("waiting on runner: {e}")).await,
         }
     }
 
