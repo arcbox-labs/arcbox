@@ -5,6 +5,94 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.13](https://github.com/arcboxlabs/arcbox/compare/v0.4.12...v0.4.13) (2026-06-27)
+
+
+### Features
+
+* **agent:** run under busybox init as a supervised child ([9f58b19](https://github.com/arcboxlabs/arcbox/commit/9f58b1936f4702e91e96b7a2acd9cd31696afb24))
+* **cli:** make 'disk compact' trigger an on-demand trim ([f34657f](https://github.com/arcboxlabs/arcbox/commit/f34657fd25434fb81b74edc8d6f06383afe35de2))
+* **profile:** add development runtime profile ([7038d70](https://github.com/arcboxlabs/arcbox/commit/7038d70c694b28916e4aa7b46de218fc5a42dd7c))
+* **virtio-blk:** punch holes on DISCARD to reclaim host disk ([a2fa7c5](https://github.com/arcboxlabs/arcbox/commit/a2fa7c55bd101678eec7c0367fd62592b14650de))
+* **virtio-blk:** share punch helper, gate DISCARD on writable devices ([9c15a13](https://github.com/arcboxlabs/arcbox/commit/9c15a130b007ac742ae00b5117332bad7edb0201))
+* **vmm:** honor WRITE_ZEROES in the HV block worker ([8cdd8ef](https://github.com/arcboxlabs/arcbox/commit/8cdd8ef40c2e573debceba5ae8ae10c43ee87ed4)), closes [#337](https://github.com/arcboxlabs/arcbox/issues/337)
+* **vmm:** punch holes on DISCARD in the HV block worker ([fa0c22a](https://github.com/arcboxlabs/arcbox/commit/fa0c22a729a194157e27be74b007cc5040283307))
+
+
+### Bug Fixes
+
+* **agent:** fail fast when init can't mount the writable layers ([0c90c65](https://github.com/arcboxlabs/arcbox/commit/0c90c6599439d8f9de748c2d4c7e7222db312b4b))
+* **api:** surface guest fstrim failures from CompactDisk ([70b0913](https://github.com/arcboxlabs/arcbox/commit/70b091331c01fc8ba7053a2bf532ea907b977256))
+* **boot:** gate PL011 earlycon to HV and preserve readiness errors ([c7a902d](https://github.com/arcboxlabs/arcbox/commit/c7a902d336316493118c85185a4d606bcf9dee6e))
+* **boot:** pin earlycon to PL011 base so HV early-boot logs are captured ([f4874e8](https://github.com/arcboxlabs/arcbox/commit/f4874e83cd183daf23afc15b68cb7bdf41828cff))
+* **boot:** retry guest readiness instead of aborting on transient early-eof ([d614c68](https://github.com/arcboxlabs/arcbox/commit/d614c68667ee76490a1aa9970f9b2cfab129aad3))
+* **daemon:** capture guest console output by default ([4ae966b](https://github.com/arcboxlabs/arcbox/commit/4ae966bdca40c1dfd4efd37058bf77c94351a5cb))
+* **net:** cache raw DNS responses ([bff8b34](https://github.com/arcboxlabs/arcbox/commit/bff8b34998d3235e2c1e00d976d8b0b7c7774b6a))
+* **net:** honor DNS cache hit metadata ([da91b77](https://github.com/arcboxlabs/arcbox/commit/da91b77ec9207ec9520b88f827218aa35101bd5a))
+* **net:** widen DNS cache record count sum ([2d88142](https://github.com/arcboxlabs/arcbox/commit/2d88142128a08f20dab58858e9e5ea3248c7d54e))
+* **storage:** drop upfront docker.img preallocation, keep image sparse ([#334](https://github.com/arcboxlabs/arcbox/issues/334)) ([5a93974](https://github.com/arcboxlabs/arcbox/commit/5a9397448f7f821db722db9fe41707f64e8f3a22))
+* **virtio-blk:** fall back to pwrite when WRITE_ZEROES punch fails ([877d9fa](https://github.com/arcboxlabs/arcbox/commit/877d9facf8d9d94e334328caf910207906726491))
+* **virtio-blk:** harden discard range handling ([e95f865](https://github.com/arcboxlabs/arcbox/commit/e95f865de05d2eb808297199ab52ca1ef83604d8))
+* **vmm:** preserve block io ordering ([52489da](https://github.com/arcboxlabs/arcbox/commit/52489da1238fe801746bbfc621a59d2185294981))
+* **vmm:** preserve block worker capacity after rebase ([f2cc061](https://github.com/arcboxlabs/arcbox/commit/f2cc0613d7511b5172807195d540dd040f8b703b))
+* **vsock:** use non-blocking read in remove_closes_fd test ([66b0ffc](https://github.com/arcboxlabs/arcbox/commit/66b0ffc9481ac747e0ab80c1d3cdb83bbad9d2ea))
+
+
+### Code Refactoring
+
+* **agent:** report fstrim failure via agent error, not text parsing ([10e5ba8](https://github.com/arcboxlabs/arcbox/commit/10e5ba84625fb96afd7fa6556eaee98d3f5f4d2e))
+* **blk:** split virtio block device ([282efb5](https://github.com/arcboxlabs/arcbox/commit/282efb51002482189d14f5cb4804c36a8d014ed6))
+* **core:** consolidate agent unary rpc ([12c237b](https://github.com/arcboxlabs/arcbox/commit/12c237bdd2d5c536e7a88fc597be1e2ae1b3d5b3))
+* **core:** move machine tests out of manager ([110e229](https://github.com/arcboxlabs/arcbox/commit/110e2294d038cfa15bf22feb30b9dc2cee2ac458))
+* **core:** split agent client internals ([2436197](https://github.com/arcboxlabs/arcbox/commit/243619798f512c8e86d84000f55895680eeefbb2))
+* **core:** split boot asset module ([0dc0c7c](https://github.com/arcboxlabs/arcbox/commit/0dc0c7c6473c5002ba69a51cb7cbe366ba5465f6))
+* **core:** split runtime helpers ([566adcc](https://github.com/arcboxlabs/arcbox/commit/566adcc68ae59da076b7ebd88fd97417dcc4eec9))
+* **core:** split vm lifecycle types ([6e80f9d](https://github.com/arcboxlabs/arcbox/commit/6e80f9d59159d9eec5ee237da7816752fef7fb93))
+* **core:** split vm types and tests ([c5bcbd7](https://github.com/arcboxlabs/arcbox/commit/c5bcbd7e092c4dc48e6af92c2c4161048e5be8de))
+* **fs:** split fuse dispatcher ([cfd1ebc](https://github.com/arcboxlabs/arcbox/commit/cfd1ebcf045ab1c4061fed4aa1ab125151aa5fc1))
+* **fs:** split passthrough filesystem ([2af0443](https://github.com/arcboxlabs/arcbox/commit/2af0443aa90ce18d74a4ce939bdb0fa692c67dc2))
+* **fs:** split virtio fs device ([1cfd756](https://github.com/arcboxlabs/arcbox/commit/1cfd7566e12ea24cf030e220f403956a5a9318cf))
+* **hypervisor:** split darwin vm ([9779325](https://github.com/arcboxlabs/arcbox/commit/97793257d7a6588827de383a4593fe2e3e1fb733))
+* **hypervisor:** split linux vm ([91f620f](https://github.com/arcboxlabs/arcbox/commit/91f620f6003205346b7164e092b030ba2a00f035))
+* **net:** split darwin datapath loop ([e2a5990](https://github.com/arcboxlabs/arcbox/commit/e2a59901c53822626ed3ba8424e3da5b8b092872))
+* **net:** split virtio net device ([f5f880e](https://github.com/arcboxlabs/arcbox/commit/f5f880ed71e8721e7bb09c81b79955d7a8ca0871))
+* **oci:** split runtime config ([03e81c0](https://github.com/arcboxlabs/arcbox/commit/03e81c0ddafe5c1e118027798d57ee34f810d1a5))
+* **packet:** split ethernet helpers ([dae1f03](https://github.com/arcboxlabs/arcbox/commit/dae1f039ea3520492bf44e68cbb838e68de0b631))
+* **splicetcp:** split tcp bridge ([6c559ff](https://github.com/arcboxlabs/arcbox/commit/6c559ff2127c874538ed6ad8f40b3b71ce425f7d))
+* **vmm:** split darwin hv backend ([0be28c2](https://github.com/arcboxlabs/arcbox/commit/0be28c2006dc622e4a95634aca9b047652100398))
+* **vmm:** split device manager ([0416c4b](https://github.com/arcboxlabs/arcbox/commit/0416c4b69bd70319bed2cdf4503b060af0463872))
+* **vmm:** split irq chip ([59538d3](https://github.com/arcboxlabs/arcbox/commit/59538d35b0e05639d97b7e137e626ade510cb563))
+* **vmm:** split manager core ([585255d](https://github.com/arcboxlabs/arcbox/commit/585255dd27d88133f8ff5b292999cd42b5906ada))
+* **vmm:** split snapshot manager ([6648135](https://github.com/arcboxlabs/arcbox/commit/6648135b0ac548b5922043c093dd21ba46979a7f))
+* **vm:** split sandbox manager ([d61fed2](https://github.com/arcboxlabs/arcbox/commit/d61fed287b407ba2b66a4a08f3e10a9fd9b071e5))
+* **vsock:** split connection manager ([a46ba93](https://github.com/arcboxlabs/arcbox/commit/a46ba93cfc8c2052361e06f8258ac806357cdc00))
+* **vsock:** split virtio device internals ([1060d7c](https://github.com/arcboxlabs/arcbox/commit/1060d7c0122039692a5da3779c970463f954c649))
+* **xtask:** fully adopt shared xtask utilities ([7e1c545](https://github.com/arcboxlabs/arcbox/commit/7e1c545418c9eb93daa0ea942519fdf02c98da88))
+* **xtask:** reuse shared xtask utilities ([b088a11](https://github.com/arcboxlabs/arcbox/commit/b088a11ab3462157eda21f6368a3ace8d24bf9ca))
+
+
+### Tests
+
+* **hv_e2e:** prove busybox-init agent supervision end-to-end ([1a855e7](https://github.com/arcboxlabs/arcbox/commit/1a855e78c4b7fbd733cc3ec2d033c0a5e0fada1f))
+* **vsock:** assert EOF on peer end in remove_closes_fd ([edcbd5a](https://github.com/arcboxlabs/arcbox/commit/edcbd5a9a964b91e41fcf0e344585c0fc0d542d5))
+
+
+### Styles
+
+* **fs:** format virtio fs device tests ([2c5e63d](https://github.com/arcboxlabs/arcbox/commit/2c5e63d1e936d095f314bbe067de826bad3af32c))
+* **vsock:** rustfmt the remove_closes_fd assertion ([99b893d](https://github.com/arcboxlabs/arcbox/commit/99b893d9b265b0a473c4a7f94eed731b10ea1a36))
+
+
+### Build System
+
+* **rust:** bump workspace toolchain to 1.96 ([a30d30e](https://github.com/arcboxlabs/arcbox/commit/a30d30eda2e5bfa93190b55e9708fbac0b36eeb6))
+
+
+### Miscellaneous Chores
+
+* **assets:** pin boot assets to 0.6.0 (busybox-init rootfs) ([c5e5ba2](https://github.com/arcboxlabs/arcbox/commit/c5e5ba297f9930aa806bf1e3077bb7ef73bb02ad))
+* **assets:** re-pin boot assets to 0.6.1 (rcS init fail-fast) ([703b563](https://github.com/arcboxlabs/arcbox/commit/703b5630734a679957004fcc2f14eab3f894c974))
+
 ## [0.4.12](https://github.com/arcboxlabs/arcbox/compare/v0.4.11...v0.4.12) (2026-06-25)
 
 
