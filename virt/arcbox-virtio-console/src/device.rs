@@ -58,6 +58,43 @@ impl ConsolePort {
             output_buffer: VecDeque::with_capacity(4096),
         }
     }
+
+    /// Drains all complete (newline-terminated) lines from `output_buffer`,
+    /// returning them trimmed. Bytes after the last newline stay buffered.
+    fn take_complete_lines(&mut self) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Some(pos) = self.output_buffer.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.output_buffer.drain(..=pos).collect();
+            if let Ok(s) = std::str::from_utf8(&line) {
+                lines.push(s.trim_end().to_string());
+            }
+        }
+        lines
+    }
+
+    /// Drains everything, including a final line with no trailing newline — e.g.
+    /// a kernel panic or a crash's dying line that would otherwise be lost when
+    /// the device is reset or dropped. Empty trailing fragments are skipped.
+    fn take_all_lines(&mut self) -> Vec<String> {
+        let mut lines = self.take_complete_lines();
+        if !self.output_buffer.is_empty() {
+            let rest: Vec<u8> = self.output_buffer.drain(..).collect();
+            if let Ok(s) = std::str::from_utf8(&rest) {
+                let trimmed = s.trim_end();
+                if !trimmed.is_empty() {
+                    lines.push(trimmed.to_string());
+                }
+            }
+        }
+        lines
+    }
+}
+
+/// Emits captured guest console lines to the host `guest_console` log target.
+fn emit_console_lines(lines: Vec<String>) {
+    for line in lines {
+        tracing::info!(target: "guest_console", "{line}");
+    }
 }
 
 /// `VirtIO` console device.
@@ -405,7 +442,9 @@ impl VirtioDevice for VirtioConsole {
         for port in &mut self.ports {
             port.open = false;
             port.input_buffer.clear();
-            port.output_buffer.clear();
+            // Flush any final partial line (e.g. a panic message with no trailing
+            // newline) before discarding the buffer, so the dying line isn't lost.
+            emit_console_lines(port.take_all_lines());
         }
     }
 
@@ -466,13 +505,10 @@ impl VirtioDevice for VirtioConsole {
                 }
                 if let Some(port) = self.ports.first_mut() {
                     port.output_buffer.extend(data.iter().copied());
-                    // Flush on newline.
-                    while let Some(pos) = port.output_buffer.iter().position(|&b| b == b'\n') {
-                        let line: Vec<u8> = port.output_buffer.drain(..=pos).collect();
-                        if let Ok(s) = std::str::from_utf8(&line) {
-                            tracing::info!(target: "guest_console", "{}", s.trim_end());
-                        }
-                    }
+                    // Emit complete (newline-terminated) lines; any trailing
+                    // partial stays buffered for the next batch (or is flushed
+                    // on reset/drop).
+                    emit_console_lines(port.take_complete_lines());
                 }
                 total_len += desc.len;
             }
@@ -481,6 +517,16 @@ impl VirtioDevice for VirtioConsole {
 
         queue.push_used_batch(&completions);
         Ok(completions)
+    }
+}
+
+impl Drop for VirtioConsole {
+    fn drop(&mut self) {
+        // Capture any final partial line buffered on each port (a panic/crash
+        // message that never got a trailing newline) before teardown loses it.
+        for port in &mut self.ports {
+            emit_console_lines(port.take_all_lines());
+        }
     }
 }
 
@@ -690,5 +736,32 @@ mod tests {
         // Input fully consumed; a second call is a no-op (no fresh avail entries).
         assert_eq!(console.rx_available(), 0);
         assert!(!console.process_rx_queue(&mut mem, &qc).unwrap());
+    }
+
+    #[test]
+    fn take_complete_lines_leaves_trailing_partial_buffered() {
+        let mut port = ConsolePort::new(0);
+        port.output_buffer
+            .extend(b"first\nsecond\npartial no newline");
+
+        // Only the newline-terminated lines come out; the partial stays buffered.
+        assert_eq!(port.take_complete_lines(), vec!["first", "second"]);
+        assert!(!port.output_buffer.is_empty());
+    }
+
+    #[test]
+    fn take_all_lines_flushes_the_dying_partial_line() {
+        let mut port = ConsolePort::new(0);
+        // A panic message that never got a trailing newline before teardown.
+        port.output_buffer
+            .extend(b"Kernel panic - not syncing: Attempted to kill init");
+
+        // take_complete_lines would drop it (no newline); take_all_lines keeps it.
+        let lines = port.take_all_lines();
+        assert_eq!(
+            lines,
+            vec!["Kernel panic - not syncing: Attempted to kill init"]
+        );
+        assert!(port.output_buffer.is_empty());
     }
 }
