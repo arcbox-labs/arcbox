@@ -42,6 +42,7 @@ pub enum BlkRequestType {
     Write,
     Flush,
     GetId,
+    Unsupported,
     /// DISCARD — deallocate (hole-punch) the listed ranges from the backing
     /// image. The range list travels in the read-only data descriptors.
     Discard,
@@ -239,12 +240,10 @@ pub fn blk_io_worker_loop(ctx: BlkWorkerContext, rx: std::sync::mpsc::Receiver<B
             }
         }
 
-        // Process batch in segments split at Flush/GetId boundaries.
-        // Within each segment, Read/Write items are sorted by (type, sector)
-        // for merge-friendly ordering. Flush/GetId items are processed after
-        // all preceding Read/Write items complete, preserving durability
-        // semantics: a Flush must not overtake a Write from the same batch.
-        process_batch(&ctx, &mut batch);
+        // Process batch in segments split at Flush/GetId boundaries. Adjacent
+        // compatible Read/Write items may be merged, but FIFO order is preserved
+        // so reads cannot overtake earlier writes.
+        process_batch(&ctx, &batch);
 
         let new_used = read_used_idx(&ctx.guest_mem, used_addr);
 
@@ -262,11 +261,10 @@ pub fn blk_io_worker_loop(ctx: BlkWorkerContext, rx: std::sync::mpsc::Receiver<B
 
 /// Processes a batch of work items, splitting at Flush/GetId boundaries.
 ///
-/// Within each segment of Read/Write items, we sort by (type, sector) for
-/// merge-friendly ordering. Flush/GetId items execute only after all
-/// preceding Read/Write items in the batch have completed, preserving the
-/// guest's durability invariant: `[Write, Flush]` must not be reordered.
-fn process_batch(ctx: &BlkWorkerContext, batch: &mut [BlkWorkItem]) {
+/// Within each segment of Read/Write items, we merge only already-adjacent
+/// same-type contiguous requests. We must preserve virtqueue FIFO order:
+/// reordering a read ahead of an earlier write can return stale data.
+fn process_batch(ctx: &BlkWorkerContext, batch: &[BlkWorkItem]) {
     let mut start = 0;
     while start < batch.len() {
         // Find the end of this Read/Write segment (up to next Flush/GetId).
@@ -280,21 +278,7 @@ fn process_batch(ctx: &BlkWorkerContext, batch: &mut [BlkWorkItem]) {
             seg_end += 1;
         }
 
-        // Sort the Read/Write segment by (type, sector) for merging.
-        if seg_end - start > 1 {
-            batch[start..seg_end].sort_unstable_by(|a, b| {
-                let type_ord = |t: &BlkRequestType| match t {
-                    BlkRequestType::Read => 0u8,
-                    BlkRequestType::Write => 1,
-                    _ => 2,
-                };
-                type_ord(&a.request_type)
-                    .cmp(&type_ord(&b.request_type))
-                    .then(a.sector.cmp(&b.sector))
-            });
-        }
-
-        // Process the sorted Read/Write segment with merging.
+        // Process in original order, merging only adjacent compatible items.
         let mut i = start;
         while i < seg_end {
             let item = &batch[i];
@@ -355,6 +339,7 @@ fn process_item(ctx: &BlkWorkerContext, item: &BlkWorkItem) {
             process_flush(ctx)
         }
         BlkRequestType::GetId => process_get_id(ctx, item),
+        BlkRequestType::Unsupported => 2, // VIRTIO_BLK_S_UNSUPP
         BlkRequestType::Discard => process_discard(ctx, item),
         BlkRequestType::WriteZeroes => process_write_zeroes(ctx, item),
     };
@@ -406,8 +391,13 @@ fn process_read(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
         return 0;
     }
     let expected_len = iovecs.iter().map(|iov| iov.iov_len).sum::<usize>();
-    let Some(byte_offset) = item.sector.checked_mul(u64::from(ctx.blk_size)) else {
-        tracing::warn!("blk read: sector offset overflow: {}", item.sector);
+    let Ok((byte_offset, _)) = arcbox_virtio::blk::checked_io_byte_range(
+        item.sector,
+        expected_len,
+        ctx.blk_size,
+        ctx.capacity_sectors,
+    ) else {
+        tracing::warn!("blk read: range out of capacity at sector {}", item.sector);
         return 1;
     };
     #[allow(clippy::cast_possible_wrap)]
@@ -457,8 +447,13 @@ fn process_write(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
         return 0;
     }
     let expected_len = iovecs.iter().map(|iov| iov.iov_len).sum::<usize>();
-    let Some(byte_offset) = item.sector.checked_mul(u64::from(ctx.blk_size)) else {
-        tracing::warn!("blk write: sector offset overflow: {}", item.sector);
+    let Ok((byte_offset, _)) = arcbox_virtio::blk::checked_io_byte_range(
+        item.sector,
+        expected_len,
+        ctx.blk_size,
+        ctx.capacity_sectors,
+    ) else {
+        tracing::warn!("blk write: range out of capacity at sector {}", item.sector);
         return 1;
     };
     #[allow(clippy::cast_possible_wrap)]
@@ -517,33 +512,37 @@ fn process_merged(ctx: &BlkWorkerContext, items: &[BlkWorkItem]) {
                         iov_base: buf.as_mut_ptr().cast(),
                         iov_len: buf.len(),
                     });
+                } else {
+                    tracing::warn!("blk merged read: GPA {:#x} len {} out of bounds", gpa, len);
+                    complete_merged(ctx, items, 1);
+                    return;
                 }
             } else if let Some(buf) = ctx.guest_mem.slice(gpa as usize, len as usize) {
                 iovecs.push(libc::iovec {
                     iov_base: buf.as_ptr().cast_mut().cast(),
                     iov_len: buf.len(),
                 });
+            } else {
+                tracing::warn!("blk merged write: GPA {:#x} len {} out of bounds", gpa, len);
+                complete_merged(ctx, items, 1);
+                return;
             }
         }
     }
 
     // Single merged I/O syscall.
     let expected_len = iovecs.iter().map(|iov| iov.iov_len).sum::<usize>();
-    let Some(byte_offset) = start_sector.checked_mul(u64::from(ctx.blk_size)) else {
-        tracing::warn!("blk merged: sector offset overflow: {}", start_sector);
-        for item in items {
-            ctx.guest_mem.write_byte(item.status_gpa as usize, 1);
-            write_used_entry(
-                &ctx.guest_mem,
-                item.used_addr,
-                item.queue_size,
-                item.head_idx,
-                1,
-            );
-        }
-        ctx.flush_barrier
-            .in_flight
-            .fetch_sub(items.len() as u32, Ordering::Release);
+    let Ok((byte_offset, _)) = arcbox_virtio::blk::checked_io_byte_range(
+        start_sector,
+        expected_len,
+        ctx.blk_size,
+        ctx.capacity_sectors,
+    ) else {
+        tracing::warn!(
+            "blk merged: range out of capacity at sector {}",
+            start_sector
+        );
+        complete_merged(ctx, items, 1);
         return;
     };
     #[allow(clippy::cast_possible_wrap)]
@@ -576,7 +575,21 @@ fn process_merged(ctx: &BlkWorkerContext, items: &[BlkWorkItem]) {
         0
     };
 
-    // Write individual used ring entries for each item.
+    complete_merged(ctx, items, status);
+
+    tracing::trace!(
+        "blk merged {} items: sector {}..+{}, {} iovecs, {} bytes",
+        items.len(),
+        start_sector,
+        items.last().map_or(0, |i| i.sector
+            + u64::from(i.total_data_len) / u64::from(ctx.blk_size))
+            - start_sector,
+        iovecs.len(),
+        n,
+    );
+}
+
+fn complete_merged(ctx: &BlkWorkerContext, items: &[BlkWorkItem], status: u8) {
     for item in items {
         ctx.guest_mem.write_byte(item.status_gpa as usize, status);
         let total_bytes = if status == 0 {
@@ -596,17 +609,6 @@ fn process_merged(ctx: &BlkWorkerContext, items: &[BlkWorkItem]) {
     ctx.flush_barrier
         .in_flight
         .fetch_sub(items.len() as u32, Ordering::Release);
-
-    tracing::trace!(
-        "blk merged {} items: sector {}..+{}, {} iovecs, {} bytes",
-        items.len(),
-        start_sector,
-        items.last().map_or(0, |i| i.sector
-            + u64::from(i.total_data_len) / u64::from(ctx.blk_size))
-            - start_sector,
-        iovecs.len(),
-        n,
-    );
 }
 
 fn process_flush(ctx: &BlkWorkerContext) -> u8 {
@@ -977,7 +979,7 @@ impl BlkWorkerHandle {
                                 8 => BlkRequestType::GetId,
                                 11 => BlkRequestType::Discard,
                                 13 => BlkRequestType::WriteZeroes,
-                                _ => BlkRequestType::Read,
+                                _ => BlkRequestType::Unsupported,
                             };
                         }
                     }
@@ -1061,6 +1063,124 @@ impl FlushBarrier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_context<'a>(mem: &'a mut [u8], raw_fd: i32, capacity_sectors: u64) -> BlkWorkerContext {
+        BlkWorkerContext {
+            // SAFETY: test memory outlives the returned context.
+            guest_mem: unsafe { GuestMemWriter::new(mem.as_mut_ptr(), mem.len(), 0) },
+            raw_fd,
+            blk_size: 512,
+            capacity_sectors,
+            read_only: false,
+            device_id: "test-blk".to_string(),
+            mmio_state: Arc::new(RwLock::new(VirtioMmioState::new(2, 0))),
+            irq_callback: Arc::new(|_, _| Ok(())),
+            irq: 32,
+            running: Arc::new(AtomicBool::new(true)),
+            flush_barrier: Arc::new(FlushBarrier::new()),
+        }
+    }
+
+    fn work_item(
+        request_type: BlkRequestType,
+        sector: u64,
+        buffers: Vec<(u64, u32, bool)>,
+        status_gpa: u64,
+    ) -> BlkWorkItem {
+        let total_data_len = buffers
+            .iter()
+            .filter(|(_, len, _)| *len > 1)
+            .map(|(_, len, _)| *len)
+            .sum();
+        BlkWorkItem {
+            head_idx: status_gpa as u16,
+            request_type,
+            sector,
+            buffers,
+            status_gpa,
+            total_data_len,
+            used_addr: 2048,
+            avail_addr: 3072,
+            queue_size: 8,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_preserves_write_then_read_order() {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        temp.write_all(&vec![0u8; 4096]).unwrap();
+        temp.as_file().sync_all().unwrap();
+
+        let mut mem = vec![0u8; 4096];
+        mem[0..512].fill(0xAB);
+        let ctx = test_context(&mut mem, temp.as_file().as_raw_fd(), 8);
+        let batch = vec![
+            work_item(BlkRequestType::Write, 0, vec![(0, 512, false)], 1500),
+            work_item(BlkRequestType::Read, 0, vec![(512, 512, true)], 1501),
+        ];
+
+        process_batch(&ctx, &batch);
+
+        assert_eq!(mem[1500], 0);
+        assert_eq!(mem[1501], 0);
+        assert!(mem[512..1024].iter().all(|&b| b == 0xAB));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_past_capacity_is_rejected() {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        temp.write_all(&vec![0u8; 4096]).unwrap();
+        temp.as_file().sync_all().unwrap();
+
+        let mut mem = vec![0xCCu8; 4096];
+        let ctx = test_context(&mut mem, temp.as_file().as_raw_fd(), 8);
+        let item = work_item(BlkRequestType::Write, 7, vec![(0, 1024, false)], 1500);
+
+        assert_eq!(process_write(&ctx, &item), 1);
+        assert_eq!(std::fs::metadata(temp.path()).unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn unsupported_request_completes_unsupp() {
+        let mut mem = vec![0u8; 4096];
+        let ctx = test_context(&mut mem, -1, 8);
+        let item = work_item(BlkRequestType::Unsupported, 0, Vec::new(), 1500);
+
+        process_item(&ctx, &item);
+
+        assert_eq!(mem[1500], 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merged_oob_buffer_fails_group() {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+
+        let mut temp = tempfile::NamedTempFile::new().unwrap();
+        temp.write_all(&vec![0xDDu8; 4096]).unwrap();
+        temp.as_file().sync_all().unwrap();
+
+        let mut mem = vec![0u8; 4096];
+        let ctx = test_context(&mut mem, temp.as_file().as_raw_fd(), 8);
+        let batch = vec![
+            work_item(BlkRequestType::Read, 0, vec![(0, 512, true)], 1500),
+            work_item(BlkRequestType::Read, 1, vec![(4090, 512, true)], 1501),
+        ];
+
+        process_batch(&ctx, &batch);
+
+        assert_eq!(mem[1500], 1);
+        assert_eq!(mem[1501], 1);
+    }
 
     /// The HV worker's DISCARD path must actually reclaim host blocks — this is
     /// the path the macOS backend uses, where DISCARD previously fell through to

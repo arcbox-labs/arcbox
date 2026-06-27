@@ -10,7 +10,7 @@ use arcbox_virtio_core::{QueueConfig, VirtioDevice, VirtioDeviceId, virtio_bindi
 
 use crate::request::{
     BlockConfig, BlockRequestHeader, BlockRequestType, BlockStatus, WRITE_ZEROES_FLAG_UNMAP,
-    parse_range_list,
+    checked_io_byte_range, parse_range_list,
 };
 
 /// `VirtIO` block device.
@@ -244,25 +244,41 @@ impl VirtioBlock {
             .raw_fd
             .ok_or_else(|| VirtioError::NotReady("Block device not activated".into()))?;
 
+        let (offset, _) = checked_io_byte_range(
+            sector,
+            data.len(),
+            self.config.blk_size,
+            self.config.capacity,
+        )?;
         #[allow(clippy::cast_possible_wrap)]
-        let offset = (sector * u64::from(self.config.blk_size)) as libc::off_t;
-        // SAFETY: fd is valid, data is a valid mutable buffer.
-        let n = unsafe {
-            libc::pread(
-                fd,
-                data.as_mut_ptr().cast::<libc::c_void>(),
-                data.len(),
-                offset,
-            )
-        };
-        if n < 0 {
-            return Err(VirtioError::Io(format!(
-                "pread failed at sector {}: {}",
-                sector,
-                std::io::Error::last_os_error()
-            )));
+        let mut off = offset as libc::off_t;
+        let mut read = 0usize;
+        while read < data.len() {
+            // SAFETY: fd is valid, and `data[read..]` is a valid mutable buffer.
+            let n = unsafe {
+                libc::pread(
+                    fd,
+                    data[read..].as_mut_ptr().cast::<libc::c_void>(),
+                    data.len() - read,
+                    off,
+                )
+            };
+            if n < 0 {
+                return Err(VirtioError::Io(format!(
+                    "pread failed at sector {}: {}",
+                    sector,
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if n == 0 {
+                return Err(VirtioError::Io(format!(
+                    "pread reached EOF before completing sector {sector}"
+                )));
+            }
+            read += n as usize;
+            off += n as libc::off_t;
         }
-        Ok(n as usize)
+        Ok(data.len())
     }
 
     /// Writes to disk using pwrite — no seek, no lock, position-independent.
@@ -275,19 +291,41 @@ impl VirtioBlock {
             .raw_fd
             .ok_or_else(|| VirtioError::NotReady("Block device not activated".into()))?;
 
+        let (offset, _) = checked_io_byte_range(
+            sector,
+            data.len(),
+            self.config.blk_size,
+            self.config.capacity,
+        )?;
         #[allow(clippy::cast_possible_wrap)]
-        let offset = (sector * u64::from(self.config.blk_size)) as libc::off_t;
-        // SAFETY: fd is valid, data is a valid buffer.
-        let n =
-            unsafe { libc::pwrite(fd, data.as_ptr().cast::<libc::c_void>(), data.len(), offset) };
-        if n < 0 {
-            return Err(VirtioError::Io(format!(
-                "pwrite failed at sector {}: {}",
-                sector,
-                std::io::Error::last_os_error()
-            )));
+        let mut off = offset as libc::off_t;
+        let mut written = 0usize;
+        while written < data.len() {
+            // SAFETY: fd is valid, and `data[written..]` is a valid buffer.
+            let n = unsafe {
+                libc::pwrite(
+                    fd,
+                    data[written..].as_ptr().cast::<libc::c_void>(),
+                    data.len() - written,
+                    off,
+                )
+            };
+            if n < 0 {
+                return Err(VirtioError::Io(format!(
+                    "pwrite failed at sector {}: {}",
+                    sector,
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if n == 0 {
+                return Err(VirtioError::Io(format!(
+                    "pwrite made no progress at sector {sector}"
+                )));
+            }
+            written += n as usize;
+            off += n as libc::off_t;
         }
-        Ok(n as usize)
+        Ok(data.len())
     }
 
     fn handle_flush(&self) -> Result<usize> {
@@ -1194,5 +1232,16 @@ mod tests {
         bytes.extend_from_slice(&0u32.to_le_bytes());
 
         assert!(device.handle_write_zeroes_list(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_handle_write_rejects_past_capacity() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(&vec![0u8; 4096]).unwrap();
+
+        let device = VirtioBlock::from_path(temp_file.path(), false).unwrap();
+
+        assert!(device.handle_write(7, &[0xAB; 1024]).is_err());
+        assert_eq!(std::fs::metadata(temp_file.path()).unwrap().len(), 4096);
     }
 }

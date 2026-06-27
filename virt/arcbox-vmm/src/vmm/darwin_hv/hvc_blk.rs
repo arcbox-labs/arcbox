@@ -29,7 +29,7 @@ pub const ARCBOX_HVC_BLK_FLUSH: u64 = 0xC200_0003;
 /// `is_write`: false=pread, true=pwrite.
 pub fn handle_hvc_blk_io(
     vcpu: &arcbox_hv::HvVcpu,
-    hvc_blk_fds: &[(i32, u32)],
+    hvc_blk_fds: &[(i32, u32, u64)],
     device_manager: &crate::device::DeviceManager,
     is_write: bool,
 ) -> u64 {
@@ -51,7 +51,7 @@ pub fn handle_hvc_blk_io(
         return (-libc::EINVAL as i64) as u64;
     }
 
-    let Some(&(raw_fd, blk_size)) = hvc_blk_fds.get(device_idx as usize) else {
+    let Some(&(raw_fd, blk_size, capacity_sectors)) = hvc_blk_fds.get(device_idx as usize) else {
         return (-libc::ENODEV as i64) as u64;
     };
 
@@ -75,7 +75,9 @@ pub fn handle_hvc_blk_io(
     // live host mapping tracked by `DeviceManager` for the VM's lifetime.
     let host_ptr = unsafe { ram_base.add(gpa - gpa_base) };
 
-    let Some(byte_offset) = sector.checked_mul(u64::from(blk_size)) else {
+    let Ok((byte_offset, _)) =
+        arcbox_virtio::blk::checked_io_byte_range(sector, byte_len, blk_size, capacity_sectors)
+    else {
         return (-libc::EINVAL as i64) as u64;
     };
     #[allow(clippy::cast_possible_wrap)]
@@ -96,15 +98,18 @@ pub fn handle_hvc_blk_io(
             .unwrap_or(libc::EIO);
         return (-errno as i64) as u64;
     }
-    n as u64
+    if n as usize != byte_len {
+        return (-libc::EIO as i64) as u64;
+    }
+    byte_len as u64
 }
 
 /// HVC block flush (fsync). X1=device_idx.
-pub fn handle_hvc_blk_flush(vcpu: &arcbox_hv::HvVcpu, hvc_blk_fds: &[(i32, u32)]) -> u64 {
+pub fn handle_hvc_blk_flush(vcpu: &arcbox_hv::HvVcpu, hvc_blk_fds: &[(i32, u32, u64)]) -> u64 {
     let Ok(device_idx) = vcpu.get_reg(X1) else {
         return (-libc::EINVAL as i64) as u64;
     };
-    let Some(&(raw_fd, _)) = hvc_blk_fds.get(device_idx as usize) else {
+    let Some(&(raw_fd, _, _)) = hvc_blk_fds.get(device_idx as usize) else {
         return (-libc::ENODEV as i64) as u64;
     };
     // SAFETY: `raw_fd` is an open fd from `hvc_blk_fds` owned by the VMM;

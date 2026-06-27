@@ -117,6 +117,39 @@ impl DiscardWriteZeroesRange {
     }
 }
 
+/// Converts a normal read/write request to a checked byte range.
+///
+/// # Errors
+///
+/// Returns an error if the byte offset overflows, the requested byte length
+/// overflows the device capacity, or the request extends past capacity.
+pub fn checked_io_byte_range(
+    sector: u64,
+    byte_len: usize,
+    blk_size: u32,
+    capacity_sectors: u64,
+) -> std::result::Result<(u64, u64), VirtioError> {
+    let block_size = u64::from(blk_size);
+    let capacity_bytes = capacity_sectors
+        .checked_mul(block_size)
+        .ok_or_else(|| VirtioError::InvalidOperation("device capacity overflow".into()))?;
+    let start = sector
+        .checked_mul(block_size)
+        .ok_or_else(|| VirtioError::InvalidOperation("I/O byte offset overflow".into()))?;
+    let len = u64::try_from(byte_len)
+        .map_err(|_| VirtioError::InvalidOperation("I/O byte length overflow".into()))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| VirtioError::InvalidOperation("I/O byte end overflow".into()))?;
+    if end > capacity_bytes {
+        return Err(VirtioError::InvalidOperation(format!(
+            "I/O exceeds device capacity: bytes {}..{} > {}",
+            start, end, capacity_bytes
+        )));
+    }
+    Ok((start, end))
+}
+
 /// `VirtIO` block request types.
 ///
 /// Values sourced from `virtio_bindings::virtio_blk::VIRTIO_BLK_T_*`.

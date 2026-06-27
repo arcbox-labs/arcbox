@@ -554,10 +554,12 @@ impl Vmm {
         // Build HVC fast-path fd table from all block devices.
         // device_idx 0 = first block device (vda), 1 = second (vdb), etc.
         {
-            let fds: Vec<(i32, u32)> = self
+            let fds: Vec<(i32, u32, u64)> = self
                 .hv_blk_devices
                 .iter()
-                .map(|(_, raw_fd, blk_size, _, _, _, _)| (*raw_fd, *blk_size))
+                .map(|(_, raw_fd, blk_size, capacity_sectors, _, _, _)| {
+                    (*raw_fd, *blk_size, *capacity_sectors)
+                })
                 .collect();
             self.hvc_blk_fds = Arc::new(fds);
         }
