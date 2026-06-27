@@ -51,28 +51,43 @@ impl CredentialStore {
         let json = serde_json::to_vec_pretty(cred).context("serializing credential")?;
         // Write-then-rename so a crash mid-write can't leave a truncated
         // credentials.json that fails to parse and strands the host unenrolled.
-        // Permissions are restricted on the temp file before the rename, so the
-        // final path is never briefly world-readable.
+        // The temp file is created `0600` from the open(2) call, so the raw
+        // token is never briefly world-readable — not in the temp file and not
+        // (via rename, which preserves the mode) in the final path.
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json).with_context(|| format!("writing {}", tmp.display()))?;
-        restrict_permissions(&tmp)?;
+        write_private(&tmp, &json)?;
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("renaming {} -> {}", tmp.display(), self.path.display()))?;
         Ok(())
     }
 }
 
+/// Write `bytes` to `path`, owner-only (`0600`) from creation on Unix.
 #[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", path.display()))
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    // `mode` only takes effect when this call creates the file; a leftover temp
+    // from a crashed run keeps its old mode, so fchmod the open handle as a
+    // backstop (operating on the fd, never racing a path lookup).
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))
 }
 
+/// Windows ACL hardening is deferred to a later slice.
 #[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<()> {
-    // Windows ACL hardening is deferred to a later slice.
-    Ok(())
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]
