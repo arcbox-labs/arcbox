@@ -180,8 +180,17 @@ impl LifecycleShared {
             });
         }
 
+        // Time the fresh boot (VM start -> agent ready) so the boot latency is
+        // one greppable structured event against the <1.5s cold / <500ms warm
+        // targets. `boot` only runs on a fresh start, so no boot is ever
+        // double-counted.
+        let boot_start = std::time::Instant::now();
         self.start_with_retries(timeout).await?;
         self.wait_for_agent(timeout).await?;
+        tracing::info!(
+            boot_ms = boot_start.elapsed().as_millis() as u64,
+            "guest boot ready"
+        );
         self.sync_guest_clock().await;
 
         // Reset recovery counters on a fully successful boot.
