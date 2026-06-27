@@ -525,6 +525,7 @@ impl AgentClient {
         mut self,
         start_runtime_if_needed: bool,
         timeout: Duration,
+        trace_id: &str,
     ) -> Result<ReadinessEvent> {
         if !self.connected {
             self.connect().await?;
@@ -535,7 +536,7 @@ impl AgentClient {
             timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
         };
         let payload = req.encode_to_vec();
-        let buf = Self::build_message(MessageType::WatchReadinessRequest, "", &payload);
+        let buf = Self::build_message(MessageType::WatchReadinessRequest, trace_id, &payload);
 
         match &mut self.transport {
             AgentTransport::Async(t) => {
@@ -596,13 +597,14 @@ impl AgentClient {
         mut self,
         start_runtime_if_needed: bool,
         timeout: Duration,
+        trace_id: &str,
     ) -> Result<ReadinessEvent> {
         let req = WatchReadinessRequest {
             start_runtime_if_needed,
             timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
         };
         let payload = req.encode_to_vec();
-        let buf = Self::build_message(MessageType::WatchReadinessRequest, "", &payload);
+        let buf = Self::build_message(MessageType::WatchReadinessRequest, trace_id, &payload);
 
         let AgentTransport::Blocking(t) = &mut self.transport else {
             return Err(CoreError::Machine(

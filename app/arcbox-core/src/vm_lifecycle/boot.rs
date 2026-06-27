@@ -482,7 +482,10 @@ impl LifecycleShared {
 
     /// Waits for the agent to become ready.
     async fn wait_for_agent(&self, timeout: Duration) -> Result<()> {
-        tracing::debug!("Waiting for agent to become ready...");
+        // Per-boot correlation id: stamped on every readiness RPC so the host's
+        // wait logs and the guest's RPC-dispatch logs can be matched for one boot.
+        let boot_id = uuid::Uuid::new_v4().to_string();
+        tracing::debug!(boot_id = %boot_id, "Waiting for agent to become ready...");
 
         enum AgentProbe {
             Ready,
@@ -491,6 +494,7 @@ impl LifecycleShared {
 
         let mm = Arc::clone(&self.machine_manager);
         let machine_name = self.machine_name.clone();
+        let boot_id_blocking = boot_id.clone();
 
         // Run the entire probe loop on a blocking thread. On macOS HV backend,
         // the agent transport is AF_UNIX socketpair → BlockingVsockTransport.
@@ -555,7 +559,7 @@ impl LifecycleShared {
                         if remaining.is_zero() {
                             return Err(agent_timeout_error(last_readiness_err.as_deref()));
                         }
-                        match agent.watch_readiness_blocking(false, remaining) {
+                        match agent.watch_readiness_blocking(false, remaining, &boot_id_blocking) {
                             Ok(_) => return Ok(AgentProbe::Ready),
                             Err(e) => {
                                 tracing::debug!("agent not ready yet: {e}");
@@ -636,7 +640,7 @@ impl LifecycleShared {
                     if remaining.is_zero() {
                         return Err(agent_timeout_error(last_readiness_err.as_deref()));
                     }
-                    match agent.watch_readiness(false, remaining).await {
+                    match agent.watch_readiness(false, remaining, &boot_id).await {
                         Ok(_) => break,
                         Err(e) => {
                             tracing::debug!("agent not ready yet: {e}");
@@ -649,7 +653,7 @@ impl LifecycleShared {
         }
 
         // Back on async context — do async follow-up work.
-        tracing::info!("Agent is ready");
+        tracing::info!(boot_id = %boot_id, "Agent is ready");
         self.health_monitor.record_success();
         #[cfg(target_os = "macos")]
         {
