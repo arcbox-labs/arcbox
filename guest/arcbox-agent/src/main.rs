@@ -137,6 +137,13 @@ async fn main() -> Result<()> {
     if parse_mode(&std::env::args().collect::<Vec<_>>()) == Mode::Init {
         tracing::info!("Running one-shot system initialization");
         init::init_system();
+        // Fail fast (non-zero exit) if a writable layer the agent depends on did
+        // not mount, so rcS can halt/retry instead of respawning an agent that
+        // would run on the read-only EROFS rootfs and fail in obscure ways.
+        if let Err(e) = init::verify_critical_mounts() {
+            tracing::error!("system initialization incomplete: {e}");
+            return Err(anyhow::anyhow!("system initialization incomplete: {e}"));
+        }
         return Ok(());
     }
 

@@ -873,6 +873,51 @@ pub fn init_system() {
     tracing::warn!("init_system is only functional on Linux");
 }
 
+/// The writable tmpfs layers the long-running agent cannot function without:
+/// `/etc` (resolv.conf, hosts, docker config), `/run` and `/var` (containerd and
+/// dockerd state), and `/tmp`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const CRITICAL_MOUNTS: &[&str] = &["/etc", "/run", "/var", "/tmp"];
+
+/// Verifies the writable tmpfs layers the agent depends on actually mounted.
+///
+/// `init_system` is deliberately best-effort — it must never abort when it is
+/// PID 1. The one-shot `arcbox-agent init` step, however, is expected to exit, so
+/// it re-checks these post-conditions and treats a missing critical mount as
+/// fatal: otherwise the agent silently runs on the read-only EROFS rootfs (e.g.
+/// unable to write `/etc/resolv.conf`) and fails in obscure ways downstream.
+#[cfg(target_os = "linux")]
+pub fn verify_critical_mounts() -> Result<(), String> {
+    report_missing_mounts(CRITICAL_MOUNTS, crate::mount::is_mounted)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "must match the fallible Linux signature"
+)]
+pub fn verify_critical_mounts() -> Result<(), String> {
+    Ok(())
+}
+
+/// Pure core of [`verify_critical_mounts`]: returns an error naming the targets
+/// for which `is_mounted` is false. Split out so it is testable without `/proc`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn report_missing_mounts(
+    targets: &[&str],
+    is_mounted: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let missing: Vec<&str> = targets.iter().copied().filter(|t| !is_mounted(t)).collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "critical writable tmpfs mounts missing (agent would run on read-only EROFS): {}",
+            missing.join(", ")
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,5 +944,16 @@ mod tests {
         let json = docker_daemon_json();
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["features"]["containerd-snapshotter"], true);
+    }
+
+    #[test]
+    fn report_missing_mounts_flags_only_unmounted() {
+        // All mounted → Ok.
+        assert!(super::report_missing_mounts(super::CRITICAL_MOUNTS, |_| true).is_ok());
+
+        // /run not mounted → error names it but not the mounted /etc.
+        let err = super::report_missing_mounts(&["/etc", "/run"], |t| t == "/etc").unwrap_err();
+        assert!(err.contains("/run"));
+        assert!(!err.contains("/etc"));
     }
 }
