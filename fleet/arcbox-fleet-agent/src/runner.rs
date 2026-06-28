@@ -26,6 +26,18 @@ use tracing::{info, warn};
 use crate::docker::{DockerRunner, RunSpec};
 use crate::host;
 
+/// Give up resending a verdict after this many attempts (~5 min at the
+/// attach-loop resend interval), so a verdict whose awakeable no longer exists
+/// (job long concluded, workflow retention expired) cannot resend forever.
+const VERDICT_MAX_RESENDS: u32 = 30;
+
+/// A verdict sent to the gateway but not yet acknowledged. Held until an
+/// `OfferVerdictAck` arrives and resent meanwhile; `attempts` bounds the resends.
+struct Outstanding {
+    msg: attach_request::Msg,
+    attempts: u32,
+}
+
 /// Outcome of the admission decision for an incoming offer.
 #[derive(Debug, PartialEq, Eq)]
 enum Admission {
@@ -46,6 +58,11 @@ pub struct RunnerSupervisor {
 struct Inner {
     /// Outbound channel to the gateway (offer verdicts).
     events: mpsc::Sender<AttachRequest>,
+    /// Verdicts sent but not yet acknowledged by the gateway, keyed by
+    /// `offer_token`. Resent until an `OfferVerdictAck` arrives so a gateway
+    /// crash-after-read cannot lose the verdict; the gateway resolves the
+    /// awakeable idempotently, so resends are safe.
+    outstanding: DashMap<String, Outstanding>,
     /// Jobs currently running here — for duplicate detection and release.
     in_flight: DashMap<String, ()>,
     /// Abort handles for in-flight jobs, for `CancelRunner`.
@@ -87,6 +104,7 @@ impl RunnerSupervisor {
         Self {
             inner: Arc::new(Inner {
                 events,
+                outstanding: DashMap::new(),
                 in_flight: DashMap::new(),
                 cancels: DashMap::new(),
                 runner_dir,
@@ -274,22 +292,64 @@ impl RunnerSupervisor {
 
     /// Accept an offer (the runner has started).
     async fn accept(&self, job_id: &str, token: &str) {
-        self.send(attach_request::Msg::RunnerAccepted(RunnerAccepted {
-            job_id: job_id.to_owned(),
-            offer_token: token.to_owned(),
-        }))
+        self.send_verdict(
+            token,
+            attach_request::Msg::RunnerAccepted(RunnerAccepted {
+                job_id: job_id.to_owned(),
+                offer_token: token.to_owned(),
+            }),
+        )
         .await;
     }
 
     /// Reject an offer with a reason.
     async fn reject(&self, job_id: &str, token: &str, reason: &str) {
         info!(job_id, reason, "offer rejected");
-        self.send(attach_request::Msg::RunnerRejected(RunnerRejected {
-            job_id: job_id.to_owned(),
-            offer_token: token.to_owned(),
-            reason: reason.to_owned(),
-        }))
+        self.send_verdict(
+            token,
+            attach_request::Msg::RunnerRejected(RunnerRejected {
+                job_id: job_id.to_owned(),
+                offer_token: token.to_owned(),
+                reason: reason.to_owned(),
+            }),
+        )
         .await;
+    }
+
+    /// Record a verdict as outstanding (resent until acked) and send it once now.
+    async fn send_verdict(&self, token: &str, msg: attach_request::Msg) {
+        self.inner.outstanding.insert(
+            token.to_owned(),
+            Outstanding {
+                msg: msg.clone(),
+                attempts: 0,
+            },
+        );
+        self.send(msg).await;
+    }
+
+    /// Stop resending the verdict the gateway just acknowledged.
+    pub fn handle_ack(&self, offer_token: &str) {
+        self.inner.outstanding.remove(offer_token);
+    }
+
+    /// Resend every still-unacked verdict onto the egress queue, bounded by
+    /// [`VERDICT_MAX_RESENDS`]. Non-blocking (`try_send`): a full buffer or a
+    /// momentarily detached stream just retries on the next tick. Driven by the
+    /// attach loop's resend ticker and, implicitly, every reconnect.
+    pub fn resend_outstanding(&self) {
+        self.inner.outstanding.retain(|token, entry| {
+            if entry.attempts >= VERDICT_MAX_RESENDS {
+                warn!(offer_token = %token, "giving up on unacknowledged verdict");
+                return false;
+            }
+            entry.attempts += 1;
+            // Ignore send errors: outstanding stays, the next tick retries.
+            let _ = self.inner.events.try_send(AttachRequest {
+                msg: Some(entry.msg.clone()),
+            });
+            true
+        });
     }
 
     /// Send a verdict, awaiting channel capacity.
@@ -420,5 +480,59 @@ mod tests {
             sup.admit("rjob_c", "linux", "amd64", &idle()),
             Admission::Accept(Backend::Docker)
         );
+    }
+
+    fn supervisor_with_rx(capacity: usize) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
+        let (events, rx) = mpsc::channel(capacity);
+        let sup = RunnerSupervisor::new(
+            events,
+            Some(PathBuf::from("/nonexistent")),
+            None,
+            vec![capability("darwin", "arm64", Backend::HostRunner)],
+            0.9,
+            2048,
+        );
+        (sup, rx)
+    }
+
+    #[tokio::test]
+    async fn verdict_tracked_and_acked() {
+        let (sup, mut rx) = supervisor_with_rx(8);
+        sup.accept("rjob_a", "tok1").await;
+        assert!(sup.inner.outstanding.contains_key("tok1"));
+        assert!(matches!(
+            rx.try_recv().expect("verdict emitted").msg,
+            Some(attach_request::Msg::RunnerAccepted(_))
+        ));
+
+        // The ack stops tracking, so a later resend emits nothing for it.
+        sup.handle_ack("tok1");
+        assert!(!sup.inner.outstanding.contains_key("tok1"));
+        sup.resend_outstanding();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn resend_reemits_unacked_verdict() {
+        let (sup, mut rx) = supervisor_with_rx(8);
+        sup.reject("rjob_b", "tok2", "busy").await;
+        rx.try_recv().expect("initial verdict");
+
+        sup.resend_outstanding();
+        match rx.try_recv().expect("resend emitted").msg {
+            Some(attach_request::Msg::RunnerRejected(r)) => assert_eq!(r.offer_token, "tok2"),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resend_gives_up_after_cap() {
+        let (sup, _rx) = supervisor_with_rx(256);
+        sup.accept("rjob_c", "tok3").await;
+        // One resend per attempt up to the cap, then the entry is dropped.
+        for _ in 0..=VERDICT_MAX_RESENDS {
+            sup.resend_outstanding();
+        }
+        assert!(!sup.inner.outstanding.contains_key("tok3"));
     }
 }

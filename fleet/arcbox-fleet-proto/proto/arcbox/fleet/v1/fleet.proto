@@ -111,7 +111,17 @@ message AttachResponse {
     ProvisionRunner provision_runner = 1;
     CancelRunner cancel = 2;
     Drain drain = 3;
+    OfferVerdictAck offer_verdict_ack = 4;
   }
+}
+
+// Acknowledges that the gateway durably handed off the agent's offer verdict
+// (RunnerAccepted/RunnerRejected) to the workflow. Until it arrives, the agent
+// resends the same verdict so a gateway crash-after-read cannot lose it; the
+// echoed token lets the agent match the ack to the verdict it is retrying.
+message OfferVerdictAck {
+  // Opaque correlation token from the offer, echoed back from the verdict.
+  string offer_token = 1;
 }
 
 // Offer to run one job. The agent maps (os, arch) to a backend via its own
