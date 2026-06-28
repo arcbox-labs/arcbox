@@ -26,6 +26,10 @@ use crate::host;
 use crate::runner::RunnerSupervisor;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// How often to resend verdicts still awaiting an `OfferVerdictAck`. Comfortably
+/// longer than normal ack latency (sub-second), so the steady state is zero
+/// resends, yet short enough to recover a lost verdict within a placement window.
+const VERDICT_RESEND_INTERVAL: Duration = Duration::from_secs(10);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const OUTBOUND_CAPACITY: usize = 64;
@@ -54,6 +58,12 @@ pub async fn run(
         config.load_ceiling,
         config.mem_floor_mib,
     );
+
+    // Process-scoped: resend unacked verdicts across reconnects. Re-emitted
+    // verdicts ride the same egress queue, so the reconnect-survival machinery
+    // below (egress forwarding + `pending`) delivers them to whichever stream is
+    // live. Detached for the agent's lifetime; the agent never shuts down here.
+    spawn_verdict_resend(supervisor.clone());
 
     let mut backoff = INITIAL_BACKOFF;
     // An event pulled from the egress queue but not yet delivered when the
@@ -177,8 +187,28 @@ async fn dispatch(supervisor: &RunnerSupervisor, msg: Option<attach_response::Ms
         }
         Some(attach_response::Msg::Cancel(cancel)) => supervisor.handle_cancel(&cancel.job_id),
         Some(attach_response::Msg::Drain(_)) => supervisor.handle_drain(),
+        Some(attach_response::Msg::OfferVerdictAck(ack)) => {
+            supervisor.handle_ack(&ack.offer_token);
+        }
         None => {}
     }
+}
+
+/// Periodically resend verdicts still awaiting an `OfferVerdictAck`, until the
+/// gateway acks them (or the resend cap is hit). Process-scoped so it spans
+/// reconnects; the supervisor holds the egress sender, so resends route through
+/// the same outbound path as fresh verdicts.
+fn spawn_verdict_resend(supervisor: RunnerSupervisor) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(VERDICT_RESEND_INTERVAL);
+        // Skip the immediate first tick: a verdict just sent has not had time to
+        // be acked, so there is nothing to resend yet.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            supervisor.resend_outstanding();
+        }
+    })
 }
 
 /// Periodically push a declarative capability + telemetry heartbeat until the
