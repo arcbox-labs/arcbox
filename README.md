@@ -2,12 +2,12 @@
 
 # ArcBox
 
-**Sandboxed execution engine for AI agents, containers, and virtual machines.**
+**A fast, open-source container runtime for macOS — built from scratch in Rust, from hypervisor to CLI.**
 
-**Built from scratch in Rust -- from hypervisor to CLI.**
+**Drop-in Docker · Native Kubernetes · Full Linux machines.**
 
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+[![Rust](https://img.shields.io/badge/rust-1.96+-orange.svg)](https://www.rust-lang.org)
 [![Desktop](https://img.shields.io/github/v/release/arcboxlabs/arcbox-desktop?label=desktop&color=green)](https://github.com/arcboxlabs/arcbox-desktop/releases)
 [![Discord](https://img.shields.io/discord/1234567890?logo=discord&label=discord&color=5865F2)](https://arcbox.link/discord)
 [![Telegram](https://img.shields.io/badge/telegram-chat-26A5E4?logo=telegram)](https://arcbox.link/telegram)
@@ -19,126 +19,169 @@
 
 ## Why ArcBox
 
-Computer Use is the next frontier for AI -- agents that can write files, run code, browse the web, and operate a real machine. But giving an agent a full computer means giving it a full attack surface. Containers share the host kernel; a single exploit and the agent is out.
+ArcBox is an open-source alternative to Docker Desktop and OrbStack for macOS.
+Docker Desktop is the incumbent; OrbStack set the bar for running Docker on a Mac
+fast and light, but it's closed-source. ArcBox aims at that bar — and is open
+source under MIT/Apache-2.0.
 
-ArcBox solves this with Firecracker-style microVMs that boot their own Linux kernel in under 200ms. Each sandbox is a real computer -- real filesystem, real network, real process tree -- with VM-level isolation that containers can't provide. And when you just need Docker, ArcBox is a drop-in replacement for Docker Desktop.
+The whole stack is written in Rust, top to bottom: our own virtual machine
+monitor built directly on Apple's **Hypervisor.framework**, a custom VirtIO
+device stack, a custom macOS networking datapath, a VirtioFS/FUSE filesystem, and
+a guest agent that talks to the host over vsock. Owning the runtime end to end is
+what makes it fast, lean, and fully under our control.
 
-## Three-Tier Runtime
+ArcBox is in **public beta** — [join the community](https://arcbox.link/discord)
+and [tell us what to build next](https://github.com/arcboxlabs/arcbox/issues).
 
-| Tier | Isolation | Boot Time | Overhead | Use Case |
-|------|-----------|-----------|----------|----------|
-| **Container** | Namespace + chroot | Instant | ~1 MB | Standard Docker workloads |
-| **Sandbox** | microVM (own kernel) | <200ms | ~10-30 MB | Untrusted code, CI/CD, AI agents |
-| **Machine** | Independent VM | ~1.5s | ~200 MB | Full Linux dev environment |
+## Containers
 
-```
-Host
-├── arcbox daemon (Docker API + gRPC)
-│
-├── System VM (Container + Sandbox tiers, shared kernel)
-│   └── arcbox-agent
-│       ├── Container Runtime ── namespace + chroot
-│       └── Sandbox Runtime ─── KVM microVM (<200ms boot)
-│
-├── Machine VM "ubuntu-dev" (independent kernel + rootfs)
-└── Machine VM "alpine-test"
-```
-
-### Sandbox — Computer Use Runtime
-
-Give an AI agent a real computer it can't break out of.
-
-- **<200ms cold boot** -- KVM microVM with minimal device model (virtio-MMIO only, no PCI/ACPI/BIOS)
-- **<50ms warm start** -- snapshot/restore for instant sandbox cloning
-- **VM-level isolation** -- each sandbox runs its own kernel; a vulnerability in one cannot escape to others
-- **Real computer** -- real filesystem, real networking, real process tree -- not a simulated shell
-- **Disposable** -- spin up, let the agent work, tear down; no state leaks between sessions
-- **Docker-compatible** -- `docker run --runtime=sandbox untrusted-image`
-
-### Container
-
-Drop-in Docker engine replacement. Point your existing Docker CLI at ArcBox:
+The core of ArcBox is a drop-in Docker engine. It exposes a Docker-compatible
+socket and proxies to a guest `dockerd`, so your existing CLI, scripts, and
+Compose files keep working unchanged.
 
 ```bash
-arcbox docker enable
+abctl docker enable        # creates and activates the "arcbox" Docker context
 docker run -d -p 8080:80 nginx
+docker compose up
+docker build -t myapp .
 ```
 
-### Machine
+Containers, images, Compose, port forwarding, bind mounts, named volumes, and
+interactive `exec`/terminal flows all work today.
 
-Full Linux VMs with persistent storage, SSH access, and their own init system.
+### amd64 and arm64 images
+
+ArcBox runs `linux/amd64` images right alongside native arm64 on Apple Silicon,
+translated transparently inside the guest by [FEX](https://github.com/FEX-Emu/FEX)
+— an open-source x86 emulator, with nothing to configure.
 
 ```bash
-arcbox machine create dev --distro ubuntu
-arcbox machine ssh dev
+docker run --platform linux/amd64 alpine uname -m
+# x86_64
 ```
 
-## Quick Start
+### Native Kubernetes
+
+A local Kubernetes cluster (k3s) managed by the daemon, with host integration
+for `kubectl`.
 
 ```bash
-# Install
-curl -sSL https://install.arcbox.dev | sh
+abctl k8s start
+abctl k8s kubeconfig >> ~/.kube/config
+kubectl get nodes
+```
 
-# Start the daemon
-arcbox daemon start
+### Migrate from Docker Desktop or OrbStack
 
-# Enable Docker compatibility
-arcbox docker enable
+Import your existing local workloads in place.
+
+```bash
+abctl migrate from docker-desktop
+abctl migrate from orbstack
+```
+
+## Quick start
+
+```bash
+# Install (Homebrew)
+brew install --cask arcboxlabs/tap/arcbox
+
+# …or via the install script
+curl -fsSL https://get.arcbox.dev | bash
+
+# Start the daemon and enable Docker compatibility
+abctl daemon start
+abctl docker enable
 
 # Run a container
 docker run -d -p 8080:80 nginx
 curl http://localhost:8080
 ```
 
-## What Works Today
+Run `abctl doctor` to check the runtime, and `abctl --help` to explore all
+commands.
 
-- **Container lifecycle** -- `run`, `stop`, `rm`, `logs`, `exec`, `inspect`
-- **Image management** -- pull from Docker Hub and OCI registries (ARM64)
-- **Port forwarding** -- `-p 8080:80` maps host ports into containers
-- **Volume mounts** -- bind mounts and named volumes
-- **Networking** -- internet access, DNS resolution, inter-container DNS
-- **Docker Compose** -- `docker-compose up/down` for multi-container stacks
-- **Context switching** -- `arcbox docker enable/disable` to toggle with Docker Desktop
-- **Machine management** -- `create/start/stop/rm/ls/inspect/exec/ssh`
-- **40+ Docker API endpoints** -- Docker Engine API v1.43 compatible
+## Sandboxes
 
-## Performance
+Need more isolation than a container? ArcBox runs **disposable microVMs** — each
+its own VM, ideal for untrusted code, CI jobs, and ephemeral test environments.
+Snapshot a booted-and-idle sandbox and restore clones from it to skip cold boot
+entirely.
 
-Custom VirtIO stack, zero-copy networking, purpose-built VirtioFS.
+```bash
+abctl sandbox create --memory 512
+abctl sandbox run <id> -- ./untrusted-binary
+abctl sandbox checkpoint <id> --name clean   # capture a ready snapshot
+abctl sandbox restore clean                  # clone a new sandbox from it
+```
 
-| Metric | Container | Sandbox | Machine |
-|--------|-----------|---------|---------|
-| Boot | Instant | <200ms cold / <50ms warm | ~1.5s |
-| Memory | ~1 MB | ~10-30 MB | ~200 MB |
-| File I/O (vs native) | >90% | >85% | >90% |
+Sandboxes are engineered for sub-200 ms cold boots, near-instant restore from
+snapshot, and tens of megabytes of overhead — disposable enough to spin up per
+job and throw away.
 
-|  | ArcBox | E2B (Firecracker) | Docker Desktop |
-|--|--------|-------------------|----------------|
-| Sandbox boot | <200ms | ~150ms | N/A |
-| Container boot | Instant | N/A | Instant |
-| Idle memory | <150 MB | Cloud-only | 1-2 GB |
+## Machines
 
-## Known Limitations
+When you want a complete environment rather than a container, spin up a full
+Linux VM with its own kernel, persistent disk, and the distro of your choice.
 
-| Feature | Status |
-|---------|--------|
-| `docker build` | Not yet -- use `docker buildx` or pre-built images |
-| Sandbox runtime (`--runtime=sandbox`) | Designed, not yet implemented |
-| Machine distro management | Designed, not yet implemented |
-| x86/amd64 images (Rosetta) | Not yet -- ARM64 only |
-| Linux host | macOS first, Linux planned |
-| GUI | CLI only -- desktop app planned |
+```bash
+abctl machine create dev --distro ubuntu
+abctl machine start dev
+abctl machine list
+```
+
+Ubuntu and Alpine machines boot today, with first-class shell and SSH access
+landing as we round out the beta.
+
+## Built from scratch
+
+ArcBox's performance-critical paths are all custom-built rather than vendored:
+
+- **Custom VMM on Hypervisor.framework** — manual vCPU execution and a device
+  model we own end to end, rather than Apple's managed Virtualization.framework.
+- **Custom VirtIO stack** — `virtio-net`, `virtio-blk`, `virtio-fs`,
+  `virtio-console`, `virtio-vsock`, and a balloon device.
+- **Custom macOS networking datapath** — userspace DHCP, DNS forwarding, TCP via
+  `smoltcp`, and host socket proxying, without `pf` NAT or a `utun` device.
+- **VirtioFS/FUSE** filesystem sharing and a vsock guest agent speaking protobuf.
+- **Transparent x86 translation** via FEX so `linux/amd64` images run on Apple Silicon.
+
+Here's the bar we're building toward, measured against OrbStack:
+
+| Metric | ArcBox | OrbStack |
+|--------|--------|----------|
+| Cold boot | <1.5 s | ~2 s |
+| Warm boot | <500 ms | <1 s |
+| Idle memory | <150 MB | ~200 MB |
+| File I/O (vs native) | >90% | 75–95% |
+| Network throughput | >50 Gbps | ~45 Gbps |
+
+## Desktop app
+
+ArcBox Desktop is a native SwiftUI app that talks to the daemon over gRPC and the
+Docker-compatible API. It covers Docker (containers, images, volumes, networks)
+and Kubernetes (pods, services), with live log streaming, an interactive
+terminal, and a container file browser. Source:
+[arcboxlabs/arcbox-desktop](https://github.com/arcboxlabs/arcbox-desktop).
+
+## What's next
+
+- First-class shell and SSH access for machines
+- Even faster x86 translation
+- Linux host support (macOS first)
+- Deeper Docker Engine API coverage
 
 ## Requirements
 
-- macOS 13 (Ventura) or later
-- Apple Silicon (M1/M2/M3/M4) -- Intel support in progress
-- Docker CLI installed (ArcBox replaces the engine, not the CLI)
+- macOS on Apple Silicon (Intel support in progress)
+- Docker CLI — ArcBox replaces the engine, not the CLI (`abctl docker setup`
+  can install it for you)
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, code standards,
-and development setup.
+and development setup. The runtime is open source under MIT/Apache-2.0; personal
+use is free forever, and commercial use is free during the public beta.
 
 ## License
 
