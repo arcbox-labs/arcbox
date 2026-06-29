@@ -15,6 +15,8 @@ use arcbox_api::{
     SystemServiceServer, kubernetes_service_server::KubernetesServiceServer,
     machine_service_server::MachineServiceServer,
 };
+#[cfg(target_os = "macos")]
+use arcbox_api::{MacosServiceImpl, macos_service_server::MacosServiceServer};
 use arcbox_core::Runtime;
 use arcbox_docker::{DockerApiServer, DockerContextManager, ServerConfig};
 use tokio::net::UnixListener;
@@ -50,6 +52,8 @@ pub async fn start_grpc(
     info!(socket = %socket_path.display(), "gRPC server listening");
 
     let machine_service = MachineServiceImpl::new(Arc::clone(&shared_runtime));
+    #[cfg(target_os = "macos")]
+    let macos_service = MacosServiceImpl::new(Arc::clone(&shared_runtime));
     let kubernetes_service = KubernetesServiceImpl::new(Arc::clone(&shared_runtime));
     let migration_service = MigrationServiceImpl::new(Arc::clone(&shared_runtime));
     let sandbox_service = SandboxServiceImpl::new(Arc::clone(&shared_runtime));
@@ -75,14 +79,20 @@ pub async fn start_grpc(
 
     let shutdown = ctx.shutdown.clone();
     let handle = tokio::spawn(async move {
-        let result = Server::builder()
+        let router = Server::builder()
             .add_service(MachineServiceServer::new(machine_service))
             .add_service(KubernetesServiceServer::new(kubernetes_service))
             .add_service(MigrationServiceServer::new(migration_service))
             .add_service(SandboxServiceServer::new(sandbox_service))
             .add_service(SandboxSnapshotServiceServer::new(sandbox_snapshot_service))
             .add_service(SystemServiceServer::new(system_service))
-            .add_service(IconServiceServer::new(icon_service))
+            .add_service(IconServiceServer::new(icon_service));
+        // macOS guests are served only on Apple Silicon hosts; on other
+        // platforms the service is simply absent (the CLI `macos` noun is
+        // likewise macOS-only).
+        #[cfg(target_os = "macos")]
+        let router = router.add_service(MacosServiceServer::new(macos_service));
+        let result = router
             .add_service(reflection_v1)
             .add_service(reflection_v1alpha)
             .serve_with_incoming_shutdown(incoming, shutdown.cancelled())

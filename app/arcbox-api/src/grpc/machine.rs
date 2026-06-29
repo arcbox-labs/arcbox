@@ -13,33 +13,9 @@ use arcbox_protocol::v1::{
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
-use super::{SharedRuntime, SharedRuntimeExt};
-
-/// Drives a `!Send` macOS VM future to completion on a dedicated blocking thread.
-///
-/// Virtualization.framework operations hold ObjC handles (and the VM's dispatch
-/// queue) across await and are not `Send`, but tonic requires handler futures to be
-/// `Send`. Running the future via a transient current-thread runtime inside
-/// `spawn_blocking` keeps that `!Send` state off the gRPC worker threads; the booted
-/// VM (which is `Send + Sync`) outlives the transient runtime.
 #[cfg(target_os = "macos")]
-async fn run_macos_blocking<T, Fut, F>(f: F) -> Result<T, Status>
-where
-    T: Send + 'static,
-    Fut: std::future::Future<Output = arcbox_core::Result<T>>,
-    F: FnOnce() -> Fut + Send + 'static,
-{
-    tokio::task::spawn_blocking(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| Status::internal(format!("macOS runtime: {e}")))?
-            .block_on(f())
-            .map_err(|e| Status::internal(e.to_string()))
-    })
-    .await
-    .map_err(|e| Status::internal(format!("macOS task join: {e}")))?
-}
+use super::run_macos_blocking;
+use super::{SharedRuntime, SharedRuntimeExt};
 
 /// Machine service implementation.
 pub struct MachineServiceImpl {
