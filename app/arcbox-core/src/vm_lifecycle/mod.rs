@@ -28,6 +28,7 @@
 //! ```
 
 mod health;
+mod machine;
 mod recovery;
 #[cfg(target_os = "macos")]
 mod serial;
