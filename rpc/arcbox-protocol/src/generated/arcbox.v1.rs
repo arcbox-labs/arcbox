@@ -549,6 +549,180 @@ pub struct MacImageRemoveRequest {
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
 }
+/// Request to create a macOS guest from a base image.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateMacosMachineRequest {
+    /// Guest name (unique).
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Base image to copy-on-write clone.
+    #[prost(string, tag = "2")]
+    pub image: ::prost::alloc::string::String,
+    /// Number of CPUs.
+    #[prost(uint32, tag = "3")]
+    pub cpus: u32,
+    /// Memory in MiB.
+    #[prost(uint64, tag = "4")]
+    pub memory_mib: u64,
+}
+/// Request to start a macOS guest.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StartMacosMachineRequest {
+    /// Guest name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+/// Request to stop a macOS guest.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StopMacosMachineRequest {
+    /// Guest name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+/// Request to remove a macOS guest.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RemoveMacosMachineRequest {
+    /// Guest name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Remove even if running (stops it first).
+    #[prost(bool, tag = "2")]
+    pub force: bool,
+}
+/// Request to inspect a macOS guest.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct InspectMacosMachineRequest {
+    /// Guest name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+/// Summary of a macOS guest.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MacosMachineSummary {
+    /// Guest name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// State (running, starting, stopped).
+    #[prost(string, tag = "2")]
+    pub state: ::prost::alloc::string::String,
+    /// Number of CPUs.
+    #[prost(uint32, tag = "3")]
+    pub cpus: u32,
+    /// Memory in MiB.
+    #[prost(uint64, tag = "4")]
+    pub memory_mib: u64,
+    /// Base image it was cloned from.
+    #[prost(string, tag = "5")]
+    pub image: ::prost::alloc::string::String,
+    /// Creation timestamp.
+    #[prost(int64, tag = "6")]
+    pub created: i64,
+}
+/// Response listing macOS guests.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MacosMachineListResponse {
+    /// Guests.
+    #[prost(message, repeated, tag = "1")]
+    pub machines: ::prost::alloc::vec::Vec<MacosMachineSummary>,
+}
+/// Detailed information about a macOS guest.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MacosMachineInfo {
+    /// Guest name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// State.
+    #[prost(string, tag = "2")]
+    pub state: ::prost::alloc::string::String,
+    /// Number of CPUs.
+    #[prost(uint32, tag = "3")]
+    pub cpus: u32,
+    /// Memory in MiB.
+    #[prost(uint64, tag = "4")]
+    pub memory_mib: u64,
+    /// Base image it was cloned from.
+    #[prost(string, tag = "5")]
+    pub image: ::prost::alloc::string::String,
+    /// Creation timestamp.
+    #[prost(int64, tag = "6")]
+    pub created: i64,
+}
+/// Request to install a base image from a local IPSW.
+///
+/// The install VM's CPU/memory are derived from the restore image's own
+/// requirements, so they are not part of the request.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MacosImagePullRequest {
+    /// Base image name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Path to a local IPSW restore image.
+    #[prost(string, tag = "2")]
+    pub ipsw_path: ::prost::alloc::string::String,
+    /// System disk size in GiB.
+    #[prost(uint64, tag = "3")]
+    pub disk_gb: u64,
+}
+/// Summary of a macOS base image.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MacosImageSummary {
+    /// Image name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Minimum CPU count required by the restore image.
+    #[prost(uint64, tag = "2")]
+    pub minimum_cpu_count: u64,
+    /// Minimum memory in MiB required by the restore image.
+    #[prost(uint64, tag = "3")]
+    pub minimum_memory_mib: u64,
+    /// System disk size in GiB.
+    #[prost(uint64, tag = "4")]
+    pub disk_gb: u64,
+    /// Creation timestamp.
+    #[prost(int64, tag = "5")]
+    pub created: i64,
+    /// Source (IPSW path), if known.
+    #[prost(string, tag = "6")]
+    pub source: ::prost::alloc::string::String,
+}
+/// Response listing macOS base images.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MacosImageListResponse {
+    /// Base images.
+    #[prost(message, repeated, tag = "1")]
+    pub images: ::prost::alloc::vec::Vec<MacosImageSummary>,
+}
+/// Request to remove a macOS base image.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MacosImageRemoveRequest {
+    /// Image name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
 /// Request to create a container.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

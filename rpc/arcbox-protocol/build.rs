@@ -22,6 +22,7 @@ fn main() {
     let protos = [
         "proto/common.proto",
         "proto/machine.proto",
+        "proto/macos.proto",
         "proto/container.proto",
         "proto/image.proto",
         "proto/agent.proto",
