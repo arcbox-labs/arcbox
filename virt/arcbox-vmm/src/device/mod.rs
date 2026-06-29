@@ -1109,7 +1109,6 @@ impl DeviceManager {
                             //
                             // SAFETY: `ram_base` is the host mapping returned by
                             // Virtualization.framework and is valid for `ram_size` bytes.
-                            let gpa_base = self.guest_ram_gpa as usize;
                             let guest_mem =
                                 unsafe { std::slice::from_raw_parts_mut(ram_base, ram_size) };
 
@@ -1145,68 +1144,25 @@ impl DeviceManager {
                                 } else {
                                     self.primary_net.as_ref()
                                 };
-                                let net_completions = match typed {
-                                    Some(arc) => arc
-                                        .lock()
-                                        .map(|d| {
-                                            d.drain_tx_queue(&qcfg, finalize_virtio_net_checksum)
-                                        })
-                                        .unwrap_or_default(),
-                                    None => Vec::new(),
+                                let net_notify = match typed {
+                                    Some(arc) => arc.lock().is_ok_and(|d| {
+                                        d.drain_tx_queue(&qcfg, finalize_virtio_net_checksum)
+                                    }),
+                                    None => false,
                                 };
-                                let _ = guest_mem; // unused on this branch now
+                                // `drain_tx_queue` now publishes the used ring
+                                // (via SplitQueue, with the StoreLoad barrier) and
+                                // avail_event itself; the VMM only raises the IRQ.
+                                let _ = guest_mem;
 
-                                if !net_completions.is_empty() {
-                                    // Update used ring for completed TX descriptors.
-                                    // Translate GPAs to slice offsets (checked).
-                                    let Some(used_off) =
-                                        (qcfg.used_addr as usize).checked_sub(gpa_base)
-                                    else {
-                                        tracing::warn!(
-                                            "invalid used GPA {:#x} below ram base {:#x}",
-                                            qcfg.used_addr,
-                                            gpa_base
-                                        );
-                                        return Ok(());
-                                    };
-                                    let q_size = qcfg.size as usize;
-                                    let used_idx_off = used_off + 2;
-                                    let mut used_idx = u16::from_le_bytes([
-                                        guest_mem[used_idx_off],
-                                        guest_mem[used_idx_off + 1],
-                                    ]);
-                                    for &(head, len) in &net_completions {
-                                        let entry =
-                                            used_off + 4 + ((used_idx as usize) % q_size) * 8;
-                                        if entry + 8 <= guest_mem.len() {
-                                            guest_mem[entry..entry + 4]
-                                                .copy_from_slice(&(head as u32).to_le_bytes());
-                                            guest_mem[entry + 4..entry + 8]
-                                                .copy_from_slice(&len.to_le_bytes());
-                                            used_idx = used_idx.wrapping_add(1);
-                                        }
+                                if net_notify && device.info.irq.is_some() {
+                                    {
+                                        let mut s = state.write().map_err(|e| {
+                                            VmmError::Device(format!("Failed to lock state: {e}"))
+                                        })?;
+                                        s.trigger_interrupt(virtio_mmio::INT_VRING);
                                     }
-                                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                                    guest_mem[used_idx_off..used_idx_off + 2]
-                                        .copy_from_slice(&used_idx.to_le_bytes());
-
-                                    // avail_event (EVENT_IDX kick suppression) is
-                                    // published inside `drain_tx_queue` — unconditionally
-                                    // on every kick and with a TOCTOU re-check — so it
-                                    // is NOT written here (doing it only on non-empty
-                                    // completions is the ABX-386 wedge).
-
-                                    if let Some(_irq) = device.info.irq {
-                                        {
-                                            let mut s = state.write().map_err(|e| {
-                                                VmmError::Device(format!(
-                                                    "Failed to lock state: {e}"
-                                                ))
-                                            })?;
-                                            s.trigger_interrupt(virtio_mmio::INT_VRING);
-                                        }
-                                        self.sync_irq_level(device_id);
-                                    }
+                                    self.sync_irq_level(device_id);
                                 }
                             } else {
                                 // Generic process_queue for all other devices.
