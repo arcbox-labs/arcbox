@@ -74,8 +74,14 @@ struct Outcome {
 }
 
 enum Failure {
-    Hang { stage: &'static str, waited_ms: u128 },
-    Error { stage: &'static str, msg: String },
+    Hang {
+        stage: &'static str,
+        waited_ms: u128,
+    },
+    Error {
+        stage: &'static str,
+        msg: String,
+    },
 }
 
 fn err(stage: &'static str) -> impl Fn(String) -> Failure {
@@ -163,7 +169,10 @@ fn run() -> Result<Outcome, Failure> {
             .map_or_else(|| Duration::from_secs(60), Duration::from_secs);
         let t_rt = Instant::now();
         match ensure_runtime(&vmm, runtime_timeout) {
-            Ok(status) => (t_rt.elapsed().as_millis() as i128, status),
+            Ok(status) => (
+                i128::try_from(t_rt.elapsed().as_millis()).unwrap_or(i128::MAX),
+                status,
+            ),
             Err(RuntimeFail::Hang) => {
                 let waited = t_rt.elapsed().as_millis();
                 let _ = vmm.stop();
@@ -214,18 +223,22 @@ fn ensure_runtime(vmm: &Vmm, overall: Duration) -> Result<String, RuntimeFail> {
     while start.elapsed() < overall {
         match ensure_runtime_once(vmm, Duration::from_secs(10)) {
             Ok((true, status)) => {
-                return Ok(if status.is_empty() { "started".into() } else { status });
+                return Ok(if status.is_empty() {
+                    "started".into()
+                } else {
+                    status
+                });
             }
             Ok((false, status)) => {
                 if status == "failed" {
                     return Err(RuntimeFail::NotReady("failed".into()));
                 }
                 last_status = status;
-                std::thread::sleep(Duration::from_millis(1000));
+                std::thread::sleep(Duration::from_secs(1));
             }
             // Transient RPC error during startup churn — retry until the
             // deadline rather than declaring a wedge prematurely.
-            Err(_) => std::thread::sleep(Duration::from_millis(1000)),
+            Err(_) => std::thread::sleep(Duration::from_secs(1)),
         }
     }
     eprintln!("[runtime] deadline reached, last status = {last_status}");

@@ -941,8 +941,8 @@ mod tests {
                     "process_queue should complete on a bounded cyclic chain"
                 );
             }
-            Err(_) => panic!(
-                "process_queue did not terminate on a cyclic descriptor chain — cycle guard regressed"
+            Err(e) => panic!(
+                "process_queue did not terminate on a cyclic descriptor chain — cycle guard regressed ({e:?})"
             ),
         }
     }
