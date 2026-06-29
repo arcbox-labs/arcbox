@@ -460,90 +460,32 @@ impl VirtioDevice for VirtioFs {
             return Ok(Vec::new());
         }
 
-        // Read descriptors directly from guest memory (not the internal VirtQueue).
-        // Translate GPAs to slice offsets by subtracting gpa_base (checked to
-        // guard against a malicious guest providing a GPA below the RAM base).
-        let gpa_base = queue_config.gpa_base as usize;
-        let desc_addr = (queue_config.desc_addr as usize)
-            .checked_sub(gpa_base)
-            .ok_or_else(|| {
-                tracing::warn!(
-                    "invalid desc GPA {:#x} below ram base {:#x}",
-                    queue_config.desc_addr,
-                    gpa_base
-                );
-                VirtioError::InvalidQueue("desc GPA below ram base".into())
-            })?;
-        let avail_addr = (queue_config.avail_addr as usize)
-            .checked_sub(gpa_base)
-            .ok_or_else(|| {
-                tracing::warn!(
-                    "invalid avail GPA {:#x} below ram base {:#x}",
-                    queue_config.avail_addr,
-                    gpa_base
-                );
-                VirtioError::InvalidQueue("avail GPA below ram base".into())
-            })?;
-        let used_addr = (queue_config.used_addr as usize)
-            .checked_sub(gpa_base)
-            .ok_or_else(|| {
-                tracing::warn!(
-                    "invalid used GPA {:#x} below ram base {:#x}",
-                    queue_config.used_addr,
-                    gpa_base
-                );
-                VirtioError::InvalidQueue("used GPA below ram base".into())
-            })?;
-        let q_size = queue_config.size as usize;
+        // SAFETY: `memory` is the guest RAM slice; the queue accesses it only
+        // through the GuestMemWriter built here, and `memory` is not touched
+        // directly while the queue is alive.
+        let mem = std::sync::Arc::new(unsafe {
+            arcbox_virtio_core::GuestMemWriter::new(
+                memory.as_mut_ptr(),
+                memory.len(),
+                queue_config.gpa_base as usize,
+            )
+        });
+        let mut queue = arcbox_virtio_core::SplitQueue::new(mem, queue_idx, queue_config, false);
+        queue.set_last_avail_idx(self.last_avail_idx_q1);
 
-        if avail_addr + 4 > memory.len() {
-            return Ok(Vec::new());
-        }
-        let avail_idx = u16::from_le_bytes([memory[avail_addr + 2], memory[avail_addr + 3]]);
-
-        // Track last processed index per queue. Use a simple field for queue 1.
-        let mut current_avail = self.last_avail_idx_q1;
         let mut completions = Vec::new();
-
-        while current_avail != avail_idx {
-            let ring_off = avail_addr + 4 + 2 * (current_avail as usize % q_size);
-            if ring_off + 2 > memory.len() {
-                break;
-            }
-            let head_idx = u16::from_le_bytes([memory[ring_off], memory[ring_off + 1]]) as usize;
-
-            // Walk descriptor chain: collect request data (read-only) and
-            // response buffer locations (write-only).
+        while let Some(chain) = queue.pop_avail() {
+            // Collect request data (read-only descriptors) and response buffer
+            // locations (write-only descriptors, kept as GPA + len).
             let mut request_data = Vec::new();
-            let mut write_bufs: Vec<(usize, usize)> = Vec::new();
-            let mut idx = head_idx;
-            for _ in 0..q_size {
-                let d_off = desc_addr + idx * 16;
-                if d_off + 16 > memory.len() {
-                    break;
-                }
-                let addr = match (u64::from_le_bytes(memory[d_off..d_off + 8].try_into().unwrap())
-                    as usize)
-                    .checked_sub(gpa_base)
+            let mut write_bufs: Vec<(u64, usize)> = Vec::new();
+            for desc in &chain.descriptors {
+                if desc.is_write() {
+                    write_bufs.push((desc.addr, desc.len as usize));
+                } else if let Some(data) = queue.mem().slice(desc.addr as usize, desc.len as usize)
                 {
-                    Some(a) => a,
-                    None => continue,
-                };
-                let len =
-                    u32::from_le_bytes(memory[d_off + 8..d_off + 12].try_into().unwrap()) as usize;
-                let flags = u16::from_le_bytes(memory[d_off + 12..d_off + 14].try_into().unwrap());
-                let next = u16::from_le_bytes(memory[d_off + 14..d_off + 16].try_into().unwrap());
-
-                if flags & arcbox_virtio_core::queue::flags::WRITE != 0 {
-                    write_bufs.push((addr, len));
-                } else if addr + len <= memory.len() {
-                    request_data.extend_from_slice(&memory[addr..addr + len]);
+                    request_data.extend_from_slice(data);
                 }
-
-                if flags & arcbox_virtio_core::queue::flags::NEXT == 0 {
-                    break;
-                }
-                idx = next as usize;
             }
 
             let response = match self.process_request(&request_data) {
@@ -567,42 +509,21 @@ impl VirtioDevice for VirtioFs {
                     break;
                 }
                 let to_write = remaining.min(buf_len);
-                if buf_addr + to_write <= memory.len() {
-                    memory[buf_addr..buf_addr + to_write]
-                        .copy_from_slice(&response[resp_offset..resp_offset + to_write]);
+                // SAFETY: write-only descriptor buffers are device-owned.
+                if let Some(buf) = unsafe { queue.mem().slice_mut(buf_addr as usize, to_write) } {
+                    buf.copy_from_slice(&response[resp_offset..resp_offset + to_write]);
                 }
                 resp_offset += to_write;
             }
 
-            // Update used ring.
-            let used_idx_off = used_addr + 2;
-            let used_idx = u16::from_le_bytes([memory[used_idx_off], memory[used_idx_off + 1]]);
-            let used_entry = used_addr + 4 + ((used_idx as usize) % q_size) * 8;
-            if used_entry + 8 <= memory.len() {
-                memory[used_entry..used_entry + 4]
-                    .copy_from_slice(&(head_idx as u32).to_le_bytes());
-                memory[used_entry + 4..used_entry + 8]
-                    .copy_from_slice(&(response.len() as u32).to_le_bytes());
-                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                let new_used = used_idx.wrapping_add(1);
-                memory[used_idx_off..used_idx_off + 2].copy_from_slice(&new_used.to_le_bytes());
-            }
-
-            // Update avail_event for EVENT_IDX notification — only when negotiated.
-            if (self.acked_features & arcbox_virtio_core::queue::VIRTIO_F_EVENT_IDX) != 0 {
-                let avail_event_off = used_addr + 4 + 8 * q_size;
-                if avail_event_off + 2 <= memory.len() {
-                    let ae = current_avail.wrapping_add(1).to_le_bytes();
-                    memory[avail_event_off] = ae[0];
-                    memory[avail_event_off + 1] = ae[1];
-                }
-            }
-
-            completions.push((head_idx as u16, response.len() as u32));
-            current_avail = current_avail.wrapping_add(1);
+            // Publish the completion (every chain advances the used ring, even
+            // when the FUSE request errored and returned an EIO response, so the
+            // used and available rings stay in sync).
+            queue.push_used(chain.head_idx, response.len() as u32);
+            completions.push((chain.head_idx, response.len() as u32));
         }
 
-        self.last_avail_idx_q1 = current_avail;
+        self.last_avail_idx_q1 = queue.last_avail_idx();
         Ok(completions)
     }
 }
