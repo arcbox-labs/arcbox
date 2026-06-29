@@ -25,8 +25,14 @@ use crate::device::{DeviceManager, DeviceType};
 /// VirtIO MMIO interrupt status bit for "used ring updated".
 const INT_VRING: u32 = 1;
 
-/// Poll cadence — fast enough that keystrokes feel instant, idle cost is nil.
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Poll cadence while an operator is attached — fast enough that keystrokes
+/// feel instant.
+const POLL_ACTIVE: Duration = Duration::from_millis(10);
+
+/// Poll cadence while no client is connected. The console is always present
+/// (including release), so back off hard when idle to keep CPU near zero —
+/// only the cheap accept() probe runs at this rate.
+const POLL_IDLE: Duration = Duration::from_millis(250);
 
 /// Resources for the debug-console RX worker thread.
 pub struct ConsoleRxWorkerContext {
@@ -49,9 +55,12 @@ pub fn console_rx_worker_loop(ctx: ConsoleRxWorkerContext) {
     while ctx.running.load(Ordering::Relaxed) {
         // `SocketConsole::read` accepts a pending client and returns operator
         // bytes (non-blocking, 0 when idle or unconnected).
-        let n = match ctx.socket.lock() {
-            Ok(mut s) => s.read(&mut buf).unwrap_or(0),
-            Err(_) => 0,
+        let (n, connected) = match ctx.socket.lock() {
+            Ok(mut s) => {
+                let n = s.read(&mut buf).unwrap_or(0);
+                (n, s.is_connected())
+            }
+            Err(_) => (0, false),
         };
 
         // Inject fresh bytes (n > 0) or flush input buffered from a prior tick
@@ -62,7 +71,7 @@ pub fn console_rx_worker_loop(ctx: ConsoleRxWorkerContext) {
             (ctx.exit_vcpus)();
         }
 
-        std::thread::sleep(POLL_INTERVAL);
+        std::thread::sleep(if connected { POLL_ACTIVE } else { POLL_IDLE });
     }
 
     tracing::info!("debug-console RX worker stopped");

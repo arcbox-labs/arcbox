@@ -273,7 +273,7 @@ impl VmManager {
         // same token to spawn a shell. Absent in normal boots.
         let debug_console_socket = entry.config.cmdline.as_deref().and_then(|c| {
             c.split_whitespace()
-                .find_map(|t| t.strip_prefix("arcbox.debug_console="))
+                .find_map(|t| t.strip_prefix(arcbox_constants::cmdline::DEBUG_CONSOLE_KEY))
                 .map(PathBuf::from)
         });
 

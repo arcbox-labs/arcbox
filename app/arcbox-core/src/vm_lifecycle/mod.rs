@@ -36,7 +36,9 @@ use crate::boot_assets::BootAssetProvider;
 use crate::error::{CoreError, Result};
 use crate::event::{Event, EventBus};
 use crate::machine::{MachineConfig, MachineInfo, MachineManager, MachineState};
-use arcbox_constants::cmdline::{GUEST_DOCKER_VSOCK_PORT_KEY, HV_EARLYCON_DIRECTIVE};
+use arcbox_constants::cmdline::{
+    DEBUG_CONSOLE_KEY, GUEST_DOCKER_VSOCK_PORT_KEY, HV_EARLYCON_DIRECTIVE,
+};
 use arcbox_error::CommonError;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -895,6 +897,28 @@ impl VmLifecycleManager {
                 cmdline.push_str(GUEST_DOCKER_VSOCK_PORT_KEY);
                 cmdline.push_str(&port.to_string());
             }
+        }
+
+        // Always attach an interactive debug console on the custom-HV backend.
+        // An operator can `socat - UNIX-CONNECT:<sock>` to get a serial root
+        // shell into the guest even when early boot hangs before networking
+        // (the dominant HV cold-boot failure mode). This token is the single
+        // source of truth: the host opens the socket at `<sock>` and the guest
+        // rcS keys off the same token to spawn the shell. HV-only — the token
+        // targets the HV virtio-console wiring; VZ owns its console internally.
+        // The socket lives under the per-user data dir (same-user access only).
+        if matches!(self.config.backend, arcbox_vmm::VmBackend::Hv)
+            && !cmdline
+                .split_whitespace()
+                .any(|t| t.starts_with(DEBUG_CONSOLE_KEY))
+        {
+            let sock = self.data_dir.join("run").join("console.sock");
+            if let Some(parent) = sock.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            cmdline.push(' ');
+            cmdline.push_str(DEBUG_CONSOLE_KEY);
+            cmdline.push_str(&sock.to_string_lossy());
         }
 
         Ok(DesiredBoot {
