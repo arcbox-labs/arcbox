@@ -5,7 +5,7 @@ use crate::error::{VZError, VZResult};
 use crate::ffi::{
     _Block_copy, _Block_release, _NSConcreteStackBlock, BlockPtr, DispatchQueue,
     SIMPLE_BLOCK_DESCRIPTOR, create_state_completion_block, extract_nserror, nsstring_to_string,
-    nsurl_file_path,
+    nsurl_file_path, release,
 };
 use crate::socket::VirtioSocketDevice;
 use crate::{msg_send, msg_send_bool, msg_send_i64};
@@ -519,6 +519,9 @@ impl VirtualMachine {
                     url as *const AnyObject,
                     block,
                 );
+                // The selector retains the NSURL synchronously; release the +1 from
+                // nsurl_file_path.
+                release(url);
             }
         });
         let result = rx.await.map_err(|_| VZError::Internal {

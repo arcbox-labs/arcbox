@@ -208,6 +208,9 @@ impl MacAuxiliaryStorage {
             let url = nsurl_file_path(&path_str);
             let alloc = msg_send!(cls, alloc);
             let obj = msg_send!(alloc, initWithURL: url);
+            // initWithURL: retains the NSURL; release the +1 from nsurl_file_path
+            // (also covers the error path below).
+            release(url);
             if obj.is_null() {
                 return Err(VZError::InvalidConfiguration(format!(
                     "failed to open macOS auxiliary storage: {path_str}"
@@ -261,6 +264,9 @@ impl MacAuxiliaryStorage {
                 options,
                 &mut error,
             );
+            // The initializer retains the NSURL; release the +1 from nsurl_file_path
+            // (also covers the error path below).
+            release(url);
             if obj.is_null() {
                 return Err(extract_nserror(error));
             }

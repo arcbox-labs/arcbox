@@ -86,7 +86,9 @@ impl MacOSRestoreImage {
         let (tx, rx) = oneshot::channel::<ObjectResult>();
         let block = create_object_completion_block(tx);
         // SAFETY: +loadFileURL:completionHandler: takes an NSURL and a block and returns
-        // void; `block` is a heap-copied block released after the await.
+        // void; `block` is a heap-copied block released after the await. The method
+        // retains the NSURL synchronously, so the +1 from nsurl_file_path is released
+        // immediately after the call.
         unsafe {
             let url = nsurl_file_path(&path_str);
             let sel = objc2::sel!(loadFileURL:completionHandler:);
@@ -97,6 +99,7 @@ impl MacOSRestoreImage {
                 *const c_void,
             ) = std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
             func(cls, sel, url as *const AnyObject, block);
+            release(url);
         }
         let received = rx.await;
         // SAFETY: `block` was returned by create_object_completion_block and not released elsewhere.
@@ -220,6 +223,9 @@ impl MacOSInstaller {
                     initWithVirtualMachine: vm_ptr,
                     restoreImageURL: url
                 );
+                // The initializer retains the NSURL; release the +1 from nsurl_file_path
+                // (also covers the error path below).
+                release(url);
                 if obj.is_null() {
                     return Err(VZError::InvalidConfiguration(
                         "failed to create VZMacOSInstaller".into(),
@@ -271,14 +277,16 @@ impl MacOSInstaller {
         });
 
         let result = loop {
-            match rx.try_recv() {
-                Ok(result) => break result,
-                Err(oneshot::error::TryRecvError::Empty) => {
-                    on_progress(self.fraction_completed());
-                    sleep(Duration::from_secs(2)).await;
+            tokio::select! {
+                // Prefer the completion signal so install() returns promptly when the
+                // installer finishes, rather than after the next progress tick.
+                biased;
+                received = &mut rx => {
+                    break received
+                        .unwrap_or_else(|_| Err("install completion handler dropped".to_string()));
                 }
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    break Err("install completion handler dropped".to_string());
+                () = sleep(Duration::from_secs(2)) => {
+                    on_progress(self.fraction_completed());
                 }
             }
         };
