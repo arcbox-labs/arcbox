@@ -141,6 +141,14 @@ pub struct DeviceManager {
     /// stored in `devices`. Used by `set_vsock` to bind the device's
     /// `DeviceCtx` and connection manager at registration time.
     vsock: Option<Arc<Mutex<arcbox_virtio::vsock::VirtioVsock>>>,
+    /// Typed handle to the virtio-console device. Shares the same `Arc`
+    /// stored in `devices`. Used by the debug-console RX worker to inject
+    /// host operator input into the console RX queue without a downcast.
+    console: Option<Arc<Mutex<arcbox_virtio::console::VirtioConsole>>>,
+    /// Debug-console Unix socket backend, set when `debug_console_socket` is
+    /// configured. Carried here from device registration so the HV start path
+    /// can hand it to the `console_rx_worker`. Same `Arc` is the console's `io`.
+    debug_console_socket: Option<Arc<Mutex<arcbox_virtio::console::SocketConsole>>>,
     /// Per-block-device async I/O worker handles. When present, QUEUE_NOTIFY
     /// for block devices is dispatched to the worker instead of processing
     /// synchronously on the vCPU thread.
@@ -201,6 +209,8 @@ impl DeviceManager {
                 crate::vsock_manager::VsockConnectionManager::new(),
             )),
             vsock: None,
+            console: None,
+            debug_console_socket: None,
             blk_workers: Mutex::new(HashMap::new()),
             net_rx_worker: net_worker::NetRxWorkerSlot::new(),
         }
@@ -322,6 +332,29 @@ impl DeviceManager {
     /// Returns the typed handle to the VirtioVsock device if registered.
     pub fn vsock(&self) -> Option<&Arc<Mutex<arcbox_virtio::vsock::VirtioVsock>>> {
         self.vsock.as_ref()
+    }
+
+    /// Registers the typed handle to the virtio-console device so the
+    /// debug-console RX worker can inject host input. Shares the same `Arc`
+    /// stored in `devices` (from `register_virtio_device`).
+    pub fn set_console(&mut self, device: Arc<Mutex<arcbox_virtio::console::VirtioConsole>>) {
+        self.console = Some(device);
+    }
+
+    /// Stores the debug-console socket backend so the HV start path can hand
+    /// it to the `console_rx_worker` after the `DeviceManager` is shared.
+    pub fn set_debug_console_socket(
+        &mut self,
+        socket: Arc<Mutex<arcbox_virtio::console::SocketConsole>>,
+    ) {
+        self.debug_console_socket = Some(socket);
+    }
+
+    /// Returns the debug-console socket backend, if one was configured.
+    pub fn debug_console_socket(
+        &self,
+    ) -> Option<&Arc<Mutex<arcbox_virtio::console::SocketConsole>>> {
+        self.debug_console_socket.as_ref()
     }
 
     /// Registers a typed handle to the bridge VirtioNet (NIC2) and binds
@@ -1395,6 +1428,67 @@ impl DeviceManager {
             return false;
         };
         dev.poll_rx_injection(&rx_qcfg, tx_qcfg.as_ref())
+    }
+
+    /// Queues host operator input (`data`) onto the virtio-console and injects
+    /// it into the guest RX queue (queue 0). Returns `true` if any descriptor
+    /// was filled, in which case the caller raises `INT_VRING` for the console.
+    ///
+    /// Drives the interactive debug console: the `console_rx_worker` reads
+    /// operator keystrokes from the Unix socket and forwards them here. Passing
+    /// empty `data` just flushes any input buffered from a previous call.
+    pub fn console_inject_input(&self, data: &[u8]) -> bool {
+        let Some(console_arc) = self.console.as_ref() else {
+            return false;
+        };
+        let Some(device) = self
+            .devices
+            .values()
+            .find(|d| d.info.device_type == DeviceType::VirtioConsole)
+        else {
+            return false;
+        };
+        let Some(mmio_arc) = device.mmio_state.as_ref() else {
+            return false;
+        };
+
+        // RX is queue 0 for virtio-console.
+        let rx_qcfg = {
+            let Ok(mmio) = mmio_arc.read() else {
+                return false;
+            };
+            let rxi = 0usize;
+            if !mmio.queue_ready[rxi] || mmio.queue_num[rxi] == 0 {
+                return false;
+            }
+            QueueConfig {
+                desc_addr: mmio.queue_desc[rxi],
+                avail_addr: mmio.queue_driver[rxi],
+                used_addr: mmio.queue_device[rxi],
+                size: mmio.queue_num[rxi],
+                ready: true,
+                gpa_base: self.guest_ram_gpa,
+            }
+        };
+
+        let Some(ram_base) = self.guest_ram_base else {
+            return false;
+        };
+        if self.guest_ram_size == 0 {
+            return false;
+        }
+        // SAFETY: `ram_base` is the platform hypervisor's guest-RAM mapping,
+        // valid for `guest_ram_size` bytes — same contract as the other
+        // guest-memory slices built in this module.
+        let guest_mem = unsafe { std::slice::from_raw_parts_mut(ram_base, self.guest_ram_size) };
+
+        let Ok(mut dev) = console_arc.lock() else {
+            return false;
+        };
+        if !data.is_empty() {
+            let _ = dev.queue_input(data);
+        }
+        dev.process_rx_queue(guest_mem, &rx_qcfg).unwrap_or(false)
     }
 }
 

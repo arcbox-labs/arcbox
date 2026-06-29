@@ -267,6 +267,16 @@ impl VmManager {
             })
             .collect();
 
+        // An `arcbox.debug_console=<path>` token on the kernel cmdline is the
+        // single source of truth for the interactive debug console: the host
+        // opens the Unix socket at `<path>`, and the guest rcS keys off the
+        // same token to spawn a shell. Absent in normal boots.
+        let debug_console_socket = entry.config.cmdline.as_deref().and_then(|c| {
+            c.split_whitespace()
+                .find_map(|t| t.strip_prefix("arcbox.debug_console="))
+                .map(PathBuf::from)
+        });
+
         VmmConfig {
             vcpu_count: entry.config.cpus,
             memory_size: entry.config.memory_mb * 1024 * 1024,
@@ -301,6 +311,7 @@ impl VmManager {
             // hardcoded path; the rosetta utility VM sets `Vz` explicitly
             // so it can host the Rosetta share.
             backend: entry.config.backend,
+            debug_console_socket,
         }
     }
 

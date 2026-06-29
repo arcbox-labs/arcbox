@@ -95,6 +95,14 @@ pub struct VmmConfig {
     /// support) or Virtualization.framework (managed execution). Requires
     /// macOS 15+ for HV backend. See [`VmBackend`] for details.
     pub backend: VmBackend,
+    /// Path for an interactive debug-console Unix socket (HV backend only).
+    ///
+    /// When set, the virtio-console is wired to a bidirectional socket backend
+    /// and a `console_rx_worker` injects operator input into the guest RX
+    /// queue, giving a serial shell reachable via `socat - UNIX-CONNECT:<path>`
+    /// — usable even when early boot hangs before networking. Debug aid; left
+    /// `None` in production.
+    pub debug_console_socket: Option<PathBuf>,
 }
 
 impl Default for VmmConfig {
@@ -116,6 +124,7 @@ impl Default for VmmConfig {
             block_devices: Vec::new(),
             bridge_nic_mac: None,
             backend: VmBackend::default(),
+            debug_console_socket: None,
         }
     }
 }
@@ -295,6 +304,10 @@ pub struct Vmm {
     /// injection; joined in `stop_darwin_hv` before guest memory drops.
     #[cfg(target_os = "macos")]
     hv_vsock_worker: Option<std::thread::JoinHandle<()>>,
+    /// Debug-console RX worker thread handle (custom HV). Only present when
+    /// `debug_console_socket` is configured; joined in `stop_darwin_hv`.
+    #[cfg(target_os = "macos")]
+    hv_console_worker: Option<std::thread::JoinHandle<()>>,
     /// HV-side network fd (NIC1). Paired with the NetworkDatapath fd.
     /// Kept alive so the socketpair stays open while the VM runs.
     #[cfg(target_os = "macos")]
@@ -468,6 +481,8 @@ impl Vmm {
             hv_device_manager: None,
             #[cfg(target_os = "macos")]
             hv_vsock_worker: None,
+            #[cfg(target_os = "macos")]
+            hv_console_worker: None,
             #[cfg(target_os = "macos")]
             hv_net_fd: None,
             hv_bridge_net_fd: None,

@@ -434,16 +434,52 @@ impl Vmm {
 
         // Console
         if self.config.serial_console || self.config.virtio_console {
-            let console = arcbox_virtio::console::VirtioConsole::new(
+            let mut console = arcbox_virtio::console::VirtioConsole::new(
                 arcbox_virtio::console::ConsoleConfig::default(),
             );
-            let (_console_id, _console_arc) = device_manager.register_virtio_device(
+
+            // Optional interactive debug console: wire a bidirectional
+            // Unix-socket backend so an operator can attach a shell even when
+            // early boot hangs before networking. The RX worker that injects
+            // operator input is spawned later, once the shared DeviceManager
+            // Arc and vCPU IDs are available.
+            let debug_socket = match &self.config.debug_console_socket {
+                Some(path) => match arcbox_virtio::console::SocketConsole::new(path) {
+                    Ok(sock) => {
+                        let sock = Arc::new(Mutex::new(sock));
+                        let io: Arc<Mutex<dyn arcbox_virtio::console::ConsoleIo>> = sock.clone();
+                        console.set_io(io);
+                        tracing::warn!(
+                            socket = %path.display(),
+                            "interactive debug console enabled \
+                             (attach: socat - UNIX-CONNECT:<socket>)"
+                        );
+                        Some(sock)
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            socket = %path.display(),
+                            "failed to create debug console socket; continuing without it"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+
+            let (_console_id, console_arc) = device_manager.register_virtio_device(
                 DeviceType::VirtioConsole,
                 "virtio-console",
                 console,
                 &mut memory_manager,
                 &irq_chip,
             )?;
+
+            if let Some(sock) = debug_socket {
+                device_manager.set_console(console_arc);
+                device_manager.set_debug_console_socket(sock);
+            }
         }
 
         // VirtioFS shared directories — create FsServer handler for each share.
@@ -1080,6 +1116,7 @@ impl Vmm {
         // pipe is rung by the connection manager on new RX work; the
         // worker also watches every connected socketpair fd for data.
         self.spawn_vsock_rx_worker(&device_manager)?;
+        self.spawn_console_rx_worker(&device_manager)?;
 
         let running = self.running.clone();
         let paused = self.hv_paused.clone();
@@ -1324,6 +1361,15 @@ impl Vmm {
             }
         }
 
+        // Debug-console RX worker: polls on a 10 ms tick and observes
+        // `running=false` promptly. Present only when the debug console was
+        // configured.
+        if let Some(t) = self.hv_console_worker.take() {
+            if let Err(e) = t.join() {
+                tracing::warn!("console-io worker thread join failed: {e:?}");
+            }
+        }
+
         // Cleanup in correct order: DAX → GIC → VM → guest memory.
         //
         // DAX mappers must be drained first because `hv_vm_unmap` must be
@@ -1500,6 +1546,36 @@ impl Vmm {
             .spawn(move || crate::vsock_rx_worker::vsock_rx_worker_loop(ctx))
             .map_err(|e| VmmError::Device(format!("spawn vsock-io worker: {e}")))?;
         self.hv_vsock_worker = Some(handle);
+        Ok(())
+    }
+
+    /// Spawns the interactive debug-console RX worker when a debug-console
+    /// socket was configured (`VmmConfig::debug_console_socket`). The worker
+    /// reads operator keystrokes from the socket and injects them into the
+    /// guest console RX queue. No-op when the debug console is disabled.
+    fn spawn_console_rx_worker(&mut self, device_manager: &Arc<DeviceManager>) -> Result<()> {
+        if self.hv_console_worker.is_some() {
+            return Ok(());
+        }
+        let Some(socket) = device_manager.debug_console_socket().cloned() else {
+            return Ok(());
+        };
+
+        let ctx = crate::console_rx_worker::ConsoleRxWorkerContext {
+            device_manager: Arc::clone(device_manager),
+            socket,
+            running: self.running.clone(),
+            exit_vcpus: make_exit_vcpus_fn(
+                self.hv_vcpu_ids
+                    .clone()
+                    .expect("hv_vcpu_ids asserted Some above"),
+            ),
+        };
+        let handle = std::thread::Builder::new()
+            .name("console-io".to_string())
+            .spawn(move || crate::console_rx_worker::console_rx_worker_loop(ctx))
+            .map_err(|e| VmmError::Device(format!("spawn console-io worker: {e}")))?;
+        self.hv_console_worker = Some(handle);
         Ok(())
     }
 
