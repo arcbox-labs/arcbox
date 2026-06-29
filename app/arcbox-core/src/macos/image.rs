@@ -179,9 +179,10 @@ impl MacImageManager {
     /// copied, so the clone boots the same installed system. Off APFS the disk falls
     /// back to a full copy (logged).
     ///
-    /// The base machine identifier is reused, which is correct for running a single
-    /// clone at a time; concurrent clones should be given distinct identifiers (done
-    /// with the VM lifecycle).
+    /// The base machine identifier is copied into the instance and reused on every
+    /// boot. It is the identifier the base's auxiliary storage was created with at
+    /// install, so reusing it gives the clone a stable identity that pairs with the
+    /// cloned NVRAM.
     ///
     /// # Errors
     /// Returns an error if the base image is missing or any clone/copy step fails.

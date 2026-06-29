@@ -2,16 +2,16 @@
 //!
 //! [`MacVm::boot`] turns the disks produced by
 //! [`MacImageManager::clone_base`](super::image::MacImageManager::clone_base) into a
-//! live `arcbox-vz` virtual machine. Each boot mints a fresh machine identifier
-//! (verified to start with the copied auxiliary storage), so concurrent clones of
-//! one base get distinct identities.
+//! live `arcbox-vz` virtual machine. The machine identifier is the one persisted with
+//! the machine (the identifier its auxiliary storage was created with at install), so
+//! a machine keeps a stable identity across reboots.
 
 use std::path::Path;
 use std::time::Duration;
 
 use arcbox_vz::{
     MacAuxiliaryStorage, MacGraphicsDeviceConfiguration, MacHardwareModel, MacMachineIdentifier,
-    MacOSBootLoader, MacPlatform, StorageDeviceConfiguration, VZError, VirtualMachine,
+    MacOSBootLoader, MacPlatform, StorageDeviceConfiguration, VirtualMachine,
     VirtualMachineConfiguration, VirtualMachineState, min_cpu_count, min_memory_size,
 };
 
@@ -19,10 +19,6 @@ use crate::error::{CoreError, Result};
 
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const READINESS_MAX_POLLS: u32 = 240; // ~60s
-
-fn vz_err(e: VZError) -> CoreError {
-    CoreError::macos(e.to_string())
-}
 
 /// A booted macOS guest VM built from a cloned base image.
 pub struct MacVm {
@@ -33,9 +29,9 @@ impl MacVm {
     /// Boots a macOS guest from cloned instance disks and waits until it reaches the
     /// Running state.
     ///
-    /// A fresh machine identifier is generated so concurrent clones of the same base
-    /// have distinct identities. `cpus`/`memory_mib` are floored to the framework
-    /// minimums. Apple Silicon only.
+    /// `machine_id` is the persisted identifier the auxiliary storage was created with;
+    /// reusing it keeps the guest's identity stable across reboots. `cpus`/`memory_mib`
+    /// are floored to the framework minimums. Apple Silicon only.
     ///
     /// # Errors
     /// Returns an error if the configuration is invalid, the VM cannot start, or it
@@ -48,33 +44,30 @@ impl MacVm {
         disk: &Path,
         aux: &Path,
         hardware_model: &[u8],
+        machine_id: &[u8],
         cpus: u32,
         memory_mib: u64,
     ) -> Result<Self> {
-        let hardware_model = MacHardwareModel::from_data(hardware_model).map_err(vz_err)?;
-        let machine_id = MacMachineIdentifier::new().map_err(vz_err)?;
-        let aux = MacAuxiliaryStorage::open(aux).map_err(vz_err)?;
-        let platform = MacPlatform::new(&hardware_model, &machine_id, &aux).map_err(vz_err)?;
+        let hardware_model = MacHardwareModel::from_data(hardware_model)?;
+        let machine_id = MacMachineIdentifier::from_data(machine_id)?;
+        let aux = MacAuxiliaryStorage::open(aux)?;
+        let platform = MacPlatform::new(&hardware_model, &machine_id, &aux)?;
 
         let cpu_count = usize::try_from(u64::from(cpus).max(min_cpu_count())).unwrap_or(1);
         let memory = (memory_mib * 1024 * 1024).max(min_memory_size());
 
-        let mut config = VirtualMachineConfiguration::new().map_err(vz_err)?;
+        let mut config = VirtualMachineConfiguration::new()?;
         config
             .set_cpu_count(cpu_count)
             .set_memory_size(memory)
             .set_platform(platform)
-            .set_boot_loader(MacOSBootLoader::new().map_err(vz_err)?)
-            .add_storage_device(
-                StorageDeviceConfiguration::disk_image(disk, false).map_err(vz_err)?,
-            )
-            .add_graphics_device(
-                MacGraphicsDeviceConfiguration::new(1920, 1080, 80).map_err(vz_err)?,
-            );
-        config.validate().map_err(vz_err)?;
-        let vm = config.build().map_err(vz_err)?;
+            .set_boot_loader(MacOSBootLoader::new()?)
+            .add_storage_device(StorageDeviceConfiguration::disk_image(disk, false)?)
+            .add_graphics_device(MacGraphicsDeviceConfiguration::new(1920, 1080, 80)?);
+        config.validate()?;
+        let vm = config.build()?;
 
-        vm.start().await.map_err(vz_err)?;
+        vm.start().await?;
         let mut polls = 0;
         while vm.state() != VirtualMachineState::Running && polls < READINESS_MAX_POLLS {
             tokio::time::sleep(READINESS_POLL_INTERVAL).await;
@@ -106,7 +99,7 @@ impl MacVm {
     /// # Errors
     /// Returns an error if the guest cannot be asked to stop.
     pub fn request_stop(&self) -> Result<()> {
-        self.vm.request_stop().map_err(vz_err)
+        Ok(self.vm.request_stop()?)
     }
 
     /// Forcibly stops the VM.
@@ -118,6 +111,6 @@ impl MacVm {
         reason = "Virtualization.framework VM handles are !Send; the caller drives stop on a single thread"
     )]
     pub async fn stop(&self) -> Result<()> {
-        self.vm.stop().await.map_err(vz_err)
+        Ok(self.vm.stop().await?)
     }
 }

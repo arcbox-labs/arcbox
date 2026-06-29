@@ -8,7 +8,7 @@ use std::path::Path;
 
 use arcbox_vz::{
     MacAuxiliaryStorage, MacGraphicsDeviceConfiguration, MacMachineIdentifier, MacOSBootLoader,
-    MacOSInstaller, MacOSRestoreImage, MacPlatform, StorageDeviceConfiguration, VZError,
+    MacOSInstaller, MacOSRestoreImage, MacPlatform, StorageDeviceConfiguration,
     VirtualMachineConfiguration, min_cpu_count, min_memory_size,
 };
 use chrono::Utc;
@@ -19,10 +19,6 @@ use crate::error::{CoreError, Result};
 /// macOS installation is memory-hungry; floor the install VM at 8 GiB.
 const INSTALL_MIN_MEMORY: u64 = 8 * GIB;
 const GIB: u64 = 1024 * 1024 * 1024;
-
-fn vz_err(e: VZError) -> CoreError {
-    CoreError::macos(e.to_string())
-}
 
 impl MacImageManager {
     /// Installs macOS from a local IPSW into a new base image named `name`.
@@ -51,10 +47,8 @@ impl MacImageManager {
             return Err(CoreError::already_exists(format!("macOS image '{name}'")));
         }
 
-        let restore = MacOSRestoreImage::load_from_url(ipsw)
-            .await
-            .map_err(vz_err)?;
-        let reqs = restore.requirements().map_err(vz_err)?;
+        let restore = MacOSRestoreImage::load_from_url(ipsw).await?;
+        let reqs = restore.requirements()?;
         if !reqs.hardware_model.is_supported() {
             return Err(CoreError::macos(
                 "restore image hardware model is not supported on this host",
@@ -70,7 +64,7 @@ impl MacImageManager {
             dir.join("hwmodel.bin"),
             reqs.hardware_model.data_representation(),
         )?;
-        let machine_id = MacMachineIdentifier::new().map_err(vz_err)?;
+        let machine_id = MacMachineIdentifier::new()?;
         std::fs::write(dir.join("machine-id.bin"), machine_id.data_representation())?;
 
         // Allocate the (sparse) system disk and fresh auxiliary storage.
@@ -78,33 +72,28 @@ impl MacImageManager {
         disk.set_len(disk_gb * GIB)?;
         drop(disk);
         let _ = std::fs::remove_file(&aux_path);
-        let aux =
-            MacAuxiliaryStorage::create(&aux_path, &reqs.hardware_model, true).map_err(vz_err)?;
+        let aux = MacAuxiliaryStorage::create(&aux_path, &reqs.hardware_model, true)?;
 
-        let platform = MacPlatform::new(&reqs.hardware_model, &machine_id, &aux).map_err(vz_err)?;
+        let platform = MacPlatform::new(&reqs.hardware_model, &machine_id, &aux)?;
         let cpus = usize::try_from(reqs.minimum_cpu_count.max(min_cpu_count())).unwrap_or(1);
         let memory = reqs
             .minimum_memory_size
             .max(INSTALL_MIN_MEMORY)
             .max(min_memory_size());
 
-        let mut config = VirtualMachineConfiguration::new().map_err(vz_err)?;
+        let mut config = VirtualMachineConfiguration::new()?;
         config
             .set_cpu_count(cpus)
             .set_memory_size(memory)
             .set_platform(platform)
-            .set_boot_loader(MacOSBootLoader::new().map_err(vz_err)?)
-            .add_storage_device(
-                StorageDeviceConfiguration::disk_image(&disk_path, false).map_err(vz_err)?,
-            )
-            .add_graphics_device(
-                MacGraphicsDeviceConfiguration::new(1920, 1080, 80).map_err(vz_err)?,
-            );
-        config.validate().map_err(vz_err)?;
-        let vm = config.build().map_err(vz_err)?;
+            .set_boot_loader(MacOSBootLoader::new()?)
+            .add_storage_device(StorageDeviceConfiguration::disk_image(&disk_path, false)?)
+            .add_graphics_device(MacGraphicsDeviceConfiguration::new(1920, 1080, 80)?);
+        config.validate()?;
+        let vm = config.build()?;
 
-        let installer = MacOSInstaller::new(&vm, ipsw).map_err(vz_err)?;
-        installer.install(&vm, on_progress).await.map_err(vz_err)?;
+        let installer = MacOSInstaller::new(&vm, ipsw)?;
+        installer.install(&vm, on_progress).await?;
 
         // The installer leaves the VM running; power it off so the base is captured
         // at rest. Best-effort — ignore an error if it is already stopped.

@@ -56,9 +56,16 @@ pub enum CoreError {
     #[error("network error: {0}")]
     Net(#[from] arcbox_net::NetError),
 
-    /// macOS guest image / clone error.
+    /// macOS guest image / clone error (a message that does not originate from
+    /// Virtualization.framework — e.g. a path or serialization failure).
+    #[cfg(target_os = "macos")]
     #[error("macOS image error: {0}")]
     Macos(String),
+
+    /// Virtualization.framework error from the `arcbox-vz` layer.
+    #[cfg(target_os = "macos")]
+    #[error("macOS virtualization error: {0}")]
+    Vz(#[from] arcbox_vz::VZError),
 }
 
 impl CoreError {
@@ -87,6 +94,7 @@ impl CoreError {
     }
 
     /// Creates a new macOS image error.
+    #[cfg(target_os = "macos")]
     #[must_use]
     pub fn macos(msg: impl Into<String>) -> Self {
         Self::Macos(msg.into())

@@ -29,6 +29,7 @@ const MACHINE_RECORD_FILE: &str = "machine.json";
 const DISK_FILE: &str = "disk.img";
 const AUX_FILE: &str = "aux.img";
 const HARDWARE_MODEL_FILE: &str = "hwmodel.bin";
+const MACHINE_ID_FILE: &str = "machine-id.bin";
 
 /// Persisted record describing a macOS machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,12 +71,22 @@ pub struct MacMachineInfo {
     pub created_at: DateTime<Utc>,
 }
 
+/// A machine's runtime slot. A slot is reserved (`Starting`) before the VM boots so
+/// the per-host guest cap is enforced atomically across the multi-second boot, then
+/// replaced by the live VM (`Running`).
+enum RunningSlot {
+    /// Reserved while booting: occupies a guest slot but has no live VM yet.
+    Starting,
+    /// A booted, running VM.
+    Running(MacVm),
+}
+
 /// Manages macOS guest machines: clone-from-base, boot, stop, remove.
 pub struct MacMachineManager {
     images: MacImageManager,
     machines_dir: PathBuf,
     records: RwLock<HashMap<String, MacMachineRecord>>,
-    running: RwLock<HashMap<String, MacVm>>,
+    running: RwLock<HashMap<String, RunningSlot>>,
 }
 
 impl MacMachineManager {
@@ -143,8 +154,14 @@ impl MacMachineManager {
     /// Returns an error if a machine with the name exists, the base image is missing,
     /// or the clone/persist fails.
     pub fn create(&self, config: MacMachineConfig) -> Result<()> {
-        let mut records = self.records.write().map_err(|_| CoreError::LockPoisoned)?;
-        if records.contains_key(&config.name) {
+        // Pre-check under a short read lock, then clone (slow file I/O) without holding
+        // any lock, then re-check on insert to settle a lost create/create race.
+        if self
+            .records
+            .read()
+            .map_err(|_| CoreError::LockPoisoned)?
+            .contains_key(&config.name)
+        {
             return Err(CoreError::already_exists(format!(
                 "macOS machine '{}'",
                 config.name
@@ -153,8 +170,10 @@ impl MacMachineManager {
 
         let dir = self.machine_dir(&config.name);
         let disks = self.images.clone_base(&config.image, &dir)?;
-        // Keep the hardware model with the machine so it boots without the base image.
+        // Keep the hardware model and machine identifier with the machine so it boots
+        // without the base image and with a stable identity across reboots.
         std::fs::write(dir.join(HARDWARE_MODEL_FILE), &disks.hardware_model)?;
+        std::fs::write(dir.join(MACHINE_ID_FILE), &disks.machine_id)?;
 
         let record = MacMachineRecord {
             name: config.name.clone(),
@@ -164,6 +183,16 @@ impl MacMachineManager {
             created_at: Utc::now(),
         };
         self.write_record(&record)?;
+
+        let mut records = self.records.write().map_err(|_| CoreError::LockPoisoned)?;
+        if records.contains_key(&config.name) {
+            drop(records);
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(CoreError::already_exists(format!(
+                "macOS machine '{}'",
+                config.name
+            )));
+        }
         records.insert(config.name, record);
         Ok(())
     }
@@ -187,8 +216,11 @@ impl MacMachineManager {
                 .cloned()
                 .ok_or_else(|| CoreError::not_found(format!("macOS machine '{name}'")))?
         };
+
+        // Atomically check the cap and reserve a slot before the multi-second boot, so
+        // concurrent starts cannot both pass the check and exceed the cap.
         {
-            let running = self.running.read().map_err(|_| CoreError::LockPoisoned)?;
+            let mut running = self.running.write().map_err(|_| CoreError::LockPoisoned)?;
             if running.contains_key(name) {
                 return Err(CoreError::invalid_state(format!(
                     "macOS machine '{name}' is already running"
@@ -199,23 +231,38 @@ impl MacMachineManager {
                     "at most {MAX_RUNNING_MACOS_GUESTS} macOS guests may run concurrently per host (Apple license)"
                 )));
             }
+            running.insert(name.to_string(), RunningSlot::Starting);
         }
 
         let dir = self.machine_dir(name);
-        let hardware_model = std::fs::read(dir.join(HARDWARE_MODEL_FILE))?;
         // The framework rejects a third macOS guest, so it backstops the cap above.
-        let vm = MacVm::boot(
-            &dir.join(DISK_FILE),
-            &dir.join(AUX_FILE),
-            &hardware_model,
-            record.cpus,
-            record.memory_mib,
-        )
-        .await?;
+        let booted = async {
+            let hardware_model = std::fs::read(dir.join(HARDWARE_MODEL_FILE))?;
+            let machine_id = std::fs::read(dir.join(MACHINE_ID_FILE))?;
+            MacVm::boot(
+                &dir.join(DISK_FILE),
+                &dir.join(AUX_FILE),
+                &hardware_model,
+                &machine_id,
+                record.cpus,
+                record.memory_mib,
+            )
+            .await
+        }
+        .await;
 
         let mut running = self.running.write().map_err(|_| CoreError::LockPoisoned)?;
-        running.insert(name.to_string(), vm);
-        Ok(())
+        match booted {
+            Ok(vm) => {
+                running.insert(name.to_string(), RunningSlot::Running(vm));
+                Ok(())
+            }
+            Err(e) => {
+                // Release the reservation so a retry (and the cap) are not wedged.
+                running.remove(name);
+                Err(e)
+            }
+        }
     }
 
     /// Stops a running macOS machine.
@@ -229,9 +276,21 @@ impl MacMachineManager {
     pub async fn stop(&self, name: &str) -> Result<()> {
         let vm = {
             let mut running = self.running.write().map_err(|_| CoreError::LockPoisoned)?;
-            running.remove(name).ok_or_else(|| {
-                CoreError::invalid_state(format!("macOS machine '{name}' is not running"))
-            })?
+            match running.remove(name) {
+                Some(RunningSlot::Running(vm)) => vm,
+                Some(slot @ RunningSlot::Starting) => {
+                    // Mid-boot: keep the reservation; start() will finalize it.
+                    running.insert(name.to_string(), slot);
+                    return Err(CoreError::invalid_state(format!(
+                        "macOS machine '{name}' is still starting"
+                    )));
+                }
+                None => {
+                    return Err(CoreError::invalid_state(format!(
+                        "macOS machine '{name}' is not running"
+                    )));
+                }
+            }
         };
         vm.stop().await
     }
@@ -271,10 +330,35 @@ impl MacMachineManager {
         Ok(())
     }
 
-    /// Returns whether a machine is currently running.
+    /// Returns whether a machine currently occupies a runtime slot (starting or
+    /// running).
     #[must_use]
     pub fn is_running(&self, name: &str) -> bool {
         self.running.read().is_ok_and(|r| r.contains_key(name))
+    }
+
+    /// Maps a machine's runtime slot to its reported state.
+    fn state_of(&self, name: &str) -> MachineState {
+        let Ok(running) = self.running.read() else {
+            return MachineState::Stopped;
+        };
+        match running.get(name) {
+            Some(RunningSlot::Running(_)) => MachineState::Running,
+            Some(RunningSlot::Starting) => MachineState::Starting,
+            None => MachineState::Stopped,
+        }
+    }
+
+    /// Builds the public view of a record, resolving its current runtime state.
+    fn info(&self, record: &MacMachineRecord) -> MacMachineInfo {
+        MacMachineInfo {
+            name: record.name.clone(),
+            image: record.image.clone(),
+            cpus: record.cpus,
+            memory_mib: record.memory_mib,
+            state: self.state_of(&record.name),
+            created_at: record.created_at,
+        }
     }
 
     /// Lists all macOS machines.
@@ -283,27 +367,45 @@ impl MacMachineManager {
         let Ok(records) = self.records.read() else {
             return Vec::new();
         };
-        records
-            .values()
-            .map(|r| MacMachineInfo {
-                name: r.name.clone(),
-                image: r.image.clone(),
-                cpus: r.cpus,
-                memory_mib: r.memory_mib,
-                state: if self.is_running(&r.name) {
-                    MachineState::Running
-                } else {
-                    MachineState::Stopped
-                },
-                created_at: r.created_at,
-            })
-            .collect()
+        records.values().map(|r| self.info(r)).collect()
     }
 
     /// Returns one macOS machine by name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<MacMachineInfo> {
-        self.list().into_iter().find(|m| m.name == name)
+        let records = self.records.read().ok()?;
+        records.get(name).map(|r| self.info(r))
+    }
+
+    /// Stops every running macOS guest, returning the per-machine errors that occur.
+    ///
+    /// Used on daemon shutdown so framework VMs are stopped cleanly rather than dropped
+    /// while still running. Reserved (still-starting) slots have no live VM and are
+    /// simply discarded.
+    #[allow(
+        clippy::future_not_send,
+        reason = "stops Virtualization.framework VMs (!Send ObjC handles across await); driven on a single thread"
+    )]
+    pub async fn stop_all(&self) -> Vec<(String, CoreError)> {
+        let vms: Vec<(String, MacVm)> = {
+            let Ok(mut running) = self.running.write() else {
+                return vec![(String::from("<all>"), CoreError::LockPoisoned)];
+            };
+            running
+                .drain()
+                .filter_map(|(name, slot)| match slot {
+                    RunningSlot::Running(vm) => Some((name, vm)),
+                    RunningSlot::Starting => None,
+                })
+                .collect()
+        };
+        let mut errors = Vec::new();
+        for (name, vm) in vms {
+            if let Err(e) = vm.stop().await {
+                errors.push((name, e));
+            }
+        }
+        errors
     }
 }
 

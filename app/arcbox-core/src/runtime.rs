@@ -591,6 +591,35 @@ impl Runtime {
         Ok(())
     }
 
+    /// Stops every running macOS guest, logging any per-machine failures.
+    ///
+    /// macOS VM operations are `!Send` (ObjC handles + the VM dispatch queue held
+    /// across await), so they are driven on a transient current-thread runtime inside
+    /// `spawn_blocking` — the same pattern the gRPC machine handlers use.
+    #[cfg(target_os = "macos")]
+    async fn shutdown_macos_guests(&self) {
+        let manager = Arc::clone(&self.mac_machine_manager);
+        let joined =
+            tokio::task::spawn_blocking(
+                move || match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(manager.stop_all()),
+                    Err(e) => vec![(String::from("<all>"), CoreError::from(e))],
+                },
+            )
+            .await;
+        match joined {
+            Ok(errors) => {
+                for (name, e) in errors {
+                    tracing::warn!("Failed to stop macOS guest {}: {}", name, e);
+                }
+            }
+            Err(e) => tracing::warn!("macOS guest shutdown task failed to join: {}", e),
+        }
+    }
+
     /// Shuts down the runtime gracefully.
     ///
     /// # Errors
@@ -651,7 +680,11 @@ impl Runtime {
             }
         }
 
-        // 4. Stop network manager.
+        // 4. Stop any running macOS guests (separate manager from Linux machines).
+        #[cfg(target_os = "macos")]
+        self.shutdown_macos_guests().await;
+
+        // 5. Stop network manager.
         if let Err(e) = self.network_manager.stop() {
             tracing::warn!("Failed to stop network manager: {}", e);
         }
@@ -683,6 +716,10 @@ impl Runtime {
                 let _ = self.machine_manager.stop(&machine.name);
             }
         }
+
+        // Stop any running macOS guests (separate manager from Linux machines).
+        #[cfg(target_os = "macos")]
+        self.shutdown_macos_guests().await;
 
         // Stop network manager.
         let _ = self.network_manager.stop();

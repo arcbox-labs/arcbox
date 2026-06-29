@@ -254,10 +254,33 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         request: Request<InspectMachineRequest>,
     ) -> Result<Response<MachineInfo>, Status> {
         let id = request.into_inner().id;
+        let runtime = self.runtime.ready()?;
 
-        let machine = self
-            .runtime
-            .ready()?
+        #[cfg(target_os = "macos")]
+        if let Some(machine) = runtime.mac_machine_manager().get(&id) {
+            return Ok(Response::new(MachineInfo {
+                id: machine.name.clone(),
+                name: machine.name,
+                state: format!("{:?}", machine.state).to_lowercase(),
+                hardware: Some(arcbox_protocol::v1::MachineHardware {
+                    cpus: machine.cpus,
+                    memory: machine.memory_mib * 1024 * 1024,
+                    arch: std::env::consts::ARCH.to_string(),
+                }),
+                network: None,
+                storage: None,
+                os: Some(arcbox_protocol::v1::MachineOs {
+                    distro: "macos".to_string(),
+                    version: machine.image,
+                    kernel: String::new(),
+                }),
+                created: None,
+                started_at: None,
+                mounts: vec![],
+            }));
+        }
+
+        let machine = runtime
             .machine_manager()
             .get(&id)
             .ok_or_else(|| Status::not_found("machine not found"))?;
