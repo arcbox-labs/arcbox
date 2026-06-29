@@ -41,6 +41,7 @@ arcbox-helper = { workspace = true }
 arcbox-migration = { workspace = true }
 libc = { workspace = true }
 tempfile = "3"
+statig = { version = "0.4.1", features = ["async"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ifbridge = { workspace = true }
