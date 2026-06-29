@@ -33,6 +33,26 @@ ArcBox is in public beta. Join the community on
 [open an issue](https://github.com/arcboxlabs/arcbox/issues) to tell us what to
 build next.
 
+## Quick start
+
+```bash
+# Install with Homebrew
+brew install --cask arcboxlabs/tap/arcbox
+
+# or with the install script
+curl -fsSL https://get.arcbox.dev | bash
+
+# Start the daemon and enable Docker compatibility
+abctl daemon start
+abctl docker enable
+
+# Run a container
+docker run -d -p 8080:80 nginx
+curl http://localhost:8080
+```
+
+Run `abctl doctor` to check the runtime, and `abctl --help` to see every command.
+
 ## Containers
 
 ArcBox is a drop-in Docker engine. It exposes a Docker-compatible socket and
@@ -78,26 +98,6 @@ Import your workloads from another local runtime.
 abctl migrate from docker-desktop
 abctl migrate from orbstack
 ```
-
-## Quick start
-
-```bash
-# Install with Homebrew
-brew install --cask arcboxlabs/tap/arcbox
-
-# or with the install script
-curl -fsSL https://get.arcbox.dev | bash
-
-# Start the daemon and enable Docker compatibility
-abctl daemon start
-abctl docker enable
-
-# Run a container
-docker run -d -p 8080:80 nginx
-curl http://localhost:8080
-```
-
-Run `abctl doctor` to check the runtime, and `abctl --help` to see every command.
 
 ## Sandboxes
 
