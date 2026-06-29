@@ -19,26 +19,15 @@
 
 ArcBox is an open-source alternative to Docker Desktop and OrbStack on macOS.
 OrbStack set the bar for running Docker on a Mac quickly and with little overhead,
-but it is closed-source. ArcBox is open source under MIT/Apache-2.0 and aims to
-match it.
+but it is closed-source. ArcBox is open source under MIT/Apache-2.0, written from
+scratch in Rust, and aims to match it.
 
-The whole stack is written in Rust. ArcBox runs its own virtual machine monitor
-on Apple's Hypervisor.framework, with a custom VirtIO device stack, a custom macOS
-networking datapath, a VirtioFS/FUSE filesystem, and a guest agent that talks to
-the host over vsock. Building the runtime ourselves is what keeps it fast and
-small.
-
-That same runtime is the foundation for running AI agents safely. An agent that
-writes and runs code needs an isolated machine to run it in, and ArcBox gives each
-one a real microVM. The sandbox API is designed to be the same on your laptop and
-on ArcBox Platform, so you can build against local sandboxes and scale to the cloud
-without changing your code. The platform runs that fleet on machines you bring
-yourself, turning hardware you already own into cloud capacity.
-
-ArcBox is in public beta. Join the community on
+The same runtime gives each AI agent, CI job, or piece of untrusted code its own
+real microVM. The sandbox you run locally is the same primitive ArcBox Platform
+runs in the cloud, so you can build against local sandboxes and scale to a fleet
+without changing your code. ArcBox is in public beta. Join us on
 [Discord](https://arcbox.link/discord), or
-[open an issue](https://github.com/arcboxlabs/arcbox/issues) to tell us what to
-build next.
+[open an issue](https://github.com/arcboxlabs/arcbox/issues).
 
 ## Quick start
 
@@ -129,11 +118,7 @@ ArcBox Platform turns hardware you already own into cloud capacity. Enroll your
 Macs and Linux machines into a fleet, and they become on-demand compute for your
 team's sandboxes, builds, and CI, at the cost of your own hardware instead of
 premium cloud pricing. Apple Silicon is first-class, so the Mac capacity that the
-big clouds meter at a steep markup is simply yours to pool.
-
-The sandbox you run locally is the same primitive the fleet runs in the cloud, so
-a sandbox you launch on your laptop and one you launch in production are the same
-object. (In development.)
+big clouds meter at a steep markup is simply yours to pool. (In development.)
 
 ## Machines
 
