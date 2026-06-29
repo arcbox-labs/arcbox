@@ -674,7 +674,10 @@ impl BlkWorkerHandle {
             let mut first_desc = true;
             let mut idx = head_idx as usize;
 
-            loop {
+            // Bounded to `q_size` iterations so a cyclic `next` chain (e.g.
+            // 0->1->0) from a malformed or malicious guest cannot spin this
+            // dispatch loop forever. Any legitimate chain fits in `q_size`.
+            for _ in 0..q_size {
                 let d_off = desc_addr + idx * 16;
                 if d_off + 16 > memory.len() {
                     break;
