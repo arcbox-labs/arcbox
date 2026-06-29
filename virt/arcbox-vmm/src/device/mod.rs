@@ -1157,25 +1157,11 @@ impl DeviceManager {
                                     guest_mem[used_idx_off..used_idx_off + 2]
                                         .copy_from_slice(&used_idx.to_le_bytes());
 
-                                    // Write avail_event in the used ring to request
-                                    // kicks from the guest on future TX submissions.
-                                    // With VIRTIO_F_EVENT_IDX, the guest checks
-                                    // vring_need_event(avail_event, new, old) before
-                                    // kicking. Setting avail_event = current avail_idx
-                                    // ensures the guest kicks on the next submission.
-                                    if let Some(avail_off) =
-                                        (qcfg.avail_addr as usize).checked_sub(gpa_base)
-                                    {
-                                        let avail_idx = u16::from_le_bytes([
-                                            guest_mem[avail_off + 2],
-                                            guest_mem[avail_off + 3],
-                                        ]);
-                                        let avail_event_off = used_off + 4 + q_size * 8;
-                                        if avail_event_off + 2 <= guest_mem.len() {
-                                            guest_mem[avail_event_off..avail_event_off + 2]
-                                                .copy_from_slice(&avail_idx.to_le_bytes());
-                                        }
-                                    }
+                                    // avail_event (EVENT_IDX kick suppression) is
+                                    // published inside `drain_tx_queue` — unconditionally
+                                    // on every kick and with a TOCTOU re-check — so it
+                                    // is NOT written here (doing it only on non-empty
+                                    // completions is the ABX-386 wedge).
 
                                     if let Some(_irq) = device.info.irq {
                                         {

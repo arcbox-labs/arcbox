@@ -579,6 +579,14 @@ impl VirtioNet {
             return Vec::new();
         };
         let q_size = qcfg.size as usize;
+        let Some(used_addr) = (qcfg.used_addr as usize).checked_sub(gpa_base) else {
+            tracing::warn!(
+                "VirtioNet::handle_tx: used GPA {:#x} below ram base {:#x}",
+                qcfg.used_addr,
+                gpa_base
+            );
+            return Vec::new();
+        };
 
         // SAFETY: `ctx.mem` was constructed from the VM-lifetime guest RAM
         // mmap. Each slice view is short-lived and never escapes this
@@ -591,96 +599,134 @@ impl VirtioNet {
         if avail_addr + 4 > memory.len() {
             return Vec::new();
         }
-        let avail_idx = u16::from_le_bytes([memory[avail_addr + 2], memory[avail_addr + 3]]);
+
+        // With VIRTIO_F_EVENT_IDX the guest consults `avail_event` via
+        // vring_need_event() before every TX kick. The host must keep it
+        // current after each drain — including empty drains — or a stale value
+        // makes the guest suppress kicks and wedge guest→host TX (ABX-386).
+        // avail_event sits just past the used ring.
+        let event_idx = (self.acked_features & arcbox_virtio_core::queue::VIRTIO_F_EVENT_IDX) != 0;
+        let avail_event_off = used_addr + 4 + q_size * 8;
 
         let mut current_avail = port.last_avail_tx.load(Ordering::Relaxed);
         let mut completions = Vec::new();
 
-        while current_avail != avail_idx {
-            let ring_off = avail_addr + 4 + 2 * ((current_avail as usize) % q_size);
-            if ring_off + 2 > memory.len() {
-                break;
-            }
-            let head_idx = u16::from_le_bytes([memory[ring_off], memory[ring_off + 1]]) as usize;
+        loop {
+            // Acquire pairs with the guest's release barrier before it bumps
+            // avail->idx, so descriptors it just published are visible here.
+            std::sync::atomic::fence(Ordering::Acquire);
+            let avail_idx = u16::from_le_bytes([memory[avail_addr + 2], memory[avail_addr + 3]]);
 
-            let mut packet_data = Vec::new();
-            let mut idx = head_idx;
-            for _ in 0..q_size {
-                let d_off = desc_addr + idx * 16;
-                if d_off + 16 > memory.len() {
+            while current_avail != avail_idx {
+                let ring_off = avail_addr + 4 + 2 * ((current_avail as usize) % q_size);
+                if ring_off + 2 > memory.len() {
                     break;
                 }
-                let addr = match (u64::from_le_bytes(memory[d_off..d_off + 8].try_into().unwrap())
-                    as usize)
-                    .checked_sub(gpa_base)
-                {
-                    Some(a) => a,
-                    None => continue,
-                };
-                let len =
-                    u32::from_le_bytes(memory[d_off + 8..d_off + 12].try_into().unwrap()) as usize;
-                let flags = u16::from_le_bytes(memory[d_off + 12..d_off + 14].try_into().unwrap());
-                let next = u16::from_le_bytes(memory[d_off + 14..d_off + 16].try_into().unwrap());
+                let head_idx =
+                    u16::from_le_bytes([memory[ring_off], memory[ring_off + 1]]) as usize;
 
-                // WRITE flag clear = read-only (guest → host). TX descriptors
-                // are always read-only.
-                if flags & 2 == 0 && addr + len <= memory.len() {
-                    packet_data.extend_from_slice(&memory[addr..addr + len]);
-                }
-                if flags & 1 == 0 {
-                    break;
-                }
-                idx = next as usize;
-            }
-
-            let total_len = packet_data.len() as u32;
-            finalize(&mut packet_data);
-
-            // Strip the virtio-net header after applying checksum offload.
-            if packet_data.len() > VirtioNetHeader::SIZE {
-                let frame = &packet_data[VirtioNetHeader::SIZE..];
-                // Retry briefly on EAGAIN/ENOBUFS: the host-side socketpair
-                // peer (datapath classifier) might be behind by a few frames
-                // under bulk bursts (iperf3 -R and similar). Without this
-                // retry, guest TCP sees silent packet loss and retransmits,
-                // collapsing throughput to under 1 MB/s while the fast-path
-                // can do ~1 GB/s.
-                let mut retries = 0;
-                loop {
-                    // SAFETY: `host_fd` is owned by the caller via `NetPort`;
-                    // `frame` is a valid slice borrowed from `packet_data`
-                    // for the duration of the write.
-                    let n = unsafe {
-                        libc::write(host_fd, frame.as_ptr().cast::<libc::c_void>(), frame.len())
-                    };
-                    if n >= 0 {
+                let mut packet_data = Vec::new();
+                let mut idx = head_idx;
+                for _ in 0..q_size {
+                    let d_off = desc_addr + idx * 16;
+                    if d_off + 16 > memory.len() {
                         break;
                     }
-                    let err = std::io::Error::last_os_error();
-                    match err.raw_os_error() {
-                        Some(libc::EAGAIN | libc::ENOBUFS) if retries < 64 => {
-                            // Yield so the peer thread can drain, then retry.
-                            std::thread::yield_now();
-                            retries += 1;
-                        }
-                        Some(libc::EAGAIN | libc::ENOBUFS) => {
-                            // Peer is persistently slow — drop the frame.
-                            // Guest TCP will retransmit.
+                    let addr =
+                        match (u64::from_le_bytes(memory[d_off..d_off + 8].try_into().unwrap())
+                            as usize)
+                            .checked_sub(gpa_base)
+                        {
+                            Some(a) => a,
+                            None => continue,
+                        };
+                    let len = u32::from_le_bytes(memory[d_off + 8..d_off + 12].try_into().unwrap())
+                        as usize;
+                    let flags =
+                        u16::from_le_bytes(memory[d_off + 12..d_off + 14].try_into().unwrap());
+                    let next =
+                        u16::from_le_bytes(memory[d_off + 14..d_off + 16].try_into().unwrap());
+
+                    // WRITE flag clear = read-only (guest → host). TX descriptors
+                    // are always read-only.
+                    if flags & 2 == 0 && addr + len <= memory.len() {
+                        packet_data.extend_from_slice(&memory[addr..addr + len]);
+                    }
+                    if flags & 1 == 0 {
+                        break;
+                    }
+                    idx = next as usize;
+                }
+
+                let total_len = packet_data.len() as u32;
+                finalize(&mut packet_data);
+
+                // Strip the virtio-net header after applying checksum offload.
+                if packet_data.len() > VirtioNetHeader::SIZE {
+                    let frame = &packet_data[VirtioNetHeader::SIZE..];
+                    // Retry briefly on EAGAIN/ENOBUFS: the host-side socketpair
+                    // peer (datapath classifier) might be behind by a few frames
+                    // under bulk bursts (iperf3 -R and similar). Without this
+                    // retry, guest TCP sees silent packet loss and retransmits,
+                    // collapsing throughput to under 1 MB/s while the fast-path
+                    // can do ~1 GB/s.
+                    let mut retries = 0;
+                    loop {
+                        // SAFETY: `host_fd` is owned by the caller via `NetPort`;
+                        // `frame` is a valid slice borrowed from `packet_data`
+                        // for the duration of the write.
+                        let n = unsafe {
+                            libc::write(host_fd, frame.as_ptr().cast::<libc::c_void>(), frame.len())
+                        };
+                        if n >= 0 {
                             break;
                         }
-                        _ => {
-                            tracing::warn!("VirtioNet TX write failed: {err}");
-                            break;
+                        let err = std::io::Error::last_os_error();
+                        match err.raw_os_error() {
+                            Some(libc::EAGAIN | libc::ENOBUFS) if retries < 64 => {
+                                // Yield so the peer thread can drain, then retry.
+                                std::thread::yield_now();
+                                retries += 1;
+                            }
+                            Some(libc::EAGAIN | libc::ENOBUFS) => {
+                                // Peer is persistently slow — drop the frame.
+                                // Guest TCP will retransmit.
+                                break;
+                            }
+                            _ => {
+                                tracing::warn!("VirtioNet TX write failed: {err}");
+                                break;
+                            }
                         }
                     }
                 }
+
+                completions.push((head_idx as u16, total_len));
+                current_avail = current_avail.wrapping_add(1);
             }
 
-            completions.push((head_idx as u16, total_len));
-            current_avail = current_avail.wrapping_add(1);
+            port.last_avail_tx.store(current_avail, Ordering::Relaxed);
+
+            // Publish the consumed cursor so the guest kicks on its next TX
+            // submission. Runs even when the drain above was empty — this is the
+            // core ABX-386 fix: an empty kick must still refresh avail_event.
+            if event_idx && avail_event_off + 2 <= memory.len() {
+                memory[avail_event_off..avail_event_off + 2]
+                    .copy_from_slice(&current_avail.to_le_bytes());
+            }
+
+            // Close the TOCTOU window: after publishing avail_event, re-read
+            // avail->idx. If the guest queued more (and may have suppressed its
+            // kick because it observed the stale avail_event), drain again.
+            // SeqCst orders the store above before this load.
+            std::sync::atomic::fence(Ordering::SeqCst);
+            let avail_idx_after =
+                u16::from_le_bytes([memory[avail_addr + 2], memory[avail_addr + 3]]);
+            if avail_idx_after == current_avail {
+                break;
+            }
         }
 
-        port.last_avail_tx.store(current_avail, Ordering::Relaxed);
         completions
     }
 
@@ -1264,6 +1310,67 @@ mod tests {
         let result = net.process_tx_queue(&memory);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn drain_tx_queue_refreshes_avail_event_on_empty_drain() {
+        // ABX-386 regression: with VIRTIO_F_EVENT_IDX the guest consults
+        // avail_event (vring_need_event) before every TX kick. An empty TX
+        // kick MUST still republish avail_event = consumed cursor, otherwise a
+        // stale value makes the guest suppress future kicks and wedges
+        // guest→host TX — the flaky cold-boot "stuck at Starting Docker engine"
+        // where the guest's DHCP DISCOVER never reaches the host.
+        use std::sync::atomic::AtomicU16;
+
+        // Minimal split-virtqueue layout in a scratch "guest RAM" buffer,
+        // GPA base 0, q_size = 4: desc @ 0x100, avail @ 0x200, used @ 0x300.
+        let q_size: u16 = 4;
+        let (desc_addr, avail_addr, used_addr) = (0x100usize, 0x200usize, 0x300usize);
+        let avail_event_off = used_addr + 4 + q_size as usize * 8;
+        let mut mem = vec![0u8; 0x1000];
+
+        // The device has already drained everything the guest produced
+        // (last_avail_tx == avail_idx == 3) → this kick drains nothing.
+        let drained: u16 = 3;
+        mem[avail_addr + 2..avail_addr + 4].copy_from_slice(&drained.to_le_bytes());
+        // Stale avail_event (what the pre-fix empty-drain path leaves behind).
+        mem[avail_event_off..avail_event_off + 2].copy_from_slice(&0u16.to_le_bytes());
+
+        let mut net = VirtioNet::new(NetConfig::default());
+        net.ack_features(arcbox_virtio_core::queue::VIRTIO_F_EVENT_IDX);
+
+        // SAFETY: `mem` outlives `net` (declared first, dropped last) and is
+        // not moved while the raw pointer is held by the bound context.
+        let ctx = DeviceCtx {
+            mem: std::sync::Arc::new(unsafe {
+                arcbox_virtio_core::GuestMemWriter::new(mem.as_mut_ptr(), mem.len(), 0)
+            }),
+            raise_irq: std::sync::Arc::new(|_| {}),
+        };
+        net.bind_ctx(ctx);
+        net.bind_port(NetPort {
+            host_fd: -1, // unused: the empty drain writes no frame
+            last_avail_tx: AtomicU16::new(drained),
+        })
+        .expect("bind port");
+
+        let qcfg = QueueConfig {
+            desc_addr: desc_addr as u64,
+            avail_addr: avail_addr as u64,
+            used_addr: used_addr as u64,
+            size: q_size,
+            ready: true,
+            gpa_base: 0,
+        };
+
+        let completions = net.drain_tx_queue(&qcfg, |_| {});
+        assert!(completions.is_empty(), "nothing to drain");
+
+        let published = u16::from_le_bytes([mem[avail_event_off], mem[avail_event_off + 1]]);
+        assert_eq!(
+            published, drained,
+            "avail_event must be refreshed to the consumed cursor on an empty drain"
+        );
     }
 
     #[test]
