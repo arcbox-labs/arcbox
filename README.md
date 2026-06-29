@@ -28,6 +28,12 @@ networking datapath, a VirtioFS/FUSE filesystem, and a guest agent that talks to
 the host over vsock. Building the runtime ourselves is what keeps it fast and
 small.
 
+That same runtime is the foundation for running AI agents safely. An agent that
+writes and runs code needs an isolated machine to run it in, and ArcBox gives each
+one a real microVM. The sandbox API is designed to be the same on your laptop and
+on ArcBox Platform, so you can build against local sandboxes and scale to the cloud
+without changing your code.
+
 ArcBox is in public beta. Join the community on
 [Discord](https://arcbox.link/discord), or
 [open an issue](https://github.com/arcboxlabs/arcbox/issues) to tell us what to
@@ -101,9 +107,9 @@ abctl migrate from orbstack
 
 ## Sandboxes
 
-ArcBox can also run disposable microVMs, each with its own kernel, for untrusted
-code, CI jobs, and short-lived test environments. You can snapshot a booted, idle
-sandbox and restore copies of it to skip a cold boot.
+ArcBox can also run disposable microVMs, each with its own kernel, for AI agents,
+untrusted code, and CI jobs. You can snapshot a booted, idle sandbox and restore
+copies of it to skip a cold boot.
 
 ```bash
 abctl sandbox create --memory 512
@@ -115,6 +121,14 @@ abctl sandbox restore clean                  # start a new sandbox from it
 Create, run, exec, snapshot, and restore work today. We are aiming for cold boots
 under 200 ms, near-instant restore from a snapshot, and roughly 10–30 MB of
 overhead per sandbox.
+
+## ArcBox Platform
+
+The sandbox you run locally is the same primitive we run in the cloud. ArcBox
+Cloud (in development) exposes the same sandbox API across a managed fleet, so a
+sandbox you launch on your laptop and one you launch in production are the same
+object, scheduled on the nearest available capacity. You can also enroll your own
+machines into the fleet and serve that capacity yourself.
 
 ## Machines
 
