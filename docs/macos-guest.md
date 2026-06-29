@@ -25,30 +25,29 @@ and they are a **Machine-tier** capability (no Container or Sandbox tier).
 
 ## Startup Path Shape
 
-The CLI → gRPC → daemon "upper half" is shared with Linux machines. At the machine
-service it forks on `MachineKind`; the macOS lower half is an independent chain through
+macOS guests are a separate noun end to end: the `arcbox macos` CLI talks to a dedicated
+`MacosService`, distinct from the Linux `arcbox machine` / `MachineService`. The two share
+no request types and no routing — only the daemon process, the gRPC socket, and the reused
+`arcbox-vz` device configuration. The macOS lower half is an independent chain through
 `arcbox-vz` into Apple's framework, and never touches `arcbox-vmm` / HV / the vsock
 guest agent.
 
 ```text
-arcbox machine ...                         (CLI, shared)
-        │  gRPC
-        ▼
-app/arcbox-api/src/grpc/machine.rs         (machine service, shared)
-        ▼
-Runtime.machine_manager()                  (built in daemon init_runtime, shared)
-        ▼
-   ┌────────── route by guest_os / owning manager ───────────┐
-   │ Linux: machine_manager()               │ macOS: mac_machine_manager() │
-   ▼                                        ▼
-VmManager::start                          macos::MacVm
-  → Vmm::new (arcbox-vmm, VmBackend::Hv)     → arcbox-vz: VirtualMachineConfiguration
-  → custom HV VMM (darwin_hv/vcpu_loop)         .set_boot_loader(MacOSBootLoader)
-  → custom virtio + Linux kernel                .set_platform(MacPlatform{hw,id,aux})
-  → ready = vsock guest-agent ping              .add_storage/network/serial/... (reused)
-                                                .build() → VirtualMachine
-                                              → vm.start() → Virtualization.framework
-                                              → ready = VZ state==Running (+ opt. SSH)
+arcbox machine ...               arcbox macos ...            (CLI, separate nouns)
+        │  gRPC                          │  gRPC
+        ▼                               ▼
+MachineService (machine.rs)      MacosService (macos.rs, macOS-only)
+        ▼                               ▼
+Runtime.machine_manager()        Runtime.mac_machine_manager()
+        ▼                               ▼
+VmManager::start                 macos::MacVm
+  → Vmm::new (arcbox-vmm, Hv)       → arcbox-vz: VirtualMachineConfiguration
+  → custom HV VMM (vcpu_loop)          .set_boot_loader(MacOSBootLoader)
+  → custom virtio + Linux kernel       .set_platform(MacPlatform{hw,id,aux})
+  → ready = vsock guest-agent ping     .add_storage/network/serial/... (reused)
+                                       .build() → VirtualMachine
+                                     → vm.start() → Virtualization.framework
+                                     → ready = VZ state==Running (+ opt. SSH)
 ```
 
 ### macOS sub-paths
@@ -67,7 +66,7 @@ VmManager::start                          macos::MacVm
 2. **Per-VM create (fast, CoW).**
 
    ```text
-   arcbox machine create <n> --os macos --image <base>
+   arcbox macos create <n> --image <base>
      → MacImageManager.clone_base: clonefile(disk.img) CoW + copy aux.img  (APFS, seconds)
      → MacMachineManager persists a machine record + the base hardware model
        (a fresh machine identifier is minted at boot, so concurrent clones differ)
@@ -76,7 +75,7 @@ VmManager::start                          macos::MacVm
 3. **Per-VM start (hot path).**
 
    ```text
-   arcbox machine start <n>
+   arcbox macos start <n>
      → MacVm.build → arcbox-vz VirtualMachineConfiguration
           boot_loader = MacOSBootLoader
           platform    = MacPlatform{ hardware_model, machine_id, aux_storage }
@@ -115,14 +114,16 @@ Teardown for the disposable loop: `request_stop` (graceful) -> delete the per-VM
 | base-image install | `app/arcbox-core/src/macos/install.rs` (`install_from_ipsw`) |
 | macOS machine lifecycle | `app/arcbox-core/src/macos/{vm.rs,machine.rs}` (`MacVm`, `MacMachineManager`) |
 | daemon wiring | `app/arcbox-core/src/runtime.rs` (`mac_machine_manager()`) |
-| daemon gRPC + CLI | `app/arcbox-api/src/grpc/machine.rs`, `app/arcbox-cli/src/commands/{machine,macos}.rs` |
+| daemon gRPC (macOS-only) | `app/arcbox-api/src/grpc/macos.rs` (`MacosServiceImpl`) |
+| CLI | `app/arcbox-cli/src/commands/macos.rs` (`arcbox macos`) |
 
-The machine gRPC service routes by `guest_os` (on create) or by which manager owns the
-name (start/stop/remove) to `mac_machine_manager()`; there is no shared `MachineKind`
-enum — the Linux `MachineManager` and `MacMachineManager` are separate, unified only at
-the CLI/gRPC surface. macOS VM operations are `!Send` (ObjC handles + the VM dispatch
-queue across await) while tonic requires `Send` handler futures, so the daemon drives
-them on a transient current-thread runtime inside `spawn_blocking`.
+`MacosService` is a wholly separate gRPC service from the Linux `MachineService`: its own
+request types (macOS-shaped, in MiB/GiB, no Linux fields), its own `arcbox macos` CLI noun,
+and it delegates straight to `mac_machine_manager()` — no `guest_os` discriminator and no
+ownership-probe routing. The service is registered and the CLI noun exists only on Apple
+Silicon hosts. macOS VM operations are `!Send` (ObjC handles + the VM dispatch queue across
+await) while tonic requires `Send` handler futures, so the daemon drives them on a transient
+current-thread runtime inside `spawn_blocking` (`grpc::run_macos_blocking`).
 
 ## Usage
 
@@ -131,14 +132,14 @@ them on a transient current-thread runtime inside `spawn_blocking`.
 arcbox macos image pull sequoia --ipsw /path/to/UniversalMac_xx.ipsw
 arcbox macos image ls
 
-# 2. Create a disposable machine by copy-on-write cloning the base (instant):
-arcbox machine create ci-1 --os macos --image sequoia --cpus 4 --memory 8192
+# 2. Create a disposable guest by copy-on-write cloning the base (instant):
+arcbox macos create ci-1 --image sequoia --cpus 4 --memory 8192
 
 # 3. Start / list / stop / remove:
-arcbox machine start ci-1
-arcbox machine ls            # an OS column shows linux | macos
-arcbox machine stop ci-1
-arcbox machine rm ci-1
+arcbox macos start ci-1
+arcbox macos ls
+arcbox macos stop ci-1
+arcbox macos rm ci-1
 arcbox macos image rm sequoia
 ```
 
@@ -165,7 +166,7 @@ arcbox macos image rm sequoia
   binary does not link under the devenv/nix toolchain (its SDK lacks the macOS 15+
   `hv_gic_*` Hypervisor.framework symbols `arcbox-hv`'s GIC backend needs — a
   pre-existing limitation unrelated to this feature). A real `arcbox macos image pull`
-  → `arcbox machine create --os macos` → `arcbox machine start` run uses the project's
+  → `arcbox macos create` → `arcbox macos start` run uses the project's
   normal (system-SDK) build path, with the daemon Developer-ID-signed.
 
 ## Security model (zero-trust): what's achievable
