@@ -32,7 +32,8 @@ That same runtime is the foundation for running AI agents safely. An agent that
 writes and runs code needs an isolated machine to run it in, and ArcBox gives each
 one a real microVM. The sandbox API is designed to be the same on your laptop and
 on ArcBox Platform, so you can build against local sandboxes and scale to the cloud
-without changing your code.
+without changing your code. The platform runs that fleet on machines you bring
+yourself, turning hardware you already own into cloud capacity.
 
 ArcBox is in public beta. Join the community on
 [Discord](https://arcbox.link/discord), or
@@ -122,13 +123,17 @@ Create, run, exec, snapshot, and restore work today. We are aiming for cold boot
 under 200 ms, near-instant restore from a snapshot, and roughly 10–30 MB of
 overhead per sandbox.
 
-## ArcBox Platform
+## Bring your own machine
 
-The sandbox you run locally is the same primitive we run in the cloud. ArcBox
-Platform (in development) exposes the same sandbox API across a managed fleet, so a
-sandbox you launch on your laptop and one you launch in production are the same
-object, scheduled on the nearest available capacity. You can also enroll your own
-machines into the fleet and serve that capacity yourself.
+ArcBox Platform turns hardware you already own into cloud capacity. Enroll your
+Macs and Linux machines into a fleet, and they become on-demand compute for your
+team's sandboxes, builds, and CI, at the cost of your own hardware instead of
+premium cloud pricing. Apple Silicon is first-class, so the Mac capacity that the
+big clouds meter at a steep markup is simply yours to pool.
+
+The sandbox you run locally is the same primitive the fleet runs in the cloud, so
+a sandbox you launch on your laptop and one you launch in production are the same
+object. (In development.)
 
 ## Machines
 
