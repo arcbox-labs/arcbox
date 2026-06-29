@@ -518,6 +518,29 @@ impl AgentClient {
             .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
     }
 
+    /// Synchronous `ensure_runtime` for the blocking transport (HV backend).
+    ///
+    /// Mirrors [`Self::ensure_runtime`] but over the blocking vsock transport
+    /// the HV backend hands out, so non-async harnesses (hv_e2e / cold-boot
+    /// repro) can drive the "Starting Docker engine" stage. The caller bounds
+    /// the wall-clock via `SO_RCVTIMEO`/`SO_SNDTIMEO` on the fd before the call.
+    pub fn ensure_runtime_blocking(
+        &mut self,
+        start_if_needed: bool,
+    ) -> Result<RuntimeEnsureResponse> {
+        let req = RuntimeEnsureRequest { start_if_needed };
+        let payload = req.encode_to_vec();
+        let (resp_type, resp_payload) =
+            self.rpc_call_blocking(MessageType::EnsureRuntimeRequest, &payload)?;
+        if resp_type != MessageType::EnsureRuntimeResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: {resp_type}"
+            )));
+        }
+        RuntimeEnsureResponse::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode response: {e}")))
+    }
+
     /// Gets guest runtime status.
     ///
     /// # Errors
