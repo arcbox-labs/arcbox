@@ -1215,72 +1215,62 @@ impl VirtioVsock {
         gpa_base: usize,
         packet: &[u8],
     ) -> usize {
-        let avail_idx =
-            u16::from_le_bytes([guest_mem[avail_addr + 2], guest_mem[avail_addr + 3]]) as usize;
-        let used_idx_off = used_addr + 2;
-        let used_idx =
-            u16::from_le_bytes([guest_mem[used_idx_off], guest_mem[used_idx_off + 1]]) as usize;
+        // Reconstruct a GPA-based QueueConfig from the offset arguments so the
+        // queue resolves every address through GuestMemWriter exactly once.
+        let cfg = QueueConfig {
+            desc_addr: (desc_addr + gpa_base) as u64,
+            avail_addr: (avail_addr + gpa_base) as u64,
+            used_addr: (used_addr + gpa_base) as u64,
+            size: q_size as u16,
+            ready: true,
+            gpa_base: gpa_base as u64,
+        };
+        // SAFETY: `guest_mem` is the guest RAM slice; the queue accesses it only
+        // through the GuestMemWriter built here, and `guest_mem` is not touched
+        // directly while the queue is alive.
+        let mem = std::sync::Arc::new(unsafe {
+            arcbox_virtio_core::GuestMemWriter::new(
+                guest_mem.as_mut_ptr(),
+                guest_mem.len(),
+                gpa_base,
+            )
+        });
+        let mut queue = arcbox_virtio_core::SplitQueue::new(mem, 0, &cfg, false);
+        // RX consumes one avail entry per injected packet, tracked by the
+        // guest's used.idx; an empty write leaves the entry for the next call.
+        let used0 = queue.mem().read_u16(cfg.used_addr as usize + 2);
+        queue.set_last_avail_idx(used0);
 
-        if avail_idx == used_idx {
+        let Some(chain) = queue.pop_avail() else {
             return 0; // No available descriptors.
-        }
+        };
 
-        let ring_off = avail_addr + 4 + 2 * (used_idx % q_size);
-        if ring_off + 2 > guest_mem.len() {
-            return 0;
-        }
-        let head_idx = u16::from_le_bytes([guest_mem[ring_off], guest_mem[ring_off + 1]]) as usize;
-
-        // Walk descriptor chain, writing packet data to WRITE-flagged
-        // descriptors.
-        let mut written = 0;
-        let mut idx = head_idx;
-        for _ in 0..q_size {
-            let d_off = desc_addr + idx * 16;
-            if d_off + 16 > guest_mem.len() {
-                break;
-            }
-            let addr_gpa =
-                u64::from_le_bytes(guest_mem[d_off..d_off + 8].try_into().unwrap()) as usize;
-            let len =
-                u32::from_le_bytes(guest_mem[d_off + 8..d_off + 12].try_into().unwrap()) as usize;
-            let flags = u16::from_le_bytes(guest_mem[d_off + 12..d_off + 14].try_into().unwrap());
-            let next = u16::from_le_bytes(guest_mem[d_off + 14..d_off + 16].try_into().unwrap());
-            let Some(addr) = addr_gpa.checked_sub(gpa_base) else {
-                continue;
-            };
-
-            if flags & 2 != 0 && addr + len <= guest_mem.len() {
+        // Walk the chain, scattering the packet into the write-only buffers.
+        let mut written = 0usize;
+        for desc in &chain.descriptors {
+            if desc.is_write() {
                 let remaining = packet.len().saturating_sub(written);
-                let to_write = remaining.min(len);
+                let to_write = remaining.min(desc.len as usize);
                 if to_write > 0 {
-                    guest_mem[addr..addr + to_write]
-                        .copy_from_slice(&packet[written..written + to_write]);
-                    written += to_write;
+                    // SAFETY: write-only descriptor buffers are device-owned.
+                    if let Some(buf) =
+                        unsafe { queue.mem().slice_mut(desc.addr as usize, to_write) }
+                    {
+                        buf.copy_from_slice(&packet[written..written + to_write]);
+                        written += to_write;
+                    }
                 }
             }
-
-            if flags & 1 == 0 || written >= packet.len() {
+            if written >= packet.len() {
                 break;
             }
-            idx = next as usize;
         }
 
         if written == 0 {
-            return 0;
+            return 0; // Nothing written — leave the avail entry unconsumed.
         }
 
-        // Update used ring entry.
-        let used_entry = used_addr + 4 + (used_idx % q_size) * 8;
-        if used_entry + 8 <= guest_mem.len() {
-            guest_mem[used_entry..used_entry + 4].copy_from_slice(&(head_idx as u32).to_le_bytes());
-            guest_mem[used_entry + 4..used_entry + 8]
-                .copy_from_slice(&(written as u32).to_le_bytes());
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            let new_used = (used_idx + 1) as u16;
-            guest_mem[used_idx_off..used_idx_off + 2].copy_from_slice(&new_used.to_le_bytes());
-        }
-
+        queue.push_used(chain.head_idx, written as u32);
         written
     }
 }
@@ -1356,88 +1346,32 @@ impl VirtioDevice for VirtioVsock {
             return Ok(Vec::new());
         }
 
-        // Translate GPAs to slice offsets by subtracting gpa_base (checked to
-        // guard against a malicious guest providing a GPA below the RAM base).
-        let gpa_base = queue_config.gpa_base as usize;
-        let desc_addr = (queue_config.desc_addr as usize)
-            .checked_sub(gpa_base)
-            .ok_or_else(|| {
-                tracing::warn!(
-                    "invalid desc GPA {:#x} below ram base {:#x}",
-                    queue_config.desc_addr,
-                    gpa_base
-                );
-                VirtioError::InvalidQueue("desc GPA below ram base".into())
-            })?;
-        let avail_addr = (queue_config.avail_addr as usize)
-            .checked_sub(gpa_base)
-            .ok_or_else(|| {
-                tracing::warn!(
-                    "invalid avail GPA {:#x} below ram base {:#x}",
-                    queue_config.avail_addr,
-                    gpa_base
-                );
-                VirtioError::InvalidQueue("avail GPA below ram base".into())
-            })?;
-        let used_addr = (queue_config.used_addr as usize)
-            .checked_sub(gpa_base)
-            .ok_or_else(|| {
-                tracing::warn!(
-                    "invalid used GPA {:#x} below ram base {:#x}",
-                    queue_config.used_addr,
-                    gpa_base
-                );
-                VirtioError::InvalidQueue("used GPA below ram base".into())
-            })?;
-        let q_size = queue_config.size as usize;
+        let event_idx = (self.acked_features & arcbox_virtio_core::queue::VIRTIO_F_EVENT_IDX) != 0;
+        // SAFETY: `memory` is the guest RAM slice; the queue accesses it only
+        // through the GuestMemWriter built here, and `memory` is not touched
+        // directly while the queue is alive.
+        let mem = std::sync::Arc::new(unsafe {
+            arcbox_virtio_core::GuestMemWriter::new(
+                memory.as_mut_ptr(),
+                memory.len(),
+                queue_config.gpa_base as usize,
+            )
+        });
+        let mut queue =
+            arcbox_virtio_core::SplitQueue::new(mem, queue_idx, queue_config, event_idx);
+        queue.set_last_avail_idx(self.last_avail_idx_tx as u16);
 
-        if avail_addr + 4 > memory.len() {
-            return Ok(Vec::new());
-        }
-        let avail_idx =
-            u16::from_le_bytes([memory[avail_addr + 2], memory[avail_addr + 3]]) as usize;
-
-        let mut current_avail = self.last_avail_idx_tx;
         let mut completions = Vec::new();
-
-        while current_avail != avail_idx {
-            let ring_off = avail_addr + 4 + 2 * (current_avail % q_size);
-            if ring_off + 2 > memory.len() {
-                break;
-            }
-            let head_idx = u16::from_le_bytes([memory[ring_off], memory[ring_off + 1]]) as usize;
-
-            // Walk descriptor chain to extract vsock packet.
+        while let Some(chain) = queue.pop_avail() {
+            // Walk the descriptor chain to extract the vsock packet (TX
+            // descriptors are read-only, guest→host data).
             let mut packet_data = Vec::new();
-            let mut idx = head_idx;
-            for _ in 0..q_size {
-                let d_off = desc_addr + idx * 16;
-                if d_off + 16 > memory.len() {
-                    break;
+            for desc in &chain.descriptors {
+                if !desc.is_write() {
+                    if let Some(data) = queue.mem().slice(desc.addr as usize, desc.len as usize) {
+                        packet_data.extend_from_slice(data);
+                    }
                 }
-                let addr = match (u64::from_le_bytes(memory[d_off..d_off + 8].try_into().unwrap())
-                    as usize)
-                    .checked_sub(gpa_base)
-                {
-                    Some(a) => a,
-                    None => continue,
-                };
-                let len =
-                    u32::from_le_bytes(memory[d_off + 8..d_off + 12].try_into().unwrap()) as usize;
-                let flags = u16::from_le_bytes(memory[d_off + 12..d_off + 14].try_into().unwrap());
-                let next = u16::from_le_bytes(memory[d_off + 14..d_off + 16].try_into().unwrap());
-
-                // TX descriptors are read-only (guest→host data).
-                if flags & arcbox_virtio_core::queue::flags::WRITE == 0
-                    && addr + len <= memory.len()
-                {
-                    packet_data.extend_from_slice(&memory[addr..addr + len]);
-                }
-
-                if flags & arcbox_virtio_core::queue::flags::NEXT == 0 {
-                    break;
-                }
-                idx = next as usize;
             }
 
             // Parse vsock header (44 bytes) and forward via host fds.
@@ -1476,33 +1410,14 @@ impl VirtioDevice for VirtioVsock {
                 );
             }
 
-            // Update used ring.
-            let used_idx_off = used_addr + 2;
-            let used_idx = u16::from_le_bytes([memory[used_idx_off], memory[used_idx_off + 1]]);
-            let used_entry = used_addr + 4 + ((used_idx as usize) % q_size) * 8;
-            if used_entry + 8 <= memory.len() {
-                memory[used_entry..used_entry + 4]
-                    .copy_from_slice(&(head_idx as u32).to_le_bytes());
-                memory[used_entry + 4..used_entry + 8]
-                    .copy_from_slice(&(packet_data.len() as u32).to_le_bytes());
-                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                let new_used = used_idx.wrapping_add(1);
-                memory[used_idx_off..used_idx_off + 2].copy_from_slice(&new_used.to_le_bytes());
-            }
-
-            // Update avail_event.
-            let avail_event_off = used_addr + 4 + 8 * q_size;
-            if avail_event_off + 2 <= memory.len() {
-                let ae = ((current_avail + 1) as u16).to_le_bytes();
-                memory[avail_event_off] = ae[0];
-                memory[avail_event_off + 1] = ae[1];
-            }
-
-            completions.push((head_idx as u16, packet_data.len() as u32));
-            current_avail += 1;
+            queue.push_used(chain.head_idx, packet_data.len() as u32);
+            // Always publish avail_event so an isolated TX frame cannot sit
+            // undrained behind EVENT_IDX kick suppression (ABX-386).
+            queue.write_avail_event();
+            completions.push((chain.head_idx, packet_data.len() as u32));
         }
 
-        self.last_avail_idx_tx = current_avail;
+        self.last_avail_idx_tx = queue.last_avail_idx() as usize;
         Ok(completions)
     }
 }
