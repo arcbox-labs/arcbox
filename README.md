@@ -125,7 +125,7 @@ overhead per sandbox.
 ## ArcBox Platform
 
 The sandbox you run locally is the same primitive we run in the cloud. ArcBox
-Cloud (in development) exposes the same sandbox API across a managed fleet, so a
+Platform (in development) exposes the same sandbox API across a managed fleet, so a
 sandbox you launch on your laptop and one you launch in production are the same
 object, scheduled on the nearest available capacity. You can also enroll your own
 machines into the fleet and serve that capacity yourself.
