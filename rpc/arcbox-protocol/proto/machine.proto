@@ -13,7 +13,8 @@ package arcbox.v1;
 
 import "common.proto";
 
-// MachineService manages virtual machines.
+// MachineService manages Linux virtual machines. macOS guests are disposable,
+// single-purpose VMs with a separate lifecycle and live in MacosService.
 service MachineService {
     // Creates a new virtual machine.
     rpc Create(CreateMachineRequest) returns (CreateMachineResponse);
@@ -48,15 +49,6 @@ service MachineService {
 
     // Gets the SSH connection info.
     rpc SSHInfo(SSHInfoRequest) returns (SSHInfoResponse);
-
-    // Installs a macOS base image from a local IPSW (long-running). Apple Silicon only.
-    rpc MacImagePull(MacImagePullRequest) returns (Empty);
-
-    // Lists macOS base images.
-    rpc MacImageList(Empty) returns (MacImageListResponse);
-
-    // Removes a macOS base image.
-    rpc MacImageRemove(MacImageRemoveRequest) returns (Empty);
 }
 
 // Request to create a machine.
@@ -85,10 +77,6 @@ message CreateMachineRequest {
     reserved 11;
     // Kernel command line.
     string cmdline = 12;
-    // Guest OS: "linux" (default) or "macos".
-    string guest_os = 13;
-    // macOS base image name to clone (when guest_os is "macos").
-    string macos_image = 14;
 }
 
 // Request that targets a machine's guest agent.
@@ -201,8 +189,6 @@ message MachineSummary {
     string ip_address = 7;
     // Creation timestamp.
     int64 created = 8;
-    // Guest OS: "linux" or "macos".
-    string guest_os = 9;
 }
 
 // Request to inspect a machine.
@@ -325,46 +311,4 @@ message SSHInfoResponse {
     string identity_file = 4;
     // SSH command string.
     string command = 5;
-}
-
-// Request to install a macOS base image from a local IPSW.
-message MacImagePullRequest {
-    // Base image name.
-    string name = 1;
-    // Path to a local IPSW restore image.
-    string ipsw_path = 2;
-    // Number of CPUs for the install VM.
-    uint32 cpus = 3;
-    // Memory in bytes for the install VM.
-    uint64 memory = 4;
-    // System disk size in bytes.
-    uint64 disk_size = 5;
-}
-
-// Summary of a macOS base image.
-message MacImageSummary {
-    // Image name.
-    string name = 1;
-    // Minimum CPU count required by the restore image.
-    uint64 minimum_cpu_count = 2;
-    // Minimum memory in MiB required by the restore image.
-    uint64 minimum_memory_mib = 3;
-    // System disk size in GiB.
-    uint64 disk_gb = 4;
-    // Creation timestamp.
-    int64 created = 5;
-    // Source (IPSW path), if known.
-    string source = 6;
-}
-
-// Response listing macOS base images.
-message MacImageListResponse {
-    // Base images.
-    repeated MacImageSummary images = 1;
-}
-
-// Request to remove a macOS base image.
-message MacImageRemoveRequest {
-    // Image name.
-    string name = 1;
 }
