@@ -2,9 +2,9 @@
 
 # ArcBox
 
-**A fast, open-source container runtime for macOS — built from scratch in Rust, from hypervisor to CLI.**
+**A fast, open-source container runtime for macOS.**
 
-**Drop-in Docker · Native Kubernetes · Full Linux machines.**
+**Built from scratch in Rust. Drop-in Docker, native Kubernetes, and full Linux VMs.**
 
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust](https://img.shields.io/badge/rust-1.96+-orange.svg)](https://www.rust-lang.org)
@@ -15,29 +15,29 @@
 
 </div>
 
----
-
 ## Why ArcBox
 
-ArcBox is an open-source alternative to Docker Desktop and OrbStack for macOS.
-Docker Desktop is the incumbent; OrbStack set the bar for running Docker on a Mac
-fast and light, but it's closed-source. ArcBox aims at that bar — and is open
-source under MIT/Apache-2.0.
+ArcBox is an open-source alternative to Docker Desktop and OrbStack on macOS.
+OrbStack set the bar for running Docker on a Mac quickly and with little overhead,
+but it is closed-source. ArcBox is open source under MIT/Apache-2.0 and aims to
+match it.
 
-The whole stack is written in Rust, top to bottom: our own virtual machine
-monitor built directly on Apple's **Hypervisor.framework**, a custom VirtIO
-device stack, a custom macOS networking datapath, a VirtioFS/FUSE filesystem, and
-a guest agent that talks to the host over vsock. Owning the runtime end to end is
-what makes it fast, lean, and fully under our control.
+The whole stack is written in Rust. ArcBox runs its own virtual machine monitor
+on Apple's Hypervisor.framework, with a custom VirtIO device stack, a custom macOS
+networking datapath, a VirtioFS/FUSE filesystem, and a guest agent that talks to
+the host over vsock. Building the runtime ourselves is what keeps it fast and
+small.
 
-ArcBox is in **public beta** — [join the community](https://arcbox.link/discord)
-and [tell us what to build next](https://github.com/arcboxlabs/arcbox/issues).
+ArcBox is in public beta. Join the community on
+[Discord](https://arcbox.link/discord), or
+[open an issue](https://github.com/arcboxlabs/arcbox/issues) to tell us what to
+build next.
 
 ## Containers
 
-The core of ArcBox is a drop-in Docker engine. It exposes a Docker-compatible
-socket and proxies to a guest `dockerd`, so your existing CLI, scripts, and
-Compose files keep working unchanged.
+ArcBox is a drop-in Docker engine. It exposes a Docker-compatible socket and
+proxies to a guest `dockerd`, so the Docker CLI, your scripts, and your Compose
+files work without changes.
 
 ```bash
 abctl docker enable        # creates and activates the "arcbox" Docker context
@@ -47,13 +47,13 @@ docker build -t myapp .
 ```
 
 Containers, images, Compose, port forwarding, bind mounts, named volumes, and
-interactive `exec`/terminal flows all work today.
+interactive `exec` all work today.
 
 ### amd64 and arm64 images
 
-ArcBox runs `linux/amd64` images right alongside native arm64 on Apple Silicon,
-translated transparently inside the guest by [FEX](https://github.com/FEX-Emu/FEX)
-— an open-source x86 emulator, with nothing to configure.
+ArcBox runs `linux/amd64` images on Apple Silicon next to native arm64. x86-64 is
+translated inside the guest by [FEX](https://github.com/FEX-Emu/FEX), an
+open-source emulator, with nothing to configure.
 
 ```bash
 docker run --platform linux/amd64 alpine uname -m
@@ -62,8 +62,7 @@ docker run --platform linux/amd64 alpine uname -m
 
 ### Native Kubernetes
 
-A local Kubernetes cluster (k3s) managed by the daemon, with host integration
-for `kubectl`.
+A local k3s cluster, managed by the daemon, with host integration for `kubectl`.
 
 ```bash
 abctl k8s start
@@ -73,7 +72,7 @@ kubectl get nodes
 
 ### Migrate from Docker Desktop or OrbStack
 
-Import your existing local workloads in place.
+Import your workloads from another local runtime.
 
 ```bash
 abctl migrate from docker-desktop
@@ -83,10 +82,10 @@ abctl migrate from orbstack
 ## Quick start
 
 ```bash
-# Install (Homebrew)
+# Install with Homebrew
 brew install --cask arcboxlabs/tap/arcbox
 
-# …or via the install script
+# or with the install script
 curl -fsSL https://get.arcbox.dev | bash
 
 # Start the daemon and enable Docker compatibility
@@ -98,31 +97,30 @@ docker run -d -p 8080:80 nginx
 curl http://localhost:8080
 ```
 
-Run `abctl doctor` to check the runtime, and `abctl --help` to explore all
-commands.
+Run `abctl doctor` to check the runtime, and `abctl --help` to see every command.
 
 ## Sandboxes
 
-Need more isolation than a container? ArcBox runs **disposable microVMs** — each
-its own VM, ideal for untrusted code, CI jobs, and ephemeral test environments.
-Snapshot a booted-and-idle sandbox and restore clones from it to skip cold boot
-entirely.
+ArcBox can also run disposable microVMs, each with its own kernel, for untrusted
+code, CI jobs, and short-lived test environments. You can snapshot a booted, idle
+sandbox and restore copies of it to skip a cold boot.
 
 ```bash
 abctl sandbox create --memory 512
 abctl sandbox run <id> -- ./untrusted-binary
 abctl sandbox checkpoint <id> --name clean   # capture a ready snapshot
-abctl sandbox restore clean                  # clone a new sandbox from it
+abctl sandbox restore clean                  # start a new sandbox from it
 ```
 
-Sandboxes are engineered for sub-200 ms cold boots, near-instant restore from
-snapshot, and tens of megabytes of overhead — disposable enough to spin up per
-job and throw away.
+Create, run, exec, snapshot, and restore work today. We are aiming for cold boots
+under 200 ms, near-instant restore from a snapshot, and roughly 10–30 MB of
+overhead per sandbox.
 
 ## Machines
 
-When you want a complete environment rather than a container, spin up a full
-Linux VM with its own kernel, persistent disk, and the distro of your choice.
+When you want a complete environment instead of a container, ArcBox can create
+full Linux VMs, each with its own kernel, persistent disk, and a distro you
+choose.
 
 ```bash
 abctl machine create dev --distro ubuntu
@@ -130,23 +128,23 @@ abctl machine start dev
 abctl machine list
 ```
 
-Ubuntu and Alpine machines boot today, with first-class shell and SSH access
-landing as we round out the beta.
+Creating, starting, and managing Ubuntu and Alpine machines works today. Shell
+and SSH access into a running machine is coming.
 
 ## Built from scratch
 
-ArcBox's performance-critical paths are all custom-built rather than vendored:
+Most of ArcBox's performance-critical code is custom rather than vendored:
 
-- **Custom VMM on Hypervisor.framework** — manual vCPU execution and a device
-  model we own end to end, rather than Apple's managed Virtualization.framework.
-- **Custom VirtIO stack** — `virtio-net`, `virtio-blk`, `virtio-fs`,
-  `virtio-console`, `virtio-vsock`, and a balloon device.
-- **Custom macOS networking datapath** — userspace DHCP, DNS forwarding, TCP via
-  `smoltcp`, and host socket proxying, without `pf` NAT or a `utun` device.
-- **VirtioFS/FUSE** filesystem sharing and a vsock guest agent speaking protobuf.
-- **Transparent x86 translation** via FEX so `linux/amd64` images run on Apple Silicon.
+- A VMM on Hypervisor.framework, with manual vCPU execution and a device model we
+  maintain ourselves.
+- VirtIO devices: `virtio-net`, `virtio-blk`, `virtio-fs`, `virtio-console`,
+  `virtio-vsock`, and a balloon device.
+- A macOS networking datapath in userspace: DHCP, DNS forwarding, TCP via
+  `smoltcp`, and host socket proxying, with no `pf` NAT or `utun` device.
+- VirtioFS/FUSE filesystem sharing, and a vsock guest agent that speaks protobuf.
+- x86 translation through FEX, so `linux/amd64` images run on Apple Silicon.
 
-Here's the bar we're building toward, measured against OrbStack:
+These are the numbers we are working toward, with OrbStack for comparison:
 
 | Metric | ArcBox | OrbStack |
 |--------|--------|----------|
@@ -158,30 +156,30 @@ Here's the bar we're building toward, measured against OrbStack:
 
 ## Desktop app
 
-ArcBox Desktop is a native SwiftUI app that talks to the daemon over gRPC and the
-Docker-compatible API. It covers Docker (containers, images, volumes, networks)
-and Kubernetes (pods, services), with live log streaming, an interactive
-terminal, and a container file browser. Source:
+ArcBox Desktop is a native SwiftUI app. It talks to the daemon over gRPC and uses
+the Docker-compatible API for Docker resources. It covers Docker (containers,
+images, volumes, networks) and Kubernetes (pods, services), and includes log
+streaming, a terminal, and a file browser for a container's filesystem. Source:
 [arcboxlabs/arcbox-desktop](https://github.com/arcboxlabs/arcbox-desktop).
 
 ## What's next
 
-- First-class shell and SSH access for machines
-- Even faster x86 translation
+- Shell and SSH access for machines
+- Faster x86 translation
 - Linux host support (macOS first)
-- Deeper Docker Engine API coverage
+- Wider Docker Engine API coverage
 
 ## Requirements
 
-- macOS on Apple Silicon (Intel support in progress)
-- Docker CLI — ArcBox replaces the engine, not the CLI (`abctl docker setup`
-  can install it for you)
+- macOS on Apple Silicon. Intel support is in progress.
+- The Docker CLI. ArcBox replaces the engine, not the CLI; `abctl docker setup`
+  can install it for you.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, code standards,
-and development setup. The runtime is open source under MIT/Apache-2.0; personal
-use is free forever, and commercial use is free during the public beta.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, code standards, and
+development setup. The runtime is open source under MIT/Apache-2.0. Personal use
+is free, and commercial use is free during the public beta.
 
 ## License
 
@@ -191,6 +189,6 @@ use is free forever, and commercial use is free during the public beta.
 
 <div align="center">
 
-**[Website](https://arcbox.dev)** · **[Docs](https://arcbox.link/docs)** · **[Discord](https://arcbox.link/discord)**
+[Website](https://arcbox.dev) · [Docs](https://arcbox.link/docs) · [Discord](https://arcbox.link/discord)
 
 </div>
