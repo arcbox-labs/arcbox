@@ -81,6 +81,15 @@ fn main() -> Result<()> {
         ..LogConfig::default()
     });
 
+    // Build identity — match a running daemon to its source revision. The
+    // packaged app restores its own daemon, so dev work must confirm this SHA.
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        build = env!("ARCBOX_BUILD_SHA"),
+        profile = ?profile,
+        "arcbox-daemon starting"
+    );
+
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

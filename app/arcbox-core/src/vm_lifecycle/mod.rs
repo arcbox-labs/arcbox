@@ -907,7 +907,19 @@ impl VmLifecycleManager {
         // rcS keys off the same token to spawn the shell. HV-only — the token
         // targets the HV virtio-console wiring; VZ owns its console internally.
         // The socket lives under the per-user data dir (same-user access only).
-        if matches!(self.config.backend, arcbox_vmm::VmBackend::Hv)
+        // TEST (cold-boot root-cause): force-disable the always-on debug console
+        // to measure whether its hvc0 shell is the flaky cold-boot hang's cause.
+        // Revert by setting this to false.
+        // Escape hatch to A/B-test the console's effect on the flaky HV cold
+        // boot: `ARCBOX_NO_DEBUG_CONSOLE=1` strips any token (host attaches no
+        // console, guest rcS spawns no shell). Default: console always attached.
+        if std::env::var_os("ARCBOX_NO_DEBUG_CONSOLE").is_some() {
+            cmdline = cmdline
+                .split_whitespace()
+                .filter(|t| !t.starts_with(DEBUG_CONSOLE_KEY))
+                .collect::<Vec<_>>()
+                .join(" ");
+        } else if matches!(self.config.backend, arcbox_vmm::VmBackend::Hv)
             && !cmdline
                 .split_whitespace()
                 .any(|t| t.starts_with(DEBUG_CONSOLE_KEY))
