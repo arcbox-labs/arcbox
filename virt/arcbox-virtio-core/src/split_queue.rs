@@ -72,6 +72,36 @@ pub struct DescChain {
     pub descriptors: Vec<VirtqDesc>,
 }
 
+/// Allocation-free walk of a descriptor chain (see [`SplitQueue::chain_iter`]).
+///
+/// Yields `VirtqDesc` by value, following `next` links and bounded by the queue
+/// size so a malformed/malicious cyclic chain terminates.
+pub struct ChainIter<'a> {
+    queue: &'a SplitQueue,
+    idx: u16,
+    /// Remaining iterations before the cycle guard trips (= queue size).
+    ttl: u16,
+    done: bool,
+}
+
+impl Iterator for ChainIter<'_> {
+    type Item = VirtqDesc;
+
+    fn next(&mut self) -> Option<VirtqDesc> {
+        if self.done || self.ttl == 0 || self.idx >= self.queue.size {
+            return None;
+        }
+        self.ttl -= 1;
+        let desc = self.queue.read_descriptor(self.idx);
+        if desc.has_next() {
+            self.idx = desc.next;
+        } else {
+            self.done = true;
+        }
+        Some(desc)
+    }
+}
+
 /// A VirtIO split virtqueue backed by guest physical memory.
 pub struct SplitQueue {
     mem: Arc<GuestMemWriter>,
@@ -186,6 +216,18 @@ impl SplitQueue {
     /// The chain walk is bounded by `size`: a cyclic `next` chain from a
     /// malformed or malicious guest terminates instead of spinning.
     pub fn pop_avail(&mut self) -> Option<DescChain> {
+        let head_idx = self.next_avail_head()?;
+        let descriptors = self.chain_iter(head_idx).collect();
+        Some(DescChain {
+            head_idx,
+            descriptors,
+        })
+    }
+
+    /// Pops the next available chain head, advancing the avail cursor, or
+    /// returns `None` if the ring is empty. Pair with [`Self::chain_iter`] for
+    /// an allocation-free chain walk on per-packet hot paths.
+    pub fn next_avail_head(&mut self) -> Option<u16> {
         let avail_idx = self.avail_idx();
         if avail_idx == self.last_avail_idx {
             return None;
@@ -195,27 +237,23 @@ impl SplitQueue {
         // observe the guest's writes. (queue_guest fenced before the idx read —
         // the wrong side — which ordered nothing useful.)
         fence(Ordering::Acquire);
-
         let head_idx = self.avail_ring_entry(self.last_avail_idx);
         self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
+        Some(head_idx)
+    }
 
-        let mut descriptors = Vec::new();
-        let mut idx = head_idx;
-        for _ in 0..self.size {
-            if idx >= self.size {
-                break; // out-of-range next index
-            }
-            let desc = self.read_descriptor(idx);
-            descriptors.push(desc);
-            if !desc.has_next() {
-                break;
-            }
-            idx = desc.next;
+    /// Returns an allocation-free iterator over the descriptor chain starting
+    /// at `head`. Bounded by the queue size so a cyclic `next` chain
+    /// terminates. Each yielded descriptor's `addr` is a GPA; access its buffer
+    /// through [`Self::mem`].
+    #[must_use]
+    pub fn chain_iter(&self, head: u16) -> ChainIter<'_> {
+        ChainIter {
+            queue: self,
+            idx: head,
+            ttl: self.size,
+            done: false,
         }
-        Some(DescChain {
-            head_idx,
-            descriptors,
-        })
     }
 
     /// Writes one used-ring entry at the current `used.idx` slot (no idx bump).
@@ -489,6 +527,48 @@ mod tests {
         let mut q = queue(&mut ram, false);
         let chain = q.pop_avail().unwrap();
         assert_eq!(chain.descriptors.len(), 1);
+    }
+
+    #[test]
+    fn chain_iter_walks_allocation_free() {
+        let mut ram = TestRam::new(0);
+        ram.write_desc(0, ram.gpa_base + DATA_OFF, 16, flags::NEXT, 1);
+        ram.write_desc(
+            1,
+            ram.gpa_base + DATA_OFF + 16,
+            32,
+            flags::NEXT | flags::WRITE,
+            2,
+        );
+        ram.write_desc(2, ram.gpa_base + DATA_OFF + 48, 64, flags::WRITE, 0);
+        ram.set_avail(0, 0);
+        ram.set_avail_idx(1);
+
+        let mut q = queue(&mut ram, false);
+        let head = q.next_avail_head().unwrap();
+        assert_eq!(head, 0);
+        let descs: Vec<_> = q.chain_iter(head).collect();
+        assert_eq!(descs.len(), 3);
+        assert_eq!(descs[0].len, 16);
+        assert!(!descs[0].is_write());
+        assert!(descs[1].is_write());
+        assert_eq!(descs[2].len, 64);
+        assert!(!descs[2].has_next());
+        // Cursor advanced exactly one entry.
+        assert!(q.next_avail_head().is_none());
+    }
+
+    #[test]
+    fn chain_iter_cycle_terminates() {
+        let mut ram = TestRam::new(0);
+        ram.write_desc(0, ram.gpa_base + DATA_OFF, 16, flags::NEXT, 1);
+        ram.write_desc(1, ram.gpa_base + DATA_OFF + 16, 16, flags::NEXT, 0);
+        ram.set_avail(0, 0);
+        ram.set_avail_idx(1);
+
+        let mut q = queue(&mut ram, false);
+        let head = q.next_avail_head().unwrap();
+        assert!(q.chain_iter(head).count() <= SIZE as usize);
     }
 
     #[test]

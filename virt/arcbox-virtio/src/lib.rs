@@ -99,7 +99,7 @@ pub use arcbox_virtio_core::queue_guest;
 // can depend on the smaller foundation crate without pulling in every
 // device implementation.
 pub use arcbox_virtio_core::{
-    DescChain, DeviceCtx, DeviceStatus, GuestMemWriter, QueueConfig, Result, SplitQueue,
+    ChainIter, DescChain, DeviceCtx, DeviceStatus, GuestMemWriter, QueueConfig, Result, SplitQueue,
     VirtioDevice, VirtioDeviceId, VirtioError, VirtqDesc, virtio_bindings,
 };
 pub use queue::{AvailRing, Descriptor, UsedRing, VirtQueue};

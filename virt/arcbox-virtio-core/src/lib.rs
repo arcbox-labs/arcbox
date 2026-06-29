@@ -40,7 +40,7 @@ pub mod split_queue;
 pub use error::{Result, VirtioError};
 pub use guest_mem::GuestMemWriter;
 pub use queue::{AvailRing, Descriptor, UsedRing, VirtQueue};
-pub use split_queue::{DescChain, SplitQueue, VirtqDesc};
+pub use split_queue::{ChainIter, DescChain, SplitQueue, VirtqDesc};
 
 // Re-export commonly used virtio constants from virtio-bindings so
 // downstream crates can reach them without an extra direct dependency.
