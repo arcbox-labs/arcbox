@@ -1030,6 +1030,13 @@ impl Vmm {
                         irq,
                         running: self.running.clone(),
                         flush_barrier: flush_barrier.clone(),
+                        // Wake WFI-parked vCPUs on completion (ABX-367), mirroring
+                        // the net/vsock RX workers.
+                        exit_vcpus: make_exit_vcpus_fn(
+                            self.hv_vcpu_ids
+                                .clone()
+                                .expect("hv_vcpu_ids asserted Some above"),
+                        ),
                     };
 
                     let thread_name = format!("blk-io-{}-q{}", dev_id_str, qi);

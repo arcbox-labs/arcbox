@@ -161,6 +161,21 @@ impl GuestMemWriter {
         // SAFETY: `gpa_to_offset` validated bounds within the allocation.
         unsafe { *self.ptr.add(off) = val };
     }
+
+    /// Raw host pointer to the start of the guest RAM mapping.
+    pub(crate) fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    /// Total length of the guest RAM mapping in bytes.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// GPA that maps to the start of the host mapping.
+    pub(crate) fn gpa_base(&self) -> usize {
+        self.gpa_base
+    }
 }
 
 // ============================================================================
@@ -190,6 +205,13 @@ pub struct BlkWorkerContext {
     pub running: Arc<AtomicBool>,
     /// Shared flush barrier for multi-queue flush synchronization.
     pub flush_barrier: Arc<FlushBarrier>,
+    /// Force-exits all vCPUs from `hv_vcpu_run`. Injecting the completion IRQ
+    /// alone does not wake a WFI-parked vCPU on this HV backend — the guest only
+    /// services it on the next VM exit. A guest blocked in WFI waiting for this
+    /// very block read (e.g. an early-boot fault on the EROFS rootfs) would
+    /// otherwise stall until an unrelated exit. Mirrors the net/vsock RX workers
+    /// (ABX-367).
+    pub exit_vcpus: Arc<dyn Fn() + Send + Sync>,
 }
 
 // SAFETY: All fields are either Send+Sync or raw pointers wrapped in
@@ -219,7 +241,6 @@ pub fn blk_io_worker_loop(ctx: BlkWorkerContext, rx: std::sync::mpsc::Receiver<B
         let used_addr = first.used_addr;
         let avail_addr = first.avail_addr;
         let queue_size = first.queue_size;
-        let old_used = read_used_idx(&ctx.guest_mem, used_addr);
 
         // Collect batch: first item + up to 31 more from try_recv.
         let mut batch = Vec::with_capacity(32);
@@ -236,11 +257,32 @@ pub fn blk_io_worker_loop(ctx: BlkWorkerContext, rx: std::sync::mpsc::Receiver<B
         // for merge-friendly ordering. Flush/GetId items are processed after
         // all preceding Read/Write items complete, preserving durability
         // semantics: a Flush must not overtake a Write from the same batch.
-        process_batch(&ctx, &mut batch);
+        let completions = process_batch(&ctx, &mut batch);
 
-        let new_used = read_used_idx(&ctx.guest_mem, used_addr);
-
-        if should_notify(&ctx.guest_mem, avail_addr, queue_size, old_used, new_used) {
+        // Publish the completions and decide whether to interrupt the guest
+        // through the unified SplitQueue. Its push_used_batch places a full
+        // SeqCst barrier between advancing used.idx and reading used_event,
+        // closing the stale-used_event race that could suppress the completion
+        // IRQ and wedge a WFI-parked guest on cold boot.
+        let cfg = arcbox_virtio::QueueConfig {
+            desc_addr: 0, // unused: the worker only publishes to the used ring
+            avail_addr,
+            used_addr,
+            size: queue_size,
+            ready: true,
+            gpa_base: ctx.guest_mem.gpa_base() as u64,
+        };
+        // SAFETY: this worker is the sole writer of the queue's used ring and
+        // the pointer is the VM-lifetime guest RAM mapping.
+        let mem = std::sync::Arc::new(unsafe {
+            arcbox_virtio::GuestMemWriter::new(
+                ctx.guest_mem.ptr(),
+                ctx.guest_mem.len(),
+                ctx.guest_mem.gpa_base(),
+            )
+        });
+        let mut queue = arcbox_virtio::SplitQueue::new(mem, 0, &cfg, true);
+        if queue.push_used_batch(&completions) {
             trigger_irq(&ctx);
         }
 
@@ -258,7 +300,8 @@ pub fn blk_io_worker_loop(ctx: BlkWorkerContext, rx: std::sync::mpsc::Receiver<B
 /// merge-friendly ordering. Flush/GetId items execute only after all
 /// preceding Read/Write items in the batch have completed, preserving the
 /// guest's durability invariant: `[Write, Flush]` must not be reordered.
-fn process_batch(ctx: &BlkWorkerContext, batch: &mut [BlkWorkItem]) {
+fn process_batch(ctx: &BlkWorkerContext, batch: &mut [BlkWorkItem]) -> Vec<(u16, u32)> {
+    let mut completions = Vec::with_capacity(batch.len());
     let mut start = 0;
     while start < batch.len() {
         // Find the end of this Read/Write segment (up to next Flush/GetId).
@@ -300,9 +343,9 @@ fn process_batch(ctx: &BlkWorkerContext, batch: &mut [BlkWorkItem]) {
                 end += 1;
             }
             if end == i + 1 {
-                process_item(ctx, item);
+                completions.push(process_item(ctx, item));
             } else {
-                process_merged(ctx, &batch[i..end]);
+                completions.extend(process_merged(ctx, &batch[i..end]));
             }
             i = end;
         }
@@ -315,14 +358,16 @@ fn process_batch(ctx: &BlkWorkerContext, batch: &mut [BlkWorkItem]) {
                 BlkRequestType::Read | BlkRequestType::Write
             )
         {
-            process_item(ctx, &batch[start]);
+            completions.push(process_item(ctx, &batch[start]));
             start += 1;
         }
     }
+    completions
 }
 
-/// Processes a single block I/O work item.
-fn process_item(ctx: &BlkWorkerContext, item: &BlkWorkItem) {
+/// Processes a single block I/O work item, returning its `(head_idx, bytes)`
+/// used-ring completion (published later by the worker loop in one batch).
+fn process_item(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> (u16, u32) {
     let is_io = matches!(
         item.request_type,
         BlkRequestType::Read | BlkRequestType::Write
@@ -354,21 +399,13 @@ fn process_item(ctx: &BlkWorkerContext, item: &BlkWorkItem) {
     // Write status byte.
     ctx.guest_mem.write_byte(item.status_gpa as usize, status);
 
-    // Compute total bytes for the used ring entry.
+    // Compute total bytes for the used ring entry; the worker loop publishes it.
     let total_bytes = if status == 0 {
         item.total_data_len + 1 // data + status byte
     } else {
         1 // just status byte
     };
-
-    // Write used ring entry.
-    write_used_entry(
-        &ctx.guest_mem,
-        item.used_addr,
-        item.queue_size,
-        item.head_idx,
-        total_bytes,
-    );
+    (item.head_idx, total_bytes)
 }
 
 /// Reads using preadv — single syscall for scatter-gather buffers.
@@ -448,7 +485,7 @@ fn process_write(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
 /// Processes a merged run of same-type items with contiguous sectors
 /// using a single preadv/pwritev syscall. Each item still gets its own
 /// used ring completion.
-fn process_merged(ctx: &BlkWorkerContext, items: &[BlkWorkItem]) {
+fn process_merged(ctx: &BlkWorkerContext, items: &[BlkWorkItem]) -> Vec<(u16, u32)> {
     let is_read = items[0].request_type == BlkRequestType::Read;
     let start_sector = items[0].sector;
 
@@ -509,7 +546,9 @@ fn process_merged(ctx: &BlkWorkerContext, items: &[BlkWorkItem]) {
         0
     };
 
-    // Write individual used ring entries for each item.
+    // Compute each item's completion; the worker loop publishes them in one
+    // batched used-ring update.
+    let mut completions = Vec::with_capacity(items.len());
     for item in items {
         ctx.guest_mem.write_byte(item.status_gpa as usize, status);
         let total_bytes = if status == 0 {
@@ -517,13 +556,7 @@ fn process_merged(ctx: &BlkWorkerContext, items: &[BlkWorkItem]) {
         } else {
             1
         };
-        write_used_entry(
-            &ctx.guest_mem,
-            item.used_addr,
-            item.queue_size,
-            item.head_idx,
-            total_bytes,
-        );
+        completions.push((item.head_idx, total_bytes));
     }
 
     ctx.flush_barrier
@@ -540,6 +573,8 @@ fn process_merged(ctx: &BlkWorkerContext, items: &[BlkWorkItem]) {
         iovecs.len(),
         n,
     );
+
+    completions
 }
 
 fn process_flush(ctx: &BlkWorkerContext) -> u8 {
@@ -569,9 +604,6 @@ fn process_get_id(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
     0
 }
 
-// Shared VirtIO queue helpers — extracted to virtqueue_util.rs.
-use crate::virtqueue_util::{read_used_idx, should_notify, write_used_entry};
-
 fn trigger_irq(ctx: &BlkWorkerContext) {
     // Set interrupt_status on MMIO state.
     if let Ok(mut s) = ctx.mmio_state.write() {
@@ -579,6 +611,9 @@ fn trigger_irq(ctx: &BlkWorkerContext) {
     }
     // Fire GIC SPI.
     let _ = (ctx.irq_callback)(ctx.irq, true);
+    // Kick vCPUs out of WFI so a guest blocked waiting for this completion
+    // services the IRQ immediately instead of at the next unrelated exit.
+    (ctx.exit_vcpus)();
 }
 
 // ============================================================================
