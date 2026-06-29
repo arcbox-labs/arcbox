@@ -12,6 +12,7 @@ fn main() {
 
     let protos = [
         "../arcbox-protocol/proto/machine.proto",
+        "../arcbox-protocol/proto/macos.proto",
         "../arcbox-protocol/proto/container.proto",
         "../arcbox-protocol/proto/image.proto",
         "../arcbox-protocol/proto/agent.proto",

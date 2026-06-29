@@ -5,7 +5,8 @@
 //!
 //! # Services
 //!
-//! - `MachineService` - Virtual machine management
+//! - `MachineService` - Linux virtual machine management
+//! - `MacosService` - macOS guest VM + base image management (Apple Silicon)
 //! - `AgentService` - Guest agent communication
 //! - `MigrationService` - Host-side runtime migration planning and execution
 //! - `VolumeService` - Volume management (from api.proto)
@@ -70,6 +71,7 @@ pub use sandbox_v1::sandbox_snapshot_service_client::SandboxSnapshotServiceClien
 pub use v1::agent_service_client::AgentServiceClient;
 pub use v1::icon_service_client::IconServiceClient;
 pub use v1::machine_service_client::MachineServiceClient;
+pub use v1::macos_service_client::MacosServiceClient;
 pub use v1::migration_service_client::MigrationServiceClient;
 pub use v1::system_service_client::SystemServiceClient;
 pub use v1::volume_service_client::VolumeServiceClient;
@@ -81,6 +83,7 @@ pub use sandbox_v1::sandbox_snapshot_service_server::{
 pub use v1::agent_service_server::{AgentService, AgentServiceServer};
 pub use v1::icon_service_server::{IconService, IconServiceServer};
 pub use v1::machine_service_server::{MachineService, MachineServiceServer};
+pub use v1::macos_service_server::{MacosService, MacosServiceServer};
 pub use v1::migration_service_server::{MigrationService, MigrationServiceServer};
 pub use v1::system_service_server::{SystemService, SystemServiceServer};
 pub use v1::volume_service_server::{VolumeService, VolumeServiceServer};

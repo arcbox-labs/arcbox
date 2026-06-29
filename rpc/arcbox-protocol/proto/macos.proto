@@ -1,0 +1,160 @@
+// macOS guest protocol definitions.
+//
+// macOS guests are disposable, single-purpose VMs on Apple Silicon: install a
+// base image once from an IPSW, then copy-on-write clone it to boot clean,
+// throwaway VMs. They run only through Virtualization.framework and share no
+// lifecycle with Linux machines (no guest agent, no kernel boot, no NAT IP),
+// so they have their own service rather than overloading MachineService.
+
+syntax = "proto3";
+
+package arcbox.v1;
+
+import "common.proto";
+
+// MacosService manages macOS guest VMs and their base images (Apple Silicon only).
+service MacosService {
+    // Creates a macOS guest by copy-on-write cloning a base image.
+    rpc Create(CreateMacosMachineRequest) returns (Empty);
+
+    // Starts a stopped macOS guest and waits until it is running.
+    rpc Start(StartMacosMachineRequest) returns (Empty);
+
+    // Stops a running macOS guest.
+    rpc Stop(StopMacosMachineRequest) returns (Empty);
+
+    // Removes a macOS guest and its cloned disks.
+    rpc Remove(RemoveMacosMachineRequest) returns (Empty);
+
+    // Lists macOS guests.
+    rpc List(Empty) returns (MacosMachineListResponse);
+
+    // Inspects a macOS guest.
+    rpc Inspect(InspectMacosMachineRequest) returns (MacosMachineInfo);
+
+    // Installs a base image from a local IPSW (long-running, ~10-20 min).
+    rpc ImagePull(MacosImagePullRequest) returns (Empty);
+
+    // Lists base images.
+    rpc ImageList(Empty) returns (MacosImageListResponse);
+
+    // Removes a base image.
+    rpc ImageRemove(MacosImageRemoveRequest) returns (Empty);
+}
+
+// Request to create a macOS guest from a base image.
+message CreateMacosMachineRequest {
+    // Guest name (unique).
+    string name = 1;
+    // Base image to copy-on-write clone.
+    string image = 2;
+    // Number of CPUs.
+    uint32 cpus = 3;
+    // Memory in MiB.
+    uint64 memory_mib = 4;
+}
+
+// Request to start a macOS guest.
+message StartMacosMachineRequest {
+    // Guest name.
+    string name = 1;
+}
+
+// Request to stop a macOS guest.
+message StopMacosMachineRequest {
+    // Guest name.
+    string name = 1;
+}
+
+// Request to remove a macOS guest.
+message RemoveMacosMachineRequest {
+    // Guest name.
+    string name = 1;
+    // Remove even if running (stops it first).
+    bool force = 2;
+}
+
+// Request to inspect a macOS guest.
+message InspectMacosMachineRequest {
+    // Guest name.
+    string name = 1;
+}
+
+// Summary of a macOS guest.
+message MacosMachineSummary {
+    // Guest name.
+    string name = 1;
+    // State (running, starting, stopped).
+    string state = 2;
+    // Number of CPUs.
+    uint32 cpus = 3;
+    // Memory in MiB.
+    uint64 memory_mib = 4;
+    // Base image it was cloned from.
+    string image = 5;
+    // Creation timestamp.
+    int64 created = 6;
+}
+
+// Response listing macOS guests.
+message MacosMachineListResponse {
+    // Guests.
+    repeated MacosMachineSummary machines = 1;
+}
+
+// Detailed information about a macOS guest.
+message MacosMachineInfo {
+    // Guest name.
+    string name = 1;
+    // State.
+    string state = 2;
+    // Number of CPUs.
+    uint32 cpus = 3;
+    // Memory in MiB.
+    uint64 memory_mib = 4;
+    // Base image it was cloned from.
+    string image = 5;
+    // Creation timestamp.
+    int64 created = 6;
+}
+
+// Request to install a base image from a local IPSW.
+//
+// The install VM's CPU/memory are derived from the restore image's own
+// requirements, so they are not part of the request.
+message MacosImagePullRequest {
+    // Base image name.
+    string name = 1;
+    // Path to a local IPSW restore image.
+    string ipsw_path = 2;
+    // System disk size in GiB.
+    uint64 disk_gb = 3;
+}
+
+// Summary of a macOS base image.
+message MacosImageSummary {
+    // Image name.
+    string name = 1;
+    // Minimum CPU count required by the restore image.
+    uint64 minimum_cpu_count = 2;
+    // Minimum memory in MiB required by the restore image.
+    uint64 minimum_memory_mib = 3;
+    // System disk size in GiB.
+    uint64 disk_gb = 4;
+    // Creation timestamp.
+    int64 created = 5;
+    // Source (IPSW path), if known.
+    string source = 6;
+}
+
+// Response listing macOS base images.
+message MacosImageListResponse {
+    // Base images.
+    repeated MacosImageSummary images = 1;
+}
+
+// Request to remove a macOS base image.
+message MacosImageRemoveRequest {
+    // Image name.
+    string name = 1;
+}
