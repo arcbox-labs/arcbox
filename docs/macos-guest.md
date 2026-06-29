@@ -79,11 +79,14 @@ VmManager::start                 macos::MacVm
      → MacVm.build → arcbox-vz VirtualMachineConfiguration
           boot_loader = MacOSBootLoader
           platform    = MacPlatform{ hardware_model, machine_id, aux_storage }
-          storage     = cloned disk.img        (reused StorageDeviceConfiguration)
-          + network / serial / entropy / balloon (reused)
-          + VirtioFS directory share for per-VM config injection (reused)
+          storage     = cloned disk.img        (StorageDeviceConfiguration)
+          network     = NAT (vmnet shared)     (DHCP + outbound internet, no host setup)
+          graphics    = MacGraphicsDeviceConfiguration
      → vm.start().await  (serial dispatch queue + ObjC completion block -> Rust oneshot)
      → ready = VZ state == Running (+ optional SSH probe); no in-guest ArcBox agent
+
+   Not yet wired: a VirtioFS config share for per-VM provisioning (the channel a
+   CI-runner token would arrive through) and serial/entropy/balloon devices.
    ```
 
 Teardown for the disposable loop: `request_stop` (graceful) -> delete the per-VM clone.

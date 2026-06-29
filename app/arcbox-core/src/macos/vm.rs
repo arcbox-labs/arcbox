@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use arcbox_vz::{
     MacAuxiliaryStorage, MacGraphicsDeviceConfiguration, MacHardwareModel, MacMachineIdentifier,
-    MacOSBootLoader, MacPlatform, StorageDeviceConfiguration, VirtualMachine,
-    VirtualMachineConfiguration, VirtualMachineState, min_cpu_count, min_memory_size,
+    MacOSBootLoader, MacPlatform, NetworkDeviceConfiguration, StorageDeviceConfiguration,
+    VirtualMachine, VirtualMachineConfiguration, VirtualMachineState, min_cpu_count,
+    min_memory_size,
 };
 
 use crate::error::{CoreError, Result};
@@ -63,6 +64,10 @@ impl MacVm {
             .set_platform(platform)
             .set_boot_loader(MacOSBootLoader::new()?)
             .add_storage_device(StorageDeviceConfiguration::disk_image(disk, false)?)
+            // NAT (vmnet shared) gives the guest a DHCP lease + outbound internet
+            // through the host with no host-side setup — all a CI runner needs to
+            // reach GitHub and pull dependencies.
+            .add_network_device(NetworkDeviceConfiguration::nat()?)
             .add_graphics_device(MacGraphicsDeviceConfiguration::new(1920, 1080, 80)?);
         config.validate()?;
         let vm = config.build()?;
