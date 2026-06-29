@@ -4,7 +4,6 @@
 //! This is one of the simplest VirtIO devices — it has a single
 //! request queue and no configuration space.
 
-use arcbox_virtio_core::error::VirtioError;
 use arcbox_virtio_core::{VirtioDevice, VirtioDeviceId, virtio_bindings};
 
 /// VirtIO entropy (RNG) device.
@@ -81,115 +80,49 @@ impl VirtioDevice for VirtioRng {
             return Ok(Vec::new());
         }
 
-        // Translate GPAs to slice offsets by subtracting gpa_base (checked to
-        // guard against a malicious guest providing a GPA below the RAM base).
-        let gpa_base = queue_config.gpa_base as usize;
-        let desc_addr = (queue_config.desc_addr as usize)
-            .checked_sub(gpa_base)
-            .ok_or_else(|| {
-                tracing::warn!(
-                    "invalid desc GPA {:#x} below ram base {:#x}",
-                    queue_config.desc_addr,
-                    gpa_base
-                );
-                VirtioError::InvalidQueue("desc GPA below ram base".into())
-            })?;
-        let avail_addr = (queue_config.avail_addr as usize)
-            .checked_sub(gpa_base)
-            .ok_or_else(|| {
-                tracing::warn!(
-                    "invalid avail GPA {:#x} below ram base {:#x}",
-                    queue_config.avail_addr,
-                    gpa_base
-                );
-                VirtioError::InvalidQueue("avail GPA below ram base".into())
-            })?;
-        let used_addr = (queue_config.used_addr as usize)
-            .checked_sub(gpa_base)
-            .ok_or_else(|| {
-                tracing::warn!(
-                    "invalid used GPA {:#x} below ram base {:#x}",
-                    queue_config.used_addr,
-                    gpa_base
-                );
-                VirtioError::InvalidQueue("used GPA below ram base".into())
-            })?;
-        let q_size = queue_config.size as usize;
+        // SAFETY: `memory` is the guest RAM slice; the queue accesses it only
+        // through the GuestMemWriter built here, and `memory` is not touched
+        // directly while the queue is alive.
+        let mem = std::sync::Arc::new(unsafe {
+            arcbox_virtio_core::GuestMemWriter::new(
+                memory.as_mut_ptr(),
+                memory.len(),
+                queue_config.gpa_base as usize,
+            )
+        });
+        let mut queue = arcbox_virtio_core::SplitQueue::new(mem, queue_idx, queue_config, false);
+        queue.set_last_avail_idx(self.last_avail);
 
-        if avail_addr + 4 > memory.len() {
-            return Ok(Vec::new());
-        }
-        let avail_idx = u16::from_le_bytes([memory[avail_addr + 2], memory[avail_addr + 3]]);
-
-        let mut current = self.last_avail;
         let mut completions = Vec::new();
-
-        while current != avail_idx {
-            let ring_off = avail_addr + 4 + 2 * (current as usize % q_size);
-            if ring_off + 2 > memory.len() {
-                break;
-            }
-            let head_idx = u16::from_le_bytes([memory[ring_off], memory[ring_off + 1]]) as usize;
-
+        while let Some(chain) = queue.pop_avail() {
             let mut filled = 0u32;
-            let mut idx = head_idx;
-            for _ in 0..q_size {
-                let d_off = desc_addr + idx * 16;
-                if d_off + 16 > memory.len() {
-                    break;
+            for desc in &chain.descriptors {
+                // RNG buffers are write-only (the device fills them).
+                if !desc.is_write() || desc.len == 0 {
+                    continue;
                 }
-                let addr = match (u64::from_le_bytes(memory[d_off..d_off + 8].try_into().unwrap())
-                    as usize)
-                    .checked_sub(gpa_base)
-                {
-                    Some(a) => a,
-                    None => continue,
+                // SAFETY: descriptor buffers are device-owned during processing.
+                let Some(buf) =
+                    (unsafe { queue.mem().slice_mut(desc.addr as usize, desc.len as usize) })
+                else {
+                    continue;
                 };
-                let len =
-                    u32::from_le_bytes(memory[d_off + 8..d_off + 12].try_into().unwrap()) as usize;
-                let flags = u16::from_le_bytes(memory[d_off + 12..d_off + 14].try_into().unwrap());
-                let next = u16::from_le_bytes(memory[d_off + 14..d_off + 16].try_into().unwrap());
-
-                // RNG buffers are write-only (device fills them).
-                if flags & 2 != 0 && addr + len <= memory.len() {
-                    // Fill with random bytes from host entropy source. A
-                    // zero-fill fallback would hand the guest all-zero bytes
-                    // while reporting them as valid entropy — so on failure
-                    // we stop filling this chain and let the guest retry via
-                    // a short read.
-                    if let Err(e) = getrandom::getrandom(&mut memory[addr..addr + len]) {
-                        tracing::warn!(
-                            "virtio-rng: getrandom failed: {e}; returning short read ({filled} bytes)",
-                        );
-                        break;
-                    }
-                    filled += len as u32;
-                }
-
-                if flags & 1 == 0 {
+                // A zero-fill fallback would hand the guest all-zero bytes while
+                // reporting them as valid entropy — so on failure we stop filling
+                // this chain and let the guest retry via a short read.
+                if let Err(e) = getrandom::getrandom(buf) {
+                    tracing::warn!(
+                        "virtio-rng: getrandom failed: {e}; returning short read ({filled} bytes)",
+                    );
                     break;
                 }
-                idx = next as usize;
+                filled += desc.len;
             }
-
-            // Update used ring.
-            let used_idx_off = used_addr + 2;
-            let used_idx = u16::from_le_bytes([memory[used_idx_off], memory[used_idx_off + 1]]);
-            let used_entry = used_addr + 4 + ((used_idx as usize) % q_size) * 8;
-            if used_entry + 8 <= memory.len() {
-                memory[used_entry..used_entry + 4]
-                    .copy_from_slice(&(head_idx as u32).to_le_bytes());
-                memory[used_entry + 4..used_entry + 8].copy_from_slice(&filled.to_le_bytes());
-                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                let new_used = used_idx.wrapping_add(1);
-                memory[used_idx_off..used_idx_off + 2].copy_from_slice(&new_used.to_le_bytes());
-            }
-
-            completions.push((head_idx as u16, filled));
-            current = current.wrapping_add(1);
+            queue.push_used(chain.head_idx, filled);
+            completions.push((chain.head_idx, filled));
         }
 
-        self.last_avail = current;
+        self.last_avail = queue.last_avail_idx();
         Ok(completions)
     }
 }
@@ -231,6 +164,43 @@ mod tests {
         let mut data = [0xFFu8; 4];
         rng.read_config(0, &mut data);
         assert_eq!(data, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_rng_process_queue_fills_write_buffer() {
+        use arcbox_virtio_core::QueueConfig;
+        use arcbox_virtio_core::queue::flags;
+
+        const DESC: usize = 0x1000;
+        const AVAIL: usize = 0x2000;
+        const USED: usize = 0x3000;
+        const DATA: usize = 0x4000;
+
+        let mut mem = vec![0u8; 0x8000];
+        // desc 0: a single write-only buffer at DATA, length 64.
+        mem[DESC..DESC + 8].copy_from_slice(&(DATA as u64).to_le_bytes());
+        mem[DESC + 8..DESC + 12].copy_from_slice(&64u32.to_le_bytes());
+        mem[DESC + 12..DESC + 14].copy_from_slice(&flags::WRITE.to_le_bytes());
+        // avail ring: idx = 1, ring[0] = head descriptor 0.
+        mem[AVAIL + 2..AVAIL + 4].copy_from_slice(&1u16.to_le_bytes());
+        mem[AVAIL + 4..AVAIL + 6].copy_from_slice(&0u16.to_le_bytes());
+
+        let cfg = QueueConfig {
+            desc_addr: DESC as u64,
+            avail_addr: AVAIL as u64,
+            used_addr: USED as u64,
+            size: 4,
+            ready: true,
+            gpa_base: 0,
+        };
+
+        let mut rng = VirtioRng::new();
+        let completions = rng.process_queue(0, &mut mem, &cfg).unwrap();
+        assert_eq!(completions, vec![(0, 64)]);
+        // Used ring advanced by one.
+        assert_eq!(u16::from_le_bytes([mem[USED + 2], mem[USED + 3]]), 1);
+        // The buffer was filled with entropy (overwhelmingly non-zero).
+        assert!(mem[DATA..DATA + 64].iter().any(|&b| b != 0));
     }
 
     #[test]

@@ -99,6 +99,10 @@ impl SplitQueue {
         cfg: &QueueConfig,
         event_idx: bool,
     ) -> Self {
+        // Seed used_idx from the guest's used ring so a transiently
+        // reconstructed queue resumes where the device left off; a freshly
+        // set-up QUEUE_READY ring reads 0.
+        let used_idx = mem.read_u16(cfg.used_addr as usize + 2);
         Self {
             mem,
             queue_idx,
@@ -107,9 +111,21 @@ impl SplitQueue {
             avail_gpa: cfg.avail_addr,
             used_gpa: cfg.used_addr,
             last_avail_idx: 0,
-            used_idx: 0,
+            used_idx,
             event_idx,
         }
+    }
+
+    /// The next available-ring index this queue will consume.
+    #[must_use]
+    pub const fn last_avail_idx(&self) -> u16 {
+        self.last_avail_idx
+    }
+
+    /// Seeds the available-ring cursor. Used when a device persists its avail
+    /// position across calls and reconstructs the queue transiently.
+    pub const fn set_last_avail_idx(&mut self, idx: u16) {
+        self.last_avail_idx = idx;
     }
 
     /// Queue index within the device.
