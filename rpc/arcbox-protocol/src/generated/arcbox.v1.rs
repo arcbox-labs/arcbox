@@ -124,12 +124,6 @@ pub struct CreateMachineRequest {
     /// Kernel command line.
     #[prost(string, tag = "12")]
     pub cmdline: ::prost::alloc::string::String,
-    /// Guest OS: "linux" (default) or "macos".
-    #[prost(string, tag = "13")]
-    pub guest_os: ::prost::alloc::string::String,
-    /// macOS base image name to clone (when guest_os is "macos").
-    #[prost(string, tag = "14")]
-    pub macos_image: ::prost::alloc::string::String,
 }
 /// Request that targets a machine's guest agent.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -298,9 +292,6 @@ pub struct MachineSummary {
     /// Creation timestamp.
     #[prost(int64, tag = "8")]
     pub created: i64,
-    /// Guest OS: "linux" or "macos".
-    #[prost(string, tag = "9")]
-    pub guest_os: ::prost::alloc::string::String,
 }
 /// Request to inspect a machine.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -485,69 +476,6 @@ pub struct SshInfoResponse {
     /// SSH command string.
     #[prost(string, tag = "5")]
     pub command: ::prost::alloc::string::String,
-}
-/// Request to install a macOS base image from a local IPSW.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct MacImagePullRequest {
-    /// Base image name.
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// Path to a local IPSW restore image.
-    #[prost(string, tag = "2")]
-    pub ipsw_path: ::prost::alloc::string::String,
-    /// Number of CPUs for the install VM.
-    #[prost(uint32, tag = "3")]
-    pub cpus: u32,
-    /// Memory in bytes for the install VM.
-    #[prost(uint64, tag = "4")]
-    pub memory: u64,
-    /// System disk size in bytes.
-    #[prost(uint64, tag = "5")]
-    pub disk_size: u64,
-}
-/// Summary of a macOS base image.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct MacImageSummary {
-    /// Image name.
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// Minimum CPU count required by the restore image.
-    #[prost(uint64, tag = "2")]
-    pub minimum_cpu_count: u64,
-    /// Minimum memory in MiB required by the restore image.
-    #[prost(uint64, tag = "3")]
-    pub minimum_memory_mib: u64,
-    /// System disk size in GiB.
-    #[prost(uint64, tag = "4")]
-    pub disk_gb: u64,
-    /// Creation timestamp.
-    #[prost(int64, tag = "5")]
-    pub created: i64,
-    /// Source (IPSW path), if known.
-    #[prost(string, tag = "6")]
-    pub source: ::prost::alloc::string::String,
-}
-/// Response listing macOS base images.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct MacImageListResponse {
-    /// Base images.
-    #[prost(message, repeated, tag = "1")]
-    pub images: ::prost::alloc::vec::Vec<MacImageSummary>,
-}
-/// Request to remove a macOS base image.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct MacImageRemoveRequest {
-    /// Image name.
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
 }
 /// Request to create a macOS guest from a base image.
 #[derive(serde::Serialize, serde::Deserialize)]
