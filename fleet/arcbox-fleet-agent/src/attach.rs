@@ -15,6 +15,7 @@ use arcbox_fleet_proto::v1::{
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::metadata::MetadataValue;
 use tracing::{info, warn};
@@ -35,17 +36,25 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const OUTBOUND_CAPACITY: usize = 64;
 const MACHINE_TOKEN_HEADER: &str = "x-arcbox-machine-token";
 const PROTOCOL_VERSION_HEADER: &str = "x-arcbox-protocol-version";
+/// How long to wait for runners to be torn down and reaped on shutdown before
+/// giving up. Killing a process group or container is near-instant, so this is a
+/// generous ceiling rather than an expected wait.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 
-/// Connect and serve the attach stream forever, reconnecting on any failure.
+/// Connect and serve the attach stream, reconnecting on any failure until
+/// `shutdown` fires, then stop runners cleanly.
 ///
 /// The supervisor and the egress queue carrying runner lifecycle events are
 /// built once and reused across reconnects, so in-flight jobs survive a dropped
-/// connection and their terminal events reach the next live stream.
+/// connection and their verdicts reach the next live stream. On shutdown the
+/// loop exits and hands off to [`RunnerSupervisor::shutdown`], which tears down
+/// any in-flight runners.
 pub async fn run(
     config: AgentConfig,
     credential: Credential,
     docker: Option<docker::DockerRunner>,
     capabilities: Vec<Capability>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     let runner_dir = config.runner_dir.clone();
 
@@ -71,8 +80,8 @@ pub async fn run(
     // event is never lost to a closed stream.
     let mut pending: Option<AttachRequest> = None;
 
-    loop {
-        match connect_and_serve(
+    while !shutdown.is_cancelled() {
+        let outcome = connect_and_serve(
             &config,
             &credential,
             &supervisor,
@@ -80,17 +89,31 @@ pub async fn run(
             &mut pending,
             &mut backoff,
             &capabilities,
+            &shutdown,
         )
-        .await
-        {
+        .await;
+        // A shutdown during the connection is a clean exit, not a failure to log
+        // or back off from.
+        if shutdown.is_cancelled() {
+            break;
+        }
+        match outcome {
             Ok(()) => info!("attach stream closed by gateway; reconnecting"),
             Err(e) => {
                 warn!(error = %e, backoff_secs = backoff.as_secs(), "attach failed; retrying");
             }
         }
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            () = tokio::time::sleep(backoff) => {}
+        }
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
+
+    info!("shutdown signal received; stopping runners");
+    supervisor.shutdown(SHUTDOWN_GRACE).await;
+    Ok(())
 }
 
 /// One connect + stream lifetime. Returns `Ok(())` on a clean close. Resets
@@ -102,6 +125,13 @@ pub async fn run(
 /// connection-scoped heartbeats are sent directly, while runner lifecycle
 /// events are forwarded from the shared egress queue. Inbound orders are routed
 /// to the persistent `supervisor`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one connection's lifecycle genuinely needs all of: endpoint config, \
+              credential, the persistent supervisor, the cross-reconnect egress queue \
+              and its pending slot, the mutable backoff, advertised capabilities, and \
+              the shutdown token"
+)]
 async fn connect_and_serve(
     config: &AgentConfig,
     credential: &Credential,
@@ -110,6 +140,7 @@ async fn connect_and_serve(
     pending: &mut Option<AttachRequest>,
     backoff: &mut Duration,
     capabilities: &[Capability],
+    shutdown: &CancellationToken,
 ) -> Result<()> {
     let channel = config
         .endpoint()?
@@ -155,6 +186,7 @@ async fn connect_and_serve(
 
     let outcome = loop {
         tokio::select! {
+            () = shutdown.cancelled() => break Ok(()),
             event = egress_rx.recv() => match event {
                 Some(msg) => {
                     if let Err(err) = req_tx.send(msg).await {
