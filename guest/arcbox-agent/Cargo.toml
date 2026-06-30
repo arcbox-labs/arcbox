@@ -40,6 +40,7 @@ flate2 = "1"
 tar = "0.4"
 num_cpus = "1"
 arcbox-dns = { workspace = true }
+wait-timeout = "0.2.1"
 
 # vsock and arcbox-vm are Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]

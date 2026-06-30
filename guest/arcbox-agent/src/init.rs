@@ -14,10 +14,14 @@ mod platform {
     use std::fs;
     use std::os::unix::fs as unix_fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
     use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
 
     use nix::mount::{MsFlags, mount};
     use nix::sys::resource::{Resource, setrlimit};
+    use wait_timeout::ChildExt;
 
     /// Runs one-time system initialization after trampoline hands off to agent.
     ///
@@ -454,17 +458,12 @@ mod platform {
             tracing::warn!(error = %e, "failed to enable ip_forward");
         }
         // Bring up loopback interface.
-        match std::process::Command::new("/bin/busybox")
-            .args(["ip", "link", "set", "lo", "up"])
-            .status()
-        {
-            Ok(s) if s.success() => {}
-            Ok(s) => tracing::warn!(
-                exit_code = s.code().unwrap_or(-1),
-                "loopback 'ip link set lo up' exited non-zero"
-            ),
-            Err(e) => tracing::warn!(error = %e, "failed to bring up loopback"),
-        }
+        run_init_cmd(
+            "/bin/busybox",
+            &["ip", "link", "set", "lo", "up"],
+            "ip link lo up",
+            Duration::from_secs(5),
+        );
 
         // Configure the primary interface via DHCP so the guest can reach
         // gateway services (DNS/NAT at 10.0.2.1).
@@ -488,22 +487,12 @@ mod platform {
             return;
         };
 
-        match std::process::Command::new("/bin/busybox")
-            .args(["ip", "link", "set", interface.as_str(), "up"])
-            .status()
-        {
-            Ok(s) if s.success() => {}
-            Ok(s) => {
-                tracing::warn!(
-                    interface,
-                    exit_code = s.code().unwrap_or(-1),
-                    "failed to bring interface up before DHCP"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(interface, error = %e, "failed to execute 'ip link set up'");
-            }
-        }
+        run_init_cmd(
+            "/bin/busybox",
+            &["ip", "link", "set", interface.as_str(), "up"],
+            "ip link primary up",
+            Duration::from_secs(5),
+        );
 
         // BusyBox udhcpc requires a script to apply lease settings.
         let udhcpc_script = "/run/udhcpc.script";
@@ -535,8 +524,9 @@ exit 0
             return;
         }
 
-        match std::process::Command::new("/bin/busybox")
-            .args([
+        if run_init_cmd(
+            "/bin/busybox",
+            &[
                 "udhcpc",
                 "-i",
                 interface.as_str(),
@@ -548,22 +538,11 @@ exit 0
                 "2",
                 "-s",
                 udhcpc_script,
-            ])
-            .status()
-        {
-            Ok(s) if s.success() => {
-                tracing::info!(interface, "DHCP lease acquired");
-            }
-            Ok(s) => {
-                tracing::warn!(
-                    interface,
-                    exit_code = s.code().unwrap_or(-1),
-                    "DHCP request failed"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(interface, error = %e, "failed to run udhcpc");
-            }
+            ],
+            "udhcpc primary",
+            Duration::from_secs(15),
+        ) {
+            tracing::info!(interface, "DHCP lease acquired");
         }
     }
 
@@ -609,9 +588,12 @@ exit 0
         };
 
         // Bring up the interface.
-        let _ = std::process::Command::new("/bin/busybox")
-            .args(["ip", "link", "set", bridge_iface, "up"])
-            .status();
+        run_init_cmd(
+            "/bin/busybox",
+            &["ip", "link", "set", bridge_iface, "up"],
+            "ip link bridge up",
+            Duration::from_secs(5),
+        );
 
         // DHCP script that only sets the IP, no default route.
         let script = r#"#!/bin/sh
@@ -633,8 +615,9 @@ exit 0
         }
         let _ = fs::set_permissions(script_path, fs::Permissions::from_mode(0o755));
 
-        match std::process::Command::new("/bin/busybox")
-            .args([
+        if run_init_cmd(
+            "/bin/busybox",
+            &[
                 "udhcpc",
                 "-i",
                 bridge_iface,
@@ -646,22 +629,11 @@ exit 0
                 "2",
                 "-s",
                 script_path,
-            ])
-            .status()
-        {
-            Ok(s) if s.success() => {
-                tracing::info!(interface = bridge_iface, "bridge NIC DHCP lease acquired");
-            }
-            Ok(s) => {
-                tracing::warn!(
-                    interface = bridge_iface,
-                    exit_code = s.code().unwrap_or(-1),
-                    "bridge NIC DHCP failed"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(interface = bridge_iface, error = %e, "bridge NIC udhcpc failed");
-            }
+            ],
+            "udhcpc bridge",
+            Duration::from_secs(15),
+        ) {
+            tracing::info!(interface = bridge_iface, "bridge NIC DHCP lease acquired");
         }
 
         // Enable proxy ARP on the bridge NIC so the guest answers ARP
@@ -727,19 +699,72 @@ exit 0
     }
 
     /// Run an iptables command, logging on failure.
-    fn run_iptables(args: &[&str], desc: &str) {
-        match std::process::Command::new("/sbin/iptables")
+    /// Runs an external command during one-shot init, isolated and bounded.
+    ///
+    /// Init shells out to busybox (`ip`, `udhcpc`) and `iptables`. A child that
+    /// hangs must never wedge init: readiness would never fire and the VM boot
+    /// would time out (observed as a flaky early-boot stall on a trivial
+    /// `ip link set lo up`). Three safeguards bound and isolate every child:
+    /// - [`ChildExt::wait_timeout`] — the load-bearing guarantee: a child
+    ///   exceeding `timeout` is killed and init continues, *whatever* the
+    ///   stall's root cause. (Still under investigation: the command hangs even
+    ///   with the isolation below, which points at an exec/page-in stall reading
+    ///   the busybox binary from erofs/virtio-blk rather than pure tty I/O.)
+    /// - stdio redirected to `/dev/null` + `process_group(0)` — defence in
+    ///   depth: the child never touches the console and leads its own group, so
+    ///   sharing `hvc0` with the always-on debug console cannot stop it via
+    ///   `SIGTTOU`/`SIGTTIN`.
+    ///
+    /// Returns whether the command exited successfully. Spawn, non-zero exit,
+    /// and timeout are logged against `desc` — degraded setup beats a boot that
+    /// never reaches readiness.
+    fn run_init_cmd(program: &str, args: &[&str], desc: &str, timeout: Duration) -> bool {
+        // Debug-level breadcrumb: the last one logged before a stall names the
+        // command that hung — the diagnostic that localizes the early-boot wedge.
+        tracing::debug!(desc, "running init command");
+        let mut child = match Command::new(program)
             .args(args)
-            .status()
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
         {
-            Ok(s) if s.success() => {}
-            Ok(s) => tracing::warn!(
-                desc,
-                exit_code = s.code().unwrap_or(-1),
-                "iptables rule failed"
-            ),
-            Err(e) => tracing::warn!(desc, error = %e, "failed to run iptables"),
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(desc, error = %e, "failed to spawn init command");
+                return false;
+            }
+        };
+        match child.wait_timeout(timeout) {
+            Ok(Some(status)) if status.success() => true,
+            Ok(Some(status)) => {
+                tracing::warn!(
+                    desc,
+                    exit_code = status.code().unwrap_or(-1),
+                    "init command failed"
+                );
+                false
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    desc,
+                    timeout_s = timeout.as_secs(),
+                    "init command timed out — killing"
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                false
+            }
+            Err(e) => {
+                tracing::warn!(desc, error = %e, "init command wait failed");
+                false
+            }
         }
+    }
+
+    fn run_iptables(args: &[&str], desc: &str) {
+        run_init_cmd("/sbin/iptables", args, desc, Duration::from_secs(10));
     }
 
     fn detect_primary_interface() -> Option<String> {
