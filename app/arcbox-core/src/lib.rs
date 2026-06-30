@@ -60,7 +60,7 @@ pub use machine::MachineManager;
 #[cfg(target_os = "macos")]
 pub use macos::{
     MacImage, MacImageManager, MacImageMeta, MacInstanceDisks, MacMachineConfig, MacMachineInfo,
-    MacMachineManager, MacVm,
+    MacMachineManager, MacVm, PullPhase, PullSource,
 };
 pub use migration::MigrationManager;
 pub use runtime::{Runtime, SandboxPortExposure};
