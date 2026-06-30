@@ -1120,11 +1120,9 @@ impl DeviceManager {
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 if let Some(handle) = workers.get(&device_id) {
-                                    tracing::trace!(
-                                        "blk async dispatch for device {}",
-                                        device_id.0
-                                    );
-                                    handle.dispatch(guest_mem, &qcfg, queue_idx);
+                                    // Ring the queue's doorbell; the owning worker
+                                    // drains avail, does the I/O, and completes.
+                                    handle.ring(queue_idx);
                                 }
                             }
                             // VirtioNet TX (queue 1): extract ethernet frames

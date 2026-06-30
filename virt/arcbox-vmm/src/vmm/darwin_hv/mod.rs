@@ -1008,9 +1008,12 @@ impl Vmm {
                 let mut queue_workers = Vec::with_capacity(num_queues as usize);
 
                 for qi in 0..num_queues {
-                    let (tx, rx) = std::sync::mpsc::channel::<crate::blk_worker::BlkWorkItem>();
+                    // Doorbell channel: the vCPU rings `()` on QUEUE_NOTIFY; the
+                    // worker owns avail-consume + I/O + completion + IRQ.
+                    let (tx, rx) = std::sync::mpsc::channel::<()>();
 
                     let worker_ctx = crate::blk_worker::BlkWorkerContext {
+                        queue_idx: qi,
                         // SAFETY: `guest_ptr` is the host mapping returned by
                         // Virtualization.framework, valid for `guest_len` bytes
                         // for the lifetime of the VM.
@@ -1047,10 +1050,7 @@ impl Vmm {
                         }) {
                         Ok(t) => {
                             self.hv_blk_worker_threads.push(t);
-                            queue_workers.push(crate::blk_worker::BlkQueueWorker {
-                                tx,
-                                last_avail_idx: std::sync::atomic::AtomicU16::new(0),
-                            });
+                            queue_workers.push(crate::blk_worker::BlkQueueWorker { doorbell: tx });
                         }
                         Err(e) => {
                             tracing::warn!("Failed to spawn {}: {}", thread_name, e);

@@ -5,7 +5,7 @@
 //! worker thread performs the actual pread/pwrite and writes completions
 //! directly to the guest's used ring, then triggers an IRQ.
 
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::device::VirtioMmioState;
@@ -27,12 +27,6 @@ pub struct BlkWorkItem {
     pub status_gpa: u64,
     /// Total byte length across all data descriptors (excluding header/status).
     pub total_data_len: u32,
-    /// Used ring GPA (from current QueueConfig, may change after reset).
-    pub used_addr: u64,
-    /// Avail ring GPA (for EVENT_IDX used_event check).
-    pub avail_addr: u64,
-    /// Queue size.
-    pub queue_size: u16,
 }
 
 /// Block request types matching VirtIO spec.
@@ -212,6 +206,9 @@ pub struct BlkWorkerContext {
     /// otherwise stall until an unrelated exit. Mirrors the net/vsock RX workers
     /// (ABX-367).
     pub exit_vcpus: Arc<dyn Fn() + Send + Sync>,
+    /// Index of the virtqueue this worker owns. The worker reads the queue's
+    /// live config from `mmio_state[queue_idx]` each drain.
+    pub queue_idx: u16,
 }
 
 // SAFETY: All fields are either Send+Sync or raw pointers wrapped in
@@ -226,147 +223,135 @@ unsafe impl Send for BlkWorkerContext {}
 ///
 /// Receives work items from the vCPU thread, performs pread/pwrite,
 /// writes completions to the used ring, and triggers IRQs.
-pub fn blk_io_worker_loop(ctx: BlkWorkerContext, rx: std::sync::mpsc::Receiver<BlkWorkItem>) {
+pub fn blk_io_worker_loop(ctx: BlkWorkerContext, doorbell: std::sync::mpsc::Receiver<()>) {
     tracing::info!(
-        "blk-io-worker started (fd={}, blk_size={})",
+        "blk-io worker started (fd={}, q={})",
         ctx.raw_fd,
-        ctx.blk_size
+        ctx.queue_idx
     );
 
-    while let Ok(first) = rx.recv() {
+    // The avail cursor persists across kicks. This worker is the SOLE owner of
+    // its queue — it consumes avail, performs I/O, publishes used, and raises
+    // the IRQ, all in one thread (the libkrun/virtio-queue model). The vCPU only
+    // rings the doorbell on QUEUE_NOTIFY; it no longer touches the ring.
+    let mut last_avail: u16 = 0;
+    while doorbell.recv().is_ok() {
         if !ctx.running.load(Ordering::Relaxed) {
             break;
         }
-
-        let used_addr = first.used_addr;
-        let avail_addr = first.avail_addr;
-        let queue_size = first.queue_size;
-
-        // Collect batch: first item + up to 31 more from try_recv.
-        let mut batch = Vec::with_capacity(32);
-        batch.push(first);
-        while batch.len() < 32 {
-            match rx.try_recv() {
-                Ok(item) => batch.push(item),
-                Err(_) => break,
-            }
-        }
-
-        // Process batch in segments split at Flush/GetId boundaries.
-        // Within each segment, Read/Write items are sorted by (type, sector)
-        // for merge-friendly ordering. Flush/GetId items are processed after
-        // all preceding Read/Write items complete, preserving durability
-        // semantics: a Flush must not overtake a Write from the same batch.
-        let completions = process_batch(&ctx, &mut batch);
-
-        // Publish the completions and decide whether to interrupt the guest
-        // through the unified SplitQueue. Its push_used_batch places a full
-        // SeqCst barrier between advancing used.idx and reading used_event,
-        // closing the stale-used_event race that could suppress the completion
-        // IRQ and wedge a WFI-parked guest on cold boot.
-        let cfg = arcbox_virtio::QueueConfig {
-            desc_addr: 0, // unused: the worker only publishes to the used ring
-            avail_addr,
-            used_addr,
-            size: queue_size,
-            ready: true,
-            gpa_base: ctx.guest_mem.gpa_base() as u64,
-        };
-        // SAFETY: this worker is the sole writer of the queue's used ring and
-        // the pointer is the VM-lifetime guest RAM mapping.
-        let mem = std::sync::Arc::new(unsafe {
-            arcbox_virtio::GuestMemWriter::new(
-                ctx.guest_mem.ptr(),
-                ctx.guest_mem.len(),
-                ctx.guest_mem.gpa_base(),
-            )
-        });
-        let mut queue = arcbox_virtio::SplitQueue::new(mem, 0, &cfg, true);
-        if queue.push_used_batch(&completions) {
-            trigger_irq(&ctx);
-        }
-
-        if batch.len() > 1 {
-            tracing::trace!("blk-io-worker: batch of {} items", batch.len());
-        }
+        // Coalesce kicks that piled up while we were busy: one drain handles
+        // them all, and a spurious extra wake just finds the ring empty.
+        while doorbell.try_recv().is_ok() {}
+        drain_queue(&ctx, &mut last_avail);
     }
 
-    tracing::info!("blk-io-worker exiting");
+    tracing::info!("blk-io worker exiting (q={})", ctx.queue_idx);
 }
 
-/// Processes a batch of work items, splitting at Flush/GetId boundaries.
+/// Drains this worker's virtqueue end to end: pop each available chain, perform
+/// its I/O, publish the completion, and interrupt the guest — wrapped in the
+/// virtio-queue/libkrun `process → enable_notification(recheck) → loop` pattern.
 ///
-/// Within each segment of Read/Write items, we sort by (type, sector) for
-/// merge-friendly ordering. Flush/GetId items execute only after all
-/// preceding Read/Write items in the batch have completed, preserving the
-/// guest's durability invariant: `[Write, Flush]` must not be reordered.
-fn process_batch(ctx: &BlkWorkerContext, batch: &mut [BlkWorkItem]) -> Vec<(u16, u32)> {
-    let mut completions = Vec::with_capacity(batch.len());
-    let mut start = 0;
-    while start < batch.len() {
-        // Find the end of this Read/Write segment (up to next Flush/GetId).
-        let mut seg_end = start;
-        while seg_end < batch.len()
-            && matches!(
-                batch[seg_end].request_type,
-                BlkRequestType::Read | BlkRequestType::Write
-            )
-        {
-            seg_end += 1;
+/// Owning both halves of the queue in one thread (rather than splitting
+/// avail-consume onto the vCPU and completion onto a separate worker) is what
+/// closes the EVENT_IDX kick-suppression race that wedged guest page-in
+/// (`folio_wait_bit_common`) on cold boot — ABX-386.
+fn drain_queue(ctx: &BlkWorkerContext, last_avail: &mut u16) {
+    let qi = ctx.queue_idx as usize;
+    let cfg = {
+        let Ok(mmio) = ctx.mmio_state.read() else {
+            return;
+        };
+        if qi >= mmio.queue_ready.len() || !mmio.queue_ready[qi] || mmio.queue_num[qi] == 0 {
+            return;
         }
-
-        // Sort the Read/Write segment by (type, sector) for merging.
-        if seg_end - start > 1 {
-            batch[start..seg_end].sort_unstable_by(|a, b| {
-                let type_ord = |t: &BlkRequestType| match t {
-                    BlkRequestType::Read => 0u8,
-                    BlkRequestType::Write => 1,
-                    _ => 2,
-                };
-                type_ord(&a.request_type)
-                    .cmp(&type_ord(&b.request_type))
-                    .then(a.sector.cmp(&b.sector))
-            });
+        arcbox_virtio::QueueConfig {
+            desc_addr: mmio.queue_desc[qi],
+            avail_addr: mmio.queue_driver[qi],
+            used_addr: mmio.queue_device[qi],
+            size: mmio.queue_num[qi],
+            ready: true,
+            gpa_base: ctx.guest_mem.gpa_base() as u64,
         }
+    };
 
-        // Process the sorted Read/Write segment with merging.
-        let mut i = start;
-        while i < seg_end {
-            let item = &batch[i];
-            let mut end = i + 1;
-            while end < seg_end
-                && batch[end].request_type == item.request_type
-                && batch[end].sector
-                    == batch[end - 1].sector
-                        + u64::from(batch[end - 1].total_data_len) / u64::from(ctx.blk_size)
-            {
-                end += 1;
+    // SAFETY: the VM-lifetime guest RAM mapping. This worker is the sole writer
+    // of the queue's used ring and only touches device-owned descriptor buffers.
+    let mem = std::sync::Arc::new(unsafe {
+        arcbox_virtio::GuestMemWriter::new(
+            ctx.guest_mem.ptr(),
+            ctx.guest_mem.len(),
+            ctx.guest_mem.gpa_base(),
+        )
+    });
+    let mut queue = arcbox_virtio::SplitQueue::new(mem, ctx.queue_idx, &cfg, true);
+    queue.set_last_avail_idx(*last_avail);
+
+    loop {
+        while let Some(chain) = queue.pop_avail() {
+            let (head, len) = match parse_chain(ctx, &chain) {
+                Some(item) => process_item(ctx, &item),
+                // Malformed chain: complete it (len 0) so the descriptor isn't
+                // leaked, rather than wedging the ring.
+                None => (chain.head_idx, 0),
+            };
+            if queue.push_used(head, len) {
+                trigger_irq(ctx);
             }
-            if end == i + 1 {
-                completions.push(process_item(ctx, item));
-            } else {
-                completions.extend(process_merged(ctx, &batch[i..end]));
-            }
-            i = end;
         }
-
-        // Process any Flush/GetId items that follow (one by one).
-        start = seg_end;
-        while start < batch.len()
-            && !matches!(
-                batch[start].request_type,
-                BlkRequestType::Read | BlkRequestType::Write
-            )
-        {
-            completions.push(process_item(ctx, &batch[start]));
-            start += 1;
+        // Re-arm notifications and re-check: loop if the guest added more (and
+        // suppressed its kick) while we were draining.
+        if !queue.enable_notification() {
+            break;
         }
     }
-    completions
+
+    *last_avail = queue.last_avail_idx();
+}
+
+/// Parses a block request from an available descriptor chain. The first
+/// descriptor is the 16-byte request header (type + sector); the remaining
+/// descriptors are data buffers, with the last writable descriptor's final byte
+/// reserved for the status code.
+fn parse_chain(ctx: &BlkWorkerContext, chain: &arcbox_virtio::DescChain) -> Option<BlkWorkItem> {
+    let header = chain.descriptors.first()?;
+    let hdr = ctx.guest_mem.slice(header.addr as usize, 16)?;
+    let req_type = u32::from_le_bytes(hdr[0..4].try_into().ok()?);
+    let sector = u64::from_le_bytes(hdr[8..16].try_into().ok()?);
+    let request_type = match req_type {
+        0 => BlkRequestType::Read,
+        1 => BlkRequestType::Write,
+        4 => BlkRequestType::Flush,
+        8 => BlkRequestType::GetId,
+        _ => BlkRequestType::Read,
+    };
+
+    let mut buffers = Vec::new();
+    let mut status_gpa = 0u64;
+    let mut total_data_len = 0u32;
+    for desc in chain.descriptors.iter().skip(1) {
+        let is_write = desc.is_write();
+        buffers.push((desc.addr, desc.len, is_write));
+        if is_write && desc.len > 0 {
+            status_gpa = desc.addr + u64::from(desc.len) - 1;
+        }
+        if desc.len > 1 {
+            total_data_len += desc.len;
+        }
+    }
+
+    Some(BlkWorkItem {
+        head_idx: chain.head_idx,
+        request_type,
+        sector,
+        buffers,
+        status_gpa,
+        total_data_len,
+    })
 }
 
 /// Processes a single block I/O work item, returning its `(head_idx, bytes)`
-/// used-ring completion (published later by the worker loop in one batch).
+/// used-ring completion.
 fn process_item(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> (u16, u32) {
     let is_io = matches!(
         item.request_type,
@@ -482,101 +467,6 @@ fn process_write(ctx: &BlkWorkerContext, item: &BlkWorkItem) -> u8 {
     0
 }
 
-/// Processes a merged run of same-type items with contiguous sectors
-/// using a single preadv/pwritev syscall. Each item still gets its own
-/// used ring completion.
-fn process_merged(ctx: &BlkWorkerContext, items: &[BlkWorkItem]) -> Vec<(u16, u32)> {
-    let is_read = items[0].request_type == BlkRequestType::Read;
-    let start_sector = items[0].sector;
-
-    // Track in-flight for all items in the merge group.
-    ctx.flush_barrier
-        .in_flight
-        .fetch_add(items.len() as u32, Ordering::Relaxed);
-
-    // Build combined iovec from all items.
-    let mut iovecs: Vec<libc::iovec> = Vec::new();
-    for item in items {
-        for &(gpa, len, is_write_flag) in &item.buffers {
-            // For reads: use write-only descriptors. For writes: use read-only.
-            let want = if is_read {
-                is_write_flag
-            } else {
-                !is_write_flag
-            };
-            if !want || len <= 1 {
-                continue;
-            }
-            if is_read {
-                // SAFETY: VirtIO descriptor buffers are device-owned.
-                if let Some(buf) = unsafe { ctx.guest_mem.slice_mut(gpa as usize, len as usize) } {
-                    iovecs.push(libc::iovec {
-                        iov_base: buf.as_mut_ptr().cast(),
-                        iov_len: buf.len(),
-                    });
-                }
-            } else if let Some(buf) = ctx.guest_mem.slice(gpa as usize, len as usize) {
-                iovecs.push(libc::iovec {
-                    iov_base: buf.as_ptr().cast_mut().cast(),
-                    iov_len: buf.len(),
-                });
-            }
-        }
-    }
-
-    // Single merged I/O syscall.
-    #[allow(clippy::cast_possible_wrap)]
-    let offset = (start_sector * u64::from(ctx.blk_size)) as libc::off_t;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let n = if is_read {
-        unsafe { libc::preadv(ctx.raw_fd, iovecs.as_ptr(), iovecs.len() as i32, offset) }
-    } else {
-        unsafe { libc::pwritev(ctx.raw_fd, iovecs.as_ptr(), iovecs.len() as i32, offset) }
-    };
-
-    let status: u8 = if n < 0 {
-        tracing::warn!(
-            "blk merged {} failed at sector {}: {}",
-            if is_read { "preadv" } else { "pwritev" },
-            start_sector,
-            std::io::Error::last_os_error()
-        );
-        1
-    } else {
-        0
-    };
-
-    // Compute each item's completion; the worker loop publishes them in one
-    // batched used-ring update.
-    let mut completions = Vec::with_capacity(items.len());
-    for item in items {
-        ctx.guest_mem.write_byte(item.status_gpa as usize, status);
-        let total_bytes = if status == 0 {
-            item.total_data_len + 1
-        } else {
-            1
-        };
-        completions.push((item.head_idx, total_bytes));
-    }
-
-    ctx.flush_barrier
-        .in_flight
-        .fetch_sub(items.len() as u32, Ordering::Release);
-
-    tracing::trace!(
-        "blk merged {} items: sector {}..+{}, {} iovecs, {} bytes",
-        items.len(),
-        start_sector,
-        items.last().map_or(0, |i| i.sector
-            + u64::from(i.total_data_len) / u64::from(ctx.blk_size))
-            - start_sector,
-        iovecs.len(),
-        n,
-    );
-
-    completions
-}
-
 fn process_flush(ctx: &BlkWorkerContext) -> u8 {
     let ret = unsafe { libc::fsync(ctx.raw_fd) };
     if ret < 0 {
@@ -622,8 +512,11 @@ fn trigger_irq(ctx: &BlkWorkerContext) {
 
 /// Per-queue I/O worker handle.
 pub struct BlkQueueWorker {
-    pub tx: std::sync::mpsc::Sender<BlkWorkItem>,
-    pub last_avail_idx: AtomicU16,
+    /// Doorbell: the vCPU rings this (sends `()`) on QUEUE_NOTIFY to wake the
+    /// owning worker. The worker — not the vCPU — consumes the avail ring,
+    /// performs the I/O, and publishes completions, so a single thread owns the
+    /// whole queue (the libkrun/virtio-queue model).
+    pub doorbell: std::sync::mpsc::Sender<()>,
 }
 
 /// Per-block-device async I/O state. Holds one worker per queue.
@@ -638,167 +531,16 @@ impl BlkWorkerHandle {
         self.queues.get(queue_idx as usize)
     }
 
-    /// Parses available descriptors from the virtqueue and dispatches them
-    /// as `BlkWorkItem`s to the worker thread.
-    ///
-    /// Returns `true` if any items were dispatched.
-    pub fn dispatch(
-        &self,
-        memory: &mut [u8],
-        qcfg: &arcbox_virtio::QueueConfig,
-        queue_idx: u16,
-    ) -> bool {
-        let Some(worker) = self.get_queue(queue_idx) else {
-            return false;
-        };
-
-        if !qcfg.ready || qcfg.size == 0 {
-            return false;
+    /// Rings the doorbell for `queue_idx`, waking the owning worker to drain the
+    /// queue. Called by the vCPU on a QUEUE_NOTIFY MMIO exit; the worker does
+    /// all ring work (avail-consume, I/O, completion, IRQ), so this never
+    /// touches guest memory.
+    pub fn ring(&self, queue_idx: u16) {
+        if let Some(worker) = self.get_queue(queue_idx) {
+            // Unbounded channel: send never blocks. A closed receiver means the
+            // worker exited during teardown — nothing to wake.
+            let _ = worker.doorbell.send(());
         }
-
-        // Translate GPAs to slice offsets (checked against ram base).
-        let gpa_base = qcfg.gpa_base as usize;
-        let Some(desc_addr) = (qcfg.desc_addr as usize).checked_sub(gpa_base) else {
-            tracing::warn!(
-                "blk dispatch: desc GPA {:#x} below ram base {:#x}",
-                qcfg.desc_addr,
-                gpa_base
-            );
-            return false;
-        };
-        let Some(avail_addr) = (qcfg.avail_addr as usize).checked_sub(gpa_base) else {
-            tracing::warn!(
-                "blk dispatch: avail GPA {:#x} below ram base {:#x}",
-                qcfg.avail_addr,
-                gpa_base
-            );
-            return false;
-        };
-        let Some(used_addr) = (qcfg.used_addr as usize).checked_sub(gpa_base) else {
-            tracing::warn!(
-                "blk dispatch: used GPA {:#x} below ram base {:#x}",
-                qcfg.used_addr,
-                gpa_base
-            );
-            return false;
-        };
-        let q_size = qcfg.size as usize;
-
-        if avail_addr + 4 > memory.len() {
-            return false;
-        }
-        let avail_idx = u16::from_le_bytes([memory[avail_addr + 2], memory[avail_addr + 3]]);
-
-        let last_avail = worker.last_avail_idx.load(Ordering::Relaxed);
-        let mut current = last_avail;
-        let mut dispatched = false;
-
-        while current != avail_idx {
-            let ring_off = avail_addr + 4 + 2 * ((current as usize) % q_size);
-            if ring_off + 2 > memory.len() {
-                break;
-            }
-            let head_idx = u16::from_le_bytes([memory[ring_off], memory[ring_off + 1]]);
-
-            // Walk descriptor chain.
-            let mut buffers = Vec::new();
-            let mut status_gpa: u64 = 0;
-            let mut total_data_len: u32 = 0;
-            let mut request_type = BlkRequestType::Read;
-            let mut sector: u64 = 0;
-            let mut first_desc = true;
-            let mut idx = head_idx as usize;
-
-            // Bounded to `q_size` iterations so a cyclic `next` chain (e.g.
-            // 0->1->0) from a malformed or malicious guest cannot spin this
-            // dispatch loop forever. Any legitimate chain fits in `q_size`.
-            for _ in 0..q_size {
-                let d_off = desc_addr + idx * 16;
-                if d_off + 16 > memory.len() {
-                    break;
-                }
-                let addr = u64::from_le_bytes(memory[d_off..d_off + 8].try_into().unwrap());
-                let len = u32::from_le_bytes(memory[d_off + 8..d_off + 12].try_into().unwrap());
-                let flags = u16::from_le_bytes(memory[d_off + 12..d_off + 14].try_into().unwrap());
-                let next = u16::from_le_bytes(memory[d_off + 14..d_off + 16].try_into().unwrap());
-                let is_write = flags & 2 != 0;
-
-                if first_desc {
-                    // First descriptor = block request header (16 bytes).
-                    first_desc = false;
-                    if len >= 16 {
-                        let Some(hdr_off) = (addr as usize).checked_sub(gpa_base) else {
-                            break;
-                        };
-                        if hdr_off + 16 <= memory.len() {
-                            let req_type = u32::from_le_bytes(
-                                memory[hdr_off..hdr_off + 4].try_into().unwrap(),
-                            );
-                            sector = u64::from_le_bytes(
-                                memory[hdr_off + 8..hdr_off + 16].try_into().unwrap(),
-                            );
-                            request_type = match req_type {
-                                0 => BlkRequestType::Read,
-                                1 => BlkRequestType::Write,
-                                4 => BlkRequestType::Flush,
-                                8 => BlkRequestType::GetId,
-                                _ => BlkRequestType::Read,
-                            };
-                        }
-                    }
-                } else {
-                    buffers.push((addr, len, is_write));
-                    // Last writable descriptor's last byte = status byte.
-                    if is_write && len > 0 {
-                        status_gpa = addr + u64::from(len) - 1;
-                    }
-                    // Count data bytes (exclude 1-byte status descriptor).
-                    if len > 1 {
-                        total_data_len += len;
-                    }
-                }
-
-                if flags & 1 == 0 {
-                    break; // No NEXT flag.
-                }
-                idx = next as usize;
-                if idx >= q_size {
-                    break;
-                }
-            }
-
-            let item = BlkWorkItem {
-                head_idx,
-                request_type,
-                sector,
-                buffers,
-                status_gpa,
-                total_data_len,
-                used_addr: qcfg.used_addr,
-                avail_addr: qcfg.avail_addr,
-                queue_size: qcfg.size,
-            };
-
-            if worker.tx.send(item).is_err() {
-                tracing::warn!("blk worker channel closed, falling back to sync");
-                break;
-            }
-            dispatched = true;
-            current = current.wrapping_add(1);
-        }
-
-        worker.last_avail_idx.store(current, Ordering::Relaxed);
-
-        // Update avail_event for EVENT_IDX.
-        if dispatched {
-            let avail_event_off = used_addr + 4 + q_size * 8;
-            if avail_event_off + 2 <= memory.len() {
-                memory[avail_event_off..avail_event_off + 2]
-                    .copy_from_slice(&current.to_le_bytes());
-            }
-        }
-
-        dispatched
     }
 }
 
