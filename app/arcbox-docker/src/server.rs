@@ -92,16 +92,16 @@ impl DockerApiServer {
         let connector = Arc::new(VsockConnector::new(Arc::clone(&self.runtime)));
         let proxy = Arc::new(ProxyState::new(connector));
 
-        // Drop the cached guest-dockerd readiness whenever the System VM
-        // restarts (e.g. a backend switch) so the next Docker request
-        // re-verifies against the fresh VM instead of failing once on a stale
-        // connection and self-healing a request later.
+        // Reset the cached guest-dockerd readiness and the pooled guest
+        // connections whenever the System VM restarts (e.g. a backend switch),
+        // so the next Docker request re-verifies and dials the fresh VM instead
+        // of failing once on a stale connection and self-healing a request later.
         drop(tokio::spawn(watch_endpoint_invalidation(
             self.runtime.event_bus().subscribe(),
             self.runtime.default_machine_name().to_owned(),
             {
                 let proxy = Arc::clone(&proxy);
-                move || proxy.invalidate_endpoint()
+                move || proxy.reset_endpoint()
             },
             shutdown.clone(),
         )));
@@ -160,13 +160,13 @@ impl DockerApiServer {
     }
 }
 
-/// Drops the proxy's cached guest-dockerd readiness each time the System VM
-/// stops.
+/// Resets the proxy's guest-dockerd endpoint each time the System VM stops.
 ///
 /// A System VM restart (notably a backend switch) leaves the cached `_ping`
-/// verification — and the pooled connections behind it — pointing at the old
-/// VM. Reacting to `MachineStopped` makes the next Docker request re-verify
-/// against the fresh VM, rather than the first request failing on a stale
+/// verification — and the pooled vsock connections behind it — pointing at the
+/// old VM. Reacting to `MachineStopped` (the `reset` closure drops both the
+/// cached readiness and the pool) makes the next Docker request re-verify and
+/// dial the fresh VM, rather than the first request failing on a stale
 /// connection and only the second one self-healing.
 ///
 /// Only the System VM's own `MachineStopped` matters; user machines stop

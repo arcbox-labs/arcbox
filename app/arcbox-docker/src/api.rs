@@ -78,6 +78,18 @@ impl ProxyState {
         self.endpoint_readiness.invalidate();
     }
 
+    /// Full reset for a System VM restart.
+    ///
+    /// Drops the cached `_ping` readiness *and* the pooled guest connections,
+    /// which all point at the stopped VM. Unlike [`Self::invalidate_endpoint`]
+    /// (the reactive single-failure path, which leaves the pool alone), this
+    /// also rebuilds the connection pool so the re-verification `_ping` cannot
+    /// reuse a dead session.
+    pub(crate) fn reset_endpoint(&self) {
+        self.endpoint_readiness.invalidate();
+        self.guest_http_client.reset();
+    }
+
     async fn ping_guest(&self) -> crate::error::Result<()> {
         let response = proxy::proxy_to_guest_pooled(
             &self.guest_http_client,
