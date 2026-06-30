@@ -260,9 +260,11 @@ impl Runtime {
     /// Switches the System VM's hypervisor backend (HV <-> VZ) and restarts the
     /// VM so it takes effect.
     ///
-    /// No-op when the backend is unchanged. Otherwise the System VM is
-    /// gracefully stopped, its backend updated, and the VM rebooted on the new
-    /// backend. The persistent dockerd data image is preserved, so containers
+    /// When the backend is unchanged this only ensures the System VM is running
+    /// (an earlier switch may have recorded the backend and then failed to
+    /// boot). Otherwise the System VM is gracefully stopped, its backend
+    /// updated, and the VM rebooted on the new backend. The persistent dockerd
+    /// data image is preserved, so containers
     /// and images survive; but because the kernel command line differs between
     /// backends (HV pins `earlycon=pl011`), the reboot detects config drift and
     /// recreates the machine record, regenerating its SSH host keys. The choice
@@ -276,6 +278,11 @@ impl Runtime {
     pub async fn switch_system_vm_backend(&self, backend: arcbox_vmm::VmBackend) -> Result<()> {
         let lifecycle = &self.vm_lifecycle;
         if lifecycle.backend() == backend {
+            // Already on the requested backend — but an earlier switch may have
+            // recorded it and then failed to boot, leaving the VM down even
+            // though the backend matches. Ensure it is actually running rather
+            // than reporting success while Docker is unreachable.
+            lifecycle.ensure_ready().await?;
             return Ok(());
         }
 
