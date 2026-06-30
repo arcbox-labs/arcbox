@@ -1,7 +1,9 @@
 //! Persistence of the long-lived machine credential.
 //!
 //! The credential is written once at enrollment and read on every `run`. On
-//! Unix the file is locked down to `0600`; Windows ACL hardening is deferred.
+//! Unix the file is locked down to `0600`. Other platforms are unsupported:
+//! without an equivalent owner-only ACL the agent refuses to persist the
+//! long-lived machine token rather than write it at default permissions.
 
 use std::path::{Path, PathBuf};
 
@@ -84,18 +86,29 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("writing {}", path.display()))
 }
 
-/// Windows ACL hardening is deferred to a later slice.
+/// Refuse to persist the machine token on platforms without owner-only file
+/// permissions. Windows ACL hardening (a protected, owner-only DACL) is not yet
+/// implemented, and writing the long-lived token at the default ACL would leave
+/// it readable by other local accounts — so credential storage is Unix-only for
+/// now.
 #[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
+fn write_private(_path: &Path, _bytes: &[u8]) -> Result<()> {
+    anyhow::bail!(
+        "Fleet agent credential storage is only supported on Unix; Windows ACL \
+         hardening is not yet implemented"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // Storage is Unix-only (owner-only `0600`); other platforms refuse to write.
+    #[cfg(unix)]
     #[test]
     fn round_trips_credential() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = std::env::temp_dir().join(format!("fleet-cred-{}", std::process::id()));
         let store = CredentialStore::new(dir.join("credentials.json"));
         assert!(store.load().unwrap().is_none());
@@ -110,12 +123,8 @@ mod tests {
         assert_eq!(loaded.machine_id, cred.machine_id);
         assert_eq!(loaded.machine_token, cred.machine_token);
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(store.path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
+        let mode = std::fs::metadata(store.path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
 
         let _ = std::fs::remove_dir_all(dir);
     }
