@@ -12,9 +12,10 @@ use std::sync::Arc;
 /// verifies guest dockerd with a real Docker `_ping`.
 pub async fn ensure_system_vm_ready(state: &AppState) -> Result<()> {
     let runtime = Arc::clone(&state.runtime);
+    let generation = runtime.system_vm_restart_generation();
     state
         .proxy
-        .ensure_endpoint_verified(async move {
+        .ensure_endpoint_verified(generation, async move {
             runtime
                 .ensure_system_vm_ready()
                 .await

@@ -136,6 +136,10 @@ pub struct VmLifecycleManager {
     /// switched at runtime so the next (re)boot picks it up. Read via
     /// [`Self::backend`].
     backend: AtomicU8,
+    /// Monotonic counter bumped on every System VM stop. Identifies the current
+    /// VM incarnation so the Docker proxy can detect a restart and reset its
+    /// cached readiness + pooled connections. Read via [`Self::restart_generation`].
+    restart_generation: AtomicU64,
     /// Data directory.
     data_dir: PathBuf,
     /// Mutex for serializing state transitions.
@@ -325,6 +329,7 @@ impl VmLifecycleManager {
             recovery,
             config,
             backend: AtomicU8::new(seeded_backend as u8),
+            restart_generation: AtomicU64::new(0),
             data_dir,
             transition_lock: Mutex::new(()),
             last_activity_ms: AtomicU64::new(now_ms),
@@ -337,6 +342,16 @@ impl VmLifecycleManager {
     #[must_use]
     pub fn machine_name(&self) -> &str {
         &self.machine_name
+    }
+
+    /// Returns the current VM incarnation counter, bumped on every stop.
+    ///
+    /// The Docker proxy compares this against the value it last verified
+    /// against to detect a System VM restart (e.g. a backend switch) and reset
+    /// its cached readiness + pooled connections before the next request.
+    #[must_use]
+    pub fn restart_generation(&self) -> u64 {
+        self.restart_generation.load(Ordering::Acquire)
     }
 
     /// Returns the absolute path of this machine's persistent dockerd
@@ -1025,6 +1040,7 @@ impl VmLifecycleManager {
         match stop_result {
             Ok(()) => {
                 *self.state.write().await = VmLifecycleState::Stopped;
+                self.restart_generation.fetch_add(1, Ordering::Release);
                 tracing::info!("Default VM stopped");
                 self.event_bus.publish(Event::MachineStopped {
                     name: self.machine_name.clone(),
@@ -1051,6 +1067,7 @@ impl VmLifecycleManager {
         let _ = self.machine_manager.remove(&self.machine_name, true);
 
         *self.state.write().await = VmLifecycleState::NotExist;
+        self.restart_generation.fetch_add(1, Ordering::Release);
         self.event_bus.publish(Event::MachineStopped {
             name: self.machine_name.clone(),
         });

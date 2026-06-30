@@ -22,6 +22,7 @@ use http_body_util::BodyExt;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Notify;
 
 /// Application state shared with handlers.
@@ -41,7 +42,7 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
-    pub(crate) fn new(connector: Arc<dyn GuestConnector>) -> Self {
+    fn new(connector: Arc<dyn GuestConnector>) -> Self {
         Self {
             guest_http_client: GuestHttpClient::new(Arc::clone(&connector)),
             connector,
@@ -62,13 +63,26 @@ impl ProxyState {
     /// The supplied `prepare_runtime` future owns the slow VM/agent/runtime
     /// readiness path. This proxy state owns the cheaper HTTP `_ping`
     /// verification and caches it until a transport failure invalidates it.
+    ///
+    /// `generation` is the System VM's current incarnation counter. When it
+    /// changes — the VM restarted (e.g. a backend switch) since the last call —
+    /// the cached readiness and pooled connections both point at the old VM, so
+    /// they are reset before verifying. Because this check is synchronous with
+    /// the request, it cannot race the restart the way an out-of-band event
+    /// watcher would.
     pub(crate) async fn ensure_endpoint_verified<F>(
         &self,
+        generation: u64,
         prepare_runtime: F,
     ) -> crate::error::Result<()>
     where
         F: Future<Output = crate::error::Result<()>>,
     {
+        if self.endpoint_readiness.observe_generation(generation) {
+            // The readiness was already invalidated by `observe_generation`;
+            // also drop the pooled connections, which dialed the old VM.
+            self.guest_http_client.reset();
+        }
         self.endpoint_readiness
             .ensure_verified(prepare_runtime, || self.ping_guest())
             .await
@@ -76,18 +90,6 @@ impl ProxyState {
 
     pub(crate) fn invalidate_endpoint(&self) {
         self.endpoint_readiness.invalidate();
-    }
-
-    /// Full reset for a System VM restart.
-    ///
-    /// Drops the cached `_ping` readiness *and* the pooled guest connections,
-    /// which all point at the stopped VM. Unlike [`Self::invalidate_endpoint`]
-    /// (the reactive single-failure path, which leaves the pool alone), this
-    /// also rebuilds the connection pool so the re-verification `_ping` cannot
-    /// reuse a dead session.
-    pub(crate) fn reset_endpoint(&self) {
-        self.endpoint_readiness.invalidate();
-        self.guest_http_client.reset();
     }
 
     async fn ping_guest(&self) -> crate::error::Result<()> {
@@ -131,6 +133,8 @@ enum EndpointReadinessState {
 struct EndpointReadiness {
     state: Mutex<EndpointReadinessState>,
     changed: Notify,
+    /// System VM incarnation this endpoint last verified against.
+    generation: AtomicU64,
 }
 
 impl EndpointReadiness {
@@ -138,7 +142,20 @@ impl EndpointReadiness {
         Self {
             state: Mutex::new(EndpointReadinessState::Unverified),
             changed: Notify::new(),
+            generation: AtomicU64::new(0),
         }
+    }
+
+    /// Records the current VM incarnation and, when it differs from the last
+    /// one seen (the System VM restarted in between), invalidates the cached
+    /// readiness and reports the change so the caller can drop stale pooled
+    /// connections too.
+    fn observe_generation(&self, generation: u64) -> bool {
+        if self.generation.swap(generation, Ordering::AcqRel) == generation {
+            return false;
+        }
+        self.invalidate();
+        true
     }
 
     async fn ensure_verified<Prepare, Verify, VerifyFuture>(
@@ -207,16 +224,10 @@ impl EndpointReadiness {
 /// so that versioned paths (`/v1.51/containers/{id}/start`) are normalised
 /// *before* Axum route matching.
 pub fn create_router(runtime: Arc<Runtime>, connector: Arc<dyn GuestConnector>) -> Router {
-    router_with_proxy(runtime, Arc::new(ProxyState::new(connector)))
-}
-
-/// Builds the router from an already-constructed [`ProxyState`].
-///
-/// The server constructs the `ProxyState` itself so it can hand a clone to the
-/// background task that drops endpoint readiness on System VM restarts; tests
-/// use [`create_router`], which builds a fresh state per call.
-pub(crate) fn router_with_proxy(runtime: Arc<Runtime>, proxy: Arc<ProxyState>) -> Router {
-    let state = AppState { runtime, proxy };
+    let state = AppState {
+        runtime,
+        proxy: Arc::new(ProxyState::new(connector)),
+    };
 
     api_routes()
         .fallback(proxy::proxy_fallback)
@@ -511,6 +522,31 @@ mod tests {
 
         assert_eq!(verified.load(Ordering::Relaxed), 2);
         assert_eq!(readiness.state(), EndpointReadinessState::Unverified);
+    }
+
+    #[tokio::test]
+    async fn readiness_generation_change_invalidates_verified_state() {
+        let readiness = EndpointReadiness::new();
+
+        // Verify against the initial incarnation (generation 0).
+        readiness
+            .ensure_verified(async { Ok::<(), DockerError>(()) }, || async {
+                Ok::<(), DockerError>(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(readiness.state(), EndpointReadinessState::Verified);
+
+        // Re-observing the same incarnation is a cache hit — no invalidation.
+        assert!(!readiness.observe_generation(0));
+        assert_eq!(readiness.state(), EndpointReadinessState::Verified);
+
+        // A new incarnation (the VM restarted) drops the cached verification.
+        assert!(readiness.observe_generation(7));
+        assert_eq!(readiness.state(), EndpointReadinessState::Unverified);
+
+        // Stable once recorded.
+        assert!(!readiness.observe_generation(7));
     }
 
     #[tokio::test]
