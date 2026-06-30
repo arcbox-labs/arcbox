@@ -13,7 +13,7 @@
 [boot]
 version = "0.6.1"
 cdn = "https://boot.arcboxcdn.com"
-manifest_sha256 = "6945c6c612c7e021ee709f7e50aeedc39ad3cefaf53c6a30b0aaac1919ac49d5"
+manifest_sha256 = "20c6a934cbba0d2b304efdc99af02eae2b9da72a9bfe2c825fb209023d4bd8d7"
 
 [[tools]]
 name = "docker"
