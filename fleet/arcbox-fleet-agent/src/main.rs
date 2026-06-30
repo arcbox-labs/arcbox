@@ -98,11 +98,14 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
         Command::Run => {
             let docker = init_docker(&config).await?;
             let capabilities = capabilities(&config, docker.as_ref());
-            let credential = CredentialStore::new(config.credentials_path())
-                .load()?
-                .context(
-                    "no credential found — run `arcbox-fleet-agent enroll --token-file …` first",
-                )?;
+            let credential = CredentialStore::new(
+                config.credential_store,
+                config.credentials_path(),
+            )?
+            .load()?
+            .context(
+                "no credential found — run `arcbox-fleet-agent enroll --token-file …` first",
+            )?;
             info!(machine_id = %credential.machine_id, "starting fleet agent");
 
             // Cancelled on the first termination signal; `attach::run` then

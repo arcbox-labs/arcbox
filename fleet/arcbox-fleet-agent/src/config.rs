@@ -19,6 +19,7 @@ const ENV_MEM_FLOOR_MIB: &str = "ARCBOX_FLEET_MEM_FLOOR_MIB";
 const ENV_DATA_DIR: &str = "ARCBOX_FLEET_DATA_DIR";
 const ENV_DOCKER: &str = "ARCBOX_FLEET_DOCKER";
 const ENV_RUNNER_IMAGE: &str = "ARCBOX_FLEET_RUNNER_IMAGE";
+const ENV_CREDENTIAL_STORE: &str = "ARCBOX_FLEET_CREDENTIAL_STORE";
 
 /// Reject an offer when 1-minute load average per core exceeds this.
 const DEFAULT_LOAD_CEILING: f64 = 0.9;
@@ -38,6 +39,19 @@ pub enum DockerMode {
     Enabled,
     /// Never use Docker, even if available.
     Disabled,
+}
+
+/// Where the long-lived machine credential is persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialMode {
+    /// OS keychain on macOS (login Keychain) and Windows (Credential Manager);
+    /// the owner-only data-dir file on Linux. On macOS the agent must run in the
+    /// user's session, where the login Keychain is unlocked.
+    Auto,
+    /// Force the OS keychain. Supported on macOS and Windows; errors on Linux.
+    Keyring,
+    /// Force the data-dir file (`0600` on Unix).
+    File,
 }
 
 /// Docker-specific configuration for running Linux jobs in containers.
@@ -64,6 +78,8 @@ pub struct AgentConfig {
     pub data_dir: PathBuf,
     /// Docker runtime configuration for Linux jobs.
     pub docker: DockerConfig,
+    /// Where the machine credential is persisted (OS keychain vs file).
+    pub credential_store: CredentialMode,
 }
 
 impl AgentConfig {
@@ -108,6 +124,17 @@ impl AgentConfig {
         let runner_image =
             std::env::var(ENV_RUNNER_IMAGE).unwrap_or_else(|_| DEFAULT_RUNNER_IMAGE.to_string());
 
+        let credential_store = match std::env::var(ENV_CREDENTIAL_STORE).as_deref() {
+            Ok("keyring") => CredentialMode::Keyring,
+            Ok("file") => CredentialMode::File,
+            Ok("auto") | Err(_) => CredentialMode::Auto,
+            Ok(other) => {
+                anyhow::bail!(
+                    "{ENV_CREDENTIAL_STORE} must be 'auto', 'keyring', or 'file', got '{other}'"
+                )
+            }
+        };
+
         Ok(Self {
             gateway,
             runner_dir,
@@ -118,6 +145,7 @@ impl AgentConfig {
                 mode: docker_mode,
                 runner_image,
             },
+            credential_store,
         })
     }
 
