@@ -4,7 +4,7 @@
 //! complete base image — `disk.img`, `aux.img`, `hwmodel.bin`, `machine-id.bin`,
 //! `meta.json` — that [`MacImageManager::clone_base`] can copy-on-write clone.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use arcbox_vz::{
     MacAuxiliaryStorage, MacGraphicsDeviceConfiguration, MacMachineIdentifier, MacOSBootLoader,
@@ -13,8 +13,27 @@ use arcbox_vz::{
 };
 use chrono::Utc;
 
+use super::download::download_ipsw;
 use super::image::{MacImage, MacImageManager, MacImageMeta};
 use crate::error::{CoreError, Result};
+
+/// Where a [`MacImageManager::pull`] obtains its IPSW.
+#[derive(Debug, Clone)]
+pub enum PullSource {
+    /// Restore from a local IPSW file.
+    LocalIpsw(PathBuf),
+    /// Download the latest Apple-published restore image.
+    Latest,
+}
+
+/// The phase a [`MacImageManager::pull`] is in, for progress reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullPhase {
+    /// Downloading the IPSW from Apple.
+    Download,
+    /// Restoring macOS onto the base image (the long phase).
+    Install,
+}
 
 /// macOS installation is memory-hungry; floor the install VM at 8 GiB.
 const INSTALL_MIN_MEMORY: u64 = 8 * GIB;
@@ -109,5 +128,45 @@ impl MacImageManager {
         };
         self.write_meta(&meta)?;
         self.get(name)
+    }
+
+    /// Pulls a base image: obtain an IPSW (downloading the latest when needed), then
+    /// restore it into a base image named `name`.
+    ///
+    /// `on_progress` is invoked with the current phase and its fraction
+    /// (`0.0..=1.0`). Apple Silicon only.
+    ///
+    /// # Errors
+    /// Returns an error if the download fails, the latest restore image has no URL,
+    /// or any restore/persist step fails.
+    #[allow(
+        clippy::future_not_send,
+        reason = "drives Virtualization.framework through !Send ObjC pointers held across await; the caller drives it on a single thread"
+    )]
+    pub async fn pull(
+        &self,
+        source: PullSource,
+        name: &str,
+        disk_gb: u64,
+        mut on_progress: impl FnMut(PullPhase, f64),
+    ) -> Result<MacImage> {
+        let ipsw = match source {
+            PullSource::LocalIpsw(path) => path,
+            PullSource::Latest => {
+                let restore = MacOSRestoreImage::latest_supported().await?;
+                let url = restore
+                    .url()
+                    .ok_or_else(|| CoreError::macos("latest restore image has no download URL"))?;
+                drop(restore);
+                download_ipsw(&url, &self.cache_dir(), None, |frac| {
+                    on_progress(PullPhase::Download, frac);
+                })
+                .await?
+            }
+        };
+        self.install_from_ipsw(&ipsw, name, disk_gb, |frac| {
+            on_progress(PullPhase::Install, frac);
+        })
+        .await
     }
 }

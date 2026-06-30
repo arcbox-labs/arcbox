@@ -105,9 +105,9 @@ pub enum ImageCommands {
 pub struct PullArgs {
     /// Base image name.
     pub name: String,
-    /// Path to a local IPSW restore image.
+    /// Path to a local IPSW restore image. Omit to download the latest from Apple.
     #[arg(long)]
-    pub ipsw: String,
+    pub ipsw: Option<String>,
     /// System disk size in GB.
     #[arg(long, default_value = "64")]
     pub disk: u64,
@@ -232,14 +232,18 @@ async fn execute_image(cmd: ImageCommands) -> Result<()> {
     match cmd {
         ImageCommands::Pull(args) => {
             let mut client = macos_client().await?;
+            let source = args
+                .ipsw
+                .as_deref()
+                .unwrap_or("latest (download from Apple)");
             println!(
-                "Installing macOS image '{}' from {} (this can take 10-20 minutes)...",
-                args.name, args.ipsw
+                "Installing macOS image '{}' from {source} (this can take 10-20 minutes)...",
+                args.name
             );
             client
                 .image_pull(tonic::Request::new(MacosImagePullRequest {
                     name: args.name.clone(),
-                    ipsw_path: args.ipsw,
+                    ipsw_path: args.ipsw.unwrap_or_default(),
                     disk_gb: args.disk,
                 }))
                 .await

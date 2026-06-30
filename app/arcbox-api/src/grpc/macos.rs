@@ -138,14 +138,24 @@ impl macos_service_server::MacosService for MacosServiceImpl {
         let name = req.name;
         let ipsw = req.ipsw_path;
         let disk_gb = req.disk_gb.max(MIN_IMAGE_DISK_GB);
+        // An empty ipsw_path means "download the latest from Apple".
+        let source = if ipsw.is_empty() {
+            arcbox_core::PullSource::Latest
+        } else {
+            arcbox_core::PullSource::LocalIpsw(std::path::PathBuf::from(ipsw))
+        };
         run_macos_blocking(move || async move {
             let mut last = String::new();
             mgr.images()
-                .install_from_ipsw(std::path::Path::new(&ipsw), &name, disk_gb, |frac| {
-                    let pct = format!("{:.0}", frac * 100.0);
-                    if pct != last {
-                        tracing::info!("macOS image install: {pct}%");
-                        last = pct;
+                .pull(source, &name, disk_gb, |phase, frac| {
+                    let label = match phase {
+                        arcbox_core::PullPhase::Download => "download",
+                        arcbox_core::PullPhase::Install => "install",
+                    };
+                    let msg = format!("macOS image {label}: {:.0}%", frac * 100.0);
+                    if msg != last {
+                        tracing::info!("{msg}");
+                        last = msg;
                     }
                 })
                 .await

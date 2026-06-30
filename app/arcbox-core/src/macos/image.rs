@@ -103,6 +103,14 @@ impl MacImageManager {
         self.images_dir.join(name)
     }
 
+    /// Directory holding downloaded IPSWs (a sibling of the images dir).
+    #[must_use]
+    pub fn cache_dir(&self) -> PathBuf {
+        self.images_dir
+            .parent()
+            .map_or_else(|| self.images_dir.join("cache"), |p| p.join("cache"))
+    }
+
     /// Loads a base image by name.
     ///
     /// # Errors
