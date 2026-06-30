@@ -41,7 +41,7 @@ pub struct ProxyState {
 }
 
 impl ProxyState {
-    fn new(connector: Arc<dyn GuestConnector>) -> Self {
+    pub(crate) fn new(connector: Arc<dyn GuestConnector>) -> Self {
         Self {
             guest_http_client: GuestHttpClient::new(Arc::clone(&connector)),
             connector,
@@ -195,10 +195,16 @@ impl EndpointReadiness {
 /// so that versioned paths (`/v1.51/containers/{id}/start`) are normalised
 /// *before* Axum route matching.
 pub fn create_router(runtime: Arc<Runtime>, connector: Arc<dyn GuestConnector>) -> Router {
-    let state = AppState {
-        runtime,
-        proxy: Arc::new(ProxyState::new(connector)),
-    };
+    router_with_proxy(runtime, Arc::new(ProxyState::new(connector)))
+}
+
+/// Builds the router from an already-constructed [`ProxyState`].
+///
+/// The server constructs the `ProxyState` itself so it can hand a clone to the
+/// background task that drops endpoint readiness on System VM restarts; tests
+/// use [`create_router`], which builds a fresh state per call.
+pub(crate) fn router_with_proxy(runtime: Arc<Runtime>, proxy: Arc<ProxyState>) -> Router {
+    let state = AppState { runtime, proxy };
 
     api_routes()
         .fallback(proxy::proxy_fallback)
