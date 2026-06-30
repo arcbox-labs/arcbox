@@ -43,7 +43,7 @@ pub async fn enroll(
         machine_id: response.machine_id,
         machine_token: response.machine_token,
     };
-    CredentialStore::new(config.credentials_path()).store(&credential)?;
+    CredentialStore::new(config.credential_store, config.credentials_path())?.store(&credential)?;
     info!(machine_id = %credential.machine_id, "enrolled");
     Ok(credential)
 }
