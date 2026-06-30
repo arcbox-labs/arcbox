@@ -44,7 +44,7 @@ use arcbox_error::CommonError;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 

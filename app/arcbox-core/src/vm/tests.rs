@@ -48,16 +48,35 @@ fn build_vmm_config_gates_rosetta_on_vz_backend() {
         ..Default::default()
     };
     let vm_id = manager.create(config).unwrap();
-    assert!(manager.build_vmm_config_for_test(&vm_id).unwrap().enable_rosetta);
+    assert!(
+        manager
+            .build_vmm_config_for_test(&vm_id)
+            .unwrap()
+            .enable_rosetta
+    );
 
     // Switching the stopped VM to HV must drop the VZ-only Rosetta share even
     // though `config.rosetta` (the host capability) is unchanged.
-    manager.set_backend(&vm_id, arcbox_vmm::VmBackend::Hv).unwrap();
-    assert!(!manager.build_vmm_config_for_test(&vm_id).unwrap().enable_rosetta);
+    manager
+        .set_backend(&vm_id, arcbox_vmm::VmBackend::Hv)
+        .unwrap();
+    assert!(
+        !manager
+            .build_vmm_config_for_test(&vm_id)
+            .unwrap()
+            .enable_rosetta
+    );
 
     // And back: switching to VZ re-wires it.
-    manager.set_backend(&vm_id, arcbox_vmm::VmBackend::Vz).unwrap();
-    assert!(manager.build_vmm_config_for_test(&vm_id).unwrap().enable_rosetta);
+    manager
+        .set_backend(&vm_id, arcbox_vmm::VmBackend::Vz)
+        .unwrap();
+    assert!(
+        manager
+            .build_vmm_config_for_test(&vm_id)
+            .unwrap()
+            .enable_rosetta
+    );
 }
 
 #[test]

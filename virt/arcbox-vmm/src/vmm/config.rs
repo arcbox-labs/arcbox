@@ -116,9 +116,7 @@ impl VmmConfig {
 /// not inferred from workload "intent". Either backend can host amd64
 /// workloads; the in-guest x86_64 translator follows the backend (VZ → Apple
 /// Rosetta, HV → FEX) and is configured separately.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[repr(u8)]
 pub enum VmBackend {
