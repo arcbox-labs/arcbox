@@ -22,7 +22,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use arcbox_logging::LogConfig;
 use clap::{Parser, Subcommand};
-use tracing::info;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
 
 use crate::config::AgentConfig;
 use crate::credentials::CredentialStore;
@@ -91,8 +92,54 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                     "no credential found — run `arcbox-fleet-agent enroll --token-file …` first",
                 )?;
             info!(machine_id = %credential.machine_id, "starting fleet agent");
-            attach::run(config, credential).await
+
+            // Cancelled on the first termination signal; `attach::run` then
+            // stops accepting work and tears down in-flight runners.
+            let shutdown = CancellationToken::new();
+            let signal_token = shutdown.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                info!("termination signal received; draining runners");
+                signal_token.cancel();
+            });
+
+            attach::run(config, credential, shutdown).await
         }
+    }
+}
+
+/// Resolve when the process receives a termination signal: Ctrl-C on any
+/// platform, or SIGTERM on Unix (e.g. a service-manager stop). If a listener
+/// cannot be installed, that signal simply never fires rather than aborting
+/// startup.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            warn!(error = %e, "failed to listen for Ctrl-C; ignoring");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to listen for SIGTERM; ignoring");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
     }
 }
 

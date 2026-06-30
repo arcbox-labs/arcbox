@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arcbox_fleet_proto::v1::{
     AttachRequest, ProvisionRunner, RunnerAccepted, RunnerFailed, RunnerFinished, RunnerStarted,
@@ -150,6 +151,45 @@ impl RunnerSupervisor {
         info!("draining: no new runners will be accepted");
     }
 
+    /// Begin graceful shutdown: stop accepting offers, cancel every in-flight
+    /// job (each `run_job` SIGKILLs its runner's process group and reaps it),
+    /// and wait — bounded by `grace` — for the jobs to release their slots.
+    ///
+    /// Terminal events are emitted best-effort: the attach stream may already be
+    /// torn down, but the gateway reclaims capacity when it observes the dropped
+    /// connection, so a runner that cannot flush its event is not stranded. The
+    /// real guarantee here is that no runner process group is left orphaned.
+    pub async fn shutdown(&self, grace: Duration) {
+        self.handle_drain();
+        // `cancels` is a subset of `in_flight`, so firing every cancel signals a
+        // teardown for each running job; jobs already mid-cancel keep tearing
+        // down and are covered by the wait below.
+        let jobs: Vec<String> = self
+            .inner
+            .cancels
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for job_id in &jobs {
+            self.handle_cancel(job_id);
+        }
+        if self.inner.in_flight.is_empty() {
+            return;
+        }
+        info!(jobs = jobs.len(), "shutdown: waiting for runners to stop");
+        let drained = async {
+            while !self.inner.in_flight.is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        if tokio::time::timeout(grace, drained).await.is_err() {
+            warn!(
+                remaining = self.inner.in_flight.len(),
+                "shutdown grace elapsed; some runners may still be terminating"
+            );
+        }
+    }
+
     /// Drive one runner process end to end, emitting accept/start/terminal
     /// events. The runner is spawned as a process group so cancellation can take
     /// down `run.sh` and every process it spawned, not just the immediate child.
@@ -290,5 +330,49 @@ mod tests {
         assert_eq!(sup.admit("rjob_a"), Admission::Duplicate);
         // A different job while draining is rejected for draining.
         assert_eq!(sup.admit("rjob_b"), Admission::Draining);
+    }
+
+    /// Register an in-flight job with a cancel signal, mirroring what
+    /// `handle_provision` sets up before spawning `run_job`.
+    fn register_in_flight(sup: &RunnerSupervisor, job_id: &str) -> oneshot::Receiver<()> {
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        sup.inner.in_flight.insert(job_id.to_string());
+        sup.inner.cancels.insert(job_id.to_string(), cancel_tx);
+        cancel_rx
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_cancels_and_waits_for_release() {
+        let sup = supervisor(4);
+        let cancel_rx = register_in_flight(&sup, "rjob_a");
+
+        // Stand in for `run_job`: release the slot once the cancel signal fires.
+        let inner = sup.inner.clone();
+        tokio::spawn(async move {
+            let _ = cancel_rx.await;
+            inner.in_flight.remove("rjob_a");
+            inner.cancels.remove("rjob_a");
+        });
+
+        sup.shutdown(Duration::from_secs(5)).await;
+
+        assert!(
+            sup.inner
+                .draining
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(sup.inner.in_flight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_after_grace_when_a_job_will_not_release() {
+        let sup = supervisor(4);
+        // Hold the receiver so the cancel send succeeds, but never release the
+        // slot — shutdown must give up after the grace rather than hang.
+        let _cancel_rx = register_in_flight(&sup, "rjob_a");
+
+        sup.shutdown(Duration::from_millis(250)).await;
+
+        assert!(!sup.inner.in_flight.is_empty());
     }
 }
