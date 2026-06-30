@@ -44,6 +44,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Smoke test cargo xtask alias
+        run: cargo xtask --help
+
       - name: Run clippy
         run: cargo clippy --workspace --exclude arcbox-agent -- -D warnings
 
