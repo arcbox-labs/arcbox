@@ -9,6 +9,27 @@ use super::{
     MAX_IRQS, TriggerMode,
 };
 
+/// First GICv3 SPI INTID. INTIDs 0–31 are SGIs/PPIs; 32+ are SPIs.
+const SPI_BASE: Irq = 32;
+
+/// Default trigger mode for an IRQ with no explicit `IrqConfig`.
+///
+/// On this GICv3/ARM64 platform every SPI we expose (virtio-mmio devices and
+/// the PL011 UART) is declared `IRQ_TYPE_LEVEL_HIGH` in the guest device tree,
+/// so an SPI must be driven as level-triggered: the line is held asserted
+/// until the guest clears the device's `interrupt_status`, and the device
+/// then deasserts it. Treating an SPI as edge (a momentary assert/deassert
+/// pulse) violates that contract — with the Apple GIC it leaves the line in a
+/// state the guest re-takes endlessly, producing an interrupt storm that wedges
+/// early boot (ABX-386). SGIs/PPIs (< 32) remain edge.
+const fn default_trigger_mode(irq: Irq) -> TriggerMode {
+    if irq >= SPI_BASE {
+        TriggerMode::Level
+    } else {
+        TriggerMode::Edge
+    }
+}
+
 /// IRQ chip abstraction.
 ///
 /// Manages interrupt routing, delivery, and coalescing.
@@ -241,7 +262,7 @@ impl IrqChip {
         let config = configs.get(&irq);
         let trigger_mode = match config {
             Some(c) => c.trigger_mode,
-            None => TriggerMode::Edge,
+            None => default_trigger_mode(irq),
         };
         drop(configs);
 
@@ -300,7 +321,7 @@ impl IrqChip {
         let config = configs.get(&irq);
         let (gsi, trigger_mode) = match config {
             Some(c) => (c.gsi, c.trigger_mode),
-            None => (irq % MAX_GSIS, TriggerMode::Edge),
+            None => (irq % MAX_GSIS, default_trigger_mode(irq)),
         };
         drop(configs);
 
@@ -360,9 +381,11 @@ impl IrqChip {
                 tracing::trace!("deassert_irq called on edge-triggered IRQ {}", irq);
                 return Ok(());
             }
-            None => {
-                return Ok(());
-            }
+            // No explicit config: SPIs default to level (see
+            // `default_trigger_mode`), so honor the deassert; sub-32 lines stay
+            // edge and have nothing to lower.
+            None if default_trigger_mode(irq) == TriggerMode::Level => irq % MAX_GSIS,
+            None => return Ok(()),
         };
         drop(configs);
 
@@ -549,6 +572,62 @@ mod tests {
 
         let recorded = events.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(recorded.as_slice(), &[(5, true), (5, false)]);
+    }
+
+    #[test]
+    fn unconfigured_spi_defaults_to_level() {
+        // ABX-386: a virtio-mmio SPI (>= 32) with no explicit IrqConfig — the
+        // shape the custom HV path produces — must be delivered level-triggered
+        // (single assert, held until an explicit deassert), not as an edge
+        // pulse. An edge pulse on a line the guest treats as level produces an
+        // interrupt storm that wedges cold boot.
+        let chip = Arc::new(IrqChip::new().unwrap());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let callback: IrqTriggerCallback = Box::new(move |gsi, level| {
+            events_clone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((gsi, level));
+            Ok(())
+        });
+        chip.set_trigger_callback(Arc::new(callback));
+
+        let spi: Irq = 48; // VIRTIO_IRQ_BASE — never configured on the HV path.
+        chip.trigger_irq(spi).unwrap();
+        chip.deassert_irq(spi).unwrap();
+
+        let recorded = events.lock().unwrap_or_else(|e| e.into_inner());
+        // Level: assert held, then a real deassert — never an assert/deassert
+        // pulse from the trigger alone.
+        assert_eq!(
+            recorded.as_slice(),
+            &[(spi % MAX_GSIS, true), (spi % MAX_GSIS, false)]
+        );
+    }
+
+    #[test]
+    fn unconfigured_legacy_irq_stays_edge() {
+        // Sub-32 lines (SGIs/PPIs) keep edge semantics: a single trigger is a
+        // self-clearing assert/deassert pulse, and deassert is a no-op.
+        let chip = Arc::new(IrqChip::new().unwrap());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let callback: IrqTriggerCallback = Box::new(move |gsi, level| {
+            events_clone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((gsi, level));
+            Ok(())
+        });
+        chip.set_trigger_callback(Arc::new(callback));
+
+        let legacy: Irq = 7;
+        chip.trigger_irq(legacy).unwrap();
+        chip.deassert_irq(legacy).unwrap(); // no-op for edge
+
+        let recorded = events.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(recorded.as_slice(), &[(7, true), (7, false)]);
     }
 
     #[test]
