@@ -103,7 +103,8 @@ pub enum ImageCommands {
 
 #[derive(Args)]
 pub struct PullArgs {
-    /// Base image name.
+    /// Local name to give the base image.
+    #[arg(long)]
     pub name: String,
     /// Path to a local IPSW restore image. Omit to download the latest from Apple.
     #[arg(long)]
@@ -264,7 +265,7 @@ async fn execute_image(cmd: ImageCommands) -> Result<()> {
                 println!("No macOS images found.");
                 println!();
                 println!("To install one, run:");
-                println!("  arcbox macos image pull <name> --ipsw <path>");
+                println!("  arcbox macos image pull --name <name> [--ipsw <path>]");
                 return Ok(());
             }
 
