@@ -13,14 +13,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arcbox_fleet_proto::v1::{
     AttachRequest, Backend, Capability, HostTelemetry, ProvisionRunner, RunnerAccepted,
     RunnerRejected, attach_request,
 };
+use command_group::AsyncCommandGroup;
 use dashmap::DashMap;
-use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::docker::{DockerRunner, RunSpec};
@@ -65,8 +66,10 @@ struct Inner {
     outstanding: DashMap<String, Outstanding>,
     /// Jobs currently running here — for duplicate detection and release.
     in_flight: DashMap<String, ()>,
-    /// Abort handles for in-flight jobs, for `CancelRunner`.
-    cancels: DashMap<String, AbortHandle>,
+    /// Cancel signals for in-flight jobs. Firing one makes the job's `run_job`
+    /// kill the runner's whole process group (host) or drop the container guard
+    /// (Docker); see [`RunnerSupervisor::handle_cancel`].
+    cancels: DashMap<String, oneshot::Sender<()>>,
     /// Directory holding the installed runner (`run.sh` / `run.cmd`).
     /// `None` when only Docker-based execution is configured.
     runner_dir: Option<PathBuf>,
@@ -152,17 +155,21 @@ impl RunnerSupervisor {
                 // Reserve synchronously so a follow-up offer sees the job in
                 // flight before the spawned task starts the runner.
                 self.inner.in_flight.insert(job_id.clone(), ());
+                // Cooperative cancel: `run_job` owns the runner and tears down
+                // its whole process group (host) or container (Docker) on this
+                // signal, so `CancelRunner` never orphans the runner's children.
+                let (cancel_tx, cancel_rx) = oneshot::channel();
+                self.inner.cancels.insert(job_id, cancel_tx);
                 let sup = self.clone();
-                let handle = tokio::spawn(async move {
+                tokio::spawn(async move {
                     // The guard releases the job on any task exit, including a
                     // panic, so the ID never leaks in `in_flight`.
                     let _release = ReleaseGuard {
                         inner: sup.inner.clone(),
                         job_id: order.job_id.clone(),
                     };
-                    sup.run_job(order, backend, token).await;
+                    sup.run_job(order, backend, token, cancel_rx).await;
                 });
-                self.inner.cancels.insert(job_id, handle.abort_handle());
             }
         }
     }
@@ -203,13 +210,14 @@ impl RunnerSupervisor {
         Admission::Accept(backend)
     }
 
-    /// Cancel an in-flight job: aborting the task drops the child (kill-on-drop)
-    /// or the container (guard-on-drop).
+    /// Cancel an in-flight job. Signals `run_job`, which tears down the runner —
+    /// the whole process group for a host job, or the container for a Docker job
+    /// — and releases the slot via its `ReleaseGuard`, so local state tracks the
+    /// real runner lifetime rather than a fire-and-forget abort.
     pub fn handle_cancel(&self, job_id: &str) {
-        if let Some((_, handle)) = self.inner.cancels.remove(job_id) {
-            handle.abort();
-            self.inner.in_flight.remove(job_id);
-            warn!(job_id, "runner canceled");
+        if let Some((_, cancel)) = self.inner.cancels.remove(job_id) {
+            let _ = cancel.send(());
+            warn!(job_id, "runner cancel requested");
         }
     }
 
@@ -221,13 +229,58 @@ impl RunnerSupervisor {
         info!("draining: no new offers will be accepted");
     }
 
+    /// Begin graceful shutdown: stop accepting offers, cancel every in-flight
+    /// job (each `run_job` tears down its runner — process group for host jobs,
+    /// container for Docker jobs), and wait — bounded by `grace` — for the jobs
+    /// to release their slots. The guarantee is that no runner process group or
+    /// container is left orphaned when the agent exits.
+    pub async fn shutdown(&self, grace: Duration) {
+        self.handle_drain();
+        // `cancels` is a subset of `in_flight`, so firing every cancel signals a
+        // teardown for each running job; jobs already mid-cancel keep tearing
+        // down and are covered by the wait below.
+        let jobs: Vec<String> = self
+            .inner
+            .cancels
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for job_id in &jobs {
+            self.handle_cancel(job_id);
+        }
+        if self.inner.in_flight.is_empty() {
+            return;
+        }
+        info!(jobs = jobs.len(), "shutdown: waiting for runners to stop");
+        let drained = async {
+            while !self.inner.in_flight.is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        if tokio::time::timeout(grace, drained).await.is_err() {
+            warn!(
+                remaining = self.inner.in_flight.len(),
+                "shutdown grace elapsed; some runners may still be terminating"
+            );
+        }
+    }
+
     /// Start the runner for an accepted offer, then accept once it is actually
     /// running. A failure to start rejects instead, so the platform re-offers.
-    async fn run_job(&self, order: ProvisionRunner, backend: Backend, token: String) {
+    async fn run_job(
+        &self,
+        order: ProvisionRunner,
+        backend: Backend,
+        token: String,
+        cancel_rx: oneshot::Receiver<()>,
+    ) {
         let job_id = order.job_id.clone();
         match backend {
-            Backend::Docker => self.run_docker_job(&job_id, &order, &token).await,
-            Backend::HostRunner => self.run_host_job(&job_id, &order, &token).await,
+            Backend::Docker => {
+                self.run_docker_job(&job_id, &order, &token, cancel_rx)
+                    .await;
+            }
+            Backend::HostRunner => self.run_host_job(&job_id, &order, &token, cancel_rx).await,
             // We never advertise these, so admit() never routes to them; reject
             // defensively rather than panic if one ever slips through.
             Backend::Vm | Backend::Unspecified => {
@@ -237,8 +290,16 @@ impl RunnerSupervisor {
         }
     }
 
-    /// Run a job directly on the host via the pre-installed runner.
-    async fn run_host_job(&self, job_id: &str, order: &ProvisionRunner, token: &str) {
+    /// Run a job directly on the host via the pre-installed runner. The runner is
+    /// spawned as a process group so cancellation tears down `run.sh` and every
+    /// process it spawned, not just the immediate child.
+    async fn run_host_job(
+        &self,
+        job_id: &str,
+        order: &ProvisionRunner,
+        token: &str,
+        mut cancel_rx: oneshot::Receiver<()>,
+    ) {
         let Some(runner_dir) = &self.inner.runner_dir else {
             self.reject(job_id, token, "no host runner directory configured")
                 .await;
@@ -246,7 +307,7 @@ impl RunnerSupervisor {
         };
 
         let mut command = runner_command(runner_dir, &order.encoded_jit_config);
-        let mut child = match command.kill_on_drop(true).spawn() {
+        let mut child = match command.group_spawn() {
             Ok(child) => child,
             Err(e) => {
                 self.reject(job_id, token, &format!("failed to spawn runner: {e}"))
@@ -259,14 +320,31 @@ impl RunnerSupervisor {
         self.accept(job_id, token).await;
         info!(job_id, "runner started (host)");
 
-        match child.wait().await {
-            Ok(status) => info!(job_id, success = status.success(), "runner exited"),
-            Err(e) => warn!(job_id, error = %e, "waiting on runner failed"),
+        tokio::select! {
+            result = child.wait() => match result {
+                Ok(status) => info!(job_id, success = status.success(), "runner exited"),
+                Err(e) => warn!(job_id, error = %e, "waiting on runner failed"),
+            },
+            // CancelRunner: SIGKILL the whole process group and reap it.
+            _ = &mut cancel_rx => {
+                if let Err(e) = child.kill().await {
+                    warn!(job_id, error = %e, "killing runner process group failed");
+                }
+                info!(job_id, "runner canceled");
+            }
         }
     }
 
-    /// Run a job inside a Docker container.
-    async fn run_docker_job(&self, job_id: &str, order: &ProvisionRunner, token: &str) {
+    /// Run a job inside a Docker container. On cancellation the in-flight
+    /// container future is dropped, and its `ContainerGuard` kills and removes
+    /// the container.
+    async fn run_docker_job(
+        &self,
+        job_id: &str,
+        order: &ProvisionRunner,
+        token: &str,
+        mut cancel_rx: oneshot::Receiver<()>,
+    ) {
         // Invariant: a Docker-backed capability is only advertised when Docker
         // is present, so admit() routes here only with `docker` set.
         let docker = self
@@ -295,11 +373,18 @@ impl RunnerSupervisor {
         self.accept(job_id, token).await;
         info!(job_id, arch = %order.arch, "runner started (docker)");
 
-        match running.wait().await {
-            Ok(outcome) => {
-                info!(job_id, success = outcome.success, detail = %outcome.detail, "runner exited");
+        tokio::select! {
+            result = running.wait() => match result {
+                Ok(outcome) => {
+                    info!(job_id, success = outcome.success, detail = %outcome.detail, "runner exited");
+                }
+                Err(e) => warn!(job_id, error = %e, "waiting on container failed"),
+            },
+            // CancelRunner: dropping the wait future drops the container guard,
+            // which kills and removes the container.
+            _ = &mut cancel_rx => {
+                info!(job_id, "runner canceled");
             }
-            Err(e) => warn!(job_id, error = %e, "waiting on container failed"),
         }
     }
 
@@ -547,5 +632,49 @@ mod tests {
             sup.resend_outstanding();
         }
         assert!(!sup.inner.outstanding.contains_key("tok3"));
+    }
+
+    /// Register an in-flight job with a cancel signal, mirroring what
+    /// `handle_provision` sets up before spawning `run_job`.
+    fn register_in_flight(sup: &RunnerSupervisor, job_id: &str) -> oneshot::Receiver<()> {
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        sup.inner.in_flight.insert(job_id.to_owned(), ());
+        sup.inner.cancels.insert(job_id.to_owned(), cancel_tx);
+        cancel_rx
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_cancels_and_waits_for_release() {
+        let sup = supervisor(vec![capability("darwin", "arm64", Backend::HostRunner)]);
+        let cancel_rx = register_in_flight(&sup, "rjob_a");
+
+        // Stand in for `run_job`: release the slot once the cancel signal fires.
+        let inner = sup.inner.clone();
+        tokio::spawn(async move {
+            let _ = cancel_rx.await;
+            inner.in_flight.remove("rjob_a");
+            inner.cancels.remove("rjob_a");
+        });
+
+        sup.shutdown(Duration::from_secs(5)).await;
+
+        assert!(
+            sup.inner
+                .draining
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(sup.inner.in_flight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_after_grace_when_a_job_will_not_release() {
+        let sup = supervisor(vec![capability("darwin", "arm64", Backend::HostRunner)]);
+        // Hold the receiver so the cancel send succeeds, but never release the
+        // slot — shutdown must give up after the grace rather than hang.
+        let _cancel_rx = register_in_flight(&sup, "rjob_a");
+
+        sup.shutdown(Duration::from_millis(250)).await;
+
+        assert!(!sup.inner.in_flight.is_empty());
     }
 }
