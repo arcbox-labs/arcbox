@@ -33,6 +33,7 @@ dirs = { workspace = true }
 hostname = { workspace = true }
 sysinfo = { workspace = true }
 command-group = { version = "5.0.1", features = ["with-tokio"] }
+tokio-util = "0.7.18"
 
 [lints]
 workspace = true

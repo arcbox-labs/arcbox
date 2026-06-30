@@ -13,6 +13,7 @@ use arcbox_fleet_proto::v1::fleet_gateway_service_client::FleetGatewayServiceCli
 use arcbox_fleet_proto::v1::{AttachRequest, Heartbeat, attach_request, attach_response};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::metadata::MetadataValue;
 use tracing::{info, warn};
@@ -27,13 +28,24 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const OUTBOUND_CAPACITY: usize = 64;
 const MACHINE_TOKEN_HEADER: &str = "x-arcbox-machine-token";
+/// How long to wait for runner process groups to be killed and reaped on
+/// shutdown before giving up. Reaping a SIGKILLed group is near-instant, so this
+/// is a generous ceiling rather than an expected wait.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 
-/// Connect and serve the attach stream forever, reconnecting on any failure.
+/// Connect and serve the attach stream, reconnecting on any failure until
+/// `shutdown` fires, then stop runners cleanly.
 ///
 /// The supervisor and the egress queue carrying runner lifecycle events are
 /// built once and reused across reconnects, so in-flight jobs survive a dropped
-/// connection and their terminal events reach the next live stream.
-pub async fn run(config: AgentConfig, credential: Credential) -> Result<()> {
+/// connection and their terminal events reach the next live stream. On shutdown
+/// the loop exits and hands off to [`RunnerSupervisor::shutdown`], which kills
+/// and reaps any in-flight runner process groups.
+pub async fn run(
+    config: AgentConfig,
+    credential: Credential,
+    shutdown: CancellationToken,
+) -> Result<()> {
     let runner_dir = config.require_runner_dir()?.to_path_buf();
 
     // Runner lifecycle events flow through this queue, which outlives any single
@@ -48,25 +60,39 @@ pub async fn run(config: AgentConfig, credential: Credential) -> Result<()> {
     // event is never lost to a closed stream.
     let mut pending: Option<AttachRequest> = None;
 
-    loop {
-        match connect_and_serve(
+    while !shutdown.is_cancelled() {
+        let outcome = connect_and_serve(
             &config,
             &credential,
             &supervisor,
             &mut egress_rx,
             &mut pending,
             &mut backoff,
+            &shutdown,
         )
-        .await
-        {
+        .await;
+        // A shutdown during the connection is a clean exit, not a failure to log
+        // or back off from.
+        if shutdown.is_cancelled() {
+            break;
+        }
+        match outcome {
             Ok(()) => info!("attach stream closed by gateway; reconnecting"),
             Err(e) => {
                 warn!(error = %e, backoff_secs = backoff.as_secs(), "attach failed; retrying");
             }
         }
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            () = tokio::time::sleep(backoff) => {}
+        }
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
+
+    info!("shutdown signal received; stopping runners");
+    supervisor.shutdown(SHUTDOWN_GRACE).await;
+    Ok(())
 }
 
 /// One connect + stream lifetime. Returns `Ok(())` on a clean close. Resets
@@ -85,6 +111,7 @@ async fn connect_and_serve(
     egress_rx: &mut mpsc::Receiver<AttachRequest>,
     pending: &mut Option<AttachRequest>,
     backoff: &mut Duration,
+    shutdown: &CancellationToken,
 ) -> Result<()> {
     let channel = config
         .endpoint()?
@@ -122,6 +149,7 @@ async fn connect_and_serve(
 
     let outcome = loop {
         tokio::select! {
+            () = shutdown.cancelled() => break Ok(()),
             event = egress_rx.recv() => match event {
                 Some(msg) => {
                     if let Err(err) = req_tx.send(msg).await {

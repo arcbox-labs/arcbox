@@ -467,6 +467,7 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic",
  "tracing",
 ]
