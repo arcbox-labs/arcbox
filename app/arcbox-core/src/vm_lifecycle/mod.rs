@@ -643,11 +643,11 @@ impl VmLifecycleManager {
             distro: None,
             distro_version: None,
             backend: self.backend(),
-            // x86_64 translator follows the backend: VZ hosts Apple Rosetta,
-            // HV uses FEX. Only wire the Rosetta share on VZ (and only where the
-            // host supports it).
-            enable_rosetta: self.config.default_vm.rosetta
-                && matches!(self.backend(), arcbox_vmm::VmBackend::Vz),
+            // Host Rosetta capability. Whether the Rosetta share is actually
+            // wired is decided per-backend at VM build time (VZ only), so the
+            // value stays correct across a backend switch — see
+            // `VmManager::build_vmm_config`.
+            enable_rosetta: self.config.default_vm.rosetta,
         };
 
         tracing::info!(

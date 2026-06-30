@@ -284,10 +284,14 @@ impl Runtime {
             "switching System VM backend; restarting the System VM"
         );
 
-        // Graceful stop, then apply the backend in place. The persisted machine
-        // (if it exists yet) is updated so the choice survives a restart; the
-        // lifecycle's own backend governs the next create on first boot.
-        let _ = lifecycle.shutdown().await;
+        // Stop first — if the VM genuinely cannot be stopped, abort rather than
+        // record a new backend the still-running VM is not actually on.
+        // `shutdown` is a no-op when not running and force-stops as a fallback,
+        // so it only errors when the VM truly could not be torn down.
+        lifecycle.shutdown().await?;
+        // Apply the backend in place. The persisted machine (if it exists yet)
+        // is updated so the choice survives a restart; the lifecycle's own
+        // backend governs the next create on first boot.
         if self.machine_manager.exists(&machine_name) {
             self.machine_manager.set_backend(&machine_name, backend)?;
         }
@@ -313,7 +317,9 @@ impl Runtime {
     /// Returns whether the System VM can run `linux/amd64` workloads.
     ///
     /// The x86_64 translator follows the System VM's backend:
-    /// - **VZ** uses Apple Rosetta — available on macOS Apple Silicon.
+    /// - **VZ** uses Apple Rosetta — requires Apple Silicon *and* the System
+    ///   VM actually wiring the Rosetta share (`default_vm.rosetta`). If Rosetta
+    ///   is disabled the VZ guest has no x86 `binfmt` handler.
     /// - **HV** uses FEX, which requires the interpreter provisioned as a
     ///   runtime binary at `<data_dir>/runtime/bin/FEX` (the same `runtime/bin`
     ///   set as `dockerd`/`containerd`, surfaced to the guest over the `arcbox`
@@ -326,7 +332,10 @@ impl Runtime {
     #[must_use]
     pub fn amd64_runtime_supported(&self) -> bool {
         match self.system_vm_backend() {
-            arcbox_vmm::VmBackend::Vz => cfg!(all(target_os = "macos", target_arch = "aarch64")),
+            arcbox_vmm::VmBackend::Vz => {
+                cfg!(all(target_os = "macos", target_arch = "aarch64"))
+                    && self.vm_lifecycle.config().default_vm.rosetta
+            }
             arcbox_vmm::VmBackend::Hv => self
                 .config
                 .data_dir

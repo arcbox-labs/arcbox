@@ -39,6 +39,28 @@ fn test_build_vmm_config_includes_guest_cid() {
 }
 
 #[test]
+fn build_vmm_config_gates_rosetta_on_vz_backend() {
+    let (manager, _dir) = test_vm_manager();
+    // Rosetta-capable machine created on VZ: the share is wired.
+    let config = VmConfig {
+        rosetta: true,
+        backend: arcbox_vmm::VmBackend::Vz,
+        ..Default::default()
+    };
+    let vm_id = manager.create(config).unwrap();
+    assert!(manager.build_vmm_config_for_test(&vm_id).unwrap().enable_rosetta);
+
+    // Switching the stopped VM to HV must drop the VZ-only Rosetta share even
+    // though `config.rosetta` (the host capability) is unchanged.
+    manager.set_backend(&vm_id, arcbox_vmm::VmBackend::Hv).unwrap();
+    assert!(!manager.build_vmm_config_for_test(&vm_id).unwrap().enable_rosetta);
+
+    // And back: switching to VZ re-wires it.
+    manager.set_backend(&vm_id, arcbox_vmm::VmBackend::Vz).unwrap();
+    assert!(manager.build_vmm_config_for_test(&vm_id).unwrap().enable_rosetta);
+}
+
+#[test]
 fn test_bridge_nic_mac_is_stable_and_locally_administered() {
     let vm_id = VmId::from_string("00112233-4455-6677-8899-aabbccddeeff".to_string());
     let mac = bridge_nic_mac_for_vm_id(&vm_id);
