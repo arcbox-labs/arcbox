@@ -149,7 +149,11 @@ impl VmManager {
                 .unwrap_or_default(),
             kernel_cmdline: entry.config.cmdline.clone().unwrap_or_default(),
             initrd_path: None,
-            enable_rosetta: entry.config.rosetta,
+            // The Rosetta share can only be hosted on VZ; `config.rosetta` is
+            // the host capability. Gating here (rather than baking it into the
+            // config) keeps it correct after `set_backend` switches HV<->VZ.
+            enable_rosetta: entry.config.rosetta
+                && matches!(entry.config.backend, arcbox_vmm::VmBackend::Vz),
             serial_console: true,
             virtio_console: true,
             shared_dirs,
@@ -167,10 +171,9 @@ impl VmManager {
                 })
                 .collect(),
             bridge_nic_mac: Some(bridge_nic_mac_for_vm_id(&entry.info.id)),
-            // Backend is now set per-machine on the `VmConfig`. The native
-            // utility VM defaults to `Hv` so behavior matches the previous
-            // hardcoded path; the rosetta utility VM sets `Vz` explicitly
-            // so it can host the Rosetta share.
+            // Backend is set per-machine on the `VmConfig`, read here at start.
+            // `VmManager::set_backend` can change it on a stopped VM to switch
+            // the System VM between HV and VZ.
             backend: entry.config.backend,
         }
     }

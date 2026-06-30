@@ -716,10 +716,11 @@ impl MachineManager {
     /// Returns an error if the machine is not found, is running/starting, or
     /// the persisted config cannot be updated.
     pub fn set_backend(&self, name: &str, backend: arcbox_vmm::VmBackend) -> Result<()> {
+        // Validate and capture the VM id without mutating anything yet.
         let vm_id = {
-            let mut machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
+            let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
             let machine = machines
-                .get_mut(name)
+                .get(name)
                 .ok_or_else(|| CoreError::not_found(name.to_string()))?;
             if matches!(
                 machine.state,
@@ -730,12 +731,23 @@ impl MachineManager {
                     machine.state
                 )));
             }
-            machine.backend = backend;
             machine.vm_id.clone()
         };
 
-        self.vm_manager.set_backend(&vm_id, backend)?;
+        // Commit the durable record first, then the lazily-built VM config, and
+        // only then the in-memory record. If a fallible step fails the earlier
+        // views are untouched, so `MachineInfo`, `VmConfig` and the on-disk
+        // record can never disagree about the backend.
         self.persistence.update(name, |m| m.backend = backend)?;
+        self.vm_manager.set_backend(&vm_id, backend)?;
+        if let Some(machine) = self
+            .machines
+            .write()
+            .map_err(|_| CoreError::LockPoisoned)?
+            .get_mut(name)
+        {
+            machine.backend = backend;
+        }
         Ok(())
     }
 
