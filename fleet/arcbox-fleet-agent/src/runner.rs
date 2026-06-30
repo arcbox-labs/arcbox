@@ -82,6 +82,23 @@ struct Inner {
     draining: std::sync::atomic::AtomicBool,
 }
 
+/// Clears a job's bookkeeping (`in_flight`, `cancels`) when dropped. Held by the
+/// runner task so release happens on every exit — normal completion, early
+/// return, abort, or panic. Without it a panicking task would leak the job ID in
+/// `in_flight` forever, and re-offers would be mis-classified as duplicates and
+/// re-accepted with no runner behind them.
+struct ReleaseGuard {
+    inner: Arc<Inner>,
+    job_id: String,
+}
+
+impl Drop for ReleaseGuard {
+    fn drop(&mut self) {
+        self.inner.in_flight.remove(&self.job_id);
+        self.inner.cancels.remove(&self.job_id);
+    }
+}
+
 impl RunnerSupervisor {
     /// Create a supervisor that emits verdicts on `events`. `capabilities` is the
     /// same set advertised to the gateway, so routing and advertisement agree.
@@ -136,7 +153,15 @@ impl RunnerSupervisor {
                 // flight before the spawned task starts the runner.
                 self.inner.in_flight.insert(job_id.clone(), ());
                 let sup = self.clone();
-                let handle = tokio::spawn(async move { sup.run_job(order, backend, token).await });
+                let handle = tokio::spawn(async move {
+                    // The guard releases the job on any task exit, including a
+                    // panic, so the ID never leaks in `in_flight`.
+                    let _release = ReleaseGuard {
+                        inner: sup.inner.clone(),
+                        job_id: order.job_id.clone(),
+                    };
+                    sup.run_job(order, backend, token).await;
+                });
                 self.inner.cancels.insert(job_id, handle.abort_handle());
             }
         }
@@ -208,7 +233,6 @@ impl RunnerSupervisor {
             Backend::Vm | Backend::Unspecified => {
                 self.reject(&job_id, &token, "backend not supported by this agent")
                     .await;
-                self.release(&job_id);
             }
         }
     }
@@ -218,7 +242,6 @@ impl RunnerSupervisor {
         let Some(runner_dir) = &self.inner.runner_dir else {
             self.reject(job_id, token, "no host runner directory configured")
                 .await;
-            self.release(job_id);
             return;
         };
 
@@ -228,7 +251,6 @@ impl RunnerSupervisor {
             Err(e) => {
                 self.reject(job_id, token, &format!("failed to spawn runner: {e}"))
                     .await;
-                self.release(job_id);
                 return;
             }
         };
@@ -241,7 +263,6 @@ impl RunnerSupervisor {
             Ok(status) => info!(job_id, success = status.success(), "runner exited"),
             Err(e) => warn!(job_id, error = %e, "waiting on runner failed"),
         }
-        self.release(job_id);
     }
 
     /// Run a job inside a Docker container.
@@ -266,7 +287,6 @@ impl RunnerSupervisor {
             Err(e) => {
                 self.reject(job_id, token, &format!("failed to start container: {e}"))
                     .await;
-                self.release(job_id);
                 return;
             }
         };
@@ -281,13 +301,6 @@ impl RunnerSupervisor {
             }
             Err(e) => warn!(job_id, error = %e, "waiting on container failed"),
         }
-        self.release(job_id);
-    }
-
-    /// Drop bookkeeping for a job.
-    fn release(&self, job_id: &str) {
-        self.inner.in_flight.remove(job_id);
-        self.inner.cancels.remove(job_id);
     }
 
     /// Accept an offer (the runner has started).
