@@ -310,6 +310,15 @@ impl Runtime {
         DEFAULT_MACHINE_NAME
     }
 
+    /// Returns the System VM incarnation counter, bumped on every stop.
+    ///
+    /// The Docker proxy reads this on each request to detect a restart (e.g. a
+    /// backend switch) synchronously, rather than racing an async event.
+    #[must_use]
+    pub fn system_vm_restart_generation(&self) -> u64 {
+        self.vm_lifecycle.restart_generation()
+    }
+
     /// Returns the guest dockerd vsock port for the System VM.
     #[must_use]
     pub const fn system_vm_docker_vsock_port(&self) -> u32 {
