@@ -261,11 +261,13 @@ impl Runtime {
     /// VM so it takes effect.
     ///
     /// No-op when the backend is unchanged. Otherwise the System VM is
-    /// gracefully stopped, its backend updated **in place** — the machine
-    /// record, SSH keys and the persistent dockerd data image are all kept,
-    /// only the lazily-built `Vmm` is rebuilt — and rebooted on the new backend.
-    /// The choice is persisted in the machine config so it survives daemon
-    /// restarts. Running containers are stopped by the restart.
+    /// gracefully stopped, its backend updated, and the VM rebooted on the new
+    /// backend. The persistent dockerd data image is preserved, so containers
+    /// and images survive; but because the kernel command line differs between
+    /// backends (HV pins `earlycon=pl011`), the reboot detects config drift and
+    /// recreates the machine record, regenerating its SSH host keys. The choice
+    /// is persisted in the machine config so it survives daemon restarts.
+    /// Running containers are stopped by the restart.
     ///
     /// # Errors
     ///
@@ -289,9 +291,9 @@ impl Runtime {
         // `shutdown` is a no-op when not running and force-stops as a fallback,
         // so it only errors when the VM truly could not be torn down.
         lifecycle.shutdown().await?;
-        // Apply the backend in place. The persisted machine (if it exists yet)
-        // is updated so the choice survives a restart; the lifecycle's own
-        // backend governs the next create on first boot.
+        // Record the new backend. The persisted machine (if it exists yet) is
+        // updated so the choice survives a restart; the lifecycle's own backend
+        // governs the recreate that `ensure_ready` triggers via drift detection.
         if self.machine_manager.exists(&machine_name) {
             self.machine_manager.set_backend(&machine_name, backend)?;
         }

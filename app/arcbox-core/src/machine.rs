@@ -704,12 +704,15 @@ impl MachineManager {
         Ok(())
     }
 
-    /// Switches a stopped machine's hypervisor backend in place.
+    /// Switches a stopped machine's hypervisor backend.
     ///
-    /// Updates the in-memory record, the lazily-built VM config, and the
-    /// persisted config — without tearing down the machine or its disks. The
-    /// machine must be stopped; the new backend takes effect on the next start
-    /// (the `Vmm` is rebuilt from `VmConfig` then).
+    /// Updates the lazily-built VM config and the in-memory and persisted
+    /// records; `set_backend` itself does not touch the machine's disks. The
+    /// machine must be stopped; the new backend takes effect on the next start,
+    /// when the `Vmm` is rebuilt from `VmConfig`. Note that for the System VM
+    /// the kernel command line differs between backends, so that next start
+    /// detects config drift and recreates the machine record (the persistent
+    /// data image survives; SSH host keys are regenerated).
     ///
     /// # Errors
     ///
@@ -734,11 +737,11 @@ impl MachineManager {
             machine.vm_id.clone()
         };
 
-        // Commit the durable record first, then the lazily-built VM config, and
-        // only then the in-memory record. If a fallible step fails the earlier
-        // views are untouched, so `MachineInfo`, `VmConfig` and the on-disk
-        // record can never disagree about the backend.
-        self.persistence.update(name, |m| m.backend = backend)?;
+        // Update the runtime views first, then commit the durable record last.
+        // The persisted backend is what seeds the lifecycle after a daemon
+        // restart, so writing it only once the in-memory updates have succeeded
+        // means a failed switch never leaves a backend on disk that the running
+        // system did not actually apply (which a later restart would then boot).
         self.vm_manager.set_backend(&vm_id, backend)?;
         if let Some(machine) = self
             .machines
@@ -748,6 +751,7 @@ impl MachineManager {
         {
             machine.backend = backend;
         }
+        self.persistence.update(name, |m| m.backend = backend)?;
         Ok(())
     }
 
