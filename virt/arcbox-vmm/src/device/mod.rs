@@ -1415,6 +1415,16 @@ impl DeviceManager {
             };
             let rxi = 0usize;
             if !mmio.queue_ready[rxi] || mmio.queue_num[rxi] == 0 {
+                if !data.is_empty() {
+                    // ABX-388: operator typed before the guest set up the console
+                    // RX queue — the bytes are dropped here, not buffered.
+                    tracing::debug!(
+                        ready = mmio.queue_ready[rxi],
+                        num = mmio.queue_num[rxi],
+                        dropped = data.len(),
+                        "debug-console: RX queue 0 not ready, dropping operator input"
+                    );
+                }
                 return false;
             }
             QueueConfig {

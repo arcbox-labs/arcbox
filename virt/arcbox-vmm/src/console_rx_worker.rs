@@ -65,7 +65,19 @@ pub fn console_rx_worker_loop(ctx: ConsoleRxWorkerContext) {
 
         // Inject fresh bytes (n > 0) or flush input buffered from a prior tick
         // against descriptors the guest has since posted (n == 0).
-        if ctx.device_manager.console_inject_input(&buf[..n]) {
+        let injected = ctx.device_manager.console_inject_input(&buf[..n]);
+        if n > 0 {
+            // Breadcrumb for diagnosing the host→guest input path (ABX-388): did
+            // operator keystrokes reach the host socket, and were they injected
+            // into the guest RX ring (false ⇒ queue not ready / no descriptors)?
+            tracing::debug!(
+                bytes = n,
+                connected,
+                injected,
+                "debug-console: operator input"
+            );
+        }
+        if injected {
             ctx.device_manager
                 .raise_interrupt_for(DeviceType::VirtioConsole, INT_VRING);
             (ctx.exit_vcpus)();
