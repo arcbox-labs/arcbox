@@ -304,6 +304,23 @@ impl SplitQueue {
         self.mem.write_u16(off, self.last_avail_idx);
     }
 
+    /// Re-arms guest→host notifications and reports whether the guest made more
+    /// entries available while we were draining.
+    ///
+    /// Publishes `avail_event` (so an EVENT_IDX guest kicks on its next entry),
+    /// inserts a SeqCst StoreLoad barrier, then re-reads `avail.idx`. Returns
+    /// `true` if the ring advanced past what we consumed — the caller must drain
+    /// again. This is the device half of the EVENT_IDX handshake: without the
+    /// barrier + re-check, a buffer the guest adds (and skips the kick for,
+    /// having read the pre-update `avail_event`) just as we stop polling sits
+    /// undrained forever. Mirrors `virtio-queue`/libkrun `enable_notification`.
+    #[must_use]
+    pub fn enable_notification(&self) -> bool {
+        self.write_avail_event();
+        fence(Ordering::SeqCst);
+        self.avail_idx() != self.last_avail_idx
+    }
+
     /// Decides whether to interrupt the guest after advancing `used.idx` from
     /// `old_used` to `new_used`.
     fn should_notify(&self, old_used: u16, new_used: u16) -> bool {
