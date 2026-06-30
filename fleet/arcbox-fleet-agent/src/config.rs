@@ -74,9 +74,15 @@ impl AgentConfig {
         let runner_dir = std::env::var_os(ENV_RUNNER_DIR).map(PathBuf::from);
 
         let load_ceiling = match std::env::var(ENV_LOAD_CEILING) {
-            Ok(v) => v
-                .parse()
-                .with_context(|| format!("{ENV_LOAD_CEILING} must be a number"))?,
+            Ok(v) => {
+                let n: f64 = v
+                    .parse()
+                    .with_context(|| format!("{ENV_LOAD_CEILING} must be a positive number"))?;
+                if n <= 0.0 {
+                    anyhow::bail!("{ENV_LOAD_CEILING} must be a positive number, got {n}");
+                }
+                n
+            }
             Err(_) => DEFAULT_LOAD_CEILING,
         };
         let mem_floor_mib = match std::env::var(ENV_MEM_FLOOR_MIB) {
