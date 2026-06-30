@@ -13,7 +13,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tower::Service;
@@ -24,20 +24,38 @@ const NATIVE_AUTHORITY: &str = "native.arcbox.internal";
 
 /// Pooled HTTP/1.1 client for ordinary guest dockerd requests.
 pub struct GuestHttpClient {
-    client: Client<GuestClientConnector, Body>,
+    connector: Arc<dyn GuestConnector>,
+    client: RwLock<Client<GuestClientConnector, Body>>,
 }
 
 impl GuestHttpClient {
     pub fn new(connector: Arc<dyn GuestConnector>) -> Self {
+        let client = Self::build_client(&connector);
+        Self {
+            connector,
+            client: RwLock::new(client),
+        }
+    }
+
+    fn build_client(connector: &Arc<dyn GuestConnector>) -> Client<GuestClientConnector, Body> {
         let mut builder = Client::builder(TokioExecutor::new());
         builder
             .pool_max_idle_per_host(MAX_IDLE_SESSIONS)
             .pool_idle_timeout(IDLE_SESSION_TIMEOUT)
             .pool_timer(TokioTimer::new());
+        builder.build(GuestClientConnector {
+            connector: Arc::clone(connector),
+        })
+    }
 
-        Self {
-            client: builder.build(GuestClientConnector { connector }),
-        }
+    /// Drops every pooled idle connection by rebuilding the client.
+    ///
+    /// Called when the System VM restarts: each pooled vsock session points at
+    /// the now-gone VM, so reusing one would fail. The fresh client dials a new
+    /// connection on the next request.
+    pub(crate) fn reset(&self) {
+        let client = Self::build_client(&self.connector);
+        *self.client.write().unwrap_or_else(|e| e.into_inner()) = client;
     }
 
     #[tracing::instrument(
@@ -50,7 +68,14 @@ impl GuestHttpClient {
         &self,
         req: hyper::Request<Body>,
     ) -> Result<hyper::Response<hyper::body::Incoming>> {
-        self.client
+        // Clone the pooled client out of the lock so it is never held across the
+        // `.await`; clones share the underlying connection pool.
+        let client = self
+            .client
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        client
             .request(req)
             .await
             .map_err(|e| DockerError::Server(format!("guest docker request failed: {e}")))
