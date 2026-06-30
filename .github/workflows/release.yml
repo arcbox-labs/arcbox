@@ -308,3 +308,31 @@ jobs:
           files: |
             ${{ steps.tarball.outputs.tarball }}
             ${{ steps.tarball.outputs.tarball }}.sha256
+
+  # ==========================================================================
+  # Sync shipped issues to Linear Releases (continuous pipeline)
+  #
+  # Runs after the binaries are published, so each Linear release records what
+  # actually shipped to Homebrew/CLI users — not just what merged. Issues are
+  # associated by scanning commits since the previous Linear release for PR
+  # references (#NNN, which Linear resolves to their linked issues) and ABX-123
+  # identifiers. Requires the LINEAR_ACCESS_KEY secret (this pipeline's access
+  # key, generated in Linear → Settings → Releases; not a personal API key).
+  # ==========================================================================
+  linear-release:
+    name: Sync Linear Release
+    needs: [version, package-and-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history required for commit-range scanning
+
+      - uses: linear/linear-release-action@v0
+        with:
+          access_key: ${{ secrets.LINEAR_ACCESS_KEY }}
+          version: ${{ needs.version.outputs.version }}
+          links: https://github.com/${{ github.repository }}/releases/tag/${{ needs.version.outputs.version }}
