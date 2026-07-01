@@ -80,12 +80,21 @@ async fn proxied_surface_is_not_shadowed() {
     assert_reaches_backend("GET", "/containers/json").await;
     assert_reaches_backend("POST", "/containers/prune").await;
 
-    // Other resource collections live in currently-empty route groups, so they
-    // fall straight through to the proxy. Asserted here so that adding a future
-    // `/{images,networks,volumes}/{id}` route can't silently shadow them.
+    // Other resource collections fall straight through to the proxy. Asserted
+    // here so that adding a future `/{images,networks,volumes}/{id}` route
+    // can't silently shadow them.
     assert_reaches_backend("GET", "/images/json").await;
     assert_reaches_backend("GET", "/networks").await;
     assert_reaches_backend("GET", "/volumes").await;
+
+    // The local /networks/{id}/connect|disconnect routes are two-segment and
+    // must not shadow the single-segment or bare network endpoints.
+    assert_reaches_backend("POST", "/networks/create").await;
+    assert_reaches_backend("POST", "/networks/prune").await;
+    assert_reaches_backend("GET", "/networks/abc").await;
+    assert_reaches_backend("DELETE", "/networks/abc").await;
+    assert_reaches_backend("POST", "/networks/abc/connect").await;
+    assert_reaches_backend("POST", "/networks/abc/disconnect").await;
 
     // System + streaming endpoints.
     assert_reaches_backend("GET", "/_ping").await;

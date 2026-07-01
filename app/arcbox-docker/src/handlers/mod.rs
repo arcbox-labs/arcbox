@@ -8,6 +8,7 @@ mod admission;
 mod build;
 mod container;
 mod identity;
+mod network;
 mod proxying;
 
 pub(crate) use admission::require_amd64_runtime;
@@ -19,5 +20,6 @@ pub(crate) use container::{
     create_container, kill_container, remove_container, rename_container, restart_container,
     start_container, stop_container,
 };
+pub(crate) use network::{network_connect, network_disconnect};
 
 pub use container::extract_container_dns_info;

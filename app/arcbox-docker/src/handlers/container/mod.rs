@@ -484,7 +484,7 @@ fn extract_canonical_id_from_inspect(inspect_json: &[u8]) -> Option<String> {
 
 /// Returns the canonical container ID from inspect JSON, falling back to the
 /// original request token when the inspect payload does not contain a usable ID.
-fn canonical_id_or_fallback(container_id: &str, inspect_json: &[u8]) -> String {
+pub(super) fn canonical_id_or_fallback(container_id: &str, inspect_json: &[u8]) -> String {
     extract_canonical_id_from_inspect(inspect_json).unwrap_or_else(|| container_id.to_string())
 }
 

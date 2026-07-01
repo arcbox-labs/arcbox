@@ -109,7 +109,23 @@ fn strip_version_prefix(path: &str) -> Option<&str> {
 fn api_routes() -> Router<AppState> {
     Router::new()
         .merge(container_routes())
+        .merge(network_routes())
         .route("/build", post(handlers::build_image))
+}
+
+fn network_routes() -> Router<AppState> {
+    // connect/disconnect change a running container's IP and aliases, so the
+    // host DNS entry must be refreshed after them. Every other network
+    // operation (list/create/inspect/remove/prune) proxies via the fallback —
+    // host routing uses one static container-subnet route, not per-network
+    // state. These two-segment routes shadow nothing: no single-segment
+    // `/networks/{id}` route is registered locally.
+    Router::new()
+        .route("/networks/{id}/connect", post(handlers::network_connect))
+        .route(
+            "/networks/{id}/disconnect",
+            post(handlers::network_disconnect),
+        )
 }
 
 fn container_routes() -> Router<AppState> {
