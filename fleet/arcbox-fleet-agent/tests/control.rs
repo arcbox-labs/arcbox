@@ -1,10 +1,10 @@
 //! End-to-end test of the local control-plane API.
 //!
 //! `arcbox-fleet-agent` ships only a binary (no library target), so this
-//! spawns the real compiled `run` binary against a scratch data dir and
-//! exercises `FleetLifecycleService` over the real Unix socket — the same
-//! path the CLI's `status`/`drain`/`resume`/`disconnect` subcommands and the
-//! desktop app use.
+//! spawns the real compiled `serve` subcommand against a scratch data dir
+//! and exercises `FleetLifecycleService` over the real Unix socket — the
+//! same path the CLI's `status`/`drain`/`resume`/`disconnect` subcommands
+//! and the desktop app use.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -84,7 +84,7 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
 
     let mut agent = AgentProcess(
         Command::new(env!("CARGO_BIN_EXE_arcbox-fleet-agent"))
-            .arg("run")
+            .arg("serve")
             .env("ARCBOX_FLEET_DATA_DIR", &data_dir)
             // Forced to the file backend so this never touches the real OS
             // keychain; nothing listens on this gateway, but the Unenrolled
