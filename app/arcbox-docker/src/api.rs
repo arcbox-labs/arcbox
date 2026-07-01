@@ -223,6 +223,13 @@ impl EndpointReadiness {
 /// Use [`strip_api_version_prefix`] as a `MapRequestLayer` around this Router
 /// so that versioned paths (`/v1.51/containers/{id}/start`) are normalised
 /// *before* Axum route matching.
+///
+/// Only a handful of mutating operations are handled locally; everything else
+/// proxies to guest dockerd via the router `fallback` (unmatched paths). The
+/// `/containers/{id}` route additionally proxies unhandled *methods* on its own
+/// path — see [`container_routes`] — because its `{id}` capture shadows the
+/// single-segment static endpoints `GET /containers/json` and
+/// `POST /containers/prune`.
 pub fn create_router(runtime: Arc<Runtime>, connector: Arc<dyn GuestConnector>) -> Router {
     let state = AppState {
         runtime,
@@ -308,7 +315,17 @@ fn container_routes() -> Router<AppState> {
         )
         .route("/containers/{id}/kill", post(handlers::kill_container))
         .route("/containers/{id}/rename", post(handlers::rename_container))
-        .route("/containers/{id}", delete(handlers::remove_container))
+        // `{id}` also matches the single-segment static endpoints
+        // `GET /containers/json` (list) and `POST /containers/prune`, whose
+        // methods aren't DELETE. Proxy any non-DELETE method on *this* path to
+        // guest dockerd so those aren't shadowed into a 405 — scoped here so the
+        // lifecycle routes above still reject wrong methods locally rather than
+        // proxying them. `DELETE /containers/{id}` (incl. a container literally
+        // named "json"/"prune") still routes to the local remove handler.
+        .route(
+            "/containers/{id}",
+            delete(handlers::remove_container).fallback(proxy::proxy_fallback),
+        )
 }
 
 fn build_routes() -> Router<AppState> {
