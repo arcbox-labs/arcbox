@@ -10,6 +10,13 @@
 //! subcommand reads the fleet join token from a file (`--token-file`) or stdin
 //! by default; `--token` is accepted for convenience but discouraged, as it
 //! leaks the token through the process argument list and shell history.
+//!
+//! Two ways to run: `run` requires a credential from a prior `enroll` (the
+//! headless/farm path) and does nothing else. `serve` additionally exposes
+//! the local control-plane API on `agent.sock`, and does not require a
+//! credential up front — `enroll`/`drain`/`resume`/`disconnect` can drive it
+//! from another invocation of this CLI, or from the desktop app, while it
+//! runs.
 
 mod attach;
 mod config;
@@ -62,7 +69,21 @@ enum Command {
         token: Option<String>,
     },
     /// Attach to the gateway and run dispatched jobs until terminated.
+    ///
+    /// Requires a credential from a prior `enroll` — the headless/farm path,
+    /// unchanged by the local control-plane API. For the desktop-managed
+    /// handoff, where enrollment arrives later over `agent.sock`, use `serve`
+    /// instead.
     Run,
+    /// Start the local control-plane API (`agent.sock`) and, once enrolled,
+    /// attach to the gateway and run dispatched jobs until terminated.
+    ///
+    /// Unlike `run`, a credential is not required at startup: if one is
+    /// already persisted this behaves like `run`, but with none it idles
+    /// until an `Enroll` call arrives over the socket (the desktop-managed
+    /// handoff) or `disconnect`/`enroll` change that from another
+    /// invocation. This is what a launchd LaunchAgent should invoke.
+    Serve,
     /// Show the running agent's enrollment/attachment status.
     Status,
     /// Stop the running agent from accepting new offers; in-flight jobs
@@ -110,6 +131,42 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             Ok(())
         }
         Command::Run => {
+            let docker = init_docker(&config).await?;
+            let capabilities = capabilities(&config, docker.as_ref());
+            let credential = CredentialStore::new(
+                config.credential_store,
+                config.credentials_path(),
+                &config.gateway,
+            )
+            .load()?
+            .context(
+                "no credential found — run `arcbox-fleet-agent enroll --token-file …` first",
+            )?;
+            info!(machine_id = %credential.machine_id, "starting fleet agent");
+
+            // Cancelled on the first termination signal; `attach::run` then
+            // stops accepting work and tears down in-flight runners.
+            let shutdown = CancellationToken::new();
+            let signal_token = shutdown.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                info!("termination signal received; draining runners");
+                signal_token.cancel();
+            });
+
+            let (supervisor, egress_rx) =
+                attach::spawn_supervisor(&config, docker, capabilities.clone());
+            attach::run(
+                config,
+                credential,
+                supervisor,
+                egress_rx,
+                capabilities,
+                shutdown,
+            )
+            .await
+        }
+        Command::Serve => {
             let docker = init_docker(&config).await?;
             let capabilities = capabilities(&config, docker.as_ref());
             let credential_store = CredentialStore::new(
