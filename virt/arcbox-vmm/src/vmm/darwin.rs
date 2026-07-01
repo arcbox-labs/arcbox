@@ -593,9 +593,9 @@ impl Vmm {
             )));
         }
 
-        match self.resolved_backend {
-            Some(ResolvedBackend::Hv) => self.connect_vsock_hv(port),
-            _ => {
+        match self.config.backend {
+            VmBackend::Hv => self.connect_vsock_hv(port),
+            VmBackend::Vz => {
                 let vm = self
                     .darwin_vm
                     .as_ref()
@@ -639,8 +639,8 @@ impl Vmm {
             )));
         }
 
-        match self.resolved_backend {
-            Some(ResolvedBackend::Hv) => {
+        match self.config.backend {
+            VmBackend::Hv => {
                 let balloon = self
                     .hv_balloon
                     .as_ref()
@@ -653,7 +653,7 @@ impl Vmm {
                 guard.set_num_pages(pages);
                 Ok(())
             }
-            Some(ResolvedBackend::Vz) | None => {
+            VmBackend::Vz => {
                 let vm = self
                     .darwin_vm
                     .as_ref()
@@ -674,11 +674,11 @@ impl Vmm {
             return 0;
         }
 
-        match self.resolved_backend {
-            Some(ResolvedBackend::Hv) => self.hv_balloon.as_ref().map_or(0, |b| {
+        match self.config.backend {
+            VmBackend::Hv => self.hv_balloon.as_ref().map_or(0, |b| {
                 b.lock().map_or(0, |g| u64::from(g.num_pages()) * 4096)
             }),
-            Some(ResolvedBackend::Vz) | None => self
+            VmBackend::Vz => self
                 .darwin_vm
                 .as_ref()
                 .map_or(0, DarwinVm::get_balloon_target_memory),
@@ -690,8 +690,8 @@ impl Vmm {
     /// Returns current balloon stats including target, current, and configured memory sizes.
     #[must_use]
     pub fn get_balloon_stats(&self) -> arcbox_hypervisor::BalloonStats {
-        let (target_bytes, current_bytes) = match self.resolved_backend {
-            Some(ResolvedBackend::Hv) => self.hv_balloon.as_ref().map_or((0, 0), |b| {
+        let (target_bytes, current_bytes) = match self.config.backend {
+            VmBackend::Hv => self.hv_balloon.as_ref().map_or((0, 0), |b| {
                 b.lock().map_or((0, 0), |g| {
                     (
                         u64::from(g.num_pages()) * 4096,
@@ -699,7 +699,7 @@ impl Vmm {
                     )
                 })
             }),
-            Some(ResolvedBackend::Vz) | None => (self.get_balloon_target(), 0),
+            VmBackend::Vz => (self.get_balloon_target(), 0),
         };
         arcbox_hypervisor::BalloonStats {
             target_bytes,

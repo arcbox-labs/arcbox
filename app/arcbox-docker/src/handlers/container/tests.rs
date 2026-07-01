@@ -55,21 +55,6 @@ fn extract_canonical_id_invalid_json() {
 }
 
 #[test]
-fn parses_id_from_create_response() {
-    let json = br#"{"Id":"abc123def456","Warnings":null}"#;
-    assert_eq!(
-        parse_create_response_id(json).as_deref(),
-        Some("abc123def456"),
-    );
-}
-
-#[test]
-fn returns_none_when_create_response_missing_id() {
-    assert_eq!(parse_create_response_id(b"{}"), None);
-    assert_eq!(parse_create_response_id(b"not json"), None);
-}
-
-#[test]
 fn canonical_id_or_fallback_uses_canonical() {
     let json = br#"{"Id":"canonical-abcdef","Name":"/my-nginx"}"#;
     assert_eq!(

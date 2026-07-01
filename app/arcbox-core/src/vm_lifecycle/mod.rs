@@ -44,7 +44,7 @@ use arcbox_error::CommonError;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 
@@ -130,6 +130,12 @@ pub struct VmLifecycleManager {
     recovery: RecoveryPolicy,
     /// Configuration.
     config: VmLifecycleConfig,
+    /// Live, switchable hypervisor backend for the System VM, encoded as
+    /// `VmBackend as u8`. Seeded from the persisted machine (falling back to
+    /// `config.backend`); updated by [`Self::set_backend`] when the backend is
+    /// switched at runtime so the next (re)boot picks it up. Read via
+    /// [`Self::backend`].
+    backend: AtomicU8,
     /// Data directory.
     data_dir: PathBuf,
     /// Mutex for serializing state transitions.
@@ -292,16 +298,21 @@ impl VmLifecycleManager {
 
         let recovery = RecoveryPolicy::new(config.max_retries, BackoffStrategy::default());
 
-        let initial_state = if let Some(info) = machine_manager.get(&machine_name) {
-            VmLifecycleState::from(info.state)
-        } else {
-            VmLifecycleState::NotExist
-        };
+        let existing = machine_manager.get(&machine_name);
+        let initial_state = existing
+            .as_ref()
+            .map_or(VmLifecycleState::NotExist, |info| {
+                VmLifecycleState::from(info.state)
+            });
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+
+        // Seed the backend from the persisted machine so a prior switch survives
+        // daemon restarts; fall back to the config default on first boot.
+        let seeded_backend = existing.map_or(config.backend, |info| info.backend);
 
         Ok(Self {
             machine_name,
@@ -313,6 +324,7 @@ impl VmLifecycleManager {
             boot_assets,
             recovery,
             config,
+            backend: AtomicU8::new(seeded_backend as u8),
             data_dir,
             transition_lock: Mutex::new(()),
             last_activity_ms: AtomicU64::new(now_ms),
@@ -630,8 +642,12 @@ impl VmLifecycleManager {
             block_devices,
             distro: None,
             distro_version: None,
-            backend: self.config.backend,
-            enable_rosetta: self.config.default_vm.rosetta,
+            backend: self.backend(),
+            // x86_64 translator follows the backend: VZ hosts Apple Rosetta,
+            // HV uses FEX. Only wire the Rosetta share on VZ (and only where the
+            // host supports it).
+            enable_rosetta: self.config.default_vm.rosetta
+                && matches!(self.backend(), arcbox_vmm::VmBackend::Vz),
         };
 
         tracing::info!(
@@ -675,7 +691,7 @@ impl VmLifecycleManager {
         // host `guest_serial` log — but only on the custom-HV backend, whose PL011
         // emulator the directive targets (VZ has no such device). See
         // `ensure_earlycon`.
-        cmdline = ensure_earlycon(cmdline, self.config.backend);
+        cmdline = ensure_earlycon(cmdline, self.backend());
 
         // Inject guest docker vsock port if configured.
         if let Some(port) = self.config.guest_docker_vsock_port {
@@ -1040,6 +1056,24 @@ impl VmLifecycleManager {
         });
 
         Ok(())
+    }
+
+    /// Returns the System VM's current hypervisor backend.
+    #[must_use]
+    pub fn backend(&self) -> arcbox_vmm::VmBackend {
+        // Encoded as `VmBackend as u8` (Hv = 0, Vz = 1).
+        match self.backend.load(Ordering::Acquire) {
+            0 => arcbox_vmm::VmBackend::Hv,
+            _ => arcbox_vmm::VmBackend::Vz,
+        }
+    }
+
+    /// Sets the hypervisor backend used on the next (re)boot of the System VM.
+    ///
+    /// Does not stop or restart a running VM; to apply immediately the caller
+    /// must force a recreate (see `Runtime::switch_system_vm_backend`).
+    pub fn set_backend(&self, backend: arcbox_vmm::VmBackend) {
+        self.backend.store(backend as u8, Ordering::Release);
     }
 
     /// Returns the configuration.

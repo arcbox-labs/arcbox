@@ -4,8 +4,7 @@ use super::headers::HeaderMapProxyExt;
 use super::{forward, upgrade, upload};
 use crate::api::AppState;
 use crate::error::Result;
-use crate::handlers::ensure_role_ready;
-use crate::request_context::ProxyRequestContext;
+use crate::handlers::ensure_system_vm_ready;
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
 use axum::http::Response;
@@ -13,10 +12,7 @@ use axum::http::Response;
 /// Catch-all handler that proxies unmatched requests to guest dockerd.
 ///
 /// Ensures forward compatibility with newer Docker API versions — any
-/// endpoint we don't explicitly handle gets forwarded transparently. When
-/// the URI carries a known container or exec ID, the request is routed to
-/// that workload's utility VM role so endpoints like
-/// `/containers/{id}/archive` follow the same VM as their lifecycle calls.
+/// endpoint we don't explicitly handle gets forwarded transparently.
 ///
 /// # Errors
 ///
@@ -27,7 +23,7 @@ use axum::http::Response;
     fields(
         method = %req.method(),
         uri = %uri,
-        utility_vm = tracing::field::Empty,
+        utility_vm = "native",
         protocol = tracing::field::Empty,
     ),
     err
@@ -37,21 +33,14 @@ pub async fn proxy_fallback(
     OriginalUri(uri): OriginalUri,
     req: axum::http::Request<Body>,
 ) -> Result<Response<Body>> {
-    let role = req
-        .extensions()
-        .get::<ProxyRequestContext>()
-        .map_or_else(|| crate::routing::UtilityVmRole::Native, |ctx| ctx.role);
-    tracing::Span::current().record("utility_vm", role.as_str());
-    ensure_role_ready(&state, role).await?;
+    ensure_system_vm_ready(&state).await?;
 
     if req.headers().wants_upgrade() {
         tracing::Span::current().record("protocol", "upgrade");
-        return match upgrade::proxy_with_upgrade_for_role(state.proxy.connector(), role, req, &uri)
-            .await
-        {
+        return match upgrade::proxy_with_upgrade(state.proxy.connector(), req, &uri).await {
             Ok(response) => Ok(response),
             Err(e) => {
-                state.proxy.invalidate_endpoint(role);
+                state.proxy.invalidate_endpoint();
                 Err(e)
             }
         };
@@ -59,29 +48,20 @@ pub async fn proxy_fallback(
 
     if upload::is_streaming_upload_request(req.method(), &uri) {
         tracing::Span::current().record("protocol", "upload");
-        return match upload::proxy_streaming_upload_for_role(
-            state.proxy.connector(),
-            role,
-            &uri,
-            req,
-        )
-        .await
-        {
+        return match upload::proxy_streaming_upload(state.proxy.connector(), &uri, req).await {
             Ok(response) => Ok(response),
             Err(e) => {
-                state.proxy.invalidate_endpoint(role);
+                state.proxy.invalidate_endpoint();
                 Err(e)
             }
         };
     }
 
     tracing::Span::current().record("protocol", "http");
-    match forward::proxy_to_guest_stream_for_role_pooled(state.proxy.client(), role, &uri, req)
-        .await
-    {
+    match forward::proxy_to_guest_stream_pooled(state.proxy.client(), &uri, req).await {
         Ok(response) => Ok(response),
         Err(e) => {
-            state.proxy.invalidate_endpoint(role);
+            state.proxy.invalidate_endpoint();
             Err(e)
         }
     }

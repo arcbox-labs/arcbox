@@ -15,15 +15,13 @@ mod uri;
 pub use connector::VsockConnector;
 pub use fallback::proxy_fallback;
 pub use forward::{
-    proxy_to_guest, proxy_to_guest_for_role, proxy_to_guest_for_role_pooled, proxy_to_guest_stream,
-    proxy_to_guest_stream_for_role, proxy_to_guest_stream_for_role_pooled,
+    proxy_to_guest, proxy_to_guest_pooled, proxy_to_guest_stream, proxy_to_guest_stream_pooled,
 };
 pub use session::GuestHttpClient;
-pub use upgrade::{proxy_with_upgrade, proxy_with_upgrade_for_role};
-pub use upload::{proxy_streaming_upload, proxy_streaming_upload_for_role};
+pub use upgrade::proxy_with_upgrade;
+pub use upload::proxy_streaming_upload;
 
 use crate::error::Result;
-use crate::routing::UtilityVmRole;
 pub use arcbox_transport::vsock::{VsockShutdown, VsockStream};
 use hyper_util::rt::TokioIo;
 use std::future::Future;
@@ -41,16 +39,4 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub trait GuestConnector: Send + Sync + 'static {
     /// Opens a new connection to guest dockerd.
     fn connect(&self) -> Pin<Box<dyn Future<Output = Result<TokioIo<VsockStream>>> + Send + '_>>;
-
-    /// Opens a new connection to guest dockerd for a utility VM role.
-    ///
-    /// Single-VM connectors can ignore the role by using the default
-    /// implementation. Dual-stack connectors should route `Native` to the HV
-    /// utility VM and `Rosetta` to the VZ/Rosetta utility VM.
-    fn connect_for(
-        &self,
-        _role: UtilityVmRole,
-    ) -> Pin<Box<dyn Future<Output = Result<TokioIo<VsockStream>>> + Send + '_>> {
-        self.connect()
-    }
 }

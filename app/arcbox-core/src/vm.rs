@@ -96,6 +96,36 @@ impl VmManager {
         Ok(())
     }
 
+    /// Updates the hypervisor backend for a stopped VM.
+    ///
+    /// The Vmm is built lazily from `VmConfig` at start, so changing the
+    /// backend here and restarting boots the VM on the new backend with no
+    /// teardown of the VM record or its disks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the VM is running/starting or not found.
+    pub fn set_backend(&self, id: &VmId, backend: arcbox_vmm::VmBackend) -> Result<()> {
+        let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
+
+        let entry = vms
+            .get_mut(id)
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+
+        if matches!(
+            entry.info.state,
+            MachineState::Running | MachineState::Starting
+        ) {
+            return Err(CoreError::invalid_state(format!(
+                "cannot set backend while VM is {:?}",
+                entry.info.state
+            )));
+        }
+
+        entry.config.backend = backend;
+        Ok(())
+    }
+
     fn build_vmm_config(entry: &VmEntry) -> VmmConfig {
         let shared_dirs: Vec<VmmSharedDirConfig> = entry
             .config

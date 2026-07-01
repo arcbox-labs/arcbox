@@ -9,10 +9,7 @@
 use crate::handlers;
 use crate::proxy;
 use crate::proxy::{GuestConnector, GuestHttpClient};
-use crate::request_context::proxy_request_context_middleware;
-use crate::routing::UtilityVmRole;
 use crate::trace::trace_id_middleware;
-use crate::workload::WorkloadRoleRegistry;
 use arcbox_core::Runtime;
 use axum::extract::OriginalUri;
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -34,15 +31,13 @@ pub struct AppState {
     pub runtime: Arc<Runtime>,
     /// Guest proxy transport state.
     pub proxy: Arc<ProxyState>,
-    /// In-process mapping from container/exec IDs to their utility VM role.
-    pub workload_roles: Arc<WorkloadRoleRegistry>,
 }
 
 /// Guest proxy transport state shared by handlers.
 pub struct ProxyState {
     connector: Arc<dyn GuestConnector>,
     guest_http_client: GuestHttpClient,
-    endpoint_readiness: GuestDockerReadiness,
+    endpoint_readiness: EndpointReadiness,
 }
 
 impl ProxyState {
@@ -50,7 +45,7 @@ impl ProxyState {
         Self {
             guest_http_client: GuestHttpClient::new(Arc::clone(&connector)),
             connector,
-            endpoint_readiness: GuestDockerReadiness::new(),
+            endpoint_readiness: EndpointReadiness::new(),
         }
     }
 
@@ -62,32 +57,30 @@ impl ProxyState {
         &self.guest_http_client
     }
 
-    /// Ensures guest dockerd is reachable at the Docker HTTP layer for `role`.
+    /// Ensures guest dockerd is reachable at the Docker HTTP layer.
     ///
     /// The supplied `prepare_runtime` future owns the slow VM/agent/runtime
     /// readiness path. This proxy state owns the cheaper HTTP `_ping`
     /// verification and caches it until a transport failure invalidates it.
     pub(crate) async fn ensure_endpoint_verified<F>(
         &self,
-        role: UtilityVmRole,
         prepare_runtime: F,
     ) -> crate::error::Result<()>
     where
         F: Future<Output = crate::error::Result<()>>,
     {
         self.endpoint_readiness
-            .ensure_verified(role, prepare_runtime, || self.ping_guest(role))
+            .ensure_verified(prepare_runtime, || self.ping_guest())
             .await
     }
 
-    pub(crate) fn invalidate_endpoint(&self, role: UtilityVmRole) {
-        self.endpoint_readiness.invalidate(role);
+    pub(crate) fn invalidate_endpoint(&self) {
+        self.endpoint_readiness.invalidate();
     }
 
-    async fn ping_guest(&self, role: UtilityVmRole) -> crate::error::Result<()> {
-        let response = proxy::proxy_to_guest_for_role_pooled(
+    async fn ping_guest(&self) -> crate::error::Result<()> {
+        let response = proxy::proxy_to_guest_pooled(
             &self.guest_http_client,
-            role,
             Method::GET,
             "/_ping",
             &HeaderMap::new(),
@@ -116,47 +109,6 @@ impl ProxyState {
     }
 }
 
-struct GuestDockerReadiness {
-    native: RoleEndpointReadiness,
-    rosetta: RoleEndpointReadiness,
-}
-
-impl GuestDockerReadiness {
-    fn new() -> Self {
-        Self {
-            native: RoleEndpointReadiness::new(),
-            rosetta: RoleEndpointReadiness::new(),
-        }
-    }
-
-    async fn ensure_verified<Prepare, Verify, VerifyFuture>(
-        &self,
-        role: UtilityVmRole,
-        prepare_runtime: Prepare,
-        verify_endpoint: Verify,
-    ) -> crate::error::Result<()>
-    where
-        Prepare: Future<Output = crate::error::Result<()>>,
-        Verify: FnOnce() -> VerifyFuture,
-        VerifyFuture: Future<Output = crate::error::Result<()>>,
-    {
-        self.for_role(role)
-            .ensure_verified(prepare_runtime, verify_endpoint)
-            .await
-    }
-
-    fn invalidate(&self, role: UtilityVmRole) {
-        self.for_role(role).invalidate();
-    }
-
-    const fn for_role(&self, role: UtilityVmRole) -> &RoleEndpointReadiness {
-        match role {
-            UtilityVmRole::Native => &self.native,
-            UtilityVmRole::Rosetta => &self.rosetta,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointReadinessState {
     Unverified,
@@ -164,12 +116,12 @@ enum EndpointReadinessState {
     Verified,
 }
 
-struct RoleEndpointReadiness {
+struct EndpointReadiness {
     state: Mutex<EndpointReadinessState>,
     changed: Notify,
 }
 
-impl RoleEndpointReadiness {
+impl EndpointReadiness {
     fn new() -> Self {
         Self {
             state: Mutex::new(EndpointReadinessState::Unverified),
@@ -246,17 +198,10 @@ pub fn create_router(runtime: Arc<Runtime>, connector: Arc<dyn GuestConnector>) 
     let state = AppState {
         runtime,
         proxy: Arc::new(ProxyState::new(connector)),
-        workload_roles: WorkloadRoleRegistry::new(),
     };
-
-    let router_state = state.clone();
 
     api_routes()
         .fallback(proxy::proxy_fallback)
-        .layer(middleware::from_fn_with_state(
-            router_state,
-            proxy_request_context_middleware,
-        ))
         .layer(middleware::from_fn(trace_id_middleware))
         .with_state(state)
 }
@@ -313,7 +258,6 @@ fn api_routes() -> Router<AppState> {
     Router::new()
         .merge(system_routes())
         .merge(container_routes())
-        .merge(exec_routes())
         .merge(build_routes())
         .merge(image_routes())
         .merge(network_routes())
@@ -336,10 +280,6 @@ fn container_routes() -> Router<AppState> {
         .route("/containers/{id}/kill", post(handlers::kill_container))
         .route("/containers/{id}/rename", post(handlers::rename_container))
         .route("/containers/{id}", delete(handlers::remove_container))
-}
-
-fn exec_routes() -> Router<AppState> {
-    Router::new().route("/containers/{id}/exec", post(handlers::exec_create))
 }
 
 fn build_routes() -> Router<AppState> {
@@ -437,20 +377,16 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_transitions_unverified_to_verified_after_success() {
-        let readiness = GuestDockerReadiness::new();
+        let readiness = EndpointReadiness::new();
         let prepared = Arc::new(AtomicUsize::new(0));
         let verified = Arc::new(AtomicUsize::new(0));
 
-        assert_eq!(
-            readiness.for_role(UtilityVmRole::Native).state(),
-            EndpointReadinessState::Unverified
-        );
+        assert_eq!(readiness.state(), EndpointReadinessState::Unverified);
 
         let prepared_current = Arc::clone(&prepared);
         let verified_current = Arc::clone(&verified);
         readiness
             .ensure_verified(
-                UtilityVmRole::Native,
                 async move {
                     prepared_current.fetch_add(1, Ordering::Relaxed);
                     Ok::<(), DockerError>(())
@@ -463,17 +399,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            readiness.for_role(UtilityVmRole::Native).state(),
-            EndpointReadinessState::Verified
-        );
+        assert_eq!(readiness.state(), EndpointReadinessState::Verified);
         assert_eq!(prepared.load(Ordering::Relaxed), 1);
         assert_eq!(verified.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
     async fn readiness_keeps_verified_state_on_cache_hit() {
-        let readiness = GuestDockerReadiness::new();
+        let readiness = EndpointReadiness::new();
         let prepared = Arc::new(AtomicUsize::new(0));
         let verified = Arc::new(AtomicUsize::new(0));
 
@@ -481,7 +414,6 @@ mod tests {
         let verified_first = Arc::clone(&verified);
         readiness
             .ensure_verified(
-                UtilityVmRole::Native,
                 async move {
                     prepared_first.fetch_add(1, Ordering::Relaxed);
                     Ok::<(), DockerError>(())
@@ -498,7 +430,6 @@ mod tests {
         let verified_second = Arc::clone(&verified);
         readiness
             .ensure_verified(
-                UtilityVmRole::Native,
                 async move {
                     prepared_second.fetch_add(1, Ordering::Relaxed);
                     Ok::<(), DockerError>(())
@@ -517,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_transitions_back_to_unverified_after_failure() {
-        let readiness = GuestDockerReadiness::new();
+        let readiness = EndpointReadiness::new();
         let prepared = Arc::new(AtomicUsize::new(0));
         let verified = Arc::new(AtomicUsize::new(0));
 
@@ -525,7 +456,6 @@ mod tests {
         let verified_current = Arc::clone(&verified);
         let err = readiness
             .ensure_verified(
-                UtilityVmRole::Native,
                 async move {
                     prepared_current.fetch_add(1, Ordering::Relaxed);
                     Ok::<(), DockerError>(())
@@ -539,68 +469,35 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("ping failed"));
-        assert_eq!(
-            readiness.for_role(UtilityVmRole::Native).state(),
-            EndpointReadinessState::Unverified
-        );
+        assert_eq!(readiness.state(), EndpointReadinessState::Unverified);
         assert_eq!(prepared.load(Ordering::Relaxed), 1);
         assert_eq!(verified.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
     async fn readiness_invalidation_transitions_verified_to_unverified() {
-        let readiness = GuestDockerReadiness::new();
+        let readiness = EndpointReadiness::new();
         let verified = Arc::new(AtomicUsize::new(0));
 
         for _ in 0..2 {
             let verified_current = Arc::clone(&verified);
             readiness
-                .ensure_verified(
-                    UtilityVmRole::Native,
-                    async { Ok::<(), DockerError>(()) },
-                    || async move {
-                        verified_current.fetch_add(1, Ordering::Relaxed);
-                        Ok::<(), DockerError>(())
-                    },
-                )
+                .ensure_verified(async { Ok::<(), DockerError>(()) }, || async move {
+                    verified_current.fetch_add(1, Ordering::Relaxed);
+                    Ok::<(), DockerError>(())
+                })
                 .await
                 .unwrap();
-            readiness.invalidate(UtilityVmRole::Native);
+            readiness.invalidate();
         }
 
         assert_eq!(verified.load(Ordering::Relaxed), 2);
-        assert_eq!(
-            readiness.for_role(UtilityVmRole::Native).state(),
-            EndpointReadinessState::Unverified
-        );
-    }
-
-    #[tokio::test]
-    async fn readiness_is_isolated_per_utility_vm_role() {
-        let readiness = GuestDockerReadiness::new();
-
-        readiness
-            .ensure_verified(
-                UtilityVmRole::Native,
-                async { Ok::<(), DockerError>(()) },
-                || async { Ok::<(), DockerError>(()) },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            readiness.for_role(UtilityVmRole::Native).state(),
-            EndpointReadinessState::Verified
-        );
-        assert_eq!(
-            readiness.for_role(UtilityVmRole::Rosetta).state(),
-            EndpointReadinessState::Unverified
-        );
+        assert_eq!(readiness.state(), EndpointReadinessState::Unverified);
     }
 
     #[tokio::test]
     async fn readiness_serializes_concurrent_verification() {
-        let readiness = Arc::new(GuestDockerReadiness::new());
+        let readiness = Arc::new(EndpointReadiness::new());
         let prepared = Arc::new(AtomicUsize::new(0));
         let verified = Arc::new(AtomicUsize::new(0));
 
@@ -610,7 +507,6 @@ mod tests {
         let first = tokio::spawn(async move {
             first_readiness
                 .ensure_verified(
-                    UtilityVmRole::Native,
                     async move {
                         first_prepared.fetch_add(1, Ordering::Relaxed);
                         sleep(Duration::from_millis(20)).await;
@@ -625,8 +521,7 @@ mod tests {
                 .await
         });
 
-        while readiness.for_role(UtilityVmRole::Native).state() != EndpointReadinessState::Verifying
-        {
+        while readiness.state() != EndpointReadinessState::Verifying {
             sleep(Duration::from_millis(1)).await;
         }
 
@@ -636,7 +531,6 @@ mod tests {
         let second = tokio::spawn(async move {
             second_readiness
                 .ensure_verified(
-                    UtilityVmRole::Native,
                     async move {
                         second_prepared.fetch_add(1, Ordering::Relaxed);
                         Ok::<(), DockerError>(())
@@ -652,10 +546,7 @@ mod tests {
         first.await.unwrap().unwrap();
         second.await.unwrap().unwrap();
 
-        assert_eq!(
-            readiness.for_role(UtilityVmRole::Native).state(),
-            EndpointReadinessState::Verified
-        );
+        assert_eq!(readiness.state(), EndpointReadinessState::Verified);
         assert_eq!(prepared.load(Ordering::Relaxed), 1);
         assert_eq!(verified.load(Ordering::Relaxed), 1);
     }

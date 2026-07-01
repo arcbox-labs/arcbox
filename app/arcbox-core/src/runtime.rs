@@ -14,7 +14,6 @@ use crate::machine::{MachineManager, MachineState};
 use crate::migration::MigrationManager;
 use crate::vm::VmManager;
 use crate::vm_lifecycle::{DEFAULT_MACHINE_NAME, VmLifecycleConfig, VmLifecycleManager};
-use crate::workload::UtilityVmRole;
 use arcbox_net::NetworkManager;
 #[cfg(target_os = "macos")]
 use arcbox_net::darwin::inbound_relay::{InboundListenerManager, InboundProtocol};
@@ -51,22 +50,6 @@ type InboundRulesMap =
 #[cfg(target_os = "macos")]
 type InboundListenerMap = Arc<TokioRwLock<HashMap<String, InboundListenerManager>>>;
 
-/// Per-role lifecycle + dockerd plumbing owned by a [`Runtime`].
-///
-/// Each enabled [`UtilityVmRole`] gets its own slot so the connector
-/// registry, port-forwarding setup, and ensure-ready paths can address the
-/// VMs independently.
-struct RoleSlot {
-    /// Lifecycle manager that owns this role's VM.
-    lifecycle: Arc<VmLifecycleManager>,
-    /// Container backend that drives ensure-ready on this role.
-    container_backend: DynContainerBackend,
-    /// Machine name this role's VM is registered under.
-    machine_name: String,
-    /// Vsock port the guest dockerd listens on inside this role's VM.
-    guest_docker_vsock_port: u32,
-}
-
 pub struct Runtime {
     /// Configuration.
     config: Config,
@@ -76,18 +59,13 @@ pub struct Runtime {
     vm_manager: Arc<VmManager>,
     /// Machine manager.
     machine_manager: Arc<MachineManager>,
-    /// VM lifecycle manager for the native (default) machine.
-    ///
-    /// Kept for the daemon-wide lifecycle methods (Kubernetes, shutdown)
-    /// that operate on the primary VM. Role-aware paths should go through
-    /// [`Self::ensure_role_ready`] instead.
+    /// Lifecycle manager for the single System VM. amd64 runs inside it via the
+    /// active backend's translator (VZ→Rosetta, HV→FEX) rather than on a
+    /// separate VM.
     vm_lifecycle: Arc<VmLifecycleManager>,
-    /// Container backend implementation for the native role.
+    /// Container backend that drives ensure-ready / dockerd plumbing for the
+    /// System VM.
     container_backend: DynContainerBackend,
-    /// Per-role utility VM slots. Always contains
-    /// [`UtilityVmRole::Native`]; [`UtilityVmRole::Rosetta`] is present
-    /// only on platforms where the VZ + Rosetta utility VM is supported.
-    role_slots: HashMap<UtilityVmRole, RoleSlot>,
     /// Network manager.
     network_manager: Arc<NetworkManager>,
     /// Host-side runtime migration manager.
@@ -107,17 +85,6 @@ pub struct Runtime {
     port_forwarders: Arc<TokioRwLock<HashMap<String, PortForwarder>>>,
     /// Tracks DNS registrations: canonical container ID → hostnames.
     dns_entries: Arc<TokioRwLock<HashMap<String, Vec<String>>>>,
-}
-
-/// Machine name used for the rosetta utility VM.
-const ROSETTA_MACHINE_NAME: &str = "rosetta";
-/// Filename of the persistent dockerd data image for the rosetta utility VM.
-const ROSETTA_DATA_IMAGE_NAME: &str = "docker-rosetta.img";
-
-/// Returns `true` on platforms where the VZ + Rosetta utility VM is
-/// supported.
-const fn rosetta_role_supported() -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
 
 impl Runtime {
@@ -168,65 +135,21 @@ impl Runtime {
             shared_dns_table,
         ));
 
-        // Build the per-role utility VM slots. The native slot is always
-        // present; the rosetta slot exists only on macOS Apple Silicon
-        // and stays cold until the first amd64 workload triggers it.
-        let mut role_slots: HashMap<UtilityVmRole, RoleSlot> = HashMap::new();
-
-        // Native (HV) slot — the existing default machine.
-        let native_lifecycle = Arc::new(VmLifecycleManager::new(
+        // Build the single System VM. The daemon runs one utility VM (default
+        // backend VZ); amd64 workloads run inside it via the active backend's
+        // x86 translator (VZ→Rosetta, HV→FEX), so there is no separate VM.
+        let system_lifecycle = Arc::new(VmLifecycleManager::new(
             machine_manager.clone(),
             event_bus.clone(),
             config.data_dir.clone(),
-            vm_lifecycle_config.clone(),
+            vm_lifecycle_config,
         )?);
-        let native_backend = create_backend(
+        let system_backend = create_backend(
             &config.container,
-            Arc::clone(&native_lifecycle),
+            Arc::clone(&system_lifecycle),
             Arc::clone(&machine_manager),
             DEFAULT_MACHINE_NAME,
         );
-        role_slots.insert(
-            UtilityVmRole::Native,
-            RoleSlot {
-                lifecycle: Arc::clone(&native_lifecycle),
-                container_backend: native_backend.clone(),
-                machine_name: DEFAULT_MACHINE_NAME.to_string(),
-                guest_docker_vsock_port: config.container.guest_docker_vsock_port,
-            },
-        );
-
-        // Rosetta (VZ) slot — lazy. The lifecycle is constructed now so
-        // its state, persistence and event topic are available, but the
-        // VM only boots when `ensure_role_ready(Rosetta)` is first called.
-        if rosetta_role_supported() {
-            let mut rosetta_config = vm_lifecycle_config;
-            rosetta_config.backend = arcbox_vmm::VmBackend::Vz;
-            rosetta_config.default_vm.rosetta = true;
-            let rosetta_lifecycle = Arc::new(VmLifecycleManager::for_machine(
-                ROSETTA_MACHINE_NAME.to_string(),
-                ROSETTA_DATA_IMAGE_NAME.to_string(),
-                machine_manager.clone(),
-                event_bus.clone(),
-                config.data_dir.clone(),
-                rosetta_config,
-            )?);
-            let rosetta_backend = create_backend(
-                &config.container,
-                Arc::clone(&rosetta_lifecycle),
-                Arc::clone(&machine_manager),
-                ROSETTA_MACHINE_NAME,
-            );
-            role_slots.insert(
-                UtilityVmRole::Rosetta,
-                RoleSlot {
-                    lifecycle: rosetta_lifecycle,
-                    container_backend: rosetta_backend,
-                    machine_name: ROSETTA_MACHINE_NAME.to_string(),
-                    guest_docker_vsock_port: config.container.guest_docker_vsock_port,
-                },
-            );
-        }
 
         let migration_manager = Arc::new(MigrationManager::new(config.docker.socket_path.clone()));
 
@@ -235,9 +158,8 @@ impl Runtime {
             event_bus,
             vm_manager,
             machine_manager,
-            vm_lifecycle: native_lifecycle,
-            container_backend: native_backend,
-            role_slots,
+            vm_lifecycle: system_lifecycle,
+            container_backend: system_backend,
             network_manager,
             migration_manager,
             #[cfg(target_os = "macos")]
@@ -319,20 +241,61 @@ impl Runtime {
         self.container_backend.ensure_ready().await
     }
 
-    /// Ensures the utility VM for `role` is running and ready.
-    ///
-    /// Drives the per-role lifecycle so the native and rosetta VMs are
-    /// reachable independently. If `role` is not configured on this host
-    /// (e.g. rosetta on non-Apple-Silicon) the native slot answers as a
-    /// degradation path — the dockerd connector still works, but the
-    /// workload runs on HV instead of VZ+Rosetta.
+    /// Ensures the System VM is running and ready, returning its guest CID.
     ///
     /// # Errors
     ///
     /// Returns an error if the underlying VM cannot be started or becomes
     /// unhealthy.
-    pub async fn ensure_role_ready(&self, role: UtilityVmRole) -> Result<u32> {
-        self.slot_for(role).container_backend.ensure_ready().await
+    pub async fn ensure_system_vm_ready(&self) -> Result<u32> {
+        self.container_backend.ensure_ready().await
+    }
+
+    /// Returns the System VM's current hypervisor backend.
+    #[must_use]
+    pub fn system_vm_backend(&self) -> arcbox_vmm::VmBackend {
+        self.vm_lifecycle.backend()
+    }
+
+    /// Switches the System VM's hypervisor backend (HV <-> VZ) and restarts the
+    /// VM so it takes effect.
+    ///
+    /// No-op when the backend is unchanged. Otherwise the System VM is
+    /// gracefully stopped, its backend updated **in place** — the machine
+    /// record, SSH keys and the persistent dockerd data image are all kept,
+    /// only the lazily-built `Vmm` is rebuilt — and rebooted on the new backend.
+    /// The choice is persisted in the machine config so it survives daemon
+    /// restarts. Running containers are stopped by the restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot be applied or the VM cannot be
+    /// restarted on the new backend.
+    pub async fn switch_system_vm_backend(&self, backend: arcbox_vmm::VmBackend) -> Result<()> {
+        let lifecycle = &self.vm_lifecycle;
+        if lifecycle.backend() == backend {
+            return Ok(());
+        }
+
+        let machine_name = lifecycle.machine_name().to_string();
+        tracing::info!(
+            from = lifecycle.backend().as_str(),
+            to = backend.as_str(),
+            "switching System VM backend; restarting the System VM"
+        );
+
+        // Graceful stop, then apply the backend in place. The persisted machine
+        // (if it exists yet) is updated so the choice survives a restart; the
+        // lifecycle's own backend governs the next create on first boot.
+        let _ = lifecycle.shutdown().await;
+        if self.machine_manager.exists(&machine_name) {
+            self.machine_manager.set_backend(&machine_name, backend)?;
+        }
+        lifecycle.set_backend(backend);
+        lifecycle.ensure_ready().await?;
+
+        tracing::info!(backend = backend.as_str(), "System VM backend switched");
+        Ok(())
     }
 
     /// Returns the default machine name used for automatic VM lifecycle.
@@ -341,72 +304,37 @@ impl Runtime {
         DEFAULT_MACHINE_NAME
     }
 
-    /// Returns the machine name that hosts `role`.
-    ///
-    /// Resolves through the per-role registry. Roles not configured on
-    /// this host fall back to the native machine name so existing callers
-    /// keep working in single-VM deployments.
+    /// Returns the guest dockerd vsock port for the System VM.
     #[must_use]
-    pub fn machine_name_for_role(&self, role: UtilityVmRole) -> &str {
-        self.slot_for(role).machine_name.as_str()
+    pub const fn system_vm_docker_vsock_port(&self) -> u32 {
+        self.config.container.guest_docker_vsock_port
     }
 
-    /// Returns the guest dockerd vsock port for `role`.
+    /// Returns whether the System VM can run `linux/amd64` workloads.
     ///
-    /// Both roles currently expose dockerd on the configured global port;
-    /// the seam exists so we can split ports per role later without a
-    /// downstream API churn.
-    #[must_use]
-    pub fn guest_docker_vsock_port_for_role(&self, role: UtilityVmRole) -> u32 {
-        self.slot_for(role).guest_docker_vsock_port
-    }
-
-    /// Returns whether the HV guest can run `linux/amd64` workloads via FEX.
+    /// The x86_64 translator follows the System VM's backend:
+    /// - **VZ** uses Apple Rosetta — available on macOS Apple Silicon.
+    /// - **HV** uses FEX, which requires the interpreter provisioned as a
+    ///   runtime binary at `<data_dir>/runtime/bin/FEX` (the same `runtime/bin`
+    ///   set as `dockerd`/`containerd`, surfaced to the guest over the `arcbox`
+    ///   VirtioFS share). The guest rootfs init registers the `binfmt_misc`
+    ///   handler iff that binary is present.
     ///
-    /// ABX-375 fail-closed gate. amd64 runtime requires the FEX interpreter
-    /// provisioned as a runtime binary at `<data_dir>/runtime/bin/FEX` — the
-    /// same `runtime/bin` set as `dockerd`/`containerd`, which the `arcbox`
-    /// VirtioFS share surfaces to the guest as `/arcbox/runtime/bin/FEX`. The
-    /// guest rootfs init registers the x86_64 `binfmt_misc` handler iff that
-    /// binary is present, so its presence is the authoritative host-side
-    /// signal.
-    ///
-    /// When it is absent, callers must fail closed: amd64 runtime requests
-    /// return a clear FEX error instead of silently falling back to
-    /// VZ/Rosetta or QEMU.
+    /// Fail-closed (ABX-375): when the active backend's translator is
+    /// unavailable, amd64 requests must return a clear error rather than
+    /// silently falling back.
     #[must_use]
     pub fn amd64_runtime_supported(&self) -> bool {
-        self.config
-            .data_dir
-            .join("runtime")
-            .join("bin")
-            .join("FEX")
-            .is_file()
-    }
-
-    /// Returns the lifecycle manager for `role`, falling back to native.
-    #[must_use]
-    pub fn lifecycle_for_role(&self, role: UtilityVmRole) -> &Arc<VmLifecycleManager> {
-        &self.slot_for(role).lifecycle
-    }
-
-    /// Returns `true` if `role` has a dedicated slot wired in this runtime.
-    /// Used by diagnostics to surface which roles are actually distinct vs
-    /// aliased onto the native fallback.
-    #[must_use]
-    pub fn role_is_distinct(&self, role: UtilityVmRole) -> bool {
-        self.role_slots.contains_key(&role)
-    }
-
-    /// Returns the role slot, falling back to native if `role` is not
-    /// configured on this host.
-    fn slot_for(&self, role: UtilityVmRole) -> &RoleSlot {
-        if let Some(slot) = self.role_slots.get(&role) {
-            return slot;
+        match self.system_vm_backend() {
+            arcbox_vmm::VmBackend::Vz => cfg!(all(target_os = "macos", target_arch = "aarch64")),
+            arcbox_vmm::VmBackend::Hv => self
+                .config
+                .data_dir
+                .join("runtime")
+                .join("bin")
+                .join("FEX")
+                .is_file(),
         }
-        self.role_slots
-            .get(&UtilityVmRole::Native)
-            .expect("Native role slot must always be present")
     }
 
     /// Gets an agent client for a machine.

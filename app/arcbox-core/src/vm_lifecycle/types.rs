@@ -127,9 +127,9 @@ pub struct VmLifecycleConfig {
     pub guest_docker_vsock_port: Option<u32>,
     /// macOS hypervisor backend this lifecycle's machine will use.
     ///
-    /// Defaults to `Hv` so the native utility VM keeps running on the
-    /// custom HV-framework path. The rosetta utility VM overrides this
-    /// to `Vz` so it can host the Rosetta share.
+    /// Defaults to the System VM default ([`arcbox_vmm::VmBackend::default`],
+    /// currently `Vz` — Apple-managed and stable). Switch to `Hv` (custom VMM
+    /// + FEX) via the System VM backend control.
     pub backend: arcbox_vmm::VmBackend,
 }
 
@@ -144,7 +144,7 @@ impl Default for VmLifecycleConfig {
             default_vm: DefaultVmConfig::default(),
             skip_vm_check: false,
             guest_docker_vsock_port: None,
-            backend: arcbox_vmm::VmBackend::Hv,
+            backend: arcbox_vmm::VmBackend::default(),
         }
     }
 }

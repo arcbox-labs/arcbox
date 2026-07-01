@@ -7,10 +7,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arcbox_grpc::SystemService;
-use arcbox_protocol::v1::{Empty, SetupStatus, setup_status};
+use arcbox_protocol::v1::{
+    Empty, SetSystemVmBackendRequest, SetupStatus, SystemVmBackend, SystemVmBackendInfo,
+    setup_status,
+};
 use tokio::sync::watch;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
+
+use crate::grpc::{SharedRuntime, SharedRuntimeExt};
 
 /// Shared state tracking daemon startup progress.
 ///
@@ -88,12 +93,33 @@ impl Default for SetupState {
 /// SystemService gRPC implementation.
 pub struct SystemServiceImpl {
     setup_state: Arc<SetupState>,
+    runtime: SharedRuntime,
 }
 
 impl SystemServiceImpl {
     /// Creates a new system service.
-    pub fn new(setup_state: Arc<SetupState>) -> Self {
-        Self { setup_state }
+    pub fn new(setup_state: Arc<SetupState>, runtime: SharedRuntime) -> Self {
+        Self {
+            setup_state,
+            runtime,
+        }
+    }
+}
+
+/// Maps the wire enum to the core backend, or `None` for the unspecified value.
+fn backend_from_proto(backend: SystemVmBackend) -> Option<arcbox_core::VmBackend> {
+    match backend {
+        SystemVmBackend::Hv => Some(arcbox_core::VmBackend::Hv),
+        SystemVmBackend::Vz => Some(arcbox_core::VmBackend::Vz),
+        SystemVmBackend::Unspecified => None,
+    }
+}
+
+/// Maps the core backend to the wire enum.
+fn backend_to_proto(backend: arcbox_core::VmBackend) -> SystemVmBackend {
+    match backend {
+        arcbox_core::VmBackend::Hv => SystemVmBackend::Hv,
+        arcbox_core::VmBackend::Vz => SystemVmBackend::Vz,
     }
 }
 
@@ -174,5 +200,31 @@ impl SystemService for SystemServiceImpl {
             }
         };
         Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn get_system_vm_backend(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<SystemVmBackendInfo>, Status> {
+        let runtime = self.runtime.ready()?;
+        Ok(Response::new(SystemVmBackendInfo {
+            backend: backend_to_proto(runtime.system_vm_backend()) as i32,
+        }))
+    }
+
+    async fn set_system_vm_backend(
+        &self,
+        request: Request<SetSystemVmBackendRequest>,
+    ) -> Result<Response<SystemVmBackendInfo>, Status> {
+        let backend = backend_from_proto(request.into_inner().backend())
+            .ok_or_else(|| Status::invalid_argument("backend must be HV or VZ"))?;
+        let runtime = self.runtime.ready()?;
+        runtime
+            .switch_system_vm_backend(backend)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(SystemVmBackendInfo {
+            backend: backend_to_proto(runtime.system_vm_backend()) as i32,
+        }))
     }
 }

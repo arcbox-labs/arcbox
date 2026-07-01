@@ -8,7 +8,6 @@ use super::headers::{ForwardedHeaderMode, HeaderMapProxyExt};
 use super::session::{GuestHttpClient, GuestHttpSession};
 use super::uri::GuestPath;
 use crate::error::{DockerError, Result};
-use crate::routing::UtilityVmRole;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Method, Request, Response, Uri, header};
 use bytes::Bytes;
@@ -26,7 +25,7 @@ use bytes::Bytes;
 #[tracing::instrument(
     name = "docker.proxy.buffered",
     skip(connector, headers, body),
-    fields(method = %method, path = path_and_query, utility_vm = UtilityVmRole::Native.as_str()),
+    fields(method = %method, path = path_and_query, utility_vm = "native"),
     err
 )]
 pub async fn proxy_to_guest(
@@ -36,43 +35,7 @@ pub async fn proxy_to_guest(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>> {
-    proxy_to_guest_for_role(
-        connector,
-        UtilityVmRole::Native,
-        method,
-        path_and_query,
-        headers,
-        body,
-    )
-    .await
-}
-
-/// Forward an HTTP request to a selected utility VM's guest dockerd.
-///
-/// Mirrors [`proxy_to_guest`] but lets the caller pick the role for
-/// programmatic internal lookups (e.g. canonical-ID resolution during
-/// lifecycle teardown).
-///
-/// # Errors
-///
-/// Returns an error if guest connection, handshake, request forwarding,
-/// or response mapping fails.
-#[tracing::instrument(
-    name = "docker.proxy.buffered",
-    skip(connector, headers, body),
-    fields(method = %method, path = path_and_query, utility_vm = role.as_str()),
-    err
-)]
-pub async fn proxy_to_guest_for_role(
-    connector: &dyn GuestConnector,
-    role: UtilityVmRole,
-    method: Method,
-    path_and_query: &str,
-    headers: &HeaderMap,
-    body: Bytes,
-) -> Result<Response<Body>> {
     BufferedForward {
-        role,
         method,
         path_and_query,
         headers,
@@ -90,19 +53,17 @@ pub async fn proxy_to_guest_for_role(
 #[tracing::instrument(
     name = "docker.proxy.buffered_pooled",
     skip(client, headers, body),
-    fields(method = %method, path = path_and_query, utility_vm = role.as_str()),
+    fields(method = %method, path = path_and_query, utility_vm = "native"),
     err
 )]
-pub async fn proxy_to_guest_for_role_pooled(
+pub async fn proxy_to_guest_pooled(
     client: &GuestHttpClient,
-    role: UtilityVmRole,
     method: Method,
     path_and_query: &str,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>> {
     BufferedForward {
-        role,
         method,
         path_and_query,
         headers,
@@ -124,7 +85,7 @@ pub async fn proxy_to_guest_for_role_pooled(
 #[tracing::instrument(
     name = "docker.proxy.stream",
     skip(connector, req),
-    fields(uri = %original_uri, utility_vm = UtilityVmRole::Native.as_str()),
+    fields(uri = %original_uri, utility_vm = "native"),
     err
 )]
 pub async fn proxy_to_guest_stream(
@@ -132,34 +93,9 @@ pub async fn proxy_to_guest_stream(
     original_uri: &Uri,
     req: Request<Body>,
 ) -> Result<Response<Body>> {
-    proxy_to_guest_stream_for_role(connector, UtilityVmRole::Native, original_uri, req).await
-}
-
-/// Forward an HTTP request to a selected utility VM's guest dockerd without buffering.
-///
-/// # Errors
-///
-/// Returns an error if guest connection, handshake, request forwarding,
-/// or response mapping fails.
-#[tracing::instrument(
-    name = "docker.proxy.stream",
-    skip(connector, req),
-    fields(uri = %original_uri, utility_vm = role.as_str()),
-    err
-)]
-pub async fn proxy_to_guest_stream_for_role(
-    connector: &dyn GuestConnector,
-    role: UtilityVmRole,
-    original_uri: &Uri,
-    req: Request<Body>,
-) -> Result<Response<Body>> {
-    StreamForward {
-        role,
-        original_uri,
-        req,
-    }
-    .send_direct(connector)
-    .await
+    StreamForward { original_uri, req }
+        .send_direct(connector)
+        .await
 }
 
 /// Forward a streaming HTTP request using a reusable guest HTTP session when possible.
@@ -170,26 +106,20 @@ pub async fn proxy_to_guest_stream_for_role(
 #[tracing::instrument(
     name = "docker.proxy.stream_pooled",
     skip(client, req),
-    fields(uri = %original_uri, utility_vm = role.as_str()),
+    fields(uri = %original_uri, utility_vm = "native"),
     err
 )]
-pub async fn proxy_to_guest_stream_for_role_pooled(
+pub async fn proxy_to_guest_stream_pooled(
     client: &GuestHttpClient,
-    role: UtilityVmRole,
     original_uri: &Uri,
     req: Request<Body>,
 ) -> Result<Response<Body>> {
-    StreamForward {
-        role,
-        original_uri,
-        req,
-    }
-    .send_pooled(client)
-    .await
+    StreamForward { original_uri, req }
+        .send_pooled(client)
+        .await
 }
 
 struct BufferedForward<'a> {
-    role: UtilityVmRole,
     method: Method,
     path_and_query: &'a str,
     headers: &'a HeaderMap,
@@ -198,18 +128,16 @@ struct BufferedForward<'a> {
 
 impl BufferedForward<'_> {
     async fn send_direct(self, connector: &dyn GuestConnector) -> Result<Response<Body>> {
-        let role = self.role;
         let uri = parse_guest_uri(self.path_and_query)?;
         let req = self.into_request(uri)?;
-        let mut session = GuestHttpSession::connect(connector, role).await?;
+        let mut session = GuestHttpSession::connect(connector).await?;
         Ok(response_with_axum_body(
             session.send_request(req, "request").await?,
         ))
     }
 
     async fn send_pooled(self, client: &GuestHttpClient) -> Result<Response<Body>> {
-        let role = self.role;
-        let uri = GuestHttpClient::uri(role, self.path_and_query)?;
+        let uri = GuestHttpClient::uri(self.path_and_query)?;
         let req = self.into_request(uri)?;
         Ok(response_with_axum_body(client.request(req).await?))
     }
@@ -220,27 +148,24 @@ impl BufferedForward<'_> {
 }
 
 struct StreamForward<'a> {
-    role: UtilityVmRole,
     original_uri: &'a Uri,
     req: Request<Body>,
 }
 
 impl StreamForward<'_> {
     async fn send_direct(self, connector: &dyn GuestConnector) -> Result<Response<Body>> {
-        let role = self.role;
         let path_and_query = GuestPath::from(self.original_uri);
         let uri = parse_guest_uri(path_and_query.as_ref())?;
         let req = self.into_request(uri)?;
-        let mut session = GuestHttpSession::connect(connector, role).await?;
+        let mut session = GuestHttpSession::connect(connector).await?;
         Ok(response_with_axum_body(
             session.send_request(req, "request").await?,
         ))
     }
 
     async fn send_pooled(self, client: &GuestHttpClient) -> Result<Response<Body>> {
-        let role = self.role;
         let path_and_query = GuestPath::from(self.original_uri);
-        let uri = GuestHttpClient::uri(role, path_and_query.as_ref())?;
+        let uri = GuestHttpClient::uri(path_and_query.as_ref())?;
         let req = self.into_request(uri)?;
         Ok(response_with_axum_body(client.request(req).await?))
     }

@@ -71,7 +71,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 Some(req.version)
             },
             block_devices: Vec::new(),
-            backend: arcbox_core::VmBackend::Hv,
+            backend: arcbox_core::VmBackend::default(),
             enable_rosetta: false,
         };
 

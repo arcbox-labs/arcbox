@@ -2,7 +2,6 @@
 
 use super::GuestConnector;
 use crate::error::{DockerError, Result};
-use crate::routing::UtilityVmRole;
 use arcbox_core::Runtime;
 use arcbox_error::CommonError;
 use arcbox_transport::vsock::{VsockShutdown, VsockStream};
@@ -41,16 +40,9 @@ impl VsockConnector {
 
 impl GuestConnector for VsockConnector {
     fn connect(&self) -> Pin<Box<dyn Future<Output = Result<TokioIo<VsockStream>>> + Send + '_>> {
-        self.connect_for(UtilityVmRole::Native)
-    }
-
-    fn connect_for(
-        &self,
-        role: UtilityVmRole,
-    ) -> Pin<Box<dyn Future<Output = Result<TokioIo<VsockStream>>> + Send + '_>> {
         let span = tracing::debug_span!(
             "docker.guest.vsock.connect",
-            utility_vm = role.as_str(),
+            utility_vm = "native",
             machine = tracing::field::Empty,
             port = tracing::field::Empty,
         );
@@ -61,18 +53,14 @@ impl GuestConnector for VsockConnector {
                     .await
                     .map_err(|_| DockerError::Server("connect semaphore closed".into()))?;
 
-                // Resolve role → machine/port via the runtime. Today both
-                // roles still alias to the default machine; once the dual VM
-                // lifecycle lands the rosetta branch returns its own machine
-                // name and dockerd port without any change here.
-                let port = self.runtime.guest_docker_vsock_port_for_role(role);
-                let machine_name = self.runtime.machine_name_for_role(role);
+                let port = self.runtime.system_vm_docker_vsock_port();
+                let machine_name = self.runtime.default_machine_name();
                 let manager = self.runtime.machine_manager().clone();
                 let name = machine_name.to_string();
                 tracing::Span::current().record("machine", name.as_str());
                 tracing::Span::current().record("port", port);
                 tracing::debug!(
-                    utility_vm = role.as_str(),
+                    utility_vm = "native",
                     machine = %name,
                     port,
                     "connecting to guest dockerd"

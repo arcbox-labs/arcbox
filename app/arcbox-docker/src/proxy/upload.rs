@@ -8,7 +8,6 @@ use super::headers::{ForwardedHeaderMode, HeaderMapProxyExt};
 use super::session::GuestHttpSession;
 use super::uri::GuestPath;
 use crate::error::{DockerError, Result};
-use crate::routing::UtilityVmRole;
 use axum::body::{Body, BodyDataStream};
 use axum::http::{HeaderValue, Method, Uri, header};
 use bytes::Bytes;
@@ -33,7 +32,7 @@ const UPLOAD_BODY_BUFFER: usize = 16;
 #[tracing::instrument(
     name = "docker.proxy.upload",
     skip(connector, req),
-    fields(uri = %original_uri, utility_vm = UtilityVmRole::Native.as_str()),
+    fields(uri = %original_uri, utility_vm = "native"),
     err
 )]
 pub async fn proxy_streaming_upload(
@@ -41,28 +40,7 @@ pub async fn proxy_streaming_upload(
     original_uri: &Uri,
     req: axum::http::Request<Body>,
 ) -> Result<axum::http::Response<Body>> {
-    proxy_streaming_upload_for_role(connector, UtilityVmRole::Native, original_uri, req).await
-}
-
-/// Forward a large upload request to a selected utility VM's guest dockerd.
-///
-/// # Errors
-///
-/// Returns an error if guest connection, handshake, request forwarding,
-/// or response mapping fails.
-#[tracing::instrument(
-    name = "docker.proxy.upload",
-    skip(connector, req),
-    fields(uri = %original_uri, utility_vm = role.as_str()),
-    err
-)]
-pub async fn proxy_streaming_upload_for_role(
-    connector: &dyn GuestConnector,
-    role: UtilityVmRole,
-    original_uri: &Uri,
-    req: axum::http::Request<Body>,
-) -> Result<axum::http::Response<Body>> {
-    let mut session = GuestHttpSession::connect(connector, role).await?;
+    let mut session = GuestHttpSession::connect(connector).await?;
 
     let had_expect = req.headers().contains_key(header::EXPECT);
     let had_content_length = req.headers().contains_key(header::CONTENT_LENGTH);

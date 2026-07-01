@@ -110,26 +110,46 @@ impl VmmConfig {
 
 /// VM backend selection for macOS.
 ///
-/// Controls whether the VMM uses Apple's Virtualization.framework (managed
-/// execution) or Hypervisor.framework (custom VMM with manual execution).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Selects whether the VMM uses Apple's Virtualization.framework (managed
+/// execution) or Hypervisor.framework (a custom VMM with manual vCPU
+/// execution). The two are parallel, directly-chosen backends — the choice is
+/// not inferred from workload "intent". Either backend can host amd64
+/// workloads; the in-guest x86_64 translator follows the backend (VZ → Apple
+/// Rosetta, HV → FEX) and is configured separately.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[repr(u8)]
 pub enum VmBackend {
-    /// Auto-select: HV for native ARM64, VZ when Rosetta is needed.
+    /// Hypervisor.framework (custom VMM with manual vCPU execution).
+    /// Requires macOS 15+.
+    Hv = 0,
+    /// Virtualization.framework (managed execution by Apple's runtime).
+    /// The default: Apple-managed and stable.
     #[default]
-    Auto,
-    /// Force Hypervisor.framework (custom VMM). Requires macOS 15+.
-    Hv,
-    /// Force Virtualization.framework (managed execution).
-    Vz,
+    Vz = 1,
 }
 
-/// Resolved backend after evaluating platform constraints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResolvedBackend {
-    /// Hypervisor.framework (custom VMM with manual vCPU execution).
-    Hv,
-    /// Virtualization.framework (managed execution by Apple's runtime).
-    Vz,
+impl VmBackend {
+    /// Stable lowercase label (`"hv"` / `"vz"`), matching the serde form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hv => "hv",
+            Self::Vz => "vz",
+        }
+    }
+
+    /// Parses a backend from its stable lowercase label.
+    #[must_use]
+    pub fn from_str_ascii(s: &str) -> Option<Self> {
+        match s {
+            "hv" => Some(Self::Hv),
+            "vz" => Some(Self::Vz),
+            _ => None,
+        }
+    }
 }
 
 /// VMM state.

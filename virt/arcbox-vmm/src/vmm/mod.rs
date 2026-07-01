@@ -34,10 +34,8 @@ mod helpers;
 #[cfg(test)]
 mod tests;
 
-pub use config::{
-    BlockDeviceConfig, ResolvedBackend, SharedDirConfig, VmBackend, VmmConfig, VmmState,
-};
-use helpers::{placeholder_vcpu_snapshots, resolve_backend};
+pub use config::{BlockDeviceConfig, SharedDirConfig, VmBackend, VmmConfig, VmmState};
+use helpers::placeholder_vcpu_snapshots;
 
 /// Virtual Machine Monitor.
 ///
@@ -138,9 +136,6 @@ pub struct Vmm {
     /// VZ-side fd for the vmnet bridge NIC attachment.
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
     vmnet_bridge_fd: Option<OwnedFd>,
-    /// Resolved backend choice for this VM instance.
-    #[cfg(target_os = "macos")]
-    resolved_backend: Option<ResolvedBackend>,
     /// Shared DeviceManager reference for HV backend (set during start_darwin_hv).
     /// Used by connect_vsock_hv to inject OP_REQUEST packets after VM starts.
     ///
@@ -320,8 +315,6 @@ impl Vmm {
             #[cfg(target_os = "macos")]
             hv_guest_mem: None,
             #[cfg(target_os = "macos")]
-            resolved_backend: None,
-            #[cfg(target_os = "macos")]
             hv_device_manager: None,
             #[cfg(target_os = "macos")]
             hv_vsock_worker: None,
@@ -403,17 +396,11 @@ impl Vmm {
         // Platform-specific initialization
         #[cfg(target_os = "macos")]
         {
-            let resolved = resolve_backend(&self.config);
-            tracing::info!(
-                "VM backend resolved: {:?} (requested: {:?})",
-                resolved,
-                self.config.backend
-            );
-            match resolved {
-                ResolvedBackend::Hv => self.initialize_darwin_hv()?,
-                ResolvedBackend::Vz => self.initialize_darwin()?,
+            tracing::info!("VM backend: {:?}", self.config.backend);
+            match self.config.backend {
+                VmBackend::Hv => self.initialize_darwin_hv()?,
+                VmBackend::Vz => self.initialize_darwin()?,
             }
-            self.resolved_backend = Some(resolved);
         }
 
         #[cfg(target_os = "linux")]
@@ -449,9 +436,9 @@ impl Vmm {
         // Linux: start vCPU threads for manual execution.
         #[cfg(target_os = "macos")]
         {
-            match self.resolved_backend {
-                Some(ResolvedBackend::Hv) => self.start_darwin_hv()?,
-                Some(ResolvedBackend::Vz) | None => self.start_darwin_vm()?,
+            match self.config.backend {
+                VmBackend::Hv => self.start_darwin_hv()?,
+                VmBackend::Vz => self.start_darwin_vm()?,
             }
         }
         #[cfg(target_os = "linux")]
@@ -490,9 +477,9 @@ impl Vmm {
 
         #[cfg(target_os = "macos")]
         {
-            match self.resolved_backend {
-                Some(ResolvedBackend::Hv) => self.pause_darwin_hv()?,
-                Some(ResolvedBackend::Vz) | None => self.pause_darwin_vm()?,
+            match self.config.backend {
+                VmBackend::Hv => self.pause_darwin_hv()?,
+                VmBackend::Vz => self.pause_darwin_vm()?,
             }
         }
         #[cfg(target_os = "linux")]
@@ -522,9 +509,9 @@ impl Vmm {
 
         #[cfg(target_os = "macos")]
         {
-            match self.resolved_backend {
-                Some(ResolvedBackend::Hv) => self.resume_darwin_hv()?,
-                Some(ResolvedBackend::Vz) | None => self.resume_darwin_vm()?,
+            match self.config.backend {
+                VmBackend::Hv => self.resume_darwin_hv()?,
+                VmBackend::Vz => self.resume_darwin_vm()?,
             }
         }
         #[cfg(target_os = "linux")]
@@ -560,9 +547,9 @@ impl Vmm {
         // Linux: stop vCPU threads.
         #[cfg(target_os = "macos")]
         {
-            match self.resolved_backend {
-                Some(ResolvedBackend::Hv) => self.stop_darwin_hv()?,
-                Some(ResolvedBackend::Vz) | None => self.stop_darwin_vm()?,
+            match self.config.backend {
+                VmBackend::Hv => self.stop_darwin_hv()?,
+                VmBackend::Vz => self.stop_darwin_vm()?,
             }
         }
         #[cfg(target_os = "linux")]
@@ -630,7 +617,7 @@ impl Vmm {
 
         #[cfg(target_os = "macos")]
         {
-            if matches!(self.resolved_backend, Some(ResolvedBackend::Hv)) {
+            if matches!(self.config.backend, VmBackend::Hv) {
                 return Err(VmmError::Unsupported(
                     "snapshot capture is not yet implemented for the HV backend".to_string(),
                 ));
@@ -683,7 +670,7 @@ impl Vmm {
 
         #[cfg(target_os = "macos")]
         {
-            if matches!(self.resolved_backend, Some(ResolvedBackend::Hv)) {
+            if matches!(self.config.backend, VmBackend::Hv) {
                 return Err(VmmError::Unsupported(
                     "snapshot restore is not yet implemented for the HV backend".to_string(),
                 ));

@@ -16,8 +16,6 @@ use axum::http::Uri;
 use bytes::Bytes;
 use serde_json::Value;
 
-pub use arcbox_core::UtilityVmRole;
-
 /// In-guest execution path for a workload's platform inside the HV utility VM.
 ///
 /// Surfaced in diagnostics as PLAN.md's `translator` field.
@@ -77,7 +75,7 @@ impl WorkloadPlatform {
 
 /// Runtime placement decision for a Docker workload.
 ///
-/// Runtime always targets the single HV utility VM ([`UtilityVmRole::Native`]);
+/// Runtime always targets the single HV system VM;
 /// [`Self::translator`] says how the platform executes inside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutingDecision {
@@ -101,13 +99,6 @@ impl RoutingDecision {
     #[must_use]
     pub const fn native_default() -> Self {
         Self::from_platform(WorkloadPlatform::Unspecified)
-    }
-
-    /// The utility VM that serves this workload. Always the single HV VM —
-    /// runtime no longer routes across utility VMs.
-    #[must_use]
-    pub const fn utility_vm(self) -> UtilityVmRole {
-        UtilityVmRole::Native
     }
 
     /// Whether this workload requires FEX in the HV guest to run.
@@ -214,8 +205,6 @@ mod tests {
     fn amd64_selects_fex_translator_on_hv() {
         let route = RoutingDecision::from_platform(WorkloadPlatform::LinuxAmd64);
         assert_eq!(route.translator, RuntimeTranslator::Fex);
-        // Runtime never leaves the single HV VM.
-        assert_eq!(route.utility_vm(), UtilityVmRole::Native);
         assert!(route.needs_fex());
     }
 
@@ -224,7 +213,6 @@ mod tests {
         for platform in [WorkloadPlatform::LinuxArm64, WorkloadPlatform::Unspecified] {
             let route = RoutingDecision::from_platform(platform);
             assert_eq!(route.translator, RuntimeTranslator::Native);
-            assert_eq!(route.utility_vm(), UtilityVmRole::Native);
             assert!(!route.needs_fex());
         }
     }
