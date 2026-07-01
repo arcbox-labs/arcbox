@@ -11,7 +11,7 @@
 //! longer running — a backstop for the immediate, handler-driven teardown.
 
 use crate::error::{DockerError, Result};
-use crate::proxy::{GuestConnector, GuestHttpClient, proxy_to_guest_pooled};
+use crate::proxy::{GuestHttpClient, ProxyState, proxy_to_guest_pooled};
 use arcbox_core::Runtime;
 use axum::http::{HeaderMap, Method};
 use bytes::Bytes;
@@ -25,19 +25,20 @@ use tokio_util::sync::CancellationToken;
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Spawns the background reconciler, cancelled via `shutdown`.
-pub fn spawn(
-    runtime: Arc<Runtime>,
-    connector: Arc<dyn GuestConnector>,
-    shutdown: CancellationToken,
-) {
+///
+/// Shares the router's [`ProxyState`] so queries go through the same pooled
+/// client, and observes the System VM restart generation before each cycle so
+/// a query right after a backend switch dials the fresh VM instead of failing
+/// once on a stale pooled connection.
+pub fn spawn(runtime: Arc<Runtime>, proxy: Arc<ProxyState>, shutdown: CancellationToken) {
     drop(tokio::spawn(async move {
-        let client = GuestHttpClient::new(connector);
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
                 () = tokio::time::sleep(RECONCILE_INTERVAL) => {
+                    proxy.reset_if_restarted(runtime.system_vm_restart_generation());
                     if let Err(e) =
-                        reconcile(&runtime, || list_running_container_ids(&client)).await
+                        reconcile(&runtime, || list_running_container_ids(proxy.client())).await
                     {
                         // Fail-safe: a guest query error skips teardown this
                         // cycle rather than risk tearing down live containers.

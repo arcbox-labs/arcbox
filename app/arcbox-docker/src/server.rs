@@ -1,7 +1,8 @@
 //! Docker API server.
 
-use crate::api::{create_router, strip_api_version_prefix};
+use crate::api::{router_with_proxy, strip_api_version_prefix};
 use crate::error::{DockerError, Result};
+use crate::proxy::ProxyState;
 use crate::proxy::VsockConnector;
 use arcbox_core::Runtime;
 use hyper::body::Incoming;
@@ -90,13 +91,16 @@ impl DockerApiServer {
         shutdown: CancellationToken,
     ) -> Result<()> {
         let connector = Arc::new(VsockConnector::new(Arc::clone(&self.runtime)));
+        let proxy = Arc::new(ProxyState::new(connector));
 
         // Backstop host-networking teardown for containers that stop without a
         // stop/kill/remove API call (natural exit, --rm, prune, OOM, guest-side
         // stop). The handlers do immediate teardown; this reconciles the rest.
+        // It shares the router's ProxyState so its queries go through the same
+        // pooled client — including the restart-generation reset.
         crate::host_reconciler::spawn(
             Arc::clone(&self.runtime),
-            Arc::clone(&connector) as Arc<dyn crate::proxy::GuestConnector>,
+            Arc::clone(&proxy),
             shutdown.clone(),
         );
 
@@ -105,7 +109,7 @@ impl DockerApiServer {
         // and cannot be used for URI rewriting.
         let version_layer = tower::util::MapRequestLayer::new(strip_api_version_prefix);
         let app = version_layer.layer(
-            create_router(Arc::clone(&self.runtime), connector).layer(TraceLayer::new_for_http()),
+            router_with_proxy(Arc::clone(&self.runtime), proxy).layer(TraceLayer::new_for_http()),
         );
 
         let mut connections = JoinSet::new();
