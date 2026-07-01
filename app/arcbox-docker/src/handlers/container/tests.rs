@@ -35,6 +35,22 @@ fn extract_id_no_containers_segment() {
 }
 
 #[test]
+fn kill_teardown_only_on_terminating_signal() {
+    // Default (no signal) and explicit SIGKILL terminate → tear down.
+    assert!(kill_terminates_container(&uri("/containers/abc/kill")));
+    assert!(kill_terminates_container(&uri("/containers/abc/kill?signal=SIGKILL")));
+    assert!(kill_terminates_container(&uri("/containers/abc/kill?signal=KILL")));
+    assert!(kill_terminates_container(&uri("/containers/abc/kill?signal=9")));
+
+    // Non-fatal / catchable signals leave the container running → no teardown.
+    assert!(!kill_terminates_container(&uri("/containers/abc/kill?signal=SIGHUP")));
+    assert!(!kill_terminates_container(&uri("/containers/abc/kill?signal=HUP")));
+    assert!(!kill_terminates_container(&uri("/containers/abc/kill?signal=SIGUSR1")));
+    assert!(!kill_terminates_container(&uri("/containers/abc/kill?signal=SIGTERM")));
+    assert!(!kill_terminates_container(&uri("/containers/abc/kill?signal=15")));
+}
+
+#[test]
 fn extract_canonical_id_from_inspect_json() {
     let json = br#"{"Id":"abc123def456789","Name":"/my-nginx","State":{}}"#;
     assert_eq!(
