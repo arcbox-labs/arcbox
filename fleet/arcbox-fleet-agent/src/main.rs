@@ -164,7 +164,13 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             // heartbeat once the agent attaches, so we advertise what we know
             // without probing the runtime.
             let capabilities = capabilities(seed.runner_script.is_some(), None);
-            enroll::enroll(&config, token, capabilities, &seed.gateway).await?;
+            let credential = enroll::enroll(&config, token, capabilities, &seed.gateway).await?;
+            CredentialStore::new(
+                config.credential_store,
+                config.credentials_path(),
+                &seed.gateway,
+            )
+            .store(&credential)?;
             Ok(())
         }
         Command::Run => {
@@ -213,11 +219,6 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             let seed = load_or_seed_settings(&settings_store, &config)?;
             let docker = init_docker(seed.docker_mode, &seed.runner_image).await?;
             let capabilities = capabilities(seed.runner_script.is_some(), docker.as_ref());
-            let credential_store = CredentialStore::new(
-                config.credential_store,
-                config.credentials_path(),
-                &seed.gateway,
-            );
             let socket_path = config.control_socket_path();
 
             // Cascades to every attach task's child token, so runners still
@@ -231,7 +232,6 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                     config,
                     docker,
                     capabilities,
-                    credential_store,
                     shutdown.clone(),
                     agent_state.clone(),
                     settings_store.clone(),
