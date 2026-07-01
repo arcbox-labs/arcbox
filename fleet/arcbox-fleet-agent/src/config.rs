@@ -153,12 +153,20 @@ impl AgentConfig {
         self.data_dir.join("credentials.json")
     }
 
-    /// Build a gateway [`Endpoint`], enabling TLS for `https` URIs.
-    pub fn endpoint(&self) -> Result<Endpoint> {
-        let endpoint = Endpoint::from_shared(self.gateway.clone())
-            .with_context(|| format!("invalid gateway URI: {}", self.gateway))?;
+    /// Path to the local control-plane Unix socket.
+    pub fn control_socket_path(&self) -> PathBuf {
+        self.data_dir.join("agent.sock")
+    }
 
-        if self.gateway.starts_with("https://") {
+    /// Build a gateway [`Endpoint`] for an arbitrary `gateway` URI, enabling
+    /// TLS for `https` URIs. Used to connect against a credential's
+    /// per-enrollment `control_plane` override instead of the configured
+    /// default (see [`crate::credentials::Credential::control_plane`]).
+    pub fn endpoint_for(&self, gateway: &str) -> Result<Endpoint> {
+        let endpoint = Endpoint::from_shared(gateway.to_owned())
+            .with_context(|| format!("invalid gateway URI: {gateway}"))?;
+
+        if gateway.starts_with("https://") {
             // Bundled webpki roots keep trust uniform across macOS/Linux/Windows.
             return endpoint
                 .tls_config(ClientTlsConfig::new().with_webpki_roots())

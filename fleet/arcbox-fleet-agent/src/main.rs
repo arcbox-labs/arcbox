@@ -13,6 +13,7 @@
 
 mod attach;
 mod config;
+mod control;
 mod credentials;
 mod docker;
 mod enroll;
@@ -20,8 +21,10 @@ mod host;
 mod runner;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use arcbox_fleet_control_proto::v1 as control_proto;
 use arcbox_fleet_proto::v1::Capability;
 use arcbox_logging::LogConfig;
 use clap::{Parser, Subcommand};
@@ -60,6 +63,17 @@ enum Command {
     },
     /// Attach to the gateway and run dispatched jobs until terminated.
     Run,
+    /// Show the running agent's enrollment/attachment status.
+    Status,
+    /// Stop the running agent from accepting new offers; in-flight jobs
+    /// finish normally.
+    Drain,
+    /// Resume accepting new offers after `drain`.
+    Resume,
+    /// Remove the running agent's machine credential and stop attaching.
+    /// A fresh `enroll` (or the control-plane `Enroll` RPC) is required to
+    /// rejoin the fleet.
+    Disconnect,
 }
 
 fn main() -> Result<()> {
@@ -92,34 +106,93 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             // heartbeat once the agent attaches, so we advertise what we know
             // without probing the runtime.
             let capabilities = capabilities(&config, None);
-            enroll::enroll(&config, token, capabilities).await?;
+            enroll::enroll(&config, token, capabilities, None).await?;
             Ok(())
         }
         Command::Run => {
             let docker = init_docker(&config).await?;
             let capabilities = capabilities(&config, docker.as_ref());
-            let credential = CredentialStore::new(
+            let credential_store = CredentialStore::new(
                 config.credential_store,
                 config.credentials_path(),
                 &config.gateway,
-            )
-            .load()?
-            .context(
-                "no credential found — run `arcbox-fleet-agent enroll --token-file …` first",
-            )?;
-            info!(machine_id = %credential.machine_id, "starting fleet agent");
+            );
+            let socket_path = config.control_socket_path();
 
-            // Cancelled on the first termination signal; `attach::run` then
-            // stops accepting work and tears down in-flight runners.
+            // Cancelled on the first termination signal; cascades to every
+            // attach task's child token, so runners still drain on SIGTERM
+            // even though `Disconnect` can also cancel one independently.
             let shutdown = CancellationToken::new();
             let signal_token = shutdown.clone();
             tokio::spawn(async move {
                 shutdown_signal().await;
-                info!("termination signal received; draining runners");
+                info!("termination signal received; shutting down");
                 signal_token.cancel();
             });
 
-            attach::run(config, credential, docker, capabilities, shutdown).await
+            let supervisor = Arc::new(
+                control::AgentSupervisor::new(
+                    config,
+                    docker,
+                    capabilities,
+                    credential_store,
+                    shutdown.clone(),
+                )
+                .await?,
+            );
+            control::serve(&socket_path, Arc::clone(&supervisor), shutdown).await?;
+            // The control server has stopped accepting connections; give any
+            // live attach task its own shutdown grace before the process exits.
+            supervisor.join().await;
+            Ok(())
+        }
+        Command::Status => {
+            let mut client = control::client::connect_default(&config).await?;
+            let response = client
+                .get_status(control_proto::GetStatusRequest {})
+                .await
+                .context("GetStatus RPC failed")?
+                .into_inner();
+            match control_proto::ConnectionState::try_from(response.state)
+                .unwrap_or(control_proto::ConnectionState::Unspecified)
+            {
+                control_proto::ConnectionState::Unenrolled => println!("unenrolled"),
+                control_proto::ConnectionState::Enrolled => {
+                    println!("enrolled (machine_id={})", response.machine_id);
+                }
+                control_proto::ConnectionState::Draining => {
+                    println!("draining (machine_id={})", response.machine_id);
+                }
+                control_proto::ConnectionState::Unspecified => println!("unknown state"),
+            }
+            Ok(())
+        }
+        Command::Drain => {
+            let mut client = control::client::connect_default(&config).await?;
+            client
+                .drain(control_proto::DrainRequest {})
+                .await
+                .context("Drain RPC failed")?;
+            println!("draining");
+            Ok(())
+        }
+        Command::Resume => {
+            let mut client = control::client::connect_default(&config).await?;
+            client
+                .resume(control_proto::ResumeRequest {})
+                .await
+                .context("Resume RPC failed")?;
+            println!("resumed");
+            Ok(())
+        }
+        Command::Disconnect => {
+            let mut client = control::client::connect_default(&config).await?;
+            client
+                .disconnect(control_proto::DisconnectRequest {})
+                .await
+                .context("Disconnect RPC failed")?;
+            println!("disconnected");
+            Ok(())
         }
     }
 }

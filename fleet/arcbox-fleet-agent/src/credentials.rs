@@ -24,6 +24,12 @@ pub struct Credential {
     pub machine_id: String,
     /// Long-lived machine token, presented in `Attach` metadata.
     pub machine_token: String,
+    /// Gateway URL this credential was enrolled against, if it overrides the
+    /// agent's configured default. Set from the local control-plane
+    /// `Enroll` RPC's `control_plane` field; `None` for the CLI's
+    /// `enroll` subcommand, which always uses the configured gateway.
+    #[serde(default)]
+    pub control_plane: Option<String>,
 }
 
 /// Reads and writes the [`Credential`] via the platform-appropriate backend.
@@ -77,6 +83,17 @@ impl CredentialStore {
             Self::Keyring(store) => store.store(cred),
         }
     }
+
+    /// Remove the persisted credential, if any. A no-op, not an error, when
+    /// none is stored — `Disconnect` clears unconditionally rather than
+    /// first checking `load()`.
+    pub fn clear(&self) -> Result<()> {
+        match self {
+            Self::File(store) => store.clear(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Self::Keyring(store) => store.clear(),
+        }
+    }
 }
 
 /// Stores the credential as an owner-only JSON file at a fixed path.
@@ -113,6 +130,14 @@ impl FileStore {
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("renaming {} -> {}", tmp.display(), self.path.display()))?;
         Ok(())
+    }
+
+    fn clear(&self) -> Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {}", self.path.display())),
+        }
     }
 }
 
@@ -187,6 +212,14 @@ impl KeyringStore {
             .set_password(&json)
             .context("writing credential to OS keychain")
     }
+
+    fn clear(&self) -> Result<()> {
+        match self.entry()?.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(e).context("deleting credential from OS keychain"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -212,16 +245,32 @@ mod tests {
         let cred = Credential {
             machine_id: "fltm_test".into(),
             machine_token: "secret".into(),
+            control_plane: Some("http://127.0.0.1:50061".into()),
         };
         store.store(&cred).unwrap();
 
         let loaded = store.load().unwrap().expect("credential present");
         assert_eq!(loaded.machine_id, cred.machine_id);
         assert_eq!(loaded.machine_token, cred.machine_token);
+        assert_eq!(loaded.control_plane, cred.control_plane);
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
 
+        store.clear().unwrap();
+        assert!(store.load().unwrap().is_none());
+        // Clearing an already-absent credential is a no-op, not an error.
+        store.clear().unwrap();
+
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_control_plane_deserializes_as_none() {
+        // Credentials persisted before `control_plane` existed must still
+        // load: the field defaults rather than failing to parse.
+        let json = r#"{"machine_id":"fltm_old","machine_token":"secret"}"#;
+        let cred: Credential = serde_json::from_str(json).unwrap();
+        assert_eq!(cred.control_plane, None);
     }
 }

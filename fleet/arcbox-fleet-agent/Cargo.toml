@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 arcbox-fleet-proto = { workspace = true }
+arcbox-fleet-control-proto = { workspace = true }
 arcbox-logging = { workspace = true }
 
 tonic = { workspace = true, features = ["tls", "tls-webpki-roots"] }
@@ -35,6 +36,7 @@ sysinfo = { workspace = true }
 command-group = { version = "5.0.1", features = ["with-tokio"] }
 tokio-util = "0.7.18"
 bollard = "0.21.0"
+hyper-util = "0.1"
 
 [lints]
 workspace = true
