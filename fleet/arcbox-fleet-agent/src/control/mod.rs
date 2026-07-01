@@ -102,6 +102,33 @@ pub async fn serve(
 /// `SHUTDOWN_GRACE`; this only needs to cover that plus scheduling overhead.
 const DISCONNECT_GRACE: Duration = Duration::from_secs(20);
 
+/// Wait up to `grace` for `task` to finish on its own; if it doesn't, abort
+/// it and wait for that reap too, so `task` is guaranteed stopped by the
+/// time this returns regardless of whether it ever observed its own
+/// cancellation signal. Split out from [`AgentSupervisor::disconnect`] so
+/// the abort-on-timeout behavior can be exercised directly with a short
+/// `grace`, instead of the real [`DISCONNECT_GRACE`].
+///
+/// Polls `&mut task` rather than the owned handle so it survives a timeout:
+/// `tokio::time::timeout` drops its future on `Elapsed`, and dropping a
+/// `JoinHandle` does not abort the task — losing the handle here would leave
+/// it running detached, still holding the old in-memory credential, with
+/// nothing to stop a concurrent `Enroll` from starting a second live
+/// attachment.
+async fn join_or_abort(mut task: tokio::task::JoinHandle<Result<()>>, grace: Duration) {
+    match tokio::time::timeout(grace, &mut task).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => warn!(error = %e, "attach task exited with an error on disconnect"),
+        Ok(Err(e)) => warn!(error = %e, "attach task panicked on disconnect"),
+        Err(_) => {
+            warn!("disconnect grace elapsed; aborting attach task");
+            task.abort();
+            // Best-effort reap; a `Cancelled` JoinError here is expected.
+            let _ = task.await;
+        }
+    }
+}
+
 /// A live attachment to the gateway: the admission authority in `admit()`
 /// and the handle to stop it. The credential itself isn't retained here —
 /// nothing reads it back once attaching starts; `machine_id` observability
@@ -296,15 +323,21 @@ impl AgentSupervisor {
             };
             attachment
         };
+        // Immediate observability: `GetStatus`/`Watch` read only `agent_state`,
+        // not the `Mutex<State>` swapped above, so without this a concurrent
+        // caller would see stale state for the whole grace window below.
+        // Re-asserted after the task is provably stopped, since a reconnect
+        // attempt that straddles this cancel could otherwise briefly clobber
+        // it (mitigated, not fully eliminated, by `connect_and_serve`'s own
+        // cancellation race).
         self.agent_state.set_enrollment(Enrollment::Unenrolled, "");
 
         attachment.shutdown.cancel();
-        match tokio::time::timeout(DISCONNECT_GRACE, attachment.task).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(e))) => warn!(error = %e, "attach task exited with an error on disconnect"),
-            Ok(Err(e)) => warn!(error = %e, "attach task panicked on disconnect"),
-            Err(_) => warn!("disconnect grace elapsed; clearing credential anyway"),
-        }
+        join_or_abort(attachment.task, DISCONNECT_GRACE).await;
+        // Authoritative: the task is now provably stopped (joined or
+        // aborted), so this can no longer be raced.
+        self.agent_state.set_enrollment(Enrollment::Unenrolled, "");
+
         Ok(self
             .credential_store_for(&self.agent_state.gateway_target())
             .clear()
@@ -371,5 +404,53 @@ impl AgentSupervisor {
                 Err(e) => warn!(error = %e, "attach task panicked"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A task that ignores `shutdown` entirely (never checks it) simulates
+    /// the pathological case `join_or_abort`'s abort branch exists for — a
+    /// reconnect attempt that never observes cancellation. Without the
+    /// abort, this would still be running (and the sender below would
+    /// eventually fire) long after `join_or_abort` returns.
+    #[tokio::test]
+    async fn join_or_abort_stops_a_task_that_ignores_cancellation() {
+        let (never_aborted_tx, never_aborted_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let _ = never_aborted_tx.send(());
+            Ok(())
+        });
+
+        let start = tokio::time::Instant::now();
+        join_or_abort(task, Duration::from_millis(50)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must abort rather than wait out the task's own 10s sleep"
+        );
+
+        // The task was aborted mid-sleep, so its sender was dropped without
+        // ever sending — the receiver observes that as an error, not a value.
+        assert!(never_aborted_rx.await.is_err());
+    }
+
+    /// A task that finishes well within `grace` is joined normally; no abort
+    /// needed, and `join_or_abort` doesn't wait out the full grace either.
+    #[tokio::test]
+    async fn join_or_abort_returns_promptly_for_a_task_that_exits_quickly() {
+        let task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(())
+        });
+
+        let start = tokio::time::Instant::now();
+        join_or_abort(task, Duration::from_secs(20)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "must return once the task joins, not wait out the full grace"
+        );
     }
 }

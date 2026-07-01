@@ -193,35 +193,51 @@ async fn connect_and_serve(
     // to one; `current` only moves to match once this actually succeeds,
     // below.
     let gateway = state.gateway_target();
-    let channel = config
-        .endpoint_for(&gateway)?
-        .connect()
-        .await
-        .with_context(|| format!("connecting to {gateway}"))?;
-    let mut client = FleetGatewayServiceClient::new(channel);
-
     let (req_tx, req_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
 
-    let mut request = Request::new(ReceiverStream::new(req_rx));
-    let token: MetadataValue<_> = credential
-        .machine_token
-        .parse()
-        .context("machine token is not a valid metadata value")?;
-    request.metadata_mut().insert(MACHINE_TOKEN_HEADER, token);
-    // Protocol-version handshake: the gateway rejects an unsupported version.
-    let version: MetadataValue<_> = PROTOCOL_VERSION
-        .to_string()
-        .parse()
-        .expect("protocol version is a valid metadata value");
-    request
-        .metadata_mut()
-        .insert(PROTOCOL_VERSION_HEADER, version);
+    // The connect + Attach-RPC handshake can block indefinitely — no connect
+    // timeout is configured on the tonic `Endpoint` — and, unlike the
+    // message loop below, has no cancellation awareness of its own. Without
+    // this race, a reconnect attempt straddling a `disconnect()` could
+    // complete the handshake and write `Attached` after `disconnect()`
+    // already wrote `Unenrolled`, with nothing to undo it (see
+    // `AgentSupervisor::disconnect`'s doc). `req_rx` moves into the connect
+    // future and is dropped with it if cancellation wins; `req_tx` stays
+    // available in this outer scope for the rest of the connection.
+    let connect = async {
+        let channel = config
+            .endpoint_for(&gateway)?
+            .connect()
+            .await
+            .with_context(|| format!("connecting to {gateway}"))?;
+        let mut client = FleetGatewayServiceClient::new(channel);
 
-    let mut inbound = client
-        .attach(request)
-        .await
-        .context("Attach RPC failed")?
-        .into_inner();
+        let mut request = Request::new(ReceiverStream::new(req_rx));
+        let token: MetadataValue<_> = credential
+            .machine_token
+            .parse()
+            .context("machine token is not a valid metadata value")?;
+        request.metadata_mut().insert(MACHINE_TOKEN_HEADER, token);
+        // Protocol-version handshake: the gateway rejects an unsupported version.
+        let version: MetadataValue<_> = PROTOCOL_VERSION
+            .to_string()
+            .parse()
+            .expect("protocol version is a valid metadata value");
+        request
+            .metadata_mut()
+            .insert(PROTOCOL_VERSION_HEADER, version);
+
+        client
+            .attach(request)
+            .await
+            .context("Attach RPC failed")
+            .map(|response| response.into_inner())
+    };
+    let mut inbound = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Ok(()),
+        result = connect => result?,
+    };
     *backoff = INITIAL_BACKOFF;
     state.set_enrollment(control_proto::Enrollment::Attached, &credential.machine_id);
     state.set_gateway_current(&gateway);
@@ -373,5 +389,73 @@ mod tests {
             .await
             .expect("resend task must exit promptly once shutdown is cancelled")
             .expect("resend task must not panic");
+    }
+
+    fn config() -> AgentConfig {
+        AgentConfig {
+            gateway: "http://127.0.0.1:1".to_owned(),
+            runner_script: None,
+            load_ceiling: 0.9,
+            mem_floor_mib: 2048,
+            data_dir: std::env::temp_dir(),
+            docker: crate::config::DockerConfig {
+                mode: DockerMode::Disabled,
+                runner_image: "img".to_owned(),
+            },
+            credential_store: crate::config::CredentialMode::File,
+        }
+    }
+
+    fn credential() -> Credential {
+        Credential {
+            machine_id: "fltm_test".to_owned(),
+            machine_token: "secret".to_owned(),
+        }
+    }
+
+    /// The connect + Attach-RPC handshake has no cancellation awareness of
+    /// its own (see this fn's own doc in the non-test code above) — without
+    /// racing it against `shutdown`, a reconnect attempt could complete the
+    /// handshake and write `Attached` after a `disconnect()` already wrote
+    /// `Unenrolled`. Cancelling before this call even starts must bail out
+    /// immediately, attempting no connect at all and touching no state.
+    #[tokio::test]
+    async fn connect_and_serve_bails_out_immediately_when_already_cancelled() {
+        let state = AgentState::new(&seed());
+        let (events, _rx) = mpsc::channel(1);
+        let supervisor =
+            RunnerSupervisor::new(events, None, None, Vec::new(), AgentState::new(&seed()));
+        let (_egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(1);
+        let mut pending = None;
+        let mut backoff = INITIAL_BACKOFF;
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let config = config();
+        let credential = credential();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            connect_and_serve(
+                &config,
+                &credential,
+                &supervisor,
+                &mut egress_rx,
+                &mut pending,
+                &mut backoff,
+                &[],
+                &shutdown,
+                &state,
+            ),
+        )
+        .await
+        .expect("must return promptly once already cancelled, not attempt a connect");
+
+        assert!(result.is_ok());
+        assert_eq!(
+            state.current().enrollment,
+            control_proto::Enrollment::Unenrolled as i32,
+            "must never have written Attaching/Attached"
+        );
     }
 }
