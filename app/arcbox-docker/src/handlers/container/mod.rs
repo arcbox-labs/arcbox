@@ -147,6 +147,28 @@ pub async fn stop_container(
     Ok(response)
 }
 
+/// Whether a `POST /containers/{id}/kill?signal=…` request terminates the
+/// container, so its host networking should be torn down.
+///
+/// Docker returns 204 for *any* delivered signal — e.g. `SIGHUP` to reload
+/// nginx or `SIGUSR1` — not just fatal ones, so teardown must key off the
+/// signal, not the 204. Only the default (no `signal` = SIGKILL) and an
+/// explicit SIGKILL are guaranteed to stop the container; anything else is
+/// treated as non-terminating (SIGTERM may be caught; SIGHUP/SIGUSR* are
+/// reload/notify signals). If such a signal does end up killing the container,
+/// the death-event teardown path removes its host state instead.
+fn kill_terminates_container(uri: &Uri) -> bool {
+    match query_param(uri, "signal") {
+        None => true, // Docker's default kill signal is SIGKILL.
+        Some(signal) => {
+            let signal = signal.trim();
+            signal.eq_ignore_ascii_case("SIGKILL")
+                || signal.eq_ignore_ascii_case("KILL")
+                || signal == "9"
+        }
+    }
+}
+
 /// Kill a container and tear down its port forwarding + DNS.
 ///
 /// # Errors
@@ -169,10 +191,12 @@ pub async fn kill_container(
     // Resolve canonical ID before proxy — kill with --rm triggers auto-remove.
     let canonical = resolve_or_raw_for_teardown(&state, &uri).await;
 
+    let terminates = kill_terminates_container(&uri);
     let response = proxy_to_system_vm(&state, &uri, req).await?;
 
-    // Docker kill returns 204 on success.
-    if response.status().as_u16() == 204 {
+    // Docker kill returns 204 for any delivered signal; only tear down when the
+    // signal actually terminates the container (see `kill_terminates_container`).
+    if response.status().as_u16() == 204 && terminates {
         if let Some(canonical) = canonical {
             state.runtime.stop_port_forwarding_by_id(&canonical).await;
             state.runtime.deregister_dns_by_id(&canonical).await;
