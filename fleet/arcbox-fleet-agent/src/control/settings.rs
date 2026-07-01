@@ -7,15 +7,14 @@ use std::path::Path;
 
 use arcbox_fleet_control_proto::v1::fleet_settings_service_server::FleetSettingsService as FleetSettingsServiceTrait;
 use arcbox_fleet_control_proto::v1::{
-    self as control_proto, GetSettingsRequest, GetSettingsResponse, UpdateSettingsRequest,
-    UpdateSettingsResponse,
+    GetSettingsRequest, GetSettingsResponse, UpdateSettingsRequest, UpdateSettingsResponse,
 };
 use tonic::transport::Endpoint;
 use tonic::{Request, Response, Status};
 
 use crate::config::DockerMode;
 use crate::settings::SettingsStore;
-use crate::state::AgentState;
+use crate::state::{AgentState, docker_mode_from_wire};
 
 pub struct SettingsService {
     state: AgentState,
@@ -59,10 +58,7 @@ impl FleetSettingsServiceTrait for SettingsService {
             self.state.set_gateway_target(v);
         }
         if let Some(v) = req.docker_mode {
-            let mode: DockerMode = control_proto::DockerMode::try_from(v)
-                .unwrap_or(control_proto::DockerMode::Unspecified)
-                .into();
-            self.state.set_docker_mode_target(mode);
+            self.state.set_docker_mode_target(docker_mode_from_wire(v));
         }
         if let Some(v) = &req.runner_script {
             let path = (!v.is_empty()).then_some(Path::new(v));
@@ -115,11 +111,9 @@ fn validate(req: &UpdateSettingsRequest, state: &AgentState) -> Result<(), Strin
     // (e.g. just load_ceiling) rejected because of it.
     if req.docker_mode.is_some() || req.runner_script.is_some() {
         let persisted = state.persisted_settings();
-        let effective_docker_mode = req.docker_mode.map_or(persisted.docker_mode, |v| {
-            control_proto::DockerMode::try_from(v)
-                .unwrap_or(control_proto::DockerMode::Unspecified)
-                .into()
-        });
+        let effective_docker_mode = req
+            .docker_mode
+            .map_or(persisted.docker_mode, docker_mode_from_wire);
         let effective_runner_script = req.runner_script.clone().unwrap_or_else(|| {
             persisted
                 .runner_script
@@ -146,6 +140,8 @@ fn validate(req: &UpdateSettingsRequest, state: &AgentState) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests {
+    use arcbox_fleet_control_proto::v1 as control_proto;
+
     use super::*;
     use crate::settings::PersistedSettings;
 

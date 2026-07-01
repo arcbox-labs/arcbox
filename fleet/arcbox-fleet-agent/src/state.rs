@@ -56,7 +56,7 @@ impl From<arcbox_fleet_control_proto::v1::DockerMode> for DockerMode {
 /// Parse a wire `DockerMode` i32 that may not be a recognized variant
 /// (an older/newer client sent something this build doesn't know) into the
 /// internal type, falling back to `Auto`.
-fn docker_mode_from_wire(raw: i32) -> DockerMode {
+pub fn docker_mode_from_wire(raw: i32) -> DockerMode {
     arcbox_fleet_control_proto::v1::DockerMode::try_from(raw)
         .unwrap_or(arcbox_fleet_control_proto::v1::DockerMode::Unspecified)
         .into()
