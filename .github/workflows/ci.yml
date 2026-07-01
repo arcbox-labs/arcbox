@@ -59,6 +59,28 @@ jobs:
       - name: Install Protobuf compiler
         run: brew install protobuf
 
+      - name: Set up buf
+        uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ github.token }}
+
+      # The desktop and agent ship/self-update independently, so the
+      # control-plane wire contract must only ever change additively. Fail any
+      # PR that breaks it against the base branch. Self-bootstrapping: inert
+      # until the proto first lands on the base branch, so it never blocks the
+      # PR that introduces it.
+      - name: Check control-plane proto for breaking changes
+        if: github.event_name == 'pull_request'
+        run: |
+          base="${{ github.base_ref }}"
+          module=fleet/arcbox-fleet-control-proto
+          git fetch --depth=1 origin "$base"
+          if git cat-file -e "FETCH_HEAD:$module/buf.yaml" 2>/dev/null; then
+            buf breaking "$module" --against ".git#ref=FETCH_HEAD,subdir=$module"
+          else
+            echo "control-plane proto not yet on '$base'; breaking check inactive"
+          fi
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
