@@ -84,11 +84,16 @@ pub fn telemetry() -> HostTelemetry {
 ///   `docker`. On Apple Silicon that is arm64 (native) plus amd64 (Rosetta).
 /// - **Host-runner capability.** The native `(os, arch)` served by the
 ///   pre-installed runner, backed by `host_runner`. Omitted when no runner
-///   directory is configured, or when Linux jobs are already Docker-served on
+///   script is configured, or when Linux jobs are already Docker-served on
 ///   this host (a Linux host with Docker). macOS is `host_runner` today; the
 ///   `vm` backend arrives with VM isolation.
-pub fn capabilities(runner_dir_present: bool, docker_arches: &[String]) -> Vec<Capability> {
-    build_capabilities(&host_os(), &host_arch(), runner_dir_present, docker_arches)
+pub fn capabilities(runner_script_present: bool, docker_arches: &[String]) -> Vec<Capability> {
+    build_capabilities(
+        &host_os(),
+        &host_arch(),
+        runner_script_present,
+        docker_arches,
+    )
 }
 
 /// Platform-independent core of [`capabilities`], taking the native `(os, arch)`
@@ -96,7 +101,7 @@ pub fn capabilities(runner_dir_present: bool, docker_arches: &[String]) -> Vec<C
 fn build_capabilities(
     native_os: &str,
     native_arch: &str,
-    runner_dir_present: bool,
+    runner_script_present: bool,
     docker_arches: &[String],
 ) -> Vec<Capability> {
     let mut caps = Vec::new();
@@ -110,7 +115,7 @@ fn build_capabilities(
     }
 
     let host_served_by_docker = native_os == "linux" && !docker_arches.is_empty();
-    if runner_dir_present && !host_served_by_docker {
+    if runner_script_present && !host_served_by_docker {
         caps.push(Capability {
             os: native_os.to_owned(),
             arch: native_arch.to_owned(),
@@ -171,8 +176,8 @@ mod tests {
     }
 
     #[test]
-    fn omits_host_capability_without_runner_dir() {
-        // Docker-only macOS: no runner dir means no darwin capability.
+    fn omits_host_capability_without_runner_script() {
+        // Docker-only macOS: no runner script means no darwin capability.
         let caps = build_capabilities("darwin", "arm64", false, &["arm64".to_owned()]);
         assert_eq!(caps.len(), 1);
         assert_eq!(triple(&caps[0]), ("linux", "arm64", Backend::Docker as i32));
