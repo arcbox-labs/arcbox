@@ -80,6 +80,7 @@ pub async fn serve(
 
     info!(socket = %socket_path.display(), "control-plane server listening");
 
+    let docker = supervisor.docker();
     Server::builder()
         .add_service(FleetLifecycleServiceServer::new(LifecycleService::new(
             supervisor,
@@ -90,6 +91,7 @@ pub async fn serve(
         .add_service(FleetSettingsServiceServer::new(SettingsService::new(
             state,
             settings_store,
+            docker,
         )))
         .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
         .await
@@ -211,6 +213,15 @@ impl AgentSupervisor {
             self.config.credentials_path(),
             gateway,
         )
+    }
+
+    /// A handle to the process-lifetime Docker runtime, if configured — read
+    /// by [`serve`] and passed to `FleetSettingsService` to validate a
+    /// candidate `runner_image` (see `control::settings`). Fixed at
+    /// construction and unaffected by the attach/detach cycle: `docker_mode`
+    /// changes are restart-scoped, so this is never stale.
+    fn docker(&self) -> Option<DockerRunner> {
+        self.docker.clone()
     }
 
     /// Spawn the attach task for `credential` and build its [`Attachment`].
