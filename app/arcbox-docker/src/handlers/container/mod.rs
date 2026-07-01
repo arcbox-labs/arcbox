@@ -5,7 +5,7 @@ use crate::port_bindings::parse_port_bindings;
 use crate::routing::{query_param, route_container_create};
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
-use axum::http::{HeaderMap, Method, Request, Uri};
+use axum::http::{Request, Uri};
 use axum::response::Response;
 use bytes::Bytes;
 use std::net::IpAddr;
@@ -311,38 +311,7 @@ async fn setup_container_networking(state: &AppState, container_id: &str) {
 
 /// Fetches the inspect JSON body for a container from guest dockerd.
 async fn inspect_container_body(state: &AppState, container_id: &str) -> Option<Bytes> {
-    let inspect_path = format!("/containers/{container_id}/json");
-    let inspect_resp = match crate::proxy::proxy_to_guest_pooled(
-        state.proxy.client(),
-        Method::GET,
-        &inspect_path,
-        &HeaderMap::new(),
-        Bytes::new(),
-    )
-    .await
-    {
-        Ok(resp) if resp.status().is_success() => resp,
-        Ok(resp) => {
-            tracing::debug!(
-                "Inspect container {} returned status {}",
-                container_id,
-                resp.status()
-            );
-            return None;
-        }
-        Err(e) => {
-            tracing::debug!("Failed to inspect container {}: {}", container_id, e);
-            return None;
-        }
-    };
-
-    match http_body_util::BodyExt::collect(inspect_resp.into_body()).await {
-        Ok(collected) => Some(collected.to_bytes()),
-        Err(e) => {
-            tracing::debug!("Failed to read inspect body for {}: {}", container_id, e);
-            None
-        }
-    }
+    crate::guest_query::inspect_container(state.proxy.client(), container_id).await
 }
 
 /// Configures port forwarding from pre-fetched inspect JSON.
@@ -572,27 +541,8 @@ async fn resolve_or_raw_for_teardown(state: &AppState, uri: &Uri) -> Option<Stri
 /// Resolves a container name, short ID, or full ID to the canonical full ID
 /// by inspecting the container on guest dockerd.
 async fn resolve_canonical_id(state: &AppState, id: &str) -> Option<String> {
-    let inspect_path = format!("/containers/{id}/json");
-    let resp = crate::proxy::proxy_to_guest_pooled(
-        state.proxy.client(),
-        Method::GET,
-        &inspect_path,
-        &HeaderMap::new(),
-        Bytes::new(),
-    )
-    .await
-    .ok()?;
-
-    if !resp.status().is_success() {
-        return None;
-    }
-
-    let body_bytes = http_body_util::BodyExt::collect(resp.into_body())
-        .await
-        .ok()?
-        .to_bytes();
-
-    extract_canonical_id_from_inspect(&body_bytes)
+    let body = crate::guest_query::inspect_container(state.proxy.client(), id).await?;
+    extract_canonical_id_from_inspect(&body)
 }
 
 #[cfg(test)]

@@ -44,6 +44,7 @@
 pub mod api;
 pub mod context;
 pub mod error;
+pub mod guest_query;
 pub mod handlers;
 pub(crate) mod host_path;
 mod host_reconciler;

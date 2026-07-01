@@ -196,25 +196,12 @@ async fn recover_container_networking(
     runtime: &Arc<Runtime>,
     setup_state: &Arc<arcbox_api::SetupState>,
 ) {
-    use arcbox_docker::proxy::VsockConnector;
-    use axum::http::{HeaderMap, Method};
-    use bytes::Bytes;
+    use arcbox_docker::guest_query;
+    use arcbox_docker::proxy::{GuestHttpClient, VsockConnector};
 
-    let connector = VsockConnector::new(Arc::clone(runtime));
-    let resp = match arcbox_docker::proxy::proxy_to_guest(
-        &connector,
-        Method::GET,
-        "/containers/json",
-        &HeaderMap::new(),
-        Bytes::new(),
-    )
-    .await
-    {
-        Ok(resp) if resp.status().is_success() => resp,
-        Ok(resp) => {
-            tracing::debug!("Container list returned status {}", resp.status());
-            return;
-        }
+    let client = GuestHttpClient::new(Arc::new(VsockConnector::new(Arc::clone(runtime))));
+    let running = match guest_query::list_running_container_ids(&client).await {
+        Ok(ids) => ids,
         Err(e) => {
             tracing::debug!("Failed to list containers for networking recovery: {}", e);
             return;
@@ -224,46 +211,11 @@ async fn recover_container_networking(
     // Successfully queried the guest VM — it is running.
     setup_state.set_vm_running(true);
 
-    let body_bytes = match http_body_util::BodyExt::collect(resp.into_body()).await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            tracing::debug!("Failed to read container list body: {}", e);
-            return;
-        }
-    };
-
-    let containers: Vec<serde_json::Value> = match serde_json::from_slice(&body_bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!("Failed to parse container list JSON: {}", e);
-            return;
-        }
-    };
-
     let mut recovered_dns = 0u32;
     let mut recovered_ports = 0u32;
-    for container in &containers {
-        let Some(id) = container.get("Id").and_then(|v| v.as_str()) else {
+    for id in &running {
+        let Some(inspect_body) = guest_query::inspect_container(&client, id).await else {
             continue;
-        };
-
-        let inspect_path = format!("/containers/{id}/json");
-        let inspect_resp = match arcbox_docker::proxy::proxy_to_guest(
-            &connector,
-            Method::GET,
-            &inspect_path,
-            &HeaderMap::new(),
-            Bytes::new(),
-        )
-        .await
-        {
-            Ok(resp) if resp.status().is_success() => resp,
-            _ => continue,
-        };
-
-        let inspect_body = match http_body_util::BodyExt::collect(inspect_resp.into_body()).await {
-            Ok(collected) => collected.to_bytes(),
-            Err(_) => continue,
         };
 
         if let Some((aliases, ip)) =

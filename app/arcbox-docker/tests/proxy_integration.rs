@@ -8,8 +8,8 @@ mod support;
 use support::mock_guest::{self, MockGuest};
 
 use arcbox_docker::proxy::{
-    GuestConnector, GuestHttpClient, VsockShutdown, VsockStream, proxy_to_guest,
-    proxy_to_guest_pooled, proxy_to_guest_stream, proxy_to_guest_stream_pooled, proxy_with_upgrade,
+    GuestConnector, GuestHttpClient, VsockShutdown, VsockStream, proxy_to_guest_pooled,
+    proxy_to_guest_stream_pooled, proxy_with_upgrade,
 };
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri, header};
@@ -66,16 +66,17 @@ async fn setup() -> (UnixSocketConnector, MockGuest, TempDir) {
 }
 
 // =============================================================================
-// Tests — proxy_to_guest (buffered forwarding)
+// Tests — proxy_to_guest_pooled (buffered forwarding)
 // =============================================================================
 
 #[tokio::test]
 async fn proxy_to_guest_echoes_body() {
     let (connector, guest, _tmp) = setup().await;
+    let client = GuestHttpClient::new(Arc::new(connector));
 
     let payload = r#"{"Image":"alpine:latest"}"#;
-    let resp = proxy_to_guest(
-        &connector,
+    let resp = proxy_to_guest_pooled(
+        &client,
         Method::POST,
         "/containers/create",
         &HeaderMap::new(),
@@ -93,9 +94,10 @@ async fn proxy_to_guest_echoes_body() {
 #[tokio::test]
 async fn proxy_to_guest_empty_body() {
     let (connector, guest, _tmp) = setup().await;
+    let client = GuestHttpClient::new(Arc::new(connector));
 
-    let resp = proxy_to_guest(
-        &connector,
+    let resp = proxy_to_guest_pooled(
+        &client,
         Method::GET,
         "/containers/json",
         &HeaderMap::new(),
@@ -160,12 +162,13 @@ async fn pooled_proxy_discards_session_when_body_is_dropped_early() {
 }
 
 // =============================================================================
-// Tests — proxy_to_guest_stream (streaming forwarding)
+// Tests — proxy_to_guest_stream_pooled (streaming forwarding)
 // =============================================================================
 
 #[tokio::test]
 async fn proxy_stream_forwards_body() {
     let (connector, guest, _tmp) = setup().await;
+    let client = GuestHttpClient::new(Arc::new(connector));
 
     let payload = r#"{"Name":"test-volume"}"#;
     let uri: Uri = "/volumes/create".parse().unwrap();
@@ -176,7 +179,9 @@ async fn proxy_stream_forwards_body() {
         .body(Body::from(payload))
         .unwrap();
 
-    let resp = proxy_to_guest_stream(&connector, &uri, req).await.unwrap();
+    let resp = proxy_to_guest_stream_pooled(&client, &uri, req)
+        .await
+        .unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
