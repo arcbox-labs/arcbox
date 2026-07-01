@@ -79,6 +79,7 @@ members = [
     # Fleet (cross-platform runner agent, MIT OR Apache-2.0)
     # ============================================
     "fleet/arcbox-fleet-proto",
+    "fleet/arcbox-fleet-control-proto",
     "fleet/arcbox-fleet-agent",
 ]
 
@@ -246,6 +247,7 @@ arcbox-protocol = { version = "0.4.17", path = "rpc/arcbox-protocol" } # x-relea
 arcbox-grpc = { version = "0.4.17", path = "rpc/arcbox-grpc" } # x-release-please-version
 arcbox-transport = { version = "0.4.17", path = "rpc/arcbox-transport" } # x-release-please-version
 arcbox-fleet-proto = { version = "0.4.17", path = "fleet/arcbox-fleet-proto" } # x-release-please-version
+arcbox-fleet-control-proto = { version = "0.4.17", path = "fleet/arcbox-fleet-control-proto" } # x-release-please-version
 arcbox-docker = { version = "0.4.17", path = "app/arcbox-docker" } # x-release-please-version
 arcbox-helper = { version = "0.4.17", path = "app/arcbox-helper" } # x-release-please-version
 arcbox-core = { version = "0.4.17", path = "app/arcbox-core" } # x-release-please-version
