@@ -9,9 +9,10 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use arcbox_fleet_control_proto::v1 as control_proto;
 use arcbox_fleet_proto::v1::fleet_gateway_service_client::FleetGatewayServiceClient;
 use arcbox_fleet_proto::v1::{
-    AttachRequest, Capability, Heartbeat, attach_request, attach_response,
+    AttachRequest, Capability, Heartbeat, HostTelemetry, attach_request, attach_response,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -25,6 +26,7 @@ use crate::credentials::Credential;
 use crate::docker;
 use crate::host;
 use crate::runner::RunnerSupervisor;
+use crate::state::AgentState;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// How often to resend verdicts still awaiting an `OfferVerdictAck`. Comfortably
@@ -41,6 +43,19 @@ const PROTOCOL_VERSION_HEADER: &str = "x-arcbox-protocol-version";
 /// generous ceiling rather than an expected wait.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 
+/// Convert a gateway-facing telemetry reading into its control-plane
+/// counterpart. A plain function, not `From`: both `HostTelemetry` types
+/// are generated in other crates, so Rust's orphan rule blocks implementing
+/// a foreign trait for two foreign types here.
+fn telemetry_to_control(t: &HostTelemetry) -> control_proto::HostTelemetry {
+    control_proto::HostTelemetry {
+        load_avg_1m: t.load_avg_1m,
+        cpu_count: t.cpu_count,
+        mem_total_mib: t.mem_total_mib,
+        mem_available_mib: t.mem_available_mib,
+    }
+}
+
 /// Build the [`RunnerSupervisor`] and its egress queue, and start the
 /// process-scoped verdict-resend loop.
 ///
@@ -52,6 +67,7 @@ pub fn spawn_supervisor(
     config: &AgentConfig,
     docker: Option<docker::DockerRunner>,
     capabilities: Vec<Capability>,
+    state: AgentState,
 ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
     let (egress_tx, egress_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
     let supervisor = RunnerSupervisor::new(
@@ -61,6 +77,7 @@ pub fn spawn_supervisor(
         capabilities,
         config.load_ceiling,
         config.mem_floor_mib,
+        state,
     );
 
     // Process-scoped: resend unacked verdicts across reconnects. Re-emitted
@@ -80,6 +97,12 @@ pub fn spawn_supervisor(
 /// their verdicts reach the next live stream. On shutdown the loop exits and
 /// hands off to [`RunnerSupervisor::shutdown`], which tears down any
 /// in-flight runners.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the reconnect loop genuinely needs all of: endpoint config, credential, the \
+              persistent supervisor, the cross-reconnect egress queue, advertised \
+              capabilities, the shutdown token, and the observable state handle"
+)]
 pub async fn run(
     config: AgentConfig,
     credential: Credential,
@@ -87,6 +110,7 @@ pub async fn run(
     mut egress_rx: mpsc::Receiver<AttachRequest>,
     capabilities: Vec<Capability>,
     shutdown: CancellationToken,
+    state: AgentState,
 ) -> Result<()> {
     let mut backoff = INITIAL_BACKOFF;
     // An event pulled from the egress queue but not yet delivered when the
@@ -95,6 +119,7 @@ pub async fn run(
     let mut pending: Option<AttachRequest> = None;
 
     while !shutdown.is_cancelled() {
+        state.set_enrollment(control_proto::Enrollment::Attaching, &credential.machine_id);
         let outcome = connect_and_serve(
             &config,
             &credential,
@@ -104,6 +129,7 @@ pub async fn run(
             &mut backoff,
             &capabilities,
             &shutdown,
+            &state,
         )
         .await;
         // A shutdown during the connection is a clean exit, not a failure to log
@@ -143,8 +169,8 @@ pub async fn run(
     clippy::too_many_arguments,
     reason = "one connection's lifecycle genuinely needs all of: endpoint config, \
               credential, the persistent supervisor, the cross-reconnect egress queue \
-              and its pending slot, the mutable backoff, advertised capabilities, and \
-              the shutdown token"
+              and its pending slot, the mutable backoff, advertised capabilities, the \
+              shutdown token, and the observable state handle"
 )]
 async fn connect_and_serve(
     config: &AgentConfig,
@@ -155,6 +181,7 @@ async fn connect_and_serve(
     backoff: &mut Duration,
     capabilities: &[Capability],
     shutdown: &CancellationToken,
+    state: &AgentState,
 ) -> Result<()> {
     // A credential enrolled via the local control-plane's `Enroll` may carry
     // a gateway override; the CLI's `enroll` subcommand never sets one, so
@@ -193,6 +220,7 @@ async fn connect_and_serve(
         .context("Attach RPC failed")?
         .into_inner();
     *backoff = INITIAL_BACKOFF;
+    state.set_enrollment(control_proto::Enrollment::Attached, &credential.machine_id);
     info!("attached to gateway");
 
     // Re-send the event stranded by the previous connection before anything else.
@@ -203,7 +231,7 @@ async fn connect_and_serve(
         }
     }
 
-    let heartbeat = spawn_heartbeat(req_tx.clone(), capabilities.to_vec());
+    let heartbeat = spawn_heartbeat(req_tx.clone(), capabilities.to_vec(), state.clone());
 
     let outcome = loop {
         tokio::select! {
@@ -275,15 +303,18 @@ fn spawn_verdict_resend(supervisor: RunnerSupervisor) -> tokio::task::JoinHandle
 fn spawn_heartbeat(
     outbound: mpsc::Sender<AttachRequest>,
     capabilities: Vec<Capability>,
+    state: AgentState,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             ticker.tick().await;
+            let telemetry = host::telemetry();
+            state.set_telemetry(telemetry_to_control(&telemetry));
             let msg = attach_request::Msg::Heartbeat(Heartbeat {
                 capabilities: capabilities.clone(),
                 host_info_json: host::host_info_json(),
-                telemetry: Some(host::telemetry()),
+                telemetry: Some(telemetry),
             });
             if outbound
                 .send(AttachRequest { msg: Some(msg) })

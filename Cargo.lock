@@ -510,6 +510,7 @@ dependencies = [
  "arcbox-fleet-control-proto",
  "arcbox-fleet-proto",
  "arcbox-logging",
+ "async-stream",
  "bollard",
  "clap",
  "command-group",

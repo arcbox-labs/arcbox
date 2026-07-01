@@ -7,6 +7,7 @@
 
 pub mod client;
 mod lifecycle;
+mod watch;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -14,8 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use arcbox_fleet_control_proto::v1::ConnectionState;
 use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_server::FleetLifecycleServiceServer;
+use arcbox_fleet_control_proto::v1::fleet_state_service_server::FleetStateServiceServer;
+use arcbox_fleet_control_proto::v1::{ConnectionState, Enrollment};
 use arcbox_fleet_proto::v1::Capability;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -29,8 +31,10 @@ use crate::config::AgentConfig;
 use crate::credentials::{Credential, CredentialStore};
 use crate::docker::DockerRunner;
 use crate::runner::RunnerSupervisor;
+use crate::state::AgentState;
 use crate::{attach, enroll};
 use lifecycle::LifecycleService;
+use watch::WatchService;
 
 /// Bind `agent.sock` and serve `FleetLifecycleService` until `shutdown`
 /// fires. Mirrors `arcbox-daemon`'s `services::start_grpc` (remove-before-bind,
@@ -40,6 +44,7 @@ use lifecycle::LifecycleService;
 pub async fn serve(
     socket_path: &Path,
     supervisor: Arc<AgentSupervisor>,
+    state: AgentState,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let _ = std::fs::remove_file(socket_path);
@@ -60,6 +65,7 @@ pub async fn serve(
         .add_service(FleetLifecycleServiceServer::new(LifecycleService::new(
             supervisor,
         )))
+        .add_service(FleetStateServiceServer::new(WatchService::new(state)))
         .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
         .await
         .context("control-plane server error")
@@ -71,10 +77,11 @@ pub async fn serve(
 /// `SHUTDOWN_GRACE`; this only needs to cover that plus scheduling overhead.
 const DISCONNECT_GRACE: Duration = Duration::from_secs(20);
 
-/// A live attachment to the gateway: the credential it authenticated with,
-/// the admission authority in `admit()`, and the handle to stop it.
+/// A live attachment to the gateway: the admission authority in `admit()`
+/// and the handle to stop it. The credential itself isn't retained here —
+/// nothing reads it back once attaching starts; `machine_id` observability
+/// goes through [`AgentState`] instead.
 struct Attachment {
-    credential: Credential,
     supervisor: RunnerSupervisor,
     /// Child of [`AgentSupervisor::process_shutdown`]: cancelling it stops
     /// only this attachment (`Disconnect`); cancelling the parent (process
@@ -103,6 +110,10 @@ pub struct AgentSupervisor {
     /// `shutdown` is a child of this token.
     process_shutdown: CancellationToken,
     state: Mutex<State>,
+    /// Observable state mirrored to `FleetStateService.Watch` subscribers —
+    /// the single source of truth `status()` reads from below, so it never
+    /// disagrees with what a `Watch` subscriber sees.
+    agent_state: AgentState,
 }
 
 impl AgentSupervisor {
@@ -114,6 +125,7 @@ impl AgentSupervisor {
         capabilities: Vec<Capability>,
         credential_store: CredentialStore,
         process_shutdown: CancellationToken,
+        agent_state: AgentState,
     ) -> Result<Self> {
         let existing = credential_store.load()?;
         let this = Self {
@@ -123,6 +135,7 @@ impl AgentSupervisor {
             credential_store,
             process_shutdown,
             state: Mutex::new(State::Unenrolled),
+            agent_state,
         };
         if let Some(credential) = existing {
             info!(machine_id = %credential.machine_id, "starting fleet agent (credential on disk)");
@@ -133,19 +146,25 @@ impl AgentSupervisor {
 
     /// Spawn the attach task for `credential` and build its [`Attachment`].
     fn attach(&self, credential: Credential) -> Attachment {
-        let (supervisor, egress_rx) =
-            attach::spawn_supervisor(&self.config, self.docker.clone(), self.capabilities.clone());
+        self.agent_state
+            .set_enrollment(Enrollment::Attaching, &credential.machine_id);
+        let (supervisor, egress_rx) = attach::spawn_supervisor(
+            &self.config,
+            self.docker.clone(),
+            self.capabilities.clone(),
+            self.agent_state.clone(),
+        );
         let shutdown = self.process_shutdown.child_token();
         let task = tokio::spawn(attach::run(
             self.config.clone(),
-            credential.clone(),
+            credential,
             supervisor.clone(),
             egress_rx,
             self.capabilities.clone(),
             shutdown.clone(),
+            self.agent_state.clone(),
         ));
         Attachment {
-            credential,
             supervisor,
             shutdown,
             task,
@@ -203,6 +222,7 @@ impl AgentSupervisor {
             };
             attachment
         };
+        self.agent_state.set_enrollment(Enrollment::Unenrolled, "");
 
         attachment.shutdown.cancel();
         match tokio::time::timeout(DISCONNECT_GRACE, attachment.task).await {
@@ -238,15 +258,23 @@ impl AgentSupervisor {
         }
     }
 
-    /// Current lifecycle state and machine id (empty when unenrolled).
+    /// Current lifecycle state and machine id (empty when unenrolled),
+    /// derived from [`AgentState`] rather than the resource-holding
+    /// `Mutex<State>` above — the two must agree, and `AgentState` is the
+    /// one `FleetStateService.Watch` subscribers also read, so there is
+    /// exactly one place this can disagree with itself.
     pub async fn status(&self) -> (ConnectionState, String) {
-        match &*self.state.lock().await {
-            State::Unenrolled => (ConnectionState::Unenrolled, String::new()),
-            State::Attached(a) if a.supervisor.is_draining() => {
-                (ConnectionState::Draining, a.credential.machine_id.clone())
+        let snapshot = self.agent_state.current();
+        let enrollment =
+            Enrollment::try_from(snapshot.enrollment).unwrap_or(Enrollment::Unenrolled);
+        let state = match enrollment {
+            Enrollment::Unspecified | Enrollment::Unenrolled => ConnectionState::Unenrolled,
+            Enrollment::Attaching | Enrollment::Attached if snapshot.draining => {
+                ConnectionState::Draining
             }
-            State::Attached(a) => (ConnectionState::Enrolled, a.credential.machine_id.clone()),
-        }
+            Enrollment::Attaching | Enrollment::Attached => ConnectionState::Enrolled,
+        };
+        (state, snapshot.machine_id)
     }
 
     /// Await the current attach task's completion, if one is running.
