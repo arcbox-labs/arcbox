@@ -89,10 +89,20 @@ impl DockerApiServer {
         listener: UnixListener,
         shutdown: CancellationToken,
     ) -> Result<()> {
+        let connector = Arc::new(VsockConnector::new(Arc::clone(&self.runtime)));
+
+        // Backstop host-networking teardown for containers that stop without a
+        // stop/kill/remove API call (natural exit, --rm, prune, OOM, guest-side
+        // stop). The handlers do immediate teardown; this reconciles the rest.
+        crate::host_reconciler::spawn(
+            Arc::clone(&self.runtime),
+            Arc::clone(&connector) as Arc<dyn crate::proxy::GuestConnector>,
+            shutdown.clone(),
+        );
+
         // Wrap the Axum Router with a MapRequestLayer that strips API version
         // prefixes *before* route matching. `Router::layer` runs after routing
         // and cannot be used for URI rewriting.
-        let connector = Arc::new(VsockConnector::new(Arc::clone(&self.runtime)));
         let version_layer = tower::util::MapRequestLayer::new(strip_api_version_prefix);
         let app = version_layer.layer(
             create_router(Arc::clone(&self.runtime), connector).layer(TraceLayer::new_for_http()),
