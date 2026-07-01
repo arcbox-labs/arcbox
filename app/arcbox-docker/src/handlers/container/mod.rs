@@ -475,21 +475,48 @@ pub async fn rename_container(
 
     if response.status().is_success() {
         if let Some(ref canonical) = canonical {
-            // Remove the old DNS entry (and the old name alias), then inspect
-            // — using the canonical ID, which survives rename — to get the new
-            // name + IP, and re-register both.
-            state.runtime.deregister_dns_by_id(canonical).await;
-
-            if let Some(body_bytes) = inspect_container_body(&state, canonical).await {
-                if let Some(name) = extract_container_name(&body_bytes) {
+            // Inspect FIRST (by canonical ID, which survives rename) and only
+            // replace the old registration once usable fresh data is in hand.
+            // Tearing down before a failed/unusable inspect would leave the
+            // container with no DNS entry and no resolvable alias at all —
+            // stale old-name DNS is strictly better than none.
+            let refreshed = match inspect_container_body(&state, canonical).await {
+                Some(body_bytes) => {
+                    let name = extract_container_name(&body_bytes);
+                    let dns = extract_container_dns_info(&body_bytes);
+                    if name.is_none() && dns.is_none() {
+                        false
+                    } else {
+                        state.runtime.deregister_dns_by_id(canonical).await;
+                        if let Some(name) = name.as_deref() {
+                            state
+                                .runtime
+                                .register_container_alias(name, canonical)
+                                .await;
+                        }
+                        if let Some((aliases, ip)) = dns {
+                            state.runtime.register_dns(canonical, &aliases, ip).await;
+                        }
+                        true
+                    }
+                }
+                None => false,
+            };
+            if !refreshed {
+                // Keep the old registration, but make sure the NEW name
+                // (known from the query) resolves for later lifecycle calls —
+                // otherwise stop/rm by the new name would be registry misses
+                // and their teardown a no-op.
+                if let Some(name) = new_name.as_deref() {
                     state
                         .runtime
-                        .register_container_alias(&name, canonical)
+                        .register_container_alias(name, canonical)
                         .await;
                 }
-                if let Some((aliases, ip)) = extract_container_dns_info(&body_bytes) {
-                    state.runtime.register_dns(canonical, &aliases, ip).await;
-                }
+                tracing::warn!(
+                    container_id = %canonical,
+                    "post-rename inspect unusable; keeping previous DNS registration"
+                );
             }
         }
     }

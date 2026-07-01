@@ -63,18 +63,23 @@ impl ProxyState {
     }
 
     /// Observes the System VM incarnation counter; when it advanced since the
-    /// last observation, drops the cached readiness and the pooled connections
+    /// last observation, drops the pooled connections and the cached readiness
     /// (both point at the stopped VM). Returns whether a reset happened.
     ///
     /// Shared by the request path ([`Self::ensure_endpoint_verified`]) and the
     /// host-networking reconciler, so both react to a restart through the same
     /// pool.
     pub(crate) fn reset_if_restarted(&self, generation: u64) -> bool {
-        let restarted = self.endpoint_readiness.observe_generation(generation);
-        if restarted {
-            self.guest_http_client.reset();
+        if !self.endpoint_readiness.advance_generation(generation) {
+            return false;
         }
-        restarted
+        // Drop the stale pool BEFORE flipping readiness to Unverified: a
+        // concurrent verifier that observes Unverified starts its `_ping`
+        // immediately, and it must dial through the fresh client — resetting
+        // afterwards would let it race onto a connection to the dead VM.
+        self.guest_http_client.reset();
+        self.endpoint_readiness.invalidate();
+        true
     }
 
     pub(crate) fn invalidate_endpoint(&self) {
@@ -133,20 +138,16 @@ impl EndpointReadiness {
         }
     }
 
-    /// Records the current VM incarnation and, when it advanced past the last
-    /// one seen (the System VM restarted in between), invalidates the cached
-    /// readiness and reports the change so the caller can drop stale pooled
-    /// connections too.
+    /// Records the current VM incarnation, returning whether it advanced past
+    /// the last one seen (i.e. the System VM restarted in between). The caller
+    /// owns the resulting reset — see [`ProxyState::reset_if_restarted`] for
+    /// the required pool-then-readiness ordering.
     ///
     /// `fetch_max` (not `swap`) keeps the counter monotonic: a request that
     /// read an older incarnation before a restart and lands here late cannot
     /// regress the counter and trigger a spurious extra pool reset.
-    fn observe_generation(&self, generation: u64) -> bool {
-        if self.generation.fetch_max(generation, Ordering::AcqRel) >= generation {
-            return false;
-        }
-        self.invalidate();
-        true
+    fn advance_generation(&self, generation: u64) -> bool {
+        self.generation.fetch_max(generation, Ordering::AcqRel) < generation
     }
 
     async fn ensure_verified<Prepare, Verify, VerifyFuture>(
@@ -334,54 +335,93 @@ mod tests {
         assert_eq!(readiness.state(), EndpointReadinessState::Unverified);
     }
 
-    #[tokio::test]
-    async fn readiness_generation_change_invalidates_verified_state() {
-        let readiness = EndpointReadiness::new();
+    /// Connector stub for ProxyState tests — never actually dialed, since the
+    /// generation tests drive the readiness state machine directly.
+    struct StubConnector;
 
-        // Verify against the initial incarnation (generation 0).
-        readiness
+    impl super::super::GuestConnector for StubConnector {
+        fn connect(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            hyper_util::rt::TokioIo<arcbox_transport::vsock::VsockStream>,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Err(DockerError::Server("stub connector".into())) })
+        }
+    }
+
+    fn stub_proxy_state() -> ProxyState {
+        ProxyState::new(Arc::new(StubConnector))
+    }
+
+    async fn mark_verified(state: &ProxyState) {
+        state
+            .endpoint_readiness
             .ensure_verified(async { Ok::<(), DockerError>(()) }, || async {
                 Ok::<(), DockerError>(())
             })
             .await
             .unwrap();
-        assert_eq!(readiness.state(), EndpointReadinessState::Verified);
-
-        // Re-observing the same incarnation is a cache hit — no invalidation.
-        assert!(!readiness.observe_generation(0));
-        assert_eq!(readiness.state(), EndpointReadinessState::Verified);
-
-        // A new incarnation (the VM restarted) drops the cached verification.
-        assert!(readiness.observe_generation(7));
-        assert_eq!(readiness.state(), EndpointReadinessState::Unverified);
-
-        // Stable once recorded.
-        assert!(!readiness.observe_generation(7));
     }
 
     #[tokio::test]
-    async fn readiness_generation_is_monotonic_under_stale_readers() {
-        let readiness = EndpointReadiness::new();
+    async fn generation_change_resets_verified_state() {
+        let proxy = stub_proxy_state();
 
-        // A request that read generation 7 observes first.
-        assert!(readiness.observe_generation(7));
+        mark_verified(&proxy).await;
+        assert_eq!(
+            proxy.endpoint_readiness.state(),
+            EndpointReadinessState::Verified
+        );
+
+        // Re-observing the same incarnation is a cache hit — no reset.
+        assert!(!proxy.reset_if_restarted(0));
+        assert_eq!(
+            proxy.endpoint_readiness.state(),
+            EndpointReadinessState::Verified
+        );
+
+        // A new incarnation (the VM restarted) drops the cached verification.
+        assert!(proxy.reset_if_restarted(7));
+        assert_eq!(
+            proxy.endpoint_readiness.state(),
+            EndpointReadinessState::Unverified
+        );
+
+        // Stable once recorded.
+        assert!(!proxy.reset_if_restarted(7));
+    }
+
+    #[tokio::test]
+    async fn generation_is_monotonic_under_stale_readers() {
+        let proxy = stub_proxy_state();
+
+        // A request that read generation 7 resets first.
+        assert!(proxy.reset_if_restarted(7));
 
         // Re-verify, then a late request carrying a STALE generation (read
         // before the restart) lands. It must neither regress the counter nor
-        // trigger a spurious invalidation.
-        readiness
-            .ensure_verified(async { Ok::<(), DockerError>(()) }, || async {
-                Ok::<(), DockerError>(())
-            })
-            .await
-            .unwrap();
-        assert!(!readiness.observe_generation(3));
-        assert_eq!(readiness.state(), EndpointReadinessState::Verified);
+        // trigger a spurious reset.
+        mark_verified(&proxy).await;
+        assert!(!proxy.reset_if_restarted(3));
+        assert_eq!(
+            proxy.endpoint_readiness.state(),
+            EndpointReadinessState::Verified
+        );
 
         // And the next current-generation observation is still a no-op (7 was
         // not overwritten by 3).
-        assert!(!readiness.observe_generation(7));
-        assert_eq!(readiness.state(), EndpointReadinessState::Verified);
+        assert!(!proxy.reset_if_restarted(7));
+        assert_eq!(
+            proxy.endpoint_readiness.state(),
+            EndpointReadinessState::Verified
+        );
     }
 
     #[tokio::test]

@@ -122,6 +122,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_reclaims_alias_only_containers() {
+        let (runtime, _tmp) = test_runtime();
+        // A container with a name alias but no DNS/port state (e.g. started
+        // with --network none): without reclamation every ephemeral --rm run
+        // would leak one alias for the life of the daemon.
+        runtime
+            .register_container_alias("ephemeral", "cafe1234")
+            .await;
+        assert!(
+            runtime
+                .registered_container_ids()
+                .await
+                .contains("cafe1234"),
+            "alias-only containers must be visible to the reconciler"
+        );
+
+        reconcile(&runtime, || async { Ok(HashSet::new()) })
+            .await
+            .unwrap();
+
+        assert!(runtime.registered_container_ids().await.is_empty());
+        assert_eq!(
+            runtime.resolve_registered_container("ephemeral").await,
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn reconcile_is_fail_safe_on_query_error() {
         let (runtime, _tmp) = test_runtime();
         runtime

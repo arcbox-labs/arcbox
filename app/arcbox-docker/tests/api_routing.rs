@@ -110,9 +110,12 @@ async fn proxied_surface_is_not_shadowed() {
 }
 
 #[tokio::test]
-async fn delete_container_named_like_a_collection_is_local() {
-    // `DELETE /containers/json` removes a container literally named "json" and
-    // must reach the local remove handler (host teardown), not 405 nor proxy.
+async fn delete_on_collection_named_paths_is_not_shadowed() {
+    // `DELETE /containers/json` removes a container literally named "json";
+    // this only pins that such requests are not 405-shadowed. Whether DELETE
+    // actually reaches the local remove handler (with its host teardown) is
+    // asserted behaviorally in api_handlers_mock.rs — a routing-level status
+    // check cannot distinguish the local handler from the proxy fallback.
     assert_reaches_backend("DELETE", "/containers/json").await;
     assert_reaches_backend("DELETE", "/containers/prune").await;
 }

@@ -51,6 +51,12 @@ fn lifecycle_routes() -> Vec<MockRoute> {
             body: "",
         },
         MockRoute {
+            method: "DELETE",
+            path: "/containers/web",
+            status: 204,
+            body: "",
+        },
+        MockRoute {
             method: "GET",
             path: "/containers/nope/json",
             status: 404,
@@ -60,17 +66,16 @@ fn lifecycle_routes() -> Vec<MockRoute> {
 }
 
 async fn send(router: &axum::Router, method: &str, uri: &str) -> (StatusCode, bytes::Bytes) {
-    let response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(method)
-                .uri(uri)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
         .unwrap();
+    // Mirror the production `MapRequestLayer(strip_api_version_prefix)` that
+    // wraps the router in DockerApiServer — without it, versioned paths would
+    // bypass the local handlers and silently fall through to the proxy.
+    let request = arcbox_docker::api::strip_api_version_prefix(request);
+    let response = router.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let body = response.into_body().collect().await.unwrap().to_bytes();
     (status, body)
@@ -128,6 +133,27 @@ async fn start_stop_cycle_manages_host_networking() {
         "stop must tear down host networking"
     );
     assert_eq!(runtime.resolve_registered_container("web").await, None);
+}
+
+#[tokio::test]
+async fn versioned_remove_by_name_runs_local_teardown() {
+    let (router, runtime, _guest, _tmp) = router_with_mock_guest(lifecycle_routes()).await;
+
+    let (status, _) = send(&router, "POST", "/containers/abc123/start").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(runtime.registered_container_ids().await.contains("abc123"));
+
+    // DELETE by NAME through a VERSIONED path. This proves two things at the
+    // behavior level: the version-strip layer routes versioned requests into
+    // the local handlers (not silently past them to the fallback), and
+    // `DELETE /containers/{id}` reaches the local remove handler whose
+    // teardown clears the registry via alias resolution.
+    let (status, _) = send(&router, "DELETE", "/v1.47/containers/web").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        runtime.registered_container_ids().await.is_empty(),
+        "remove must run local host teardown, resolved from the name alias"
+    );
 }
 
 #[tokio::test]
