@@ -61,6 +61,7 @@ pub mod migrate;
 pub mod sandbox;
 pub mod setup;
 pub mod symlink;
+pub mod system;
 #[cfg(target_os = "macos")]
 pub mod uninstall;
 pub mod version;
@@ -128,6 +129,10 @@ pub enum Commands {
     /// Manage native Kubernetes integration
     #[command(subcommand, alias = "k8s")]
     Kubernetes(kubernetes::KubernetesCommands),
+
+    /// Manage the single System VM (hypervisor backend)
+    #[command(subcommand)]
+    System(system::SystemCommands),
 
     /// Manage boot assets (kernel/rootfs)
     #[command(subcommand)]

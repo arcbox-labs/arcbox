@@ -45,7 +45,6 @@ pub mod runtime;
 pub mod trace;
 pub mod vm;
 pub mod vm_lifecycle;
-pub mod workload;
 
 pub use agent_client::AgentClient;
 pub use arcbox_vmm::VmBackend;
@@ -63,4 +62,3 @@ pub use vm_lifecycle::{
     DEFAULT_MACHINE_NAME, DefaultVmConfig, HealthMonitor, VmLifecycleConfig, VmLifecycleManager,
     VmLifecycleState,
 };
-pub use workload::UtilityVmRole;

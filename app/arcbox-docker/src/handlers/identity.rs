@@ -9,12 +9,6 @@ pub fn extract_container_id(uri: &Uri) -> Option<String> {
     extract_id_after_segment(uri, "containers", &["json", "create", "prune"])
 }
 
-/// Extracts the `{id}` token from an `/exec/{id}/...` URI.
-#[must_use]
-pub fn extract_exec_id(uri: &Uri) -> Option<String> {
-    extract_id_after_segment(uri, "exec", &[])
-}
-
 fn extract_id_after_segment(uri: &Uri, segment: &str, skip_tokens: &[&str]) -> Option<String> {
     let segments: Vec<&str> = uri.path().split('/').filter(|s| !s.is_empty()).collect();
     for (i, seg) in segments.iter().enumerate() {
@@ -34,27 +28,6 @@ mod tests {
 
     fn uri(s: &str) -> Uri {
         s.parse().unwrap()
-    }
-
-    #[test]
-    fn extract_exec_id_from_simple_path() {
-        assert_eq!(
-            extract_exec_id(&uri("/exec/exec-abc/start")).as_deref(),
-            Some("exec-abc"),
-        );
-    }
-
-    #[test]
-    fn extract_exec_id_from_versioned_path() {
-        assert_eq!(
-            extract_exec_id(&uri("/v1.51/exec/exec-xyz/resize?w=80&h=24")).as_deref(),
-            Some("exec-xyz"),
-        );
-    }
-
-    #[test]
-    fn extract_exec_id_ignores_non_exec_paths() {
-        assert_eq!(extract_exec_id(&uri("/containers/abc/start")), None);
     }
 
     #[test]

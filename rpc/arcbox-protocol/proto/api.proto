@@ -190,6 +190,34 @@ service SystemService {
     // Streams setup status updates. The server pushes a new message
     // each time the daemon phase changes (e.g. VM starting → ready).
     rpc WatchSetupStatus(Empty) returns (stream SetupStatus);
+
+    // Gets the System VM's current hypervisor backend.
+    rpc GetSystemVmBackend(Empty) returns (SystemVmBackendInfo);
+
+    // Switches the System VM's hypervisor backend (HV <-> VZ). The choice is
+    // persisted; the System VM is restarted so it takes effect, which stops
+    // running containers. Returns the resulting backend.
+    rpc SetSystemVmBackend(SetSystemVmBackendRequest) returns (SystemVmBackendInfo);
+}
+
+// Hypervisor backend for the single System VM.
+enum SystemVmBackend {
+    // Unset; rejected by SetSystemVmBackend.
+    SYSTEM_VM_BACKEND_UNSPECIFIED = 0;
+    // Hypervisor.framework — ArcBox's custom VMM (amd64 via FEX). macOS 15+.
+    SYSTEM_VM_BACKEND_HV = 1;
+    // Virtualization.framework — Apple-managed execution. The default.
+    SYSTEM_VM_BACKEND_VZ = 2;
+}
+
+// The System VM's hypervisor backend.
+message SystemVmBackendInfo {
+    SystemVmBackend backend = 1;
+}
+
+// Request to switch the System VM's hypervisor backend.
+message SetSystemVmBackendRequest {
+    SystemVmBackend backend = 1;
 }
 
 // Request to get system info.

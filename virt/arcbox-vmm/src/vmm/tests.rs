@@ -69,12 +69,12 @@ fn test_vmm_state_transitions() {
 fn test_hv_snapshot_returns_unsupported() {
     let config = VmmConfig {
         guest_cid: Some(3),
+        backend: VmBackend::Hv,
         ..Default::default()
     };
     let mut vmm = Vmm::new(config).unwrap();
 
     // Simulate a started HV VM without actually booting one.
-    vmm.resolved_backend = Some(ResolvedBackend::Hv);
     vmm.state = VmmState::Running;
 
     match vmm.capture_snapshot_context() {

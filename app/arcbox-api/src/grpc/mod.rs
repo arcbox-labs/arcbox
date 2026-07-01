@@ -31,7 +31,7 @@ use tonic::Status;
 pub type SharedRuntime = Arc<OnceLock<Arc<Runtime>>>;
 
 /// Extension trait for obtaining the runtime from a deferred handle.
-trait SharedRuntimeExt {
+pub(crate) trait SharedRuntimeExt {
     /// Returns the runtime, or `UNAVAILABLE` if it hasn't been initialized yet.
     fn ready(&self) -> Result<&Arc<Runtime>, Status>;
 }

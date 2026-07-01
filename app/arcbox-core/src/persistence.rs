@@ -49,6 +49,10 @@ pub struct PersistedMachine {
     pub state: PersistedState,
     /// VM ID (for correlation).
     pub vm_id: String,
+    /// macOS hypervisor backend. Defaults to [`arcbox_vmm::VmBackend::default`]
+    /// (`Vz`) for configs written before the field existed.
+    #[serde(default)]
+    pub backend: arcbox_vmm::VmBackend,
     /// Creation timestamp.
     #[serde(default = "default_created_at")]
     pub created_at: DateTime<Utc>,
@@ -134,6 +138,7 @@ impl From<&MachineInfo> for PersistedMachine {
             ip_address: info.ip_address.clone(),
             state: info.state.into(),
             vm_id: info.vm_id.to_string(),
+            backend: info.backend,
             created_at: info.created_at,
         }
     }
@@ -325,6 +330,7 @@ mod tests {
             ssh_key_path: None,
             ip_address: None,
             cid: None,
+            backend: arcbox_vmm::VmBackend::Hv,
             created_at,
         };
 
@@ -336,6 +342,8 @@ mod tests {
         assert_eq!(loaded.memory_mb, 4096);
         assert_eq!(loaded.kernel, Some("/path/to/kernel".to_string()));
         assert_eq!(loaded.cmdline, Some("console=ttyS0".to_string()));
+        // The hypervisor backend must round-trip so a switch survives restart.
+        assert_eq!(loaded.backend, arcbox_vmm::VmBackend::Hv);
         // Check created_at is preserved (within 1 second tolerance)
         assert!((loaded.created_at - created_at).num_seconds().abs() < 1);
     }
@@ -363,6 +371,7 @@ mod tests {
                 ssh_key_path: None,
                 ip_address: None,
                 cid: None,
+                backend: arcbox_vmm::VmBackend::default(),
                 created_at: Utc::now(),
             };
             persistence.save(&info).unwrap();
@@ -396,6 +405,7 @@ mod tests {
             ssh_key_path: None,
             ip_address: None,
             cid: None,
+            backend: arcbox_vmm::VmBackend::default(),
             created_at: Utc::now(),
         };
 
@@ -427,6 +437,7 @@ mod tests {
             ssh_key_path: None,
             ip_address: None,
             cid: None,
+            backend: arcbox_vmm::VmBackend::default(),
             created_at: Utc::now(),
         };
 
@@ -473,6 +484,7 @@ mod tests {
             ssh_key_path: None,
             ip_address: Some("10.0.2.15".to_string()),
             cid: None,
+            backend: arcbox_vmm::VmBackend::default(),
             created_at: Utc::now(),
         };
         persistence.save(&info).unwrap();

@@ -54,7 +54,8 @@ pub async fn start_grpc(
     let migration_service = MigrationServiceImpl::new(Arc::clone(&shared_runtime));
     let sandbox_service = SandboxServiceImpl::new(Arc::clone(&shared_runtime));
     let sandbox_snapshot_service = SandboxSnapshotServiceImpl::new(Arc::clone(&shared_runtime));
-    let system_service = SystemServiceImpl::new(Arc::clone(&ctx.setup_state));
+    let system_service =
+        SystemServiceImpl::new(Arc::clone(&ctx.setup_state), Arc::clone(&shared_runtime));
     let icon_service = IconServiceImpl::new();
 
     let shutdown = ctx.shutdown.clone();

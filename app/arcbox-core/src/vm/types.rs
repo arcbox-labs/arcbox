@@ -145,9 +145,9 @@ pub struct VmConfig {
     pub rosetta: bool,
     /// macOS hypervisor backend selection.
     ///
-    /// `Hv` (default) drives the custom HV-framework VMM; `Vz` drives
-    /// Apple's Virtualization.framework managed execution and is the only
-    /// backend that can host the Rosetta share.
+    /// `Vz` (default) drives Apple's Virtualization.framework managed
+    /// execution and is the only backend that can host the Rosetta share;
+    /// `Hv` drives the custom HV-framework VMM.
     pub backend: arcbox_vmm::VmBackend,
 }
 
@@ -165,7 +165,7 @@ impl Default for VmConfig {
             guest_cid: None,
             balloon: true,
             rosetta: cfg!(all(target_os = "macos", target_arch = "aarch64")),
-            backend: arcbox_vmm::VmBackend::Hv,
+            backend: arcbox_vmm::VmBackend::default(),
         }
     }
 }

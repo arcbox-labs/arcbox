@@ -10,7 +10,6 @@
 use super::uri::GuestPath;
 use super::{GuestConnector, HANDSHAKE_TIMEOUT};
 use crate::error::{DockerError, Result};
-use crate::routing::UtilityVmRole;
 use arcbox_error::CommonError;
 use arcbox_transport::vsock::VsockStream;
 use axum::body::Body;
@@ -165,41 +164,15 @@ fn parse_response_head(buf: &[u8]) -> Result<Option<(usize, StatusCode, HeaderMa
 #[tracing::instrument(
     name = "docker.proxy.upgrade",
     skip(connector, client_req),
-    fields(uri = %original_uri, utility_vm = UtilityVmRole::Native.as_str()),
+    fields(uri = %original_uri, utility_vm = "native"),
     err
 )]
 pub async fn proxy_with_upgrade(
     connector: &dyn GuestConnector,
-    client_req: axum::http::Request<Body>,
-    original_uri: &Uri,
-) -> Result<Response<Body>> {
-    proxy_with_upgrade_for_role(connector, UtilityVmRole::Native, client_req, original_uri).await
-}
-
-/// Forward an HTTP request with upgrade support to a selected utility VM's
-/// guest dockerd.
-///
-/// Mirrors [`proxy_with_upgrade`] but lets the caller pick the role for
-/// per-workload upgrade endpoints (`/containers/{id}/attach`,
-/// `/exec/{id}/start` interactive, BuildKit session).
-///
-/// # Errors
-///
-/// Returns an error if guest connection, upgrade handshake, or response
-/// construction fails.
-#[tracing::instrument(
-    name = "docker.proxy.upgrade",
-    skip(connector, client_req),
-    fields(uri = %original_uri, utility_vm = role.as_str()),
-    err
-)]
-pub async fn proxy_with_upgrade_for_role(
-    connector: &dyn GuestConnector,
-    role: UtilityVmRole,
     mut client_req: axum::http::Request<Body>,
     original_uri: &Uri,
 ) -> Result<Response<Body>> {
-    let io = connector.connect_for(role).await?;
+    let io = connector.connect().await?;
     // Unwrap TokioIo to get the raw vsock stream — we drive the guest
     // side manually so the fd stays alive throughout the bridge.
     let mut guest_stream = io.into_inner();

@@ -66,6 +66,8 @@ pub struct MachineInfo {
     pub ssh_key_path: Option<PathBuf>,
     /// Guest IP address (reported by agent via vsock).
     pub ip_address: Option<String>,
+    /// macOS hypervisor backend this machine boots on.
+    pub backend: arcbox_vmm::VmBackend,
     /// Creation time.
     pub created_at: DateTime<Utc>,
 }
@@ -93,10 +95,8 @@ pub struct MachineConfig {
     pub distro_version: Option<String>,
     /// macOS hypervisor backend for this machine.
     ///
-    /// `Hv` runs ArcBox's custom HV-framework VMM (fast path for
-    /// `linux/arm64` workloads); `Vz` runs Apple's
-    /// Virtualization.framework managed execution (required for Rosetta).
-    /// Defaults to `Hv` so the existing single-VM behavior is preserved.
+    /// `Vz` (default) runs Apple's Virtualization.framework managed execution
+    /// (required for Rosetta); `Hv` runs ArcBox's custom HV-framework VMM.
     pub backend: arcbox_vmm::VmBackend,
     /// Whether to expose Apple Rosetta inside the guest for `linux/amd64`
     /// translation.
@@ -119,7 +119,7 @@ impl Default for MachineConfig {
             block_devices: Vec::new(),
             distro: None,
             distro_version: None,
-            backend: arcbox_vmm::VmBackend::Hv,
+            backend: arcbox_vmm::VmBackend::default(),
             enable_rosetta: false,
         }
     }
@@ -183,6 +183,7 @@ impl MachineManager {
                 cmdline: persisted.cmdline.clone(),
                 shared_dirs: shared_dirs.clone(),
                 block_devices: persisted.block_devices.clone(),
+                backend: persisted.backend,
                 ..Default::default()
             };
 
@@ -204,6 +205,7 @@ impl MachineManager {
                     disk_path: persisted.disk_path.clone().map(PathBuf::from),
                     ssh_key_path: persisted.ssh_key_path.clone().map(PathBuf::from),
                     ip_address: persisted.ip_address.clone(),
+                    backend: persisted.backend,
                     created_at: persisted.created_at,
                 };
                 machines.insert(persisted.name.clone(), info);
@@ -308,6 +310,7 @@ impl MachineManager {
             disk_path: None,
             ssh_key_path: None,
             ip_address: None,
+            backend: config.backend,
             created_at: Utc::now(),
         };
 
@@ -701,6 +704,41 @@ impl MachineManager {
         Ok(())
     }
 
+    /// Switches a stopped machine's hypervisor backend in place.
+    ///
+    /// Updates the in-memory record, the lazily-built VM config, and the
+    /// persisted config — without tearing down the machine or its disks. The
+    /// machine must be stopped; the new backend takes effect on the next start
+    /// (the `Vmm` is rebuilt from `VmConfig` then).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the machine is not found, is running/starting, or
+    /// the persisted config cannot be updated.
+    pub fn set_backend(&self, name: &str, backend: arcbox_vmm::VmBackend) -> Result<()> {
+        let vm_id = {
+            let mut machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
+            let machine = machines
+                .get_mut(name)
+                .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+            if matches!(
+                machine.state,
+                MachineState::Running | MachineState::Starting
+            ) {
+                return Err(CoreError::invalid_state(format!(
+                    "cannot switch backend while machine '{name}' is {:?}",
+                    machine.state
+                )));
+            }
+            machine.backend = backend;
+            machine.vm_id.clone()
+        };
+
+        self.vm_manager.set_backend(&vm_id, backend)?;
+        self.persistence.update(name, |m| m.backend = backend)?;
+        Ok(())
+    }
+
     /// Attempts graceful machine shutdown via guest ACPI stop request.
     ///
     /// Returns `Ok(true)` if the machine stopped, `Ok(false)` if graceful
@@ -765,6 +803,14 @@ impl MachineManager {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<MachineInfo> {
         self.machines.read().ok()?.get(name).cloned()
+    }
+
+    /// Returns whether a machine with `name` is registered.
+    #[must_use]
+    pub fn exists(&self, name: &str) -> bool {
+        self.machines
+            .read()
+            .is_ok_and(|machines| machines.contains_key(name))
     }
 
     /// Lists all machines.
@@ -876,6 +922,7 @@ impl MachineManager {
             disk_path: None,
             ssh_key_path: None,
             ip_address: None,
+            backend: arcbox_vmm::VmBackend::default(),
             created_at: Utc::now(),
         };
 

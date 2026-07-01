@@ -2006,6 +2006,22 @@ pub struct NetworkContainer {
     #[prost(string, tag = "5")]
     pub mac_address: ::prost::alloc::string::String,
 }
+/// The System VM's hypervisor backend.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct SystemVmBackendInfo {
+    #[prost(enumeration = "SystemVmBackend", tag = "1")]
+    pub backend: i32,
+}
+/// Request to switch the System VM's hypervisor backend.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct SetSystemVmBackendRequest {
+    #[prost(enumeration = "SystemVmBackend", tag = "1")]
+    pub backend: i32,
+}
 /// Request to get system info.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2565,6 +2581,41 @@ pub mod setup_status {
                 "CLEANING_UP" => Some(Self::CleaningUp),
                 _ => None,
             }
+        }
+    }
+}
+/// Hypervisor backend for the single System VM.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SystemVmBackend {
+    /// Unset; rejected by SetSystemVmBackend.
+    Unspecified = 0,
+    /// Hypervisor.framework — ArcBox's custom VMM (amd64 via FEX). macOS 15+.
+    Hv = 1,
+    /// Virtualization.framework — Apple-managed execution. The default.
+    Vz = 2,
+}
+impl SystemVmBackend {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SYSTEM_VM_BACKEND_UNSPECIFIED",
+            Self::Hv => "SYSTEM_VM_BACKEND_HV",
+            Self::Vz => "SYSTEM_VM_BACKEND_VZ",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SYSTEM_VM_BACKEND_UNSPECIFIED" => Some(Self::Unspecified),
+            "SYSTEM_VM_BACKEND_HV" => Some(Self::Hv),
+            "SYSTEM_VM_BACKEND_VZ" => Some(Self::Vz),
+            _ => None,
         }
     }
 }

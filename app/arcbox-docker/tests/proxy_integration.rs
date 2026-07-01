@@ -9,10 +9,8 @@ use support::mock_guest::{self, MockGuest};
 
 use arcbox_docker::proxy::{
     GuestConnector, GuestHttpClient, VsockShutdown, VsockStream, proxy_to_guest,
-    proxy_to_guest_for_role_pooled, proxy_to_guest_stream, proxy_to_guest_stream_for_role_pooled,
-    proxy_with_upgrade,
+    proxy_to_guest_pooled, proxy_to_guest_stream, proxy_to_guest_stream_pooled, proxy_with_upgrade,
 };
-use arcbox_docker::routing::UtilityVmRole;
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri, header};
 use bytes::Bytes;
@@ -116,16 +114,10 @@ async fn pooled_proxy_reuses_http_session_after_body_eof() {
     let client = GuestHttpClient::new(Arc::new(connector.clone()));
 
     for path in ["/containers/json", "/images/json"] {
-        let resp = proxy_to_guest_for_role_pooled(
-            &client,
-            UtilityVmRole::Native,
-            Method::GET,
-            path,
-            &HeaderMap::new(),
-            Bytes::new(),
-        )
-        .await
-        .unwrap();
+        let resp =
+            proxy_to_guest_pooled(&client, Method::GET, path, &HeaderMap::new(), Bytes::new())
+                .await
+                .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         let _ = resp.into_body().collect().await.unwrap();
@@ -140,9 +132,8 @@ async fn pooled_proxy_discards_session_when_body_is_dropped_early() {
     let (connector, guest, _tmp) = setup().await;
     let client = GuestHttpClient::new(Arc::new(connector.clone()));
 
-    let resp = proxy_to_guest_for_role_pooled(
+    let resp = proxy_to_guest_pooled(
         &client,
-        UtilityVmRole::Native,
         Method::POST,
         "/containers/create",
         &HeaderMap::new(),
@@ -153,9 +144,8 @@ async fn pooled_proxy_discards_session_when_body_is_dropped_early() {
     assert_eq!(resp.status(), StatusCode::OK);
     drop(resp);
 
-    let resp = proxy_to_guest_for_role_pooled(
+    let resp = proxy_to_guest_pooled(
         &client,
-        UtilityVmRole::Native,
         Method::GET,
         "/containers/json",
         &HeaderMap::new(),
@@ -207,7 +197,7 @@ async fn pooled_proxy_stream_reuses_http_session_after_body_eof() {
             .body(Body::empty())
             .unwrap();
 
-        let resp = proxy_to_guest_stream_for_role_pooled(&client, UtilityVmRole::Native, &uri, req)
+        let resp = proxy_to_guest_stream_pooled(&client, &uri, req)
             .await
             .unwrap();
 
