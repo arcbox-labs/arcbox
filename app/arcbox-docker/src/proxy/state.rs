@@ -56,14 +56,25 @@ impl ProxyState {
     where
         F: Future<Output = Result<()>>,
     {
-        if self.endpoint_readiness.observe_generation(generation) {
-            // The readiness was already invalidated by `observe_generation`;
-            // also drop the pooled connections, which dialed the old VM.
-            self.guest_http_client.reset();
-        }
+        self.reset_if_restarted(generation);
         self.endpoint_readiness
             .ensure_verified(prepare_runtime, || self.ping_guest())
             .await
+    }
+
+    /// Observes the System VM incarnation counter; when it advanced since the
+    /// last observation, drops the cached readiness and the pooled connections
+    /// (both point at the stopped VM). Returns whether a reset happened.
+    ///
+    /// Shared by the request path ([`Self::ensure_endpoint_verified`]) and the
+    /// host-networking reconciler, so both react to a restart through the same
+    /// pool.
+    pub(crate) fn reset_if_restarted(&self, generation: u64) -> bool {
+        let restarted = self.endpoint_readiness.observe_generation(generation);
+        if restarted {
+            self.guest_http_client.reset();
+        }
+        restarted
     }
 
     pub(crate) fn invalidate_endpoint(&self) {
