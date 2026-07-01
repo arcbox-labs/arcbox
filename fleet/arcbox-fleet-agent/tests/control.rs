@@ -14,8 +14,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_client::FleetLifecycleServiceClient;
+use arcbox_fleet_control_proto::v1::fleet_state_service_client::FleetStateServiceClient;
 use arcbox_fleet_control_proto::v1::{
-    ConnectionState, DrainRequest, GetAgentInfoRequest, GetStatusRequest,
+    ConnectionState, DrainRequest, Enrollment, GetAgentInfoRequest, GetStatusRequest, WatchRequest,
 };
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
@@ -49,12 +50,11 @@ impl Service<Uri> for TestUnixConnector {
     }
 }
 
-async fn connect(socket_path: &Path) -> FleetLifecycleServiceClient<Channel> {
-    let channel = Endpoint::from_static("http://[::]:50051")
+async fn connect(socket_path: &Path) -> Channel {
+    Endpoint::from_static("http://[::]:50051")
         .connect_with_connector(TestUnixConnector(socket_path.to_path_buf()))
         .await
-        .expect("connect to control socket");
-    FleetLifecycleServiceClient::new(channel)
+        .expect("connect to control socket")
 }
 
 /// Poll for `agent.sock` to appear, failing fast (with the exit status) if
@@ -99,7 +99,8 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
     );
 
     wait_for_socket(&mut agent.0, &socket_path);
-    let mut client = connect(&socket_path).await;
+    let channel = connect(&socket_path).await;
+    let mut client = FleetLifecycleServiceClient::new(channel.clone());
 
     let info = client
         .get_agent_info(GetAgentInfoRequest {})
@@ -119,6 +120,31 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
         ConnectionState::Unenrolled
     );
     assert_eq!(status.machine_id, "");
+
+    // FleetStateService.Watch: the client holds no state of its own, so the
+    // very first message must already be a full, current snapshot — not
+    // require a change to happen first.
+    let mut watch_client = FleetStateServiceClient::new(channel);
+    let mut stream = watch_client
+        .watch(WatchRequest {})
+        .await
+        .expect("Watch RPC")
+        .into_inner();
+    let snapshot = stream
+        .message()
+        .await
+        .expect("watch stream")
+        .expect("initial snapshot")
+        .snapshot
+        .expect("snapshot present");
+    assert_eq!(
+        Enrollment::try_from(snapshot.enrollment).unwrap(),
+        Enrollment::Unenrolled
+    );
+    assert_eq!(snapshot.machine_id, "");
+    assert!(snapshot.capabilities.is_empty());
+    assert!(snapshot.in_flight.is_empty());
+    assert!(snapshot.recent_verdicts.is_empty());
 
     let drain_err = client
         .drain(DrainRequest {})

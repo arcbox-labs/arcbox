@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arcbox_fleet_control_proto::v1 as control_proto;
 use arcbox_fleet_proto::v1::{
     AttachRequest, Backend, Capability, HostTelemetry, ProvisionRunner, RunnerAccepted,
     RunnerRejected, attach_request,
@@ -27,6 +28,25 @@ use tracing::{info, warn};
 
 use crate::docker::{DockerRunner, RunSpec};
 use crate::host;
+use crate::state::AgentState;
+
+/// Convert a gateway-advertised capability into its control-plane
+/// counterpart. A plain function, not `From`: both `Capability` types are
+/// generated in other crates, so Rust's orphan rule blocks implementing a
+/// foreign trait (`From`) for two foreign types here.
+fn capability_to_control(c: &Capability) -> control_proto::Capability {
+    let backed_by = match Backend::try_from(c.backed_by) {
+        Ok(Backend::HostRunner) => control_proto::Backend::HostRunner,
+        Ok(Backend::Docker) => control_proto::Backend::Docker,
+        Ok(Backend::Vm) => control_proto::Backend::Vm,
+        Ok(Backend::Unspecified) | Err(_) => control_proto::Backend::Unspecified,
+    };
+    control_proto::Capability {
+        os: c.os.clone(),
+        arch: c.arch.clone(),
+        backed_by: backed_by as i32,
+    }
+}
 
 /// Outcome of the admission decision for an incoming offer.
 #[derive(Debug, PartialEq, Eq)]
@@ -78,6 +98,8 @@ struct Inner {
     mem_floor_mib: u64,
     /// Set once `Drain` is received; no new jobs are accepted.
     draining: std::sync::atomic::AtomicBool,
+    /// Observable state mirrored to `FleetStateService.Watch` subscribers.
+    state: AgentState,
 }
 
 /// Clears a job's `in_flight` entry when dropped. Held by the runner task so
@@ -96,6 +118,7 @@ struct ReleaseGuard {
 impl Drop for ReleaseGuard {
     fn drop(&mut self) {
         self.inner.in_flight.remove(&self.job_id);
+        self.inner.state.remove_in_flight(&self.job_id);
     }
 }
 
@@ -109,7 +132,11 @@ impl RunnerSupervisor {
         capabilities: Vec<Capability>,
         load_ceiling: f64,
         mem_floor_mib: u64,
+        state: AgentState,
     ) -> Self {
+        // Static for the attachment's lifetime, so this is set once rather
+        // than tracked incrementally alongside `backends` below.
+        state.set_capabilities(capabilities.iter().map(capability_to_control).collect());
         let backends = capabilities
             .into_iter()
             .filter_map(|c| {
@@ -129,6 +156,7 @@ impl RunnerSupervisor {
                 load_ceiling,
                 mem_floor_mib,
                 draining: std::sync::atomic::AtomicBool::new(false),
+                state,
             }),
         }
     }
@@ -164,7 +192,12 @@ impl RunnerSupervisor {
                 // down the runner — process group (host) or container (Docker),
                 // awaited — so `CancelRunner` never orphans the runner's work.
                 let cancel = CancellationToken::new();
-                self.inner.in_flight.insert(job_id, cancel.clone());
+                self.inner.in_flight.insert(job_id.clone(), cancel.clone());
+                self.inner.state.add_in_flight(control_proto::InFlightJob {
+                    job_id,
+                    os: order.os.clone(),
+                    arch: order.arch.clone(),
+                });
                 let sup = self.clone();
                 tokio::spawn(async move {
                     // The guard releases the job on any task exit, including a
@@ -247,6 +280,7 @@ impl RunnerSupervisor {
         self.inner
             .draining
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.inner.state.set_draining(true);
         info!("draining: no new offers will be accepted");
     }
 
@@ -258,14 +292,8 @@ impl RunnerSupervisor {
         self.inner
             .draining
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.inner.state.set_draining(false);
         info!("resumed: accepting new offers");
-    }
-
-    /// Whether the supervisor is currently refusing new offers.
-    pub fn is_draining(&self) -> bool {
-        self.inner
-            .draining
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Begin graceful shutdown: stop accepting offers, cancel every in-flight
@@ -448,6 +476,11 @@ impl RunnerSupervisor {
 
     /// Accept an offer (the runner has started).
     fn accept(&self, job_id: &str, token: &str) {
+        self.inner.state.push_verdict(control_proto::OfferVerdict {
+            job_id: job_id.to_owned(),
+            accepted: true,
+            reason: String::new(),
+        });
         self.send_verdict(
             token,
             attach_request::Msg::RunnerAccepted(RunnerAccepted {
@@ -460,6 +493,11 @@ impl RunnerSupervisor {
     /// Reject an offer with a reason.
     fn reject(&self, job_id: &str, token: &str, reason: &str) {
         info!(job_id, reason, "offer rejected");
+        self.inner.state.push_verdict(control_proto::OfferVerdict {
+            job_id: job_id.to_owned(),
+            accepted: false,
+            reason: reason.to_owned(),
+        });
         self.send_verdict(
             token,
             attach_request::Msg::RunnerRejected(RunnerRejected {
@@ -550,12 +588,23 @@ mod tests {
             capabilities,
             0.9,
             2048,
+            AgentState::new(),
         )
     }
 
     // Idle host: plenty of headroom.
     fn idle() -> HostTelemetry {
         telemetry(0.5, 8192)
+    }
+
+    #[test]
+    fn constructor_mirrors_capabilities_into_state() {
+        let sup = supervisor(vec![capability("darwin", "arm64", Backend::HostRunner)]);
+        let caps = sup.inner.state.current().capabilities;
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].os, "darwin");
+        assert_eq!(caps[0].arch, "arm64");
+        assert_eq!(caps[0].backed_by, control_proto::Backend::HostRunner as i32);
     }
 
     #[test]
@@ -599,17 +648,17 @@ mod tests {
     #[test]
     fn resume_undoes_drain() {
         let sup = supervisor(vec![capability("darwin", "arm64", Backend::HostRunner)]);
-        assert!(!sup.is_draining());
+        assert!(!sup.inner.state.current().draining);
 
         sup.handle_drain();
-        assert!(sup.is_draining());
+        assert!(sup.inner.state.current().draining);
         assert!(matches!(
             sup.admit("rjob_a", "darwin", "arm64", &idle()),
             Admission::Reject(_)
         ));
 
         sup.resume();
-        assert!(!sup.is_draining());
+        assert!(!sup.inner.state.current().draining);
         assert_eq!(
             sup.admit("rjob_a", "darwin", "arm64", &idle()),
             Admission::Accept(Backend::HostRunner)
@@ -645,6 +694,7 @@ mod tests {
             vec![capability("darwin", "arm64", Backend::HostRunner)],
             0.9,
             2048,
+            AgentState::new(),
         );
         (sup, rx)
     }
@@ -664,6 +714,54 @@ mod tests {
         assert!(!sup.inner.outstanding.contains_key("tok1"));
         sup.resend_outstanding();
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn accept_and_reject_push_verdicts_into_state() {
+        let (sup, _rx) = supervisor_with_rx(8);
+        sup.accept("rjob_a", "tok1");
+        sup.reject("rjob_b", "tok2", "busy");
+
+        let verdicts = sup.inner.state.current().recent_verdicts;
+        assert_eq!(verdicts.len(), 2);
+        assert!(verdicts[0].accepted);
+        assert!(!verdicts[1].accepted);
+        assert_eq!(verdicts[1].reason, "busy");
+    }
+
+    #[tokio::test]
+    async fn accepted_offer_is_tracked_in_state_in_flight() {
+        let (sup, _rx) = supervisor_with_rx(8);
+        sup.handle_provision(ProvisionRunner {
+            job_id: "rjob_a".to_owned(),
+            os: "darwin".to_owned(),
+            arch: "arm64".to_owned(),
+            encoded_jit_config: String::new(),
+            offer_token: "tok1".to_owned(),
+        });
+
+        let in_flight = sup.inner.state.current().in_flight;
+        assert_eq!(in_flight.len(), 1);
+        assert_eq!(in_flight[0].job_id, "rjob_a");
+        assert_eq!(in_flight[0].os, "darwin");
+        assert_eq!(in_flight[0].arch, "arm64");
+    }
+
+    #[test]
+    fn release_guard_drop_removes_from_state_in_flight() {
+        let sup = supervisor(vec![capability("darwin", "arm64", Backend::HostRunner)]);
+        sup.inner.state.add_in_flight(control_proto::InFlightJob {
+            job_id: "rjob_a".to_owned(),
+            os: "darwin".to_owned(),
+            arch: "arm64".to_owned(),
+        });
+        {
+            let _guard = ReleaseGuard {
+                inner: sup.inner.clone(),
+                job_id: "rjob_a".to_owned(),
+            };
+        }
+        assert!(sup.inner.state.current().in_flight.is_empty());
     }
 
     #[tokio::test]

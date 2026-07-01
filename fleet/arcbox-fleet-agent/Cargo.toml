@@ -23,6 +23,7 @@ prost = { workspace = true }
 
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+async-stream = { workspace = true }
 
 tracing = { workspace = true }
 clap = { workspace = true }

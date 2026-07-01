@@ -26,6 +26,7 @@ mod docker;
 mod enroll;
 mod host;
 mod runner;
+mod state;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,6 +42,7 @@ use tracing::{info, warn};
 use crate::config::{AgentConfig, DockerMode};
 use crate::credentials::CredentialStore;
 use crate::docker::DockerRunner;
+use crate::state::AgentState;
 
 #[derive(Debug, Parser)]
 #[command(name = "arcbox-fleet-agent", author, version, about)]
@@ -154,8 +156,15 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 signal_token.cancel();
             });
 
-            let (supervisor, egress_rx) =
-                attach::spawn_supervisor(&config, docker, capabilities.clone());
+            // `run` opens no control socket, so nothing ever subscribes to
+            // this — it only exists to satisfy `attach`'s shared signature.
+            let agent_state = AgentState::new();
+            let (supervisor, egress_rx) = attach::spawn_supervisor(
+                &config,
+                docker,
+                capabilities.clone(),
+                agent_state.clone(),
+            );
             attach::run(
                 config,
                 credential,
@@ -163,6 +172,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 egress_rx,
                 capabilities,
                 shutdown,
+                agent_state,
             )
             .await
         }
@@ -187,6 +197,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 signal_token.cancel();
             });
 
+            let agent_state = AgentState::new();
             let supervisor = Arc::new(
                 control::AgentSupervisor::new(
                     config,
@@ -194,10 +205,11 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                     capabilities,
                     credential_store,
                     shutdown.clone(),
+                    agent_state.clone(),
                 )
                 .await?,
             );
-            control::serve(&socket_path, Arc::clone(&supervisor), shutdown).await?;
+            control::serve(&socket_path, Arc::clone(&supervisor), agent_state, shutdown).await?;
             // The control server has stopped accepting connections; give any
             // live attach task its own shutdown grace before the process exits.
             supervisor.join().await;
