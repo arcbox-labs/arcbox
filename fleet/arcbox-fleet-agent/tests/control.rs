@@ -178,17 +178,15 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
         settings.gateway.expect("gateway present").current,
         "http://127.0.0.1:1"
     );
+    let docker_mode = settings.docker_mode.expect("docker_mode present");
     assert_eq!(
-        DockerMode::try_from(settings.docker_mode.expect("docker_mode present").current).unwrap(),
+        DockerMode::try_from(docker_mode.current).unwrap(),
         DockerMode::Disabled
     );
-    assert_eq!(
-        settings
-            .runner_script
-            .expect("runner_script present")
-            .current,
-        ""
-    );
+    assert_eq!(docker_mode.current, docker_mode.target);
+    let runner_script = settings.runner_script.expect("runner_script present");
+    assert_eq!(runner_script.current, "");
+    assert_eq!(runner_script.current, runner_script.target);
 
     // UpdateSettings: load_ceiling applies instantly — current and target
     // both move together, with no reattach or restart involved.
