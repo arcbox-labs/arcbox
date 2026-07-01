@@ -4,3 +4,12 @@ modules:
 lint:
   use:
     - STANDARD
+# The desktop and agent ship and self-update independently, so a shipped
+# desktop reads whatever wire shape a newer agent sends. WIRE_JSON locks the
+# runtime contract (binary + JSON representation) shipped clients depend on
+# while still allowing source-level refactors (renaming fields, moving
+# messages between files) that never cross the version boundary. Enforced by
+# `buf breaking` against the base branch in CI.
+breaking:
+  use:
+    - WIRE_JSON
