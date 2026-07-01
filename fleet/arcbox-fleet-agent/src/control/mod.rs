@@ -40,6 +40,20 @@ use lifecycle::LifecycleService;
 use settings::SettingsService;
 use watch::WatchService;
 
+/// Wraps an unexpected internal failure (a disk write, a gateway round-trip,
+/// a keychain clear) so `?` converts it to a tonic `Status` via the `From`
+/// impl below — the repo's error-conversion convention, where a crate-local
+/// type sidesteps the orphan rule that blocks `From<anyhow::Error> for
+/// Status`. Everything wrapped here maps to `INTERNAL`; a site needing a
+/// different code maps it itself.
+struct Internal(anyhow::Error);
+
+impl From<Internal> for Status {
+    fn from(e: Internal) -> Self {
+        Self::internal(e.0.to_string())
+    }
+}
+
 /// Bind `agent.sock` and serve `FleetLifecycleService` until `shutdown`
 /// fires. Mirrors `arcbox-daemon`'s `services::start_grpc` (remove-before-bind,
 /// then `UnixListener`/`UnixListenerStream`), plus an explicit owner-only
@@ -214,7 +228,7 @@ impl AgentSupervisor {
         // The gateway round-trip must not hold `state` locked.
         let credential = enroll::enroll(&self.config, token, self.capabilities.clone(), &gateway)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(Internal)?;
 
         let mut state = self.state.lock().await;
         if matches!(*state, State::Attached(_)) {
@@ -234,7 +248,7 @@ impl AgentSupervisor {
             self.agent_state.set_gateway_current(control_plane);
             self.settings_store
                 .store(&self.agent_state.persisted_settings())
-                .map_err(|e| Status::internal(e.to_string()))?;
+                .map_err(Internal)?;
         }
 
         let machine_id = credential.machine_id.clone();
@@ -267,9 +281,7 @@ impl AgentSupervisor {
             Ok(Err(e)) => warn!(error = %e, "attach task panicked on disconnect"),
             Err(_) => warn!("disconnect grace elapsed; clearing credential anyway"),
         }
-        self.credential_store
-            .clear()
-            .map_err(|e| Status::internal(e.to_string()))
+        Ok(self.credential_store.clear().map_err(Internal)?)
     }
 
     /// Stop accepting new offers; in-flight jobs finish normally.

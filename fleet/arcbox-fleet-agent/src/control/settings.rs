@@ -12,6 +12,7 @@ use arcbox_fleet_control_proto::v1::{
 use tonic::transport::Endpoint;
 use tonic::{Request, Response, Status};
 
+use super::Internal;
 use crate::config::DockerMode;
 use crate::settings::SettingsStore;
 use crate::state::{AgentState, docker_mode_from_wire};
@@ -67,7 +68,7 @@ impl FleetSettingsServiceTrait for SettingsService {
 
         self.store
             .store(&self.state.persisted_settings())
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(Internal)?;
 
         Ok(Response::new(UpdateSettingsResponse {
             settings: Some(self.state.settings()),
