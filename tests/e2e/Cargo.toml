@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+description = "End-to-end integration tests for the ArcBox container and VM runtime"
 
 [dependencies]
 anyhow.workspace = true
