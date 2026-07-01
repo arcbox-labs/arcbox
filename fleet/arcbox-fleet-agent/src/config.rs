@@ -134,6 +134,13 @@ impl AgentConfig {
                 )
             }
         };
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        if credential_store == CredentialMode::Keyring {
+            anyhow::bail!(
+                "{ENV_CREDENTIAL_STORE}=keyring is only supported on macOS and Windows; \
+                 use 'file' (the default on Linux)"
+            );
+        }
 
         Ok(Self {
             gateway,

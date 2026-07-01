@@ -39,28 +39,17 @@ impl CredentialStore {
     /// Select a backend from `mode` and the platform.
     ///
     /// `Auto` uses the OS keychain on macOS/Windows and the `path` file
-    /// elsewhere; `Keyring` forces the keychain (and errors where none exists);
-    /// `File` forces the file.
-    pub fn new(mode: CredentialMode, path: PathBuf) -> Result<Self> {
-        let use_keyring = match mode {
-            CredentialMode::Keyring => true,
-            CredentialMode::File => false,
-            CredentialMode::Auto => cfg!(any(target_os = "macos", target_os = "windows")),
-        };
-        if use_keyring {
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            {
-                return Ok(Self::Keyring(KeyringStore));
-            }
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            {
-                anyhow::bail!(
-                    "ARCBOX_FLEET_CREDENTIAL_STORE=keyring is only supported on macOS and \
-                     Windows; use 'file' (the default on Linux)"
-                );
-            }
+    /// elsewhere; `Keyring` forces the keychain; `File` forces the file. `mode`
+    /// is validated against the platform when parsed from the environment, so
+    /// `Keyring` never reaches here on a platform without a keychain.
+    pub fn new(mode: CredentialMode, path: PathBuf) -> Self {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if matches!(mode, CredentialMode::Keyring | CredentialMode::Auto) {
+            return Self::Keyring(KeyringStore);
         }
-        Ok(Self::File(FileStore { path }))
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let _ = mode;
+        Self::File(FileStore { path })
     }
 
     /// Load the stored credential, or `None` if the host has not enrolled yet.
@@ -201,7 +190,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("fleet-cred-{}", std::process::id()));
         let path = dir.join("credentials.json");
-        let store = CredentialStore::new(CredentialMode::File, path.clone()).unwrap();
+        let store = CredentialStore::new(CredentialMode::File, path.clone());
         assert!(store.load().unwrap().is_none());
 
         let cred = Credential {

@@ -101,7 +101,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             let credential = CredentialStore::new(
                 config.credential_store,
                 config.credentials_path(),
-            )?
+            )
             .load()?
             .context(
                 "no credential found — run `arcbox-fleet-agent enroll --token-file …` first",
