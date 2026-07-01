@@ -82,6 +82,12 @@ impl ContainerBackend for GuestDockerBackend {
 
     async fn ensure_ready(&self) -> Result<u32> {
         let cid = self.vm_lifecycle.ensure_ready().await?;
+        // Test mode: skip_vm_check registered a mock machine with no agent
+        // behind it, so there is no guest readiness to watch. This lets the
+        // Docker API handler tests run against a mock guest without a VM.
+        if self.vm_lifecycle.config().skip_vm_check {
+            return Ok(cid);
+        }
         self.wait_guest_endpoint_ready().await?;
         Ok(cid)
     }
