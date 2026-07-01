@@ -5,51 +5,18 @@
 //! handler layer's `ensure_vm_ready`) to isolate proxy forwarding logic.
 
 mod support;
-use support::mock_guest::{self, MockGuest};
+use support::mock_guest::{self, MockGuest, UnixSocketConnector};
 
 use arcbox_docker::proxy::{
-    GuestConnector, GuestHttpClient, VsockShutdown, VsockStream, proxy_to_guest_pooled,
-    proxy_to_guest_stream_pooled, proxy_with_upgrade,
+    GuestHttpClient, proxy_to_guest_pooled, proxy_to_guest_stream_pooled, proxy_with_upgrade,
 };
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri, header};
 use bytes::Bytes;
 use http_body_util::BodyExt;
-use hyper_util::rt::TokioIo;
-use std::future::Future;
-use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use tempfile::TempDir;
-
-// =============================================================================
-// UnixSocketConnector — test connector that connects to mock guest
-// =============================================================================
-
-#[derive(Clone)]
-struct UnixSocketConnector {
-    socket_path: PathBuf,
-    connect_count: Arc<AtomicUsize>,
-}
-
-impl GuestConnector for UnixSocketConnector {
-    fn connect(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = arcbox_docker::Result<TokioIo<VsockStream>>> + Send + '_>>
-    {
-        Box::pin(async {
-            self.connect_count.fetch_add(1, Ordering::Relaxed);
-            let stream = tokio::net::UnixStream::connect(&self.socket_path)
-                .await
-                .map_err(|e| arcbox_docker::DockerError::Server(e.to_string()))?;
-            Ok(TokioIo::new(VsockStream::from_unix_stream_with_shutdown(
-                stream,
-                VsockShutdown::CloseOnDropOnly,
-            )))
-        })
-    }
-}
 
 // =============================================================================
 // Test helpers
@@ -58,10 +25,7 @@ impl GuestConnector for UnixSocketConnector {
 async fn setup() -> (UnixSocketConnector, MockGuest, TempDir) {
     let tmp = TempDir::new().unwrap();
     let guest = mock_guest::start(tmp.path()).await;
-    let connector = UnixSocketConnector {
-        socket_path: guest.socket_path.clone(),
-        connect_count: Arc::new(AtomicUsize::new(0)),
-    };
+    let connector = UnixSocketConnector::new(guest.socket_path.clone());
     (connector, guest, tmp)
 }
 
