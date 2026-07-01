@@ -921,14 +921,18 @@ impl Runtime {
     }
 
     /// Returns the set of container IDs that currently hold host-side
-    /// networking state (port forwarding and/or DNS).
+    /// networking state (port forwarding, DNS, and/or a name alias).
     ///
     /// Used by the Docker layer's reconciler to detect containers whose host
     /// state outlived the container — e.g. a container that exited without a
     /// `stop`/`kill`/`remove` API call (`--rm`, prune, OOM, a guest-side stop).
+    /// Alias-only containers (no published ports, no IP — e.g. `--network
+    /// none`) are included so the reconciler reclaims their alias entries too;
+    /// otherwise every ephemeral `--rm` run would leak one alias forever.
     pub async fn registered_container_ids(&self) -> std::collections::HashSet<String> {
         let mut ids: std::collections::HashSet<String> =
             self.dns_entries.read().await.keys().cloned().collect();
+        ids.extend(self.container_aliases.read().await.values().cloned());
         #[cfg(target_os = "macos")]
         ids.extend(self.inbound_rules.read().await.keys().cloned());
         #[cfg(not(target_os = "macos"))]
