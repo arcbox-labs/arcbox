@@ -271,9 +271,19 @@ impl AgentState {
     // -- Settings: writers. `load_ceiling`/`mem_floor_mib`/`runner_image`
     // apply instantly, so their setters write both `current` and `target`
     // in one `send_modify` — there's never a moment where they should
-    // differ. `gateway`/`docker_mode`/`runner_script` have independent
-    // current/target setters: `target` is written by `UpdateSettings`,
-    // `current` by whichever engine code actually resolves/applies it.
+    // differ.
+    //
+    // `docker_mode`/`runner_script` are restart-scoped: `UpdateSettings`
+    // moves only their `target`, and `current` stays whatever the process
+    // started with (fixed by `AgentState::new` from the persisted seed)
+    // until the next restart re-seeds from it — so they get a `target`
+    // setter but no `current` setter. Whether an `Auto` docker_mode
+    // actually found Docker is observable via `capabilities`, not by
+    // resolving `current` away from the requested policy.
+    //
+    // `gateway` alone has an independent `current` setter: `UpdateSettings`
+    // writes `target`, and `attach.rs` writes `current` once it has
+    // actually dialed that gateway.
 
     pub fn set_load_ceiling(&self, value: f64) {
         self.tx.send_modify(|s| {
@@ -360,19 +370,6 @@ impl AgentState {
         });
     }
 
-    pub fn set_docker_mode_current(&self, mode: DockerMode) {
-        let mode = docker_mode_to_control(mode) as i32;
-        self.tx.send_modify(|s| {
-            s.settings
-                .as_mut()
-                .expect(SETTINGS_INVARIANT)
-                .docker_mode
-                .as_mut()
-                .expect(SETTINGS_INVARIANT)
-                .current = mode;
-        });
-    }
-
     pub fn set_runner_script_target(&self, script: Option<&Path>) {
         let value = path_to_setting_value(script);
         self.tx.send_modify(|s| {
@@ -383,19 +380,6 @@ impl AgentState {
                 .as_mut()
                 .expect(SETTINGS_INVARIANT)
                 .target = value;
-        });
-    }
-
-    pub fn set_runner_script_current(&self, script: Option<&Path>) {
-        let value = path_to_setting_value(script);
-        self.tx.send_modify(|s| {
-            s.settings
-                .as_mut()
-                .expect(SETTINGS_INVARIANT)
-                .runner_script
-                .as_mut()
-                .expect(SETTINGS_INVARIANT)
-                .current = value;
         });
     }
 }
@@ -455,17 +439,35 @@ mod tests {
         state.settings().gateway.unwrap().current
     }
 
+    /// A freshly-seeded agent must report `current == target` for *every*
+    /// setting, so a client's "current != target ⇒ pending" rendering shows
+    /// nothing pending on a clean start. `docker_mode` is the load-bearing
+    /// case: the seed here is `Auto`, and nothing at startup may resolve its
+    /// `current` to a concrete `Enabled`/`Disabled` (which would leave it
+    /// perpetually != the `Auto` target) — that resolution is observable via
+    /// `capabilities`, not by moving `current` off the requested policy.
     #[test]
     fn settings_seed_current_equals_target() {
         let state = AgentState::new(&seed());
         assert_eq!(state.load_ceiling_current(), 0.9);
         assert_eq!(state.mem_floor_mib_current(), 2048);
-        assert_eq!(gateway_current(&state), state.gateway_target());
         let settings = state.settings();
+        let load_ceiling = settings.load_ceiling.unwrap();
+        assert_eq!(load_ceiling.current, load_ceiling.target);
+        let mem_floor = settings.mem_floor_mib.unwrap();
+        assert_eq!(mem_floor.current, mem_floor.target);
+        let runner_image = settings.runner_image.unwrap();
+        assert_eq!(runner_image.current, runner_image.target);
+        let gateway = settings.gateway.unwrap();
+        assert_eq!(gateway.current, gateway.target);
+        let docker_mode = settings.docker_mode.unwrap();
         assert_eq!(
-            settings.docker_mode.unwrap().current,
+            docker_mode.current,
             arcbox_fleet_control_proto::v1::DockerMode::Auto as i32
         );
+        assert_eq!(docker_mode.current, docker_mode.target);
+        let runner_script = settings.runner_script.unwrap();
+        assert_eq!(runner_script.current, runner_script.target);
     }
 
     #[test]

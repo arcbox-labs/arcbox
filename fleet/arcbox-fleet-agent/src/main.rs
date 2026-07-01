@@ -191,9 +191,6 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             // this over `Watch` — but `RunnerSupervisor` still reads
             // admission thresholds live from it, so it's load-bearing.
             let agent_state = AgentState::new(&seed);
-            agent_state
-                .set_docker_mode_current(resolved_docker_mode(seed.docker_mode, docker.as_ref()));
-            agent_state.set_runner_script_current(seed.runner_script.as_deref());
             let (supervisor, egress_rx) = attach::spawn_supervisor(
                 &config,
                 docker,
@@ -229,9 +226,6 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             let shutdown = spawn_shutdown_signal("termination signal received; shutting down");
 
             let agent_state = AgentState::new(&seed);
-            agent_state
-                .set_docker_mode_current(resolved_docker_mode(seed.docker_mode, docker.as_ref()));
-            agent_state.set_runner_script_current(seed.runner_script.as_deref());
             let supervisor = Arc::new(
                 control::AgentSupervisor::new(
                     config,
@@ -468,17 +462,6 @@ fn load_or_seed_settings(store: &SettingsStore, config: &AgentConfig) -> Result<
     Ok(store
         .load()?
         .unwrap_or_else(|| PersistedSettings::from(config)))
-}
-
-/// The `docker_mode` actually in effect after [`init_docker`] runs —
-/// `Auto` resolves concretely to whether Docker actually came up, so
-/// `current` never reports "auto" as a steady state.
-fn resolved_docker_mode(configured: DockerMode, docker: Option<&DockerRunner>) -> DockerMode {
-    match configured {
-        DockerMode::Auto if docker.is_some() => DockerMode::Enabled,
-        DockerMode::Auto => DockerMode::Disabled,
-        other => other,
-    }
 }
 
 fn parse_docker_mode(s: &str) -> Result<control_proto::DockerMode> {
