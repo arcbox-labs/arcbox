@@ -56,8 +56,9 @@ fn telemetry_to_control(t: &HostTelemetry) -> control_proto::HostTelemetry {
     }
 }
 
-/// Build the [`RunnerSupervisor`] and its egress queue, and start the
-/// process-scoped verdict-resend loop.
+/// Build the [`RunnerSupervisor`] and its egress queue. The verdict-resend
+/// loop is started by [`run`] instead, so it shares the attachment's shutdown
+/// token and is reaped with it.
 ///
 /// Split from [`run`] so a caller — the local control-plane's
 /// `AgentSupervisor` — can hold the returned `RunnerSupervisor` handle for
@@ -77,13 +78,6 @@ pub fn spawn_supervisor(
         capabilities,
         state,
     );
-
-    // Process-scoped: resend unacked verdicts across reconnects. Re-emitted
-    // verdicts ride the same egress queue, so the reconnect-survival machinery
-    // below (egress forwarding + `pending`) delivers them to whichever stream is
-    // live. Detached for the agent's lifetime; the agent never shuts down here.
-    spawn_verdict_resend(supervisor.clone());
-
     (supervisor, egress_rx)
 }
 
@@ -115,6 +109,13 @@ pub async fn run(
     // connection dropped; re-sent first on the next connection so a terminal
     // event is never lost to a closed stream.
     let mut pending: Option<AttachRequest> = None;
+
+    // Attachment-scoped: resend unacked verdicts across reconnects within this
+    // attachment, exiting when `shutdown` fires. Tied to the attachment rather
+    // than the process because `AgentSupervisor::attach` spawns a fresh `run`
+    // per enrollment — a process-lifetime task here would leak one per
+    // disconnect/re-enroll cycle.
+    let resend = spawn_verdict_resend(supervisor.clone(), shutdown.clone());
 
     while !shutdown.is_cancelled() {
         state.set_enrollment(control_proto::Enrollment::Attaching, &credential.machine_id);
@@ -151,6 +152,10 @@ pub async fn run(
 
     info!("shutdown signal received; stopping runners");
     supervisor.shutdown(SHUTDOWN_GRACE).await;
+    // The loop only exits once `shutdown` is cancelled, so the resend task has
+    // already broken out of its own loop; await it so it's fully reaped before
+    // this attachment's task returns.
+    let _ = resend.await;
     Ok(())
 }
 
@@ -278,17 +283,25 @@ fn dispatch(supervisor: &RunnerSupervisor, msg: Option<attach_response::Msg>) {
 
 /// Periodically resend verdicts still awaiting an `OfferVerdictAck`, until the
 /// gateway settles them (delivered to the workflow, or found obsolete).
-/// Process-scoped so it spans reconnects; the supervisor holds the egress
-/// sender, so resends route through the same outbound path as fresh verdicts.
-fn spawn_verdict_resend(supervisor: RunnerSupervisor) -> tokio::task::JoinHandle<()> {
+/// Attachment-scoped: it spans reconnects within one attachment and exits when
+/// `shutdown` fires, so it's reaped on disconnect instead of outliving the
+/// attachment that spawned it. The supervisor holds the egress sender, so
+/// resends route through the same outbound path as fresh verdicts.
+fn spawn_verdict_resend(
+    supervisor: RunnerSupervisor,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(VERDICT_RESEND_INTERVAL);
         // Skip the immediate first tick: a verdict just sent has not had time to
         // be acked, so there is nothing to resend yet.
         ticker.tick().await;
         loop {
-            ticker.tick().await;
-            supervisor.resend_outstanding();
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                _ = ticker.tick() => supervisor.resend_outstanding(),
+            }
         }
     })
 }
@@ -324,4 +337,41 @@ fn spawn_heartbeat(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DockerMode;
+    use crate::settings::PersistedSettings;
+
+    fn seed() -> PersistedSettings {
+        PersistedSettings {
+            load_ceiling: 0.9,
+            mem_floor_mib: 2048,
+            runner_image: "img".to_owned(),
+            gateway: "https://fleet.arcbox.dev".to_owned(),
+            docker_mode: DockerMode::Disabled,
+            runner_script: None,
+        }
+    }
+
+    /// The verdict-resend loop is attachment-scoped: cancelling the shutdown
+    /// token must reap it. Otherwise every disconnect/re-enroll cycle would
+    /// leak a task holding a supervisor clone (DashMaps, egress sender, Docker
+    /// handle) for the life of the process.
+    #[tokio::test]
+    async fn verdict_resend_task_exits_when_shutdown_fires() {
+        let (events, _rx) = mpsc::channel(1);
+        let supervisor =
+            RunnerSupervisor::new(events, None, None, Vec::new(), AgentState::new(&seed()));
+        let shutdown = CancellationToken::new();
+        let handle = spawn_verdict_resend(supervisor, shutdown.clone());
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("resend task must exit promptly once shutdown is cancelled")
+            .expect("resend task must not panic");
+    }
 }

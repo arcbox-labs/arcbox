@@ -164,6 +164,11 @@ impl AgentSupervisor {
     fn attach(&self, credential: Credential) -> Attachment {
         self.agent_state
             .set_enrollment(Enrollment::Attaching, &credential.machine_id);
+        // A fresh attachment always starts accepting: `Drain` is runtime-only
+        // (never persisted), and the previous attachment's teardown shares this
+        // process-lifetime state, so clear any stale draining flag rather than
+        // letting a re-enroll inherit it.
+        self.agent_state.set_draining(false);
         let (supervisor, egress_rx) = attach::spawn_supervisor(
             &self.config,
             self.docker.clone(),
@@ -200,21 +205,11 @@ impl AgentSupervisor {
             ));
         }
 
-        let gateway = if let Some(control_plane) = control_plane {
-            // Enrolling against a specific gateway means dialing it
-            // immediately — `attach()` below does exactly that — so both
-            // `current` and `target` already agree with what happens next,
-            // the same way `FleetSettingsService.UpdateSettings` would
-            // persist any other setting.
-            self.agent_state.set_gateway_target(control_plane);
-            self.agent_state.set_gateway_current(control_plane);
-            self.settings_store
-                .store(&self.agent_state.persisted_settings())
-                .map_err(|e| Status::internal(e.to_string()))?;
-            control_plane.to_owned()
-        } else {
-            self.agent_state.gateway_target()
-        };
+        // Resolve the gateway to dial without mutating shared state yet: a
+        // concurrent Enroll may still win the race check below, and a losing
+        // attempt must not leave its gateway override applied or persisted.
+        let gateway =
+            control_plane.map_or_else(|| self.agent_state.gateway_target(), str::to_owned);
 
         // The gateway round-trip must not hold `state` locked.
         let credential = enroll::enroll(&self.config, token, self.capabilities.clone(), &gateway)
@@ -229,6 +224,19 @@ impl AgentSupervisor {
                 "already enrolled — disconnect first",
             ));
         }
+
+        // Won the race — now, and only now, persist an explicit gateway
+        // override. `attach()` below dials `gateway_target`, so both `current`
+        // and `target` already agree with what happens next, the same way
+        // `FleetSettingsService.UpdateSettings` persists any other setting.
+        if let Some(control_plane) = control_plane {
+            self.agent_state.set_gateway_target(control_plane);
+            self.agent_state.set_gateway_current(control_plane);
+            self.settings_store
+                .store(&self.agent_state.persisted_settings())
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
+
         let machine_id = credential.machine_id.clone();
         *state = State::Attached(self.attach(credential));
         Ok(machine_id)

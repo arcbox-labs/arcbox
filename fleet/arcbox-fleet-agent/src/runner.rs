@@ -272,11 +272,21 @@ impl RunnerSupervisor {
         }
     }
 
-    /// Stop accepting new work; in-flight jobs run to completion.
-    pub fn handle_drain(&self) {
+    /// Stop admitting new offers locally, without touching the observable
+    /// [`AgentState`] draining flag. Shared by the user-facing `Drain` (which
+    /// also flips the observable flag) and by [`Self::shutdown`] (which must
+    /// not: a disconnect's teardown would otherwise leave the shared,
+    /// process-lifetime state stuck draining, so a re-enroll on the same
+    /// process would inherit it and report Draining while actually admitting).
+    fn stop_accepting(&self) {
         self.inner
             .draining
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Stop accepting new work; in-flight jobs run to completion.
+    pub fn handle_drain(&self) {
+        self.stop_accepting();
         self.inner.state.set_draining(true);
         info!("draining: no new offers will be accepted");
     }
@@ -299,7 +309,7 @@ impl RunnerSupervisor {
     /// to release their slots. The guarantee is that no runner process group or
     /// container is left orphaned when the agent exits.
     pub async fn shutdown(&self, grace: Duration) {
-        self.handle_drain();
+        self.stop_accepting();
         // Cancelling is idempotent, so jobs already mid-cancel just keep
         // tearing down and are covered by the wait below.
         for entry in &self.inner.in_flight {
@@ -926,5 +936,32 @@ mod tests {
         sup.shutdown(Duration::from_millis(250)).await;
 
         assert!(!sup.inner.in_flight.is_empty());
+    }
+
+    /// The user-facing `Drain` flips the observable `AgentState.draining`
+    /// flag, but teardown (`shutdown`) must not: that flag is process-lifetime
+    /// and shared across attachments, so a disconnect that faked a drain would
+    /// leave a later re-enroll reporting Draining while it is in fact admitting
+    /// jobs. Both still stop admission locally (see the shutdown tests above,
+    /// which assert `inner.draining`).
+    #[tokio::test]
+    async fn shutdown_does_not_flip_observable_draining_but_drain_does() {
+        let drained = AgentState::new(&seed());
+        let (events, _rx) = mpsc::channel(1);
+        RunnerSupervisor::new(events, None, None, Vec::new(), drained.clone()).handle_drain();
+        assert!(
+            drained.current().draining,
+            "Drain flips the observable flag"
+        );
+
+        let torn_down = AgentState::new(&seed());
+        let (events, _rx) = mpsc::channel(1);
+        RunnerSupervisor::new(events, None, None, Vec::new(), torn_down.clone())
+            .shutdown(Duration::from_secs(1))
+            .await;
+        assert!(
+            !torn_down.current().draining,
+            "teardown must not flip the observable flag",
+        );
     }
 }
