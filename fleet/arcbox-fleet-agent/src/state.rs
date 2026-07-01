@@ -71,6 +71,18 @@ fn setting_value_to_path(value: &str) -> Option<PathBuf> {
     (!value.is_empty()).then(|| PathBuf::from(value))
 }
 
+/// The always-present settings block. Every accessor goes through these two
+/// helpers so the outer [`SETTINGS_INVARIANT`] assertion is spelled once here
+/// rather than at each of the ~15 call sites (and each new settable field
+/// inherits it for free).
+fn settings_of(snapshot: &AgentStateSnapshot) -> &AgentSettings {
+    snapshot.settings.as_ref().expect(SETTINGS_INVARIANT)
+}
+
+fn settings_mut(snapshot: &mut AgentStateSnapshot) -> &mut AgentSettings {
+    snapshot.settings.as_mut().expect(SETTINGS_INVARIANT)
+}
+
 /// Cheap-to-clone handle onto the agent's observable state. Every setter is
 /// synchronous (`watch::Sender::send_modify` never awaits), so it can be
 /// called from non-async contexts like `Drop` impls.
@@ -140,7 +152,7 @@ impl AgentState {
 
     /// The current settings, for `GetSettings`.
     pub fn settings(&self) -> AgentSettings {
-        self.tx.borrow().settings.clone().expect(SETTINGS_INVARIANT)
+        settings_of(&self.tx.borrow()).clone()
     }
 
     /// The current settings, projected down to their persisted
@@ -150,7 +162,7 @@ impl AgentState {
     /// request.
     pub fn persisted_settings(&self) -> PersistedSettings {
         let snapshot = self.tx.borrow();
-        let s = snapshot.settings.as_ref().expect(SETTINGS_INVARIANT);
+        let s = settings_of(&snapshot);
         PersistedSettings {
             load_ceiling: s.load_ceiling.as_ref().expect(SETTINGS_INVARIANT).target,
             mem_floor_mib: s.mem_floor_mib.as_ref().expect(SETTINGS_INVARIANT).target,
@@ -215,11 +227,7 @@ impl AgentState {
     // pulls) — extract just the one field needed, no whole-snapshot clone.
 
     pub fn load_ceiling_current(&self) -> f64 {
-        self.tx
-            .borrow()
-            .settings
-            .as_ref()
-            .expect(SETTINGS_INVARIANT)
+        settings_of(&self.tx.borrow())
             .load_ceiling
             .as_ref()
             .expect(SETTINGS_INVARIANT)
@@ -227,11 +235,7 @@ impl AgentState {
     }
 
     pub fn mem_floor_mib_current(&self) -> u64 {
-        self.tx
-            .borrow()
-            .settings
-            .as_ref()
-            .expect(SETTINGS_INVARIANT)
+        settings_of(&self.tx.borrow())
             .mem_floor_mib
             .as_ref()
             .expect(SETTINGS_INVARIANT)
@@ -239,11 +243,7 @@ impl AgentState {
     }
 
     pub fn runner_image_current(&self) -> String {
-        self.tx
-            .borrow()
-            .settings
-            .as_ref()
-            .expect(SETTINGS_INVARIANT)
+        settings_of(&self.tx.borrow())
             .runner_image
             .as_ref()
             .expect(SETTINGS_INVARIANT)
@@ -256,11 +256,7 @@ impl AgentState {
     /// was last dialed outside of the full `settings()`/`persisted_settings()`
     /// snapshots, which `GetSettings`/`Watch` already expose it through.
     pub fn gateway_target(&self) -> String {
-        self.tx
-            .borrow()
-            .settings
-            .as_ref()
-            .expect(SETTINGS_INVARIANT)
+        settings_of(&self.tx.borrow())
             .gateway
             .as_ref()
             .expect(SETTINGS_INVARIANT)
@@ -287,10 +283,7 @@ impl AgentState {
 
     pub fn set_load_ceiling(&self, value: f64) {
         self.tx.send_modify(|s| {
-            let setting = s
-                .settings
-                .as_mut()
-                .expect(SETTINGS_INVARIANT)
+            let setting = settings_mut(s)
                 .load_ceiling
                 .as_mut()
                 .expect(SETTINGS_INVARIANT);
@@ -301,10 +294,7 @@ impl AgentState {
 
     pub fn set_mem_floor_mib(&self, value: u64) {
         self.tx.send_modify(|s| {
-            let setting = s
-                .settings
-                .as_mut()
-                .expect(SETTINGS_INVARIANT)
+            let setting = settings_mut(s)
                 .mem_floor_mib
                 .as_mut()
                 .expect(SETTINGS_INVARIANT);
@@ -315,10 +305,7 @@ impl AgentState {
 
     pub fn set_runner_image(&self, value: String) {
         self.tx.send_modify(|s| {
-            let setting = s
-                .settings
-                .as_mut()
-                .expect(SETTINGS_INVARIANT)
+            let setting = settings_mut(s)
                 .runner_image
                 .as_mut()
                 .expect(SETTINGS_INVARIANT);
@@ -330,10 +317,7 @@ impl AgentState {
     pub fn set_gateway_target(&self, value: &str) {
         self.tx.send_modify(|s| {
             value.clone_into(
-                &mut s
-                    .settings
-                    .as_mut()
-                    .expect(SETTINGS_INVARIANT)
+                &mut settings_mut(s)
                     .gateway
                     .as_mut()
                     .expect(SETTINGS_INVARIANT)
@@ -345,10 +329,7 @@ impl AgentState {
     pub fn set_gateway_current(&self, value: &str) {
         self.tx.send_modify(|s| {
             value.clone_into(
-                &mut s
-                    .settings
-                    .as_mut()
-                    .expect(SETTINGS_INVARIANT)
+                &mut settings_mut(s)
                     .gateway
                     .as_mut()
                     .expect(SETTINGS_INVARIANT)
@@ -360,9 +341,7 @@ impl AgentState {
     pub fn set_docker_mode_target(&self, mode: DockerMode) {
         let mode = docker_mode_to_control(mode) as i32;
         self.tx.send_modify(|s| {
-            s.settings
-                .as_mut()
-                .expect(SETTINGS_INVARIANT)
+            settings_mut(s)
                 .docker_mode
                 .as_mut()
                 .expect(SETTINGS_INVARIANT)
@@ -373,9 +352,7 @@ impl AgentState {
     pub fn set_runner_script_target(&self, script: Option<&Path>) {
         let value = path_to_setting_value(script);
         self.tx.send_modify(|s| {
-            s.settings
-                .as_mut()
-                .expect(SETTINGS_INVARIANT)
+            settings_mut(s)
                 .runner_script
                 .as_mut()
                 .expect(SETTINGS_INVARIANT)
