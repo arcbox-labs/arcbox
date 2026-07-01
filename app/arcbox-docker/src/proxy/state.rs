@@ -122,12 +122,16 @@ impl EndpointReadiness {
         }
     }
 
-    /// Records the current VM incarnation and, when it differs from the last
+    /// Records the current VM incarnation and, when it advanced past the last
     /// one seen (the System VM restarted in between), invalidates the cached
     /// readiness and reports the change so the caller can drop stale pooled
     /// connections too.
+    ///
+    /// `fetch_max` (not `swap`) keeps the counter monotonic: a request that
+    /// read an older incarnation before a restart and lands here late cannot
+    /// regress the counter and trigger a spurious extra pool reset.
     fn observe_generation(&self, generation: u64) -> bool {
-        if self.generation.swap(generation, Ordering::AcqRel) == generation {
+        if self.generation.fetch_max(generation, Ordering::AcqRel) >= generation {
             return false;
         }
         self.invalidate();
@@ -342,6 +346,31 @@ mod tests {
 
         // Stable once recorded.
         assert!(!readiness.observe_generation(7));
+    }
+
+    #[tokio::test]
+    async fn readiness_generation_is_monotonic_under_stale_readers() {
+        let readiness = EndpointReadiness::new();
+
+        // A request that read generation 7 observes first.
+        assert!(readiness.observe_generation(7));
+
+        // Re-verify, then a late request carrying a STALE generation (read
+        // before the restart) lands. It must neither regress the counter nor
+        // trigger a spurious invalidation.
+        readiness
+            .ensure_verified(async { Ok::<(), DockerError>(()) }, || async {
+                Ok::<(), DockerError>(())
+            })
+            .await
+            .unwrap();
+        assert!(!readiness.observe_generation(3));
+        assert_eq!(readiness.state(), EndpointReadinessState::Verified);
+
+        // And the next current-generation observation is still a no-op (7 was
+        // not overwritten by 3).
+        assert!(!readiness.observe_generation(7));
+        assert_eq!(readiness.state(), EndpointReadinessState::Verified);
     }
 
     #[tokio::test]

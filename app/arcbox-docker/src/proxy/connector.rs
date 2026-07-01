@@ -23,8 +23,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// and Docker clients retry aggressively.
 const MAX_CONCURRENT_CONNECTS: usize = 8;
 
-static CONNECT_SEMAPHORE: LazyLock<Semaphore> =
-    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_CONNECTS));
+static CONNECT_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTS)));
 
 /// Connects to guest dockerd via vsock through the machine manager.
 pub struct VsockConnector {
@@ -48,8 +48,8 @@ impl GuestConnector for VsockConnector {
         );
         Box::pin(
             async move {
-                let _permit = CONNECT_SEMAPHORE
-                    .acquire()
+                let permit = Arc::clone(&CONNECT_SEMAPHORE)
+                    .acquire_owned()
                     .await
                     .map_err(|_| DockerError::Server("connect semaphore closed".into()))?;
 
@@ -67,6 +67,12 @@ impl GuestConnector for VsockConnector {
                 );
 
                 let handle = tokio::task::spawn_blocking(move || {
+                    // The permit rides with the blocking closure. A hung
+                    // connect cannot be aborted once running (spawn_blocking
+                    // is not cancellable), so a timed-out attempt must keep
+                    // holding its permit — otherwise every retry would spawn
+                    // another stuck thread and the semaphore would cap nothing.
+                    let _permit = permit;
                     let fd = manager.connect_vsock_port(&name, port)?;
                     // SAFETY: fd is a valid, newly-opened vsock file descriptor.
                     Ok::<_, arcbox_core::CoreError>(unsafe { OwnedFd::from_raw_fd(fd) })

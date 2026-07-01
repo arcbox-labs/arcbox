@@ -209,7 +209,10 @@ pub async fn proxy_with_upgrade(
         for (key, value) in &response_headers {
             builder = builder.header(key, value);
         }
-        // Read whatever response body the guest sent (bounded).
+        // Best-effort, bounded read of the guest's error body: one chunk, up
+        // to 8 KiB, no Content-Length framing. Docker error bodies are small
+        // JSON; a longer body is deliberately truncated rather than parsed,
+        // since this raw stream has no HTTP body decoder.
         let mut error_body = upgraded_prefix.to_vec();
         error_body.resize(8192, 0);
         let n = guest_stream
