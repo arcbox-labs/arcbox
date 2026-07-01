@@ -78,33 +78,6 @@ impl From<MachineState> for VmLifecycleState {
     }
 }
 
-/// State transition events.
-#[derive(Debug, Clone)]
-pub enum VmEvent {
-    /// Request to create VM.
-    Create,
-    /// VM creation completed.
-    Created,
-    /// Request to start VM.
-    Start,
-    /// Agent became ready.
-    AgentReady,
-    /// VM became idle (no activity for `idle_timeout`).
-    IdleTimeout,
-    /// Activity detected, exit idle state.
-    Activity,
-    /// Request to stop VM.
-    Stop,
-    /// VM stopped successfully.
-    Stopped,
-    /// Force stop VM.
-    ForceStop,
-    /// VM crashed or failed.
-    Failure(String),
-    /// Retry after failure.
-    Retry,
-}
-
 /// VM lifecycle configuration.
 #[derive(Debug, Clone)]
 pub struct VmLifecycleConfig {
