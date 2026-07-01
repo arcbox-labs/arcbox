@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.14](https://github.com/arcboxlabs/arcbox/compare/v0.4.13...v0.4.14) (2026-07-01)
+
+
+### Features
+
+* **core,vmm,docker:** switchable HV/VZ backend for a single System VM ([a7362d2](https://github.com/arcboxlabs/arcbox/commit/a7362d25fee628dbee92faae9ddfcdc80733c739))
+* **fleet:** cross-platform runner agent skeleton ([f7e8113](https://github.com/arcboxlabs/arcbox/commit/f7e8113f45e69d19d42398caf2d7ba3ffba7bb4b))
+* **fleet:** read enrollment token from file or stdin, not just argv ([8906c39](https://github.com/arcboxlabs/arcbox/commit/8906c3989d12a1bbe207394e9b5317040333b42f))
+* **fleet:** stop runners cleanly on SIGTERM/SIGINT ([659d7b4](https://github.com/arcboxlabs/arcbox/commit/659d7b40fdb8e7a2b2a1feddaa2ac1f78940d795))
+
+
+### Bug Fixes
+
+* **core:** address backend-switch review findings ([a0cd06b](https://github.com/arcboxlabs/arcbox/commit/a0cd06bf5ced854d588cdc454d66559351bb7c56))
+* **core:** commit switched backend durably last; correct switch docs ([515ea6b](https://github.com/arcboxlabs/arcbox/commit/515ea6b15331bd976bd0af055d7e811bb78e56d5))
+* **core:** ensure System VM is running on a same-backend switch ([8e4789d](https://github.com/arcboxlabs/arcbox/commit/8e4789d0c461a5ae9ef91e1be9ad62311a2af095))
+* **docker:** drain guest connection pool on System VM restart ([3243401](https://github.com/arcboxlabs/arcbox/commit/3243401f34de57ee5ed39210c6cae5315fb1e412))
+* **docker:** invalidate proxy readiness on System VM restart ([cc72404](https://github.com/arcboxlabs/arcbox/commit/cc724040c1f45c685d024e85b5b4e9f247185674))
+* **docker:** reset proxy endpoint via VM incarnation, not an async event ([8b11b45](https://github.com/arcboxlabs/arcbox/commit/8b11b452af8b6f42388e2aca75f33cc2f22fa4c1))
+* **fleet:** create credential temp file 0600 from the start ([54a7ef8](https://github.com/arcboxlabs/arcbox/commit/54a7ef8ee01ea27669c1abd9bb84bfadb4c757cf))
+* **fleet:** kill the whole runner process group on cancel ([329afd3](https://github.com/arcboxlabs/arcbox/commit/329afd377b57691e9b061cfe848da86ea9274824))
+* **fleet:** make ProvisionRunner handling idempotent on job_id ([3196ab6](https://github.com/arcboxlabs/arcbox/commit/3196ab6f359c3ff14745edca5e6683f72d621369))
+* **fleet:** persist runner supervisor across attach reconnects ([ef30bee](https://github.com/arcboxlabs/arcbox/commit/ef30beed82480230182922aae58060d08e7c9a35))
+* **fleet:** reconnect backoff reset, reject max_concurrent=0, atomic credential write ([9a7c96b](https://github.com/arcboxlabs/arcbox/commit/9a7c96be1f99afca332b4fc5567114b9b7a8d31e))
+* **fleet:** refuse insecure credential storage on non-Unix ([add1fdf](https://github.com/arcboxlabs/arcbox/commit/add1fdf70513a6765f6a603f217b089ce2e79273))
+* **xtask:** use non-colliding xtask-kit package ([#344](https://github.com/arcboxlabs/arcbox/issues/344)) ([8fb7d35](https://github.com/arcboxlabs/arcbox/commit/8fb7d3547128fd4a83613d3941e6c0f929d25bc7))
+
+
+### Documentation
+
+* **fleet:** sync vendored proto + correct enroll token help ([4916374](https://github.com/arcboxlabs/arcbox/commit/4916374495e89c6f09ed58c41e2419609287d9b0))
+
+
+### Styles
+
+* **core,vmm:** apply rustfmt ([ad5b8ca](https://github.com/arcboxlabs/arcbox/commit/ad5b8ca0ccc27ce3ebf9170d5ef52f6f42b6d57f))
+
+
+### Continuous Integration
+
+* **release:** sync shipped issues to Linear Releases ([#343](https://github.com/arcboxlabs/arcbox/issues/343)) ([4e74a93](https://github.com/arcboxlabs/arcbox/commit/4e74a93dfac25165436ecbab256a87df68d448f2))
+
 ## [0.4.13](https://github.com/arcboxlabs/arcbox/compare/v0.4.12...v0.4.13) (2026-06-27)
 
 
