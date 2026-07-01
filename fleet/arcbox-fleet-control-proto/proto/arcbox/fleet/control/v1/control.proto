@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package arcbox.fleet.control.v1;
+
+// Local control-plane API served by the fleet agent on a Unix socket
+// (~/.arcbox/fleet/agent.sock, owner-only). Clients: the arcbox-fleet-agent
+// CLI and the desktop app. The agent and its clients ship and self-update
+// independently, so this API evolves additively — call GetAgentInfo and
+// adapt to what it reports, rather than gating other RPCs on an exact
+// version match.
+service FleetLifecycleService {
+  // Version/capability handshake. Call first; do not hard-reject on skew.
+  rpc GetAgentInfo(GetAgentInfoRequest) returns (GetAgentInfoResponse);
+
+  // Exchanges an enrollment token for the machine credential via the
+  // gateway, persists it, and starts attaching. This is the desktop-managed
+  // handoff: the machine credential is created and persisted here, in the
+  // agent — never in the desktop. Fails if already enrolled; Disconnect
+  // first. The headless/farm path instead uses the `arcbox-fleet-agent
+  // enroll` CLI subcommand before this process is even running.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+
+  // Stops accepting new offers; in-flight jobs finish normally.
+  rpc Drain(DrainRequest) returns (DrainResponse);
+
+  // Resumes accepting new offers after a Drain.
+  rpc Resume(ResumeRequest) returns (ResumeResponse);
+
+  // Removes the machine credential and stops attaching. Returns to the
+  // unenrolled state; a fresh Enroll is required to rejoin the fleet.
+  rpc Disconnect(DisconnectRequest) returns (DisconnectResponse);
+
+  // Current lifecycle/attachment status.
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+}
+
+message GetAgentInfoRequest {}
+
+message GetAgentInfoResponse {
+  // `CARGO_PKG_VERSION` of the running agent.
+  string agent_version = 1;
+  // Bumped only on breaking control-API changes.
+  uint32 api_version = 2;
+  // Forward-compatible capability flags a client can probe for instead of
+  // gating behavior on `api_version` alone.
+  repeated string features = 3;
+}
+
+message EnrollRequest {
+  string enrollment_token = 1;
+  // Gateway URL override for this enrollment; empty uses the agent's
+  // configured default (ARCBOX_FLEET_GATEWAY / DEFAULT_GATEWAY).
+  string control_plane = 2;
+}
+
+message EnrollResponse {
+  // Prefixed machine id (`fltm_...`).
+  string machine_id = 1;
+}
+
+message DrainRequest {}
+message DrainResponse {}
+
+message ResumeRequest {}
+message ResumeResponse {}
+
+message DisconnectRequest {}
+message DisconnectResponse {}
+
+// Lifecycle state of the agent's relationship to the gateway. Distinguishing
+// a live gateway connection from a reconnect-in-progress ("attaching" vs
+// "attached", per RUN-35's live state-watch group) needs a connectivity
+// signal this RPC does not have; that lands with the state-watch API.
+enum ConnectionState {
+  CONNECTION_STATE_UNSPECIFIED = 0;
+  // No machine credential is persisted; Enroll is required.
+  CONNECTION_STATE_UNENROLLED = 1;
+  // Credential persisted; the agent attaches (and reconnects) in the
+  // background.
+  CONNECTION_STATE_ENROLLED = 2;
+  // Enrolled but not accepting new offers.
+  CONNECTION_STATE_DRAINING = 3;
+}
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  ConnectionState state = 1;
+  // Empty when unenrolled.
+  string machine_id = 2;
+}

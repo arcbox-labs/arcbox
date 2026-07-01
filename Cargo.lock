@@ -528,6 +528,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-fleet-control-proto"
+version = "0.4.17"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
 name = "arcbox-fleet-proto"
 version = "0.4.17"
 dependencies = [
