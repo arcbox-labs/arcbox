@@ -89,3 +89,80 @@ message GetStatusResponse {
   // Empty when unenrolled.
   string machine_id = 2;
 }
+
+// Live state-watch: the desktop holds no state of its own and renders only
+// what this streams — settings (a later addition) will push through the
+// same snapshot instead of needing their own notification path.
+service FleetStateService {
+  // Server-streaming: the first message is the current snapshot, then one
+  // per change for as long as the client stays subscribed.
+  rpc Watch(WatchRequest) returns (stream WatchResponse);
+}
+
+message WatchRequest {}
+
+message WatchResponse {
+  AgentStateSnapshot snapshot = 1;
+}
+
+// Distinguishes a live gateway connection from a reconnect-in-progress,
+// which GetStatus's coarser ConnectionState cannot (see its comment above).
+enum Enrollment {
+  ENROLLMENT_UNSPECIFIED = 0;
+  ENROLLMENT_UNENROLLED = 1;
+  // Enrolled, dialing or reconnecting to the gateway.
+  ENROLLMENT_ATTACHING = 2;
+  // Enrolled, attach stream live.
+  ENROLLMENT_ATTACHED = 3;
+}
+
+// What execution backend serves a capability. Deliberately redefined here
+// rather than imported from arcbox-fleet-proto (the vendored, externally
+// owned gateway contract) — this keeps the two contracts free to evolve
+// independently even though the shapes overlap.
+enum Backend {
+  BACKEND_UNSPECIFIED = 0;
+  BACKEND_HOST_RUNNER = 1;
+  BACKEND_DOCKER = 2;
+  BACKEND_VM = 3;
+}
+
+message Capability {
+  string os = 1;
+  string arch = 2;
+  Backend backed_by = 3;
+}
+
+message InFlightJob {
+  string job_id = 1;
+  string os = 2;
+  string arch = 3;
+}
+
+message OfferVerdict {
+  string job_id = 1;
+  bool accepted = 2;
+  // Empty when accepted.
+  string reason = 3;
+}
+
+message HostTelemetry {
+  double load_avg_1m = 1;
+  uint32 cpu_count = 2;
+  uint64 mem_total_mib = 3;
+  uint64 mem_available_mib = 4;
+}
+
+message AgentStateSnapshot {
+  Enrollment enrollment = 1;
+  // Empty when unenrolled.
+  string machine_id = 2;
+  bool draining = 3;
+  repeated Capability capabilities = 4;
+  repeated InFlightJob in_flight = 5;
+  // Bounded ring buffer, most recent last (see AgentState::push_verdict).
+  repeated OfferVerdict recent_verdicts = 6;
+  // Absent until the first heartbeat tick after attaching. Singular message
+  // fields are presence-tracked by default in proto3 (no `optional` needed).
+  HostTelemetry telemetry = 7;
+}
