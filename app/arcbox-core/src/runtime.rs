@@ -897,6 +897,22 @@ impl Runtime {
         tracing::info!(container_id, ?hostnames, "DNS entries deregistered");
     }
 
+    /// Returns the set of container IDs that currently hold host-side
+    /// networking state (port forwarding and/or DNS).
+    ///
+    /// Used by the Docker layer's reconciler to detect containers whose host
+    /// state outlived the container — e.g. a container that exited without a
+    /// `stop`/`kill`/`remove` API call (`--rm`, prune, OOM, a guest-side stop).
+    pub async fn registered_container_ids(&self) -> std::collections::HashSet<String> {
+        let mut ids: std::collections::HashSet<String> =
+            self.dns_entries.read().await.keys().cloned().collect();
+        #[cfg(target_os = "macos")]
+        ids.extend(self.inbound_rules.read().await.keys().cloned());
+        #[cfg(not(target_os = "macos"))]
+        ids.extend(self.port_forwarders.read().await.keys().cloned());
+        ids
+    }
+
     /// Stops all active port forwarders across every machine.
     pub async fn stop_port_forwarding_all(&self) {
         #[cfg(target_os = "macos")]
