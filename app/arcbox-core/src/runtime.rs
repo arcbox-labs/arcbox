@@ -85,6 +85,11 @@ pub struct Runtime {
     port_forwarders: Arc<TokioRwLock<HashMap<String, PortForwarder>>>,
     /// Tracks DNS registrations: canonical container ID → hostnames.
     dns_entries: Arc<TokioRwLock<HashMap<String, Vec<String>>>>,
+    /// Maps a container's unique name to its canonical ID, so teardown can
+    /// resolve the name/short-ID a client used without a guest inspect
+    /// round-trip. Populated at registration, updated on rename, cleared with
+    /// the rest of the container's host state.
+    container_aliases: Arc<TokioRwLock<HashMap<String, String>>>,
 }
 
 impl Runtime {
@@ -169,6 +174,7 @@ impl Runtime {
             #[cfg(not(target_os = "macos"))]
             port_forwarders: Arc::new(TokioRwLock::new(HashMap::new())),
             dns_entries: Arc::new(TokioRwLock::new(HashMap::new())),
+            container_aliases: Arc::new(TokioRwLock::new(HashMap::new())),
         })
     }
 
@@ -875,12 +881,29 @@ impl Runtime {
         );
     }
 
+    /// Records a container's unique name so later lifecycle calls can resolve
+    /// it to the canonical ID without a guest round-trip.
+    pub async fn register_container_alias(&self, name: &str, container_id: &str) {
+        self.container_aliases
+            .write()
+            .await
+            .insert(name.to_string(), container_id.to_string());
+    }
+
     /// Removes DNS entries for a container by its canonical ID.
     ///
-    /// Shared aliases (e.g. compose service-level names used by multiple
+    /// Also drops the container's name aliases — even when no DNS entry was
+    /// ever registered (e.g. a container with port forwarding but no IP), so
+    /// teardown never leaks alias mappings.
+    ///
+    /// Shared DNS hostnames (e.g. compose service-level names used by multiple
     /// replicas) are only removed from the network manager when no other
     /// container still references them.
     pub async fn deregister_dns_by_id(&self, container_id: &str) {
+        self.container_aliases
+            .write()
+            .await
+            .retain(|_, id| id != container_id);
         let mut entries = self.dns_entries.write().await;
         let Some(hostnames) = entries.remove(container_id) else {
             return;
@@ -911,6 +934,33 @@ impl Runtime {
         #[cfg(not(target_os = "macos"))]
         ids.extend(self.port_forwarders.read().await.keys().cloned());
         ids
+    }
+
+    /// Resolves a container token (name, short ID, or full ID) to the
+    /// canonical ID of a container with registered host networking state —
+    /// without a guest round-trip.
+    ///
+    /// Resolution order: exact registered ID, then name alias, then a unique
+    /// registered-ID prefix (Docker short IDs). Returns `None` when the token
+    /// matches nothing registered — which for teardown means there is nothing
+    /// to tear down, and for a DNS refresh means there is nothing to refresh.
+    pub async fn resolve_registered_container(&self, token: &str) -> Option<String> {
+        let registered = self.registered_container_ids().await;
+        if registered.contains(token) {
+            return Some(token.to_string());
+        }
+        if let Some(id) = self.container_aliases.read().await.get(token) {
+            return Some(id.clone());
+        }
+        // Unique-prefix match for Docker short IDs. Require a few characters
+        // so a short name can't accidentally prefix-match an unrelated ID.
+        if token.len() >= 4 && token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let mut matches = registered.iter().filter(|id| id.starts_with(token));
+            if let (Some(id), None) = (matches.next(), matches.next()) {
+                return Some(id.clone());
+            }
+        }
+        None
     }
 
     /// Stops all active port forwarders across every machine.

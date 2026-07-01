@@ -7,7 +7,9 @@
 //! All other network operations proxy through the fallback untouched (host
 //! routing uses one static container-subnet route, not per-network state).
 
-use super::container::{canonical_id_or_fallback, extract_container_dns_info};
+use super::container::{
+    canonical_id_or_fallback, extract_container_dns_info, extract_container_name,
+};
 use super::proxying::proxy_to_system_vm;
 use crate::api::AppState;
 use crate::error::{DockerError, Result};
@@ -101,6 +103,14 @@ async fn refresh_container_dns(state: &AppState, token: &str) {
     };
     let canonical = canonical_id_or_fallback(token, &inspect);
     state.runtime.deregister_dns_by_id(&canonical).await;
+    // Deregistration also cleared the name alias — re-register it so later
+    // lifecycle calls by name still resolve.
+    if let Some(name) = extract_container_name(&inspect) {
+        state
+            .runtime
+            .register_container_alias(&name, &canonical)
+            .await;
+    }
     if let Some((aliases, ip)) = extract_container_dns_info(&inspect) {
         state.runtime.register_dns(&canonical, &aliases, ip).await;
     }
