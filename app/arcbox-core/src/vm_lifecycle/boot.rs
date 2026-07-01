@@ -18,28 +18,35 @@ use crate::machine::MachineConfig;
 use arcbox_constants::cmdline::{GUEST_DOCKER_VSOCK_PORT_KEY, HV_EARLYCON_DIRECTIVE};
 use arcbox_error::CommonError;
 
-use super::actor::{InternalEvent, LifecycleShared};
+use super::actor::{Completion, InternalEvent, LifecycleShared};
 use super::types::{DesiredBoot, machine_drift_reason};
 use super::{DOCKER_DATA_IMAGE_SIZE_BYTES, RecoveryAction};
 
 impl LifecycleShared {
     /// Boots the VM end-to-end (create if needed, start with retries, wait for
-    /// the agent) and reports the outcome to the actor.
+    /// the agent) and reports the outcome to the actor, tagged with the epoch
+    /// this sub-task was spawned under.
     pub(super) async fn run_boot(
         self: Arc<Self>,
         create: bool,
         timeout: Duration,
-        events: &mpsc::UnboundedSender<InternalEvent>,
+        epoch: u64,
+        events: &mpsc::UnboundedSender<Completion>,
     ) {
         let outcome = match self.boot(create, timeout).await {
             Ok(()) => InternalEvent::AgentReady,
             Err(e) => InternalEvent::BootFailed(e.to_string()),
         };
-        let _ = events.send(outcome);
+        let _ = events.send(Completion { epoch, outcome });
     }
 
-    /// Gracefully stops the VM (force-stop fallback) and reports the outcome.
-    pub(super) async fn run_stop(self: Arc<Self>, events: &mpsc::UnboundedSender<InternalEvent>) {
+    /// Gracefully stops the VM (force-stop fallback) and reports the outcome,
+    /// tagged with the epoch this sub-task was spawned under.
+    pub(super) async fn run_stop(
+        self: Arc<Self>,
+        epoch: u64,
+        events: &mpsc::UnboundedSender<Completion>,
+    ) {
         // Stop health monitoring before tearing the VM down.
         self.health_monitor.stop();
 
@@ -81,7 +88,7 @@ impl LifecycleShared {
             }
             Err(e) => InternalEvent::StopFailed(e.to_string()),
         };
-        let _ = events.send(outcome);
+        let _ = events.send(Completion { epoch, outcome });
     }
 
     /// The boot body: drift check, optional (re)create, start loop with

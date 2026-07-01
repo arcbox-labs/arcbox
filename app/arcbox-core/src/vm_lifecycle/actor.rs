@@ -66,6 +66,21 @@ pub(super) enum InternalEvent {
     StopFailed(String),
 }
 
+/// An [`InternalEvent`] tagged with the epoch of the sub-task that sent it.
+///
+/// `JoinHandle::abort` is best-effort: a sub-task that already completed and
+/// enqueued its outcome is unaffected, so after a `ForceStop` + reboot a stale
+/// completion from the superseded task can still be sitting in the channel.
+/// The actor bumps its epoch on every spawn/abort and drops completions whose
+/// epoch doesn't match the live sub-task, so a stale `AgentReady`/`Stopped`
+/// can neither clobber the new task's `inflight` handle nor drive the machine.
+pub(super) struct Completion {
+    /// Epoch of the sub-task that produced this outcome.
+    pub(super) epoch: u64,
+    /// The outcome itself.
+    pub(super) outcome: InternalEvent,
+}
+
 /// State shared between the facade, the actor, and boot/stop sub-tasks.
 ///
 /// Everything here is either immutable after construction or atomic, so the
@@ -207,9 +222,9 @@ pub(super) struct LifecycleActor {
     /// Commands from the facade.
     commands: mpsc::UnboundedReceiver<Command>,
     /// Completions from boot/stop sub-tasks.
-    events_rx: mpsc::UnboundedReceiver<InternalEvent>,
+    events_rx: mpsc::UnboundedReceiver<Completion>,
     /// Cloned into every spawned sub-task so it can report back.
-    events_tx: mpsc::UnboundedSender<InternalEvent>,
+    events_tx: mpsc::UnboundedSender<Completion>,
     /// Publishes the public state after every dispatch.
     state_tx: watch::Sender<VmLifecycleState>,
     /// Effect sink passed to every dispatch as the statig context.
@@ -226,6 +241,12 @@ pub(super) struct LifecycleActor {
     pending_stop: bool,
     /// The in-flight boot or stop sub-task, aborted on `ForceStop`.
     inflight: Option<JoinHandle<()>>,
+    /// Epoch of the live sub-task; bumped on every spawn and abort so stale
+    /// completions from superseded tasks are recognized and dropped.
+    epoch: u64,
+    /// The detached machine-removal task of a force stop, joined by the
+    /// force-stop reply so callers still observe "removed" on return.
+    removal: Option<JoinHandle<()>>,
 }
 
 impl LifecycleActor {
@@ -248,6 +269,8 @@ impl LifecycleActor {
             pending_timeout: None,
             pending_stop: false,
             inflight: None,
+            epoch: 0,
+            removal: None,
         }
     }
 
@@ -319,35 +342,35 @@ impl LifecycleActor {
     fn apply(&mut self, effect: Effect) {
         match effect {
             Effect::SpawnBoot { create, timeout_ms } => {
+                let epoch = self.abort_inflight();
                 let shared = Arc::clone(&self.shared);
                 let events = self.events_tx.clone();
                 let timeout = Duration::from_millis(timeout_ms);
                 self.inflight = Some(tokio::spawn(async move {
-                    shared.run_boot(create, timeout, &events).await;
+                    shared.run_boot(create, timeout, epoch, &events).await;
                 }));
             }
             Effect::SpawnStop => {
-                // Stopping preempts a still-running boot: there is no point
-                // finishing a boot for a VM we are about to stop.
-                if let Some(handle) = self.inflight.take() {
-                    handle.abort();
-                }
+                let epoch = self.abort_inflight();
                 let shared = Arc::clone(&self.shared);
                 let events = self.events_tx.clone();
                 self.inflight = Some(tokio::spawn(async move {
-                    shared.run_stop(&events).await;
+                    shared.run_stop(epoch, &events).await;
                 }));
             }
             Effect::AbortInflight => {
-                if let Some(handle) = self.inflight.take() {
-                    handle.abort();
-                }
+                self.abort_inflight();
             }
             Effect::RemoveMachine => {
-                let _ = self
-                    .shared
-                    .machine_manager
-                    .remove(&self.shared.machine_name, true);
+                // `remove(force = true)` tears the VM down synchronously (a
+                // hypervisor stop that can block for seconds); keep it off the
+                // actor so the command loop stays responsive. The force-stop
+                // reply joins `removal`, preserving the caller-visible
+                // "returned ⇒ removed" contract.
+                let shared = Arc::clone(&self.shared);
+                self.removal = Some(tokio::task::spawn_blocking(move || {
+                    let _ = shared.machine_manager.remove(&shared.machine_name, true);
+                }));
             }
             Effect::Balloon(BalloonTarget::Idle) => self.shared.shrink_balloon(),
             Effect::Balloon(BalloonTarget::Full) => self.shared.restore_balloon(),
@@ -395,7 +418,16 @@ impl LifecycleActor {
                 }
                 self.pending_timeout = None;
                 self.pending_stop = false;
-                let _ = reply.send(Ok(()));
+                // Reply once the detached removal finishes, so callers keep
+                // the old "force_stop returned ⇒ machine removed" contract
+                // without the removal blocking the actor.
+                let removal = self.removal.take();
+                drop(tokio::spawn(async move {
+                    if let Some(handle) = removal {
+                        let _ = handle.await;
+                    }
+                    let _ = reply.send(Ok(()));
+                }));
             }
             Command::Activity => {
                 self.dispatch(machine, VmEvent::Activity);
@@ -465,9 +497,31 @@ impl LifecycleActor {
         }
     }
 
-    fn on_internal(&mut self, machine: &mut Machine, ev: InternalEvent) {
+    /// Aborts the in-flight sub-task (if any) and bumps the epoch so any
+    /// completion it already enqueued is recognized as stale. Returns the new
+    /// epoch for the next sub-task to tag its completion with.
+    fn abort_inflight(&mut self) -> u64 {
+        if let Some(handle) = self.inflight.take() {
+            handle.abort();
+        }
+        self.epoch += 1;
+        self.epoch
+    }
+
+    fn on_internal(&mut self, machine: &mut Machine, completion: Completion) {
+        if completion.epoch != self.epoch {
+            // Completion from a superseded sub-task (aborted after it had
+            // already finished): the machine has moved on; ignore it.
+            tracing::debug!(
+                machine = %self.shared.machine_name,
+                stale_epoch = completion.epoch,
+                current_epoch = self.epoch,
+                "dropping stale lifecycle sub-task completion"
+            );
+            return;
+        }
         self.inflight = None;
-        match ev {
+        match completion.outcome {
             InternalEvent::AgentReady => {
                 self.dispatch(machine, VmEvent::AgentReady);
                 // Serve a shutdown that arrived mid-boot now that the boot
