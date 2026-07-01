@@ -128,8 +128,7 @@ pub async fn stop_container(
     if let Some(id) = extract_container_id(&uri) {
         tracing::Span::current().record("container_id", id.as_str());
     }
-    // Resolve canonical ID before proxy — the name/short-id is still valid now
-    // but may become stale after stop (e.g. --rm containers).
+    // Resolve the canonical ID from the host registry (no guest round-trip).
     let canonical = resolve_or_raw_for_teardown(&state, &uri).await;
 
     let response = proxy_to_system_vm(&state, &uri, req).await?;
@@ -188,7 +187,7 @@ pub async fn kill_container(
     if let Some(id) = extract_container_id(&uri) {
         tracing::Span::current().record("container_id", id.as_str());
     }
-    // Resolve canonical ID before proxy — kill with --rm triggers auto-remove.
+    // Resolve the canonical ID from the host registry (no guest round-trip).
     let canonical = resolve_or_raw_for_teardown(&state, &uri).await;
 
     let terminates = kill_terminates_container(&uri);
@@ -235,6 +234,12 @@ pub async fn restart_container(
             let _ = state.runtime.ensure_vm_ready().await;
             if let Some(body_bytes) = inspect_container_body(&state, &id).await {
                 let canonical = canonical_id_or_fallback(&id, &body_bytes);
+                if let Some(name) = extract_container_name(&body_bytes) {
+                    state
+                        .runtime
+                        .register_container_alias(&name, &canonical)
+                        .await;
+                }
                 if let Some((aliases, ip)) = extract_container_dns_info(&body_bytes) {
                     state.runtime.register_dns(&canonical, &aliases, ip).await;
                 }
@@ -264,7 +269,7 @@ pub async fn remove_container(
     if let Some(id) = extract_container_id(&uri) {
         tracing::Span::current().record("container_id", id.as_str());
     }
-    // Resolve canonical ID before proxy — the name/short-id is still valid now.
+    // Resolve the canonical ID from the host registry (no guest round-trip).
     let canonical = resolve_or_raw_for_teardown(&state, &uri).await;
 
     let response = proxy_to_system_vm(&state, &uri, req).await?;
@@ -296,6 +301,15 @@ async fn setup_container_networking(state: &AppState, container_id: &str) {
     // Use the canonical full container ID from inspect (not the URI token which
     // may be a name or short ID) so that stop/remove can reliably match the key.
     let canonical_id = canonical_id_or_fallback(container_id, &body_bytes);
+
+    // Record the name → ID alias so later lifecycle calls (stop/kill/remove by
+    // name or short ID) resolve without a guest round-trip.
+    if let Some(name) = extract_container_name(&body_bytes) {
+        state
+            .runtime
+            .register_container_alias(&name, &canonical_id)
+            .await;
+    }
 
     // Port forwarding.
     setup_port_forwarding_from_inspect(state, &canonical_id, &body_bytes).await;
@@ -448,8 +462,8 @@ pub async fn rename_container(
     if let Some(id) = extract_container_id(&uri) {
         tracing::Span::current().record("container_id", id.as_str());
     }
-    // Resolve canonical ID BEFORE proxy — the old name/short-id is still valid
-    // now but will be invalid after a successful rename.
+    // Resolve the canonical ID from the host registry BEFORE proxying — the
+    // old name alias is dropped as part of the post-rename refresh.
     let canonical = resolve_canonical_from_uri(&state, &uri).await;
     let new_name = query_param(&uri, "name").map(str::to_string);
     if let Some(name) = new_name.as_deref() {
@@ -461,14 +475,21 @@ pub async fn rename_container(
 
     if response.status().is_success() {
         if let Some(ref canonical) = canonical {
-            // Remove the old DNS entry, then inspect (using the canonical ID,
-            // which survives rename) to get the new name + IP and re-register.
+            // Remove the old DNS entry (and the old name alias), then inspect
+            // — using the canonical ID, which survives rename — to get the new
+            // name + IP, and re-register both.
             state.runtime.deregister_dns_by_id(canonical).await;
 
-            if let Some(body_bytes) = inspect_container_body(&state, canonical).await
-                && let Some((aliases, ip)) = extract_container_dns_info(&body_bytes)
-            {
-                state.runtime.register_dns(canonical, &aliases, ip).await;
+            if let Some(body_bytes) = inspect_container_body(&state, canonical).await {
+                if let Some(name) = extract_container_name(&body_bytes) {
+                    state
+                        .runtime
+                        .register_container_alias(&name, canonical)
+                        .await;
+                }
+                if let Some((aliases, ip)) = extract_container_dns_info(&body_bytes) {
+                    state.runtime.register_dns(canonical, &aliases, ip).await;
+                }
             }
         }
     }
@@ -488,61 +509,40 @@ pub(super) fn canonical_id_or_fallback(container_id: &str, inspect_json: &[u8]) 
     extract_canonical_id_from_inspect(inspect_json).unwrap_or_else(|| container_id.to_string())
 }
 
+/// Extracts a container's unique name from Docker inspect JSON.
+pub fn extract_container_name(inspect_json: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(inspect_json).ok()?;
+    let name = value.get("Name")?.as_str()?.trim_start_matches('/');
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// Extracts a container identifier from the URI and resolves it to the
-/// canonical full ID via an inspect against guest dockerd.
-/// Returns `None` (with a warning) when canonical resolution fails.
+/// canonical full ID of a container with registered host networking state.
 ///
-/// Teardown handlers (stop/kill/remove) layer a raw-ID fallback on top
-/// of this via [`resolve_or_raw_for_teardown`] so transient inspect
-/// failures don't leak port forwarding listeners and DNS entries.
-/// Non-teardown callers (e.g. rename) must keep using the strict result:
-/// a raw URI token that is a name becomes stale after a successful
-/// rename, which would break DNS re-registration.
-///
-/// Best-effort wakes the VM before inspecting, since
-/// [`resolve_canonical_id`] uses `proxy_to_guest_pooled` directly and
-/// does not call `ensure_vm_ready` itself. Readiness failures are not
-/// fatal — the subsequent inspect will surface them as a `None` resolution.
+/// Resolution is purely against the host registry (exact ID, name alias, or
+/// unique short-ID prefix) — no guest round-trip. Every container that got
+/// host networking was registered with its name at setup, so `None` means
+/// the container has no host state to refresh or tear down.
 async fn resolve_canonical_from_uri(state: &AppState, uri: &Uri) -> Option<String> {
-    let id = extract_container_id(uri)?;
-    // Best-effort wake; if it fails, the inspect call below will too.
-    let _ = state.runtime.ensure_vm_ready().await;
-    match resolve_canonical_id(state, &id).await {
-        Some(canonical) => Some(canonical),
-        None => {
-            tracing::warn!(
-                container_id = %id,
-                utility_vm = "native",
-                "Failed to resolve canonical container ID"
-            );
-            None
-        }
-    }
+    let token = extract_container_id(uri)?;
+    state.runtime.resolve_registered_container(&token).await
 }
 
 /// Variant of [`resolve_canonical_from_uri`] for teardown handlers
-/// (stop/kill/remove): on canonical-resolution failure, falls back to
-/// the raw URI-extracted ID so cleanup of port forwarding + DNS still
-/// runs. A non-matching key is a no-op against the canonical-keyed maps
-/// — strictly better than skipping teardown entirely.
+/// (stop/kill/remove): when the token resolves to nothing registered, the
+/// raw token is returned as-is. Teardown only matters for containers *with*
+/// host state, so an unresolved token makes the teardown calls harmless
+/// no-ops against the canonical-keyed maps; the reconciler backstops
+/// anything the registry missed.
 async fn resolve_or_raw_for_teardown(state: &AppState, uri: &Uri) -> Option<String> {
-    if let Some(canonical) = resolve_canonical_from_uri(state, uri).await {
-        return Some(canonical);
-    }
-    let raw = extract_container_id(uri)?;
-    tracing::warn!(
-        container_id = %raw,
-        utility_vm = "native",
-        "Using raw URI-extracted ID for networking teardown"
-    );
-    Some(raw)
-}
-
-/// Resolves a container name, short ID, or full ID to the canonical full ID
-/// by inspecting the container on guest dockerd.
-async fn resolve_canonical_id(state: &AppState, id: &str) -> Option<String> {
-    let body = crate::guest_query::inspect_container(state.proxy.client(), id).await?;
-    extract_canonical_id_from_inspect(&body)
+    let token = extract_container_id(uri)?;
+    Some(
+        state
+            .runtime
+            .resolve_registered_container(&token)
+            .await
+            .unwrap_or(token),
+    )
 }
 
 #[cfg(test)]

@@ -23,3 +23,4 @@ pub(crate) use container::{
 pub(crate) use network::{network_connect, network_disconnect};
 
 pub use container::extract_container_dns_info;
+pub use container::extract_container_name;

@@ -90,6 +90,91 @@ fn test_check_executable_not_executable() {
     assert!(err.to_string().contains("not executable"), "got: {err}");
 }
 
+fn networking_test_runtime() -> (Runtime, tempfile::TempDir) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        data_dir: temp_dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let runtime = Runtime::new(config).expect("runtime init should succeed");
+    (runtime, temp_dir)
+}
+
+#[tokio::test]
+async fn resolve_registered_container_by_id_alias_and_prefix() {
+    let (runtime, _tmp) = networking_test_runtime();
+    let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let id = "0a1b2c3d4e5f00112233445566778899";
+    runtime.register_dns(id, &["web.local".into()], ip).await;
+    runtime.register_container_alias("web", id).await;
+
+    // Exact canonical ID.
+    assert_eq!(
+        runtime.resolve_registered_container(id).await.as_deref(),
+        Some(id)
+    );
+    // Name alias.
+    assert_eq!(
+        runtime.resolve_registered_container("web").await.as_deref(),
+        Some(id)
+    );
+    // Unique short-ID prefix.
+    assert_eq!(
+        runtime
+            .resolve_registered_container("0a1b2c3d4e5f")
+            .await
+            .as_deref(),
+        Some(id)
+    );
+    // Unregistered token resolves to nothing.
+    assert_eq!(runtime.resolve_registered_container("nope").await, None);
+}
+
+#[tokio::test]
+async fn resolve_registered_container_rejects_ambiguous_prefix() {
+    let (runtime, _tmp) = networking_test_runtime();
+    let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    runtime
+        .register_dns("abcd1111", &["a.local".into()], ip)
+        .await;
+    runtime
+        .register_dns("abcd2222", &["b.local".into()], ip)
+        .await;
+
+    // Prefix matching two registered IDs must not guess.
+    assert_eq!(runtime.resolve_registered_container("abcd").await, None);
+    // Longer, unique prefixes still resolve.
+    assert_eq!(
+        runtime
+            .resolve_registered_container("abcd1")
+            .await
+            .as_deref(),
+        Some("abcd1111")
+    );
+}
+
+#[tokio::test]
+async fn deregister_dns_clears_aliases_even_without_dns_entry() {
+    let (runtime, _tmp) = networking_test_runtime();
+    // Alias registered without any DNS entry (e.g. port forwarding only).
+    runtime
+        .register_container_alias("ports-only", "feed1234")
+        .await;
+    assert_eq!(
+        runtime
+            .resolve_registered_container("ports-only")
+            .await
+            .as_deref(),
+        Some("feed1234")
+    );
+
+    runtime.deregister_dns_by_id("feed1234").await;
+    assert_eq!(
+        runtime.resolve_registered_container("ports-only").await,
+        None
+    );
+}
+
 #[test]
 fn test_runtime_new_propagates_config_vm_defaults() {
     let temp_dir = tempfile::tempdir().unwrap();

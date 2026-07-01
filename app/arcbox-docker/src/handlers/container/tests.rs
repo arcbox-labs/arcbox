@@ -67,6 +67,17 @@ fn kill_teardown_only_on_terminating_signal() {
 }
 
 #[test]
+fn extract_name_from_inspect_json() {
+    assert_eq!(
+        extract_container_name(br#"{"Id":"abc","Name":"/my-nginx"}"#).as_deref(),
+        Some("my-nginx")
+    );
+    assert_eq!(extract_container_name(br#"{"Name":""}"#), None);
+    assert_eq!(extract_container_name(br#"{"Id":"abc"}"#), None);
+    assert_eq!(extract_container_name(b"not json"), None);
+}
+
+#[test]
 fn extract_canonical_id_from_inspect_json() {
     let json = br#"{"Id":"abc123def456789","Name":"/my-nginx","State":{}}"#;
     assert_eq!(

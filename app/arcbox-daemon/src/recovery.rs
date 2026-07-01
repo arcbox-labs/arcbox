@@ -218,6 +218,12 @@ async fn recover_container_networking(
             continue;
         };
 
+        // Re-register the name alias so lifecycle calls by name resolve
+        // without a guest round-trip (mirrors handler-side registration).
+        if let Some(name) = arcbox_docker::handlers::extract_container_name(&inspect_body) {
+            runtime.register_container_alias(&name, id).await;
+        }
+
         if let Some((aliases, ip)) =
             arcbox_docker::handlers::extract_container_dns_info(&inspect_body)
         {
