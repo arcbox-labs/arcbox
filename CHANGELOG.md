@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.15](https://github.com/arcboxlabs/arcbox/compare/v0.4.14...v0.4.15) (2026-07-01)
+
+
+### Features
+
+* **docker:** reconcile host networking against guest container state ([5a9bb29](https://github.com/arcboxlabs/arcbox/commit/5a9bb29e7b205cfa5875c5a9f201d75619ad2a03))
+* **docker:** refresh host DNS on network connect/disconnect ([cebd282](https://github.com/arcboxlabs/arcbox/commit/cebd2820734643e20f205aa4ccb6db7c9f34f7b3))
+* **fleet:** Docker-based Linux runner support ([4d66d34](https://github.com/arcboxlabs/arcbox/commit/4d66d34a8eca39deafa7ed5da7232af7574c9368))
+* **fleet:** verify docker by pulling the runner image at startup ([51557fb](https://github.com/arcboxlabs/arcbox/commit/51557fba291293e4da70cba44ca22b7f611a6902))
+
+
+### Bug Fixes
+
+* **core,docker:** address adversarial-review findings on the proxy series ([4b57fbf](https://github.com/arcboxlabs/arcbox/commit/4b57fbfb6c1fe2bf4a3b6b2226bff248de5d2650))
+* **docker:** harden proxy edge paths ([4df8daf](https://github.com/arcboxlabs/arcbox/commit/4df8daf288cd1738d9bf298a491fbaa28a5bdce9))
+* **docker:** only tear down host networking on a terminating kill signal ([b6d3ae9](https://github.com/arcboxlabs/arcbox/commit/b6d3ae9a9910502721175a20959b750a897f8d85))
+* **docker:** proxy method-mismatched /containers/{id} instead of 405 ([f7b6e9a](https://github.com/arcboxlabs/arcbox/commit/f7b6e9acc3cdb09fc55b03fa2aa95133eb6e270e))
+* **fleet:** admit jobs per capacity pool to match gateway reservation ([3605e14](https://github.com/arcboxlabs/arcbox/commit/3605e14c9f512835b06ee390684896c3016c9f41))
+* **fleet:** always route linux jobs through Docker for isolation ([2a5e6b5](https://github.com/arcboxlabs/arcbox/commit/2a5e6b5b5d85f72478c05979fa2c83fa8f81e731))
+* **fleet:** connect to ArcBox socket on macOS, fix comments ([33c953d](https://github.com/arcboxlabs/arcbox/commit/33c953d98c45aa0b4567a62fb25740a813d0e406))
+* **fleet:** don't probe docker during enrollment ([baff099](https://github.com/arcboxlabs/arcbox/commit/baff099976be02e1dcb23d9819909bb68ac371ba))
+* **fleet:** remove orphaned container before reusing its name ([e34be79](https://github.com/arcboxlabs/arcbox/commit/e34be7984f766fcedfa7bf207be1088605c9703a))
+* **fleet:** use pullable actions-runner image as default ([e5578c4](https://github.com/arcboxlabs/arcbox/commit/e5578c43878a85a4cde08c9b1c921f08c725124b))
+
+
+### Performance Improvements
+
+* **core,docker,daemon:** resolve teardown IDs from a host registry ([91620cb](https://github.com/arcboxlabs/arcbox/commit/91620cb9f6fe251e142b6e7a1ce2399c84111f90))
+
+
+### Code Refactoring
+
+* **docker,daemon:** consolidate guest dockerd queries ([93985d7](https://github.com/arcboxlabs/arcbox/commit/93985d7cf5a0b352bec5cf670d45ca2d4130a316))
+* **docker:** classify guest transport errors; gate readiness invalidation ([a683af5](https://github.com/arcboxlabs/arcbox/commit/a683af5516b05f021ce5248a47e8d870900bc098))
+* **docker:** move proxy transport state into proxy/state.rs ([f928469](https://github.com/arcboxlabs/arcbox/commit/f9284694c1e426af45fed88f5efae2012f57b3cc))
+* **docker:** share the proxy pool with the host reconciler ([5bf19de](https://github.com/arcboxlabs/arcbox/commit/5bf19de5b57dcf0ec6d04cc2ebab3543f04d4d56))
+* **fleet:** drop max_concurrent from DockerCapabilities ([7d6fa7b](https://github.com/arcboxlabs/arcbox/commit/7d6fa7bd63213b9ba4a4216497df6438f6c91bbb))
+* **fleet:** replace DockerCapabilities with plain arch list ([b877391](https://github.com/arcboxlabs/arcbox/commit/b8773912461516011201a92e36b0884202343f00))
+
+
+### Tests
+
+* **docker:** handler-path API tests that run in CI ([8c19580](https://github.com/arcboxlabs/arcbox/commit/8c195806cc5121bcc41b0f78c195162e89c4adb4))
+* **docker:** mock-guest canned routes for offline handler tests ([c9f41a8](https://github.com/arcboxlabs/arcbox/commit/c9f41a840d7f2e09ee1738094785af934c307fae))
+* **docker:** router-level routing coverage that runs in CI ([8600087](https://github.com/arcboxlabs/arcbox/commit/8600087d28c6160cff16c53e38461a1d242ef0c6))
+
+
+### Styles
+
+* **docker:** rustfmt kill-signal gate tests ([c18648f](https://github.com/arcboxlabs/arcbox/commit/c18648f4a6dc6f758efb0dcbd347706b5aab7b08))
+
 ## [0.4.14](https://github.com/arcboxlabs/arcbox/compare/v0.4.13...v0.4.14) (2026-07-01)
 
 
