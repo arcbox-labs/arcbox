@@ -597,18 +597,29 @@ impl LifecycleActor {
         }
     }
 
-    /// Whether a boot from `state` must (re)create the machine first.
+    /// Whether a boot from `state` must (re)create the machine first: only
+    /// when no machine record exists.
     ///
-    /// Config drift against the resolved boot assets is re-checked inside the
-    /// boot sub-task, where resolving assets (a potential download) cannot
-    /// block the actor.
+    /// The lifecycle state deliberately plays no part: the machine re-enters
+    /// at `NotExist` on every daemon start, while the registry may well hold
+    /// the persisted machine — which must be started, not recreated
+    /// (`MachineManager::create` rejects duplicate names). Config drift
+    /// against the resolved boot assets is re-checked inside the boot
+    /// sub-task, where resolving assets (a potential download) cannot block
+    /// the actor.
     fn decide_create(&self, state: VmLifecycleState) -> bool {
-        state == VmLifecycleState::NotExist
-            || self
-                .shared
-                .machine_manager
-                .get(&self.shared.machine_name)
-                .is_none()
+        let exists = self
+            .shared
+            .machine_manager
+            .get(&self.shared.machine_name)
+            .is_some();
+        if !exists && state != VmLifecycleState::NotExist {
+            tracing::warn!(
+                state = state.as_str(),
+                "machine record missing while lifecycle state indicates existing VM; recreating"
+            );
+        }
+        !exists
     }
 }
 
