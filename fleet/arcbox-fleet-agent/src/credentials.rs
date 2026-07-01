@@ -109,21 +109,10 @@ impl FileStore {
     }
 
     fn store(&self, cred: &Credential) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let json = serde_json::to_vec_pretty(cred).context("serializing credential")?;
-        // Write-then-rename so a crash mid-write can't leave a truncated
-        // credentials.json that fails to parse and strands the host unenrolled.
-        // The temp file is created `0600` from the open(2) call, so the raw
-        // token is never briefly world-readable — not in the temp file and not
-        // (via rename, which preserves the mode) in the final path.
-        let tmp = self.path.with_extension("json.tmp");
-        write_private(&tmp, &json)?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("renaming {} -> {}", tmp.display(), self.path.display()))?;
-        Ok(())
+        // `write_private` refuses a plaintext write on non-Unix, so the raw
+        // token never lands in an unhardened file; on Unix it's `0600` from
+        // creation and the rename preserves that mode.
+        crate::fsutil::write_json_atomic(&self.path, cred, write_private)
     }
 
     fn clear(&self) -> Result<()> {

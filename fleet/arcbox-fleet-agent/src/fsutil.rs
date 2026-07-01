@@ -1,9 +1,10 @@
 //! Small filesystem helper shared by anything that persists state to the
 //! data directory with an owner-only file mode.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 
 /// Write `bytes` to `path`, owner-only (`0600`) from creation on Unix. On
 /// non-Unix platforms this writes normally — callers with a secret to
@@ -33,4 +34,30 @@ pub fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(not(unix))]
 pub fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Serialize `value` as pretty JSON and write it to `path` atomically: write a
+/// `<path>.tmp` sibling via `write` — the owner-only primitive the caller
+/// chooses, since a plain settings file and a secret credential harden
+/// differently (the latter refuses a plaintext write on non-Unix) — then
+/// rename it over `path`. The rename makes the replace atomic, so a crash
+/// mid-write can't leave a truncated file that fails to parse on the next
+/// read, and it preserves the temp file's mode so a secret is never briefly
+/// world-readable at the final path.
+pub fn write_json_atomic<T: Serialize>(
+    path: &Path,
+    value: &T,
+    write: impl FnOnce(&Path, &[u8]) -> Result<()>,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let json = serde_json::to_vec_pretty(value).context("serializing to JSON")?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    write(&tmp, &json)?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))
 }

@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{AgentConfig, DockerMode};
-use crate::fsutil::write_owner_only;
+use crate::fsutil::{write_json_atomic, write_owner_only};
 
 /// Live-settable agent configuration, as last requested (`target`) — see
 /// [`crate::state::AgentState`] for the paired `current` values the engine
@@ -73,20 +73,11 @@ impl SettingsStore {
         }
     }
 
-    /// Persist `settings`, replacing whatever was there before.
+    /// Persist `settings`, replacing whatever was there before. Settings
+    /// aren't secret, so a plain owner-only write suffices on every platform
+    /// (unlike the credential, which refuses a file backend off Unix).
     pub fn store(&self, settings: &PersistedSettings) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let json = serde_json::to_vec_pretty(settings).context("serializing settings")?;
-        // Write-then-rename so a crash mid-write can't leave a truncated
-        // settings.json that fails to parse on the next start.
-        let tmp = self.path.with_extension("json.tmp");
-        write_owner_only(&tmp, &json)?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("renaming {} -> {}", tmp.display(), self.path.display()))?;
-        Ok(())
+        write_json_atomic(&self.path, settings, write_owner_only)
     }
 }
 
