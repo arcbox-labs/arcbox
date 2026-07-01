@@ -25,8 +25,8 @@ pub struct PersistedSettings {
     pub runner_image: String,
     pub gateway: String,
     pub docker_mode: DockerMode,
-    /// Direct path to the runner entry point (`run.sh`/`run.cmd`), not its
-    /// containing directory.
+    /// Direct path to the runner entry point (`run.sh`), not its containing
+    /// directory.
     pub runner_script: Option<PathBuf>,
 }
 

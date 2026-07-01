@@ -85,8 +85,8 @@ struct Inner {
     /// still starting is observed at the next cancellation point rather than
     /// lost; see [`RunnerSupervisor::handle_cancel`].
     in_flight: DashMap<String, CancellationToken>,
-    /// Path to the installed runner's entry point (`run.sh` / `run.cmd`).
-    /// `None` when only Docker-based execution is configured.
+    /// Path to the installed runner's entry point (`run.sh`). `None` when
+    /// only Docker-based execution is configured.
     runner_script: Option<PathBuf>,
     /// Docker runtime for Linux jobs, if available.
     docker: Option<DockerRunner>,
@@ -545,27 +545,14 @@ impl RunnerSupervisor {
     }
 }
 
-/// Build the platform-appropriate runner invocation. `script` is the direct
-/// path to the entry point (`run.sh` / `run.cmd`); no `.current_dir()` is
-/// set because these wrapper scripts locate their own sibling files via
-/// `$0`'s dirname, not the caller's working directory.
+/// Build the runner invocation. `script` is the direct path to the entry
+/// point (`run.sh`); no `.current_dir()` is set because the wrapper script
+/// locates its own sibling files via `$0`'s dirname, not the caller's
+/// working directory.
 fn runner_command(script: &Path, encoded_jit_config: &str) -> tokio::process::Command {
-    #[cfg(windows)]
-    {
-        let mut command = tokio::process::Command::new("cmd");
-        command
-            .arg("/C")
-            .arg(script)
-            .arg("--jitconfig")
-            .arg(encoded_jit_config);
-        command
-    }
-    #[cfg(not(windows))]
-    {
-        let mut command = tokio::process::Command::new(script);
-        command.arg("--jitconfig").arg(encoded_jit_config);
-        command
-    }
+    let mut command = tokio::process::Command::new(script);
+    command.arg("--jitconfig").arg(encoded_jit_config);
+    command
 }
 
 #[cfg(test)]

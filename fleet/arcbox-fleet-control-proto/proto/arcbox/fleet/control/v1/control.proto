@@ -202,8 +202,8 @@ message UpdateSettingsRequest {
   optional string runner_image = 3;
   optional string gateway = 4;
   optional DockerMode docker_mode = 5;
-  // Direct path to the runner entry point (run.sh / run.cmd), not its
-  // containing directory.
+  // Direct path to the runner entry point (run.sh), not its containing
+  // directory.
   optional string runner_script = 6;
 }
 

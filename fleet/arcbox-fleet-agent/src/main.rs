@@ -1,9 +1,9 @@
 //! ArcBox Fleet runner agent.
 //!
-//! A standalone, cross-platform binary that enrolls a host with the Fleet
-//! gateway and, once attached, runs GitHub Actions jobs. Linux jobs run in a
-//! Docker container for isolation when a Docker-compatible runtime is
-//! available; other jobs run via the pre-installed runner
+//! A standalone binary, for macOS and Linux hosts, that enrolls with the
+//! Fleet gateway and, once attached, runs GitHub Actions jobs. Linux jobs
+//! run in a Docker container for isolation when a Docker-compatible runtime
+//! is available; other jobs run via the pre-installed runner
 //! (`run.sh --jitconfig …`).
 //!
 //! Configuration is environment-driven (`ARCBOX_FLEET_*`). The `enroll`
@@ -17,6 +17,13 @@
 //! credential up front — `enroll`/`drain`/`resume`/`disconnect` can drive it
 //! from another invocation of this CLI, or from the desktop app, while it
 //! runs.
+
+// The local control-plane API (agent.sock) is a Unix domain socket with no
+// Windows equivalent implemented, so this crate targets macOS and Linux
+// only. A single, clear message here beats a scattered trail of
+// "type not found" errors across `control/`.
+#[cfg(not(unix))]
+compile_error!("arcbox-fleet-agent supports macOS and Linux only");
 
 mod attach;
 mod config;
@@ -369,8 +376,9 @@ fn spawn_shutdown_signal(message: &'static str) -> CancellationToken {
     shutdown
 }
 
-/// Resolve when the process receives a termination signal: Ctrl-C on any
-/// platform, or SIGTERM on Unix (e.g. a service-manager stop). If a listener
+/// Resolve when the process receives a termination signal: Ctrl-C, or
+/// SIGTERM (e.g. a service-manager stop) — every supported target (macOS,
+/// Linux) is Unix, so SIGTERM handling is unconditional. If a listener
 /// cannot be installed, that signal simply never fires rather than aborting
 /// startup.
 async fn shutdown_signal() {
@@ -381,7 +389,6 @@ async fn shutdown_signal() {
         }
     };
 
-    #[cfg(unix)]
     let terminate = async {
         use tokio::signal::unix::{SignalKind, signal};
         match signal(SignalKind::terminate()) {
@@ -394,9 +401,6 @@ async fn shutdown_signal() {
             }
         }
     };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
 
     tokio::select! {
         () = ctrl_c => {}
