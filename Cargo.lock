@@ -507,6 +507,7 @@ name = "arcbox-fleet-agent"
 version = "0.4.17"
 dependencies = [
  "anyhow",
+ "arcbox-fleet-control-proto",
  "arcbox-fleet-proto",
  "arcbox-logging",
  "bollard",
@@ -515,6 +516,7 @@ dependencies = [
  "dashmap",
  "dirs",
  "hostname",
+ "hyper-util",
  "keyring",
  "prost",
  "serde",

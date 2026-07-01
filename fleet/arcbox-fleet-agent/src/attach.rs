@@ -41,29 +41,24 @@ const PROTOCOL_VERSION_HEADER: &str = "x-arcbox-protocol-version";
 /// generous ceiling rather than an expected wait.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 
-/// Connect and serve the attach stream, reconnecting on any failure until
-/// `shutdown` fires, then stop runners cleanly.
+/// Build the [`RunnerSupervisor`] and its egress queue, and start the
+/// process-scoped verdict-resend loop.
 ///
-/// The supervisor and the egress queue carrying runner lifecycle events are
-/// built once and reused across reconnects, so in-flight jobs survive a dropped
-/// connection and their verdicts reach the next live stream. On shutdown the
-/// loop exits and hands off to [`RunnerSupervisor::shutdown`], which tears down
-/// any in-flight runners.
-pub async fn run(
-    config: AgentConfig,
-    credential: Credential,
+/// Split from [`run`] so a caller — the local control-plane's
+/// `AgentSupervisor` — can hold the returned `RunnerSupervisor` handle for
+/// `Drain`/`Resume`/`GetStatus` while [`run`] drives the reconnect loop in
+/// its own task.
+pub fn spawn_supervisor(
+    config: &AgentConfig,
     docker: Option<docker::DockerRunner>,
     capabilities: Vec<Capability>,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    let runner_dir = config.runner_dir.clone();
-
-    let (egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
+) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
+    let (egress_tx, egress_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
     let supervisor = RunnerSupervisor::new(
         egress_tx,
-        runner_dir,
+        config.runner_dir.clone(),
         docker,
-        capabilities.clone(),
+        capabilities,
         config.load_ceiling,
         config.mem_floor_mib,
     );
@@ -74,6 +69,25 @@ pub async fn run(
     // live. Detached for the agent's lifetime; the agent never shuts down here.
     spawn_verdict_resend(supervisor.clone());
 
+    (supervisor, egress_rx)
+}
+
+/// Connect and serve the attach stream, reconnecting on any failure until
+/// `shutdown` fires, then stop runners cleanly.
+///
+/// `supervisor` and `egress_rx` come from [`spawn_supervisor`] and are reused
+/// across reconnects, so in-flight jobs survive a dropped connection and
+/// their verdicts reach the next live stream. On shutdown the loop exits and
+/// hands off to [`RunnerSupervisor::shutdown`], which tears down any
+/// in-flight runners.
+pub async fn run(
+    config: AgentConfig,
+    credential: Credential,
+    supervisor: RunnerSupervisor,
+    mut egress_rx: mpsc::Receiver<AttachRequest>,
+    capabilities: Vec<Capability>,
+    shutdown: CancellationToken,
+) -> Result<()> {
     let mut backoff = INITIAL_BACKOFF;
     // An event pulled from the egress queue but not yet delivered when the
     // connection dropped; re-sent first on the next connection so a terminal
@@ -142,11 +156,18 @@ async fn connect_and_serve(
     capabilities: &[Capability],
     shutdown: &CancellationToken,
 ) -> Result<()> {
+    // A credential enrolled via the local control-plane's `Enroll` may carry
+    // a gateway override; the CLI's `enroll` subcommand never sets one, so
+    // this falls back to the configured default.
+    let gateway = credential
+        .control_plane
+        .as_deref()
+        .unwrap_or(&config.gateway);
     let channel = config
-        .endpoint()?
+        .endpoint_for(gateway)?
         .connect()
         .await
-        .with_context(|| format!("connecting to {}", config.gateway))?;
+        .with_context(|| format!("connecting to {gateway}"))?;
     let mut client = FleetGatewayServiceClient::new(channel);
 
     let (req_tx, req_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);

@@ -250,6 +250,24 @@ impl RunnerSupervisor {
         info!("draining: no new offers will be accepted");
     }
 
+    /// Resume accepting new work after a local [`Self::handle_drain`]. This
+    /// is the local control-plane's `Resume`, distinct from the gateway's
+    /// own `Drain` push (e.g. a machine being decommissioned), which this
+    /// agent has no way to countermand.
+    pub fn resume(&self) {
+        self.inner
+            .draining
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        info!("resumed: accepting new offers");
+    }
+
+    /// Whether the supervisor is currently refusing new offers.
+    pub fn is_draining(&self) -> bool {
+        self.inner
+            .draining
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Begin graceful shutdown: stop accepting offers, cancel every in-flight
     /// job (each `run_job` tears down its runner — process group for host jobs,
     /// container for Docker jobs), and wait — bounded by `grace` — for the jobs
@@ -576,6 +594,26 @@ mod tests {
             sup.admit("rjob_b", "darwin", "arm64", &idle()),
             Admission::Reject(_)
         ));
+    }
+
+    #[test]
+    fn resume_undoes_drain() {
+        let sup = supervisor(vec![capability("darwin", "arm64", Backend::HostRunner)]);
+        assert!(!sup.is_draining());
+
+        sup.handle_drain();
+        assert!(sup.is_draining());
+        assert!(matches!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Reject(_)
+        ));
+
+        sup.resume();
+        assert!(!sup.is_draining());
+        assert_eq!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Accept(Backend::HostRunner)
+        );
     }
 
     #[test]
