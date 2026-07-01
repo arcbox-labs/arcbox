@@ -6,14 +6,18 @@ use arcbox_fleet_proto::v1::{Capability, EnrollRequest};
 use tracing::info;
 
 use crate::config::{AgentConfig, PROTOCOL_VERSION};
-use crate::credentials::{Credential, CredentialStore};
+use crate::credentials::Credential;
 use crate::host;
 
-/// Call `Enroll` on `gateway` and persist the returned credential. The
-/// caller resolves `gateway`: the CLI `enroll` subcommand uses the
-/// persisted settings (or configured default) gateway; the control-plane
-/// `Enroll` RPC uses its `control_plane` override if given, else the
-/// current settings target — see `AgentSupervisor::enroll`.
+/// Call `Enroll` on `gateway` and return the machine credential — persisting
+/// it is the caller's job, done only once the caller has committed to the
+/// result: the CLI `enroll` subcommand stores it straight away, while the
+/// control-plane `Enroll` RPC stores it only after winning the enrollment
+/// race, so a losing concurrent enroll never overwrites the winner's
+/// credential (see `AgentSupervisor::enroll`). The caller also resolves
+/// `gateway`: the CLI uses the persisted-settings (or configured default)
+/// gateway; the RPC uses its `control_plane` override if given, else the
+/// current settings target.
 pub async fn enroll(
     config: &AgentConfig,
     token: String,
@@ -48,8 +52,6 @@ pub async fn enroll(
         machine_id: response.machine_id,
         machine_token: response.machine_token,
     };
-    CredentialStore::new(config.credential_store, config.credentials_path(), gateway)
-        .store(&credential)?;
     info!(machine_id = %credential.machine_id, "enrolled");
     Ok(credential)
 }

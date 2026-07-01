@@ -130,7 +130,6 @@ pub struct AgentSupervisor {
     config: AgentConfig,
     docker: Option<DockerRunner>,
     capabilities: Vec<Capability>,
-    credential_store: CredentialStore,
     /// Cancelled on process shutdown (SIGTERM/Ctrl-C); every attachment's
     /// `shutdown` is a child of this token.
     process_shutdown: CancellationToken,
@@ -151,27 +150,40 @@ impl AgentSupervisor {
         config: AgentConfig,
         docker: Option<DockerRunner>,
         capabilities: Vec<Capability>,
-        credential_store: CredentialStore,
         process_shutdown: CancellationToken,
         agent_state: AgentState,
         settings_store: SettingsStore,
     ) -> Result<Self> {
-        let existing = credential_store.load()?;
         let this = Self {
             config,
             docker,
             capabilities,
-            credential_store,
             process_shutdown,
             state: Mutex::new(State::Unenrolled),
             agent_state,
             settings_store,
         };
+        let existing = this
+            .credential_store_for(&this.agent_state.gateway_target())
+            .load()?;
         if let Some(credential) = existing {
             info!(machine_id = %credential.machine_id, "starting fleet agent (credential on disk)");
             *this.state.lock().await = State::Attached(this.attach(credential));
         }
         Ok(this)
+    }
+
+    /// The credential store scoped to `gateway`. Built per operation rather
+    /// than held: the keychain backend keys its entry by gateway URI, and the
+    /// effective gateway can change over this supervisor's lifetime (an
+    /// `Enroll` `control_plane` override, or a settings update), so a store
+    /// captured at startup could read or clear the wrong entry.
+    fn credential_store_for(&self, gateway: &str) -> CredentialStore {
+        CredentialStore::new(
+            self.config.credential_store,
+            self.config.credentials_path(),
+            gateway,
+        )
     }
 
     /// Spawn the attach task for `credential` and build its [`Attachment`].
@@ -232,17 +244,29 @@ impl AgentSupervisor {
 
         let mut state = self.state.lock().await;
         if matches!(*state, State::Attached(_)) {
-            // Lost a race with a concurrent Enroll; the credential just
-            // fetched is simply discarded rather than clobbering the winner.
+            // Lost a race with a concurrent Enroll. The credential just fetched
+            // is dropped here without ever being persisted — only the winner,
+            // below, writes to the credential store — so it cannot clobber the
+            // winner's persisted credential.
             return Err(Status::failed_precondition(
                 "already enrolled — disconnect first",
             ));
         }
 
-        // Won the race — now, and only now, persist an explicit gateway
-        // override. `attach()` below dials `gateway_target`, so both `current`
-        // and `target` already agree with what happens next, the same way
+        // Won the race. Persist the credential now, and only now: a losing
+        // concurrent Enroll returned above without writing, so what lands on
+        // disk always matches the attachment started just below — a later
+        // restart reattaches as the same machine. Scoped to the gateway just
+        // enrolled against, which the settings write below makes the target,
+        // so the restart load finds it under the same key.
+        self.credential_store_for(&gateway)
+            .store(&credential)
+            .map_err(Internal)?;
+
+        // Persist an explicit gateway override the same way
         // `FleetSettingsService.UpdateSettings` persists any other setting.
+        // `attach()` below dials `gateway_target`, so both `current` and
+        // `target` already agree with what happens next.
         if let Some(control_plane) = control_plane {
             self.agent_state.set_gateway_target(control_plane);
             self.agent_state.set_gateway_current(control_plane);
@@ -281,7 +305,10 @@ impl AgentSupervisor {
             Ok(Err(e)) => warn!(error = %e, "attach task panicked on disconnect"),
             Err(_) => warn!("disconnect grace elapsed; clearing credential anyway"),
         }
-        Ok(self.credential_store.clear().map_err(Internal)?)
+        Ok(self
+            .credential_store_for(&self.agent_state.gateway_target())
+            .clear()
+            .map_err(Internal)?)
     }
 
     /// Stop accepting new offers; in-flight jobs finish normally.
