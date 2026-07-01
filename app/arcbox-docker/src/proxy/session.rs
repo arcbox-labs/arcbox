@@ -78,7 +78,7 @@ impl GuestHttpClient {
         client
             .request(req)
             .await
-            .map_err(|e| DockerError::Server(format!("guest docker request failed: {e}")))
+            .map_err(|e| DockerError::GuestUnavailable(format!("guest docker request failed: {e}")))
     }
 
     pub(super) fn uri(path_and_query: &str) -> Result<Uri> {
@@ -198,7 +198,9 @@ impl GuestHttpSession {
                 .map_err(|_| {
                     DockerError::from(CommonError::timeout("guest docker handshake timed out"))
                 })?
-                .map_err(|e| DockerError::Server(format!("guest docker handshake failed: {e}")))?;
+                .map_err(|e| {
+                    DockerError::GuestUnavailable(format!("guest docker handshake failed: {e}"))
+                })?;
 
         tokio::spawn(async move {
             if let Err(e) = conn.await {
@@ -224,10 +226,9 @@ impl GuestHttpSession {
         req: hyper::Request<Body>,
         context: &str,
     ) -> Result<hyper::Response<hyper::body::Incoming>> {
-        self.sender
-            .send_request(req)
-            .await
-            .map_err(|e| DockerError::Server(format!("guest docker {context} failed: {e}")))
+        self.sender.send_request(req).await.map_err(|e| {
+            DockerError::GuestUnavailable(format!("guest docker {context} failed: {e}"))
+        })
     }
 }
 

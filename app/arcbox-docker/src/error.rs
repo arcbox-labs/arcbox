@@ -52,6 +52,14 @@ pub enum DockerError {
     #[error("Server error: {0}")]
     Server(String),
 
+    /// Guest dockerd transport failure (connect, handshake, send, or
+    /// response read). Distinguished from [`Self::Server`] so the proxy
+    /// invalidates its cached endpoint readiness only when the *guest* side
+    /// failed — a client-side error (e.g. an aborted upload) says nothing
+    /// about the guest.
+    #[error("guest docker unavailable: {0}")]
+    GuestUnavailable(String),
+
     /// Not implemented.
     #[error("Not implemented: {0}")]
     NotImplemented(String),
@@ -75,8 +83,20 @@ impl DockerError {
             Self::InvalidParameter(_) | Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Server(_) | Self::Context(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::GuestUnavailable(_) => StatusCode::BAD_GATEWAY,
             Self::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
         }
+    }
+
+    /// Whether this error indicates the guest-side transport failed (as
+    /// opposed to a client-side or internal error). Used to decide whether a
+    /// proxy failure should invalidate the cached endpoint readiness.
+    #[must_use]
+    pub const fn is_guest_transport(&self) -> bool {
+        matches!(
+            self,
+            Self::GuestUnavailable(_) | Self::Common(CommonError::Timeout(_))
+        )
     }
 
     /// Maps `CommonError` to HTTP status code.

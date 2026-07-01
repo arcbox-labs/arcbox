@@ -90,7 +90,9 @@ impl GuestConnector for VsockConnector {
                             DockerError::Server(format!("connect task {reason}: {e}"))
                         })?
                         .map_err(|e| {
-                            DockerError::Server(format!("failed to connect to guest docker: {e}"))
+                            DockerError::GuestUnavailable(format!(
+                                "failed to connect to guest docker: {e}"
+                            ))
                         })?,
                     Err(_elapsed) => {
                         abort_handle.abort();
@@ -101,7 +103,9 @@ impl GuestConnector for VsockConnector {
                 let stream =
                     VsockStream::from_fd_with_shutdown(owned_fd, VsockShutdown::CloseOnDropOnly)
                         .map_err(|e| {
-                            DockerError::Server(format!("failed to create guest stream: {e}"))
+                            DockerError::GuestUnavailable(format!(
+                                "failed to create guest stream: {e}"
+                            ))
                         })?;
                 Ok(TokioIo::new(stream))
             }

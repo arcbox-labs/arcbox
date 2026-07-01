@@ -154,7 +154,7 @@ async fn pump_upload_body(
     drop(tx);
 
     if receiver_dropped {
-        Err(DockerError::Server(
+        Err(DockerError::GuestUnavailable(
             "guest upload body receiver closed before request completed".into(),
         ))
     } else {
