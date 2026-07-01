@@ -14,17 +14,56 @@ use tonic::{Request, Response, Status};
 
 use super::Internal;
 use crate::config::DockerMode;
+use crate::docker::DockerRunner;
 use crate::settings::SettingsStore;
 use crate::state::{AgentState, docker_mode_from_wire};
 
 pub struct SettingsService {
     state: AgentState,
     store: SettingsStore,
+    /// The process-lifetime Docker handle, if configured — used to validate
+    /// a candidate `runner_image` against currently-advertised arches. Never
+    /// stale: `docker_mode` changes are restart-scoped (see
+    /// `AgentSupervisor::docker`'s doc).
+    docker: Option<DockerRunner>,
 }
 
 impl SettingsService {
-    pub fn new(state: AgentState, store: SettingsStore) -> Self {
-        Self { state, store }
+    pub fn new(state: AgentState, store: SettingsStore, docker: Option<DockerRunner>) -> Self {
+        Self {
+            state,
+            store,
+            docker,
+        }
+    }
+
+    /// If Docker is configured and currently advertising at least one Linux
+    /// arch, verify `image` can still be pulled for those arches before
+    /// accepting it — otherwise a bad runner_image swap is only discovered
+    /// later, as avoidable accept-then-reject churn at job dispatch (see
+    /// `docker.rs`'s `DockerRunner::new` doc). Rejects only if the new image
+    /// serves *none* of the currently-advertised arches, matching this
+    /// module's docker_mode/runner_script "leaves nothing servable"
+    /// precedent below — a partial mismatch (the new image drops one of
+    /// several arches) is allowed through, since blocking every runner_image
+    /// change over one dropped minor arch would be stricter than that
+    /// precedent intends.
+    async fn validate_runner_image(&self, image: &str) -> Result<(), String> {
+        let Some(docker) = &self.docker else {
+            return Ok(());
+        };
+        let served = docker.linux_arches();
+        if served.is_empty() {
+            return Ok(());
+        }
+        let still_servable = docker.verify_pullable(image, &served).await;
+        if still_servable.is_empty() {
+            return Err(format!(
+                "runner_image {image} could not be pulled for any currently-served Linux \
+                 architecture ({served:?}); this would leave Docker-backed jobs unable to run"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -45,6 +84,11 @@ impl FleetSettingsServiceTrait for SettingsService {
     ) -> Result<Response<UpdateSettingsResponse>, Status> {
         let req = request.into_inner();
         validate(&req, &self.state).map_err(Status::invalid_argument)?;
+        if let Some(image) = &req.runner_image {
+            self.validate_runner_image(image)
+                .await
+                .map_err(Status::invalid_argument)?;
+        }
 
         if let Some(v) = req.load_ceiling {
             self.state.set_load_ceiling(v);
@@ -253,5 +297,25 @@ mod tests {
             ..request()
         };
         assert!(validate(&req, &state).is_err());
+    }
+
+    /// The pull-check itself needs a live Docker daemon (see `docker.rs`,
+    /// which has no unit tests for the same reason), but the "no Docker
+    /// configured" guard is a plain branch and must accept any runner_image
+    /// unconditionally rather than, say, panicking on an absent `DockerRunner`.
+    #[tokio::test]
+    async fn validate_runner_image_accepts_anything_without_docker() {
+        let dir = std::env::temp_dir().join(format!("fleet-settings-image-{}", std::process::id()));
+        let service = SettingsService::new(
+            AgentState::new(&seed()),
+            SettingsStore::new(dir.join("settings.json")),
+            None,
+        );
+        assert!(
+            service
+                .validate_runner_image("not-even-a-real-image!!")
+                .await
+                .is_ok()
+        );
     }
 }

@@ -181,18 +181,14 @@ impl DockerRunner {
     /// `default_image` is a local bootstrap parameter, not stored: it is
     /// only used to verify readiness here. Live jobs use whatever
     /// `runner_image` is current at dispatch time (`RunSpec::runner_image`),
-    /// which may since have changed via `UpdateSettings`.
+    /// which may since have changed via `UpdateSettings` — see
+    /// [`Self::verify_pullable`], `FleetSettingsService.UpdateSettings`'s
+    /// guard against a runner_image change that would silently strand a
+    /// currently-advertised arch.
     pub async fn new(default_image: &str) -> Result<Self> {
         let client = connect().await?;
 
-        let mut linux_arches = Vec::new();
-        for arch in candidate_arches() {
-            let platform = format!("linux/{arch}");
-            match Self::pull_image(&client, default_image, &platform).await {
-                Ok(()) => linux_arches.push(arch),
-                Err(e) => warn!(arch, error = %e, "skipping arch: default image pull failed"),
-            }
-        }
+        let linux_arches = Self::pullable_arches(&client, default_image, candidate_arches()).await;
         if linux_arches.is_empty() {
             anyhow::bail!("docker reachable but could not pull {default_image} for any arch");
         }
@@ -207,6 +203,32 @@ impl DockerRunner {
     /// Linux architectures this Docker host serves, verified pullable at startup.
     pub fn linux_arches(&self) -> Vec<String> {
         self.linux_arches.clone()
+    }
+
+    /// Verify `image` is pullable for each of `arches`, returning the subset
+    /// that succeeded. Used by `FleetSettingsService.UpdateSettings` to
+    /// check a candidate `runner_image` against the arches already
+    /// advertised (`Self::linux_arches`) before accepting it — catching a
+    /// bad image at the settings boundary rather than as job-dispatch churn
+    /// later. A pull that already has the image cached returns quickly, so
+    /// this is cheap to call on every runner_image change.
+    pub async fn verify_pullable(&self, image: &str, arches: &[String]) -> Vec<String> {
+        Self::pullable_arches(&self.client, image, arches.to_vec()).await
+    }
+
+    /// Shared by [`Self::new`] (verifying `default_image` against every
+    /// candidate arch at startup) and [`Self::verify_pullable`] (verifying
+    /// an arbitrary candidate image against a caller-supplied arch set).
+    async fn pullable_arches(client: &Docker, image: &str, arches: Vec<String>) -> Vec<String> {
+        let mut ok = Vec::new();
+        for arch in arches {
+            let platform = format!("linux/{arch}");
+            match Self::pull_image(client, image, &platform).await {
+                Ok(()) => ok.push(arch),
+                Err(e) => warn!(arch, error = %e, "skipping arch: image pull failed"),
+            }
+        }
+        ok
     }
 
     /// Create and start a container for `spec`, returning a handle to await.
