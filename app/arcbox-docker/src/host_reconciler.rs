@@ -10,12 +10,10 @@
 //! running containers and tears down host state for any registered container no
 //! longer running — a backstop for the immediate, handler-driven teardown.
 
-use crate::error::{DockerError, Result};
-use crate::proxy::{GuestHttpClient, ProxyState, proxy_to_guest_pooled};
+use crate::error::Result;
+use crate::guest_query::list_running_container_ids;
+use crate::proxy::ProxyState;
 use arcbox_core::Runtime;
-use axum::http::{HeaderMap, Method};
-use bytes::Bytes;
-use http_body_util::BodyExt;
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
@@ -77,46 +75,10 @@ where
     Ok(())
 }
 
-/// Queries guest dockerd for the IDs of currently-running containers.
-async fn list_running_container_ids(client: &GuestHttpClient) -> Result<HashSet<String>> {
-    let response = proxy_to_guest_pooled(
-        client,
-        Method::GET,
-        "/containers/json",
-        &HeaderMap::new(),
-        Bytes::new(),
-    )
-    .await?;
-    if !response.status().is_success() {
-        return Err(DockerError::Server(format!(
-            "guest /containers/json returned {}",
-            response.status()
-        )));
-    }
-    let body = BodyExt::collect(response.into_body())
-        .await
-        .map_err(|e| DockerError::Server(format!("read /containers/json body: {e}")))?
-        .to_bytes();
-    Ok(parse_container_ids(&body))
-}
-
-/// Extracts full container IDs from a `GET /containers/json` response body.
-/// Malformed JSON yields an empty set (treated as a failed read upstream).
-fn parse_container_ids(body: &[u8]) -> HashSet<String> {
-    serde_json::from_slice::<Vec<serde_json::Value>>(body)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|c| {
-            c.get("Id")
-                .and_then(serde_json::Value::as_str)
-                .map(String::from)
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::DockerError;
     use arcbox_core::{Config, Runtime, VmLifecycleConfig};
     use std::net::{IpAddr, Ipv4Addr};
     use tempfile::TempDir;
@@ -133,17 +95,6 @@ mod tests {
         };
         let runtime = Arc::new(Runtime::with_vm_lifecycle_config(config, vlc).expect("runtime"));
         (runtime, tmp)
-    }
-
-    #[test]
-    fn parse_ids_from_docker_list() {
-        let body = br#"[{"Id":"aaa","Names":["/x"]},{"Id":"bbb"}]"#;
-        assert_eq!(
-            parse_container_ids(body),
-            HashSet::from(["aaa".to_string(), "bbb".to_string()])
-        );
-        assert!(parse_container_ids(b"[]").is_empty());
-        assert!(parse_container_ids(b"not json").is_empty());
     }
 
     #[tokio::test]

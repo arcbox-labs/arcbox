@@ -15,9 +15,7 @@ mod uri;
 
 pub use connector::VsockConnector;
 pub use fallback::proxy_fallback;
-pub use forward::{
-    proxy_to_guest, proxy_to_guest_pooled, proxy_to_guest_stream, proxy_to_guest_stream_pooled,
-};
+pub use forward::{proxy_to_guest_pooled, proxy_to_guest_stream_pooled};
 pub use session::GuestHttpClient;
 pub use state::ProxyState;
 pub use upgrade::proxy_with_upgrade;
