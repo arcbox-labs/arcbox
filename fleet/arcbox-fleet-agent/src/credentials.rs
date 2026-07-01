@@ -24,12 +24,6 @@ pub struct Credential {
     pub machine_id: String,
     /// Long-lived machine token, presented in `Attach` metadata.
     pub machine_token: String,
-    /// Gateway URL this credential was enrolled against, if it overrides the
-    /// agent's configured default. Set from the local control-plane
-    /// `Enroll` RPC's `control_plane` field; `None` for the CLI's
-    /// `enroll` subcommand, which always uses the configured gateway.
-    #[serde(default)]
-    pub control_plane: Option<String>,
 }
 
 /// Reads and writes the [`Credential`] via the platform-appropriate backend.
@@ -144,23 +138,7 @@ impl FileStore {
 /// Write `bytes` to `path`, owner-only (`0600`) from creation on Unix.
 #[cfg(unix)]
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    // `mode` only takes effect when this call creates the file; a leftover temp
-    // from a crashed run keeps its old mode, so fchmod the open handle as a
-    // backstop (operating on the fd, never racing a path lookup).
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", path.display()))?;
-    file.write_all(bytes)
-        .with_context(|| format!("writing {}", path.display()))
+    crate::fsutil::write_owner_only(path, bytes)
 }
 
 /// Refuse to persist the machine token via a file on platforms without
@@ -245,14 +223,12 @@ mod tests {
         let cred = Credential {
             machine_id: "fltm_test".into(),
             machine_token: "secret".into(),
-            control_plane: Some("http://127.0.0.1:50061".into()),
         };
         store.store(&cred).unwrap();
 
         let loaded = store.load().unwrap().expect("credential present");
         assert_eq!(loaded.machine_id, cred.machine_id);
         assert_eq!(loaded.machine_token, cred.machine_token);
-        assert_eq!(loaded.control_plane, cred.control_plane);
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
@@ -263,14 +239,5 @@ mod tests {
         store.clear().unwrap();
 
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn missing_control_plane_deserializes_as_none() {
-        // Credentials persisted before `control_plane` existed must still
-        // load: the field defaults rather than failing to parse.
-        let json = r#"{"machine_id":"fltm_old","machine_token":"secret"}"#;
-        let cred: Credential = serde_json::from_str(json).unwrap();
-        assert_eq!(cred.control_plane, None);
     }
 }

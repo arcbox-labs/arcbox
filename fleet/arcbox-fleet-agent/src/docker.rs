@@ -23,6 +23,9 @@ pub struct RunSpec<'a> {
     pub encoded_jit_config: &'a str,
     /// Target CPU architecture (`arm64` or `amd64`).
     pub arch: &'a str,
+    /// Image to run this job in — the live-settable `runner_image`, read
+    /// fresh by the caller for each job rather than fixed at construction.
+    pub runner_image: &'a str,
 }
 
 /// A container that has been created and started. Held by the caller while the
@@ -87,8 +90,6 @@ impl RunningContainer {
 #[derive(Clone)]
 pub struct DockerRunner {
     client: Docker,
-    /// Image used when the platform sends no image override.
-    default_image: String,
     /// Linux arches verified pullable at startup, advertised as capacity pools.
     linux_arches: Vec<String>,
 }
@@ -176,13 +177,18 @@ impl DockerRunner {
     /// never advertises it. Docker counts as available only if at least one arch
     /// pulls; otherwise this returns an error and the caller proceeds without it
     /// (`Auto`) or fails startup (`Enabled`).
-    pub async fn new(default_image: String) -> Result<Self> {
+    ///
+    /// `default_image` is a local bootstrap parameter, not stored: it is
+    /// only used to verify readiness here. Live jobs use whatever
+    /// `runner_image` is current at dispatch time (`RunSpec::runner_image`),
+    /// which may since have changed via `UpdateSettings`.
+    pub async fn new(default_image: &str) -> Result<Self> {
         let client = connect().await?;
 
         let mut linux_arches = Vec::new();
         for arch in candidate_arches() {
             let platform = format!("linux/{arch}");
-            match Self::pull_image(&client, &default_image, &platform).await {
+            match Self::pull_image(&client, default_image, &platform).await {
                 Ok(()) => linux_arches.push(arch),
                 Err(e) => warn!(arch, error = %e, "skipping arch: default image pull failed"),
             }
@@ -194,7 +200,6 @@ impl DockerRunner {
         info!(?linux_arches, "docker runtime available");
         Ok(Self {
             client,
-            default_image,
             linux_arches,
         })
     }
@@ -213,7 +218,7 @@ impl DockerRunner {
     pub async fn start(&self, spec: RunSpec<'_>) -> Result<RunningContainer> {
         let platform = format!("linux/{}", spec.arch);
 
-        Self::pull_image(&self.client, &self.default_image, &platform).await?;
+        Self::pull_image(&self.client, spec.runner_image, &platform).await?;
 
         let container_name = container_name(spec.job_id);
 
@@ -223,7 +228,7 @@ impl DockerRunner {
         self.remove_job_container(spec.job_id).await;
 
         let config = ContainerCreateBody {
-            image: Some(self.default_image.clone()),
+            image: Some(spec.runner_image.to_owned()),
             cmd: Some(vec![
                 "./run.sh".to_owned(),
                 "--jitconfig".to_owned(),

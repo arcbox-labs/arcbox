@@ -7,6 +7,7 @@
 
 pub mod client;
 mod lifecycle;
+mod settings;
 mod watch;
 
 use std::os::unix::fs::PermissionsExt;
@@ -16,6 +17,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_server::FleetLifecycleServiceServer;
+use arcbox_fleet_control_proto::v1::fleet_settings_service_server::FleetSettingsServiceServer;
 use arcbox_fleet_control_proto::v1::fleet_state_service_server::FleetStateServiceServer;
 use arcbox_fleet_control_proto::v1::{ConnectionState, Enrollment};
 use arcbox_fleet_proto::v1::Capability;
@@ -31,9 +33,11 @@ use crate::config::AgentConfig;
 use crate::credentials::{Credential, CredentialStore};
 use crate::docker::DockerRunner;
 use crate::runner::RunnerSupervisor;
+use crate::settings::SettingsStore;
 use crate::state::AgentState;
 use crate::{attach, enroll};
 use lifecycle::LifecycleService;
+use settings::SettingsService;
 use watch::WatchService;
 
 /// Bind `agent.sock` and serve `FleetLifecycleService` until `shutdown`
@@ -45,6 +49,7 @@ pub async fn serve(
     socket_path: &Path,
     supervisor: Arc<AgentSupervisor>,
     state: AgentState,
+    settings_store: SettingsStore,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let _ = std::fs::remove_file(socket_path);
@@ -65,7 +70,13 @@ pub async fn serve(
         .add_service(FleetLifecycleServiceServer::new(LifecycleService::new(
             supervisor,
         )))
-        .add_service(FleetStateServiceServer::new(WatchService::new(state)))
+        .add_service(FleetStateServiceServer::new(WatchService::new(
+            state.clone(),
+        )))
+        .add_service(FleetSettingsServiceServer::new(SettingsService::new(
+            state,
+            settings_store,
+        )))
         .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
         .await
         .context("control-plane server error")
@@ -114,6 +125,9 @@ pub struct AgentSupervisor {
     /// the single source of truth `status()` reads from below, so it never
     /// disagrees with what a `Watch` subscriber sees.
     agent_state: AgentState,
+    /// Persists an `Enroll`-provided gateway override the same way
+    /// `FleetSettingsService.UpdateSettings` persists any other setting.
+    settings_store: SettingsStore,
 }
 
 impl AgentSupervisor {
@@ -126,6 +140,7 @@ impl AgentSupervisor {
         credential_store: CredentialStore,
         process_shutdown: CancellationToken,
         agent_state: AgentState,
+        settings_store: SettingsStore,
     ) -> Result<Self> {
         let existing = credential_store.load()?;
         let this = Self {
@@ -136,6 +151,7 @@ impl AgentSupervisor {
             process_shutdown,
             state: Mutex::new(State::Unenrolled),
             agent_state,
+            settings_store,
         };
         if let Some(credential) = existing {
             info!(machine_id = %credential.machine_id, "starting fleet agent (credential on disk)");
@@ -183,15 +199,27 @@ impl AgentSupervisor {
                 "already enrolled — disconnect first",
             ));
         }
+
+        let gateway = if let Some(control_plane) = control_plane {
+            // Enrolling against a specific gateway means dialing it
+            // immediately — `attach()` below does exactly that — so both
+            // `current` and `target` already agree with what happens next,
+            // the same way `FleetSettingsService.UpdateSettings` would
+            // persist any other setting.
+            self.agent_state.set_gateway_target(control_plane);
+            self.agent_state.set_gateway_current(control_plane);
+            self.settings_store
+                .store(&self.agent_state.persisted_settings())
+                .map_err(|e| Status::internal(e.to_string()))?;
+            control_plane.to_owned()
+        } else {
+            self.agent_state.gateway_target()
+        };
+
         // The gateway round-trip must not hold `state` locked.
-        let credential = enroll::enroll(
-            &self.config,
-            token,
-            self.capabilities.clone(),
-            control_plane,
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+        let credential = enroll::enroll(&self.config, token, self.capabilities.clone(), &gateway)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         let mut state = self.state.lock().await;
         if matches!(*state, State::Attached(_)) {

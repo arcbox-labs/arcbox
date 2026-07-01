@@ -24,8 +24,10 @@ mod control;
 mod credentials;
 mod docker;
 mod enroll;
+mod fsutil;
 mod host;
 mod runner;
+mod settings;
 mod state;
 
 use std::path::PathBuf;
@@ -33,6 +35,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arcbox_fleet_control_proto::v1 as control_proto;
+use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_client::FleetLifecycleServiceClient;
+use arcbox_fleet_control_proto::v1::fleet_settings_service_client::FleetSettingsServiceClient;
 use arcbox_fleet_proto::v1::Capability;
 use arcbox_logging::LogConfig;
 use clap::{Parser, Subcommand};
@@ -42,6 +46,7 @@ use tracing::{info, warn};
 use crate::config::{AgentConfig, DockerMode};
 use crate::credentials::CredentialStore;
 use crate::docker::DockerRunner;
+use crate::settings::{PersistedSettings, SettingsStore};
 use crate::state::AgentState;
 
 #[derive(Debug, Parser)]
@@ -97,6 +102,34 @@ enum Command {
     /// A fresh `enroll` (or the control-plane `Enroll` RPC) is required to
     /// rejoin the fleet.
     Disconnect,
+    /// Get or update the running agent's live-settable configuration.
+    #[command(subcommand)]
+    Settings(SettingsCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum SettingsCommand {
+    /// Show every setting's current (in-effect) and target (requested) value.
+    Get,
+    /// Update one or more settings. Only the flags given are changed;
+    /// `load_ceiling`/`mem_floor_mib`/`runner_image` apply on the next
+    /// offer/job, `gateway` on the next reconnect, and `docker_mode`/
+    /// `runner_script` on the next full restart.
+    Set {
+        #[arg(long)]
+        load_ceiling: Option<f64>,
+        #[arg(long)]
+        mem_floor_mib: Option<u64>,
+        #[arg(long)]
+        runner_image: Option<String>,
+        #[arg(long)]
+        gateway: Option<String>,
+        /// "auto" | "enabled" | "disabled".
+        #[arg(long)]
+        docker_mode: Option<String>,
+        #[arg(long)]
+        runner_script: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -123,22 +156,26 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
     match command {
         Command::Enroll { token_file, token } => {
             let token = resolve_enrollment_token(token_file, token)?;
+            let settings_store = SettingsStore::new(config.settings_path());
+            let seed = load_or_seed_settings(&settings_store, &config)?;
             // Enrollment is pure credential exchange — it never needs Docker, so
             // an operator can enroll before the runtime is up. The capabilities
             // sent here are an initial hint, replaced wholesale by the first
             // heartbeat once the agent attaches, so we advertise what we know
             // without probing the runtime.
-            let capabilities = capabilities(&config, None);
-            enroll::enroll(&config, token, capabilities, None).await?;
+            let capabilities = capabilities(seed.runner_script.is_some(), None);
+            enroll::enroll(&config, token, capabilities, &seed.gateway).await?;
             Ok(())
         }
         Command::Run => {
-            let docker = init_docker(&config).await?;
-            let capabilities = capabilities(&config, docker.as_ref());
+            let settings_store = SettingsStore::new(config.settings_path());
+            let seed = load_or_seed_settings(&settings_store, &config)?;
+            let docker = init_docker(seed.docker_mode, &seed.runner_image).await?;
+            let capabilities = capabilities(seed.runner_script.is_some(), docker.as_ref());
             let credential = CredentialStore::new(
                 config.credential_store,
                 config.credentials_path(),
-                &config.gateway,
+                &seed.gateway,
             )
             .load()?
             .context(
@@ -151,8 +188,12 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             let shutdown = spawn_shutdown_signal("termination signal received; draining runners");
 
             // `run` opens no control socket, so nothing ever subscribes to
-            // this — it only exists to satisfy `attach`'s shared signature.
-            let agent_state = AgentState::new();
+            // this over `Watch` — but `RunnerSupervisor` still reads
+            // admission thresholds live from it, so it's load-bearing.
+            let agent_state = AgentState::new(&seed);
+            agent_state
+                .set_docker_mode_current(resolved_docker_mode(seed.docker_mode, docker.as_ref()));
+            agent_state.set_runner_script_current(seed.runner_script.as_deref());
             let (supervisor, egress_rx) = attach::spawn_supervisor(
                 &config,
                 docker,
@@ -171,12 +212,14 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             .await
         }
         Command::Serve => {
-            let docker = init_docker(&config).await?;
-            let capabilities = capabilities(&config, docker.as_ref());
+            let settings_store = SettingsStore::new(config.settings_path());
+            let seed = load_or_seed_settings(&settings_store, &config)?;
+            let docker = init_docker(seed.docker_mode, &seed.runner_image).await?;
+            let capabilities = capabilities(seed.runner_script.is_some(), docker.as_ref());
             let credential_store = CredentialStore::new(
                 config.credential_store,
                 config.credentials_path(),
-                &config.gateway,
+                &seed.gateway,
             );
             let socket_path = config.control_socket_path();
 
@@ -185,7 +228,10 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             // independently.
             let shutdown = spawn_shutdown_signal("termination signal received; shutting down");
 
-            let agent_state = AgentState::new();
+            let agent_state = AgentState::new(&seed);
+            agent_state
+                .set_docker_mode_current(resolved_docker_mode(seed.docker_mode, docker.as_ref()));
+            agent_state.set_runner_script_current(seed.runner_script.as_deref());
             let supervisor = Arc::new(
                 control::AgentSupervisor::new(
                     config,
@@ -194,17 +240,26 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                     credential_store,
                     shutdown.clone(),
                     agent_state.clone(),
+                    settings_store.clone(),
                 )
                 .await?,
             );
-            control::serve(&socket_path, Arc::clone(&supervisor), agent_state, shutdown).await?;
+            control::serve(
+                &socket_path,
+                Arc::clone(&supervisor),
+                agent_state,
+                settings_store,
+                shutdown,
+            )
+            .await?;
             // The control server has stopped accepting connections; give any
             // live attach task its own shutdown grace before the process exits.
             supervisor.join().await;
             Ok(())
         }
         Command::Status => {
-            let mut client = control::client::connect_default(&config).await?;
+            let channel = control::client::connect_default(&config).await?;
+            let mut client = FleetLifecycleServiceClient::new(channel);
             let response = client
                 .get_status(control_proto::GetStatusRequest {})
                 .await
@@ -225,7 +280,8 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             Ok(())
         }
         Command::Drain => {
-            let mut client = control::client::connect_default(&config).await?;
+            let channel = control::client::connect_default(&config).await?;
+            let mut client = FleetLifecycleServiceClient::new(channel);
             client
                 .drain(control_proto::DrainRequest {})
                 .await
@@ -234,7 +290,8 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             Ok(())
         }
         Command::Resume => {
-            let mut client = control::client::connect_default(&config).await?;
+            let channel = control::client::connect_default(&config).await?;
+            let mut client = FleetLifecycleServiceClient::new(channel);
             client
                 .resume(control_proto::ResumeRequest {})
                 .await
@@ -243,12 +300,62 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             Ok(())
         }
         Command::Disconnect => {
-            let mut client = control::client::connect_default(&config).await?;
+            let channel = control::client::connect_default(&config).await?;
+            let mut client = FleetLifecycleServiceClient::new(channel);
             client
                 .disconnect(control_proto::DisconnectRequest {})
                 .await
                 .context("Disconnect RPC failed")?;
             println!("disconnected");
+            Ok(())
+        }
+        Command::Settings(SettingsCommand::Get) => {
+            let channel = control::client::connect_default(&config).await?;
+            let mut client = FleetSettingsServiceClient::new(channel);
+            let response = client
+                .get_settings(control_proto::GetSettingsRequest {})
+                .await
+                .context("GetSettings RPC failed")?
+                .into_inner();
+            print_settings(
+                response
+                    .settings
+                    .context("GetSettings response missing settings")?,
+            );
+            Ok(())
+        }
+        Command::Settings(SettingsCommand::Set {
+            load_ceiling,
+            mem_floor_mib,
+            runner_image,
+            gateway,
+            docker_mode,
+            runner_script,
+        }) => {
+            let docker_mode = docker_mode
+                .as_deref()
+                .map(parse_docker_mode)
+                .transpose()?
+                .map(|m| m as i32);
+            let channel = control::client::connect_default(&config).await?;
+            let mut client = FleetSettingsServiceClient::new(channel);
+            let response = client
+                .update_settings(control_proto::UpdateSettingsRequest {
+                    load_ceiling,
+                    mem_floor_mib,
+                    runner_image,
+                    gateway,
+                    docker_mode,
+                    runner_script: runner_script.map(|p| p.to_string_lossy().into_owned()),
+                })
+                .await
+                .context("UpdateSettings RPC failed")?
+                .into_inner();
+            print_settings(
+                response
+                    .settings
+                    .context("UpdateSettings response missing settings")?,
+            );
             Ok(())
         }
     }
@@ -329,28 +436,124 @@ fn resolve_enrollment_token(token_file: Option<PathBuf>, token: Option<String>) 
 }
 
 /// Build the capabilities this agent advertises: the native host-runner
-/// capability (if a runner directory is set) plus any Docker-served Linux
-/// capabilities. Capacity is decided per offer from live telemetry, not here.
-fn capabilities(config: &AgentConfig, docker: Option<&DockerRunner>) -> Vec<Capability> {
+/// capability (if a runner script is configured) plus any Docker-served
+/// Linux capabilities. Capacity is decided per offer from live telemetry,
+/// not here.
+fn capabilities(runner_script_present: bool, docker: Option<&DockerRunner>) -> Vec<Capability> {
     let docker_arches = docker.map(DockerRunner::linux_arches).unwrap_or_default();
-    host::capabilities(config.runner_dir.is_some(), &docker_arches)
+    host::capabilities(runner_script_present, &docker_arches)
 }
 
-/// Probe Docker availability according to the configured [`DockerMode`].
-async fn init_docker(config: &AgentConfig) -> Result<Option<DockerRunner>> {
-    match config.docker.mode {
+/// Probe Docker availability according to `mode`.
+async fn init_docker(mode: DockerMode, runner_image: &str) -> Result<Option<DockerRunner>> {
+    match mode {
         DockerMode::Disabled => Ok(None),
         DockerMode::Enabled => {
-            let runner = DockerRunner::new(config.docker.runner_image.clone()).await?;
+            let runner = DockerRunner::new(runner_image).await?;
             Ok(Some(runner))
         }
-        DockerMode::Auto => match DockerRunner::new(config.docker.runner_image.clone()).await {
+        DockerMode::Auto => match DockerRunner::new(runner_image).await {
             Ok(runner) => Ok(Some(runner)),
             Err(e) => {
                 warn!(error = %e, "docker not available; linux capabilities will not be advertised");
                 Ok(None)
             }
         },
+    }
+}
+
+/// Load persisted settings, seeding from `config`'s env-derived values on
+/// first-ever start.
+fn load_or_seed_settings(store: &SettingsStore, config: &AgentConfig) -> Result<PersistedSettings> {
+    Ok(store
+        .load()?
+        .unwrap_or_else(|| PersistedSettings::from(config)))
+}
+
+/// The `docker_mode` actually in effect after [`init_docker`] runs —
+/// `Auto` resolves concretely to whether Docker actually came up, so
+/// `current` never reports "auto" as a steady state.
+fn resolved_docker_mode(configured: DockerMode, docker: Option<&DockerRunner>) -> DockerMode {
+    match configured {
+        DockerMode::Auto if docker.is_some() => DockerMode::Enabled,
+        DockerMode::Auto => DockerMode::Disabled,
+        other => other,
+    }
+}
+
+fn parse_docker_mode(s: &str) -> Result<control_proto::DockerMode> {
+    match s.to_lowercase().as_str() {
+        "auto" => Ok(control_proto::DockerMode::Auto),
+        "enabled" => Ok(control_proto::DockerMode::Enabled),
+        "disabled" => Ok(control_proto::DockerMode::Disabled),
+        other => {
+            anyhow::bail!("docker_mode must be 'auto', 'enabled', or 'disabled', got '{other}'")
+        }
+    }
+}
+
+fn docker_mode_label(raw: i32) -> &'static str {
+    match control_proto::DockerMode::try_from(raw).unwrap_or(control_proto::DockerMode::Unspecified)
+    {
+        control_proto::DockerMode::Auto => "auto",
+        control_proto::DockerMode::Enabled => "enabled",
+        control_proto::DockerMode::Disabled => "disabled",
+        control_proto::DockerMode::Unspecified => "unspecified",
+    }
+}
+
+/// Print one setting as `name: <current>`, or `name: <current> (target:
+/// <target>)` when the two differ (e.g. `gateway` before the next
+/// reconnect, or `docker_mode`/`runner_script` before the next restart).
+fn print_setting(name: &str, current: &str, target: &str) {
+    if current == target {
+        println!("{name}: {current}");
+    } else {
+        println!("{name}: {current} (target: {target})");
+    }
+}
+
+fn print_settings(s: control_proto::AgentSettings) {
+    if let Some(v) = s.load_ceiling {
+        print_setting(
+            "load_ceiling",
+            &v.current.to_string(),
+            &v.target.to_string(),
+        );
+    }
+    if let Some(v) = s.mem_floor_mib {
+        print_setting(
+            "mem_floor_mib",
+            &v.current.to_string(),
+            &v.target.to_string(),
+        );
+    }
+    if let Some(v) = s.runner_image {
+        print_setting("runner_image", &v.current, &v.target);
+    }
+    if let Some(v) = s.gateway {
+        print_setting("gateway", &v.current, &v.target);
+    }
+    if let Some(v) = s.docker_mode {
+        print_setting(
+            "docker_mode",
+            docker_mode_label(v.current),
+            docker_mode_label(v.target),
+        );
+    }
+    if let Some(v) = s.runner_script {
+        let none = "(none)".to_owned();
+        let current = if v.current.is_empty() {
+            &none
+        } else {
+            &v.current
+        };
+        let target = if v.target.is_empty() {
+            &none
+        } else {
+            &v.target
+        };
+        print_setting("runner_script", current, target);
     }
 }
 

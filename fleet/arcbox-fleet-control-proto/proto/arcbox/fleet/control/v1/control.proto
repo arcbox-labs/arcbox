@@ -165,4 +165,73 @@ message AgentStateSnapshot {
   // Absent until the first heartbeat tick after attaching. Singular message
   // fields are presence-tracked by default in proto3 (no `optional` needed).
   HostTelemetry telemetry = 7;
+  AgentSettings settings = 8;
+}
+
+// Persisted, settable configuration. The desktop holds no state of its
+// own, so this rides the same Watch stream as everything else above
+// instead of needing its own notification path.
+service FleetSettingsService {
+  rpc GetSettings(GetSettingsRequest) returns (GetSettingsResponse);
+  rpc UpdateSettings(UpdateSettingsRequest) returns (UpdateSettingsResponse);
+}
+
+message GetSettingsRequest {}
+message GetSettingsResponse {
+  AgentSettings settings = 1;
+}
+message UpdateSettingsResponse {
+  AgentSettings settings = 1;
+}
+
+enum DockerMode {
+  DOCKER_MODE_UNSPECIFIED = 0;
+  DOCKER_MODE_AUTO = 1;
+  DOCKER_MODE_ENABLED = 2;
+  DOCKER_MODE_DISABLED = 3;
+}
+
+// A client only ever writes `target`; `current` is engine-observed and
+// only changes because the engine itself reports a new value. Rejected
+// with INVALID_ARGUMENT as a whole (no partial apply) if the resulting
+// docker_mode/runner_script combination would leave nothing servable —
+// see FleetSettingsService.UpdateSettings's implementation.
+message UpdateSettingsRequest {
+  optional double load_ceiling = 1;
+  optional uint64 mem_floor_mib = 2;
+  optional string runner_image = 3;
+  optional string gateway = 4;
+  optional DockerMode docker_mode = 5;
+  // Direct path to the runner entry point (run.sh / run.cmd), not its
+  // containing directory.
+  optional string runner_script = 6;
+}
+
+// Reused across every setting regardless of type, so a client's rendering
+// logic ("show current; if current != target, show pending") never needs
+// to special-case a field.
+message DoubleSetting {
+  double current = 1;
+  double target = 2;
+}
+message Uint64Setting {
+  uint64 current = 1;
+  uint64 target = 2;
+}
+message StringSetting {
+  string current = 1;
+  string target = 2;
+}
+message DockerModeSetting {
+  DockerMode current = 1;
+  DockerMode target = 2;
+}
+
+message AgentSettings {
+  DoubleSetting load_ceiling = 1;
+  Uint64Setting mem_floor_mib = 2;
+  StringSetting runner_image = 3;
+  StringSetting gateway = 4;
+  DockerModeSetting docker_mode = 5;
+  StringSetting runner_script = 6;
 }

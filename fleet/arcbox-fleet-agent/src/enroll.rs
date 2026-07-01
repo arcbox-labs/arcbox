@@ -9,20 +9,17 @@ use crate::config::{AgentConfig, PROTOCOL_VERSION};
 use crate::credentials::{Credential, CredentialStore};
 use crate::host;
 
-/// Call `Enroll` on the gateway and persist the returned credential.
-///
-/// `control_plane` overrides the agent's configured default gateway for
-/// this enrollment (the desktop-managed handoff's per-enrollment gateway);
-/// `None` uses `config.gateway`, as the CLI's `enroll` subcommand always
-/// does. Whichever gateway is used is persisted onto the returned
-/// [`Credential`] so later reconnects target the same one.
+/// Call `Enroll` on `gateway` and persist the returned credential. The
+/// caller resolves `gateway`: the CLI `enroll` subcommand uses the
+/// persisted settings (or configured default) gateway; the control-plane
+/// `Enroll` RPC uses its `control_plane` override if given, else the
+/// current settings target — see `AgentSupervisor::enroll`.
 pub async fn enroll(
     config: &AgentConfig,
     token: String,
     capabilities: Vec<Capability>,
-    control_plane: Option<&str>,
+    gateway: &str,
 ) -> Result<Credential> {
-    let gateway = control_plane.unwrap_or(&config.gateway);
     let channel = config
         .endpoint_for(gateway)?
         .connect()
@@ -50,14 +47,9 @@ pub async fn enroll(
     let credential = Credential {
         machine_id: response.machine_id,
         machine_token: response.machine_token,
-        control_plane: control_plane.map(str::to_owned),
     };
-    CredentialStore::new(
-        config.credential_store,
-        config.credentials_path(),
-        &config.gateway,
-    )
-    .store(&credential)?;
+    CredentialStore::new(config.credential_store, config.credentials_path(), gateway)
+        .store(&credential)?;
     info!(machine_id = %credential.machine_id, "enrolled");
     Ok(credential)
 }
