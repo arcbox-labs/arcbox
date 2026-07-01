@@ -6,11 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-/// Write `bytes` to `path`, owner-only (`0600`) from creation on Unix. On
-/// non-Unix platforms this writes normally — callers with a secret to
-/// protect (unlike a plain settings file) must refuse or otherwise harden
-/// separately; see `credentials.rs`'s own `write_private`.
-#[cfg(unix)]
+/// Write `bytes` to `path`, owner-only (`0600`) from creation on Unix — every
+/// supported target (macOS, Linux) is Unix.
 pub fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -29,11 +26,6 @@ pub fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("chmod 0600 {}", path.display()))?;
     file.write_all(bytes)
         .with_context(|| format!("writing {}", path.display()))
-}
-
-#[cfg(not(unix))]
-pub fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
 }
 
 /// Serialize `value` as pretty JSON and write it to `path` atomically: write a

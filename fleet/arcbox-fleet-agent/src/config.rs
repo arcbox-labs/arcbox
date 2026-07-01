@@ -45,11 +45,11 @@ pub enum DockerMode {
 /// Where the long-lived machine credential is persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialMode {
-    /// OS keychain on macOS (login Keychain) and Windows (Credential Manager);
-    /// the owner-only data-dir file on Linux. On macOS the agent must run in the
-    /// user's session, where the login Keychain is unlocked.
+    /// OS keychain (login Keychain) on macOS; the owner-only data-dir file on
+    /// Linux. On macOS the agent must run in the user's session, where the
+    /// login Keychain is unlocked.
     Auto,
-    /// Force the OS keychain. Supported on macOS and Windows; errors on Linux.
+    /// Force the OS keychain. Supported on macOS only; errors on Linux.
     Keyring,
     /// Force the data-dir file (`0600` on Unix).
     File,
@@ -69,8 +69,8 @@ pub struct AgentConfig {
     /// Gateway endpoint URI (scheme selects transport: `https` → TLS, `http` → h2c).
     pub gateway: String,
     /// Direct path to the pre-installed GitHub Actions runner's entry point
-    /// (`run.sh` on Unix, `run.cmd` on Windows) — not its containing
-    /// directory. `None` until set; required only by the `run` command.
+    /// (`run.sh`) — not its containing directory. `None` until set; required
+    /// only by the `run` command.
     pub runner_script: Option<PathBuf>,
     /// Reject an offer when 1-minute load average per core exceeds this.
     pub load_ceiling: f64,
@@ -128,10 +128,10 @@ impl AgentConfig {
                 )
             }
         };
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        #[cfg(not(target_os = "macos"))]
         if credential_store == CredentialMode::Keyring {
             anyhow::bail!(
-                "{ENV_CREDENTIAL_STORE}=keyring is only supported on macOS and Windows; \
+                "{ENV_CREDENTIAL_STORE}=keyring is only supported on macOS; \
                  use 'file' (the default on Linux)"
             );
         }
@@ -174,7 +174,7 @@ impl AgentConfig {
             .with_context(|| format!("invalid gateway URI: {gateway}"))?;
 
         if gateway.starts_with("https://") {
-            // Bundled webpki roots keep trust uniform across macOS/Linux/Windows.
+            // Bundled webpki roots keep trust uniform across macOS/Linux.
             return endpoint
                 .tls_config(ClientTlsConfig::new().with_webpki_roots())
                 .context("failed to configure TLS");

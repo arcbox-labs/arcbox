@@ -1,7 +1,7 @@
 //! Docker API-based execution of Linux runner jobs.
 //!
 //! Talks to any Docker-compatible runtime (ArcBox on macOS, Docker Engine on
-//! Linux/Windows) via the local socket. Each Linux job runs inside a container
+//! Linux) via the local socket. Each Linux job runs inside a container
 //! launched from the configured runner image.
 
 use anyhow::{Context, Result};
@@ -169,8 +169,8 @@ impl DockerRunner {
     ///
     /// On macOS, prefers ArcBox's own socket (`~/.arcbox/docker.sock`) and falls
     /// back to the system default (Docker Desktop, Colima, …) when ArcBox is
-    /// absent or unresponsive. On other platforms it uses the system default
-    /// directly (e.g. `/var/run/docker.sock` on Linux, named pipe on Windows).
+    /// absent or unresponsive. On Linux it uses the system default directly
+    /// (`/var/run/docker.sock`).
     ///
     /// The pull is the readiness check: an arch is advertised only if its image
     /// pulls, so a host that cannot realize `linux/amd64` (no working emulation)

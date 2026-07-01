@@ -1,7 +1,7 @@
 [package]
 name = "arcbox-fleet-agent"
 publish = false
-description = "Cross-platform Fleet runner agent: enrolls, attaches to the gateway, and runs GitHub Actions jobs"
+description = "Fleet runner agent (macOS, Linux): enrolls, attaches to the gateway, and runs GitHub Actions jobs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -42,5 +42,5 @@ hyper-util = "0.1"
 [lints]
 workspace = true
 
-[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
 keyring = "4"

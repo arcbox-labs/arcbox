@@ -1,12 +1,12 @@
 //! Persistence of the long-lived machine credential.
 //!
 //! The credential is written once at enrollment and read on every `run`. The
-//! backend is chosen by [`CredentialMode`]: the OS keychain on macOS (login
-//! Keychain) and Windows (Credential Manager), or an owner-only (`0600`) file on
-//! Linux. The keychain item is access-controlled to this binary by the OS, so a
-//! same-user process can't read it without a prompt — a boundary the file lacks.
-//! The macOS login Keychain is unlocked by the user's login, so the agent must
-//! run in that session; Linux has no keychain backend that fits a headless,
+//! backend is chosen by [`CredentialMode`]: the OS keychain (login Keychain) on
+//! macOS, or an owner-only (`0600`) file on Linux. The keychain item is
+//! access-controlled to this binary by the OS, so a same-user process can't
+//! read it without a prompt — a boundary the file lacks. The macOS login
+//! Keychain is unlocked by the user's login, so the agent must run in that
+//! session; Linux has no keychain backend that fits a headless,
 //! reboot-persistent agent, so it uses the file (encryption at rest there is the
 //! deployment's job, via LUKS). See [`CredentialStore::new`].
 
@@ -30,17 +30,17 @@ pub struct Credential {
 pub enum CredentialStore {
     /// Owner-only JSON file in the data directory.
     File(FileStore),
-    /// OS keychain: the login Keychain on macOS, Credential Manager on Windows.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    /// OS keychain: the login Keychain on macOS.
+    #[cfg(target_os = "macos")]
     Keyring(KeyringStore),
 }
 
 impl CredentialStore {
     /// Select a backend from `mode` and the platform.
     ///
-    /// `Auto` uses the OS keychain on macOS/Windows and the `path` file
-    /// elsewhere; `Keyring` forces the keychain; `File` forces the file. `mode`
-    /// is validated against the platform when parsed from the environment, so
+    /// `Auto` uses the OS keychain on macOS and the `path` file elsewhere;
+    /// `Keyring` forces the keychain; `File` forces the file. `mode` is
+    /// validated against the platform when parsed from the environment, so
     /// `Keyring` never reaches here on a platform without a keychain.
     ///
     /// `gateway` scopes the credential to the environment it was enrolled
@@ -49,13 +49,13 @@ impl CredentialStore {
     /// silently overwriting each other. The file backend is scoped by `path`
     /// (per data dir) instead.
     pub fn new(mode: CredentialMode, path: PathBuf, gateway: &str) -> Self {
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        #[cfg(target_os = "macos")]
         if matches!(mode, CredentialMode::Keyring | CredentialMode::Auto) {
             return Self::Keyring(KeyringStore {
                 account: gateway.to_owned(),
             });
         }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        #[cfg(not(target_os = "macos"))]
         let _ = (mode, gateway);
         Self::File(FileStore { path })
     }
@@ -64,7 +64,7 @@ impl CredentialStore {
     pub fn load(&self) -> Result<Option<Credential>> {
         match self {
             Self::File(store) => store.load(),
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(target_os = "macos")]
             Self::Keyring(store) => store.load(),
         }
     }
@@ -73,7 +73,7 @@ impl CredentialStore {
     pub fn store(&self, cred: &Credential) -> Result<()> {
         match self {
             Self::File(store) => store.store(cred),
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(target_os = "macos")]
             Self::Keyring(store) => store.store(cred),
         }
     }
@@ -84,7 +84,7 @@ impl CredentialStore {
     pub fn clear(&self) -> Result<()> {
         match self {
             Self::File(store) => store.clear(),
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(target_os = "macos")]
             Self::Keyring(store) => store.clear(),
         }
     }
@@ -124,35 +124,22 @@ impl FileStore {
     }
 }
 
-/// Write `bytes` to `path`, owner-only (`0600`) from creation on Unix.
-#[cfg(unix)]
+/// Write `bytes` to `path`, owner-only (`0600`) from creation on Unix — every
+/// supported target (macOS, Linux) is Unix, so this is the only backend.
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     crate::fsutil::write_owner_only(path, bytes)
-}
-
-/// Refuse to persist the machine token via a file on platforms without
-/// owner-only file permissions. On Windows the secure path is the OS keychain
-/// (`ARCBOX_FLEET_CREDENTIAL_STORE=auto`, the default there); the file backend
-/// has no ACL hardening, so writing the long-lived token at the default ACL
-/// would leave it readable by other local accounts.
-#[cfg(not(unix))]
-fn write_private(_path: &std::path::Path, _bytes: &[u8]) -> Result<()> {
-    anyhow::bail!(
-        "file credential storage is not hardened on this platform; use the OS \
-         keychain (ARCBOX_FLEET_CREDENTIAL_STORE=auto)"
-    )
 }
 
 /// Stores the credential as a single JSON blob in the OS keychain, one entry
 /// per gateway (the account is the gateway URI), so enrolling against another
 /// environment never clobbers this one's credential.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "macos")]
 pub struct KeyringStore {
     /// Keychain account: the gateway URI this credential enrolls against.
     account: String,
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "macos")]
 impl KeyringStore {
     /// Keychain service under which every credential entry is stored.
     const SERVICE: &'static str = "dev.arcbox.fleet-agent";
@@ -194,7 +181,7 @@ mod tests {
     use super::*;
 
     // The file backend is the default (and only) store on Linux, where the test
-    // suite runs; the keychain backends are exercised on macOS/Windows builds.
+    // suite runs; the keychain backend is exercised on macOS builds.
     #[cfg(unix)]
     #[test]
     fn file_store_round_trips_at_0600() {
