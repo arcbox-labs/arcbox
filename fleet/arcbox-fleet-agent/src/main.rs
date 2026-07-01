@@ -146,15 +146,9 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             )?;
             info!(machine_id = %credential.machine_id, "starting fleet agent");
 
-            // Cancelled on the first termination signal; `attach::run` then
-            // stops accepting work and tears down in-flight runners.
-            let shutdown = CancellationToken::new();
-            let signal_token = shutdown.clone();
-            tokio::spawn(async move {
-                shutdown_signal().await;
-                info!("termination signal received; draining runners");
-                signal_token.cancel();
-            });
+            // `attach::run` stops accepting work and tears down in-flight
+            // runners once this fires.
+            let shutdown = spawn_shutdown_signal("termination signal received; draining runners");
 
             // `run` opens no control socket, so nothing ever subscribes to
             // this — it only exists to satisfy `attach`'s shared signature.
@@ -186,16 +180,10 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             );
             let socket_path = config.control_socket_path();
 
-            // Cancelled on the first termination signal; cascades to every
-            // attach task's child token, so runners still drain on SIGTERM
-            // even though `Disconnect` can also cancel one independently.
-            let shutdown = CancellationToken::new();
-            let signal_token = shutdown.clone();
-            tokio::spawn(async move {
-                shutdown_signal().await;
-                info!("termination signal received; shutting down");
-                signal_token.cancel();
-            });
+            // Cascades to every attach task's child token, so runners still
+            // drain on SIGTERM even though `Disconnect` can also cancel one
+            // independently.
+            let shutdown = spawn_shutdown_signal("termination signal received; shutting down");
 
             let agent_state = AgentState::new();
             let supervisor = Arc::new(
@@ -264,6 +252,20 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Build a `CancellationToken` cancelled on the first termination signal
+/// (see [`shutdown_signal`]), logging `message` when it fires. Shared by
+/// `run` and `serve`, whose shutdown trigger is otherwise identical.
+fn spawn_shutdown_signal(message: &'static str) -> CancellationToken {
+    let shutdown = CancellationToken::new();
+    let signal_token = shutdown.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        info!("{message}");
+        signal_token.cancel();
+    });
+    shutdown
 }
 
 /// Resolve when the process receives a termination signal: Ctrl-C on any
