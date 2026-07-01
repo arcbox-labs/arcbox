@@ -167,8 +167,8 @@ impl AgentConfig {
 
     /// Build a gateway [`Endpoint`] for an arbitrary `gateway` URI, enabling
     /// TLS for `https` URIs. Used to connect against the persisted
-    /// settings' current `gateway`, which may override this config's
-    /// default (see [`crate::state::AgentState::gateway_current`]).
+    /// settings' target `gateway`, which may override this config's
+    /// default (see [`crate::state::AgentState::gateway_target`]).
     pub fn endpoint_for(&self, gateway: &str) -> Result<Endpoint> {
         let endpoint = Endpoint::from_shared(gateway.to_owned())
             .with_context(|| format!("invalid gateway URI: {gateway}"))?;
