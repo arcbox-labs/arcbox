@@ -6,6 +6,12 @@
 //! same path the CLI's `status`/`drain`/`resume`/`disconnect` subcommands
 //! and the desktop app use.
 
+#![allow(
+    clippy::float_cmp,
+    reason = "settings values are moved/copied here, never computed, so exact \
+              float equality is always well-defined — no rounding can occur"
+)]
+
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -14,9 +20,11 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_client::FleetLifecycleServiceClient;
+use arcbox_fleet_control_proto::v1::fleet_settings_service_client::FleetSettingsServiceClient;
 use arcbox_fleet_control_proto::v1::fleet_state_service_client::FleetStateServiceClient;
 use arcbox_fleet_control_proto::v1::{
-    ConnectionState, DrainRequest, Enrollment, GetAgentInfoRequest, GetStatusRequest, WatchRequest,
+    ConnectionState, DockerMode, DrainRequest, Enrollment, GetAgentInfoRequest, GetSettingsRequest,
+    GetStatusRequest, UpdateSettingsRequest, WatchRequest,
 };
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
@@ -101,6 +109,7 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
     wait_for_socket(&mut agent.0, &socket_path);
     let channel = connect(&socket_path).await;
     let mut client = FleetLifecycleServiceClient::new(channel.clone());
+    let mut settings_client = FleetSettingsServiceClient::new(channel.clone());
 
     let info = client
         .get_agent_info(GetAgentInfoRequest {})
@@ -145,6 +154,95 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
     assert!(snapshot.capabilities.is_empty());
     assert!(snapshot.in_flight.is_empty());
     assert!(snapshot.recent_verdicts.is_empty());
+
+    // FleetSettingsService.GetSettings: a fresh agent reports current ==
+    // target everywhere, seeded from its env configuration.
+    let settings = settings_client
+        .get_settings(GetSettingsRequest {})
+        .await
+        .expect("GetSettings")
+        .into_inner()
+        .settings
+        .expect("settings present");
+    let load_ceiling = settings.load_ceiling.expect("load_ceiling present");
+    assert_eq!(load_ceiling.current, 0.9);
+    assert_eq!(load_ceiling.current, load_ceiling.target);
+    assert_eq!(
+        settings
+            .mem_floor_mib
+            .expect("mem_floor_mib present")
+            .current,
+        2048
+    );
+    assert_eq!(
+        settings.gateway.expect("gateway present").current,
+        "http://127.0.0.1:1"
+    );
+    assert_eq!(
+        DockerMode::try_from(settings.docker_mode.expect("docker_mode present").current).unwrap(),
+        DockerMode::Disabled
+    );
+    assert_eq!(
+        settings
+            .runner_script
+            .expect("runner_script present")
+            .current,
+        ""
+    );
+
+    // UpdateSettings: load_ceiling applies instantly — current and target
+    // both move together, with no reattach or restart involved.
+    let updated = settings_client
+        .update_settings(UpdateSettingsRequest {
+            load_ceiling: Some(0.5),
+            ..Default::default()
+        })
+        .await
+        .expect("UpdateSettings")
+        .into_inner()
+        .settings
+        .expect("settings present");
+    let load_ceiling = updated.load_ceiling.expect("load_ceiling present");
+    assert_eq!(load_ceiling.current, 0.5);
+    assert_eq!(load_ceiling.target, 0.5);
+
+    // The change reaches a fresh Watch subscription without polling —
+    // settings ride the same object as everything else `Watch` streams.
+    let mut confirm_stream = watch_client
+        .watch(WatchRequest {})
+        .await
+        .expect("Watch RPC")
+        .into_inner();
+    let confirmed = confirm_stream
+        .message()
+        .await
+        .expect("watch stream")
+        .expect("snapshot")
+        .snapshot
+        .expect("snapshot present");
+    assert_eq!(
+        confirmed
+            .settings
+            .expect("settings present")
+            .load_ceiling
+            .expect("load_ceiling present")
+            .current,
+        0.5
+    );
+
+    // Safety invariant enforced end-to-end: this agent already has
+    // docker_mode=Disabled and no runner_script (its env-derived seed —
+    // a legitimate Docker-only farm shape), so a request that explicitly
+    // touches docker_mode without also supplying a runner_script is
+    // rejected rather than silently leaving the host serving nothing.
+    let unsafe_err = settings_client
+        .update_settings(UpdateSettingsRequest {
+            docker_mode: Some(DockerMode::Disabled as i32),
+            ..Default::default()
+        })
+        .await
+        .expect_err("should reject docker_mode=disabled with no runner_script");
+    assert_eq!(unsafe_err.code(), tonic::Code::InvalidArgument);
 
     let drain_err = client
         .drain(DrainRequest {})

@@ -85,17 +85,13 @@ struct Inner {
     /// still starting is observed at the next cancellation point rather than
     /// lost; see [`RunnerSupervisor::handle_cancel`].
     in_flight: DashMap<String, CancellationToken>,
-    /// Directory holding the installed runner (`run.sh` / `run.cmd`).
+    /// Path to the installed runner's entry point (`run.sh` / `run.cmd`).
     /// `None` when only Docker-based execution is configured.
-    runner_dir: Option<PathBuf>,
+    runner_script: Option<PathBuf>,
     /// Docker runtime for Linux jobs, if available.
     docker: Option<DockerRunner>,
     /// The backend serving each advertised `(os, arch)` — the routing table.
     backends: HashMap<(String, String), Backend>,
-    /// Reject an offer when 1-minute load per core exceeds this.
-    load_ceiling: f64,
-    /// Reject an offer when available memory (MiB) is below this.
-    mem_floor_mib: u64,
     /// Set once `Drain` is received; no new jobs are accepted.
     draining: std::sync::atomic::AtomicBool,
     /// Observable state mirrored to `FleetStateService.Watch` subscribers.
@@ -125,13 +121,14 @@ impl Drop for ReleaseGuard {
 impl RunnerSupervisor {
     /// Create a supervisor that emits verdicts on `events`. `capabilities` is the
     /// same set advertised to the gateway, so routing and advertisement agree.
+    /// `load_ceiling`/`mem_floor_mib` are not parameters: `admit()` reads
+    /// them live from `state`, which is the single source of truth settings
+    /// write through.
     pub fn new(
         events: mpsc::Sender<AttachRequest>,
-        runner_dir: Option<PathBuf>,
+        runner_script: Option<PathBuf>,
         docker: Option<DockerRunner>,
         capabilities: Vec<Capability>,
-        load_ceiling: f64,
-        mem_floor_mib: u64,
         state: AgentState,
     ) -> Self {
         // Static for the attachment's lifetime, so this is set once rather
@@ -150,11 +147,9 @@ impl RunnerSupervisor {
                 events,
                 outstanding: DashMap::new(),
                 in_flight: DashMap::new(),
-                runner_dir,
+                runner_script,
                 docker,
                 backends,
-                load_ceiling,
-                mem_floor_mib,
                 draining: std::sync::atomic::AtomicBool::new(false),
                 state,
             }),
@@ -240,10 +235,12 @@ impl RunnerSupervisor {
         } else {
             telemetry.load_avg_1m
         };
-        if load_per_core > self.inner.load_ceiling {
+        let load_ceiling = self.inner.state.load_ceiling_current();
+        if load_per_core > load_ceiling {
             return Admission::Reject(format!("load too high ({load_per_core:.2}/core)"));
         }
-        if telemetry.mem_available_mib < self.inner.mem_floor_mib {
+        let mem_floor_mib = self.inner.state.mem_floor_mib_current();
+        if telemetry.mem_available_mib < mem_floor_mib {
             return Admission::Reject(format!(
                 "low memory ({} MiB free)",
                 telemetry.mem_available_mib
@@ -359,12 +356,12 @@ impl RunnerSupervisor {
         token: &str,
         cancel: CancellationToken,
     ) {
-        let Some(runner_dir) = &self.inner.runner_dir else {
-            self.reject(job_id, token, "no host runner directory configured");
+        let Some(runner_script) = &self.inner.runner_script else {
+            self.reject(job_id, token, "no host runner script configured");
             return;
         };
 
-        let mut command = runner_command(runner_dir, &order.encoded_jit_config);
+        let mut command = runner_command(runner_script, &order.encoded_jit_config);
         let mut child = match command.group_spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -416,11 +413,13 @@ impl RunnerSupervisor {
         // Startup is cancellation-aware: a slow image pull must not make the
         // agent deaf to CancelRunner and then accept a job the platform has
         // already concluded.
+        let runner_image = self.inner.state.runner_image_current();
         let started = {
             let start = std::pin::pin!(docker.start(RunSpec {
                 job_id,
                 encoded_jit_config: &order.encoded_jit_config,
                 arch: &order.arch,
+                runner_image: &runner_image,
             }));
             tokio::select! {
                 result = start => Some(result),
@@ -536,11 +535,13 @@ impl RunnerSupervisor {
     }
 }
 
-/// Build the platform-appropriate runner invocation.
-fn runner_command(runner_dir: &Path, encoded_jit_config: &str) -> tokio::process::Command {
+/// Build the platform-appropriate runner invocation. `script` is the direct
+/// path to the entry point (`run.sh` / `run.cmd`); no `.current_dir()` is
+/// set because these wrapper scripts locate their own sibling files via
+/// `$0`'s dirname, not the caller's working directory.
+fn runner_command(script: &Path, encoded_jit_config: &str) -> tokio::process::Command {
     #[cfg(windows)]
     {
-        let script = runner_dir.join("run.cmd");
         let mut command = tokio::process::Command::new("cmd");
         command
             .arg("/C")
@@ -551,7 +552,6 @@ fn runner_command(runner_dir: &Path, encoded_jit_config: &str) -> tokio::process
     }
     #[cfg(not(windows))]
     {
-        let script = runner_dir.join("run.sh");
         let mut command = tokio::process::Command::new(script);
         command.arg("--jitconfig").arg(encoded_jit_config);
         command
@@ -579,6 +579,19 @@ mod tests {
         }
     }
 
+    /// Seed matching the pre-slice-3 hardcoded test defaults (0.9 load
+    /// ceiling, 2048 MiB memory floor).
+    fn seed() -> crate::settings::PersistedSettings {
+        crate::settings::PersistedSettings {
+            load_ceiling: 0.9,
+            mem_floor_mib: 2048,
+            runner_image: "ghcr.io/actions/actions-runner:latest".to_owned(),
+            gateway: "https://fleet.arcbox.dev".to_owned(),
+            docker_mode: crate::config::DockerMode::Auto,
+            runner_script: None,
+        }
+    }
+
     fn supervisor(capabilities: Vec<Capability>) -> RunnerSupervisor {
         let (events, _rx) = mpsc::channel(1);
         RunnerSupervisor::new(
@@ -586,9 +599,7 @@ mod tests {
             Some(PathBuf::from("/nonexistent")),
             None,
             capabilities,
-            0.9,
-            2048,
-            AgentState::new(),
+            AgentState::new(&seed()),
         )
     }
 
@@ -692,9 +703,29 @@ mod tests {
             Some(PathBuf::from("/nonexistent")),
             None,
             vec![capability("darwin", "arm64", Backend::HostRunner)],
-            0.9,
-            2048,
-            AgentState::new(),
+            AgentState::new(&seed()),
+        );
+        (sup, rx)
+    }
+
+    /// A supervisor whose load/memory thresholds can never reject, for
+    /// tests that exercise `handle_provision`'s real `host::telemetry()`
+    /// path (unlike `admit()`-level tests, which inject fake telemetry
+    /// directly and so aren't sensitive to the test machine's actual load).
+    fn supervisor_with_rx_unconstrained(
+        capacity: usize,
+    ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
+        let (events, rx) = mpsc::channel(capacity);
+        let sup = RunnerSupervisor::new(
+            events,
+            Some(PathBuf::from("/nonexistent")),
+            None,
+            vec![capability("darwin", "arm64", Backend::HostRunner)],
+            AgentState::new(&crate::settings::PersistedSettings {
+                load_ceiling: f64::MAX,
+                mem_floor_mib: 0,
+                ..seed()
+            }),
         );
         (sup, rx)
     }
@@ -731,7 +762,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_offer_is_tracked_in_state_in_flight() {
-        let (sup, _rx) = supervisor_with_rx(8);
+        let (sup, _rx) = supervisor_with_rx_unconstrained(8);
         sup.handle_provision(ProvisionRunner {
             job_id: "rjob_a".to_owned(),
             os: "darwin".to_owned(),

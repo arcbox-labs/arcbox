@@ -1,20 +1,75 @@
 //! Reactive, observable agent state: a single value pushed via `watch`,
 //! mirroring `arcbox-api`'s `SetupState`. Every module that owns a
-//! transition (enrollment, admission, telemetry) calls straight into this;
-//! `FleetStateService::watch` (`control/watch.rs`) is the only reader that
-//! turns it into a stream. Settings (a later addition) will push through
-//! this same snapshot rather than needing their own notification path.
+//! transition (enrollment, admission, telemetry, settings) calls straight
+//! into this; `FleetStateService::watch` (`control/watch.rs`) is the only
+//! reader that turns it into a stream.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arcbox_fleet_control_proto::v1::{
-    AgentStateSnapshot, Capability, Enrollment, HostTelemetry, InFlightJob, OfferVerdict,
+    AgentSettings, AgentStateSnapshot, Capability, DockerModeSetting, DoubleSetting, Enrollment,
+    HostTelemetry, InFlightJob, OfferVerdict, StringSetting, Uint64Setting,
 };
 use tokio::sync::watch;
+
+use crate::config::DockerMode;
+use crate::settings::PersistedSettings;
 
 /// Bound on `recent_verdicts` so a long-lived agent's snapshot doesn't grow
 /// without limit; only recent history is useful for a live status view.
 const RECENT_VERDICTS_CAP: usize = 20;
+
+/// `AgentState::new` always populates `settings` fully, unlike `telemetry`
+/// (legitimately absent until the first heartbeat) — every accessor below
+/// relies on this and panics via this message if it's ever violated.
+const SETTINGS_INVARIANT: &str = "AgentState::new always initializes settings";
+
+/// Convert a gateway-facing `DockerMode` into its control-plane
+/// counterpart. A plain function, not `From`: `control_proto::DockerMode`
+/// is generated in another crate, so Rust's orphan rule blocks
+/// implementing a foreign trait for a foreign *target* type here.
+fn docker_mode_to_control(mode: DockerMode) -> arcbox_fleet_control_proto::v1::DockerMode {
+    match mode {
+        DockerMode::Auto => arcbox_fleet_control_proto::v1::DockerMode::Auto,
+        DockerMode::Enabled => arcbox_fleet_control_proto::v1::DockerMode::Enabled,
+        DockerMode::Disabled => arcbox_fleet_control_proto::v1::DockerMode::Disabled,
+    }
+}
+
+/// The reverse direction has no such restriction — `DockerMode` (the
+/// target here) is local to this crate, so the orphan rule allows a real
+/// `From` impl even though the source type is foreign. Unrecognized/absent
+/// wire values fall back to `Auto`, matching `AgentConfig::from_env`'s own
+/// default.
+impl From<arcbox_fleet_control_proto::v1::DockerMode> for DockerMode {
+    fn from(mode: arcbox_fleet_control_proto::v1::DockerMode) -> Self {
+        match mode {
+            arcbox_fleet_control_proto::v1::DockerMode::Enabled => Self::Enabled,
+            arcbox_fleet_control_proto::v1::DockerMode::Disabled => Self::Disabled,
+            arcbox_fleet_control_proto::v1::DockerMode::Auto
+            | arcbox_fleet_control_proto::v1::DockerMode::Unspecified => Self::Auto,
+        }
+    }
+}
+
+/// Parse a wire `DockerMode` i32 that may not be a recognized variant
+/// (an older/newer client sent something this build doesn't know) into the
+/// internal type, falling back to `Auto`.
+fn docker_mode_from_wire(raw: i32) -> DockerMode {
+    arcbox_fleet_control_proto::v1::DockerMode::try_from(raw)
+        .unwrap_or(arcbox_fleet_control_proto::v1::DockerMode::Unspecified)
+        .into()
+}
+
+fn path_to_setting_value(path: Option<&Path>) -> String {
+    path.map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn setting_value_to_path(value: &str) -> Option<PathBuf> {
+    (!value.is_empty()).then(|| PathBuf::from(value))
+}
 
 /// Cheap-to-clone handle onto the agent's observable state. Every setter is
 /// synchronous (`watch::Sender::send_modify` never awaits), so it can be
@@ -26,7 +81,39 @@ pub struct AgentState {
 
 impl AgentState {
     /// A fresh, unenrolled snapshot — no credential, nothing running.
-    pub fn new() -> Self {
+    /// `seed`'s values populate `settings` with `current == target`
+    /// everywhere; callers that resolve a different `current` post-startup
+    /// (e.g. `docker_mode`, once `init_docker()` actually runs) update it
+    /// separately.
+    pub fn new(seed: &PersistedSettings) -> Self {
+        let runner_script = path_to_setting_value(seed.runner_script.as_deref());
+        let docker_mode = docker_mode_to_control(seed.docker_mode) as i32;
+        let settings = AgentSettings {
+            load_ceiling: Some(DoubleSetting {
+                current: seed.load_ceiling,
+                target: seed.load_ceiling,
+            }),
+            mem_floor_mib: Some(Uint64Setting {
+                current: seed.mem_floor_mib,
+                target: seed.mem_floor_mib,
+            }),
+            runner_image: Some(StringSetting {
+                current: seed.runner_image.clone(),
+                target: seed.runner_image.clone(),
+            }),
+            gateway: Some(StringSetting {
+                current: seed.gateway.clone(),
+                target: seed.gateway.clone(),
+            }),
+            docker_mode: Some(DockerModeSetting {
+                current: docker_mode,
+                target: docker_mode,
+            }),
+            runner_script: Some(StringSetting {
+                current: runner_script.clone(),
+                target: runner_script,
+            }),
+        };
         let (tx, _) = watch::channel(AgentStateSnapshot {
             enrollment: Enrollment::Unenrolled as i32,
             machine_id: String::new(),
@@ -35,6 +122,7 @@ impl AgentState {
             in_flight: Vec::new(),
             recent_verdicts: Vec::new(),
             telemetry: None,
+            settings: Some(settings),
         });
         Self { tx: Arc::new(tx) }
     }
@@ -48,6 +136,38 @@ impl AgentState {
     /// A snapshot of the current state.
     pub fn current(&self) -> AgentStateSnapshot {
         self.tx.borrow().clone()
+    }
+
+    /// The current settings, for `GetSettings`.
+    pub fn settings(&self) -> AgentSettings {
+        self.tx.borrow().settings.clone().expect(SETTINGS_INVARIANT)
+    }
+
+    /// The current settings, projected down to their persisted
+    /// (`target`-only) shape — what [`crate::settings::SettingsStore`]
+    /// writes to disk, and the baseline `FleetSettingsService.UpdateSettings`
+    /// computes "effective post-update" values against before applying a
+    /// request.
+    pub fn persisted_settings(&self) -> PersistedSettings {
+        let snapshot = self.tx.borrow();
+        let s = snapshot.settings.as_ref().expect(SETTINGS_INVARIANT);
+        PersistedSettings {
+            load_ceiling: s.load_ceiling.as_ref().expect(SETTINGS_INVARIANT).target,
+            mem_floor_mib: s.mem_floor_mib.as_ref().expect(SETTINGS_INVARIANT).target,
+            runner_image: s
+                .runner_image
+                .as_ref()
+                .expect(SETTINGS_INVARIANT)
+                .target
+                .clone(),
+            gateway: s.gateway.as_ref().expect(SETTINGS_INVARIANT).target.clone(),
+            docker_mode: docker_mode_from_wire(
+                s.docker_mode.as_ref().expect(SETTINGS_INVARIANT).target,
+            ),
+            runner_script: setting_value_to_path(
+                &s.runner_script.as_ref().expect(SETTINGS_INVARIANT).target,
+            ),
+        }
     }
 
     pub fn set_enrollment(&self, enrollment: Enrollment, machine_id: &str) {
@@ -90,17 +210,215 @@ impl AgentState {
     pub fn set_telemetry(&self, telemetry: HostTelemetry) {
         self.tx.send_modify(|s| s.telemetry = Some(telemetry));
     }
-}
 
-impl Default for AgentState {
-    fn default() -> Self {
-        Self::new()
+    // -- Settings: cheap reads for the engine's hot paths (admit(), image
+    // pulls) — extract just the one field needed, no whole-snapshot clone.
+
+    pub fn load_ceiling_current(&self) -> f64 {
+        self.tx
+            .borrow()
+            .settings
+            .as_ref()
+            .expect(SETTINGS_INVARIANT)
+            .load_ceiling
+            .as_ref()
+            .expect(SETTINGS_INVARIANT)
+            .current
+    }
+
+    pub fn mem_floor_mib_current(&self) -> u64 {
+        self.tx
+            .borrow()
+            .settings
+            .as_ref()
+            .expect(SETTINGS_INVARIANT)
+            .mem_floor_mib
+            .as_ref()
+            .expect(SETTINGS_INVARIANT)
+            .current
+    }
+
+    pub fn runner_image_current(&self) -> String {
+        self.tx
+            .borrow()
+            .settings
+            .as_ref()
+            .expect(SETTINGS_INVARIANT)
+            .runner_image
+            .as_ref()
+            .expect(SETTINGS_INVARIANT)
+            .current
+            .clone()
+    }
+
+    /// The desired gateway — what `attach.rs` dials on its next attempt.
+    /// There's no `gateway_current` reader: nothing needs to read back what
+    /// was last dialed outside of the full `settings()`/`persisted_settings()`
+    /// snapshots, which `GetSettings`/`Watch` already expose it through.
+    pub fn gateway_target(&self) -> String {
+        self.tx
+            .borrow()
+            .settings
+            .as_ref()
+            .expect(SETTINGS_INVARIANT)
+            .gateway
+            .as_ref()
+            .expect(SETTINGS_INVARIANT)
+            .target
+            .clone()
+    }
+
+    // -- Settings: writers. `load_ceiling`/`mem_floor_mib`/`runner_image`
+    // apply instantly, so their setters write both `current` and `target`
+    // in one `send_modify` — there's never a moment where they should
+    // differ. `gateway`/`docker_mode`/`runner_script` have independent
+    // current/target setters: `target` is written by `UpdateSettings`,
+    // `current` by whichever engine code actually resolves/applies it.
+
+    pub fn set_load_ceiling(&self, value: f64) {
+        self.tx.send_modify(|s| {
+            let setting = s
+                .settings
+                .as_mut()
+                .expect(SETTINGS_INVARIANT)
+                .load_ceiling
+                .as_mut()
+                .expect(SETTINGS_INVARIANT);
+            setting.current = value;
+            setting.target = value;
+        });
+    }
+
+    pub fn set_mem_floor_mib(&self, value: u64) {
+        self.tx.send_modify(|s| {
+            let setting = s
+                .settings
+                .as_mut()
+                .expect(SETTINGS_INVARIANT)
+                .mem_floor_mib
+                .as_mut()
+                .expect(SETTINGS_INVARIANT);
+            setting.current = value;
+            setting.target = value;
+        });
+    }
+
+    pub fn set_runner_image(&self, value: String) {
+        self.tx.send_modify(|s| {
+            let setting = s
+                .settings
+                .as_mut()
+                .expect(SETTINGS_INVARIANT)
+                .runner_image
+                .as_mut()
+                .expect(SETTINGS_INVARIANT);
+            setting.current.clone_from(&value);
+            setting.target = value;
+        });
+    }
+
+    pub fn set_gateway_target(&self, value: &str) {
+        self.tx.send_modify(|s| {
+            value.clone_into(
+                &mut s
+                    .settings
+                    .as_mut()
+                    .expect(SETTINGS_INVARIANT)
+                    .gateway
+                    .as_mut()
+                    .expect(SETTINGS_INVARIANT)
+                    .target,
+            );
+        });
+    }
+
+    pub fn set_gateway_current(&self, value: &str) {
+        self.tx.send_modify(|s| {
+            value.clone_into(
+                &mut s
+                    .settings
+                    .as_mut()
+                    .expect(SETTINGS_INVARIANT)
+                    .gateway
+                    .as_mut()
+                    .expect(SETTINGS_INVARIANT)
+                    .current,
+            );
+        });
+    }
+
+    pub fn set_docker_mode_target(&self, mode: DockerMode) {
+        let mode = docker_mode_to_control(mode) as i32;
+        self.tx.send_modify(|s| {
+            s.settings
+                .as_mut()
+                .expect(SETTINGS_INVARIANT)
+                .docker_mode
+                .as_mut()
+                .expect(SETTINGS_INVARIANT)
+                .target = mode;
+        });
+    }
+
+    pub fn set_docker_mode_current(&self, mode: DockerMode) {
+        let mode = docker_mode_to_control(mode) as i32;
+        self.tx.send_modify(|s| {
+            s.settings
+                .as_mut()
+                .expect(SETTINGS_INVARIANT)
+                .docker_mode
+                .as_mut()
+                .expect(SETTINGS_INVARIANT)
+                .current = mode;
+        });
+    }
+
+    pub fn set_runner_script_target(&self, script: Option<&Path>) {
+        let value = path_to_setting_value(script);
+        self.tx.send_modify(|s| {
+            s.settings
+                .as_mut()
+                .expect(SETTINGS_INVARIANT)
+                .runner_script
+                .as_mut()
+                .expect(SETTINGS_INVARIANT)
+                .target = value;
+        });
+    }
+
+    pub fn set_runner_script_current(&self, script: Option<&Path>) {
+        let value = path_to_setting_value(script);
+        self.tx.send_modify(|s| {
+            s.settings
+                .as_mut()
+                .expect(SETTINGS_INVARIANT)
+                .runner_script
+                .as_mut()
+                .expect(SETTINGS_INVARIANT)
+                .current = value;
+        });
     }
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::float_cmp,
+    reason = "settings values are moved/copied here, never computed, so exact \
+              float equality is always well-defined — no rounding can occur"
+)]
 mod tests {
     use super::*;
+
+    fn seed() -> PersistedSettings {
+        PersistedSettings {
+            load_ceiling: 0.9,
+            mem_floor_mib: 2048,
+            runner_image: "ghcr.io/actions/actions-runner:latest".to_owned(),
+            gateway: "https://fleet.arcbox.dev".to_owned(),
+            docker_mode: DockerMode::Auto,
+            runner_script: None,
+        }
+    }
 
     fn job(id: &str) -> InFlightJob {
         InFlightJob {
@@ -120,7 +438,7 @@ mod tests {
 
     #[test]
     fn starts_unenrolled_and_empty() {
-        let snap = AgentState::new().current();
+        let snap = AgentState::new(&seed()).current();
         assert_eq!(snap.enrollment, Enrollment::Unenrolled as i32);
         assert_eq!(snap.machine_id, "");
         assert!(!snap.draining);
@@ -130,9 +448,48 @@ mod tests {
         assert!(snap.telemetry.is_none());
     }
 
+    /// `AgentState` has no `gateway_current` reader (nothing outside tests
+    /// needs it — see its doc comment), so tests read it via the full
+    /// `settings()` snapshot instead.
+    fn gateway_current(state: &AgentState) -> String {
+        state.settings().gateway.unwrap().current
+    }
+
+    #[test]
+    fn settings_seed_current_equals_target() {
+        let state = AgentState::new(&seed());
+        assert_eq!(state.load_ceiling_current(), 0.9);
+        assert_eq!(state.mem_floor_mib_current(), 2048);
+        assert_eq!(gateway_current(&state), state.gateway_target());
+        let settings = state.settings();
+        assert_eq!(
+            settings.docker_mode.unwrap().current,
+            arcbox_fleet_control_proto::v1::DockerMode::Auto as i32
+        );
+    }
+
+    #[test]
+    fn gateway_current_and_target_are_independent() {
+        let state = AgentState::new(&seed());
+        state.set_gateway_target("https://staging.fleet.arcbox.dev");
+        assert_eq!(gateway_current(&state), "https://fleet.arcbox.dev");
+        assert_eq!(state.gateway_target(), "https://staging.fleet.arcbox.dev");
+
+        state.set_gateway_current("https://staging.fleet.arcbox.dev");
+        assert_eq!(gateway_current(&state), state.gateway_target());
+    }
+
+    #[test]
+    fn set_load_ceiling_sets_both_current_and_target() {
+        let state = AgentState::new(&seed());
+        state.set_load_ceiling(0.5);
+        assert_eq!(state.load_ceiling_current(), 0.5);
+        assert_eq!(state.settings().load_ceiling.unwrap().target, 0.5);
+    }
+
     #[test]
     fn in_flight_add_and_remove_round_trips() {
-        let state = AgentState::new();
+        let state = AgentState::new(&seed());
         state.add_in_flight(job("rjob_a"));
         state.add_in_flight(job("rjob_b"));
         assert_eq!(state.current().in_flight.len(), 2);
@@ -145,7 +502,7 @@ mod tests {
 
     #[test]
     fn recent_verdicts_cap_drops_oldest_and_keeps_most_recent_last() {
-        let state = AgentState::new();
+        let state = AgentState::new(&seed());
         for i in 0..RECENT_VERDICTS_CAP + 5 {
             state.push_verdict(verdict(&format!("rjob_{i}")));
         }
@@ -160,7 +517,7 @@ mod tests {
 
     #[test]
     fn set_enrollment_updates_machine_id() {
-        let state = AgentState::new();
+        let state = AgentState::new(&seed());
         state.set_enrollment(Enrollment::Attaching, "fltm_test");
         let snap = state.current();
         assert_eq!(snap.enrollment, Enrollment::Attaching as i32);
@@ -169,7 +526,7 @@ mod tests {
 
     #[test]
     fn set_draining_toggles() {
-        let state = AgentState::new();
+        let state = AgentState::new(&seed());
         state.set_draining(true);
         assert!(state.current().draining);
         state.set_draining(false);

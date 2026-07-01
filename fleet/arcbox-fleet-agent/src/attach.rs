@@ -72,11 +72,9 @@ pub fn spawn_supervisor(
     let (egress_tx, egress_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
     let supervisor = RunnerSupervisor::new(
         egress_tx,
-        config.runner_dir.clone(),
+        config.runner_script.clone(),
         docker,
         capabilities,
-        config.load_ceiling,
-        config.mem_floor_mib,
         state,
     );
 
@@ -183,15 +181,15 @@ async fn connect_and_serve(
     shutdown: &CancellationToken,
     state: &AgentState,
 ) -> Result<()> {
-    // A credential enrolled via the local control-plane's `Enroll` may carry
-    // a gateway override; the CLI's `enroll` subcommand never sets one, so
-    // this falls back to the configured default.
-    let gateway = credential
-        .control_plane
-        .as_deref()
-        .unwrap_or(&config.gateway);
+    // The desired (`target`) gateway, not `config.gateway` directly —
+    // `AgentSupervisor` seeds it from config and `UpdateSettings` can move
+    // it from there. Re-read on every attempt so a change takes effect on
+    // whatever reconnect happens next, without this loop ever being forced
+    // to one; `current` only moves to match once this actually succeeds,
+    // below.
+    let gateway = state.gateway_target();
     let channel = config
-        .endpoint_for(gateway)?
+        .endpoint_for(&gateway)?
         .connect()
         .await
         .with_context(|| format!("connecting to {gateway}"))?;
@@ -221,6 +219,7 @@ async fn connect_and_serve(
         .into_inner();
     *backoff = INITIAL_BACKOFF;
     state.set_enrollment(control_proto::Enrollment::Attached, &credential.machine_id);
+    state.set_gateway_current(&gateway);
     info!("attached to gateway");
 
     // Re-send the event stranded by the previous connection before anything else.

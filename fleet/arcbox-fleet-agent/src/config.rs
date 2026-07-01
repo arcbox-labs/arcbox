@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
 /// Production gateway endpoint. Overridable via `ARCBOX_FLEET_GATEWAY` for
@@ -13,7 +14,7 @@ use tonic::transport::{ClientTlsConfig, Endpoint};
 pub const DEFAULT_GATEWAY: &str = "https://fleet.arcbox.dev";
 
 const ENV_GATEWAY: &str = "ARCBOX_FLEET_GATEWAY";
-const ENV_RUNNER_DIR: &str = "ARCBOX_FLEET_RUNNER_DIR";
+const ENV_RUNNER_SCRIPT: &str = "ARCBOX_FLEET_RUNNER_SCRIPT";
 const ENV_LOAD_CEILING: &str = "ARCBOX_FLEET_LOAD_CEILING";
 const ENV_MEM_FLOOR_MIB: &str = "ARCBOX_FLEET_MEM_FLOOR_MIB";
 const ENV_DATA_DIR: &str = "ARCBOX_FLEET_DATA_DIR";
@@ -31,7 +32,7 @@ const DEFAULT_RUNNER_IMAGE: &str = "ghcr.io/actions/actions-runner:latest";
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Whether Docker-based Linux job execution is enabled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DockerMode {
     /// Probe the Docker socket at startup; proceed without Docker if unavailable.
     Auto,
@@ -67,9 +68,10 @@ pub struct DockerConfig {
 pub struct AgentConfig {
     /// Gateway endpoint URI (scheme selects transport: `https` → TLS, `http` → h2c).
     pub gateway: String,
-    /// Directory holding the pre-installed GitHub Actions runner (`run.sh`/`run.cmd`).
-    /// `None` until set; required only by the `run` command.
-    pub runner_dir: Option<PathBuf>,
+    /// Direct path to the pre-installed GitHub Actions runner's entry point
+    /// (`run.sh` on Unix, `run.cmd` on Windows) — not its containing
+    /// directory. `None` until set; required only by the `run` command.
+    pub runner_script: Option<PathBuf>,
     /// Reject an offer when 1-minute load average per core exceeds this.
     pub load_ceiling: f64,
     /// Reject an offer when available memory (MiB) is below this.
@@ -87,7 +89,7 @@ impl AgentConfig {
     pub fn from_env() -> Result<Self> {
         let gateway = std::env::var(ENV_GATEWAY).unwrap_or_else(|_| DEFAULT_GATEWAY.to_string());
 
-        let runner_dir = std::env::var_os(ENV_RUNNER_DIR).map(PathBuf::from);
+        let runner_script = std::env::var_os(ENV_RUNNER_SCRIPT).map(PathBuf::from);
 
         let load_ceiling = match std::env::var(ENV_LOAD_CEILING) {
             Ok(v) => parse_load_ceiling(&v)?,
@@ -136,7 +138,7 @@ impl AgentConfig {
 
         Ok(Self {
             gateway,
-            runner_dir,
+            runner_script,
             load_ceiling,
             mem_floor_mib,
             data_dir,
@@ -158,10 +160,15 @@ impl AgentConfig {
         self.data_dir.join("agent.sock")
     }
 
+    /// Path to the persisted, live-settable configuration.
+    pub fn settings_path(&self) -> PathBuf {
+        self.data_dir.join("settings.json")
+    }
+
     /// Build a gateway [`Endpoint`] for an arbitrary `gateway` URI, enabling
-    /// TLS for `https` URIs. Used to connect against a credential's
-    /// per-enrollment `control_plane` override instead of the configured
-    /// default (see [`crate::credentials::Credential::control_plane`]).
+    /// TLS for `https` URIs. Used to connect against the persisted
+    /// settings' current `gateway`, which may override this config's
+    /// default (see [`crate::state::AgentState::gateway_current`]).
     pub fn endpoint_for(&self, gateway: &str) -> Result<Endpoint> {
         let endpoint = Endpoint::from_shared(gateway.to_owned())
             .with_context(|| format!("invalid gateway URI: {gateway}"))?;

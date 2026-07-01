@@ -1,6 +1,6 @@
 //! Unix-socket gRPC client helper for the `status`/`drain`/`resume`/
-//! `disconnect` CLI subcommands, connecting to the running agent's
-//! `agent.sock`. Mirrors `arcbox-cli`'s `UnixConnector`
+//! `disconnect`/`settings` CLI subcommands, connecting to the running
+//! agent's `agent.sock`. Mirrors `arcbox-cli`'s `UnixConnector`
 //! (`app/arcbox-cli/src/commands/machine.rs`).
 
 use std::future::Future;
@@ -9,7 +9,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use anyhow::{Context as _, Result};
-use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_client::FleetLifecycleServiceClient;
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
 use tonic::codegen::{Service, http::Uri};
@@ -18,14 +17,16 @@ use tonic::transport::{Channel, Endpoint};
 use crate::config::AgentConfig;
 
 /// Connect to the running agent's control socket, at `config`'s configured
-/// path (see [`AgentConfig::control_socket_path`]).
-pub async fn connect_default(config: &AgentConfig) -> Result<FleetLifecycleServiceClient<Channel>> {
+/// path (see [`AgentConfig::control_socket_path`]). Returns the raw
+/// channel — a single `Channel` can back as many typed service clients as
+/// a caller needs (`FleetLifecycleServiceClient`, `FleetSettingsServiceClient`, ...).
+pub async fn connect_default(config: &AgentConfig) -> Result<Channel> {
     connect(&config.control_socket_path()).await
 }
 
-/// Connect to `socket_path` and return a `FleetLifecycleService` client.
-pub async fn connect(socket_path: &Path) -> Result<FleetLifecycleServiceClient<Channel>> {
-    let channel = Endpoint::from_static("http://[::]:50051")
+/// Connect to `socket_path`, returning the raw channel.
+pub async fn connect(socket_path: &Path) -> Result<Channel> {
+    Endpoint::from_static("http://[::]:50051")
         .connect_with_connector(UnixConnector::new(socket_path.to_path_buf()))
         .await
         .with_context(|| {
@@ -33,8 +34,7 @@ pub async fn connect(socket_path: &Path) -> Result<FleetLifecycleServiceClient<C
                 "failed to connect to fleet agent control socket at {}",
                 socket_path.display()
             )
-        })?;
-    Ok(FleetLifecycleServiceClient::new(channel))
+        })
 }
 
 struct UnixConnector {
