@@ -1,5 +1,8 @@
+use super::boot::{agent_timeout_error, ensure_earlycon, ensure_sparse_block_image};
+use super::types::{DesiredBoot, machine_drift_reason};
 use super::*;
 use crate::machine::MachineState;
+use arcbox_constants::cmdline::HV_EARLYCON_DIRECTIVE;
 
 #[test]
 fn test_lifecycle_state_is_ready() {
@@ -83,7 +86,7 @@ fn ensure_sparse_block_image_is_thin_provisioned() {
     let path = dir.path().join("data").join("docker.img");
     let size_bytes = DOCKER_DATA_IMAGE_SIZE_BYTES; // 8 TiB virtual size
 
-    VmLifecycleManager::ensure_sparse_block_image(&path, size_bytes).unwrap();
+    ensure_sparse_block_image(&path, size_bytes).unwrap();
 
     let meta = std::fs::metadata(&path).unwrap();
     assert_eq!(
@@ -113,16 +116,16 @@ fn ensure_sparse_block_image_never_shrinks() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("docker.img");
 
-    VmLifecycleManager::ensure_sparse_block_image(&path, 8192).unwrap();
+    ensure_sparse_block_image(&path, 8192).unwrap();
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
 
     // A call with a smaller virtual size must not truncate the existing
     // image — that would discard guest data.
-    VmLifecycleManager::ensure_sparse_block_image(&path, 4096).unwrap();
+    ensure_sparse_block_image(&path, 4096).unwrap();
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
 
     // A larger size grows it.
-    VmLifecycleManager::ensure_sparse_block_image(&path, 16384).unwrap();
+    ensure_sparse_block_image(&path, 16384).unwrap();
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 16384);
 }
 

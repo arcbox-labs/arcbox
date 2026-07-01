@@ -13,15 +13,14 @@
 //! ```text
 //! managed                                 ForceStop / Failure (anywhere)
 //!  ├─ booting ── creating, starting       AgentReady → running
-//!  ├─ active  ── running, idle            Stop → stopping
+//!  ├─ active  ── running, idle            Stop → stopping; IdleTimeout ⇄ Activity
 //!  ├─ stopping                            Stopped → stopped
 //!  └─ resting ── not_exist, created,      Start → creating | starting
 //!                stopped, failed
 //! ```
-
-// The machine and its plumbing are introduced here additively and wired into
-// `VmLifecycleManager` in a follow-up commit; until then the items are unused.
-#![allow(dead_code)]
+//!
+//! `Stop` during `booting` is not a machine transition: the actor defers it
+//! until the boot resolves (see `actor.rs`).
 
 use statig::prelude::*;
 
@@ -32,13 +31,13 @@ type Outcome = statig::Outcome<State>;
 
 /// A lifecycle event fed to the state machine.
 ///
-/// Replaces the previously-undispatched `types::VmEvent`. Every variant is
-/// produced by the actor (commands) or by a boot/stop sub-task (completions).
+/// Every variant is produced by the actor (commands) or by a boot/stop
+/// sub-task (completions); none is dead vocabulary.
 #[derive(Debug, Clone)]
 pub(super) enum VmEvent {
     /// `ensure_ready` on a VM that needs starting. `create` is precomputed by
-    /// the actor's `plan_boot` (drift/missing detection); it selects
-    /// `creating` vs `starting`.
+    /// the actor (`decide_create`: missing machine record) and selects
+    /// `creating` vs `starting`; config drift is re-checked in the boot task.
     Start {
         /// Whether the machine must be (re)created before starting.
         create: bool,
@@ -50,8 +49,9 @@ pub(super) enum VmEvent {
     Activity,
     /// Boot sub-task: the guest agent reported ready.
     AgentReady,
-    /// Boot or stop sub-task: terminal failure (reason carried for the actor).
-    Failure(String),
+    /// Boot or stop sub-task: terminal failure. The reason string stays on the
+    /// actor side (`InternalEvent`), which delivers it to waiting callers.
+    Failure,
     /// Idle ticker fired and the idle threshold was exceeded.
     IdleTimeout,
     /// Graceful shutdown request.
@@ -104,6 +104,9 @@ pub(super) enum Effect {
     RemoveMachine,
     /// Apply a balloon target.
     Balloon(BalloonTarget),
+    /// Bump the VM incarnation counter (the Docker proxy watches it to detect
+    /// restarts and reset cached readiness + pooled connections).
+    BumpGeneration,
     /// Publish a lifecycle notification on the event bus.
     Publish(Notify),
     /// Resolve all parked `ensure_ready` callers with the agent CID.
@@ -137,6 +140,7 @@ impl Effects {
     fn force_stop(&mut self) -> Outcome {
         self.emit(Effect::AbortInflight);
         self.emit(Effect::RemoveMachine);
+        self.emit(Effect::BumpGeneration);
         self.emit(Effect::Publish(Notify::Stopped));
         self.emit(Effect::FailWaiters("force stopped".to_owned()));
         Transition(State::not_exist())
@@ -157,10 +161,10 @@ impl VmLifecycle {
     // ----- managed (root): ForceStop / Failure, anywhere -----
 
     #[superstate]
-    async fn managed(event: &VmEvent, context: &mut Effects) -> Outcome {
+    fn managed(event: &VmEvent, context: &mut Effects) -> Outcome {
         match event {
             VmEvent::ForceStop => context.force_stop(),
-            VmEvent::Failure(_) => Transition(State::failed()),
+            VmEvent::Failure => Transition(State::failed()),
             _ => Handled,
         }
     }
@@ -168,7 +172,7 @@ impl VmLifecycle {
     // ----- resting leaves: Start kicks off a boot -----
 
     #[superstate(superstate = "managed")]
-    async fn resting(event: &VmEvent, context: &mut Effects) -> Outcome {
+    fn resting(event: &VmEvent, context: &mut Effects) -> Outcome {
         match event {
             VmEvent::Start { create, timeout_ms } => {
                 context.emit(Effect::SpawnBoot {
@@ -186,29 +190,29 @@ impl VmLifecycle {
     }
 
     #[state(superstate = "resting")]
-    async fn not_exist() -> Outcome {
+    fn not_exist() -> Outcome {
         Super
     }
 
     #[state(superstate = "resting")]
-    async fn created() -> Outcome {
+    fn created() -> Outcome {
         Super
     }
 
     #[state(superstate = "resting")]
-    async fn stopped() -> Outcome {
+    fn stopped() -> Outcome {
         Super
     }
 
     #[state(superstate = "resting")]
-    async fn failed() -> Outcome {
+    fn failed() -> Outcome {
         Super
     }
 
     // ----- booting leaves: AgentReady promotes to running -----
 
     #[superstate(superstate = "managed")]
-    async fn booting(event: &VmEvent, context: &mut Effects) -> Outcome {
+    fn booting(event: &VmEvent, context: &mut Effects) -> Outcome {
         match event {
             VmEvent::AgentReady => {
                 context.emit(Effect::Publish(Notify::Started));
@@ -219,26 +223,24 @@ impl VmLifecycle {
         }
     }
 
+    // `Stop` during a boot is deliberately not a transition here: the actor
+    // parks it (`pending_stop`) and dispatches it once the boot resolves,
+    // mirroring how the old `transition_lock` serialized shutdown behind an
+    // in-flight boot.
     #[state(superstate = "booting")]
-    async fn creating() -> Outcome {
+    fn creating() -> Outcome {
         Super
     }
 
     #[state(superstate = "booting")]
-    async fn starting(event: &VmEvent, context: &mut Effects) -> Outcome {
-        match event {
-            VmEvent::Stop => {
-                context.emit(Effect::SpawnStop);
-                Transition(State::stopping())
-            }
-            _ => Super,
-        }
+    fn starting() -> Outcome {
+        Super
     }
 
     // ----- active leaves: running / idle -----
 
     #[superstate(superstate = "managed")]
-    async fn active(event: &VmEvent, context: &mut Effects) -> Outcome {
+    fn active(event: &VmEvent, context: &mut Effects) -> Outcome {
         match event {
             VmEvent::Stop => {
                 context.emit(Effect::SpawnStop);
@@ -249,7 +251,7 @@ impl VmLifecycle {
     }
 
     #[state(superstate = "active")]
-    async fn running(event: &VmEvent, context: &mut Effects) -> Outcome {
+    fn running(event: &VmEvent, context: &mut Effects) -> Outcome {
         match event {
             VmEvent::IdleTimeout => {
                 context.emit(Effect::Balloon(BalloonTarget::Idle));
@@ -263,7 +265,7 @@ impl VmLifecycle {
     }
 
     #[state(superstate = "active")]
-    async fn idle(event: &VmEvent, context: &mut Effects) -> Outcome {
+    fn idle(event: &VmEvent, context: &mut Effects) -> Outcome {
         match event {
             VmEvent::Activity | VmEvent::Start { .. } => {
                 context.emit(Effect::Balloon(BalloonTarget::Full));
@@ -276,9 +278,10 @@ impl VmLifecycle {
     // ----- stopping leaf -----
 
     #[state(superstate = "managed")]
-    async fn stopping(event: &VmEvent, context: &mut Effects) -> Outcome {
+    fn stopping(event: &VmEvent, context: &mut Effects) -> Outcome {
         match event {
             VmEvent::Stopped => {
+                context.emit(Effect::BumpGeneration);
                 context.emit(Effect::Publish(Notify::Stopped));
                 Transition(State::stopped())
             }
@@ -308,24 +311,19 @@ impl State {
 mod machine_tests {
     use super::*;
 
-    type Machine = statig::awaitable::InitializedStateMachine<VmLifecycle>;
+    type Machine = statig::blocking::InitializedStateMachine<VmLifecycle>;
 
     /// Builds an initialized machine starting from `not_exist`.
-    async fn machine(fx: &mut Effects) -> Machine {
+    fn machine(fx: &mut Effects) -> Machine {
         VmLifecycle
             .uninitialized_state_machine()
             .init_with_context(fx)
-            .await
     }
 
     /// Dispatches `event`, returning the resulting public state and the effects
     /// the transition emitted.
-    async fn step(
-        sm: &mut Machine,
-        fx: &mut Effects,
-        event: VmEvent,
-    ) -> (VmLifecycleState, Vec<Effect>) {
-        sm.handle_with_context(&event, fx).await;
+    fn step(sm: &mut Machine, fx: &mut Effects, event: VmEvent) -> (VmLifecycleState, Vec<Effect>) {
+        sm.handle_with_context(&event, fx);
         (sm.state().to_public(), fx.take())
     }
 
@@ -338,13 +336,13 @@ mod machine_tests {
         }
     }
 
-    #[tokio::test]
-    async fn start_from_not_exist_creates_then_boots_to_running() {
+    #[test]
+    fn start_from_not_exist_creates_then_boots_to_running() {
         let mut fx = Effects::default();
-        let mut sm = machine(&mut fx).await;
+        let mut sm = machine(&mut fx);
         assert_eq!(sm.state().to_public(), VmLifecycleState::NotExist);
 
-        let (state, effects) = step(&mut sm, &mut fx, start(true)).await;
+        let (state, effects) = step(&mut sm, &mut fx, start(true));
         assert_eq!(state, VmLifecycleState::Creating);
         assert_eq!(
             effects,
@@ -354,7 +352,7 @@ mod machine_tests {
             }]
         );
 
-        let (state, effects) = step(&mut sm, &mut fx, VmEvent::AgentReady).await;
+        let (state, effects) = step(&mut sm, &mut fx, VmEvent::AgentReady);
         assert_eq!(state, VmLifecycleState::Running);
         assert_eq!(
             effects,
@@ -362,11 +360,11 @@ mod machine_tests {
         );
     }
 
-    #[tokio::test]
-    async fn start_without_create_goes_straight_to_starting() {
+    #[test]
+    fn start_without_create_goes_straight_to_starting() {
         let mut fx = Effects::default();
-        let mut sm = machine(&mut fx).await;
-        let (state, effects) = step(&mut sm, &mut fx, start(false)).await;
+        let mut sm = machine(&mut fx);
+        let (state, effects) = step(&mut sm, &mut fx, start(false));
         assert_eq!(state, VmLifecycleState::Starting);
         assert_eq!(
             effects,
@@ -377,22 +375,22 @@ mod machine_tests {
         );
     }
 
-    #[tokio::test]
-    async fn boot_failure_lands_in_failed() {
+    #[test]
+    fn boot_failure_lands_in_failed() {
         let mut fx = Effects::default();
-        let mut sm = machine(&mut fx).await;
-        step(&mut sm, &mut fx, start(true)).await;
-        let (state, effects) = step(&mut sm, &mut fx, VmEvent::Failure("boom".into())).await;
+        let mut sm = machine(&mut fx);
+        step(&mut sm, &mut fx, start(true));
+        let (state, effects) = step(&mut sm, &mut fx, VmEvent::Failure);
         assert_eq!(state, VmLifecycleState::Failed);
         assert!(effects.is_empty());
     }
 
-    #[tokio::test]
-    async fn idle_round_trip_shrinks_then_restores_balloon() {
+    #[test]
+    fn idle_round_trip_shrinks_then_restores_balloon() {
         let mut fx = Effects::default();
-        let mut sm = running_machine(&mut fx).await;
+        let mut sm = running_machine(&mut fx);
 
-        let (state, effects) = step(&mut sm, &mut fx, VmEvent::IdleTimeout).await;
+        let (state, effects) = step(&mut sm, &mut fx, VmEvent::IdleTimeout);
         assert_eq!(state, VmLifecycleState::Idle);
         assert_eq!(
             effects,
@@ -402,46 +400,51 @@ mod machine_tests {
             ]
         );
 
-        let (state, effects) = step(&mut sm, &mut fx, VmEvent::Activity).await;
+        let (state, effects) = step(&mut sm, &mut fx, VmEvent::Activity);
         assert_eq!(state, VmLifecycleState::Running);
         assert_eq!(effects, vec![Effect::Balloon(BalloonTarget::Full)]);
     }
 
-    #[tokio::test]
-    async fn activity_while_running_is_a_noop() {
+    #[test]
+    fn activity_while_running_is_a_noop() {
         let mut fx = Effects::default();
-        let mut sm = running_machine(&mut fx).await;
-        let (state, effects) = step(&mut sm, &mut fx, VmEvent::Activity).await;
+        let mut sm = running_machine(&mut fx);
+        let (state, effects) = step(&mut sm, &mut fx, VmEvent::Activity);
         assert_eq!(state, VmLifecycleState::Running);
         assert!(effects.is_empty());
     }
 
-    #[tokio::test]
-    async fn stop_from_running_drains_through_stopping() {
+    #[test]
+    fn stop_from_running_drains_through_stopping() {
         let mut fx = Effects::default();
-        let mut sm = running_machine(&mut fx).await;
+        let mut sm = running_machine(&mut fx);
 
-        let (state, effects) = step(&mut sm, &mut fx, VmEvent::Stop).await;
+        let (state, effects) = step(&mut sm, &mut fx, VmEvent::Stop);
         assert_eq!(state, VmLifecycleState::Stopping);
         assert_eq!(effects, vec![Effect::SpawnStop]);
 
-        let (state, effects) = step(&mut sm, &mut fx, VmEvent::Stopped).await;
+        let (state, effects) = step(&mut sm, &mut fx, VmEvent::Stopped);
         assert_eq!(state, VmLifecycleState::Stopped);
-        assert_eq!(effects, vec![Effect::Publish(Notify::Stopped)]);
+        assert_eq!(
+            effects,
+            vec![Effect::BumpGeneration, Effect::Publish(Notify::Stopped)]
+        );
     }
 
-    #[tokio::test]
-    async fn stop_is_accepted_while_starting() {
+    #[test]
+    fn stop_while_booting_is_swallowed_for_actor_deferral() {
+        // The actor parks a mid-boot Stop (`pending_stop`) instead of the
+        // machine transitioning; the machine must treat it as handled noise.
         let mut fx = Effects::default();
-        let mut sm = machine(&mut fx).await;
-        step(&mut sm, &mut fx, start(false)).await;
-        let (state, effects) = step(&mut sm, &mut fx, VmEvent::Stop).await;
-        assert_eq!(state, VmLifecycleState::Stopping);
-        assert_eq!(effects, vec![Effect::SpawnStop]);
+        let mut sm = machine(&mut fx);
+        step(&mut sm, &mut fx, start(false));
+        let (state, effects) = step(&mut sm, &mut fx, VmEvent::Stop);
+        assert_eq!(state, VmLifecycleState::Starting);
+        assert!(effects.is_empty());
     }
 
-    #[tokio::test]
-    async fn force_stop_preempts_from_every_phase() {
+    #[test]
+    fn force_stop_preempts_from_every_phase() {
         for reach in [
             ReachState::Creating,
             ReachState::Running,
@@ -449,10 +452,10 @@ mod machine_tests {
             ReachState::Stopping,
         ] {
             let mut fx = Effects::default();
-            let mut sm = machine(&mut fx).await;
-            reach.drive(&mut sm, &mut fx).await;
+            let mut sm = machine(&mut fx);
+            reach.drive(&mut sm, &mut fx);
 
-            let (state, effects) = step(&mut sm, &mut fx, VmEvent::ForceStop).await;
+            let (state, effects) = step(&mut sm, &mut fx, VmEvent::ForceStop);
             assert_eq!(
                 state,
                 VmLifecycleState::NotExist,
@@ -463,6 +466,7 @@ mod machine_tests {
                 vec![
                     Effect::AbortInflight,
                     Effect::RemoveMachine,
+                    Effect::BumpGeneration,
                     Effect::Publish(Notify::Stopped),
                     Effect::FailWaiters("force stopped".to_owned()),
                 ]
@@ -470,10 +474,10 @@ mod machine_tests {
         }
     }
 
-    async fn running_machine(fx: &mut Effects) -> Machine {
-        let mut sm = machine(fx).await;
-        sm.handle_with_context(&start(true), fx).await;
-        sm.handle_with_context(&VmEvent::AgentReady, fx).await;
+    fn running_machine(fx: &mut Effects) -> Machine {
+        let mut sm = machine(fx);
+        sm.handle_with_context(&start(true), fx);
+        sm.handle_with_context(&VmEvent::AgentReady, fx);
         fx.take();
         sm
     }
@@ -487,20 +491,20 @@ mod machine_tests {
     }
 
     impl ReachState {
-        async fn drive(self, sm: &mut Machine, fx: &mut Effects) {
-            sm.handle_with_context(&start(true), fx).await;
+        fn drive(self, sm: &mut Machine, fx: &mut Effects) {
+            sm.handle_with_context(&start(true), fx);
             match self {
                 Self::Creating => {}
                 Self::Running => {
-                    sm.handle_with_context(&VmEvent::AgentReady, fx).await;
+                    sm.handle_with_context(&VmEvent::AgentReady, fx);
                 }
                 Self::Idle => {
-                    sm.handle_with_context(&VmEvent::AgentReady, fx).await;
-                    sm.handle_with_context(&VmEvent::IdleTimeout, fx).await;
+                    sm.handle_with_context(&VmEvent::AgentReady, fx);
+                    sm.handle_with_context(&VmEvent::IdleTimeout, fx);
                 }
                 Self::Stopping => {
-                    sm.handle_with_context(&VmEvent::AgentReady, fx).await;
-                    sm.handle_with_context(&VmEvent::Stop, fx).await;
+                    sm.handle_with_context(&VmEvent::AgentReady, fx);
+                    sm.handle_with_context(&VmEvent::Stop, fx);
                 }
             }
             fx.take();
