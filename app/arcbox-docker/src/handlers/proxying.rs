@@ -34,13 +34,10 @@ pub async fn proxy_to_system_vm(
     req: Request<Body>,
 ) -> Result<Response> {
     ensure_system_vm_ready(state).await?;
-    match proxy::proxy_to_guest_stream_pooled(state.proxy.client(), uri, req).await {
-        Ok(response) => Ok(response),
-        Err(e) => {
-            state.proxy.invalidate_endpoint();
-            Err(e)
-        }
-    }
+    proxy::invalidate_on_guest_error(
+        state,
+        proxy::proxy_to_guest_stream_pooled(state.proxy.client(), uri, req).await,
+    )
 }
 
 /// Forward an upload request to guest dockerd.
@@ -50,11 +47,8 @@ pub async fn proxy_upload_to_system_vm(
     req: Request<Body>,
 ) -> Result<Response> {
     ensure_system_vm_ready(state).await?;
-    match proxy::proxy_streaming_upload(state.proxy.connector(), uri, req).await {
-        Ok(response) => Ok(response),
-        Err(e) => {
-            state.proxy.invalidate_endpoint();
-            Err(e)
-        }
-    }
+    proxy::invalidate_on_guest_error(
+        state,
+        proxy::proxy_streaming_upload(state.proxy.connector(), uri, req).await,
+    )
 }

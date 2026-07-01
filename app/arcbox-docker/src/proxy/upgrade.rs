@@ -83,10 +83,9 @@ async fn send_raw_upgrade(
     }
     .encode();
 
-    stream
-        .write_all(&raw)
-        .await
-        .map_err(|e| DockerError::Server(format!("failed to write upgrade request: {e}")))?;
+    stream.write_all(&raw).await.map_err(|e| {
+        DockerError::GuestUnavailable(format!("failed to write upgrade request: {e}"))
+    })?;
 
     // Read response headers in chunks. A chunked read may consume bytes that
     // belong to the upgraded stream, so return the over-read tail to the
@@ -94,12 +93,11 @@ async fn send_raw_upgrade(
     let mut buf = Vec::with_capacity(1024);
     let (header_end_index, status, response_headers) = loop {
         let mut chunk = [0_u8; 1024];
-        let n = stream
-            .read(&mut chunk)
-            .await
-            .map_err(|e| DockerError::Server(format!("failed to read upgrade response: {e}")))?;
+        let n = stream.read(&mut chunk).await.map_err(|e| {
+            DockerError::GuestUnavailable(format!("failed to read upgrade response: {e}"))
+        })?;
         if n == 0 {
-            return Err(DockerError::Server(
+            return Err(DockerError::GuestUnavailable(
                 "guest closed connection before upgrade response".into(),
             ));
         }
