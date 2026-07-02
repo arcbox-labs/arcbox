@@ -133,16 +133,26 @@ impl RunnerSupervisor {
         }
     }
 
-    /// Decide on an offer and answer it. A redelivered offer for a running job
-    /// is re-accepted (idempotent, echoing the new token); otherwise it is
+    /// Decide on an offer and answer it. A redelivered offer for a job started
+    /// here is re-accepted (idempotent, echoing the new token); otherwise it is
     /// accepted (and a runner started) or rejected.
     pub fn handle_provision(&self, order: ProvisionRunner) {
         let job_id = order.job_id.clone();
         let token = order.offer_token.clone();
+        // The exact same offer redelivered (a gateway/worker replay before its
+        // dispatch was journaled): the verdict is already recorded and the
+        // resend loop is delivering it — answering again would only overwrite
+        // that pending verdict.
+        if self.inner.outstanding.contains_key(&token) {
+            info!(job_id, "offer replayed; verdict already pending");
+            return;
+        }
         match self.admit(&job_id, &order.os, &order.arch, &host::telemetry()) {
             Admission::Duplicate => {
-                // At-least-once delivery: a re-offer of a running job must never
-                // start a second runner, but must still resolve this offer.
+                // At-least-once delivery: a re-offer of a job started here must
+                // never start a second runner, but must still resolve this
+                // offer — with the new token, since each offer has its own
+                // awakeable and the old one is dead.
                 info!(job_id, "duplicate offer; re-accepting");
                 self.accept(&job_id, &token);
             }
@@ -172,10 +182,14 @@ impl RunnerSupervisor {
     /// Decide whether to run `job_id`. `Duplicate` takes precedence so a
     /// redelivery is never a fresh runner. Then drain, then capability routing,
     /// then live headroom (load per core and free memory). The check/insert gap
-    /// in [`Self::handle_provision`] is safe: the attach loop dispatches offers
-    /// one at a time with no `.await` between this check and the reservation.
+    /// in [`Self::handle_provision`] is safe: dispatch is synchronous and the
+    /// attach loop delivers offers one at a time.
     fn admit(&self, job_id: &str, os: &str, arch: &str, telemetry: &HostTelemetry) -> Admission {
-        if self.inner.in_flight.contains_key(job_id) {
+        // Started here and still settling counts as a duplicate too: a runner
+        // can finish (releasing `in_flight`) while its accept is still unacked,
+        // and a re-offer of that job must replay "started here" — not admit a
+        // fresh runner for a job whose single-use JIT config is already spent.
+        if self.inner.in_flight.contains_key(job_id) || self.has_unacked_accept(job_id) {
             return Admission::Duplicate;
         }
         if self
@@ -203,6 +217,16 @@ impl RunnerSupervisor {
             ));
         }
         Admission::Accept(backend)
+    }
+
+    /// Whether an accepted verdict for `job_id` is still awaiting its ack — the
+    /// window between the runner exiting and the gateway settling the accept.
+    /// A linear scan: `outstanding` only holds verdicts the gateway hasn't
+    /// settled yet, so it is empty in steady state.
+    fn has_unacked_accept(&self, job_id: &str) -> bool {
+        self.inner.outstanding.iter().any(|entry| {
+            matches!(entry.value(), attach_request::Msg::RunnerAccepted(a) if a.job_id == job_id)
+        })
     }
 
     /// Cancel an in-flight job. Signals `run_job`, which tears down the runner —
@@ -619,6 +643,49 @@ mod tests {
             }
         }
         assert!(sup.inner.outstanding.contains_key("tok2"));
+    }
+
+    #[tokio::test]
+    async fn replayed_offer_token_is_not_answered_twice() {
+        let (sup, mut rx) = supervisor_with_rx(8);
+        sup.reject("rjob_a", "tok1", "busy");
+        rx.try_recv().expect("initial verdict");
+
+        // The same offer redelivered verbatim: the pending verdict stands and
+        // no fresh admission (which might now accept) overwrites it.
+        sup.handle_provision(ProvisionRunner {
+            job_id: "rjob_a".to_owned(),
+            os: "darwin".to_owned(),
+            arch: "arm64".to_owned(),
+            encoded_jit_config: String::new(),
+            offer_token: "tok1".to_owned(),
+        });
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(
+            sup.inner.outstanding.get("tok1").map(|e| e.value().clone()),
+            Some(attach_request::Msg::RunnerRejected(_))
+        ));
+        assert!(!sup.inner.in_flight.contains_key("rjob_a"));
+    }
+
+    #[tokio::test]
+    async fn unacked_accept_makes_a_reoffer_duplicate() {
+        let (sup, _rx) = supervisor_with_rx(8);
+        // The runner started and exited (no longer in flight), but the accept
+        // has not been acked: a re-offer must replay "started here" under its
+        // new token, not admit a fresh runner.
+        sup.accept("rjob_a", "tok1");
+        assert_eq!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Duplicate
+        );
+
+        // Once the gateway settles the accept, the job is genuinely done here.
+        sup.handle_ack("tok1");
+        assert_eq!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Accept(Backend::HostRunner)
+        );
     }
 
     #[tokio::test]
