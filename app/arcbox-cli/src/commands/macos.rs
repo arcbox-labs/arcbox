@@ -1,7 +1,7 @@
 //! macOS guest management commands (Apple Silicon only).
 //!
-//! Disposable, single-purpose macOS VMs: install a base image once from an
-//! IPSW, then copy-on-write clone it to boot clean, throwaway guests. This is a
+//! Disposable, single-purpose macOS VMs: pull a pre-baked base image once,
+//! then copy-on-write clone it to boot clean, throwaway guests. This is a
 //! distinct noun from `arcbox machine` (Linux) and talks to its own
 //! `MacosService`.
 
@@ -91,7 +91,7 @@ pub struct RemoveArgs {
 /// macOS base image commands.
 #[derive(Subcommand)]
 pub enum ImageCommands {
-    /// Install a base image from a local IPSW (long-running)
+    /// Pull a published base image (e.g. tahoe-base or tahoe-base@2026.07.02)
     Pull(PullArgs),
     /// List base images
     #[command(name = "ls", alias = "list")]
@@ -103,15 +103,14 @@ pub enum ImageCommands {
 
 #[derive(Args)]
 pub struct PullArgs {
-    /// Local name to give the base image.
+    /// Image reference: stream name with optional pinned version
+    /// (e.g. "tahoe-base" or "tahoe-base@2026.07.02").
+    #[arg(required_unless_present = "manifest", conflicts_with = "manifest")]
+    pub reference: Option<String>,
+    /// Pull directly from a manifest (URL or daemon-local path), bypassing
+    /// the published index.
     #[arg(long)]
-    pub name: String,
-    /// Path to a local IPSW restore image. Omit to download the latest from Apple.
-    #[arg(long)]
-    pub ipsw: Option<String>,
-    /// System disk size in GB.
-    #[arg(long, default_value = "64")]
-    pub disk: u64,
+    pub manifest: Option<String>,
 }
 
 #[derive(Args)]
@@ -232,24 +231,38 @@ async fn execute_list() -> Result<()> {
 async fn execute_image(cmd: ImageCommands) -> Result<()> {
     match cmd {
         ImageCommands::Pull(args) => {
+            use std::io::Write as _;
+
             let mut client = macos_client().await?;
-            let source = args
-                .ipsw
-                .as_deref()
-                .unwrap_or("latest (download from Apple)");
-            println!(
-                "Installing macOS image '{}' from {source} (this can take 10-20 minutes)...",
-                args.name
-            );
-            client
+            let what = args
+                .reference
+                .clone()
+                .or_else(|| args.manifest.clone())
+                .unwrap_or_default();
+            let mut stream = client
                 .image_pull(tonic::Request::new(MacosImagePullRequest {
-                    name: args.name.clone(),
-                    ipsw_path: args.ipsw.unwrap_or_default(),
-                    disk_gb: args.disk,
+                    reference: args.reference.unwrap_or_default(),
+                    manifest_url: args.manifest.unwrap_or_default(),
                 }))
                 .await
-                .context("Failed to install macOS image")?;
-            println!("macOS image '{}' installed", args.name);
+                .context("Failed to pull macOS image")?
+                .into_inner();
+
+            let mut last_stage = String::new();
+            while let Some(event) = stream
+                .message()
+                .await
+                .context("Failed to pull macOS image")?
+            {
+                if event.stage != last_stage && !last_stage.is_empty() {
+                    println!();
+                }
+                last_stage.clone_from(&event.stage);
+                print!("\r{}: {:>3.0}%", event.stage, event.fraction * 100.0);
+                let _ = std::io::stdout().flush();
+            }
+            println!();
+            println!("macOS image '{what}' pulled");
             Ok(())
         }
         ImageCommands::List => {
@@ -264,22 +277,34 @@ async fn execute_image(cmd: ImageCommands) -> Result<()> {
             if images.is_empty() {
                 println!("No macOS images found.");
                 println!();
-                println!("To install one, run:");
-                println!("  arcbox macos image pull --name <name> [--ipsw <path>]");
+                println!("To pull one, run:");
+                println!("  arcbox macos image pull tahoe-base");
                 return Ok(());
             }
 
             println!(
-                "{:<20} {:<6} {:<10} {:<8}",
-                "NAME", "CPUS", "MEMORY", "DISK"
+                "{:<20} {:<14} {:<8} {:<8} {:<12}",
+                "NAME", "VERSION", "OS", "DISK", "CREATED"
             );
             for image in &images {
+                let created = chrono::DateTime::from_timestamp(image.created, 0)
+                    .map(|t| t.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
                 println!(
-                    "{:<20} {:<6} {:<10} {:<8}",
+                    "{:<20} {:<14} {:<8} {:<8} {:<12}",
                     image.name,
-                    image.minimum_cpu_count,
-                    format!("{} MB", image.minimum_memory_mib),
+                    if image.version.is_empty() {
+                        "-"
+                    } else {
+                        &image.version
+                    },
+                    if image.os_version.is_empty() {
+                        "-"
+                    } else {
+                        &image.os_version
+                    },
                     format!("{} GB", image.disk_gb),
+                    created,
                 );
             }
             Ok(())

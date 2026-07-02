@@ -1,10 +1,11 @@
 // macOS guest protocol definitions.
 //
-// macOS guests are disposable, single-purpose VMs on Apple Silicon: install a
-// base image once from an IPSW, then copy-on-write clone it to boot clean,
-// throwaway VMs. They run only through Virtualization.framework and share no
-// lifecycle with Linux machines (no guest agent, no kernel boot, no NAT IP),
-// so they have their own service rather than overloading MachineService.
+// macOS guests are disposable, single-purpose VMs on Apple Silicon: pull a
+// pre-baked base image once from ArcBox's distribution bucket, then
+// copy-on-write clone it to boot clean, throwaway VMs. They run only through
+// Virtualization.framework and share no lifecycle with Linux machines (no
+// guest agent, no kernel boot, no NAT IP), so they have their own service
+// rather than overloading MachineService.
 
 syntax = "proto3";
 
@@ -32,8 +33,9 @@ service MacosService {
     // Inspects a macOS guest.
     rpc Inspect(InspectMacosMachineRequest) returns (MacosMachineInfo);
 
-    // Installs a base image from a local IPSW (long-running, ~10-20 min).
-    rpc ImagePull(MacosImagePullRequest) returns (Empty);
+    // Pulls a published base image from the distribution bucket, streaming
+    // progress until the image is verified and registered (long-running).
+    rpc ImagePull(MacosImagePullRequest) returns (stream MacosImagePullEvent);
 
     // Lists base images.
     rpc ImageList(Empty) returns (MacosImageListResponse);
@@ -118,33 +120,45 @@ message MacosMachineInfo {
     int64 created = 6;
 }
 
-// Request to install a base image from a local IPSW.
+// Request to pull a published base image.
 //
-// The install VM's CPU/memory are derived from the restore image's own
-// requirements, so they are not part of the request.
+// Exactly one of `reference` / `manifest_url` must be set. CPU/memory/disk
+// characteristics come from the published manifest, not the request.
 message MacosImagePullRequest {
-    // Base image name.
-    string name = 1;
-    // Path to a local IPSW restore image.
-    string ipsw_path = 2;
-    // System disk size in GiB.
-    uint64 disk_gb = 3;
+    // Image reference: a stream name with an optional pinned version,
+    // e.g. "tahoe-base" or "tahoe-base@2026.07.02".
+    string reference = 1;
+    // Manifest override (URL or daemon-local path); bypasses the published
+    // index. Intended for development and pinning escapes.
+    string manifest_url = 2;
+}
+
+// Progress event emitted while a base image pull runs.
+message MacosImagePullEvent {
+    // Stage: resolving | validating | disk | aux | verifying.
+    string stage = 1;
+    // Completion fraction within the stage (0.0..=1.0).
+    double fraction = 2;
 }
 
 // Summary of a macOS base image.
 message MacosImageSummary {
     // Image name.
     string name = 1;
-    // Minimum CPU count required by the restore image.
+    // Minimum CPU count required by the guest.
     uint64 minimum_cpu_count = 2;
-    // Minimum memory in MiB required by the restore image.
+    // Minimum memory in MiB required by the guest.
     uint64 minimum_memory_mib = 3;
-    // System disk size in GiB.
+    // System disk size in GB (decimal, logical).
     uint64 disk_gb = 4;
     // Creation timestamp.
     int64 created = 5;
-    // Source (IPSW path), if known.
+    // Source (manifest location), if known.
     string source = 6;
+    // Published version label (e.g. "2026.07.02"), if pulled.
+    string version = 7;
+    // Guest macOS product version (e.g. "26.5"), if known.
+    string os_version = 8;
 }
 
 // Response listing macOS base images.
