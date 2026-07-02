@@ -9,7 +9,7 @@
 //! registry entry.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -108,6 +108,34 @@ impl Write for SparseWriter {
     }
 }
 
+/// Removes the staging directory on drop unless disarmed.
+///
+/// This is what makes the pull future cancellation-safe: if the caller drops
+/// it at any await point (e.g. the gRPC client disconnected), the partial
+/// image is cleaned up by this guard's `Drop` rather than leaking.
+struct StagingGuard {
+    path: Option<PathBuf>,
+}
+
+impl StagingGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    /// Keeps the directory (it has been renamed into its final location).
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
 /// Decodes a base64 manifest field.
 fn decode_field(field: &str, value: &str) -> Result<Vec<u8>> {
     BASE64
@@ -148,46 +176,136 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// Consecutive transient-failure budget for a streaming download; any received
+/// byte resets it, so a 20 GB pull tolerates many blips but not a dead link.
+const DOWNLOAD_RETRIES: u32 = 4;
+const DOWNLOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Streams a compressed file from `location`, decompressing into a sparse,
 /// pre-sized `dst`. Verifies compressed size, SHA-256, and decompressed size
 /// against `spec`. `on_progress` receives the downloaded fraction.
+///
+/// HTTP downloads resume mid-stream on transient failures: the zstd decoder
+/// state lives in memory, so a dropped connection is re-requested with
+/// `Range: bytes=<received>-` and decoding continues where it left off. (A
+/// daemon restart still restarts the pull from zero — resume covers network
+/// blips within one attempt, which is the failure that matters at 20 GB.)
+/// Hash + decompress + sparse-write sink for a compressed download stream.
+///
+/// A struct rather than a closure so callers can read `received` between
+/// `consume` calls (the resume offset for `Range` re-requests).
+struct StreamSink<F: FnMut(f64)> {
+    decoder: zstd::stream::write::Decoder<'static, SparseWriter>,
+    hasher: Sha256,
+    received: u64,
+    compressed_size: u64,
+    path: String,
+    on_progress: F,
+}
+
+impl<F: FnMut(f64)> StreamSink<F> {
+    fn consume(&mut self, bytes: &[u8]) -> Result<()> {
+        self.hasher.update(bytes);
+        self.decoder
+            .write_all(bytes)
+            .map_err(|e| CoreError::macos(format!("decompress {}: {e}", self.path)))?;
+        self.received += bytes.len() as u64;
+        if self.compressed_size > 0 {
+            (self.on_progress)((self.received as f64 / self.compressed_size as f64).min(1.0));
+        }
+        Ok(())
+    }
+}
+
+/// Failure of a single download attempt: transient failures are retried from
+/// the current offset, fatal ones abort the pull.
+enum AttemptError {
+    Transient(CoreError),
+    Fatal(CoreError),
+}
+
+/// One HTTP request feeding the sink, resuming at `sink.received`.
+/// Returns the bytes this attempt contributed.
+async fn stream_http_once<F: FnMut(f64)>(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    sink: &mut StreamSink<F>,
+) -> std::result::Result<u64, AttemptError> {
+    let mut request = client.get(url.clone());
+    if sink.received > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={}-", sink.received));
+    }
+    let mut resp = request
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| AttemptError::Transient(CoreError::macos(format!("download {url}: {e}"))))?;
+    if sink.received > 0 && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        // The server ignored the Range header; replaying the body from zero
+        // would corrupt the in-memory decoder state. Retrying cannot help.
+        return Err(AttemptError::Fatal(CoreError::macos(format!(
+            "download {url}: server does not honor Range requests; cannot resume"
+        ))));
+    }
+    let start = sink.received;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| AttemptError::Transient(CoreError::macos(format!("download {url}: {e}"))))?
+    {
+        // A decode/write failure is local, not a network blip.
+        sink.consume(&chunk).map_err(AttemptError::Fatal)?;
+    }
+    Ok(sink.received - start)
+}
+
 async fn fetch_zstd_to_sparse(
     location: &RemoteLocation,
     spec: &RemoteFile,
     dst: &Path,
-    mut on_progress: impl FnMut(f64),
+    on_progress: impl FnMut(f64),
 ) -> Result<()> {
     let file = std::fs::File::create(dst)?;
     file.set_len(spec.uncompressed_size)?;
-    let mut decoder = zstd::stream::write::Decoder::new(SparseWriter::new(file))
-        .map_err(|e| CoreError::macos(format!("zstd init: {e}")))?;
-
-    let mut hasher = Sha256::new();
-    let mut received: u64 = 0;
-    let mut consume = |bytes: &[u8]| -> Result<()> {
-        hasher.update(bytes);
-        decoder
-            .write_all(bytes)
-            .map_err(|e| CoreError::macos(format!("decompress {}: {e}", spec.path)))?;
-        received += bytes.len() as u64;
-        if spec.compressed_size > 0 {
-            on_progress((received as f64 / spec.compressed_size as f64).min(1.0));
-        }
-        Ok(())
+    let mut sink = StreamSink {
+        decoder: zstd::stream::write::Decoder::new(SparseWriter::new(file))
+            .map_err(|e| CoreError::macos(format!("zstd init: {e}")))?,
+        hasher: Sha256::new(),
+        received: 0,
+        compressed_size: spec.compressed_size,
+        path: spec.path.clone(),
+        on_progress,
     };
 
     match location {
         RemoteLocation::Http(url) => {
-            let mut resp = reqwest::get(url.clone())
-                .await
-                .and_then(reqwest::Response::error_for_status)
-                .map_err(|e| CoreError::macos(format!("download {url}: {e}")))?;
-            while let Some(chunk) = resp
-                .chunk()
-                .await
-                .map_err(|e| CoreError::macos(format!("download {url}: {e}")))?
-            {
-                consume(&chunk)?;
+            let client = reqwest::Client::new();
+            let mut failures: u32 = 0;
+            while sink.received < spec.compressed_size {
+                match stream_http_once(&client, url, &mut sink).await {
+                    Ok(_) if sink.received >= spec.compressed_size => break,
+                    // Progress resets the failure budget; a clean-but-short
+                    // body counts as a failure too (otherwise it would spin).
+                    Ok(progressed) => {
+                        failures = if progressed > 0 { 1 } else { failures + 1 };
+                        tracing::warn!(
+                            "download {url}: connection ended early; resuming at byte {}",
+                            sink.received
+                        );
+                    }
+                    Err(AttemptError::Fatal(e)) => return Err(e),
+                    Err(AttemptError::Transient(e)) => {
+                        failures += 1;
+                        tracing::warn!("{e}; resuming at byte {}", sink.received);
+                    }
+                }
+                if failures > DOWNLOAD_RETRIES {
+                    return Err(CoreError::macos(format!(
+                        "download {url}: giving up after {DOWNLOAD_RETRIES} consecutive failures at byte {}",
+                        sink.received
+                    )));
+                }
+                tokio::time::sleep(DOWNLOAD_RETRY_DELAY).await;
             }
         }
         RemoteLocation::File(path) => {
@@ -199,11 +317,17 @@ async fn fetch_zstd_to_sparse(
                 if n == 0 {
                     break;
                 }
-                consume(&buf[..n])?;
+                sink.consume(&buf[..n])?;
             }
         }
     }
 
+    let StreamSink {
+        mut decoder,
+        hasher,
+        received,
+        ..
+    } = sink;
     decoder
         .flush()
         .map_err(|e| CoreError::macos(format!("decompress {}: {e}", spec.path)))?;
@@ -296,20 +420,18 @@ impl MacImageManager {
         }
         on_progress(PullStage::Validate, 1.0);
 
-        // Assemble in a staging directory; rename live only when complete.
+        // Assemble in a staging directory; rename live only when complete. The
+        // guard removes it on any early return — or if this future is dropped
+        // (client cancellation) at any await point.
         let staging = self.image_dir(&format!(".pull-{}", manifest.name));
         if staging.exists() {
             std::fs::remove_dir_all(&staging)?;
         }
         std::fs::create_dir_all(&staging)?;
+        let mut guard = StagingGuard::new(staging.clone());
 
-        let result = self
-            .pull_into(&staging, &manifest_location, &manifest, &mut on_progress)
-            .await;
-        if let Err(e) = result {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(e);
-        }
+        self.pull_into(&staging, &manifest_location, &manifest, &mut on_progress)
+            .await?;
 
         std::fs::write(staging.join(HARDWARE_MODEL_FILE), &hardware_model)?;
         std::fs::write(staging.join(MACHINE_ID_FILE), &machine_id)?;
@@ -321,6 +443,7 @@ impl MacImageManager {
             std::fs::remove_dir_all(&final_dir)?;
         }
         std::fs::rename(&staging, &final_dir)?;
+        guard.disarm();
         on_progress(PullStage::Verify, 1.0);
         self.get(&manifest.name)
     }
@@ -397,6 +520,98 @@ fn meta_from_manifest(manifest: &ImageManifest, location: &RemoteLocation) -> Ma
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Minimal HTTP server for download tests. First plain GET: claims the
+    /// full length but sends only the first half, then hangs up (simulating a
+    /// dropped connection). `Range: bytes=N-` requests: served completely.
+    async fn serve_flaky_zst(listener: tokio::net::TcpListener, full: Vec<u8>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let full = full.clone();
+            tokio::spawn(async move {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let req = String::from_utf8_lossy(&req).to_ascii_lowercase();
+                let range_start = req
+                    .lines()
+                    .find_map(|l| l.strip_prefix("range: bytes="))
+                    .and_then(|r| r.split('-').next())
+                    .and_then(|s| s.parse::<usize>().ok());
+                match range_start {
+                    None => {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            full.len()
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(&full[..full.len() / 2]).await;
+                        // Drop mid-body: the client sees a broken connection.
+                    }
+                    Some(start) => {
+                        let rest = &full[start..];
+                        let head = format!(
+                            "HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\ncontent-range: bytes {start}-{}/{}\r\nconnection: close\r\n\r\n",
+                            rest.len(),
+                            full.len() - 1,
+                            full.len()
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(rest).await;
+                    }
+                }
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn http_download_resumes_after_connection_drop() {
+        let mut raw = vec![0xABu8; SPARSE_BLOCK];
+        raw.extend_from_slice(&vec![0u8; SPARSE_BLOCK]);
+        raw.extend_from_slice(&vec![0xCDu8; SPARSE_BLOCK]);
+        let compressed = zstd::encode_all(&raw[..], 3).unwrap();
+        let spec = RemoteFile {
+            path: "disk.img.zst".into(),
+            uncompressed_size: raw.len() as u64,
+            compressed_size: compressed.len() as u64,
+            sha256: hex(&Sha256::digest(&compressed)),
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/disk.img.zst", listener.local_addr().unwrap());
+        tokio::spawn(serve_flaky_zst(listener, compressed));
+
+        let dir = tempdir().unwrap();
+        let dst = dir.path().join("disk.img");
+        fetch_zstd_to_sparse(&RemoteLocation::parse(&url), &spec, &dst, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), raw);
+    }
+
+    #[test]
+    fn staging_guard_removes_unless_disarmed() {
+        let dir = tempdir().unwrap();
+        let staging = dir.path().join("staging");
+
+        std::fs::create_dir_all(&staging).unwrap();
+        drop(StagingGuard::new(staging.clone()));
+        assert!(!staging.exists());
+
+        std::fs::create_dir_all(&staging).unwrap();
+        let mut guard = StagingGuard::new(staging.clone());
+        guard.disarm();
+        drop(guard);
+        assert!(staging.exists());
+    }
 
     /// Real hardware-model data representation captured from a Tahoe base
     /// image (`config.json .hardwareModel`); decodes on any host, and
