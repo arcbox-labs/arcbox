@@ -27,18 +27,6 @@ use tracing::{info, warn};
 use crate::docker::{DockerRunner, RunSpec};
 use crate::host;
 
-/// Give up resending a verdict after this many attempts (~5 min at the
-/// attach-loop resend interval), so a verdict whose awakeable no longer exists
-/// (job long concluded, workflow retention expired) cannot resend forever.
-const VERDICT_MAX_RESENDS: u32 = 30;
-
-/// A verdict sent to the gateway but not yet acknowledged. Held until an
-/// `OfferVerdictAck` arrives and resent meanwhile; `attempts` bounds the resends.
-struct Outstanding {
-    msg: attach_request::Msg,
-    attempts: u32,
-}
-
 /// Outcome of the admission decision for an incoming offer.
 #[derive(Debug, PartialEq, Eq)]
 enum Admission {
@@ -61,9 +49,13 @@ struct Inner {
     events: mpsc::Sender<AttachRequest>,
     /// Verdicts sent but not yet acknowledged by the gateway, keyed by
     /// `offer_token`. Resent until an `OfferVerdictAck` arrives so a gateway
-    /// crash-after-read cannot lose the verdict; the gateway resolves the
-    /// awakeable idempotently, so resends are safe.
-    outstanding: DashMap<String, Outstanding>,
+    /// crash-after-read cannot lose the verdict. There is no local expiry: the
+    /// gateway acks every settled verdict — durably handed off (resolution is
+    /// idempotent, so resends are safe) or provably obsolete — so only a
+    /// transiently unreachable gateway leaves an entry here, and resending
+    /// through that is exactly the recovery we want. Growth is bounded because
+    /// offers originate from the same parked workflows the acks come from.
+    outstanding: DashMap<String, attach_request::Msg>,
     /// Jobs currently running here — for duplicate detection and release.
     in_flight: DashMap<String, ()>,
     /// Cancel signals for in-flight jobs. Firing one makes the job's `run_job`
@@ -140,7 +132,7 @@ impl RunnerSupervisor {
     /// Decide on an offer and answer it. A redelivered offer for a running job
     /// is re-accepted (idempotent, echoing the new token); otherwise it is
     /// accepted (and a runner started) or rejected.
-    pub async fn handle_provision(&self, order: ProvisionRunner) {
+    pub fn handle_provision(&self, order: ProvisionRunner) {
         let job_id = order.job_id.clone();
         let token = order.offer_token.clone();
         match self.admit(&job_id, &order.os, &order.arch, &host::telemetry()) {
@@ -148,9 +140,9 @@ impl RunnerSupervisor {
                 // At-least-once delivery: a re-offer of a running job must never
                 // start a second runner, but must still resolve this offer.
                 info!(job_id, "duplicate offer; re-accepting");
-                self.accept(&job_id, &token).await;
+                self.accept(&job_id, &token);
             }
-            Admission::Reject(reason) => self.reject(&job_id, &token, &reason).await,
+            Admission::Reject(reason) => self.reject(&job_id, &token, &reason),
             Admission::Accept(backend) => {
                 // Reserve synchronously so a follow-up offer sees the job in
                 // flight before the spawned task starts the runner.
@@ -284,8 +276,7 @@ impl RunnerSupervisor {
             // We never advertise these, so admit() never routes to them; reject
             // defensively rather than panic if one ever slips through.
             Backend::Vm | Backend::Unspecified => {
-                self.reject(&job_id, &token, "backend not supported by this agent")
-                    .await;
+                self.reject(&job_id, &token, "backend not supported by this agent");
             }
         }
     }
@@ -301,8 +292,7 @@ impl RunnerSupervisor {
         mut cancel_rx: oneshot::Receiver<()>,
     ) {
         let Some(runner_dir) = &self.inner.runner_dir else {
-            self.reject(job_id, token, "no host runner directory configured")
-                .await;
+            self.reject(job_id, token, "no host runner directory configured");
             return;
         };
 
@@ -310,14 +300,13 @@ impl RunnerSupervisor {
         let mut child = match command.group_spawn() {
             Ok(child) => child,
             Err(e) => {
-                self.reject(job_id, token, &format!("failed to spawn runner: {e}"))
-                    .await;
+                self.reject(job_id, token, &format!("failed to spawn runner: {e}"));
                 return;
             }
         };
 
         // The runner is running: accept the offer.
-        self.accept(job_id, token).await;
+        self.accept(job_id, token);
         info!(job_id, "runner started (host)");
 
         tokio::select! {
@@ -363,14 +352,13 @@ impl RunnerSupervisor {
         {
             Ok(running) => running,
             Err(e) => {
-                self.reject(job_id, token, &format!("failed to start container: {e}"))
-                    .await;
+                self.reject(job_id, token, &format!("failed to start container: {e}"));
                 return;
             }
         };
 
         // The container is running: accept the offer.
-        self.accept(job_id, token).await;
+        self.accept(job_id, token);
         info!(job_id, arch = %order.arch, "runner started (docker)");
 
         tokio::select! {
@@ -389,19 +377,18 @@ impl RunnerSupervisor {
     }
 
     /// Accept an offer (the runner has started).
-    async fn accept(&self, job_id: &str, token: &str) {
+    fn accept(&self, job_id: &str, token: &str) {
         self.send_verdict(
             token,
             attach_request::Msg::RunnerAccepted(RunnerAccepted {
                 job_id: job_id.to_owned(),
                 offer_token: token.to_owned(),
             }),
-        )
-        .await;
+        );
     }
 
     /// Reject an offer with a reason.
-    async fn reject(&self, job_id: &str, token: &str, reason: &str) {
+    fn reject(&self, job_id: &str, token: &str, reason: &str) {
         info!(job_id, reason, "offer rejected");
         self.send_verdict(
             token,
@@ -410,56 +397,33 @@ impl RunnerSupervisor {
                 offer_token: token.to_owned(),
                 reason: reason.to_owned(),
             }),
-        )
-        .await;
-    }
-
-    /// Record a verdict as outstanding (resent until acked) and send it once now.
-    async fn send_verdict(&self, token: &str, msg: attach_request::Msg) {
-        self.inner.outstanding.insert(
-            token.to_owned(),
-            Outstanding {
-                msg: msg.clone(),
-                attempts: 0,
-            },
         );
-        self.send(msg).await;
     }
 
-    /// Stop resending the verdict the gateway just acknowledged.
+    /// Record a verdict as outstanding (resent until acked) and try to send it
+    /// now. Never blocks: the `outstanding` entry is the source of truth for
+    /// delivery, so a full egress buffer just means the resend tick delivers
+    /// instead — runner supervision must not stall on verdict transport.
+    fn send_verdict(&self, token: &str, msg: attach_request::Msg) {
+        self.inner.outstanding.insert(token.to_owned(), msg.clone());
+        let _ = self.inner.events.try_send(AttachRequest { msg: Some(msg) });
+    }
+
+    /// Stop resending the verdict the gateway just settled (delivered to the
+    /// workflow, or found obsolete).
     pub fn handle_ack(&self, offer_token: &str) {
         self.inner.outstanding.remove(offer_token);
     }
 
-    /// Resend every still-unacked verdict onto the egress queue, bounded by
-    /// [`VERDICT_MAX_RESENDS`]. Non-blocking (`try_send`): a full buffer or a
-    /// momentarily detached stream just retries on the next tick. Driven by the
-    /// attach loop's resend ticker and, implicitly, every reconnect.
+    /// Resend every still-unacked verdict onto the egress queue. Non-blocking
+    /// (`try_send`): a full buffer or a momentarily detached stream just retries
+    /// on the next tick. Driven by the attach loop's resend ticker and,
+    /// implicitly, every reconnect.
     pub fn resend_outstanding(&self) {
-        self.inner.outstanding.retain(|token, entry| {
-            if entry.attempts >= VERDICT_MAX_RESENDS {
-                warn!(offer_token = %token, "giving up on unacknowledged verdict");
-                return false;
-            }
-            entry.attempts += 1;
-            // Ignore send errors: outstanding stays, the next tick retries.
+        for entry in &self.inner.outstanding {
             let _ = self.inner.events.try_send(AttachRequest {
-                msg: Some(entry.msg.clone()),
+                msg: Some(entry.value().clone()),
             });
-            true
-        });
-    }
-
-    /// Send a verdict, awaiting channel capacity.
-    async fn send(&self, msg: attach_request::Msg) {
-        if self
-            .inner
-            .events
-            .send(AttachRequest { msg: Some(msg) })
-            .await
-            .is_err()
-        {
-            warn!("event channel closed; gateway stream is reconnecting");
         }
     }
 }
@@ -596,7 +560,7 @@ mod tests {
     #[tokio::test]
     async fn verdict_tracked_and_acked() {
         let (sup, mut rx) = supervisor_with_rx(8);
-        sup.accept("rjob_a", "tok1").await;
+        sup.accept("rjob_a", "tok1");
         assert!(sup.inner.outstanding.contains_key("tok1"));
         assert!(matches!(
             rx.try_recv().expect("verdict emitted").msg,
@@ -611,27 +575,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resend_reemits_unacked_verdict() {
+    async fn resend_reemits_unacked_verdict_until_acked() {
         let (sup, mut rx) = supervisor_with_rx(8);
-        sup.reject("rjob_b", "tok2", "busy").await;
+        sup.reject("rjob_b", "tok2", "busy");
         rx.try_recv().expect("initial verdict");
 
-        sup.resend_outstanding();
-        match rx.try_recv().expect("resend emitted").msg {
-            Some(attach_request::Msg::RunnerRejected(r)) => assert_eq!(r.offer_token, "tok2"),
-            other => panic!("unexpected message: {other:?}"),
+        // No local expiry: every tick re-emits until the gateway acks.
+        for _ in 0..3 {
+            sup.resend_outstanding();
+            match rx.try_recv().expect("resend emitted").msg {
+                Some(attach_request::Msg::RunnerRejected(r)) => assert_eq!(r.offer_token, "tok2"),
+                other => panic!("unexpected message: {other:?}"),
+            }
         }
+        assert!(sup.inner.outstanding.contains_key("tok2"));
     }
 
     #[tokio::test]
-    async fn resend_gives_up_after_cap() {
-        let (sup, _rx) = supervisor_with_rx(256);
-        sup.accept("rjob_c", "tok3").await;
-        // One resend per attempt up to the cap, then the entry is dropped.
-        for _ in 0..=VERDICT_MAX_RESENDS {
-            sup.resend_outstanding();
-        }
-        assert!(!sup.inner.outstanding.contains_key("tok3"));
+    async fn verdict_survives_full_egress_buffer() {
+        // Capacity 1: the initial send fills the buffer, further sends drop.
+        let (sup, mut rx) = supervisor_with_rx(1);
+        sup.accept("rjob_a", "tok1");
+        sup.accept("rjob_b", "tok2");
+
+        // Both verdicts stay outstanding regardless of delivery; once the
+        // buffer drains, the resend tick delivers the one that didn't fit.
+        assert!(sup.inner.outstanding.contains_key("tok1"));
+        assert!(sup.inner.outstanding.contains_key("tok2"));
+        rx.try_recv().expect("first verdict delivered");
+        sup.resend_outstanding();
+        rx.try_recv().expect("second verdict delivered by resend");
     }
 
     /// Register an in-flight job with a cancel signal, mirroring what
