@@ -396,7 +396,6 @@ fn meta_from_manifest(manifest: &ImageManifest, location: &RemoteLocation) -> Ma
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use tempfile::tempdir;
 
     /// Real hardware-model data representation captured from a Tahoe base
