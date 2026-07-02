@@ -169,26 +169,32 @@ impl macos_service_server::MacosService for MacosServiceImpl {
             // doesn't emit an event per network chunk.
             let progress = tx.clone();
             let mut last = (PullStage::Resolve, u32::MAX);
-            let result = mgr
-                .images()
-                .pull_remote(source, move |stage, fraction| {
-                    #[allow(
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss,
-                        reason = "fraction is clamped to 0.0..=1.0 by the producer"
-                    )]
-                    let percent = (fraction * 100.0) as u32;
-                    if last != (stage, percent) {
-                        last = (stage, percent);
-                        let _ = progress.send(Ok(MacosImagePullEvent {
-                            stage: stage_name(stage).to_string(),
-                            fraction,
-                        }));
+            let pull = mgr.images().pull_remote(source, move |stage, fraction| {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "fraction is clamped to 0.0..=1.0 by the producer"
+                )]
+                let percent = (fraction * 100.0) as u32;
+                if last != (stage, percent) {
+                    last = (stage, percent);
+                    let _ = progress.send(Ok(MacosImagePullEvent {
+                        stage: stage_name(stage).to_string(),
+                        fraction,
+                    }));
+                }
+            });
+            // A dropped client stream closes the channel; cancel the pull by
+            // dropping its future (its staging guard cleans up the partials).
+            tokio::select! {
+                result = pull => {
+                    if let Err(e) = result {
+                        let _ = tx.send(Err(Status::internal(e.to_string())));
                     }
-                })
-                .await;
-            if let Err(e) = result {
-                let _ = tx.send(Err(Status::internal(e.to_string())));
+                }
+                () = tx.closed() => {
+                    tracing::info!("macOS image pull canceled: client disconnected");
+                }
             }
         });
         Ok(Response::new(Box::pin(UnboundedReceiverStream::new(rx))))
