@@ -323,6 +323,7 @@ dependencies = [
  "arcbox-vmm",
  "arcbox-vz",
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "dirs",
@@ -344,6 +345,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
