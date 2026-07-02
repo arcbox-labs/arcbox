@@ -26,9 +26,10 @@ pub struct RunSpec<'a> {
 }
 
 /// A container that has been created and started. Held by the caller while the
-/// job runs; [`wait`](RunningContainer::wait) drives it to completion, and a
-/// drop before then (e.g. `CancelRunner` aborting the task) kills and removes it
-/// via the embedded [`ContainerGuard`].
+/// job runs: [`wait`](Self::wait) observes the exit, then [`remove`](Self::remove)
+/// or [`cancel`](Self::cancel) tears the container down — both awaited, so the
+/// caller's bookkeeping settles only after the container is actually gone. The
+/// embedded [`ContainerGuard`] is a panic safety net, not the teardown path.
 pub struct RunningContainer {
     client: Docker,
     id: String,
@@ -36,14 +37,14 @@ pub struct RunningContainer {
 }
 
 impl RunningContainer {
-    /// Block until the container exits, then remove it. The agent reports no
-    /// outcome upstream (the GitHub webhook is authoritative); the outcome here
-    /// is for logging only.
-    pub async fn wait(self) -> Result<DockerOutcome> {
-        let Self { client, id, guard } = self;
-        let wait = client
+    /// Block until the container exits and return its exit code. No cleanup —
+    /// follow with [`remove`](Self::remove). The agent reports no outcome
+    /// upstream (the GitHub webhook is authoritative); the code is for logging.
+    pub async fn wait(&self) -> Result<i64> {
+        let wait = self
+            .client
             .wait_container(
-                &id,
+                &self.id,
                 Some(WaitContainerOptions {
                     condition: "not-running".to_owned(),
                 }),
@@ -51,9 +52,14 @@ impl RunningContainer {
             .next()
             .await
             .context("container wait stream ended unexpectedly")?
-            .with_context(|| format!("waiting on container {id}"))?;
+            .with_context(|| format!("waiting on container {}", self.id))?;
+        Ok(wait.status_code)
+    }
 
-        let exit_code = wait.status_code;
+    /// Remove the (exited) container, awaited. Failures are logged, not
+    /// propagated: the job itself already concluded.
+    pub async fn remove(self) {
+        let Self { client, id, guard } = self;
         guard.defuse();
         let options = RemoveContainerOptions {
             force: true,
@@ -62,18 +68,19 @@ impl RunningContainer {
         if let Err(e) = client.remove_container(&id, Some(options)).await {
             warn!(container = %id, error = %e, "failed to remove container");
         }
-
-        Ok(DockerOutcome {
-            success: exit_code == 0,
-            detail: format!("container exited with code {exit_code}"),
-        })
     }
-}
 
-/// Terminal outcome of a containerized job.
-pub struct DockerOutcome {
-    pub success: bool,
-    pub detail: String,
+    /// Kill and remove the container, awaited — the cancellation/shutdown
+    /// teardown. Once this returns the container is gone (or its removal
+    /// failed loudly), so a shutdown that awaits it leaves no orphan behind.
+    pub async fn cancel(self) {
+        // The container may have exited on its own in the cancel race; a failed
+        // kill is expected then, and the forced remove below handles both cases.
+        if let Err(e) = self.client.kill_container(&self.id, None).await {
+            debug!(container = %self.id, error = %e, "kill on cancel failed (may have exited)");
+        }
+        self.remove().await;
+    }
 }
 
 /// Wraps the Docker Engine API for running GitHub Actions jobs in containers.
@@ -84,6 +91,12 @@ pub struct DockerRunner {
     default_image: String,
     /// Linux arches verified pullable at startup, advertised as capacity pools.
     linux_arches: Vec<String>,
+}
+
+/// Deterministic per-job container name, so redeliveries and interrupted
+/// startups can always find (and remove) whatever an earlier attempt created.
+fn container_name(job_id: &str) -> String {
+    format!("arcbox-{job_id}")
 }
 
 /// ArcBox's Docker-compatible socket path on macOS (`~/.arcbox/docker.sock`).
@@ -202,21 +215,12 @@ impl DockerRunner {
 
         Self::pull_image(&self.client, &self.default_image, &platform).await?;
 
-        let container_name = format!("arcbox-{}", spec.job_id);
+        let container_name = container_name(spec.job_id);
 
         // The name is deterministic per job, so a redelivery after a crash that
         // left an orphan would otherwise collide on create. Remove any leftover
         // first (remove-before-bind); a missing container is the normal case.
-        let _ = self
-            .client
-            .remove_container(
-                &container_name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
+        self.remove_job_container(spec.job_id).await;
 
         let config = ContainerCreateBody {
             image: Some(self.default_image.clone()),
@@ -257,6 +261,23 @@ impl DockerRunner {
         })
     }
 
+    /// Force-remove the container named for `job_id`, if any — awaited and
+    /// idempotent. Used as remove-before-bind ahead of a create, and as the
+    /// cleanup when a cancellation interrupts [`start`](Self::start) mid-flight
+    /// (the deterministic name reaches whatever the dropped start created).
+    pub async fn remove_job_container(&self, job_id: &str) {
+        let _ = self
+            .client
+            .remove_container(
+                &container_name(job_id),
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+    }
+
     /// Pull an image for a specific platform.
     async fn pull_image(client: &Docker, image: &str, platform: &str) -> Result<()> {
         debug!(image, platform, "pulling image");
@@ -274,11 +295,14 @@ impl DockerRunner {
     }
 }
 
-/// Kills and removes a container on drop — the cancellation safety net.
+/// Kills and removes a container on drop — the panic safety net.
 ///
-/// On normal completion the caller calls [`defuse`](Self::defuse) and handles
-/// cleanup explicitly (where errors can be logged). On task abort, the guard
-/// spawns a fire-and-forget cleanup task.
+/// Every deliberate exit ([`RunningContainer::remove`]/[`cancel`]) defuses the
+/// guard and awaits the teardown itself, so this drop path only fires when the
+/// runner task dies without reaching one — a panic, or the future dropped
+/// without cancellation. The spawned cleanup is fire-and-forget by necessity
+/// (drop cannot await); it must never be the path a correctness guarantee
+/// rides on.
 struct ContainerGuard {
     client: Docker,
     container_id: String,
