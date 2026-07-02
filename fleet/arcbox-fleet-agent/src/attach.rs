@@ -200,7 +200,7 @@ async fn connect_and_serve(
                 None => break Ok(()),
             },
             message = inbound.message() => match message {
-                Ok(Some(message)) => dispatch(supervisor, message.msg).await,
+                Ok(Some(message)) => dispatch(supervisor, message.msg),
                 Ok(None) => break Ok(()),
                 Err(status) => break Err(anyhow::Error::from(status)),
             },
@@ -211,11 +211,13 @@ async fn connect_and_serve(
     outcome
 }
 
-/// Route one inbound `AttachResponse` to the supervisor.
-async fn dispatch(supervisor: &RunnerSupervisor, msg: Option<attach_response::Msg>) {
+/// Route one inbound `AttachResponse` to the supervisor. Synchronous: every
+/// handler only mutates supervisor state and spawns work, so dispatch can never
+/// stall the stream loop.
+fn dispatch(supervisor: &RunnerSupervisor, msg: Option<attach_response::Msg>) {
     match msg {
         Some(attach_response::Msg::ProvisionRunner(order)) => {
-            supervisor.handle_provision(order).await;
+            supervisor.handle_provision(order);
         }
         Some(attach_response::Msg::Cancel(cancel)) => supervisor.handle_cancel(&cancel.job_id),
         Some(attach_response::Msg::Drain(_)) => supervisor.handle_drain(),
@@ -227,9 +229,9 @@ async fn dispatch(supervisor: &RunnerSupervisor, msg: Option<attach_response::Ms
 }
 
 /// Periodically resend verdicts still awaiting an `OfferVerdictAck`, until the
-/// gateway acks them (or the resend cap is hit). Process-scoped so it spans
-/// reconnects; the supervisor holds the egress sender, so resends route through
-/// the same outbound path as fresh verdicts.
+/// gateway settles them (delivered to the workflow, or found obsolete).
+/// Process-scoped so it spans reconnects; the supervisor holds the egress
+/// sender, so resends route through the same outbound path as fresh verdicts.
 fn spawn_verdict_resend(supervisor: RunnerSupervisor) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(VERDICT_RESEND_INTERVAL);
