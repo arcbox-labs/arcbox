@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.16](https://github.com/arcboxlabs/arcbox/compare/v0.4.15...v0.4.16) (2026-07-01)
+
+
+### Features
+
+* **core:** define VmLifecycle statig HSM (states/superstate/events/effects) ([8f02e34](https://github.com/arcboxlabs/arcbox/commit/8f02e3430919d34ddc1a285c7689c7f267c700af))
+
+
+### Bug Fixes
+
+* **core:** guard lifecycle actor against stale completions and blocking removal ([4c1c42f](https://github.com/arcboxlabs/arcbox/commit/4c1c42faee8825ed83b7ebafc65c20b20bb21aa1))
+* **core:** start persisted machines without recreate after daemon restart ([fddd45c](https://github.com/arcboxlabs/arcbox/commit/fddd45c99e7713501695a119e48ef2b54a46cc53))
+
+
+### Code Refactoring
+
+* **core:** drive VmLifecycleManager via a statig lifecycle actor ([2c5cc85](https://github.com/arcboxlabs/arcbox/commit/2c5cc85972765d0d7fb78b92330d9a6313b2ec75))
+
+
+### Miscellaneous Chores
+
+* **core:** add statig(async) state-machine dependency ([c3407f5](https://github.com/arcboxlabs/arcbox/commit/c3407f5798008bdb9a0d7a1d448f021367b6f658))
+
 ## [0.4.15](https://github.com/arcboxlabs/arcbox/compare/v0.4.14...v0.4.15) (2026-07-01)
 
 
