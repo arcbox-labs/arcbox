@@ -15,26 +15,41 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
 
-const META_FILE: &str = "meta.json";
-const DISK_FILE: &str = "disk.img";
-const AUX_FILE: &str = "aux.img";
-const HARDWARE_MODEL_FILE: &str = "hwmodel.bin";
-const MACHINE_ID_FILE: &str = "machine-id.bin";
+pub(super) const META_FILE: &str = "meta.json";
+pub(super) const DISK_FILE: &str = "disk.img";
+pub(super) const AUX_FILE: &str = "aux.img";
+pub(super) const HARDWARE_MODEL_FILE: &str = "hwmodel.bin";
+pub(super) const MACHINE_ID_FILE: &str = "machine-id.bin";
 
 /// Persisted metadata describing a macOS base image template.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MacImageMeta {
     /// Image name (unique within the registry).
     pub name: String,
-    /// Source the image was installed from (IPSW path or "latest"), if known.
+    /// Where the image came from (manifest location or IPSW path), if known.
     pub source: Option<String>,
-    /// Minimum CPU count reported by the restore image.
+    /// Stream the image was pulled from (e.g. `tahoe-base`), if pulled.
+    #[serde(default)]
+    pub stream: Option<String>,
+    /// Published version label (e.g. `2026.07.02`), if pulled.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Guest macOS product version (e.g. `26.5`), if known.
+    #[serde(default)]
+    pub os_version: Option<String>,
+    /// Guest macOS build number (e.g. `25F71`), if known.
+    #[serde(default)]
+    pub os_build: Option<String>,
+    /// Preinstalled GitHub Actions runner version, if known.
+    #[serde(default)]
+    pub runner_version: Option<String>,
+    /// Minimum CPU count required by the guest.
     pub minimum_cpu_count: u64,
-    /// Minimum guest memory in MiB reported by the restore image.
+    /// Minimum guest memory in MiB required by the guest.
     pub minimum_memory_mib: u64,
-    /// System disk size in GiB.
+    /// System disk size in GB (decimal, logical size).
     pub disk_gb: u64,
-    /// When the image was created.
+    /// When the image was created locally.
     pub created_at: DateTime<Utc>,
 }
 
@@ -172,8 +187,16 @@ impl MacImageManager {
     /// # Errors
     /// Returns an error if the metadata cannot be serialized or written.
     pub fn write_meta(&self, meta: &MacImageMeta) -> Result<()> {
-        let dir = self.image_dir(&meta.name);
-        std::fs::create_dir_all(&dir)?;
+        Self::write_meta_in(&self.image_dir(&meta.name), meta)
+    }
+
+    /// Persists metadata into an explicit directory (used by the pull flow to
+    /// assemble an image in a staging directory before renaming it live).
+    ///
+    /// # Errors
+    /// Returns an error if the metadata cannot be serialized or written.
+    pub(super) fn write_meta_in(dir: &Path, meta: &MacImageMeta) -> Result<()> {
+        std::fs::create_dir_all(dir)?;
         let json = serde_json::to_string_pretty(meta)
             .map_err(|e| CoreError::macos(format!("serialize image metadata: {e}")))?;
         std::fs::write(dir.join(META_FILE), json)?;
@@ -257,6 +280,11 @@ mod tests {
         MacImageMeta {
             name: "base".into(),
             source: Some("/tmp/UniversalMac.ipsw".into()),
+            stream: None,
+            version: None,
+            os_version: None,
+            os_build: None,
+            runner_version: None,
             minimum_cpu_count: 2,
             minimum_memory_mib: 4096,
             disk_gb: 64,

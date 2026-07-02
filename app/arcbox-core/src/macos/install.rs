@@ -121,6 +121,11 @@ impl MacImageManager {
         let meta = MacImageMeta {
             name: name.to_string(),
             source: Some(ipsw.display().to_string()),
+            stream: None,
+            version: None,
+            os_version: None,
+            os_build: None,
+            runner_version: None,
             minimum_cpu_count: reqs.minimum_cpu_count,
             minimum_memory_mib: memory / (1024 * 1024),
             disk_gb,
