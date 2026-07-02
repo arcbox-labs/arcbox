@@ -90,15 +90,7 @@ impl AgentConfig {
         let runner_dir = std::env::var_os(ENV_RUNNER_DIR).map(PathBuf::from);
 
         let load_ceiling = match std::env::var(ENV_LOAD_CEILING) {
-            Ok(v) => {
-                let n: f64 = v
-                    .parse()
-                    .with_context(|| format!("{ENV_LOAD_CEILING} must be a positive number"))?;
-                if n <= 0.0 {
-                    anyhow::bail!("{ENV_LOAD_CEILING} must be a positive number, got {n}");
-                }
-                n
-            }
+            Ok(v) => parse_load_ceiling(&v)?,
             Err(_) => DEFAULT_LOAD_CEILING,
         };
         let mem_floor_mib = match std::env::var(ENV_MEM_FLOOR_MIB) {
@@ -176,8 +168,39 @@ impl AgentConfig {
     }
 }
 
+/// Parse `ARCBOX_FLEET_LOAD_CEILING`: a positive, finite load-per-core bound.
+/// Non-finite values must be rejected here: every admission comparison against
+/// `NaN` is false, which would silently disable the load gate, and `inf` never
+/// rejects — a misconfiguration should fail startup, not neuter admission.
+fn parse_load_ceiling(v: &str) -> Result<f64> {
+    let n: f64 = v
+        .parse()
+        .with_context(|| format!("{ENV_LOAD_CEILING} must be a positive finite number"))?;
+    if !(n.is_finite() && n > 0.0) {
+        anyhow::bail!("{ENV_LOAD_CEILING} must be a positive finite number, got {n}");
+    }
+    Ok(n)
+}
+
 /// `~/.arcbox/fleet`, resolved from the user's home directory.
 fn default_data_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("could not determine home directory")?;
     Ok(home.join(".arcbox").join("fleet"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "1.5 parses exactly; no arithmetic involved"
+    )]
+    fn load_ceiling_requires_positive_finite() {
+        assert_eq!(parse_load_ceiling("1.5").unwrap(), 1.5);
+        for bad in ["0", "-1.5", "NaN", "inf", "-inf", "nonsense"] {
+            assert!(parse_load_ceiling(bad).is_err(), "accepted {bad}");
+        }
+    }
 }
