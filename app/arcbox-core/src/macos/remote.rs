@@ -18,7 +18,7 @@ use crate::error::{CoreError, Result};
 /// Default base location of the published image index (the `darwin` bucket).
 ///
 /// Overridable with the `ARCBOX_MACOS_IMAGE_BASE` environment variable.
-pub const DEFAULT_IMAGE_BASE: &str = "https://images.arcbox.dev";
+pub const DEFAULT_IMAGE_BASE: &str = "https://darwin.arcboxcdn.com";
 
 /// Environment variable overriding [`DEFAULT_IMAGE_BASE`].
 pub const IMAGE_BASE_ENV: &str = "ARCBOX_MACOS_IMAGE_BASE";
