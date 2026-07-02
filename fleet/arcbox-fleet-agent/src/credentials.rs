@@ -42,13 +42,21 @@ impl CredentialStore {
     /// elsewhere; `Keyring` forces the keychain; `File` forces the file. `mode`
     /// is validated against the platform when parsed from the environment, so
     /// `Keyring` never reaches here on a platform without a keychain.
-    pub fn new(mode: CredentialMode, path: PathBuf) -> Self {
+    ///
+    /// `gateway` scopes the credential to the environment it was enrolled
+    /// against: the keychain keys its entry by gateway URI, so credentials for
+    /// different gateways (production, staging, local e2e) coexist instead of
+    /// silently overwriting each other. The file backend is scoped by `path`
+    /// (per data dir) instead.
+    pub fn new(mode: CredentialMode, path: PathBuf, gateway: &str) -> Self {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         if matches!(mode, CredentialMode::Keyring | CredentialMode::Auto) {
-            return Self::Keyring(KeyringStore);
+            return Self::Keyring(KeyringStore {
+                account: gateway.to_owned(),
+            });
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let _ = mode;
+        let _ = (mode, gateway);
         Self::File(FileStore { path })
     }
 
@@ -143,22 +151,26 @@ fn write_private(_path: &std::path::Path, _bytes: &[u8]) -> Result<()> {
     )
 }
 
-/// Stores the credential as a single JSON blob in the OS keychain.
+/// Stores the credential as a single JSON blob in the OS keychain, one entry
+/// per gateway (the account is the gateway URI), so enrolling against another
+/// environment never clobbers this one's credential.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-pub struct KeyringStore;
+pub struct KeyringStore {
+    /// Keychain account: the gateway URI this credential enrolls against.
+    account: String,
+}
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 impl KeyringStore {
-    /// Keychain service and account under which the credential blob is stored.
+    /// Keychain service under which every credential entry is stored.
     const SERVICE: &'static str = "dev.arcbox.fleet-agent";
-    const ACCOUNT: &'static str = "machine-credential";
 
-    fn entry() -> Result<keyring::Entry> {
-        keyring::Entry::new(Self::SERVICE, Self::ACCOUNT).context("opening OS keychain entry")
+    fn entry(&self) -> Result<keyring::Entry> {
+        keyring::Entry::new(Self::SERVICE, &self.account).context("opening OS keychain entry")
     }
 
     fn load(&self) -> Result<Option<Credential>> {
-        match Self::entry()?.get_password() {
+        match self.entry()?.get_password() {
             Ok(json) => {
                 let cred =
                     serde_json::from_str(&json).context("malformed credential in OS keychain")?;
@@ -171,7 +183,7 @@ impl KeyringStore {
 
     fn store(&self, cred: &Credential) -> Result<()> {
         let json = serde_json::to_string(cred).context("serializing credential")?;
-        Self::entry()?
+        self.entry()?
             .set_password(&json)
             .context("writing credential to OS keychain")
     }
@@ -190,7 +202,11 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("fleet-cred-{}", std::process::id()));
         let path = dir.join("credentials.json");
-        let store = CredentialStore::new(CredentialMode::File, path.clone());
+        let store = CredentialStore::new(
+            CredentialMode::File,
+            path.clone(),
+            "https://fleet.arcbox.dev",
+        );
         assert!(store.load().unwrap().is_none());
 
         let cred = Credential {

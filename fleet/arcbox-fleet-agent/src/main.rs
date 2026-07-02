@@ -101,6 +101,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             let credential = CredentialStore::new(
                 config.credential_store,
                 config.credentials_path(),
+                &config.gateway,
             )
             .load()?
             .context(
