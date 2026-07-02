@@ -591,23 +591,34 @@ pub struct MacosMachineInfo {
     #[prost(int64, tag = "6")]
     pub created: i64,
 }
-/// Request to install a base image from a local IPSW.
+/// Request to pull a published base image.
 ///
-/// The install VM's CPU/memory are derived from the restore image's own
-/// requirements, so they are not part of the request.
+/// Exactly one of `reference` / `manifest_url` must be set. CPU/memory/disk
+/// characteristics come from the published manifest, not the request.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MacosImagePullRequest {
-    /// Base image name.
+    /// Image reference: a stream name with an optional pinned version,
+    /// e.g. "tahoe-base" or "tahoe-base@2026.07.02".
     #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// Path to a local IPSW restore image.
+    pub reference: ::prost::alloc::string::String,
+    /// Manifest override (URL or daemon-local path); bypasses the published
+    /// index. Intended for development and pinning escapes.
     #[prost(string, tag = "2")]
-    pub ipsw_path: ::prost::alloc::string::String,
-    /// System disk size in GiB.
-    #[prost(uint64, tag = "3")]
-    pub disk_gb: u64,
+    pub manifest_url: ::prost::alloc::string::String,
+}
+/// Progress event emitted while a base image pull runs.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MacosImagePullEvent {
+    /// Stage: resolving | validating | disk | aux | verifying.
+    #[prost(string, tag = "1")]
+    pub stage: ::prost::alloc::string::String,
+    /// Completion fraction within the stage (0.0..=1.0).
+    #[prost(double, tag = "2")]
+    pub fraction: f64,
 }
 /// Summary of a macOS base image.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -617,21 +628,27 @@ pub struct MacosImageSummary {
     /// Image name.
     #[prost(string, tag = "1")]
     pub name: ::prost::alloc::string::String,
-    /// Minimum CPU count required by the restore image.
+    /// Minimum CPU count required by the guest.
     #[prost(uint64, tag = "2")]
     pub minimum_cpu_count: u64,
-    /// Minimum memory in MiB required by the restore image.
+    /// Minimum memory in MiB required by the guest.
     #[prost(uint64, tag = "3")]
     pub minimum_memory_mib: u64,
-    /// System disk size in GiB.
+    /// System disk size in GB (decimal, logical).
     #[prost(uint64, tag = "4")]
     pub disk_gb: u64,
     /// Creation timestamp.
     #[prost(int64, tag = "5")]
     pub created: i64,
-    /// Source (IPSW path), if known.
+    /// Source (manifest location), if known.
     #[prost(string, tag = "6")]
     pub source: ::prost::alloc::string::String,
+    /// Published version label (e.g. "2026.07.02"), if pulled.
+    #[prost(string, tag = "7")]
+    pub version: ::prost::alloc::string::String,
+    /// Guest macOS product version (e.g. "26.5"), if known.
+    #[prost(string, tag = "8")]
+    pub os_version: ::prost::alloc::string::String,
 }
 /// Response listing macOS base images.
 #[derive(serde::Serialize, serde::Deserialize)]

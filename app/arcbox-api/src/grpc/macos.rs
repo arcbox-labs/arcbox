@@ -3,23 +3,36 @@
 //! Disposable macOS VMs and their base images. The whole surface delegates to
 //! [`arcbox_core::MacMachineManager`]; lifecycle operations hold `!Send`
 //! Virtualization.framework handles across await, so they run through
-//! [`super::run_macos_blocking`].
+//! [`super::run_macos_blocking`]. Image pulls are plain `Send` futures and
+//! stream progress from an ordinary spawned task.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
+use arcbox_core::{PullStage, RemoteLocation, RemoteSource};
 use arcbox_grpc::v1::macos_service_server;
 use arcbox_protocol::v1::{
     CreateMacosMachineRequest, Empty, InspectMacosMachineRequest, MacosImageListResponse,
-    MacosImagePullRequest, MacosImageRemoveRequest, MacosImageSummary, MacosMachineInfo,
-    MacosMachineListResponse, MacosMachineSummary, RemoveMacosMachineRequest,
+    MacosImagePullEvent, MacosImagePullRequest, MacosImageRemoveRequest, MacosImageSummary,
+    MacosMachineInfo, MacosMachineListResponse, MacosMachineSummary, RemoveMacosMachineRequest,
     StartMacosMachineRequest, StopMacosMachineRequest,
 };
+use tokio_stream::Stream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::{Request, Response, Status};
 
 use super::{SharedRuntime, SharedRuntimeExt, run_macos_blocking};
 
-/// Minimum system disk size for a base image, in GiB.
-const MIN_IMAGE_DISK_GB: u64 = 64;
+/// Wire name of a pull stage.
+const fn stage_name(stage: PullStage) -> &'static str {
+    match stage {
+        PullStage::Resolve => "resolving",
+        PullStage::Validate => "validating",
+        PullStage::Disk => "disk",
+        PullStage::Aux => "aux",
+        PullStage::Verify => "verifying",
+    }
+}
 
 /// macOS guest service implementation.
 pub struct MacosServiceImpl {
@@ -129,39 +142,56 @@ impl macos_service_server::MacosService for MacosServiceImpl {
         }))
     }
 
+    type ImagePullStream = Pin<Box<dyn Stream<Item = Result<MacosImagePullEvent, Status>> + Send>>;
+
     async fn image_pull(
         &self,
         request: Request<MacosImagePullRequest>,
-    ) -> Result<Response<Empty>, Status> {
+    ) -> Result<Response<Self::ImagePullStream>, Status> {
         let req = request.into_inner();
+        let source =
+            match (req.reference.is_empty(), req.manifest_url.is_empty()) {
+                (false, true) => RemoteSource::Reference(req.reference.parse().map_err(
+                    |e: arcbox_core::CoreError| Status::invalid_argument(e.to_string()),
+                )?),
+                (true, false) => RemoteSource::Manifest(RemoteLocation::parse(&req.manifest_url)),
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "exactly one of reference / manifest_url must be set",
+                    ));
+                }
+            };
+
         let mgr = Arc::clone(self.runtime.ready()?.mac_machine_manager());
-        let name = req.name;
-        let ipsw = req.ipsw_path;
-        let disk_gb = req.disk_gb.max(MIN_IMAGE_DISK_GB);
-        // An empty ipsw_path means "download the latest from Apple".
-        let source = if ipsw.is_empty() {
-            arcbox_core::PullSource::Latest
-        } else {
-            arcbox_core::PullSource::LocalIpsw(std::path::PathBuf::from(ipsw))
-        };
-        run_macos_blocking(move || async move {
-            let mut last = String::new();
-            mgr.images()
-                .pull(source, &name, disk_gb, |phase, frac| {
-                    let label = match phase {
-                        arcbox_core::PullPhase::Download => "download",
-                        arcbox_core::PullPhase::Install => "install",
-                    };
-                    let msg = format!("macOS image {label}: {:.0}%", frac * 100.0);
-                    if msg != last {
-                        tracing::info!("{msg}");
-                        last = msg;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            // Throttle to whole-percent changes so a multi-gigabyte download
+            // doesn't emit an event per network chunk.
+            let progress = tx.clone();
+            let mut last = (PullStage::Resolve, u32::MAX);
+            let result = mgr
+                .images()
+                .pull_remote(source, move |stage, fraction| {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "fraction is clamped to 0.0..=1.0 by the producer"
+                    )]
+                    let percent = (fraction * 100.0) as u32;
+                    if last != (stage, percent) {
+                        last = (stage, percent);
+                        let _ = progress.send(Ok(MacosImagePullEvent {
+                            stage: stage_name(stage).to_string(),
+                            fraction,
+                        }));
                     }
                 })
-                .await
-        })
-        .await?;
-        Ok(Response::new(Empty {}))
+                .await;
+            if let Err(e) = result {
+                let _ = tx.send(Err(Status::internal(e.to_string())));
+            }
+        });
+        Ok(Response::new(Box::pin(UnboundedReceiverStream::new(rx))))
     }
 
     async fn image_list(
@@ -182,6 +212,8 @@ impl macos_service_server::MacosService for MacosServiceImpl {
                 disk_gb: i.meta.disk_gb,
                 created: i.meta.created_at.timestamp(),
                 source: i.meta.source.unwrap_or_default(),
+                version: i.meta.version.unwrap_or_default(),
+                os_version: i.meta.os_version.unwrap_or_default(),
             })
             .collect();
         Ok(Response::new(MacosImageListResponse { images }))
