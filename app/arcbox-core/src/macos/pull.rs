@@ -309,11 +309,15 @@ async fn fetch_zstd_to_sparse(
             }
         }
         RemoteLocation::File(path) => {
-            use std::io::Read;
-            let mut src = std::fs::File::open(path)?;
+            // tokio::fs (not std): every read is an await point, which is what
+            // keeps this future cancellable — a sync loop here would run to
+            // completion inside a single poll, immune to `select!`/drop, while
+            // pinning a runtime worker for the whole decompression.
+            use tokio::io::AsyncReadExt;
+            let mut src = tokio::fs::File::open(path).await?;
             let mut buf = vec![0u8; 1024 * 1024];
             loop {
-                let n = src.read(&mut buf)?;
+                let n = src.read(&mut buf).await?;
                 if n == 0 {
                     break;
                 }
