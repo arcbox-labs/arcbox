@@ -60,9 +60,10 @@ pub use machine::MachineManager;
 #[cfg(target_os = "macos")]
 pub use macos::{
     ImageReference, MacImage, MacImageManager, MacImageMeta, MacInstanceDisks, MacMachineConfig,
-    MacMachineInfo, MacMachineManager, MacVm, PullPhase, PullSource, PullStage, RemoteLocation,
-    RemoteSource,
+    MacMachineInfo, MacMachineManager, MacVm, PullStage, RemoteLocation, RemoteSource,
 };
+#[cfg(feature = "macos-ipsw-install")]
+pub use macos::{PullPhase, PullSource};
 pub use migration::MigrationManager;
 pub use runtime::{Runtime, SandboxPortExposure};
 pub use vm::{SharedDirConfig, VmConfig, VmManager};
