@@ -62,6 +62,10 @@ provision-bundled = []
 provision-distro = []
 vmnet = ["arcbox-vmm/vmnet"]
 gic = ["arcbox-vmm/gic"]
+# Retained-but-unshipped macOS IPSW installer (install_from_ipsw + Apple IPSW
+# download). The product acquires images via `pull` only; this stays compiled
+# under the feature so the code cannot rot. Not part of any default build.
+macos-ipsw-install = []
 
 [lints]
 workspace = true

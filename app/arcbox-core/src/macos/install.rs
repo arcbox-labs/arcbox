@@ -3,6 +3,11 @@
 //! Drives the arcbox-vz installer (the same flow proven by Gate B) and persists a
 //! complete base image — `disk.img`, `aux.img`, `hwmodel.bin`, `machine-id.bin`,
 //! `meta.json` — that [`MacImageManager::clone_base`] can copy-on-write clone.
+//!
+//! Retained but unshipped: the product acquires base images exclusively via
+//! [`MacImageManager::pull_remote`](super::pull); this module is compiled only
+//! under the `macos-ipsw-install` feature so the installer flow stays
+//! compiler-verified without being product surface.
 
 use std::path::{Path, PathBuf};
 
