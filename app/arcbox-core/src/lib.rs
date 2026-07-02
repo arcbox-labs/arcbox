@@ -59,8 +59,9 @@ pub use error::{CoreError, Result};
 pub use machine::MachineManager;
 #[cfg(target_os = "macos")]
 pub use macos::{
-    MacImage, MacImageManager, MacImageMeta, MacInstanceDisks, MacMachineConfig, MacMachineInfo,
-    MacMachineManager, MacVm, PullPhase, PullSource,
+    ImageReference, MacImage, MacImageManager, MacImageMeta, MacInstanceDisks, MacMachineConfig,
+    MacMachineInfo, MacMachineManager, MacVm, PullPhase, PullSource, PullStage, RemoteLocation,
+    RemoteSource,
 };
 pub use migration::MigrationManager;
 pub use runtime::{Runtime, SandboxPortExposure};
