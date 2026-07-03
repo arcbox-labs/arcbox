@@ -177,7 +177,17 @@ impl VmRunner {
         if spec.encoded_jit_config.contains('\'') {
             bail!("encoded JIT config contains a quote — not a base64 payload");
         }
+        let command = format!(
+            "{GUEST_RUNNER_SCRIPT} --jitconfig '{}'",
+            spec.encoded_jit_config
+        );
+        self.start_with_command(&spec, &command).await
+    }
 
+    /// [`start`](Self::start) with the guest command explicit, so the
+    /// daemon-backed integration test below can exercise the full
+    /// provision→ssh→exec→destroy cycle without a real runner invocation.
+    async fn start_with_command(&self, spec: &RunSpec<'_>, command: &str) -> Result<RunningVm> {
         let name = machine_name(spec.job_id);
         let mut client = self.client.clone();
 
@@ -213,13 +223,7 @@ impl VmRunner {
                 .await
                 .context("opening SSH session channel")?;
             channel
-                .exec(
-                    true,
-                    format!(
-                        "{GUEST_RUNNER_SCRIPT} --jitconfig '{}'",
-                        spec.encoded_jit_config
-                    ),
-                )
+                .exec(true, command)
                 .await
                 .context("starting the runner over SSH")?;
             info!(job_id = spec.job_id, guest = %name, ip, "runner started (vm)");
@@ -473,6 +477,32 @@ mod tests {
     fn stream_name_strips_pinned_version() {
         assert_eq!(stream_name("tahoe-base"), "tahoe-base");
         assert_eq!(stream_name("tahoe-base@2026.07.02"), "tahoe-base");
+    }
+
+    /// Full provision→ssh→exec→destroy cycle against a live daemon.
+    /// Requires `arcbox-daemon` running with the default image pulled
+    /// (`arcbox macos image pull tahoe-base`); run manually:
+    /// `cargo test -p arcbox-fleet-agent vm_round_trip -- --ignored`.
+    #[tokio::test]
+    #[ignore = "needs a live arcbox-daemon with the tahoe-base image installed"]
+    async fn vm_round_trip_boots_and_execs_over_ssh() {
+        let socket = arcbox_constants::paths::HostLayout::from_env_or_default().grpc_socket;
+        let runner = VmRunner::new(&socket, "tahoe-base")
+            .await
+            .expect("daemon probe");
+        let mut running = runner
+            .start_with_command(
+                &RunSpec {
+                    job_id: "itest",
+                    encoded_jit_config: "",
+                    runner_image: "tahoe-base",
+                },
+                "/usr/bin/true",
+            )
+            .await
+            .expect("provision guest and exec");
+        assert_eq!(running.wait().await, Some(0));
+        running.destroy().await;
     }
 
     #[test]
