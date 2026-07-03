@@ -705,6 +705,8 @@ mod tests {
             docker_mode: DockerMode::Disabled,
             runner_script: None,
             participate: true,
+            vm_mode: crate::config::VmMode::Auto,
+            macos_runner_image: "tahoe-base".to_owned(),
         }
     }
 
@@ -718,6 +720,10 @@ mod tests {
             docker: DockerConfig {
                 mode: DockerMode::Disabled,
                 linux_runner_image: "ghcr.io/actions/actions-runner:latest".to_owned(),
+            },
+            vm: crate::config::VmConfig {
+                mode: crate::config::VmMode::Disabled,
+                macos_runner_image: "tahoe-base".to_owned(),
             },
             credential_store: CredentialMode::File,
         }

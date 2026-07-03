@@ -17,9 +17,9 @@ use tonic::transport::Endpoint;
 use tonic::{Request, Response, Status};
 
 use super::Internal;
-use crate::config::DockerMode;
+use crate::config::{DockerMode, VmMode};
 use crate::settings::SettingsStore;
-use crate::state::{AgentState, docker_mode_from_wire};
+use crate::state::{AgentState, docker_mode_from_wire, vm_mode_from_wire};
 
 pub struct SettingsService {
     state: AgentState,
@@ -89,6 +89,14 @@ impl FleetSettingsServiceTrait for SettingsService {
         if let Some(v) = req.participate {
             self.state.set_participate_target(v);
         }
+        // Target only — `FleetImageService.Prepare` pulls it through the
+        // daemon and promotes it to `current`.
+        if let Some(v) = &req.macos_runner_image {
+            self.state.set_macos_runner_image_target(v);
+        }
+        if let Some(v) = req.vm_mode {
+            self.state.set_vm_mode_target(vm_mode_from_wire(v));
+        }
 
         self.store
             .store(&self.state.persisted_settings())
@@ -144,13 +152,28 @@ fn validate(req: &UpdateSettingsRequest, state: &AgentState) -> Result<(), Strin
             return Err(format!("runner_script {runner_script} does not exist"));
         }
     }
+    if let Some(macos_runner_image) = &req.macos_runner_image {
+        if macos_runner_image.trim().is_empty() {
+            return Err("macos_runner_image must not be empty".to_owned());
+        }
+    }
+    if let Some(vm_mode) = req.vm_mode
+        && vm_mode_from_wire(vm_mode) == VmMode::Enabled
+        && std::env::consts::OS != "macos"
+    {
+        return Err(
+            "vm_mode=enabled requires a macOS host (the VM backend runs macOS guests via \
+                    the local arcbox-daemon)"
+                .to_owned(),
+        );
+    }
 
-    // Only gate this request if it actually touches docker_mode or
-    // runner_script — a host that already has this combination from its
-    // env-derived seed (a legitimate, existing deployment shape; see this
-    // module's doc) must not have every *unrelated* UpdateSettings call
-    // (e.g. just load_ceiling) rejected because of it.
-    if req.docker_mode.is_some() || req.runner_script.is_some() {
+    // Only gate this request if it actually touches docker_mode,
+    // runner_script, or vm_mode — a host that already has this combination
+    // from its env-derived seed (a legitimate, existing deployment shape;
+    // see this module's doc) must not have every *unrelated* UpdateSettings
+    // call (e.g. just load_ceiling) rejected because of it.
+    if req.docker_mode.is_some() || req.runner_script.is_some() || req.vm_mode.is_some() {
         let persisted = state.persisted_settings();
         let effective_docker_mode = req
             .docker_mode
@@ -162,15 +185,19 @@ fn validate(req: &UpdateSettingsRequest, state: &AgentState) -> Result<(), Strin
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default()
         });
+        let effective_vm_mode = req.vm_mode.map_or(persisted.vm_mode, vm_mode_from_wire);
+        // Only Enabled modes are guarantees; Auto may resolve to nothing.
         let leaves_nothing_servable = matches!(
             effective_docker_mode,
             DockerMode::Auto | DockerMode::Disabled
-        ) && effective_runner_script.is_empty();
+        ) && effective_runner_script.is_empty()
+            && effective_vm_mode != VmMode::Enabled;
         if leaves_nothing_servable {
             return Err(
-                "cannot leave docker_mode as auto/disabled with no runner_script configured — \
-                 this would leave the host advertising no capabilities at all; supply \
-                 runner_script in the same request or set docker_mode to enabled"
+                "cannot leave docker_mode as auto/disabled with no runner_script configured and \
+                 vm_mode not enabled — this would leave the host advertising no capabilities at \
+                 all; supply runner_script in the same request, or set docker_mode or vm_mode to \
+                 enabled"
                     .to_owned(),
             );
         }
@@ -195,6 +222,8 @@ mod tests {
             docker_mode: DockerMode::Auto,
             runner_script: None,
             participate: true,
+            vm_mode: crate::config::VmMode::Auto,
+            macos_runner_image: "tahoe-base".to_owned(),
         }
     }
 
@@ -207,6 +236,8 @@ mod tests {
             docker_mode: None,
             runner_script: None,
             participate: None,
+            macos_runner_image: None,
+            vm_mode: None,
         }
     }
 
@@ -276,6 +307,45 @@ mod tests {
             ..request()
         };
         assert!(validate(&req, &state).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_macos_runner_image() {
+        let state = AgentState::new(&seed());
+        let req = UpdateSettingsRequest {
+            macos_runner_image: Some("  ".to_owned()),
+            ..request()
+        };
+        assert!(validate(&req, &state).is_err());
+    }
+
+    /// vm_mode=enabled is a servability guarantee, so it rescues the
+    /// docker-disabled/no-runner-script combination the cross-field check
+    /// otherwise rejects. macOS-only: on other hosts vm_mode=enabled is
+    /// itself rejected first.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn vm_enabled_satisfies_the_servability_check() {
+        let state = AgentState::new(&seed());
+        let req = UpdateSettingsRequest {
+            docker_mode: Some(control_proto::DockerMode::Disabled as i32),
+            vm_mode: Some(control_proto::VmMode::Enabled as i32),
+            ..request()
+        };
+        assert!(validate(&req, &state).is_ok());
+
+        // Downgrading vm_mode while nothing else serves is rejected.
+        let state = AgentState::new(&crate::settings::PersistedSettings {
+            docker_mode: DockerMode::Disabled,
+            runner_script: None,
+            vm_mode: VmMode::Enabled,
+            ..seed()
+        });
+        let req = UpdateSettingsRequest {
+            vm_mode: Some(control_proto::VmMode::Disabled as i32),
+            ..request()
+        };
+        assert!(validate(&req, &state).is_err());
     }
 
     #[test]

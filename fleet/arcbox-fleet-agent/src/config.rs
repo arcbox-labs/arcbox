@@ -22,6 +22,8 @@ const ENV_MEM_FLOOR_MIB: &str = "ARCBOX_FLEET_MEM_FLOOR_MIB";
 const ENV_DATA_DIR: &str = "ARCBOX_FLEET_DATA_DIR";
 const ENV_DOCKER: &str = "ARCBOX_FLEET_DOCKER";
 const ENV_LINUX_RUNNER_IMAGE: &str = "ARCBOX_FLEET_LINUX_RUNNER_IMAGE";
+const ENV_VM: &str = "ARCBOX_FLEET_VM";
+const ENV_MACOS_RUNNER_IMAGE: &str = "ARCBOX_FLEET_MACOS_RUNNER_IMAGE";
 const ENV_CREDENTIAL_STORE: &str = "ARCBOX_FLEET_CREDENTIAL_STORE";
 
 /// Reject an offer when 1-minute load average per core exceeds this.
@@ -29,6 +31,8 @@ const DEFAULT_LOAD_CEILING: f64 = 0.9;
 /// Reject an offer when available memory is below this many MiB.
 const DEFAULT_MEM_FLOOR_MIB: u64 = 2048;
 const DEFAULT_LINUX_RUNNER_IMAGE: &str = "ghcr.io/actions/actions-runner:latest";
+/// Published macOS base-image stream with the Actions runner baked in.
+pub const DEFAULT_MACOS_RUNNER_IMAGE: &str = "tahoe-base";
 
 /// Wire-protocol version this agent speaks; the gateway rejects a mismatch.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -41,6 +45,19 @@ pub enum DockerMode {
     /// Require Docker; fail startup if the socket is unreachable.
     Enabled,
     /// Never use Docker, even if available.
+    Disabled,
+}
+
+/// Whether darwin jobs run in disposable macOS VMs provisioned through the
+/// local arcbox-daemon (isolation), instead of the pre-installed host runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VmMode {
+    /// Probe the daemon at startup; fall back to the host runner if it cannot
+    /// serve VMs (unreachable, or the macOS runner image is not installed).
+    Auto,
+    /// Require the daemon; fail startup if it cannot serve VMs.
+    Enabled,
+    /// Never run darwin jobs in VMs, even if the daemon could.
     Disabled,
 }
 
@@ -65,6 +82,15 @@ pub struct DockerConfig {
     pub linux_runner_image: String,
 }
 
+/// VM-backend configuration for running darwin jobs in disposable macOS
+/// guests via the local arcbox-daemon.
+#[derive(Debug, Clone)]
+pub struct VmConfig {
+    pub mode: VmMode,
+    /// macOS base-image stream darwin VM jobs boot from.
+    pub macos_runner_image: String,
+}
+
 /// Resolved agent configuration.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -82,6 +108,8 @@ pub struct AgentConfig {
     pub data_dir: PathBuf,
     /// Docker runtime configuration for Linux jobs.
     pub docker: DockerConfig,
+    /// VM-backend configuration for darwin jobs.
+    pub vm: VmConfig,
     /// Where the machine credential is persisted (OS keychain vs file).
     pub credential_store: CredentialMode,
 }
@@ -120,6 +148,17 @@ impl AgentConfig {
         let linux_runner_image = std::env::var(ENV_LINUX_RUNNER_IMAGE)
             .unwrap_or_else(|_| DEFAULT_LINUX_RUNNER_IMAGE.to_string());
 
+        let vm_mode = match std::env::var(ENV_VM).as_deref() {
+            Ok("true") => VmMode::Enabled,
+            Ok("false") => VmMode::Disabled,
+            Ok("auto") | Err(_) => VmMode::Auto,
+            Ok(other) => {
+                anyhow::bail!("{ENV_VM} must be 'auto', 'true', or 'false', got '{other}'")
+            }
+        };
+        let macos_runner_image = std::env::var(ENV_MACOS_RUNNER_IMAGE)
+            .unwrap_or_else(|_| DEFAULT_MACOS_RUNNER_IMAGE.to_string());
+
         let credential_store = match std::env::var(ENV_CREDENTIAL_STORE).as_deref() {
             Ok("keyring") => CredentialMode::Keyring,
             Ok("file") => CredentialMode::File,
@@ -147,6 +186,10 @@ impl AgentConfig {
             docker: DockerConfig {
                 mode: docker_mode,
                 linux_runner_image,
+            },
+            vm: VmConfig {
+                mode: vm_mode,
+                macos_runner_image,
             },
             credential_store,
         })
