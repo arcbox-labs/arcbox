@@ -14,7 +14,18 @@ service FleetGatewayService {
   // credential in the `x-arcbox-machine-token` metadata key.
   // (Named Attach because tonic reserves `connect` on generated clients.)
   rpc Attach(stream AttachRequest) returns (stream AttachResponse);
+
+  // Machine-initiated removal from the fleet — terminal. Marks the machine
+  // decommissioned and revokes its credential in the same write; any live
+  // attach stream is evicted. Authenticated like Attach. Effectively
+  // idempotent from the machine's view: a repeat call fails UNAUTHENTICATED
+  // (the credential is already revoked), which the agent treats the same as
+  // success.
+  rpc Unenroll(UnenrollRequest) returns (UnenrollResponse);
 }
+
+message UnenrollRequest {}
+message UnenrollResponse {}
 
 message EnrollRequest {
   // Multi-use fleet join token: valid for any machine in the fleet until it
@@ -117,10 +128,12 @@ message AttachResponse {
 
 // Tells the agent to stop resending an offer verdict
 // (RunnerAccepted/RunnerRejected): the gateway either durably handed it off to
-// the workflow or found the offer obsolete (its workflow already moved on or
-// expired) — resending can achieve nothing more. Until it arrives, the agent
-// resends the same verdict so a gateway crash-after-read cannot lose it; the
-// echoed token lets the agent match the ack to the verdict it is retrying.
+// the workflow (which also covers an offer whose workflow already moved on or
+// expired — the completion is accepted and dropped) or proved the verdict can
+// never be delivered — resending can achieve nothing more. Until it arrives,
+// the agent resends the same verdict so a gateway crash-after-read cannot
+// lose it; the echoed token lets the agent match the ack to the verdict it is
+// retrying.
 message OfferVerdictAck {
   // Opaque correlation token from the offer, echoed back from the verdict.
   string offer_token = 1;
