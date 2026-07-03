@@ -63,6 +63,19 @@ pub fn authenticated_request<T>(message: T, machine_token: &str) -> Result<Reque
     Ok(request)
 }
 
+/// Whether the error chain contains an `UNAUTHENTICATED` gRPC status — the
+/// gateway's definitive "this credential is revoked" (a RUN-40
+/// decommission), surfaced either by the Attach handshake or as a
+/// mid-stream eviction item. Transport failures are not `Status` values,
+/// so an unreachable gateway never matches.
+fn is_unauthenticated(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(|status| status.code() == tonic::Code::Unauthenticated)
+    })
+}
+
 /// Convert a gateway-facing telemetry reading into its control-plane
 /// counterpart. A plain function, not `From`: both `HostTelemetry` types
 /// are generated in other crates, so Rust's orphan rule blocks implementing
@@ -158,6 +171,22 @@ pub async fn run(
         }
         match outcome {
             Ok(()) => info!("attach stream closed by gateway; reconnecting"),
+            Err(e) if is_unauthenticated(&e) => {
+                // The gateway definitively rejected the credential — the
+                // machine was decommissioned server-side (RUN-40), whether
+                // at the handshake or as a mid-stream eviction. Retrying can
+                // never succeed; park visibly instead, keeping the
+                // credential on disk until an operator unenrolls, so a
+                // server-side auth regression can never make agents wipe
+                // their own credentials.
+                warn!("gateway rejected the machine credential; parked until an explicit unenroll");
+                state.set_enrollment(
+                    control_proto::Enrollment::CredentialRejected,
+                    &credential.machine_id,
+                );
+                shutdown.cancelled().await;
+                break;
+            }
             Err(e) => {
                 warn!(error = %e, backoff_secs = backoff.as_secs(), "attach failed; retrying");
             }
@@ -379,6 +408,114 @@ mod tests {
             runner_script: None,
             participate: true,
         }
+    }
+
+    /// A gateway that rejects every call with `UNAUTHENTICATED` — what a
+    /// decommissioned machine's revoked credential meets (RUN-40).
+    struct RejectingGateway;
+
+    #[tonic::async_trait]
+    impl arcbox_fleet_proto::v1::fleet_gateway_service_server::FleetGatewayService
+        for RejectingGateway
+    {
+        async fn enroll(
+            &self,
+            _: Request<arcbox_fleet_proto::v1::EnrollRequest>,
+        ) -> Result<tonic::Response<arcbox_fleet_proto::v1::EnrollResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unauthenticated("machine decommissioned"))
+        }
+
+        type AttachStream = tokio_stream::wrappers::ReceiverStream<
+            Result<arcbox_fleet_proto::v1::AttachResponse, tonic::Status>,
+        >;
+
+        async fn attach(
+            &self,
+            _: Request<tonic::Streaming<AttachRequest>>,
+        ) -> Result<tonic::Response<Self::AttachStream>, tonic::Status> {
+            Err(tonic::Status::unauthenticated("machine decommissioned"))
+        }
+
+        async fn unenroll(
+            &self,
+            _: Request<arcbox_fleet_proto::v1::UnenrollRequest>,
+        ) -> Result<tonic::Response<arcbox_fleet_proto::v1::UnenrollResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unauthenticated("machine decommissioned"))
+        }
+    }
+
+    /// A revoked credential parks the attach loop: `CREDENTIAL_REJECTED` is
+    /// observable, no reconnect attempts follow, and the loop still exits
+    /// cleanly on shutdown (so unenroll's teardown works from parked).
+    #[tokio::test]
+    async fn attach_parks_visibly_when_the_gateway_rejects_the_credential() {
+        use arcbox_fleet_proto::v1::fleet_gateway_service_server::FleetGatewayServiceServer;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(FleetGatewayServiceServer::new(RejectingGateway))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+
+        let state = AgentState::new(&PersistedSettings {
+            gateway: gateway.clone(),
+            ..seed()
+        });
+        let config = AgentConfig {
+            gateway,
+            runner_script: None,
+            load_ceiling: 0.9,
+            mem_floor_mib: 2048,
+            data_dir: std::env::temp_dir(),
+            docker: crate::config::DockerConfig {
+                mode: DockerMode::Disabled,
+                linux_runner_image: "img".to_owned(),
+            },
+            credential_store: crate::config::CredentialMode::File,
+        };
+        let credential = Credential {
+            machine_id: "fltm_parked".to_owned(),
+            machine_token: "flt_revoked".to_owned(),
+        };
+        let (supervisor, egress_rx) = spawn_supervisor(&config, None, Vec::new(), state.clone());
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(run(
+            config,
+            credential,
+            supervisor,
+            egress_rx,
+            Vec::new(),
+            shutdown.clone(),
+            state.clone(),
+        ));
+
+        // The loop must reach the parked state rather than retry-looping.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = state.current();
+            if snapshot.enrollment == control_proto::Enrollment::CredentialRejected as i32 {
+                assert_eq!(snapshot.machine_id, "fltm_parked");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "never parked on the rejected credential"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Parked is not exited: the task is still alive, waiting on shutdown.
+        assert!(!run.is_finished());
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("parked loop exits on shutdown")
+            .expect("attach task must not panic")
+            .expect("clean exit");
     }
 
     /// The verdict-resend loop is attachment-scoped: cancelling the shutdown
