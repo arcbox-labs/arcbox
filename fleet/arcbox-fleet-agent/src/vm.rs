@@ -144,6 +144,26 @@ impl VmRunner {
         remove_vm(&mut client, &machine_name(job_id)).await;
     }
 
+    /// Pull `reference` through the daemon, returning its progress stream
+    /// (terminal event: stage `"done"`). `FleetImageService.Prepare` drives
+    /// this to converge `macos_runner_image` onto its target; a pull the
+    /// daemon already has registered completes immediately, so
+    /// re-preparation is cheap when nothing changed.
+    pub async fn pull(
+        &self,
+        reference: &str,
+    ) -> Result<tonic::Streaming<arcbox_protocol::v1::MacosImagePullEvent>> {
+        let mut client = self.client.clone();
+        let stream = client
+            .image_pull(arcbox_protocol::v1::MacosImagePullRequest {
+                reference: reference.to_owned(),
+                manifest_url: String::new(),
+            })
+            .await
+            .with_context(|| format!("pulling macOS image '{reference}' through the daemon"))?;
+        Ok(stream.into_inner())
+    }
+
     /// Provision a guest for `spec` and start the runner in it, returning a
     /// handle to await. Returning `Ok` means the runner command has been
     /// issued over SSH — the caller can then accept the offer. Any failure

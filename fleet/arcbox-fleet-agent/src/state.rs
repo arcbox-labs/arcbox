@@ -324,14 +324,6 @@ impl AgentState {
 
     /// The desired macOS image — what `FleetImageService.Prepare` pulls
     /// through the daemon and then promotes to `current`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by the macOS image Prepare path, which lands later in this \
-                  change set; the #[expect] forces removal then"
-        )
-    )]
     pub fn macos_runner_image_target(&self) -> String {
         settings_of(&self.tx.borrow())
             .macos_runner_image
@@ -521,14 +513,6 @@ impl AgentState {
         });
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by the macOS image Prepare path, which lands later in this \
-                  change set; the #[expect] forces removal then"
-        )
-    )]
     pub fn set_macos_runner_image_current(&self, value: &str) {
         self.tx.send_modify(|s| {
             value.clone_into(
