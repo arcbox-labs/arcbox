@@ -37,9 +37,6 @@ mod host;
 mod runner;
 mod settings;
 mod state;
-// The VM backend's job routing lands in the next commit of this change
-// set; the #[expect] forces this attribute's removal then.
-#[expect(dead_code)]
 mod vm;
 
 use std::path::PathBuf;
@@ -56,10 +53,11 @@ use clap::{Args, Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::config::{AgentConfig, DockerMode};
+use crate::config::{AgentConfig, DockerMode, VmMode};
 use crate::docker::DockerRunner;
 use crate::settings::{PersistedSettings, SettingsStore};
 use crate::state::AgentState;
+use crate::vm::VmRunner;
 
 #[derive(Debug, Parser)]
 #[command(name = "arcbox-fleet-agent", author, version, about)]
@@ -220,12 +218,12 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             let token = resolve_enrollment_token(token_file, token)?;
             let settings_store = SettingsStore::new(config.settings_path());
             let seed = load_or_seed_settings(&settings_store, &config)?;
-            // Enrollment is pure credential exchange — it never needs Docker, so
-            // an operator can enroll before the runtime is up. The capabilities
-            // sent here are an initial hint, replaced wholesale by the first
-            // heartbeat once the agent attaches, so we advertise what we know
-            // without probing the runtime.
-            let capabilities = capabilities(seed.runner_script.is_some(), None);
+            // Enrollment is pure credential exchange — it never needs Docker or
+            // the daemon, so an operator can enroll before either runtime is up.
+            // The capabilities sent here are an initial hint, replaced wholesale
+            // by the first heartbeat once the agent attaches, so we advertise
+            // what we know without probing the runtimes.
+            let capabilities = capabilities(seed.runner_script.is_some(), None, None);
             let credential = enroll::enroll(&config, token, capabilities, &seed.gateway).await?;
             config
                 .credential_store_for(&seed.gateway)
@@ -236,7 +234,14 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             let settings_store = SettingsStore::new(config.settings_path());
             let seed = load_or_seed_settings(&settings_store, &config)?;
             let docker = init_docker(seed.docker_mode, &seed.linux_runner_image).await?;
-            let capabilities = capabilities(seed.runner_script.is_some(), docker.as_ref());
+            let vm = init_vm(
+                seed.vm_mode,
+                &seed.macos_runner_image,
+                &config.vm.daemon_socket,
+            )
+            .await?;
+            let capabilities =
+                capabilities(seed.runner_script.is_some(), docker.as_ref(), vm.as_ref());
             let credential = config.credential_store_for(&seed.gateway).load()?.context(
                 "no credential found — run `arcbox-fleet-agent quick enroll --token-file …` first",
             )?;
@@ -253,6 +258,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             let (supervisor, egress_rx) = attach::spawn_supervisor(
                 &config,
                 docker,
+                vm,
                 capabilities.clone(),
                 agent_state.clone(),
             );
@@ -282,7 +288,14 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             let settings_store = SettingsStore::new(config.settings_path());
             let seed = load_or_seed_settings(&settings_store, &config)?;
             let docker = init_docker(seed.docker_mode, &seed.linux_runner_image).await?;
-            let capabilities = capabilities(seed.runner_script.is_some(), docker.as_ref());
+            let vm = init_vm(
+                seed.vm_mode,
+                &seed.macos_runner_image,
+                &config.vm.daemon_socket,
+            )
+            .await?;
+            let capabilities =
+                capabilities(seed.runner_script.is_some(), docker.as_ref(), vm.as_ref());
             let socket_path = config.control_socket_path();
 
             // Cascades to every attach task's child token, so runners still
@@ -295,6 +308,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 control::AgentSupervisor::new(
                     config,
                     docker,
+                    vm,
                     capabilities,
                     shutdown.clone(),
                     agent_state.clone(),
@@ -533,13 +547,17 @@ fn resolve_enrollment_token(token_file: Option<PathBuf>, token: Option<String>) 
     Ok(token)
 }
 
-/// Build the capabilities this agent advertises: the native host-runner
-/// capability (if a runner script is configured) plus any Docker-served
-/// Linux capabilities. Capacity is decided per offer from live telemetry,
-/// not here.
-fn capabilities(runner_script_present: bool, docker: Option<&DockerRunner>) -> Vec<Capability> {
+/// Build the capabilities this agent advertises: any Docker-served Linux
+/// capabilities, plus the native pair — VM-served when the daemon backend
+/// is active, else the host runner (if a runner script is configured).
+/// Capacity is decided per offer from live telemetry, not here.
+fn capabilities(
+    runner_script_present: bool,
+    docker: Option<&DockerRunner>,
+    vm: Option<&VmRunner>,
+) -> Vec<Capability> {
     let docker_arches = docker.map(DockerRunner::linux_arches).unwrap_or_default();
-    host::capabilities(runner_script_present, &docker_arches)
+    host::capabilities(runner_script_present, &docker_arches, vm.is_some())
 }
 
 /// Probe Docker availability according to `mode`.
@@ -554,6 +572,41 @@ async fn init_docker(mode: DockerMode, linux_runner_image: &str) -> Result<Optio
             Ok(runner) => Ok(Some(runner)),
             Err(e) => {
                 warn!(error = %e, "docker not available; linux capabilities will not be advertised");
+                Ok(None)
+            }
+        },
+    }
+}
+
+/// Probe the local arcbox-daemon's macOS VM backend according to `mode`
+/// (mirrors [`init_docker`]). The backend is macOS-only: on other hosts
+/// `Auto` resolves to none and `Enabled` fails startup.
+async fn init_vm(
+    mode: VmMode,
+    macos_runner_image: &str,
+    daemon_socket: &std::path::Path,
+) -> Result<Option<VmRunner>> {
+    if std::env::consts::OS != "macos" {
+        anyhow::ensure!(
+            mode != VmMode::Enabled,
+            "vm_mode=enabled requires a macOS host (the VM backend runs macOS guests via the \
+             local arcbox-daemon)"
+        );
+        return Ok(None);
+    }
+    match mode {
+        VmMode::Disabled => Ok(None),
+        VmMode::Enabled => {
+            let runner = VmRunner::new(daemon_socket, macos_runner_image).await?;
+            Ok(Some(runner))
+        }
+        VmMode::Auto => match VmRunner::new(daemon_socket, macos_runner_image).await {
+            Ok(runner) => Ok(Some(runner)),
+            Err(e) => {
+                warn!(
+                    error = format!("{e:#}"),
+                    "macOS VM backend not available; darwin jobs fall back to the host runner"
+                );
                 Ok(None)
             }
         },

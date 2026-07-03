@@ -92,11 +92,6 @@ pub struct VmConfig {
     pub macos_runner_image: String,
     /// arcbox-daemon gRPC socket — the daemon↔CLI socket contract
     /// (`~/.arcbox/run/arcbox.sock` by default, via `arcbox-constants`).
-    #[expect(
-        dead_code,
-        reason = "read by the VM backend's startup probe, which lands in the next commit \
-                  of this change set; the #[expect] forces removal then"
-    )]
     pub daemon_socket: PathBuf,
 }
 

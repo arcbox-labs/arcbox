@@ -34,10 +34,16 @@ impl FleetLifecycleService for LifecycleService {
         &self,
         _request: Request<GetAgentInfoRequest>,
     ) -> Result<Response<GetAgentInfoResponse>, Status> {
+        let mut features = Vec::new();
+        if self.supervisor.vm_active() {
+            // The local daemon serves disposable macOS guests for darwin
+            // jobs (see crate::vm).
+            features.push("vm-backend".to_owned());
+        }
         Ok(Response::new(GetAgentInfoResponse {
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
             api_version: API_VERSION,
-            features: Vec::new(),
+            features,
         }))
     }
 
