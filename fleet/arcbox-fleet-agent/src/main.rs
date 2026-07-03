@@ -130,10 +130,10 @@ enum SettingsCommand {
     Get,
     /// Update one or more settings. Only the flags given are changed;
     /// `load_ceiling`/`mem_floor_mib` apply on the next offer/job,
-    /// `linux_runner_image` once `prepare` verifies it, `gateway` on the
-    /// next reconnect, `participate` as soon as the detach/reattach
-    /// completes, and `docker_mode`/`runner_script` on the next full
-    /// restart.
+    /// `linux_runner_image` once `prepare` verifies it, `participate` as
+    /// soon as the detach/reattach completes, and `docker_mode`/
+    /// `runner_script` on the next full restart. `gateway` is only
+    /// settable while unenrolled (it takes effect on the next enroll).
     Set {
         #[arg(long)]
         load_ceiling: Option<f64>,
