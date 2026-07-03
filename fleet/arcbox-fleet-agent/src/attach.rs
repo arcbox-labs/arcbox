@@ -365,7 +365,7 @@ mod tests {
         PersistedSettings {
             load_ceiling: 0.9,
             mem_floor_mib: 2048,
-            runner_image: "img".to_owned(),
+            linux_runner_image: "img".to_owned(),
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: DockerMode::Disabled,
             runner_script: None,
@@ -400,7 +400,7 @@ mod tests {
             data_dir: std::env::temp_dir(),
             docker: crate::config::DockerConfig {
                 mode: DockerMode::Disabled,
-                runner_image: "img".to_owned(),
+                linux_runner_image: "img".to_owned(),
             },
             credential_store: crate::config::CredentialMode::File,
         }

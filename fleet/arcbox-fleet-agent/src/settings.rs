@@ -22,7 +22,7 @@ use crate::fsutil::{write_json_atomic, write_owner_only};
 pub struct PersistedSettings {
     pub load_ceiling: f64,
     pub mem_floor_mib: u64,
-    pub runner_image: String,
+    pub linux_runner_image: String,
     pub gateway: String,
     pub docker_mode: DockerMode,
     /// Direct path to the runner entry point (`run.sh`), not its containing
@@ -36,7 +36,7 @@ impl From<&AgentConfig> for PersistedSettings {
         Self {
             load_ceiling: config.load_ceiling,
             mem_floor_mib: config.mem_floor_mib,
-            runner_image: config.docker.runner_image.clone(),
+            linux_runner_image: config.docker.linux_runner_image.clone(),
             gateway: config.gateway.clone(),
             docker_mode: config.docker.mode,
             runner_script: config.runner_script.clone(),
@@ -94,7 +94,7 @@ mod tests {
         PersistedSettings {
             load_ceiling: 0.75,
             mem_floor_mib: 4096,
-            runner_image: "ghcr.io/actions/actions-runner:latest".to_owned(),
+            linux_runner_image: "ghcr.io/actions/actions-runner:latest".to_owned(),
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: DockerMode::Auto,
             runner_script: Some(PathBuf::from("/opt/actions-runner/run.sh")),
@@ -133,7 +133,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/does-not-matter"),
             docker: crate::config::DockerConfig {
                 mode: DockerMode::Enabled,
-                runner_image: "example/image:latest".to_owned(),
+                linux_runner_image: "example/image:latest".to_owned(),
             },
             credential_store: crate::config::CredentialMode::File,
         };
@@ -144,6 +144,6 @@ mod tests {
         assert_eq!(seeded.load_ceiling, config.load_ceiling);
         assert_eq!(seeded.mem_floor_mib, config.mem_floor_mib);
         assert_eq!(seeded.docker_mode, config.docker.mode);
-        assert_eq!(seeded.runner_image, config.docker.runner_image);
+        assert_eq!(seeded.linux_runner_image, config.docker.linux_runner_image);
     }
 }

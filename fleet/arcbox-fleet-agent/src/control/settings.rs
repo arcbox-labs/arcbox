@@ -22,7 +22,7 @@ pub struct SettingsService {
     state: AgentState,
     store: SettingsStore,
     /// The process-lifetime Docker handle, if configured — used to validate
-    /// a candidate `runner_image` against currently-advertised arches. Never
+    /// a candidate `linux_runner_image` against currently-advertised arches. Never
     /// stale: `docker_mode` changes are restart-scoped (see
     /// `AgentSupervisor::docker`'s doc).
     docker: Option<DockerRunner>,
@@ -39,13 +39,13 @@ impl SettingsService {
 
     /// If Docker is configured and currently advertising at least one Linux
     /// arch, verify `image` can still be pulled for those arches before
-    /// accepting it — otherwise a bad runner_image swap is only discovered
+    /// accepting it — otherwise a bad linux_runner_image swap is only discovered
     /// later, as avoidable accept-then-reject churn at job dispatch (see
     /// `docker.rs`'s `DockerRunner::new` doc). Rejects only if the new image
     /// serves *none* of the currently-advertised arches, matching this
     /// module's docker_mode/runner_script "leaves nothing servable"
     /// precedent below — a partial mismatch (the new image drops one of
-    /// several arches) is allowed through, since blocking every runner_image
+    /// several arches) is allowed through, since blocking every linux_runner_image
     /// change over one dropped minor arch would be stricter than that
     /// precedent intends.
     async fn validate_runner_image(&self, image: &str) -> Result<(), String> {
@@ -59,7 +59,7 @@ impl SettingsService {
         let still_servable = docker.verify_pullable(image, &served).await;
         if still_servable.is_empty() {
             return Err(format!(
-                "runner_image {image} could not be pulled for any currently-served Linux \
+                "linux_runner_image {image} could not be pulled for any currently-served Linux \
                  architecture ({served:?}); this would leave Docker-backed jobs unable to run"
             ));
         }
@@ -84,7 +84,7 @@ impl FleetSettingsServiceTrait for SettingsService {
     ) -> Result<Response<UpdateSettingsResponse>, Status> {
         let req = request.into_inner();
         validate(&req, &self.state).map_err(Status::invalid_argument)?;
-        if let Some(image) = &req.runner_image {
+        if let Some(image) = &req.linux_runner_image {
             self.validate_runner_image(image)
                 .await
                 .map_err(Status::invalid_argument)?;
@@ -96,8 +96,8 @@ impl FleetSettingsServiceTrait for SettingsService {
         if let Some(v) = req.mem_floor_mib {
             self.state.set_mem_floor_mib(v);
         }
-        if let Some(v) = req.runner_image {
-            self.state.set_runner_image(v);
+        if let Some(v) = req.linux_runner_image {
+            self.state.set_linux_runner_image(v);
         }
         if let Some(v) = &req.gateway {
             self.state.set_gateway_target(v);
@@ -135,9 +135,9 @@ fn validate(req: &UpdateSettingsRequest, state: &AgentState) -> Result<(), Strin
             return Err("load_ceiling must be a positive number".to_owned());
         }
     }
-    if let Some(runner_image) = &req.runner_image {
-        if runner_image.trim().is_empty() {
-            return Err("runner_image must not be empty".to_owned());
+    if let Some(linux_runner_image) = &req.linux_runner_image {
+        if linux_runner_image.trim().is_empty() {
+            return Err("linux_runner_image must not be empty".to_owned());
         }
     }
     if let Some(gateway) = &req.gateway {
@@ -194,7 +194,7 @@ mod tests {
         PersistedSettings {
             load_ceiling: 0.9,
             mem_floor_mib: 2048,
-            runner_image: "ghcr.io/actions/actions-runner:latest".to_owned(),
+            linux_runner_image: "ghcr.io/actions/actions-runner:latest".to_owned(),
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: DockerMode::Auto,
             runner_script: None,
@@ -205,7 +205,7 @@ mod tests {
         UpdateSettingsRequest {
             load_ceiling: None,
             mem_floor_mib: None,
-            runner_image: None,
+            linux_runner_image: None,
             gateway: None,
             docker_mode: None,
             runner_script: None,
@@ -301,7 +301,7 @@ mod tests {
 
     /// The pull-check itself needs a live Docker daemon (see `docker.rs`,
     /// which has no unit tests for the same reason), but the "no Docker
-    /// configured" guard is a plain branch and must accept any runner_image
+    /// configured" guard is a plain branch and must accept any linux_runner_image
     /// unconditionally rather than, say, panicking on an absent `DockerRunner`.
     #[tokio::test]
     async fn validate_runner_image_accepts_anything_without_docker() {

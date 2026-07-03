@@ -423,7 +423,7 @@ impl RunnerSupervisor {
         // Startup is cancellation-aware: a slow image pull must not make the
         // agent deaf to CancelRunner and then accept a job the platform has
         // already concluded.
-        let runner_image = self.inner.state.runner_image_current();
+        let runner_image = self.inner.state.linux_runner_image_current();
         let started = {
             let start = std::pin::pin!(docker.start(RunSpec {
                 job_id,
@@ -582,7 +582,7 @@ mod tests {
         crate::settings::PersistedSettings {
             load_ceiling: 0.9,
             mem_floor_mib: 2048,
-            runner_image: "ghcr.io/actions/actions-runner:latest".to_owned(),
+            linux_runner_image: "ghcr.io/actions/actions-runner:latest".to_owned(),
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: crate::config::DockerMode::Auto,
             runner_script: None,
