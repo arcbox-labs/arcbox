@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arcbox_fleet_control_proto::v1::{
-    AgentSettings, AgentStateSnapshot, Capability, DockerModeSetting, DoubleSetting, Enrollment,
-    HostTelemetry, InFlightJob, OfferVerdict, StringSetting, Uint64Setting,
+    AgentSettings, AgentStateSnapshot, BoolSetting, Capability, DockerModeSetting, DoubleSetting,
+    Enrollment, HostTelemetry, InFlightJob, OfferVerdict, StringSetting, Uint64Setting,
 };
 use tokio::sync::watch;
 
@@ -125,6 +125,10 @@ impl AgentState {
                 current: runner_script.clone(),
                 target: runner_script,
             }),
+            participate: Some(BoolSetting {
+                current: seed.participate,
+                target: seed.participate,
+            }),
         };
         let (tx, _) = watch::channel(AgentStateSnapshot {
             enrollment: Enrollment::Unenrolled as i32,
@@ -179,6 +183,7 @@ impl AgentState {
             runner_script: setting_value_to_path(
                 &s.runner_script.as_ref().expect(SETTINGS_INVARIANT).target,
             ),
+            participate: s.participate.as_ref().expect(SETTINGS_INVARIANT).target,
         }
     }
 
@@ -262,6 +267,16 @@ impl AgentState {
             .clone()
     }
 
+    /// The desired participation — what `AgentSupervisor`'s reconciler
+    /// converges the attachment onto.
+    pub fn participate_target(&self) -> bool {
+        settings_of(&self.tx.borrow())
+            .participate
+            .as_ref()
+            .expect(SETTINGS_INVARIANT)
+            .target
+    }
+
     /// The desired gateway — what `attach.rs` dials on its next attempt.
     /// There's no `gateway_current` reader: nothing needs to read back what
     /// was last dialed outside of the full `settings()`/`persisted_settings()`
@@ -287,13 +302,15 @@ impl AgentState {
     // actually found Docker is observable via `capabilities`, not by
     // resolving `current` away from the requested policy.
     //
-    // `gateway` and `linux_runner_image` have independent `current`
-    // setters, written only once the engine has realized the value:
-    // `attach.rs` sets the gateway's `current` when it has actually dialed
-    // that gateway, and `FleetImageService.Prepare` sets the image's
+    // `gateway`, `linux_runner_image`, and `participate` have independent
+    // `current` setters, written only once the engine has realized the
+    // value: `attach.rs` sets the gateway's `current` when it has actually
+    // dialed that gateway, `FleetImageService.Prepare` sets the image's
     // `current` when the target has been pulled for every advertised arch
     // (startup's `init_docker` verifies the seed the same way, which is
-    // why `AgentState::new` may seed `current == target`).
+    // why `AgentState::new` may seed `current == target`), and the
+    // supervisor's participation reconciler flips `participate`'s
+    // `current` when the detach/reattach completes.
 
     pub fn set_load_ceiling(&self, value: f64) {
         self.tx.send_modify(|s| {
@@ -386,6 +403,26 @@ impl AgentState {
                 .target = value;
         });
     }
+
+    pub fn set_participate_target(&self, value: bool) {
+        self.tx.send_modify(|s| {
+            settings_mut(s)
+                .participate
+                .as_mut()
+                .expect(SETTINGS_INVARIANT)
+                .target = value;
+        });
+    }
+
+    pub fn set_participate_current(&self, value: bool) {
+        self.tx.send_modify(|s| {
+            settings_mut(s)
+                .participate
+                .as_mut()
+                .expect(SETTINGS_INVARIANT)
+                .current = value;
+        });
+    }
 }
 
 #[cfg(test)]
@@ -405,6 +442,7 @@ mod tests {
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: DockerMode::Auto,
             runner_script: None,
+            participate: true,
         }
     }
 

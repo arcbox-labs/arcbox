@@ -188,6 +188,9 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
     let runner_script = settings.runner_script.expect("runner_script present");
     assert_eq!(runner_script.current, "");
     assert_eq!(runner_script.current, runner_script.target);
+    let participate = settings.participate.expect("participate present");
+    assert!(participate.current);
+    assert!(participate.target);
 
     // UpdateSettings: load_ceiling applies instantly — current and target
     // both move together, with no reattach or restart involved.
@@ -271,6 +274,45 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
         .expect("linux_runner_image present");
     assert_eq!(prepared.current, "ghcr.io/acme/runner:v2");
     assert_eq!(prepared.current, prepared.target);
+
+    // participate rides the same settings surface, target-only: the
+    // supervisor's reconciler realizes it. Unenrolled, there is nothing to
+    // detach, so `current` follows the target trivially — but still
+    // asynchronously (the reconciler observes the watch channel), so poll
+    // briefly rather than assume ordering.
+    let updated = settings_client
+        .update_settings(UpdateSettingsRequest {
+            participate: Some(false),
+            ..Default::default()
+        })
+        .await
+        .expect("UpdateSettings")
+        .into_inner()
+        .settings
+        .expect("settings present")
+        .participate
+        .expect("participate present");
+    assert!(!updated.target);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let participate = settings_client
+            .get_settings(GetSettingsRequest {})
+            .await
+            .expect("GetSettings")
+            .into_inner()
+            .settings
+            .expect("settings present")
+            .participate
+            .expect("participate present");
+        if !participate.current {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "reconciler never realized participate=false on an unenrolled agent"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Safety invariant enforced end-to-end: this agent already has
     // docker_mode=Disabled and no runner_script (its env-derived seed —

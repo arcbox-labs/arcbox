@@ -146,6 +146,7 @@ mod tests {
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: DockerMode::Disabled,
             runner_script: None,
+            participate: true,
         }
     }
 

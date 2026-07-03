@@ -114,7 +114,7 @@ pub async fn serve(
 /// react to cancellation before clearing the credential anyway. The task's
 /// own runner teardown is separately bounded by `attach::run`'s
 /// `SHUTDOWN_GRACE`; this only needs to cover that plus scheduling overhead.
-const UNENROLL_GRACE: Duration = Duration::from_secs(20);
+const TEARDOWN_GRACE: Duration = Duration::from_secs(20);
 
 /// Bound on the best-effort gateway `Unenroll` call inside
 /// [`AgentSupervisor::unenroll`]. Generous for a healthy round-trip, but a
@@ -127,7 +127,7 @@ const GATEWAY_UNENROLL_TIMEOUT: Duration = Duration::from_secs(10);
 /// time this returns regardless of whether it ever observed its own
 /// cancellation signal. Split out from [`AgentSupervisor::unenroll`] so
 /// the abort-on-timeout behavior can be exercised directly with a short
-/// `grace`, instead of the real [`UNENROLL_GRACE`].
+/// `grace`, instead of the real [`TEARDOWN_GRACE`].
 ///
 /// Polls `&mut task` rather than the owned handle so it survives a timeout:
 /// `tokio::time::timeout` drops its future on `Elapsed`, and dropping a
@@ -161,6 +161,10 @@ fn check_enrollable(state: &State) -> Result<(), &'static str> {
     match state {
         State::Unenrolled => Ok(()),
         State::Unenrolling => Err("unenroll in progress — retry shortly"),
+        State::Detaching => Err("detach in progress — retry shortly"),
+        State::Detached { .. } => {
+            Err("already enrolled — set participate=true to reattach, or unenroll first")
+        }
         State::Attached(_) => Err("already enrolled — unenroll first"),
     }
 }
@@ -189,12 +193,24 @@ struct Attachment {
 
 enum State {
     Unenrolled,
-    /// A `Unenroll` is tearing its attachment down (bounded by
-    /// [`UNENROLL_GRACE`]). `Enroll` is refused while here: an enrollment
+    /// An `Unenroll` is tearing its attachment down (bounded by
+    /// [`TEARDOWN_GRACE`]). `Enroll` is refused while here: an enrollment
     /// that raced into the teardown window would have its observable state
     /// stomped by the old task's late writes and by unenroll's own final
     /// `Unenrolled` re-assert, so the window is closed instead of fenced.
     Unenrolling,
+    /// The participation reconciler is tearing its attachment down
+    /// (`participate` moved to false). Same gating rationale as
+    /// [`State::Unenrolling`].
+    Detaching,
+    /// Enrolled — the credential is kept for reattaching — but deliberately
+    /// offline: `participate` is false. The machine shows Offline
+    /// server-side.
+    Detached {
+        credential: Credential,
+        /// See [`Attachment::credential_gateway`].
+        credential_gateway: String,
+    },
     Attached(Attachment),
 }
 
@@ -244,8 +260,20 @@ impl AgentSupervisor {
         let gateway = this.agent_state.gateway_target();
         let existing = this.credential_store_for(&gateway).load()?;
         if let Some(credential) = existing {
-            info!(machine_id = %credential.machine_id, "starting fleet agent (credential on disk)");
-            *this.state.lock().await = State::Attached(this.attach(credential, gateway));
+            if this.agent_state.participate_target() {
+                info!(machine_id = %credential.machine_id, "starting fleet agent (credential on disk)");
+                *this.state.lock().await = State::Attached(this.attach(credential, gateway));
+            } else {
+                // An operator's detach must survive a launchd restart — a
+                // silent reattach here would betray it.
+                info!(machine_id = %credential.machine_id, "starting fleet agent detached (participate=false)");
+                this.agent_state
+                    .set_enrollment(Enrollment::Detached, &credential.machine_id);
+                *this.state.lock().await = State::Detached {
+                    credential,
+                    credential_gateway: gateway,
+                };
+            }
         }
         Ok(this)
     }
@@ -278,6 +306,8 @@ impl AgentSupervisor {
     fn attach(&self, credential: Credential, credential_gateway: String) -> Attachment {
         self.agent_state
             .set_enrollment(Enrollment::Attaching, &credential.machine_id);
+        // Attaching realizes participation.
+        self.agent_state.set_participate_current(true);
         // A fresh attachment always starts accepting: `Drain` is runtime-only
         // (never persisted), and the previous attachment's teardown shares this
         // process-lifetime state, so clear any stale draining flag rather than
@@ -346,17 +376,20 @@ impl AgentSupervisor {
             .store(&credential)
             .map_err(Internal)?;
 
-        // Persist an explicit gateway override the same way
-        // `FleetSettingsService.UpdateSettings` persists any other setting.
-        // `attach()` below dials `gateway_target`, so both `current` and
-        // `target` already agree with what happens next.
+        // Enrolling is an explicit act of participation: override a stale
+        // participate=false so the reconciler doesn't immediately detach
+        // the attachment started below. Persisted together with an explicit
+        // gateway override, the same way `UpdateSettings` persists any
+        // other setting; `attach()` below dials `gateway_target`, so both
+        // `current` and `target` already agree with what happens next.
+        self.agent_state.set_participate_target(true);
         if let Some(control_plane) = control_plane {
             self.agent_state.set_gateway_target(control_plane);
             self.agent_state.set_gateway_current(control_plane);
-            self.settings_store
-                .store(&self.agent_state.persisted_settings())
-                .map_err(Internal)?;
         }
+        self.settings_store
+            .store(&self.agent_state.persisted_settings())
+            .map_err(Internal)?;
 
         let machine_id = credential.machine_id.clone();
         *state = State::Attached(self.attach(credential, gateway));
@@ -367,10 +400,19 @@ impl AgentSupervisor {
     /// machine at the gateway (best-effort), and removes the persisted
     /// credential. Observably `Unenrolled` immediately (`GetStatus`/
     /// `Watch`); the attach task's own teardown finishes in the background,
-    /// bounded by [`UNENROLL_GRACE`], and `Enroll` is refused until it
+    /// bounded by [`TEARDOWN_GRACE`], and `Enroll` is refused until it
     /// completes (see [`State::Unenrolling`]).
     pub async fn unenroll(&self) -> Result<(), Status> {
-        let attachment = {
+        // What we are leaving from: a live attachment (needs teardown) or a
+        // detached-but-enrolled state (credential only).
+        enum Leaving {
+            Attached(Attachment),
+            Detached {
+                credential: Credential,
+                credential_gateway: String,
+            },
+        }
+        let leaving = {
             let mut state = self.state.lock().await;
             match &*state {
                 State::Unenrolled => {
@@ -379,12 +421,13 @@ impl AgentSupervisor {
                 State::Unenrolling => {
                     return Err(Status::failed_precondition("unenroll already in progress"));
                 }
-                State::Attached(_) => {}
+                State::Detaching => {
+                    return Err(Status::failed_precondition(
+                        "detach in progress — retry shortly",
+                    ));
+                }
+                State::Attached(_) | State::Detached { .. } => {}
             }
-            let State::Attached(attachment) = std::mem::replace(&mut *state, State::Unenrolling)
-            else {
-                unreachable!("checked above");
-            };
             // Immediate observability: `GetStatus`/`Watch` read only
             // `agent_state`, not the `Mutex<State>`, so without this a
             // concurrent caller would see stale state for the whole grace
@@ -392,16 +435,35 @@ impl AgentSupervisor {
             // other `agent_state` enrollment write happens under it too, so
             // none can interleave here.
             self.agent_state.set_enrollment(Enrollment::Unenrolled, "");
-            attachment
+            match std::mem::replace(&mut *state, State::Unenrolling) {
+                State::Attached(attachment) => Leaving::Attached(attachment),
+                State::Detached {
+                    credential,
+                    credential_gateway,
+                } => Leaving::Detached {
+                    credential,
+                    credential_gateway,
+                },
+                _ => unreachable!("checked above"),
+            }
         };
 
-        attachment.shutdown.cancel();
-        join_or_abort(attachment.task, UNENROLL_GRACE).await;
+        let (credential, credential_gateway) = match leaving {
+            Leaving::Attached(attachment) => {
+                attachment.shutdown.cancel();
+                join_or_abort(attachment.task, TEARDOWN_GRACE).await;
+                (attachment.credential, attachment.credential_gateway)
+            }
+            Leaving::Detached {
+                credential,
+                credential_gateway,
+            } => (credential, credential_gateway),
+        };
 
-        // Authoritative: the task is provably stopped (joined or aborted)
-        // and `Unenrolling` kept every `Enroll` out of the grace window,
-        // so no live attachment's state can be stomped here and no stale
-        // write from the old task survives it.
+        // Authoritative: any attach task is provably stopped (joined or
+        // aborted) and `Unenrolling` kept every `Enroll` out of the grace
+        // window, so no live attachment's state can be stomped here and no
+        // stale write from the old task survives it.
         {
             let mut state = self.state.lock().await;
             *state = State::Unenrolled;
@@ -415,21 +477,17 @@ impl AgentSupervisor {
         // from its side.
         match tokio::time::timeout(
             GATEWAY_UNENROLL_TIMEOUT,
-            enroll::unenroll(
-                &self.config,
-                &attachment.credential_gateway,
-                &attachment.credential.machine_token,
-            ),
+            enroll::unenroll(&self.config, &credential_gateway, &credential.machine_token),
         )
         .await
         {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                warn!(error = %e, gateway = %attachment.credential_gateway,
+                warn!(error = %e, gateway = %credential_gateway,
                       "gateway unenroll failed; clearing the local credential anyway");
             }
             Err(_) => {
-                warn!(gateway = %attachment.credential_gateway,
+                warn!(gateway = %credential_gateway,
                       "gateway unenroll timed out; clearing the local credential anyway");
             }
         }
@@ -438,9 +496,92 @@ impl AgentSupervisor {
         // live `gateway_target`, which a settings update may have moved
         // while attached (see `Attachment::credential_gateway`).
         Ok(self
-            .credential_store_for(&attachment.credential_gateway)
+            .credential_store_for(&credential_gateway)
             .clear()
             .map_err(Internal)?)
+    }
+
+    /// Converge the attachment onto the `participate` target: detach (keep
+    /// the credential) when it moves to false, reattach with the kept
+    /// credential when it moves back to true. One pass; the reconciler task
+    /// re-invokes it on every [`AgentState`] change — including this
+    /// method's own writes, which is what re-checks a target that flipped
+    /// mid-teardown.
+    async fn reconcile_participation(&self) {
+        let target = self.agent_state.participate_target();
+        let mut state = self.state.lock().await;
+        match &*state {
+            State::Attached(_) if !target => {
+                let State::Attached(attachment) = std::mem::replace(&mut *state, State::Detaching)
+                else {
+                    unreachable!("just matched");
+                };
+                let machine_id = attachment.credential.machine_id.clone();
+                // Immediate observability, written under the lock (the same
+                // discipline as `unenroll`).
+                self.agent_state
+                    .set_enrollment(Enrollment::Detached, &machine_id);
+                drop(state);
+
+                attachment.shutdown.cancel();
+                join_or_abort(attachment.task, TEARDOWN_GRACE).await;
+
+                let mut state = self.state.lock().await;
+                *state = State::Detached {
+                    credential: attachment.credential,
+                    credential_gateway: attachment.credential_gateway,
+                };
+                // Authoritative re-assert + realized flag: the task is
+                // provably stopped and `Detaching` kept `Enroll` out.
+                self.agent_state
+                    .set_enrollment(Enrollment::Detached, &machine_id);
+                self.agent_state.set_participate_current(false);
+                info!(machine_id = %machine_id, "detached from the fleet (participate=false)");
+            }
+            State::Detached { .. } if target => {
+                let State::Detached {
+                    credential,
+                    credential_gateway,
+                } = std::mem::replace(&mut *state, State::Unenrolled)
+                else {
+                    unreachable!("just matched");
+                };
+                info!(machine_id = %credential.machine_id, "reattaching (participate=true)");
+                // `attach` is synchronous (it only spawns), so the
+                // transitional `Unenrolled` above is never observable: the
+                // lock is held across both writes.
+                *state = State::Attached(self.attach(credential, credential_gateway));
+            }
+            // Nothing to attach or detach: the wish is trivially realized.
+            State::Unenrolled => self.agent_state.set_participate_current(target),
+            _ => {}
+        }
+    }
+
+    /// Drive [`Self::reconcile_participation`] from the [`AgentState`]
+    /// watch channel until `shutdown` fires. This is what lets
+    /// `FleetSettingsService` stay free of any supervisor dependency:
+    /// settings write the target, the supervisor observes and converges.
+    pub fn spawn_participation_reconciler(
+        self: &Arc<Self>,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut rx = this.agent_state.subscribe();
+            loop {
+                this.reconcile_participation().await;
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => break,
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
     }
 
     /// Stop accepting new offers; in-flight jobs finish normally.
@@ -453,6 +594,9 @@ impl AgentSupervisor {
             State::Unenrolled | State::Unenrolling => {
                 Err(Status::failed_precondition("not enrolled"))
             }
+            State::Detaching | State::Detached { .. } => Err(Status::failed_precondition(
+                "not attached (participate=false)",
+            )),
         }
     }
 
@@ -466,6 +610,9 @@ impl AgentSupervisor {
             State::Unenrolled | State::Unenrolling => {
                 Err(Status::failed_precondition("not enrolled"))
             }
+            State::Detaching | State::Detached { .. } => Err(Status::failed_precondition(
+                "not attached (participate=false)",
+            )),
         }
     }
 
@@ -480,6 +627,7 @@ impl AgentSupervisor {
             Enrollment::try_from(snapshot.enrollment).unwrap_or(Enrollment::Unenrolled);
         let state = match enrollment {
             Enrollment::Unspecified | Enrollment::Unenrolled => ConnectionState::Unenrolled,
+            Enrollment::Detached => ConnectionState::Detached,
             Enrollment::Attaching | Enrollment::Attached if snapshot.draining => {
                 ConnectionState::Draining
             }
@@ -497,9 +645,13 @@ impl AgentSupervisor {
             let mut state = self.state.lock().await;
             match std::mem::replace(&mut *state, State::Unenrolled) {
                 State::Attached(a) => Some(a),
-                // During `Unenrolling` the unenroll call owns the
-                // attachment handle and awaits it itself; nothing to join.
-                State::Unenrolled | State::Unenrolling => None,
+                // During `Unenrolling`/`Detaching` the transition owns the
+                // attachment handle and awaits it itself; `Detached` has no
+                // task at all. Nothing to join.
+                State::Unenrolled
+                | State::Unenrolling
+                | State::Detaching
+                | State::Detached { .. } => None,
             }
         };
         if let Some(a) = attachment {
@@ -526,6 +678,7 @@ mod tests {
             gateway: "http://127.0.0.1:1".to_owned(),
             docker_mode: DockerMode::Disabled,
             runner_script: None,
+            participate: true,
         }
     }
 
@@ -544,7 +697,171 @@ mod tests {
         }
     }
 
-    /// While a unenroll is inside its teardown grace, a concurrent
+    /// Build an unenrolled supervisor over a scratch data dir.
+    async fn test_supervisor(
+        dir: &std::path::Path,
+        agent_state: AgentState,
+    ) -> Arc<AgentSupervisor> {
+        Arc::new(
+            AgentSupervisor::new(
+                test_config(dir.to_path_buf()),
+                None,
+                Vec::new(),
+                CancellationToken::new(),
+                agent_state,
+                SettingsStore::new(dir.join("settings.json")),
+            )
+            .await
+            .expect("no credential on disk, so no attach on startup"),
+        )
+    }
+
+    fn test_credential() -> Credential {
+        Credential {
+            machine_id: "fltm_test".to_owned(),
+            machine_token: "flt_token_test".to_owned(),
+        }
+    }
+
+    /// The reconciler realizes `participate=false` by detaching — the
+    /// credential is kept in the `Detached` state, the enrollment shows
+    /// Detached, and `current` flips false — and realizes `true` again by
+    /// reattaching with that same credential.
+    #[tokio::test]
+    async fn reconciler_detaches_and_reattaches_keeping_the_credential() {
+        let dir = std::env::temp_dir().join(format!("fleet-participate-{}", std::process::id()));
+        let agent_state = AgentState::new(&seed());
+        let supervisor = test_supervisor(&dir, agent_state.clone()).await;
+
+        // Inject a live attachment whose task observes its cancel promptly.
+        let shutdown = supervisor.process_shutdown.child_token();
+        let task_token = shutdown.clone();
+        let task = tokio::spawn(async move {
+            task_token.cancelled().await;
+            Ok(())
+        });
+        let (events, _events_rx) = tokio::sync::mpsc::channel(1);
+        let runner = crate::runner::RunnerSupervisor::new(
+            events,
+            None,
+            None,
+            Vec::new(),
+            agent_state.clone(),
+        );
+        *supervisor.state.lock().await = State::Attached(Attachment {
+            supervisor: runner,
+            shutdown,
+            task,
+            credential: test_credential(),
+            credential_gateway: "http://127.0.0.1:1".to_owned(),
+        });
+
+        agent_state.set_participate_target(false);
+        supervisor.reconcile_participation().await;
+
+        {
+            let state = supervisor.state.lock().await;
+            let State::Detached { credential, .. } = &*state else {
+                panic!("expected Detached after reconciling participate=false");
+            };
+            assert_eq!(credential.machine_id, "fltm_test");
+        }
+        let snapshot = agent_state.current();
+        assert_eq!(snapshot.enrollment, Enrollment::Detached as i32);
+        assert_eq!(snapshot.machine_id, "fltm_test");
+        assert!(!agent_state.settings().participate.unwrap().current);
+
+        agent_state.set_participate_target(true);
+        supervisor.reconcile_participation().await;
+
+        assert!(matches!(
+            &*supervisor.state.lock().await,
+            State::Attached(_)
+        ));
+        assert!(agent_state.settings().participate.unwrap().current);
+        // The fresh attachment starts dialing (the gateway is unreachable in
+        // this test, so it stays Attaching — which is enough to prove the
+        // kept credential was reused).
+        assert_eq!(
+            agent_state.current().enrollment,
+            Enrollment::Attaching as i32
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Unenroll must also work from `Detached` (leave the fleet while
+    /// offline): no task to tear down, straight to the credential clear.
+    #[tokio::test]
+    async fn unenroll_from_detached_clears_the_credential() {
+        let dir = std::env::temp_dir().join(format!("fleet-det-unenroll-{}", std::process::id()));
+        let agent_state = AgentState::new(&seed());
+        let supervisor = test_supervisor(&dir, agent_state.clone()).await;
+
+        let store = supervisor.credential_store_for("http://127.0.0.1:1");
+        store
+            .store(&test_credential())
+            .expect("persist test credential");
+        *supervisor.state.lock().await = State::Detached {
+            credential: test_credential(),
+            credential_gateway: "http://127.0.0.1:1".to_owned(),
+        };
+        agent_state.set_enrollment(Enrollment::Detached, "fltm_test");
+
+        supervisor.unenroll().await.expect("unenroll from detached");
+
+        assert!(matches!(*supervisor.state.lock().await, State::Unenrolled));
+        assert_eq!(
+            agent_state.current().enrollment,
+            Enrollment::Unenrolled as i32
+        );
+        assert!(store.load().expect("store readable").is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A persisted `participate=false` must survive a restart: the agent
+    /// starts detached instead of silently reattaching.
+    #[tokio::test]
+    async fn startup_honors_persisted_participate_false() {
+        let dir = std::env::temp_dir().join(format!("fleet-start-det-{}", std::process::id()));
+        let config = test_config(dir.clone());
+        CredentialStore::new(
+            config.credential_store,
+            config.credentials_path(),
+            "http://127.0.0.1:1",
+        )
+        .store(&test_credential())
+        .expect("persist test credential");
+
+        let agent_state = AgentState::new(&PersistedSettings {
+            participate: false,
+            ..seed()
+        });
+        let supervisor = AgentSupervisor::new(
+            config,
+            None,
+            Vec::new(),
+            CancellationToken::new(),
+            agent_state.clone(),
+            SettingsStore::new(dir.join("settings.json")),
+        )
+        .await
+        .expect("startup with credential");
+
+        assert!(matches!(
+            *supervisor.state.lock().await,
+            State::Detached { .. }
+        ));
+        let snapshot = agent_state.current();
+        assert_eq!(snapshot.enrollment, Enrollment::Detached as i32);
+        assert_eq!(snapshot.machine_id, "fltm_test");
+        assert!(!agent_state.settings().participate.unwrap().current);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// While an unenroll is inside its teardown grace, a concurrent
     /// `Enroll` must be refused — not succeed and then have its observable
     /// state stomped by the unenroll's final `Unenrolled` re-assert (or
     /// by the old task's late writes). Once the unenroll completes, the

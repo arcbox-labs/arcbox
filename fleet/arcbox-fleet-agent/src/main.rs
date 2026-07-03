@@ -131,7 +131,8 @@ enum SettingsCommand {
     /// Update one or more settings. Only the flags given are changed;
     /// `load_ceiling`/`mem_floor_mib` apply on the next offer/job,
     /// `linux_runner_image` once `prepare` verifies it, `gateway` on the
-    /// next reconnect, and `docker_mode`/`runner_script` on the next full
+    /// next reconnect, `participate` as soon as the detach/reattach
+    /// completes, and `docker_mode`/`runner_script` on the next full
     /// restart.
     Set {
         #[arg(long)]
@@ -147,6 +148,10 @@ enum SettingsCommand {
         docker_mode: Option<String>,
         #[arg(long)]
         runner_script: Option<PathBuf>,
+        /// "false" detaches from the fleet keeping the credential; "true"
+        /// reattaches with the same identity.
+        #[arg(long)]
+        participate: Option<bool>,
     },
 }
 
@@ -256,6 +261,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 )
                 .await?,
             );
+            let reconciler = supervisor.spawn_participation_reconciler(shutdown.clone());
             control::serve(
                 &socket_path,
                 Arc::clone(&supervisor),
@@ -267,6 +273,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             // The control server has stopped accepting connections; give any
             // live attach task its own shutdown grace before the process exits.
             supervisor.join().await;
+            let _ = reconciler.await;
             Ok(())
         }
         Command::Status => {
@@ -286,6 +293,12 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 }
                 control_proto::ConnectionState::Draining => {
                     println!("draining (machine_id={})", response.machine_id);
+                }
+                control_proto::ConnectionState::Detached => {
+                    println!(
+                        "detached (machine_id={}; participate=false — set participate=true to reattach)",
+                        response.machine_id
+                    );
                 }
                 control_proto::ConnectionState::Unspecified => println!("unknown state"),
             }
@@ -343,6 +356,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             gateway,
             docker_mode,
             runner_script,
+            participate,
         }) => {
             let docker_mode = docker_mode
                 .as_deref()
@@ -359,6 +373,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                     gateway,
                     docker_mode,
                     runner_script: runner_script.map(|p| p.to_string_lossy().into_owned()),
+                    participate,
                 })
                 .await
                 .context("UpdateSettings RPC failed")?
@@ -554,6 +569,9 @@ fn print_setting(name: &str, current: &str, target: &str) {
 }
 
 fn print_settings(s: control_proto::AgentSettings) {
+    if let Some(v) = s.participate {
+        print_setting("participate", &v.current.to_string(), &v.target.to_string());
+    }
     if let Some(v) = s.load_ceiling {
         print_setting(
             "load_ceiling",
