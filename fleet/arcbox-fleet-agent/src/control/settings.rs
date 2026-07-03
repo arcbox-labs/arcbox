@@ -10,7 +10,8 @@ use std::path::Path;
 
 use arcbox_fleet_control_proto::v1::fleet_settings_service_server::FleetSettingsService as FleetSettingsServiceTrait;
 use arcbox_fleet_control_proto::v1::{
-    GetSettingsRequest, GetSettingsResponse, UpdateSettingsRequest, UpdateSettingsResponse,
+    Enrollment, GetSettingsRequest, GetSettingsResponse, UpdateSettingsRequest,
+    UpdateSettingsResponse,
 };
 use tonic::transport::Endpoint;
 use tonic::{Request, Response, Status};
@@ -108,6 +109,22 @@ fn validate(req: &UpdateSettingsRequest, state: &AgentState) -> Result<(), Strin
     }
     if let Some(gateway) = &req.gateway {
         Endpoint::from_shared(gateway.clone()).map_err(|e| format!("invalid gateway URI: {e}"))?;
+        // A credential is bound to the gateway it enrolled against — the
+        // keychain keys its entry by gateway URI, and the machine record
+        // lives in that gateway's database — so moving the target under an
+        // enrollment could only strand it (a startup lookup under the new
+        // key would miss the credential; the old gateway would never see
+        // this machine again). Every enrollment state except Unenrolled
+        // implies a credential on disk.
+        let enrollment =
+            Enrollment::try_from(state.current().enrollment).unwrap_or(Enrollment::Unenrolled);
+        if enrollment != Enrollment::Unenrolled {
+            return Err(
+                "cannot change the gateway while enrolled — unenroll first, then set the \
+                 gateway and re-enroll"
+                    .to_owned(),
+            );
+        }
     }
     if let Some(runner_script) = &req.runner_script {
         if !runner_script.is_empty() && !Path::new(runner_script).is_file() {
@@ -266,6 +283,38 @@ mod tests {
             ..request()
         };
         assert!(validate(&req, &state).is_err());
+    }
+
+    /// The gateway is only settable while unenrolled: every other
+    /// enrollment state implies a credential keyed by the current gateway,
+    /// which a moved target would strand.
+    #[test]
+    fn gateway_change_requires_unenrolled() {
+        let req = UpdateSettingsRequest {
+            gateway: Some("https://other.gateway.test".to_owned()),
+            ..request()
+        };
+
+        let state = AgentState::new(&seed());
+        assert!(validate(&req, &state).is_ok(), "unenrolled may retarget");
+
+        for enrollment in [
+            control_proto::Enrollment::Attaching,
+            control_proto::Enrollment::Attached,
+            control_proto::Enrollment::Detached,
+            control_proto::Enrollment::CredentialRejected,
+        ] {
+            state.set_enrollment(enrollment, "fltm_test");
+            let err = validate(&req, &state).expect_err("credential exists");
+            assert!(err.contains("unenroll first"), "{enrollment:?}: {err}");
+        }
+
+        // Other settings stay updatable regardless of enrollment.
+        let unrelated = UpdateSettingsRequest {
+            load_ceiling: Some(0.5),
+            ..request()
+        };
+        assert!(validate(&unrelated, &state).is_ok());
     }
 
     /// `linux_runner_image` is prepare-scoped: `UpdateSettings` must move

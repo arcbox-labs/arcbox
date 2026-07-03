@@ -236,11 +236,12 @@ async fn connect_and_serve(
     state: &AgentState,
 ) -> Result<()> {
     // The desired (`target`) gateway, not `config.gateway` directly —
-    // `AgentSupervisor` seeds it from config and `UpdateSettings` can move
-    // it from there. Re-read on every attempt so a change takes effect on
-    // whatever reconnect happens next, without this loop ever being forced
-    // to one; `current` only moves to match once this actually succeeds,
-    // below.
+    // `AgentSupervisor` seeds it from config, and an `Enroll` gateway
+    // override can have moved it from there. It cannot move while this
+    // attachment lives (`UpdateSettings` refuses gateway changes whenever a
+    // credential exists), so the per-attempt re-read is for freshness of
+    // the enrolled value, not to chase a live retarget; `current` only
+    // moves to match once this actually succeeds, below.
     let gateway = state.gateway_target();
     let (req_tx, req_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
 
