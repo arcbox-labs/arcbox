@@ -1,10 +1,13 @@
-//! One-shot enrollment: exchange an enrollment token for the machine credential.
+//! One-shot gateway RPCs: enroll (exchange an enrollment token for the
+//! machine credential) and unenroll (decommission the machine, revoking
+//! that credential server-side).
 
 use anyhow::{Context, Result};
 use arcbox_fleet_proto::v1::fleet_gateway_service_client::FleetGatewayServiceClient;
-use arcbox_fleet_proto::v1::{Capability, EnrollRequest};
+use arcbox_fleet_proto::v1::{Capability, EnrollRequest, UnenrollRequest};
 use tracing::info;
 
+use crate::attach::authenticated_request;
 use crate::config::{AgentConfig, PROTOCOL_VERSION};
 use crate::credentials::Credential;
 use crate::host;
@@ -54,4 +57,31 @@ pub async fn enroll(
     };
     info!(machine_id = %credential.machine_id, "enrolled");
     Ok(credential)
+}
+
+/// Call `Unenroll` on `gateway`, authenticated with `machine_token` — the
+/// server half of leaving the fleet: marks the machine decommissioned and
+/// revokes this credential. `UNAUTHENTICATED` means the credential is
+/// already revoked, which is exactly the state unenrolling wants, so it
+/// counts as success.
+pub async fn unenroll(config: &AgentConfig, gateway: &str, machine_token: &str) -> Result<()> {
+    let channel = config
+        .endpoint_for(gateway)?
+        .connect()
+        .await
+        .with_context(|| format!("connecting to fleet gateway at {gateway}"))?;
+    let mut client = FleetGatewayServiceClient::new(channel);
+
+    let request = authenticated_request(UnenrollRequest {}, machine_token)?;
+    match client.unenroll(request).await {
+        Ok(_) => {
+            info!("unenrolled at gateway (machine decommissioned)");
+            Ok(())
+        }
+        Err(status) if status.code() == tonic::Code::Unauthenticated => {
+            info!("gateway reports the credential already revoked");
+            Ok(())
+        }
+        Err(status) => Err(status).context("Unenroll RPC failed"),
+    }
 }
