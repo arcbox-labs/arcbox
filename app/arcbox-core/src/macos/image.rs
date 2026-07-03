@@ -2,17 +2,21 @@
 //!
 //! A base image is a directory under `data_dir/macos/images/<name>/` holding an
 //! installed macOS system disk plus the auxiliary storage and identity needed to
-//! boot it. [`MacImageManager::clone_base`] produces a per-VM instance from a base
-//! by copy-on-write cloning the (large) system disk via `clonefile(2)` — instant
+//! boot it. [`MacImage::clone_into`] produces a per-VM instance from a base by
+//! copy-on-write cloning the (large) system disk via `clonefile(2)` — instant
 //! and space-shared on APFS — so every VM is a clean, disposable copy.
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
+use super::validate_name;
 use crate::error::{CoreError, Result};
 
 pub(super) const META_FILE: &str = "meta.json";
@@ -83,6 +87,41 @@ impl MacImage {
     pub fn machine_id_path(&self) -> PathBuf {
         self.dir.join(MACHINE_ID_FILE)
     }
+
+    /// Clones this base image into `dst_dir`, producing per-VM disks ready to boot.
+    ///
+    /// The (large) system disk is copy-on-write cloned via `clonefile(2)` — instant
+    /// and space-shared on APFS — while the small auxiliary storage and identity are
+    /// copied, so the clone boots the same installed system. Off APFS the disk falls
+    /// back to a full copy (logged).
+    ///
+    /// The base machine identifier is copied into the instance and reused on every
+    /// boot. It is the identifier the base's auxiliary storage was created with at
+    /// install, so reusing it gives the clone a stable identity that pairs with the
+    /// cloned NVRAM.
+    ///
+    /// # Errors
+    /// Returns an error if any clone/copy step fails.
+    pub fn clone_into(&self, dst_dir: &Path) -> Result<MacInstanceDisks> {
+        std::fs::create_dir_all(dst_dir)?;
+
+        let dst_disk = dst_dir.join(DISK_FILE);
+        cow_clone(&self.disk_path(), &dst_disk)?;
+
+        let dst_aux = dst_dir.join(AUX_FILE);
+        let _ = std::fs::remove_file(&dst_aux);
+        std::fs::copy(self.aux_path(), &dst_aux)?;
+
+        let hardware_model = std::fs::read(self.hardware_model_path())?;
+        let machine_id = std::fs::read(self.machine_id_path())?;
+
+        Ok(MacInstanceDisks {
+            disk: dst_disk,
+            aux: dst_aux,
+            hardware_model,
+            machine_id,
+        })
+    }
 }
 
 /// Disk artifacts of a cloned per-VM instance, ready to assemble into a VM.
@@ -101,6 +140,10 @@ pub struct MacInstanceDisks {
 /// Manages macOS base image templates and their copy-on-write clones.
 pub struct MacImageManager {
     images_dir: PathBuf,
+    /// Per-image-name locks serializing concurrent pulls of the same image so
+    /// they cannot corrupt the shared staging directory. Bounded by the number
+    /// of distinct image names ever pulled.
+    pull_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl MacImageManager {
@@ -109,13 +152,18 @@ impl MacImageManager {
     pub fn new(data_dir: &Path) -> Self {
         Self {
             images_dir: data_dir.join("macos").join("images"),
+            pull_locks: Mutex::new(HashMap::new()),
         }
     }
 
     /// Directory holding a named image's artifacts.
-    #[must_use]
-    pub fn image_dir(&self, name: &str) -> PathBuf {
-        self.images_dir.join(name)
+    ///
+    /// # Errors
+    /// Returns an error if `name` is not a single safe path component (see
+    /// [`validate_name`]).
+    pub(super) fn image_dir(&self, name: &str) -> Result<PathBuf> {
+        validate_name(name)?;
+        Ok(self.images_dir.join(name))
     }
 
     /// Directory holding downloaded IPSWs (a sibling of the images dir).
@@ -126,13 +174,25 @@ impl MacImageManager {
             .map_or_else(|| self.images_dir.join("cache"), |p| p.join("cache"))
     }
 
+    /// Returns the lock serializing pulls of image `name` (creating it on first use).
+    pub(super) async fn pull_lock(&self, name: &str) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.pull_locks
+                .lock()
+                .await
+                .entry(name.to_string())
+                .or_default(),
+        )
+    }
+
     /// Loads a base image by name.
     ///
     /// # Errors
-    /// Returns a not-found error if no such image exists, or a macOS error if its
-    /// metadata cannot be parsed.
+    /// Returns a not-found error if no such image exists, an invalid-name error
+    /// if `name` is not a safe path component, or a macOS error if its metadata
+    /// cannot be parsed.
     pub fn get(&self, name: &str) -> Result<MacImage> {
-        let dir = self.image_dir(name);
+        let dir = self.image_dir(name)?;
         let meta_path = dir.join(META_FILE);
         if !meta_path.exists() {
             return Err(CoreError::not_found(format!("macOS image '{name}'")));
@@ -168,10 +228,11 @@ impl MacImageManager {
     /// Removes a base image and all its artifacts.
     ///
     /// # Errors
-    /// Returns a not-found error if the image does not exist, or an I/O error if
-    /// removal fails.
+    /// Returns a not-found error if the image does not exist, an invalid-name
+    /// error if `name` is not a safe path component, or an I/O error if removal
+    /// fails.
     pub fn remove(&self, name: &str) -> Result<()> {
-        let dir = self.image_dir(name);
+        let dir = self.image_dir(name)?;
         if !dir.exists() {
             return Err(CoreError::not_found(format!("macOS image '{name}'")));
         }
@@ -185,9 +246,10 @@ impl MacImageManager {
     /// flow; this records the accompanying `meta.json`.
     ///
     /// # Errors
-    /// Returns an error if the metadata cannot be serialized or written.
+    /// Returns an error if the name is invalid or the metadata cannot be
+    /// serialized or written.
     pub fn write_meta(&self, meta: &MacImageMeta) -> Result<()> {
-        Self::write_meta_in(&self.image_dir(&meta.name), meta)
+        Self::write_meta_in(&self.image_dir(&meta.name)?, meta)
     }
 
     /// Persists metadata into an explicit directory (used by the pull flow to
@@ -201,42 +263,6 @@ impl MacImageManager {
             .map_err(|e| CoreError::macos(format!("serialize image metadata: {e}")))?;
         std::fs::write(dir.join(META_FILE), json)?;
         Ok(())
-    }
-
-    /// Clones a base image into `dst_dir`, producing per-VM disks ready to boot.
-    ///
-    /// The (large) system disk is copy-on-write cloned via `clonefile(2)` — instant
-    /// and space-shared on APFS — while the small auxiliary storage and identity are
-    /// copied, so the clone boots the same installed system. Off APFS the disk falls
-    /// back to a full copy (logged).
-    ///
-    /// The base machine identifier is copied into the instance and reused on every
-    /// boot. It is the identifier the base's auxiliary storage was created with at
-    /// install, so reusing it gives the clone a stable identity that pairs with the
-    /// cloned NVRAM.
-    ///
-    /// # Errors
-    /// Returns an error if the base image is missing or any clone/copy step fails.
-    pub fn clone_base(&self, base: &str, dst_dir: &Path) -> Result<MacInstanceDisks> {
-        let image = self.get(base)?;
-        std::fs::create_dir_all(dst_dir)?;
-
-        let dst_disk = dst_dir.join(DISK_FILE);
-        cow_clone(&image.disk_path(), &dst_disk)?;
-
-        let dst_aux = dst_dir.join(AUX_FILE);
-        let _ = std::fs::remove_file(&dst_aux);
-        std::fs::copy(image.aux_path(), &dst_aux)?;
-
-        let hardware_model = std::fs::read(image.hardware_model_path())?;
-        let machine_id = std::fs::read(image.machine_id_path())?;
-
-        Ok(MacInstanceDisks {
-            disk: dst_disk,
-            aux: dst_aux,
-            hardware_model,
-            machine_id,
-        })
     }
 }
 
@@ -301,7 +327,10 @@ mod tests {
 
         let loaded = mgr.get("base").unwrap();
         assert_eq!(loaded.meta, meta);
-        assert_eq!(loaded.disk_path(), mgr.image_dir("base").join("disk.img"));
+        assert_eq!(
+            loaded.disk_path(),
+            mgr.image_dir("base").unwrap().join("disk.img")
+        );
         assert_eq!(mgr.list().len(), 1);
     }
 
@@ -311,5 +340,20 @@ mod tests {
         let mgr = MacImageManager::new(dir.path());
         assert!(mgr.get("nope").is_err());
         assert!(mgr.list().is_empty());
+    }
+
+    #[test]
+    fn traversal_names_are_rejected_before_touching_the_fs() {
+        let dir = tempdir().unwrap();
+        // A sibling directory that a traversal name would try to escape into.
+        let victim = dir.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        let mgr = MacImageManager::new(dir.path());
+
+        assert!(mgr.get("../victim").is_err());
+        assert!(mgr.remove("../victim").is_err());
+        assert!(mgr.image_dir("a/b").is_err());
+        // The rejected names never reached the filesystem.
+        assert!(victim.exists());
     }
 }

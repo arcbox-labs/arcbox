@@ -75,8 +75,11 @@ VmManager::start                 macos::MacVm
 2. **Per-VM create (fast, CoW).**
 
    ```text
-   arcbox macos create <n> --image <base>
-     → MacImageManager.clone_base: clonefile(disk.img) CoW + copy aux.img  (APFS, seconds)
+   arcbox macos create <n> --image <base> [--cpus N --memory MiB]
+     → reject if --cpus / --memory are below the image's published minimums
+     → assemble in a staging dir, then rename it into place atomically
+       (concurrent creates of the same name cannot corrupt each other)
+     → MacImage.clone_into: clonefile(disk.img) CoW + copy aux.img  (APFS, seconds)
      → MacMachineManager persists a machine record + the base hardware model
        and machine identifier (clones share the base identifier — the one its
        NVRAM was created with; same practice as Tart, proven fine in CI fleets)
@@ -212,6 +215,10 @@ hard ceiling, verified against Apple/Arm primary sources:
   TDX/SEV-SNP equivalent; the Secure Enclave's memory encryption protects only the SEP;
   and Private Cloud Compute is Apple-internal and relies on attestation + statelessness,
   not in-use memory encryption. Integrity attestation ≠ confidentiality-from-host.
+- **(C) Registry path safety — ENFORCED.** Image and machine names are validated to a
+  single path component (no separators, `..`, or absolute paths), so a caller- or
+  manifest-supplied name can never escape the managed `macos/images` / `macos/machines`
+  roots when a directory is created, renamed, or removed.
 
 So macOS CI on Apple Silicon can offer (A) but never (B). Builds that genuinely require
 confidentiality from the host must run in a TEE on x86 (TDX/SEV-SNP) or Arm (CCA)

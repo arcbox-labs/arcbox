@@ -1,7 +1,7 @@
 //! A running macOS guest VM, assembled from a cloned base image.
 //!
 //! [`MacVm::boot`] turns the disks produced by
-//! [`MacImageManager::clone_base`](super::image::MacImageManager::clone_base) into a
+//! [`MacImage::clone_into`](super::image::MacImage::clone_into) into a
 //! live `arcbox-vz` virtual machine. The machine identifier is the one persisted with
 //! the machine (the identifier its auxiliary storage was created with at install), so
 //! a machine keeps a stable identity across reboots.
