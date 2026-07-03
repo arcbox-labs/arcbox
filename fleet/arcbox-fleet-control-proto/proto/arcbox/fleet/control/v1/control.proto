@@ -15,7 +15,7 @@ service FleetLifecycleService {
   // Exchanges an enrollment token for the machine credential via the
   // gateway, persists it, and starts attaching. This is the desktop-managed
   // handoff: the machine credential is created and persisted here, in the
-  // agent — never in the desktop. Fails if already enrolled; Disconnect
+  // agent — never in the desktop. Fails if already enrolled; Unenroll
   // first. The headless/farm path instead uses the `arcbox-fleet-agent
   // enroll` CLI subcommand before this process is even running.
   rpc Enroll(EnrollRequest) returns (EnrollResponse);
@@ -26,9 +26,10 @@ service FleetLifecycleService {
   // Resumes accepting new offers after a Drain.
   rpc Resume(ResumeRequest) returns (ResumeResponse);
 
-  // Removes the machine credential and stops attaching. Returns to the
-  // unenrolled state; a fresh Enroll is required to rejoin the fleet.
-  rpc Disconnect(DisconnectRequest) returns (DisconnectResponse);
+  // Leaves the fleet — terminal. Stops attaching and removes the machine
+  // credential; the server keeps the machine record (decommissioned), so a
+  // later Enroll joins as a new machine.
+  rpc Unenroll(UnenrollRequest) returns (UnenrollResponse);
 
   // Current lifecycle/attachment status.
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
@@ -64,8 +65,8 @@ message DrainResponse {}
 message ResumeRequest {}
 message ResumeResponse {}
 
-message DisconnectRequest {}
-message DisconnectResponse {}
+message UnenrollRequest {}
+message UnenrollResponse {}
 
 // Lifecycle state of the agent's relationship to the gateway. Distinguishing
 // a live gateway connection from a reconnect-in-progress ("attaching" vs

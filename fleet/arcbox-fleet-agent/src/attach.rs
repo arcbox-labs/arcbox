@@ -114,7 +114,7 @@ pub async fn run(
     // attachment, exiting when `shutdown` fires. Tied to the attachment rather
     // than the process because `AgentSupervisor::attach` spawns a fresh `run`
     // per enrollment — a process-lifetime task here would leak one per
-    // disconnect/re-enroll cycle.
+    // unenroll/re-enroll cycle.
     let resend = spawn_verdict_resend(supervisor.clone(), shutdown.clone());
 
     while !shutdown.is_cancelled() {
@@ -198,10 +198,10 @@ async fn connect_and_serve(
     // The connect + Attach-RPC handshake can block indefinitely — no connect
     // timeout is configured on the tonic `Endpoint` — and, unlike the
     // message loop below, has no cancellation awareness of its own. Without
-    // this race, a reconnect attempt straddling a `disconnect()` could
-    // complete the handshake and write `Attached` after `disconnect()`
+    // this race, a reconnect attempt straddling an `unenroll()` could
+    // complete the handshake and write `Attached` after `unenroll()`
     // already wrote `Unenrolled`, with nothing to undo it (see
-    // `AgentSupervisor::disconnect`'s doc). `req_rx` moves into the connect
+    // `AgentSupervisor::unenroll`'s doc). `req_rx` moves into the connect
     // future and is dropped with it if cancellation wins; `req_tx` stays
     // available in this outer scope for the rest of the connection.
     let connect = async {
@@ -300,7 +300,7 @@ fn dispatch(supervisor: &RunnerSupervisor, msg: Option<attach_response::Msg>) {
 /// Periodically resend verdicts still awaiting an `OfferVerdictAck`, until the
 /// gateway settles them (delivered to the workflow, or found obsolete).
 /// Attachment-scoped: it spans reconnects within one attachment and exits when
-/// `shutdown` fires, so it's reaped on disconnect instead of outliving the
+/// `shutdown` fires, so it's reaped on unenroll instead of outliving the
 /// attachment that spawned it. The supervisor holds the egress sender, so
 /// resends route through the same outbound path as fresh verdicts.
 fn spawn_verdict_resend(
@@ -373,7 +373,7 @@ mod tests {
     }
 
     /// The verdict-resend loop is attachment-scoped: cancelling the shutdown
-    /// token must reap it. Otherwise every disconnect/re-enroll cycle would
+    /// token must reap it. Otherwise every unenroll/re-enroll cycle would
     /// leak a task holding a supervisor clone (DashMaps, egress sender, Docker
     /// handle) for the life of the process.
     #[tokio::test]
@@ -416,7 +416,7 @@ mod tests {
     /// The connect + Attach-RPC handshake has no cancellation awareness of
     /// its own (see this fn's own doc in the non-test code above) — without
     /// racing it against `shutdown`, a reconnect attempt could complete the
-    /// handshake and write `Attached` after a `disconnect()` already wrote
+    /// handshake and write `Attached` after an `unenroll()` already wrote
     /// `Unenrolled`. Cancelling before this call even starts must bail out
     /// immediately, attempting no connect at all and touching no state.
     #[tokio::test]

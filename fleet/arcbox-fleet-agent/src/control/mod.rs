@@ -2,7 +2,7 @@
 //! (`~/.arcbox/fleet/agent.sock`) that turns the agent's enrollment from a
 //! fixed, credential-required-at-startup process into a state machine the
 //! `arcbox-fleet-agent` CLI and the desktop app can drive — enroll, drain,
-//! resume, disconnect — while it runs. See [`lifecycle`] for the tonic
+//! resume, unenroll — while it runs. See [`lifecycle`] for the tonic
 //! service implementation.
 
 pub mod client;
@@ -60,7 +60,7 @@ impl From<Internal> for Status {
 /// Bind `agent.sock` and serve `FleetLifecycleService` until `shutdown`
 /// fires. Mirrors `arcbox-daemon`'s `services::start_grpc` (remove-before-bind,
 /// then `UnixListener`/`UnixListenerStream`), plus explicit owner-only
-/// permissions: unlike the daemon's socket, this one can enroll/disconnect
+/// permissions: unlike the daemon's socket, this one can enroll/unenroll
 /// the machine, so it must not rely on umask alone. The parent directory
 /// (which also holds the credential file) is made `0700` *before* the bind,
 /// so the socket is unreachable by other users even during the brief window
@@ -110,18 +110,18 @@ pub async fn serve(
         .context("control-plane server error")
 }
 
-/// How long [`AgentSupervisor::disconnect`] waits for the attach task to
+/// How long [`AgentSupervisor::unenroll`] waits for the attach task to
 /// react to cancellation before clearing the credential anyway. The task's
 /// own runner teardown is separately bounded by `attach::run`'s
 /// `SHUTDOWN_GRACE`; this only needs to cover that plus scheduling overhead.
-const DISCONNECT_GRACE: Duration = Duration::from_secs(20);
+const UNENROLL_GRACE: Duration = Duration::from_secs(20);
 
 /// Wait up to `grace` for `task` to finish on its own; if it doesn't, abort
 /// it and wait for that reap too, so `task` is guaranteed stopped by the
 /// time this returns regardless of whether it ever observed its own
-/// cancellation signal. Split out from [`AgentSupervisor::disconnect`] so
+/// cancellation signal. Split out from [`AgentSupervisor::unenroll`] so
 /// the abort-on-timeout behavior can be exercised directly with a short
-/// `grace`, instead of the real [`DISCONNECT_GRACE`].
+/// `grace`, instead of the real [`UNENROLL_GRACE`].
 ///
 /// Polls `&mut task` rather than the owned handle so it survives a timeout:
 /// `tokio::time::timeout` drops its future on `Elapsed`, and dropping a
@@ -132,10 +132,10 @@ const DISCONNECT_GRACE: Duration = Duration::from_secs(20);
 async fn join_or_abort(mut task: tokio::task::JoinHandle<Result<()>>, grace: Duration) {
     match tokio::time::timeout(grace, &mut task).await {
         Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(e))) => warn!(error = %e, "attach task exited with an error on disconnect"),
-        Ok(Err(e)) => warn!(error = %e, "attach task panicked on disconnect"),
+        Ok(Ok(Err(e))) => warn!(error = %e, "attach task exited with an error on unenroll"),
+        Ok(Err(e)) => warn!(error = %e, "attach task panicked on unenroll"),
         Err(_) => {
-            warn!("disconnect grace elapsed; aborting attach task");
+            warn!("unenroll grace elapsed; aborting attach task");
             task.abort();
             // Best-effort reap; a `Cancelled` JoinError here is expected.
             let _ = task.await;
@@ -145,7 +145,7 @@ async fn join_or_abort(mut task: tokio::task::JoinHandle<Result<()>>, grace: Dur
 
 /// The `Enroll` admission check: only `Unenrolled` may proceed. Applied
 /// twice — before the gateway round-trip and again after re-locking — so
-/// both an already-live attachment and a `Disconnect` that started
+/// both an already-live attachment and an `Unenroll` that started
 /// mid-round-trip refuse the enrollment.
 ///
 /// Returns a plain message rather than `Status` — every failure here maps
@@ -154,8 +154,8 @@ async fn join_or_abort(mut task: tokio::task::JoinHandle<Result<()>>, grace: Dur
 fn check_enrollable(state: &State) -> Result<(), &'static str> {
     match state {
         State::Unenrolled => Ok(()),
-        State::Disconnecting => Err("disconnect in progress — retry shortly"),
-        State::Attached(_) => Err("already enrolled — disconnect first"),
+        State::Unenrolling => Err("unenroll in progress — retry shortly"),
+        State::Attached(_) => Err("already enrolled — unenroll first"),
     }
 }
 
@@ -166,12 +166,12 @@ fn check_enrollable(state: &State) -> Result<(), &'static str> {
 struct Attachment {
     supervisor: RunnerSupervisor,
     /// Child of [`AgentSupervisor::process_shutdown`]: cancelling it stops
-    /// only this attachment (`Disconnect`); cancelling the parent (process
+    /// only this attachment (`Unenroll`); cancelling the parent (process
     /// shutdown) cascades to it too, so runners still drain on SIGTERM.
     shutdown: CancellationToken,
     task: tokio::task::JoinHandle<Result<()>>,
     /// The gateway this attachment's credential is persisted under (the
-    /// keychain backend keys its entry by gateway URI). `disconnect` clears
+    /// keychain backend keys its entry by gateway URI). `unenroll` clears
     /// exactly this store: reading the live `gateway_target` there instead
     /// would clear the wrong entry if a settings update moved the target
     /// while attached, leaving this credential behind on disk.
@@ -180,12 +180,12 @@ struct Attachment {
 
 enum State {
     Unenrolled,
-    /// A `Disconnect` is tearing its attachment down (bounded by
-    /// [`DISCONNECT_GRACE`]). `Enroll` is refused while here: an enrollment
+    /// A `Unenroll` is tearing its attachment down (bounded by
+    /// [`UNENROLL_GRACE`]). `Enroll` is refused while here: an enrollment
     /// that raced into the teardown window would have its observable state
-    /// stomped by the old task's late writes and by disconnect's own final
+    /// stomped by the old task's late writes and by unenroll's own final
     /// `Unenrolled` re-assert, so the window is closed instead of fenced.
-    Disconnecting,
+    Unenrolling,
     Attached(Attachment),
 }
 
@@ -319,7 +319,7 @@ impl AgentSupervisor {
             .map_err(Internal)?;
 
         let mut state = self.state.lock().await;
-        // Lost a race with a concurrent Enroll (or a Disconnect started
+        // Lost a race with a concurrent Enroll (or a Unenroll started
         // mid-round-trip). The credential just fetched is dropped here
         // without ever being persisted — only the winner, below, writes to
         // the credential store — so it cannot clobber the winner's
@@ -355,24 +355,22 @@ impl AgentSupervisor {
 
     /// Stop attaching and remove the persisted credential. Observably
     /// `Unenrolled` immediately (`GetStatus`/`Watch`); the attach task's own
-    /// teardown finishes in the background, bounded by [`DISCONNECT_GRACE`],
+    /// teardown finishes in the background, bounded by [`UNENROLL_GRACE`],
     /// and `Enroll` is refused until it completes (see
-    /// [`State::Disconnecting`]).
-    pub async fn disconnect(&self) -> Result<(), Status> {
+    /// [`State::Unenrolling`]).
+    pub async fn unenroll(&self) -> Result<(), Status> {
         let attachment = {
             let mut state = self.state.lock().await;
             match &*state {
                 State::Unenrolled => {
                     return Err(Status::failed_precondition("not enrolled"));
                 }
-                State::Disconnecting => {
-                    return Err(Status::failed_precondition(
-                        "disconnect already in progress",
-                    ));
+                State::Unenrolling => {
+                    return Err(Status::failed_precondition("unenroll already in progress"));
                 }
                 State::Attached(_) => {}
             }
-            let State::Attached(attachment) = std::mem::replace(&mut *state, State::Disconnecting)
+            let State::Attached(attachment) = std::mem::replace(&mut *state, State::Unenrolling)
             else {
                 unreachable!("checked above");
             };
@@ -387,10 +385,10 @@ impl AgentSupervisor {
         };
 
         attachment.shutdown.cancel();
-        join_or_abort(attachment.task, DISCONNECT_GRACE).await;
+        join_or_abort(attachment.task, UNENROLL_GRACE).await;
 
         // Authoritative: the task is provably stopped (joined or aborted)
-        // and `Disconnecting` kept every `Enroll` out of the grace window,
+        // and `Unenrolling` kept every `Enroll` out of the grace window,
         // so no live attachment's state can be stomped here and no stale
         // write from the old task survives it.
         {
@@ -415,7 +413,7 @@ impl AgentSupervisor {
                 a.supervisor.handle_drain();
                 Ok(())
             }
-            State::Unenrolled | State::Disconnecting => {
+            State::Unenrolled | State::Unenrolling => {
                 Err(Status::failed_precondition("not enrolled"))
             }
         }
@@ -428,7 +426,7 @@ impl AgentSupervisor {
                 a.supervisor.resume();
                 Ok(())
             }
-            State::Unenrolled | State::Disconnecting => {
+            State::Unenrolled | State::Unenrolling => {
                 Err(Status::failed_precondition("not enrolled"))
             }
         }
@@ -462,9 +460,9 @@ impl AgentSupervisor {
             let mut state = self.state.lock().await;
             match std::mem::replace(&mut *state, State::Unenrolled) {
                 State::Attached(a) => Some(a),
-                // During `Disconnecting` the disconnect call owns the
+                // During `Unenrolling` the unenroll call owns the
                 // attachment handle and awaits it itself; nothing to join.
-                State::Unenrolled | State::Disconnecting => None,
+                State::Unenrolled | State::Unenrolling => None,
             }
         };
         if let Some(a) = attachment {
@@ -509,13 +507,13 @@ mod tests {
         }
     }
 
-    /// While a disconnect is inside its teardown grace, a concurrent
+    /// While a unenroll is inside its teardown grace, a concurrent
     /// `Enroll` must be refused — not succeed and then have its observable
-    /// state stomped by the disconnect's final `Unenrolled` re-assert (or
-    /// by the old task's late writes). Once the disconnect completes, the
+    /// state stomped by the unenroll's final `Unenrolled` re-assert (or
+    /// by the old task's late writes). Once the unenroll completes, the
     /// gate opens again.
     #[tokio::test]
-    async fn enroll_is_refused_during_disconnect_grace() {
+    async fn enroll_is_refused_during_unenroll_grace() {
         let dir = std::env::temp_dir().join(format!("fleet-disc-race-{}", std::process::id()));
         let agent_state = AgentState::new(&seed());
         let supervisor = Arc::new(
@@ -550,9 +548,9 @@ mod tests {
             credential_gateway: "http://127.0.0.1:1".to_owned(),
         });
 
-        let disconnect = {
+        let unenroll = {
             let supervisor = Arc::clone(&supervisor);
-            tokio::spawn(async move { supervisor.disconnect().await })
+            tokio::spawn(async move { supervisor.unenroll().await })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -560,14 +558,14 @@ mod tests {
         let err = supervisor
             .enroll("flt_join_test".to_owned(), None)
             .await
-            .expect_err("enroll during disconnect grace must be refused");
+            .expect_err("enroll during unenroll grace must be refused");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(err.message().contains("disconnect in progress"), "{err}");
+        assert!(err.message().contains("unenroll in progress"), "{err}");
 
-        disconnect
+        unenroll
             .await
-            .expect("disconnect task")
-            .expect("disconnect succeeds");
+            .expect("unenroll task")
+            .expect("unenroll succeeds");
         assert!(matches!(*supervisor.state.lock().await, State::Unenrolled));
 
         // Gate open again: enroll now passes the state check and fails

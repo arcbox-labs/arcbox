@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_server::FleetLifecycleService;
 use arcbox_fleet_control_proto::v1::{
-    DisconnectRequest, DisconnectResponse, DrainRequest, DrainResponse, EnrollRequest,
-    EnrollResponse, GetAgentInfoRequest, GetAgentInfoResponse, GetStatusRequest, GetStatusResponse,
-    ResumeRequest, ResumeResponse,
+    DrainRequest, DrainResponse, EnrollRequest, EnrollResponse, GetAgentInfoRequest,
+    GetAgentInfoResponse, GetStatusRequest, GetStatusResponse, ResumeRequest, ResumeResponse,
+    UnenrollRequest, UnenrollResponse,
 };
 use tonic::{Request, Response, Status};
 
@@ -73,12 +73,12 @@ impl FleetLifecycleService for LifecycleService {
         Ok(Response::new(ResumeResponse {}))
     }
 
-    async fn disconnect(
+    async fn unenroll(
         &self,
-        _request: Request<DisconnectRequest>,
-    ) -> Result<Response<DisconnectResponse>, Status> {
-        self.supervisor.disconnect().await?;
-        Ok(Response::new(DisconnectResponse {}))
+        _request: Request<UnenrollRequest>,
+    ) -> Result<Response<UnenrollResponse>, Status> {
+        self.supervisor.unenroll().await?;
+        Ok(Response::new(UnenrollResponse {}))
     }
 
     async fn get_status(

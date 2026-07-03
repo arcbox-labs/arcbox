@@ -14,7 +14,7 @@
 //! Two ways to run: `run` requires a credential from a prior `enroll` (the
 //! headless/farm path) and does nothing else. `serve` additionally exposes
 //! the local control-plane API on `agent.sock`, and does not require a
-//! credential up front — `enroll`/`drain`/`resume`/`disconnect` can drive it
+//! credential up front — `enroll`/`drain`/`resume`/`unenroll` can drive it
 //! from another invocation of this CLI, or from the desktop app, while it
 //! runs.
 
@@ -96,7 +96,7 @@ enum Command {
     /// Unlike `run`, a credential is not required at startup: if one is
     /// already persisted this behaves like `run`, but with none it idles
     /// until an `Enroll` call arrives over the socket (the desktop-managed
-    /// handoff) or `disconnect`/`enroll` change that from another
+    /// handoff) or `unenroll`/`enroll` change that from another
     /// invocation. This is what a launchd LaunchAgent should invoke.
     Serve,
     /// Show the running agent's enrollment/attachment status.
@@ -106,10 +106,10 @@ enum Command {
     Drain,
     /// Resume accepting new offers after `drain`.
     Resume,
-    /// Remove the running agent's machine credential and stop attaching.
-    /// A fresh `enroll` (or the control-plane `Enroll` RPC) is required to
-    /// rejoin the fleet.
-    Disconnect,
+    /// Leave the fleet — terminal. Stops attaching and removes the machine
+    /// credential; the server keeps the machine record, so a fresh `enroll`
+    /// (or the control-plane `Enroll` RPC) joins as a new machine.
+    Unenroll,
     /// Get or update the running agent's live-settable configuration.
     #[command(subcommand)]
     Settings(SettingsCommand),
@@ -240,7 +240,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             let socket_path = config.control_socket_path();
 
             // Cascades to every attach task's child token, so runners still
-            // drain on SIGTERM even though `Disconnect` can also cancel one
+            // drain on SIGTERM even though `Unenroll` can also cancel one
             // independently.
             let shutdown = spawn_shutdown_signal("termination signal received; shutting down");
 
@@ -311,14 +311,14 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             println!("resumed");
             Ok(())
         }
-        Command::Disconnect => {
+        Command::Unenroll => {
             let channel = control::client::connect_default(&config).await?;
             let mut client = FleetLifecycleServiceClient::new(channel);
             client
-                .disconnect(control_proto::DisconnectRequest {})
+                .unenroll(control_proto::UnenrollRequest {})
                 .await
-                .context("Disconnect RPC failed")?;
-            println!("disconnected");
+                .context("Unenroll RPC failed")?;
+            println!("unenrolled");
             Ok(())
         }
         Command::Settings(SettingsCommand::Get) => {
