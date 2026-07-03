@@ -101,8 +101,9 @@ enum Command {
     /// then promote it to current. Also the "update to latest" verb — a
     /// floating target (a moving tag) is re-fetched and re-promoted.
     Prepare {
-        /// Image kinds to prepare ("linux-runner-image"). Empty prepares
-        /// every kind the agent supports.
+        /// Image kinds to prepare ("linux-runner-image",
+        /// "macos-runner-image"). Empty prepares every kind the agent
+        /// supports.
         kinds: Vec<String>,
     },
 }
@@ -624,7 +625,10 @@ fn load_or_seed_settings(store: &SettingsStore, config: &AgentConfig) -> Result<
 fn parse_image_kind(s: &str) -> Result<control_proto::ImageKind> {
     match s.to_lowercase().as_str() {
         "linux-runner-image" => Ok(control_proto::ImageKind::LinuxRunnerImage),
-        other => anyhow::bail!("image kind must be 'linux-runner-image', got '{other}'"),
+        "macos-runner-image" => Ok(control_proto::ImageKind::MacosRunnerImage),
+        other => anyhow::bail!(
+            "image kind must be 'linux-runner-image' or 'macos-runner-image', got '{other}'"
+        ),
     }
 }
 

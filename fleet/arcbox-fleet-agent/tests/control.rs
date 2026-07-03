@@ -261,7 +261,15 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
     while let Some(event) = prepare.message().await.expect("prepare stream") {
         stages.push(event.stage);
     }
-    assert_eq!(stages, ["skipped", "promoted"]);
+    // Empty kinds expand to every kind this host supports — the Linux image
+    // everywhere, plus the macOS image on macOS hosts. With neither runtime
+    // configured each kind is skipped and promoted.
+    let expected: &[&str] = if cfg!(target_os = "macos") {
+        &["skipped", "promoted", "skipped", "promoted"]
+    } else {
+        &["skipped", "promoted"]
+    };
+    assert_eq!(stages, expected);
 
     let prepared = settings_client
         .get_settings(GetSettingsRequest {})

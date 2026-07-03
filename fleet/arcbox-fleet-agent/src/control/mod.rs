@@ -91,6 +91,7 @@ pub async fn serve(
     info!(socket = %socket_path.display(), "control-plane server listening");
 
     let docker = supervisor.docker();
+    let vm = supervisor.vm();
     Server::builder()
         .add_service(FleetLifecycleServiceServer::new(LifecycleService::new(
             supervisor,
@@ -103,7 +104,7 @@ pub async fn serve(
             settings_store,
         )))
         .add_service(FleetImageServiceServer::new(ImageService::new(
-            state, docker,
+            state, docker, vm,
         )))
         .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
         .await
@@ -301,6 +302,14 @@ impl AgentSupervisor {
     /// `vm_mode` changes are restart-scoped.
     pub fn vm_active(&self) -> bool {
         self.vm.is_some()
+    }
+
+    /// A handle to the macOS VM backend, if active — read by [`serve`] and
+    /// passed to `FleetImageService` to prepare a candidate
+    /// `macos_runner_image` through the daemon. Fixed at construction, same
+    /// rationale as [`Self::docker`].
+    fn vm(&self) -> Option<crate::vm::VmRunner> {
+        self.vm.clone()
     }
 
     /// Spawn the attach task for `credential` and build its [`Attachment`].
