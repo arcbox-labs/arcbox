@@ -18,8 +18,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::image::MacImageManager;
-use super::lease;
 use super::vm::MacVm;
+use super::{StagingGuard, lease, validate_name};
 use crate::error::{CoreError, Result};
 use crate::machine::MachineState;
 
@@ -135,8 +135,13 @@ impl MacMachineManager {
         &self.images
     }
 
-    fn machine_dir(&self, name: &str) -> PathBuf {
-        self.machines_dir.join(name)
+    /// Directory holding a named machine's artifacts.
+    ///
+    /// # Errors
+    /// Returns an error if `name` is not a single safe path component.
+    fn machine_dir(&self, name: &str) -> Result<PathBuf> {
+        validate_name(name)?;
+        Ok(self.machines_dir.join(name))
     }
 
     fn load_records(machines_dir: &Path) -> HashMap<String, MacMachineRecord> {
@@ -166,8 +171,13 @@ impl MacMachineManager {
     }
 
     fn write_record(&self, record: &MacMachineRecord) -> Result<()> {
-        let dir = self.machine_dir(&record.name);
-        std::fs::create_dir_all(&dir)?;
+        Self::write_record_in(&self.machine_dir(&record.name)?, record)
+    }
+
+    /// Serializes a machine record into an explicit directory (used by `create`
+    /// to assemble a machine in a staging directory before renaming it live).
+    fn write_record_in(dir: &Path, record: &MacMachineRecord) -> Result<()> {
+        std::fs::create_dir_all(dir)?;
         let json = serde_json::to_string_pretty(record)
             .map_err(|e| CoreError::macos(format!("serialize machine record: {e}")))?;
         std::fs::write(dir.join(MACHINE_RECORD_FILE), json)?;
@@ -176,12 +186,19 @@ impl MacMachineManager {
 
     /// Creates a macOS machine by copy-on-write cloning `config.image`.
     ///
+    /// The instance is assembled in a unique staging directory and renamed into
+    /// place atomically under the records lock, so concurrent creates of the same
+    /// name cannot corrupt each other. `config.cpus`/`config.memory_mib` must meet
+    /// the image's published minimums.
+    ///
     /// # Errors
-    /// Returns an error if a machine with the name exists, the base image is missing,
+    /// Returns an error if the name is invalid, a machine with the name exists, the
+    /// base image is missing, the requested resources are below the image minimums,
     /// or the clone/persist fails.
     pub fn create(&self, config: MacMachineConfig) -> Result<()> {
-        // Pre-check under a short read lock, then clone (slow file I/O) without holding
-        // any lock, then re-check on insert to settle a lost create/create race.
+        let final_dir = self.machine_dir(&config.name)?;
+
+        // Fast pre-check; the authoritative check happens under the write lock below.
         if self
             .records
             .read()
@@ -194,13 +211,34 @@ impl MacMachineManager {
             )));
         }
 
-        let dir = self.machine_dir(&config.name);
-        let disks = self.images.clone_base(&config.image, &dir)?;
+        // Enforce the image's published resource minimums before the slow clone.
+        let image = self.images.get(&config.image)?;
+        if u64::from(config.cpus) < image.meta.minimum_cpu_count {
+            return Err(CoreError::macos(format!(
+                "image '{}' requires at least {} CPUs",
+                config.image, image.meta.minimum_cpu_count
+            )));
+        }
+        if config.memory_mib < image.meta.minimum_memory_mib {
+            return Err(CoreError::macos(format!(
+                "image '{}' requires at least {} MiB of memory",
+                config.image, image.meta.minimum_memory_mib
+            )));
+        }
+
+        // Assemble in a unique staging directory. Two concurrent creates of the
+        // same name each stage independently, so the loser only ever removes its
+        // own staging directory — never the winner's cloned disks. The guard
+        // removes staging on any early return.
+        let staging =
+            self.machines_dir
+                .join(format!(".create-{}-{}", config.name, uuid::Uuid::new_v4()));
+        let mut guard = StagingGuard::new(staging.clone());
+        let disks = image.clone_into(&staging)?;
         // Keep the hardware model and machine identifier with the machine so it boots
         // without the base image and with a stable identity across reboots.
-        std::fs::write(dir.join(HARDWARE_MODEL_FILE), &disks.hardware_model)?;
-        std::fs::write(dir.join(MACHINE_ID_FILE), &disks.machine_id)?;
-
+        std::fs::write(staging.join(HARDWARE_MODEL_FILE), &disks.hardware_model)?;
+        std::fs::write(staging.join(MACHINE_ID_FILE), &disks.machine_id)?;
         let record = MacMachineRecord {
             name: config.name.clone(),
             image: config.image,
@@ -209,17 +247,22 @@ impl MacMachineManager {
             created_at: Utc::now(),
             mac_address: Some(generate_mac()),
         };
-        self.write_record(&record)?;
+        Self::write_record_in(&staging, &record)?;
 
+        // Land under the write lock: re-check, clear any stale orphan, rename, insert.
         let mut records = self.records.write().map_err(|_| CoreError::LockPoisoned)?;
         if records.contains_key(&config.name) {
-            drop(records);
-            let _ = std::fs::remove_dir_all(&dir);
             return Err(CoreError::already_exists(format!(
                 "macOS machine '{}'",
                 config.name
             )));
         }
+        if final_dir.exists() {
+            // An orphan from an earlier create that crashed before inserting.
+            std::fs::remove_dir_all(&final_dir)?;
+        }
+        std::fs::rename(&staging, &final_dir)?;
+        guard.disarm();
         records.insert(config.name, record);
         Ok(())
     }
@@ -280,7 +323,7 @@ impl MacMachineManager {
             running.insert(name.to_string(), RunningSlot::Starting);
         }
 
-        let dir = self.machine_dir(name);
+        let dir = self.machine_dir(name)?;
         // The framework rejects a third macOS guest, so it backstops the cap above.
         let booted = async {
             let hardware_model = std::fs::read(dir.join(HARDWARE_MODEL_FILE))?;
@@ -314,6 +357,9 @@ impl MacMachineManager {
 
     /// Stops a running macOS machine.
     ///
+    /// If the stop fails, the machine stays tracked as running (the VZ guest may
+    /// still be live), so the guest cap and [`list`](Self::list) remain accurate.
+    ///
     /// # Errors
     /// Returns an error if the machine is not running or cannot be stopped.
     #[allow(
@@ -339,7 +385,16 @@ impl MacMachineManager {
                 }
             }
         };
-        vm.stop().await
+        if let Err(e) = vm.stop().await {
+            // Stop failed: the VZ guest may still hold a framework slot. Re-insert
+            // so the guest cap and list() reflect that it is still running.
+            self.running
+                .write()
+                .map_err(|_| CoreError::LockPoisoned)?
+                .insert(name.to_string(), RunningSlot::Running(vm));
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Removes a macOS machine and its disks.
@@ -366,7 +421,7 @@ impl MacMachineManager {
             self.stop(name).await?;
         }
 
-        let dir = self.machine_dir(name);
+        let dir = self.machine_dir(name)?;
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
@@ -466,7 +521,76 @@ impl MacMachineManager {
 
 #[cfg(test)]
 mod tests {
+    use super::super::MacImageMeta;
     use super::*;
+    use tempfile::tempdir;
+
+    /// Writes a minimal but clonable base image into the manager's registry.
+    fn write_base_image(mgr: &MacMachineManager, name: &str, min_cpu: u64, min_mem: u64) {
+        mgr.images()
+            .write_meta(&MacImageMeta {
+                name: name.into(),
+                source: None,
+                stream: None,
+                version: None,
+                os_version: None,
+                os_build: None,
+                runner_version: None,
+                minimum_cpu_count: min_cpu,
+                minimum_memory_mib: min_mem,
+                disk_gb: 1,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        let dir = mgr.images().image_dir(name).unwrap();
+        std::fs::write(dir.join("disk.img"), b"disk").unwrap();
+        std::fs::write(dir.join("aux.img"), b"aux").unwrap();
+        std::fs::write(dir.join("hwmodel.bin"), b"hw").unwrap();
+        std::fs::write(dir.join("machine-id.bin"), b"id").unwrap();
+    }
+
+    fn config(name: &str, cpus: u32, memory_mib: u64) -> MacMachineConfig {
+        MacMachineConfig {
+            name: name.into(),
+            image: "base".into(),
+            cpus,
+            memory_mib,
+        }
+    }
+
+    #[test]
+    fn create_rejects_resources_below_image_minimums() {
+        let dir = tempdir().unwrap();
+        let mgr = MacMachineManager::new(dir.path());
+        write_base_image(&mgr, "base", 2, 4096);
+
+        assert!(mgr.create(config("ci", 1, 8192)).is_err()); // too few CPUs
+        assert!(mgr.create(config("ci", 4, 1024)).is_err()); // too little memory
+        assert!(mgr.get("ci").is_none()); // nothing recorded
+    }
+
+    #[test]
+    fn create_conflict_keeps_the_existing_machine_disks() {
+        let dir = tempdir().unwrap();
+        let mgr = MacMachineManager::new(dir.path());
+        write_base_image(&mgr, "base", 2, 4096);
+
+        mgr.create(config("ci", 4, 8192)).unwrap();
+        let disk = mgr.machine_dir("ci").unwrap().join(DISK_FILE);
+        assert!(disk.exists());
+
+        // A second create for the same name must fail without destroying the first.
+        assert!(mgr.create(config("ci", 4, 8192)).is_err());
+        assert!(disk.exists());
+    }
+
+    #[test]
+    fn create_rejects_invalid_names() {
+        let dir = tempdir().unwrap();
+        let mgr = MacMachineManager::new(dir.path());
+        write_base_image(&mgr, "base", 2, 4096);
+        assert!(mgr.create(config("../escape", 4, 8192)).is_err());
+    }
 
     #[test]
     fn record_round_trips() {

@@ -9,7 +9,7 @@
 //! registry entry.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -21,6 +21,7 @@ use super::image::{
     MacImageMeta,
 };
 use super::remote::{ImageManifest, ImageReference, RemoteFile, RemoteIndex, RemoteLocation};
+use super::{StagingGuard, validate_name};
 use crate::error::{CoreError, Result};
 
 /// Where a [`MacImageManager::pull_remote`] finds its manifest.
@@ -134,34 +135,6 @@ impl Write for SparseWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
-    }
-}
-
-/// Removes the staging directory on drop unless disarmed.
-///
-/// This is what makes the pull future cancellation-safe: if the caller drops
-/// it at any await point (e.g. the gRPC client disconnected), the partial
-/// image is cleaned up by this guard's `Drop` rather than leaking.
-struct StagingGuard {
-    path: Option<PathBuf>,
-}
-
-impl StagingGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
-    }
-
-    /// Keeps the directory (it has been renamed into its final location).
-    fn disarm(&mut self) {
-        self.path = None;
-    }
-}
-
-impl Drop for StagingGuard {
-    fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            let _ = std::fs::remove_dir_all(path);
-        }
     }
 }
 
@@ -419,6 +392,9 @@ async fn resolve_source(source: &RemoteSource) -> Result<(RemoteLocation, ImageM
             manifest.disk.disk_format
         )));
     }
+    // The name becomes a registry directory; reject anything that could escape it
+    // (a `--manifest` source is not index-validated like a reference is).
+    validate_name(&manifest.name)?;
     if let RemoteSource::Reference(reference) = source {
         if manifest.name != reference.stream {
             return Err(CoreError::macos(format!(
@@ -481,6 +457,12 @@ impl MacImageManager {
         let (manifest_location, manifest) = resolve_source(&source).await?;
         on_progress(PullStage::Resolve, 1.0);
 
+        // Serialize pulls of the same image: concurrent pulls would otherwise
+        // share the `.pull-<name>` staging directory and corrupt each other's
+        // download. A second pull waits here, then no-ops via the check below.
+        let lock = self.pull_lock(&manifest.name).await;
+        let _pull_guard = lock.lock().await;
+
         on_progress(PullStage::Validate, 0.0);
         let hardware_model = decode_field("hardware_model", &manifest.hardware_model)?;
         let machine_id = decode_field("machine_id", &manifest.machine_id)?;
@@ -497,7 +479,7 @@ impl MacImageManager {
         // Assemble in a staging directory; rename live only when complete. The
         // guard removes it on any early return — or if this future is dropped
         // (client cancellation) at any await point.
-        let staging = self.image_dir(&format!(".pull-{}", manifest.name));
+        let staging = self.image_dir(&format!(".pull-{}", manifest.name))?;
         if staging.exists() {
             std::fs::remove_dir_all(&staging)?;
         }
@@ -512,7 +494,7 @@ impl MacImageManager {
         Self::write_meta_in(&staging, &meta_from_manifest(&manifest, &manifest_location))?;
 
         on_progress(PullStage::Verify, 0.5);
-        let final_dir = self.image_dir(&manifest.name);
+        let final_dir = self.image_dir(&manifest.name)?;
         if final_dir.exists() {
             std::fs::remove_dir_all(&final_dir)?;
         }
@@ -806,6 +788,40 @@ mod tests {
         // Re-pull of the same version is a no-op (returns the existing image).
         let again = mgr.pull_remote(source, |_, _| {}).await.unwrap();
         assert_eq!(again.meta.created_at, image.meta.created_at);
+    }
+
+    #[tokio::test]
+    async fn manifest_with_traversal_name_is_rejected() {
+        let images = tempdir().unwrap();
+        let publish = tempdir().unwrap();
+
+        // A `--manifest` source is not index-validated, so a hostile name must be
+        // rejected during resolution — before anything is downloaded or landed.
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "name": "../evil",
+            "version": "2026.07.02",
+            "os": { "product_version": "26.5" },
+            "hardware_model": REAL_HARDWARE_MODEL_B64,
+            "machine_id": REAL_MACHINE_ID_B64,
+            "minimum_cpu_count": 2,
+            "minimum_memory_mib": 4096,
+            "disk": {
+                "path": "disk.img.zst", "disk_format": "raw",
+                "uncompressed_size": 1, "compressed_size": 1, "sha256": "00"
+            },
+            "aux": {
+                "path": "aux.img.zst",
+                "uncompressed_size": 1, "compressed_size": 1, "sha256": "00"
+            }
+        });
+        let manifest_path = publish.path().join("manifest.json");
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+
+        let mgr = MacImageManager::new(images.path());
+        let source = RemoteSource::Manifest(RemoteLocation::File(manifest_path));
+        assert!(mgr.pull_remote(source.clone(), |_, _| {}).await.is_err());
+        assert!(mgr.resolve_remote(&source).await.is_err());
     }
 
     /// Resolve answers "what would land / what's installed" without

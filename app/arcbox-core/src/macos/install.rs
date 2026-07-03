@@ -2,7 +2,8 @@
 //!
 //! Drives the arcbox-vz installer (the same flow proven by Gate B) and persists a
 //! complete base image — `disk.img`, `aux.img`, `hwmodel.bin`, `machine-id.bin`,
-//! `meta.json` — that [`MacImageManager::clone_base`] can copy-on-write clone.
+//! `meta.json` — that [`MacImage::clone_into`](super::image::MacImage::clone_into)
+//! can copy-on-write clone.
 //!
 //! Retained but unshipped: the product acquires base images exclusively via
 //! [`MacImageManager::pull_remote`](super::pull); this module is compiled only
@@ -66,7 +67,7 @@ impl MacImageManager {
         disk_gb: u64,
         on_progress: impl FnMut(f64),
     ) -> Result<MacImage> {
-        let dir = self.image_dir(name);
+        let dir = self.image_dir(name)?;
         if dir.join("meta.json").exists() {
             return Err(CoreError::already_exists(format!("macOS image '{name}'")));
         }
