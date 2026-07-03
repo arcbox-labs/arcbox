@@ -6,6 +6,7 @@ mod download;
 mod image;
 #[cfg(feature = "macos-ipsw-install")]
 mod install;
+mod lease;
 mod machine;
 mod pull;
 mod remote;

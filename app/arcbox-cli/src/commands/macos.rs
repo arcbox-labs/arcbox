@@ -8,9 +8,9 @@
 use anyhow::{Context, Result};
 use arcbox_grpc::v1::macos_service_client::MacosServiceClient;
 use arcbox_protocol::v1::{
-    CreateMacosMachineRequest, Empty, MacosImagePullRequest, MacosImageRemoveRequest,
-    MacosImageResolveRequest, RemoveMacosMachineRequest, StartMacosMachineRequest,
-    StopMacosMachineRequest,
+    CreateMacosMachineRequest, Empty, InspectMacosMachineRequest, MacosImagePullRequest,
+    MacosImageRemoveRequest, MacosImageResolveRequest, RemoveMacosMachineRequest,
+    StartMacosMachineRequest, StopMacosMachineRequest,
 };
 use clap::{Args, Subcommand};
 use tonic::transport::{Channel, Endpoint};
@@ -54,6 +54,8 @@ pub enum MacosCommands {
     /// List guests
     #[command(name = "ls", alias = "list")]
     List,
+    /// Print a running guest's IP address (from its DHCP lease)
+    Ip(IpArgs),
     /// Manage macOS base images
     #[command(subcommand)]
     Image(ImageCommands),
@@ -78,6 +80,16 @@ pub struct CreateArgs {
 pub struct NameArgs {
     /// Guest name.
     pub name: String,
+}
+
+#[derive(Args)]
+pub struct IpArgs {
+    /// Guest name.
+    pub name: String,
+    /// Keep retrying for up to this many seconds — a freshly started guest
+    /// takes a few seconds to acquire its DHCP lease.
+    #[arg(long, default_value = "0")]
+    pub wait: u16,
 }
 
 #[derive(Args)]
@@ -133,7 +145,35 @@ pub async fn execute(cmd: MacosCommands) -> Result<()> {
         MacosCommands::Stop(args) => execute_stop(args).await,
         MacosCommands::Remove(args) => execute_remove(args).await,
         MacosCommands::List => execute_list().await,
+        MacosCommands::Ip(args) => execute_ip(args).await,
         MacosCommands::Image(c) => execute_image(c).await,
+    }
+}
+
+async fn execute_ip(args: IpArgs) -> Result<()> {
+    let mut client = macos_client().await?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(args.wait.into());
+    loop {
+        let info = client
+            .inspect(tonic::Request::new(InspectMacosMachineRequest {
+                name: args.name.clone(),
+            }))
+            .await
+            .context("Failed to inspect macOS guest")?
+            .into_inner();
+        if !info.ip_address.is_empty() {
+            println!("{}", info.ip_address);
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            let hint = if info.state == "running" {
+                "the guest has not acquired a DHCP lease yet — try --wait 30"
+            } else {
+                "is the guest running?"
+            };
+            anyhow::bail!("no IP address found for '{}' ({hint})", args.name);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 

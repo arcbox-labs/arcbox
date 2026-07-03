@@ -90,14 +90,22 @@ VmManager::start                 macos::MacVm
           boot_loader = MacOSBootLoader
           platform    = MacPlatform{ hardware_model, machine_id, aux_storage }
           storage     = cloned disk.img        (StorageDeviceConfiguration)
-          network     = NAT (vmnet shared)     (DHCP + outbound internet, no host setup)
+          network     = NAT (vmnet shared)     (DHCP + outbound internet, no host setup;
+                                                MAC pinned from the machine record)
           graphics    = MacGraphicsDeviceConfiguration
      → vm.start().await  (serial dispatch queue + ObjC completion block -> Rust oneshot)
      → ready = VZ state == Running (+ optional SSH probe); no in-guest ArcBox agent
 
-   Not yet wired: a VirtioFS config share for per-VM provisioning (the channel a
-   CI-runner token would arrive through) and serial/entropy/balloon devices.
+   Not yet wired: serial/entropy/balloon devices.
    ```
+
+4. **Guest address discovery.** Each machine's MAC is generated at create,
+   persisted in its record, and pinned to the NAT interface at boot. vmnet's
+   DHCP server (`bootpd`) writes leases to `/var/db/dhcpd_leases`; the daemon
+   resolves the machine's lease by that MAC (`app/arcbox-core/src/macos/lease.rs`)
+   and reports the address via `Inspect`. `arcbox macos ip <n> [--wait <secs>]`
+   prints it — the handle callers (e.g. a CI driver) use to `ssh` into the
+   guest and run work directly, with no in-guest agent or provisioning channel.
 
 Teardown for the disposable loop: `request_stop` (graceful) -> delete the per-VM clone.
 `save_state`/`restore_state` (macOS 14+) enable Anka-style instant start later.
@@ -128,6 +136,7 @@ Teardown for the disposable loop: `request_stop` (graceful) -> delete the per-VM
 | base-image pull (streaming, sparse) | `app/arcbox-core/src/macos/pull.rs` (`pull_remote`) |
 | IPSW install (feature `macos-ipsw-install`, unshipped) | `app/arcbox-core/src/macos/install.rs` (`install_from_ipsw`) |
 | macOS machine lifecycle | `app/arcbox-core/src/macos/{vm.rs,machine.rs}` (`MacVm`, `MacMachineManager`) |
+| guest IP from DHCP lease | `app/arcbox-core/src/macos/lease.rs` |
 | daemon wiring | `app/arcbox-core/src/runtime.rs` (`mac_machine_manager()`) |
 | daemon gRPC (macOS-only) | `app/arcbox-api/src/grpc/macos.rs` (`MacosServiceImpl`) |
 | CLI | `app/arcbox-cli/src/commands/macos.rs` (`arcbox macos`) |

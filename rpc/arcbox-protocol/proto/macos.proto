@@ -4,8 +4,9 @@
 // pre-baked base image once from ArcBox's distribution bucket, then
 // copy-on-write clone it to boot clean, throwaway VMs. They run only through
 // Virtualization.framework and share no lifecycle with Linux machines (no
-// guest agent, no kernel boot, no NAT IP), so they have their own service
-// rather than overloading MachineService.
+// guest agent, no kernel boot, no ArcBox NAT stack — networking is vmnet NAT,
+// with the guest address resolved from its DHCP lease), so they have their
+// own service rather than overloading MachineService.
 
 syntax = "proto3";
 
@@ -124,6 +125,12 @@ message MacosMachineInfo {
     string image = 5;
     // Creation timestamp.
     int64 created = 6;
+    // MAC address of the guest's NAT interface, pinned at creation.
+    string mac_address = 7;
+    // IPv4 address of the guest's DHCP lease. Empty until the running guest
+    // has acquired one (typically a few seconds after boot), and always
+    // empty for a stopped guest.
+    string ip_address = 8;
 }
 
 // Request to pull a published base image.

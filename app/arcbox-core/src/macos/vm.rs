@@ -31,8 +31,10 @@ impl MacVm {
     /// Running state.
     ///
     /// `machine_id` is the persisted identifier the auxiliary storage was created with;
-    /// reusing it keeps the guest's identity stable across reboots. `cpus`/`memory_mib`
-    /// are floored to the framework minimums. Apple Silicon only.
+    /// reusing it keeps the guest's identity stable across reboots. `mac_address` is
+    /// pinned to the NAT interface so the guest's DHCP lease identifies it on the
+    /// host. `cpus`/`memory_mib` are floored to the framework minimums. Apple
+    /// Silicon only.
     ///
     /// # Errors
     /// Returns an error if the configuration is invalid, the VM cannot start, or it
@@ -46,6 +48,7 @@ impl MacVm {
         aux: &Path,
         hardware_model: &[u8],
         machine_id: &[u8],
+        mac_address: &str,
         cpus: u32,
         memory_mib: u64,
     ) -> Result<Self> {
@@ -66,8 +69,9 @@ impl MacVm {
             .add_storage_device(StorageDeviceConfiguration::disk_image(disk, false)?)
             // NAT (vmnet shared) gives the guest a DHCP lease + outbound internet
             // through the host with no host-side setup — all a CI runner needs to
-            // reach GitHub and pull dependencies.
-            .add_network_device(NetworkDeviceConfiguration::nat()?)
+            // reach GitHub and pull dependencies. The pinned MAC is what lets the
+            // host find that lease (see super::lease).
+            .add_network_device(NetworkDeviceConfiguration::nat_with_mac(mac_address)?)
             .add_graphics_device(MacGraphicsDeviceConfiguration::new(1920, 1080, 80)?);
         config.validate()?;
         let vm = config.build()?;
