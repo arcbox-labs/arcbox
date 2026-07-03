@@ -116,6 +116,12 @@ pub async fn serve(
 /// `SHUTDOWN_GRACE`; this only needs to cover that plus scheduling overhead.
 const UNENROLL_GRACE: Duration = Duration::from_secs(20);
 
+/// Bound on the best-effort gateway `Unenroll` call inside
+/// [`AgentSupervisor::unenroll`]. Generous for a healthy round-trip, but a
+/// blackholed gateway (no connect timeout is configured on the endpoint)
+/// must not hang the RPC — the local clear proceeds without the server half.
+const GATEWAY_UNENROLL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Wait up to `grace` for `task` to finish on its own; if it doesn't, abort
 /// it and wait for that reap too, so `task` is guaranteed stopped by the
 /// time this returns regardless of whether it ever observed its own
@@ -160,9 +166,9 @@ fn check_enrollable(state: &State) -> Result<(), &'static str> {
 }
 
 /// A live attachment to the gateway: the admission authority in `admit()`
-/// and the handle to stop it. The credential itself isn't retained here —
-/// nothing reads it back once attaching starts; `machine_id` observability
-/// goes through [`AgentState`] instead.
+/// and the handle to stop it. Retains a copy of the credential for
+/// `unenroll`'s server-side revocation call; `machine_id` observability
+/// still goes through [`AgentState`].
 struct Attachment {
     supervisor: RunnerSupervisor,
     /// Child of [`AgentSupervisor::process_shutdown`]: cancelling it stops
@@ -170,11 +176,14 @@ struct Attachment {
     /// shutdown) cascades to it too, so runners still drain on SIGTERM.
     shutdown: CancellationToken,
     task: tokio::task::JoinHandle<Result<()>>,
+    /// The credential this attachment runs with — what `unenroll` presents
+    /// to the gateway to decommission the machine.
+    credential: Credential,
     /// The gateway this attachment's credential is persisted under (the
-    /// keychain backend keys its entry by gateway URI). `unenroll` clears
-    /// exactly this store: reading the live `gateway_target` there instead
-    /// would clear the wrong entry if a settings update moved the target
-    /// while attached, leaving this credential behind on disk.
+    /// keychain backend keys its entry by gateway URI). `unenroll` calls
+    /// and clears exactly this store: reading the live `gateway_target`
+    /// there instead would clear the wrong entry if a settings update moved
+    /// the target while attached, leaving this credential behind on disk.
     credential_gateway: String,
 }
 
@@ -283,7 +292,7 @@ impl AgentSupervisor {
         let shutdown = self.process_shutdown.child_token();
         let task = tokio::spawn(attach::run(
             self.config.clone(),
-            credential,
+            credential.clone(),
             supervisor.clone(),
             egress_rx,
             self.capabilities.clone(),
@@ -294,6 +303,7 @@ impl AgentSupervisor {
             supervisor,
             shutdown,
             task,
+            credential,
             credential_gateway,
         }
     }
@@ -353,11 +363,12 @@ impl AgentSupervisor {
         Ok(machine_id)
     }
 
-    /// Stop attaching and remove the persisted credential. Observably
-    /// `Unenrolled` immediately (`GetStatus`/`Watch`); the attach task's own
-    /// teardown finishes in the background, bounded by [`UNENROLL_GRACE`],
-    /// and `Enroll` is refused until it completes (see
-    /// [`State::Unenrolling`]).
+    /// Leave the fleet — terminal. Stops attaching, decommissions the
+    /// machine at the gateway (best-effort), and removes the persisted
+    /// credential. Observably `Unenrolled` immediately (`GetStatus`/
+    /// `Watch`); the attach task's own teardown finishes in the background,
+    /// bounded by [`UNENROLL_GRACE`], and `Enroll` is refused until it
+    /// completes (see [`State::Unenrolling`]).
     pub async fn unenroll(&self) -> Result<(), Status> {
         let attachment = {
             let mut state = self.state.lock().await;
@@ -395,6 +406,32 @@ impl AgentSupervisor {
             let mut state = self.state.lock().await;
             *state = State::Unenrolled;
             self.agent_state.set_enrollment(Enrollment::Unenrolled, "");
+        }
+
+        // The server half, best-effort and time-bounded: decommission the
+        // machine and revoke the credential at the gateway (RUN-40). An
+        // unreachable gateway must not block leaving — proceed with the
+        // local clear, and the org can decommission the leftover record
+        // from its side.
+        match tokio::time::timeout(
+            GATEWAY_UNENROLL_TIMEOUT,
+            enroll::unenroll(
+                &self.config,
+                &attachment.credential_gateway,
+                &attachment.credential.machine_token,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(error = %e, gateway = %attachment.credential_gateway,
+                      "gateway unenroll failed; clearing the local credential anyway");
+            }
+            Err(_) => {
+                warn!(gateway = %attachment.credential_gateway,
+                      "gateway unenroll timed out; clearing the local credential anyway");
+            }
         }
 
         // Keyed by the gateway this attachment enrolled against, not the
@@ -541,10 +578,20 @@ mod tests {
         let (events, _events_rx) = tokio::sync::mpsc::channel(1);
         let runner =
             crate::runner::RunnerSupervisor::new(events, None, None, Vec::new(), agent_state);
+        // A persisted credential, so the completed unenroll can prove the
+        // local clear happens even though this gateway is unreachable (the
+        // server-side call is best-effort).
+        let credential = Credential {
+            machine_id: "fltm_test".to_owned(),
+            machine_token: "flt_token_test".to_owned(),
+        };
+        let store = supervisor.credential_store_for("http://127.0.0.1:1");
+        store.store(&credential).expect("persist test credential");
         *supervisor.state.lock().await = State::Attached(Attachment {
             supervisor: runner,
             shutdown,
             task,
+            credential,
             credential_gateway: "http://127.0.0.1:1".to_owned(),
         });
 
@@ -567,6 +614,8 @@ mod tests {
             .expect("unenroll task")
             .expect("unenroll succeeds");
         assert!(matches!(*supervisor.state.lock().await, State::Unenrolled));
+        // The unreachable gateway didn't block the terminal local outcome.
+        assert!(store.load().expect("credential store readable").is_none());
 
         // Gate open again: enroll now passes the state check and fails
         // later, at the unreachable gateway — a different error.

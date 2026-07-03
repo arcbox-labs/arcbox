@@ -43,6 +43,26 @@ const PROTOCOL_VERSION_HEADER: &str = "x-arcbox-protocol-version";
 /// generous ceiling rather than an expected wait.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 
+/// Wrap `message` with the machine-credential and protocol-version metadata
+/// every authenticated gateway RPC carries (`Attach` here,
+/// `enroll::unenroll`'s `Unenroll`).
+pub fn authenticated_request<T>(message: T, machine_token: &str) -> Result<Request<T>> {
+    let mut request = Request::new(message);
+    let token: MetadataValue<_> = machine_token
+        .parse()
+        .context("machine token is not a valid metadata value")?;
+    request.metadata_mut().insert(MACHINE_TOKEN_HEADER, token);
+    // Protocol-version handshake: the gateway rejects an unsupported version.
+    let version: MetadataValue<_> = PROTOCOL_VERSION
+        .to_string()
+        .parse()
+        .expect("protocol version is a valid metadata value");
+    request
+        .metadata_mut()
+        .insert(PROTOCOL_VERSION_HEADER, version);
+    Ok(request)
+}
+
 /// Convert a gateway-facing telemetry reading into its control-plane
 /// counterpart. A plain function, not `From`: both `HostTelemetry` types
 /// are generated in other crates, so Rust's orphan rule blocks implementing
@@ -212,20 +232,8 @@ async fn connect_and_serve(
             .with_context(|| format!("connecting to {gateway}"))?;
         let mut client = FleetGatewayServiceClient::new(channel);
 
-        let mut request = Request::new(ReceiverStream::new(req_rx));
-        let token: MetadataValue<_> = credential
-            .machine_token
-            .parse()
-            .context("machine token is not a valid metadata value")?;
-        request.metadata_mut().insert(MACHINE_TOKEN_HEADER, token);
-        // Protocol-version handshake: the gateway rejects an unsupported version.
-        let version: MetadataValue<_> = PROTOCOL_VERSION
-            .to_string()
-            .parse()
-            .expect("protocol version is a valid metadata value");
-        request
-            .metadata_mut()
-            .insert(PROTOCOL_VERSION_HEADER, version);
+        let request =
+            authenticated_request(ReceiverStream::new(req_rx), &credential.machine_token)?;
 
         client
             .attach(request)
