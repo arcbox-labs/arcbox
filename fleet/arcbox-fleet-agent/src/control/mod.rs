@@ -6,6 +6,7 @@
 //! service implementation.
 
 pub mod client;
+mod image;
 mod lifecycle;
 mod settings;
 mod watch;
@@ -16,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use arcbox_fleet_control_proto::v1::fleet_image_service_server::FleetImageServiceServer;
 use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_server::FleetLifecycleServiceServer;
 use arcbox_fleet_control_proto::v1::fleet_settings_service_server::FleetSettingsServiceServer;
 use arcbox_fleet_control_proto::v1::fleet_state_service_server::FleetStateServiceServer;
@@ -36,6 +38,7 @@ use crate::runner::RunnerSupervisor;
 use crate::settings::SettingsStore;
 use crate::state::AgentState;
 use crate::{attach, enroll};
+use image::ImageService;
 use lifecycle::LifecycleService;
 use settings::SettingsService;
 use watch::WatchService;
@@ -89,9 +92,11 @@ pub async fn serve(
             state.clone(),
         )))
         .add_service(FleetSettingsServiceServer::new(SettingsService::new(
-            state,
+            state.clone(),
             settings_store,
-            docker,
+        )))
+        .add_service(FleetImageServiceServer::new(ImageService::new(
+            state, docker,
         )))
         .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
         .await
@@ -216,10 +221,10 @@ impl AgentSupervisor {
     }
 
     /// A handle to the process-lifetime Docker runtime, if configured — read
-    /// by [`serve`] and passed to `FleetSettingsService` to validate a
-    /// candidate `linux_runner_image` (see `control::settings`). Fixed at
-    /// construction and unaffected by the attach/detach cycle: `docker_mode`
-    /// changes are restart-scoped, so this is never stale.
+    /// by [`serve`] and passed to `FleetImageService` to prepare a candidate
+    /// `linux_runner_image` (see `control::image`). Fixed at construction
+    /// and unaffected by the attach/detach cycle: `docker_mode` changes are
+    /// restart-scoped, so this is never stale.
     fn docker(&self) -> Option<DockerRunner> {
         self.docker.clone()
     }
