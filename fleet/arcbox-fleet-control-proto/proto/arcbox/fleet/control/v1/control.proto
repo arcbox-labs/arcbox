@@ -83,6 +83,9 @@ enum ConnectionState {
   CONNECTION_STATE_DRAINING = 3;
   // Enrolled but deliberately offline: the participate setting is off.
   CONNECTION_STATE_DETACHED = 4;
+  // The gateway rejected the credential (machine decommissioned
+  // server-side); parked until an explicit Unenroll.
+  CONNECTION_STATE_CREDENTIAL_REJECTED = 5;
 }
 
 message GetStatusRequest {}
@@ -121,6 +124,11 @@ enum Enrollment {
   // the participate setting is off. The machine shows Offline server-side;
   // participate=true reattaches with the same identity.
   ENROLLMENT_DETACHED = 4;
+  // The gateway rejected the credential (revoked server-side — the machine
+  // was decommissioned). The agent stops reconnecting and keeps the
+  // credential on disk until an explicit Unenroll, so a server-side auth
+  // regression can never make agents wipe their own credentials.
+  ENROLLMENT_CREDENTIAL_REJECTED = 5;
 }
 
 // What execution backend serves a capability. Deliberately redefined here

@@ -300,6 +300,13 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                         response.machine_id
                     );
                 }
+                control_proto::ConnectionState::CredentialRejected => {
+                    println!(
+                        "credential rejected (machine_id={}; the machine was decommissioned \
+                         server-side — run `unenroll` to clear it and re-enroll to rejoin)",
+                        response.machine_id
+                    );
+                }
                 control_proto::ConnectionState::Unspecified => println!("unknown state"),
             }
             Ok(())

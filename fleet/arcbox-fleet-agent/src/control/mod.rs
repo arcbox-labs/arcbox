@@ -628,6 +628,7 @@ impl AgentSupervisor {
         let state = match enrollment {
             Enrollment::Unspecified | Enrollment::Unenrolled => ConnectionState::Unenrolled,
             Enrollment::Detached => ConnectionState::Detached,
+            Enrollment::CredentialRejected => ConnectionState::CredentialRejected,
             Enrollment::Attaching | Enrollment::Attached if snapshot.draining => {
                 ConnectionState::Draining
             }
