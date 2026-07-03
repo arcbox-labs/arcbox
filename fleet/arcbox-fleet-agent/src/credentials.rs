@@ -109,10 +109,9 @@ impl FileStore {
     }
 
     fn store(&self, cred: &Credential) -> Result<()> {
-        // `write_private` refuses a plaintext write on non-Unix, so the raw
-        // token never lands in an unhardened file; on Unix it's `0600` from
-        // creation and the rename preserves that mode.
-        crate::fsutil::write_json_atomic(&self.path, cred, write_private)
+        // Owner-only (`0600`) from creation, and the rename preserves that
+        // mode, so the raw token is never briefly world-readable.
+        crate::fsutil::write_json_atomic(&self.path, cred)
     }
 
     fn clear(&self) -> Result<()> {
@@ -122,12 +121,6 @@ impl FileStore {
             Err(e) => Err(e).with_context(|| format!("removing {}", self.path.display())),
         }
     }
-}
-
-/// Write `bytes` to `path`, owner-only (`0600`) from creation on Unix — every
-/// supported target (macOS, Linux) is Unix, so this is the only backend.
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    crate::fsutil::write_owner_only(path, bytes)
 }
 
 /// Stores the credential as a single JSON blob in the OS keychain, one entry
