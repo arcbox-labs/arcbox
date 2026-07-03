@@ -19,12 +19,13 @@ use std::process::{Child, Command, Stdio};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use arcbox_fleet_control_proto::v1::fleet_image_service_client::FleetImageServiceClient;
 use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_client::FleetLifecycleServiceClient;
 use arcbox_fleet_control_proto::v1::fleet_settings_service_client::FleetSettingsServiceClient;
 use arcbox_fleet_control_proto::v1::fleet_state_service_client::FleetStateServiceClient;
 use arcbox_fleet_control_proto::v1::{
     ConnectionState, DockerMode, DrainRequest, Enrollment, GetAgentInfoRequest, GetSettingsRequest,
-    GetStatusRequest, UpdateSettingsRequest, WatchRequest,
+    GetStatusRequest, PrepareRequest, UpdateSettingsRequest, WatchRequest,
 };
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
@@ -133,7 +134,7 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
     // FleetStateService.Watch: the client holds no state of its own, so the
     // very first message must already be a full, current snapshot — not
     // require a change to happen first.
-    let mut watch_client = FleetStateServiceClient::new(channel);
+    let mut watch_client = FleetStateServiceClient::new(channel.clone());
     let mut stream = watch_client
         .watch(WatchRequest {})
         .await
@@ -227,6 +228,49 @@ async fn unenrolled_agent_reports_status_and_rejects_drain() {
             .current,
         0.5
     );
+
+    // linux_runner_image is prepare-scoped end-to-end: UpdateSettings moves
+    // only `target`; FleetImageService.Prepare is what promotes it. This
+    // agent runs with Docker disabled, so preparation has nothing to verify
+    // the image against and promotes directly ("skipped" then "promoted").
+    let updated = settings_client
+        .update_settings(UpdateSettingsRequest {
+            linux_runner_image: Some("ghcr.io/acme/runner:v2".to_owned()),
+            ..Default::default()
+        })
+        .await
+        .expect("UpdateSettings")
+        .into_inner()
+        .settings
+        .expect("settings present")
+        .linux_runner_image
+        .expect("linux_runner_image present");
+    assert_eq!(updated.current, "ghcr.io/actions/actions-runner:latest");
+    assert_eq!(updated.target, "ghcr.io/acme/runner:v2");
+
+    let mut image_client = FleetImageServiceClient::new(channel);
+    let mut prepare = image_client
+        .prepare(PrepareRequest { kinds: Vec::new() })
+        .await
+        .expect("Prepare RPC")
+        .into_inner();
+    let mut stages = Vec::new();
+    while let Some(event) = prepare.message().await.expect("prepare stream") {
+        stages.push(event.stage);
+    }
+    assert_eq!(stages, ["skipped", "promoted"]);
+
+    let prepared = settings_client
+        .get_settings(GetSettingsRequest {})
+        .await
+        .expect("GetSettings")
+        .into_inner()
+        .settings
+        .expect("settings present")
+        .linux_runner_image
+        .expect("linux_runner_image present");
+    assert_eq!(prepared.current, "ghcr.io/acme/runner:v2");
+    assert_eq!(prepared.current, prepared.target);
 
     // Safety invariant enforced end-to-end: this agent already has
     // docker_mode=Disabled and no runner_script (its env-derived seed —
