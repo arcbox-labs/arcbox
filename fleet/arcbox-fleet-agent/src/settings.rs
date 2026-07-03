@@ -164,6 +164,7 @@ mod tests {
             vm: crate::config::VmConfig {
                 mode: crate::config::VmMode::Disabled,
                 macos_runner_image: "tahoe-base".to_owned(),
+                daemon_socket: std::path::PathBuf::from("/nonexistent/arcbox.sock"),
             },
             credential_store: crate::config::CredentialMode::File,
         };

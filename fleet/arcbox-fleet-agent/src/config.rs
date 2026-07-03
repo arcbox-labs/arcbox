@@ -24,6 +24,7 @@ const ENV_DOCKER: &str = "ARCBOX_FLEET_DOCKER";
 const ENV_LINUX_RUNNER_IMAGE: &str = "ARCBOX_FLEET_LINUX_RUNNER_IMAGE";
 const ENV_VM: &str = "ARCBOX_FLEET_VM";
 const ENV_MACOS_RUNNER_IMAGE: &str = "ARCBOX_FLEET_MACOS_RUNNER_IMAGE";
+const ENV_DAEMON_SOCKET: &str = "ARCBOX_FLEET_DAEMON_SOCKET";
 const ENV_CREDENTIAL_STORE: &str = "ARCBOX_FLEET_CREDENTIAL_STORE";
 
 /// Reject an offer when 1-minute load average per core exceeds this.
@@ -89,6 +90,14 @@ pub struct VmConfig {
     pub mode: VmMode,
     /// macOS base-image stream darwin VM jobs boot from.
     pub macos_runner_image: String,
+    /// arcbox-daemon gRPC socket — the daemon↔CLI socket contract
+    /// (`~/.arcbox/run/arcbox.sock` by default, via `arcbox-constants`).
+    #[expect(
+        dead_code,
+        reason = "read by the VM backend's startup probe, which lands in the next commit \
+                  of this change set; the #[expect] forces removal then"
+    )]
+    pub daemon_socket: PathBuf,
 }
 
 /// Resolved agent configuration.
@@ -158,6 +167,10 @@ impl AgentConfig {
         };
         let macos_runner_image = std::env::var(ENV_MACOS_RUNNER_IMAGE)
             .unwrap_or_else(|_| DEFAULT_MACOS_RUNNER_IMAGE.to_string());
+        let daemon_socket = match std::env::var_os(ENV_DAEMON_SOCKET) {
+            Some(path) => PathBuf::from(path),
+            None => arcbox_constants::paths::HostLayout::from_env_or_default().grpc_socket,
+        };
 
         let credential_store = match std::env::var(ENV_CREDENTIAL_STORE).as_deref() {
             Ok("keyring") => CredentialMode::Keyring,
@@ -190,6 +203,7 @@ impl AgentConfig {
             vm: VmConfig {
                 mode: vm_mode,
                 macos_runner_image,
+                daemon_socket,
             },
             credential_store,
         })
