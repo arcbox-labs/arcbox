@@ -9,7 +9,8 @@ use anyhow::{Context, Result};
 use arcbox_grpc::v1::macos_service_client::MacosServiceClient;
 use arcbox_protocol::v1::{
     CreateMacosMachineRequest, Empty, MacosImagePullRequest, MacosImageRemoveRequest,
-    RemoveMacosMachineRequest, StartMacosMachineRequest, StopMacosMachineRequest,
+    MacosImageResolveRequest, RemoveMacosMachineRequest, StartMacosMachineRequest,
+    StopMacosMachineRequest,
 };
 use clap::{Args, Subcommand};
 use tonic::transport::{Channel, Endpoint};
@@ -92,7 +93,10 @@ pub struct RemoveArgs {
 #[derive(Subcommand)]
 pub enum ImageCommands {
     /// Pull a published base image (e.g. tahoe-base or tahoe-base@2026.07.02)
-    Pull(PullArgs),
+    Pull(SourceArgs),
+    /// Resolve a reference against the published index without downloading:
+    /// what version a pull would land, and what is installed locally
+    Resolve(SourceArgs),
     /// List base images
     #[command(name = "ls", alias = "list")]
     List,
@@ -101,14 +105,16 @@ pub enum ImageCommands {
     Remove(ImageRemoveArgs),
 }
 
+/// Where an image comes from — shared by `pull` and `resolve`, which take
+/// the same source.
 #[derive(Args)]
-pub struct PullArgs {
+pub struct SourceArgs {
     /// Image reference: stream name with optional pinned version
     /// (e.g. "tahoe-base" or "tahoe-base@2026.07.02").
     #[arg(required_unless_present = "manifest", conflicts_with = "manifest")]
     pub reference: Option<String>,
-    /// Pull directly from a manifest (URL or daemon-local path), bypassing
-    /// the published index.
+    /// Use a manifest directly (URL or daemon-local path), bypassing the
+    /// published index.
     #[arg(long)]
     pub manifest: Option<String>,
 }
@@ -249,11 +255,18 @@ async fn execute_image(cmd: ImageCommands) -> Result<()> {
                 .into_inner();
 
             let mut last_stage = String::new();
+            let mut landed = None;
             while let Some(event) = stream
                 .message()
                 .await
                 .context("Failed to pull macOS image")?
             {
+                // The terminal event carries the landed image instead of
+                // progress; report it as the outcome, not as a stage line.
+                if let Some(image) = event.image {
+                    landed = Some(image);
+                    continue;
+                }
                 if event.stage != last_stage && !last_stage.is_empty() {
                     println!();
                 }
@@ -262,7 +275,35 @@ async fn execute_image(cmd: ImageCommands) -> Result<()> {
                 let _ = std::io::stdout().flush();
             }
             println!();
-            println!("macOS image '{what}' pulled");
+            match landed {
+                Some(image) => println!("macOS image '{}@{}' pulled", image.name, image.version),
+                None => println!("macOS image '{what}' pulled"),
+            }
+            Ok(())
+        }
+        ImageCommands::Resolve(args) => {
+            let mut client = macos_client().await?;
+            let info = client
+                .image_resolve(tonic::Request::new(MacosImageResolveRequest {
+                    reference: args.reference.unwrap_or_default(),
+                    manifest_url: args.manifest.unwrap_or_default(),
+                }))
+                .await
+                .context("Failed to resolve macOS image")?
+                .into_inner();
+            println!("{}@{}", info.name, info.version);
+            println!("os: macOS {}", info.os_version);
+            println!(
+                "requires: {} CPUs, {} MiB memory, {} GB disk",
+                info.minimum_cpu_count, info.minimum_memory_mib, info.disk_gb
+            );
+            if info.installed_version.is_empty() {
+                println!("installed: (none)");
+            } else if info.installed_version == info.version {
+                println!("installed: {} (up to date)", info.installed_version);
+            } else {
+                println!("installed: {} (update available)", info.installed_version);
+            }
             Ok(())
         }
         ImageCommands::List => {

@@ -9,13 +9,14 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arcbox_core::{PullStage, RemoteLocation, RemoteSource};
+use arcbox_core::{MacImage, PullStage, RemoteLocation, RemoteSource};
 use arcbox_grpc::v1::macos_service_server;
 use arcbox_protocol::v1::{
     CreateMacosMachineRequest, Empty, InspectMacosMachineRequest, MacosImageListResponse,
-    MacosImagePullEvent, MacosImagePullRequest, MacosImageRemoveRequest, MacosImageSummary,
-    MacosMachineInfo, MacosMachineListResponse, MacosMachineSummary, RemoveMacosMachineRequest,
-    StartMacosMachineRequest, StopMacosMachineRequest,
+    MacosImagePullEvent, MacosImagePullRequest, MacosImageRemoveRequest, MacosImageResolveRequest,
+    MacosImageResolveResponse, MacosImageSummary, MacosMachineInfo, MacosMachineListResponse,
+    MacosMachineSummary, RemoveMacosMachineRequest, StartMacosMachineRequest,
+    StopMacosMachineRequest,
 };
 use tokio_stream::Stream;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -31,6 +32,35 @@ const fn stage_name(stage: PullStage) -> &'static str {
         PullStage::Disk => "disk",
         PullStage::Aux => "aux",
         PullStage::Verify => "verifying",
+    }
+}
+
+/// Parses an image source: exactly one of `reference` / `manifest_url`.
+/// Shared by `ImagePull` and `ImageResolve`, which take the same source.
+fn parse_source(reference: &str, manifest_url: &str) -> Result<RemoteSource, Status> {
+    match (reference.is_empty(), manifest_url.is_empty()) {
+        (false, true) => Ok(RemoteSource::Reference(reference.parse().map_err(
+            |e: arcbox_core::CoreError| Status::invalid_argument(e.to_string()),
+        )?)),
+        (true, false) => Ok(RemoteSource::Manifest(RemoteLocation::parse(manifest_url))),
+        _ => Err(Status::invalid_argument(
+            "exactly one of reference / manifest_url must be set",
+        )),
+    }
+}
+
+/// Wire summary of a registered image. Shared by `ImageList` and
+/// `ImagePull`'s terminal event.
+fn image_summary(image: MacImage) -> MacosImageSummary {
+    MacosImageSummary {
+        name: image.meta.name,
+        minimum_cpu_count: image.meta.minimum_cpu_count,
+        minimum_memory_mib: image.meta.minimum_memory_mib,
+        disk_gb: image.meta.disk_gb,
+        created: image.meta.created_at.timestamp(),
+        source: image.meta.source.unwrap_or_default(),
+        version: image.meta.version.unwrap_or_default(),
+        os_version: image.meta.os_version.unwrap_or_default(),
     }
 }
 
@@ -149,18 +179,7 @@ impl macos_service_server::MacosService for MacosServiceImpl {
         request: Request<MacosImagePullRequest>,
     ) -> Result<Response<Self::ImagePullStream>, Status> {
         let req = request.into_inner();
-        let source =
-            match (req.reference.is_empty(), req.manifest_url.is_empty()) {
-                (false, true) => RemoteSource::Reference(req.reference.parse().map_err(
-                    |e: arcbox_core::CoreError| Status::invalid_argument(e.to_string()),
-                )?),
-                (true, false) => RemoteSource::Manifest(RemoteLocation::parse(&req.manifest_url)),
-                _ => {
-                    return Err(Status::invalid_argument(
-                        "exactly one of reference / manifest_url must be set",
-                    ));
-                }
-            };
+        let source = parse_source(&req.reference, &req.manifest_url)?;
 
         let mgr = Arc::clone(self.runtime.ready()?.mac_machine_manager());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -181,23 +200,57 @@ impl macos_service_server::MacosService for MacosServiceImpl {
                     let _ = progress.send(Ok(MacosImagePullEvent {
                         stage: stage_name(stage).to_string(),
                         fraction,
+                        image: None,
                     }));
                 }
             });
             // A dropped client stream closes the channel; cancel the pull by
             // dropping its future (its staging guard cleans up the partials).
             tokio::select! {
-                result = pull => {
-                    if let Err(e) = result {
+                result = pull => match result {
+                    // Terminal event: what actually landed (or was already
+                    // present), so the caller learns the concrete version a
+                    // floating reference resolved to.
+                    Ok(image) => {
+                        let _ = tx.send(Ok(MacosImagePullEvent {
+                            stage: "done".to_string(),
+                            fraction: 1.0,
+                            image: Some(image_summary(image)),
+                        }));
+                    }
+                    Err(e) => {
                         let _ = tx.send(Err(Status::internal(e.to_string())));
                     }
-                }
+                },
                 () = tx.closed() => {
                     tracing::info!("macOS image pull canceled: client disconnected");
                 }
             }
         });
         Ok(Response::new(Box::pin(UnboundedReceiverStream::new(rx))))
+    }
+
+    async fn image_resolve(
+        &self,
+        request: Request<MacosImageResolveRequest>,
+    ) -> Result<Response<MacosImageResolveResponse>, Status> {
+        let req = request.into_inner();
+        let source = parse_source(&req.reference, &req.manifest_url)?;
+        let mgr = Arc::clone(self.runtime.ready()?.mac_machine_manager());
+        let resolved = mgr
+            .images()
+            .resolve_remote(&source)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(MacosImageResolveResponse {
+            name: resolved.name,
+            version: resolved.version,
+            os_version: resolved.os_version,
+            minimum_cpu_count: resolved.minimum_cpu_count,
+            minimum_memory_mib: resolved.minimum_memory_mib,
+            disk_gb: resolved.disk_gb,
+            installed_version: resolved.installed_version.unwrap_or_default(),
+        }))
     }
 
     async fn image_list(
@@ -211,16 +264,7 @@ impl macos_service_server::MacosService for MacosServiceImpl {
             .images()
             .list()
             .into_iter()
-            .map(|i| MacosImageSummary {
-                name: i.meta.name,
-                minimum_cpu_count: i.meta.minimum_cpu_count,
-                minimum_memory_mib: i.meta.minimum_memory_mib,
-                disk_gb: i.meta.disk_gb,
-                created: i.meta.created_at.timestamp(),
-                source: i.meta.source.unwrap_or_default(),
-                version: i.meta.version.unwrap_or_default(),
-                os_version: i.meta.os_version.unwrap_or_default(),
-            })
+            .map(image_summary)
             .collect();
         Ok(Response::new(MacosImageListResponse { images }))
     }

@@ -147,6 +147,7 @@ current-thread runtime inside `spawn_blocking` (`grpc::run_macos_blocking`).
 arcbox macos image pull tahoe-base            # latest per the published index
 arcbox macos image pull tahoe-base@2026.07.02 # pinned version
 arcbox macos image pull --manifest <url|path> # dev: bypass the index
+arcbox macos image resolve tahoe-base        # what a pull would land, without downloading
 arcbox macos image ls
 
 # 2. Create a disposable guest by copy-on-write cloning the base (instant):
