@@ -1,5 +1,5 @@
 //! Unix-socket gRPC client helper for the `status`/`drain`/`resume`/
-//! `disconnect`/`settings` CLI subcommands, connecting to the running
+//! `unenroll`/`settings` CLI subcommands, connecting to the running
 //! agent's `agent.sock`. Mirrors `arcbox-cli`'s `UnixConnector`
 //! (`app/arcbox-cli/src/commands/machine.rs`).
 

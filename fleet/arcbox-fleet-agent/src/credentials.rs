@@ -79,7 +79,7 @@ impl CredentialStore {
     }
 
     /// Remove the persisted credential, if any. A no-op, not an error, when
-    /// none is stored — `Disconnect` clears unconditionally rather than
+    /// none is stored — `Unenroll` clears unconditionally rather than
     /// first checking `load()`.
     pub fn clear(&self) -> Result<()> {
         match self {

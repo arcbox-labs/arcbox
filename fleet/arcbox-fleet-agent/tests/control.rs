@@ -3,7 +3,7 @@
 //! `arcbox-fleet-agent` ships only a binary (no library target), so this
 //! spawns the real compiled `serve` subcommand against a scratch data dir
 //! and exercises `FleetLifecycleService` over the real Unix socket — the
-//! same path the CLI's `status`/`drain`/`resume`/`disconnect` subcommands
+//! same path the CLI's `status`/`drain`/`resume`/`unenroll` subcommands
 //! and the desktop app use.
 
 #![allow(

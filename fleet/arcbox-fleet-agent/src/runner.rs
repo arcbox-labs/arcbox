@@ -275,7 +275,7 @@ impl RunnerSupervisor {
     /// Stop admitting new offers locally, without touching the observable
     /// [`AgentState`] draining flag. Shared by the user-facing `Drain` (which
     /// also flips the observable flag) and by [`Self::shutdown`] (which must
-    /// not: a disconnect's teardown would otherwise leave the shared,
+    /// not: an unenroll's teardown would otherwise leave the shared,
     /// process-lifetime state stuck draining, so a re-enroll on the same
     /// process would inherit it and report Draining while actually admitting).
     fn stop_accepting(&self) {
@@ -927,7 +927,7 @@ mod tests {
 
     /// The user-facing `Drain` flips the observable `AgentState.draining`
     /// flag, but teardown (`shutdown`) must not: that flag is process-lifetime
-    /// and shared across attachments, so a disconnect that faked a drain would
+    /// and shared across attachments, so an unenroll that faked a drain would
     /// leave a later re-enroll reporting Draining while it is in fact admitting
     /// jobs. Both still stop admission locally (see the shutdown tests above,
     /// which assert `inner.draining`).
