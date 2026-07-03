@@ -251,6 +251,17 @@ impl AgentState {
             .clone()
     }
 
+    /// The desired image — what `FleetImageService.Prepare` verifies and
+    /// then promotes to `current`.
+    pub fn linux_runner_image_target(&self) -> String {
+        settings_of(&self.tx.borrow())
+            .linux_runner_image
+            .as_ref()
+            .expect(SETTINGS_INVARIANT)
+            .target
+            .clone()
+    }
+
     /// The desired gateway — what `attach.rs` dials on its next attempt.
     /// There's no `gateway_current` reader: nothing needs to read back what
     /// was last dialed outside of the full `settings()`/`persisted_settings()`
@@ -264,10 +275,9 @@ impl AgentState {
             .clone()
     }
 
-    // -- Settings: writers. `load_ceiling`/`mem_floor_mib`/`linux_runner_image`
-    // apply instantly, so their setters write both `current` and `target`
-    // in one `send_modify` — there's never a moment where they should
-    // differ.
+    // -- Settings: writers. `load_ceiling`/`mem_floor_mib` apply instantly,
+    // so their setters write both `current` and `target` in one
+    // `send_modify` — there's never a moment where they should differ.
     //
     // `docker_mode`/`runner_script` are restart-scoped: `UpdateSettings`
     // moves only their `target`, and `current` stays whatever the process
@@ -277,9 +287,13 @@ impl AgentState {
     // actually found Docker is observable via `capabilities`, not by
     // resolving `current` away from the requested policy.
     //
-    // `gateway` alone has an independent `current` setter: `UpdateSettings`
-    // writes `target`, and `attach.rs` writes `current` once it has
-    // actually dialed that gateway.
+    // `gateway` and `linux_runner_image` have independent `current`
+    // setters, written only once the engine has realized the value:
+    // `attach.rs` sets the gateway's `current` when it has actually dialed
+    // that gateway, and `FleetImageService.Prepare` sets the image's
+    // `current` when the target has been pulled for every advertised arch
+    // (startup's `init_docker` verifies the seed the same way, which is
+    // why `AgentState::new` may seed `current == target`).
 
     pub fn set_load_ceiling(&self, value: f64) {
         self.tx.send_modify(|s| {
@@ -303,14 +317,27 @@ impl AgentState {
         });
     }
 
-    pub fn set_linux_runner_image(&self, value: String) {
+    pub fn set_linux_runner_image_target(&self, value: &str) {
         self.tx.send_modify(|s| {
-            let setting = settings_mut(s)
-                .linux_runner_image
-                .as_mut()
-                .expect(SETTINGS_INVARIANT);
-            setting.current.clone_from(&value);
-            setting.target = value;
+            value.clone_into(
+                &mut settings_mut(s)
+                    .linux_runner_image
+                    .as_mut()
+                    .expect(SETTINGS_INVARIANT)
+                    .target,
+            );
+        });
+    }
+
+    pub fn set_linux_runner_image_current(&self, value: &str) {
+        self.tx.send_modify(|s| {
+            value.clone_into(
+                &mut settings_mut(s)
+                    .linux_runner_image
+                    .as_mut()
+                    .expect(SETTINGS_INVARIANT)
+                    .current,
+            );
         });
     }
 
@@ -456,6 +483,23 @@ mod tests {
 
         state.set_gateway_current("https://staging.fleet.arcbox.dev");
         assert_eq!(gateway_current(&state), state.gateway_target());
+    }
+
+    #[test]
+    fn linux_runner_image_current_and_target_are_independent() {
+        let state = AgentState::new(&seed());
+        state.set_linux_runner_image_target("ghcr.io/acme/runner:v2");
+        assert_eq!(
+            state.linux_runner_image_current(),
+            "ghcr.io/actions/actions-runner:latest"
+        );
+        assert_eq!(state.linux_runner_image_target(), "ghcr.io/acme/runner:v2");
+
+        state.set_linux_runner_image_current("ghcr.io/acme/runner:v2");
+        assert_eq!(
+            state.linux_runner_image_current(),
+            state.linux_runner_image_target()
+        );
     }
 
     #[test]

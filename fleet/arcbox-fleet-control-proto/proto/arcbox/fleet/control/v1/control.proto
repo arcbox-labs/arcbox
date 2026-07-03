@@ -201,6 +201,9 @@ message UpdateSettingsRequest {
   optional uint64 mem_floor_mib = 2;
   // Container image Linux jobs run in ("linux" names the jobs' platform;
   // macOS jobs get their own image setting alongside the VM backend).
+  // Writes `target` only — the image becomes `current` when
+  // FleetImageService.Prepare verifies it, never as a side effect of this
+  // call.
   optional string linux_runner_image = 3;
   optional string gateway = 4;
   optional DockerMode docker_mode = 5;
@@ -232,8 +235,54 @@ message DockerModeSetting {
 message AgentSettings {
   DoubleSetting load_ceiling = 1;
   Uint64Setting mem_floor_mib = 2;
+  // For image settings, `target` is operator intent and may float (a
+  // moving tag or an unpinned stream); `current` is the verified artifact
+  // jobs actually use. FleetImageService.Prepare is what converges the
+  // two — including re-resolving a floating target that moved.
   StringSetting linux_runner_image = 3;
   StringSetting gateway = 4;
   DockerModeSetting docker_mode = 5;
   StringSetting runner_script = 6;
+}
+
+// Long-running image preparation, split out of FleetSettingsService so
+// quick state reads/writes never share a service with RPCs that stream a
+// multi-gigabyte transfer's progress.
+service FleetImageService {
+  // Converge each requested image setting's `current` onto its `target`:
+  // fetch and verify the target artifact through the runtime that owns it
+  // (the Docker socket today; the arcbox-daemon socket once the macOS VM
+  // backend lands), then promote `current` — all-or-nothing per kind.
+  // Cancelling the stream (client disconnect) abandons the promotion;
+  // re-running Prepare resumes from whatever the runtime already cached.
+  rpc Prepare(PrepareRequest) returns (stream PrepareResponse);
+}
+
+// Which image setting a Prepare call (or event) concerns. One value per
+// preparable image setting; the macOS image kind arrives with the VM
+// backend.
+enum ImageKind {
+  IMAGE_KIND_UNSPECIFIED = 0;
+  // `linux_runner_image`, prepared by pulling it for every
+  // currently-advertised Docker-served Linux arch.
+  IMAGE_KIND_LINUX_RUNNER_IMAGE = 1;
+}
+
+message PrepareRequest {
+  // Image settings to converge; empty prepares every kind this agent
+  // supports. An unrecognized kind (from a newer client) is rejected with
+  // INVALID_ARGUMENT rather than silently skipped.
+  repeated ImageKind kinds = 1;
+}
+
+// Progress for one preparation step. Human-oriented: `detail`/`stage` are
+// display strings ("linux/arm64", "pulling"), not a machine contract.
+message PrepareResponse {
+  ImageKind kind = 1;
+  // What within the kind is progressing — a platform for Docker pulls.
+  string detail = 2;
+  // Coarse stage label; "promoted" is always the kind's final event.
+  string stage = 3;
+  // Completion fraction within the stage (0.0..=1.0).
+  double fraction = 4;
 }
