@@ -59,9 +59,12 @@ impl From<Internal> for Status {
 
 /// Bind `agent.sock` and serve `FleetLifecycleService` until `shutdown`
 /// fires. Mirrors `arcbox-daemon`'s `services::start_grpc` (remove-before-bind,
-/// then `UnixListener`/`UnixListenerStream`), plus an explicit owner-only
-/// permission: unlike the daemon's socket, this one can enroll/disconnect
-/// the machine, so it must not rely on umask alone.
+/// then `UnixListener`/`UnixListenerStream`), plus explicit owner-only
+/// permissions: unlike the daemon's socket, this one can enroll/disconnect
+/// the machine, so it must not rely on umask alone. The parent directory
+/// (which also holds the credential file) is made `0700` *before* the bind,
+/// so the socket is unreachable by other users even during the brief window
+/// between `bind` and its own `0600` chmod.
 pub async fn serve(
     socket_path: &Path,
     supervisor: Arc<AgentSupervisor>,
@@ -73,6 +76,10 @@ pub async fn serve(
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
+        // Unconditional, not just on creation: an existing data dir from an
+        // older or umask-lenient run gets the same traversal barrier.
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 0700 {}", parent.display()))?;
     }
 
     let listener = UnixListener::bind(socket_path)
@@ -147,6 +154,12 @@ struct Attachment {
     /// shutdown) cascades to it too, so runners still drain on SIGTERM.
     shutdown: CancellationToken,
     task: tokio::task::JoinHandle<Result<()>>,
+    /// The gateway this attachment's credential is persisted under (the
+    /// keychain backend keys its entry by gateway URI). `disconnect` clears
+    /// exactly this store: reading the live `gateway_target` there instead
+    /// would clear the wrong entry if a settings update moved the target
+    /// while attached, leaving this credential behind on disk.
+    credential_gateway: String,
 }
 
 enum State {
@@ -197,12 +210,11 @@ impl AgentSupervisor {
             agent_state,
             settings_store,
         };
-        let existing = this
-            .credential_store_for(&this.agent_state.gateway_target())
-            .load()?;
+        let gateway = this.agent_state.gateway_target();
+        let existing = this.credential_store_for(&gateway).load()?;
         if let Some(credential) = existing {
             info!(machine_id = %credential.machine_id, "starting fleet agent (credential on disk)");
-            *this.state.lock().await = State::Attached(this.attach(credential));
+            *this.state.lock().await = State::Attached(this.attach(credential, gateway));
         }
         Ok(this)
     }
@@ -230,7 +242,9 @@ impl AgentSupervisor {
     }
 
     /// Spawn the attach task for `credential` and build its [`Attachment`].
-    fn attach(&self, credential: Credential) -> Attachment {
+    /// `credential_gateway` is the store key the credential is persisted
+    /// under (see [`Attachment::credential_gateway`]).
+    fn attach(&self, credential: Credential, credential_gateway: String) -> Attachment {
         self.agent_state
             .set_enrollment(Enrollment::Attaching, &credential.machine_id);
         // A fresh attachment always starts accepting: `Drain` is runtime-only
@@ -258,6 +272,7 @@ impl AgentSupervisor {
             supervisor,
             shutdown,
             task,
+            credential_gateway,
         }
     }
 
@@ -319,7 +334,7 @@ impl AgentSupervisor {
         }
 
         let machine_id = credential.machine_id.clone();
-        *state = State::Attached(self.attach(credential));
+        *state = State::Attached(self.attach(credential, gateway));
         Ok(machine_id)
     }
 
@@ -354,8 +369,11 @@ impl AgentSupervisor {
         // aborted), so this can no longer be raced.
         self.agent_state.set_enrollment(Enrollment::Unenrolled, "");
 
+        // Keyed by the gateway this attachment enrolled against, not the
+        // live `gateway_target`, which a settings update may have moved
+        // while attached (see `Attachment::credential_gateway`).
         Ok(self
-            .credential_store_for(&self.agent_state.gateway_target())
+            .credential_store_for(&attachment.credential_gateway)
             .clear()
             .map_err(Internal)?)
     }
