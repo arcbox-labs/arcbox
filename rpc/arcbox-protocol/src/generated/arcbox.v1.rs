@@ -590,6 +590,14 @@ pub struct MacosMachineInfo {
     /// Creation timestamp.
     #[prost(int64, tag = "6")]
     pub created: i64,
+    /// MAC address of the guest's NAT interface, pinned at creation.
+    #[prost(string, tag = "7")]
+    pub mac_address: ::prost::alloc::string::String,
+    /// IPv4 address of the guest's DHCP lease. Empty until the running guest
+    /// has acquired one (typically a few seconds after boot), and always
+    /// empty for a stopped guest.
+    #[prost(string, tag = "8")]
+    pub ip_address: ::prost::alloc::string::String,
 }
 /// Request to pull a published base image.
 ///

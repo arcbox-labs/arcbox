@@ -169,6 +169,8 @@ impl macos_service_server::MacosService for MacosServiceImpl {
             memory_mib: machine.memory_mib,
             image: machine.image,
             created: machine.created_at.timestamp(),
+            mac_address: machine.mac_address.unwrap_or_default(),
+            ip_address: machine.ip_address.unwrap_or_default(),
         }))
     }
 

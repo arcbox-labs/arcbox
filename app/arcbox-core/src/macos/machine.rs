@@ -18,6 +18,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::image::MacImageManager;
+use super::lease;
 use super::vm::MacVm;
 use crate::error::{CoreError, Result};
 use crate::machine::MachineState;
@@ -39,6 +40,25 @@ struct MacMachineRecord {
     cpus: u32,
     memory_mib: u64,
     created_at: DateTime<Utc>,
+    /// MAC address pinned to the guest's NAT interface. Stable across
+    /// reboots so the guest's DHCP lease identifies it (see [`lease`]).
+    /// `None` only for records written before the field existed; `start`
+    /// backfills it.
+    #[serde(default)]
+    mac_address: Option<String>,
+}
+
+/// Generates a random locally-administered unicast MAC address.
+fn generate_mac() -> String {
+    let mut b: [u8; 6] = uuid::Uuid::new_v4().into_bytes()[..6]
+        .try_into()
+        .expect("slice of length 6");
+    // Locally administered (bit 1), unicast (bit 0 clear).
+    b[0] = (b[0] | 0x02) & 0xFE;
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5]
+    )
 }
 
 /// Configuration for creating a macOS machine from a base image.
@@ -69,6 +89,12 @@ pub struct MacMachineInfo {
     pub state: MachineState,
     /// Creation time.
     pub created_at: DateTime<Utc>,
+    /// MAC address of the guest's NAT interface. `None` only for machines
+    /// created before MAC pinning that have not been started since.
+    pub mac_address: Option<String>,
+    /// IPv4 address from the guest's DHCP lease. `None` unless the machine
+    /// is running and has acquired a lease.
+    pub ip_address: Option<String>,
 }
 
 /// A machine's runtime slot. A slot is reserved (`Starting`) before the VM boots so
@@ -181,6 +207,7 @@ impl MacMachineManager {
             cpus: config.cpus,
             memory_mib: config.memory_mib,
             created_at: Utc::now(),
+            mac_address: Some(generate_mac()),
         };
         self.write_record(&record)?;
 
@@ -217,6 +244,25 @@ impl MacMachineManager {
                 .ok_or_else(|| CoreError::not_found(format!("macOS machine '{name}'")))?
         };
 
+        // Records written before MAC pinning have none persisted: mint one now
+        // so the boot below can pin it and the machine keeps it from then on.
+        let mac_address = match record.mac_address.clone() {
+            Some(mac) => mac,
+            None => {
+                let mac = generate_mac();
+                let record = MacMachineRecord {
+                    mac_address: Some(mac.clone()),
+                    ..record.clone()
+                };
+                self.write_record(&record)?;
+                self.records
+                    .write()
+                    .map_err(|_| CoreError::LockPoisoned)?
+                    .insert(name.to_owned(), record);
+                mac
+            }
+        };
+
         // Atomically check the cap and reserve a slot before the multi-second boot, so
         // concurrent starts cannot both pass the check and exceed the cap.
         {
@@ -244,6 +290,7 @@ impl MacMachineManager {
                 &dir.join(AUX_FILE),
                 &hardware_model,
                 &machine_id,
+                &mac_address,
                 record.cpus,
                 record.memory_mib,
             )
@@ -349,15 +396,23 @@ impl MacMachineManager {
         }
     }
 
-    /// Builds the public view of a record, resolving its current runtime state.
+    /// Builds the public view of a record, resolving its current runtime state
+    /// and — for a running guest — the IP of its DHCP lease.
     fn info(&self, record: &MacMachineRecord) -> MacMachineInfo {
+        let state = self.state_of(&record.name);
+        let ip_address = match (&record.mac_address, state) {
+            (Some(mac), MachineState::Running) => lease::resolve_ip(mac),
+            _ => None,
+        };
         MacMachineInfo {
             name: record.name.clone(),
             image: record.image.clone(),
             cpus: record.cpus,
             memory_mib: record.memory_mib,
-            state: self.state_of(&record.name),
+            state,
             created_at: record.created_at,
+            mac_address: record.mac_address.clone(),
+            ip_address,
         }
     }
 
@@ -421,9 +476,30 @@ mod tests {
             cpus: 4,
             memory_mib: 8192,
             created_at: Utc::now(),
+            mac_address: Some("06:aa:bb:cc:dd:0e".into()),
         };
         let json = serde_json::to_string(&record).unwrap();
         let back: MacMachineRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(record, back);
+    }
+
+    #[test]
+    fn record_without_mac_still_loads() {
+        // Records persisted before MAC pinning have no mac_address field.
+        let json = r#"{"name":"old","image":"sequoia","cpus":2,"memory_mib":4096,
+                       "created_at":"2026-07-01T00:00:00Z"}"#;
+        let record: MacMachineRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.mac_address, None);
+    }
+
+    #[test]
+    fn generated_mac_is_locally_administered_unicast() {
+        for _ in 0..64 {
+            let mac = generate_mac();
+            assert_eq!(mac.len(), 17);
+            let first = u8::from_str_radix(&mac[..2], 16).unwrap();
+            assert_eq!(first & 0x02, 0x02, "locally administered bit: {mac}");
+            assert_eq!(first & 0x01, 0x00, "unicast bit: {mac}");
+        }
     }
 }
