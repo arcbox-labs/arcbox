@@ -613,12 +613,57 @@ pub struct MacosImagePullRequest {
 #[serde(rename_all = "camelCase")]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MacosImagePullEvent {
-    /// Stage: resolving | validating | disk | aux | verifying.
+    /// Stage: resolving | validating | disk | aux | verifying | done.
     #[prost(string, tag = "1")]
     pub stage: ::prost::alloc::string::String,
     /// Completion fraction within the stage (0.0..=1.0).
     #[prost(double, tag = "2")]
     pub fraction: f64,
+    /// Set only on the final "done" event: the image that landed (or was
+    /// already present) in the registry, so a caller learns the concrete
+    /// version a floating reference resolved to.
+    #[prost(message, optional, tag = "3")]
+    pub image: ::core::option::Option<MacosImageSummary>,
+}
+/// Request to resolve a published image reference. Same source semantics as
+/// MacosImagePullRequest: exactly one of `reference` / `manifest_url`.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MacosImageResolveRequest {
+    /// Image reference: a stream name with an optional pinned version.
+    #[prost(string, tag = "1")]
+    pub reference: ::prost::alloc::string::String,
+    /// Manifest override (URL or daemon-local path); bypasses the index.
+    #[prost(string, tag = "2")]
+    pub manifest_url: ::prost::alloc::string::String,
+}
+/// What a reference resolves to, without pulling.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MacosImageResolveResponse {
+    /// Stream name (e.g. "tahoe-base").
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Concrete version a pull would land, even for a floating reference.
+    #[prost(string, tag = "2")]
+    pub version: ::prost::alloc::string::String,
+    /// Guest macOS product version (e.g. "26.5").
+    #[prost(string, tag = "3")]
+    pub os_version: ::prost::alloc::string::String,
+    /// Minimum CPU count required by the guest.
+    #[prost(uint64, tag = "4")]
+    pub minimum_cpu_count: u64,
+    /// Minimum guest memory in MiB required by the guest.
+    #[prost(uint64, tag = "5")]
+    pub minimum_memory_mib: u64,
+    /// System disk size in GB (decimal, logical).
+    #[prost(uint64, tag = "6")]
+    pub disk_gb: u64,
+    /// Version currently installed under this stream name; empty if none.
+    #[prost(string, tag = "7")]
+    pub installed_version: ::prost::alloc::string::String,
 }
 /// Summary of a macOS base image.
 #[derive(serde::Serialize, serde::Deserialize)]
