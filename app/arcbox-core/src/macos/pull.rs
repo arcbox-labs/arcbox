@@ -32,6 +32,35 @@ pub enum RemoteSource {
     Manifest(RemoteLocation),
 }
 
+/// What a [`MacImageManager::resolve_remote`] found, without downloading.
+///
+/// The concrete version a pull of the same source would land, its
+/// requirements, and what is currently installed under that stream name —
+/// everything a caller needs to answer "is an update pending" and "does
+/// this fit the host".
+#[derive(Debug, Clone)]
+pub struct ResolvedImage {
+    /// Stream name (`tahoe-base`).
+    pub name: String,
+    /// Concrete version a pull would land (`2026.07.02`), even when the
+    /// source reference floats.
+    pub version: String,
+    /// Guest macOS product version (e.g. `26.5`).
+    pub os_version: String,
+    /// Guest macOS build number, if published.
+    pub os_build: Option<String>,
+    /// Preinstalled GitHub Actions runner version, if published.
+    pub runner_version: Option<String>,
+    /// Minimum CPU count required by the guest.
+    pub minimum_cpu_count: u64,
+    /// Minimum guest memory in MiB required by the guest.
+    pub minimum_memory_mib: u64,
+    /// System disk size in GB (decimal, logical).
+    pub disk_gb: u64,
+    /// The version installed under this stream name locally, if any.
+    pub installed_version: Option<String>,
+}
+
 /// The stage a [`MacImageManager::pull_remote`] is in, for progress reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PullStage {
@@ -356,7 +385,83 @@ async fn fetch_zstd_to_sparse(
     Ok(())
 }
 
+/// Resolves `source` to the manifest a pull would consume: index resolution
+/// (for a reference), then schema, disk-format, and name-match checks.
+/// Shared by [`MacImageManager::pull_remote`] and
+/// [`MacImageManager::resolve_remote`], so "what resolve reported" and
+/// "what pull lands" can never drift.
+async fn resolve_source(source: &RemoteSource) -> Result<(RemoteLocation, ImageManifest)> {
+    let manifest_location = match source {
+        RemoteSource::Manifest(location) => location.clone(),
+        RemoteSource::Reference(reference) => {
+            let base = super::remote::image_base().as_dir();
+            let index: RemoteIndex = base.join("index.json")?.fetch_json().await?;
+            if index.schema_version != 1 {
+                return Err(CoreError::macos(format!(
+                    "unsupported image index schema_version {}",
+                    index.schema_version
+                )));
+            }
+            let (_version, manifest_path) = index.resolve(reference)?;
+            base.join(&manifest_path)?
+        }
+    };
+    let manifest: ImageManifest = manifest_location.fetch_json().await?;
+    if manifest.schema_version != 1 {
+        return Err(CoreError::macos(format!(
+            "unsupported image manifest schema_version {}",
+            manifest.schema_version
+        )));
+    }
+    if manifest.disk.disk_format != "raw" {
+        return Err(CoreError::macos(format!(
+            "unsupported disk format '{}'",
+            manifest.disk.disk_format
+        )));
+    }
+    if let RemoteSource::Reference(reference) = source {
+        if manifest.name != reference.stream {
+            return Err(CoreError::macos(format!(
+                "manifest name '{}' does not match requested stream '{}'",
+                manifest.name, reference.stream
+            )));
+        }
+    }
+    Ok((manifest_location, manifest))
+}
+
 impl MacImageManager {
+    /// Resolves `source` against the published index without downloading
+    /// any artifact: the concrete version a pull would land, its
+    /// requirements, and the locally installed version of the same stream.
+    /// Also validates host support (hardware model), so a caller can reject
+    /// an image this host cannot boot before committing to a pull.
+    ///
+    /// # Errors
+    /// Returns an error if resolution fails (unknown stream/version,
+    /// unreachable index, malformed manifest) or the image's hardware model
+    /// is not supported on this host.
+    pub async fn resolve_remote(&self, source: &RemoteSource) -> Result<ResolvedImage> {
+        let (_, manifest) = resolve_source(source).await?;
+        let hardware_model = decode_field("hardware_model", &manifest.hardware_model)?;
+        validate_hardware_model(&hardware_model)?;
+        let installed_version = self
+            .get(&manifest.name)
+            .ok()
+            .and_then(|image| image.meta.version);
+        Ok(ResolvedImage {
+            name: manifest.name,
+            version: manifest.version,
+            os_version: manifest.os.product_version,
+            os_build: (!manifest.os.build.is_empty()).then_some(manifest.os.build),
+            runner_version: manifest.runner_version,
+            minimum_cpu_count: manifest.minimum_cpu_count,
+            minimum_memory_mib: manifest.minimum_memory_mib,
+            disk_gb: manifest.disk.file.uncompressed_size / 1_000_000_000,
+            installed_version,
+        })
+    }
+
     /// Pulls a published base image into the local registry.
     ///
     /// Validates host support from the manifest before downloading anything
@@ -373,42 +478,7 @@ impl MacImageManager {
         mut on_progress: impl FnMut(PullStage, f64),
     ) -> Result<MacImage> {
         on_progress(PullStage::Resolve, 0.0);
-        let manifest_location = match &source {
-            RemoteSource::Manifest(location) => location.clone(),
-            RemoteSource::Reference(reference) => {
-                let base = super::remote::image_base().as_dir();
-                let index: RemoteIndex = base.join("index.json")?.fetch_json().await?;
-                if index.schema_version != 1 {
-                    return Err(CoreError::macos(format!(
-                        "unsupported image index schema_version {}",
-                        index.schema_version
-                    )));
-                }
-                let (_version, manifest_path) = index.resolve(reference)?;
-                base.join(&manifest_path)?
-            }
-        };
-        let manifest: ImageManifest = manifest_location.fetch_json().await?;
-        if manifest.schema_version != 1 {
-            return Err(CoreError::macos(format!(
-                "unsupported image manifest schema_version {}",
-                manifest.schema_version
-            )));
-        }
-        if manifest.disk.disk_format != "raw" {
-            return Err(CoreError::macos(format!(
-                "unsupported disk format '{}'",
-                manifest.disk.disk_format
-            )));
-        }
-        if let RemoteSource::Reference(reference) = &source {
-            if manifest.name != reference.stream {
-                return Err(CoreError::macos(format!(
-                    "manifest name '{}' does not match requested stream '{}'",
-                    manifest.name, reference.stream
-                )));
-            }
-        }
+        let (manifest_location, manifest) = resolve_source(&source).await?;
         on_progress(PullStage::Resolve, 1.0);
 
         on_progress(PullStage::Validate, 0.0);
@@ -736,6 +806,67 @@ mod tests {
         // Re-pull of the same version is a no-op (returns the existing image).
         let again = mgr.pull_remote(source, |_, _| {}).await.unwrap();
         assert_eq!(again.meta.created_at, image.meta.created_at);
+    }
+
+    /// Resolve answers "what would land / what's installed" without
+    /// touching the registry: nothing is downloaded or registered, and
+    /// `installed_version` flips from `None` to the landed version once a
+    /// pull actually runs.
+    #[tokio::test]
+    async fn resolve_reports_metadata_without_pulling() {
+        let images = tempdir().unwrap();
+        let publish = tempdir().unwrap();
+
+        let disk = vec![0xABu8; SPARSE_BLOCK];
+        let (disk_csize, disk_sha) = write_zstd(&publish.path().join("disk.img.zst"), &disk);
+        let aux = vec![0x5Au8; 128];
+        let (aux_csize, aux_sha) = write_zstd(&publish.path().join("aux.img.zst"), &aux);
+
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "name": "tahoe-base",
+            "version": "2026.07.02",
+            "os": { "product_version": "26.5", "build": "25F71" },
+            "runner_version": "2.334.0",
+            "hardware_model": REAL_HARDWARE_MODEL_B64,
+            "machine_id": REAL_MACHINE_ID_B64,
+            "minimum_cpu_count": 2,
+            "minimum_memory_mib": 4096,
+            "disk": {
+                "path": "disk.img.zst",
+                "disk_format": "raw",
+                "uncompressed_size": disk.len(),
+                "compressed_size": disk_csize,
+                "sha256": disk_sha
+            },
+            "aux": {
+                "path": "aux.img.zst",
+                "uncompressed_size": aux.len(),
+                "compressed_size": aux_csize,
+                "sha256": aux_sha
+            }
+        });
+        let manifest_path = publish.path().join("manifest.json");
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+
+        let mgr = MacImageManager::new(images.path());
+        let source = RemoteSource::Manifest(RemoteLocation::File(manifest_path));
+
+        let resolved = mgr.resolve_remote(&source).await.unwrap();
+        assert_eq!(resolved.name, "tahoe-base");
+        assert_eq!(resolved.version, "2026.07.02");
+        assert_eq!(resolved.os_version, "26.5");
+        assert_eq!(resolved.os_build.as_deref(), Some("25F71"));
+        assert_eq!(resolved.runner_version.as_deref(), Some("2.334.0"));
+        assert_eq!(resolved.minimum_cpu_count, 2);
+        assert_eq!(resolved.minimum_memory_mib, 4096);
+        assert_eq!(resolved.installed_version, None);
+        // Resolution must not have registered or staged anything.
+        assert!(mgr.list().is_empty());
+
+        mgr.pull_remote(source.clone(), |_, _| {}).await.unwrap();
+        let resolved = mgr.resolve_remote(&source).await.unwrap();
+        assert_eq!(resolved.installed_version.as_deref(), Some("2026.07.02"));
     }
 
     #[tokio::test]

@@ -61,6 +61,7 @@ pub use machine::MachineManager;
 pub use macos::{
     ImageReference, MacImage, MacImageManager, MacImageMeta, MacInstanceDisks, MacMachineConfig,
     MacMachineInfo, MacMachineManager, MacVm, PullStage, RemoteLocation, RemoteSource,
+    ResolvedImage,
 };
 #[cfg(feature = "macos-ipsw-install")]
 pub use macos::{PullPhase, PullSource};
