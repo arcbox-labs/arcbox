@@ -109,9 +109,9 @@ impl AgentState {
                 current: seed.mem_floor_mib,
                 target: seed.mem_floor_mib,
             }),
-            runner_image: Some(StringSetting {
-                current: seed.runner_image.clone(),
-                target: seed.runner_image.clone(),
+            linux_runner_image: Some(StringSetting {
+                current: seed.linux_runner_image.clone(),
+                target: seed.linux_runner_image.clone(),
             }),
             gateway: Some(StringSetting {
                 current: seed.gateway.clone(),
@@ -166,8 +166,8 @@ impl AgentState {
         PersistedSettings {
             load_ceiling: s.load_ceiling.as_ref().expect(SETTINGS_INVARIANT).target,
             mem_floor_mib: s.mem_floor_mib.as_ref().expect(SETTINGS_INVARIANT).target,
-            runner_image: s
-                .runner_image
+            linux_runner_image: s
+                .linux_runner_image
                 .as_ref()
                 .expect(SETTINGS_INVARIANT)
                 .target
@@ -242,9 +242,9 @@ impl AgentState {
             .current
     }
 
-    pub fn runner_image_current(&self) -> String {
+    pub fn linux_runner_image_current(&self) -> String {
         settings_of(&self.tx.borrow())
-            .runner_image
+            .linux_runner_image
             .as_ref()
             .expect(SETTINGS_INVARIANT)
             .current
@@ -264,7 +264,7 @@ impl AgentState {
             .clone()
     }
 
-    // -- Settings: writers. `load_ceiling`/`mem_floor_mib`/`runner_image`
+    // -- Settings: writers. `load_ceiling`/`mem_floor_mib`/`linux_runner_image`
     // apply instantly, so their setters write both `current` and `target`
     // in one `send_modify` — there's never a moment where they should
     // differ.
@@ -303,10 +303,10 @@ impl AgentState {
         });
     }
 
-    pub fn set_runner_image(&self, value: String) {
+    pub fn set_linux_runner_image(&self, value: String) {
         self.tx.send_modify(|s| {
             let setting = settings_mut(s)
-                .runner_image
+                .linux_runner_image
                 .as_mut()
                 .expect(SETTINGS_INVARIANT);
             setting.current.clone_from(&value);
@@ -374,7 +374,7 @@ mod tests {
         PersistedSettings {
             load_ceiling: 0.9,
             mem_floor_mib: 2048,
-            runner_image: "ghcr.io/actions/actions-runner:latest".to_owned(),
+            linux_runner_image: "ghcr.io/actions/actions-runner:latest".to_owned(),
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: DockerMode::Auto,
             runner_script: None,
@@ -433,8 +433,8 @@ mod tests {
         assert_eq!(load_ceiling.current, load_ceiling.target);
         let mem_floor = settings.mem_floor_mib.unwrap();
         assert_eq!(mem_floor.current, mem_floor.target);
-        let runner_image = settings.runner_image.unwrap();
-        assert_eq!(runner_image.current, runner_image.target);
+        let linux_runner_image = settings.linux_runner_image.unwrap();
+        assert_eq!(linux_runner_image.current, linux_runner_image.target);
         let gateway = settings.gateway.unwrap();
         assert_eq!(gateway.current, gateway.target);
         let docker_mode = settings.docker_mode.unwrap();

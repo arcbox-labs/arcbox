@@ -119,7 +119,7 @@ enum SettingsCommand {
     /// Show every setting's current (in-effect) and target (requested) value.
     Get,
     /// Update one or more settings. Only the flags given are changed;
-    /// `load_ceiling`/`mem_floor_mib`/`runner_image` apply on the next
+    /// `load_ceiling`/`mem_floor_mib`/`linux_runner_image` apply on the next
     /// offer/job, `gateway` on the next reconnect, and `docker_mode`/
     /// `runner_script` on the next full restart.
     Set {
@@ -128,7 +128,7 @@ enum SettingsCommand {
         #[arg(long)]
         mem_floor_mib: Option<u64>,
         #[arg(long)]
-        runner_image: Option<String>,
+        linux_runner_image: Option<String>,
         #[arg(long)]
         gateway: Option<String>,
         /// "auto" | "enabled" | "disabled".
@@ -183,7 +183,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
         Command::Run => {
             let settings_store = SettingsStore::new(config.settings_path());
             let seed = load_or_seed_settings(&settings_store, &config)?;
-            let docker = init_docker(seed.docker_mode, &seed.runner_image).await?;
+            let docker = init_docker(seed.docker_mode, &seed.linux_runner_image).await?;
             let capabilities = capabilities(seed.runner_script.is_some(), docker.as_ref());
             let credential = CredentialStore::new(
                 config.credential_store,
@@ -224,7 +224,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
         Command::Serve => {
             let settings_store = SettingsStore::new(config.settings_path());
             let seed = load_or_seed_settings(&settings_store, &config)?;
-            let docker = init_docker(seed.docker_mode, &seed.runner_image).await?;
+            let docker = init_docker(seed.docker_mode, &seed.linux_runner_image).await?;
             let capabilities = capabilities(seed.runner_script.is_some(), docker.as_ref());
             let socket_path = config.control_socket_path();
 
@@ -328,7 +328,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
         Command::Settings(SettingsCommand::Set {
             load_ceiling,
             mem_floor_mib,
-            runner_image,
+            linux_runner_image,
             gateway,
             docker_mode,
             runner_script,
@@ -344,7 +344,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 .update_settings(control_proto::UpdateSettingsRequest {
                     load_ceiling,
                     mem_floor_mib,
-                    runner_image,
+                    linux_runner_image,
                     gateway,
                     docker_mode,
                     runner_script: runner_script.map(|p| p.to_string_lossy().into_owned()),
@@ -443,14 +443,14 @@ fn capabilities(runner_script_present: bool, docker: Option<&DockerRunner>) -> V
 }
 
 /// Probe Docker availability according to `mode`.
-async fn init_docker(mode: DockerMode, runner_image: &str) -> Result<Option<DockerRunner>> {
+async fn init_docker(mode: DockerMode, linux_runner_image: &str) -> Result<Option<DockerRunner>> {
     match mode {
         DockerMode::Disabled => Ok(None),
         DockerMode::Enabled => {
-            let runner = DockerRunner::new(runner_image).await?;
+            let runner = DockerRunner::new(linux_runner_image).await?;
             Ok(Some(runner))
         }
-        DockerMode::Auto => match DockerRunner::new(runner_image).await {
+        DockerMode::Auto => match DockerRunner::new(linux_runner_image).await {
             Ok(runner) => Ok(Some(runner)),
             Err(e) => {
                 warn!(error = %e, "docker not available; linux capabilities will not be advertised");
@@ -515,8 +515,8 @@ fn print_settings(s: control_proto::AgentSettings) {
             &v.target.to_string(),
         );
     }
-    if let Some(v) = s.runner_image {
-        print_setting("runner_image", &v.current, &v.target);
+    if let Some(v) = s.linux_runner_image {
+        print_setting("linux_runner_image", &v.current, &v.target);
     }
     if let Some(v) = s.gateway {
         print_setting("gateway", &v.current, &v.target);

@@ -217,7 +217,7 @@ impl AgentSupervisor {
 
     /// A handle to the process-lifetime Docker runtime, if configured — read
     /// by [`serve`] and passed to `FleetSettingsService` to validate a
-    /// candidate `runner_image` (see `control::settings`). Fixed at
+    /// candidate `linux_runner_image` (see `control::settings`). Fixed at
     /// construction and unaffected by the attach/detach cycle: `docker_mode`
     /// changes are restart-scoped, so this is never stale.
     fn docker(&self) -> Option<DockerRunner> {

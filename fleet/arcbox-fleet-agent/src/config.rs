@@ -19,14 +19,14 @@ const ENV_LOAD_CEILING: &str = "ARCBOX_FLEET_LOAD_CEILING";
 const ENV_MEM_FLOOR_MIB: &str = "ARCBOX_FLEET_MEM_FLOOR_MIB";
 const ENV_DATA_DIR: &str = "ARCBOX_FLEET_DATA_DIR";
 const ENV_DOCKER: &str = "ARCBOX_FLEET_DOCKER";
-const ENV_RUNNER_IMAGE: &str = "ARCBOX_FLEET_RUNNER_IMAGE";
+const ENV_LINUX_RUNNER_IMAGE: &str = "ARCBOX_FLEET_LINUX_RUNNER_IMAGE";
 const ENV_CREDENTIAL_STORE: &str = "ARCBOX_FLEET_CREDENTIAL_STORE";
 
 /// Reject an offer when 1-minute load average per core exceeds this.
 const DEFAULT_LOAD_CEILING: f64 = 0.9;
 /// Reject an offer when available memory is below this many MiB.
 const DEFAULT_MEM_FLOOR_MIB: u64 = 2048;
-const DEFAULT_RUNNER_IMAGE: &str = "ghcr.io/actions/actions-runner:latest";
+const DEFAULT_LINUX_RUNNER_IMAGE: &str = "ghcr.io/actions/actions-runner:latest";
 
 /// Wire-protocol version this agent speaks; the gateway rejects a mismatch.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -60,7 +60,7 @@ pub enum CredentialMode {
 pub struct DockerConfig {
     pub mode: DockerMode,
     /// Container image used for Linux runner jobs.
-    pub runner_image: String,
+    pub linux_runner_image: String,
 }
 
 /// Resolved agent configuration.
@@ -115,8 +115,8 @@ impl AgentConfig {
                 anyhow::bail!("{ENV_DOCKER} must be 'auto', 'true', or 'false', got '{other}'")
             }
         };
-        let runner_image =
-            std::env::var(ENV_RUNNER_IMAGE).unwrap_or_else(|_| DEFAULT_RUNNER_IMAGE.to_string());
+        let linux_runner_image = std::env::var(ENV_LINUX_RUNNER_IMAGE)
+            .unwrap_or_else(|_| DEFAULT_LINUX_RUNNER_IMAGE.to_string());
 
         let credential_store = match std::env::var(ENV_CREDENTIAL_STORE).as_deref() {
             Ok("keyring") => CredentialMode::Keyring,
@@ -144,7 +144,7 @@ impl AgentConfig {
             data_dir,
             docker: DockerConfig {
                 mode: docker_mode,
-                runner_image,
+                linux_runner_image,
             },
             credential_store,
         })

@@ -23,7 +23,7 @@ pub struct RunSpec<'a> {
     pub encoded_jit_config: &'a str,
     /// Target CPU architecture (`arm64` or `amd64`).
     pub arch: &'a str,
-    /// Image to run this job in — the live-settable `runner_image`, read
+    /// Image to run this job in — the live-settable `linux_runner_image`, read
     /// fresh by the caller for each job rather than fixed at construction.
     pub runner_image: &'a str,
 }
@@ -180,10 +180,11 @@ impl DockerRunner {
     ///
     /// `default_image` is a local bootstrap parameter, not stored: it is
     /// only used to verify readiness here. Live jobs use whatever
-    /// `runner_image` is current at dispatch time (`RunSpec::runner_image`),
-    /// which may since have changed via `UpdateSettings` — see
-    /// [`Self::verify_pullable`], `FleetSettingsService.UpdateSettings`'s
-    /// guard against a runner_image change that would silently strand a
+    /// `linux_runner_image` is current at dispatch time
+    /// (`RunSpec::runner_image`), which may since have changed via
+    /// `UpdateSettings` — see [`Self::verify_pullable`],
+    /// `FleetSettingsService.UpdateSettings`'s guard against a
+    /// linux_runner_image change that would silently strand a
     /// currently-advertised arch.
     pub async fn new(default_image: &str) -> Result<Self> {
         let client = connect().await?;
@@ -207,11 +208,11 @@ impl DockerRunner {
 
     /// Verify `image` is pullable for each of `arches`, returning the subset
     /// that succeeded. Used by `FleetSettingsService.UpdateSettings` to
-    /// check a candidate `runner_image` against the arches already
+    /// check a candidate `linux_runner_image` against the arches already
     /// advertised (`Self::linux_arches`) before accepting it — catching a
     /// bad image at the settings boundary rather than as job-dispatch churn
     /// later. A pull that already has the image cached returns quickly, so
-    /// this is cheap to call on every runner_image change.
+    /// this is cheap to call on every linux_runner_image change.
     pub async fn verify_pullable(&self, image: &str, arches: &[String]) -> Vec<String> {
         Self::pullable_arches(&self.client, image, arches.to_vec()).await
     }

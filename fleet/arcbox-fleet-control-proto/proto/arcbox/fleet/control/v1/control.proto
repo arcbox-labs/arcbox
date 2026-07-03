@@ -199,7 +199,9 @@ enum DockerMode {
 message UpdateSettingsRequest {
   optional double load_ceiling = 1;
   optional uint64 mem_floor_mib = 2;
-  optional string runner_image = 3;
+  // Container image Linux jobs run in ("linux" names the jobs' platform;
+  // macOS jobs get their own image setting alongside the VM backend).
+  optional string linux_runner_image = 3;
   optional string gateway = 4;
   optional DockerMode docker_mode = 5;
   // Direct path to the runner entry point (run.sh), not its containing
@@ -230,7 +232,7 @@ message DockerModeSetting {
 message AgentSettings {
   DoubleSetting load_ceiling = 1;
   Uint64Setting mem_floor_mib = 2;
-  StringSetting runner_image = 3;
+  StringSetting linux_runner_image = 3;
   StringSetting gateway = 4;
   DockerModeSetting docker_mode = 5;
   StringSetting runner_script = 6;
