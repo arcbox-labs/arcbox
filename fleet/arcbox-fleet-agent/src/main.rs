@@ -37,6 +37,10 @@ mod host;
 mod runner;
 mod settings;
 mod state;
+// The VM backend's job routing lands in the next commit of this change
+// set; the #[expect] forces this attribute's removal then.
+#[expect(dead_code)]
+mod vm;
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -38,6 +38,10 @@ command-group = { version = "5.0.1", features = ["with-tokio"] }
 tokio-util = "0.7.18"
 bollard = "0.21.0"
 hyper-util = "0.1"
+arcbox-grpc.workspace = true
+arcbox-protocol.workspace = true
+arcbox-constants.workspace = true
+russh = { version = "0.62.1", default-features = false, features = ["ring", "flate2"] }
 
 [lints]
 workspace = true
