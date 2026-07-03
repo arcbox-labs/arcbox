@@ -100,6 +100,7 @@ fn telemetry_to_control(t: &HostTelemetry) -> control_proto::HostTelemetry {
 pub fn spawn_supervisor(
     config: &AgentConfig,
     docker: Option<docker::DockerRunner>,
+    vm: Option<crate::vm::VmRunner>,
     capabilities: Vec<Capability>,
     state: AgentState,
 ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
@@ -108,6 +109,7 @@ pub fn spawn_supervisor(
         egress_tx,
         config.runner_script.clone(),
         docker,
+        vm,
         capabilities,
         state,
     );
@@ -493,7 +495,8 @@ mod tests {
             machine_id: "fltm_parked".to_owned(),
             machine_token: "flt_revoked".to_owned(),
         };
-        let (supervisor, egress_rx) = spawn_supervisor(&config, None, Vec::new(), state.clone());
+        let (supervisor, egress_rx) =
+            spawn_supervisor(&config, None, None, Vec::new(), state.clone());
         let shutdown = CancellationToken::new();
         let run = tokio::spawn(run(
             config,
@@ -537,8 +540,14 @@ mod tests {
     #[tokio::test]
     async fn verdict_resend_task_exits_when_shutdown_fires() {
         let (events, _rx) = mpsc::channel(1);
-        let supervisor =
-            RunnerSupervisor::new(events, None, None, Vec::new(), AgentState::new(&seed()));
+        let supervisor = RunnerSupervisor::new(
+            events,
+            None,
+            None,
+            None,
+            Vec::new(),
+            AgentState::new(&seed()),
+        );
         let shutdown = CancellationToken::new();
         let handle = spawn_verdict_resend(supervisor, shutdown.clone());
 
@@ -586,8 +595,14 @@ mod tests {
     async fn connect_and_serve_bails_out_immediately_when_already_cancelled() {
         let state = AgentState::new(&seed());
         let (events, _rx) = mpsc::channel(1);
-        let supervisor =
-            RunnerSupervisor::new(events, None, None, Vec::new(), AgentState::new(&seed()));
+        let supervisor = RunnerSupervisor::new(
+            events,
+            None,
+            None,
+            None,
+            Vec::new(),
+            AgentState::new(&seed()),
+        );
         let (_egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(1);
         let mut pending = None;
         let mut backoff = INITIAL_BACKOFF;

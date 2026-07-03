@@ -228,6 +228,7 @@ enum State {
 pub struct AgentSupervisor {
     config: AgentConfig,
     docker: Option<DockerRunner>,
+    vm: Option<crate::vm::VmRunner>,
     capabilities: Vec<Capability>,
     /// Cancelled on process shutdown (SIGTERM/Ctrl-C); every attachment's
     /// `shutdown` is a child of this token.
@@ -248,6 +249,7 @@ impl AgentSupervisor {
     pub async fn new(
         config: AgentConfig,
         docker: Option<DockerRunner>,
+        vm: Option<crate::vm::VmRunner>,
         capabilities: Vec<Capability>,
         process_shutdown: CancellationToken,
         agent_state: AgentState,
@@ -256,6 +258,7 @@ impl AgentSupervisor {
         let this = Self {
             config,
             docker,
+            vm,
             capabilities,
             process_shutdown,
             state: Mutex::new(State::Unenrolled),
@@ -292,6 +295,14 @@ impl AgentSupervisor {
         self.docker.clone()
     }
 
+    /// Whether the macOS VM backend is active — the daemon probe succeeded
+    /// at startup. Reported as a `GetAgentInfo` feature so clients can
+    /// discover it. Fixed at construction like [`Self::docker`]:
+    /// `vm_mode` changes are restart-scoped.
+    pub fn vm_active(&self) -> bool {
+        self.vm.is_some()
+    }
+
     /// Spawn the attach task for `credential` and build its [`Attachment`].
     /// `credential_gateway` is the store key the credential is persisted
     /// under (see [`Attachment::credential_gateway`]).
@@ -308,6 +319,7 @@ impl AgentSupervisor {
         let (supervisor, egress_rx) = attach::spawn_supervisor(
             &self.config,
             self.docker.clone(),
+            self.vm.clone(),
             self.capabilities.clone(),
             self.agent_state.clone(),
         );
@@ -739,6 +751,7 @@ mod tests {
             AgentSupervisor::new(
                 test_config(dir.to_path_buf()),
                 None,
+                None,
                 Vec::new(),
                 CancellationToken::new(),
                 agent_state,
@@ -811,6 +824,7 @@ mod tests {
         let (events, _events_rx) = tokio::sync::mpsc::channel(1);
         let runner = crate::runner::RunnerSupervisor::new(
             events,
+            None,
             None,
             None,
             Vec::new(),
@@ -906,6 +920,7 @@ mod tests {
         let supervisor = AgentSupervisor::new(
             config,
             None,
+            None,
             Vec::new(),
             CancellationToken::new(),
             agent_state.clone(),
@@ -939,6 +954,7 @@ mod tests {
             AgentSupervisor::new(
                 test_config(dir.clone()),
                 None,
+                None,
                 Vec::new(),
                 CancellationToken::new(),
                 agent_state.clone(),
@@ -959,7 +975,7 @@ mod tests {
         });
         let (events, _events_rx) = tokio::sync::mpsc::channel(1);
         let runner =
-            crate::runner::RunnerSupervisor::new(events, None, None, Vec::new(), agent_state);
+            crate::runner::RunnerSupervisor::new(events, None, None, None, Vec::new(), agent_state);
         // A persisted credential, so the completed unenroll can prove the
         // local clear happens even though this gateway is unreachable (the
         // server-side call is best-effort).

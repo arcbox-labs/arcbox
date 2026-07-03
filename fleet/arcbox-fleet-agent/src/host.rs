@@ -82,17 +82,25 @@ pub fn telemetry() -> HostTelemetry {
 /// - **Docker-served Linux capabilities.** `docker_arches` is the set of Linux
 ///   arches Docker can run (empty when Docker is absent), each backed by
 ///   `docker`. On Apple Silicon that is arm64 (native) plus amd64 (Rosetta).
+/// - **VM capability.** `vm_active` means the local arcbox-daemon can boot
+///   disposable macOS guests (see `crate::vm`); the native `(os, arch)` is
+///   then served by `vm`, which wins over the host runner — isolation is the
+///   point of the backend.
 /// - **Host-runner capability.** The native `(os, arch)` served by the
 ///   pre-installed runner, backed by `host_runner`. Omitted when no runner
-///   script is configured, or when Linux jobs are already Docker-served on
-///   this host (a Linux host with Docker). macOS is `host_runner` today; the
-///   `vm` backend arrives with VM isolation.
-pub fn capabilities(runner_script_present: bool, docker_arches: &[String]) -> Vec<Capability> {
+///   script is configured, or when the native pair is already served by
+///   Docker (a Linux host) or by the VM backend (above).
+pub fn capabilities(
+    runner_script_present: bool,
+    docker_arches: &[String],
+    vm_active: bool,
+) -> Vec<Capability> {
     build_capabilities(
         &host_os(),
         &host_arch(),
         runner_script_present,
         docker_arches,
+        vm_active,
     )
 }
 
@@ -103,6 +111,7 @@ fn build_capabilities(
     native_arch: &str,
     runner_script_present: bool,
     docker_arches: &[String],
+    vm_active: bool,
 ) -> Vec<Capability> {
     let mut caps = Vec::new();
 
@@ -112,6 +121,15 @@ fn build_capabilities(
             arch: arch.clone(),
             backed_by: Backend::Docker as i32,
         });
+    }
+
+    if vm_active {
+        caps.push(Capability {
+            os: native_os.to_owned(),
+            arch: native_arch.to_owned(),
+            backed_by: Backend::Vm as i32,
+        });
+        return caps;
     }
 
     let host_served_by_docker = native_os == "linux" && !docker_arches.is_empty();
@@ -144,7 +162,7 @@ mod tests {
 
     #[test]
     fn host_only_without_docker() {
-        let caps = build_capabilities("darwin", "arm64", true, &[]);
+        let caps = build_capabilities("darwin", "arm64", true, &[], false);
         assert_eq!(caps.len(), 1);
         assert_eq!(
             triple(&caps[0]),
@@ -155,7 +173,7 @@ mod tests {
     #[test]
     fn macos_adds_docker_linux_capabilities() {
         let arches = vec!["arm64".to_owned(), "amd64".to_owned()];
-        let caps = build_capabilities("darwin", "arm64", true, &arches);
+        let caps = build_capabilities("darwin", "arm64", true, &arches, false);
         // Two docker linux capabilities plus the darwin host-runner one.
         assert_eq!(caps.len(), 3);
         assert_eq!(triple(&caps[0]), ("linux", "arm64", Backend::Docker as i32));
@@ -170,7 +188,7 @@ mod tests {
     fn linux_host_capability_is_docker_served() {
         // On a Linux host with Docker the native capability IS the docker linux
         // one — no separate host-runner capability is added.
-        let caps = build_capabilities("linux", "amd64", true, &["amd64".to_owned()]);
+        let caps = build_capabilities("linux", "amd64", true, &["amd64".to_owned()], false);
         assert_eq!(caps.len(), 1);
         assert_eq!(triple(&caps[0]), ("linux", "amd64", Backend::Docker as i32));
     }
@@ -178,8 +196,25 @@ mod tests {
     #[test]
     fn omits_host_capability_without_runner_script() {
         // Docker-only macOS: no runner script means no darwin capability.
-        let caps = build_capabilities("darwin", "arm64", false, &["arm64".to_owned()]);
+        let caps = build_capabilities("darwin", "arm64", false, &["arm64".to_owned()], false);
         assert_eq!(caps.len(), 1);
         assert_eq!(triple(&caps[0]), ("linux", "arm64", Backend::Docker as i32));
+    }
+
+    #[test]
+    fn vm_backend_serves_the_native_pair_and_wins_over_host_runner() {
+        // With the VM backend active, darwin/arm64 is VM-served even though a
+        // runner script is configured — isolation wins.
+        let caps = build_capabilities("darwin", "arm64", true, &["arm64".to_owned()], true);
+        assert_eq!(caps.len(), 2);
+        assert_eq!(triple(&caps[0]), ("linux", "arm64", Backend::Docker as i32));
+        assert_eq!(triple(&caps[1]), ("darwin", "arm64", Backend::Vm as i32));
+    }
+
+    #[test]
+    fn vm_backend_without_runner_script_still_serves_darwin() {
+        let caps = build_capabilities("darwin", "arm64", false, &[], true);
+        assert_eq!(caps.len(), 1);
+        assert_eq!(triple(&caps[0]), ("darwin", "arm64", Backend::Vm as i32));
     }
 }

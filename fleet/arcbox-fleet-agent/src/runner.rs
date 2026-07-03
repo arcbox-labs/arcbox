@@ -5,10 +5,11 @@
 //! webhook is the authoritative outcome.
 //!
 //! Backend is chosen from the agent's own advertised capabilities: Linux jobs a
-//! Docker capability serves run in a container (isolation); a `host_runner`
-//! capability runs via the pre-installed runner. Capacity is never a number —
-//! admission gates on live load and free memory, so a busy host simply rejects
-//! and the platform re-offers elsewhere.
+//! Docker capability serves run in a container (isolation); darwin jobs a `vm`
+//! capability serves run in a disposable macOS guest via the local daemon
+//! (isolation); a `host_runner` capability runs via the pre-installed runner.
+//! Capacity is never a number — admission gates on live load and free memory,
+//! so a busy host simply rejects and the platform re-offers elsewhere.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,12 @@ use tracing::{info, warn};
 use crate::docker::{DockerRunner, RunSpec};
 use crate::host;
 use crate::state::AgentState;
+use crate::vm::VmRunner;
+
+/// Watchdog on a VM job's runtime: GitHub concludes jobs at 6 h, so a
+/// session still open past that (plus slack) means the guest wedged — treat
+/// it as a cancellation and destroy the guest.
+const MAX_VM_JOB_RUNTIME: Duration = Duration::from_secs(6 * 3600 + 1800);
 
 /// Convert a gateway-advertised capability into its control-plane
 /// counterpart. A plain function, not `From`: both `Capability` types are
@@ -90,6 +97,8 @@ struct Inner {
     runner_script: Option<PathBuf>,
     /// Docker runtime for Linux jobs, if available.
     docker: Option<DockerRunner>,
+    /// macOS VM backend for darwin jobs, if the local daemon serves it.
+    vm: Option<VmRunner>,
     /// The backend serving each advertised `(os, arch)` — the routing table.
     backends: HashMap<(String, String), Backend>,
     /// Set once `Drain` is received; no new jobs are accepted.
@@ -128,6 +137,7 @@ impl RunnerSupervisor {
         events: mpsc::Sender<AttachRequest>,
         runner_script: Option<PathBuf>,
         docker: Option<DockerRunner>,
+        vm: Option<VmRunner>,
         capabilities: Vec<Capability>,
         state: AgentState,
     ) -> Self {
@@ -149,6 +159,7 @@ impl RunnerSupervisor {
                 in_flight: DashMap::new(),
                 runner_script,
                 docker,
+                vm,
                 backends,
                 draining: std::sync::atomic::AtomicBool::new(false),
                 state,
@@ -348,10 +359,98 @@ impl RunnerSupervisor {
         match backend {
             Backend::Docker => self.run_docker_job(&job_id, &order, &token, cancel).await,
             Backend::HostRunner => self.run_host_job(&job_id, &order, &token, cancel).await,
-            // We never advertise these, so admit() never routes to them; reject
-            // defensively rather than panic if one ever slips through.
-            Backend::Vm | Backend::Unspecified => {
+            Backend::Vm => self.run_vm_job(&job_id, &order, &token, cancel).await,
+            // Never advertised, so admit() never routes here; reject
+            // defensively rather than panic if it ever slips through.
+            Backend::Unspecified => {
                 self.reject(&job_id, &token, "backend not supported by this agent");
+            }
+        }
+    }
+
+    /// Run a job in a disposable macOS guest via the local daemon. Same
+    /// cancellation discipline as [`Self::run_docker_job`]: observed during
+    /// startup and while running, teardown awaited — destroying the guest
+    /// kills the runner, so no in-guest process management exists or is
+    /// needed. A runtime watchdog backstops a wedged guest whose ssh
+    /// session would otherwise stay open forever.
+    async fn run_vm_job(
+        &self,
+        job_id: &str,
+        order: &ProvisionRunner,
+        token: &str,
+        cancel: CancellationToken,
+    ) {
+        // Invariant: the vm capability is only advertised when the daemon
+        // probe succeeded, so admit() routes here only with `vm` set.
+        let vm = self
+            .inner
+            .vm
+            .as_ref()
+            .expect("vm backend implies a vm runner");
+
+        // Startup (clone, boot, DHCP wait, ssh) takes minutes and must not
+        // make the agent deaf to CancelRunner.
+        let runner_image = self.inner.state.macos_runner_image_current();
+        let started = {
+            let start = std::pin::pin!(vm.start(crate::vm::RunSpec {
+                job_id,
+                encoded_jit_config: &order.encoded_jit_config,
+                runner_image: &runner_image,
+            }));
+            tokio::select! {
+                result = start => Some(result),
+                () = cancel.cancelled() => None,
+            }
+        };
+        let mut running = match started {
+            Some(Ok(running)) => running,
+            Some(Err(e)) => {
+                // Includes the daemon's two-guest license-cap refusal: reject
+                // and the platform re-offers elsewhere.
+                self.reject(
+                    job_id,
+                    token,
+                    &format!("failed to start macOS guest: {e:#}"),
+                );
+                return;
+            }
+            None => {
+                // Canceled mid-startup: no verdict is owed (the platform
+                // already concluded the job). Dropping `start` stopped the
+                // provisioning; the awaited remove reaches whatever it had
+                // created by then (the name is deterministic).
+                vm.remove_job_vm(job_id).await;
+                info!(job_id, "runner canceled during startup");
+                return;
+            }
+        };
+
+        // The runner command has been issued in the guest: accept the offer.
+        self.accept(job_id, token);
+        info!(job_id, "runner started (vm)");
+
+        let exited = {
+            let wait = std::pin::pin!(running.wait());
+            tokio::select! {
+                exit = wait => Some(exit),
+                () = cancel.cancelled() => None,
+                () = tokio::time::sleep(MAX_VM_JOB_RUNTIME) => {
+                    warn!(job_id, "vm job exceeded the runtime watchdog; destroying guest");
+                    None
+                }
+            }
+        };
+        match exited {
+            Some(exit_status) => {
+                info!(job_id, ?exit_status, "runner exited");
+                running.destroy().await;
+            }
+            // CancelRunner or the watchdog: destroy the guest, awaited, so
+            // the in-flight slot outlives the guest — never the reverse.
+            None => {
+                running.destroy().await;
+                info!(job_id, "runner canceled");
             }
         }
     }
@@ -598,6 +697,7 @@ mod tests {
             events,
             Some(PathBuf::from("/nonexistent")),
             None,
+            None,
             capabilities,
             AgentState::new(&seed()),
         )
@@ -624,6 +724,15 @@ mod tests {
         assert_eq!(
             sup.admit("rjob_a", "darwin", "arm64", &idle()),
             Admission::Accept(Backend::HostRunner)
+        );
+    }
+
+    #[test]
+    fn vm_backed_capability_routes_to_the_vm_backend() {
+        let sup = supervisor(vec![capability("darwin", "arm64", Backend::Vm)]);
+        assert_eq!(
+            sup.admit("rjob_a", "darwin", "arm64", &idle()),
+            Admission::Accept(Backend::Vm)
         );
     }
 
@@ -702,6 +811,7 @@ mod tests {
             events,
             Some(PathBuf::from("/nonexistent")),
             None,
+            None,
             vec![capability("darwin", "arm64", Backend::HostRunner)],
             AgentState::new(&seed()),
         );
@@ -719,6 +829,7 @@ mod tests {
         let sup = RunnerSupervisor::new(
             events,
             Some(PathBuf::from("/nonexistent")),
+            None,
             None,
             vec![capability("darwin", "arm64", Backend::HostRunner)],
             AgentState::new(&crate::settings::PersistedSettings {
@@ -938,7 +1049,7 @@ mod tests {
     async fn shutdown_does_not_flip_observable_draining_but_drain_does() {
         let drained = AgentState::new(&seed());
         let (events, _rx) = mpsc::channel(1);
-        RunnerSupervisor::new(events, None, None, Vec::new(), drained.clone()).handle_drain();
+        RunnerSupervisor::new(events, None, None, None, Vec::new(), drained.clone()).handle_drain();
         assert!(
             drained.current().draining,
             "Drain flips the observable flag"
@@ -946,7 +1057,7 @@ mod tests {
 
         let torn_down = AgentState::new(&seed());
         let (events, _rx) = mpsc::channel(1);
-        RunnerSupervisor::new(events, None, None, Vec::new(), torn_down.clone())
+        RunnerSupervisor::new(events, None, None, None, Vec::new(), torn_down.clone())
             .shutdown(Duration::from_secs(1))
             .await;
         assert!(

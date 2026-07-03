@@ -313,14 +313,6 @@ impl AgentState {
             .clone()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by the VM backend's job routing, which lands in the next commit \
-                  of this change set; the #[expect] forces removal then"
-        )
-    )]
     pub fn macos_runner_image_current(&self) -> String {
         settings_of(&self.tx.borrow())
             .macos_runner_image
