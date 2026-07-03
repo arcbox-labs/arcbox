@@ -4,8 +4,7 @@
 //! derived fresh by the engine at each start (see
 //! [`crate::state::AgentState`]). Settings aren't secret, unlike the
 //! machine credential, so this is always a plain file — there's no
-//! OS-keychain backend to fall back to, and no reason to refuse on
-//! non-Unix platforms the way `credentials.rs` does.
+//! OS-keychain backend the way `credentials.rs` has.
 
 use std::path::PathBuf;
 
@@ -13,7 +12,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{AgentConfig, DockerMode};
-use crate::fsutil::{write_json_atomic, write_owner_only};
+use crate::fsutil::write_json_atomic;
 
 /// Live-settable agent configuration, as last requested (`target`) — see
 /// [`crate::state::AgentState`] for the paired `current` values the engine
@@ -74,10 +73,10 @@ impl SettingsStore {
     }
 
     /// Persist `settings`, replacing whatever was there before. Settings
-    /// aren't secret, so a plain owner-only write suffices on every platform
-    /// (unlike the credential, which refuses a file backend off Unix).
+    /// aren't secret, so the plain owner-only file always suffices (unlike
+    /// the credential, which prefers the OS keychain on macOS).
     pub fn store(&self, settings: &PersistedSettings) -> Result<()> {
-        write_json_atomic(&self.path, settings, write_owner_only)
+        write_json_atomic(&self.path, settings)
     }
 }
 
