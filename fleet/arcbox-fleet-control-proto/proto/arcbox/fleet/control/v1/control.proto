@@ -81,6 +81,8 @@ enum ConnectionState {
   CONNECTION_STATE_ENROLLED = 2;
   // Enrolled but not accepting new offers.
   CONNECTION_STATE_DRAINING = 3;
+  // Enrolled but deliberately offline: the participate setting is off.
+  CONNECTION_STATE_DETACHED = 4;
 }
 
 message GetStatusRequest {}
@@ -115,6 +117,10 @@ enum Enrollment {
   ENROLLMENT_ATTACHING = 2;
   // Enrolled, attach stream live.
   ENROLLMENT_ATTACHED = 3;
+  // Enrolled — the credential is kept — but deliberately not attached:
+  // the participate setting is off. The machine shows Offline server-side;
+  // participate=true reattaches with the same identity.
+  ENROLLMENT_DETACHED = 4;
 }
 
 // What execution backend serves a capability. Deliberately redefined here
@@ -211,6 +217,13 @@ message UpdateSettingsRequest {
   // Direct path to the runner entry point (run.sh), not its containing
   // directory.
   optional string runner_script = 6;
+  // Whether this machine takes part in the fleet. false detaches — the
+  // credential is kept and the machine shows Offline server-side — and
+  // true reattaches with the same identity. Writes `target` only; the
+  // supervisor reconciles, and `current` flips when the attach/detach
+  // actually completes. This is deliberately the one lifecycle-touching
+  // setting (see FleetSettingsService's doc).
+  optional bool participate = 7;
 }
 
 // Reused across every setting regardless of type, so a client's rendering
@@ -232,6 +245,10 @@ message DockerModeSetting {
   DockerMode current = 1;
   DockerMode target = 2;
 }
+message BoolSetting {
+  bool current = 1;
+  bool target = 2;
+}
 
 message AgentSettings {
   DoubleSetting load_ceiling = 1;
@@ -244,6 +261,7 @@ message AgentSettings {
   StringSetting gateway = 4;
   DockerModeSetting docker_mode = 5;
   StringSetting runner_script = 6;
+  BoolSetting participate = 7;
 }
 
 // Long-running image preparation, split out of FleetSettingsService so

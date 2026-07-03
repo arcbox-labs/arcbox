@@ -27,6 +27,10 @@ pub struct PersistedSettings {
     /// Direct path to the runner entry point (`run.sh`), not its containing
     /// directory.
     pub runner_script: Option<PathBuf>,
+    /// Whether this machine takes part in the fleet; `false` keeps the
+    /// credential but stays detached. Persisted so a launchd restart honors
+    /// an operator's detach instead of silently reattaching.
+    pub participate: bool,
 }
 
 impl From<&AgentConfig> for PersistedSettings {
@@ -39,6 +43,9 @@ impl From<&AgentConfig> for PersistedSettings {
             gateway: config.gateway.clone(),
             docker_mode: config.docker.mode,
             runner_script: config.runner_script.clone(),
+            // No env seed: a fresh install participates; only an explicit
+            // UpdateSettings opts a machine out.
+            participate: true,
         }
     }
 }
@@ -97,6 +104,7 @@ mod tests {
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: DockerMode::Auto,
             runner_script: Some(PathBuf::from("/opt/actions-runner/run.sh")),
+            participate: true,
         }
     }
 

@@ -1,7 +1,10 @@
 //! `FleetSettingsService` — the tonic server impl. Reads/writes
-//! [`AgentState`] directly; no `AgentSupervisor` dependency, since settings
-//! never touch the attach lifecycle (see `state.rs`'s module doc and
-//! RUN-35's design notes: no setting ever forces a reattach).
+//! [`AgentState`] directly; no `AgentSupervisor` dependency, even for
+//! `participate` — the one setting that deliberately touches the attach
+//! lifecycle. This service only writes its target; the supervisor's
+//! participation reconciler observes the same watch channel and converges
+//! (`AgentSupervisor::spawn_participation_reconciler`), so lifecycle
+//! ownership stays in exactly one place.
 
 use std::path::Path;
 
@@ -66,6 +69,11 @@ impl FleetSettingsServiceTrait for SettingsService {
         if let Some(v) = &req.runner_script {
             let path = (!v.is_empty()).then_some(Path::new(v));
             self.state.set_runner_script_target(path);
+        }
+        // Target only — the supervisor's participation reconciler performs
+        // the detach/reattach and flips `current` when it completes.
+        if let Some(v) = req.participate {
+            self.state.set_participate_target(v);
         }
 
         self.store
@@ -156,6 +164,7 @@ mod tests {
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: DockerMode::Auto,
             runner_script: None,
+            participate: true,
         }
     }
 
@@ -167,6 +176,7 @@ mod tests {
             gateway: None,
             docker_mode: None,
             runner_script: None,
+            participate: None,
         }
     }
 
@@ -218,6 +228,7 @@ mod tests {
         let state = AgentState::new(&crate::settings::PersistedSettings {
             docker_mode: DockerMode::Disabled,
             runner_script: None,
+            participate: true,
             ..seed()
         });
         let req = UpdateSettingsRequest {

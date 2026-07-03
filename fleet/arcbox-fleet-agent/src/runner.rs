@@ -586,6 +586,7 @@ mod tests {
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: crate::config::DockerMode::Auto,
             runner_script: None,
+            participate: true,
         }
     }
 
