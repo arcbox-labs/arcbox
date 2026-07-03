@@ -143,6 +143,22 @@ async fn join_or_abort(mut task: tokio::task::JoinHandle<Result<()>>, grace: Dur
     }
 }
 
+/// The `Enroll` admission check: only `Unenrolled` may proceed. Applied
+/// twice — before the gateway round-trip and again after re-locking — so
+/// both an already-live attachment and a `Disconnect` that started
+/// mid-round-trip refuse the enrollment.
+///
+/// Returns a plain message rather than `Status` — every failure here maps
+/// to the same `FAILED_PRECONDITION` code, so the caller does that one
+/// conversion (the same convention as `control::settings::validate`).
+fn check_enrollable(state: &State) -> Result<(), &'static str> {
+    match state {
+        State::Unenrolled => Ok(()),
+        State::Disconnecting => Err("disconnect in progress — retry shortly"),
+        State::Attached(_) => Err("already enrolled — disconnect first"),
+    }
+}
+
 /// A live attachment to the gateway: the admission authority in `admit()`
 /// and the handle to stop it. The credential itself isn't retained here —
 /// nothing reads it back once attaching starts; `machine_id` observability
@@ -164,6 +180,12 @@ struct Attachment {
 
 enum State {
     Unenrolled,
+    /// A `Disconnect` is tearing its attachment down (bounded by
+    /// [`DISCONNECT_GRACE`]). `Enroll` is refused while here: an enrollment
+    /// that raced into the teardown window would have its observable state
+    /// stomped by the old task's late writes and by disconnect's own final
+    /// `Unenrolled` re-assert, so the window is closed instead of fenced.
+    Disconnecting,
     Attached(Attachment),
 }
 
@@ -283,11 +305,7 @@ impl AgentSupervisor {
         token: String,
         control_plane: Option<&str>,
     ) -> Result<String, Status> {
-        if matches!(*self.state.lock().await, State::Attached(_)) {
-            return Err(Status::failed_precondition(
-                "already enrolled — disconnect first",
-            ));
-        }
+        check_enrollable(&*self.state.lock().await).map_err(Status::failed_precondition)?;
 
         // Resolve the gateway to dial without mutating shared state yet: a
         // concurrent Enroll may still win the race check below, and a losing
@@ -301,15 +319,12 @@ impl AgentSupervisor {
             .map_err(Internal)?;
 
         let mut state = self.state.lock().await;
-        if matches!(*state, State::Attached(_)) {
-            // Lost a race with a concurrent Enroll. The credential just fetched
-            // is dropped here without ever being persisted — only the winner,
-            // below, writes to the credential store — so it cannot clobber the
-            // winner's persisted credential.
-            return Err(Status::failed_precondition(
-                "already enrolled — disconnect first",
-            ));
-        }
+        // Lost a race with a concurrent Enroll (or a Disconnect started
+        // mid-round-trip). The credential just fetched is dropped here
+        // without ever being persisted — only the winner, below, writes to
+        // the credential store — so it cannot clobber the winner's
+        // persisted credential.
+        check_enrollable(&state).map_err(Status::failed_precondition)?;
 
         // Won the race. Persist the credential now, and only now: a losing
         // concurrent Enroll returned above without writing, so what lands on
@@ -338,36 +353,51 @@ impl AgentSupervisor {
         Ok(machine_id)
     }
 
-    /// Stop attaching and remove the persisted credential. Returns to
-    /// `Unenrolled` immediately (concurrent `GetStatus`/`Drain`/`Resume`
-    /// observe that right away); the attach task's own teardown finishes in
-    /// the background, bounded by [`DISCONNECT_GRACE`].
+    /// Stop attaching and remove the persisted credential. Observably
+    /// `Unenrolled` immediately (`GetStatus`/`Watch`); the attach task's own
+    /// teardown finishes in the background, bounded by [`DISCONNECT_GRACE`],
+    /// and `Enroll` is refused until it completes (see
+    /// [`State::Disconnecting`]).
     pub async fn disconnect(&self) -> Result<(), Status> {
         let attachment = {
             let mut state = self.state.lock().await;
-            if matches!(*state, State::Unenrolled) {
-                return Err(Status::failed_precondition("not enrolled"));
+            match &*state {
+                State::Unenrolled => {
+                    return Err(Status::failed_precondition("not enrolled"));
+                }
+                State::Disconnecting => {
+                    return Err(Status::failed_precondition(
+                        "disconnect already in progress",
+                    ));
+                }
+                State::Attached(_) => {}
             }
-            let State::Attached(attachment) = std::mem::replace(&mut *state, State::Unenrolled)
+            let State::Attached(attachment) = std::mem::replace(&mut *state, State::Disconnecting)
             else {
                 unreachable!("checked above");
             };
+            // Immediate observability: `GetStatus`/`Watch` read only
+            // `agent_state`, not the `Mutex<State>`, so without this a
+            // concurrent caller would see stale state for the whole grace
+            // window below. Written while still holding the lock — every
+            // other `agent_state` enrollment write happens under it too, so
+            // none can interleave here.
+            self.agent_state.set_enrollment(Enrollment::Unenrolled, "");
             attachment
         };
-        // Immediate observability: `GetStatus`/`Watch` read only `agent_state`,
-        // not the `Mutex<State>` swapped above, so without this a concurrent
-        // caller would see stale state for the whole grace window below.
-        // Re-asserted after the task is provably stopped, since a reconnect
-        // attempt that straddles this cancel could otherwise briefly clobber
-        // it (mitigated, not fully eliminated, by `connect_and_serve`'s own
-        // cancellation race).
-        self.agent_state.set_enrollment(Enrollment::Unenrolled, "");
 
         attachment.shutdown.cancel();
         join_or_abort(attachment.task, DISCONNECT_GRACE).await;
-        // Authoritative: the task is now provably stopped (joined or
-        // aborted), so this can no longer be raced.
-        self.agent_state.set_enrollment(Enrollment::Unenrolled, "");
+
+        // Authoritative: the task is provably stopped (joined or aborted)
+        // and `Disconnecting` kept every `Enroll` out of the grace window,
+        // so no live attachment's state can be stomped here and no stale
+        // write from the old task survives it.
+        {
+            let mut state = self.state.lock().await;
+            *state = State::Unenrolled;
+            self.agent_state.set_enrollment(Enrollment::Unenrolled, "");
+        }
 
         // Keyed by the gateway this attachment enrolled against, not the
         // live `gateway_target`, which a settings update may have moved
@@ -385,7 +415,9 @@ impl AgentSupervisor {
                 a.supervisor.handle_drain();
                 Ok(())
             }
-            State::Unenrolled => Err(Status::failed_precondition("not enrolled")),
+            State::Unenrolled | State::Disconnecting => {
+                Err(Status::failed_precondition("not enrolled"))
+            }
         }
     }
 
@@ -396,7 +428,9 @@ impl AgentSupervisor {
                 a.supervisor.resume();
                 Ok(())
             }
-            State::Unenrolled => Err(Status::failed_precondition("not enrolled")),
+            State::Unenrolled | State::Disconnecting => {
+                Err(Status::failed_precondition("not enrolled"))
+            }
         }
     }
 
@@ -428,7 +462,9 @@ impl AgentSupervisor {
             let mut state = self.state.lock().await;
             match std::mem::replace(&mut *state, State::Unenrolled) {
                 State::Attached(a) => Some(a),
-                State::Unenrolled => None,
+                // During `Disconnecting` the disconnect call owns the
+                // attachment handle and awaits it itself; nothing to join.
+                State::Unenrolled | State::Disconnecting => None,
             }
         };
         if let Some(a) = attachment {
@@ -444,6 +480,106 @@ impl AgentSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{CredentialMode, DockerConfig, DockerMode};
+    use crate::settings::PersistedSettings;
+
+    fn seed() -> PersistedSettings {
+        PersistedSettings {
+            load_ceiling: 0.9,
+            mem_floor_mib: 2048,
+            linux_runner_image: "ghcr.io/actions/actions-runner:latest".to_owned(),
+            gateway: "http://127.0.0.1:1".to_owned(),
+            docker_mode: DockerMode::Disabled,
+            runner_script: None,
+        }
+    }
+
+    fn test_config(data_dir: std::path::PathBuf) -> AgentConfig {
+        AgentConfig {
+            gateway: "http://127.0.0.1:1".to_owned(),
+            runner_script: None,
+            load_ceiling: 0.9,
+            mem_floor_mib: 2048,
+            data_dir,
+            docker: DockerConfig {
+                mode: DockerMode::Disabled,
+                linux_runner_image: "ghcr.io/actions/actions-runner:latest".to_owned(),
+            },
+            credential_store: CredentialMode::File,
+        }
+    }
+
+    /// While a disconnect is inside its teardown grace, a concurrent
+    /// `Enroll` must be refused — not succeed and then have its observable
+    /// state stomped by the disconnect's final `Unenrolled` re-assert (or
+    /// by the old task's late writes). Once the disconnect completes, the
+    /// gate opens again.
+    #[tokio::test]
+    async fn enroll_is_refused_during_disconnect_grace() {
+        let dir = std::env::temp_dir().join(format!("fleet-disc-race-{}", std::process::id()));
+        let agent_state = AgentState::new(&seed());
+        let supervisor = Arc::new(
+            AgentSupervisor::new(
+                test_config(dir.clone()),
+                None,
+                Vec::new(),
+                CancellationToken::new(),
+                agent_state.clone(),
+                SettingsStore::new(dir.join("settings.json")),
+            )
+            .await
+            .expect("no credential on disk, so no attach on startup"),
+        );
+
+        // Inject a live attachment whose task takes a while to observe its
+        // cancel — the teardown grace window the race lives in.
+        let shutdown = supervisor.process_shutdown.child_token();
+        let task_token = shutdown.clone();
+        let task = tokio::spawn(async move {
+            task_token.cancelled().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok(())
+        });
+        let (events, _events_rx) = tokio::sync::mpsc::channel(1);
+        let runner =
+            crate::runner::RunnerSupervisor::new(events, None, None, Vec::new(), agent_state);
+        *supervisor.state.lock().await = State::Attached(Attachment {
+            supervisor: runner,
+            shutdown,
+            task,
+            credential_gateway: "http://127.0.0.1:1".to_owned(),
+        });
+
+        let disconnect = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move { supervisor.disconnect().await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Mid-grace: the enrollment gate is closed.
+        let err = supervisor
+            .enroll("flt_join_test".to_owned(), None)
+            .await
+            .expect_err("enroll during disconnect grace must be refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("disconnect in progress"), "{err}");
+
+        disconnect
+            .await
+            .expect("disconnect task")
+            .expect("disconnect succeeds");
+        assert!(matches!(*supervisor.state.lock().await, State::Unenrolled));
+
+        // Gate open again: enroll now passes the state check and fails
+        // later, at the unreachable gateway — a different error.
+        let err = supervisor
+            .enroll("flt_join_test".to_owned(), None)
+            .await
+            .expect_err("gateway is unreachable");
+        assert_ne!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// A task that ignores `shutdown` entirely (never checks it) simulates
     /// the pathological case `join_or_abort`'s abort branch exists for — a
