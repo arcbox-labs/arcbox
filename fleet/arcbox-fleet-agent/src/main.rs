@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arcbox_fleet_control_proto::v1 as control_proto;
+use arcbox_fleet_control_proto::v1::fleet_image_service_client::FleetImageServiceClient;
 use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_client::FleetLifecycleServiceClient;
 use arcbox_fleet_control_proto::v1::fleet_settings_service_client::FleetSettingsServiceClient;
 use arcbox_fleet_proto::v1::Capability;
@@ -112,6 +113,15 @@ enum Command {
     /// Get or update the running agent's live-settable configuration.
     #[command(subcommand)]
     Settings(SettingsCommand),
+    /// Converge the running agent's image settings onto their targets:
+    /// fetch and verify each target image through the runtime that owns it,
+    /// then promote it to current. Also the "update to latest" verb — a
+    /// floating target (a moving tag) is re-fetched and re-promoted.
+    Prepare {
+        /// Image kinds to prepare ("linux-runner-image"). Empty prepares
+        /// every kind the agent supports.
+        kinds: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -119,9 +129,10 @@ enum SettingsCommand {
     /// Show every setting's current (in-effect) and target (requested) value.
     Get,
     /// Update one or more settings. Only the flags given are changed;
-    /// `load_ceiling`/`mem_floor_mib`/`linux_runner_image` apply on the next
-    /// offer/job, `gateway` on the next reconnect, and `docker_mode`/
-    /// `runner_script` on the next full restart.
+    /// `load_ceiling`/`mem_floor_mib` apply on the next offer/job,
+    /// `linux_runner_image` once `prepare` verifies it, `gateway` on the
+    /// next reconnect, and `docker_mode`/`runner_script` on the next full
+    /// restart.
     Set {
         #[arg(long)]
         load_ceiling: Option<f64>,
@@ -359,6 +370,23 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             );
             Ok(())
         }
+        Command::Prepare { kinds } => {
+            let kinds = kinds
+                .iter()
+                .map(|s| parse_image_kind(s).map(|k| k as i32))
+                .collect::<Result<Vec<_>>>()?;
+            let channel = control::client::connect_default(&config).await?;
+            let mut client = FleetImageServiceClient::new(channel);
+            let mut stream = client
+                .prepare(control_proto::PrepareRequest { kinds })
+                .await
+                .context("Prepare RPC failed")?
+                .into_inner();
+            while let Some(event) = stream.message().await.context("prepare failed")? {
+                print_prepare_event(&event);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -466,6 +494,31 @@ fn load_or_seed_settings(store: &SettingsStore, config: &AgentConfig) -> Result<
     Ok(store
         .load()?
         .unwrap_or_else(|| PersistedSettings::from(config)))
+}
+
+fn parse_image_kind(s: &str) -> Result<control_proto::ImageKind> {
+    match s.to_lowercase().as_str() {
+        "linux-runner-image" => Ok(control_proto::ImageKind::LinuxRunnerImage),
+        other => anyhow::bail!("image kind must be 'linux-runner-image', got '{other}'"),
+    }
+}
+
+fn image_kind_label(raw: i32) -> &'static str {
+    match control_proto::ImageKind::try_from(raw).unwrap_or(control_proto::ImageKind::Unspecified) {
+        control_proto::ImageKind::LinuxRunnerImage => "linux_runner_image",
+        control_proto::ImageKind::Unspecified => "unknown",
+    }
+}
+
+/// Print one preparation progress event as `kind: stage [detail] (pct%)`.
+fn print_prepare_event(event: &control_proto::PrepareResponse) {
+    let label = image_kind_label(event.kind);
+    let pct = (event.fraction * 100.0).round();
+    if event.detail.is_empty() {
+        println!("{label}: {} ({pct:.0}%)", event.stage);
+    } else {
+        println!("{label}: {} {} ({pct:.0}%)", event.stage, event.detail);
+    }
 }
 
 fn parse_docker_mode(s: &str) -> Result<control_proto::DockerMode> {
