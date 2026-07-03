@@ -63,7 +63,11 @@ fn resolve_kinds(raw: &[i32]) -> Result<Vec<ImageKind>, String> {
         .iter()
         .map(|&v| match ImageKind::try_from(v) {
             Ok(ImageKind::LinuxRunnerImage) => Ok(ImageKind::LinuxRunnerImage),
-            Ok(ImageKind::Unspecified) | Err(_) => Err(format!("unsupported image kind {v}")),
+            // Wired up with the VM backend's Prepare path (see the module
+            // doc); until then an explicit request for it is rejected.
+            Ok(ImageKind::MacosRunnerImage | ImageKind::Unspecified) | Err(_) => {
+                Err(format!("unsupported image kind {v}"))
+            }
         })
         .collect::<Result<Vec<_>, _>>()?;
     kinds.sort_unstable();
@@ -147,6 +151,8 @@ mod tests {
             docker_mode: DockerMode::Disabled,
             runner_script: None,
             participate: true,
+            vm_mode: crate::config::VmMode::Auto,
+            macos_runner_image: "tahoe-base".to_owned(),
         }
     }
 

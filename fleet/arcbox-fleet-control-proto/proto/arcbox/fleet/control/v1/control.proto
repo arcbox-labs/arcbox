@@ -206,6 +206,20 @@ enum DockerMode {
   DOCKER_MODE_DISABLED = 3;
 }
 
+// Whether darwin jobs run in disposable macOS VMs provisioned through the
+// local arcbox-daemon (isolation), instead of the pre-installed host
+// runner. Restart-scoped, like DockerMode.
+enum VmMode {
+  VM_MODE_UNSPECIFIED = 0;
+  // Probe the daemon at startup; fall back to the host runner if the
+  // daemon is unreachable or the macOS runner image is not installed.
+  VM_MODE_AUTO = 1;
+  // Require the daemon; fail startup if it cannot serve VMs.
+  VM_MODE_ENABLED = 2;
+  // Never run darwin jobs in VMs, even if the daemon could.
+  VM_MODE_DISABLED = 3;
+}
+
 // A client only ever writes `target`; `current` is engine-observed and
 // only changes because the engine itself reports a new value. Rejected
 // with INVALID_ARGUMENT as a whole (no partial apply) if the resulting
@@ -232,6 +246,10 @@ message UpdateSettingsRequest {
   // actually completes. This is deliberately the one lifecycle-touching
   // setting (see FleetSettingsService's doc).
   optional bool participate = 7;
+  // macOS base-image stream for darwin VM jobs. Writes `target` only —
+  // FleetImageService.Prepare pulls it through the daemon and promotes.
+  optional string macos_runner_image = 8;
+  optional VmMode vm_mode = 9;
 }
 
 // Reused across every setting regardless of type, so a client's rendering
@@ -253,6 +271,10 @@ message DockerModeSetting {
   DockerMode current = 1;
   DockerMode target = 2;
 }
+message VmModeSetting {
+  VmMode current = 1;
+  VmMode target = 2;
+}
 message BoolSetting {
   bool current = 1;
   bool target = 2;
@@ -270,6 +292,11 @@ message AgentSettings {
   DockerModeSetting docker_mode = 5;
   StringSetting runner_script = 6;
   BoolSetting participate = 7;
+  // macOS base-image stream darwin VM jobs boot from (e.g. "tahoe-base",
+  // optionally pinned: "tahoe-base@2026.07.02"). Same target/current
+  // semantics as linux_runner_image; prepared through the daemon.
+  StringSetting macos_runner_image = 8;
+  VmModeSetting vm_mode = 9;
 }
 
 // Long-running image preparation, split out of FleetSettingsService so
@@ -286,13 +313,15 @@ service FleetImageService {
 }
 
 // Which image setting a Prepare call (or event) concerns. One value per
-// preparable image setting; the macOS image kind arrives with the VM
-// backend.
+// preparable image setting.
 enum ImageKind {
   IMAGE_KIND_UNSPECIFIED = 0;
   // `linux_runner_image`, prepared by pulling it for every
   // currently-advertised Docker-served Linux arch.
   IMAGE_KIND_LINUX_RUNNER_IMAGE = 1;
+  // `macos_runner_image`, prepared by pulling it through the local
+  // arcbox-daemon's MacosService.ImagePull.
+  IMAGE_KIND_MACOS_RUNNER_IMAGE = 2;
 }
 
 message PrepareRequest {

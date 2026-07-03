@@ -11,8 +11,17 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AgentConfig, DockerMode};
+use crate::config::{AgentConfig, DEFAULT_MACOS_RUNNER_IMAGE, DockerMode, VmMode};
 use crate::fsutil::write_json_atomic;
+
+/// Serde defaults for fields added after settings files already existed in
+/// the wild — a pre-field settings.json must load as if seeded fresh.
+fn default_vm_mode() -> VmMode {
+    VmMode::Auto
+}
+fn default_macos_runner_image() -> String {
+    DEFAULT_MACOS_RUNNER_IMAGE.to_owned()
+}
 
 /// Live-settable agent configuration, as last requested (`target`) — see
 /// [`crate::state::AgentState`] for the paired `current` values the engine
@@ -31,6 +40,12 @@ pub struct PersistedSettings {
     /// credential but stays detached. Persisted so a launchd restart honors
     /// an operator's detach instead of silently reattaching.
     pub participate: bool,
+    /// Whether darwin jobs run in daemon-provisioned macOS VMs.
+    #[serde(default = "default_vm_mode")]
+    pub vm_mode: VmMode,
+    /// macOS base-image stream darwin VM jobs boot from.
+    #[serde(default = "default_macos_runner_image")]
+    pub macos_runner_image: String,
 }
 
 impl From<&AgentConfig> for PersistedSettings {
@@ -46,6 +61,8 @@ impl From<&AgentConfig> for PersistedSettings {
             // No env seed: a fresh install participates; only an explicit
             // UpdateSettings opts a machine out.
             participate: true,
+            vm_mode: config.vm.mode,
+            macos_runner_image: config.vm.macos_runner_image.clone(),
         }
     }
 }
@@ -105,6 +122,8 @@ mod tests {
             docker_mode: DockerMode::Auto,
             runner_script: Some(PathBuf::from("/opt/actions-runner/run.sh")),
             participate: true,
+            vm_mode: crate::config::VmMode::Auto,
+            macos_runner_image: "tahoe-base".to_owned(),
         }
     }
 
@@ -142,6 +161,10 @@ mod tests {
                 mode: DockerMode::Enabled,
                 linux_runner_image: "example/image:latest".to_owned(),
             },
+            vm: crate::config::VmConfig {
+                mode: crate::config::VmMode::Disabled,
+                macos_runner_image: "tahoe-base".to_owned(),
+            },
             credential_store: crate::config::CredentialMode::File,
         };
 
@@ -152,5 +175,25 @@ mod tests {
         assert_eq!(seeded.mem_floor_mib, config.mem_floor_mib);
         assert_eq!(seeded.docker_mode, config.docker.mode);
         assert_eq!(seeded.linux_runner_image, config.docker.linux_runner_image);
+        assert_eq!(seeded.vm_mode, config.vm.mode);
+        assert_eq!(seeded.macos_runner_image, config.vm.macos_runner_image);
+    }
+
+    /// A settings.json written before the VM-backend fields existed must
+    /// load as if those fields were seeded fresh.
+    #[test]
+    fn pre_vm_fields_settings_file_loads_with_defaults() {
+        let json = r#"{
+            "load_ceiling": 0.9,
+            "mem_floor_mib": 2048,
+            "linux_runner_image": "ghcr.io/actions/actions-runner:latest",
+            "gateway": "https://fleet.arcbox.dev",
+            "docker_mode": "Auto",
+            "runner_script": null,
+            "participate": true
+        }"#;
+        let settings: PersistedSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.vm_mode, crate::config::VmMode::Auto);
+        assert_eq!(settings.macos_runner_image, DEFAULT_MACOS_RUNNER_IMAGE);
     }
 }

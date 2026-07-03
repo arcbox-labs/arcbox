@@ -165,6 +165,13 @@ enum SettingsCommand {
         /// reattaches with the same identity.
         #[arg(long)]
         participate: Option<bool>,
+        /// macOS base-image stream darwin VM jobs boot from (e.g.
+        /// "tahoe-base" or "tahoe-base@2026.07.02").
+        #[arg(long)]
+        macos_runner_image: Option<String>,
+        /// "auto" | "enabled" | "disabled".
+        #[arg(long)]
+        vm_mode: Option<String>,
     },
 }
 
@@ -394,10 +401,17 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             docker_mode,
             runner_script,
             participate,
+            macos_runner_image,
+            vm_mode,
         }) => {
             let docker_mode = docker_mode
                 .as_deref()
                 .map(parse_docker_mode)
+                .transpose()?
+                .map(|m| m as i32);
+            let vm_mode = vm_mode
+                .as_deref()
+                .map(parse_vm_mode)
                 .transpose()?
                 .map(|m| m as i32);
             let channel = control::client::connect_default(&config).await?;
@@ -411,6 +425,8 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                     docker_mode,
                     runner_script: runner_script.map(|p| p.to_string_lossy().into_owned()),
                     participate,
+                    macos_runner_image,
+                    vm_mode,
                 })
                 .await
                 .context("UpdateSettings RPC failed")?
@@ -558,6 +574,7 @@ fn parse_image_kind(s: &str) -> Result<control_proto::ImageKind> {
 fn image_kind_label(raw: i32) -> &'static str {
     match control_proto::ImageKind::try_from(raw).unwrap_or(control_proto::ImageKind::Unspecified) {
         control_proto::ImageKind::LinuxRunnerImage => "linux_runner_image",
+        control_proto::ImageKind::MacosRunnerImage => "macos_runner_image",
         control_proto::ImageKind::Unspecified => "unknown",
     }
 }
@@ -581,6 +598,26 @@ fn parse_docker_mode(s: &str) -> Result<control_proto::DockerMode> {
         other => {
             anyhow::bail!("docker_mode must be 'auto', 'enabled', or 'disabled', got '{other}'")
         }
+    }
+}
+
+fn parse_vm_mode(s: &str) -> Result<control_proto::VmMode> {
+    match s.to_lowercase().as_str() {
+        "auto" => Ok(control_proto::VmMode::Auto),
+        "enabled" => Ok(control_proto::VmMode::Enabled),
+        "disabled" => Ok(control_proto::VmMode::Disabled),
+        other => {
+            anyhow::bail!("vm_mode must be 'auto', 'enabled', or 'disabled', got '{other}'")
+        }
+    }
+}
+
+fn vm_mode_label(raw: i32) -> &'static str {
+    match control_proto::VmMode::try_from(raw).unwrap_or(control_proto::VmMode::Unspecified) {
+        control_proto::VmMode::Auto => "auto",
+        control_proto::VmMode::Enabled => "enabled",
+        control_proto::VmMode::Disabled => "disabled",
+        control_proto::VmMode::Unspecified => "unspecified",
     }
 }
 
@@ -649,6 +686,12 @@ fn print_settings(s: control_proto::AgentSettings) {
             &v.target
         };
         print_setting("runner_script", current, target);
+    }
+    if let Some(v) = s.macos_runner_image {
+        print_setting("macos_runner_image", &v.current, &v.target);
+    }
+    if let Some(v) = s.vm_mode {
+        print_setting("vm_mode", vm_mode_label(v.current), vm_mode_label(v.target));
     }
 }
 

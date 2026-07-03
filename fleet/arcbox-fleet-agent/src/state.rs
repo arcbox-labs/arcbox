@@ -10,10 +10,11 @@ use std::sync::Arc;
 use arcbox_fleet_control_proto::v1::{
     AgentSettings, AgentStateSnapshot, BoolSetting, Capability, DockerModeSetting, DoubleSetting,
     Enrollment, HostTelemetry, InFlightJob, OfferVerdict, StringSetting, Uint64Setting,
+    VmModeSetting,
 };
 use tokio::sync::watch;
 
-use crate::config::DockerMode;
+use crate::config::{DockerMode, VmMode};
 use crate::settings::PersistedSettings;
 
 /// Bound on `recent_verdicts` so a long-lived agent's snapshot doesn't grow
@@ -62,6 +63,35 @@ pub fn docker_mode_from_wire(raw: i32) -> DockerMode {
         .into()
 }
 
+/// `VmMode` mirrors `DockerMode`'s conversion trio above, for the same
+/// orphan-rule reasons.
+fn vm_mode_to_control(mode: VmMode) -> arcbox_fleet_control_proto::v1::VmMode {
+    match mode {
+        VmMode::Auto => arcbox_fleet_control_proto::v1::VmMode::Auto,
+        VmMode::Enabled => arcbox_fleet_control_proto::v1::VmMode::Enabled,
+        VmMode::Disabled => arcbox_fleet_control_proto::v1::VmMode::Disabled,
+    }
+}
+
+impl From<arcbox_fleet_control_proto::v1::VmMode> for VmMode {
+    fn from(mode: arcbox_fleet_control_proto::v1::VmMode) -> Self {
+        match mode {
+            arcbox_fleet_control_proto::v1::VmMode::Enabled => Self::Enabled,
+            arcbox_fleet_control_proto::v1::VmMode::Disabled => Self::Disabled,
+            arcbox_fleet_control_proto::v1::VmMode::Auto
+            | arcbox_fleet_control_proto::v1::VmMode::Unspecified => Self::Auto,
+        }
+    }
+}
+
+/// Parse a wire `VmMode` i32, falling back to `Auto` like
+/// [`docker_mode_from_wire`].
+pub fn vm_mode_from_wire(raw: i32) -> VmMode {
+    arcbox_fleet_control_proto::v1::VmMode::try_from(raw)
+        .unwrap_or(arcbox_fleet_control_proto::v1::VmMode::Unspecified)
+        .into()
+}
+
 fn path_to_setting_value(path: Option<&Path>) -> String {
     path.map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
@@ -100,6 +130,7 @@ impl AgentState {
     pub fn new(seed: &PersistedSettings) -> Self {
         let runner_script = path_to_setting_value(seed.runner_script.as_deref());
         let docker_mode = docker_mode_to_control(seed.docker_mode) as i32;
+        let vm_mode = vm_mode_to_control(seed.vm_mode);
         let settings = AgentSettings {
             load_ceiling: Some(DoubleSetting {
                 current: seed.load_ceiling,
@@ -128,6 +159,14 @@ impl AgentState {
             participate: Some(BoolSetting {
                 current: seed.participate,
                 target: seed.participate,
+            }),
+            macos_runner_image: Some(StringSetting {
+                current: seed.macos_runner_image.clone(),
+                target: seed.macos_runner_image.clone(),
+            }),
+            vm_mode: Some(VmModeSetting {
+                current: vm_mode as i32,
+                target: vm_mode as i32,
             }),
         };
         let (tx, _) = watch::channel(AgentStateSnapshot {
@@ -184,6 +223,13 @@ impl AgentState {
                 &s.runner_script.as_ref().expect(SETTINGS_INVARIANT).target,
             ),
             participate: s.participate.as_ref().expect(SETTINGS_INVARIANT).target,
+            vm_mode: vm_mode_from_wire(s.vm_mode.as_ref().expect(SETTINGS_INVARIANT).target),
+            macos_runner_image: s
+                .macos_runner_image
+                .as_ref()
+                .expect(SETTINGS_INVARIANT)
+                .target
+                .clone(),
         }
     }
 
@@ -261,6 +307,42 @@ impl AgentState {
     pub fn linux_runner_image_target(&self) -> String {
         settings_of(&self.tx.borrow())
             .linux_runner_image
+            .as_ref()
+            .expect(SETTINGS_INVARIANT)
+            .target
+            .clone()
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the VM backend's job routing, which lands in the next commit \
+                  of this change set; the #[expect] forces removal then"
+        )
+    )]
+    pub fn macos_runner_image_current(&self) -> String {
+        settings_of(&self.tx.borrow())
+            .macos_runner_image
+            .as_ref()
+            .expect(SETTINGS_INVARIANT)
+            .current
+            .clone()
+    }
+
+    /// The desired macOS image — what `FleetImageService.Prepare` pulls
+    /// through the daemon and then promotes to `current`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the macOS image Prepare path, which lands later in this \
+                  change set; the #[expect] forces removal then"
+        )
+    )]
+    pub fn macos_runner_image_target(&self) -> String {
+        settings_of(&self.tx.borrow())
+            .macos_runner_image
             .as_ref()
             .expect(SETTINGS_INVARIANT)
             .target
@@ -424,6 +506,49 @@ impl AgentState {
         });
     }
 
+    pub fn set_vm_mode_target(&self, mode: VmMode) {
+        let mode = vm_mode_to_control(mode) as i32;
+        self.tx.send_modify(|s| {
+            settings_mut(s)
+                .vm_mode
+                .as_mut()
+                .expect(SETTINGS_INVARIANT)
+                .target = mode;
+        });
+    }
+
+    pub fn set_macos_runner_image_target(&self, value: &str) {
+        self.tx.send_modify(|s| {
+            value.clone_into(
+                &mut settings_mut(s)
+                    .macos_runner_image
+                    .as_mut()
+                    .expect(SETTINGS_INVARIANT)
+                    .target,
+            );
+        });
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the macOS image Prepare path, which lands later in this \
+                  change set; the #[expect] forces removal then"
+        )
+    )]
+    pub fn set_macos_runner_image_current(&self, value: &str) {
+        self.tx.send_modify(|s| {
+            value.clone_into(
+                &mut settings_mut(s)
+                    .macos_runner_image
+                    .as_mut()
+                    .expect(SETTINGS_INVARIANT)
+                    .current,
+            );
+        });
+    }
+
     pub fn set_runner_script_target(&self, script: Option<&Path>) {
         let value = path_to_setting_value(script);
         self.tx.send_modify(|s| {
@@ -474,6 +599,8 @@ mod tests {
             docker_mode: DockerMode::Auto,
             runner_script: None,
             participate: true,
+            vm_mode: crate::config::VmMode::Auto,
+            macos_runner_image: "tahoe-base".to_owned(),
         }
     }
 
@@ -602,6 +729,20 @@ mod tests {
         assert_eq!(
             state.linux_runner_image_current(),
             state.linux_runner_image_target()
+        );
+    }
+
+    #[test]
+    fn macos_runner_image_current_and_target_are_independent() {
+        let state = AgentState::new(&seed());
+        state.set_macos_runner_image_target("tahoe-base@2026.07.02");
+        assert_eq!(state.macos_runner_image_current(), "tahoe-base");
+        assert_eq!(state.macos_runner_image_target(), "tahoe-base@2026.07.02");
+
+        state.set_macos_runner_image_current("tahoe-base@2026.07.02");
+        assert_eq!(
+            state.macos_runner_image_current(),
+            state.macos_runner_image_target()
         );
     }
 
