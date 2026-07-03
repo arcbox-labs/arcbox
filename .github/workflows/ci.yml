@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [master, develop]
 
+# Every job only reads the repo; nothing here writes back through the API.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
