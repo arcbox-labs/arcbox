@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::{CoreError, Result};
 
+mod disk;
 #[cfg(feature = "macos-ipsw-install")]
 mod download;
 mod image;
