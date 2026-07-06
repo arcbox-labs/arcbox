@@ -128,23 +128,29 @@ pub async fn start_services(
         }
     });
 
-    // Docker API server.
-    let docker_server = DockerApiServer::new(
-        ServerConfig {
-            socket_path: ctx.layout.docker_socket.clone(),
-        },
-        Arc::clone(runtime),
-    );
+    // VM-host-only mode: the Docker API, Docker CLI integration, and the
+    // Kubernetes proxy all depend on the Linux VM, so they are skipped when it
+    // is not booted.
+    let linux_vm = runtime.config().vm.autostart;
 
-    let docker_shutdown = ctx.shutdown.clone();
-    let docker = tokio::spawn(async move {
-        if let Err(e) = docker_server.run(docker_shutdown).await {
-            tracing::error!("Docker API server error: {}", e);
-        }
+    // Docker API server.
+    let docker = linux_vm.then(|| {
+        let docker_server = DockerApiServer::new(
+            ServerConfig {
+                socket_path: ctx.layout.docker_socket.clone(),
+            },
+            Arc::clone(runtime),
+        );
+        let docker_shutdown = ctx.shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(e) = docker_server.run(docker_shutdown).await {
+                tracing::error!("Docker API server error: {}", e);
+            }
+        })
     });
 
     // Docker CLI integration (optional).
-    if ctx.docker_integration {
+    if linux_vm && ctx.docker_integration {
         match DockerContextManager::new_with_context_name(
             ctx.layout.docker_socket.clone(),
             ctx.profile.docker_context_name(),
@@ -163,7 +169,11 @@ pub async fn start_services(
     }
 
     // Kubernetes API proxy (TCP 127.0.0.1:16443 → guest vsock).
-    let kubernetes_proxy = crate::kubernetes_proxy::start(Arc::clone(runtime)).await;
+    let kubernetes_proxy = if linux_vm {
+        crate::kubernetes_proxy::start(Arc::clone(runtime)).await
+    } else {
+        None
+    };
 
     // Mirror route-install events into SetupStatus. VM (re)starts install
     // the container route from vm_lifecycle, outside the cold-start

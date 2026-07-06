@@ -45,6 +45,12 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub docker_integration: bool,
 
+    /// Run as a VM host only: do not boot the default Linux VM, and disable the
+    /// Docker API, Docker CLI integration, and Kubernetes proxy. macOS guest
+    /// management is unaffected. Overrides `[vm] autostart` in the config file.
+    #[arg(long)]
+    pub no_linux_vm: bool,
+
     /// Run in foreground (also log to stderr in human-readable format).
     #[arg(long)]
     pub foreground: bool,

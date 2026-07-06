@@ -56,6 +56,12 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub docker_integration: bool,
 
+    /// Run as a VM host only: do not boot the default Linux VM, and disable the
+    /// Docker API, Docker CLI integration, and Kubernetes proxy. macOS guest
+    /// management is unaffected.
+    #[arg(long)]
+    pub no_linux_vm: bool,
+
     /// Guest dockerd API vsock port.
     #[arg(long)]
     pub guest_docker_vsock_port: Option<u32>,
@@ -409,6 +415,9 @@ fn build_daemon_args(args: &DaemonArgs) -> Vec<OsString> {
     }
     if args.docker_integration {
         daemon_args.push(OsString::from("--docker-integration"));
+    }
+    if args.no_linux_vm {
+        daemon_args.push(OsString::from("--no-linux-vm"));
     }
     if let Some(port) = args.guest_docker_vsock_port {
         daemon_args.push(OsString::from("--guest-docker-vsock-port"));

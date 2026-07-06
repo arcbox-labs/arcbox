@@ -17,6 +17,12 @@ use crate::self_setup::SetupTask as _;
 /// - Re-installs the container subnet route (cold-start reconcile)
 /// - Installs DNS resolver and Docker socket via helper (best-effort)
 pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
+    // Every recovery task here reconciles Linux-VM container networking or
+    // Docker integration; none apply in VM-host-only mode.
+    if !runtime.config().vm.autostart {
+        return;
+    }
+
     recover_container_networking(runtime, &ctx.setup_state).await;
 
     // Cold-start route reconcile (non-blocking). This is load-bearing after
