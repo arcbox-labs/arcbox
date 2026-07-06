@@ -183,7 +183,9 @@ impl RuntimeServicesStarted {
             if self.linux_vm {
                 println!("Use 'arcbox docker enable' to configure Docker CLI integration.");
             } else {
-                println!("Running as a VM host only (--no-linux-vm): Docker and Kubernetes are disabled.");
+                println!(
+                    "Running as a VM host only (--no-linux-vm): Docker and Kubernetes are disabled."
+                );
             }
             println!("Press Ctrl+C to stop.");
 
