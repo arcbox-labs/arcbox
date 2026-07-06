@@ -217,7 +217,10 @@ pub async fn wait_for_signal() {
 
 async fn drain(handles: &mut ServiceHandles) {
     if tokio::time::timeout(DRAIN_TIMEOUT, async {
-        let _ = tokio::join!(&mut handles.dns, &mut handles.docker, &mut handles.grpc);
+        let _ = tokio::join!(&mut handles.dns, &mut handles.grpc);
+        if let Some(h) = handles.docker.as_mut() {
+            let _ = h.await;
+        }
         if let Some(h) = handles.kubernetes_proxy.as_mut() {
             let _ = h.await;
         }
@@ -230,8 +233,10 @@ async fn drain(handles: &mut ServiceHandles) {
             DRAIN_TIMEOUT.as_secs()
         );
         handles.dns.abort();
-        handles.docker.abort();
         handles.grpc.abort();
+        if let Some(h) = handles.docker.as_mut() {
+            h.abort();
+        }
         if let Some(h) = handles.kubernetes_proxy.as_mut() {
             h.abort();
         }

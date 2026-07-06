@@ -568,6 +568,18 @@ impl Runtime {
         tokio::fs::create_dir_all(self.config.data_dir.join("vms")).await?;
         tokio::fs::create_dir_all(self.config.data_dir.join("machines")).await?;
 
+        // VM-host-only mode: skip the entire Linux/Docker system-VM bootstrap.
+        // The Linux VM never boots (so no lifecycle actor and no idle balloon
+        // management), and no guest binaries are downloaded. The daemon layer
+        // likewise skips the Docker API, Docker CLI integration, and the
+        // Kubernetes proxy. macOS guest management is unaffected.
+        if !self.config.vm.autostart {
+            tracing::info!(
+                "Linux VM autostart disabled; running as a VM host only (Docker/Kubernetes unavailable)"
+            );
+            return Ok(());
+        }
+
         // Download every runtime binary in the boot manifest if not cached:
         // dockerd, containerd, containerd-shim-runc-v2, runc, docker-init, k3s,
         // and the optional FEX x86_64 interpreter for linux/amd64. ArcBox's

@@ -15,6 +15,7 @@
 //! [vm]
 //! # cpus = 8         # default: host core count
 //! # memory_mb = 8192  # default: half of host RAM (512–16384)
+//! # autostart = true  # boot the default Linux VM (Docker/K8s); false = VM-host only
 //!
 //! [machine]
 //! disk_gb = 50
@@ -197,6 +198,12 @@ pub struct VmDefaults {
     /// non-interactively via `ARCBOX_VM_BACKEND` or `config.toml` — the
     /// entry point for the dual-backend e2e matrix.
     pub backend: arcbox_vmm::VmBackend,
+    /// Whether to boot the default Linux VM (the Docker/Kubernetes system VM)
+    /// on daemon startup. When `false`, the daemon runs as a VM host only:
+    /// the Linux VM never starts and the Docker API, Docker CLI integration,
+    /// and Kubernetes proxy are all disabled. macOS guest management is
+    /// unaffected. Overridden to `false` by the daemon's `--no-linux-vm` flag.
+    pub autostart: bool,
 }
 
 impl VmDefaults {
@@ -223,6 +230,7 @@ impl Default for VmDefaults {
             memory_mb: arcbox_hypervisor::default_vm_memory_size() / (1024 * 1024),
             kernel_path: None,
             backend: arcbox_vmm::VmBackend::default(),
+            autostart: true,
         }
     }
 }

@@ -114,12 +114,15 @@ pub struct DaemonContext {
 pub struct VmArgs {
     pub guest_docker_vsock_port: Option<u32>,
     pub kernel: Option<PathBuf>,
+    /// `--no-linux-vm`: forces `config.vm.autostart = false` in `init_runtime`.
+    pub no_linux_vm: bool,
 }
 
 /// Handles to spawned services for drain-on-shutdown.
 pub struct ServiceHandles {
     pub dns: tokio::task::JoinHandle<()>,
-    pub docker: tokio::task::JoinHandle<()>,
+    /// Docker API server task; `None` in VM-host-only mode.
+    pub docker: Option<tokio::task::JoinHandle<()>>,
     pub grpc: tokio::task::JoinHandle<()>,
     pub kubernetes_proxy: Option<tokio::task::JoinHandle<()>>,
 }

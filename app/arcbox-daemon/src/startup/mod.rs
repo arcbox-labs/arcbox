@@ -77,6 +77,7 @@ async fn init_early(args: DaemonArgs, handles: StartupHandles) -> Result<EarlyCo
         vm_args: VmArgs {
             guest_docker_vsock_port: args.guest_docker_vsock_port,
             kernel: args.kernel,
+            no_linux_vm: args.no_linux_vm,
         },
     })
 }
@@ -214,6 +215,11 @@ async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
     // propagates config.vm.* into the VM lifecycle config.
     if let Some(ref kernel) = ctx.vm_args.kernel {
         config.vm.kernel_path = Some(kernel.clone());
+    }
+
+    // --no-linux-vm wins over the config file, forcing VM-host-only mode.
+    if ctx.vm_args.no_linux_vm {
+        config.vm.autostart = false;
     }
 
     let runtime = Arc::new(Runtime::new(config).context("Failed to create runtime")?);

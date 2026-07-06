@@ -141,6 +141,7 @@ pub struct RuntimeBooted {
 impl RuntimeBooted {
     /// Starts services that require an initialized runtime.
     pub async fn start_runtime_services(self) -> Result<RuntimeServicesStarted> {
+        let linux_vm = self.runtime.config().vm.autostart;
         let handles = record_startup_phase("start_runtime_services", async {
             let handles = services::start_services(&self.ctx, &self.runtime, self.grpc).await?;
             recovery::run(&self.ctx, &self.runtime).await;
@@ -150,6 +151,7 @@ impl RuntimeBooted {
         Ok(RuntimeServicesStarted {
             ctx: self.ctx,
             handles,
+            linux_vm,
         })
     }
 }
@@ -157,6 +159,8 @@ impl RuntimeBooted {
 pub struct RuntimeServicesStarted {
     ctx: DaemonContext,
     handles: ServiceHandles,
+    /// Whether the Linux VM (and its Docker/K8s services) is running.
+    linux_vm: bool,
 }
 
 impl RuntimeServicesStarted {
@@ -169,12 +173,18 @@ impl RuntimeServicesStarted {
                 .set_phase(SetupPhase::Ready, "Daemon ready");
 
             println!("ArcBox daemon started");
-            println!("  Docker API: {}", self.ctx.layout.docker_socket.display());
+            if self.linux_vm {
+                println!("  Docker API: {}", self.ctx.layout.docker_socket.display());
+            }
             println!("  gRPC API:   {}", self.ctx.layout.grpc_socket.display());
             println!("  DNS:        127.0.0.1:{}", self.ctx.dns_port);
             println!("  Data:       {}", self.ctx.layout.data_dir.display());
             println!();
-            println!("Use 'arcbox docker enable' to configure Docker CLI integration.");
+            if self.linux_vm {
+                println!("Use 'arcbox docker enable' to configure Docker CLI integration.");
+            } else {
+                println!("Running as a VM host only (--no-linux-vm): Docker and Kubernetes are disabled.");
+            }
             println!("Press Ctrl+C to stop.");
 
             Ok(())
