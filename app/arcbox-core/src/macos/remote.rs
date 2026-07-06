@@ -15,10 +15,14 @@ use serde::Deserialize;
 
 use crate::error::{CoreError, Result};
 
-/// Default base location of the published image index (the `darwin` bucket).
+/// Default base location of the published image index: the `darwin/` platform
+/// namespace at the CDN root (the `arcboxcdn-image` bucket fronted by
+/// `image.arcboxcdn.com`). `index.json` and every manifest resolve relative
+/// to this, so the namespace can move or gain a vanity domain without touching
+/// any published file.
 ///
 /// Overridable with the `ARCBOX_MACOS_IMAGE_BASE` environment variable.
-pub const DEFAULT_IMAGE_BASE: &str = "https://darwin.arcboxcdn.com";
+pub const DEFAULT_IMAGE_BASE: &str = "https://image.arcboxcdn.com/darwin";
 
 /// Environment variable overriding [`DEFAULT_IMAGE_BASE`].
 pub const IMAGE_BASE_ENV: &str = "ARCBOX_MACOS_IMAGE_BASE";
@@ -151,8 +155,8 @@ pub struct ImageManifest {
     pub minimum_cpu_count: u64,
     /// Minimum guest memory in MiB.
     pub minimum_memory_mib: u64,
-    /// The compressed system disk.
-    pub disk: DiskFile,
+    /// The compressed, chunked system disk.
+    pub disk: DiskManifest,
     /// The compressed auxiliary (NVRAM) storage.
     pub aux: RemoteFile,
 }
@@ -180,14 +184,35 @@ pub struct RemoteFile {
     pub sha256: String,
 }
 
-/// The disk entry: a [`RemoteFile`] plus its on-disk format.
+/// The system disk in a manifest: split at fixed `chunk_size` offsets into
+/// independently decompressible zstd frames. Chunk `i` covers uncompressed
+/// bytes `[i * chunk_size, (i + 1) * chunk_size)`; the last chunk holds the
+/// remainder. Splitting keeps every stored object under the CDN's cacheable
+/// size limit and lets the client fetch, verify, and sparse-write chunks in
+/// parallel. The manifest also carries a whole-disk `uncompressed_sha256`; the
+/// client relies on per-chunk hashing plus deterministic placement instead of
+/// re-reading the assembled image, so that field is not consumed here.
 #[derive(Debug, Deserialize)]
-pub struct DiskFile {
+pub struct DiskManifest {
     /// Raw disk image format (currently always `raw`).
     pub disk_format: String,
-    /// The file itself.
-    #[serde(flatten)]
-    pub file: RemoteFile,
+    /// Decompressed size of the assembled disk, in bytes.
+    pub uncompressed_size: u64,
+    /// Uncompressed run length each non-final chunk decompresses to.
+    pub chunk_size: u64,
+    /// Ordered chunks; each an independent zstd frame.
+    pub chunks: Vec<DiskChunk>,
+}
+
+/// One compressed disk chunk, stored as its own object next to the manifest.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiskChunk {
+    /// File name relative to the manifest's directory (`disk.NNN.zst`).
+    pub path: String,
+    /// Compressed (stored) size in bytes.
+    pub size: u64,
+    /// Hex SHA-256 of the compressed bytes.
+    pub sha256: String,
 }
 
 /// A fetchable location: an HTTP(S) URL or a local filesystem path.
