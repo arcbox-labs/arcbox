@@ -189,9 +189,16 @@ pub struct RemoteFile {
 /// bytes `[i * chunk_size, (i + 1) * chunk_size)`; the last chunk holds the
 /// remainder. Splitting keeps every stored object under the CDN's cacheable
 /// size limit and lets the client fetch, verify, and sparse-write chunks in
-/// parallel. The manifest also carries a whole-disk `uncompressed_sha256`; the
-/// client relies on per-chunk hashing plus deterministic placement instead of
-/// re-reading the assembled image, so that field is not consumed here.
+/// parallel.
+///
+/// Integrity model: each chunk is verified against its own compressed
+/// SHA-256 before it is decoded, and placed at the offset given by its array
+/// index — so the assembled disk is correct without re-reading the multi-GB
+/// result. This trusts the producer to emit chunks in offset order (they are:
+/// `disk.000.zst`, `disk.001.zst`, …). The manifest also carries a whole-disk
+/// `uncompressed_sha256` for out-of-band/publisher-side auditing; the client
+/// does not consume it (a client-side re-read would defeat the streaming
+/// design).
 #[derive(Debug, Deserialize)]
 pub struct DiskManifest {
     /// Raw disk image format (currently always `raw`).
