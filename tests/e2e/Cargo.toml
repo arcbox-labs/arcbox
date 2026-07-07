@@ -13,7 +13,7 @@ arcbox-core.workspace = true
 arcbox-grpc.workspace = true
 arcbox-protocol.workspace = true
 arcbox-vmm.workspace = true
-hyper-util = "0.1.20"
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 libc.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
