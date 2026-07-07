@@ -70,55 +70,43 @@ impl AgentClient {
         }
     }
 
-    /// Creates an agent client from an existing vsock file descriptor.
+    /// Creates an agent client over an existing fd using the **blocking**
+    /// transport.
     ///
-    /// Detects the socket domain via `getsockname`:
-    /// - `AF_UNIX` → blocking transport (HV backend socketpair)
-    /// - anything else → async tokio transport (VZ / AF_VSOCK)
+    /// For the HV backend's AF_UNIX socketpair: the blocking path avoids the
+    /// tokio/kqueue reactor stall on rapid connect/teardown cycles. Callers
+    /// must route streaming RPCs elsewhere — the blocking transport rejects
+    /// them.
     #[cfg(target_os = "macos")]
-    pub fn from_fd(cid: u32, fd: std::os::unix::io::RawFd) -> Result<Self> {
-        let is_unix = {
-            let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-            let mut len: libc::socklen_t =
-                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            let ret = unsafe {
-                libc::getsockname(fd, (&raw mut addr).cast::<libc::sockaddr>(), &raw mut len)
-            };
-            // Hard-fail on getsockname errors rather than silently falling
-            // through to async transport. If the HV backend handed us an
-            // AF_UNIX socketpair and getsockname fails, mis-routing to async
-            // transport would re-enter the exact kqueue/tokio stall the
-            // blocking path was designed to avoid.
-            if ret != 0 {
-                let err = std::io::Error::last_os_error();
-                return Err(CoreError::Machine(format!(
-                    "getsockname failed on vsock fd {fd}: {err}"
-                )));
-            }
-            addr.ss_family == libc::AF_UNIX as libc::sa_family_t
-        };
+    pub fn from_fd_blocking(cid: u32, fd: std::os::unix::io::RawFd) -> Result<Self> {
+        let transport = unsafe { BlockingVsockTransport::from_raw_fd(fd) }
+            .map_err(|e| CoreError::Machine(format!("invalid vsock fd: {e}")))?;
+        Ok(Self {
+            cid,
+            transport: AgentTransport::Blocking(transport),
+            connected: true,
+        })
+    }
 
-        if is_unix {
-            // HV backend socketpair — use blocking transport to avoid
-            // tokio/kqueue reactor stall on rapid connect/teardown cycles.
-            let transport = unsafe { BlockingVsockTransport::from_raw_fd(fd) }
-                .map_err(|e| CoreError::Machine(format!("invalid vsock fd: {e}")))?;
-            Ok(Self {
-                cid,
-                transport: AgentTransport::Blocking(transport),
-                connected: true,
-            })
-        } else {
-            // VZ backend or AF_VSOCK — use async tokio transport.
-            let addr = VsockAddr::new(cid, AGENT_PORT);
-            let transport = VsockTransport::from_raw_fd(fd, addr)
-                .map_err(|e| CoreError::Machine(format!("invalid vsock fd: {e}")))?;
-            Ok(Self {
-                cid,
-                transport: AgentTransport::Async(transport),
-                connected: true,
-            })
-        }
+    /// Creates an agent client over an existing fd using the **async** tokio
+    /// transport.
+    ///
+    /// For the VZ backend's bridged socket fd (and any true AF_VSOCK fd):
+    /// supports the full RPC surface including streaming sandbox calls.
+    ///
+    /// The choice between this and [`Self::from_fd_blocking`] must come from
+    /// the VM backend — both backends hand over unnamed AF_UNIX fds, so the
+    /// socket domain cannot distinguish them.
+    #[cfg(target_os = "macos")]
+    pub fn from_fd_async(cid: u32, fd: std::os::unix::io::RawFd) -> Result<Self> {
+        let addr = VsockAddr::new(cid, AGENT_PORT);
+        let transport = VsockTransport::from_raw_fd(fd, addr)
+            .map_err(|e| CoreError::Machine(format!("invalid vsock fd: {e}")))?;
+        Ok(Self {
+            cid,
+            transport: AgentTransport::Async(transport),
+            connected: true,
+        })
     }
 
     /// Returns the VM CID.

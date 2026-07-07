@@ -562,8 +562,23 @@ impl MachineManager {
         let cid = self
             .get_cid(name)
             .ok_or_else(|| CoreError::invalid_state("CID not assigned"))?;
+        let backend = {
+            let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
+            let machine = machines
+                .get(name)
+                .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+            self.vm_manager.backend(&machine.vm_id)?
+        };
         let fd = self.connect_vsock_port(name, AGENT_PORT)?;
-        AgentClient::from_fd(cid, fd)
+        // The transport must follow the backend, not the fd's socket domain:
+        // both backends hand over unnamed AF_UNIX fds, but only the HV
+        // socketpair needs the blocking transport (tokio/kqueue stalls on
+        // rapid connect/teardown cycles), and only the async transport
+        // supports the streaming sandbox RPCs VZ clients rely on.
+        match backend {
+            arcbox_vmm::VmBackend::Hv => AgentClient::from_fd_blocking(cid, fd),
+            arcbox_vmm::VmBackend::Vz => AgentClient::from_fd_async(cid, fd),
+        }
     }
 
     /// Connects to a vsock port on a running machine (macOS).
