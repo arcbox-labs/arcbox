@@ -74,6 +74,13 @@ pub enum ExceptionClass {
 pub struct MmioInfo {
     /// Guest physical address that was accessed.
     pub address: u64,
+    /// Whether the instruction syndrome is valid (ESR ISS[24] = ISV). When
+    /// `false`, `access_size` / `register` / `sign_extend` / `sixty_four` are
+    /// architecturally UNKNOWN and the access **cannot** be serviced from this
+    /// syndrome alone — it came from an instruction the hardware does not
+    /// syndrome-decode (LDP/STP, atomics, some writeback-addressing forms).
+    /// Only `is_write` (WnR) and `address` are meaningful in that case.
+    pub isv: bool,
     /// `true` if the guest was writing, `false` if reading.
     pub is_write: bool,
     /// Width of the access: 1, 2, 4, or 8 bytes.
@@ -85,8 +92,12 @@ pub struct MmioInfo {
     /// the guest intended to write. For reads, the VMM writes the emulated
     /// value back via `HvVcpu::set_reg(self.register, value)`.
     pub value: u64,
-    /// Whether the loaded value should be sign-extended.
+    /// Whether the loaded value should be sign-extended (ESR ISS[21] = SSE).
     pub sign_extend: bool,
+    /// Transfer register width (ESR ISS[15] = SF): `true` = 64-bit (Xt),
+    /// `false` = 32-bit (Wt). Only meaningful for a sign-extended load, which
+    /// must extend to this width.
+    pub sixty_four: bool,
 }
 
 /// Parse a raw [`ffi::HvVcpuExitInfo`] into a typed [`VcpuExit`].
@@ -109,19 +120,32 @@ fn parse_exception(syndrome: u64, exc: &ffi::HvVcpuExitException) -> ExceptionCl
 
     match ec {
         EC_DATA_ABORT_LOWER | EC_DATA_ABORT_SAME => {
+            // ESR_EL2 Data Abort ISS (ARM DDI 0487, D17.2.40):
+            //   ISS[24]    ISV — Instruction Syndrome Valid. When 0, SAS/SSE/SRT/SF
+            //              are UNKNOWN (LDP/STP, atomics, some writeback forms); the
+            //              access cannot be decoded from the syndrome alone.
+            //   ISS[23:22] SAS — access size (0=B,1=H,2=W,3=D)   [valid iff ISV]
+            //   ISS[21]    SSE — sign-extend the loaded value     [valid iff ISV]
+            //   ISS[20:16] SRT — transfer register Xt             [valid iff ISV]
+            //   ISS[15]    SF  — 64-bit register width            [valid iff ISV]
+            //   ISS[6]     WnR — write-not-read                   [always valid]
+            let isv = ((syndrome >> 24) & 1) != 0;
             let is_write = ((syndrome >> 6) & 1) != 0;
             let sas = ((syndrome >> 22) & 3) as u8;
             let access_size = 1u8 << sas;
             let register = ((syndrome >> 16) & 0x1f) as u8;
             let sign_extend = ((syndrome >> 21) & 1) != 0;
+            let sixty_four = ((syndrome >> 15) & 1) != 0;
 
             ExceptionClass::DataAbort(MmioInfo {
                 address: exc.physical_address,
+                isv,
                 is_write,
                 access_size,
                 register,
                 value: 0,
                 sign_extend,
+                sixty_four,
             })
         }
         EC_INSN_ABORT_LOWER | EC_INSN_ABORT_SAME => ExceptionClass::InstructionAbort {
@@ -177,9 +201,12 @@ mod tests {
     use super::*;
 
     /// Build a syndrome value for a data abort with the given parameters.
+    /// Sets ISV=1 (a hardware-decoded single-register access, as Linux's
+    /// virtio-mmio driver always produces).
     fn data_abort_syndrome(ec: u8, sas: u8, is_write: bool, reg: u8, sext: bool) -> u64 {
         let mut s: u64 = 0;
         s |= u64::from(ec) << 26;
+        s |= 1 << 24; // ISV
         s |= u64::from(sas) << 22;
         if sext {
             s |= 1 << 21;
@@ -246,6 +273,7 @@ mod tests {
                 class: ExceptionClass::DataAbort(mmio),
                 ..
             } => {
+                assert!(mmio.isv);
                 assert!(mmio.is_write);
                 assert_eq!(mmio.access_size, 4);
                 assert_eq!(mmio.register, 5);
@@ -253,6 +281,57 @@ mod tests {
                 assert!(!mmio.sign_extend);
             }
             other => panic!("expected DataAbort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_data_abort_isv_clear() {
+        // A data abort from an instruction the hardware does not syndrome-decode
+        // (LDP/STP, atomics, ...): ISS[24]=0. The transfer-register / size fields
+        // must not be trusted; only ISV=false and WnR are meaningful.
+        let mut syndrome = data_abort_syndrome(EC_DATA_ABORT_LOWER, 3, false, 7, false);
+        syndrome &= !(1 << 24); // clear ISV
+        let info = ffi::HvVcpuExitInfo {
+            reason: ffi::HV_EXIT_REASON_EXCEPTION,
+            exception: ffi::HvVcpuExitException {
+                syndrome,
+                virtual_address: 0,
+                physical_address: 0x0900_0000,
+            },
+        };
+        match parse_exit(&info) {
+            VcpuExit::Exception {
+                class: ExceptionClass::DataAbort(mmio),
+                ..
+            } => assert!(!mmio.isv),
+            other => panic!("expected DataAbort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_data_abort_sf_bit() {
+        // SF (ISS[15]) selects the 64-bit register width for the transfer.
+        let base = data_abort_syndrome(EC_DATA_ABORT_LOWER, 2, false, 3, true);
+        for (sf, expect_64) in [(0u64, false), (1u64, true)] {
+            let syndrome = base | (sf << 15);
+            let info = ffi::HvVcpuExitInfo {
+                reason: ffi::HV_EXIT_REASON_EXCEPTION,
+                exception: ffi::HvVcpuExitException {
+                    syndrome,
+                    virtual_address: 0,
+                    physical_address: 0x0900_0000,
+                },
+            };
+            match parse_exit(&info) {
+                VcpuExit::Exception {
+                    class: ExceptionClass::DataAbort(mmio),
+                    ..
+                } => {
+                    assert_eq!(mmio.sixty_four, expect_64, "SF={sf}");
+                    assert!(mmio.sign_extend);
+                }
+                other => panic!("expected DataAbort for SF={sf}, got {other:?}"),
+            }
         }
     }
 
