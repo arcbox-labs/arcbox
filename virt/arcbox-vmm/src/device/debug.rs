@@ -88,7 +88,7 @@ impl DeviceManager {
                 let event_idx =
                     (state.driver_features & arcbox_virtio::queue::VIRTIO_F_EVENT_IDX) != 0;
 
-                let queues = (0..8usize)
+                let queues = (0..super::MAX_VIRTQUEUES)
                     .filter(|&qi| {
                         state.queue_num[qi] != 0 || state.queue_ready[qi] || state.kicks[qi] != 0
                     })

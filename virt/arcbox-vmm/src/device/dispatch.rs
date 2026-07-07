@@ -215,7 +215,7 @@ impl DeviceManager {
                                 VmmError::Device(format!("Failed to lock state: {e}"))
                             })?;
                             let qi = queue_idx as usize;
-                            if qi < 8 {
+                            if qi < MAX_VIRTQUEUES {
                                 QueueConfig {
                                     desc_addr: mmio_state.queue_desc[qi],
                                     avail_addr: mmio_state.queue_driver[qi],

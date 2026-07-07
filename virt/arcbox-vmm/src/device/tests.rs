@@ -210,3 +210,37 @@ fn virtio_debug_snapshot_reads_ring_indices() {
     assert_eq!(q1.avail_idx, None);
     assert_eq!(q1.used_idx, None);
 }
+
+/// Regression for ABX-386: virtio-blk uses one queue per vCPU, so VMs
+/// with more than 8 vCPUs configure queue selectors >= 8. The old 8-slot
+/// register file silently dropped those writes — the guest's blk-mq
+/// queues 8..N existed guest-side only and any request submitted on them
+/// was never seen by the host (the cold-boot demand-paging stall).
+#[test]
+fn queue_config_beyond_eight_round_trips() {
+    let mut state = VirtioMmioState::new(2, 0);
+
+    state.write(virtio_mmio::regs::QUEUE_SEL, 12);
+    state.write(virtio_mmio::regs::QUEUE_NUM, 256);
+    state.write(virtio_mmio::regs::QUEUE_DESC_LOW, 0x8000_1000);
+    state.write(virtio_mmio::regs::QUEUE_DESC_HIGH, 0x1);
+    state.write(virtio_mmio::regs::QUEUE_DRIVER_LOW, 0x8000_2000);
+    state.write(virtio_mmio::regs::QUEUE_DEVICE_LOW, 0x8000_3000);
+    state.write(virtio_mmio::regs::QUEUE_READY, 1);
+    state.write(virtio_mmio::regs::QUEUE_NOTIFY, 12);
+
+    assert_eq!(state.queue_num[12], 256);
+    assert_eq!(state.queue_desc[12], 0x1_8000_1000);
+    assert_eq!(state.queue_driver[12], 0x8000_2000);
+    assert_eq!(state.queue_device[12], 0x8000_3000);
+    assert!(state.queue_ready[12]);
+    assert_eq!(state.read(virtio_mmio::regs::QUEUE_READY), 1);
+    assert_eq!(state.kicks[12], 1);
+
+    // Selectors beyond the register file must advertise "queue not
+    // available" (QueueNumMax = 0) instead of silently dropping config.
+    state.write(virtio_mmio::regs::QUEUE_SEL, MAX_VIRTQUEUES as u32);
+    assert_eq!(state.read(virtio_mmio::regs::QUEUE_NUM_MAX), 0);
+    state.write(virtio_mmio::regs::QUEUE_SEL, 12);
+    assert_eq!(state.read(virtio_mmio::regs::QUEUE_NUM_MAX), 1024);
+}

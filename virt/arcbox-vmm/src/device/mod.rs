@@ -30,7 +30,7 @@ mod tests;
 
 use checksum::finalize_virtio_net_checksum;
 pub use debug::{DeviceDebug, QueueDebug};
-pub use mmio_state::{MmioDevice, VirtioMmioState, virtio_mmio};
+pub use mmio_state::{MAX_VIRTQUEUES, MmioDevice, VirtioMmioState, virtio_mmio};
 pub use tree::DeviceTreeEntry;
 
 /// Device identifier.
