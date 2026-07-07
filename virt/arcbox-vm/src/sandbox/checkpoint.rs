@@ -5,6 +5,21 @@ use super::boot::{
 use super::cleanup::remove_sandbox_impl;
 use super::*;
 
+/// Move a file even when source and destination sit on different mounts.
+///
+/// The jailer chroot is its own vfsmount (bind + pivot_root), so a plain
+/// `rename(2)` out of it fails with `EXDEV` regardless of the underlying
+/// filesystem; fall back to copy + remove in that case.
+async fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    match tokio::fs::rename(from, to).await {
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            tokio::fs::copy(from, to).await?;
+            tokio::fs::remove_file(from).await
+        }
+        other => other,
+    }
+}
+
 impl SandboxManager {
     pub async fn checkpoint_sandbox(
         &self,
@@ -74,11 +89,11 @@ impl SandboxManager {
             let catalog_dir = self.snapshots.prepare_dir(sandbox_id, &snapshot_id)?;
             let dst_vmstate = catalog_dir.join("vmstate");
             let dst_mem = catalog_dir.join("mem");
-            tokio::fs::rename(chroot_snap.join("vmstate"), &dst_vmstate)
+            move_file(&chroot_snap.join("vmstate"), &dst_vmstate)
                 .await
                 .map_err(VmmError::Io)?;
             if chroot_snap.join("mem").exists() {
-                tokio::fs::rename(chroot_snap.join("mem"), &dst_mem)
+                move_file(&chroot_snap.join("mem"), &dst_mem)
                     .await
                     .map_err(VmmError::Io)?;
             }

@@ -57,7 +57,11 @@ pub fn build_binaries() -> Result<()> {
     info!("building release binaries + musl guest agents");
     let shell = xshell::Shell::new()?;
     shell.change_dir(repo_root());
-    xshell::cmd!(shell, "cargo build --release -p arcbox-cli -p arcbox-daemon").run()?;
+    xshell::cmd!(
+        shell,
+        "cargo build --release -p arcbox-cli -p arcbox-daemon"
+    )
+    .run()?;
     xshell::cmd!(
         shell,
         "cargo build --release -p arcbox-agent -p arcbox-vm --bins --target aarch64-unknown-linux-musl"
@@ -155,9 +159,10 @@ fn run_scenario(
 /// Attach the default `x-machine` routing header.
 fn with_machine<T>(msg: T) -> tonic::Request<T> {
     let mut request = tonic::Request::new(msg);
-    request
-        .metadata_mut()
-        .insert("x-machine", tonic::metadata::MetadataValue::from_static("default"));
+    request.metadata_mut().insert(
+        "x-machine",
+        tonic::metadata::MetadataValue::from_static("default"),
+    );
     request
 }
 
@@ -215,8 +220,7 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
 
     // -- Run ----------------------------------------------------------------
     let run_started = Instant::now();
-    let stdout =
-        run_and_collect(&mut sandboxes, "smoke1", &["/bin/echo", "hello-sandbox"]).await?;
+    let stdout = run_and_collect(&mut sandboxes, "smoke1", &["/bin/echo", "hello-sandbox"]).await?;
     if !stdout.contains("hello-sandbox") {
         bail!("run output missing marker: {stdout:?}");
     }
@@ -268,8 +272,7 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
         .context("Restore failed")?
         .into_inner();
     info!(id = %restored.id, ip = %restored.ip_address, "sandbox restored");
-    let stdout =
-        run_and_collect(&mut sandboxes, "smoke2", &["/bin/echo", "hello-restore"]).await?;
+    let stdout = run_and_collect(&mut sandboxes, "smoke2", &["/bin/echo", "hello-restore"]).await?;
     if !stdout.contains("hello-restore") {
         bail!("restored sandbox run output missing marker: {stdout:?}");
     }
