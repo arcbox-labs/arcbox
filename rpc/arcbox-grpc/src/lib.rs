@@ -37,6 +37,11 @@
 pub use arcbox_protocol;
 pub use tonic;
 
+/// Compiled file descriptor set of every ArcBox proto, for gRPC server
+/// reflection (`tonic-reflection`). Covers `arcbox.v1` and `sandbox.v1`.
+pub const FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/arcbox_descriptor.bin"));
+
 /// All gRPC services from the unified arcbox.v1 package.
 ///
 /// This module contains tonic-generated client and server code for:
