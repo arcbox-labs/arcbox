@@ -241,19 +241,26 @@ pub(super) fn create_rootfs_symlink(vm_dir: &Path, dm_device: &str) -> Result<St
         .ok_or_else(|| VmmError::Config(format!("non-UTF-8 path: {}", link_path.display())))
 }
 
-/// Release dm-snapshot + recreated origin directory after a failed restore.
+/// Release the resources a partial restore has acquired: dm-snapshot CoW, the
+/// TAP/IP allocation, and the recreated origin directory.
 ///
-/// `CowHandle` has no Drop impl, so dropping it would leak the dm device,
-/// loop device, and sparse COW file.  This must be called on every error
-/// path between `cow_manager.setup` and the point where the handle is
-/// handed off to the SandboxInstance.
+/// None of these have a `Drop` that frees them (`CowHandle` and
+/// `NetworkAllocation` are plain records), so dropping them on a `?` would leak
+/// the dm device + loop + COW file and the TAP + IP. This must be called on
+/// every error path between resource acquisition and the point where they are
+/// handed off to the `SandboxInstance`.
 pub(super) async fn cleanup_pending_restore(
     cow_manager: &CowManager,
+    network: &NetworkManager,
     cow: Option<CowHandle>,
+    net_alloc: Option<&NetworkAllocation>,
     origin_dir: Option<&Path>,
 ) {
     if let Some(handle) = cow {
         cow_manager.teardown(&handle).await;
+    }
+    if let Some(net) = net_alloc {
+        network.release(net);
     }
     if let Some(dir) = origin_dir
         && let Err(e) = tokio::fs::remove_dir_all(dir).await

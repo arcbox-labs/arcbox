@@ -33,7 +33,9 @@ fn claim_running(id: &SandboxId, instances: &InstanceMap) -> Result<()> {
 /// owns it). If a concurrent `stop` moved it to `Stopping`, that transition is
 /// left intact — stop owns the teardown from there.
 fn release_running(id: &SandboxId, instances: &InstanceMap) {
-    if let Some(arc) = instances.read().unwrap().get(id).cloned() {
+    // Drop the map read guard before taking the instance lock.
+    let arc = instances.read().unwrap().get(id).cloned();
+    if let Some(arc) = arc {
         let mut inst = arc.lock().unwrap();
         if inst.state == SandboxState::Running {
             inst.state = SandboxState::Ready;
@@ -53,7 +55,9 @@ fn finish_workload(
     instances: &InstanceMap,
     events_tx: &broadcast::Sender<SandboxEvent>,
 ) {
-    if let Some(arc) = instances.read().unwrap().get(id).cloned() {
+    // Drop the map read guard before taking the instance lock.
+    let arc = instances.read().unwrap().get(id).cloned();
+    if let Some(arc) = arc {
         let mut inst = arc.lock().unwrap();
         inst.last_exit_code = Some(exit_code);
         inst.last_exited_at = Some(Utc::now());
