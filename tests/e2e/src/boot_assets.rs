@@ -297,14 +297,44 @@ pub fn stage_dev_boot_assets(root: &Path, data_dir: &Path, version: &str) -> Res
     // the freshest agent found locally: the dev tree, a local
     // cross-compile, or the one an installed ArcBox app seeded — newest
     // mtime wins, since a stale agent fails the boot in confusing ways.
-    let agent_candidates = [
-        dev_boot_dir.join("arcbox-agent"),
-        root.join("target/aarch64-unknown-linux-musl/release/arcbox-agent"),
+    if !stage_freshest_binary(root, &dev_boot_dir, "arcbox-agent", &test_boot_dir)? {
+        warn!(
+            "no arcbox-agent found (looked in boot-assets/dev, musl target, ~/.arcbox/bin); \
+             the daemon will fail at runtime init"
+        );
+    }
+
+    // The sandbox service execs the microVM init at `/arcbox/bin/vm-agent`
+    // (= `<data_dir>/bin/vm-agent` through the VirtioFS data-dir mount), so
+    // stage it straight into the test data dir. Missing vm-agent degrades
+    // only sandbox scenarios, not the Docker lifecycle.
+    if !stage_freshest_binary(root, &dev_boot_dir, "vm-agent", &data_dir.join("bin"))? {
+        warn!("no vm-agent found; sandbox create will fail inside the guest");
+    }
+
+    info!(dev_boot_dir = %dev_boot_dir.display(), "using development boot assets");
+    Ok(())
+}
+
+/// Copy the newest-mtime copy of `name` (dev boot dir, musl target dir, or an
+/// installed ArcBox data dir) into `dest_dir`. Returns false when no
+/// candidate exists.
+fn stage_freshest_binary(
+    root: &Path,
+    dev_boot_dir: &Path,
+    name: &str,
+    dest_dir: &Path,
+) -> Result<bool> {
+    let candidates = [
+        dev_boot_dir.join(name),
+        root.join("target/aarch64-unknown-linux-musl/release")
+            .join(name),
         arcbox_constants::paths::ArcboxProfile::Production
             .default_data_dir()
-            .join("bin/arcbox-agent"),
+            .join("bin")
+            .join(name),
     ];
-    let freshest_agent = agent_candidates
+    let freshest = candidates
         .iter()
         .filter_map(|path| {
             let mtime = fs::metadata(path).ok()?.modified().ok()?;
@@ -312,19 +342,14 @@ pub fn stage_dev_boot_assets(root: &Path, data_dir: &Path, version: &str) -> Res
         })
         .max_by_key(|(_, mtime)| *mtime)
         .map(|(path, _)| path);
-    match freshest_agent {
-        Some(agent) => {
-            copy_file(agent, &test_boot_dir.join("arcbox-agent"))?;
-            info!(agent = %agent.display(), "staged guest agent");
+    match freshest {
+        Some(binary) => {
+            copy_file(binary, &dest_dir.join(name))?;
+            info!(binary = %binary.display(), name, "staged guest binary");
+            Ok(true)
         }
-        None => warn!(
-            "no arcbox-agent found (looked in boot-assets/dev, musl target, ~/.arcbox/bin); \
-             the daemon will fail at runtime init"
-        ),
+        None => Ok(false),
     }
-
-    info!(dev_boot_dir = %dev_boot_dir.display(), "using development boot assets");
-    Ok(())
 }
 
 fn copy_file(from: &Path, to: &Path) -> Result<()> {

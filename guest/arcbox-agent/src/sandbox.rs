@@ -49,14 +49,18 @@ async fn drain_trailing_input<S: AsyncRead + Unpin>(stream: &mut S) {
 /// Thin wrapper around [`SandboxManager`] for use in the agent's RPC layer.
 pub struct SandboxService {
     manager: Arc<SandboxManager>,
+    /// Default rootfs image path; auto-built on first use when missing.
+    default_rootfs: String,
 }
 
 impl SandboxService {
     /// Create a new [`SandboxService`] from the given config.
     pub fn new(config: VmmConfig) -> anyhow::Result<Self> {
+        let default_rootfs = config.defaults.rootfs.clone();
         let manager = SandboxManager::new(config).map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(Self {
             manager: Arc::new(manager),
+            default_rootfs,
         })
     }
 
@@ -67,8 +71,9 @@ impl SandboxService {
     /// Create a sandbox.
     ///
     /// When the rootfs path points to a directory (overlay2 layer), the agent
-    /// converts it to ext4 via `oci2rootfs` and injects `vm-agent` before
-    /// booting. Ext4 images are used directly.
+    /// converts it to ext4 via the `oci2rootfs` library and injects `vm-agent`
+    /// before booting. Ext4 images are used directly. An empty rootfs selects
+    /// the default busybox + vm-agent image, auto-built on first use.
     pub async fn create(
         &self,
         payload: &[u8],
@@ -77,8 +82,15 @@ impl SandboxService {
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let mut spec = proto_to_spec(req);
 
-        // Auto-detect: directory → overlay2 layer needing conversion.
-        if !spec.rootfs.is_empty() && std::path::Path::new(&spec.rootfs).is_dir() {
+        if spec.rootfs.is_empty() {
+            // Default rootfs: build the busybox + vm-agent image on first use
+            // (rebuilt when the staged vm-agent is newer than the image).
+            crate::rootfs_builder::ensure_default_rootfs(&self.default_rootfs)
+                .await
+                .map_err(|e| SandboxError::Internal(format!("default rootfs: {e}")))?;
+            spec.rootfs.clone_from(&self.default_rootfs);
+        } else if std::path::Path::new(&spec.rootfs).is_dir() {
+            // Directory → overlay2 layer needing conversion.
             let ext4_path = crate::rootfs_builder::convert_layer_to_rootfs(&spec.rootfs)
                 .await
                 .map_err(|e| SandboxError::Internal(format!("rootfs build failed: {e}")))?;

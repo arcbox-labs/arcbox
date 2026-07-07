@@ -6,3 +6,11 @@ linker = "aarch64-linux-musl-gcc"
 
 [target.x86_64-unknown-linux-musl]
 linker = "x86_64-linux-musl-gcc"
+
+# C build scripts (cc crate) must use the same musl toolchain as the linker
+# above; the host clang cannot compile for *-linux-musl (no musl headers).
+[env]
+CC_aarch64_unknown_linux_musl = "aarch64-linux-musl-gcc"
+AR_aarch64_unknown_linux_musl = "aarch64-linux-musl-ar"
+CC_x86_64_unknown_linux_musl = "x86_64-linux-musl-gcc"
+AR_x86_64_unknown_linux_musl = "x86_64-linux-musl-ar"
