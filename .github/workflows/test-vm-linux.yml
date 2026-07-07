@@ -177,17 +177,17 @@ jobs:
           curl -sL "$BASE/vmlinux-6.1.102"              -o /tmp/fc-assets/vmlinux
           curl -sL "$BASE/ubuntu-22.04.ext4"            -o /tmp/fc-assets/rootfs-base.ext4
 
-      - name: Build vmm-guest-agent (Linux x86_64)
-        run: cargo build -p arcbox-vm --bin vmm-guest-agent --release
+      - name: Build vm-agent (Linux x86_64)
+        run: cargo build -p arcbox-vm --bin vm-agent --release
 
-      - name: Inject vmm-guest-agent into rootfs
+      - name: Inject vm-agent into rootfs
         run: |
           cp /tmp/fc-assets/rootfs-base.ext4 /tmp/fc-assets/rootfs.ext4
           sudo e2fsck -f -y /tmp/fc-assets/rootfs.ext4 || true
           sudo resize2fs /tmp/fc-assets/rootfs.ext4 512M
           mkdir -p /tmp/fc-mnt
           sudo mount -o loop /tmp/fc-assets/rootfs.ext4 /tmp/fc-mnt
-          sudo cp target/release/vmm-guest-agent /tmp/fc-mnt/sbin/vm-agent
+          sudo cp target/release/vm-agent /tmp/fc-mnt/sbin/vm-agent
           sudo chmod +x /tmp/fc-mnt/sbin/vm-agent
           sudo umount /tmp/fc-mnt
 
@@ -253,17 +253,17 @@ jobs:
 
       - name: Build binaries
         run: |
-          cargo build -p arcbox-vm --bin vmm-guest-agent --release
+          cargo build -p arcbox-vm --bin vm-agent --release
           cargo test -p arcbox-agent --test sandbox_service_manager --no-run
 
-      - name: Inject vmm-guest-agent into rootfs
+      - name: Inject vm-agent into rootfs
         run: |
           cp /tmp/fc-assets/rootfs-base.ext4 /tmp/fc-assets/rootfs.ext4
           sudo e2fsck -f -y /tmp/fc-assets/rootfs.ext4 || true
           sudo resize2fs /tmp/fc-assets/rootfs.ext4 512M
           mkdir -p /tmp/fc-mnt
           sudo mount -o loop /tmp/fc-assets/rootfs.ext4 /tmp/fc-mnt
-          sudo cp target/release/vmm-guest-agent /tmp/fc-mnt/sbin/vm-agent
+          sudo cp target/release/vm-agent /tmp/fc-mnt/sbin/vm-agent
           sudo chmod +x /tmp/fc-mnt/sbin/vm-agent
           sudo umount /tmp/fc-mnt
 

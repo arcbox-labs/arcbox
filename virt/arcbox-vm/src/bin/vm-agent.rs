@@ -636,7 +636,7 @@ mod agent {
                     // failure we abort the exec with 126 rather than run the
                     // workload with the wrong identity.
                     unsafe {
-                        if libc::setgroups(1, &gid) != 0
+                        if libc::setgroups(1, &raw const gid) != 0
                             || libc::setgid(gid) != 0
                             || libc::setuid(u.uid as libc::uid_t) != 0
                         {
