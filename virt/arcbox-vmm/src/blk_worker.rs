@@ -118,45 +118,6 @@ impl GuestMemWriter {
         unsafe { Some(std::slice::from_raw_parts(self.ptr.add(off), len)) }
     }
 
-    pub(crate) fn read_u16(&self, gpa: usize) -> u16 {
-        let Some(off) = self.gpa_to_offset(gpa, 2) else {
-            return 0;
-        };
-        // SAFETY: `gpa_to_offset` validated bounds within the allocation.
-        unsafe {
-            let p = self.ptr.add(off);
-            u16::from_le_bytes([*p, *p.add(1)])
-        }
-    }
-
-    pub(crate) fn write_u16(&self, gpa: usize, val: u16) {
-        let Some(off) = self.gpa_to_offset(gpa, 2) else {
-            return;
-        };
-        let bytes = val.to_le_bytes();
-        // SAFETY: `gpa_to_offset` validated bounds within the allocation.
-        unsafe {
-            let p = self.ptr.add(off);
-            *p = bytes[0];
-            *p.add(1) = bytes[1];
-        }
-    }
-
-    pub(crate) fn write_u32(&self, gpa: usize, val: u32) {
-        let Some(off) = self.gpa_to_offset(gpa, 4) else {
-            return;
-        };
-        let bytes = val.to_le_bytes();
-        // SAFETY: `gpa_to_offset` validated bounds within the allocation.
-        unsafe {
-            let p = self.ptr.add(off);
-            *p = bytes[0];
-            *p.add(1) = bytes[1];
-            *p.add(2) = bytes[2];
-            *p.add(3) = bytes[3];
-        }
-    }
-
     fn write_byte(&self, gpa: usize, val: u8) {
         let Some(off) = self.gpa_to_offset(gpa, 1) else {
             return;

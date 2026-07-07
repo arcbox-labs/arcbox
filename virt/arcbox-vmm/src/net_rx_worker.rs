@@ -8,17 +8,19 @@
 //! host→guest data path.
 //!
 //! This worker thread continuously drains `net_host_fd` via kqueue,
-//! injects frames directly into the guest virtio-net RX queue, and
+//! injects frames into the guest virtio-net RX queue through the
+//! unified `SplitQueue` (sharing `arcbox_net_inject::queue::
+//! inject_one_frame` with the channel-based inject thread), and
 //! coalesces interrupts to minimize VM exit overhead.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::blk_worker::GuestMemWriter;
+use arcbox_virtio::{GuestMemWriter, QueueConfig, SplitQueue};
+
 use crate::device::VirtioMmioState;
 use crate::irq::Irq;
-use crate::virtqueue_util;
 
 /// Maximum frames to inject per kqueue wakeup before checking
 /// interrupt coalescing thresholds.
@@ -34,27 +36,17 @@ const COALESCE_TIMEOUT: Duration = Duration::from_micros(50);
 /// kqueue poll timeout — bounds the shutdown check frequency.
 const POLL_TIMEOUT: Duration = Duration::from_millis(1);
 
-/// VirtIO-net header size (all zeros for simple RX passthrough).
-const VIRTIO_NET_HDR_SIZE: usize = 12;
-
-/// Immutable RX queue layout, captured once at DRIVER_OK time.
-/// All GPAs are absolute guest physical addresses, translated to
-/// host offsets by `GuestMemWriter::gpa_to_offset`.
-pub struct RxQueueConfig {
-    pub desc_gpa: u64,
-    pub avail_gpa: u64,
-    pub used_gpa: u64,
-    pub size: u16,
-}
-
 /// Shared context for the net-io worker thread.
 pub struct NetRxWorkerContext {
     /// Raw fd of the HV-side socketpair end (non-blocking, SOCK_DGRAM).
     pub net_host_fd: i32,
-    /// Guest memory writer (Send + Sync, VM-lifetime pointer).
-    pub guest_mem: GuestMemWriter,
+    /// Guest memory (Send + Sync, VM-lifetime pointer). Backs the
+    /// worker-owned `SplitQueue`.
+    pub guest_mem: Arc<GuestMemWriter>,
     /// RX queue layout (queue index 0 of primary VirtioNet).
-    pub rx_queue: RxQueueConfig,
+    pub rx_queue: QueueConfig,
+    /// Whether `VIRTIO_F_EVENT_IDX` was negotiated with the guest.
+    pub event_idx: bool,
     /// MMIO state for setting interrupt_status (INT_VRING).
     pub mmio_state: Arc<RwLock<VirtioMmioState>>,
     /// IRQ callback for GIC SPI injection (thread-safe).
@@ -66,11 +58,6 @@ pub struct NetRxWorkerContext {
     /// VM shutdown flag.
     pub running: Arc<AtomicBool>,
 }
-
-// SAFETY: All fields are either Send+Sync or raw pointers wrapped in
-// GuestMemWriter which is Send+Sync. The irq_callback and exit_vcpus
-// closures capture only thread-safe types (Arc<Gic>, weak refs).
-unsafe impl Send for NetRxWorkerContext {}
 
 /// Triggers a virtio-net RX interrupt: sets MMIO interrupt_status,
 /// fires the GIC SPI, and kicks all vCPUs out of hv_vcpu_run.
@@ -85,137 +72,17 @@ fn trigger_net_irq(ctx: &NetRxWorkerContext) {
     (ctx.exit_vcpus)();
 }
 
-/// Conditionally triggers an interrupt based on EVENT_IDX suppression.
-/// Only fires set_spi + hv_vcpus_exit when the guest actually wants
-/// a notification (used_event crossed). Reduces VM exits significantly.
-fn maybe_notify(ctx: &NetRxWorkerContext, old_used: u16, new_used: u16) {
-    if virtqueue_util::should_notify(
-        &ctx.guest_mem,
-        ctx.rx_queue.avail_gpa,
-        ctx.rx_queue.size,
-        old_used,
-        new_used,
-    ) {
+/// Flushes a batch: republishes `avail_event` (EVENT_IDX only) and fires
+/// the IRQ when any push since the last flush requested one.
+fn flush_batch(ctx: &NetRxWorkerContext, queue: &SplitQueue, fire: bool) {
+    if ctx.event_idx {
+        // RX semantics: publish the guest's current avail.idx (widest kick
+        // suppression window for a polling consumer), not the consumed cursor.
+        queue.write_avail_event_current();
+    }
+    if fire {
         trigger_net_irq(ctx);
     }
-}
-
-/// Injects a single frame into the guest RX queue.
-///
-/// Returns `true` if the frame was successfully injected, `false`
-/// if no RX descriptors are available or the frame couldn't be written.
-fn inject_one_frame(ctx: &NetRxWorkerContext, frame: &[u8], used_idx: &mut u16) -> bool {
-    let q_size = ctx.rx_queue.size as usize;
-    if q_size == 0 {
-        return false;
-    }
-
-    // Read avail_idx from guest memory.
-    std::sync::atomic::fence(Ordering::Acquire);
-    let avail_idx = ctx.guest_mem.read_u16(ctx.rx_queue.avail_gpa as usize + 2);
-    if *used_idx == avail_idx {
-        return false; // No RX descriptors available.
-    }
-
-    // Pop available descriptor.
-    let ring_off = ctx.rx_queue.avail_gpa as usize + 4 + 2 * ((*used_idx as usize) % q_size);
-    let head_idx = ctx.guest_mem.read_u16(ring_off) as usize;
-
-    // Build packet: virtio-net header (zeroed) + ethernet frame.
-    let total_len = VIRTIO_NET_HDR_SIZE + frame.len();
-
-    // Walk descriptor chain and write the packet.
-    let mut written = 0;
-    let mut idx = head_idx;
-    let desc_base = ctx.rx_queue.desc_gpa as usize;
-
-    for _ in 0..q_size {
-        let d_off = desc_base + idx * 16;
-        let Some(desc_slice) = ctx.guest_mem.slice(d_off, 16) else {
-            break;
-        };
-
-        let addr_gpa = u64::from_le_bytes(desc_slice[0..8].try_into().unwrap()) as usize;
-        let len = u32::from_le_bytes(desc_slice[8..12].try_into().unwrap()) as usize;
-        let flags = u16::from_le_bytes(desc_slice[12..14].try_into().unwrap());
-        let next = u16::from_le_bytes(desc_slice[14..16].try_into().unwrap());
-
-        // RX descriptors are device-writable (flag bit 1).
-        if flags & 2 != 0 && len > 0 {
-            // SAFETY: VirtIO descriptor buffers are device-owned during
-            // injection. The guest will not access them until used_idx
-            // advances (after Release fence below).
-            let Some(buf) = (unsafe { ctx.guest_mem.slice_mut(addr_gpa, len) }) else {
-                continue;
-            };
-
-            let remaining = total_len.saturating_sub(written);
-            let to_write = remaining.min(len);
-
-            if written < VIRTIO_NET_HDR_SIZE {
-                // Write virtio-net header (or partial header).
-                // With MRG_RXBUF, num_buffers (bytes 10-11) must be 1.
-                let hdr_remaining = VIRTIO_NET_HDR_SIZE - written;
-                let hdr_bytes = hdr_remaining.min(to_write);
-                buf[..hdr_bytes].fill(0);
-                if written <= 10 && written + hdr_bytes > 10 {
-                    let nb_off = 10 - written;
-                    if nb_off + 2 <= hdr_bytes {
-                        buf[nb_off..nb_off + 2].copy_from_slice(&1u16.to_le_bytes());
-                    }
-                }
-                // GSO for large TCP/IPv4 frames with NEEDS_CSUM.
-                if written == 0
-                    && hdr_bytes >= 10
-                    && frame.len() > 1500
-                    && frame.len() >= 54
-                    && frame[12] == 0x08
-                    && frame[13] == 0x00
-                    && frame[23] == 6
-                    && frame[14] & 0x0F == 5
-                {
-                    buf[0] = 1; // NEEDS_CSUM
-                    buf[1] = 1; // GSO_TCPV4
-                    buf[2..4].copy_from_slice(&54u16.to_le_bytes()); // hdr_len: ETH(14)+IP(20)+TCP(20)
-                    buf[4..6].copy_from_slice(&1460u16.to_le_bytes()); // gso_size
-                    buf[6..8].copy_from_slice(&34u16.to_le_bytes()); // csum_start: offset to TCP hdr
-                    buf[8..10].copy_from_slice(&16u16.to_le_bytes()); // csum_offset: TCP checksum
-                }
-                // Write frame data after header.
-                let frame_bytes = to_write - hdr_bytes;
-                if frame_bytes > 0 {
-                    buf[hdr_bytes..hdr_bytes + frame_bytes].copy_from_slice(&frame[..frame_bytes]);
-                }
-            } else {
-                // Pure frame data.
-                let frame_off = written - VIRTIO_NET_HDR_SIZE;
-                buf[..to_write].copy_from_slice(&frame[frame_off..frame_off + to_write]);
-            }
-            written += to_write;
-        }
-
-        if flags & 1 == 0 || written >= total_len {
-            break;
-        }
-        idx = next as usize;
-    }
-
-    if written == 0 {
-        return false;
-    }
-
-    // Update used ring entry.
-    let used_entry_off = ctx.rx_queue.used_gpa as usize + 4 + ((*used_idx as usize) % q_size) * 8;
-    ctx.guest_mem.write_u32(used_entry_off, head_idx as u32);
-    ctx.guest_mem.write_u32(used_entry_off + 4, written as u32);
-
-    // Release fence: ensure descriptor data is visible before used_idx.
-    std::sync::atomic::fence(Ordering::Release);
-    *used_idx = used_idx.wrapping_add(1);
-    ctx.guest_mem
-        .write_u16(ctx.rx_queue.used_gpa as usize + 2, *used_idx);
-
-    true
 }
 
 /// Main loop for the net-io worker thread.
@@ -273,11 +140,15 @@ pub fn net_rx_worker_loop(ctx: NetRxWorkerContext) {
         tv_nsec: POLL_TIMEOUT.as_nanos() as i64,
     };
 
-    // Read used_idx from guest memory (resume from where poll_net_rx left off).
-    let mut used_idx = ctx.guest_mem.read_u16(ctx.rx_queue.used_gpa as usize + 2);
+    let mut queue = SplitQueue::new(Arc::clone(&ctx.guest_mem), 0, &ctx.rx_queue, ctx.event_idx);
+    // Resume from where poll_net_rx left off: RX consumes one avail entry
+    // per used entry published, so the avail cursor starts at used.idx.
+    queue.set_last_avail_idx(ctx.guest_mem.read_u16(ctx.rx_queue.used_addr as usize + 2));
+
     let mut pending_frames: u16 = 0;
     let mut batch_start: Option<Instant> = None;
-    let mut old_used = used_idx;
+    // Whether any push since the last flush requested an interrupt.
+    let mut fire = false;
 
     loop {
         if !ctx.running.load(Ordering::Relaxed) {
@@ -307,7 +178,6 @@ pub fn net_rx_worker_loop(ctx: NetRxWorkerContext) {
         if nev > 0 {
             // net_host_fd is readable — drain frames.
             let mut frame_buf = [0u8; 2048];
-            old_used = used_idx;
 
             for _ in 0..BATCH_SIZE {
                 let n = unsafe {
@@ -322,7 +192,9 @@ pub fn net_rx_worker_loop(ctx: NetRxWorkerContext) {
                 }
 
                 let frame = &frame_buf[..n as usize];
-                if inject_one_frame(&ctx, frame, &mut used_idx) {
+                if let Some(notify) = arcbox_net_inject::queue::inject_one_frame(&mut queue, frame)
+                {
+                    fire |= notify;
                     pending_frames += 1;
                     if batch_start.is_none() {
                         batch_start = Some(Instant::now());
@@ -333,11 +205,10 @@ pub fn net_rx_worker_loop(ctx: NetRxWorkerContext) {
                     // The frame just read is lost — TCP retransmission from
                     // the host will recover it after the guest reposts.
                     if pending_frames > 0 {
-                        write_avail_event(&ctx, used_idx);
-                        maybe_notify(&ctx, old_used, used_idx);
+                        flush_batch(&ctx, &queue, fire);
                         pending_frames = 0;
                         batch_start = None;
-                        old_used = used_idx;
+                        fire = false;
                     }
                     // 100μs gives the vCPU enough time to process the
                     // interrupt and repost descriptors.
@@ -347,11 +218,10 @@ pub fn net_rx_worker_loop(ctx: NetRxWorkerContext) {
 
                 // Check count threshold.
                 if pending_frames >= COALESCE_COUNT {
-                    write_avail_event(&ctx, used_idx);
-                    maybe_notify(&ctx, old_used, used_idx);
+                    flush_batch(&ctx, &queue, fire);
                     pending_frames = 0;
                     batch_start = None;
-                    old_used = used_idx;
+                    fire = false;
                 }
             }
         }
@@ -360,10 +230,10 @@ pub fn net_rx_worker_loop(ctx: NetRxWorkerContext) {
         if pending_frames > 0 {
             if let Some(start) = batch_start {
                 if start.elapsed() >= COALESCE_TIMEOUT {
-                    write_avail_event(&ctx, used_idx);
-                    maybe_notify(&ctx, old_used, used_idx);
+                    flush_batch(&ctx, &queue, fire);
                     pending_frames = 0;
                     batch_start = None;
+                    fire = false;
                 }
             }
         }
@@ -371,25 +241,12 @@ pub fn net_rx_worker_loop(ctx: NetRxWorkerContext) {
 
     // Flush any remaining pending frames on shutdown.
     if pending_frames > 0 {
-        write_avail_event(&ctx, used_idx);
+        if ctx.event_idx {
+            queue.write_avail_event_current();
+        }
         trigger_net_irq(&ctx); // Always notify on shutdown.
     }
 
     unsafe { libc::close(kq) };
     tracing::info!("net-io worker stopped");
-}
-
-/// Writes avail_event into the used ring so the guest knows when
-/// to kick us for new RX buffer submissions (EVENT_IDX).
-fn write_avail_event(ctx: &NetRxWorkerContext, used_idx: u16) {
-    let q_size = ctx.rx_queue.size as usize;
-    let avail_event_off = ctx.rx_queue.used_gpa as usize + 4 + q_size * 8;
-    // Request notification when guest posts the next batch of buffers.
-    let avail_idx = ctx.guest_mem.read_u16(ctx.rx_queue.avail_gpa as usize + 2);
-    // Release fence: ensure prior used-ring writes are globally visible
-    // before the guest observes the new avail_event value. On ARM64 plain
-    // stores are not ordered across threads without this.
-    std::sync::atomic::fence(Ordering::Release);
-    ctx.guest_mem.write_u16(avail_event_off, avail_idx);
-    let _ = used_idx; // Suppress unused warning; used_idx is for future should_notify.
 }

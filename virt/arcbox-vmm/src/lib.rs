@@ -77,7 +77,6 @@ pub(crate) mod net_rx_worker;
 pub mod snapshot;
 pub mod vcpu;
 pub mod vcpu_stats;
-pub(crate) mod virtqueue_util;
 pub mod vmm;
 #[cfg(target_os = "macos")]
 pub(crate) mod vsock_rx_worker;
