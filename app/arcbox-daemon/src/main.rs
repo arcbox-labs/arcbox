@@ -121,27 +121,36 @@ fn sentry_environment() -> Option<String> {
 }
 
 async fn run(args: DaemonArgs) -> Result<()> {
-    let setup_state = Arc::new(SetupState::new());
+    let handles = context::StartupHandles::new(Arc::new(SetupState::new()));
 
-    let ready = match start(args, Arc::clone(&setup_state)).await {
-        Ok(ready) => ready,
-        Err(e) => {
-            // Publish the failure on the setup stream before exiting so a
-            // WatchSetupStatus client (desktop app, e2e harness) learns the
-            // cause instead of seeing a bare disconnect. The brief grace
-            // period lets already-connected streams flush the final event;
-            // with no clients it only delays the error exit.
-            setup_state.set_failed(&format!("{e:#}"));
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            return Err(e);
+    // The signal watcher must be armed for the whole startup window: the
+    // pipeline boots the VM, and without a handler the default SIGTERM
+    // disposition kills the process mid-boot, orphaning the VM and the
+    // Virtualization.framework helpers holding its disk images.
+    let ready = tokio::select! {
+        ready = start(args, handles.clone()) => match ready {
+            Ok(ready) => ready,
+            Err(e) => {
+                // Publish the failure on the setup stream before exiting so a
+                // WatchSetupStatus client (desktop app, e2e harness) learns the
+                // cause instead of seeing a bare disconnect. The brief grace
+                // period lets already-connected streams flush the final event;
+                // with no clients it only delays the error exit.
+                handles.setup_state.set_failed(&format!("{e:#}"));
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                return Err(e);
+            }
+        },
+        () = shutdown::wait_for_signal() => {
+            return shutdown::interrupt_startup(&handles).await;
         }
     };
 
     shutdown::run(ready.ctx, ready.handles).await
 }
 
-async fn start(args: DaemonArgs, setup_state: Arc<SetupState>) -> Result<startup::ReadyDaemon> {
-    startup::Startup::from_args(args, setup_state)
+async fn start(args: DaemonArgs, handles: context::StartupHandles) -> Result<startup::ReadyDaemon> {
+    startup::Startup::from_args(args, handles)
         .prepare_host()
         .await?
         .acquire_daemon_lease()

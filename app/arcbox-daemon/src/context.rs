@@ -20,6 +20,34 @@ use tokio_util::sync::CancellationToken;
 
 use crate::startup::DaemonLock;
 
+/// Handles created before the startup pipeline runs and shared with it.
+///
+/// A shutdown signal can arrive while the pipeline is still building the
+/// daemon. `main` holds a clone so the interrupt path can reach whatever
+/// the pipeline has published so far: the runtime (for a bounded stop of a
+/// VM that keeps booting in its lifecycle tasks even after the startup
+/// future is dropped) and the cancellation token (for services that are
+/// already running).
+#[derive(Clone)]
+pub struct StartupHandles {
+    pub shared_runtime: SharedRuntime,
+    /// Filled right after runtime construction, before the VM boots.
+    pub early_runtime: SharedRuntime,
+    pub setup_state: Arc<SetupState>,
+    pub shutdown: CancellationToken,
+}
+
+impl StartupHandles {
+    pub fn new(setup_state: Arc<SetupState>) -> Self {
+        Self {
+            shared_runtime: Arc::new(std::sync::OnceLock::new()),
+            early_runtime: Arc::new(std::sync::OnceLock::new()),
+            setup_state,
+            shutdown: CancellationToken::new(),
+        }
+    }
+}
+
 /// Pre-lock context produced by the startup pipeline.
 ///
 /// Contains everything needed to start the gRPC SystemService (so

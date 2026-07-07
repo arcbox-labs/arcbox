@@ -3,7 +3,13 @@
 //! First signal triggers graceful shutdown with visible feedback.
 //! Second signal force-quits: skips the VM graceful stop but still runs
 //! full cleanup (port forwarding, network manager, routes, sockets).
+//!
+//! Signals arriving before startup completes are handled by
+//! [`interrupt_startup`] — `main::run` keeps a signal watcher armed for
+//! the whole startup window so a mid-boot SIGTERM cannot fall through to
+//! the default disposition and orphan the VM.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -11,9 +17,15 @@ use arcbox_docker::DockerContextManager;
 use tokio::signal;
 use tracing::{info, warn};
 
-use crate::context::{DaemonContext, ServiceHandles};
+use crate::context::{DaemonContext, ServiceHandles, StartupHandles};
 
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a startup interrupt waits for a graceful runtime stop before
+/// force-killing the VM. A boot in flight parks graceful `Stop` behind
+/// itself in the VM lifecycle actor, so an unbounded wait could last the
+/// whole boot timeout — longer than launchd's own SIGKILL patience.
+const STARTUP_ABORT_GRACE: Duration = Duration::from_secs(10);
 
 /// Waits for a shutdown signal, drains services, and cleans up.
 pub async fn run(ctx: DaemonContext, mut handles: ServiceHandles) -> Result<()> {
@@ -101,7 +113,85 @@ fn remove_sockets(ctx: &DaemonContext) {
     // file. Removing it would race with a concurrent startup.
 }
 
-async fn wait_for_signal() {
+/// Tears down a daemon whose startup was interrupted by a signal.
+///
+/// The startup future has been dropped at an await point, but a VM that
+/// began booting lives on in its lifecycle tasks — reach it through the
+/// pre-pipeline [`StartupHandles`] and stop it so no orphaned VM or
+/// Virtualization.framework helper keeps holding disk images.
+///
+/// Mirrors [`run`]'s two-signal contract: the graceful stop is bounded by
+/// [`STARTUP_ABORT_GRACE`] (or cut short by a second signal), then the VM
+/// is force-killed.
+pub async fn interrupt_startup(handles: &StartupHandles) -> Result<()> {
+    println!("Shutting down... (press Ctrl+C again to force quit)");
+    info!("Shutdown signal received during startup, aborting");
+
+    // Publish the cause on the setup stream, then give already-connected
+    // WatchSetupStatus clients a moment to flush before the gRPC server
+    // (which observes the cancellation token) shuts down.
+    handles
+        .setup_state
+        .set_failed("startup interrupted by shutdown signal");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    handles.shutdown.cancel();
+
+    // `early_runtime` is filled before the VM boots, so it covers every
+    // window in which a VM can exist; empty means nothing to tear down.
+    let Some(runtime) = handles.early_runtime.get() else {
+        info!("ArcBox daemon stopped");
+        return Ok(());
+    };
+    let runtime = Arc::clone(runtime);
+
+    let graceful = tokio::spawn({
+        let runtime = Arc::clone(&runtime);
+        async move { runtime.shutdown().await }
+    });
+
+    let forced = tokio::select! {
+        result = tokio::time::timeout(STARTUP_ABORT_GRACE, graceful) => match result {
+            Ok(Ok(Err(e))) => {
+                warn!("Runtime shutdown error during startup abort: {e}");
+                false
+            }
+            Ok(Err(e)) => {
+                warn!("Runtime shutdown task panicked during startup abort: {e}");
+                true
+            }
+            Err(_) => {
+                warn!(
+                    "Graceful stop did not finish within {}s during startup abort, forcing",
+                    STARTUP_ABORT_GRACE.as_secs()
+                );
+                true
+            }
+            Ok(Ok(Ok(()))) => false,
+        },
+        () = wait_for_signal() => {
+            println!("Force shutting down...");
+            warn!("Second signal received during startup abort, forcing shutdown");
+            true
+        }
+    };
+
+    if forced {
+        let _ = runtime.shutdown_force().await;
+    }
+
+    info!("ArcBox daemon stopped");
+
+    if forced {
+        // The abandoned graceful-stop task may still be blocked waiting for
+        // the VM (it occupies a worker thread); exit directly rather than
+        // hanging in runtime drop, mirroring the force path of `run`.
+        std::process::exit(0);
+    }
+
+    Ok(())
+}
+
+pub async fn wait_for_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
