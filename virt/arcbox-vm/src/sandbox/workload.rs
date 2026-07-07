@@ -17,10 +17,28 @@ pub(super) async fn start_run_workload(
 ) -> Result<tokio::sync::mpsc::Receiver<Result<OutputChunk>>> {
     let inner_rx = vsock::run(uds_path, start).await?;
 
-    // Transition to Running only after the vsock session is established.
-    let entry = instances.read().unwrap().get(id).cloned();
-    if let Some(arc) = entry {
-        arc.lock().unwrap().state = SandboxState::Running;
+    // Claim the sandbox with a guarded Ready → Running transition. A `stop`
+    // that raced this workload (e.g. arriving during the boot → initial-cmd
+    // window) sets `Stopping` under the same lock; if it won, abort here
+    // instead of clobbering its state and running on released resources.
+    // `stop` then sees either `Running` (drains us) or its own `Stopping`
+    // (we bailed) — never a lost update.
+    {
+        let arc = instances
+            .read()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| VmmError::NotFound(id.clone()))?;
+        let mut inst = arc.lock().unwrap();
+        if inst.state != SandboxState::Ready {
+            return Err(VmmError::WrongState {
+                id: id.clone(),
+                expected: "Ready".into(),
+                actual: inst.state.to_string(),
+            });
+        }
+        inst.state = SandboxState::Running;
     }
     let _ = events_tx.send(SandboxEvent::new(id, "running"));
 
@@ -38,9 +56,16 @@ pub(super) async fn start_run_workload(
                     let value = instances.read().unwrap().get(&sandbox_id).cloned();
                     if let Some(arc) = value {
                         let mut inst = arc.lock().unwrap();
-                        inst.state = SandboxState::Ready;
                         inst.last_exit_code = Some(exit_code);
                         inst.last_exited_at = Some(Utc::now());
+                        // Return to Ready only from an active state. During a
+                        // stop's drain the state is Stopping — flipping to
+                        // Ready is the drain's completion signal — but never
+                        // resurrect a sandbox stop has already driven to
+                        // Stopped (its resources are gone).
+                        if matches!(inst.state, SandboxState::Running | SandboxState::Stopping) {
+                            inst.state = SandboxState::Ready;
+                        }
                     }
                     let _ = events_tx.send(
                         SandboxEvent::new(&sandbox_id, "idle")
@@ -129,10 +154,19 @@ impl SandboxManager {
 
         let (in_tx, inner_rx) = vsock::exec(&uds_path, start).await?;
 
-        // Transition to Running only after vsock session is established.
+        // Guarded Ready → Running transition (see start_run_workload): abort
+        // if a stop raced this exec session rather than clobber its state.
         {
             let inst = self.get_instance(id)?;
-            inst.lock().unwrap().state = SandboxState::Running;
+            let mut guard = inst.lock().unwrap();
+            if guard.state != SandboxState::Ready {
+                return Err(VmmError::WrongState {
+                    id: id.clone(),
+                    expected: "Ready".into(),
+                    actual: guard.state.to_string(),
+                });
+            }
+            guard.state = SandboxState::Running;
         }
         let _ = self.events_tx.send(SandboxEvent::new(id, "running"));
 
@@ -150,9 +184,14 @@ impl SandboxManager {
                         let value = instances.read().unwrap().get(&sandbox_id).cloned();
                         if let Some(arc) = value {
                             let mut inst = arc.lock().unwrap();
-                            inst.state = SandboxState::Ready;
                             inst.last_exit_code = Some(exit_code);
                             inst.last_exited_at = Some(Utc::now());
+                            // See start_run_workload: only return to Ready from
+                            // an active state; never resurrect a Stopped sandbox.
+                            if matches!(inst.state, SandboxState::Running | SandboxState::Stopping)
+                            {
+                                inst.state = SandboxState::Ready;
+                            }
                         }
                         let _ = events_tx.send(
                             SandboxEvent::new(&sandbox_id, "idle")
