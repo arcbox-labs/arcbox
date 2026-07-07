@@ -313,7 +313,7 @@ impl AgentClient {
         if resp.protocol_version < MIN_AGENT_PROTOCOL_VERSION {
             return Err(CoreError::Machine(format!(
                 "guest agent is incompatible with this daemon: agent protocol {} \
-                 (agent version {:?}), daemon requires >= {}. The staged agent \
+                 (agent version {}), daemon requires >= {}. The staged agent \
                  binary is stale — reinstall or update ArcBox so the bundled \
                  agent is staged again",
                 resp.protocol_version, resp.version, MIN_AGENT_PROTOCOL_VERSION,
