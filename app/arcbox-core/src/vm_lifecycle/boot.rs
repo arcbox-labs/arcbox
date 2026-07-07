@@ -486,7 +486,24 @@ impl LifecycleShared {
                 // deadline elapses. HV's AF_UNIX transport stays on this
                 // blocking thread; async transports are handed back to tokio.
                 match mm.connect_agent(&machine_name) {
-                    Ok(agent) if agent.is_blocking() => {
+                    Ok(mut agent) if agent.is_blocking() => {
+                        // Protocol handshake before the readiness watch: Ping
+                        // is understood by every agent generation, so a stale
+                        // staged agent fails the boot here with an actionable
+                        // protocol error instead of an opaque readiness
+                        // timeout (the ABX-385 failure mode). A ping transport
+                        // error is the usual "not listening yet" race — retry.
+                        match agent.ping_blocking() {
+                            Ok(resp) => {
+                                crate::agent_client::AgentClient::check_agent_protocol(&resp)?;
+                            }
+                            Err(e) => {
+                                tracing::debug!("agent not answering ping yet: {e}");
+                                last_readiness_err = Some(e.to_string());
+                                std::thread::sleep(poll_interval);
+                                continue;
+                            }
+                        }
                         let remaining =
                             deadline.saturating_duration_since(std::time::Instant::now());
                         if remaining.is_zero() {
@@ -529,7 +546,7 @@ impl LifecycleShared {
                     }
                     // Reuse the connection from the probe loop on the first
                     // iteration, then reconnect on each retry.
-                    let agent = match next_agent.take() {
+                    let mut agent = match next_agent.take() {
                         Some(agent) => agent,
                         None => match self.machine_manager.connect_agent(&self.machine_name) {
                             Ok(agent) => agent,
@@ -540,6 +557,33 @@ impl LifecycleShared {
                             }
                         },
                     };
+                    // Protocol handshake before the readiness watch — mirrors
+                    // the blocking arm: a stale agent fails loudly here, a
+                    // ping transport error is a "not listening yet" retry.
+                    // The async unary ping has no native deadline (the
+                    // blocking transport does), so bound it by the remaining
+                    // boot budget or a silent agent could hang the handshake
+                    // past the startup timeout.
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(agent_timeout_error(last_readiness_err.as_deref()));
+                    }
+                    match tokio::time::timeout(remaining, agent.ping()).await {
+                        Ok(Ok(resp)) => {
+                            crate::agent_client::AgentClient::check_agent_protocol(&resp)?;
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!("agent not answering ping yet: {e}");
+                            last_readiness_err = Some(e.to_string());
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            continue;
+                        }
+                        Err(_) => {
+                            return Err(agent_timeout_error(Some(
+                                "handshake ping timed out before the agent answered",
+                            )));
+                        }
+                    }
                     // Recompute the budget after a potentially slow reconnect so
                     // watch_readiness doesn't block past the deadline.
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

@@ -414,6 +414,9 @@ impl MachineManager {
                 match self.connect_agent(name) {
                     Ok(mut agent) if agent.is_blocking() => match agent.ping_blocking() {
                         Ok(resp) => {
+                            // Stale agents fail machine start loudly instead
+                            // of misbehaving under proto field skew.
+                            crate::agent_client::AgentClient::check_agent_protocol(&resp)?;
                             tracing::debug!(
                                 "Machine '{}' agent reachable (version: {}, attempt {})",
                                 name,

@@ -63,6 +63,11 @@ message AgentPingResponse {
     string message = 1;
     // Agent version.
     string version = 2;
+    // Host↔agent protocol version the agent speaks
+    // (`arcbox_constants::wire::AGENT_PROTOCOL_VERSION`). Absent (0) on
+    // agents that predate the handshake; the host rejects agents below
+    // its minimum supported version at boot.
+    uint32 protocol_version = 3;
 }
 
 // System information from the guest.

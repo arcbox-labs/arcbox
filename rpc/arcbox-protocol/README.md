@@ -22,6 +22,22 @@ re-exported through:
 | `agent` | `agent.proto` | Guest agent health/runtime messages |
 | `api` | `api.proto` | Network/system/volume/migration API messages |
 
+## Protocol evolution
+
+The daemon and the in-VM `arcbox-agent` are distributed separately, so a
+running guest may speak an older schema than the host. Two mechanisms keep
+skew safe:
+
+- **Additive-only schemas.** CI runs `buf breaking` against `master`
+  (`.github/workflows/ci.yml`): never remove or renumber fields; use
+  `reserved` when retiring them.
+- **Boot handshake.** The agent reports
+  `AgentPingResponse.protocol_version`
+  (`arcbox_constants::wire::AGENT_PROTOCOL_VERSION`); the host rejects
+  agents below `MIN_AGENT_PROTOCOL_VERSION` before watching readiness.
+  Bump the protocol version when a change alters the *meaning* of
+  existing messages; purely additive, ignorable fields don't need one.
+
 ## Usage
 
 ```rust
