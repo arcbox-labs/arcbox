@@ -93,17 +93,7 @@ impl BootAssetProvider {
             .await
             .map_err(|e| CoreError::config(format!("boot asset error: {e}")))?;
 
-        if let Some(expected) = boot_asset_manifest_sha256() {
-            let manifest_path = self.config.version_cache_dir().join("manifest.json");
-            let bytes = std::fs::read(&manifest_path)
-                .map_err(|e| CoreError::config(format!("read manifest: {e}")))?;
-            let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
-            if actual != expected {
-                return Err(CoreError::config(format!(
-                    "manifest SHA256 mismatch: expected {expected}, got {actual}"
-                )));
-            }
-        }
+        self.verify_manifest_pin()?;
 
         Ok(BootAssets {
             kernel: prepared.kernel,
@@ -125,11 +115,53 @@ impl BootAssetProvider {
         dest_dir: &Path,
         progress: Option<ProgressCallback>,
     ) -> Result<()> {
+        // The binaries are verified against manifest-supplied hashes, so
+        // their integrity is only as good as the manifest itself — check
+        // the pin on both sides of the inner call. Before: reject an
+        // already-tampered cached manifest without downloading anything it
+        // names. After: catch tampering that raced the prepare (the inner
+        // manager re-reads the file). The residual window — swapping the
+        // file between the inner read and either check — closes only when
+        // arcbox-boot verifies the bytes it parses (tracked in ABX-411).
+        if self.cached_manifest_path().exists() {
+            self.verify_manifest_pin()?;
+        }
+
         let cb: Option<InnerProgressCallback> = progress.map(|p| -> InnerProgressCallback { p });
         self.manager
             .prepare_binaries(dest_dir, cb)
             .await
-            .map_err(|e| CoreError::config(format!("binary prepare error: {e}")))
+            .map_err(|e| CoreError::config(format!("binary prepare error: {e}")))?;
+
+        self.verify_manifest_pin()
+    }
+
+    fn cached_manifest_path(&self) -> PathBuf {
+        self.config.version_cache_dir().join("manifest.json")
+    }
+
+    /// Verifies the cached `manifest.json` against the sha256 pin compiled
+    /// in from `assets.lock`. Fail-closed on mismatch; a missing pin only
+    /// warns — dev workflows drop the pin deliberately to boot locally
+    /// built assets.
+    fn verify_manifest_pin(&self) -> Result<()> {
+        let Some(expected) = boot_asset_manifest_sha256() else {
+            tracing::warn!(
+                "assets.lock carries no boot manifest_sha256 pin; skipping manifest \
+                 verification (expected only in local development builds)"
+            );
+            return Ok(());
+        };
+        let bytes = std::fs::read(self.cached_manifest_path())
+            .map_err(|e| CoreError::config(format!("read manifest: {e}")))?;
+        let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(CoreError::config(format!(
+                "manifest SHA256 mismatch: expected {expected}, got {actual}"
+            )))
+        }
     }
 
     /// Returns true if the current version's boot assets are fully cached

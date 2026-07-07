@@ -27,3 +27,7 @@ futures-util = { version = "0.3", optional = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "fs", "io-util"] }
