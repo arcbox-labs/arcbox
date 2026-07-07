@@ -14,22 +14,28 @@ use crate::sandbox::SandboxService;
 
 /// Returns the global [`SandboxService`] singleton.
 ///
-/// The service is initialised lazily on the first call.  Initialisation
-/// failures are logged as warnings and `None` is stored, so sandbox
-/// operations will return a 503 error rather than crashing the agent.
-pub(super) fn sandbox_service() -> Option<&'static Arc<SandboxService>> {
-    static SERVICE: OnceLock<Option<Arc<SandboxService>>> = OnceLock::new();
+/// The service is initialised lazily on the first call. The nested-virt
+/// prerequisite is probed first: without `/dev/kvm` every sandbox RPC is
+/// rejected with 412 (mapped to `FAILED_PRECONDITION` on the host) and an
+/// actionable reason. Initialisation failures store a 503 so sandbox
+/// operations degrade instead of crashing the agent.
+pub(super) fn sandbox_service() -> Result<&'static Arc<SandboxService>, &'static (i32, String)> {
+    static SERVICE: OnceLock<Result<Arc<SandboxService>, (i32, String)>> = OnceLock::new();
     SERVICE
         .get_or_init(|| {
+            if let Err(reason) = crate::sandbox::probe_kvm() {
+                tracing::warn!(reason, "sandbox prerequisite missing");
+                return Err((412, reason));
+            }
             let config = crate::config::load();
             match SandboxService::new(config) {
                 Ok(svc) => {
                     tracing::info!("sandbox service initialised");
-                    Some(Arc::new(svc))
+                    Ok(Arc::new(svc))
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "sandbox service unavailable");
-                    None
+                    Err((503, format!("sandbox service unavailable: {e}")))
                 }
             }
         })
@@ -51,9 +57,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let svc = match sandbox_service() {
-        Some(s) => Arc::clone(s),
-        None => {
-            let err = ErrorResponse::new(503, "sandbox service unavailable");
+        Ok(s) => Arc::clone(s),
+        Err((code, reason)) => {
+            let err = ErrorResponse::new(*code, reason.as_str());
             write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
             return Ok(());
         }

@@ -66,20 +66,54 @@ pub(super) fn parse_response(response: &[u8]) -> Result<(u32, String, Vec<u8>)> 
     Ok((resp_type, trace_id, payload))
 }
 
-/// Parses an error response from the agent.
-pub(super) fn parse_error_response(payload: &[u8]) -> Result<String> {
+/// Parses an error response from the agent into `(status code, message)`.
+///
+/// The code is HTTP-style (400/404/409/412/500/503) and is mapped onto a
+/// gRPC status by the API layer via `CoreError::Agent`.
+pub(super) fn parse_error_response(payload: &[u8]) -> Result<(i32, String)> {
     if payload.len() < ERROR_HEADER_SIZE {
-        return Ok("unknown error".to_string());
+        return Ok((500, "unknown error".to_string()));
     }
 
     let mut cursor = std::io::Cursor::new(payload);
-    let _code = cursor.get_i32();
+    let code = cursor.get_i32();
     let msg_len = cursor.get_u32() as usize;
 
     if payload.len() < ERROR_HEADER_SIZE + msg_len {
-        return Ok("truncated error message".to_string());
+        return Ok((code, "truncated error message".to_string()));
     }
 
-    String::from_utf8(payload[ERROR_HEADER_SIZE..ERROR_HEADER_SIZE + msg_len].to_vec())
-        .map_err(|_| CoreError::Machine("invalid error message encoding".to_string()))
+    let message =
+        String::from_utf8(payload[ERROR_HEADER_SIZE..ERROR_HEADER_SIZE + msg_len].to_vec())
+            .map_err(|_| CoreError::Machine("invalid error message encoding".to_string()))?;
+    Ok((code, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirror of the agent's `ErrorResponse::encode` framing.
+    fn encode_error(code: i32, message: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&code.to_be_bytes());
+        buf.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        buf.extend_from_slice(message.as_bytes());
+        buf
+    }
+
+    #[test]
+    fn error_response_roundtrips_code_and_message() {
+        let payload = encode_error(412, "nested virtualization required");
+        let (code, message) = parse_error_response(&payload).unwrap();
+        assert_eq!(code, 412);
+        assert_eq!(message, "nested virtualization required");
+    }
+
+    #[test]
+    fn short_error_payload_degrades_to_500() {
+        let (code, message) = parse_error_response(&[0x01]).unwrap();
+        assert_eq!(code, 500);
+        assert_eq!(message, "unknown error");
+    }
 }

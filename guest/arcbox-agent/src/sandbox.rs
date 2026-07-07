@@ -46,6 +46,32 @@ async fn drain_trailing_input<S: AsyncRead + Unpin>(stream: &mut S) {
 // SandboxService
 // =============================================================================
 
+/// Verify the nested-virtualization prerequisite for sandboxes.
+///
+/// Firecracker needs `/dev/kvm`, which exists in this guest only when the
+/// host enabled nested virtualization (VZ backend on Apple Silicon M3+ with
+/// macOS 15+). Returns an actionable reason when the prerequisite is missing
+/// so `Create` can fail fast with `FAILED_PRECONDITION` instead of an opaque
+/// asynchronous boot failure.
+pub fn probe_kvm() -> Result<(), String> {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(
+            "sandboxes require nested virtualization (/dev/kvm is missing in the guest): \
+             use the VZ backend on Apple Silicon M3 or newer with macOS 15+; \
+             the HV backend and Intel/M1/M2 hosts cannot run sandboxes"
+                .into(),
+        ),
+        Err(e) => Err(format!(
+            "/dev/kvm exists but cannot be opened ({e}); sandboxes are unavailable"
+        )),
+    }
+}
+
 /// Thin wrapper around [`SandboxManager`] for use in the agent's RPC layer.
 pub struct SandboxService {
     manager: Arc<SandboxManager>,
@@ -101,7 +127,7 @@ impl SandboxService {
             .manager
             .create_sandbox(spec)
             .await
-            .map_err(|e| SandboxError::Internal(e.to_string()))?;
+            .map_err(SandboxError::from)?;
         register_sandbox_dns(&id, &ip_address);
         Ok(sandbox_v1::CreateSandboxResponse {
             id,
@@ -117,7 +143,7 @@ impl SandboxService {
         self.manager
             .stop_sandbox(&req.id, req.timeout_seconds)
             .await
-            .map_err(|e| SandboxError::Internal(e.to_string()))?;
+            .map_err(SandboxError::from)?;
         deregister_sandbox_dns(&req.id);
         Ok(())
     }
@@ -129,7 +155,7 @@ impl SandboxService {
         self.manager
             .remove_sandbox(&req.id, req.force)
             .await
-            .map_err(|e| SandboxError::Internal(e.to_string()))?;
+            .map_err(SandboxError::from)?;
         deregister_sandbox_dns(&req.id);
         Ok(())
     }
@@ -141,7 +167,7 @@ impl SandboxService {
         let info = self
             .manager
             .inspect_sandbox(&req.id)
-            .map_err(|e| SandboxError::Internal(e.to_string()))?;
+            .map_err(SandboxError::from)?;
         Ok(vm_info_to_proto(info))
     }
 
@@ -186,7 +212,7 @@ impl SandboxService {
                 req.timeout_seconds,
             )
             .await
-            .map_err(|e| SandboxError::Internal(e.to_string()))?;
+            .map_err(SandboxError::from)?;
 
         let (tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         tokio::spawn(async move {
@@ -264,7 +290,7 @@ impl SandboxService {
                 req.timeout_seconds,
             )
             .await
-            .map_err(|e| SandboxError::Internal(e.to_string()))?;
+            .map_err(SandboxError::from)?;
 
         let (tx, out_stream_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         tokio::spawn(async move {
@@ -509,7 +535,7 @@ impl SandboxService {
             .manager
             .checkpoint_sandbox(&req.sandbox_id, req.name)
             .await
-            .map_err(|e| SandboxError::Internal(e.to_string()))?;
+            .map_err(SandboxError::from)?;
         Ok(checkpoint_to_proto(info))
     }
 
@@ -535,7 +561,7 @@ impl SandboxService {
             .manager
             .restore_sandbox(spec)
             .await
-            .map_err(|e| SandboxError::Internal(e.to_string()))?;
+            .map_err(SandboxError::from)?;
         register_sandbox_dns(&id, &ip_address);
         Ok(sandbox_v1::RestoreResponse { id, ip_address })
     }
@@ -555,7 +581,7 @@ impl SandboxService {
         let summaries = self
             .manager
             .list_checkpoints(filter)
-            .map_err(|e| SandboxError::Internal(e.to_string()))?;
+            .map_err(SandboxError::from)?;
         Ok(sandbox_v1::ListSnapshotsResponse {
             snapshots: summaries
                 .into_iter()
@@ -569,7 +595,7 @@ impl SandboxService {
         let info = self
             .manager
             .inspect_sandbox(&sandbox_id.to_string())
-            .map_err(|e| SandboxError::Internal(e.to_string()))?;
+            .map_err(SandboxError::from)?;
         info.network
             .and_then(|n| n.ip_address.parse().ok())
             .ok_or_else(|| {
@@ -583,7 +609,7 @@ impl SandboxService {
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         self.manager
             .delete_checkpoint(&req.snapshot_id)
-            .map_err(|e| SandboxError::Internal(e.to_string()))
+            .map_err(SandboxError::from)
     }
 }
 

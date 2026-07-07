@@ -206,8 +206,8 @@ impl AgentClient {
 
         // Check for error response.
         if resp_type == MessageType::Error as u32 {
-            let error_msg = wire::parse_error_response(&payload)?;
-            return Err(CoreError::Machine(error_msg));
+            let (code, message) = wire::parse_error_response(&payload)?;
+            return Err(CoreError::Agent { code, message });
         }
 
         Ok((resp_type, payload))
@@ -240,8 +240,8 @@ impl AgentClient {
 
         let (resp_type, _resp_trace, payload) = wire::parse_response(&response)?;
         if resp_type == MessageType::Error as u32 {
-            let error_msg = wire::parse_error_response(&payload)?;
-            return Err(CoreError::Machine(error_msg));
+            let (code, message) = wire::parse_error_response(&payload)?;
+            return Err(CoreError::Agent { code, message });
         }
         Ok((resp_type, payload))
     }
@@ -606,8 +606,8 @@ impl AgentClient {
     fn decode_readiness_event(raw: &[u8]) -> Result<ReadinessEvent> {
         let (resp_type, _, resp_payload) = wire::parse_response(raw)?;
         if resp_type == MessageType::Error as u32 {
-            let error_msg = wire::parse_error_response(&resp_payload)?;
-            return Err(CoreError::Machine(error_msg));
+            let (code, message) = wire::parse_error_response(&resp_payload)?;
+            return Err(CoreError::Agent { code, message });
         }
         if resp_type != MessageType::ReadinessEvent as u32 {
             return Err(CoreError::Machine(format!(
@@ -827,9 +827,9 @@ impl AgentClient {
                 };
 
                 if resp_type == MessageType::Error as u32 {
-                    let msg = wire::parse_error_response(&resp_payload)
-                        .unwrap_or_else(|_| "unknown error".to_string());
-                    let _ = tx.send(Err(CoreError::Machine(msg)));
+                    let (code, message) = wire::parse_error_response(&resp_payload)
+                        .unwrap_or_else(|_| (500, "unknown error".to_string()));
+                    let _ = tx.send(Err(CoreError::Agent { code, message }));
                     break;
                 }
 
@@ -902,9 +902,9 @@ impl AgentClient {
                 };
 
                 if resp_type == MessageType::Error as u32 {
-                    let msg = wire::parse_error_response(&resp_payload)
-                        .unwrap_or_else(|_| "unknown error".to_string());
-                    let _ = tx.send(Err(CoreError::Machine(msg)));
+                    let (code, message) = wire::parse_error_response(&resp_payload)
+                        .unwrap_or_else(|_| (500, "unknown error".to_string()));
+                    let _ = tx.send(Err(CoreError::Agent { code, message }));
                     break;
                 }
 
@@ -1009,9 +1009,9 @@ impl AgentClient {
                 };
 
                 if resp_type == MessageType::Error as u32 {
-                    let msg = wire::parse_error_response(&resp_payload)
-                        .unwrap_or_else(|_| "unknown error".to_string());
-                    let _ = out_tx.send(Err(CoreError::Machine(msg)));
+                    let (code, message) = wire::parse_error_response(&resp_payload)
+                        .unwrap_or_else(|_| (500, "unknown error".to_string()));
+                    let _ = out_tx.send(Err(CoreError::Agent { code, message }));
                     break;
                 }
 
