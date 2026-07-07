@@ -87,8 +87,8 @@ mod agent {
         env: HashMap<String, String>,
         #[serde(default)]
         working_dir: String,
-        #[serde(default, rename = "user")]
-        _user: String,
+        #[serde(default)]
+        user: String,
         #[serde(default)]
         tty: bool,
         #[serde(default = "default_tty_width")]
@@ -405,14 +405,42 @@ mod agent {
     // Non-interactive execution (piped stdio)
     // -------------------------------------------------------------------------
 
-    fn handle_piped(conn: VsockStream, start: StartCommand) {
+    /// Resolve `StartCommand.user` against the rootfs passwd/group files.
+    fn resolve_start_user(
+        user: &str,
+    ) -> Result<Option<arcbox_vm::user_spec::ResolvedUser>, String> {
+        let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+        let group = std::fs::read_to_string("/etc/group").unwrap_or_default();
+        arcbox_vm::user_spec::resolve_user(user, &passwd, &group)
+    }
+
+    /// Report a start failure to the host as a stderr chunk plus an exit
+    /// frame, so clients see the reason instead of a bare stream EOF.
+    fn report_start_failure(conn: &mut VsockStream, exit_code: i32, message: &str) {
+        let _ = write_frame(conn, MSG_STDERR, message.as_bytes());
+        let _ = write_frame(conn, MSG_EXIT, &exit_code.to_le_bytes());
+    }
+
+    fn handle_piped(mut conn: VsockStream, start: StartCommand) {
+        use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
+
+        let user = match resolve_start_user(&start.user) {
+            Ok(u) => u,
+            Err(msg) => {
+                report_start_failure(&mut conn, 126, &msg);
+                return;
+            }
+        };
 
         let mut cmd = Command::new(start.cmd.first().expect("empty cmd"));
         cmd.args(start.cmd.get(1..).unwrap_or(&[]));
         cmd.envs(&start.env);
         if !start.working_dir.is_empty() {
             cmd.current_dir(&start.working_dir);
+        }
+        if let Some(u) = user {
+            cmd.uid(u.uid).gid(u.gid);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -422,6 +450,7 @@ mod agent {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("agent: spawn {:?}: {e}", start.cmd);
+                report_start_failure(&mut conn, 127, &format!("spawn {:?}: {e}", start.cmd));
                 return;
             }
         };
@@ -514,15 +543,25 @@ mod agent {
     // Interactive execution (pseudo-TTY)
     // -------------------------------------------------------------------------
 
-    fn handle_tty(conn: VsockStream, start: StartCommand) {
+    fn handle_tty(mut conn: VsockStream, start: StartCommand) {
         use nix::pty::OpenptyResult;
         use nix::unistd::{ForkResult, fork, setsid};
         use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+
+        // Resolve the user before forking so failures are reportable.
+        let user = match resolve_start_user(&start.user) {
+            Ok(u) => u,
+            Err(msg) => {
+                report_start_failure(&mut conn, 126, &msg);
+                return;
+            }
+        };
 
         let OpenptyResult { master, slave } = match nix::pty::openpty(None, None) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("agent: openpty: {e}");
+                report_start_failure(&mut conn, 126, &format!("openpty: {e}"));
                 return;
             }
         };
@@ -587,6 +626,23 @@ mod agent {
                 {
                     // SAFETY: cwd is a valid C string.
                     unsafe { libc::chdir(cwd.as_ptr()) };
+                }
+
+                if let Some(u) = user {
+                    // Drop privileges: supplementary groups, then gid, then
+                    // uid — the reverse order would lose the right to setgid.
+                    let gid = u.gid as libc::gid_t;
+                    // SAFETY: plain syscalls on the just-forked child; on any
+                    // failure we abort the exec with 126 rather than run the
+                    // workload with the wrong identity.
+                    unsafe {
+                        if libc::setgroups(1, &gid) != 0
+                            || libc::setgid(gid) != 0
+                            || libc::setuid(u.uid as libc::uid_t) != 0
+                        {
+                            libc::_exit(126);
+                        }
+                    }
                 }
 
                 // SAFETY: exec replaces the process image; argv is null-terminated.

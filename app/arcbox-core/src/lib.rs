@@ -46,7 +46,7 @@ pub mod trace;
 pub mod vm;
 pub mod vm_lifecycle;
 
-pub use agent_client::AgentClient;
+pub use agent_client::{AgentClient, ExecSessionInput};
 pub use arcbox_vmm::{DeviceDebug, QueueDebug, VmBackend};
 pub use boot_assets::{
     BootAssetConfig, BootAssetManifest, BootAssetProvider, BootAssets, DownloadProgress,

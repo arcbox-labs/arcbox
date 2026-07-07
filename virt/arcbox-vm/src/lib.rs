@@ -39,6 +39,7 @@ pub mod snapshot;
 pub mod snapshot_cow;
 pub mod spawn;
 pub mod store;
+pub mod user_spec;
 pub mod vsock;
 
 // Keep the general VM manager available for internal tooling.
