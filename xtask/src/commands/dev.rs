@@ -69,15 +69,9 @@ fn boot_version(lockfile: &std::path::Path) -> Result<String> {
 }
 
 fn default_data_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
-        dirs::home_dir()
-            .expect("home directory is required for default macOS data dir")
-            .join("Library/Application Support/arcbox")
-    } else {
-        dirs::data_dir()
-            .expect("data directory is required for default Linux data dir")
-            .join("arcbox")
-    }
+    // Same resolution as the daemon/CLI (~/.arcbox), not the old
+    // Application Support location.
+    arcbox_constants::paths::ArcboxProfile::Production.default_data_dir()
 }
 
 fn dev_assets_match(dev_boot_dir: &std::path::Path, version: &str) -> Result<bool> {

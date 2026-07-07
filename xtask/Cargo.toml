@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+arcbox-constants = { version = "0.4.16", path = "../common/arcbox-constants", features = ["std"] }
 clap = { workspace = true, features = ["derive", "env"] }
 dirs.workspace = true
 flate2 = "1.1.9"
