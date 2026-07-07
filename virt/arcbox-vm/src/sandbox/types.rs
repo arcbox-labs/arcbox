@@ -53,10 +53,11 @@ pub struct SandboxMountSpec {
 
 /// Full sandbox creation parameters.
 ///
-/// Fields related to workload execution (`cmd`, `env`, `working_dir`, `user`,
-/// `mounts`) are **not consumed by `create_sandbox`**.  They are stored in the
-/// spec for later use by `run_in_sandbox` / `exec_in_sandbox` or passed through
-/// the gRPC layer.  `image` and `ssh_public_key` are reserved for future use.
+/// The initial workload fields (`cmd`, `env`, `working_dir`, `user`) are
+/// consumed by the boot task: a non-empty `cmd` is launched automatically
+/// once the sandbox is ready, through the same path as `Run`.
+/// `mounts`, `image`, and `ssh_public_key` are validated at the service
+/// boundary (see the guest agent's `SandboxService::create`).
 #[derive(Debug, Clone, Default)]
 pub struct SandboxSpec {
     /// Caller-supplied ID; auto-generated (UUID) when `None` or empty.
