@@ -2,12 +2,12 @@ use std::{
     env,
     fs::{self},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use tempfile::TempDir;
 use toml_edit::DocumentMut;
 use tracing::{info, warn};
@@ -104,37 +104,15 @@ impl TestContext {
     }
 
     fn docker_host(&self) -> String {
-        // Default HostLayout: the Docker socket lives under <data_dir>/run.
-        format!("unix://{}", self.test_dir.join("run/docker.sock").display())
+        crate::docker::docker_host(&self.test_dir)
     }
 
     fn docker_output(&self, args: &[&str], timeout: Duration) -> Result<String> {
-        let output = run_with_timeout(
-            Command::new("docker")
-                .env("DOCKER_HOST", self.docker_host())
-                .args(args),
-            timeout,
-        )?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if output.status.success() {
-            Ok(format!("{stdout}{stderr}"))
-        } else {
-            bail!(
-                "docker {} failed with {}\n{}{}",
-                args.join(" "),
-                output.status,
-                stdout,
-                stderr
-            );
-        }
+        crate::docker::docker_output(&self.test_dir, args, timeout)
     }
 
     fn docker_ignore(&self, args: &[String]) {
-        let _ = Command::new("docker")
-            .env("DOCKER_HOST", self.docker_host())
-            .args(args)
-            .status();
+        crate::docker::docker_ignore(&self.test_dir, args);
     }
 }
 
@@ -589,26 +567,6 @@ fn test_stop_rm(ctx: &TestContext) -> Result<()> {
 
 fn remove_container(ctx: &TestContext, cid: &str) {
     ctx.docker_ignore(&["rm".to_owned(), "-f".to_owned(), cid.to_owned()]);
-}
-
-fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<std::process::Output> {
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if child.try_wait()?.is_some() {
-            return child
-                .wait_with_output()
-                .context("collecting command output");
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-    Err(anyhow!("command timed out after {}s", timeout.as_secs()))
 }
 
 fn cid_prefix(cid: &str) -> &str {
