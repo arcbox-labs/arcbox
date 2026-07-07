@@ -16,10 +16,38 @@ struct Cli {
 enum Command {
     /// Development-only repository orchestration.
     Dev(DevArgs),
+    /// Repeated e2e test runs with artifact capture.
+    E2e(E2eArgs),
     /// macOS host build, signing, and local runtime tasks.
     Macos(MacosArgs),
     /// Release metadata and artifact generation.
     Release(ReleaseArgs),
+}
+
+#[derive(Args)]
+struct E2eArgs {
+    /// System VM backend(s) for the daemon under test.
+    #[arg(long, value_enum, default_value = "vz")]
+    backend: E2eBackend,
+    /// Repetitions per backend.
+    #[arg(long, default_value_t = 1)]
+    repeat: u32,
+    /// arcbox-e2e integration test target to run.
+    #[arg(long, default_value = "boot_assets")]
+    test: String,
+    /// Stop at the first failing run.
+    #[arg(long)]
+    fail_fast: bool,
+    /// Artifacts directory (default: target/e2e-artifacts/<unix-time>).
+    #[arg(long)]
+    artifacts_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum E2eBackend {
+    Vz,
+    Hv,
+    Both,
 }
 
 #[derive(Args)]
@@ -152,6 +180,7 @@ fn main() {
 fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Dev(args) => commands::dev::run(args),
+        Command::E2e(args) => commands::e2e::run(args),
         Command::Macos(args) => commands::macos::run(args),
         Command::Release(args) => commands::release::run(args),
     }

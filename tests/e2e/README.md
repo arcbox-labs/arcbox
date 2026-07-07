@@ -68,6 +68,15 @@ the bug is above the hypervisor layer:
 cargo test -p arcbox-e2e --test backend_matrix -- --ignored --nocapture
 ```
 
+Stress runner — repeated runs with artifact capture (per-run logs under
+`target/e2e-artifacts/<unix-time>/`, failing runs' preserved data dirs
+recorded in the summary). Race fixes need a cheap red first:
+
+```bash
+cargo xtask e2e --backend both --repeat 20
+cargo xtask e2e --test hv_vmm --backend hv --repeat 200 --fail-fast
+```
+
 When using the repository development shell, prefix with `devenv shell --`.
 
 List available E2E tests without running ignored tests:
