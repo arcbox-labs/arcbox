@@ -149,6 +149,10 @@ impl SandboxManager {
     ///
     /// Returns `(sandbox_id, ip_address)`.
     pub async fn restore_sandbox(&self, spec: RestoreSandboxSpec) -> Result<(SandboxId, String)> {
+        // Gate on the startup sweep before touching per-id resources (see
+        // create_sandbox / await_reconcile).
+        self.await_reconcile().await;
+
         let new_id = spec
             .id
             .clone()

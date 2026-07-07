@@ -44,21 +44,44 @@ pub(super) async fn boot_sandbox(
             );
             super::reconcile::write_state_record(&vm_dir, &record);
 
-            let value = instances.read().unwrap().get(&id).cloned();
-            if let Some(arc) = value {
-                let mut inst = arc.lock().unwrap();
-                // If stop was requested while booting, do not transition to Ready.
-                if inst.state == SandboxState::Stopping || inst.state == SandboxState::Stopped {
-                    info!(sandbox_id = %id, "sandbox boot completed but stop was requested; staying stopped");
-                    return;
+            // Hand the booted resources to the instance while holding the map
+            // read guard, so a concurrent force-remove/TTL (which needs the
+            // write guard to drop the entry) cannot slip between the presence
+            // check and the handoff. If the instance is gone or already
+            // stopping, tear the resources down instead of dropping them — a
+            // dropped CowHandle leaks the dm device + loop + sparse COW file.
+            let mut process = Some(process);
+            let mut vm = Some(vm);
+            let mut cow_handle = cow_handle;
+            let accepted = {
+                let map = instances.read().unwrap();
+                match map.get(&id) {
+                    Some(arc) => {
+                        let mut inst = arc.lock().unwrap();
+                        if matches!(inst.state, SandboxState::Stopping | SandboxState::Stopped) {
+                            false
+                        } else {
+                            inst.process = process.take();
+                            inst.vm = vm.take();
+                            inst.vsock_uds_path = Some(vsock_uds_path.clone());
+                            inst.cow_handle = cow_handle.take();
+                            inst.state = SandboxState::Ready;
+                            inst.ready_at = Some(ready_at);
+                            true
+                        }
+                    }
+                    None => false,
                 }
-                inst.process = Some(process);
-                inst.vm = Some(vm);
-                inst.vsock_uds_path = Some(vsock_uds_path.clone());
-                inst.cow_handle = cow_handle;
-                inst.state = SandboxState::Ready;
-                inst.ready_at = Some(ready_at);
+            };
+
+            if !accepted {
+                info!(sandbox_id = %id, "sandbox removed/stopped during boot; tearing down booted resources");
+                if let Some(process) = process.take() {
+                    tear_down_orphaned_boot(process, cow_handle.take(), &cow_manager).await;
+                }
+                return;
             }
+
             let _ = events_tx.send(SandboxEvent::new(&id, "ready"));
             info!(sandbox_id = %id, "sandbox booted and ready");
 
@@ -291,6 +314,27 @@ pub(super) async fn kill_and_reap_fc(process: &mut fc_sdk::FirecrackerProcess) {
         );
     }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), process.wait()).await;
+}
+
+/// Tear down the resources of a boot that finished after its sandbox was
+/// force-removed (or TTL-expired) mid-boot.
+///
+/// The instance entry is gone (or stopping), so these resources were never
+/// handed off. Without an explicit teardown the CoW dm device + loop + sparse
+/// COW file leak (`CowHandle` has no `Drop`) and Firecracker is left holding
+/// the block device. The TAP/IP and jailer chroot are owned by the racing
+/// remove/stop path and are intentionally not touched here.
+async fn tear_down_orphaned_boot(
+    mut process: fc_sdk::FirecrackerProcess,
+    cow_handle: Option<CowHandle>,
+    cow_manager: &CowManager,
+) {
+    // Kill + reap FC before the dm teardown so `dmsetup remove` doesn't hit
+    // EBUSY on the still-open block device.
+    kill_and_reap_fc(&mut process).await;
+    if let Some(handle) = cow_handle {
+        cow_manager.teardown(&handle).await;
+    }
 }
 
 /// Perform the actual Firecracker boot: spawn process, configure, start VM.
