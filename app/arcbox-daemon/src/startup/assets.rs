@@ -97,6 +97,7 @@ pub fn find_bundle_contents() -> Option<PathBuf> {
 /// Contents/Resources/assets/{version}/  → ~/.arcbox/boot/{version}/
 /// Contents/Resources/runtime/           → ~/.arcbox/runtime/
 /// Contents/Resources/bin/arcbox-agent   → ~/.arcbox/bin/arcbox-agent
+/// Contents/Resources/bin/vm-agent      → ~/.arcbox/bin/vm-agent
 /// ```
 pub(super) fn seed_from_bundle(data_dir: &Path) -> Result<BundleSeed> {
     let Some(contents) = find_bundle_contents() else {
@@ -130,6 +131,19 @@ pub(super) fn seed_from_bundle(data_dir: &Path) -> Result<BundleSeed> {
     if agent_src.exists() {
         seed.agent = seed_agent_from_bundle(&agent_src, data_dir)
             .context("Failed to seed arcbox-agent from bundle")?;
+    }
+
+    // 4. Sandbox microVM init (optional — sandboxes degrade without it).
+    // The guest resolves it at /arcbox/bin/vm-agent via the VirtioFS
+    // data-dir mount.
+    let vm_agent_src = contents.join("Resources/bin/vm-agent");
+    if vm_agent_src.exists() {
+        seed_dir_files(
+            &contents.join("Resources/bin"),
+            &data_dir.join("bin"),
+            &["vm-agent"],
+            "sandbox vm-agent",
+        );
     }
 
     Ok(seed)
