@@ -250,7 +250,7 @@ impl SandboxService {
                         // Encode an exit chunk carrying the error.
                         let done_msg = sandbox_v1::RunOutput {
                             stream: "exit".into(),
-                            data: Vec::new().into(),
+                            data: Vec::new(),
                             exit_code: 1,
                             done: true,
                         };
@@ -262,7 +262,7 @@ impl SandboxService {
                 let is_done = chunk.stream == "exit";
                 let msg = sandbox_v1::RunOutput {
                     stream: chunk.stream,
-                    data: chunk.data.into(),
+                    data: chunk.data,
                     exit_code: chunk.exit_code,
                     done: is_done,
                 };
@@ -374,7 +374,7 @@ impl SandboxService {
         let (in_tx, mut out_rx) = match self.exec(payload).await {
             Ok(pair) => pair,
             Err(e) => {
-                let err = ErrorResponse::new(e.status_code(), &e.to_string());
+                let err = ErrorResponse::new(e.status_code(), e.to_string());
                 write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
                 return Ok(());
             }
@@ -424,9 +424,8 @@ impl SandboxService {
             let trace_id_owned = trace_id.to_owned();
             let output_fut = async {
                 while let Some(encoded) = out_rx.recv().await {
-                    let done = sandbox_v1::ExecOutput::decode(encoded.as_slice())
-                        .map(|m| m.done)
-                        .unwrap_or(false);
+                    let done =
+                        sandbox_v1::ExecOutput::decode(encoded.as_slice()).is_ok_and(|m| m.done);
                     write_message(
                         &mut wh,
                         MessageType::SandboxExecOutput,
@@ -477,7 +476,7 @@ impl SandboxService {
         let mut rx = match self.run(payload).await {
             Ok(r) => r,
             Err(e) => {
-                let err = ErrorResponse::new(e.status_code(), &e.to_string());
+                let err = ErrorResponse::new(e.status_code(), e.to_string());
                 write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
                 return Ok(());
             }
@@ -503,7 +502,7 @@ impl SandboxService {
         let mut rx = match self.subscribe_events(payload) {
             Ok(r) => r,
             Err(e) => {
-                let err = ErrorResponse::new(e.status_code(), &e.to_string());
+                let err = ErrorResponse::new(e.status_code(), e.to_string());
                 write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
                 return Ok(());
             }
@@ -525,7 +524,7 @@ impl SandboxService {
         let req = sandbox_v1::SandboxEventsRequest::decode(payload)
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let filter_id = req.id.clone();
-        let filter_action = req.action.clone();
+        let filter_action = req.action;
 
         let mut bcast_rx = self.manager.subscribe_events();
         let (tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -598,7 +597,7 @@ impl SandboxService {
         const CHUNK_SIZE: usize = 1024 * 1024;
         for chunk in data.chunks(CHUNK_SIZE) {
             let msg = sandbox_v1::FileChunk {
-                data: chunk.to_vec().into(),
+                data: chunk.to_vec(),
                 done: false,
             };
             write_message(
@@ -610,7 +609,7 @@ impl SandboxService {
             .await?;
         }
         let done = sandbox_v1::FileChunk {
-            data: Vec::new().into(),
+            data: Vec::new(),
             done: true,
         };
         write_message(
@@ -881,8 +880,8 @@ fn vm_info_to_proto(info: SandboxInfo) -> sandbox_v1::SandboxInfo {
         limits: Some(limits),
         network,
         created_at: info.created_at.timestamp(),
-        ready_at: info.ready_at.map(|t| t.timestamp()).unwrap_or(0),
-        last_exited_at: info.last_exited_at.map(|t| t.timestamp()).unwrap_or(0),
+        ready_at: info.ready_at.map_or(0, |t| t.timestamp()),
+        last_exited_at: info.last_exited_at.map_or(0, |t| t.timestamp()),
         last_exit_code: info.last_exit_code.unwrap_or(0),
         error: info.error.unwrap_or_default(),
     }

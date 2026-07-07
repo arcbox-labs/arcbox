@@ -260,18 +260,32 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
     );
     info!(%snapshot_id, "checkpoint taken");
 
+    // Stop the origin before restoring: with `network_override: false` the
+    // restored sandbox reuses the recorded NIC (the origin's TAP), so the
+    // origin must release it first. Fresh-network restore (a new TAP while
+    // the origin keeps running) relies on FC's `network_overrides`
+    // snapshot-load field, which the pinned Firecracker 1.10.1 predates —
+    // see docs/sandbox-api.md.
     let restore_started = Instant::now();
+    sandboxes
+        .stop(with_machine(StopSandboxRequest {
+            id: "smoke1".into(),
+            timeout_seconds: 20,
+        }))
+        .await
+        .context("Stop origin before restore failed")?;
+
     let restored = snapshots
         .restore(with_machine(RestoreRequest {
             id: "smoke2".into(),
             snapshot_id: snapshot_id.clone(),
-            network_override: true,
+            network_override: false,
             ..Default::default()
         }))
         .await
         .context("Restore failed")?
         .into_inner();
-    info!(id = %restored.id, ip = %restored.ip_address, "sandbox restored");
+    info!(id = %restored.id, "sandbox restored");
     let stdout = run_and_collect(&mut sandboxes, "smoke2", &["/bin/echo", "hello-restore"]).await?;
     if !stdout.contains("hello-restore") {
         bail!("restored sandbox run output missing marker: {stdout:?}");
@@ -289,13 +303,6 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
 
     // -- Teardown -----------------------------------------------------------
     let teardown_started = Instant::now();
-    sandboxes
-        .stop(with_machine(StopSandboxRequest {
-            id: "smoke1".into(),
-            timeout_seconds: 20,
-        }))
-        .await
-        .context("Stop failed")?;
     for id in ["smoke1", "smoke2"] {
         sandboxes
             .remove(with_machine(RemoveSandboxRequest {
