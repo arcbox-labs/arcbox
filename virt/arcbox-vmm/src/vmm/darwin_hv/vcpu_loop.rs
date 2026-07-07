@@ -46,6 +46,9 @@ pub(super) struct VcpuContext {
     pub device_manager: Arc<crate::device::DeviceManager>,
     /// Shared flag; the loop exits when this is set to `false`.
     pub running: Arc<AtomicBool>,
+    /// Set (with `running=false`) when the guest issues PSCI SYSTEM_RESET, so
+    /// the lifecycle driver reboots the guest instead of powering it off.
+    pub reset_requested: Arc<AtomicBool>,
     /// Cooperative pause flag. When `true`, the vCPU parks itself after its
     /// next `vcpu.run()` return instead of re-entering guest execution.
     /// Cleared by `resume`, which also unparks the thread.
@@ -153,6 +156,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
     let VcpuContext {
         device_manager,
         running,
+        reset_requested,
         paused,
         pl011,
         cpu_on_senders,
@@ -476,7 +480,14 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                     }
                     _ => {
                         // PSCI and other standard calls.
-                        handle_psci(vcpu_id, func_id, &vcpu, &running, cpu_on_senders.as_ref());
+                        handle_psci(
+                            vcpu_id,
+                            func_id,
+                            &vcpu,
+                            &running,
+                            &reset_requested,
+                            cpu_on_senders.as_ref(),
+                        );
                         if !running.load(Ordering::Relaxed) {
                             break;
                         }
@@ -494,7 +505,14 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                handle_psci(vcpu_id, func_id, &vcpu, &running, cpu_on_senders.as_ref());
+                handle_psci(
+                    vcpu_id,
+                    func_id,
+                    &vcpu,
+                    &running,
+                    &reset_requested,
+                    cpu_on_senders.as_ref(),
+                );
                 if !running.load(Ordering::Relaxed) {
                     break;
                 }

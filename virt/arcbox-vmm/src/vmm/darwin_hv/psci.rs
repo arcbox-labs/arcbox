@@ -166,12 +166,16 @@ fn cpu_on_snapshot(cpu_on_senders: Option<&CpuOnSenders>) -> Vec<bool> {
 }
 
 /// Reads registers X1–X3, resolves the PSCI call, applies its effect (shutdown
-/// flag or CPU_ON dispatch), and writes the return value into X0.
+/// or reboot flag, CPU_ON dispatch), and writes the return value into X0.
+///
+/// SYSTEM_RESET sets `reset_requested` in addition to clearing `running`, so
+/// the lifecycle driver reboots the guest rather than powering the machine off.
 pub fn handle_psci(
     vcpu_id: u32,
     func_id: u64,
     vcpu: &arcbox_hv::HvVcpu,
     running: &Arc<AtomicBool>,
+    reset_requested: &Arc<AtomicBool>,
     cpu_on_senders: Option<&CpuOnSenders>,
 ) {
     let x1 = vcpu.get_reg(X1).unwrap_or(0);
@@ -193,6 +197,7 @@ pub fn handle_psci(
         }
         PsciEffect::SystemReset => {
             tracing::info!("vCPU {vcpu_id}: PSCI SYSTEM_RESET");
+            reset_requested.store(true, Ordering::SeqCst);
             running.store(false, Ordering::SeqCst);
         }
         PsciEffect::CpuOn {

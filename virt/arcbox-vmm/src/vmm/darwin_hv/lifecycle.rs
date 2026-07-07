@@ -234,6 +234,7 @@ impl Vmm {
 
         let running = self.running.clone();
         let paused = self.hv_paused.clone();
+        let reset_requested = self.hv_reset_requested.clone();
         // Ensure a fresh start always begins unpaused, even if a prior
         // session was stopped while paused.
         paused.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -278,6 +279,7 @@ impl Vmm {
 
                 let r = running.clone();
                 let p = paused.clone();
+                let rr = reset_requested.clone();
                 let dm = device_manager.clone();
                 let th = vcpu_thread_handles.clone();
                 let ids = hv_vcpu_ids.clone();
@@ -301,6 +303,7 @@ impl Vmm {
                                 VcpuContext {
                                     device_manager: dm,
                                     running: r,
+                                    reset_requested: rr,
                                     paused: p,
                                     pl011: uart,
                                     cpu_on_senders: Some(senders_for_thread),
@@ -340,6 +343,7 @@ impl Vmm {
                         VcpuContext {
                             device_manager,
                             running,
+                            reset_requested,
                             paused,
                             pl011,
                             cpu_on_senders,
