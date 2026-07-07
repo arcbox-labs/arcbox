@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 pub mod boot_assets;
+pub mod sandbox;
 pub mod daemon;
 pub mod docker;
 pub mod metrics;

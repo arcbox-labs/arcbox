@@ -468,6 +468,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "toml_edit 0.25.12+spec-1.1.0",
  "tonic",
  "tower 0.5.3",

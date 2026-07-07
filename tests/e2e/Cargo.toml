@@ -20,6 +20,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 toml_edit = "0.25.12"
 tonic.workspace = true
 tower.workspace = true
