@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arcbox_grpc::SystemService;
 use arcbox_protocol::v1::{
     Empty, SetSystemVmBackendRequest, SetupStatus, SystemVmBackend, SystemVmBackendInfo,
-    setup_status,
+    VirtioDebugInfo, VirtioDeviceDebug, VirtioQueueDebug, setup_status,
 };
 use tokio::sync::watch;
 use tokio_stream::Stream;
@@ -135,6 +135,36 @@ fn backend_to_proto(backend: arcbox_core::VmBackend) -> SystemVmBackend {
     }
 }
 
+/// Maps a core virtio device snapshot to the wire message. (A `From`
+/// impl is impossible here — both types are foreign to this crate.)
+fn device_debug_to_proto(device: arcbox_core::DeviceDebug) -> VirtioDeviceDebug {
+    VirtioDeviceDebug {
+        id: device.id,
+        device_type: device.device_type,
+        name: device.name,
+        status: u32::from(device.status),
+        interrupt_status: device.interrupt_status,
+        event_idx: device.event_idx,
+        interrupts: device.interrupts,
+        queues: device
+            .queues
+            .into_iter()
+            .map(|queue| VirtioQueueDebug {
+                index: u32::from(queue.index),
+                size: u32::from(queue.size),
+                ready: queue.ready,
+                kicks: queue.kicks,
+                avail_idx: queue.avail_idx.map(u32::from),
+                used_idx: queue.used_idx.map(u32::from),
+                avail_flags: queue.avail_flags.map(u32::from),
+                used_flags: queue.used_flags.map(u32::from),
+                used_event: queue.used_event.map(u32::from),
+                avail_event: queue.avail_event.map(u32::from),
+            })
+            .collect(),
+    }
+}
+
 #[tonic::async_trait]
 impl SystemService for SystemServiceImpl {
     async fn get_info(
@@ -222,6 +252,20 @@ impl SystemService for SystemServiceImpl {
         Ok(Response::new(SystemVmBackendInfo {
             backend: backend_to_proto(runtime.system_vm_backend()) as i32,
         }))
+    }
+
+    async fn get_virtio_debug(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<VirtioDebugInfo>, Status> {
+        let runtime = self.runtime.ready()?;
+        let devices = runtime
+            .system_vm_virtio_debug()
+            .map_err(|e| Status::failed_precondition(e.to_string()))?
+            .into_iter()
+            .map(device_debug_to_proto)
+            .collect();
+        Ok(Response::new(VirtioDebugInfo { devices }))
     }
 
     async fn set_system_vm_backend(

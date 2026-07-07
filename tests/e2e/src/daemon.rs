@@ -192,6 +192,27 @@ impl DaemonHandle {
         self.terminate()
     }
 
+    /// Fetches the daemon's virtio queue debug snapshot and writes it to
+    /// `virtio-debug.json` under the data dir. Meant for failure paths:
+    /// one structured record per device (kicks, interrupts, live ring
+    /// indices) instead of log archaeology. Empty device list under VZ.
+    pub fn dump_virtio_debug(&self) -> Result<PathBuf> {
+        let socket = self.grpc_socket();
+        let info = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("building tokio runtime for virtio debug dump")?
+            .block_on(async {
+                let channel = connect_unix(&socket).await?;
+                let mut client = SystemServiceClient::new(channel);
+                anyhow::Ok(client.get_virtio_debug(Empty {}).await?.into_inner())
+            })?;
+        let path = self.data_dir.join("virtio-debug.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&info)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(path)
+    }
+
     /// Errors with the exit status and log tail if the daemon has exited.
     fn check_alive(&mut self) -> Result<()> {
         if let Some(status) = self.child.try_wait().context("polling daemon")? {

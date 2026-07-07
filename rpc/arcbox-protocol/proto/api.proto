@@ -198,6 +198,13 @@ service SystemService {
     // persisted; the System VM is restarted so it takes effect, which stops
     // running containers. Returns the resulting backend.
     rpc SetSystemVmBackend(SetSystemVmBackendRequest) returns (SystemVmBackendInfo);
+
+    // Dumps a diagnostic snapshot of the System VM's virtio devices:
+    // per-queue kick counters, live avail/used ring indices, EVENT_IDX
+    // slots, and pending interrupt state. Custom-VMM backends only —
+    // empty under VZ, where the devices belong to
+    // Virtualization.framework.
+    rpc GetVirtioDebug(Empty) returns (VirtioDebugInfo);
 }
 
 // Hypervisor backend for the single System VM.
@@ -218,6 +225,57 @@ message SystemVmBackendInfo {
 // Request to switch the System VM's hypervisor backend.
 message SetSystemVmBackendRequest {
     SystemVmBackend backend = 1;
+}
+
+// Diagnostic snapshot of the System VM's virtio devices.
+message VirtioDebugInfo {
+    repeated VirtioDeviceDebug devices = 1;
+}
+
+// Snapshot of one virtio MMIO device.
+message VirtioDeviceDebug {
+    // Device ID within the VMM's device manager.
+    uint32 id = 1;
+    // Device type, e.g. "VirtioNet".
+    string device_type = 2;
+    // Device name.
+    string name = 3;
+    // MMIO device status register bits.
+    uint32 status = 4;
+    // Pending interrupt reasons not yet acknowledged by the guest.
+    uint32 interrupt_status = 5;
+    // Whether VIRTIO_F_EVENT_IDX was negotiated.
+    bool event_idx = 6;
+    // Cumulative interrupts raised by the device.
+    uint64 interrupts = 7;
+    // Configured queues.
+    repeated VirtioQueueDebug queues = 8;
+}
+
+// Snapshot of one virtqueue. Ring fields are only present when the ring
+// address was configured and lies inside guest RAM.
+message VirtioQueueDebug {
+    // Queue index within the device.
+    uint32 index = 1;
+    // Ring size negotiated by the driver.
+    uint32 size = 2;
+    // QUEUE_READY state.
+    bool ready = 3;
+    // Cumulative guest kicks (QUEUE_NOTIFY writes).
+    uint64 kicks = 4;
+    // avail.idx — where the guest has published up to.
+    optional uint32 avail_idx = 5;
+    // used.idx — where the device has completed up to. A persistent gap
+    // behind avail_idx means the queue is wedged.
+    optional uint32 used_idx = 6;
+    // avail.flags (bit 0 = VRING_AVAIL_F_NO_INTERRUPT).
+    optional uint32 avail_flags = 7;
+    // used.flags (bit 0 = VRING_USED_F_NO_NOTIFY).
+    optional uint32 used_flags = 8;
+    // used_event slot (guest → device kick threshold; EVENT_IDX only).
+    optional uint32 used_event = 9;
+    // avail_event slot (device → guest interrupt threshold; EVENT_IDX only).
+    optional uint32 avail_event = 10;
 }
 
 // Request to get system info.

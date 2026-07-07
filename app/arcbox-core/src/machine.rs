@@ -664,6 +664,27 @@ impl MachineManager {
         self.vm_manager.read_agent_log_output(&machine.vm_id)
     }
 
+    /// Captures a virtio device debug snapshot for a running machine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the machine is not found or not running.
+    pub fn virtio_debug(&self, name: &str) -> Result<Vec<arcbox_vmm::DeviceDebug>> {
+        let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
+
+        let machine = machines
+            .get(name)
+            .ok_or_else(|| CoreError::not_found(name.to_string()))?;
+
+        if machine.state != MachineState::Running {
+            return Err(CoreError::invalid_state(format!(
+                "machine '{name}' is not running"
+            )));
+        }
+
+        self.vm_manager.virtio_debug(&machine.vm_id)
+    }
+
     /// Stops a machine.
     ///
     /// # Errors

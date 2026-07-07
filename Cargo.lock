@@ -459,6 +459,7 @@ dependencies = [
  "arcbox-vmm",
  "hyper-util",
  "libc",
+ "serde_json",
  "tempfile",
  "tokio",
  "toml_edit 0.25.12+spec-1.1.0",

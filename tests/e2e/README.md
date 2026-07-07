@@ -20,6 +20,11 @@ macOS virtualization support (plus a local Docker CLI for the daemon-level test)
   Drop terminates the daemon gracefully (SIGTERM, then SIGKILL). The isolated
   data dir means tests never touch `~/.arcbox` and can run alongside a
   developer's daemon.
+- `DaemonHandle::dump_virtio_debug` — fetches the daemon's `GetVirtioDebug`
+  snapshot (per-queue kicks, interrupts, live avail/used ring indices;
+  HV backend only) into `virtio-debug.json` under the data dir. The
+  boot-assets scenario and the `hv_e2e` probe capture it automatically on
+  failure, while the VM is still alive.
 
 ## Parallel daemons: one data dir per daemon
 

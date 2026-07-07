@@ -168,9 +168,29 @@ fn run() -> Result<(), String> {
         t.elapsed().as_secs_f64() * 1000.0
     );
 
+    let result = run_phases(&mut vmm, &dax_fixture, boot_timeout);
+    if result.is_err() {
+        // Dump the virtio queue snapshot while the VM is still alive —
+        // a wedged ring (avail ahead of used, interrupt pending but
+        // unacknowledged) is only observable before teardown.
+        match serde_json::to_string_pretty(&vmm.virtio_debug()) {
+            Ok(json) => eprintln!("[virtio-debug]\n{json}"),
+            Err(e) => eprintln!("[virtio-debug] serialization failed: {e}"),
+        }
+    }
+    result
+}
+
+/// Phases 3–7: everything after the VM is running. Split out so `run`
+/// can capture a virtio debug snapshot when any phase fails.
+fn run_phases(
+    vmm: &mut Vmm,
+    dax_fixture: &DaxFixture,
+    boot_timeout: Duration,
+) -> Result<(), String> {
     println!("[phase 3] wait for agent on vsock port {AGENT_PORT}");
     let t = Instant::now();
-    ping_with_timeout(&vmm, boot_timeout).map_err(|e| {
+    ping_with_timeout(vmm, boot_timeout).map_err(|e| {
         format!(
             "agent never responded within {}s: {e}",
             boot_timeout.as_secs()
@@ -182,7 +202,7 @@ fn run() -> Result<(), String> {
     );
 
     println!("[phase 4] get system info");
-    let info = get_system_info(&vmm)?;
+    let info = get_system_info(vmm)?;
     if info.kernel_version.is_empty() {
         return Err("system info: kernel_version is empty".into());
     }
@@ -192,15 +212,15 @@ fn run() -> Result<(), String> {
     );
 
     println!("[phase 4.5] DAX end-to-end (ABX-362)");
-    dax_round_trip(&vmm, &dax_fixture)?;
+    dax_round_trip(vmm, dax_fixture)?;
 
     println!("[phase 4.7] agent supervision — busybox init respawn");
-    supervision_round_trip(&vmm)?;
+    supervision_round_trip(vmm)?;
 
     println!("[phase 5] pause VM (ABX-360)");
     vmm.pause().map_err(|e| format!("Vmm::pause: {e}"))?;
     // Ping should fail because the guest vCPUs are parked.
-    match ping_once(&vmm, Duration::from_secs(2)) {
+    match ping_once(vmm, Duration::from_secs(2)) {
         Ok(()) => {
             return Err("ping succeeded while VM was paused — pause did not stop guest".into());
         }
@@ -212,7 +232,7 @@ fn run() -> Result<(), String> {
     // Ping should eventually succeed again. Use the retry loop because
     // the guest kernel can take a few hundred milliseconds to catch up
     // on missed timer ticks after resume.
-    match ping_with_timeout(&vmm, Duration::from_secs(30)) {
+    match ping_with_timeout(vmm, Duration::from_secs(30)) {
         Ok(()) => println!("          ping after resume succeeded — guest is back"),
         Err(e) => {
             println!("          ⚠  ping after resume did not succeed within 30s: {e}");

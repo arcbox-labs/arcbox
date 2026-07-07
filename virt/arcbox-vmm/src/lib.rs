@@ -93,7 +93,9 @@ pub mod vsock_manager {
 
 pub use boot::{BootParams, KernelLoader, KernelType};
 pub use builder::{VmBuilder, VmInstance};
-pub use device::{DeviceId, DeviceInfo, DeviceManager, DeviceTreeEntry, DeviceType};
+pub use device::{
+    DeviceDebug, DeviceId, DeviceInfo, DeviceManager, DeviceTreeEntry, DeviceType, QueueDebug,
+};
 pub use error::{Result, VmmError};
 pub use fdt::{FdtBuilder, FdtConfig};
 pub use snapshot::{

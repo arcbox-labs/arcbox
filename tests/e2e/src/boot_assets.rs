@@ -193,6 +193,14 @@ pub fn run(config: BootAssetsConfig) -> Result<()> {
         // Preserve the workspace (daemon + guest logs, disk images) so the
         // failure can be inspected; the path is logged by TestContext::drop.
         ctx.keep_test_dir = true;
+        // Best-effort virtio queue snapshot while the daemon still runs —
+        // ring wedges are invisible once the VM is gone.
+        if let Some(daemon) = &ctx.daemon {
+            match daemon.dump_virtio_debug() {
+                Ok(path) => info!(path = %path.display(), "virtio debug snapshot captured"),
+                Err(error) => warn!("virtio debug dump failed: {error:#}"),
+            }
+        }
     }
     result
 }

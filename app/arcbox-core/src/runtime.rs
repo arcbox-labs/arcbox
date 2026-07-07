@@ -258,6 +258,18 @@ impl Runtime {
         self.container_backend.ensure_ready().await
     }
 
+    /// Captures a virtio device debug snapshot of the System VM.
+    ///
+    /// Custom-VMM backends only — empty under VZ (see
+    /// [`arcbox_vmm::Vmm::virtio_debug`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the System VM is not running.
+    pub fn system_vm_virtio_debug(&self) -> Result<Vec<arcbox_vmm::DeviceDebug>> {
+        self.machine_manager.virtio_debug(DEFAULT_MACHINE_NAME)
+    }
+
     /// Returns the System VM's current hypervisor backend.
     #[must_use]
     pub fn system_vm_backend(&self) -> arcbox_vmm::VmBackend {
