@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arcbox_grpc::SystemService;
 use arcbox_protocol::v1::{
-    Empty, SetSystemVmBackendRequest, SetupStatus, SystemVmBackend, SystemVmBackendInfo,
+    Empty, SetSystemVmBackendRequest, SetupStatus, SystemVmBackend, SystemVmBackendInfo, VcpuDebug,
     VirtioDebugInfo, VirtioDeviceDebug, VirtioQueueDebug, setup_status,
 };
 use tokio::sync::watch;
@@ -270,13 +270,34 @@ impl SystemService for SystemServiceImpl {
         // The early handle exists as soon as the runtime is constructed —
         // a boot that never reaches READY is this RPC's main use case.
         let runtime = self.early_runtime.ready()?;
-        let devices = runtime
-            .system_vm_virtio_debug()
-            .map_err(|e| Status::failed_precondition(e.to_string()))?
-            .into_iter()
-            .map(device_debug_to_proto)
-            .collect();
-        Ok(Response::new(VirtioDebugInfo { devices }))
+        let snapshot = runtime
+            .system_vm_debug_snapshot()
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        Ok(Response::new(VirtioDebugInfo {
+            devices: snapshot
+                .devices
+                .into_iter()
+                .map(device_debug_to_proto)
+                .collect(),
+            vcpus: snapshot
+                .vcpus
+                .into_iter()
+                .map(|v| VcpuDebug {
+                    vcpu: v.vcpu,
+                    mmio_reads: v.mmio_reads,
+                    mmio_writes: v.mmio_writes,
+                    wfi: v.wfi,
+                    hvc: v.hvc,
+                    smc: v.smc,
+                    vtimer: v.vtimer,
+                    kicks_received: v.kicks_received,
+                    sysreg: v.sysreg,
+                    other: v.other,
+                })
+                .collect(),
+            kick_broadcasts: snapshot.kick_broadcasts,
+            unpark_broadcasts: snapshot.unpark_broadcasts,
+        }))
     }
 
     async fn set_system_vm_backend(

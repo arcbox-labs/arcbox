@@ -664,7 +664,8 @@ impl MachineManager {
         self.vm_manager.read_agent_log_output(&machine.vm_id)
     }
 
-    /// Captures a virtio device debug snapshot for a machine.
+    /// Captures a debug snapshot (virtio queues + vCPU exit counters)
+    /// for a machine.
     ///
     /// Deliberately not gated on `MachineState::Running`: a machine
     /// stuck booting (state still Starting) is this snapshot's main
@@ -674,14 +675,14 @@ impl MachineManager {
     ///
     /// Returns an error if the machine is not found or its VMM has not
     /// been created.
-    pub fn virtio_debug(&self, name: &str) -> Result<Vec<arcbox_vmm::DeviceDebug>> {
+    pub fn debug_snapshot(&self, name: &str) -> Result<arcbox_vmm::VmDebugSnapshot> {
         let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
 
         let machine = machines
             .get(name)
             .ok_or_else(|| CoreError::not_found(name.to_string()))?;
 
-        self.vm_manager.virtio_debug(&machine.vm_id)
+        self.vm_manager.debug_snapshot(&machine.vm_id)
     }
 
     /// Stops a machine.

@@ -129,6 +129,7 @@ impl Vmm {
         if let Some(ref gic_ref) = gic {
             let gic_weak = Arc::downgrade(gic_ref);
             let threads_weak = Arc::downgrade(&vcpu_thread_handles);
+            let unpark_broadcasts = self.hv_unpark_broadcasts.clone();
             let callback: IrqTriggerCallback = Box::new(move |gsi: Gsi, level: bool| {
                 if let Some(g) = gic_weak.upgrade() {
                     g.set_spi(gsi, level).map_err(|e| {
@@ -144,6 +145,7 @@ impl Vmm {
                 if level {
                     if let Some(handles) = threads_weak.upgrade() {
                         if let Ok(handles) = handles.lock() {
+                            unpark_broadcasts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             for t in handles.iter() {
                                 t.unpark();
                             }

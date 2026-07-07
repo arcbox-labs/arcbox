@@ -76,6 +76,7 @@ pub mod memory;
 pub(crate) mod net_rx_worker;
 pub mod snapshot;
 pub mod vcpu;
+pub mod vcpu_stats;
 pub(crate) mod virtqueue_util;
 pub mod vmm;
 #[cfg(target_os = "macos")]
@@ -103,4 +104,5 @@ pub use snapshot::{
     SnapshotTargetType, VmRestoreData, VmSnapshotContext,
 };
 pub use vcpu::{DeviceManagerExitHandler, ExitHandler, VcpuManager};
+pub use vcpu_stats::{VcpuStats, VcpuStatsSnapshot, VmDebugSnapshot};
 pub use vmm::{BlockDeviceConfig, SharedDirConfig, VmBackend, Vmm, VmmConfig, VmmState};

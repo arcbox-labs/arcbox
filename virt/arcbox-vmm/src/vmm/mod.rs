@@ -119,6 +119,16 @@ pub struct Vmm {
     /// by `pause`/`stop` to target `hv_vcpus_exit` correctly on arm64.
     #[cfg(target_os = "macos")]
     hv_vcpu_ids: Option<darwin_hv::HvVcpuIds>,
+    /// Per-vCPU exit counters (custom HV). Sized by `start_darwin_hv`;
+    /// kept after stop for post-mortem snapshots.
+    #[cfg(target_os = "macos")]
+    hv_vcpu_stats: Vec<std::sync::Arc<crate::vcpu_stats::VcpuStats>>,
+    /// Times any component broadcast `hv_vcpus_exit` to all vCPUs.
+    #[cfg(target_os = "macos")]
+    hv_kick_broadcasts: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Times the IRQ callback unparked all vCPU threads.
+    #[cfg(target_os = "macos")]
+    hv_unpark_broadcasts: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// PSCI CPU_ON channel senders for secondary vCPUs (custom HV).
     #[cfg(target_os = "macos")]
     #[allow(clippy::type_complexity)]
@@ -304,6 +314,12 @@ impl Vmm {
             hv_vcpu_thread_handles: None,
             #[cfg(target_os = "macos")]
             hv_vcpu_ids: None,
+            #[cfg(target_os = "macos")]
+            hv_vcpu_stats: Vec::new(),
+            #[cfg(target_os = "macos")]
+            hv_kick_broadcasts: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(target_os = "macos")]
+            hv_unpark_broadcasts: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(target_os = "macos")]
             hv_cpu_on_senders: None,
             #[cfg(all(target_os = "macos", feature = "vmnet"))]
@@ -616,6 +632,38 @@ impl Vmm {
             .as_ref()
             .map(DeviceManager::virtio_debug)
             .unwrap_or_default()
+    }
+
+    /// Captures the full VM debug snapshot: virtio device/queue state
+    /// plus per-vCPU exit counters and broadcast-wakeup totals.
+    ///
+    /// Custom-VMM backends only — empty under VZ.
+    #[must_use]
+    pub fn debug_snapshot(&self) -> crate::vcpu_stats::VmDebugSnapshot {
+        crate::vcpu_stats::VmDebugSnapshot {
+            devices: self.virtio_debug(),
+            #[cfg(target_os = "macos")]
+            vcpus: self
+                .hv_vcpu_stats
+                .iter()
+                .enumerate()
+                .map(|(i, stats)| stats.snapshot(i as u32))
+                .collect(),
+            #[cfg(not(target_os = "macos"))]
+            vcpus: Vec::new(),
+            #[cfg(target_os = "macos")]
+            kick_broadcasts: self
+                .hv_kick_broadcasts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            #[cfg(not(target_os = "macos"))]
+            kick_broadcasts: 0,
+            #[cfg(target_os = "macos")]
+            unpark_broadcasts: self
+                .hv_unpark_broadcasts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            #[cfg(not(target_os = "macos"))]
+            unpark_broadcasts: 0,
+        }
     }
 
     /// Captures a VM snapshot context from the running hypervisor VM.

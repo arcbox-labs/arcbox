@@ -2022,13 +2022,57 @@ pub struct SetSystemVmBackendRequest {
     #[prost(enumeration = "SystemVmBackend", tag = "1")]
     pub backend: i32,
 }
-/// Diagnostic snapshot of the System VM's virtio devices.
+/// Diagnostic snapshot of the System VM's virtio devices and vCPUs.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct VirtioDebugInfo {
     #[prost(message, repeated, tag = "1")]
     pub devices: ::prost::alloc::vec::Vec<VirtioDeviceDebug>,
+    /// Per-vCPU exit counters (custom-VMM backends; empty under VZ).
+    #[prost(message, repeated, tag = "2")]
+    pub vcpus: ::prost::alloc::vec::Vec<VcpuDebug>,
+    /// Times any component broadcast hv_vcpus_exit to ALL vCPUs.
+    #[prost(uint64, tag = "3")]
+    pub kick_broadcasts: u64,
+    /// Times the IRQ callback unparked ALL vCPU threads on an SPI assertion.
+    #[prost(uint64, tag = "4")]
+    pub unpark_broadcasts: u64,
+}
+/// Cumulative exit counters for one vCPU.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct VcpuDebug {
+    #[prost(uint32, tag = "1")]
+    pub vcpu: u32,
+    /// MMIO read exits.
+    #[prost(uint64, tag = "2")]
+    pub mmio_reads: u64,
+    /// MMIO write exits (includes every virtio QUEUE_NOTIFY doorbell).
+    #[prost(uint64, tag = "3")]
+    pub mmio_writes: u64,
+    /// WFI exits — the guest going idle.
+    #[prost(uint64, tag = "4")]
+    pub wfi: u64,
+    /// HVC exits (PSCI + ArcBox hypercalls).
+    #[prost(uint64, tag = "5")]
+    pub hvc: u64,
+    /// SMC exits.
+    #[prost(uint64, tag = "6")]
+    pub smc: u64,
+    /// Virtual-timer activations.
+    #[prost(uint64, tag = "7")]
+    pub vtimer: u64,
+    /// Times this vCPU was kicked out of hv_vcpu_run by hv_vcpus_exit.
+    #[prost(uint64, tag = "8")]
+    pub kicks_received: u64,
+    /// Trapped system-register accesses (treated RAZ/WI).
+    #[prost(uint64, tag = "9")]
+    pub sysreg: u64,
+    /// Unhandled exception classes and unknown exits.
+    #[prost(uint64, tag = "10")]
+    pub other: u64,
 }
 /// Snapshot of one virtio MMIO device.
 #[derive(serde::Serialize, serde::Deserialize)]

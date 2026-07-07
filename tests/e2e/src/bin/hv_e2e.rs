@@ -257,7 +257,7 @@ fn run() -> Result<(), String> {
         // Dump the virtio queue snapshot while the VM is still alive —
         // a wedged ring (avail ahead of used, interrupt pending but
         // unacknowledged) is only observable before teardown.
-        match serde_json::to_string_pretty(&vmm.virtio_debug()) {
+        match serde_json::to_string_pretty(&vmm.debug_snapshot()) {
             Ok(json) => eprintln!("[virtio-debug]\n{json}"),
             Err(e) => eprintln!("[virtio-debug] serialization failed: {e}"),
         }

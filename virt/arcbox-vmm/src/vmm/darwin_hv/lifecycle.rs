@@ -144,6 +144,7 @@ impl Vmm {
                             self.hv_vcpu_ids
                                 .clone()
                                 .expect("hv_vcpu_ids asserted Some above"),
+                            self.hv_kick_broadcasts.clone(),
                         ),
                     };
 
@@ -212,6 +213,7 @@ impl Vmm {
                     self.hv_vcpu_ids
                         .clone()
                         .expect("hv_vcpu_ids asserted Some above"),
+                    self.hv_kick_broadcasts.clone(),
                 );
                 dm.set_net_rx_hooks(net_irq_cb, exit_fn);
             }
@@ -247,6 +249,12 @@ impl Vmm {
             .clone()
             .expect("hv_vcpu_ids asserted Some above");
 
+        // Per-vCPU exit counters, kept on the Vmm for debug snapshots.
+        let vcpu_stats: Vec<Arc<crate::vcpu_stats::VcpuStats>> = (0..vcpu_count)
+            .map(|_| Arc::new(crate::vcpu_stats::VcpuStats::default()))
+            .collect();
+        self.hv_vcpu_stats.clone_from(&vcpu_stats);
+
         // --- Set up PSCI CPU_ON channels for secondary vCPUs ---
         let cpu_on_senders: Option<CpuOnSenders> = if vcpu_count > 1 {
             let mut senders_vec: Vec<Option<mpsc::Sender<CpuOnRequest>>> = Vec::new();
@@ -263,6 +271,7 @@ impl Vmm {
                 let ids = hv_vcpu_ids.clone();
                 let uart = pl011.clone();
                 let hvc_fds_clone = self.hvc_blk_fds.clone();
+                let stats = vcpu_stats[i as usize].clone();
                 let senders_placeholder: Option<CpuOnSenders> = None;
 
                 let t = std::thread::Builder::new()
@@ -286,6 +295,7 @@ impl Vmm {
                                     vcpu_thread_handles: th,
                                     hv_vcpu_ids: ids,
                                     hvc_blk_fds: hvc_fds_clone,
+                                    stats,
                                 },
                             );
                         }
@@ -307,6 +317,7 @@ impl Vmm {
         // --- Spawn BSP (vCPU 0) ---
         let hvc_blk_fds = self.hvc_blk_fds.clone();
         let bsp_hv_vcpu_ids = hv_vcpu_ids;
+        let bsp_stats = vcpu_stats[0].clone();
         {
             let t = std::thread::Builder::new()
                 .name("hv-vcpu-0".to_string())
@@ -324,6 +335,7 @@ impl Vmm {
                             vcpu_thread_handles,
                             hv_vcpu_ids: bsp_hv_vcpu_ids,
                             hvc_blk_fds,
+                            stats: bsp_stats,
                         },
                     );
                 })
