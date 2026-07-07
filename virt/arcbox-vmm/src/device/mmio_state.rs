@@ -117,6 +117,12 @@ pub struct VirtioMmioState {
     pub shm_sel: u32,
     /// SHM regions: (base_ipa, length). Index = region ID.
     pub shm_regions: Vec<(u64, u64)>,
+    /// Cumulative guest kicks (`QUEUE_NOTIFY` writes) per queue.
+    /// Diagnostic only — never reset, so a post-mortem after a device
+    /// reset keeps the full history.
+    pub kicks: [u64; 8],
+    /// Cumulative interrupts raised via [`Self::trigger_interrupt`].
+    pub interrupts: u64,
 }
 
 impl VirtioMmioState {
@@ -140,6 +146,8 @@ impl VirtioMmioState {
             config_generation: 0,
             shm_sel: 0,
             shm_regions: Vec::new(),
+            kicks: [0; 8],
+            interrupts: 0,
         }
     }
 
@@ -233,7 +241,12 @@ impl VirtioMmioState {
                 }
             }
             regs::QUEUE_NOTIFY => {
-                // Guest is notifying us about available buffers
+                // Guest is notifying us about available buffers. Dispatch
+                // happens in DeviceManager::handle_mmio_write; here we only
+                // account the kick.
+                if (value as usize) < 8 {
+                    self.kicks[value as usize] += 1;
+                }
                 tracing::trace!("VirtIO queue {} notified", value);
             }
             regs::INTERRUPT_ACK => {
@@ -301,6 +314,7 @@ impl VirtioMmioState {
     /// Triggers an interrupt.
     pub const fn trigger_interrupt(&mut self, reason: u32) {
         self.interrupt_status |= reason;
+        self.interrupts += 1;
     }
 }
 

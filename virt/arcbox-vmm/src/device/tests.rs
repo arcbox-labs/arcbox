@@ -119,3 +119,94 @@ fn test_finalize_virtio_net_checksum_repairs_ipv4_udp_frame() {
         udp_checksum(src_ip.octets(), dst_ip.octets(), &udp_datagram)
     );
 }
+
+#[test]
+fn queue_notify_write_counts_kicks() {
+    let mut state = VirtioMmioState::new(1, 0);
+    state.write(virtio_mmio::regs::QUEUE_NOTIFY, 0);
+    state.write(virtio_mmio::regs::QUEUE_NOTIFY, 0);
+    state.write(virtio_mmio::regs::QUEUE_NOTIFY, 2);
+    // Out-of-range queue index is ignored, not a panic.
+    state.write(virtio_mmio::regs::QUEUE_NOTIFY, 9);
+    assert_eq!(state.kicks[0], 2);
+    assert_eq!(state.kicks[2], 1);
+    assert_eq!(state.kicks[1], 0);
+}
+
+#[test]
+fn kick_counters_survive_device_reset() {
+    let mut state = VirtioMmioState::new(1, 0);
+    state.write(virtio_mmio::regs::QUEUE_NOTIFY, 0);
+    state.trigger_interrupt(virtio_mmio::INT_VRING);
+    state.write(virtio_mmio::regs::STATUS, 0); // device reset
+    assert_eq!(state.kicks[0], 1);
+    assert_eq!(state.interrupts, 1);
+    assert_eq!(state.interrupt_status, 0); // reset still clears live state
+}
+
+#[test]
+fn trigger_interrupt_counts() {
+    let mut state = VirtioMmioState::new(1, 0);
+    state.trigger_interrupt(virtio_mmio::INT_VRING);
+    state.trigger_interrupt(virtio_mmio::INT_VRING);
+    assert_eq!(state.interrupts, 2);
+    assert_eq!(state.interrupt_status, virtio_mmio::INT_VRING);
+}
+
+#[test]
+fn virtio_debug_snapshot_reads_ring_indices() {
+    const GPA_BASE: u64 = 0x1000;
+    const QUEUE_SIZE: u16 = 4;
+    let mut ram = vec![0u8; 0x1000];
+    let avail = GPA_BASE + 0x100;
+    let used = GPA_BASE + 0x200;
+
+    // Split-ring words the snapshot should pick up.
+    let w = |ram: &mut [u8], gpa: u64, value: u16| {
+        let off = (gpa - GPA_BASE) as usize;
+        ram[off..off + 2].copy_from_slice(&value.to_le_bytes());
+    };
+    w(&mut ram, avail, 1); // avail.flags = NO_INTERRUPT
+    w(&mut ram, avail + 2, 7); // avail.idx
+    w(&mut ram, avail + 4 + 2 * u64::from(QUEUE_SIZE), 5); // used_event
+    w(&mut ram, used + 2, 3); // used.idx
+    w(&mut ram, used + 4 + 8 * u64::from(QUEUE_SIZE), 6); // avail_event
+
+    let mut manager = DeviceManager::new();
+    // SAFETY: `ram` outlives the manager use below and covers the range.
+    unsafe { manager.set_guest_memory(ram.as_mut_ptr(), ram.len(), GPA_BASE) };
+    let id = manager.register(DeviceType::VirtioNet, "net0").unwrap();
+
+    let mut state = VirtioMmioState::new(1, 0);
+    state.driver_features = arcbox_virtio::queue::VIRTIO_F_EVENT_IDX;
+    state.queue_num[0] = QUEUE_SIZE;
+    state.queue_ready[0] = true;
+    state.queue_driver[0] = avail;
+    state.queue_device[0] = used;
+    // Queue 1 configured but with unset ring addresses: fields become None.
+    state.queue_num[1] = QUEUE_SIZE;
+    state.write(virtio_mmio::regs::QUEUE_NOTIFY, 0);
+    state.trigger_interrupt(virtio_mmio::INT_VRING);
+    manager.devices.get_mut(&id).unwrap().mmio_state = Some(Arc::new(RwLock::new(state)));
+
+    let snapshot = manager.virtio_debug();
+    assert_eq!(snapshot.len(), 1);
+    let device = &snapshot[0];
+    assert_eq!(device.device_type, "VirtioNet");
+    assert!(device.event_idx);
+    assert_eq!(device.interrupts, 1);
+    assert_eq!(device.queues.len(), 2);
+
+    let q0 = &device.queues[0];
+    assert!(q0.ready);
+    assert_eq!(q0.kicks, 1);
+    assert_eq!(q0.avail_flags, Some(1));
+    assert_eq!(q0.avail_idx, Some(7));
+    assert_eq!(q0.used_idx, Some(3));
+    assert_eq!(q0.used_event, Some(5));
+    assert_eq!(q0.avail_event, Some(6));
+
+    let q1 = &device.queues[1];
+    assert_eq!(q1.avail_idx, None);
+    assert_eq!(q1.used_idx, None);
+}

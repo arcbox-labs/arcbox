@@ -599,6 +599,25 @@ impl Vmm {
         self.hv_dax_mappers.get(share_idx).map(|m| m.stats())
     }
 
+    /// Captures a debug snapshot of the VM's virtio MMIO devices:
+    /// per-queue kick counters, live avail/used ring indices, EVENT_IDX
+    /// slots, and pending interrupt state.
+    ///
+    /// Custom-VMM backends only (HV on macOS, KVM on Linux) — returns an
+    /// empty list under VZ, where the devices belong to
+    /// Virtualization.framework.
+    #[must_use]
+    pub fn virtio_debug(&self) -> Vec<crate::device::DeviceDebug> {
+        #[cfg(target_os = "macos")]
+        if let Some(dm) = &self.hv_device_manager {
+            return dm.virtio_debug();
+        }
+        self.device_manager
+            .as_ref()
+            .map(DeviceManager::virtio_debug)
+            .unwrap_or_default()
+    }
+
     /// Captures a VM snapshot context from the running hypervisor VM.
     ///
     /// The returned context contains device state and full guest memory.
