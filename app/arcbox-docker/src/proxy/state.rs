@@ -178,21 +178,32 @@ impl EndpointReadiness {
                 continue;
             }
 
+            // This future owns the `Verifying` slot from here on, and it can
+            // be dropped at any await point: hyper cancels the request future
+            // when the client disconnects (e.g. the docker CLI times out its
+            // `_ping` while the System VM reboots). The claim's Drop rolls the
+            // state back to `Unverified` and wakes a parked request to take
+            // over — without it, a cancelled verifier leaves `Verifying`
+            // behind forever and every later request parks behind a
+            // verification nobody is running.
+            let claim = VerifyingClaim {
+                readiness: Some(self),
+            };
             let result = async {
                 prepare_runtime.await?;
                 verify_endpoint().await
             }
             .await;
-
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            *state = if result.is_ok() {
-                EndpointReadinessState::Verified
-            } else {
-                EndpointReadinessState::Unverified
-            };
-            self.changed.notify_waiters();
+            claim.complete(result.is_ok());
             return result;
         }
+    }
+
+    /// Sets the terminal state of a verification and wakes parked requests.
+    fn finish(&self, next: EndpointReadinessState) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        *state = next;
+        self.changed.notify_waiters();
     }
 
     fn invalidate(&self) {
@@ -206,6 +217,36 @@ impl EndpointReadiness {
     #[cfg(test)]
     fn state(&self) -> EndpointReadinessState {
         *self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// RAII claim on the `Verifying` slot of [`EndpointReadiness`].
+///
+/// Dropped without [`Self::complete`] — the verifier future was cancelled
+/// mid-verification — it rolls the state back to `Unverified` and notifies,
+/// so a parked request re-runs the verification instead of parking forever.
+struct VerifyingClaim<'a> {
+    readiness: Option<&'a EndpointReadiness>,
+}
+
+impl VerifyingClaim<'_> {
+    fn complete(mut self, verified: bool) {
+        if let Some(readiness) = self.readiness.take() {
+            readiness.finish(if verified {
+                EndpointReadinessState::Verified
+            } else {
+                EndpointReadinessState::Unverified
+            });
+        }
+    }
+}
+
+impl Drop for VerifyingClaim<'_> {
+    fn drop(&mut self) {
+        if let Some(readiness) = self.readiness.take() {
+            tracing::debug!("endpoint verification cancelled; rolling back to unverified");
+            readiness.finish(EndpointReadinessState::Unverified);
+        }
     }
 }
 
@@ -333,6 +374,83 @@ mod tests {
 
         assert_eq!(verified.load(Ordering::Relaxed), 2);
         assert_eq!(readiness.state(), EndpointReadinessState::Unverified);
+    }
+
+    #[tokio::test]
+    async fn cancelled_verifier_rolls_back_to_unverified() {
+        let readiness = Arc::new(EndpointReadiness::new());
+
+        // A verifier stuck in prepare_runtime (e.g. parked across a System VM
+        // reboot) whose client disconnects: hyper drops the request future.
+        let stuck_readiness = Arc::clone(&readiness);
+        let stuck = tokio::spawn(async move {
+            stuck_readiness
+                .ensure_verified(std::future::pending::<Result<()>>(), || async {
+                    Ok::<(), DockerError>(())
+                })
+                .await
+        });
+        while readiness.state() != EndpointReadinessState::Verifying {
+            sleep(Duration::from_millis(1)).await;
+        }
+
+        stuck.abort();
+        let _ = stuck.await;
+
+        assert_eq!(readiness.state(), EndpointReadinessState::Unverified);
+
+        // The next request verifies instead of parking forever.
+        let verified = Arc::new(AtomicUsize::new(0));
+        let verified_current = Arc::clone(&verified);
+        readiness
+            .ensure_verified(async { Ok::<(), DockerError>(()) }, || async move {
+                verified_current.fetch_add(1, Ordering::Relaxed);
+                Ok::<(), DockerError>(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(readiness.state(), EndpointReadinessState::Verified);
+        assert_eq!(verified.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_verifier_hands_over_to_parked_request() {
+        let readiness = Arc::new(EndpointReadiness::new());
+
+        let stuck_readiness = Arc::clone(&readiness);
+        let stuck = tokio::spawn(async move {
+            stuck_readiness
+                .ensure_verified(std::future::pending::<Result<()>>(), || async {
+                    Ok::<(), DockerError>(())
+                })
+                .await
+        });
+        while readiness.state() != EndpointReadinessState::Verifying {
+            sleep(Duration::from_millis(1)).await;
+        }
+
+        // A second request parks behind the stuck verification.
+        let parked_readiness = Arc::clone(&readiness);
+        let parked_verified = Arc::new(AtomicUsize::new(0));
+        let parked_counter = Arc::clone(&parked_verified);
+        let parked = tokio::spawn(async move {
+            parked_readiness
+                .ensure_verified(async { Ok::<(), DockerError>(()) }, || async move {
+                    parked_counter.fetch_add(1, Ordering::Relaxed);
+                    Ok::<(), DockerError>(())
+                })
+                .await
+        });
+        // Let it register on the notify before the cancellation fires.
+        sleep(Duration::from_millis(10)).await;
+
+        stuck.abort();
+        let _ = stuck.await;
+
+        // The parked request must wake, take over, and verify.
+        parked.await.unwrap().unwrap();
+        assert_eq!(readiness.state(), EndpointReadinessState::Verified);
+        assert_eq!(parked_verified.load(Ordering::Relaxed), 1);
     }
 
     /// Connector stub for ProxyState tests — never actually dialed, since the
