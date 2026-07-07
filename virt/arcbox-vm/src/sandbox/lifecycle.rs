@@ -126,10 +126,21 @@ impl SandboxManager {
 
     /// Stop a sandbox gracefully.
     ///
-    /// Sends Ctrl+Alt+Del to the guest and waits up to `timeout_seconds`
-    /// (default 30 s) for the VM to shut down.
+    /// Waits up to `timeout_seconds` (default 30 s) for an active workload
+    /// to exit, asks the guest to shut down (Ctrl+Alt+Del reboots the guest,
+    /// which exits Firecracker), and SIGKILLs Firecracker only if it
+    /// outlives the remaining budget. All runtime resources (TAP + IP,
+    /// dm-snapshot CoW, jailer chroot) are released on `Stopped`; only the
+    /// inspectable record and the log directory survive until `Remove`.
     pub async fn stop_sandbox(&self, id: &SandboxId, timeout_seconds: u32) -> Result<()> {
-        let vm_handle = {
+        let budget = Duration::from_secs(u64::from(if timeout_seconds > 0 {
+            timeout_seconds
+        } else {
+            30
+        }));
+        let deadline = tokio::time::Instant::now() + budget;
+
+        let (was_running, vm_handle) = {
             let instance = self.get_instance(id)?;
             let mut inst = instance.lock().unwrap();
             match inst.state {
@@ -142,42 +153,62 @@ impl SandboxManager {
                     });
                 }
             }
+            let was_running = inst.state == SandboxState::Running;
             inst.state = SandboxState::Stopping;
-            inst.vm.as_ref().map(Arc::clone)
+            (was_running, inst.vm.as_ref().map(Arc::clone))
         };
 
         let _ = self.events_tx.send(SandboxEvent::new(id, "stopping"));
 
-        if let Some(vm) = vm_handle {
-            let timeout = if timeout_seconds > 0 {
-                timeout_seconds
-            } else {
-                30
-            };
-            // Ignore errors — VM may have already exited.
-            let _ =
-                tokio::time::timeout(Duration::from_secs(timeout as u64), vm.send_ctrl_alt_del())
-                    .await;
+        // Drain: give an active workload the budget to finish. The run/exec
+        // watcher flips the state to Ready (over our Stopping) when the exit
+        // chunk arrives, so poll for that transition.
+        if was_running {
+            while tokio::time::Instant::now() < deadline {
+                let state = self.get_instance(id)?.lock().unwrap().state;
+                if state != SandboxState::Stopping {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            // Re-assert Stopping for observers regardless of drain outcome.
+            self.get_instance(id)?.lock().unwrap().state = SandboxState::Stopping;
         }
 
-        // Force-kill the Firecracker process if it is still alive.
+        // Ask the guest to shut down. Ctrl+Alt+Del triggers a guest reboot,
+        // which Firecracker turns into a VM exit. Errors are ignored — the
+        // VM may already be gone.
+        if let Some(vm) = vm_handle {
+            let _ = tokio::time::timeout(Duration::from_secs(5), vm.send_ctrl_alt_del()).await;
+        }
+
+        // Wait for Firecracker to exit within the remaining budget; SIGKILL
+        // as a fallback, then reap.
+        let fc_process = self.get_instance(id)?.lock().unwrap().process.take();
+        if let Some(mut proc) = fc_process {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or(Duration::from_secs(1))
+                .max(Duration::from_secs(1));
+            if tokio::time::timeout(remaining, proc.wait()).await.is_err() {
+                warn!(sandbox_id = %id, "guest did not shut down in time; killing firecracker");
+                super::boot::kill_and_reap_fc(&mut proc).await;
+            }
+        }
+
+        // Release TAP/IP, CoW device, and chroot now that FC is gone; the
+        // record itself stays inspectable until Remove.
         {
             let instance = self.get_instance(id)?;
-            let mut inst = instance.lock().unwrap();
-            if let Some(ref mut proc) = inst.process
-                && let Some(pid) = proc.pid()
-                && pid > 0
-            {
-                let _ = nix::sys::signal::kill(
-                    #[allow(
-                        clippy::cast_possible_wrap,
-                        reason = "Firecracker pid fits platform pid_t"
-                    )]
-                    nix::unistd::Pid::from_raw(pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-            inst.state = SandboxState::Stopped;
+            super::cleanup::release_runtime_resources(
+                id,
+                &instance,
+                &self.network,
+                &self.config,
+                &self.cow_manager,
+            )
+            .await;
+            instance.lock().unwrap().state = SandboxState::Stopped;
         }
 
         let _ = self.events_tx.send(SandboxEvent::new(id, "stopped"));
