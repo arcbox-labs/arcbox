@@ -20,14 +20,22 @@ use tokio_util::sync::CancellationToken;
 
 use crate::startup::DaemonLock;
 
+/// Daemon lock shared between the startup pipeline and `main`.
+///
+/// Filled by the lease phase; kept alive by [`StartupHandles`] so the
+/// flock survives the startup future being dropped on a signal.
+pub type SharedDaemonLock = Arc<std::sync::OnceLock<Arc<DaemonLock>>>;
+
 /// Handles created before the startup pipeline runs and shared with it.
 ///
 /// A shutdown signal can arrive while the pipeline is still building the
 /// daemon. `main` holds a clone so the interrupt path can reach whatever
 /// the pipeline has published so far: the runtime (for a bounded stop of a
 /// VM that keeps booting in its lifecycle tasks even after the startup
-/// future is dropped) and the cancellation token (for services that are
-/// already running).
+/// future is dropped), the cancellation token (for services that are
+/// already running), and the daemon lock (dropping the startup future
+/// would otherwise release the flock while this process still tears down
+/// its VM, letting a concurrent daemon boot into the same resources).
 #[derive(Clone)]
 pub struct StartupHandles {
     pub shared_runtime: SharedRuntime,
@@ -35,6 +43,10 @@ pub struct StartupHandles {
     pub early_runtime: SharedRuntime,
     pub setup_state: Arc<SetupState>,
     pub shutdown: CancellationToken,
+    /// Filled by the lease phase. Held here (not only in the pipeline's
+    /// context) so the exclusive flock lives until process exit even when
+    /// the startup future is cancelled mid-flight.
+    pub daemon_lock: SharedDaemonLock,
 }
 
 impl StartupHandles {
@@ -44,6 +56,7 @@ impl StartupHandles {
             early_runtime: Arc::new(std::sync::OnceLock::new()),
             setup_state,
             shutdown: CancellationToken::new(),
+            daemon_lock: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -64,6 +77,8 @@ pub struct EarlyContext {
     pub early_runtime: SharedRuntime,
     pub setup_state: Arc<SetupState>,
     pub shutdown: CancellationToken,
+    /// Empty slot the lease phase publishes the acquired lock into.
+    pub daemon_lock_slot: SharedDaemonLock,
     pub dns_domain: String,
     pub dns_port: u16,
     pub docker_integration: bool,
@@ -78,9 +93,10 @@ pub struct DaemonContext {
     pub profile: ArcboxProfile,
     pub layout: HostLayout,
     /// Exclusive lock held for the daemon's lifetime.
-    /// Held via RAII — the flock is released when this value drops.
-    #[allow(dead_code)] // held for drop semantics
-    pub daemon_lock: DaemonLock,
+    /// Held via RAII — the flock is released when the last clone drops;
+    /// `StartupHandles` holds a sibling clone so a cancelled startup
+    /// future cannot release it early.
+    pub daemon_lock: Arc<DaemonLock>,
     /// Shared with gRPC services. Empty after `acquire_lock`, filled by `init_runtime`.
     pub shared_runtime: SharedRuntime,
     /// Filled by `init_runtime` right after runtime construction, before

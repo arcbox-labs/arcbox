@@ -61,6 +61,7 @@ async fn init_early(args: DaemonArgs, handles: StartupHandles) -> Result<EarlyCo
         early_runtime: handles.early_runtime,
         setup_state: handles.setup_state,
         shutdown: handles.shutdown,
+        daemon_lock_slot: handles.daemon_lock,
         dns_domain,
         dns_port,
         docker_integration: args.docker_integration,
@@ -84,6 +85,14 @@ async fn acquire_lock(early: EarlyContext) -> Result<DaemonContext> {
         .await
         .context("lock task panicked")?
         .context("failed to acquire daemon lock")?;
+    let lock = Arc::new(lock);
+    // Publish a sibling clone into the pre-pipeline handles: a signal drops
+    // this pipeline's context mid-flight, and the flock must outlive that
+    // drop for as long as the interrupt path is still tearing down the VM.
+    early
+        .daemon_lock_slot
+        .set(Arc::clone(&lock))
+        .map_err(|_| anyhow::anyhow!("acquire_lock called twice"))?;
     Ok(DaemonContext {
         profile: early.profile,
         layout: early.layout,

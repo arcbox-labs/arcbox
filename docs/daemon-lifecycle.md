@@ -124,6 +124,12 @@ signal received during startup
 `early_runtime` is filled right after `Runtime` construction, before the
 VM boots, so it covers every window in which a VM can exist.
 
+The daemon lease survives the abort: the lock is shared into the
+pre-pipeline handles when acquired, so cancelling the startup future
+does not release the flock — a concurrent daemon cannot take the lease
+while this process is still tearing down its VM. The flock releases at
+process exit, as in every other path.
+
 ## Crash / SIGKILL
 
 When the daemon is killed without graceful shutdown:
