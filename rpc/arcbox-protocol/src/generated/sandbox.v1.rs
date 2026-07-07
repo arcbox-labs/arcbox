@@ -255,6 +255,67 @@ pub struct ExecOutput {
     #[prost(bool, tag = "4")]
     pub done: bool,
 }
+/// Request to read a file from a sandbox.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReadFileRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Absolute path inside the sandbox rootfs.
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+}
+/// One chunk of file data in a ReadFile / WriteFile stream.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FileChunk {
+    /// Raw bytes (may be empty on the final chunk).
+    #[prost(bytes = "vec", tag = "1")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+    /// True on the last chunk of the stream.
+    #[prost(bool, tag = "2")]
+    pub done: bool,
+}
+/// Opens a WriteFile stream. Must be the first WriteFileRequest message.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WriteFileOpen {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Absolute destination path inside the sandbox rootfs.
+    #[prost(string, tag = "2")]
+    pub path: ::prost::alloc::string::String,
+    /// Unix permission bits for the created file (0 = 0644).
+    #[prost(uint32, tag = "3")]
+    pub mode: u32,
+}
+/// A single client message in a WriteFile stream.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WriteFileRequest {
+    #[prost(oneof = "write_file_request::Payload", tags = "1, 2")]
+    pub payload: ::core::option::Option<write_file_request::Payload>,
+}
+/// Nested message and enum types in `WriteFileRequest`.
+pub mod write_file_request {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        /// Stream header — sandbox, path, and mode.
+        #[prost(message, tag = "1")]
+        Open(super::WriteFileOpen),
+        /// File content chunk; the last one has done == true.
+        #[prost(message, tag = "2")]
+        Chunk(super::FileChunk),
+    }
+}
 /// Request to stop a sandbox gracefully.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

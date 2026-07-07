@@ -149,6 +149,15 @@ where
             svc.handle_exec(stream, trace_id, payload).await?;
         }
         // -----------------------------------------------------------------
+        // File I/O
+        // -----------------------------------------------------------------
+        MessageType::SandboxFileReadRequest => {
+            svc.handle_read_file(stream, trace_id, payload).await?;
+        }
+        MessageType::SandboxFileWriteRequest => {
+            svc.handle_write_file(stream, trace_id, payload).await?;
+        }
+        // -----------------------------------------------------------------
         // Snapshots
         // -----------------------------------------------------------------
         MessageType::SandboxCheckpointRequest => match svc.checkpoint(payload).await {

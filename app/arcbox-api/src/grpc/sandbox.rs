@@ -5,9 +5,10 @@ use std::pin::Pin;
 use arcbox_grpc::SandboxService;
 use arcbox_protocol::sandbox_v1::Empty as SandboxEmpty;
 use arcbox_protocol::sandbox_v1::{
-    CreateSandboxRequest, CreateSandboxResponse, ExecInput, ExecOutput, InspectSandboxRequest,
-    ListSandboxesRequest, ListSandboxesResponse, RemoveSandboxRequest, RunOutput, RunRequest,
-    SandboxEvent, SandboxEventsRequest, SandboxInfo, StopSandboxRequest, exec_input,
+    CreateSandboxRequest, CreateSandboxResponse, ExecInput, ExecOutput, FileChunk,
+    InspectSandboxRequest, ListSandboxesRequest, ListSandboxesResponse, ReadFileRequest,
+    RemoveSandboxRequest, RunOutput, RunRequest, SandboxEvent, SandboxEventsRequest, SandboxInfo,
+    StopSandboxRequest, WriteFileRequest, exec_input, write_file_request,
 };
 use tokio_stream::Stream;
 use tokio_stream::StreamExt as _;
@@ -220,6 +221,77 @@ impl SandboxService for SandboxServiceImpl {
             .await
             .map_err(ApiError::from)?;
         Ok(Response::new(resp))
+    }
+
+    type ReadFileStream = Pin<Box<dyn Stream<Item = Result<FileChunk, Status>> + Send + 'static>>;
+
+    async fn read_file(
+        &self,
+        request: Request<ReadFileRequest>,
+    ) -> Result<Response<Self::ReadFileStream>, Status> {
+        let machine = request.machine_id()?;
+        let agent = self
+            .runtime
+            .ready()?
+            .get_agent(&machine)
+            .map_err(ApiError::from)?;
+        let rx = agent
+            .sandbox_read_file(request.into_inner())
+            .await
+            .map_err(ApiError::from)?;
+        let stream = UnboundedReceiverStream::new(rx)
+            .map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn write_file(
+        &self,
+        request: Request<Streaming<WriteFileRequest>>,
+    ) -> Result<Response<SandboxEmpty>, Status> {
+        let machine = request.machine_id()?;
+        let agent = self
+            .runtime
+            .ready()?
+            .get_agent(&machine)
+            .map_err(ApiError::from)?;
+
+        let mut stream = request.into_inner();
+
+        // The first message in the stream must carry the Open payload.
+        let first = stream.next().await.ok_or_else(|| {
+            Status::invalid_argument("write_file: stream closed before Open message")
+        })??;
+        let open = match first.payload {
+            Some(write_file_request::Payload::Open(open)) => open,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "write_file: first message must be Open",
+                ));
+            }
+        };
+
+        // Bridge gRPC chunks into the agent write stream; dropping the
+        // sender ends the transfer and triggers the terminating frame.
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Some(Ok(msg)) = stream.next().await {
+                if let Some(write_file_request::Payload::Chunk(chunk)) = msg.payload {
+                    let done = chunk.done;
+                    if !chunk.data.is_empty() && tx.send(chunk.data.clone()).await.is_err() {
+                        return;
+                    }
+                    if done {
+                        break;
+                    }
+                }
+            }
+        });
+
+        agent
+            .sandbox_write_file(open, rx)
+            .await
+            .map_err(ApiError::from)?;
+        Ok(Response::new(SandboxEmpty {}))
     }
 
     type EventsStream = Pin<Box<dyn Stream<Item = Result<SandboxEvent, Status>> + Send + 'static>>;

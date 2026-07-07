@@ -73,6 +73,16 @@ pub enum MessageType {
     /// TTY resize frame sent by the host during an exec session. Payload is
     /// a prost-encoded `sandbox.v1.TerminalSize`.
     SandboxExecResize = 0x0034,
+    /// Read a file from a sandbox (payload: `sandbox.v1.ReadFileRequest`).
+    /// The agent answers with a stream of [`Self::SandboxFileData`] frames.
+    SandboxFileReadRequest = 0x0035,
+    /// Open a file-write stream into a sandbox (payload:
+    /// `sandbox.v1.WriteFileOpen`), followed by [`Self::SandboxFileChunk`]
+    /// frames and answered with [`Self::SandboxFileWriteResponse`].
+    SandboxFileWriteRequest = 0x0036,
+    /// One chunk of file content during a write stream (payload:
+    /// `sandbox.v1.FileChunk`; `done == true` on the last chunk).
+    SandboxFileChunk = 0x0037,
 
     // Sandbox snapshot request types (0x0040 - 0x0043).
     SandboxCheckpointRequest = 0x0040,
@@ -113,6 +123,11 @@ pub enum MessageType {
     SandboxRunOutput = 0x1035,
     SandboxExecOutput = 0x1036,
     SandboxEvent = 0x1037,
+    /// One chunk of file content answering [`Self::SandboxFileReadRequest`]
+    /// (payload: `sandbox.v1.FileChunk`; `done == true` on the last chunk).
+    SandboxFileData = 0x1038,
+    /// Acknowledges a completed file-write stream (empty payload).
+    SandboxFileWriteResponse = 0x1039,
 
     // Sandbox snapshot response types (0x1040 - 0x1043).
     SandboxCheckpointResponse = 0x1040,
@@ -156,6 +171,9 @@ impl MessageType {
             0x0032 => Some(Self::SandboxEventsRequest),
             0x0033 => Some(Self::SandboxExecInput),
             0x0034 => Some(Self::SandboxExecResize),
+            0x0035 => Some(Self::SandboxFileReadRequest),
+            0x0036 => Some(Self::SandboxFileWriteRequest),
+            0x0037 => Some(Self::SandboxFileChunk),
             // Sandbox snapshot requests.
             0x0040 => Some(Self::SandboxCheckpointRequest),
             0x0041 => Some(Self::SandboxRestoreRequest),
@@ -188,6 +206,8 @@ impl MessageType {
             0x1035 => Some(Self::SandboxRunOutput),
             0x1036 => Some(Self::SandboxExecOutput),
             0x1037 => Some(Self::SandboxEvent),
+            0x1038 => Some(Self::SandboxFileData),
+            0x1039 => Some(Self::SandboxFileWriteResponse),
             // Sandbox snapshot responses.
             0x1040 => Some(Self::SandboxCheckpointResponse),
             0x1041 => Some(Self::SandboxRestoreResponse),
@@ -213,6 +233,8 @@ impl MessageType {
                 | Self::SandboxRunRequest
                 | Self::SandboxExecRequest
                 | Self::SandboxEventsRequest
+                | Self::SandboxFileReadRequest
+                | Self::SandboxFileWriteRequest
                 | Self::SandboxCheckpointRequest
                 | Self::SandboxRestoreRequest
                 | Self::SandboxListSnapshotsRequest
@@ -290,9 +312,14 @@ mod tests {
             (0x0032, MessageType::SandboxEventsRequest),
             (0x0033, MessageType::SandboxExecInput),
             (0x0034, MessageType::SandboxExecResize),
+            (0x0035, MessageType::SandboxFileReadRequest),
+            (0x0036, MessageType::SandboxFileWriteRequest),
+            (0x0037, MessageType::SandboxFileChunk),
             (0x1035, MessageType::SandboxRunOutput),
             (0x1036, MessageType::SandboxExecOutput),
             (0x1037, MessageType::SandboxEvent),
+            (0x1038, MessageType::SandboxFileData),
+            (0x1039, MessageType::SandboxFileWriteResponse),
             // Sandbox snapshots.
             (0x0040, MessageType::SandboxCheckpointRequest),
             (0x0041, MessageType::SandboxRestoreRequest),
@@ -319,6 +346,8 @@ mod tests {
     fn is_sandbox_request_classifies_correctly() {
         assert!(MessageType::SandboxCreateRequest.is_sandbox_request());
         assert!(MessageType::SandboxRunRequest.is_sandbox_request());
+        assert!(MessageType::SandboxFileReadRequest.is_sandbox_request());
+        assert!(MessageType::SandboxFileWriteRequest.is_sandbox_request());
         assert!(MessageType::SandboxCheckpointRequest.is_sandbox_request());
         assert!(!MessageType::PingRequest.is_sandbox_request());
         assert!(!MessageType::SandboxCreateResponse.is_sandbox_request());
