@@ -152,7 +152,9 @@ Covers `arcbox-daemon` (startup/shutdown), `arcbox-core` (`vm_lifecycle`),
 ## Docker proxy ↔ lifecycle contract (cross-crate)
 
 `VmLifecycleManager::restart_generation()` is bumped on every VM stop
-(`mod.rs`). The Docker proxy compares it via the request path to detect a
+(the `fetch_add` lives in `actor.rs`'s `Effect::BumpGeneration` arm;
+`mod.rs` holds only the read accessor). The Docker proxy compares it via
+the request path to detect a
 System VM restart (backend switch / recovery) and reset stale state
 (`arcbox-docker/src/proxy/state.rs`). When editing either side, keep in
 lockstep:
@@ -224,8 +226,10 @@ double red (HV and VZ) points above the hypervisor. Run cheapest first:
 
 1. Crate unit tests for the touched crate.
 2. Daemon-level e2e with `ARCBOX_VM_BACKEND=hv`:
-   `cargo test -p arcbox-e2e --test virtio_debug` (live `GetVirtioDebug`
-   snapshot) and `--test boot_assets`.
+   `cargo test -p arcbox-e2e --test virtio_debug -- --ignored` (live
+   `GetVirtioDebug` snapshot) and `--test boot_assets -- --ignored`. The
+   e2e targets are `#[ignore]`d — without `-- --ignored` the run reports
+   "0 tests run" and validates nothing.
 3. Race-class fixes: `cargo xtask e2e --repeat N` (prebuilds once, archives
    per-run logs/metrics, preserves failed data dirs).
 

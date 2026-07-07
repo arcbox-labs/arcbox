@@ -165,6 +165,7 @@ coverage: the near-`u64::MAX` ring-address snapshot regression in
 ## Validation
 
 Follow the ladder in `virt/AGENTS.md`, cheapest first: crate unit tests →
-`cargo test -p arcbox-e2e --test hv_vmm` (bare probe) →
-`--test virtio_debug` / `--test boot_assets` with `ARCBOX_VM_BACKEND=hv`
-(daemon level) → `cargo xtask e2e --repeat N` for race-class fixes.
+`cargo test -p arcbox-e2e --test hv_vmm -- --ignored` (bare probe) →
+`--test virtio_debug` / `--test boot_assets` (each with `-- --ignored`)
+under `ARCBOX_VM_BACKEND=hv` (daemon level) → `cargo xtask e2e --repeat N`
+for race-class fixes.

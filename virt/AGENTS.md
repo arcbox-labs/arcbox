@@ -166,10 +166,13 @@ was localized to "vCPU count, threshold exactly 8".
 ## Validation ladder (cheapest first)
 
 1. crate unit tests for the touched crate;
-2. bare probe: `cargo test -p arcbox-e2e --test hv_vmm`;
-3. daemon level: `cargo test -p arcbox-e2e --test virtio_debug` and
-   `--test boot_assets` with `ARCBOX_VM_BACKEND=hv`;
+2. bare probe: `cargo test -p arcbox-e2e --test hv_vmm -- --ignored`;
+3. daemon level: `cargo test -p arcbox-e2e --test virtio_debug -- --ignored`
+   and `--test boot_assets -- --ignored` with `ARCBOX_VM_BACKEND=hv`;
 4. race-class fixes: `cargo xtask e2e --repeat N`.
+
+The e2e targets are `#[ignore]`d: without `-- --ignored` the run reports
+"0 tests run" and validates nothing (`cargo xtask e2e` passes it for you).
 
 R2/R3 acceptance in Linear is read from the cumulative broadcast counters
 (per-boot ≈ 2301 unpark-broadcasts / 71 kick-broadcasts). A refactor must

@@ -24,8 +24,9 @@ non-obvious invariants and failure signatures.
   and hold *your changed lines* to zero new warnings; do NOT bulk-fix the
   backlog in an unrelated PR — it buries your diff.
 - **Validation ladder, cheapest first** (from `virt/AGENTS.md`): crate unit
-  tests → bare probe `cargo test -p arcbox-e2e --test hv_vmm` → daemon level
-  `--test boot_assets` / `--test virtio_debug` with `ARCBOX_VM_BACKEND=hv` →
+  tests → bare probe `cargo test -p arcbox-e2e --test hv_vmm -- --ignored` →
+  daemon level `--test boot_assets` / `--test virtio_debug` (each with
+  `-- --ignored`) under `ARCBOX_VM_BACKEND=hv` →
   `cargo xtask e2e --repeat N` for race-class fixes.
 - **VZ is the oracle**: HV-only red points at the HV implementation; double red
   points above the hypervisor. Readiness is observed host-side *only* via

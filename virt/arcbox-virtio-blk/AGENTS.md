@@ -125,9 +125,9 @@ near-`u64::MAX` sectors/lengths, not just the happy path (parent
    `zero_ranges_zeroes_backing_file`,
    `range_parser_concatenates_split_payload_descriptors`). A feature test must
    exercise the real request path, not a leaf helper.
-2. Bare HV probe: `cargo test -p arcbox-e2e --test hv_vmm`.
-3. Daemon-level boot: `cargo test -p arcbox-e2e --test virtio_debug` and
-   `--test boot_assets` with `ARCBOX_VM_BACKEND=hv`.
+2. Bare HV probe: `cargo test -p arcbox-e2e --test hv_vmm -- --ignored`.
+3. Daemon-level boot: `cargo test -p arcbox-e2e --test virtio_debug -- --ignored`
+   and `--test boot_assets -- --ignored` with `ARCBOX_VM_BACKEND=hv`.
 4. Race-class fixes: `cargo xtask e2e --repeat N` (never hand-loop `cargo test`).
 
 The harness self-preserves forensics on failure (`virtio-debug.json` captured
