@@ -29,6 +29,17 @@ pub enum CoreError {
     #[error("machine error: {0}")]
     Machine(String),
 
+    /// Error reported by the guest agent over the vsock wire, carrying an
+    /// HTTP-style status code (400/404/409/412/500/503) that the API layer
+    /// maps onto the matching gRPC status.
+    #[error("{message}")]
+    Agent {
+        /// HTTP-style status code from the agent's `ErrorResponse`.
+        code: i32,
+        /// Human-readable error message.
+        message: String,
+    },
+
     /// Persistence deserialization error.
     #[error("persistence error: {0}")]
     Persistence(#[from] toml::de::Error),

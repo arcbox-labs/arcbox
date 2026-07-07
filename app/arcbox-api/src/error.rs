@@ -50,6 +50,15 @@ impl From<ApiError> for tonic::Status {
                 CommonError::PermissionDenied(_) => Self::permission_denied(message),
                 _ => Self::internal(message),
             },
+            // Agent-reported errors carry an HTTP-style code over the wire.
+            ApiError::Core(arcbox_core::CoreError::Agent { code, .. }) => match code {
+                400 => Self::invalid_argument(message),
+                404 => Self::not_found(message),
+                409 => Self::already_exists(message),
+                412 => Self::failed_precondition(message),
+                503 => Self::unavailable(message),
+                _ => Self::internal(message),
+            },
             ApiError::Grpc(_) => Self::unavailable(message),
             _ => Self::internal(message),
         }
