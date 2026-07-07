@@ -4,6 +4,10 @@ use super::*;
 
 impl SandboxManager {
     pub async fn create_sandbox(&self, mut spec: SandboxSpec) -> Result<(SandboxId, String)> {
+        // Do not allocate any per-id resources until the startup orphan sweep
+        // has run — otherwise a re-created same-id sandbox races it.
+        self.await_reconcile().await;
+
         // Apply daemon defaults for fields not supplied by the caller.
         let defaults = &self.config.defaults;
         if spec.kernel.is_empty() {
