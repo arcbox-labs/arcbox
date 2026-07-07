@@ -18,6 +18,8 @@ enum Command {
     Dev(DevArgs),
     /// Repeated e2e test runs with artifact capture.
     E2e(E2eArgs),
+    /// Sample a process's idle CPU% and RSS against the idle targets.
+    Idle(IdleArgs),
     /// macOS host build, signing, and local runtime tasks.
     Macos(MacosArgs),
     /// Release metadata and artifact generation.
@@ -41,6 +43,16 @@ struct E2eArgs {
     /// Artifacts directory (default: target/e2e-artifacts/<unix-time>).
     #[arg(long)]
     artifacts_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct IdleArgs {
+    /// Process ID to sample (e.g. a running arcbox-daemon).
+    #[arg(long)]
+    pid: u32,
+    /// Sampling window in seconds.
+    #[arg(long, default_value_t = 30)]
+    seconds: u64,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -181,6 +193,7 @@ fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Dev(args) => commands::dev::run(args),
         Command::E2e(args) => commands::e2e::run(args),
+        Command::Idle(args) => commands::idle::run(args),
         Command::Macos(args) => commands::macos::run(args),
         Command::Release(args) => commands::release::run(args),
     }
