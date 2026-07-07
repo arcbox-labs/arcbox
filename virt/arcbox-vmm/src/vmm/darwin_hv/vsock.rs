@@ -137,6 +137,7 @@ impl Vmm {
                 self.hv_vcpu_ids
                     .clone()
                     .expect("hv_vcpu_ids asserted Some above"),
+                self.hv_kick_broadcasts.clone(),
             ),
         };
         let handle = std::thread::Builder::new()

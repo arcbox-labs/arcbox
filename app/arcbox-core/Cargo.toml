@@ -47,6 +47,7 @@ statig = "0.4.1"
 ifbridge = { workspace = true }
 
 [dev-dependencies]
+figment = { workspace = true, features = ["test"] }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 

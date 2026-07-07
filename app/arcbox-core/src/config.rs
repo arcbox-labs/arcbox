@@ -190,6 +190,13 @@ pub struct VmDefaults {
     pub memory_mb: u64,
     /// Kernel path (optional, uses embedded kernel if not set).
     pub kernel_path: Option<PathBuf>,
+    /// macOS hypervisor backend for the System VM (`"vz"` or `"hv"`).
+    ///
+    /// First-boot default only: once the machine exists, its persisted
+    /// backend (as switched via `arcbox system backend`) wins. Settable
+    /// non-interactively via `ARCBOX_VM_BACKEND` or `config.toml` — the
+    /// entry point for the dual-backend e2e matrix.
+    pub backend: arcbox_vmm::VmBackend,
 }
 
 impl VmDefaults {
@@ -215,6 +222,7 @@ impl Default for VmDefaults {
             cpus: arcbox_hypervisor::default_vm_cpu_count(),
             memory_mb: arcbox_hypervisor::default_vm_memory_size() / (1024 * 1024),
             kernel_path: None,
+            backend: arcbox_vmm::VmBackend::default(),
         }
     }
 }
@@ -410,6 +418,37 @@ mod tests {
             ..VmDefaults::default()
         };
         assert_eq!(vm.effective_cpus(), 3);
+    }
+
+    #[test]
+    fn vm_backend_defaults_to_vz() {
+        assert_eq!(Config::default().vm.backend, arcbox_vmm::VmBackend::Vz);
+    }
+
+    #[test]
+    fn vm_backend_parses_from_toml() {
+        let config: Config = Figment::new()
+            .merge(Serialized::defaults(Config::default()))
+            .merge(Toml::string("[vm]\nbackend = \"hv\""))
+            .extract()
+            .expect("config with vm.backend");
+        assert_eq!(config.vm.backend, arcbox_vmm::VmBackend::Hv);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err, reason = "figment::Jail closure signature")]
+    fn vm_backend_parses_from_env() {
+        // Mirrors the env layer of `load_for_profile` without reading the
+        // host's real config files.
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("ARCBOX_VM_BACKEND", "hv");
+            let config: Config = Figment::new()
+                .merge(Serialized::defaults(Config::default()))
+                .merge(Env::prefixed("ARCBOX_").split("_"))
+                .extract()?;
+            assert_eq!(config.vm.backend, arcbox_vmm::VmBackend::Hv);
+            Ok(())
+        });
     }
 
     #[test]

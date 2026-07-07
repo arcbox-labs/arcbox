@@ -2022,6 +2022,126 @@ pub struct SetSystemVmBackendRequest {
     #[prost(enumeration = "SystemVmBackend", tag = "1")]
     pub backend: i32,
 }
+/// Diagnostic snapshot of the System VM's virtio devices and vCPUs.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct VirtioDebugInfo {
+    #[prost(message, repeated, tag = "1")]
+    pub devices: ::prost::alloc::vec::Vec<VirtioDeviceDebug>,
+    /// Per-vCPU exit counters (custom-VMM backends; empty under VZ).
+    #[prost(message, repeated, tag = "2")]
+    pub vcpus: ::prost::alloc::vec::Vec<VcpuDebug>,
+    /// Times any component broadcast hv_vcpus_exit to ALL vCPUs.
+    #[prost(uint64, tag = "3")]
+    pub kick_broadcasts: u64,
+    /// Times the IRQ callback unparked ALL vCPU threads on an SPI assertion.
+    #[prost(uint64, tag = "4")]
+    pub unpark_broadcasts: u64,
+}
+/// Cumulative exit counters for one vCPU.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct VcpuDebug {
+    #[prost(uint32, tag = "1")]
+    pub vcpu: u32,
+    /// MMIO read exits.
+    #[prost(uint64, tag = "2")]
+    pub mmio_reads: u64,
+    /// MMIO write exits (includes every virtio QUEUE_NOTIFY doorbell).
+    #[prost(uint64, tag = "3")]
+    pub mmio_writes: u64,
+    /// WFI exits — the guest going idle.
+    #[prost(uint64, tag = "4")]
+    pub wfi: u64,
+    /// HVC exits (PSCI + ArcBox hypercalls).
+    #[prost(uint64, tag = "5")]
+    pub hvc: u64,
+    /// SMC exits.
+    #[prost(uint64, tag = "6")]
+    pub smc: u64,
+    /// Virtual-timer activations.
+    #[prost(uint64, tag = "7")]
+    pub vtimer: u64,
+    /// Times this vCPU was kicked out of hv_vcpu_run by hv_vcpus_exit.
+    #[prost(uint64, tag = "8")]
+    pub kicks_received: u64,
+    /// Trapped system-register accesses (treated RAZ/WI).
+    #[prost(uint64, tag = "9")]
+    pub sysreg: u64,
+    /// Unhandled exception classes and unknown exits.
+    #[prost(uint64, tag = "10")]
+    pub other: u64,
+}
+/// Snapshot of one virtio MMIO device.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct VirtioDeviceDebug {
+    /// Device ID within the VMM's device manager.
+    #[prost(uint32, tag = "1")]
+    pub id: u32,
+    /// Device type, e.g. "VirtioNet".
+    #[prost(string, tag = "2")]
+    pub device_type: ::prost::alloc::string::String,
+    /// Device name.
+    #[prost(string, tag = "3")]
+    pub name: ::prost::alloc::string::String,
+    /// MMIO device status register bits.
+    #[prost(uint32, tag = "4")]
+    pub status: u32,
+    /// Pending interrupt reasons not yet acknowledged by the guest.
+    #[prost(uint32, tag = "5")]
+    pub interrupt_status: u32,
+    /// Whether VIRTIO_F_EVENT_IDX was negotiated.
+    #[prost(bool, tag = "6")]
+    pub event_idx: bool,
+    /// Cumulative interrupts raised by the device.
+    #[prost(uint64, tag = "7")]
+    pub interrupts: u64,
+    /// Configured queues.
+    #[prost(message, repeated, tag = "8")]
+    pub queues: ::prost::alloc::vec::Vec<VirtioQueueDebug>,
+}
+/// Snapshot of one virtqueue. Ring fields are only present when the ring
+/// address was configured and lies inside guest RAM.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct VirtioQueueDebug {
+    /// Queue index within the device.
+    #[prost(uint32, tag = "1")]
+    pub index: u32,
+    /// Ring size negotiated by the driver.
+    #[prost(uint32, tag = "2")]
+    pub size: u32,
+    /// QUEUE_READY state.
+    #[prost(bool, tag = "3")]
+    pub ready: bool,
+    /// Cumulative guest kicks (QUEUE_NOTIFY writes).
+    #[prost(uint64, tag = "4")]
+    pub kicks: u64,
+    /// avail.idx — where the guest has published up to.
+    #[prost(uint32, optional, tag = "5")]
+    pub avail_idx: ::core::option::Option<u32>,
+    /// used.idx — where the device has completed up to. A persistent gap
+    /// behind avail_idx means the queue is wedged.
+    #[prost(uint32, optional, tag = "6")]
+    pub used_idx: ::core::option::Option<u32>,
+    /// avail.flags (bit 0 = VRING_AVAIL_F_NO_INTERRUPT).
+    #[prost(uint32, optional, tag = "7")]
+    pub avail_flags: ::core::option::Option<u32>,
+    /// used.flags (bit 0 = VRING_USED_F_NO_NOTIFY).
+    #[prost(uint32, optional, tag = "8")]
+    pub used_flags: ::core::option::Option<u32>,
+    /// used_event slot (guest → device kick threshold; EVENT_IDX only).
+    #[prost(uint32, optional, tag = "9")]
+    pub used_event: ::core::option::Option<u32>,
+    /// avail_event slot (device → guest interrupt threshold; EVENT_IDX only).
+    #[prost(uint32, optional, tag = "10")]
+    pub avail_event: ::core::option::Option<u32>,
+}
 /// Request to get system info.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

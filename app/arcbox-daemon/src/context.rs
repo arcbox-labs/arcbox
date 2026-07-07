@@ -30,6 +30,10 @@ pub struct EarlyContext {
     pub profile: ArcboxProfile,
     pub layout: HostLayout,
     pub shared_runtime: SharedRuntime,
+    /// Filled as soon as the runtime is constructed, before the VM boots.
+    /// Diagnostics only (`GetVirtioDebug`) — a stuck boot must stay
+    /// observable while `shared_runtime` is still empty.
+    pub early_runtime: SharedRuntime,
     pub setup_state: Arc<SetupState>,
     pub shutdown: CancellationToken,
     pub dns_domain: String,
@@ -51,6 +55,9 @@ pub struct DaemonContext {
     pub daemon_lock: DaemonLock,
     /// Shared with gRPC services. Empty after `acquire_lock`, filled by `init_runtime`.
     pub shared_runtime: SharedRuntime,
+    /// Filled by `init_runtime` right after runtime construction, before
+    /// the VM boots. Diagnostics only (`GetVirtioDebug`).
+    pub early_runtime: SharedRuntime,
     pub setup_state: Arc<SetupState>,
     pub shutdown: CancellationToken,
     pub dns_domain: String,

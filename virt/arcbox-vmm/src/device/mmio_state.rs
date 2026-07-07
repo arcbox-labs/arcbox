@@ -83,6 +83,17 @@ pub mod virtio_mmio {
     pub const MMIO_SIZE: u64 = 0x200;
 }
 
+/// Maximum virtqueues per MMIO device.
+///
+/// Must exceed the largest per-device queue count the VMM configures.
+/// virtio-blk uses one queue per vCPU (`setup.rs` multi-queue), so this
+/// bounds the supported vCPU count. The previous limit of 8 silently
+/// dropped queue configuration for `queue_sel >= 8`: on >8-vCPU VMs the
+/// guest's blk-mq queues 8..N existed guest-side only, and any request
+/// submitted from a CPU mapped to them was never seen by the host —
+/// the cold-boot demand-paging stall (ABX-386).
+pub const MAX_VIRTQUEUES: usize = 64;
+
 /// `VirtIO` MMIO device state.
 pub struct VirtioMmioState {
     /// Device type ID.
@@ -98,15 +109,15 @@ pub struct VirtioMmioState {
     /// Queue selector.
     pub queue_sel: u32,
     /// Queue sizes.
-    pub queue_num: [u16; 8],
+    pub queue_num: [u16; MAX_VIRTQUEUES],
     /// Queue ready flags.
-    pub queue_ready: [bool; 8],
+    pub queue_ready: [bool; MAX_VIRTQUEUES],
     /// Queue descriptor addresses.
-    pub queue_desc: [u64; 8],
+    pub queue_desc: [u64; MAX_VIRTQUEUES],
     /// Queue driver addresses.
-    pub queue_driver: [u64; 8],
+    pub queue_driver: [u64; MAX_VIRTQUEUES],
     /// Queue device addresses.
-    pub queue_device: [u64; 8],
+    pub queue_device: [u64; MAX_VIRTQUEUES],
     /// Device status.
     pub status: u8,
     /// Interrupt status.
@@ -117,6 +128,12 @@ pub struct VirtioMmioState {
     pub shm_sel: u32,
     /// SHM regions: (base_ipa, length). Index = region ID.
     pub shm_regions: Vec<(u64, u64)>,
+    /// Cumulative guest kicks (`QUEUE_NOTIFY` writes) per queue.
+    /// Diagnostic only — never reset, so a post-mortem after a device
+    /// reset keeps the full history.
+    pub kicks: [u64; MAX_VIRTQUEUES],
+    /// Cumulative interrupts raised via [`Self::trigger_interrupt`].
+    pub interrupts: u64,
 }
 
 impl VirtioMmioState {
@@ -130,16 +147,18 @@ impl VirtioMmioState {
             device_features_sel: 0,
             driver_features_sel: 0,
             queue_sel: 0,
-            queue_num: [0; 8],
-            queue_ready: [false; 8],
-            queue_desc: [0; 8],
-            queue_driver: [0; 8],
-            queue_device: [0; 8],
+            queue_num: [0; MAX_VIRTQUEUES],
+            queue_ready: [false; MAX_VIRTQUEUES],
+            queue_desc: [0; MAX_VIRTQUEUES],
+            queue_driver: [0; MAX_VIRTQUEUES],
+            queue_device: [0; MAX_VIRTQUEUES],
             status: 0,
             interrupt_status: 0,
             config_generation: 0,
             shm_sel: 0,
             shm_regions: Vec::new(),
+            kicks: [0; MAX_VIRTQUEUES],
+            interrupts: 0,
         }
     }
 
@@ -160,9 +179,19 @@ impl VirtioMmioState {
                     (self.device_features >> 32) as u32
                 }
             }
-            regs::QUEUE_NUM_MAX => 1024, // Max queue size (increased from 256 for throughput)
+            regs::QUEUE_NUM_MAX => {
+                // Max queue size (increased from 256 for throughput).
+                // 0 = "queue not available" per virtio-mmio 1.1 — reported
+                // for selectors beyond our register file so a guest can
+                // never configure a queue the host cannot track.
+                if (self.queue_sel as usize) < MAX_VIRTQUEUES {
+                    1024
+                } else {
+                    0
+                }
+            }
             regs::QUEUE_READY => {
-                if (self.queue_sel as usize) < 8 {
+                if (self.queue_sel as usize) < MAX_VIRTQUEUES {
                     u32::from(self.queue_ready[self.queue_sel as usize])
                 } else {
                     0
@@ -223,17 +252,22 @@ impl VirtioMmioState {
             regs::QUEUE_SEL => self.queue_sel = value,
             0x0ac => self.shm_sel = value, // SHMSel write
             regs::QUEUE_NUM => {
-                if (self.queue_sel as usize) < 8 {
+                if (self.queue_sel as usize) < MAX_VIRTQUEUES {
                     self.queue_num[self.queue_sel as usize] = value as u16;
                 }
             }
             regs::QUEUE_READY => {
-                if (self.queue_sel as usize) < 8 {
+                if (self.queue_sel as usize) < MAX_VIRTQUEUES {
                     self.queue_ready[self.queue_sel as usize] = value != 0;
                 }
             }
             regs::QUEUE_NOTIFY => {
-                // Guest is notifying us about available buffers
+                // Guest is notifying us about available buffers. Dispatch
+                // happens in DeviceManager::handle_mmio_write; here we only
+                // account the kick.
+                if (value as usize) < MAX_VIRTQUEUES {
+                    self.kicks[value as usize] += 1;
+                }
                 tracing::trace!("VirtIO queue {} notified", value);
             }
             regs::INTERRUPT_ACK => {
@@ -245,48 +279,48 @@ impl VirtioMmioState {
                     // Device reset
                     self.driver_features = 0;
                     self.queue_sel = 0;
-                    self.queue_num = [0; 8];
-                    self.queue_ready = [false; 8];
+                    self.queue_num = [0; MAX_VIRTQUEUES];
+                    self.queue_ready = [false; MAX_VIRTQUEUES];
                     self.interrupt_status = 0;
                 }
             }
             regs::QUEUE_DESC_LOW => {
-                if (self.queue_sel as usize) < 8 {
+                if (self.queue_sel as usize) < MAX_VIRTQUEUES {
                     self.queue_desc[self.queue_sel as usize] =
                         (self.queue_desc[self.queue_sel as usize] & 0xFFFF_FFFF_0000_0000)
                             | u64::from(value);
                 }
             }
             regs::QUEUE_DESC_HIGH => {
-                if (self.queue_sel as usize) < 8 {
+                if (self.queue_sel as usize) < MAX_VIRTQUEUES {
                     self.queue_desc[self.queue_sel as usize] =
                         (self.queue_desc[self.queue_sel as usize] & 0x0000_0000_FFFF_FFFF)
                             | (u64::from(value) << 32);
                 }
             }
             regs::QUEUE_DRIVER_LOW => {
-                if (self.queue_sel as usize) < 8 {
+                if (self.queue_sel as usize) < MAX_VIRTQUEUES {
                     self.queue_driver[self.queue_sel as usize] =
                         (self.queue_driver[self.queue_sel as usize] & 0xFFFF_FFFF_0000_0000)
                             | u64::from(value);
                 }
             }
             regs::QUEUE_DRIVER_HIGH => {
-                if (self.queue_sel as usize) < 8 {
+                if (self.queue_sel as usize) < MAX_VIRTQUEUES {
                     self.queue_driver[self.queue_sel as usize] =
                         (self.queue_driver[self.queue_sel as usize] & 0x0000_0000_FFFF_FFFF)
                             | (u64::from(value) << 32);
                 }
             }
             regs::QUEUE_DEVICE_LOW => {
-                if (self.queue_sel as usize) < 8 {
+                if (self.queue_sel as usize) < MAX_VIRTQUEUES {
                     self.queue_device[self.queue_sel as usize] =
                         (self.queue_device[self.queue_sel as usize] & 0xFFFF_FFFF_0000_0000)
                             | u64::from(value);
                 }
             }
             regs::QUEUE_DEVICE_HIGH => {
-                if (self.queue_sel as usize) < 8 {
+                if (self.queue_sel as usize) < MAX_VIRTQUEUES {
                     self.queue_device[self.queue_sel as usize] =
                         (self.queue_device[self.queue_sel as usize] & 0x0000_0000_FFFF_FFFF)
                             | (u64::from(value) << 32);
@@ -301,6 +335,7 @@ impl VirtioMmioState {
     /// Triggers an interrupt.
     pub const fn trigger_interrupt(&mut self, reason: u32) {
         self.interrupt_status |= reason;
+        self.interrupts += 1;
     }
 }
 

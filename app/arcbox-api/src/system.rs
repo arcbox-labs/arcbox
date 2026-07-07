@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use arcbox_grpc::SystemService;
 use arcbox_protocol::v1::{
-    Empty, SetSystemVmBackendRequest, SetupStatus, SystemVmBackend, SystemVmBackendInfo,
-    setup_status,
+    Empty, SetSystemVmBackendRequest, SetupStatus, SystemVmBackend, SystemVmBackendInfo, VcpuDebug,
+    VirtioDebugInfo, VirtioDeviceDebug, VirtioQueueDebug, setup_status,
 };
 use tokio::sync::watch;
 use tokio_stream::Stream;
@@ -106,14 +106,23 @@ impl Default for SetupState {
 pub struct SystemServiceImpl {
     setup_state: Arc<SetupState>,
     runtime: SharedRuntime,
+    /// Diagnostics handle, filled as soon as the runtime is constructed
+    /// (before the VM boots) so `GetVirtioDebug` can observe a stuck
+    /// boot while `runtime` is still empty.
+    early_runtime: SharedRuntime,
 }
 
 impl SystemServiceImpl {
     /// Creates a new system service.
-    pub fn new(setup_state: Arc<SetupState>, runtime: SharedRuntime) -> Self {
+    pub fn new(
+        setup_state: Arc<SetupState>,
+        runtime: SharedRuntime,
+        early_runtime: SharedRuntime,
+    ) -> Self {
         Self {
             setup_state,
             runtime,
+            early_runtime,
         }
     }
 }
@@ -132,6 +141,36 @@ fn backend_to_proto(backend: arcbox_core::VmBackend) -> SystemVmBackend {
     match backend {
         arcbox_core::VmBackend::Hv => SystemVmBackend::Hv,
         arcbox_core::VmBackend::Vz => SystemVmBackend::Vz,
+    }
+}
+
+/// Maps a core virtio device snapshot to the wire message. (A `From`
+/// impl is impossible here — both types are foreign to this crate.)
+fn device_debug_to_proto(device: arcbox_core::DeviceDebug) -> VirtioDeviceDebug {
+    VirtioDeviceDebug {
+        id: device.id,
+        device_type: device.device_type,
+        name: device.name,
+        status: u32::from(device.status),
+        interrupt_status: device.interrupt_status,
+        event_idx: device.event_idx,
+        interrupts: device.interrupts,
+        queues: device
+            .queues
+            .into_iter()
+            .map(|queue| VirtioQueueDebug {
+                index: u32::from(queue.index),
+                size: u32::from(queue.size),
+                ready: queue.ready,
+                kicks: queue.kicks,
+                avail_idx: queue.avail_idx.map(u32::from),
+                used_idx: queue.used_idx.map(u32::from),
+                avail_flags: queue.avail_flags.map(u32::from),
+                used_flags: queue.used_flags.map(u32::from),
+                used_event: queue.used_event.map(u32::from),
+                avail_event: queue.avail_event.map(u32::from),
+            })
+            .collect(),
     }
 }
 
@@ -221,6 +260,43 @@ impl SystemService for SystemServiceImpl {
         let runtime = self.runtime.ready()?;
         Ok(Response::new(SystemVmBackendInfo {
             backend: backend_to_proto(runtime.system_vm_backend()) as i32,
+        }))
+    }
+
+    async fn get_virtio_debug(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<VirtioDebugInfo>, Status> {
+        // The early handle exists as soon as the runtime is constructed —
+        // a boot that never reaches READY is this RPC's main use case.
+        let runtime = self.early_runtime.ready()?;
+        let snapshot = runtime
+            .system_vm_debug_snapshot()
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        Ok(Response::new(VirtioDebugInfo {
+            devices: snapshot
+                .devices
+                .into_iter()
+                .map(device_debug_to_proto)
+                .collect(),
+            vcpus: snapshot
+                .vcpus
+                .into_iter()
+                .map(|v| VcpuDebug {
+                    vcpu: v.vcpu,
+                    mmio_reads: v.mmio_reads,
+                    mmio_writes: v.mmio_writes,
+                    wfi: v.wfi,
+                    hvc: v.hvc,
+                    smc: v.smc,
+                    vtimer: v.vtimer,
+                    kicks_received: v.kicks_received,
+                    sysreg: v.sysreg,
+                    other: v.other,
+                })
+                .collect(),
+            kick_broadcasts: snapshot.kick_broadcasts,
+            unpark_broadcasts: snapshot.unpark_broadcasts,
         }))
     }
 

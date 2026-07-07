@@ -105,6 +105,7 @@ impl Runtime {
         // point (daemon, machine, diagnose, API server) uses the same values.
         vm_lifecycle_config.default_vm.cpus = config.vm.effective_cpus();
         vm_lifecycle_config.default_vm.memory_mb = config.vm.memory_mb;
+        vm_lifecycle_config.backend = config.vm.backend;
         if let Some(ref kernel) = config.vm.kernel_path {
             vm_lifecycle_config.default_vm.kernel = Some(kernel.clone());
         }
@@ -255,6 +256,19 @@ impl Runtime {
     /// unhealthy.
     pub async fn ensure_system_vm_ready(&self) -> Result<u32> {
         self.container_backend.ensure_ready().await
+    }
+
+    /// Captures a debug snapshot (virtio queues + vCPU exit counters)
+    /// of the System VM.
+    ///
+    /// Custom-VMM backends only — empty under VZ (see
+    /// [`arcbox_vmm::Vmm::debug_snapshot`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the System VM's VMM has not been created.
+    pub fn system_vm_debug_snapshot(&self) -> Result<arcbox_vmm::VmDebugSnapshot> {
+        self.machine_manager.debug_snapshot(DEFAULT_MACHINE_NAME)
     }
 
     /// Returns the System VM's current hypervisor backend.

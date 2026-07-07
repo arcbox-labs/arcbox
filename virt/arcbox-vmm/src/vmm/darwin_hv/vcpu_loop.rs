@@ -64,6 +64,9 @@ pub(super) struct VcpuContext {
     pub hv_vcpu_ids: HvVcpuIds,
     /// Per-block-device file descriptors and sector sizes for HVC fast path.
     pub hvc_blk_fds: Arc<Vec<(i32, u32, u64)>>,
+    /// This vCPU's exit counters (diagnostics; written Relaxed by this
+    /// thread only).
+    pub stats: Arc<crate::vcpu_stats::VcpuStats>,
 }
 
 /// Reads the value of an MMIO write source register, handling the ARM64
@@ -109,6 +112,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
         vcpu_thread_handles,
         hv_vcpu_ids,
         hvc_blk_fds,
+        stats,
     } = ctx;
 
     let vcpu = match HvVcpu::new() {
@@ -236,6 +240,11 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                 class: ExceptionClass::DataAbort(ref mmio),
                 ..
             } => {
+                crate::vcpu_stats::VcpuStats::bump(if mmio.is_write {
+                    &stats.mmio_writes
+                } else {
+                    &stats.mmio_reads
+                });
                 // Check PL011 UART region first, then fall through to DeviceManager.
                 let handled_by_pl011 = {
                     let uart_match = {
@@ -329,6 +338,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                 class: ExceptionClass::WaitForInterrupt,
                 ..
             } => {
+                crate::vcpu_stats::VcpuStats::bump(&stats.wfi);
                 // Guest executed WFI — it is idle and waiting for an interrupt.
                 // Before parking, poll the bridge for incoming data. vsock and
                 // net injection are handled by their dedicated worker threads.
@@ -356,6 +366,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                 class: ExceptionClass::HypercallHvc(_imm),
                 ..
             } => {
+                crate::vcpu_stats::VcpuStats::bump(&stats.hvc);
                 let func_id = match vcpu.get_reg(reg::X0) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -394,6 +405,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                 class: ExceptionClass::SmcCall(_),
                 ..
             } => {
+                crate::vcpu_stats::VcpuStats::bump(&stats.smc);
                 // Some guests route PSCI through SMC instead of HVC.
                 let func_id = match vcpu.get_reg(reg::X0) {
                     Ok(v) => v,
@@ -406,11 +418,13 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
             }
 
             VcpuExit::VtimerActivated => {
+                crate::vcpu_stats::VcpuStats::bump(&stats.vtimer);
                 // Virtual timer fired. Unmask it so the guest sees the interrupt.
                 let _ = vcpu.set_vtimer_mask(false);
             }
 
             VcpuExit::Canceled => {
+                crate::vcpu_stats::VcpuStats::bump(&stats.kicks_received);
                 if running.load(Ordering::Relaxed) {
                     // Woken by net-io thread for interrupt delivery.
                     continue;
@@ -432,6 +446,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                     },
                 ..
             } => {
+                crate::vcpu_stats::VcpuStats::bump(&stats.sysreg);
                 // Apple's framework forwards unknown sysreg accesses as
                 // EC=0x18 without auto-advancing ELR_EL2. If we re-enter
                 // guest execution with PC unchanged, the same MSR/MRS
@@ -464,10 +479,12 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
             VcpuExit::Exception {
                 class: ref other, ..
             } => {
+                crate::vcpu_stats::VcpuStats::bump(&stats.other);
                 tracing::warn!("vCPU {vcpu_id}: unhandled exception: {other:?}");
             }
 
             VcpuExit::Unknown(reason) => {
+                crate::vcpu_stats::VcpuStats::bump(&stats.other);
                 tracing::warn!("vCPU {vcpu_id}: unknown exit reason {reason}");
             }
         }

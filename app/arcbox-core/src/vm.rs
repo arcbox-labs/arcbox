@@ -937,6 +937,31 @@ impl VmManager {
         Ok(vmm.get_balloon_stats())
     }
 
+    /// Captures a debug snapshot (virtio queue state + vCPU exit
+    /// counters) from a VM.
+    ///
+    /// Custom-VMM backends only — empty under VZ (see
+    /// [`arcbox_vmm::Vmm::debug_snapshot`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the VM is not found or its VMM has not been
+    /// created.
+    pub fn debug_snapshot(&self, id: &VmId) -> Result<arcbox_vmm::VmDebugSnapshot> {
+        let vms = self.vms.read().map_err(|_| CoreError::LockPoisoned)?;
+
+        let entry = vms
+            .get(id)
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+
+        let vmm = entry
+            .vmm
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("VMM not initialized"))?;
+
+        Ok(vmm.debug_snapshot())
+    }
+
     /// Takes the inbound listener manager from a running VM (Darwin only).
     ///
     /// The manager is created during VM start when the network device is set up.

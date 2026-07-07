@@ -145,12 +145,51 @@ impl LifecycleShared {
 
         self.start_with_retries(timeout).await?;
         self.wait_for_agent(timeout).await?;
+        self.sync_guest_clock().await;
 
         // Reset recovery counters on a fully successful boot.
         self.recovery.reset();
         self.health_monitor.reset();
 
         Ok(())
+    }
+
+    /// Pushes the host wall clock into the guest right after readiness.
+    ///
+    /// The ping request carries `timestamp_secs`, which the agent applies
+    /// via `clock_settime`. VZ guests read wall time from the platform
+    /// RTC, but the HV backend exposes no RTC device — without this push
+    /// the guest clock stays at the kernel default epoch and every TLS
+    /// handshake fails certificate validity checks. Best effort: a failed
+    /// sync only warns (readiness already proved the agent reachable, and
+    /// the guest can also be synced by any later ping).
+    async fn sync_guest_clock(&self) {
+        let machine_manager = self.machine_manager.clone();
+        let machine_name = self.machine_name.clone();
+        // `connect_agent` yields a blocking transport on the HV AF_UNIX
+        // socketpair and an async one on AF_VSOCK (VZ) / Linux; ping over
+        // whichever the client actually has.
+        let connected =
+            tokio::task::spawn_blocking(move || machine_manager.connect_agent(&machine_name)).await;
+        let result = match connected {
+            Ok(Ok(mut agent)) => {
+                if agent.is_blocking() {
+                    tokio::task::spawn_blocking(move || agent.ping_blocking().map(|_| ()))
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(CoreError::Vm(format!("clock sync task panicked: {e}")))
+                        })
+                } else {
+                    agent.ping().await.map(|_| ())
+                }
+            }
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(CoreError::Vm(format!("clock sync task panicked: {e}"))),
+        };
+        match result {
+            Ok(()) => tracing::info!("guest wall clock synced from host"),
+            Err(e) => tracing::warn!(error = %e, "guest clock sync ping failed"),
+        }
     }
 
     /// Starts the machine, retrying per the recovery policy within `timeout`,

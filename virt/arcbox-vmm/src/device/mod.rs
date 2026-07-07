@@ -18,6 +18,7 @@ use crate::irq::{Irq, IrqChip};
 use crate::memory::MemoryManager;
 
 mod checksum;
+mod debug;
 mod dispatch;
 mod mmio_state;
 pub(crate) mod net_worker;
@@ -28,7 +29,8 @@ mod tree;
 mod tests;
 
 use checksum::finalize_virtio_net_checksum;
-pub use mmio_state::{MmioDevice, VirtioMmioState, virtio_mmio};
+pub use debug::{DeviceDebug, QueueDebug};
+pub use mmio_state::{MAX_VIRTQUEUES, MmioDevice, VirtioMmioState, virtio_mmio};
 pub use tree::DeviceTreeEntry;
 
 /// Device identifier.

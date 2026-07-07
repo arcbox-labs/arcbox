@@ -19,6 +19,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use arcbox_constants::paths::ArcboxProfile;
 use arcbox_grpc::v1::system_service_client::SystemServiceClient;
 use arcbox_protocol::v1::{Empty, setup_status};
 use hyper_util::rt::TokioIo;
@@ -61,6 +62,7 @@ impl DaemonHandle {
     /// `--data-dir` and `--foreground`, capturing stdout/stderr to
     /// `harness-daemon.log` inside the data directory.
     pub fn spawn(config: DaemonConfig) -> Result<Self> {
+        assert_isolated(&config.data_dir)?;
         ensure_signed(&config.binary)?;
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("creating {}", config.data_dir.display()))?;
@@ -190,6 +192,27 @@ impl DaemonHandle {
         self.terminate()
     }
 
+    /// Fetches the daemon's virtio queue debug snapshot and writes it to
+    /// `virtio-debug.json` under the data dir. Meant for failure paths:
+    /// one structured record per device (kicks, interrupts, live ring
+    /// indices) instead of log archaeology. Empty device list under VZ.
+    pub fn dump_virtio_debug(&self) -> Result<PathBuf> {
+        let socket = self.grpc_socket();
+        let info = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("building tokio runtime for virtio debug dump")?
+            .block_on(async {
+                let channel = connect_unix(&socket).await?;
+                let mut client = SystemServiceClient::new(channel);
+                anyhow::Ok(client.get_virtio_debug(Empty {}).await?.into_inner())
+            })?;
+        let path = self.data_dir.join("virtio-debug.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&info)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(path)
+    }
+
     /// Errors with the exit status and log tail if the daemon has exited.
     fn check_alive(&mut self) -> Result<()> {
         if let Some(status) = self.child.try_wait().context("polling daemon")? {
@@ -239,6 +262,42 @@ impl Drop for DaemonHandle {
     }
 }
 
+/// Rejects a data dir that is (or lives inside) a real profile root
+/// (`~/.arcbox`, `~/.arcbox-dev`).
+///
+/// A daemon under test pointed there would contend with the developer's
+/// own daemon for the flock, sockets, and machine state. Every harness
+/// daemon gets its own throwaway data dir — one data dir per daemon is
+/// what makes parallel fixes independent (see tests/e2e/README.md).
+fn assert_isolated(data_dir: &Path) -> Result<()> {
+    // Resolve symlinks where possible so `~/.arcbox` aliases are caught
+    // too; fall back to the literal path when it does not exist yet.
+    let resolved = data_dir.canonicalize().unwrap_or_else(|_| {
+        data_dir
+            .parent()
+            .and_then(|p| p.canonicalize().ok())
+            .and_then(|p| data_dir.file_name().map(|n| p.join(n)))
+            .unwrap_or_else(|| data_dir.to_path_buf())
+    });
+    for profile in [ArcboxProfile::Production, ArcboxProfile::Development] {
+        let root = profile.default_data_dir();
+        // A profile root that is itself a symlink (e.g. ~/.arcbox →
+        // another volume) must match by its canonical form too, or a
+        // data dir given via the symlink target would slip through.
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if resolved.starts_with(&root) || resolved.starts_with(&canonical_root) {
+            bail!(
+                "refusing to run a daemon under test in {} — it is inside the default \
+                 {profile} data dir {} and would clobber a real daemon's state; \
+                 use an isolated per-test data dir (e.g. a tempdir)",
+                data_dir.display(),
+                root.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Connects a tonic channel over a Unix domain socket.
 async fn connect_unix(socket: &Path) -> Result<Channel> {
     // The URI is required by the HTTP/2 layer but unused: the connector
@@ -272,5 +331,27 @@ impl Service<Uri> for UnixConnector {
             let stream = UnixStream::connect(socket_path).await?;
             Ok(TokioIo::new(stream))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_profile_roots_are_rejected() {
+        for profile in [ArcboxProfile::Production, ArcboxProfile::Development] {
+            let root = profile.default_data_dir();
+            assert!(assert_isolated(&root).is_err(), "{}", root.display());
+            assert!(assert_isolated(&root.join("nested/dir")).is_err());
+        }
+    }
+
+    #[test]
+    fn tempdirs_are_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_isolated(dir.path()).expect("tempdir must be accepted");
+        // Not-yet-created children are fine too — spawn creates them.
+        assert_isolated(&dir.path().join("does-not-exist-yet")).expect("child of tempdir");
     }
 }

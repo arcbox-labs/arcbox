@@ -154,7 +154,10 @@ fn fdt_err(e: vm_fdt::Error) -> VmmError {
 /// a silent no-op. The registry is snapshotted on each invocation so
 /// late-arriving secondaries (PSCI CPU_ON) are picked up. Safe to call from
 /// any thread. See ABX-367.
-fn make_exit_vcpus_fn(ids: HvVcpuIds) -> Arc<dyn Fn() + Send + Sync> {
+fn make_exit_vcpus_fn(
+    ids: HvVcpuIds,
+    broadcasts: Arc<std::sync::atomic::AtomicU64>,
+) -> Arc<dyn Fn() + Send + Sync> {
     Arc::new(move || {
         let ids_snapshot: Vec<u64> = ids
             .lock()
@@ -163,6 +166,7 @@ fn make_exit_vcpus_fn(ids: HvVcpuIds) -> Arc<dyn Fn() + Send + Sync> {
         if ids_snapshot.is_empty() {
             return;
         }
+        broadcasts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: `ids_snapshot` is a live Vec owned by this closure for
         // the duration of the FFI call; the pointer and length are
         // consistent.

@@ -13,6 +13,7 @@ use toml_edit::DocumentMut;
 use tracing::{info, warn};
 
 use crate::daemon::{DaemonConfig, DaemonHandle};
+use crate::metrics::RunMetrics;
 use crate::{env_flag, repo_root};
 
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -21,14 +22,29 @@ const DOCKER_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub struct BootAssetsConfig {
-    skip_build: bool,
-    keep_test_dir: bool,
-    version: Option<String>,
-    guest_docker_vsock_port: u32,
+    pub skip_build: bool,
+    pub keep_test_dir: bool,
+    pub version: Option<String>,
+    pub guest_docker_vsock_port: u32,
+    /// System VM backend for the daemon under test. `None` leaves the
+    /// daemon's own default (VZ) in effect.
+    pub backend: Option<arcbox_vmm::VmBackend>,
+    /// Container image the lifecycle tests pull and run. Override via
+    /// `ARCBOX_E2E_IMAGE` (e.g. a mirror ref) on networks where
+    /// docker.io is unreachable from the guest.
+    pub image: String,
 }
 
 impl BootAssetsConfig {
     pub fn from_env() -> Result<Self> {
+        let backend = match env::var("ARCBOX_VM_BACKEND") {
+            Ok(value) => Some(
+                arcbox_vmm::VmBackend::from_str_ascii(&value)
+                    .with_context(|| format!("invalid ARCBOX_VM_BACKEND '{value}'"))?,
+            ),
+            Err(env::VarError::NotPresent) => None,
+            Err(error) => return Err(error).context("reading ARCBOX_VM_BACKEND"),
+        };
         Ok(Self {
             skip_build: env_flag("SKIP_BUILD"),
             keep_test_dir: env_flag("KEEP_TEST_DIR"),
@@ -40,6 +56,8 @@ impl BootAssetsConfig {
                 Err(env::VarError::NotPresent) => 2375,
                 Err(error) => return Err(error).context("reading ARCBOX_GUEST_DOCKER_VSOCK_PORT"),
             },
+            backend,
+            image: env::var("ARCBOX_E2E_IMAGE").unwrap_or_else(|_| "alpine:latest".to_owned()),
         })
     }
 }
@@ -51,6 +69,8 @@ struct TestContext {
     version: String,
     label: String,
     guest_docker_vsock_port: u32,
+    backend: Option<arcbox_vmm::VmBackend>,
+    image: String,
     keep_test_dir: bool,
     daemon: Option<DaemonHandle>,
 }
@@ -76,6 +96,8 @@ impl TestContext {
             version,
             label,
             guest_docker_vsock_port: config.guest_docker_vsock_port,
+            backend: config.backend,
+            image: config.image,
             keep_test_dir: config.keep_test_dir,
             daemon: None,
         })
@@ -153,43 +175,78 @@ impl Drop for TestContext {
     }
 }
 
+/// Builds the release binaries the daemon-level scenarios spawn.
+pub fn build_release_binaries() -> Result<()> {
+    info!("building latest release binaries");
+    let shell = xshell::Shell::new()?;
+    shell.change_dir(repo_root());
+    xshell::cmd!(
+        shell,
+        "cargo build --release -p arcbox-cli -p arcbox-daemon"
+    )
+    .run()?;
+    Ok(())
+}
+
 pub fn run(config: BootAssetsConfig) -> Result<()> {
-    info!("starting boot assets integration test");
+    info!(backend = ?config.backend, "starting boot assets integration test");
 
     if !config.skip_build {
-        info!("building latest release binaries");
-        let shell = xshell::Shell::new()?;
-        shell.change_dir(repo_root());
-        xshell::cmd!(
-            shell,
-            "cargo build --release -p arcbox-cli -p arcbox-daemon"
-        )
-        .run()?;
+        build_release_binaries()?;
     }
 
+    let backend_label = config.backend.map(arcbox_vmm::VmBackend::as_str);
+    let mut metrics = RunMetrics::new("boot_assets", backend_label);
     let mut ctx = TestContext::new(config)?;
-    let result = run_scenario(&mut ctx);
+    let result = run_scenario(&mut ctx, &mut metrics);
+    metrics.passed = result.is_ok();
+    match metrics.write(Some(&ctx.test_dir)) {
+        Ok(paths) => {
+            for path in paths {
+                info!(path = %path.display(), "run metrics written");
+            }
+        }
+        Err(error) => warn!("writing run metrics failed: {error:#}"),
+    }
     if result.is_err() {
         // Preserve the workspace (daemon + guest logs, disk images) so the
         // failure can be inspected; the path is logged by TestContext::drop.
         ctx.keep_test_dir = true;
+        // Best-effort virtio queue snapshot while the daemon still runs —
+        // ring wedges are invisible once the VM is gone.
+        if let Some(daemon) = &ctx.daemon {
+            match daemon.dump_virtio_debug() {
+                Ok(path) => info!(path = %path.display(), "virtio debug snapshot captured"),
+                Err(error) => warn!("virtio debug dump failed: {error:#}"),
+            }
+        }
     }
     result
 }
 
-fn run_scenario(ctx: &mut TestContext) -> Result<()> {
+fn run_scenario(ctx: &mut TestContext, metrics: &mut RunMetrics) -> Result<()> {
     check_prerequisites(ctx)?;
     setup_test_env(ctx)?;
-    start_daemon(ctx)?;
+    metrics.time("daemon_ready", || start_daemon(ctx))?;
 
-    pull_alpine(ctx)?;
-    smoke_container_create(ctx)?;
+    metrics.time("image_pull", || pull_image(ctx))?;
+    metrics.time("container_create_smoke", || smoke_container_create(ctx))?;
 
-    test_container_run(ctx).context("container run lifecycle test")?;
-    test_background_container(ctx).context("background container lifecycle test")?;
-    test_docker_logs(ctx).context("docker logs lifecycle test")?;
-    test_docker_exec(ctx).context("docker exec lifecycle test")?;
-    test_stop_rm(ctx).context("docker stop/rm lifecycle test")?;
+    metrics.time("container_run", || {
+        test_container_run(ctx).context("container run lifecycle test")
+    })?;
+    metrics.time("background_container", || {
+        test_background_container(ctx).context("background container lifecycle test")
+    })?;
+    metrics.time("docker_logs", || {
+        test_docker_logs(ctx).context("docker logs lifecycle test")
+    })?;
+    metrics.time("docker_exec", || {
+        test_docker_exec(ctx).context("docker exec lifecycle test")
+    })?;
+    metrics.time("docker_stop_rm", || {
+        test_stop_rm(ctx).context("docker stop/rm lifecycle test")
+    })?;
 
     info!(daemon_log = %ctx.test_dir.join("log/daemon.log").display(), "boot assets integration test passed");
     Ok(())
@@ -217,11 +274,78 @@ fn check_prerequisites(ctx: &TestContext) -> Result<()> {
     Ok(())
 }
 
-fn prepare_dev_boot_assets(ctx: &TestContext) -> Result<()> {
-    let shell = xshell::Shell::new()?;
-    shell.change_dir(&ctx.root);
-    let version = &ctx.version;
-    xshell::cmd!(shell, "cargo xtask dev boot-assets --version {version}").run()?;
+/// Resolves the boot asset version for a test run: the
+/// `ARCBOX_BOOT_ASSET_VERSION` override, or `assets.lock`.
+pub fn resolve_boot_version(root: &Path) -> Result<String> {
+    match env::var("ARCBOX_BOOT_ASSET_VERSION") {
+        Ok(version) => Ok(version),
+        Err(_) => boot_version(&root.join("assets.lock")),
+    }
+}
+
+/// Stages the development boot assets under `<data_dir>/boot/<version>`.
+///
+/// A daemon pointed at `data_dir` then boots without downloading.
+/// Refreshes `boot-assets/dev` via xtask if incomplete.
+pub fn stage_dev_boot_assets(root: &Path, data_dir: &Path, version: &str) -> Result<()> {
+    let test_boot_dir = data_dir.join("boot").join(version);
+    fs::create_dir_all(&test_boot_dir)
+        .with_context(|| format!("creating {}", test_boot_dir.display()))?;
+
+    let dev_boot_dir = root.join("boot-assets/dev");
+    if !dev_boot_dir.join("kernel").is_file()
+        || !dev_boot_dir.join("rootfs.erofs").is_file()
+        || !dev_boot_dir.join("manifest.json").is_file()
+    {
+        warn!("development boot assets incomplete; refreshing");
+        let shell = xshell::Shell::new()?;
+        shell.change_dir(root);
+        xshell::cmd!(shell, "cargo xtask dev boot-assets --version {version}").run()?;
+    }
+
+    copy_file(&dev_boot_dir.join("kernel"), &test_boot_dir.join("kernel"))?;
+    copy_file(
+        &dev_boot_dir.join("rootfs.erofs"),
+        &test_boot_dir.join("rootfs.erofs"),
+    )?;
+    copy_file(
+        &dev_boot_dir.join("manifest.json"),
+        &test_boot_dir.join("manifest.json"),
+    )?;
+
+    // The daemon installs `boot/<version>/arcbox-agent` into `bin/` at
+    // startup (its boot-cache fallback; the bundle path doesn't apply to
+    // a bare test daemon, and the CDN ships no standalone agent). Stage
+    // the freshest agent found locally: the dev tree, a local
+    // cross-compile, or the one an installed ArcBox app seeded — newest
+    // mtime wins, since a stale agent fails the boot in confusing ways.
+    let agent_candidates = [
+        dev_boot_dir.join("arcbox-agent"),
+        root.join("target/aarch64-unknown-linux-musl/release/arcbox-agent"),
+        arcbox_constants::paths::ArcboxProfile::Production
+            .default_data_dir()
+            .join("bin/arcbox-agent"),
+    ];
+    let freshest_agent = agent_candidates
+        .iter()
+        .filter_map(|path| {
+            let mtime = fs::metadata(path).ok()?.modified().ok()?;
+            Some((path, mtime))
+        })
+        .max_by_key(|(_, mtime)| *mtime)
+        .map(|(path, _)| path);
+    match freshest_agent {
+        Some(agent) => {
+            copy_file(agent, &test_boot_dir.join("arcbox-agent"))?;
+            info!(agent = %agent.display(), "staged guest agent");
+        }
+        None => warn!(
+            "no arcbox-agent found (looked in boot-assets/dev, musl target, ~/.arcbox/bin); \
+             the daemon will fail at runtime init"
+        ),
+    }
+
+    info!(dev_boot_dir = %dev_boot_dir.display(), "using development boot assets");
     Ok(())
 }
 
@@ -237,36 +361,19 @@ fn copy_file(from: &Path, to: &Path) -> Result<()> {
 
 fn setup_test_env(ctx: &TestContext) -> Result<()> {
     info!(test_dir = %ctx.test_dir.display(), "setting up test environment");
-    let test_boot_dir = ctx.test_dir.join("boot").join(&ctx.version);
-    fs::create_dir_all(&test_boot_dir)
-        .with_context(|| format!("creating {}", test_boot_dir.display()))?;
-
-    let dev_boot_dir = ctx.root.join("boot-assets/dev");
-    if !dev_boot_dir.join("kernel").is_file()
-        || !dev_boot_dir.join("rootfs.erofs").is_file()
-        || !dev_boot_dir.join("manifest.json").is_file()
-    {
-        warn!("development boot assets incomplete; refreshing");
-        prepare_dev_boot_assets(ctx)?;
-    }
-
-    copy_file(&dev_boot_dir.join("kernel"), &test_boot_dir.join("kernel"))?;
-    copy_file(
-        &dev_boot_dir.join("rootfs.erofs"),
-        &test_boot_dir.join("rootfs.erofs"),
-    )?;
-    copy_file(
-        &dev_boot_dir.join("manifest.json"),
-        &test_boot_dir.join("manifest.json"),
-    )?;
-    info!(dev_boot_dir = %dev_boot_dir.display(), "using development boot assets");
-    Ok(())
+    stage_dev_boot_assets(&ctx.root, &ctx.test_dir, &ctx.version)
 }
 
 /// Spawns the daemon and blocks until it reports READY on the setup
 /// status stream — VM booted, agent up, services started.
 fn start_daemon(ctx: &mut TestContext) -> Result<()> {
-    info!("starting daemon");
+    info!(backend = ?ctx.backend, "starting daemon");
+    let mut env = vec![("ARCBOX_BOOT_ASSET_VERSION".to_owned(), ctx.version.clone())];
+    if let Some(backend) = ctx.backend {
+        // First-boot backend selection; the data dir is fresh, so no
+        // persisted machine backend can override it.
+        env.push(("ARCBOX_VM_BACKEND".to_owned(), backend.as_str().to_owned()));
+    }
     let mut daemon = DaemonHandle::spawn(DaemonConfig {
         binary: ctx.root.join("target/release/arcbox-daemon"),
         data_dir: ctx.test_dir.clone(),
@@ -274,7 +381,7 @@ fn start_daemon(ctx: &mut TestContext) -> Result<()> {
             "--guest-docker-vsock-port".to_owned(),
             ctx.guest_docker_vsock_port.to_string(),
         ],
-        env: vec![("ARCBOX_BOOT_ASSET_VERSION".to_owned(), ctx.version.clone())],
+        env,
     })?;
 
     let started = Instant::now();
@@ -287,9 +394,9 @@ fn start_daemon(ctx: &mut TestContext) -> Result<()> {
     Ok(())
 }
 
-fn pull_alpine(ctx: &TestContext) -> Result<()> {
-    info!("pulling alpine image");
-    match ctx.docker_output(&["pull", "alpine:latest"], Duration::from_secs(90)) {
+fn pull_image(ctx: &TestContext) -> Result<()> {
+    info!(image = %ctx.image, "pulling test image");
+    match ctx.docker_output(&["pull", &ctx.image], Duration::from_secs(90)) {
         Ok(output) => {
             fs::write(ctx.test_dir.join("pull.log"), output)
                 .with_context(|| format!("writing {}", ctx.test_dir.join("pull.log").display()))?;
@@ -310,7 +417,7 @@ fn smoke_container_create(ctx: &TestContext) -> Result<()> {
     info!("creating container against the ready daemon");
     let cid = ctx
         .docker_output(
-            &["create", "--label", &ctx.label, "alpine", "echo", "test"],
+            &["create", "--label", &ctx.label, &ctx.image, "echo", "test"],
             DOCKER_TIMEOUT,
         )?
         .lines()
@@ -328,7 +435,7 @@ fn test_container_run(ctx: &TestContext) -> Result<()> {
     info!("[test] container run: docker run alpine echo hello");
     let cid = ctx
         .docker_output(
-            &["create", "--label", &ctx.label, "alpine", "echo", "hello"],
+            &["create", "--label", &ctx.label, &ctx.image, "echo", "hello"],
             DOCKER_TIMEOUT,
         )?
         .lines()
@@ -351,7 +458,9 @@ fn test_background_container(ctx: &TestContext) -> Result<()> {
     info!("[test] background container: docker run -d + docker ps");
     let cid = ctx
         .docker_output(
-            &["run", "-d", "--label", &ctx.label, "alpine", "sleep", "300"],
+            &[
+                "run", "-d", "--label", &ctx.label, &ctx.image, "sleep", "300",
+            ],
             DOCKER_TIMEOUT,
         )?
         .lines()
@@ -385,7 +494,7 @@ fn test_docker_logs(ctx: &TestContext) -> Result<()> {
                 "-d",
                 "--label",
                 &ctx.label,
-                "alpine",
+                &ctx.image,
                 "sh",
                 "-c",
                 "echo 'log-output-test'; sleep 10",
@@ -420,7 +529,9 @@ fn test_docker_exec(ctx: &TestContext) -> Result<()> {
     info!("[test] docker exec: run command in running container");
     let cid = ctx
         .docker_output(
-            &["run", "-d", "--label", &ctx.label, "alpine", "sleep", "300"],
+            &[
+                "run", "-d", "--label", &ctx.label, &ctx.image, "sleep", "300",
+            ],
             DOCKER_TIMEOUT,
         )?
         .lines()
@@ -446,7 +557,9 @@ fn test_stop_rm(ctx: &TestContext) -> Result<()> {
     info!("[test] stop/rm: graceful stop and remove");
     let cid = ctx
         .docker_output(
-            &["run", "-d", "--label", &ctx.label, "alpine", "sleep", "300"],
+            &[
+                "run", "-d", "--label", &ctx.label, &ctx.image, "sleep", "300",
+            ],
             DOCKER_TIMEOUT,
         )?
         .lines()

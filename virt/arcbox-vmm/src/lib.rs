@@ -76,6 +76,7 @@ pub mod memory;
 pub(crate) mod net_rx_worker;
 pub mod snapshot;
 pub mod vcpu;
+pub mod vcpu_stats;
 pub mod vmm;
 #[cfg(target_os = "macos")]
 pub(crate) mod vsock_rx_worker;
@@ -92,7 +93,9 @@ pub mod vsock_manager {
 
 pub use boot::{BootParams, KernelLoader, KernelType};
 pub use builder::{VmBuilder, VmInstance};
-pub use device::{DeviceId, DeviceInfo, DeviceManager, DeviceTreeEntry, DeviceType};
+pub use device::{
+    DeviceDebug, DeviceId, DeviceInfo, DeviceManager, DeviceTreeEntry, DeviceType, QueueDebug,
+};
 pub use error::{Result, VmmError};
 pub use fdt::{FdtBuilder, FdtConfig};
 pub use snapshot::{
@@ -100,4 +103,5 @@ pub use snapshot::{
     SnapshotTargetType, VmRestoreData, VmSnapshotContext,
 };
 pub use vcpu::{DeviceManagerExitHandler, ExitHandler, VcpuManager};
+pub use vcpu_stats::{VcpuStats, VcpuStatsSnapshot, VmDebugSnapshot};
 pub use vmm::{BlockDeviceConfig, SharedDirConfig, VmBackend, Vmm, VmmConfig, VmmState};
