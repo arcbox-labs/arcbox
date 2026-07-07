@@ -452,6 +452,7 @@ name = "arcbox-e2e"
 version = "0.4.16"
 dependencies = [
  "anyhow",
+ "arcbox-constants",
  "arcbox-core",
  "arcbox-grpc",
  "arcbox-protocol",

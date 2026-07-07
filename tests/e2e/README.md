@@ -21,6 +21,24 @@ macOS virtualization support (plus a local Docker CLI for the daemon-level test)
   data dir means tests never touch `~/.arcbox` and can run alongside a
   developer's daemon.
 
+## Parallel daemons: one data dir per daemon
+
+Everything a daemon contends on — flock, gRPC/Docker sockets, logs, machine
+state — derives from `--data-dir` (`HostLayout`), so daemons with distinct data
+dirs run side by side. That is the isolation contract for parallel fix work:
+**one worktree/agent = one data dir**, and the harness enforces it —
+`DaemonHandle::spawn` refuses a data dir inside `~/.arcbox` or `~/.arcbox-dev`.
+
+Three host-global resources are *not* covered by the data dir. Tests must not
+touch them:
+
+- **Privileged helper state** (`/var/run/arcbox*`, `/etc/resolver`, host
+  routes) — never run the helper from a test.
+- **Docker CLI context** (`~/.docker`) — never pass `--docker-integration`;
+  point the Docker CLI at the handle's socket with `DOCKER_HOST` instead.
+- **Published host ports** — don't publish fixed host ports from containers;
+  concurrent runs would collide.
+
 ## Commands
 
 Daemon-level test — boots the VM through a real daemon and runs Docker

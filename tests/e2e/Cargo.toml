@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+arcbox-constants.workspace = true
 arcbox-core.workspace = true
 arcbox-grpc.workspace = true
 arcbox-protocol.workspace = true
