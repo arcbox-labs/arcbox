@@ -299,7 +299,7 @@ fn assert_isolated(data_dir: &Path) -> Result<()> {
 }
 
 /// Connects a tonic channel over a Unix domain socket.
-async fn connect_unix(socket: &Path) -> Result<Channel> {
+pub async fn connect_unix(socket: &Path) -> Result<Channel> {
     // The URI is required by the HTTP/2 layer but unused: the connector
     // below ignores it and dials the Unix socket.
     let channel = Endpoint::from_static("http://[::]:50051")

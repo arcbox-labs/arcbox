@@ -252,7 +252,7 @@ fn run_scenario(ctx: &mut TestContext, metrics: &mut RunMetrics) -> Result<()> {
     Ok(())
 }
 
-fn boot_version(lockfile: &Path) -> Result<String> {
+pub fn boot_version(lockfile: &Path) -> Result<String> {
     let text = fs::read_to_string(lockfile)
         .with_context(|| format!("reading asset lockfile {}", lockfile.display()))?;
     let doc = text
