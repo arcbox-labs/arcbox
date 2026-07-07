@@ -89,6 +89,7 @@ Exposed to the guest VM via VirtioFS at `/arcbox/runtime/bin`.
 | `bin/arcbox` | Compatibility symlink → abctl | cli (`abctl setup install`) |
 | `bin/arcbox-daemon` | Fallback daemon binary path | cli |
 | `bin/arcbox-agent` | Guest agent binary | daemon (bundle seed / boot cache) |
+| `bin/vm-agent` | Sandbox microVM init binary (guest sees `/arcbox/bin/vm-agent`) | daemon (bundle seed / boot cache) |
 
 ### 1.7 `shell/` — Shell Integration
 
@@ -248,10 +249,13 @@ Tags defined in `common/arcbox-constants/src/virtiofs.rs`.
 | `/run/arcbox/data` | Btrfs temporary mount point | agent |
 | `/run/arcbox/vmm.sock` | Guest VMM gRPC socket | agent |
 | `/var/lib/arcbox/sandboxes` | Firecracker sandbox data | agent |
-| `/var/lib/arcbox/kernel/vmlinux` | Sandbox kernel | agent |
-| `/var/lib/arcbox/images/sandbox.ext4` | Sandbox rootfs | agent |
-| `/usr/local/bin/firecracker` | Firecracker binary | EROFS rootfs |
-| `/etc/arcbox/vmm.toml` | Guest VMM configuration | EROFS rootfs |
+| `/var/lib/arcbox/sandbox/rootfs.ext4` | Default sandbox rootfs (busybox + vm-agent, auto-built) | agent |
+| `/var/lib/arcbox/sandbox/rootfs-<hash>.ext4` | Converted overlay2 rootfs cache | agent |
+| `/var/lib/arcbox/jailer` | Firecracker jailer chroots | agent |
+| `/arcbox/runtime/bin/{firecracker,jailer}` | Firecracker binaries (boot manifest, via VirtioFS) | host daemon |
+| `/arcbox/runtime/kernel/vmlinux` | Sandbox guest kernel (boot manifest, via VirtioFS) | host daemon |
+| `/arcbox/bin/vm-agent` | Sandbox init binary, staged next to `arcbox-agent` (via VirtioFS) | host daemon |
+| `/etc/arcbox/vmm.toml` | Optional guest VMM config override (not shipped; built-in defaults apply) | admin (manual) |
 
 ---
 

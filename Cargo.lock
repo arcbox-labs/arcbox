@@ -158,6 +158,7 @@ dependencies = [
  "anyhow",
  "arcbox-constants",
  "arcbox-dns",
+ "arcbox-ext4",
  "arcbox-protocol",
  "arcbox-vm",
  "async-trait",
@@ -170,6 +171,7 @@ dependencies = [
  "nix 0.29.0",
  "notify",
  "num_cpus",
+ "oci2rootfs",
  "pin-project-lite",
  "prost",
  "serde",
@@ -477,6 +479,17 @@ name = "arcbox-error"
 version = "0.4.16"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "arcbox-ext4"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9dce000de67c1a27347fed86e9ce76199463fbb5a3d7f13cb0f3d1c16b6dae3"
+dependencies = [
+ "tar",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -1419,6 +1432,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1e928d4b69e3077709075a938a05ffbedfa53a84c8f766efbf8220bb1ff60e1"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -1600,6 +1615,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
+]
+
+[[package]]
+name = "containerregistry-image"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1199b7cfc7bced15304d6cf5db698e5221b08e0eb143c054aaf46296f0fd48a9"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "containerregistry-layout"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4875a5a717d943e673869dcde59f9db1a1ffeedec86f4faf43d6783d33614740"
+dependencies = [
+ "containerregistry-image",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -2955,6 +2995,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom 0.4.2",
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.93"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3592,6 +3642,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "oci2rootfs"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32117a443cb043dbc1876d75bf0c55b58ecc662642cac06d8f569ce6f9b9ac6e"
+dependencies = [
+ "arcbox-ext4",
+ "containerregistry-image",
+ "containerregistry-layout",
+ "flate2",
+ "tar",
+ "thiserror",
+ "tracing",
+ "uuid",
+ "zstd",
 ]
 
 [[package]]
@@ -6852,6 +6919,34 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[package]]
+name = "zstd"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "7.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.0.16+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
 
 [[package]]
 name = "zvariant"

@@ -8,7 +8,7 @@ repository.workspace = true
 description       = "Guest-side Firecracker sandbox manager (frozen; see arcbox-vmm for host VMM)."
 
 [[bin]]
-name = "vmm-guest-agent"
+name = "vm-agent"
 path = "src/bin/vm-agent.rs"
 
 [dependencies]

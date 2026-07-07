@@ -1,27 +1,42 @@
-//! Convert a Docker overlay2 layer directory to a bootable ext4 rootfs.
+//! Build bootable ext4 rootfs images for sandboxes.
 //!
-//! Runs `oci2rootfs` on the overlay2 layer path, then injects `/sbin/vm-agent`
-//! into the resulting ext4 via loop mount. Cached ext4 images are reused to
-//! avoid redundant conversions.
+//! Two builders live here, both backed by the pure-Rust `oci2rootfs` /
+//! `arcbox-ext4` stack (no external binary, no mount, no root required for
+//! the ext4 write itself):
+//!
+//! - [`convert_layer_to_rootfs`] — convert a Docker overlay2 layer directory
+//!   to ext4, then inject `/sbin/vm-agent` via loop mount. Cached ext4
+//!   images are reused to avoid redundant conversions.
+//! - [`ensure_default_rootfs`] — build the default busybox + vm-agent image
+//!   used when `CreateSandboxRequest` supplies no rootfs. Rebuilt when the
+//!   source binaries are newer than the cached image.
 
+use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use arcbox_ext4::constants::file_mode;
+use arcbox_ext4::{FormatOptions, Formatter};
 use tokio::process::Command;
 use uuid::Uuid;
 
-/// Path to the `oci2rootfs` binary (on VirtioFS).
-const OCI2ROOTFS_BIN: &str = "/arcbox/bin/oci2rootfs";
-
-/// Path to the `vm-agent` binary (on VirtioFS).
+/// Path to the `vm-agent` binary (host `~/.arcbox/bin` via VirtioFS).
 const VM_AGENT_BIN: &str = "/arcbox/bin/vm-agent";
 
-/// Directory for cached rootfs images.
-const ROOTFS_CACHE_DIR: &str = "/arcbox/bin";
+/// Static busybox shipped in the guest EROFS rootfs.
+const GUEST_BUSYBOX: &str = "/bin/busybox";
+
+/// Directory for generated rootfs images (btrfs data volume, writable).
+const ROOTFS_CACHE_DIR: &str = "/var/lib/arcbox/sandbox";
+
+/// Capacity of the default busybox rootfs image. The image file is written
+/// sparsely; per-sandbox writes land in the dm-snapshot COW overlay, so this
+/// bounds a sandbox's writable space, not host disk use.
+const DEFAULT_ROOTFS_SIZE: u64 = 512 * 1024 * 1024;
 
 /// Check if a file has a valid ext4 superblock magic (0x53EF at offset 0x438).
 pub fn has_ext4_magic(path: &Path) -> bool {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::{Seek, SeekFrom};
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
@@ -52,16 +67,36 @@ pub async fn convert_layer_to_rootfs(layer_path: &str) -> Result<String> {
         return Ok(ext4_path);
     }
 
+    tokio::fs::create_dir_all(ROOTFS_CACHE_DIR)
+        .await
+        .context("failed to create rootfs cache dir")?;
+
     let req_id = Uuid::new_v4().to_string();
     let ext4_tmp = format!("{ROOTFS_CACHE_DIR}/.rootfs-{req_id}.ext4.tmp");
 
-    // Run oci2rootfs.
+    // Convert via the oci2rootfs library (blocking CPU/IO work).
     tracing::info!(layer = %layer_path, ext4 = %ext4_path, "converting overlay2 layer to ext4");
-    run_oci2rootfs(layer_path, &ext4_tmp).await?;
+    {
+        let layer = layer_path.to_owned();
+        let out = ext4_tmp.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let source = oci2rootfs::Overlay2Source::open(&layer)
+                .context("failed to open overlay2 layer")?;
+            oci2rootfs::Converter::new(&out)
+                .convert(source)
+                .context("overlay2 → ext4 conversion failed")?;
+            Ok(())
+        })
+        .await
+        .context("conversion task panicked")??;
+    }
 
     // Inject vm-agent.
     tracing::info!("injecting vm-agent into rootfs");
-    inject_vm_agent(&ext4_tmp, &req_id).await?;
+    if let Err(e) = inject_vm_agent(&ext4_tmp, &req_id).await {
+        let _ = tokio::fs::remove_file(&ext4_tmp).await;
+        return Err(e);
+    }
 
     // Atomic rename into cache.
     tokio::fs::rename(&ext4_tmp, &ext4_path)
@@ -72,23 +107,209 @@ pub async fn convert_layer_to_rootfs(layer_path: &str) -> Result<String> {
     Ok(ext4_path)
 }
 
-/// Run `oci2rootfs` on an overlay2 layer directory.
-async fn run_oci2rootfs(layer_path: &str, output: &str) -> Result<()> {
-    if !Path::new(OCI2ROOTFS_BIN).exists() {
-        bail!("oci2rootfs not found at {OCI2ROOTFS_BIN}");
+/// Ensure the default busybox + vm-agent rootfs exists at `path` and is
+/// newer than its source binaries. Returns without touching the image when
+/// it is already up to date.
+pub async fn ensure_default_rootfs(path: &str) -> Result<()> {
+    let image = Path::new(path);
+    if is_default_rootfs_fresh(image) {
+        return Ok(());
     }
 
-    let result = Command::new(OCI2ROOTFS_BIN)
-        .args([layer_path, "--output", output])
+    if !Path::new(VM_AGENT_BIN).exists() {
+        bail!(
+            "vm-agent not found at {VM_AGENT_BIN}; it is staged by the host \
+             daemon next to arcbox-agent"
+        );
+    }
+
+    let applets = busybox_applets().await?;
+
+    let parent = image
+        .parent()
+        .with_context(|| format!("default rootfs path has no parent: {path}"))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .context("failed to create default rootfs dir")?;
+
+    let tmp = parent.join(format!(".default-{}.ext4.tmp", Uuid::new_v4()));
+    let spec = DefaultRootfsSpec {
+        busybox: GUEST_BUSYBOX.into(),
+        vm_agent: VM_AGENT_BIN.into(),
+        applets,
+        size: DEFAULT_ROOTFS_SIZE,
+    };
+
+    tracing::info!(path, "building default sandbox rootfs");
+    {
+        let tmp = tmp.clone();
+        tokio::task::spawn_blocking(move || build_default_rootfs(&spec, &tmp))
+            .await
+            .context("default rootfs build task panicked")??;
+    }
+
+    tokio::fs::rename(&tmp, image)
+        .await
+        .context("failed to move default rootfs into place")?;
+    tracing::info!(path, "default sandbox rootfs ready");
+    Ok(())
+}
+
+/// True when the default rootfs image exists, looks like ext4, and is newer
+/// than both source binaries (busybox and vm-agent).
+fn is_default_rootfs_fresh(image: &Path) -> bool {
+    if !has_ext4_magic(image) {
+        return false;
+    }
+    let Ok(image_mtime) = image.metadata().and_then(|m| m.modified()) else {
+        return false;
+    };
+    for source in [GUEST_BUSYBOX, VM_AGENT_BIN] {
+        match std::fs::metadata(source).and_then(|m| m.modified()) {
+            Ok(mtime) if mtime <= image_mtime => {}
+            // Missing or newer source: rebuild (the build reports missing
+            // vm-agent with an actionable error).
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Inputs for [`build_default_rootfs`].
+struct DefaultRootfsSpec {
+    /// Static busybox binary copied to `/bin/busybox`.
+    busybox: std::path::PathBuf,
+    /// vm-agent binary copied to `/sbin/vm-agent` (the sandbox init).
+    vm_agent: std::path::PathBuf,
+    /// Applet names to symlink into `/bin` (from `busybox --list`).
+    applets: Vec<String>,
+    /// ext4 image capacity in bytes.
+    size: u64,
+}
+
+/// Write a minimal bootable rootfs: busybox + applet symlinks + vm-agent as
+/// `/sbin/vm-agent` (and `/sbin/init`), plus the standard directory skeleton.
+fn build_default_rootfs(spec: &DefaultRootfsSpec, out: &Path) -> Result<()> {
+    const DIR: u16 = file_mode::S_IFDIR | 0o755;
+    const EXE: u16 = file_mode::S_IFREG | 0o755;
+    const LNK: u16 = file_mode::S_IFLNK | 0o777;
+
+    let mut fmt = Formatter::with_options(out, FormatOptions::new(spec.size).label("arcbox-sbx"))
+        .context("failed to create ext4 formatter")?;
+
+    for dir in [
+        "/bin", "/sbin", "/dev", "/proc", "/sys", "/run", "/etc", "/root", "/var",
+    ] {
+        fmt.create(dir, DIR, None, None, None, None, None, None)
+            .with_context(|| format!("mkdir {dir}"))?;
+    }
+    // World-writable sticky /tmp.
+    fmt.create(
+        "/tmp",
+        file_mode::S_IFDIR | file_mode::S_ISVTX | 0o777,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .context("mkdir /tmp")?;
+
+    let mut busybox = std::fs::File::open(&spec.busybox)
+        .with_context(|| format!("failed to open {}", spec.busybox.display()))?;
+    fmt.create(
+        "/bin/busybox",
+        EXE,
+        None,
+        None,
+        Some(&mut busybox),
+        None,
+        None,
+        None,
+    )
+    .context("write /bin/busybox")?;
+
+    for applet in &spec.applets {
+        if applet == "busybox" || applet.contains('/') {
+            continue;
+        }
+        let path = format!("/bin/{applet}");
+        fmt.create(&path, LNK, Some("busybox"), None, None, None, None, None)
+            .with_context(|| format!("symlink {path}"))?;
+    }
+
+    let mut vm_agent = std::fs::File::open(&spec.vm_agent)
+        .with_context(|| format!("failed to open {}", spec.vm_agent.display()))?;
+    fmt.create(
+        "/sbin/vm-agent",
+        EXE,
+        None,
+        None,
+        Some(&mut vm_agent),
+        None,
+        None,
+        None,
+    )
+    .context("write /sbin/vm-agent")?;
+    // Fallback for boot args that omit init=: PID 1 is still vm-agent.
+    fmt.create(
+        "/sbin/init",
+        LNK,
+        Some("vm-agent"),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .context("symlink /sbin/init")?;
+
+    let passwd = "root:x:0:0:root:/root:/bin/sh\n";
+    fmt.create(
+        "/etc/passwd",
+        file_mode::S_IFREG | 0o644,
+        None,
+        None,
+        Some(&mut passwd.as_bytes()),
+        None,
+        None,
+        None,
+    )
+    .context("write /etc/passwd")?;
+    let group = "root:x:0:\n";
+    fmt.create(
+        "/etc/group",
+        file_mode::S_IFREG | 0o644,
+        None,
+        None,
+        Some(&mut group.as_bytes()),
+        None,
+        None,
+        None,
+    )
+    .context("write /etc/group")?;
+
+    fmt.close().context("failed to finalize ext4 image")?;
+    Ok(())
+}
+
+/// List busybox applets via `busybox --list`.
+async fn busybox_applets() -> Result<Vec<String>> {
+    let output = Command::new(GUEST_BUSYBOX)
+        .arg("--list")
         .output()
         .await
-        .context("failed to spawn oci2rootfs")?;
-
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        bail!("oci2rootfs failed: {stderr}");
+        .with_context(|| format!("failed to run {GUEST_BUSYBOX} --list"))?;
+    if !output.status.success() {
+        bail!("busybox --list failed with {}", output.status);
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Inject vm-agent into an ext4 image via loop mount.
@@ -101,7 +322,7 @@ async fn inject_vm_agent(ext4_path: &str, req_id: &str) -> Result<()> {
     tokio::fs::create_dir_all(&mount_dir).await?;
 
     // Mount.
-    let status = Command::new("/bin/busybox")
+    let status = Command::new(GUEST_BUSYBOX)
         .args(["mount", "-o", "loop", ext4_path, &mount_dir])
         .status()
         .await
@@ -121,14 +342,14 @@ async fn inject_vm_agent(ext4_path: &str, req_id: &str) -> Result<()> {
 
     // chmod 755.
     if copy_result.is_ok() {
-        let _ = Command::new("/bin/busybox")
+        let _ = Command::new(GUEST_BUSYBOX)
             .args(["chmod", "755", &dest])
             .status()
             .await;
     }
 
     // Always unmount and cleanup, even on failure.
-    let _ = Command::new("/bin/busybox")
+    let _ = Command::new(GUEST_BUSYBOX)
         .args(["umount", &mount_dir])
         .status()
         .await;
@@ -168,5 +389,45 @@ mod tests {
         let a = path_hash("/var/lib/docker/overlay2/abc123");
         let b = path_hash("/var/lib/docker/overlay2/def456");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn default_rootfs_builds_and_contains_init_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let busybox = dir.path().join("busybox");
+        let vm_agent = dir.path().join("vm-agent");
+        std::fs::write(&busybox, b"#!busybox-stub").unwrap();
+        std::fs::write(&vm_agent, b"#!vm-agent-stub").unwrap();
+
+        let out = dir.path().join("rootfs.ext4");
+        let spec = DefaultRootfsSpec {
+            busybox,
+            vm_agent,
+            applets: vec!["sh".into(), "ls".into(), "busybox".into()],
+            size: 8 * 1024 * 1024,
+        };
+        build_default_rootfs(&spec, &out).unwrap();
+
+        assert!(has_ext4_magic(&out));
+
+        let reader = arcbox_ext4::Reader::new(&out).unwrap();
+        for path in [
+            "/bin/busybox",
+            "/sbin/vm-agent",
+            "/sbin/init",
+            "/bin/sh",
+            "/etc/passwd",
+        ] {
+            assert!(
+                reader.tree().lookup(Path::new(path)).is_some(),
+                "missing {path}"
+            );
+        }
+        assert!(
+            reader
+                .tree()
+                .lookup(Path::new("/bin/nonexistent"))
+                .is_none()
+        );
     }
 }

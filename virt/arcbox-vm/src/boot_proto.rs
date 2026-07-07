@@ -1,5 +1,5 @@
 //! Boot protocol types shared between the host-side sandbox orchestrator
-//! and the guest-side `vmm-guest-agent`.
+//! and the guest-side `vm-agent`.
 //!
 //! These types define the contract passed through kernel boot parameters.
 //! Both sides import from this module so the encoding is defined once.
@@ -13,7 +13,7 @@ use std::str::FromStr;
 /// Format: `ip=<client>::<gateway>:<netmask>::eth0:off`
 ///
 /// Constructed by [`SandboxManager`](crate::SandboxManager) when building
-/// boot args, and parsed by `vmm-guest-agent` to derive the DNS nameserver
+/// boot args, and parsed by `vm-agent` to derive the DNS nameserver
 /// from the gateway.
 ///
 /// [`Display`] and [`FromStr`] round-trip through the same format so the

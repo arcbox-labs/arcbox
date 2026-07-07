@@ -1,4 +1,4 @@
-//! `vmm-guest-agent` — in-VM daemon that accepts exec/run sessions over vsock.
+//! `vm-agent` — in-VM daemon that accepts exec/run sessions over vsock.
 //!
 //! The agent listens on AF_VSOCK port 52.  For each connection it:
 //!
@@ -738,13 +738,13 @@ mod agent {
     /// sandboxes or custom rootfs with their own resolver config).
     fn setup_dns() {
         let Some(token) = cmdline_token("ip=") else {
-            eprintln!("vmm-guest-agent: no ip= parameter in cmdline, skipping DNS setup");
+            eprintln!("vm-agent: no ip= parameter in cmdline, skipping DNS setup");
             return;
         };
         let ip_param = match token.parse::<KernelIpParam>() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("vmm-guest-agent: invalid ip= parameter: {e}");
+                eprintln!("vm-agent: invalid ip= parameter: {e}");
                 return;
             }
         };
@@ -752,10 +752,10 @@ mod agent {
         let content = format!("nameserver {}\n", ip_param.gateway);
         match std::fs::write("/etc/resolv.conf", &content) {
             Ok(()) => eprintln!(
-                "vmm-guest-agent: wrote /etc/resolv.conf (nameserver {})",
+                "vm-agent: wrote /etc/resolv.conf (nameserver {})",
                 ip_param.gateway
             ),
-            Err(e) => eprintln!("vmm-guest-agent: failed to write /etc/resolv.conf: {e}"),
+            Err(e) => eprintln!("vm-agent: failed to write /etc/resolv.conf: {e}"),
         }
     }
 
@@ -797,9 +797,7 @@ mod agent {
     pub fn run() {
         mount_filesystems();
         setup_dns();
-        eprintln!(
-            "vmm-guest-agent: listening on vsock ports {AGENT_PORT} (exec), {FILE_PORT} (file I/O)"
-        );
+        eprintln!("vm-agent: listening on vsock ports {AGENT_PORT} (exec), {FILE_PORT} (file I/O)");
         let exec_fd = create_vsock_listener(AGENT_PORT);
         let file_fd = create_vsock_listener(FILE_PORT);
 
@@ -884,7 +882,7 @@ fn main() {
 
     #[cfg(not(target_os = "linux"))]
     {
-        eprintln!("vmm-guest-agent requires Linux (AF_VSOCK)");
+        eprintln!("vm-agent requires Linux (AF_VSOCK)");
         std::process::exit(1);
     }
 }
