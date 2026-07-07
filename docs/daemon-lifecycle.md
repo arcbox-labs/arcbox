@@ -25,6 +25,12 @@ start_services    DNS, Docker API, Docker CLI integration     ~instant
 Ready             SetupPhase::Ready
 ```
 
+If any phase fails, the daemon publishes `SetupPhase::Failed` with the
+error text in `SetupStatus.error`, waits ~200 ms so connected
+`WatchSetupStatus` streams flush the final event, and exits non-zero.
+Clients should treat FAILED (or stream EOF plus daemon exit) as
+startup failure.
+
 ### Why gRPC starts before resource cleanup
 
 The desktop app polls the daemon's gRPC `WatchSetupStatus` stream with a

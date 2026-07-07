@@ -9,8 +9,17 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+arcbox-core.workspace = true
+arcbox-grpc.workspace = true
+arcbox-protocol.workspace = true
+arcbox-vmm.workspace = true
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+libc.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
 toml_edit = "0.25.12"
+tonic.workspace = true
+tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 xshell = "0.2.7"

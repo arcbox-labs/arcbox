@@ -598,6 +598,9 @@ message SetupStatus {
         DEGRADED = 7;
         DOWNLOADING_ASSETS = 8;
         CLEANING_UP = 9;
+        // Startup failed fatally; the daemon exits shortly after
+        // publishing this phase. See the `error` field for the cause.
+        FAILED = 10;
     }
 
     // Current daemon phase.
@@ -614,4 +617,8 @@ message SetupStatus {
     string message = 6;
     // Whether Docker CLI tools are installed.
     bool docker_tools_installed = 7;
+    // Fatal startup error description. Set only when phase == FAILED,
+    // so streaming clients learn the cause instead of seeing a bare
+    // disconnect when the daemon exits.
+    string error = 8;
 }

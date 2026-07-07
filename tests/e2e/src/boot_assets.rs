@@ -1,8 +1,8 @@
 use std::{
     env,
-    fs::{self, File},
+    fs::{self},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -10,11 +10,15 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use tempfile::TempDir;
 use toml_edit::DocumentMut;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-use crate::repo_root;
+use crate::daemon::{DaemonConfig, DaemonHandle};
+use crate::{env_flag, repo_root};
 
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Generous ceiling for the daemon's full startup (asset seeding + VM boot
+/// + agent readiness), observed via `WatchSetupStatus`.
+const READY_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub struct BootAssetsConfig {
     skip_build: bool,
@@ -48,7 +52,7 @@ struct TestContext {
     label: String,
     guest_docker_vsock_port: u32,
     keep_test_dir: bool,
-    daemon: Option<Child>,
+    daemon: Option<DaemonHandle>,
 }
 
 impl TestContext {
@@ -78,7 +82,8 @@ impl TestContext {
     }
 
     fn docker_host(&self) -> String {
-        format!("unix://{}", self.test_dir.join("docker.sock").display())
+        // Default HostLayout: the Docker socket lives under <data_dir>/run.
+        format!("unix://{}", self.test_dir.join("run/docker.sock").display())
     }
 
     fn docker_output(&self, args: &[&str], timeout: Duration) -> Result<String> {
@@ -132,15 +137,17 @@ impl Drop for TestContext {
             }
         }
 
-        if let Some(mut daemon) = self.daemon.take() {
-            let _ = daemon.kill();
-            let _ = daemon.wait();
+        if let Some(daemon) = self.daemon.take() {
+            match daemon.shutdown() {
+                Ok(status) => info!(%status, "daemon stopped"),
+                Err(error) => warn!("daemon shutdown failed: {error:#}"),
+            }
         }
 
         if self.keep_test_dir {
             if let Some(temp_dir) = self.temp_dir.take() {
                 let path = temp_dir.keep();
-                warn!(path = %path.display(), "KEEP_TEST_DIR set, preserving test directory");
+                warn!(path = %path.display(), "preserving test directory");
             }
         }
     }
@@ -161,31 +168,31 @@ pub fn run(config: BootAssetsConfig) -> Result<()> {
     }
 
     let mut ctx = TestContext::new(config)?;
-    check_prerequisites(&ctx)?;
-    setup_test_env(&ctx)?;
-    start_daemon(&mut ctx)?;
-
-    pull_alpine(&ctx)?;
-    trigger_vm_boot(&ctx)?;
-
-    test_container_run(&ctx).context("container run lifecycle test")?;
-    test_background_container(&ctx).context("background container lifecycle test")?;
-    test_docker_logs(&ctx).context("docker logs lifecycle test")?;
-    test_docker_exec(&ctx).context("docker exec lifecycle test")?;
-    test_stop_rm(&ctx).context("docker stop/rm lifecycle test")?;
-
-    info!(daemon_log = %ctx.test_dir.join("daemon.log").display(), "boot assets integration test passed");
-    Ok(())
+    let result = run_scenario(&mut ctx);
+    if result.is_err() {
+        // Preserve the workspace (daemon + guest logs, disk images) so the
+        // failure can be inspected; the path is logged by TestContext::drop.
+        ctx.keep_test_dir = true;
+    }
+    result
 }
 
-fn env_flag(name: &str) -> bool {
-    env::var(name).is_ok_and(|value| {
-        value.is_empty()
-            || matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-    })
+fn run_scenario(ctx: &mut TestContext) -> Result<()> {
+    check_prerequisites(ctx)?;
+    setup_test_env(ctx)?;
+    start_daemon(ctx)?;
+
+    pull_alpine(ctx)?;
+    smoke_container_create(ctx)?;
+
+    test_container_run(ctx).context("container run lifecycle test")?;
+    test_background_container(ctx).context("background container lifecycle test")?;
+    test_docker_logs(ctx).context("docker logs lifecycle test")?;
+    test_docker_exec(ctx).context("docker exec lifecycle test")?;
+    test_stop_rm(ctx).context("docker stop/rm lifecycle test")?;
+
+    info!(daemon_log = %ctx.test_dir.join("log/daemon.log").display(), "boot assets integration test passed");
+    Ok(())
 }
 
 fn boot_version(lockfile: &Path) -> Result<String> {
@@ -206,28 +213,6 @@ fn check_prerequisites(ctx: &TestContext) -> Result<()> {
     if !daemon.is_file() {
         bail!("arcbox-daemon binary not found at {}", daemon.display());
     }
-
-    let output = Command::new("codesign")
-        .args(["-d", "--entitlements", ":-"])
-        .arg(&daemon)
-        .output()
-        .with_context(|| format!("reading entitlements from {}", daemon.display()))?;
-    let entitlements = String::from_utf8_lossy(&output.stderr);
-    if !entitlements.contains("com.apple.security.virtualization") {
-        warn!("binary not signed with virtualization entitlement; signing");
-        let entitlements_file = ctx.root.join("bundle/arcbox.entitlements");
-        let status = Command::new("codesign")
-            .arg("--entitlements")
-            .arg(&entitlements_file)
-            .args(["--force", "-s", "-"])
-            .arg(&daemon)
-            .status()
-            .with_context(|| format!("signing {}", daemon.display()))?;
-        if !status.success() {
-            bail!("codesign failed for {}", daemon.display());
-        }
-    }
-
     info!("prerequisites OK");
     Ok(())
 }
@@ -278,36 +263,27 @@ fn setup_test_env(ctx: &TestContext) -> Result<()> {
     Ok(())
 }
 
+/// Spawns the daemon and blocks until it reports READY on the setup
+/// status stream — VM booted, agent up, services started.
 fn start_daemon(ctx: &mut TestContext) -> Result<()> {
     info!("starting daemon");
-    let log = File::create(ctx.test_dir.join("daemon.log"))?;
-    let stderr = log.try_clone()?;
-    let daemon = Command::new(ctx.root.join("target/release/arcbox-daemon"))
-        .env("ARCBOX_BOOT_ASSET_VERSION", &ctx.version)
-        .arg("--data-dir")
-        .arg(&ctx.test_dir)
-        .arg("--socket")
-        .arg(ctx.test_dir.join("docker.sock"))
-        .arg("--guest-docker-vsock-port")
-        .arg(ctx.guest_docker_vsock_port.to_string())
-        .stdout(log)
-        .stderr(stderr)
-        .spawn()
-        .context("starting arcbox-daemon")?;
-    let pid = daemon.id();
-    fs::write(ctx.test_dir.join("daemon.pid"), pid.to_string())?;
+    let mut daemon = DaemonHandle::spawn(DaemonConfig {
+        binary: ctx.root.join("target/release/arcbox-daemon"),
+        data_dir: ctx.test_dir.clone(),
+        args: vec![
+            "--guest-docker-vsock-port".to_owned(),
+            ctx.guest_docker_vsock_port.to_string(),
+        ],
+        env: vec![("ARCBOX_BOOT_ASSET_VERSION".to_owned(), ctx.version.clone())],
+    })?;
+
+    let started = Instant::now();
+    daemon.wait_ready_blocking(READY_TIMEOUT)?;
+    info!(
+        elapsed_seconds = started.elapsed().as_secs(),
+        "daemon is ready"
+    );
     ctx.daemon = Some(daemon);
-    thread::sleep(Duration::from_secs(2));
-
-    if let Some(daemon) = ctx.daemon.as_mut() {
-        if let Some(status) = daemon.try_wait()? {
-            error!("daemon failed to start");
-            print_file(&ctx.test_dir.join("daemon.log"));
-            bail!("arcbox-daemon exited with {status}");
-        }
-    }
-
-    info!(pid, "daemon started");
     Ok(())
 }
 
@@ -323,63 +299,29 @@ fn pull_alpine(ctx: &TestContext) -> Result<()> {
         Err(error) => {
             fs::write(ctx.test_dir.join("pull.log"), format!("{error:#}"))
                 .with_context(|| format!("writing {}", ctx.test_dir.join("pull.log").display()))?;
-            error!("docker pull failed");
-            Err(error)
+            Err(error).context("docker pull")
         }
     }
 }
 
-fn trigger_vm_boot(ctx: &TestContext) -> Result<()> {
-    info!("creating container to trigger VM boot");
-    let container_id_path = ctx.test_dir.join("container_id");
-    let container_err_path = ctx.test_dir.join("container_create.err");
-    let mut create = Command::new("docker")
-        .env("DOCKER_HOST", ctx.docker_host())
-        .args(["create", "--label", &ctx.label, "alpine", "echo", "test"])
-        .stdout(File::create(&container_id_path)?)
-        .stderr(File::create(&container_err_path)?)
-        .spawn()
-        .context("starting docker create")?;
-
-    if !wait_for_agent(ctx) {
-        let _ = create.kill();
-        let _ = create.wait();
-        bail!("agent connection timeout");
-    }
-
-    if create.wait()?.success() {
-        let cid = fs::read_to_string(&container_id_path)
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        info!(
-            container_id = cid_prefix(&cid),
-            "container create completed"
-        );
-        Ok(())
-    } else {
-        let stderr = fs::read_to_string(&container_err_path).unwrap_or_default();
-        bail!("container create failed: {stderr}");
-    }
-}
-
-fn wait_for_agent(ctx: &TestContext) -> bool {
-    info!("waiting for agent connection");
-    for elapsed in 0..60 {
-        if fs::read_to_string(ctx.test_dir.join("daemon.log"))
-            .unwrap_or_default()
-            .contains("Agent is ready")
-        {
-            info!(elapsed_seconds = elapsed, "agent connected");
-            return true;
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-
-    error!("agent connection timeout");
-    error!("daemon log follows");
-    print_file(&ctx.test_dir.join("daemon.log"));
-    false
+/// First `docker create` against the ready daemon — exercises the full
+/// API → runtime → guest agent path once before the lifecycle tests.
+fn smoke_container_create(ctx: &TestContext) -> Result<()> {
+    info!("creating container against the ready daemon");
+    let cid = ctx
+        .docker_output(
+            &["create", "--label", &ctx.label, "alpine", "echo", "test"],
+            DOCKER_TIMEOUT,
+        )?
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    info!(
+        container_id = cid_prefix(&cid),
+        "container create completed"
+    );
+    Ok(())
 }
 
 fn test_container_run(ctx: &TestContext) -> Result<()> {
@@ -554,12 +496,6 @@ fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<std::pro
     let _ = child.kill();
     let _ = child.wait();
     Err(anyhow!("command timed out after {}s", timeout.as_secs()))
-}
-
-fn print_file(path: &Path) {
-    if let Ok(contents) = fs::read_to_string(path) {
-        print!("{contents}");
-    }
 }
 
 fn cid_prefix(cid: &str) -> &str {

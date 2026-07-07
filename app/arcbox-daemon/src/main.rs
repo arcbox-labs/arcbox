@@ -9,7 +9,10 @@ mod services;
 mod shutdown;
 mod startup;
 
+use std::sync::Arc;
+
 use anyhow::Result;
+use arcbox_api::SetupState;
 use arcbox_constants::paths::ArcboxProfile;
 use arcbox_logging::LogConfig;
 use clap::Parser;
@@ -118,7 +121,27 @@ fn sentry_environment() -> Option<String> {
 }
 
 async fn run(args: DaemonArgs) -> Result<()> {
-    let ready = startup::Startup::from_args(args)
+    let setup_state = Arc::new(SetupState::new());
+
+    let ready = match start(args, Arc::clone(&setup_state)).await {
+        Ok(ready) => ready,
+        Err(e) => {
+            // Publish the failure on the setup stream before exiting so a
+            // WatchSetupStatus client (desktop app, e2e harness) learns the
+            // cause instead of seeing a bare disconnect. The brief grace
+            // period lets already-connected streams flush the final event;
+            // with no clients it only delays the error exit.
+            setup_state.set_failed(&format!("{e:#}"));
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            return Err(e);
+        }
+    };
+
+    shutdown::run(ready.ctx, ready.handles).await
+}
+
+async fn start(args: DaemonArgs, setup_state: Arc<SetupState>) -> Result<startup::ReadyDaemon> {
+    startup::Startup::from_args(args, setup_state)
         .prepare_host()
         .await?
         .acquire_daemon_lease()
@@ -134,7 +157,5 @@ async fn run(args: DaemonArgs) -> Result<()> {
         .start_runtime_services()
         .await?
         .mark_ready()
-        .await?;
-
-    shutdown::run(ready.ctx, ready.handles).await
+        .await
 }

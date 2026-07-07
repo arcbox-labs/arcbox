@@ -37,6 +37,7 @@ impl SetupState {
             vm_running: false,
             message: "Daemon starting...".to_string(),
             docker_tools_installed: false,
+            error: String::new(),
         };
         let (tx, _) = watch::channel(initial);
         Self { tx: Arc::new(tx) }
@@ -47,6 +48,17 @@ impl SetupState {
         self.tx.send_modify(|s| {
             s.phase = phase.into();
             message.clone_into(&mut s.message);
+        });
+    }
+
+    /// Marks startup as fatally failed. The daemon exits shortly after;
+    /// the error rides the final watch update so streaming clients learn
+    /// the cause instead of seeing a bare disconnect.
+    pub fn set_failed(&self, error: &str) {
+        self.tx.send_modify(|s| {
+            s.phase = setup_status::Phase::Failed.into();
+            "Daemon startup failed".clone_into(&mut s.message);
+            error.clone_into(&mut s.error);
         });
     }
 

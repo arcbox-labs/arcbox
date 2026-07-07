@@ -8,7 +8,7 @@ mod resource_cleanup;
 
 pub use assets::find_bundle_contents;
 pub use lock::DaemonLock;
-pub use pipeline::Startup;
+pub use pipeline::{ReadyDaemon, Startup};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,9 +32,7 @@ const DEFAULT_DNS_DOMAIN: &str = "arcbox.local";
 /// Returns an [`EarlyContext`] sufficient to start the gRPC
 /// SystemService so clients can observe the full startup progression.
 /// Call [`acquire_lock`] next to obtain a [`DaemonContext`].
-async fn init_early(args: DaemonArgs) -> Result<EarlyContext> {
-    let setup_state = Arc::new(SetupState::new());
-
+async fn init_early(args: DaemonArgs, setup_state: Arc<SetupState>) -> Result<EarlyContext> {
     let profile = args
         .profile
         .unwrap_or_else(ArcboxProfile::from_env_or_default);

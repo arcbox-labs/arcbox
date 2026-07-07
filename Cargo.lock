@@ -452,8 +452,17 @@ name = "arcbox-e2e"
 version = "0.4.16"
 dependencies = [
  "anyhow",
+ "arcbox-core",
+ "arcbox-grpc",
+ "arcbox-protocol",
+ "arcbox-vmm",
+ "hyper-util",
+ "libc",
  "tempfile",
+ "tokio",
  "toml_edit 0.25.12+spec-1.1.0",
+ "tonic",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
  "xshell",

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use arcbox_api::SetupPhase;
+use arcbox_api::{SetupPhase, SetupState};
 use arcbox_core::Runtime;
 use macos_resolver::FileResolver;
 use tracing::{info, warn};
@@ -21,6 +21,7 @@ use super::{acquire_lock, assets, init_early, init_runtime, prepare_assets, wait
 /// Entry point for the daemon startup lifecycle.
 pub struct Startup {
     args: DaemonArgs,
+    setup_state: Arc<SetupState>,
 }
 
 pub struct ReadyDaemon {
@@ -30,14 +31,18 @@ pub struct ReadyDaemon {
 
 impl Startup {
     /// Creates a startup pipeline from parsed daemon arguments.
-    pub fn from_args(args: DaemonArgs) -> Self {
-        Self { args }
+    ///
+    /// `setup_state` is owned by the caller so it can publish a FAILED
+    /// phase if any pipeline step errors out.
+    pub fn from_args(args: DaemonArgs, setup_state: Arc<SetupState>) -> Self {
+        Self { args, setup_state }
     }
 
     /// Prepares host directories and pre-lock context.
     pub async fn prepare_host(self) -> Result<HostPrepared> {
         info!("Starting ArcBox daemon...");
-        let early = record_startup_phase("prepare_host", init_early(self.args)).await?;
+        let early =
+            record_startup_phase("prepare_host", init_early(self.args, self.setup_state)).await?;
         Ok(HostPrepared { early })
     }
 }

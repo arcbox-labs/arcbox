@@ -16,13 +16,14 @@
 //!    (Exercises ABX-360.)
 //! 7. `Vmm::stop()` shuts down cleanly.
 //!
-//! Usage:
-//!   cargo build --release --example hv_e2e -p arcbox-core
+//! Usage — via the ignored e2e test, which builds, signs, and runs it:
+//!   cargo test -p arcbox-e2e --test hv_vmm -- --ignored --nocapture
+//! Or manually:
+//!   cargo build --release -p arcbox-e2e --bin hv_e2e
 //!   codesign --force --options runtime \
-//!       --entitlements bundle/arcbox.entitlements \
-//!       --sign "Developer ID Application: ArcBox, Inc. (422ACSY6Y5)" \
-//!       target/release/examples/hv_e2e
-//!   ./target/release/examples/hv_e2e
+//!       --entitlements bundle/arcbox.dev.entitlements \
+//!       -s - target/release/hv_e2e
+//!   ./target/release/hv_e2e
 //!
 //! Environment:
 //!   ARCBOX_HV_E2E_KERNEL    override kernel path
