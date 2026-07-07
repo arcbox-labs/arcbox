@@ -13,6 +13,7 @@ use toml_edit::DocumentMut;
 use tracing::{info, warn};
 
 use crate::daemon::{DaemonConfig, DaemonHandle};
+use crate::metrics::RunMetrics;
 use crate::{env_flag, repo_root};
 
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -187,8 +188,19 @@ pub fn run(config: BootAssetsConfig) -> Result<()> {
         build_release_binaries()?;
     }
 
+    let backend_label = config.backend.map(arcbox_vmm::VmBackend::as_str);
+    let mut metrics = RunMetrics::new("boot_assets", backend_label);
     let mut ctx = TestContext::new(config)?;
-    let result = run_scenario(&mut ctx);
+    let result = run_scenario(&mut ctx, &mut metrics);
+    metrics.passed = result.is_ok();
+    match metrics.write(Some(&ctx.test_dir)) {
+        Ok(paths) => {
+            for path in paths {
+                info!(path = %path.display(), "run metrics written");
+            }
+        }
+        Err(error) => warn!("writing run metrics failed: {error:#}"),
+    }
     if result.is_err() {
         // Preserve the workspace (daemon + guest logs, disk images) so the
         // failure can be inspected; the path is logged by TestContext::drop.
@@ -205,19 +217,29 @@ pub fn run(config: BootAssetsConfig) -> Result<()> {
     result
 }
 
-fn run_scenario(ctx: &mut TestContext) -> Result<()> {
+fn run_scenario(ctx: &mut TestContext, metrics: &mut RunMetrics) -> Result<()> {
     check_prerequisites(ctx)?;
     setup_test_env(ctx)?;
-    start_daemon(ctx)?;
+    metrics.time("daemon_ready", || start_daemon(ctx))?;
 
-    pull_alpine(ctx)?;
-    smoke_container_create(ctx)?;
+    metrics.time("image_pull", || pull_alpine(ctx))?;
+    metrics.time("container_create_smoke", || smoke_container_create(ctx))?;
 
-    test_container_run(ctx).context("container run lifecycle test")?;
-    test_background_container(ctx).context("background container lifecycle test")?;
-    test_docker_logs(ctx).context("docker logs lifecycle test")?;
-    test_docker_exec(ctx).context("docker exec lifecycle test")?;
-    test_stop_rm(ctx).context("docker stop/rm lifecycle test")?;
+    metrics.time("container_run", || {
+        test_container_run(ctx).context("container run lifecycle test")
+    })?;
+    metrics.time("background_container", || {
+        test_background_container(ctx).context("background container lifecycle test")
+    })?;
+    metrics.time("docker_logs", || {
+        test_docker_logs(ctx).context("docker logs lifecycle test")
+    })?;
+    metrics.time("docker_exec", || {
+        test_docker_exec(ctx).context("docker exec lifecycle test")
+    })?;
+    metrics.time("docker_stop_rm", || {
+        test_stop_rm(ctx).context("docker stop/rm lifecycle test")
+    })?;
 
     info!(daemon_log = %ctx.test_dir.join("log/daemon.log").display(), "boot assets integration test passed");
     Ok(())

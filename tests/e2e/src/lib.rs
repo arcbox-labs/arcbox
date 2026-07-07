@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 pub mod boot_assets;
 pub mod daemon;
+pub mod metrics;
 pub mod signing;
 
 pub fn repo_root() -> PathBuf {

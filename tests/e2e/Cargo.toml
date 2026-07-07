@@ -16,6 +16,7 @@ arcbox-protocol.workspace = true
 arcbox-vmm.workspace = true
 hyper-util = "0.1.20"
 libc.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

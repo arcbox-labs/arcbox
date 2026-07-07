@@ -459,6 +459,7 @@ dependencies = [
  "arcbox-vmm",
  "hyper-util",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

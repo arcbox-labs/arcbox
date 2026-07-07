@@ -152,9 +152,12 @@ fn run() -> Result<(), String> {
         debug_console_socket: None,
     };
 
+    let mut metrics = arcbox_e2e::metrics::RunMetrics::new("hv_vmm", Some("hv"));
+
     println!("[phase 1] create VMM");
     let t = Instant::now();
     let mut vmm = Vmm::new(config).map_err(|e| format!("Vmm::new: {e}"))?;
+    metrics.record("create_vmm", t.elapsed().as_secs_f64());
     println!(
         "          ok in {:.0}ms",
         t.elapsed().as_secs_f64() * 1000.0
@@ -163,12 +166,13 @@ fn run() -> Result<(), String> {
     println!("[phase 2] start VM (HV backend)");
     let t = Instant::now();
     vmm.start().map_err(|e| format!("Vmm::start: {e}"))?;
+    metrics.record("start_vm", t.elapsed().as_secs_f64());
     println!(
         "          ok in {:.0}ms",
         t.elapsed().as_secs_f64() * 1000.0
     );
 
-    let result = run_phases(&mut vmm, &dax_fixture, boot_timeout);
+    let result = run_phases(&mut vmm, &dax_fixture, boot_timeout, &mut metrics);
     if result.is_err() {
         // Dump the virtio queue snapshot while the VM is still alive —
         // a wedged ring (avail ahead of used, interrupt pending but
@@ -177,6 +181,15 @@ fn run() -> Result<(), String> {
             Ok(json) => eprintln!("[virtio-debug]\n{json}"),
             Err(e) => eprintln!("[virtio-debug] serialization failed: {e}"),
         }
+    }
+    metrics.passed = result.is_ok();
+    match metrics.write(None) {
+        Ok(paths) => {
+            for path in paths {
+                println!("[metrics] written to {}", path.display());
+            }
+        }
+        Err(e) => eprintln!("[metrics] write failed: {e:#}"),
     }
     result
 }
@@ -187,6 +200,7 @@ fn run_phases(
     vmm: &mut Vmm,
     dax_fixture: &DaxFixture,
     boot_timeout: Duration,
+    metrics: &mut arcbox_e2e::metrics::RunMetrics,
 ) -> Result<(), String> {
     println!("[phase 3] wait for agent on vsock port {AGENT_PORT}");
     let t = Instant::now();
@@ -196,6 +210,7 @@ fn run_phases(
             boot_timeout.as_secs()
         )
     })?;
+    metrics.record("agent_ready", t.elapsed().as_secs_f64());
     println!(
         "          agent responded after {:.1}s",
         t.elapsed().as_secs_f64()
@@ -245,6 +260,7 @@ fn run_phases(
     println!("[phase 7] stop VM");
     let t = Instant::now();
     vmm.stop().map_err(|e| format!("Vmm::stop: {e}"))?;
+    metrics.record("stop_vm", t.elapsed().as_secs_f64());
     println!(
         "          ok in {:.0}ms",
         t.elapsed().as_secs_f64() * 1000.0

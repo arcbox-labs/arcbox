@@ -101,5 +101,8 @@ Environment variables read by the tests:
   port to `arcbox-daemon`.
 - `ARCBOX_HV_E2E_KERNEL` / `ARCBOX_HV_E2E_ROOTFS` / `ARCBOX_HV_E2E_TIMEOUT` /
   `ARCBOX_DATA_DIR` — HV probe overrides; see `src/bin/hv_e2e.rs`.
+- `ARCBOX_E2E_METRICS_DIR` / `ARCBOX_E2E_RUN_LABEL` — archive per-run phase
+  timings as `<label>.metrics.json` in the given directory (set automatically
+  by `cargo xtask e2e`). Runs also write `metrics.json` into their data dir.
 
 Tracing is controlled with `RUST_LOG`; it defaults to `info` when unset.
