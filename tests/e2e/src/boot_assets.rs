@@ -13,7 +13,7 @@ use toml_edit::DocumentMut;
 use tracing::{info, warn};
 
 use crate::daemon::{DaemonConfig, DaemonHandle};
-use crate::repo_root;
+use crate::{env_flag, repo_root};
 
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Generous ceiling for the daemon's full startup (asset seeding + VM boot
@@ -196,16 +196,6 @@ fn run_scenario(ctx: &mut TestContext) -> Result<()> {
 
     info!(daemon_log = %ctx.test_dir.join("log/daemon.log").display(), "boot assets integration test passed");
     Ok(())
-}
-
-fn env_flag(name: &str) -> bool {
-    env::var(name).is_ok_and(|value| {
-        value.is_empty()
-            || matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-    })
 }
 
 fn boot_version(lockfile: &Path) -> Result<String> {

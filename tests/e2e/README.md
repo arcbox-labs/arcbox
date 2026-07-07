@@ -5,22 +5,39 @@ assets, Docker, and external test fixtures. Keep long-running test process
 management here rather than in `xtask`.
 
 E2E tests use Rust's standard test harness instead of a custom runner. Tests are
-ignored by default because they build release binaries, boot a VM, and require a
-local Docker CLI plus macOS virtualization support.
+ignored by default because they build release binaries, boot a VM, and require
+macOS virtualization support (plus a local Docker CLI for the daemon-level test).
+
+## Fixtures
+
+- `signing::ensure_signed` — idempotently signs a test binary with the
+  virtualization entitlements: Developer ID when the ArcBox identity is in the
+  keychain, otherwise ad-hoc with `bundle/arcbox.dev.entitlements` (sufficient
+  for HV/VZ; only bridged vmnet needs Developer ID).
+- `daemon::DaemonHandle` — spawns a signed `arcbox-daemon` under an isolated
+  `--data-dir` and waits for readiness on the daemon's `WatchSetupStatus` gRPC
+  stream, failing fast on a FAILED phase or daemon exit (with the log tail).
+  Drop terminates the daemon gracefully (SIGTERM, then SIGKILL). The isolated
+  data dir means tests never touch `~/.arcbox` and can run alongside a
+  developer's daemon.
 
 ## Commands
 
-Run the boot assets VM and Docker lifecycle integration test:
+Daemon-level test — boots the VM through a real daemon and runs Docker
+lifecycle checks over the Docker API socket:
 
 ```bash
 cargo test -p arcbox-e2e --test boot_assets -- --ignored --nocapture
 ```
 
-When using the repository development shell:
+VMM-level HV probe — drives the HV backend directly (no daemon): boot, vsock
+agent RPC, DAX, agent supervision, pause/resume, stop:
 
 ```bash
-devenv shell -- cargo test -p arcbox-e2e --test boot_assets -- --ignored --nocapture
+cargo test -p arcbox-e2e --test hv_vmm -- --ignored --nocapture
 ```
+
+When using the repository development shell, prefix with `devenv shell --`.
 
 List available E2E tests without running ignored tests:
 
@@ -30,13 +47,16 @@ cargo test -p arcbox-e2e -- --list
 
 ## Configuration
 
-The boot assets test reads configuration from environment variables:
+Environment variables read by the tests:
 
 - `SKIP_BUILD=1` — reuse existing `target/release` binaries.
-- `KEEP_TEST_DIR=1` — preserve the temporary test directory for debugging.
+- `KEEP_TEST_DIR=1` — always preserve the temporary test directory (it is
+  preserved automatically when the test fails).
 - `ARCBOX_BOOT_ASSET_VERSION=<version>` — override `assets.lock`
   `[boot].version`.
 - `ARCBOX_GUEST_DOCKER_VSOCK_PORT=<port>` — pass a custom guest Docker vsock
   port to `arcbox-daemon`.
+- `ARCBOX_HV_E2E_KERNEL` / `ARCBOX_HV_E2E_ROOTFS` / `ARCBOX_HV_E2E_TIMEOUT` /
+  `ARCBOX_DATA_DIR` — HV probe overrides; see `src/bin/hv_e2e.rs`.
 
 Tracing is controlled with `RUST_LOG`; it defaults to `info` when unset.
