@@ -314,6 +314,13 @@ pub struct ContainerRuntimeConfig {
     /// Guest dockerd API vsock port.
     pub guest_docker_vsock_port: u32,
     /// Backend startup timeout in milliseconds.
+    ///
+    /// Must exceed the guest agent's worst-case runtime bring-up with
+    /// headroom: readiness gates on dockerd answering `/_ping`, and the
+    /// guest can spend up to ~30 s waiting for containerd plus its ~90 s
+    /// dockerd readiness poll (~120 s total) on large data volumes. A
+    /// shorter host timeout would abort boots the guest was still going
+    /// to finish.
     pub startup_timeout_ms: u64,
 }
 
@@ -321,7 +328,7 @@ impl Default for ContainerRuntimeConfig {
     fn default() -> Self {
         Self {
             guest_docker_vsock_port: DOCKER_API_VSOCK_PORT,
-            startup_timeout_ms: 60_000,
+            startup_timeout_ms: 150_000,
         }
     }
 }

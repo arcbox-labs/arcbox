@@ -61,8 +61,8 @@ pub(super) async fn handle_ensure_runtime(req: RuntimeEnsureRequest) -> RpcRespo
     let response = ensure_runtime::ensure_runtime(
         guard,
         req.start_if_needed,
-        || do_ensure_runtime_start(),
-        || do_ensure_runtime_probe(),
+        do_ensure_runtime_start,
+        do_ensure_runtime_probe,
     )
     .await;
 
@@ -77,10 +77,10 @@ async fn do_ensure_runtime_start() -> RuntimeEnsureResponse {
         notes.push(note);
     }
 
-    // Poll until docker socket is ready (up to ~90 seconds).
+    // Poll until the docker API answers /_ping (up to ~90 seconds).
     // On large data volumes with VirtIO block I/O, containerd may need
     // up to 30s to scan its content store, and dockerd may need additional
-    // time to load containers from Btrfs.
+    // time to load containers from Btrfs before it starts serving.
     let mut status = collect_runtime_status().await;
     for _ in 0..180 {
         if status.docker_ready {
@@ -260,16 +260,24 @@ async fn collect_runtime_status() -> RuntimeStatusResponse {
 
     let containerd_ready = probe_first_ready_socket(&CONTAINERD_SOCKET_CANDIDATES).await;
     // Two-level check: socket connectable (fast) + HTTP API probe (strong).
-    // Use socket connectable as the ready gate so the daemon doesn't stall
-    // when dockerd takes >30s to fully initialize (Loading containers on
-    // large data volumes). The HTTP probe result is included in the detail.
+    // The API probe is the ready gate: dockerd binds its socket before it
+    // finishes initializing (Loading containers…), so a socket-only gate
+    // reports ready while the first API calls still fail. Slow dockerd
+    // starts are covered by budget, not by weakening the gate — the
+    // ensure-runtime driver polls ~90s and the host startup timeout
+    // exceeds it (`ContainerRuntimeConfig::startup_timeout_ms`).
     let docker_socket_ok = probe_unix_socket(DOCKER_API_UNIX_SOCKET).await;
     let docker_api_ok = if docker_socket_ok {
         probe_docker_api_ready(DOCKER_API_UNIX_SOCKET).await
     } else {
         false
     };
-    let docker_ready = docker_socket_ok;
+    let docker_probe = DockerProbe {
+        socket_exists: Path::new(DOCKER_API_UNIX_SOCKET).exists(),
+        socket_ok: docker_socket_ok,
+        api_ok: docker_api_ok,
+    };
+    let docker_ready = docker_probe.ready();
     let runtime_dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
     let missing_runtime_binaries = missing_runtime_binaries_at(&runtime_dir);
 
@@ -302,52 +310,9 @@ async fn collect_runtime_status() -> RuntimeStatusResponse {
         }
     });
 
-    // dockerd status — distinguish socket-connectable vs API-ready.
-    let docker_detail = if docker_api_ok {
-        format!("API /_ping OK: {}", DOCKER_API_UNIX_SOCKET)
-    } else if docker_socket_ok {
-        format!(
-            "socket connectable, API initializing: {}",
-            DOCKER_API_UNIX_SOCKET
-        )
-    } else if Path::new(DOCKER_API_UNIX_SOCKET).exists() {
-        format!(
-            "socket exists but not connectable: {}",
-            DOCKER_API_UNIX_SOCKET
-        )
-    } else {
-        format!("socket missing: {}", DOCKER_API_UNIX_SOCKET)
-    };
+    services.push(docker_probe.service_status());
 
-    services.push(ServiceStatus {
-        name: "dockerd".to_string(),
-        status: if docker_ready {
-            SERVICE_READY.to_string()
-        } else if Path::new(DOCKER_API_UNIX_SOCKET).exists() {
-            SERVICE_ERROR.to_string()
-        } else {
-            SERVICE_NOT_READY.to_string()
-        },
-        detail: docker_detail,
-    });
-
-    // Build the summary detail string.
-    let detail = if docker_ready {
-        "docker socket ready".to_string()
-    } else if Path::new(DOCKER_API_UNIX_SOCKET).exists() {
-        format!(
-            "docker socket exists but not reachable: {}",
-            DOCKER_API_UNIX_SOCKET
-        )
-    } else if !missing_runtime_binaries.is_empty() {
-        format!(
-            "docker socket missing: {}; {}",
-            DOCKER_API_UNIX_SOCKET,
-            runtime_missing_detail_from(&missing_runtime_binaries)
-        )
-    } else {
-        format!("docker socket missing: {}", DOCKER_API_UNIX_SOCKET)
-    };
+    let detail = docker_probe.summary_detail(&missing_runtime_binaries);
 
     RuntimeStatusResponse {
         containerd_ready,
@@ -355,6 +320,83 @@ async fn collect_runtime_status() -> RuntimeStatusResponse {
         endpoint: format!("vsock:{}", docker_api_vsock_port()),
         detail,
         services,
+    }
+}
+
+/// Observed dockerd probe results, classified into status/detail strings.
+///
+/// Ready means the API answered `/_ping` — a bound-but-initializing socket
+/// (dockerd loading containers) is explicitly *not ready*, only reported
+/// in the detail so operators can tell "starting up" from "broken".
+struct DockerProbe {
+    socket_exists: bool,
+    socket_ok: bool,
+    api_ok: bool,
+}
+
+impl DockerProbe {
+    fn ready(&self) -> bool {
+        self.api_ok
+    }
+
+    fn service_status(&self) -> arcbox_protocol::agent::ServiceStatus {
+        let status = if self.ready() {
+            SERVICE_READY
+        } else if self.socket_ok {
+            // Bound socket, API still initializing — progress, not an error.
+            SERVICE_NOT_READY
+        } else if self.socket_exists {
+            // Socket file present but connections fail: dockerd died.
+            SERVICE_ERROR
+        } else {
+            SERVICE_NOT_READY
+        };
+
+        let detail = if self.ready() {
+            format!("API /_ping OK: {}", DOCKER_API_UNIX_SOCKET)
+        } else if self.socket_ok {
+            format!(
+                "socket connectable, API initializing: {}",
+                DOCKER_API_UNIX_SOCKET
+            )
+        } else if self.socket_exists {
+            format!(
+                "socket exists but not connectable: {}",
+                DOCKER_API_UNIX_SOCKET
+            )
+        } else {
+            format!("socket missing: {}", DOCKER_API_UNIX_SOCKET)
+        };
+
+        arcbox_protocol::agent::ServiceStatus {
+            name: "dockerd".to_string(),
+            status: status.to_string(),
+            detail,
+        }
+    }
+
+    fn summary_detail(&self, missing_runtime_binaries: &[&'static str]) -> String {
+        if self.ready() {
+            "docker engine ready (API /_ping OK)".to_string()
+        } else if self.socket_ok {
+            format!(
+                "docker API initializing (socket connectable): {}",
+                DOCKER_API_UNIX_SOCKET
+            )
+        } else if self.socket_exists {
+            format!(
+                "docker socket exists but not reachable: {}",
+                DOCKER_API_UNIX_SOCKET
+            )
+        } else if !missing_runtime_binaries.is_empty() {
+            format!(
+                "docker socket missing: {}; {}",
+                DOCKER_API_UNIX_SOCKET,
+                runtime_missing_detail_from(missing_runtime_binaries)
+            )
+        } else {
+            format!("docker socket missing: {}", DOCKER_API_UNIX_SOCKET)
+        }
     }
 }
 
@@ -614,7 +656,9 @@ async fn try_start_bundled_runtime() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::shared_containerd_config;
+    use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
+
+    use super::{DockerProbe, shared_containerd_config};
 
     #[test]
     fn shared_containerd_config_uses_k3s_cni_paths() {
@@ -622,5 +666,53 @@ mod tests {
         assert!(config.contains("bin_dir = \"/var/lib/rancher/k3s/data/cni\""));
         assert!(config.contains("conf_dir = \"/var/lib/rancher/k3s/agent/etc/cni/net.d\""));
         assert!(config.contains("max_conf_num = 1"));
+    }
+
+    fn probe(socket_exists: bool, socket_ok: bool, api_ok: bool) -> DockerProbe {
+        DockerProbe {
+            socket_exists,
+            socket_ok,
+            api_ok,
+        }
+    }
+
+    #[test]
+    fn docker_ready_requires_api_ping_not_just_socket() {
+        // Bound-but-initializing socket (dockerd loading containers) must
+        // not report ready — the regression behind the "500s right after
+        // engine ready" flake.
+        assert!(!probe(true, true, false).ready());
+        assert!(probe(true, true, true).ready());
+    }
+
+    #[test]
+    fn initializing_socket_is_not_ready_but_also_not_an_error() {
+        let status = probe(true, true, false).service_status();
+        assert_eq!(status.status, SERVICE_NOT_READY);
+        assert!(status.detail.contains("API initializing"));
+    }
+
+    #[test]
+    fn dead_socket_file_is_an_error() {
+        let status = probe(true, false, false).service_status();
+        assert_eq!(status.status, SERVICE_ERROR);
+        assert!(status.detail.contains("not connectable"));
+    }
+
+    #[test]
+    fn ready_probe_reports_ready_service() {
+        let status = probe(true, true, true).service_status();
+        assert_eq!(status.status, SERVICE_READY);
+        assert!(status.detail.contains("/_ping OK"));
+    }
+
+    #[test]
+    fn summary_mentions_missing_binaries_when_socket_absent() {
+        let summary = probe(false, false, false).summary_detail(&["dockerd", "runc"]);
+        assert!(summary.contains("socket missing"));
+        assert!(summary.contains("dockerd, runc"));
+
+        let initializing = probe(true, true, false).summary_detail(&[]);
+        assert!(initializing.contains("initializing"));
     }
 }
