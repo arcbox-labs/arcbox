@@ -86,11 +86,10 @@ pub mod vsock_manager {
     pub use arcbox_virtio_vsock::manager::*;
 }
 
-// Back-compat re-export of `queue` / `queue_guest` modules (moved to
+// Back-compat re-export of the `queue` module (moved to
 // `arcbox-virtio-core`). Existing `arcbox_virtio::queue::VirtQueue`
 // paths keep working.
 pub use arcbox_virtio_core::queue;
-pub use arcbox_virtio_core::queue_guest;
 
 // Re-export the foundational types from arcbox-virtio-core so existing
 // `arcbox_virtio::{VirtioDevice, DeviceCtx, ...}` imports keep working

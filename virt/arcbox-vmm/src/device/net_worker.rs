@@ -157,6 +157,34 @@ impl NetRxWorkerSlot {
 
         let qi = 0; // RX queue index.
 
+        // RX queue layout, captured at DRIVER_OK time (shared by both worker
+        // flavors below).
+        let queue = arcbox_virtio::QueueConfig {
+            desc_addr: mmio.queue_desc[qi],
+            avail_addr: mmio.queue_driver[qi],
+            used_addr: mmio.queue_device[qi],
+            size: mmio.queue_num[qi],
+            ready: true,
+            gpa_base: guest_ram_gpa,
+        };
+        // Capture whether VIRTIO_F_EVENT_IDX was negotiated. This is
+        // valid here because try_spawn runs from the DRIVER_OK path,
+        // after feature negotiation has completed.
+        let event_idx_enabled =
+            (mmio.driver_features & arcbox_virtio::queue::VIRTIO_F_EVENT_IDX) != 0;
+        drop(mmio);
+
+        // SAFETY: `guest_ram_base` is the host mapping returned by
+        // the hypervisor, valid for `guest_ram_size` bytes for the
+        // lifetime of the VM.
+        let guest_mem = unsafe {
+            Arc::new(arcbox_virtio::GuestMemWriter::new(
+                guest_ram_base,
+                guest_ram_size,
+                guest_ram_gpa as usize,
+            ))
+        };
+
         // Try the new RxInjectThread path (channel-based, HV backend).
         let rx_channel = self
             .rx_inject_channel
@@ -165,30 +193,6 @@ impl NetRxWorkerSlot {
             .take();
 
         if let Some(rx_channel) = rx_channel {
-            // SAFETY: `guest_ram_base` is the host mapping returned by
-            // the hypervisor, valid for `guest_ram_size` bytes for the
-            // lifetime of the VM.
-            let guest_mem = unsafe {
-                arcbox_net_inject::guest_mem::GuestMemWriter::new(
-                    guest_ram_base,
-                    guest_ram_size,
-                    guest_ram_gpa as usize,
-                )
-            };
-
-            let queue = arcbox_net_inject::queue::RxQueueConfig {
-                desc_gpa: mmio.queue_desc[qi],
-                avail_gpa: mmio.queue_driver[qi],
-                used_gpa: mmio.queue_device[qi],
-                size: mmio.queue_num[qi],
-            };
-            // Capture whether VIRTIO_F_EVENT_IDX was negotiated. This is
-            // valid here because try_spawn runs from the DRIVER_OK path,
-            // after feature negotiation has completed.
-            let event_idx_enabled =
-                (mmio.driver_features & arcbox_virtio::queue::VIRTIO_F_EVENT_IDX) != 0;
-            drop(mmio);
-
             // Wrap the VMM IRQ callback to match the inject crate's type.
             let vmm_callback = irq_callback;
             let inject_callback: Arc<arcbox_net_inject::irq::IrqCallback> =
@@ -258,29 +262,11 @@ impl NetRxWorkerSlot {
             return;
         };
 
-        let rx_queue = crate::net_rx_worker::RxQueueConfig {
-            desc_gpa: mmio.queue_desc[qi],
-            avail_gpa: mmio.queue_driver[qi],
-            used_gpa: mmio.queue_device[qi],
-            size: mmio.queue_num[qi],
-        };
-        drop(mmio);
-
-        // SAFETY: `guest_ram_base` is the host mapping returned by
-        // the hypervisor, valid for `guest_ram_size` bytes for the
-        // lifetime of the VM.
-        let guest_mem = unsafe {
-            crate::blk_worker::GuestMemWriter::new(
-                guest_ram_base,
-                guest_ram_size,
-                guest_ram_gpa as usize,
-            )
-        };
-
         let ctx = crate::net_rx_worker::NetRxWorkerContext {
             net_host_fd: net_fd,
             guest_mem,
-            rx_queue,
+            rx_queue: queue,
+            event_idx: event_idx_enabled,
             mmio_state: mmio_arc.clone(),
             irq_callback,
             irq,

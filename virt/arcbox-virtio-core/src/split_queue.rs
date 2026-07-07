@@ -304,6 +304,24 @@ impl SplitQueue {
         self.mem.write_u16(off, self.last_avail_idx);
     }
 
+    /// Publishes `avail_event = the guest's current avail.idx`, requesting a
+    /// kick only for entries posted beyond everything currently visible.
+    ///
+    /// For polling consumers that never need guest kicks (the net RX inject
+    /// thread re-reads `avail.idx` on every attempt), this maximally
+    /// suppresses the guest's QUEUE_NOTIFY MMIO exits, whereas
+    /// [`Self::write_avail_event`] (consumed cursor) is for drain-then-sleep
+    /// consumers that must be kicked for the very next entry.
+    ///
+    /// The `Release` fence orders prior used-ring writes before the
+    /// `avail_event` store, pairing with the guest's acquire on the used ring.
+    pub fn write_avail_event_current(&self) {
+        let avail_idx = self.avail_idx();
+        fence(Ordering::Release);
+        let off = self.used_gpa as usize + 4 + self.size as usize * 8;
+        self.mem.write_u16(off, avail_idx);
+    }
+
     /// Re-arms guest→host notifications and reports whether the guest made more
     /// entries available while we were draining.
     ///
@@ -649,6 +667,20 @@ mod tests {
         let _ = q.pop_avail();
         q.write_avail_event();
         assert_eq!(ram.avail_event(), 1); // consumed avail index
+    }
+
+    #[test]
+    fn write_avail_event_current_publishes_guest_avail_idx() {
+        let mut ram = TestRam::new(0);
+        ram.write_desc(0, ram.gpa_base + DATA_OFF, 16, 0, 0);
+        ram.set_avail(0, 0);
+        // Guest has posted 5 entries; the device consumed only 1.
+        ram.set_avail_idx(5);
+        let mut q = queue(&mut ram, true);
+        let _ = q.pop_avail();
+        q.write_avail_event_current();
+        // A polling consumer wants kicks only past everything posted.
+        assert_eq!(ram.avail_event(), 5);
     }
 
     /// The bug `queue_guest::GuestMemoryVirtQueue` had: assuming GPA 0 maps to
