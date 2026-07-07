@@ -21,14 +21,25 @@ const DOCKER_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub struct BootAssetsConfig {
-    skip_build: bool,
-    keep_test_dir: bool,
-    version: Option<String>,
-    guest_docker_vsock_port: u32,
+    pub skip_build: bool,
+    pub keep_test_dir: bool,
+    pub version: Option<String>,
+    pub guest_docker_vsock_port: u32,
+    /// System VM backend for the daemon under test. `None` leaves the
+    /// daemon's own default (VZ) in effect.
+    pub backend: Option<arcbox_vmm::VmBackend>,
 }
 
 impl BootAssetsConfig {
     pub fn from_env() -> Result<Self> {
+        let backend = match env::var("ARCBOX_VM_BACKEND") {
+            Ok(value) => Some(
+                arcbox_vmm::VmBackend::from_str_ascii(&value)
+                    .with_context(|| format!("invalid ARCBOX_VM_BACKEND '{value}'"))?,
+            ),
+            Err(env::VarError::NotPresent) => None,
+            Err(error) => return Err(error).context("reading ARCBOX_VM_BACKEND"),
+        };
         Ok(Self {
             skip_build: env_flag("SKIP_BUILD"),
             keep_test_dir: env_flag("KEEP_TEST_DIR"),
@@ -40,6 +51,7 @@ impl BootAssetsConfig {
                 Err(env::VarError::NotPresent) => 2375,
                 Err(error) => return Err(error).context("reading ARCBOX_GUEST_DOCKER_VSOCK_PORT"),
             },
+            backend,
         })
     }
 }
@@ -51,6 +63,7 @@ struct TestContext {
     version: String,
     label: String,
     guest_docker_vsock_port: u32,
+    backend: Option<arcbox_vmm::VmBackend>,
     keep_test_dir: bool,
     daemon: Option<DaemonHandle>,
 }
@@ -76,6 +89,7 @@ impl TestContext {
             version,
             label,
             guest_docker_vsock_port: config.guest_docker_vsock_port,
+            backend: config.backend,
             keep_test_dir: config.keep_test_dir,
             daemon: None,
         })
@@ -153,18 +167,24 @@ impl Drop for TestContext {
     }
 }
 
+/// Builds the release binaries the daemon-level scenarios spawn.
+pub fn build_release_binaries() -> Result<()> {
+    info!("building latest release binaries");
+    let shell = xshell::Shell::new()?;
+    shell.change_dir(repo_root());
+    xshell::cmd!(
+        shell,
+        "cargo build --release -p arcbox-cli -p arcbox-daemon"
+    )
+    .run()?;
+    Ok(())
+}
+
 pub fn run(config: BootAssetsConfig) -> Result<()> {
-    info!("starting boot assets integration test");
+    info!(backend = ?config.backend, "starting boot assets integration test");
 
     if !config.skip_build {
-        info!("building latest release binaries");
-        let shell = xshell::Shell::new()?;
-        shell.change_dir(repo_root());
-        xshell::cmd!(
-            shell,
-            "cargo build --release -p arcbox-cli -p arcbox-daemon"
-        )
-        .run()?;
+        build_release_binaries()?;
     }
 
     let mut ctx = TestContext::new(config)?;
@@ -266,7 +286,13 @@ fn setup_test_env(ctx: &TestContext) -> Result<()> {
 /// Spawns the daemon and blocks until it reports READY on the setup
 /// status stream — VM booted, agent up, services started.
 fn start_daemon(ctx: &mut TestContext) -> Result<()> {
-    info!("starting daemon");
+    info!(backend = ?ctx.backend, "starting daemon");
+    let mut env = vec![("ARCBOX_BOOT_ASSET_VERSION".to_owned(), ctx.version.clone())];
+    if let Some(backend) = ctx.backend {
+        // First-boot backend selection; the data dir is fresh, so no
+        // persisted machine backend can override it.
+        env.push(("ARCBOX_VM_BACKEND".to_owned(), backend.as_str().to_owned()));
+    }
     let mut daemon = DaemonHandle::spawn(DaemonConfig {
         binary: ctx.root.join("target/release/arcbox-daemon"),
         data_dir: ctx.test_dir.clone(),
@@ -274,7 +300,7 @@ fn start_daemon(ctx: &mut TestContext) -> Result<()> {
             "--guest-docker-vsock-port".to_owned(),
             ctx.guest_docker_vsock_port.to_string(),
         ],
-        env: vec![("ARCBOX_BOOT_ASSET_VERSION".to_owned(), ctx.version.clone())],
+        env,
     })?;
 
     let started = Instant::now();

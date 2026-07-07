@@ -55,6 +55,14 @@ agent RPC, DAX, agent supervision, pause/resume, stop:
 cargo test -p arcbox-e2e --test hv_vmm -- --ignored --nocapture
 ```
 
+Dual-backend matrix — the boot-assets scenario once per backend, VZ first.
+VZ is the oracle: HV-only red means an HV implementation bug, double red means
+the bug is above the hypervisor layer:
+
+```bash
+cargo test -p arcbox-e2e --test backend_matrix -- --ignored --nocapture
+```
+
 When using the repository development shell, prefix with `devenv shell --`.
 
 List available E2E tests without running ignored tests:
@@ -72,6 +80,9 @@ Environment variables read by the tests:
   preserved automatically when the test fails).
 - `ARCBOX_BOOT_ASSET_VERSION=<version>` — override `assets.lock`
   `[boot].version`.
+- `ARCBOX_VM_BACKEND=vz|hv` — System VM backend for the daemon under test
+  (first-boot default; the daemon reads the same variable). The matrix test
+  overrides it per run.
 - `ARCBOX_GUEST_DOCKER_VSOCK_PORT=<port>` — pass a custom guest Docker vsock
   port to `arcbox-daemon`.
 - `ARCBOX_HV_E2E_KERNEL` / `ARCBOX_HV_E2E_ROOTFS` / `ARCBOX_HV_E2E_TIMEOUT` /
