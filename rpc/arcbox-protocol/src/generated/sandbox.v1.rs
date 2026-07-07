@@ -614,6 +614,12 @@ pub struct CheckpointResponse {
     pub created_at: ::prost::alloc::string::String,
 }
 /// Request to restore a sandbox from a snapshot.
+///
+/// Direct-mode (non-jailer) limitation: the snapshot's vmstate records the
+/// origin sandbox's absolute vsock socket path, so concurrent restores from
+/// the same snapshot — or restoring while the origin sandbox is still
+/// running — fail with FAILED_PRECONDITION on the vsock conflict. Jailer
+/// mode restores into per-sandbox chroots and has no such constraint.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[derive(Clone, PartialEq, ::prost::Message)]

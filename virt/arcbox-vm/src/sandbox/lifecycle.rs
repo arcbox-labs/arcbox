@@ -208,7 +208,10 @@ impl SandboxManager {
                 &self.cow_manager,
             )
             .await;
-            instance.lock().unwrap().state = SandboxState::Stopped;
+            let mut inst = instance.lock().unwrap();
+            inst.state = SandboxState::Stopped;
+            // Every reconcilable resource is gone; drop the crash record.
+            super::reconcile::clear_state_record(&inst.vm_dir);
         }
 
         let _ = self.events_tx.send(SandboxEvent::new(id, "stopped"));

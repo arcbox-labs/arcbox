@@ -28,6 +28,22 @@ pub(super) async fn boot_sandbox(
         Ok((process, vm, vsock_uds_path, cow_handle)) => {
             let ready_at = Utc::now();
 
+            // Persist the crash-recovery record before handing resources to
+            // the instance, so an agent restart can reconcile them.
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "Firecracker pid fits platform pid_t"
+            )]
+            let record = super::reconcile::SandboxStateRecord::new(
+                &id,
+                process.pid().map(|p| p as i32),
+                net_alloc.as_ref(),
+                cow_handle.as_ref(),
+                config.firecracker.jailer.is_some(),
+                None,
+            );
+            super::reconcile::write_state_record(&vm_dir, &record);
+
             let value = instances.read().unwrap().get(&id).cloned();
             if let Some(arc) = value {
                 let mut inst = arc.lock().unwrap();
@@ -81,7 +97,7 @@ async fn run_initial_cmd(
     id: &SandboxId,
     spec: SandboxSpec,
     vsock_uds_path: &Path,
-    instances: &Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>,
+    instances: &super::InstanceMap,
     events_tx: &broadcast::Sender<SandboxEvent>,
 ) {
     let start = StartCommand {

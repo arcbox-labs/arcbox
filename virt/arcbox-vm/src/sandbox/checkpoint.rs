@@ -472,6 +472,25 @@ impl SandboxManager {
         instance.state = SandboxState::Ready;
         instance.ready_at = Some(Utc::now());
 
+        // Persist the crash-recovery record for the restored sandbox.
+        #[allow(
+            clippy::cast_possible_wrap,
+            reason = "Firecracker pid fits platform pid_t"
+        )]
+        let record = super::reconcile::SandboxStateRecord::new(
+            &new_id,
+            instance
+                .process
+                .as_ref()
+                .and_then(|p| p.pid())
+                .map(|p| p as i32),
+            instance.network.as_ref(),
+            instance.cow_handle.as_ref(),
+            self.config.firecracker.jailer.is_some(),
+            instance.restore_origin_dir.as_deref(),
+        );
+        super::reconcile::write_state_record(&instance.vm_dir, &record);
+
         {
             let mut instances = self.instances.write().unwrap();
             instances.insert(new_id.clone(), Arc::new(Mutex::new(instance)));

@@ -12,13 +12,14 @@ pub(super) async fn start_run_workload(
     id: &SandboxId,
     uds_path: &Path,
     start: StartCommand,
-    instances: &Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>,
+    instances: &super::InstanceMap,
     events_tx: &broadcast::Sender<SandboxEvent>,
 ) -> Result<tokio::sync::mpsc::Receiver<Result<OutputChunk>>> {
     let inner_rx = vsock::run(uds_path, start).await?;
 
     // Transition to Running only after the vsock session is established.
-    if let Some(arc) = instances.read().unwrap().get(id).cloned() {
+    let entry = instances.read().unwrap().get(id).cloned();
+    if let Some(arc) = entry {
         arc.lock().unwrap().state = SandboxState::Running;
     }
     let _ = events_tx.send(SandboxEvent::new(id, "running"));
