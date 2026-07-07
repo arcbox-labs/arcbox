@@ -34,7 +34,6 @@
 pub mod error;
 pub mod guest_mem;
 pub mod queue;
-pub mod queue_guest;
 pub mod split_queue;
 
 pub use error::{Result, VirtioError};

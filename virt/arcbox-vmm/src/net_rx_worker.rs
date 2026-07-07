@@ -59,11 +59,6 @@ pub struct NetRxWorkerContext {
     pub running: Arc<AtomicBool>,
 }
 
-// SAFETY: All fields are either Send+Sync or raw pointers wrapped in
-// GuestMemWriter which is Send+Sync. The irq_callback and exit_vcpus
-// closures capture only thread-safe types (Arc<Gic>, weak refs).
-unsafe impl Send for NetRxWorkerContext {}
-
 /// Triggers a virtio-net RX interrupt: sets MMIO interrupt_status,
 /// fires the GIC SPI, and kicks all vCPUs out of hv_vcpu_run.
 fn trigger_net_irq(ctx: &NetRxWorkerContext) {

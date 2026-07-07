@@ -694,8 +694,15 @@ mod tests {
 
         let (writer, reader) = tcp_pair();
         drop(writer); // immediate EOF
-        // EOF is visible as soon as the FIN arrives; give loopback a moment.
-        std::thread::sleep(Duration::from_millis(10));
+        // Wait until the FIN is visible (peek returns Ok(0)) so the poll
+        // below deterministically takes the EOF path.
+        let mut probe = [0u8; 1];
+        for _ in 0..500 {
+            match reader.peek(&mut probe) {
+                Ok(0) => break,
+                _ => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
 
         let mut conns = vec![inline_conn(reader)];
         let (mut batch, mut fire) = (0u16, false);
