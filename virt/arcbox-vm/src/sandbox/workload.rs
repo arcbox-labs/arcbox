@@ -1,13 +1,116 @@
 use super::*;
 
+/// Guarded `Ready → Running` transition.
+///
+/// This is the sandbox's single-workload claim. It is taken **before** any
+/// command is dispatched into the guest, so a caller that loses a concurrent
+/// race (or arrives after a `stop` set `Stopping`) is rejected with
+/// `WrongState` *without* having launched a process. A blind assignment here
+/// was the original defect: two concurrent `Run`s would both dispatch, then
+/// one would be told it lost — after its command was already executing.
+fn claim_running(id: &SandboxId, instances: &InstanceMap) -> Result<()> {
+    let arc = instances
+        .read()
+        .unwrap()
+        .get(id)
+        .cloned()
+        .ok_or_else(|| VmmError::NotFound(id.clone()))?;
+    let mut inst = arc.lock().unwrap();
+    if inst.state != SandboxState::Ready {
+        return Err(VmmError::WrongState {
+            id: id.clone(),
+            expected: "Ready".into(),
+            actual: inst.state.to_string(),
+        });
+    }
+    inst.state = SandboxState::Running;
+    Ok(())
+}
+
+/// Roll a claim back to `Ready` after a failed dispatch.
+///
+/// Only downgrades when the sandbox is still `Running` (i.e. this claim still
+/// owns it). If a concurrent `stop` moved it to `Stopping`, that transition is
+/// left intact — stop owns the teardown from there.
+fn release_running(id: &SandboxId, instances: &InstanceMap) {
+    if let Some(arc) = instances.read().unwrap().get(id).cloned() {
+        let mut inst = arc.lock().unwrap();
+        if inst.state == SandboxState::Running {
+            inst.state = SandboxState::Ready;
+        }
+    }
+}
+
+/// Record a workload's exit and return the sandbox to `Ready`.
+///
+/// Runs when the `exit` chunk is observed. The `Ready` flip happens only from
+/// an active state (`Running` during a normal workload, `Stopping` while a
+/// `stop` drains — where the flip is the drain's completion signal); a sandbox
+/// already driven to `Stopped` is never resurrected.
+fn finish_workload(
+    id: &SandboxId,
+    exit_code: i32,
+    instances: &InstanceMap,
+    events_tx: &broadcast::Sender<SandboxEvent>,
+) {
+    if let Some(arc) = instances.read().unwrap().get(id).cloned() {
+        let mut inst = arc.lock().unwrap();
+        inst.last_exit_code = Some(exit_code);
+        inst.last_exited_at = Some(Utc::now());
+        if matches!(inst.state, SandboxState::Running | SandboxState::Stopping) {
+            inst.state = SandboxState::Ready;
+        }
+    }
+    let _ = events_tx
+        .send(SandboxEvent::new(id, "idle").with_attr("exit_code", &exit_code.to_string()));
+}
+
+/// Spawn the watcher that mirrors a workload's output to the caller and drives
+/// the exit-side state machine.
+///
+/// The watcher **always drains `inner_rx` to completion** so the `exit` chunk
+/// is processed even after the caller drops its receiver. Coupling the state
+/// update to a successful forward was the original defect: a consumer that
+/// disconnected mid-workload broke the loop before the exit frame, stranding
+/// the sandbox in `Running` forever. Now a gone consumer only stops the
+/// forwarding; the drain (and the `Running → Ready` flip) continues.
+fn spawn_exit_watcher(
+    id: &SandboxId,
+    inner_rx: tokio::sync::mpsc::Receiver<Result<OutputChunk>>,
+    instances: &InstanceMap,
+    events_tx: &broadcast::Sender<SandboxEvent>,
+) -> tokio::sync::mpsc::Receiver<Result<OutputChunk>> {
+    let (wrapped_tx, wrapped_rx) = tokio::sync::mpsc::channel(64);
+    let instances = Arc::clone(instances);
+    let events_tx = events_tx.clone();
+    let sandbox_id = id.clone();
+    tokio::spawn(async move {
+        let mut inner_rx = inner_rx;
+        let mut consumer_gone = false;
+        while let Some(result) = inner_rx.recv().await {
+            // Handle the exit chunk regardless of the consumer's presence.
+            if let Ok(chunk) = &result
+                && chunk.stream == "exit"
+            {
+                finish_workload(&sandbox_id, chunk.exit_code, &instances, &events_tx);
+            }
+            // Forward until the consumer goes away, then keep draining so the
+            // exit chunk above is still reached.
+            if !consumer_gone && wrapped_tx.send(result).await.is_err() {
+                consumer_gone = true;
+            }
+        }
+    });
+    wrapped_rx
+}
+
 /// Start a non-interactive workload over the sandbox's vsock and wire up the
 /// `Running → Ready` state machine.
 ///
-/// Shared by `Run` and the initial `cmd` launched right after boot: connects
-/// to the in-VM agent (retrying while it is still starting), flips the
-/// sandbox to `Running` once the session is established, and spawns a
-/// watcher that intercepts the exit chunk to restore `Ready`, record the
-/// exit code, and broadcast an `idle` event.
+/// Shared by `Run` and the initial `cmd` launched right after boot: claims the
+/// sandbox (`Ready → Running`) **before** connecting so a losing racer never
+/// dispatches a command, launches the session, then spawns the exit watcher.
+/// A launch failure rolls the claim back to `Ready`.
 pub(super) async fn start_run_workload(
     id: &SandboxId,
     uds_path: &Path,
@@ -15,73 +118,18 @@ pub(super) async fn start_run_workload(
     instances: &super::InstanceMap,
     events_tx: &broadcast::Sender<SandboxEvent>,
 ) -> Result<tokio::sync::mpsc::Receiver<Result<OutputChunk>>> {
-    let inner_rx = vsock::run(uds_path, start).await?;
+    claim_running(id, instances)?;
 
-    // Claim the sandbox with a guarded Ready → Running transition. A `stop`
-    // that raced this workload (e.g. arriving during the boot → initial-cmd
-    // window) sets `Stopping` under the same lock; if it won, abort here
-    // instead of clobbering its state and running on released resources.
-    // `stop` then sees either `Running` (drains us) or its own `Stopping`
-    // (we bailed) — never a lost update.
-    {
-        let arc = instances
-            .read()
-            .unwrap()
-            .get(id)
-            .cloned()
-            .ok_or_else(|| VmmError::NotFound(id.clone()))?;
-        let mut inst = arc.lock().unwrap();
-        if inst.state != SandboxState::Ready {
-            return Err(VmmError::WrongState {
-                id: id.clone(),
-                expected: "Ready".into(),
-                actual: inst.state.to_string(),
-            });
+    let inner_rx = match vsock::run(uds_path, start).await {
+        Ok(rx) => rx,
+        Err(e) => {
+            release_running(id, instances);
+            return Err(e);
         }
-        inst.state = SandboxState::Running;
-    }
+    };
     let _ = events_tx.send(SandboxEvent::new(id, "running"));
 
-    // Wrap the receiver to intercept MSG_EXIT and update state.
-    let (wrapped_tx, wrapped_rx) = tokio::sync::mpsc::channel(64);
-    let instances = Arc::clone(instances);
-    let events_tx = events_tx.clone();
-    let sandbox_id = id.clone();
-    tokio::spawn(async move {
-        let mut inner_rx = inner_rx;
-        while let Some(result) = inner_rx.recv().await {
-            let send_result = match &result {
-                Ok(chunk) if chunk.stream == "exit" => {
-                    let exit_code = chunk.exit_code;
-                    let value = instances.read().unwrap().get(&sandbox_id).cloned();
-                    if let Some(arc) = value {
-                        let mut inst = arc.lock().unwrap();
-                        inst.last_exit_code = Some(exit_code);
-                        inst.last_exited_at = Some(Utc::now());
-                        // Return to Ready only from an active state. During a
-                        // stop's drain the state is Stopping — flipping to
-                        // Ready is the drain's completion signal — but never
-                        // resurrect a sandbox stop has already driven to
-                        // Stopped (its resources are gone).
-                        if matches!(inst.state, SandboxState::Running | SandboxState::Stopping) {
-                            inst.state = SandboxState::Ready;
-                        }
-                    }
-                    let _ = events_tx.send(
-                        SandboxEvent::new(&sandbox_id, "idle")
-                            .with_attr("exit_code", &exit_code.to_string()),
-                    );
-                    wrapped_tx.send(result).await
-                }
-                _ => wrapped_tx.send(result).await,
-            };
-            if send_result.is_err() {
-                break;
-            }
-        }
-    });
-
-    Ok(wrapped_rx)
+    Ok(spawn_exit_watcher(id, inner_rx, instances, events_tx))
 }
 
 impl SandboxManager {
@@ -152,61 +200,166 @@ impl SandboxManager {
             timeout_seconds,
         };
 
-        let (in_tx, inner_rx) = vsock::exec(&uds_path, start).await?;
+        // Claim BEFORE opening the session (see start_run_workload): a losing
+        // racer must not launch an interactive process in the guest.
+        claim_running(id, &self.instances)?;
 
-        // Guarded Ready → Running transition (see start_run_workload): abort
-        // if a stop raced this exec session rather than clobber its state.
-        {
-            let inst = self.get_instance(id)?;
-            let mut guard = inst.lock().unwrap();
-            if guard.state != SandboxState::Ready {
-                return Err(VmmError::WrongState {
-                    id: id.clone(),
-                    expected: "Ready".into(),
-                    actual: guard.state.to_string(),
-                });
+        let (in_tx, inner_rx) = match vsock::exec(&uds_path, start).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                release_running(id, &self.instances);
+                return Err(e);
             }
-            guard.state = SandboxState::Running;
-        }
+        };
         let _ = self.events_tx.send(SandboxEvent::new(id, "running"));
 
-        // Wrap the output receiver to intercept MSG_EXIT and update state.
-        let (wrapped_tx, wrapped_rx) = tokio::sync::mpsc::channel(64);
-        let instances = Arc::clone(&self.instances);
-        let events_tx = self.events_tx.clone();
-        let sandbox_id = id.clone();
-        tokio::spawn(async move {
-            let mut inner_rx = inner_rx;
-            while let Some(result) = inner_rx.recv().await {
-                let send_result = match &result {
-                    Ok(chunk) if chunk.stream == "exit" => {
-                        let exit_code = chunk.exit_code;
-                        let value = instances.read().unwrap().get(&sandbox_id).cloned();
-                        if let Some(arc) = value {
-                            let mut inst = arc.lock().unwrap();
-                            inst.last_exit_code = Some(exit_code);
-                            inst.last_exited_at = Some(Utc::now());
-                            // See start_run_workload: only return to Ready from
-                            // an active state; never resurrect a Stopped sandbox.
-                            if matches!(inst.state, SandboxState::Running | SandboxState::Stopping)
-                            {
-                                inst.state = SandboxState::Ready;
-                            }
-                        }
-                        let _ = events_tx.send(
-                            SandboxEvent::new(&sandbox_id, "idle")
-                                .with_attr("exit_code", &exit_code.to_string()),
-                        );
-                        wrapped_tx.send(result).await
-                    }
-                    _ => wrapped_tx.send(result).await,
-                };
-                if send_result.is_err() {
-                    break;
-                }
-            }
-        });
-
+        let wrapped_rx = spawn_exit_watcher(id, inner_rx, &self.instances, &self.events_tx);
         Ok((in_tx, wrapped_rx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a one-instance map in the given state for state-machine tests.
+    fn instance_map(id: &str, state: SandboxState) -> InstanceMap {
+        let mut inst = SandboxInstance::new(
+            id.to_owned(),
+            SandboxSpec::default(),
+            None,
+            PathBuf::from("/tmp/does-not-matter"),
+        );
+        inst.state = state;
+        let map = HashMap::from([(id.to_owned(), Arc::new(Mutex::new(inst)))]);
+        Arc::new(RwLock::new(map))
+    }
+
+    fn state_of(id: &str, instances: &InstanceMap) -> SandboxState {
+        instances.read().unwrap()[id].lock().unwrap().state
+    }
+
+    #[test]
+    fn claim_running_transitions_from_ready_only() {
+        let instances = instance_map("s", SandboxState::Ready);
+        claim_running(&"s".to_owned(), &instances).unwrap();
+        assert_eq!(state_of("s", &instances), SandboxState::Running);
+
+        // A second claim on the now-Running sandbox must be rejected — this is
+        // the guard that stops a concurrent workload from being dispatched.
+        let err = claim_running(&"s".to_owned(), &instances).unwrap_err();
+        assert!(matches!(err, VmmError::WrongState { .. }));
+        assert_eq!(state_of("s", &instances), SandboxState::Running);
+    }
+
+    #[test]
+    fn claim_running_rejects_missing_and_stopping() {
+        let instances = instance_map("s", SandboxState::Stopping);
+        assert!(matches!(
+            claim_running(&"s".to_owned(), &instances).unwrap_err(),
+            VmmError::WrongState { .. }
+        ));
+        assert!(matches!(
+            claim_running(&"missing".to_owned(), &instances).unwrap_err(),
+            VmmError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn release_running_only_downgrades_running() {
+        let instances = instance_map("s", SandboxState::Running);
+        release_running(&"s".to_owned(), &instances);
+        assert_eq!(state_of("s", &instances), SandboxState::Ready);
+
+        // A stop that won the race left Stopping; rollback must not clobber it.
+        instances.read().unwrap()["s"].lock().unwrap().state = SandboxState::Stopping;
+        release_running(&"s".to_owned(), &instances);
+        assert_eq!(state_of("s", &instances), SandboxState::Stopping);
+    }
+
+    #[tokio::test]
+    async fn watcher_restores_ready_even_when_consumer_disconnects() {
+        // Regression for the strand-in-Running bug: drop the consumer before
+        // the exit chunk; the watcher must still process the exit and flip
+        // Running → Ready.
+        let instances = instance_map("s", SandboxState::Running);
+        let (events_tx, _events_rx) = broadcast::channel(16);
+        let (inner_tx, inner_rx) = tokio::sync::mpsc::channel(8);
+
+        let wrapped_rx = spawn_exit_watcher(&"s".to_owned(), inner_rx, &instances, &events_tx);
+        drop(wrapped_rx); // consumer gone immediately
+
+        inner_tx
+            .send(Ok(OutputChunk {
+                stream: "stdout".into(),
+                data: b"noise".to_vec(),
+                exit_code: 0,
+            }))
+            .await
+            .unwrap();
+        inner_tx
+            .send(Ok(OutputChunk {
+                stream: "exit".into(),
+                data: vec![],
+                exit_code: 7,
+            }))
+            .await
+            .unwrap();
+        drop(inner_tx); // guest side closes after exit
+
+        // Give the detached watcher a moment to drain and update state.
+        for _ in 0..50 {
+            if state_of("s", &instances) == SandboxState::Ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state_of("s", &instances), SandboxState::Ready);
+        let last_exit_code = {
+            let guard = instances.read().unwrap();
+            let code = guard["s"].lock().unwrap().last_exit_code;
+            code
+        };
+        assert_eq!(last_exit_code, Some(7));
+    }
+
+    #[tokio::test]
+    async fn watcher_forwards_then_finishes_for_a_live_consumer() {
+        let instances = instance_map("s", SandboxState::Running);
+        let (events_tx, mut events_rx) = broadcast::channel(16);
+        let (inner_tx, inner_rx) = tokio::sync::mpsc::channel(8);
+
+        let mut wrapped_rx = spawn_exit_watcher(&"s".to_owned(), inner_rx, &instances, &events_tx);
+
+        inner_tx
+            .send(Ok(OutputChunk {
+                stream: "stdout".into(),
+                data: b"hello".to_vec(),
+                exit_code: 0,
+            }))
+            .await
+            .unwrap();
+        let first = wrapped_rx.recv().await.unwrap().unwrap();
+        assert_eq!(first.data, b"hello");
+
+        inner_tx
+            .send(Ok(OutputChunk {
+                stream: "exit".into(),
+                data: vec![],
+                exit_code: 0,
+            }))
+            .await
+            .unwrap();
+        drop(inner_tx);
+
+        // The forwarded exit chunk arrives, then the channel closes.
+        let exit = wrapped_rx.recv().await.unwrap().unwrap();
+        assert_eq!(exit.stream, "exit");
+        assert!(wrapped_rx.recv().await.is_none());
+        assert_eq!(state_of("s", &instances), SandboxState::Ready);
+
+        // An "idle" event was broadcast on exit.
+        let ev = events_rx.recv().await.unwrap();
+        assert_eq!(ev.action, "idle");
     }
 }
