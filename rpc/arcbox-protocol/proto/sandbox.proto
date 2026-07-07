@@ -55,6 +55,16 @@ service SandboxService {
     // Emitted actions: "created" | "ready" | "running" | "idle" |
     //                  "stopping" | "stopped" | "failed" | "removed"
     rpc Events(SandboxEventsRequest) returns (stream SandboxEvent);
+
+    // Read a file from inside a sandbox as a stream of chunks.
+    // The final chunk has done == true. The sandbox must be alive
+    // (ready or running). Limited to 256 MiB per file.
+    rpc ReadFile(ReadFileRequest) returns (stream FileChunk);
+
+    // Write a file into a sandbox. The first message must carry `open`;
+    // subsequent messages stream `chunk` payloads, the last one with
+    // done == true. Limited to 256 MiB per file.
+    rpc WriteFile(stream WriteFileRequest) returns (Empty);
 }
 
 // =============================================================================
@@ -277,6 +287,46 @@ message ExecOutput {
     int32 exit_code = 3;
     // True on the last message of the stream.
     bool done = 4;
+}
+
+// =============================================================================
+// File I/O
+// =============================================================================
+
+// Request to read a file from a sandbox.
+message ReadFileRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Absolute path inside the sandbox rootfs.
+    string path = 2;
+}
+
+// One chunk of file data in a ReadFile / WriteFile stream.
+message FileChunk {
+    // Raw bytes (may be empty on the final chunk).
+    bytes data = 1;
+    // True on the last chunk of the stream.
+    bool done = 2;
+}
+
+// Opens a WriteFile stream. Must be the first WriteFileRequest message.
+message WriteFileOpen {
+    // Sandbox ID.
+    string id = 1;
+    // Absolute destination path inside the sandbox rootfs.
+    string path = 2;
+    // Unix permission bits for the created file (0 = 0644).
+    uint32 mode = 3;
+}
+
+// A single client message in a WriteFile stream.
+message WriteFileRequest {
+    oneof payload {
+        // Stream header — sandbox, path, and mode.
+        WriteFileOpen open = 1;
+        // File content chunk; the last one has done == true.
+        FileChunk chunk = 2;
+    }
 }
 
 // =============================================================================

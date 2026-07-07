@@ -19,10 +19,11 @@ use arcbox_protocol::agent::{
 };
 use arcbox_protocol::sandbox_v1::{
     CheckpointRequest, CheckpointResponse, CreateSandboxRequest, CreateSandboxResponse,
-    DeleteSnapshotRequest, ExecOutput, ExecRequest, InspectSandboxRequest, ListSandboxesRequest,
-    ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse, RemoveSandboxRequest,
-    RestoreRequest, RestoreResponse, RunOutput, RunRequest, SandboxEvent, SandboxEventsRequest,
-    SandboxInfo, StopSandboxRequest, TerminalSize,
+    DeleteSnapshotRequest, ExecOutput, ExecRequest, FileChunk, InspectSandboxRequest,
+    ListSandboxesRequest, ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse,
+    ReadFileRequest, RemoveSandboxRequest, RestoreRequest, RestoreResponse, RunOutput, RunRequest,
+    SandboxEvent, SandboxEventsRequest, SandboxInfo, StopSandboxRequest, TerminalSize,
+    WriteFileOpen,
 };
 use arcbox_transport::Transport;
 use arcbox_transport::vsock::{BlockingVsockTransport, VsockAddr, VsockTransport};
@@ -798,6 +799,137 @@ impl AgentClient {
             MessageType::SandboxListResponse,
         )
         .await
+    }
+
+    /// Streams a file out of a sandbox as decoded [`FileChunk`]s.
+    ///
+    /// The final chunk carries `done == true`. Consumes the client because
+    /// the stream task requires exclusive transport access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the initial send fails.
+    pub async fn sandbox_read_file(
+        mut self,
+        req: ReadFileRequest,
+    ) -> Result<mpsc::UnboundedReceiver<Result<FileChunk>>> {
+        if !self.connected {
+            self.connect().await?;
+        }
+
+        let payload = req.encode_to_vec();
+        let buf = wire::build_message(MessageType::SandboxFileReadRequest, "", &payload);
+        self.transport
+            .async_send(buf)
+            .await
+            .map_err(|e| CoreError::Machine(format!("failed to send read-file request: {e}")))?;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let raw = match self.transport.async_recv().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(Err(CoreError::Machine(format!("recv error: {e}"))));
+                        break;
+                    }
+                };
+                let (resp_type, _, resp_payload) = match wire::parse_response(&raw) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                };
+                if resp_type == MessageType::Error as u32 {
+                    let (code, message) = wire::parse_error_response(&resp_payload)
+                        .unwrap_or_else(|_| (500, "unknown error".to_string()));
+                    let _ = tx.send(Err(CoreError::Agent { code, message }));
+                    break;
+                }
+                if resp_type != MessageType::SandboxFileData as u32 {
+                    let _ = tx.send(Err(CoreError::Machine(format!(
+                        "unexpected response type: 0x{resp_type:04x}"
+                    ))));
+                    break;
+                }
+                match FileChunk::decode(&resp_payload[..]) {
+                    Ok(chunk) => {
+                        let done = chunk.done;
+                        if tx.send(Ok(chunk)).is_err() || done {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(CoreError::Machine(format!("decode error: {e}"))));
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
+    /// Writes a file into a sandbox from a channel of data chunks.
+    ///
+    /// The channel closing marks end-of-data; the client then sends the
+    /// terminating chunk and waits for the agent's acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any send fails or the agent reports a failure.
+    pub async fn sandbox_write_file(
+        mut self,
+        open: WriteFileOpen,
+        mut data_rx: mpsc::Receiver<Vec<u8>>,
+    ) -> Result<()> {
+        if !self.connected {
+            self.connect().await?;
+        }
+
+        let payload = open.encode_to_vec();
+        let buf = wire::build_message(MessageType::SandboxFileWriteRequest, "", &payload);
+        self.transport
+            .async_send(buf)
+            .await
+            .map_err(|e| CoreError::Machine(format!("failed to send write-file open: {e}")))?;
+
+        while let Some(data) = data_rx.recv().await {
+            let chunk = FileChunk { data, done: false };
+            let frame =
+                wire::build_message(MessageType::SandboxFileChunk, "", &chunk.encode_to_vec());
+            self.transport
+                .async_send(frame)
+                .await
+                .map_err(|e| CoreError::Machine(format!("failed to send file chunk: {e}")))?;
+        }
+        let done = FileChunk {
+            data: Vec::new(),
+            done: true,
+        };
+        let frame = wire::build_message(MessageType::SandboxFileChunk, "", &done.encode_to_vec());
+        self.transport
+            .async_send(frame)
+            .await
+            .map_err(|e| CoreError::Machine(format!("failed to send final chunk: {e}")))?;
+
+        let raw = self
+            .transport
+            .async_recv()
+            .await
+            .map_err(|e| CoreError::Machine(format!("recv error: {e}")))?;
+        let (resp_type, _, resp_payload) = wire::parse_response(&raw)?;
+        if resp_type == MessageType::Error as u32 {
+            let (code, message) = wire::parse_error_response(&resp_payload)?;
+            return Err(CoreError::Agent { code, message });
+        }
+        if resp_type != MessageType::SandboxFileWriteResponse as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected response type: 0x{resp_type:04x}"
+            )));
+        }
+        Ok(())
     }
 
     /// Runs a command inside a sandbox and returns a channel of streaming output.
