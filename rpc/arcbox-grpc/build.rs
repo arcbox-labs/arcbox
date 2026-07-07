@@ -20,8 +20,14 @@ fn main() {
         "../arcbox-protocol/proto/sandbox.proto",
     ];
 
+    let descriptor_path =
+        std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR set by cargo"))
+            .join("arcbox_descriptor.bin");
+
     // Configure tonic-build
     tonic_build::configure()
+        // Emit the file descriptor set for gRPC server reflection.
+        .file_descriptor_set_path(&descriptor_path)
         // Map arcbox.v1 package to arcbox_protocol::v1 types
         .extern_path(".arcbox.v1", "::arcbox_protocol::v1")
         // Map sandbox.v1 package to arcbox_protocol::sandbox_v1 types

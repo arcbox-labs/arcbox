@@ -61,6 +61,18 @@ pub async fn start_grpc(
     );
     let icon_service = IconServiceImpl::new();
 
+    // Server reflection lets SDK authors and grpcurl discover the API
+    // without vendoring the protos (both v1 and the legacy v1alpha are
+    // served — grpcurl still speaks v1alpha by default).
+    let reflection_v1 = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(arcbox_grpc::FILE_DESCRIPTOR_SET)
+        .build_v1()
+        .context("building gRPC reflection service")?;
+    let reflection_v1alpha = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(arcbox_grpc::FILE_DESCRIPTOR_SET)
+        .build_v1alpha()
+        .context("building gRPC reflection service (v1alpha)")?;
+
     let shutdown = ctx.shutdown.clone();
     let handle = tokio::spawn(async move {
         let result = Server::builder()
@@ -71,6 +83,8 @@ pub async fn start_grpc(
             .add_service(SandboxSnapshotServiceServer::new(sandbox_snapshot_service))
             .add_service(SystemServiceServer::new(system_service))
             .add_service(IconServiceServer::new(icon_service))
+            .add_service(reflection_v1)
+            .add_service(reflection_v1alpha)
             .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
             .await;
 
