@@ -2527,6 +2527,11 @@ pub struct SetupStatus {
     /// Whether Docker CLI tools are installed.
     #[prost(bool, tag = "7")]
     pub docker_tools_installed: bool,
+    /// Fatal startup error description. Set only when phase == FAILED,
+    /// so streaming clients learn the cause instead of seeing a bare
+    /// disconnect when the daemon exits.
+    #[prost(string, tag = "8")]
+    pub error: ::prost::alloc::string::String,
 }
 /// Nested message and enum types in `SetupStatus`.
 pub mod setup_status {
@@ -2546,6 +2551,9 @@ pub mod setup_status {
         Degraded = 7,
         DownloadingAssets = 8,
         CleaningUp = 9,
+        /// Startup failed fatally; the daemon exits shortly after
+        /// publishing this phase. See the `error` field for the cause.
+        Failed = 10,
     }
     impl Phase {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -2564,6 +2572,7 @@ pub mod setup_status {
                 Self::Degraded => "DEGRADED",
                 Self::DownloadingAssets => "DOWNLOADING_ASSETS",
                 Self::CleaningUp => "CLEANING_UP",
+                Self::Failed => "FAILED",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2579,6 +2588,7 @@ pub mod setup_status {
                 "DEGRADED" => Some(Self::Degraded),
                 "DOWNLOADING_ASSETS" => Some(Self::DownloadingAssets),
                 "CLEANING_UP" => Some(Self::CleaningUp),
+                "FAILED" => Some(Self::Failed),
                 _ => None,
             }
         }
