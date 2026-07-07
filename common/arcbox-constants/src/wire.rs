@@ -1,3 +1,20 @@
+/// Host↔agent RPC protocol version this build speaks.
+///
+/// Carried in `AgentPingResponse.protocol_version` and checked by the
+/// host during the boot handshake. Bump when a change alters the
+/// *meaning* of existing messages (new required semantics, repurposed
+/// fields, behavioral contracts) — purely additive, ignorable changes
+/// don't need a bump. Unknown `MessageType`s already fail cleanly; this
+/// version catches the silent proto3 field-skew class instead.
+pub const AGENT_PROTOCOL_VERSION: u32 = 1;
+
+/// Oldest agent protocol version this host still accepts.
+///
+/// Agents reporting less (including `0` — agents that predate the
+/// handshake field) are rejected at boot with an actionable error
+/// instead of silently misbehaving under field skew.
+pub const MIN_AGENT_PROTOCOL_VERSION: u32 = 1;
+
 /// Number of bytes in the fixed RPC frame header (`length` + `type`).
 pub const FRAME_HEADER_SIZE: usize = 8;
 

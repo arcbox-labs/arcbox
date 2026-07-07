@@ -1442,6 +1442,12 @@ pub struct AgentPingResponse {
     /// Agent version.
     #[prost(string, tag = "2")]
     pub version: ::prost::alloc::string::String,
+    /// Host↔agent protocol version the agent speaks
+    /// (`arcbox_constants::wire::AGENT_PROTOCOL_VERSION`). Absent (0) on
+    /// agents that predate the handshake; the host rejects agents below
+    /// its minimum supported version at boot.
+    #[prost(uint32, tag = "3")]
+    pub protocol_version: u32,
 }
 /// System information from the guest.
 #[derive(serde::Serialize, serde::Deserialize)]

@@ -293,6 +293,44 @@ impl AgentClient {
         Self::decode_response(&resp_payload)
     }
 
+    /// Verifies the agent's protocol version from a ping response.
+    ///
+    /// Rejects agents older than
+    /// [`arcbox_constants::wire::MIN_AGENT_PROTOCOL_VERSION`] — including
+    /// pre-handshake agents that report `0` — so a stale staged agent
+    /// fails the boot with an actionable error instead of silently
+    /// misdecoding newer requests (proto3 defaults unknown fields).
+    /// A *newer* agent than the host only warns: protocol evolution is
+    /// additive, so newer agents understand older hosts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the agent's protocol version is below the
+    /// host's minimum supported version.
+    pub fn check_agent_protocol(resp: &PingResponse) -> Result<()> {
+        use arcbox_constants::wire::{AGENT_PROTOCOL_VERSION, MIN_AGENT_PROTOCOL_VERSION};
+
+        if resp.protocol_version < MIN_AGENT_PROTOCOL_VERSION {
+            return Err(CoreError::Machine(format!(
+                "guest agent is incompatible with this daemon: agent protocol {} \
+                 (agent version {:?}), daemon requires >= {}. The staged agent \
+                 binary is stale — reinstall or update ArcBox so the bundled \
+                 agent is staged again",
+                resp.protocol_version, resp.version, MIN_AGENT_PROTOCOL_VERSION,
+            )));
+        }
+        if resp.protocol_version > AGENT_PROTOCOL_VERSION {
+            tracing::warn!(
+                agent_protocol = resp.protocol_version,
+                host_protocol = AGENT_PROTOCOL_VERSION,
+                agent_version = %resp.version,
+                "guest agent speaks a newer protocol than this daemon; \
+                 continuing (protocol evolution is additive)"
+            );
+        }
+        Ok(())
+    }
+
     /// Synchronous ping — uses blocking transport's native deadline.
     /// Call from `spawn_blocking` or any non-async context.
     pub fn ping_blocking(&mut self) -> Result<PingResponse> {
@@ -1106,5 +1144,35 @@ mod tests {
         let client = AgentClient::new(3);
         assert_eq!(client.cid(), 3);
         assert!(!client.connected);
+    }
+
+    fn ping_response(protocol_version: u32) -> PingResponse {
+        PingResponse {
+            message: "pong".to_string(),
+            version: "0.4.16".to_string(),
+            protocol_version,
+        }
+    }
+
+    #[test]
+    fn pre_handshake_agent_is_rejected() {
+        // Agents older than the handshake never set the field → proto3
+        // default 0 → must be rejected, not silently accepted.
+        let err = AgentClient::check_agent_protocol(&ping_response(0))
+            .expect_err("protocol 0 must be rejected");
+        assert!(err.to_string().contains("incompatible"));
+    }
+
+    #[test]
+    fn current_protocol_is_accepted() {
+        let resp = ping_response(arcbox_constants::wire::AGENT_PROTOCOL_VERSION);
+        AgentClient::check_agent_protocol(&resp).expect("current protocol must pass");
+    }
+
+    #[test]
+    fn newer_agent_protocol_is_accepted_with_warning() {
+        // Additive evolution: a newer agent understands an older host.
+        let resp = ping_response(arcbox_constants::wire::AGENT_PROTOCOL_VERSION + 1);
+        AgentClient::check_agent_protocol(&resp).expect("newer protocol must pass");
     }
 }

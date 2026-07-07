@@ -415,5 +415,6 @@ fn handle_ping(req: arcbox_protocol::agent::PingRequest) -> RpcResponse {
             format!("pong: {}", req.message)
         },
         version: AGENT_VERSION.to_string(),
+        protocol_version: arcbox_constants::wire::AGENT_PROTOCOL_VERSION,
     })
 }

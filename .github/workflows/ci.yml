@@ -11,6 +11,32 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  proto-breaking:
+    name: Proto Breaking-Change Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The host↔agent channel has no runtime version negotiation beyond the
+    # ping handshake, so proto evolution must stay wire-compatible and
+    # additive-only. Compares the PR's protos against master.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch master for comparison
+        run: git fetch origin master:refs/remotes/origin/master
+
+      - name: Install buf
+        uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+
+      - name: Check for breaking proto changes against master
+        run: |
+          buf breaking rpc/arcbox-protocol/proto \
+            --against '.git#branch=origin/master,subdir=rpc/arcbox-protocol/proto'
+
   ci:
     name: Build, Lint, and Test
     runs-on: macos-26
