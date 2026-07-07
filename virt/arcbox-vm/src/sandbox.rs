@@ -35,6 +35,7 @@ mod boot;
 mod checkpoint;
 mod cleanup;
 mod lifecycle;
+mod reconcile;
 mod types;
 mod workload;
 
@@ -45,6 +46,9 @@ pub use types::{
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// Shared registry of live sandbox instances.
+pub(crate) type InstanceMap = Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>;
 
 /// Manages the full lifecycle of multiple sandbox microVMs.
 pub struct SandboxManager {
@@ -77,11 +81,26 @@ impl SandboxManager {
             std::fs::create_dir_all(base).map_err(VmmError::Io)?;
         }
 
+        let config = Arc::new(config);
+
+        // Sweep leftovers of a previous agent process (crash / respawn):
+        // orphaned Firecracker processes, TAPs, dm devices, chroots. Only
+        // meaningful inside a tokio runtime; sync constructions (unit tests)
+        // have no previous instance to reconcile.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let config = Arc::clone(&config);
+            let network = Arc::clone(&network);
+            let cow_manager = Arc::clone(&cow_manager);
+            tokio::spawn(async move {
+                reconcile::sweep_orphans(&config, &network, &cow_manager).await;
+            });
+        }
+
         Ok(Self {
             instances: Arc::new(RwLock::new(HashMap::new())),
             network,
             snapshots,
-            config: Arc::new(config),
+            config,
             events_tx,
             cow_manager,
         })
