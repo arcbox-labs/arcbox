@@ -79,8 +79,11 @@ pub struct CreateSandboxRequest {
     #[prost(message, optional, tag = "6")]
     pub limits: ::core::option::Option<ResourceLimits>,
     /// --- Initial workload (optional) ---
-    /// OCI image reference. When set, the agent pulls and runs this image
-    /// inside the sandbox. Empty = use rootfs directly.
+    /// OCI image reference. NOT supported in Sandbox V1: a non-empty value is
+    /// rejected with FAILED_PRECONDITION. Build the rootfs from a local
+    /// Docker image instead (CLI --from-image resolves the overlay2 layer and
+    /// passes it as `rootfs`). Registry pull lands with a rustls-capable
+    /// oci2rootfs release.
     #[prost(string, tag = "7")]
     pub image: ::prost::alloc::string::String,
     /// Initial command launched automatically after boot.
@@ -100,6 +103,8 @@ pub struct CreateSandboxRequest {
     #[prost(string, tag = "11")]
     pub user: ::prost::alloc::string::String,
     /// --- Filesystem ---
+    /// NOT supported in Sandbox V1: a non-empty list is rejected with
+    /// FAILED_PRECONDITION. Copy files in with WriteFile / `sandbox cp`.
     #[prost(message, repeated, tag = "12")]
     pub mounts: ::prost::alloc::vec::Vec<Mount>,
     /// --- Network ---
@@ -112,7 +117,8 @@ pub struct CreateSandboxRequest {
     #[prost(uint32, tag = "14")]
     pub ttl_seconds: u32,
     /// --- Provisioning ---
-    /// SSH public key injected via MMDS (empty = no SSH).
+    /// NOT supported in Sandbox V1: a set value is rejected with
+    /// FAILED_PRECONDITION. Use Exec for interactive access.
     #[prost(string, optional, tag = "15")]
     pub ssh_public_key: ::core::option::Option<::prost::alloc::string::String>,
 }

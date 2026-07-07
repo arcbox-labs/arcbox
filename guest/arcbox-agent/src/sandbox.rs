@@ -110,6 +110,31 @@ impl SandboxService {
             .map_err(|e| SandboxError::Decode(e.to_string()))?;
         let mut spec = proto_to_spec(req);
 
+        // V1 contract: reject declared-but-unimplemented spec fields
+        // explicitly instead of silently ignoring them.
+        if !spec.mounts.is_empty() {
+            return Err(SandboxError::Unsupported(
+                "mounts are not supported in Sandbox V1; copy files in with \
+                 WriteFile (`arcbox sandbox cp`) instead"
+                    .into(),
+            ));
+        }
+        if spec.ssh_public_key.is_some() {
+            return Err(SandboxError::Unsupported(
+                "ssh_public_key is not supported in Sandbox V1; use Exec for \
+                 interactive access"
+                    .into(),
+            ));
+        }
+        if !spec.image.is_empty() {
+            return Err(SandboxError::Unsupported(
+                "registry image pull is not supported in Sandbox V1; build the \
+                 rootfs from a local Docker image with `arcbox sandbox create \
+                 --from-image` instead"
+                    .into(),
+            ));
+        }
+
         if spec.rootfs.is_empty() {
             // Default rootfs: build the busybox + vm-agent image on first use
             // (rebuilt when the staged vm-agent is newer than the image).
