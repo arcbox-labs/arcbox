@@ -216,6 +216,7 @@ dependencies = [
  "futures-util",
  "reqwest",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
