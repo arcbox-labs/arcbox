@@ -5,10 +5,12 @@ use std::pin::Pin;
 use arcbox_grpc::SandboxService;
 use arcbox_protocol::sandbox_v1::Empty as SandboxEmpty;
 use arcbox_protocol::sandbox_v1::{
-    CreateSandboxRequest, CreateSandboxResponse, ExecInput, ExecOutput, FileChunk,
-    InspectSandboxRequest, ListSandboxesRequest, ListSandboxesResponse, ReadFileRequest,
-    RemoveSandboxRequest, RunOutput, RunRequest, SandboxEvent, SandboxEventsRequest, SandboxInfo,
-    StopSandboxRequest, WriteFileRequest, exec_input, write_file_request,
+    CreateSandboxRequest, CreateSandboxResponse, ExecInput, ExecOutput, ExposePortRequest,
+    ExposePortResponse, FileChunk, InspectSandboxRequest, ListSandboxesRequest,
+    ListSandboxesResponse, ReadFileRequest, RemoveSandboxRequest, RunOutput, RunRequest,
+    SandboxEvent, SandboxEventsRequest, SandboxInfo, SandboxPortForwardRemoveRequest,
+    SandboxPortForwardRequest, StopSandboxRequest, UnexposePortRequest, WriteFileRequest,
+    exec_input, write_file_request,
 };
 use tokio_stream::Stream;
 use tokio_stream::StreamExt as _;
@@ -16,7 +18,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::codec::Streaming;
 use tonic::{Request, Response, Status};
 
-use arcbox_core::ExecSessionInput;
+use arcbox_core::{ExecSessionInput, SandboxPortExposure};
 
 use crate::ApiError;
 
@@ -157,10 +159,9 @@ impl SandboxService for SandboxServiceImpl {
             .await
             .map_err(ApiError::from)?;
 
-        self.runtime
-            .ready()?
-            .deregister_dns_by_id(&sandbox_id)
-            .await;
+        let runtime = self.runtime.ready()?;
+        runtime.deregister_dns_by_id(&sandbox_id).await;
+        runtime.remove_sandbox_ports(&sandbox_id).await;
 
         Ok(Response::new(SandboxEmpty {}))
     }
@@ -181,10 +182,9 @@ impl SandboxService for SandboxServiceImpl {
             .await
             .map_err(ApiError::from)?;
 
-        self.runtime
-            .ready()?
-            .deregister_dns_by_id(&sandbox_id)
-            .await;
+        let runtime = self.runtime.ready()?;
+        runtime.deregister_dns_by_id(&sandbox_id).await;
+        runtime.remove_sandbox_ports(&sandbox_id).await;
 
         Ok(Response::new(SandboxEmpty {}))
     }
@@ -291,6 +291,121 @@ impl SandboxService for SandboxServiceImpl {
             .sandbox_write_file(open, rx)
             .await
             .map_err(ApiError::from)?;
+        Ok(Response::new(SandboxEmpty {}))
+    }
+
+    async fn expose_port(
+        &self,
+        request: Request<ExposePortRequest>,
+    ) -> Result<Response<ExposePortResponse>, Status> {
+        let machine = request.machine_id()?;
+        let req = request.into_inner();
+        let sandbox_port = u16::try_from(req.sandbox_port)
+            .ok()
+            .filter(|p| *p != 0)
+            .ok_or_else(|| Status::invalid_argument("sandbox_port must be 1-65535"))?;
+        let host_port = u16::try_from(req.host_port)
+            .map_err(|_| Status::invalid_argument("host_port must be 0-65535"))?;
+        let protocol = if req.protocol.is_empty() {
+            "tcp".to_owned()
+        } else {
+            req.protocol.to_ascii_lowercase()
+        };
+
+        // Guest half: allocate the reserved relay port and install the DNAT.
+        let mut agent = self
+            .runtime
+            .ready()?
+            .get_agent(&machine)
+            .map_err(ApiError::from)?;
+        let forwarded = agent
+            .sandbox_port_forward(SandboxPortForwardRequest {
+                id: req.id.clone(),
+                sandbox_port: u32::from(sandbox_port),
+                protocol: protocol.clone(),
+            })
+            .await
+            .map_err(ApiError::from)?;
+        let guest_port = u16::try_from(forwarded.guest_port)
+            .map_err(|_| Status::internal("agent returned an invalid guest port"))?;
+
+        // Host half: bind the listener; default the host port to the relay
+        // port for a stable, collision-free mapping.
+        let host_port = if host_port == 0 {
+            guest_port
+        } else {
+            host_port
+        };
+        let exposure = SandboxPortExposure {
+            sandbox_id: req.id.clone(),
+            sandbox_port,
+            protocol: protocol.clone(),
+            host_port,
+            guest_port,
+        };
+        if let Err(e) = self
+            .runtime
+            .ready()?
+            .expose_sandbox_port(&machine, &exposure)
+            .await
+        {
+            // Roll back the guest DNAT so a failed bind leaves no half rule.
+            let mut agent = self
+                .runtime
+                .ready()?
+                .get_agent(&machine)
+                .map_err(ApiError::from)?;
+            let _ = agent
+                .sandbox_port_forward_remove(SandboxPortForwardRemoveRequest {
+                    id: req.id,
+                    sandbox_port: u32::from(sandbox_port),
+                    protocol,
+                })
+                .await;
+            return Err(ApiError::from(e).into());
+        }
+
+        Ok(Response::new(ExposePortResponse {
+            host_port: u32::from(host_port),
+            guest_port: u32::from(guest_port),
+        }))
+    }
+
+    async fn unexpose_port(
+        &self,
+        request: Request<UnexposePortRequest>,
+    ) -> Result<Response<SandboxEmpty>, Status> {
+        let machine = request.machine_id()?;
+        let req = request.into_inner();
+        let sandbox_port = u16::try_from(req.sandbox_port)
+            .ok()
+            .filter(|p| *p != 0)
+            .ok_or_else(|| Status::invalid_argument("sandbox_port must be 1-65535"))?;
+        let protocol = if req.protocol.is_empty() {
+            "tcp".to_owned()
+        } else {
+            req.protocol.to_ascii_lowercase()
+        };
+
+        let mut agent = self
+            .runtime
+            .ready()?
+            .get_agent(&machine)
+            .map_err(ApiError::from)?;
+        agent
+            .sandbox_port_forward_remove(SandboxPortForwardRemoveRequest {
+                id: req.id.clone(),
+                sandbox_port: u32::from(sandbox_port),
+                protocol: protocol.clone(),
+            })
+            .await
+            .map_err(ApiError::from)?;
+
+        self.runtime
+            .ready()?
+            .unexpose_sandbox_port(&req.id, sandbox_port, &protocol)
+            .await;
+
         Ok(Response::new(SandboxEmpty {}))
     }
 

@@ -8,6 +8,7 @@ mod btrfs;
 mod cmdline;
 mod disk;
 mod kubernetes;
+mod port_forward;
 mod probe;
 mod proxy;
 mod rpc;

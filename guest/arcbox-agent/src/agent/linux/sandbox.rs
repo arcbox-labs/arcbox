@@ -7,10 +7,19 @@
 
 use std::sync::{Arc, OnceLock};
 
+use prost::Message as _;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Mutex;
 
+use super::port_forward::{PortForwardManager, Protocol};
 use crate::rpc::{ErrorResponse, MessageType, write_message};
 use crate::sandbox::SandboxService;
+
+/// Returns the global [`PortForwardManager`] singleton.
+fn port_forwards() -> &'static Mutex<PortForwardManager> {
+    static MANAGER: OnceLock<Mutex<PortForwardManager>> = OnceLock::new();
+    MANAGER.get_or_init(|| Mutex::new(PortForwardManager::default()))
+}
 
 /// Returns the global [`SandboxService`] singleton.
 ///
@@ -31,7 +40,9 @@ pub(super) fn sandbox_service() -> Result<&'static Arc<SandboxService>, &'static
             match SandboxService::new(config) {
                 Ok(svc) => {
                     tracing::info!("sandbox service initialised");
-                    Ok(Arc::new(svc))
+                    let svc = Arc::new(svc);
+                    spawn_port_forward_cleanup(&svc);
+                    Ok(svc)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "sandbox service unavailable");
@@ -40,6 +51,38 @@ pub(super) fn sandbox_service() -> Result<&'static Arc<SandboxService>, &'static
             }
         })
         .as_ref()
+}
+
+/// Drop every DNAT mapping of a sandbox as soon as it stops.
+///
+/// Subscribing to lifecycle events covers all teardown paths — explicit
+/// Stop/Remove, TTL expiry, and boot failures — without threading cleanup
+/// hooks through each of them.
+fn spawn_port_forward_cleanup(svc: &Arc<SandboxService>) {
+    use arcbox_protocol::sandbox_v1::{SandboxEvent, SandboxEventsRequest};
+
+    let payload = SandboxEventsRequest::default().encode_to_vec();
+    let mut rx = match svc.subscribe_events(&payload) {
+        Ok(rx) => rx,
+        Err(e) => {
+            tracing::warn!(error = %e, "port-forward cleanup subscription failed");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        while let Some(encoded) = rx.recv().await {
+            let Ok(event) = SandboxEvent::decode(encoded.as_slice()) else {
+                continue;
+            };
+            if event.action == "stopped" || event.action == "removed" || event.action == "failed" {
+                port_forwards()
+                    .lock()
+                    .await
+                    .remove_all_for(&event.sandbox_id)
+                    .await;
+            }
+        }
+    });
 }
 
 /// Dispatches a sandbox RPC request.
@@ -158,6 +201,15 @@ where
             svc.handle_write_file(stream, trace_id, payload).await?;
         }
         // -----------------------------------------------------------------
+        // Port forwarding
+        // -----------------------------------------------------------------
+        MessageType::SandboxPortForwardRequest => {
+            handle_port_forward(stream, &svc, trace_id, payload).await?;
+        }
+        MessageType::SandboxPortForwardRemoveRequest => {
+            handle_port_forward_remove(stream, trace_id, payload).await?;
+        }
+        // -----------------------------------------------------------------
         // Snapshots
         // -----------------------------------------------------------------
         MessageType::SandboxCheckpointRequest => match svc.checkpoint(payload).await {
@@ -239,4 +291,121 @@ where
 {
     let err = ErrorResponse::new(code, message);
     write_message(stream, MessageType::Error, trace_id, &err.encode()).await
+}
+
+/// Install a DNAT mapping and answer with the allocated guest port.
+async fn handle_port_forward<S>(
+    stream: &mut S,
+    svc: &SandboxService,
+    trace_id: &str,
+    payload: &[u8],
+) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    use arcbox_protocol::sandbox_v1::{SandboxPortForwardRequest, SandboxPortForwardResponse};
+
+    let (req, sandbox_port, protocol) = match SandboxPortForwardRequest::decode(payload)
+        .map_err(|e| format!("decode error: {e}"))
+        .and_then(|req| {
+            let port = u16::try_from(req.sandbox_port)
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| format!("invalid sandbox port {}", req.sandbox_port))?;
+            let proto = Protocol::parse(&req.protocol).map_err(|e| e.to_string())?;
+            Ok((req, port, proto))
+        }) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            let err = ErrorResponse::new(400, msg);
+            write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
+            return Ok(());
+        }
+    };
+
+    let ip = match svc.sandbox_ip(&req.id) {
+        Ok(ip) => ip,
+        Err(e) => {
+            let err = ErrorResponse::new(e.status_code(), e.to_string());
+            write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
+            return Ok(());
+        }
+    };
+
+    match port_forwards()
+        .lock()
+        .await
+        .forward(&req.id, ip, sandbox_port, protocol)
+        .await
+    {
+        Ok(guest_port) => {
+            let resp = SandboxPortForwardResponse {
+                guest_port: u32::from(guest_port),
+            };
+            write_message(
+                stream,
+                MessageType::SandboxPortForwardResponse,
+                trace_id,
+                &resp.encode_to_vec(),
+            )
+            .await?;
+        }
+        Err(e) => {
+            let err = ErrorResponse::new(500, e.to_string());
+            write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove a DNAT mapping (idempotent) and acknowledge.
+async fn handle_port_forward_remove<S>(
+    stream: &mut S,
+    trace_id: &str,
+    payload: &[u8],
+) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    use arcbox_protocol::sandbox_v1::SandboxPortForwardRemoveRequest;
+
+    let (req, sandbox_port, protocol) = match SandboxPortForwardRemoveRequest::decode(payload)
+        .map_err(|e| format!("decode error: {e}"))
+        .and_then(|req| {
+            let port = u16::try_from(req.sandbox_port)
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| format!("invalid sandbox port {}", req.sandbox_port))?;
+            let proto = Protocol::parse(&req.protocol).map_err(|e| e.to_string())?;
+            Ok((req, port, proto))
+        }) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            let err = ErrorResponse::new(400, msg);
+            write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
+            return Ok(());
+        }
+    };
+
+    match port_forwards()
+        .lock()
+        .await
+        .remove(&req.id, sandbox_port, protocol)
+        .await
+    {
+        Ok(()) => {
+            write_message(
+                stream,
+                MessageType::SandboxPortForwardRemoveResponse,
+                trace_id,
+                &[],
+            )
+            .await?;
+        }
+        Err(e) => {
+            let err = ErrorResponse::new(500, e.to_string());
+            write_message(stream, MessageType::Error, trace_id, &err.encode()).await?;
+        }
+    }
+    Ok(())
 }

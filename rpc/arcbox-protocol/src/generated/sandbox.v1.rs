@@ -316,6 +316,90 @@ pub mod write_file_request {
         Chunk(super::FileChunk),
     }
 }
+/// Request to expose a sandbox port on the host.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExposePortRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Port the workload listens on inside the sandbox.
+    #[prost(uint32, tag = "2")]
+    pub sandbox_port: u32,
+    /// Host port to bind (0 = reuse the allocated guest relay port).
+    #[prost(uint32, tag = "3")]
+    pub host_port: u32,
+    /// "tcp" (default) or "udp".
+    #[prost(string, tag = "4")]
+    pub protocol: ::prost::alloc::string::String,
+}
+/// Response to ExposePort.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ExposePortResponse {
+    /// Host port the service is reachable on (via loopback).
+    #[prost(uint32, tag = "1")]
+    pub host_port: u32,
+    /// Reserved-range guest port carrying the DNAT relay.
+    #[prost(uint32, tag = "2")]
+    pub guest_port: u32,
+}
+/// Request to remove an exposed port mapping.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UnexposePortRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// The sandbox port previously passed to ExposePort.
+    #[prost(uint32, tag = "2")]
+    pub sandbox_port: u32,
+    /// "tcp" (default) or "udp".
+    #[prost(string, tag = "3")]
+    pub protocol: ::prost::alloc::string::String,
+}
+/// Ask the guest agent to DNAT a reserved guest port to a sandbox port.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SandboxPortForwardRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Destination port inside the sandbox.
+    #[prost(uint32, tag = "2")]
+    pub sandbox_port: u32,
+    /// "tcp" (default) or "udp".
+    #[prost(string, tag = "3")]
+    pub protocol: ::prost::alloc::string::String,
+}
+/// Guest agent's answer: the allocated reserved-range guest port.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct SandboxPortForwardResponse {
+    /// Guest port now DNATed to the sandbox.
+    #[prost(uint32, tag = "1")]
+    pub guest_port: u32,
+}
+/// Ask the guest agent to remove a DNAT mapping.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SandboxPortForwardRemoveRequest {
+    /// Sandbox ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// The sandbox port previously forwarded.
+    #[prost(uint32, tag = "2")]
+    pub sandbox_port: u32,
+    /// "tcp" (default) or "udp".
+    #[prost(string, tag = "3")]
+    pub protocol: ::prost::alloc::string::String,
+}
 /// Request to stop a sandbox gracefully.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

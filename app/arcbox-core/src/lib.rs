@@ -56,7 +56,7 @@ pub use config::{Config, ContainerRuntimeConfig};
 pub use error::{CoreError, Result};
 pub use machine::MachineManager;
 pub use migration::MigrationManager;
-pub use runtime::Runtime;
+pub use runtime::{Runtime, SandboxPortExposure};
 pub use vm::{SharedDirConfig, VmConfig, VmManager};
 pub use vm_lifecycle::{
     DEFAULT_MACHINE_NAME, DefaultVmConfig, HealthMonitor, VmLifecycleConfig, VmLifecycleManager,

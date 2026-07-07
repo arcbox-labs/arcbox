@@ -65,6 +65,15 @@ service SandboxService {
     // subsequent messages stream `chunk` payloads, the last one with
     // done == true. Limited to 256 MiB per file.
     rpc WriteFile(stream WriteFileRequest) returns (Empty);
+
+    // Expose a sandbox port on the host. The guest installs a DNAT rule from
+    // a reserved guest port (40000-49999) to the sandbox, and the daemon
+    // binds a host listener forwarding into the guest. Removed automatically
+    // on Stop/Remove.
+    rpc ExposePort(ExposePortRequest) returns (ExposePortResponse);
+
+    // Remove a previously exposed port mapping.
+    rpc UnexposePort(UnexposePortRequest) returns (Empty);
 }
 
 // =============================================================================
@@ -327,6 +336,68 @@ message WriteFileRequest {
         // File content chunk; the last one has done == true.
         FileChunk chunk = 2;
     }
+}
+
+// =============================================================================
+// Port exposure
+// =============================================================================
+
+// Request to expose a sandbox port on the host.
+message ExposePortRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Port the workload listens on inside the sandbox.
+    uint32 sandbox_port = 2;
+    // Host port to bind (0 = reuse the allocated guest relay port).
+    uint32 host_port = 3;
+    // "tcp" (default) or "udp".
+    string protocol = 4;
+}
+
+// Response to ExposePort.
+message ExposePortResponse {
+    // Host port the service is reachable on (via loopback).
+    uint32 host_port = 1;
+    // Reserved-range guest port carrying the DNAT relay.
+    uint32 guest_port = 2;
+}
+
+// Request to remove an exposed port mapping.
+message UnexposePortRequest {
+    // Sandbox ID.
+    string id = 1;
+    // The sandbox port previously passed to ExposePort.
+    uint32 sandbox_port = 2;
+    // "tcp" (default) or "udp".
+    string protocol = 3;
+}
+
+// --- agent wire payloads (vsock, not served over gRPC) ---
+
+// Ask the guest agent to DNAT a reserved guest port to a sandbox port.
+message SandboxPortForwardRequest {
+    // Sandbox ID.
+    string id = 1;
+    // Destination port inside the sandbox.
+    uint32 sandbox_port = 2;
+    // "tcp" (default) or "udp".
+    string protocol = 3;
+}
+
+// Guest agent's answer: the allocated reserved-range guest port.
+message SandboxPortForwardResponse {
+    // Guest port now DNATed to the sandbox.
+    uint32 guest_port = 1;
+}
+
+// Ask the guest agent to remove a DNAT mapping.
+message SandboxPortForwardRemoveRequest {
+    // Sandbox ID.
+    string id = 1;
+    // The sandbox port previously forwarded.
+    uint32 sandbox_port = 2;
+    // "tcp" (default) or "udp".
+    string protocol = 3;
 }
 
 // =============================================================================

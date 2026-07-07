@@ -8,10 +8,10 @@ use arcbox_core::vm_lifecycle::DEFAULT_MACHINE_NAME;
 use arcbox_grpc::{SandboxServiceClient, SandboxSnapshotServiceClient};
 use arcbox_protocol::sandbox_v1::{
     CheckpointRequest, CreateSandboxRequest, DeleteSnapshotRequest, ExecInput, ExecRequest,
-    FileChunk, InspectSandboxRequest, ListSandboxesRequest, ListSnapshotsRequest, ReadFileRequest,
-    RemoveSandboxRequest, ResourceLimits, RestoreRequest, RunRequest, SandboxEventsRequest,
-    StopSandboxRequest, TerminalSize as ProtoTerminalSize, WriteFileOpen, WriteFileRequest,
-    exec_input, write_file_request,
+    ExposePortRequest, FileChunk, InspectSandboxRequest, ListSandboxesRequest,
+    ListSnapshotsRequest, ReadFileRequest, RemoveSandboxRequest, ResourceLimits, RestoreRequest,
+    RunRequest, SandboxEventsRequest, StopSandboxRequest, TerminalSize as ProtoTerminalSize,
+    UnexposePortRequest, WriteFileOpen, WriteFileRequest, exec_input, write_file_request,
 };
 use clap::{Args, Subcommand};
 use std::collections::HashMap;
@@ -69,6 +69,10 @@ pub enum SandboxCommands {
     Events(EventsArgs),
     /// Copy a file into or out of a sandbox (<id>:<path> denotes the sandbox side)
     Cp(CpArgs),
+    /// Expose a sandbox port on the host (via loopback)
+    Expose(ExposeArgs),
+    /// Remove an exposed sandbox port
+    Unexpose(UnexposeArgs),
     /// Checkpoint a sandbox into a snapshot
     Checkpoint(CheckpointArgs),
     /// Restore a sandbox from a snapshot
@@ -195,6 +199,31 @@ pub struct CpArgs {
 }
 
 #[derive(Args)]
+pub struct ExposeArgs {
+    /// Sandbox ID
+    pub id: String,
+    /// Port the workload listens on inside the sandbox
+    pub port: u16,
+    /// Host port to bind (0 = pick the guest relay port)
+    #[arg(long, default_value = "0")]
+    pub host_port: u16,
+    /// Protocol: tcp or udp
+    #[arg(long, default_value = "tcp")]
+    pub protocol: String,
+}
+
+#[derive(Args)]
+pub struct UnexposeArgs {
+    /// Sandbox ID
+    pub id: String,
+    /// The sandbox port previously exposed
+    pub port: u16,
+    /// Protocol: tcp or udp
+    #[arg(long, default_value = "tcp")]
+    pub protocol: String,
+}
+
+#[derive(Args)]
 pub struct CheckpointArgs {
     /// Sandbox ID to checkpoint
     pub id: String,
@@ -240,6 +269,8 @@ pub async fn execute(cmd: SandboxCommands) -> Result<()> {
         SandboxCommands::Exec(args) => execute_exec(args).await,
         SandboxCommands::Events(args) => execute_events(args).await,
         SandboxCommands::Cp(args) => execute_cp(args).await,
+        SandboxCommands::Expose(args) => execute_expose(args).await,
+        SandboxCommands::Unexpose(args) => execute_unexpose(args).await,
         SandboxCommands::Checkpoint(args) => execute_checkpoint(args).await,
         SandboxCommands::Restore(args) => execute_restore(args).await,
         SandboxCommands::ListSnapshots(args) => execute_list_snapshots(args).await,
@@ -840,5 +871,42 @@ async fn execute_cp(args: CpArgs) -> Result<()> {
             anyhow::bail!("sandbox-to-sandbox copies are not supported");
         }
     }
+    Ok(())
+}
+
+async fn execute_expose(args: ExposeArgs) -> Result<()> {
+    let channel = sandbox_channel().await?;
+    let mut client = SandboxServiceClient::new(channel);
+    let request = attach_machine(tonic::Request::new(ExposePortRequest {
+        id: args.id.clone(),
+        sandbox_port: u32::from(args.port),
+        host_port: u32::from(args.host_port),
+        protocol: args.protocol.clone(),
+    }));
+    let resp = client
+        .expose_port(request)
+        .await
+        .context("Failed to expose sandbox port")?
+        .into_inner();
+    println!(
+        "{}:{}/{} exposed on localhost:{}",
+        args.id, args.port, args.protocol, resp.host_port
+    );
+    Ok(())
+}
+
+async fn execute_unexpose(args: UnexposeArgs) -> Result<()> {
+    let channel = sandbox_channel().await?;
+    let mut client = SandboxServiceClient::new(channel);
+    let request = attach_machine(tonic::Request::new(UnexposePortRequest {
+        id: args.id.clone(),
+        sandbox_port: u32::from(args.port),
+        protocol: args.protocol.clone(),
+    }));
+    client
+        .unexpose_port(request)
+        .await
+        .context("Failed to unexpose sandbox port")?;
+    println!("{}:{}/{} unexposed", args.id, args.port, args.protocol);
     Ok(())
 }
