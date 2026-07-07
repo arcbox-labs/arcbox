@@ -155,8 +155,13 @@ pub async fn ensure_default_rootfs(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// True when the default rootfs image exists, looks like ext4, and is newer
-/// than both source binaries (busybox and vm-agent).
+/// True when the default rootfs image can be used as-is (no rebuild needed).
+///
+/// A valid ext4 image is fresh unless a build source (busybox or vm-agent)
+/// is **present and newer** than it. A *missing* source is not staleness: we
+/// cannot rebuild from an absent binary, so an existing valid image — e.g. a
+/// caller-supplied default rootfs, or the production image on a host without
+/// the dev build sources — is kept rather than clobbered.
 fn is_default_rootfs_fresh(image: &Path) -> bool {
     if !has_ext4_magic(image) {
         return false;
@@ -165,11 +170,11 @@ fn is_default_rootfs_fresh(image: &Path) -> bool {
         return false;
     };
     for source in [GUEST_BUSYBOX, VM_AGENT_BIN] {
-        match std::fs::metadata(source).and_then(|m| m.modified()) {
-            Ok(mtime) if mtime <= image_mtime => {}
-            // Missing or newer source: rebuild (the build reports missing
-            // vm-agent with an actionable error).
-            _ => return false,
+        // Only a source that exists AND is newer forces a rebuild.
+        if let Ok(mtime) = std::fs::metadata(source).and_then(|m| m.modified())
+            && mtime > image_mtime
+        {
+            return false;
         }
     }
     true
@@ -429,5 +434,35 @@ mod tests {
                 .lookup(Path::new("/bin/nonexistent"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn existing_image_is_fresh_when_build_sources_are_absent() {
+        // A valid ext4 default rootfs must be reused as-is when the dev build
+        // sources (/bin/busybox, /arcbox/bin/vm-agent) don't exist — the case
+        // of a caller-supplied default rootfs on a host without the build
+        // toolchain. Regression for the sandbox_service_manager integration
+        // test, which passes an empty request rootfs backed by a real image.
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("rootfs.ext4");
+        let spec = DefaultRootfsSpec {
+            busybox: dir.path().join("busybox"),
+            vm_agent: dir.path().join("vm-agent"),
+            applets: vec!["sh".into()],
+            size: 8 * 1024 * 1024,
+        };
+        std::fs::write(&spec.busybox, b"stub").unwrap();
+        std::fs::write(&spec.vm_agent, b"stub").unwrap();
+        build_default_rootfs(&spec, &image).unwrap();
+        assert!(has_ext4_magic(&image));
+
+        // GUEST_BUSYBOX / VM_AGENT_BIN are absolute guest paths that do not
+        // exist in the host test environment, so this exercises the
+        // missing-source branch directly.
+        assert!(
+            is_default_rootfs_fresh(&image),
+            "a valid image with absent build sources must be reused, not rebuilt"
+        );
+        assert!(!is_default_rootfs_fresh(&dir.path().join("missing.ext4")));
     }
 }
