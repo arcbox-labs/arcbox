@@ -121,6 +121,10 @@ impl LifecycleShared {
         tokio::task::spawn_blocking(move || mm.reboot(&name))
             .await
             .map_err(|e| CoreError::Vm(format!("reboot task panicked: {e}")))??;
+        // The teardown dropped the bridge along with the VMM; the fresh boot
+        // created a new one, so the host container-subnet route must be
+        // reinstalled exactly like after a normal start.
+        self.spawn_route_reconciler();
         self.wait_for_agent(timeout).await?;
         self.sync_guest_clock().await;
         Ok(())
