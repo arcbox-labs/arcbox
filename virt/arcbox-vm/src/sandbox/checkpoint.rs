@@ -42,47 +42,57 @@ impl SandboxManager {
         };
 
         let vm = self.get_vm_handle(sandbox_id)?;
+        let snapshot_id = Uuid::new_v4().to_string();
 
         // Pause before snapshotting.
         vm.pause().await.map_err(VmmError::from)?;
 
-        let snapshot_id = Uuid::new_v4().to_string();
-
+        // Everything between pause and resume is fallible (chroot dir setup,
+        // chown, catalog dir prep, the snapshot RPC). Run it in a block whose
+        // result is handled only AFTER an unconditional resume — a bare `?`
+        // here previously left the guest paused forever, wedging every later
+        // RPC. Returns the chroot snapshot dir (jailer mode) to move afterward.
+        //
         // In jailer mode FC runs inside a chroot and can only write to paths
-        // within that chroot.  We create a temporary snapshot directory inside
-        // the chroot, pass the chroot-relative paths to FC, then move the
-        // resulting files to the standard catalog location on the host.
-        let (fc_vmstate_path, fc_mem_path, chroot_snap_dir_opt) =
-            if let Some(ref jc) = self.config.firecracker.jailer {
-                let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
-                let cr = chroot_root(&self.config.firecracker.binary, base, sandbox_id);
-                let chroot_snap = cr.join("snapshots").join(&snapshot_id);
-                std::fs::create_dir_all(&chroot_snap).map_err(VmmError::Io)?;
-                // Firecracker runs as jc.uid/jc.gid; chown the directory so it
-                // can create the snapshot files.
-                let uid = nix::unistd::Uid::from_raw(jc.uid);
-                let gid = nix::unistd::Gid::from_raw(jc.gid);
-                nix::unistd::chown(&chroot_snap, Some(uid), Some(gid))
-                    .map_err(|e| VmmError::Process(format!("chown snapshot dir: {e}")))?;
-                // Paths as seen by Firecracker inside the chroot.
-                let fc_vmstate = format!("/snapshots/{snapshot_id}/vmstate");
-                let fc_mem = format!("/snapshots/{snapshot_id}/mem");
-                (fc_vmstate, fc_mem, Some(chroot_snap))
-            } else {
-                let snap_dir = self.snapshots.prepare_dir(sandbox_id, &snapshot_id)?;
-                (
-                    snap_dir.join("vmstate").to_str().unwrap().to_owned(),
-                    snap_dir.join("mem").to_str().unwrap().to_owned(),
-                    None,
-                )
-            };
+        // within it, so the snapshot is written to a chroot-local dir and moved
+        // to the catalog after resume.
+        let paused: Result<Option<PathBuf>> = async {
+            let (fc_vmstate_path, fc_mem_path, chroot_snap_dir_opt) =
+                if let Some(ref jc) = self.config.firecracker.jailer {
+                    let base = jc.chroot_base_dir.as_deref().unwrap_or("/srv/jailer");
+                    let cr = chroot_root(&self.config.firecracker.binary, base, sandbox_id);
+                    let chroot_snap = cr.join("snapshots").join(&snapshot_id);
+                    std::fs::create_dir_all(&chroot_snap).map_err(VmmError::Io)?;
+                    // Firecracker runs as jc.uid/jc.gid; chown the directory so
+                    // it can create the snapshot files.
+                    let uid = nix::unistd::Uid::from_raw(jc.uid);
+                    let gid = nix::unistd::Gid::from_raw(jc.gid);
+                    nix::unistd::chown(&chroot_snap, Some(uid), Some(gid))
+                        .map_err(|e| VmmError::Process(format!("chown snapshot dir: {e}")))?;
+                    // Paths as seen by Firecracker inside the chroot.
+                    let fc_vmstate = format!("/snapshots/{snapshot_id}/vmstate");
+                    let fc_mem = format!("/snapshots/{snapshot_id}/mem");
+                    (fc_vmstate, fc_mem, Some(chroot_snap))
+                } else {
+                    let snap_dir = self.snapshots.prepare_dir(sandbox_id, &snapshot_id)?;
+                    (
+                        snap_dir.join("vmstate").to_str().unwrap().to_owned(),
+                        snap_dir.join("mem").to_str().unwrap().to_owned(),
+                        None,
+                    )
+                };
 
-        let snap_result = vm.create_snapshot(&fc_vmstate_path, &fc_mem_path).await;
+            vm.create_snapshot(&fc_vmstate_path, &fc_mem_path)
+                .await
+                .map_err(VmmError::from)?;
+            Ok(chroot_snap_dir_opt)
+        }
+        .await;
 
-        // Always resume regardless of snapshot success.
+        // Always resume, regardless of how the paused section fared.
         let _ = vm.resume().await;
 
-        snap_result.map_err(VmmError::from)?;
+        let chroot_snap_dir_opt = paused?;
 
         // If jailer mode, move snapshot files from chroot to the catalog dir.
         let (vmstate_path, mem_path) = if let Some(chroot_snap) = chroot_snap_dir_opt {
@@ -156,13 +166,24 @@ impl SandboxManager {
             )));
         }
 
-        // Uniqueness check.
-        {
-            let instances = self.instances.read().unwrap();
-            if instances.contains_key(&new_id) {
-                return Err(VmmError::AlreadyExists(new_id.clone()));
-            }
-        }
+        // Reserve the id atomically so a concurrent restore/create of the same
+        // id fails fast with AlreadyExists instead of both proceeding to set up
+        // the deterministic per-id CoW/dm/TAP resources and corrupting each
+        // other (see reserve_id). Unwound on every error path via Drop.
+        let vm_dir = PathBuf::from(&self.config.firecracker.data_dir)
+            .join("sandboxes")
+            .join(&new_id);
+        let restore_spec = SandboxSpec {
+            id: Some(new_id.clone()),
+            labels: spec.labels.clone(),
+            ttl_seconds: spec.ttl_seconds,
+            ..Default::default()
+        };
+        let reservation = super::reserve_id(
+            &self.instances,
+            &new_id,
+            SandboxInstance::new(new_id.clone(), restore_spec, None, vm_dir.clone()),
+        )?;
 
         // Allocate network if requested.
         let net_alloc = if spec.network_override {
@@ -176,10 +197,7 @@ impl SandboxManager {
             .map(|n| n.ip_address.to_string())
             .unwrap_or_default();
 
-        // Create working directory.
-        let vm_dir = PathBuf::from(&self.config.firecracker.data_dir)
-            .join("sandboxes")
-            .join(&new_id);
+        // Create working directory (path reserved above).
         std::fs::create_dir_all(&vm_dir).map_err(VmmError::Io)?;
         let socket_path = vm_dir.join("firecracker.sock");
 
@@ -403,7 +421,9 @@ impl SandboxManager {
                 kill_and_reap_fc(&mut process).await;
                 cleanup_pending_restore(
                     &self.cow_manager,
+                    &self.network,
                     pending_cow,
+                    net_alloc.as_ref(),
                     pending_origin_dir.as_deref(),
                 )
                 .await;
@@ -441,7 +461,9 @@ impl SandboxManager {
                 kill_and_reap_fc(&mut process).await;
                 cleanup_pending_restore(
                     &self.cow_manager,
+                    &self.network,
                     pending_cow.take(),
+                    net_alloc.as_ref(),
                     pending_origin_dir.as_deref(),
                 )
                 .await;
@@ -468,48 +490,41 @@ impl SandboxManager {
             Ok(Ok(())) => {}
         }
 
-        // Build and register the new sandbox instance.
-        let restore_spec = SandboxSpec {
-            id: Some(new_id.clone()),
-            labels: spec.labels,
-            ttl_seconds: spec.ttl_seconds,
-            ..Default::default()
-        };
-        let mut instance =
-            SandboxInstance::new(new_id.clone(), restore_spec, net_alloc.clone(), vm_dir);
-        instance.process = Some(process);
-        instance.vm = Some(vm);
-        instance.vsock_uds_path = Some(actual_vsock_path);
-        // Hand off pending resources to the instance — they're now tracked
-        // for teardown via `remove_sandbox_impl` and won't leak.
-        instance.cow_handle = pending_cow.take();
-        instance.restore_origin_dir = pending_origin_dir.take();
-        instance.state = SandboxState::Ready;
-        instance.ready_at = Some(Utc::now());
-
-        // Persist the crash-recovery record for the restored sandbox.
-        #[allow(
-            clippy::cast_possible_wrap,
-            reason = "Firecracker pid fits platform pid_t"
-        )]
-        let record = super::reconcile::SandboxStateRecord::new(
-            &new_id,
-            instance
-                .process
-                .as_ref()
-                .and_then(|p| p.pid())
-                .map(|p| p as i32),
-            instance.network.as_ref(),
-            instance.cow_handle.as_ref(),
-            self.config.firecracker.jailer.is_some(),
-            instance.restore_origin_dir.as_deref(),
-        );
-        super::reconcile::write_state_record(&instance.vm_dir, &record);
-
+        // Populate the reserved instance in place, then commit the reservation
+        // so it survives (the placeholder inserted by reserve_id is otherwise
+        // removed on drop). All resources are now tracked on the instance and
+        // torn down via remove_sandbox_impl.
+        let arc = reservation.instance();
         {
-            let mut instances = self.instances.write().unwrap();
-            instances.insert(new_id.clone(), Arc::new(Mutex::new(instance)));
+            let mut inst = arc.lock().unwrap();
+            inst.network.clone_from(&net_alloc);
+            inst.process = Some(process);
+            inst.vm = Some(vm);
+            inst.vsock_uds_path = Some(actual_vsock_path);
+            inst.cow_handle = pending_cow.take();
+            inst.restore_origin_dir = pending_origin_dir.take();
+            inst.state = SandboxState::Ready;
+            inst.ready_at = Some(Utc::now());
+
+            // Persist the crash-recovery record for the restored sandbox.
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "Firecracker pid fits platform pid_t"
+            )]
+            let record = super::reconcile::SandboxStateRecord::new(
+                &new_id,
+                inst.process
+                    .as_ref()
+                    .and_then(|p| p.pid())
+                    .map(|p| p as i32),
+                inst.network.as_ref(),
+                inst.cow_handle.as_ref(),
+                self.config.firecracker.jailer.is_some(),
+                inst.restore_origin_dir.as_deref(),
+            );
+            super::reconcile::write_state_record(&inst.vm_dir, &record);
         }
+        reservation.commit();
 
         let _ = self.events_tx.send(SandboxEvent::new(&new_id, "ready"));
 
