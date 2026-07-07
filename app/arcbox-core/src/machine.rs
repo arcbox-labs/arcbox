@@ -725,6 +725,39 @@ impl MachineManager {
         Ok(())
     }
 
+    /// Reports whether a machine's VM stopped on its own (guest-driven), and if
+    /// so whether it was a reboot request. See [`VmManager::vm_self_stopped`].
+    #[must_use]
+    pub fn vm_self_stopped(&self, name: &str) -> Option<bool> {
+        let machines = self.machines.read().ok()?;
+        let vm_id = machines.get(name)?.vm_id.clone();
+        drop(machines);
+        self.vm_manager.vm_self_stopped(&vm_id)
+    }
+
+    /// Reboots a machine's VM in place (guest PSCI SYSTEM_RESET): a full
+    /// teardown then a fresh boot, leaving the machine record Running. The
+    /// caller re-establishes agent readiness afterward.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the machine is unknown or the reboot fails.
+    pub fn reboot(&self, name: &str) -> Result<()> {
+        let vm_id = {
+            let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
+            machines
+                .get(name)
+                .ok_or_else(|| CoreError::not_found(name.to_string()))?
+                .vm_id
+                .clone()
+        };
+        // Reboot is a slow teardown+reboot; do it without holding the registry
+        // lock so concurrent reads stay responsive.
+        self.vm_manager.reboot(&vm_id)?;
+        tracing::info!("Rebooted machine '{}'", name);
+        Ok(())
+    }
+
     /// Switches a stopped machine's hypervisor backend.
     ///
     /// Updates the lazily-built VM config and the in-memory and persisted

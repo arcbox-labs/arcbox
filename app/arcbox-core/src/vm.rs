@@ -281,6 +281,46 @@ impl VmManager {
         Ok(())
     }
 
+    /// Reports whether a VM stopped on its own — i.e. its VMM is still owned by
+    /// the entry (no `stop()` cleared it) but is no longer running.
+    ///
+    /// `None` = still running, or no VMM/entry. `Some(true)` = stopped via a
+    /// guest PSCI SYSTEM_RESET (reboot request); `Some(false)` = stopped some
+    /// other way (guest halt / crash).
+    #[must_use]
+    pub fn vm_self_stopped(&self, id: &VmId) -> Option<bool> {
+        let vms = self.vms.read().ok()?;
+        let vmm = vms.get(id)?.vmm.as_ref()?;
+        if vmm.is_running() {
+            None
+        } else {
+            Some(vmm.reset_requested())
+        }
+    }
+
+    /// Reboots a VM in place: full teardown + fresh boot in the same process,
+    /// keeping the entry (unlike `stop`, which drops the VMM). Used when the
+    /// guest issued PSCI SYSTEM_RESET.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry is missing, has no VMM, or the reboot
+    /// (teardown + re-initialization) fails.
+    pub fn reboot(&self, id: &VmId) -> Result<()> {
+        let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
+        let entry = vms
+            .get_mut(id)
+            .ok_or_else(|| CoreError::not_found(id.to_string()))?;
+        let vmm = entry
+            .vmm
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state(format!("VM {id} has no VMM to reboot")))?;
+        vmm.reboot()?;
+        entry.info.state = MachineState::Running;
+        tracing::info!("Rebooted VM {}", id);
+        Ok(())
+    }
+
     /// Attempts graceful VM shutdown via vsock shutdown RPC.
     ///
     /// Sends a shutdown command to the guest agent, then waits for the VM to
