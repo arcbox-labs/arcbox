@@ -440,7 +440,7 @@ fn ping_once(vmm: &Vmm, deadline: Duration) -> Result<(), String> {
     set_socket_timeout(fd, deadline).map_err(|e| format!("set_socket_timeout: {e}"))?;
 
     let mut client =
-        AgentClient::from_fd(GUEST_CID, fd).map_err(|e| format!("AgentClient::from_fd: {e}"))?;
+        AgentClient::from_fd_blocking(GUEST_CID, fd).map_err(|e| format!("AgentClient::from_fd_blocking: {e}"))?;
     client
         .ping_blocking()
         .map(|_| ())
@@ -491,7 +491,7 @@ fn dax_round_trip(vmm: &Vmm, fixture: &DaxFixture) -> Result<(), String> {
         .connect_vsock(AGENT_PORT)
         .map_err(|e| format!("connect_vsock: {e}"))?;
     let mut client =
-        AgentClient::from_fd(GUEST_CID, fd).map_err(|e| format!("AgentClient::from_fd: {e}"))?;
+        AgentClient::from_fd_blocking(GUEST_CID, fd).map_err(|e| format!("AgentClient::from_fd_blocking: {e}"))?;
     let resp = client
         .mmap_read_file_blocking(&fixture.guest_path, 0, fixture.length as u64)
         .map_err(|e| format!("mmap_read_file_blocking: {e}"))?;
@@ -608,7 +608,7 @@ fn get_system_info(vmm: &Vmm) -> Result<arcbox_protocol::SystemInfo, String> {
         .connect_vsock(AGENT_PORT)
         .map_err(|e| format!("connect_vsock: {e}"))?;
     let mut client =
-        AgentClient::from_fd(GUEST_CID, fd).map_err(|e| format!("AgentClient::from_fd: {e}"))?;
+        AgentClient::from_fd_blocking(GUEST_CID, fd).map_err(|e| format!("AgentClient::from_fd_blocking: {e}"))?;
     client
         .get_system_info_blocking()
         .map_err(|e| format!("get_system_info_blocking: {e}"))
@@ -652,7 +652,7 @@ fn kill_agent(vmm: &Vmm) -> Result<(), String> {
         .connect_vsock(AGENT_PORT)
         .map_err(|e| format!("connect_vsock: {e}"))?;
     let mut client =
-        AgentClient::from_fd(GUEST_CID, fd).map_err(|e| format!("AgentClient::from_fd: {e}"))?;
+        AgentClient::from_fd_blocking(GUEST_CID, fd).map_err(|e| format!("AgentClient::from_fd_blocking: {e}"))?;
     client
         .kill_agent_blocking()
         .map_err(|e| format!("kill_agent_blocking: {e}"))

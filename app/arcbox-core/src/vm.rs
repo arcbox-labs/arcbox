@@ -105,6 +105,18 @@ impl VmManager {
     /// # Errors
     ///
     /// Returns an error if the VM is running/starting or not found.
+    /// Returns the backend a VM is configured to run on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the VM is not found.
+    pub fn backend(&self, id: &VmId) -> Result<arcbox_vmm::VmBackend> {
+        let vms = self.vms.read().map_err(|_| CoreError::LockPoisoned)?;
+        vms.get(id)
+            .map(|entry| entry.config.backend)
+            .ok_or_else(|| CoreError::not_found(id.to_string()))
+    }
+
     pub fn set_backend(&self, id: &VmId, backend: arcbox_vmm::VmBackend) -> Result<()> {
         let mut vms = self.vms.write().map_err(|_| CoreError::LockPoisoned)?;
 
