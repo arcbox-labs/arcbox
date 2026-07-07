@@ -310,8 +310,12 @@ mod tests {
     #[test]
     fn test_pl011_read_flags() {
         let uart = Pl011::new();
-        // Flag register should always return 0 (TX FIFO not full).
-        assert_eq!(uart.read(PL011_BASE + PL011_FR, 4), 0);
+        // Idle flag register: RXFE (bit 4) and TXFE (bit 7) set, TXFF (bit 5)
+        // clear — the line is empty and ready, with no phantom RX data.
+        let fr = uart.read(PL011_BASE + PL011_FR, 4);
+        assert_eq!(fr & (1 << 4), 1 << 4, "RXFE must be set");
+        assert_eq!(fr & (1 << 7), 1 << 7, "TXFE must be set");
+        assert_eq!(fr & (1 << 5), 0, "TXFF must be clear");
     }
 
     #[test]

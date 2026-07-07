@@ -93,6 +93,43 @@ impl LifecycleShared {
         let _ = events.send(Completion { epoch, outcome });
     }
 
+    /// Reboots the VM in place (guest PSCI SYSTEM_RESET), then waits for the
+    /// agent, reporting the outcome tagged with this sub-task's epoch. Mirrors
+    /// [`run_boot`](Self::run_boot) so the actor treats a reboot exactly like a
+    /// boot (AgentReady promotes back to running; BootFailed lands in failed).
+    pub(super) async fn run_reboot(
+        self: Arc<Self>,
+        timeout: Duration,
+        epoch: u64,
+        events: &mpsc::UnboundedSender<Completion>,
+    ) {
+        let outcome = match self.reboot(timeout).await {
+            Ok(()) => InternalEvent::AgentReady,
+            Err(e) => InternalEvent::BootFailed(e.to_string()),
+        };
+        let _ = events.send(Completion { epoch, outcome });
+    }
+
+    /// Reboot body: a full teardown + fresh boot of the VMM (blocking), then
+    /// agent readiness + clock sync — the tail of `boot` without the
+    /// create/drift step, since the machine record and disks are unchanged.
+    async fn reboot(&self, timeout: Duration) -> Result<()> {
+        let mm = Arc::clone(&self.machine_manager);
+        let name = self.machine_name.clone();
+        // `reboot` is a synchronous stop + re-init + start; keep it off the
+        // async workers.
+        tokio::task::spawn_blocking(move || mm.reboot(&name))
+            .await
+            .map_err(|e| CoreError::Vm(format!("reboot task panicked: {e}")))??;
+        // The teardown dropped the bridge along with the VMM; the fresh boot
+        // created a new one, so the host container-subnet route must be
+        // reinstalled exactly like after a normal start.
+        self.spawn_route_reconciler();
+        self.wait_for_agent(timeout).await?;
+        self.sync_guest_clock().await;
+        Ok(())
+    }
+
     /// The boot body: drift check, optional (re)create, start loop with
     /// recovery retries, then agent readiness.
     async fn boot(&self, create_hint: bool, timeout: Duration) -> Result<()> {

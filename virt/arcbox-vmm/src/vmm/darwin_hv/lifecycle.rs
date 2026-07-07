@@ -234,6 +234,7 @@ impl Vmm {
 
         let running = self.running.clone();
         let paused = self.hv_paused.clone();
+        let reset_requested = self.hv_reset_requested.clone();
         // Ensure a fresh start always begins unpaused, even if a prior
         // session was stopped while paused.
         paused.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -256,23 +257,36 @@ impl Vmm {
         self.hv_vcpu_stats.clone_from(&vcpu_stats);
 
         // --- Set up PSCI CPU_ON channels for secondary vCPUs ---
+        // The registry is shared with *every* vCPU thread — the BSP and each
+        // secondary — so a CPU_ON issued from any CPU can reach any target.
+        // Linux may bring a secondary online from a CPU other than the BSP
+        // (CPU hotplug, some resume paths); handing the secondaries `None`
+        // here made every such call return NOT_SUPPORTED.
         let cpu_on_senders: Option<CpuOnSenders> = if vcpu_count > 1 {
-            let mut senders_vec: Vec<Option<mpsc::Sender<CpuOnRequest>>> = Vec::new();
-            senders_vec.push(None); // Slot 0 = BSP
+            let senders: CpuOnSenders =
+                Arc::new(Mutex::new(Vec::with_capacity(vcpu_count as usize)));
+            senders
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(None); // Slot 0 = BSP
 
             for i in 1..vcpu_count {
                 let (tx, rx) = mpsc::channel::<CpuOnRequest>();
-                senders_vec.push(Some(tx));
+                senders
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(Some(tx));
 
                 let r = running.clone();
                 let p = paused.clone();
+                let rr = reset_requested.clone();
                 let dm = device_manager.clone();
                 let th = vcpu_thread_handles.clone();
                 let ids = hv_vcpu_ids.clone();
                 let uart = pl011.clone();
                 let hvc_fds_clone = self.hvc_blk_fds.clone();
                 let stats = vcpu_stats[i as usize].clone();
-                let senders_placeholder: Option<CpuOnSenders> = None;
+                let senders_for_thread = senders.clone();
 
                 let t = std::thread::Builder::new()
                     .name(format!("hv-vcpu-{i}"))
@@ -289,9 +303,10 @@ impl Vmm {
                                 VcpuContext {
                                     device_manager: dm,
                                     running: r,
+                                    reset_requested: rr,
                                     paused: p,
                                     pl011: uart,
-                                    cpu_on_senders: senders_placeholder,
+                                    cpu_on_senders: Some(senders_for_thread),
                                     vcpu_thread_handles: th,
                                     hv_vcpu_ids: ids,
                                     hvc_blk_fds: hvc_fds_clone,
@@ -307,7 +322,6 @@ impl Vmm {
                 self.hv_vcpu_threads.push(t);
             }
 
-            let senders = Arc::new(Mutex::new(senders_vec));
             self.hv_cpu_on_senders = Some(senders.clone());
             Some(senders)
         } else {
@@ -329,6 +343,7 @@ impl Vmm {
                         VcpuContext {
                             device_manager,
                             running,
+                            reset_requested,
                             paused,
                             pl011,
                             cpu_on_senders,

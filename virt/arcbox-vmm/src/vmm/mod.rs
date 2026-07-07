@@ -245,6 +245,12 @@ pub struct Vmm {
     /// (which is a terminal stop signal).
     #[cfg(target_os = "macos")]
     hv_paused: Arc<AtomicBool>,
+    /// Set by a guest PSCI SYSTEM_RESET (as opposed to SYSTEM_OFF): the vCPU
+    /// loop stops the VM and flags this so the lifecycle driver reboots the
+    /// guest via [`Vmm::reboot`] instead of tearing the machine down. Cleared
+    /// by `reboot`.
+    #[cfg(target_os = "macos")]
+    hv_reset_requested: Arc<AtomicBool>,
 }
 
 impl Vmm {
@@ -355,6 +361,8 @@ impl Vmm {
             hv_balloon: None,
             #[cfg(target_os = "macos")]
             hv_paused: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "macos")]
+            hv_reset_requested: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -588,6 +596,43 @@ impl Vmm {
         self.state = VmmState::Stopped;
         tracing::info!("VMM stopped");
         Ok(())
+    }
+
+    /// Returns whether the guest requested a reboot (PSCI SYSTEM_RESET) rather
+    /// than a power-off. The lifecycle driver polls this after the VM stops to
+    /// choose between tearing the machine down and rebooting it via
+    /// [`Vmm::reboot`]. Always `false` on non-macOS backends (only the HV path
+    /// tracks the flag).
+    #[must_use]
+    pub fn reset_requested(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.hv_reset_requested.load(Ordering::SeqCst)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// Reboots the guest in the same process: full teardown followed by a fresh
+    /// boot, re-creating the hypervisor VM and reloading the kernel/FDT. Clears
+    /// the reset-requested flag. Used by the lifecycle driver when the guest
+    /// issued PSCI SYSTEM_RESET.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if teardown or re-initialization fails.
+    pub fn reboot(&mut self) -> Result<()> {
+        tracing::info!("Rebooting VM: full teardown + fresh boot");
+        #[cfg(target_os = "macos")]
+        self.hv_reset_requested.store(false, Ordering::SeqCst);
+        self.stop()?;
+        // `initialize()` requires the Created state; `stop()` left us Stopped
+        // with every resource released. Reset the state so `start()` re-runs
+        // initialization from a clean slate (re-creating the HvVm on HV).
+        self.state = VmmState::Created;
+        self.start()
     }
 
     /// Returns the configured memory size for this VM.

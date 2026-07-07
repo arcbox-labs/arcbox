@@ -283,6 +283,13 @@ impl LifecycleActor {
         let mut idle_ticker = tokio::time::interval(Duration::from_secs(BALLOON_SHRINK_DELAY_SECS));
         idle_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // Poll for a guest-initiated stop (PSCI SYSTEM_RESET) so a guest reboot
+        // becomes an in-place VMM reboot. Coarse interval: reboot isn't
+        // latency-critical and an idle daemon shouldn't wake often.
+        const VM_LIVENESS_POLL_SECS: u64 = 2;
+        let mut liveness_ticker = tokio::time::interval(Duration::from_secs(VM_LIVENESS_POLL_SECS));
+        liveness_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             // Split-borrow the receivers away from `self` so the dispatch
             // helpers can borrow `self` mutably inside the match arms.
@@ -296,6 +303,9 @@ impl LifecycleActor {
                 }
                 _ = idle_ticker.tick() => {
                     self.on_idle_tick(&mut machine);
+                }
+                _ = liveness_ticker.tick() => {
+                    self.on_liveness_tick(&mut machine);
                 }
             }
         }
@@ -356,6 +366,15 @@ impl LifecycleActor {
                 let events = self.events_tx.clone();
                 self.inflight = Some(tokio::spawn(async move {
                     shared.run_stop(epoch, &events).await;
+                }));
+            }
+            Effect::SpawnReboot { timeout_ms } => {
+                let epoch = self.abort_inflight();
+                let shared = Arc::clone(&self.shared);
+                let events = self.events_tx.clone();
+                let timeout = Duration::from_millis(timeout_ms);
+                self.inflight = Some(tokio::spawn(async move {
+                    shared.run_reboot(timeout, epoch, &events).await;
                 }));
             }
             Effect::AbortInflight => {
@@ -594,6 +613,29 @@ impl LifecycleActor {
                 self.shared.idle_seconds()
             );
             self.dispatch(machine, VmEvent::IdleTimeout);
+        }
+    }
+
+    /// Detects a guest-initiated VM stop and, when it was a PSCI SYSTEM_RESET,
+    /// reboots the VM in place. Only meaningful while we believe the VM is up;
+    /// a guest halt/crash (`Some(false)`) is left as-is for now.
+    fn on_liveness_tick(&mut self, machine: &mut Machine) {
+        if !matches!(
+            self.public(),
+            VmLifecycleState::Running | VmLifecycleState::Idle
+        ) {
+            return;
+        }
+        if self
+            .shared
+            .machine_manager
+            .vm_self_stopped(&self.shared.machine_name)
+            == Some(true)
+        {
+            tracing::info!("guest requested reboot (SYSTEM_RESET); rebooting VM in place");
+            let timeout_ms =
+                u64::try_from(self.shared.config.startup_timeout.as_millis()).unwrap_or(u64::MAX);
+            self.dispatch(machine, VmEvent::GuestReset { timeout_ms });
         }
     }
 

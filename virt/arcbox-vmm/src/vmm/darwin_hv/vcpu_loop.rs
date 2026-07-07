@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use arcbox_hv::{ExceptionClass, HvVcpu, VcpuExit};
+use arcbox_hv::{ExceptionClass, HvVcpu, MmioInfo, VcpuExit};
 
 use super::hvc_blk::{
     ARCBOX_HVC_BLK_FLUSH, ARCBOX_HVC_BLK_READ, ARCBOX_HVC_BLK_WRITE, ARCBOX_HVC_PROBE,
@@ -46,6 +46,9 @@ pub(super) struct VcpuContext {
     pub device_manager: Arc<crate::device::DeviceManager>,
     /// Shared flag; the loop exits when this is set to `false`.
     pub running: Arc<AtomicBool>,
+    /// Set (with `running=false`) when the guest issues PSCI SYSTEM_RESET, so
+    /// the lifecycle driver reboots the guest instead of powering it off.
+    pub reset_requested: Arc<AtomicBool>,
     /// Cooperative pause flag. When `true`, the vCPU parks itself after its
     /// next `vcpu.run()` return instead of re-entering guest execution.
     /// Cleared by `resume`, which also unparks the thread.
@@ -87,6 +90,53 @@ fn read_mmio_write_reg(vcpu: &HvVcpu, vcpu_id: u32, register: u8) -> Option<u64>
     }
 }
 
+/// Sign-extends an MMIO load result from `access_size` bytes to the transfer
+/// register width. `sixty_four` selects the AArch64 target: `true` → 64-bit Xt
+/// (`LDRSB/H/W` into X), `false` → 32-bit Wt (`LDRSB/H` into W, whose write
+/// zero-extends into the 64-bit register). Zero-extending loads never set
+/// `sign_extend`, so they never reach this.
+fn sign_extend_mmio(value: u64, access_size: u8, sixty_four: bool) -> u64 {
+    let bits = u32::from(access_size) * 8;
+    // Nothing to extend once the loaded width already fills the register.
+    if bits == 0 || bits >= 64 {
+        return value;
+    }
+    if sixty_four {
+        let shift = 64 - bits;
+        #[allow(clippy::cast_possible_wrap)]
+        let signed = (value << shift) as i64 >> shift;
+        signed as u64
+    } else if bits >= 32 {
+        // 32-bit target loading 32 bits: no extension, zero-extend to 64.
+        u64::from(value as u32)
+    } else {
+        // Sign-extend within 32 bits, then zero-extend the W-register write.
+        let shift = 32 - bits;
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let signed = ((value as u32) << shift) as i32 >> shift;
+        u64::from(signed as u32)
+    }
+}
+
+/// Completes an MMIO read: applies sign-extension when the faulting load
+/// requested it, honors the `Rt == 31` zero-register discard, and writes the
+/// result into the guest's transfer register.
+fn complete_mmio_read(vcpu: &HvVcpu, vcpu_id: u32, mmio: &MmioInfo, raw: u64) {
+    // Rt == 31 in a load is the zero register (XZR/WZR): the result is
+    // discarded. `set_reg(31, _)` would instead clobber SP.
+    if mmio.register == 31 {
+        return;
+    }
+    let value = if mmio.sign_extend {
+        sign_extend_mmio(raw, mmio.access_size, mmio.sixty_four)
+    } else {
+        raw
+    };
+    if let Err(e) = vcpu.set_reg(u32::from(mmio.register), value) {
+        tracing::error!("vCPU {vcpu_id}: set_reg(X{}) failed: {e}", mmio.register);
+    }
+}
+
 /// Runs a single vCPU in a loop, dispatching MMIO traps to the device manager.
 ///
 /// This function is intended to be called from a dedicated thread per vCPU.
@@ -106,6 +156,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
     let VcpuContext {
         device_manager,
         running,
+        reset_requested,
         paused,
         pl011,
         cpu_on_senders,
@@ -149,6 +200,39 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
         tracing::warn!("vCPU {vcpu_id}: set SCTLR_EL1 failed: {e}");
     }
 
+    // Set MPIDR_EL1 for this vCPU (Aff0 = vcpu_id, other affinity fields 0).
+    // GIC affinity routing and the FDT `reg` values both depend on it, so the
+    // write must stick: if MPIDR is silently non-writable on some macOS version
+    // every vCPU reports Aff0 = 0 and interrupts misroute in a subtle,
+    // hard-to-debug way. Verify the readback and abort the boot rather than run
+    // with corrupted affinity. Done *before* the registry pushes below so a
+    // failure early-returns without leaving a stale vCPU id / thread handle
+    // (ABX-367). The readback only distinguishes a rejected write on
+    // secondaries — the BSP's Aff0 is 0 whether or not the write took.
+    let mpidr = u64::from(vcpu_id) & 0xFF;
+    if let Err(e) = vcpu.set_sys_reg(arcbox_hv::sys_reg::HV_SYS_REG_MPIDR_EL1, mpidr) {
+        tracing::error!("vCPU {vcpu_id}: set MPIDR_EL1 failed: {e}; aborting boot");
+        running.store(false, Ordering::SeqCst);
+        return;
+    }
+    match vcpu.get_sys_reg(arcbox_hv::sys_reg::HV_SYS_REG_MPIDR_EL1) {
+        Ok(v) if v & 0xFF == u64::from(vcpu_id) => {}
+        Ok(v) => {
+            tracing::error!(
+                "vCPU {vcpu_id}: MPIDR_EL1 Aff0 readback {:#x} != {vcpu_id}; aborting boot \
+                 (GIC affinity would be wrong)",
+                v & 0xFF,
+            );
+            running.store(false, Ordering::SeqCst);
+            return;
+        }
+        Err(e) => {
+            tracing::error!("vCPU {vcpu_id}: MPIDR_EL1 readback failed: {e}; aborting boot");
+            running.store(false, Ordering::SeqCst);
+            return;
+        }
+    }
+
     // Register this vCPU's framework ID and this thread's handle after all
     // register-setup calls succeed. If any setup call fails above, the
     // early return drops `HvVcpu` (triggering `hv_vcpu_destroy`) and the
@@ -168,13 +252,6 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         handles.push(std::thread::current());
-    }
-
-    // Set MPIDR_EL1 for this vCPU (used by GIC affinity routing).
-    // Simple layout: Aff0 = vcpu_id, all other affinity fields 0.
-    let mpidr = u64::from(vcpu_id) & 0xFF;
-    if let Err(e) = vcpu.set_sys_reg(arcbox_hv::sys_reg::HV_SYS_REG_MPIDR_EL1, mpidr) {
-        tracing::warn!("vCPU {vcpu_id}: set MPIDR failed (may not be writable): {e}");
     }
 
     tracing::info!(
@@ -245,6 +322,26 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                 } else {
                     &stats.mmio_reads
                 });
+
+                // ISV=0: the syndrome carries no valid transfer register or
+                // access size (LDP/STP, atomics, some writeback-addressing
+                // forms). We cannot service the access correctly and must not
+                // fabricate a decode — that silently corrupts guest registers
+                // or MMIO state. Refuse loudly and skip the instruction rather
+                // than act on garbage. Linux's virtio-mmio driver only issues
+                // single-register `readl`/`writel` (ISV=1), so this is a
+                // defensive path; correct handling would single-step re-execute.
+                if !mmio.isv {
+                    tracing::error!(
+                        "vCPU {vcpu_id}: undecodable MMIO {} at {:#x} (ESR ISV=0) — skipping instruction",
+                        if mmio.is_write { "write" } else { "read" },
+                        mmio.address,
+                    );
+                    let pc = vcpu.get_reg(reg::PC).unwrap_or(0);
+                    let _ = vcpu.set_reg(reg::PC, pc.wrapping_add(4));
+                    continue;
+                }
+
                 // Check PL011 UART region first, then fall through to DeviceManager.
                 let handled_by_pl011 = {
                     let uart_match = {
@@ -265,12 +362,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                                 .lock()
                                 .unwrap()
                                 .read(mmio.address, mmio.access_size as usize);
-                            if let Err(e) = vcpu.set_reg(u32::from(mmio.register), value) {
-                                tracing::error!(
-                                    "vCPU {vcpu_id}: set_reg(X{}) failed: {e}",
-                                    mmio.register
-                                );
-                            }
+                            complete_mmio_read(&vcpu, vcpu_id, mmio, value);
                         }
                         true
                     } else {
@@ -319,12 +411,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                                 0 // Return 0 for unknown reads.
                             }
                         };
-                        if let Err(e) = vcpu.set_reg(u32::from(mmio.register), value) {
-                            tracing::error!(
-                                "vCPU {vcpu_id}: set_reg(X{}) failed: {e}",
-                                mmio.register
-                            );
-                        }
+                        complete_mmio_read(&vcpu, vcpu_id, mmio, value);
                     }
                 }
 
@@ -393,7 +480,14 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                     }
                     _ => {
                         // PSCI and other standard calls.
-                        handle_psci(vcpu_id, func_id, &vcpu, &running, cpu_on_senders.as_ref());
+                        handle_psci(
+                            vcpu_id,
+                            func_id,
+                            &vcpu,
+                            &running,
+                            &reset_requested,
+                            cpu_on_senders.as_ref(),
+                        );
                         if !running.load(Ordering::Relaxed) {
                             break;
                         }
@@ -411,7 +505,14 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                handle_psci(vcpu_id, func_id, &vcpu, &running, cpu_on_senders.as_ref());
+                handle_psci(
+                    vcpu_id,
+                    func_id,
+                    &vcpu,
+                    &running,
+                    &reset_requested,
+                    cpu_on_senders.as_ref(),
+                );
                 if !running.load(Ordering::Relaxed) {
                     break;
                 }
@@ -494,4 +595,57 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
     pl011.lock().unwrap().flush();
 
     tracing::info!("vCPU {vcpu_id}: exited");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sign_extend_mmio;
+
+    #[test]
+    fn ldrsb_to_x_sign_extends_to_64() {
+        // LDRSB Xt, [..]: 1 byte, 64-bit target. 0x80 -> -128 in all 64 bits.
+        assert_eq!(sign_extend_mmio(0x80, 1, true), 0xFFFF_FFFF_FFFF_FF80);
+        assert_eq!(sign_extend_mmio(0x7F, 1, true), 0x7F);
+    }
+
+    #[test]
+    fn ldrsb_to_w_sign_extends_within_32_then_zero_extends() {
+        // LDRSB Wt, [..]: 1 byte, 32-bit target. 0x80 -> 0xFFFF_FF80, and the
+        // W-register write zero-extends the upper 32 bits.
+        assert_eq!(sign_extend_mmio(0x80, 1, false), 0x0000_0000_FFFF_FF80);
+        assert_eq!(sign_extend_mmio(0x7F, 1, false), 0x7F);
+    }
+
+    #[test]
+    fn ldrsh_sign_extends_halfword() {
+        assert_eq!(sign_extend_mmio(0x8000, 2, true), 0xFFFF_FFFF_FFFF_8000);
+        assert_eq!(sign_extend_mmio(0x8000, 2, false), 0x0000_0000_FFFF_8000);
+        assert_eq!(sign_extend_mmio(0x1234, 2, true), 0x1234);
+    }
+
+    #[test]
+    fn ldrsw_sign_extends_word_to_64() {
+        // LDRSW is always 32-bit source into a 64-bit register.
+        assert_eq!(
+            sign_extend_mmio(0x8000_0000, 4, true),
+            0xFFFF_FFFF_8000_0000
+        );
+        assert_eq!(sign_extend_mmio(0x0000_0001, 4, true), 0x1);
+    }
+
+    #[test]
+    fn full_and_wide_widths_are_passthrough() {
+        // 8-byte load: nothing above bit 63 to extend into.
+        assert_eq!(
+            sign_extend_mmio(0xFFFF_FFFF_FFFF_FF80, 8, true),
+            0xFFFF_FFFF_FFFF_FF80
+        );
+        // 4-byte load into a 32-bit register is not sign-extended (no SSE):
+        // this helper only runs when sign_extend is set, but the width-fills-
+        // register branch must still zero-extend cleanly.
+        assert_eq!(
+            sign_extend_mmio(0x8000_0000, 4, false),
+            0x0000_0000_8000_0000
+        );
+    }
 }
