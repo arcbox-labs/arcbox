@@ -252,7 +252,7 @@ fn ensure_runtime_once(vmm: &Vmm, deadline: Duration) -> Result<(bool, String), 
         .map_err(|e| format!("connect_vsock: {e}"))?;
     set_socket_timeout(fd, deadline).map_err(|e| format!("set_socket_timeout: {e}"))?;
     let mut client =
-        AgentClient::from_fd(GUEST_CID, fd).map_err(|e| format!("AgentClient::from_fd: {e}"))?;
+        AgentClient::from_fd_blocking(GUEST_CID, fd).map_err(|e| format!("AgentClient::from_fd_blocking: {e}"))?;
     let resp = client
         .ensure_runtime_blocking(true)
         .map_err(|e| format!("ensure_runtime: {e}"))?;
@@ -280,7 +280,7 @@ fn ping_once(vmm: &Vmm, deadline: Duration) -> Result<(), String> {
         .map_err(|e| format!("connect_vsock: {e}"))?;
     set_socket_timeout(fd, deadline).map_err(|e| format!("set_socket_timeout: {e}"))?;
     let mut client =
-        AgentClient::from_fd(GUEST_CID, fd).map_err(|e| format!("AgentClient::from_fd: {e}"))?;
+        AgentClient::from_fd_blocking(GUEST_CID, fd).map_err(|e| format!("AgentClient::from_fd_blocking: {e}"))?;
     client
         .ping_blocking()
         .map(|_| ())
