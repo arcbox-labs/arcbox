@@ -2,34 +2,58 @@
 
 ## Startup Sequence
 
-The daemon starts in five ordered phases. Each phase must complete before
-the next begins.
+Startup is a typed pipeline of eight ordered steps
+(`app/arcbox-daemon/src/main.rs::start` → `startup/pipeline.rs`). Each step
+consumes the previous step's context type, so skipping or reordering a step
+is a compile error.
 
 ```
-init_early        Create directories, resolve config          ~instant
+prepare_host             Create directories, resolve config      ~instant
     │
-acquire_lock      flock(daemon.lock), terminate stale daemon  ~instant or ≤30 s
+acquire_daemon_lease     flock(daemon.lock), terminate stale     ~instant or ≤30 s
+    │                    daemon
     │
-start_grpc        Bind arcbox.sock, SystemService available   ~instant
-    │             Desktop can connect from this point on.
+start_control_plane      Bind arcbox.sock, SystemService up      ~instant
+    │                    Desktop can connect from this point on.
     │
-wait_for_resources  Wait for docker.img holders to release    0–10 s
-    │               Reported as CLEANING_UP phase via gRPC.
+release_stale_resources  Wait for docker.img holders to release  0–10 s
+    │                    Reported as CLEANING_UP via gRPC.
     │
-init_runtime      Seed/download boot assets, start VM         variable
-                  Reported as DOWNLOADING_ASSETS → ASSETS_READY
-                  → VM_STARTING → VM_READY → NETWORK_READY.
+prepare_assets           Seed/download boot assets               variable
+    │                    Reported as DOWNLOADING_ASSETS →
+    │                    ASSETS_READY.
     │
-start_services    DNS, Docker API, Docker CLI integration     ~instant
+boot_runtime             Construct Runtime, boot the System VM   variable
+    │                    Emits no phase of its own; VM/network
+    │                    progress surfaces as SetupStatus infra
+    │                    flags, not phases (see below).
     │
-Ready             SetupPhase::Ready
+start_runtime_services   DNS, Docker API, recovery               ~instant
+    │
+mark_ready               SetupPhase::Ready
 ```
 
-If any phase fails, the daemon publishes `SetupPhase::Failed` with the
+If any step fails, the daemon publishes `SetupPhase::Failed` with the
 error text in `SetupStatus.error`, waits ~200 ms so connected
 `WatchSetupStatus` streams flush the final event, and exits non-zero.
 Clients should treat FAILED (or stream EOF plus daemon exit) as
 startup failure.
+
+### Phase enum caveats
+
+- The observable progression is `INITIALIZING → [CLEANING_UP] →
+  DOWNLOADING_ASSETS → ASSETS_READY → READY` (or `FAILED`). The
+  `VM_STARTING` / `VM_READY` / `NETWORK_READY` / `DEGRADED` values in
+  `SetupStatus.Phase` are reserved but currently never emitted — do not
+  wait on them.
+- Enum ordinal ≠ progression order (`DOWNLOADING_ASSETS = 8` occurs before
+  `READY = 6`). Clients must match on the value, never compare ordinals.
+  New phases are appended with the next free number regardless of where
+  they sit in the progression — values are additive-only.
+- VM / route / DNS progress during and after `boot_runtime` is carried by
+  the boolean `SetupStatus` fields (`vm_running`, `route_installed`,
+  `dns_resolver_installed`, …), set by recovery and `route_status_loop`,
+  not by phase transitions.
 
 ### Why gRPC starts before resource cleanup
 

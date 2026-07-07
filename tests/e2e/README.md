@@ -114,7 +114,10 @@ Environment variables read by the tests:
   `[boot].version`.
 - `ARCBOX_VM_BACKEND=vz|hv` — System VM backend for the daemon under test
   (first-boot default; the daemon reads the same variable). The matrix test
-  overrides it per run.
+  overrides it per run. To pin the guest vCPU count at this level, set
+  `[vm] cpus = N` in the test data dir's `config.toml` (default: host core
+  count) — the `ARCBOX_HV_E2E_VCPUS` knob only drives the bare `hv_e2e`
+  probe, not daemon-level tests.
 - `ARCBOX_E2E_IMAGE=<ref>` — container image for the lifecycle tests
   (default `alpine:latest`). Point it at a mirror on networks where the
   guest cannot reach docker.io.

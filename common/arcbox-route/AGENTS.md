@@ -9,10 +9,10 @@
 
 ## Architecture
 - `lib.rs` — Public API (`add`, `remove`, `get`) + `Ipv4Net` validated type (source of truth for "valid subnet")
-- `msg.rs` — `rt_msghdr` message construction, `route_send()` I/O via `PF_ROUTE` socket
+- `msg.rs` — `rt_msghdr` message construction, `route_write()` (mutations) / `route_query()` (RTM_GET reply matching) I/O via `PF_ROUTE` socket
 - `sockaddr.rs` — `sockaddr_in`/`sockaddr_dl` builders (crate-internal, not re-exported)
 - Only dependency beyond `libc`: `tracing` for structured logging
-- Consumer: `arcbox-helper` (privileged root daemon) calls this via `mutations/route.rs`
+- Consumer: `arcbox-helper` (privileged root daemon) calls this via `app/arcbox-helper/src/server/mutations/route.rs`
 
 ## Code Style
 - `Ipv4Net` is `Copy` (5 bytes) — always pass by value, never `&Ipv4Net`
