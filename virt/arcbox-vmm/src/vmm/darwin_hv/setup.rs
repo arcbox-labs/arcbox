@@ -15,6 +15,17 @@ use crate::vmm::darwin_hv::pl011::{PL011_BASE, PL011_SIZE};
 
 use super::*;
 
+/// Fills `buf` with fresh entropy from the host CSPRNG for the FDT boot seeds
+/// (`rng-seed`, `kaslr-seed`). Fails fast: a weak or absent boot seed is a real
+/// security regression, so we propagate the error rather than seed with a
+/// predictable value.
+fn read_boot_entropy(buf: &mut [u8]) -> Result<()> {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(buf))
+        .map_err(|e| VmmError::Memory(format!("FDT seed: reading /dev/urandom failed: {e}")))
+}
+
 impl Vmm {
     /// Custom VMM initialization using Hypervisor.framework (manual execution).
     ///
@@ -559,6 +570,17 @@ impl Vmm {
                 fdt.property_u64("linux,initrd-end", initrd_start + initrd_size)
                     .map_err(fdt_err)?;
             }
+            // Seed the guest's entropy pool and KASLR from the host CSPRNG.
+            // Without rng-seed the guest CRNG initializes late (it otherwise
+            // blocks until virtio-rng feeds it); without kaslr-seed the kernel
+            // gets no early KASLR entropy. VZ's bootloader supplies both.
+            let mut rng_seed = [0u8; 64];
+            read_boot_entropy(&mut rng_seed)?;
+            fdt.property("rng-seed", &rng_seed).map_err(fdt_err)?;
+            let mut kaslr = [0u8; 8];
+            read_boot_entropy(&mut kaslr)?;
+            fdt.property_u64("kaslr-seed", u64::from_le_bytes(kaslr))
+                .map_err(fdt_err)?;
             fdt.end_node(chosen).map_err(fdt_err)?;
 
             // Memory node

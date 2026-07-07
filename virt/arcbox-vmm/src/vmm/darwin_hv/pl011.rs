@@ -16,6 +16,14 @@ pub const PL011_DR: u64 = 0x000;
 /// Flag Register offset.
 pub const PL011_FR: u64 = 0x018;
 
+// UARTFR (flag register) bits. This emulator is TX-only with an always-
+// drainable transmit path and no receive FIFO, so the idle state is:
+// receive FIFO empty, transmit FIFO empty, transmit FIFO not full.
+/// Receive FIFO empty (bit 4) — always set: we deliver no RX data.
+const FR_RXFE: u64 = 1 << 4;
+/// Transmit FIFO empty (bit 7) — always set: writes drain immediately.
+const FR_TXFE: u64 = 1 << 7;
+
 /// Minimal PL011 UART emulator for early boot console output.
 pub struct Pl011 {
     /// Accumulated output buffer (line buffered).
@@ -37,8 +45,10 @@ impl Pl011 {
     pub fn read(&self, addr: u64, _size: usize) -> u64 {
         let offset = addr - PL011_BASE;
         match offset {
-            // Flag Register: TX FIFO never full, RX FIFO always empty.
-            PL011_FR => 0,
+            // Flag Register: RX FIFO empty + TX FIFO empty (TXFF stays clear),
+            // so a driver polling RXFE won't read phantom input and one waiting
+            // on TXFE before writing sees the line ready.
+            PL011_FR => FR_RXFE | FR_TXFE,
             _ => 0,
         }
     }
