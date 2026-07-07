@@ -490,10 +490,30 @@ async fn execute_exec(args: ExecArgs) -> Result<()> {
         None
     };
 
+    // Resize pump: SIGWINCH → gRPC resize frames (TTY sessions only).
+    if args.tty {
+        let resize_tx = msg_tx.clone();
+        match arcbox_cli::terminal::ResizeWatcher::new() {
+            Ok(mut watcher) => {
+                tokio::spawn(async move {
+                    while let Some(size) = watcher.recv().await {
+                        let msg = ExecInput {
+                            payload: Some(exec_input::Payload::Resize(ProtoTerminalSize {
+                                width: u32::from(size.cols),
+                                height: u32::from(size.rows),
+                            })),
+                        };
+                        if resize_tx.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            Err(e) => tracing::warn!(error = %e, "terminal resize forwarding disabled"),
+        }
+    }
+
     // Stdin pump: local terminal → gRPC stream.
-    // NOTE: TTY resize (SIGWINCH) is not yet forwarded — the gRPC→agent
-    // pipeline has no resize wire message. Will be added when the full
-    // resize path is wired up.
     let stdin_tx = msg_tx;
     tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();

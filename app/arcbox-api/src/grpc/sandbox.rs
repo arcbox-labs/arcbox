@@ -15,6 +15,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::codec::Streaming;
 use tonic::{Request, Response, Status};
 
+use arcbox_core::ExecSessionInput;
+
 use crate::ApiError;
 
 use super::{RequestExt, SharedRuntime, SharedRuntimeExt};
@@ -108,17 +110,24 @@ impl SandboxService for SandboxServiceImpl {
             _ => return Err(Status::invalid_argument("exec: first message must be Init")),
         };
 
-        // Feed remaining gRPC input into a channel for the core layer.
+        // Feed remaining gRPC input (stdin + TTY resizes) into a channel for
+        // the core layer. Stream end sends the empty-stdin EOF sentinel.
         let (in_tx, in_rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
             while let Some(Ok(input)) = stream.next().await {
-                if let Some(exec_input::Payload::Stdin(data)) = input.payload {
-                    if in_tx.send(data).await.is_err() {
-                        return;
-                    }
+                let msg = match input.payload {
+                    Some(exec_input::Payload::Stdin(data)) => ExecSessionInput::Stdin(data),
+                    Some(exec_input::Payload::Resize(size)) => ExecSessionInput::Resize {
+                        width: u16::try_from(size.width).unwrap_or(u16::MAX),
+                        height: u16::try_from(size.height).unwrap_or(u16::MAX),
+                    },
+                    _ => continue,
+                };
+                if in_tx.send(msg).await.is_err() {
+                    return;
                 }
             }
-            let _ = in_tx.send(Vec::new()).await;
+            let _ = in_tx.send(ExecSessionInput::Stdin(Vec::new())).await;
         });
 
         let out_rx = agent

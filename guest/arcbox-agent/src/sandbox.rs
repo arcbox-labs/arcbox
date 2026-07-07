@@ -34,7 +34,9 @@ async fn drain_trailing_input<S: AsyncRead + Unpin>(stream: &mut S) {
     use tokio::time::{Duration, timeout};
     let _ = timeout(Duration::from_millis(100), async {
         if let Ok((msg_type, _, _)) = read_message(stream).await {
-            if msg_type != MessageType::SandboxExecInput {
+            if msg_type != MessageType::SandboxExecInput
+                && msg_type != MessageType::SandboxExecResize
+            {
                 tracing::warn!(?msg_type, "unexpected trailing message after exec");
             }
         }
@@ -372,6 +374,18 @@ impl SandboxService {
                                 ExecInputMsg::Eof
                             } else {
                                 ExecInputMsg::Stdin(data)
+                            };
+                            if in_tx.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok((MessageType::SandboxExecResize, _, data)) => {
+                            let Ok(size) = sandbox_v1::TerminalSize::decode(data.as_slice()) else {
+                                break;
+                            };
+                            let msg = ExecInputMsg::Resize {
+                                width: u16::try_from(size.width).unwrap_or(u16::MAX),
+                                height: u16::try_from(size.height).unwrap_or(u16::MAX),
                             };
                             if in_tx.send(msg).await.is_err() {
                                 break;

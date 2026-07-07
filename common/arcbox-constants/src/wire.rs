@@ -63,13 +63,16 @@ pub enum MessageType {
     SandboxInspectRequest = 0x0023,
     SandboxListRequest = 0x0024,
 
-    // Sandbox workload request types (0x0030 - 0x0033).
+    // Sandbox workload request types (0x0030 - 0x0034).
     SandboxRunRequest = 0x0030,
     SandboxExecRequest = 0x0031,
     SandboxEventsRequest = 0x0032,
     /// Streaming stdin frame sent by the host after [`SandboxExecRequest`]
     /// to forward user input to the running process.
     SandboxExecInput = 0x0033,
+    /// TTY resize frame sent by the host during an exec session. Payload is
+    /// a prost-encoded `sandbox.v1.TerminalSize`.
+    SandboxExecResize = 0x0034,
 
     // Sandbox snapshot request types (0x0040 - 0x0043).
     SandboxCheckpointRequest = 0x0040,
@@ -152,6 +155,7 @@ impl MessageType {
             0x0031 => Some(Self::SandboxExecRequest),
             0x0032 => Some(Self::SandboxEventsRequest),
             0x0033 => Some(Self::SandboxExecInput),
+            0x0034 => Some(Self::SandboxExecResize),
             // Sandbox snapshot requests.
             0x0040 => Some(Self::SandboxCheckpointRequest),
             0x0041 => Some(Self::SandboxRestoreRequest),
@@ -285,6 +289,7 @@ mod tests {
             (0x0031, MessageType::SandboxExecRequest),
             (0x0032, MessageType::SandboxEventsRequest),
             (0x0033, MessageType::SandboxExecInput),
+            (0x0034, MessageType::SandboxExecResize),
             (0x1035, MessageType::SandboxRunOutput),
             (0x1036, MessageType::SandboxExecOutput),
             (0x1037, MessageType::SandboxEvent),

@@ -22,7 +22,7 @@ use arcbox_protocol::sandbox_v1::{
     DeleteSnapshotRequest, ExecOutput, ExecRequest, InspectSandboxRequest, ListSandboxesRequest,
     ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse, RemoveSandboxRequest,
     RestoreRequest, RestoreResponse, RunOutput, RunRequest, SandboxEvent, SandboxEventsRequest,
-    SandboxInfo, StopSandboxRequest,
+    SandboxInfo, StopSandboxRequest, TerminalSize,
 };
 use arcbox_transport::Transport;
 use arcbox_transport::vsock::{BlockingVsockTransport, VsockAddr, VsockTransport};
@@ -30,6 +30,21 @@ use bytes::Bytes;
 use prost::Message;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// A single client→sandbox message during an interactive exec session.
+#[derive(Debug)]
+pub enum ExecSessionInput {
+    /// Raw bytes for the process's stdin. An empty payload signals EOF and
+    /// ends the input stream.
+    Stdin(Vec<u8>),
+    /// Resize the pseudo-TTY (only meaningful for `tty = true` sessions).
+    Resize {
+        /// Terminal width in columns.
+        width: u16,
+        /// Terminal height in rows.
+        height: u16,
+    },
+}
 
 /// Agent client for a single VM.
 pub struct AgentClient {
@@ -934,8 +949,9 @@ impl AgentClient {
     /// Starts an interactive exec session inside a sandbox.
     ///
     /// Consumes the client because the stream task requires exclusive transport
-    /// access.  The caller supplies a receiver of raw stdin bytes (empty `Vec`
-    /// signals EOF).  Returns an output receiver of [`ExecOutput`] frames.
+    /// access.  The caller supplies a receiver of [`ExecSessionInput`]s (stdin
+    /// bytes, TTY resizes, or EOF).  Returns an output receiver of
+    /// [`ExecOutput`] frames.
     ///
     /// # Errors
     ///
@@ -943,7 +959,7 @@ impl AgentClient {
     pub async fn sandbox_exec(
         mut self,
         req: ExecRequest,
-        mut stdin_rx: mpsc::Receiver<Vec<u8>>,
+        mut input_rx: mpsc::Receiver<ExecSessionInput>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ExecOutput>>> {
         if !self.connected {
             self.connect().await?;
@@ -963,16 +979,28 @@ impl AgentClient {
 
         let (out_tx, out_rx) = mpsc::unbounded_channel();
 
-        // Stdin pump: channel → SandboxExecInput frames.
+        // Input pump: channel → SandboxExecInput / SandboxExecResize frames.
         let stdin_handle = tokio::spawn(async move {
             loop {
-                match stdin_rx.recv().await {
-                    Some(data) => {
+                match input_rx.recv().await {
+                    Some(ExecSessionInput::Stdin(data)) => {
+                        let is_eof = data.is_empty();
                         let frame = wire::build_message(MessageType::SandboxExecInput, "", &data);
-                        if sender.send(frame).await.is_err() {
+                        if sender.send(frame).await.is_err() || is_eof {
                             break;
                         }
-                        if data.is_empty() {
+                    }
+                    Some(ExecSessionInput::Resize { width, height }) => {
+                        let size = TerminalSize {
+                            width: u32::from(width),
+                            height: u32::from(height),
+                        };
+                        let frame = wire::build_message(
+                            MessageType::SandboxExecResize,
+                            "",
+                            &size.encode_to_vec(),
+                        );
+                        if sender.send(frame).await.is_err() {
                             break;
                         }
                     }
