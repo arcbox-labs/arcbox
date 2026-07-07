@@ -14,15 +14,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arcbox_api::{SetupPhase, SetupState};
+use arcbox_api::SetupPhase;
 use arcbox_constants::paths::{ArcboxProfile, HostLayout};
 use arcbox_core::{Config, Runtime};
 use macos_resolver::to_env_prefix;
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::DaemonArgs;
-use crate::context::{DaemonContext, EarlyContext, VmArgs};
+use crate::context::{DaemonContext, EarlyContext, StartupHandles, VmArgs};
 
 const DNS_PREFIX: &str = "arcbox";
 const DEFAULT_DNS_DOMAIN: &str = "arcbox.local";
@@ -32,7 +31,7 @@ const DEFAULT_DNS_DOMAIN: &str = "arcbox.local";
 /// Returns an [`EarlyContext`] sufficient to start the gRPC
 /// SystemService so clients can observe the full startup progression.
 /// Call [`acquire_lock`] next to obtain a [`DaemonContext`].
-async fn init_early(args: DaemonArgs, setup_state: Arc<SetupState>) -> Result<EarlyContext> {
+async fn init_early(args: DaemonArgs, handles: StartupHandles) -> Result<EarlyContext> {
     let profile = args
         .profile
         .unwrap_or_else(ArcboxProfile::from_env_or_default);
@@ -58,10 +57,11 @@ async fn init_early(args: DaemonArgs, setup_state: Arc<SetupState>) -> Result<Ea
     Ok(EarlyContext {
         profile,
         layout,
-        shared_runtime: Arc::new(std::sync::OnceLock::new()),
-        early_runtime: Arc::new(std::sync::OnceLock::new()),
-        setup_state,
-        shutdown: CancellationToken::new(),
+        shared_runtime: handles.shared_runtime,
+        early_runtime: handles.early_runtime,
+        setup_state: handles.setup_state,
+        shutdown: handles.shutdown,
+        daemon_lock_slot: handles.daemon_lock,
         dns_domain,
         dns_port,
         docker_integration: args.docker_integration,
@@ -85,6 +85,14 @@ async fn acquire_lock(early: EarlyContext) -> Result<DaemonContext> {
         .await
         .context("lock task panicked")?
         .context("failed to acquire daemon lock")?;
+    let lock = Arc::new(lock);
+    // Publish a sibling clone into the pre-pipeline handles: a signal drops
+    // this pipeline's context mid-flight, and the flock must outlive that
+    // drop for as long as the interrupt path is still tearing down the VM.
+    early
+        .daemon_lock_slot
+        .set(Arc::clone(&lock))
+        .map_err(|_| anyhow::anyhow!("acquire_lock called twice"))?;
     Ok(DaemonContext {
         profile: early.profile,
         layout: early.layout,

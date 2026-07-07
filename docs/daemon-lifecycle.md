@@ -102,6 +102,34 @@ signal received
 
 No manual intervention needed.
 
+## Signal During Startup
+
+The signal watcher is armed before the startup pipeline runs (`main::run`
+selects the pipeline against `wait_for_signal`), so SIGTERM / Ctrl+C
+arriving mid-startup triggers an orderly abort instead of the default
+kill-and-orphan:
+
+```
+signal received during startup
+  ├─ SetupState.set_failed("startup interrupted…")  → WatchSetupStatus clients see the cause
+  ├─ cancel CancellationToken                       → gRPC (if started) drains
+  ├─ early_runtime empty?  → exit (nothing to tear down)
+  ├─ runtime.shutdown()    → bounded to 10 s: an in-flight boot parks
+  │                          graceful Stop behind itself, so an unbounded
+  │                          wait could last the whole boot timeout
+  └─ on timeout / second signal → runtime.shutdown_force()  → VM killed,
+                                  no orphaned XPC helpers holding docker.img
+```
+
+`early_runtime` is filled right after `Runtime` construction, before the
+VM boots, so it covers every window in which a VM can exist.
+
+The daemon lease survives the abort: the lock is shared into the
+pre-pipeline handles when acquired, so cancelling the startup future
+does not release the flock — a concurrent daemon cannot take the lease
+while this process is still tearing down its VM. The flock releases at
+process exit, as in every other path.
+
 ## Crash / SIGKILL
 
 When the daemon is killed without graceful shutdown:
