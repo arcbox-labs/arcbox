@@ -60,6 +60,12 @@ pub(super) enum VmEvent {
     Stopped,
     /// Force-stop request (preempts any in-flight boot/stop).
     ForceStop,
+    /// The VM stopped on its own because the guest issued PSCI SYSTEM_RESET
+    /// (reboot). Detected by the liveness tick; triggers an in-place reboot.
+    GuestReset {
+        /// Startup budget (ms) for the post-reboot agent-readiness wait.
+        timeout_ms: u64,
+    },
 }
 
 /// Balloon target requested by a transition; the actor applies it idempotently.
@@ -98,6 +104,12 @@ pub(super) enum Effect {
     },
     /// Spawn the graceful-stop sub-task.
     SpawnStop,
+    /// Spawn the reboot sub-task: reboot the VMM in place, then wait for the
+    /// agent, reporting AgentReady / BootFailed like a boot.
+    SpawnReboot {
+        /// Startup budget in milliseconds.
+        timeout_ms: u64,
+    },
     /// Abort the in-flight boot/stop sub-task (force path).
     AbortInflight,
     /// Remove the machine record (force path).
@@ -246,6 +258,16 @@ impl VmLifecycle {
                 context.emit(Effect::SpawnStop);
                 Transition(State::stopping())
             }
+            VmEvent::GuestReset { timeout_ms } => {
+                // Guest rebooted itself (PSCI SYSTEM_RESET). Bump the
+                // incarnation so the Docker proxy drops cached readiness, then
+                // reboot the VMM in place and boot back to running.
+                context.emit(Effect::BumpGeneration);
+                context.emit(Effect::SpawnReboot {
+                    timeout_ms: *timeout_ms,
+                });
+                Transition(State::starting())
+            }
             _ => Super,
         }
     }
@@ -383,6 +405,43 @@ mod machine_tests {
         let (state, effects) = step(&mut sm, &mut fx, VmEvent::Failure);
         assert_eq!(state, VmLifecycleState::Failed);
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn guest_reset_reboots_from_running() {
+        let mut fx = Effects::default();
+        let mut sm = running_machine(&mut fx);
+
+        let (state, effects) = step(&mut sm, &mut fx, VmEvent::GuestReset { timeout_ms: T });
+        assert_eq!(state, VmLifecycleState::Starting);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::BumpGeneration,
+                Effect::SpawnReboot { timeout_ms: T }
+            ]
+        );
+
+        // The reboot sub-task reports agent readiness -> back to running.
+        let (state, _) = step(&mut sm, &mut fx, VmEvent::AgentReady);
+        assert_eq!(state, VmLifecycleState::Running);
+    }
+
+    #[test]
+    fn guest_reset_from_idle_also_reboots() {
+        let mut fx = Effects::default();
+        let mut sm = running_machine(&mut fx);
+        step(&mut sm, &mut fx, VmEvent::IdleTimeout); // -> Idle
+
+        let (state, effects) = step(&mut sm, &mut fx, VmEvent::GuestReset { timeout_ms: T });
+        assert_eq!(state, VmLifecycleState::Starting);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::BumpGeneration,
+                Effect::SpawnReboot { timeout_ms: T }
+            ]
+        );
     }
 
     #[test]
