@@ -293,6 +293,71 @@ fn test_process_tx_queue_not_ready() {
 }
 
 #[test]
+fn drain_tx_queue_refreshes_avail_event_on_empty_drain() {
+    // ABX-386 regression: with VIRTIO_F_EVENT_IDX the guest consults
+    // avail_event (vring_need_event) before every TX kick. An empty TX
+    // kick MUST still republish avail_event = consumed cursor, otherwise a
+    // stale value makes the guest suppress future kicks and wedges
+    // guest→host TX — the flaky cold-boot "stuck at Starting Docker engine"
+    // where the guest's DHCP DISCOVER never reaches the host.
+    use std::sync::atomic::AtomicU16;
+
+    use arcbox_virtio_core::{DeviceCtx, QueueConfig};
+
+    use crate::config::NetPort;
+
+    // Minimal split-virtqueue layout in a scratch "guest RAM" buffer,
+    // GPA base 0, q_size = 4: desc @ 0x100, avail @ 0x200, used @ 0x300.
+    let q_size: u16 = 4;
+    let (desc_addr, avail_addr, used_addr) = (0x100usize, 0x200usize, 0x300usize);
+    let avail_event_off = used_addr + 4 + q_size as usize * 8;
+    let mut mem = vec![0u8; 0x1000];
+
+    // The device has already drained everything the guest produced
+    // (last_avail_tx == avail_idx == 3) → this kick drains nothing.
+    let drained: u16 = 3;
+    mem[avail_addr + 2..avail_addr + 4].copy_from_slice(&drained.to_le_bytes());
+    // Stale avail_event (what the pre-fix empty-drain path leaves behind).
+    mem[avail_event_off..avail_event_off + 2].copy_from_slice(&0u16.to_le_bytes());
+
+    let mut net = VirtioNet::new(NetConfig::default());
+    net.ack_features(arcbox_virtio_core::queue::VIRTIO_F_EVENT_IDX);
+
+    // SAFETY: `mem` outlives `net` (declared first, dropped last) and is
+    // not moved while the raw pointer is held by the bound context.
+    let ctx = DeviceCtx {
+        mem: std::sync::Arc::new(unsafe {
+            arcbox_virtio_core::GuestMemWriter::new(mem.as_mut_ptr(), mem.len(), 0)
+        }),
+        raise_irq: std::sync::Arc::new(|_| {}),
+    };
+    net.bind_ctx(ctx);
+    net.bind_port(NetPort {
+        host_fd: -1, // unused: the empty drain writes no frame
+        last_avail_tx: AtomicU16::new(drained),
+    })
+    .expect("bind port");
+
+    let qcfg = QueueConfig {
+        desc_addr: desc_addr as u64,
+        avail_addr: avail_addr as u64,
+        used_addr: used_addr as u64,
+        size: q_size,
+        ready: true,
+        gpa_base: 0,
+    };
+
+    let notify = net.drain_tx_queue(&qcfg, |_| {});
+    assert!(!notify, "nothing to drain → no completion → no IRQ");
+
+    let published = u16::from_le_bytes([mem[avail_event_off], mem[avail_event_off + 1]]);
+    assert_eq!(
+        published, drained,
+        "avail_event must be refreshed to the consumed cursor on an empty drain"
+    );
+}
+
+#[test]
 fn test_inject_rx_batch_mrg_rxbuf_spans_chains() {
     use arcbox_virtio_core::queue::{Descriptor, flags};
     // With MRG_RXBUF on, a frame larger than a single chain's write-only

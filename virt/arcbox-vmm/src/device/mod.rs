@@ -146,6 +146,14 @@ pub struct DeviceManager {
     /// stored in `devices`. Used by `set_vsock` to bind the device's
     /// `DeviceCtx` and connection manager at registration time.
     vsock: Option<Arc<Mutex<arcbox_virtio::vsock::VirtioVsock>>>,
+    /// Typed handle to the virtio-console device. Shares the same `Arc`
+    /// stored in `devices`. Used by the debug-console RX worker to inject
+    /// host operator input into the console RX queue without a downcast.
+    console: Option<Arc<Mutex<arcbox_virtio::console::VirtioConsole>>>,
+    /// Debug-console Unix socket backend, set when `debug_console_socket` is
+    /// configured. Carried here from device registration so the HV start path
+    /// can hand it to the `console_rx_worker`. Same `Arc` is the console's `io`.
+    debug_console_socket: Option<Arc<Mutex<arcbox_virtio::console::SocketConsole>>>,
     /// Per-block-device async I/O worker handles. When present, QUEUE_NOTIFY
     /// for block devices is dispatched to the worker instead of processing
     /// synchronously on the vCPU thread.
@@ -206,6 +214,8 @@ impl DeviceManager {
                 crate::vsock_manager::VsockConnectionManager::new(),
             )),
             vsock: None,
+            console: None,
+            debug_console_socket: None,
             blk_workers: Mutex::new(HashMap::new()),
             net_rx_worker: net_worker::NetRxWorkerSlot::new(),
         }
@@ -327,6 +337,29 @@ impl DeviceManager {
     /// Returns the typed handle to the VirtioVsock device if registered.
     pub fn vsock(&self) -> Option<&Arc<Mutex<arcbox_virtio::vsock::VirtioVsock>>> {
         self.vsock.as_ref()
+    }
+
+    /// Registers the typed handle to the virtio-console device so the
+    /// debug-console RX worker can inject host input. Shares the same `Arc`
+    /// stored in `devices` (from `register_virtio_device`).
+    pub fn set_console(&mut self, device: Arc<Mutex<arcbox_virtio::console::VirtioConsole>>) {
+        self.console = Some(device);
+    }
+
+    /// Stores the debug-console socket backend so the HV start path can hand
+    /// it to the `console_rx_worker` after the `DeviceManager` is shared.
+    pub fn set_debug_console_socket(
+        &mut self,
+        socket: Arc<Mutex<arcbox_virtio::console::SocketConsole>>,
+    ) {
+        self.debug_console_socket = Some(socket);
+    }
+
+    /// Returns the debug-console socket backend, if one was configured.
+    pub fn debug_console_socket(
+        &self,
+    ) -> Option<&Arc<Mutex<arcbox_virtio::console::SocketConsole>>> {
+        self.debug_console_socket.as_ref()
     }
 
     /// Registers a typed handle to the bridge VirtioNet (NIC2) and binds

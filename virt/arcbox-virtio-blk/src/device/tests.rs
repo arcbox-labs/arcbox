@@ -48,6 +48,105 @@ fn test_block_config_features() {
     assert_eq!(device.features() & VirtioBlock::FEATURE_WRITE_ZEROES, 0);
 }
 
+/// Writes a 16-byte virtqueue descriptor into a guest-memory descriptor
+/// table at `table + idx * 16` (addr/len/flags/next, little-endian).
+fn write_desc(
+    mem: &mut [u8],
+    table: usize,
+    idx: usize,
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+) {
+    let b = table + idx * 16;
+    mem[b..b + 8].copy_from_slice(&addr.to_le_bytes());
+    mem[b + 8..b + 12].copy_from_slice(&len.to_le_bytes());
+    mem[b + 12..b + 14].copy_from_slice(&flags.to_le_bytes());
+    mem[b + 14..b + 16].copy_from_slice(&next.to_le_bytes());
+}
+
+/// A malformed/malicious guest can publish a descriptor chain whose `next`
+/// links form a cycle (0 -> 1 -> 0). The chain walk must be bounded by the
+/// queue size; an unbounded walk spins the vCPU thread forever. We run
+/// `process_queue` on a worker thread and require it to terminate.
+#[test]
+fn process_queue_terminates_on_cyclic_descriptor_chain() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use arcbox_virtio_core::QueueConfig;
+
+    const Q_SIZE: u16 = 4;
+    const DESC: usize = 0x1000;
+    const AVAIL: usize = 0x2000;
+    const USED: usize = 0x3000;
+    const HDR: usize = 0x4000;
+    const MEM_LEN: usize = 0x8000;
+
+    let config = BlockConfig {
+        capacity: 64,
+        blk_size: 512,
+        path: PathBuf::new(),
+        read_only: false,
+        num_queues: 1,
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let mut mem = vec![0u8; MEM_LEN];
+        // desc0: read-only request header, NEXT -> desc1.
+        write_desc(
+            &mut mem,
+            DESC,
+            0,
+            HDR as u64,
+            16,
+            arcbox_virtio_core::queue::flags::NEXT,
+            1,
+        );
+        // desc1: read-only, NEXT -> desc0 (cycle).
+        write_desc(
+            &mut mem,
+            DESC,
+            1,
+            HDR as u64,
+            16,
+            arcbox_virtio_core::queue::flags::NEXT,
+            0,
+        );
+        // avail ring: idx = 1, ring[0] = head descriptor 0.
+        mem[AVAIL + 2..AVAIL + 4].copy_from_slice(&1u16.to_le_bytes());
+        mem[AVAIL + 4..AVAIL + 6].copy_from_slice(&0u16.to_le_bytes());
+        // Header bytes at HDR are all zero => request type In (0), sector 0.
+
+        let mut device = VirtioBlock::new(config);
+        let qcfg = QueueConfig {
+            desc_addr: DESC as u64,
+            avail_addr: AVAIL as u64,
+            used_addr: USED as u64,
+            size: Q_SIZE,
+            ready: true,
+            gpa_base: 0,
+        };
+        let ok = device.process_queue(0, &mut mem, &qcfg).is_ok();
+        let _ = tx.send(ok);
+    });
+
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(ok) => {
+            handle.join().unwrap();
+            assert!(
+                ok,
+                "process_queue should complete on a bounded cyclic chain"
+            );
+        }
+        Err(e) => panic!(
+            "process_queue did not terminate on a cyclic descriptor chain — cycle guard regressed ({e:?})"
+        ),
+    }
+}
+
 #[test]
 fn test_read_write() {
     let mut temp_file = NamedTempFile::new().unwrap();

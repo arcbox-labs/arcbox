@@ -65,6 +65,14 @@ pub struct VmmConfig {
     /// support) or Virtualization.framework (managed execution). Requires
     /// macOS 15+ for HV backend. See [`VmBackend`] for details.
     pub backend: VmBackend,
+    /// Path for an interactive debug-console Unix socket (HV backend only).
+    ///
+    /// When set, the virtio-console is wired to a bidirectional socket backend
+    /// and a `console_rx_worker` injects operator input into the guest RX
+    /// queue, giving a serial shell reachable via `socat - UNIX-CONNECT:<path>`
+    /// — usable even when early boot hangs before networking. Debug aid; left
+    /// `None` in production.
+    pub debug_console_socket: Option<PathBuf>,
 }
 
 impl Default for VmmConfig {
@@ -86,6 +94,7 @@ impl Default for VmmConfig {
             block_devices: Vec::new(),
             bridge_nic_mac: None,
             backend: VmBackend::default(),
+            debug_console_socket: None,
         }
     }
 }

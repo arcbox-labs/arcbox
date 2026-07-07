@@ -1,0 +1,90 @@
+//! Interactive debug-console RX worker thread.
+//!
+//! Reads operator keystrokes from the debug-console Unix socket and injects
+//! them into the guest virtio-console RX queue, then raises `INT_VRING` and
+//! force-exits WFI-idle vCPUs so a guest shell sees the input promptly — the
+//! same delivery scheme the vsock/net RX workers use.
+//!
+//! Output flows the other way for free: the console device mirrors guest TX
+//! bytes to the same socket from `process_queue`, so an operator attached with
+//! `socat - UNIX-CONNECT:<sock>` gets a bidirectional console.
+//!
+//! This is a debug aid gated behind `VmmConfig::debug_console_socket`; it is
+//! not part of the normal boot path. Polling (rather than `kevent`) keeps it
+//! dead simple — console I/O is human-paced, so a 10 ms tick is imperceptible.
+
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use arcbox_virtio::console::{ConsoleIo, SocketConsole};
+
+use crate::device::{DeviceManager, DeviceType};
+
+/// VirtIO MMIO interrupt status bit for "used ring updated".
+const INT_VRING: u32 = 1;
+
+/// Poll cadence while an operator is attached — fast enough that keystrokes
+/// feel instant.
+const POLL_ACTIVE: Duration = Duration::from_millis(10);
+
+/// Poll cadence while no client is connected. The console is always present
+/// (including release), so back off hard when idle to keep CPU near zero —
+/// only the cheap accept() probe runs at this rate.
+const POLL_IDLE: Duration = Duration::from_millis(250);
+
+/// Resources for the debug-console RX worker thread.
+pub struct ConsoleRxWorkerContext {
+    /// Device manager owning the console device.
+    pub device_manager: Arc<DeviceManager>,
+    /// The debug-console socket backend (operator input source). Shares the
+    /// same `Arc` set as the console device's output `io`.
+    pub socket: Arc<Mutex<SocketConsole>>,
+    /// VM shutdown flag.
+    pub running: Arc<AtomicBool>,
+    /// Force-exit all vCPUs from `hv_vcpu_run` (thread-safe).
+    pub exit_vcpus: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Main loop for the debug-console RX worker thread.
+pub fn console_rx_worker_loop(ctx: ConsoleRxWorkerContext) {
+    tracing::info!("debug-console RX worker started");
+    let mut buf = [0u8; 1024];
+
+    while ctx.running.load(Ordering::Relaxed) {
+        // `SocketConsole::read` accepts a pending client and returns operator
+        // bytes (non-blocking, 0 when idle or unconnected).
+        let (n, connected) = match ctx.socket.lock() {
+            Ok(mut s) => {
+                let n = s.read(&mut buf).unwrap_or(0);
+                (n, s.is_connected())
+            }
+            Err(_) => (0, false),
+        };
+
+        // Inject fresh bytes (n > 0) or flush input buffered from a prior tick
+        // against descriptors the guest has since posted (n == 0).
+        let injected = ctx.device_manager.console_inject_input(&buf[..n]);
+        if n > 0 {
+            // Breadcrumb for diagnosing the host→guest input path (ABX-388): did
+            // operator keystrokes reach the host socket, and were they injected
+            // into the guest RX ring (false ⇒ queue not ready / no descriptors)?
+            tracing::debug!(
+                bytes = n,
+                connected,
+                injected,
+                "debug-console: operator input"
+            );
+        }
+        if injected {
+            ctx.device_manager
+                .raise_interrupt_for(DeviceType::VirtioConsole, INT_VRING);
+            (ctx.exit_vcpus)();
+        }
+
+        std::thread::sleep(if connected { POLL_ACTIVE } else { POLL_IDLE });
+    }
+
+    tracing::info!("debug-console RX worker stopped");
+}

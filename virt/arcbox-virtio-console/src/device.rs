@@ -76,6 +76,10 @@ pub struct VirtioConsole {
     io: Option<Arc<Mutex<dyn ConsoleIo>>>,
     /// Event sender for console input.
     input_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    /// Last consumed available index for the RX queue (host -> guest).
+    /// Tracked directly because the HV path reads the ring from guest memory
+    /// rather than via the internal `VirtQueue`.
+    rx_last_avail: u16,
 }
 
 impl VirtioConsole {
@@ -112,6 +116,7 @@ impl VirtioConsole {
             tx_queue: None,
             io: None,
             input_tx: None,
+            rx_last_avail: 0,
         }
     }
 
@@ -248,6 +253,83 @@ impl VirtioConsole {
             .map(|p| p.input_buffer.len())
             .unwrap_or(0)
     }
+
+    /// Injects pending host input (queued via [`queue_input`](Self::queue_input))
+    /// into the guest RX queue (queue 0), advancing the used ring.
+    ///
+    /// Descriptors are read directly from guest memory — the HV path drives the
+    /// queue from `QueueConfig` rather than the internal [`VirtQueue`]. Returns
+    /// `true` if at least one descriptor was filled, in which case the caller
+    /// must raise an `INT_VRING` interrupt so the guest services the input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a queue address lies below the guest RAM base.
+    pub fn process_rx_queue(
+        &mut self,
+        memory: &mut [u8],
+        queue_config: &QueueConfig,
+    ) -> Result<bool> {
+        if !queue_config.ready || queue_config.size == 0 {
+            return Ok(false);
+        }
+        // Nothing buffered to deliver.
+        if self.rx_available() == 0 {
+            return Ok(false);
+        }
+
+        // SAFETY: `memory` is the guest RAM slice; the queue accesses it only
+        // through the GuestMemWriter built here, and `memory` is not touched
+        // directly while the queue is alive.
+        let mem = std::sync::Arc::new(unsafe {
+            arcbox_virtio_core::GuestMemWriter::new(
+                memory.as_mut_ptr(),
+                memory.len(),
+                queue_config.gpa_base as usize,
+            )
+        });
+        let mut queue = arcbox_virtio_core::SplitQueue::new(mem, 0, queue_config, false);
+        queue.set_last_avail_idx(self.rx_last_avail);
+
+        let mut completions: Vec<(u16, u32)> = Vec::new();
+        // Fill RX descriptor chains with buffered input. Stop as soon as the
+        // input buffer drains, leaving the remaining descriptors for the next
+        // batch of keystrokes.
+        while self.rx_available() > 0 {
+            let Some(chain) = queue.pop_avail() else {
+                break;
+            };
+            let mut written = 0u32;
+            let mut input_done = false;
+            for desc in &chain.descriptors {
+                // RX descriptors are write-only (the device writes guest input).
+                if desc.is_write() && desc.len > 0 {
+                    if let Some(port) = self.ports.first_mut() {
+                        let n = (desc.len as usize).min(port.input_buffer.len());
+                        // SAFETY: write-only descriptor buffers are device-owned.
+                        if let Some(buf) = unsafe { queue.mem().slice_mut(desc.addr as usize, n) } {
+                            for slot in buf.iter_mut() {
+                                if let Some(b) = port.input_buffer.pop_front() {
+                                    *slot = b;
+                                }
+                            }
+                            written += n as u32;
+                            input_done = port.input_buffer.is_empty();
+                        }
+                    }
+                }
+                if input_done {
+                    break; // input exhausted
+                }
+            }
+            completions.push((chain.head_idx, written));
+        }
+
+        let injected = !completions.is_empty();
+        queue.push_used_batch(&completions);
+        self.rx_last_avail = queue.last_avail_idx();
+        Ok(injected)
+    }
 }
 
 impl VirtioDevice for VirtioConsole {
@@ -318,6 +400,7 @@ impl VirtioDevice for VirtioConsole {
         self.acked_features = 0;
         self.rx_queue = None;
         self.tx_queue = None;
+        self.rx_last_avail = 0;
 
         for port in &mut self.ports {
             port.open = false;
@@ -342,141 +425,61 @@ impl VirtioDevice for VirtioConsole {
             return Ok(Vec::new());
         }
 
-        // Translate GPAs to slice offsets by subtracting gpa_base (checked to
-        // guard against a malicious guest providing a GPA below the RAM base).
-        let gpa_base = queue_config.gpa_base as usize;
-        let desc_addr = (queue_config.desc_addr as usize)
-            .checked_sub(gpa_base)
-            .ok_or_else(|| {
-                tracing::warn!(
-                    "invalid desc GPA {:#x} below ram base {:#x}",
-                    queue_config.desc_addr,
-                    gpa_base
-                );
-                VirtioError::InvalidQueue("desc GPA below ram base".into())
-            })?;
-        let avail_addr = (queue_config.avail_addr as usize)
-            .checked_sub(gpa_base)
-            .ok_or_else(|| {
-                tracing::warn!(
-                    "invalid avail GPA {:#x} below ram base {:#x}",
-                    queue_config.avail_addr,
-                    gpa_base
-                );
-                VirtioError::InvalidQueue("avail GPA below ram base".into())
-            })?;
-        let used_addr = (queue_config.used_addr as usize)
-            .checked_sub(gpa_base)
-            .ok_or_else(|| {
-                tracing::warn!(
-                    "invalid used GPA {:#x} below ram base {:#x}",
-                    queue_config.used_addr,
-                    gpa_base
-                );
-                VirtioError::InvalidQueue("used GPA below ram base".into())
-            })?;
-        let queue_size = queue_config.size as usize;
+        // SAFETY: `memory` is the guest RAM slice; the queue accesses it only
+        // through the GuestMemWriter built here, and `memory` is not touched
+        // directly while the queue is alive.
+        let mem = std::sync::Arc::new(unsafe {
+            arcbox_virtio_core::GuestMemWriter::new(
+                memory.as_mut_ptr(),
+                memory.len(),
+                queue_config.gpa_base as usize,
+            )
+        });
+        let mut queue = arcbox_virtio_core::SplitQueue::new(mem, queue_idx, queue_config, false);
+        // TX posts exactly one used entry per consumed avail entry, so the avail
+        // cursor tracks the guest's current used.idx (which SplitQueue seeded).
+        let start = queue.mem().read_u16(queue_config.used_addr as usize + 2);
+        queue.set_last_avail_idx(start);
 
-        if avail_addr + 4 > memory.len() {
-            return Ok(Vec::new());
-        }
-        let avail_idx = u16::from_le_bytes([memory[avail_addr + 2], memory[avail_addr + 3]]);
-
-        if used_addr + 4 > memory.len() {
-            return Ok(Vec::new());
-        }
-        let used_idx_ref = &memory[used_addr + 2..used_addr + 4];
-        let mut used_idx = u16::from_le_bytes([used_idx_ref[0], used_idx_ref[1]]);
+        // Mirror guest output to the attached backend (e.g. the debug-console
+        // Unix socket) in addition to the `guest_console` tracing target, so an
+        // interactive operator sees raw output immediately — including partial
+        // lines and prompts that never carry a trailing newline.
+        let io = self.io.clone();
 
         let mut completions = Vec::new();
-
-        while used_idx != avail_idx {
-            let avail_ring_off = avail_addr + 4 + (used_idx as usize % queue_size) * 2;
-            if avail_ring_off + 2 > memory.len() {
-                break;
-            }
-            let head_idx = u16::from_le_bytes([memory[avail_ring_off], memory[avail_ring_off + 1]]);
-
-            // Walk descriptor chain, extract TX data.
-            let mut idx = head_idx as usize;
+        while let Some(chain) = queue.pop_avail() {
             let mut total_len = 0u32;
-            for _ in 0..queue_size {
-                let d_off = desc_addr + idx * 16;
-                if d_off + 16 > memory.len() {
-                    break;
+            for desc in &chain.descriptors {
+                // Read-only descriptor = data FROM guest (TX output).
+                if desc.is_write() {
+                    continue;
                 }
-                let addr = match (u64::from_le_bytes(memory[d_off..d_off + 8].try_into().unwrap())
-                    as usize)
-                    .checked_sub(gpa_base)
-                {
-                    Some(a) => a,
-                    None => continue,
+                let Some(data) = queue.mem().slice(desc.addr as usize, desc.len as usize) else {
+                    continue;
                 };
-                let len = u32::from_le_bytes(memory[d_off + 8..d_off + 12].try_into().unwrap());
-                let flags = u16::from_le_bytes(memory[d_off + 12..d_off + 14].try_into().unwrap());
-                let next = u16::from_le_bytes(memory[d_off + 14..d_off + 16].try_into().unwrap());
-
-                let is_write = flags & 2 != 0; // VIRTQ_DESC_F_WRITE
-                if !is_write {
-                    // Read-only descriptor = data FROM guest (TX output).
-                    let start = addr;
-                    let end = start + len as usize;
-                    if end <= memory.len() {
-                        let data = &memory[start..end];
-                        if let Some(port) = self.ports.first_mut() {
-                            port.output_buffer.extend(data.iter().copied());
-                            // Flush on newline.
-                            while let Some(pos) =
-                                port.output_buffer.iter().position(|&b| b == b'\n')
-                            {
-                                let line: Vec<u8> = port.output_buffer.drain(..=pos).collect();
-                                if let Ok(s) = std::str::from_utf8(&line) {
-                                    tracing::info!(target: "guest_console", "{}", s.trim_end());
-                                }
-                            }
-                        }
-                        total_len += len;
+                if let Some(io) = &io {
+                    if let Ok(mut g) = io.lock() {
+                        let _ = g.write(data);
+                        let _ = g.flush();
                     }
                 }
-
-                if flags & 1 == 0 {
-                    break; // No NEXT
+                if let Some(port) = self.ports.first_mut() {
+                    port.output_buffer.extend(data.iter().copied());
+                    // Flush on newline.
+                    while let Some(pos) = port.output_buffer.iter().position(|&b| b == b'\n') {
+                        let line: Vec<u8> = port.output_buffer.drain(..=pos).collect();
+                        if let Ok(s) = std::str::from_utf8(&line) {
+                            tracing::info!(target: "guest_console", "{}", s.trim_end());
+                        }
+                    }
                 }
-                idx = next as usize;
+                total_len += desc.len;
             }
-
-            let used_ring_off = used_addr + 4 + (used_idx as usize % queue_size) * 8;
-            if used_ring_off + 8 <= memory.len() {
-                memory[used_ring_off..used_ring_off + 4]
-                    .copy_from_slice(&(head_idx as u32).to_le_bytes());
-                memory[used_ring_off + 4..used_ring_off + 8]
-                    .copy_from_slice(&total_len.to_le_bytes());
-            }
-
-            used_idx = used_idx.wrapping_add(1);
-            completions.push((head_idx, total_len));
+            completions.push((chain.head_idx, total_len));
         }
 
-        if !completions.is_empty() {
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            let new_used = used_idx.to_le_bytes();
-            memory[used_addr + 2] = new_used[0];
-            memory[used_addr + 3] = new_used[1];
-
-            // Only write avail_event when VIRTIO_F_EVENT_IDX was negotiated;
-            // without it the field lives past the used ring and the write
-            // would corrupt guest memory. Console does not advertise EVENT_IDX
-            // so this branch is currently unreachable.
-            if (self.acked_features & arcbox_virtio_core::queue::VIRTIO_F_EVENT_IDX) != 0 {
-                let avail_event_off = used_addr + 4 + 8 * queue_size;
-                if avail_event_off + 2 <= memory.len() {
-                    let ae = avail_idx.to_le_bytes();
-                    memory[avail_event_off] = ae[0];
-                    memory[avail_event_off + 1] = ae[1];
-                }
-            }
-        }
-
+        queue.push_used_batch(&completions);
         Ok(completions)
     }
 }
@@ -633,5 +636,59 @@ mod tests {
     fn test_console_rx_available_empty() {
         let console = VirtioConsole::new(ConsoleConfig::default());
         assert_eq!(console.rx_available(), 0);
+    }
+
+    #[test]
+    fn test_console_process_rx_queue_injects_input() {
+        // Lay out a 4-entry RX virtqueue inside a flat guest-memory buffer.
+        const SIZE: u16 = 4;
+        const DESC: usize = 0x100;
+        const AVAIL: usize = 0x200;
+        const USED: usize = 0x300;
+        const BUF: usize = 0x400;
+        let mut mem = vec![0u8; 0x600];
+
+        // Descriptor 0: write-only buffer at BUF, len 16.
+        mem[DESC..DESC + 8].copy_from_slice(&(BUF as u64).to_le_bytes());
+        mem[DESC + 8..DESC + 12].copy_from_slice(&16u32.to_le_bytes());
+        mem[DESC + 12..DESC + 14].copy_from_slice(&2u16.to_le_bytes()); // VIRTQ_DESC_F_WRITE
+        mem[DESC + 14..DESC + 16].copy_from_slice(&0u16.to_le_bytes());
+
+        // Avail ring: ring[0] = descriptor 0, idx = 1.
+        mem[AVAIL + 4..AVAIL + 6].copy_from_slice(&0u16.to_le_bytes());
+        mem[AVAIL + 2..AVAIL + 4].copy_from_slice(&1u16.to_le_bytes());
+
+        let qc = QueueConfig {
+            desc_addr: DESC as u64,
+            avail_addr: AVAIL as u64,
+            used_addr: USED as u64,
+            size: SIZE,
+            ready: true,
+            gpa_base: 0,
+        };
+
+        let mut console = VirtioConsole::new(ConsoleConfig::default());
+        // No input yet → nothing to inject.
+        assert!(!console.process_rx_queue(&mut mem, &qc).unwrap());
+
+        console.queue_input(b"hello").unwrap();
+        let injected = console.process_rx_queue(&mut mem, &qc).unwrap();
+        assert!(injected);
+        assert_eq!(&mem[BUF..BUF + 5], b"hello");
+
+        // Used ring advanced to 1, entry id = descriptor 0, len = 5.
+        assert_eq!(u16::from_le_bytes([mem[USED + 2], mem[USED + 3]]), 1);
+        assert_eq!(
+            u32::from_le_bytes([mem[USED + 4], mem[USED + 5], mem[USED + 6], mem[USED + 7]]),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes([mem[USED + 8], mem[USED + 9], mem[USED + 10], mem[USED + 11]]),
+            5
+        );
+
+        // Input fully consumed; a second call is a no-op (no fresh avail entries).
+        assert_eq!(console.rx_available(), 0);
+        assert!(!console.process_rx_queue(&mut mem, &qc).unwrap());
     }
 }

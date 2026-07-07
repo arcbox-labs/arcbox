@@ -112,9 +112,12 @@ impl Vmm {
                 let mut queue_workers = Vec::with_capacity(num_queues as usize);
 
                 for qi in 0..num_queues {
-                    let (tx, rx) = std::sync::mpsc::channel::<crate::blk_worker::BlkWorkItem>();
+                    // Doorbell channel: the vCPU rings `()` on QUEUE_NOTIFY; the
+                    // worker owns avail-consume + I/O + completion + IRQ.
+                    let (tx, rx) = std::sync::mpsc::channel::<()>();
 
                     let worker_ctx = crate::blk_worker::BlkWorkerContext {
+                        queue_idx: qi,
                         // SAFETY: `guest_ptr` is the host mapping returned by
                         // Virtualization.framework, valid for `guest_len` bytes
                         // for the lifetime of the VM.
@@ -135,6 +138,13 @@ impl Vmm {
                         irq,
                         running: self.running.clone(),
                         flush_barrier: flush_barrier.clone(),
+                        // Wake WFI-parked vCPUs on completion (ABX-367), mirroring
+                        // the net/vsock RX workers.
+                        exit_vcpus: make_exit_vcpus_fn(
+                            self.hv_vcpu_ids
+                                .clone()
+                                .expect("hv_vcpu_ids asserted Some above"),
+                        ),
                     };
 
                     let thread_name = format!("blk-io-{}-q{}", dev_id_str, qi);
@@ -145,10 +155,7 @@ impl Vmm {
                         }) {
                         Ok(t) => {
                             self.hv_blk_worker_threads.push(t);
-                            queue_workers.push(crate::blk_worker::BlkQueueWorker {
-                                tx,
-                                last_avail_idx: std::sync::atomic::AtomicU16::new(0),
-                            });
+                            queue_workers.push(crate::blk_worker::BlkQueueWorker { doorbell: tx });
                         }
                         Err(e) => {
                             tracing::warn!("Failed to spawn {}: {}", thread_name, e);
@@ -221,6 +228,7 @@ impl Vmm {
         // pipe is rung by the connection manager on new RX work; the
         // worker also watches every connected socketpair fd for data.
         self.spawn_vsock_rx_worker(&device_manager)?;
+        self.spawn_console_rx_worker(&device_manager)?;
 
         let running = self.running.clone();
         let paused = self.hv_paused.clone();
@@ -462,6 +470,15 @@ impl Vmm {
         if let Some(t) = self.hv_vsock_worker.take() {
             if let Err(e) = t.join() {
                 tracing::warn!("vsock-io worker thread join failed: {e:?}");
+            }
+        }
+
+        // Debug-console RX worker: polls on a 10 ms tick and observes
+        // `running=false` promptly. Present only when the debug console was
+        // configured.
+        if let Some(t) = self.hv_console_worker.take() {
+            if let Err(e) = t.join() {
+                tracing::warn!("console-io worker thread join failed: {e:?}");
             }
         }
 

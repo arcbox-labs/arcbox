@@ -85,6 +85,24 @@ impl GuestMemWriter {
         }
     }
 
+    /// Reads a little-endian `u32` from the given GPA. Returns 0 on
+    /// out-of-bounds access.
+    pub fn read_u32(&self, gpa: usize) -> u32 {
+        match self.slice(gpa, 4) {
+            Some(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            None => 0,
+        }
+    }
+
+    /// Reads a little-endian `u64` from the given GPA. Returns 0 on
+    /// out-of-bounds access.
+    pub fn read_u64(&self, gpa: usize) -> u64 {
+        match self.slice(gpa, 8) {
+            Some(b) => u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+            None => 0,
+        }
+    }
+
     /// Writes a little-endian `u16` to the given GPA. No-op on
     /// out-of-bounds access.
     pub fn write_u16(&self, gpa: usize, val: u16) {

@@ -50,6 +50,7 @@ fn main() {
         block_devices: Vec::new(),
         bridge_nic_mac: None,
         backend: arcbox_vmm::VmBackend::default(),
+        debug_console_socket: None,
     };
 
     println!("VMM Configuration:");

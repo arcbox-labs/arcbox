@@ -15,7 +15,9 @@ use tokio::sync::mpsc;
 use crate::error::{CoreError, Result};
 use crate::event::Event;
 use crate::machine::MachineConfig;
-use arcbox_constants::cmdline::{GUEST_DOCKER_VSOCK_PORT_KEY, HV_EARLYCON_DIRECTIVE};
+use arcbox_constants::cmdline::{
+    DEBUG_CONSOLE_KEY, GUEST_DOCKER_VSOCK_PORT_KEY, HV_EARLYCON_DIRECTIVE,
+};
 use arcbox_error::CommonError;
 
 use super::actor::{Completion, InternalEvent, LifecycleShared};
@@ -319,7 +321,8 @@ impl LifecycleShared {
     /// [`Self::boot`] so machine creation and drift detection always agree on
     /// the desired kernel and cmdline. The cmdline is the base (explicit
     /// override or the boot manifest default) with `quiet` stripped,
-    /// `earlycon` ensured, and the guest docker vsock port injected.
+    /// `earlycon` ensured, the guest docker vsock port injected, and the
+    /// HV debug-console token attached.
     async fn resolve_desired_boot(&self) -> Result<DesiredBoot> {
         let assets = self.boot_assets.get_assets().await?;
         let mut cmdline = self
@@ -352,6 +355,37 @@ impl LifecycleShared {
                 cmdline.push_str(GUEST_DOCKER_VSOCK_PORT_KEY);
                 cmdline.push_str(&port.to_string());
             }
+        }
+
+        // Always attach an interactive debug console on the custom-HV backend.
+        // An operator can `socat - UNIX-CONNECT:<sock>` to get a serial root
+        // shell into the guest even when early boot hangs before networking
+        // (the dominant HV cold-boot failure mode). This token is the single
+        // source of truth: the host opens the socket at `<sock>` and the guest
+        // rcS keys off the same token to spawn the shell. HV-only — the token
+        // targets the HV virtio-console wiring; VZ owns its console internally.
+        // The socket lives under the per-user data dir (same-user access only).
+        // Escape hatch to A/B-test the console's effect on the flaky HV cold
+        // boot: `ARCBOX_NO_DEBUG_CONSOLE=1` strips any token (host attaches no
+        // console, guest rcS spawns no shell). Default: console always attached.
+        if std::env::var_os("ARCBOX_NO_DEBUG_CONSOLE").is_some() {
+            cmdline = cmdline
+                .split_whitespace()
+                .filter(|t| !t.starts_with(DEBUG_CONSOLE_KEY))
+                .collect::<Vec<_>>()
+                .join(" ");
+        } else if matches!(self.backend(), arcbox_vmm::VmBackend::Hv)
+            && !cmdline
+                .split_whitespace()
+                .any(|t| t.starts_with(DEBUG_CONSOLE_KEY))
+        {
+            let sock = self.data_dir.join("run").join("console.sock");
+            if let Some(parent) = sock.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            cmdline.push(' ');
+            cmdline.push_str(DEBUG_CONSOLE_KEY);
+            cmdline.push_str(&sock.to_string_lossy());
         }
 
         Ok(DesiredBoot {

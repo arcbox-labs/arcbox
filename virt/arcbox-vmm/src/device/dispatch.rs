@@ -239,7 +239,6 @@ impl DeviceManager {
                             //
                             // SAFETY: `ram_base` is the host mapping returned by
                             // Virtualization.framework and is valid for `ram_size` bytes.
-                            let gpa_base = self.guest_ram_gpa as usize;
                             let guest_mem =
                                 unsafe { std::slice::from_raw_parts_mut(ram_base, ram_size) };
 
@@ -251,11 +250,9 @@ impl DeviceManager {
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 if let Some(handle) = workers.get(&device_id) {
-                                    tracing::trace!(
-                                        "blk async dispatch for device {}",
-                                        device_id.0
-                                    );
-                                    handle.dispatch(guest_mem, &qcfg, queue_idx);
+                                    // Ring the queue's doorbell; the owning worker
+                                    // drains avail, does the I/O, and completes.
+                                    handle.ring(queue_idx);
                                 }
                             }
                             // VirtioNet TX (queue 1): extract ethernet frames
@@ -275,82 +272,25 @@ impl DeviceManager {
                                 } else {
                                     self.primary_net.as_ref()
                                 };
-                                let net_completions = match typed {
-                                    Some(arc) => arc
-                                        .lock()
-                                        .map(|d| {
-                                            d.drain_tx_queue(&qcfg, finalize_virtio_net_checksum)
-                                        })
-                                        .unwrap_or_default(),
-                                    None => Vec::new(),
+                                let net_notify = match typed {
+                                    Some(arc) => arc.lock().is_ok_and(|d| {
+                                        d.drain_tx_queue(&qcfg, finalize_virtio_net_checksum)
+                                    }),
+                                    None => false,
                                 };
-                                let _ = guest_mem; // unused on this branch now
+                                // `drain_tx_queue` now publishes the used ring
+                                // (via SplitQueue, with the StoreLoad barrier) and
+                                // avail_event itself; the VMM only raises the IRQ.
+                                let _ = guest_mem;
 
-                                if !net_completions.is_empty() {
-                                    // Update used ring for completed TX descriptors.
-                                    // Translate GPAs to slice offsets (checked).
-                                    let Some(used_off) =
-                                        (qcfg.used_addr as usize).checked_sub(gpa_base)
-                                    else {
-                                        tracing::warn!(
-                                            "invalid used GPA {:#x} below ram base {:#x}",
-                                            qcfg.used_addr,
-                                            gpa_base
-                                        );
-                                        return Ok(());
-                                    };
-                                    let q_size = qcfg.size as usize;
-                                    let used_idx_off = used_off + 2;
-                                    let mut used_idx = u16::from_le_bytes([
-                                        guest_mem[used_idx_off],
-                                        guest_mem[used_idx_off + 1],
-                                    ]);
-                                    for &(head, len) in &net_completions {
-                                        let entry =
-                                            used_off + 4 + ((used_idx as usize) % q_size) * 8;
-                                        if entry + 8 <= guest_mem.len() {
-                                            guest_mem[entry..entry + 4]
-                                                .copy_from_slice(&(head as u32).to_le_bytes());
-                                            guest_mem[entry + 4..entry + 8]
-                                                .copy_from_slice(&len.to_le_bytes());
-                                            used_idx = used_idx.wrapping_add(1);
-                                        }
-                                    }
-                                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                                    guest_mem[used_idx_off..used_idx_off + 2]
-                                        .copy_from_slice(&used_idx.to_le_bytes());
-
-                                    // Write avail_event in the used ring to request
-                                    // kicks from the guest on future TX submissions.
-                                    // With VIRTIO_F_EVENT_IDX, the guest checks
-                                    // vring_need_event(avail_event, new, old) before
-                                    // kicking. Setting avail_event = current avail_idx
-                                    // ensures the guest kicks on the next submission.
-                                    if let Some(avail_off) =
-                                        (qcfg.avail_addr as usize).checked_sub(gpa_base)
+                                if net_notify && device.info.irq.is_some() {
                                     {
-                                        let avail_idx = u16::from_le_bytes([
-                                            guest_mem[avail_off + 2],
-                                            guest_mem[avail_off + 3],
-                                        ]);
-                                        let avail_event_off = used_off + 4 + q_size * 8;
-                                        if avail_event_off + 2 <= guest_mem.len() {
-                                            guest_mem[avail_event_off..avail_event_off + 2]
-                                                .copy_from_slice(&avail_idx.to_le_bytes());
-                                        }
+                                        let mut s = state.write().map_err(|e| {
+                                            VmmError::Device(format!("Failed to lock state: {e}"))
+                                        })?;
+                                        s.trigger_interrupt(virtio_mmio::INT_VRING);
                                     }
-
-                                    if let Some(_irq) = device.info.irq {
-                                        {
-                                            let mut s = state.write().map_err(|e| {
-                                                VmmError::Device(format!(
-                                                    "Failed to lock state: {e}"
-                                                ))
-                                            })?;
-                                            s.trigger_interrupt(virtio_mmio::INT_VRING);
-                                        }
-                                        self.sync_irq_level(device_id);
-                                    }
+                                    self.sync_irq_level(device_id);
                                 }
                             } else {
                                 // Generic process_queue for all other devices.

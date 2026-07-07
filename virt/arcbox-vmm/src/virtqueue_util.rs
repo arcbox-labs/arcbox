@@ -1,33 +1,11 @@
-//! Shared VirtIO queue helper functions used by both the block I/O
-//! worker and the net-io RX worker.
-
-use std::sync::atomic::Ordering;
+//! Shared VirtIO queue helper used by the net-io RX worker.
+//!
+//! The block worker now publishes completions through the unified
+//! `arcbox_virtio::SplitQueue`, whose `push_used_batch` carries the spec
+//! `should_notify` logic with a full StoreLoad barrier. This module remains for
+//! the net RX worker until it migrates too; once it does, the whole file goes.
 
 use crate::blk_worker::GuestMemWriter;
-
-/// Reads the `used.idx` field from the used ring in guest memory.
-pub fn read_used_idx(guest_mem: &GuestMemWriter, used_gpa: u64) -> u16 {
-    guest_mem.read_u16(used_gpa as usize + 2)
-}
-
-/// Writes a single used ring entry (id + len) and bumps `used.idx`.
-///
-/// The `Release` fence ensures the entry data is visible to the guest
-/// before it sees the index advance.
-pub fn write_used_entry(
-    guest_mem: &GuestMemWriter,
-    used_gpa: u64,
-    queue_size: u16,
-    head_idx: u16,
-    total_bytes: u32,
-) {
-    let used_idx = read_used_idx(guest_mem, used_gpa);
-    let entry_off = used_gpa as usize + 4 + ((used_idx as usize) % (queue_size as usize)) * 8;
-    guest_mem.write_u32(entry_off, head_idx as u32);
-    guest_mem.write_u32(entry_off + 4, total_bytes);
-    std::sync::atomic::fence(Ordering::Release);
-    guest_mem.write_u16(used_gpa as usize + 2, used_idx.wrapping_add(1));
-}
 
 /// Checks whether the guest wants an interrupt (EVENT_IDX suppression).
 ///

@@ -148,6 +148,10 @@ pub struct Vmm {
     /// injection; joined in `stop_darwin_hv` before guest memory drops.
     #[cfg(target_os = "macos")]
     hv_vsock_worker: Option<std::thread::JoinHandle<()>>,
+    /// Debug-console RX worker thread handle (custom HV). Only present when
+    /// `debug_console_socket` is configured; joined in `stop_darwin_hv`.
+    #[cfg(target_os = "macos")]
+    hv_console_worker: Option<std::thread::JoinHandle<()>>,
     /// HV-side network fd (NIC1). Paired with the NetworkDatapath fd.
     /// Kept alive so the socketpair stays open while the VM runs.
     #[cfg(target_os = "macos")]
@@ -318,6 +322,8 @@ impl Vmm {
             hv_device_manager: None,
             #[cfg(target_os = "macos")]
             hv_vsock_worker: None,
+            #[cfg(target_os = "macos")]
+            hv_console_worker: None,
             #[cfg(target_os = "macos")]
             hv_net_fd: None,
             hv_bridge_net_fd: None,

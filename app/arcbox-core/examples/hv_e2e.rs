@@ -148,6 +148,7 @@ fn run() -> Result<(), String> {
         }],
         bridge_nic_mac: None,
         backend: VmBackend::Hv,
+        debug_console_socket: None,
     };
 
     println!("[phase 1] create VMM");

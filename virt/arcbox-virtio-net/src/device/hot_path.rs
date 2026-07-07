@@ -12,148 +12,112 @@ impl VirtioNet {
     /// each chain's read-flagged descriptors into a packet, runs `finalize`
     /// to complete any guest-requested checksum offload, strips the
     /// virtio-net header, and writes the raw Ethernet frame to the bound
-    /// host fd. Returns `(head_idx, total_len_including_header)` for each
-    /// drained chain so the caller can advance the used ring.
+    /// host fd. Publishes completions to the used ring itself and returns
+    /// whether any chain was drained, so the caller can fire the IRQ.
     ///
     /// `finalize` is injected so arcbox-virtio doesn't depend on
     /// arcbox-net's checksum helpers.
-    pub fn drain_tx_queue<F>(&self, qcfg: &QueueConfig, finalize: F) -> Vec<(u16, u32)>
+    pub fn drain_tx_queue<F>(&self, qcfg: &QueueConfig, finalize: F) -> bool
     where
         F: Fn(&mut [u8]),
     {
         let Some(port) = self.port.get() else {
-            return Vec::new();
+            return false;
         };
         let Some(ctx) = self.ctx.as_ref() else {
-            return Vec::new();
+            return false;
         };
         if !qcfg.ready || qcfg.size == 0 {
-            return Vec::new();
+            return false;
         }
         let host_fd = port.host_fd;
+        let event_idx = (self.acked_features & arcbox_virtio_core::queue::VIRTIO_F_EVENT_IDX) != 0;
 
-        // Translate GPAs to slice offsets (checked against ram base).
-        let gpa_base = qcfg.gpa_base as usize;
-        let Some(desc_addr) = (qcfg.desc_addr as usize).checked_sub(gpa_base) else {
-            tracing::warn!(
-                "VirtioNet::handle_tx: desc GPA {:#x} below ram base {:#x}",
-                qcfg.desc_addr,
-                gpa_base
-            );
-            return Vec::new();
-        };
-        let Some(avail_addr) = (qcfg.avail_addr as usize).checked_sub(gpa_base) else {
-            tracing::warn!(
-                "VirtioNet::handle_tx: avail GPA {:#x} below ram base {:#x}",
-                qcfg.avail_addr,
-                gpa_base
-            );
-            return Vec::new();
-        };
-        let q_size = qcfg.size as usize;
+        // The queue is the sole accessor of these rings for this call; `ctx.mem`
+        // wraps the VM-lifetime guest RAM mapping.
+        let mut queue = arcbox_virtio_core::SplitQueue::new(ctx.mem.clone(), 1, qcfg, event_idx);
+        queue.set_last_avail_idx(port.last_avail_tx.load(Ordering::Relaxed));
 
-        // SAFETY: `ctx.mem` was constructed from the VM-lifetime guest RAM
-        // mmap. Each slice view is short-lived and never escapes this
-        // function; the wider aliasing concern is documented on the
-        // `GuestMemWriter` type.
-        let Some(memory) = (unsafe { ctx.mem.slice_mut(gpa_base, ctx.mem.len()) }) else {
-            return Vec::new();
-        };
+        let mut notify = false;
+        // Drain in a TOCTOU loop: after publishing avail_event the guest may
+        // have queued more and suppressed its kick on the stale value, so
+        // re-check the avail ring and drain again.
+        loop {
+            let mut completions = Vec::new();
+            while let Some(chain) = queue.pop_avail() {
+                // TX descriptors are read-only (guest → host data).
+                let mut packet_data = Vec::new();
+                for desc in &chain.descriptors {
+                    if !desc.is_write() {
+                        if let Some(data) = queue.mem().slice(desc.addr as usize, desc.len as usize)
+                        {
+                            packet_data.extend_from_slice(data);
+                        }
+                    }
+                }
 
-        if avail_addr + 4 > memory.len() {
-            return Vec::new();
-        }
-        let avail_idx = u16::from_le_bytes([memory[avail_addr + 2], memory[avail_addr + 3]]);
+                let total_len = packet_data.len() as u32;
+                finalize(&mut packet_data);
 
-        let mut current_avail = port.last_avail_tx.load(Ordering::Relaxed);
-        let mut completions = Vec::new();
+                // Strip the virtio-net header (after checksum offload), then
+                // write the frame to the host fd with a brief EAGAIN/ENOBUFS
+                // retry: the datapath peer can lag a few frames under bulk
+                // bursts, and silent loss collapses guest TCP throughput.
+                if packet_data.len() > VirtioNetHeader::SIZE {
+                    let frame = &packet_data[VirtioNetHeader::SIZE..];
+                    let mut retries = 0;
+                    loop {
+                        // SAFETY: `host_fd` is owned via `NetPort`; `frame` is a
+                        // valid slice of `packet_data` for the write's duration.
+                        let n = unsafe {
+                            libc::write(host_fd, frame.as_ptr().cast::<libc::c_void>(), frame.len())
+                        };
+                        if n >= 0 {
+                            break;
+                        }
+                        let err = std::io::Error::last_os_error();
+                        match err.raw_os_error() {
+                            Some(libc::EAGAIN | libc::ENOBUFS) if retries < 64 => {
+                                std::thread::yield_now();
+                                retries += 1;
+                            }
+                            Some(libc::EAGAIN | libc::ENOBUFS) => break,
+                            _ => {
+                                tracing::warn!("VirtioNet TX write failed: {err}");
+                                break;
+                            }
+                        }
+                    }
+                }
 
-        while current_avail != avail_idx {
-            let ring_off = avail_addr + 4 + 2 * ((current_avail as usize) % q_size);
-            if ring_off + 2 > memory.len() {
+                completions.push((chain.head_idx, total_len));
+            }
+
+            // Publish the completions to the used ring (push_used_batch carries a
+            // full StoreLoad barrier). Net interrupts on any completed TX buffer.
+            if !completions.is_empty() {
+                notify = true;
+            }
+            queue.push_used_batch(&completions);
+
+            // Refresh avail_event even on an empty drain — the ABX-386 fix so a
+            // stale value can't make an EVENT_IDX guest suppress its TX kick.
+            // Only when negotiated: the field sits past the used ring otherwise.
+            if event_idx {
+                queue.write_avail_event();
+            }
+
+            // Close the TOCTOU window: SeqCst orders the avail_event store before
+            // re-reading avail.idx; if the guest queued more, drain again.
+            std::sync::atomic::fence(Ordering::SeqCst);
+            if !queue.has_avail() {
                 break;
             }
-            let head_idx = u16::from_le_bytes([memory[ring_off], memory[ring_off + 1]]) as usize;
-
-            let mut packet_data = Vec::new();
-            let mut idx = head_idx;
-            for _ in 0..q_size {
-                let d_off = desc_addr + idx * 16;
-                if d_off + 16 > memory.len() {
-                    break;
-                }
-                let addr = match (u64::from_le_bytes(memory[d_off..d_off + 8].try_into().unwrap())
-                    as usize)
-                    .checked_sub(gpa_base)
-                {
-                    Some(a) => a,
-                    None => continue,
-                };
-                let len =
-                    u32::from_le_bytes(memory[d_off + 8..d_off + 12].try_into().unwrap()) as usize;
-                let flags = u16::from_le_bytes(memory[d_off + 12..d_off + 14].try_into().unwrap());
-                let next = u16::from_le_bytes(memory[d_off + 14..d_off + 16].try_into().unwrap());
-
-                // WRITE flag clear = read-only (guest → host). TX descriptors
-                // are always read-only.
-                if flags & 2 == 0 && addr + len <= memory.len() {
-                    packet_data.extend_from_slice(&memory[addr..addr + len]);
-                }
-                if flags & 1 == 0 {
-                    break;
-                }
-                idx = next as usize;
-            }
-
-            let total_len = packet_data.len() as u32;
-            finalize(&mut packet_data);
-
-            // Strip the virtio-net header after applying checksum offload.
-            if packet_data.len() > VirtioNetHeader::SIZE {
-                let frame = &packet_data[VirtioNetHeader::SIZE..];
-                // Retry briefly on EAGAIN/ENOBUFS: the host-side socketpair
-                // peer (datapath classifier) might be behind by a few frames
-                // under bulk bursts (iperf3 -R and similar). Without this
-                // retry, guest TCP sees silent packet loss and retransmits,
-                // collapsing throughput to under 1 MB/s while the fast-path
-                // can do ~1 GB/s.
-                let mut retries = 0;
-                loop {
-                    // SAFETY: `host_fd` is owned by the caller via `NetPort`;
-                    // `frame` is a valid slice borrowed from `packet_data`
-                    // for the duration of the write.
-                    let n = unsafe {
-                        libc::write(host_fd, frame.as_ptr().cast::<libc::c_void>(), frame.len())
-                    };
-                    if n >= 0 {
-                        break;
-                    }
-                    let err = std::io::Error::last_os_error();
-                    match err.raw_os_error() {
-                        Some(libc::EAGAIN | libc::ENOBUFS) if retries < 64 => {
-                            // Yield so the peer thread can drain, then retry.
-                            std::thread::yield_now();
-                            retries += 1;
-                        }
-                        Some(libc::EAGAIN | libc::ENOBUFS) => {
-                            // Peer is persistently slow — drop the frame.
-                            // Guest TCP will retransmit.
-                            break;
-                        }
-                        _ => {
-                            tracing::warn!("VirtioNet TX write failed: {err}");
-                            break;
-                        }
-                    }
-                }
-            }
-
-            completions.push((head_idx as u16, total_len));
-            current_avail = current_avail.wrapping_add(1);
         }
 
-        port.last_avail_tx.store(current_avail, Ordering::Relaxed);
-        completions
+        port.last_avail_tx
+            .store(queue.last_avail_idx(), Ordering::Relaxed);
+        notify
     }
 
     /// Writes a raw Ethernet frame (without virtio-net header) directly to
@@ -199,51 +163,26 @@ impl VirtioNet {
             return false;
         }
         let host_fd = port.host_fd;
-        let gpa_base = rx_qcfg.gpa_base as usize;
+        let event_idx = (self.acked_features & arcbox_virtio_core::queue::VIRTIO_F_EVENT_IDX) != 0;
 
-        // SAFETY: `ctx.mem` was constructed from the VM-lifetime guest RAM
-        // mmap. Each slice view is short-lived.
-        let Some(guest_mem) = (unsafe { ctx.mem.slice_mut(gpa_base, ctx.mem.len()) }) else {
-            return false;
-        };
-
-        // Translate GPAs to slice offsets (checked against ram base).
-        let Some(desc_addr) = (rx_qcfg.desc_addr as usize).checked_sub(gpa_base) else {
-            return false;
-        };
-        let Some(avail_addr) = (rx_qcfg.avail_addr as usize).checked_sub(gpa_base) else {
-            return false;
-        };
-        let Some(used_addr) = (rx_qcfg.used_addr as usize).checked_sub(gpa_base) else {
-            return false;
-        };
-        let q_size = rx_qcfg.size as usize;
-
-        if avail_addr + 4 > guest_mem.len() {
-            return false;
-        }
+        // RX consumes one avail entry per injected frame, tracked by the guest's
+        // used.idx (which SplitQueue seeds); the queue is the sole accessor here.
+        let mut queue = arcbox_virtio_core::SplitQueue::new(ctx.mem.clone(), 0, rx_qcfg, event_idx);
+        let used0 = queue.mem().read_u16(rx_qcfg.used_addr as usize + 2);
+        queue.set_last_avail_idx(used0);
 
         let mut injected = false;
-        let used_idx_off = used_addr + 2;
-        let mut used_idx =
-            u16::from_le_bytes([guest_mem[used_idx_off], guest_mem[used_idx_off + 1]]);
-
+        let hdr_len = VirtioNetHeader::SIZE;
         for _ in 0..64 {
-            // Re-read avail_idx each iteration so newly posted buffers are
-            // picked up without waiting for the next poll cycle.
-            std::sync::atomic::fence(Ordering::Acquire);
-            let avail_idx =
-                u16::from_le_bytes([guest_mem[avail_addr + 2], guest_mem[avail_addr + 3]]);
-
-            if avail_idx == used_idx {
+            // Stop when the guest has no RX buffer posted.
+            if !queue.has_avail() {
                 break;
             }
 
             // Non-blocking read from the bound fd.
             let mut buf = [0u8; 9216]; // MAX_FRAME_SIZE
-            // SAFETY: `host_fd` is owned by the bound `NetPort`. `buf` is a
-            // valid mutable stack slice of `buf.len()` bytes. MSG_DONTWAIT
-            // ensures non-blocking.
+            // SAFETY: `host_fd` is owned by the bound `NetPort`; `buf` is a valid
+            // mutable stack slice; MSG_DONTWAIT keeps it non-blocking.
             let n = unsafe {
                 libc::recv(
                     host_fd,
@@ -256,96 +195,58 @@ impl VirtioNet {
                 break;
             }
             let frame = &buf[..n as usize];
+            // The injected buffer is a zeroed virtio-net header followed by the
+            // frame, scattered across the chain's write-only descriptors.
+            let total = hdr_len + frame.len();
 
-            // Prepend 12-byte virtio-net header (all zeros = no offload).
-            let virtio_hdr = [0u8; 12];
-            let total = virtio_hdr.len() + frame.len();
-
-            // Pop an available RX descriptor and write header + frame.
-            let ring_off = avail_addr + 4 + 2 * ((used_idx as usize) % q_size);
-            if ring_off + 2 > guest_mem.len() {
+            let Some(chain) = queue.pop_avail() else {
                 break;
-            }
-            let head_idx =
-                u16::from_le_bytes([guest_mem[ring_off], guest_mem[ring_off + 1]]) as usize;
-
-            let mut written = 0;
-            let mut idx = head_idx;
-            for _ in 0..q_size {
-                let d_off = desc_addr + idx * 16;
-                if d_off + 16 > guest_mem.len() {
-                    break;
-                }
-                let addr_gpa =
-                    u64::from_le_bytes(guest_mem[d_off..d_off + 8].try_into().unwrap()) as usize;
-                let len = u32::from_le_bytes(guest_mem[d_off + 8..d_off + 12].try_into().unwrap())
-                    as usize;
-                let flags =
-                    u16::from_le_bytes(guest_mem[d_off + 12..d_off + 14].try_into().unwrap());
-                let next =
-                    u16::from_le_bytes(guest_mem[d_off + 14..d_off + 16].try_into().unwrap());
-                let Some(addr) = addr_gpa.checked_sub(gpa_base) else {
+            };
+            let mut written = 0usize;
+            for desc in &chain.descriptors {
+                if !desc.is_write() {
                     continue;
-                };
-
-                if flags & 2 != 0 && addr + len <= guest_mem.len() {
-                    // Scatter from [virtio_hdr | frame] combined.
-                    let remaining = total.saturating_sub(written);
-                    let to_write = remaining.min(len);
-                    if to_write > 0 {
-                        let hdr_remaining = virtio_hdr.len().saturating_sub(written);
-                        if hdr_remaining > 0 {
-                            let hdr_write = hdr_remaining.min(to_write);
-                            guest_mem[addr..addr + hdr_write]
-                                .copy_from_slice(&virtio_hdr[written..written + hdr_write]);
-                            if to_write > hdr_write {
-                                let frame_write = to_write - hdr_write;
-                                guest_mem[addr + hdr_write..addr + hdr_write + frame_write]
-                                    .copy_from_slice(&frame[..frame_write]);
-                            }
-                        } else {
-                            let frame_off = written - virtio_hdr.len();
-                            guest_mem[addr..addr + to_write]
-                                .copy_from_slice(&frame[frame_off..frame_off + to_write]);
-                        }
-                        written += to_write;
-                    }
                 }
-
-                if flags & 1 == 0 || written >= total {
+                if written >= total {
                     break;
                 }
-                idx = next as usize;
+                let to_write = (total - written).min(desc.len as usize);
+                if to_write == 0 {
+                    continue;
+                }
+                // SAFETY: write-only descriptor buffers are device-owned.
+                if let Some(out) = unsafe { queue.mem().slice_mut(desc.addr as usize, to_write) } {
+                    for (k, slot) in out.iter_mut().enumerate() {
+                        let pos = written + k;
+                        // virtio-net header is all zeros; frame follows it.
+                        *slot = if pos < hdr_len {
+                            0
+                        } else {
+                            frame[pos - hdr_len]
+                        };
+                    }
+                    written += to_write;
+                }
             }
 
             if written == 0 {
+                // No writable space in this chain; drop the frame and leave the
+                // avail entry unconsumed (matches the legacy behavior).
                 continue;
             }
 
-            // Update used ring.
-            let used_entry = used_addr + 4 + ((used_idx as usize) % q_size) * 8;
-            if used_entry + 8 <= guest_mem.len() {
-                guest_mem[used_entry..used_entry + 4]
-                    .copy_from_slice(&(head_idx as u32).to_le_bytes());
-                guest_mem[used_entry + 4..used_entry + 8]
-                    .copy_from_slice(&(written as u32).to_le_bytes());
-                std::sync::atomic::fence(Ordering::Release);
-                used_idx = used_idx.wrapping_add(1);
-                guest_mem[used_idx_off..used_idx_off + 2].copy_from_slice(&used_idx.to_le_bytes());
-            }
-
+            queue.push_used(chain.head_idx, written as u32);
             injected = true;
         }
 
-        // Write avail_event for EVENT_IDX.
-        if injected {
-            let avail_idx_now =
-                u16::from_le_bytes([guest_mem[avail_addr + 2], guest_mem[avail_addr + 3]]);
-            let avail_event_off = used_addr + 4 + q_size * 8;
-            if avail_event_off + 2 <= guest_mem.len() {
-                guest_mem[avail_event_off..avail_event_off + 2]
-                    .copy_from_slice(&avail_idx_now.to_le_bytes());
-            }
+        // Publish avail_event for an EVENT_IDX guest (gated: the field sits past
+        // the used ring when EVENT_IDX is not negotiated). RX publishes the
+        // current avail.idx (not the consumed cursor): the host polls for frames
+        // so it only wants a kick for RX buffers posted beyond what it has seen.
+        if injected && event_idx {
+            let avail_idx_now = queue.mem().read_u16(rx_qcfg.avail_addr as usize + 2);
+            let avail_event_off = rx_qcfg.used_addr as usize + 4 + rx_qcfg.size as usize * 8;
+            queue.mem().write_u16(avail_event_off, avail_idx_now);
         }
 
         injected

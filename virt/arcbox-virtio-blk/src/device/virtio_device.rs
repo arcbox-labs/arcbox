@@ -171,10 +171,13 @@ impl VirtioDevice for VirtioBlock {
             let head_idx =
                 u16::from_le_bytes([memory[ring_offset], memory[ring_offset + 1]]) as usize;
 
-            // Walk the descriptor chain starting at head_idx.
+            // Walk the descriptor chain starting at head_idx. Bounded to
+            // `q_size` iterations so a cyclic `next` chain (e.g. 0->1->0) from a
+            // malformed or malicious guest cannot spin the vCPU thread forever.
+            // Any legitimate chain has at most `q_size` descriptors.
             let mut descriptors = Vec::new();
             let mut idx = head_idx;
-            loop {
+            for _ in 0..q_size {
                 let desc_offset = desc_table_addr + idx * 16;
                 if desc_offset + 16 > memory.len() {
                     return Err(VirtioError::InvalidQueue("descriptor out of bounds".into()));

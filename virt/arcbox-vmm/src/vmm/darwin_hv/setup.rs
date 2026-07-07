@@ -208,16 +208,52 @@ impl Vmm {
 
         // Console
         if self.config.serial_console || self.config.virtio_console {
-            let console = arcbox_virtio::console::VirtioConsole::new(
+            let mut console = arcbox_virtio::console::VirtioConsole::new(
                 arcbox_virtio::console::ConsoleConfig::default(),
             );
-            let (_console_id, _console_arc) = device_manager.register_virtio_device(
+
+            // Optional interactive debug console: wire a bidirectional
+            // Unix-socket backend so an operator can attach a shell even when
+            // early boot hangs before networking. The RX worker that injects
+            // operator input is spawned later, once the shared DeviceManager
+            // Arc and vCPU IDs are available.
+            let debug_socket = match &self.config.debug_console_socket {
+                Some(path) => match arcbox_virtio::console::SocketConsole::new(path) {
+                    Ok(sock) => {
+                        let sock = Arc::new(Mutex::new(sock));
+                        let io: Arc<Mutex<dyn arcbox_virtio::console::ConsoleIo>> = sock.clone();
+                        console.set_io(io);
+                        tracing::warn!(
+                            socket = %path.display(),
+                            "interactive debug console enabled \
+                             (attach: socat - UNIX-CONNECT:<socket>)"
+                        );
+                        Some(sock)
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            socket = %path.display(),
+                            "failed to create debug console socket; continuing without it"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+
+            let (_console_id, console_arc) = device_manager.register_virtio_device(
                 DeviceType::VirtioConsole,
                 "virtio-console",
                 console,
                 &mut memory_manager,
                 &irq_chip,
             )?;
+
+            if let Some(sock) = debug_socket {
+                device_manager.set_console(console_arc);
+                device_manager.set_debug_console_socket(sock);
+            }
         }
 
         // VirtioFS shared directories — create FsServer handler for each share.

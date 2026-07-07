@@ -28,6 +28,7 @@ use crate::error::VmmError;
 
 use super::*;
 
+mod console;
 #[cfg(test)]
 mod guest_ram;
 mod hvc_blk;

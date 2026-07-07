@@ -63,6 +63,7 @@
 pub mod blk_worker;
 pub mod boot;
 pub mod builder;
+pub(crate) mod console_rx_worker;
 pub mod dax;
 pub mod device;
 // Intentionally not `pub` — only used by darwin_hv to spawn the worker.

@@ -138,6 +138,16 @@ impl VmManager {
             })
             .collect();
 
+        // An `arcbox.debug_console=<path>` token on the kernel cmdline is the
+        // single source of truth for the interactive debug console: the host
+        // opens the Unix socket at `<path>`, and the guest rcS keys off the
+        // same token to spawn a shell. Absent in normal boots.
+        let debug_console_socket = entry.config.cmdline.as_deref().and_then(|c| {
+            c.split_whitespace()
+                .find_map(|t| t.strip_prefix(arcbox_constants::cmdline::DEBUG_CONSOLE_KEY))
+                .map(PathBuf::from)
+        });
+
         VmmConfig {
             vcpu_count: entry.config.cpus,
             memory_size: entry.config.memory_mb * 1024 * 1024,
@@ -175,6 +185,7 @@ impl VmManager {
             // `VmManager::set_backend` can change it on a stopped VM to switch
             // the System VM between HV and VZ.
             backend: entry.config.backend,
+            debug_console_socket,
         }
     }
 

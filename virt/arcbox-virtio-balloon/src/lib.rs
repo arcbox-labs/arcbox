@@ -37,7 +37,6 @@
 
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
-use arcbox_virtio_core::error::VirtioError;
 use arcbox_virtio_core::{QueueConfig, VirtioDevice, VirtioDeviceId, virtio_bindings};
 
 /// VIRTIO balloon feature: guest may deflate on its own OOM.
@@ -205,114 +204,47 @@ impl VirtioDevice for VirtioBalloon {
         }
 
         let gpa_base = queue_config.gpa_base as usize;
-        let desc_addr = (queue_config.desc_addr as usize)
-            .checked_sub(gpa_base)
-            .ok_or_else(|| VirtioError::InvalidQueue("desc GPA below ram base".into()))?;
-        let avail_addr = (queue_config.avail_addr as usize)
-            .checked_sub(gpa_base)
-            .ok_or_else(|| VirtioError::InvalidQueue("avail GPA below ram base".into()))?;
-        let used_addr = (queue_config.used_addr as usize)
-            .checked_sub(gpa_base)
-            .ok_or_else(|| VirtioError::InvalidQueue("used GPA below ram base".into()))?;
-        let q_size = queue_config.size as usize;
-
-        if avail_addr + 4 > memory.len() {
-            return Ok(Vec::new());
-        }
-        let avail_idx = u16::from_le_bytes([memory[avail_addr + 2], memory[avail_addr + 3]]);
-
+        // SAFETY: `memory` is the guest RAM slice; the queue accesses it only
+        // through the GuestMemWriter built here, and `memory` is not touched
+        // directly while the queue is alive.
+        let mem = std::sync::Arc::new(unsafe {
+            arcbox_virtio_core::GuestMemWriter::new(memory.as_mut_ptr(), memory.len(), gpa_base)
+        });
+        let mut queue = arcbox_virtio_core::SplitQueue::new(mem, queue_idx, queue_config, false);
         let idx_slot = queue_idx as usize;
-        let mut current = self.last_avail[idx_slot];
+        queue.set_last_avail_idx(self.last_avail[idx_slot]);
+
         let mut completions = Vec::new();
-
-        while current != avail_idx {
-            let ring_off = avail_addr + 4 + 2 * (current as usize % q_size);
-            if ring_off + 2 > memory.len() {
-                break;
-            }
-            let head_idx = u16::from_le_bytes([memory[ring_off], memory[ring_off + 1]]) as usize;
-
-            // Walk the descriptor chain. Each read-only descriptor
-            // (flags.VRING_DESC_F_WRITE cleared) contains an array of
-            // u32 PFNs — little-endian per virtio-bindings.
-            let mut idx = head_idx;
+        while let Some(chain) = queue.pop_avail() {
+            // Each read-only descriptor carries a little-endian u32 PFN array.
             let mut chain_pages_handled = 0u32;
-            for _ in 0..q_size {
-                let d_off = desc_addr + idx * 16;
-                if d_off + 16 > memory.len() {
-                    break;
+            for desc in &chain.descriptors {
+                // Only read-only descriptors on the inflate queue carry PFNs.
+                if desc.is_write() || queue_idx != QUEUE_INFLATE {
+                    continue;
                 }
-                let addr = u64::from_le_bytes(memory[d_off..d_off + 8].try_into().unwrap());
-                let len =
-                    u32::from_le_bytes(memory[d_off + 8..d_off + 12].try_into().unwrap()) as usize;
-                let flags = u16::from_le_bytes(memory[d_off + 12..d_off + 14].try_into().unwrap());
-                let next = u16::from_le_bytes(memory[d_off + 14..d_off + 16].try_into().unwrap());
-
-                let buf_addr = match (addr as usize).checked_sub(gpa_base) {
-                    Some(a) => a,
-                    None => {
-                        tracing::warn!(
-                            "virtio-balloon: descriptor GPA {:#x} below ram base {:#x}",
-                            addr,
-                            gpa_base
-                        );
-                        break;
-                    }
+                // Copy the PFN bytes out before madvise so the immutable borrow
+                // on guest memory is released before we take the raw pointer.
+                let Some(buf) = queue.mem().slice(desc.addr as usize, desc.len as usize) else {
+                    continue;
                 };
-                if buf_addr + len > memory.len() {
-                    tracing::warn!(
-                        "virtio-balloon: descriptor out of bounds ({}+{} > {})",
-                        buf_addr,
-                        len,
-                        memory.len()
-                    );
-                    break;
-                }
-
-                // Only read-only descriptors carry PFN lists.
-                let is_write_only = flags & 2 != 0;
-                if !is_write_only && queue_idx == QUEUE_INFLATE {
-                    // Copy the PFN bytes out before invoking madvise so we
-                    // drop the immutable borrow on `memory` before taking
-                    // a raw mutable pointer into the same region.
-                    let pfn_bytes: Vec<u8> = memory[buf_addr..buf_addr + len].to_vec();
-                    let ram_ptr = memory.as_mut_ptr();
-                    let ram_len = memory.len();
-                    chain_pages_handled += handle_pfn_list(&pfn_bytes, ram_ptr, ram_len, gpa_base);
-                }
-                // Deflate queue: we only need to complete the descriptor.
-                // Pages reclaimed via MADV_DONTNEED re-fault naturally,
-                // so no explicit remap is needed.
-
-                if flags & 1 == 0 {
-                    break;
-                }
-                idx = next as usize;
+                let pfn_bytes = buf.to_vec();
+                let ram_ptr = queue.mem().ptr();
+                let ram_len = queue.mem().len();
+                chain_pages_handled += handle_pfn_list(&pfn_bytes, ram_ptr, ram_len, gpa_base);
             }
-
-            // Update used ring. Balloon completions write 0 bytes
-            // (we did not write anything into the descriptor buffer).
-            let used_idx_off = used_addr + 2;
-            let used_idx = u16::from_le_bytes([memory[used_idx_off], memory[used_idx_off + 1]]);
-            let used_entry = used_addr + 4 + ((used_idx as usize) % q_size) * 8;
-            if used_entry + 8 <= memory.len() {
-                memory[used_entry..used_entry + 4]
-                    .copy_from_slice(&(head_idx as u32).to_le_bytes());
-                memory[used_entry + 4..used_entry + 8].copy_from_slice(&0u32.to_le_bytes());
-                std::sync::atomic::fence(Ordering::Release);
-                let new_used = used_idx.wrapping_add(1);
-                memory[used_idx_off..used_idx_off + 2].copy_from_slice(&new_used.to_le_bytes());
-            }
-
-            completions.push((head_idx as u16, 0));
+            // Balloon completions write 0 bytes (nothing is written into the
+            // descriptor buffer). Deflate just completes the descriptor —
+            // MADV_DONTNEED pages re-fault naturally, so no explicit remap.
+            queue.push_used(chain.head_idx, 0);
+            completions.push((chain.head_idx, 0));
             if queue_idx == QUEUE_INFLATE && chain_pages_handled > 0 {
                 self.inflated_total
                     .fetch_add(chain_pages_handled, Ordering::AcqRel);
             }
-            current = current.wrapping_add(1);
         }
 
-        self.last_avail[idx_slot] = current;
+        self.last_avail[idx_slot] = queue.last_avail_idx();
         Ok(completions)
     }
 }
