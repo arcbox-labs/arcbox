@@ -85,11 +85,14 @@ impl Drop for MemoryBalloonDeviceConfiguration {
 /// Use `set_target_memory_size()` to adjust the balloon.
 pub struct MemoryBalloonDevice {
     inner: *mut AnyObject,
+    /// The VM's serial dispatch queue. Virtualization.framework requires every
+    /// access to the device — reads and mutations — to run on this queue.
+    queue: *mut AnyObject,
 }
 
-// SAFETY: The inner pointer refers to a VZ framework-managed object. Access is synchronized by the framework's internal dispatch queue.
+// SAFETY: The inner pointer refers to a VZ framework-managed object; every access goes through the VM's serial dispatch queue. `queue` is a thread-safe GCD queue pointer.
 unsafe impl Send for MemoryBalloonDevice {}
-// SAFETY: See above — access is synchronized by the framework's dispatch queue.
+// SAFETY: See above — all access is dispatched onto the VM's serial queue.
 unsafe impl Sync for MemoryBalloonDevice {}
 
 impl MemoryBalloonDevice {
@@ -97,9 +100,10 @@ impl MemoryBalloonDevice {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that `ptr` is a valid `VZVirtioTraditionalMemoryBalloonDevice`.
-    pub(crate) fn from_raw(ptr: *mut AnyObject) -> Self {
-        Self { inner: ptr }
+    /// The caller must ensure that `ptr` is a valid `VZVirtioTraditionalMemoryBalloonDevice`
+    /// and `queue` is the serial dispatch queue the owning VM was created on.
+    pub(crate) fn from_raw(ptr: *mut AnyObject, queue: *mut AnyObject) -> Self {
+        Self { inner: ptr, queue }
     }
 
     /// Sets the target virtual machine memory size.
@@ -107,6 +111,10 @@ impl MemoryBalloonDevice {
     /// The balloon device will inflate or deflate to reach the target memory size.
     /// - A smaller target means the balloon inflates (reclaims memory from guest)
     /// - A larger target means the balloon deflates (returns memory to guest)
+    ///
+    /// The call is dispatched onto the VM's serial queue because
+    /// `setTargetVirtualMachineMemorySize:` is a mutating VZ method and the
+    /// framework asserts (`dispatch_assert_queue`) that mutations run on it.
     ///
     /// # Arguments
     ///
@@ -116,10 +124,17 @@ impl MemoryBalloonDevice {
             tracing::warn!("set_target_memory_size called on null device");
             return;
         }
-        // SAFETY: self.inner is checked non-null above. Sending setTargetVirtualMachineMemorySize: with a u64 value.
-        unsafe {
-            msg_send_void_u64!(self.inner, setTargetVirtualMachineMemorySize: bytes);
-        }
+        let inner = self.inner;
+        // SAFETY: `queue` is the VM's serial dispatch queue; from_raw borrows it
+        // without taking ownership, so it is never released here.
+        let queue = unsafe { crate::ffi::DispatchQueue::from_raw(self.queue) };
+        queue.sync(|| {
+            // SAFETY: inner is checked non-null above and this runs on the VM's
+            // serial queue, satisfying VZ's queue requirement for mutations.
+            unsafe {
+                msg_send_void_u64!(inner, setTargetVirtualMachineMemorySize: bytes);
+            }
+        });
         tracing::debug!(
             "Set balloon target memory to {} bytes ({}MB)",
             bytes,
@@ -129,14 +144,19 @@ impl MemoryBalloonDevice {
 
     /// Gets the target virtual machine memory size.
     ///
-    /// Returns the target memory size in bytes.
+    /// Returns the target memory size in bytes. Dispatched onto the VM's serial
+    /// queue for the same reason as [`Self::set_target_memory_size`].
     pub fn target_memory_size(&self) -> u64 {
         if self.inner.is_null() {
             tracing::warn!("target_memory_size called on null device");
             return 0;
         }
-        // SAFETY: self.inner is checked non-null above. Sending targetVirtualMachineMemorySize to a valid balloon device.
-        unsafe { msg_send_u64!(self.inner, targetVirtualMachineMemorySize) }
+        let inner = self.inner;
+        // SAFETY: `queue` is the VM's serial dispatch queue; borrowed, not owned.
+        let queue = unsafe { crate::ffi::DispatchQueue::from_raw(self.queue) };
+        // SAFETY: inner is checked non-null above and the read runs on the VM's
+        // serial queue.
+        queue.sync(|| unsafe { msg_send_u64!(inner, targetVirtualMachineMemorySize) })
     }
 
     /// Returns the raw object pointer.
@@ -155,11 +175,16 @@ impl MemoryBalloonDevice {
 /// # Arguments
 ///
 /// * `vm_ptr` - Raw pointer to `VZVirtualMachine`
+/// * `queue` - The VM's serial dispatch queue, threaded into each device so its
+///   accesses run on the queue VZ requires.
 ///
 /// # Returns
 ///
 /// A vector of `MemoryBalloonDevice` wrappers.
-pub fn vm_memory_balloon_devices(vm_ptr: *mut AnyObject) -> Vec<MemoryBalloonDevice> {
+pub fn vm_memory_balloon_devices(
+    vm_ptr: *mut AnyObject,
+    queue: *mut AnyObject,
+) -> Vec<MemoryBalloonDevice> {
     if vm_ptr.is_null() {
         return Vec::new();
     }
@@ -177,7 +202,7 @@ pub fn vm_memory_balloon_devices(vm_ptr: *mut AnyObject) -> Vec<MemoryBalloonDev
         for i in 0..count {
             let device = crate::ffi::nsarray_object_at_index(devices, i);
             if !device.is_null() {
-                result.push(MemoryBalloonDevice::from_raw(device));
+                result.push(MemoryBalloonDevice::from_raw(device, queue));
             }
         }
 
