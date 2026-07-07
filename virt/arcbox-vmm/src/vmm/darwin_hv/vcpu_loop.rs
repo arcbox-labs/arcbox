@@ -196,6 +196,39 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
         tracing::warn!("vCPU {vcpu_id}: set SCTLR_EL1 failed: {e}");
     }
 
+    // Set MPIDR_EL1 for this vCPU (Aff0 = vcpu_id, other affinity fields 0).
+    // GIC affinity routing and the FDT `reg` values both depend on it, so the
+    // write must stick: if MPIDR is silently non-writable on some macOS version
+    // every vCPU reports Aff0 = 0 and interrupts misroute in a subtle,
+    // hard-to-debug way. Verify the readback and abort the boot rather than run
+    // with corrupted affinity. Done *before* the registry pushes below so a
+    // failure early-returns without leaving a stale vCPU id / thread handle
+    // (ABX-367). The readback only distinguishes a rejected write on
+    // secondaries — the BSP's Aff0 is 0 whether or not the write took.
+    let mpidr = u64::from(vcpu_id) & 0xFF;
+    if let Err(e) = vcpu.set_sys_reg(arcbox_hv::sys_reg::HV_SYS_REG_MPIDR_EL1, mpidr) {
+        tracing::error!("vCPU {vcpu_id}: set MPIDR_EL1 failed: {e}; aborting boot");
+        running.store(false, Ordering::SeqCst);
+        return;
+    }
+    match vcpu.get_sys_reg(arcbox_hv::sys_reg::HV_SYS_REG_MPIDR_EL1) {
+        Ok(v) if v & 0xFF == u64::from(vcpu_id) => {}
+        Ok(v) => {
+            tracing::error!(
+                "vCPU {vcpu_id}: MPIDR_EL1 Aff0 readback {:#x} != {vcpu_id}; aborting boot \
+                 (GIC affinity would be wrong)",
+                v & 0xFF,
+            );
+            running.store(false, Ordering::SeqCst);
+            return;
+        }
+        Err(e) => {
+            tracing::error!("vCPU {vcpu_id}: MPIDR_EL1 readback failed: {e}; aborting boot");
+            running.store(false, Ordering::SeqCst);
+            return;
+        }
+    }
+
     // Register this vCPU's framework ID and this thread's handle after all
     // register-setup calls succeed. If any setup call fails above, the
     // early return drops `HvVcpu` (triggering `hv_vcpu_destroy`) and the
@@ -215,13 +248,6 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         handles.push(std::thread::current());
-    }
-
-    // Set MPIDR_EL1 for this vCPU (used by GIC affinity routing).
-    // Simple layout: Aff0 = vcpu_id, all other affinity fields 0.
-    let mpidr = u64::from(vcpu_id) & 0xFF;
-    if let Err(e) = vcpu.set_sys_reg(arcbox_hv::sys_reg::HV_SYS_REG_MPIDR_EL1, mpidr) {
-        tracing::warn!("vCPU {vcpu_id}: set MPIDR failed (may not be writable): {e}");
     }
 
     tracing::info!(
