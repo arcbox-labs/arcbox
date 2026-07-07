@@ -35,6 +35,21 @@ The project is in **alpha**. Breaking changes (internal or user-facing) are acce
 - `.agents/skills/` — shared Claude Code skills (symlinked from `.claude/skills/`)
 - `docs/` — supplementary documentation (boot assets, daemon lifecycle)
 
+## Component Rules
+
+Per-directory agent rules live in `AGENTS.md` files next to the code they
+govern, and are imported here:
+
+@virt/AGENTS.md
+@virt/arcbox-vmm/AGENTS.md
+@virt/arcbox-virtio-blk/AGENTS.md
+@app/AGENTS.md
+@tests/e2e/AGENTS.md
+@xtask/AGENTS.md
+
+(`common/arcbox-route/AGENTS.md` is crate-local reference material and is
+loaded on demand rather than imported.)
+
 ## Planning
 
 When asked to plan, the plan must be fully resolved before implementation begins. Every decision must be locked — no "TBD", no "option A or B", no open questions. The plan should have exactly one possible outcome. If anything is unclear or uncertain, ask the user before finalizing.
@@ -74,6 +89,8 @@ When asked to plan, the plan must be fully resolved before implementation begins
 - Keep each commit atomic — compilable, runnable. Target ~200 lines changed (excluding generated files); hard limit 400. Don't make commits too small either — group related changes into one coherent commit unless that's all there is.
 - Commit along the way. Do not batch all changes into a single commit at the end.
 - Use `cargo add` / `cargo remove` for dependency changes, not manual Cargo.toml edits.
+- PR merges are squash-only (merge commits are disabled on the repo). For stacked PRs, merge the base PR first — and expect GitHub to close the stacked PR when the base branch is deleted; recovery is: re-push the old base ref, reopen the PR, retarget it to master, delete the ref again, then close/reopen once more to trigger CI (pushes made while a PR is closed fire no events).
+- Review-bot findings (pullfrog/Codex/Greptile) get verified against the code first, then either fixed with a reply + thread resolution, or refuted with evidence in the reply. Never resolve a thread silently.
 
 ## Licensing
 
