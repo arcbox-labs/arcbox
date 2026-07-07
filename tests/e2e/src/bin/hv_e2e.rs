@@ -35,6 +35,21 @@
 //!                           `MmapReadFile` + `KillAgent` handlers (busybox-init
 //!                           build). Phase 4 also needs the busybox-init rootfs.
 //!
+//! Config-matrix knobs — each shifts one dimension of the boot config
+//! toward the daemon's System VM shape, to bisect daemon-vs-probe boot
+//! failures (defaults reproduce the historical minimal probe):
+//!   ARCBOX_HV_E2E_VCPUS         vCPU count (default: 2)
+//!   ARCBOX_HV_E2E_MEMORY_MB     guest memory in MiB (default: 1024)
+//!   ARCBOX_HV_E2E_BALLOON=1     enable the balloon device
+//!   ARCBOX_HV_E2E_NETWORKING=1  enable the NAT networking datapath
+//!   ARCBOX_HV_E2E_DATA_IMG_MB   attach a writable sparse blk device (0 = off)
+//!   ARCBOX_HV_E2E_EXTRA_SHARES  extra VirtioFS shares (default: 0)
+//!   ARCBOX_HV_E2E_BRIDGE=1      add the bridge NIC (second VirtioNet)
+//!   ARCBOX_HV_E2E_BOOT_ONLY=1   stop after agent readiness (skip DAX,
+//!                               supervision, pause/resume phases)
+//!   ARCBOX_HV_E2E_LOGLEVEL      guest kernel console loglevel (default: 4;
+//!                               8 = everything, for pinning boot stalls)
+//!
 //! Exit code 0 = all assertions passed. Non-zero = failure.
 
 use std::fmt::Write;
@@ -105,54 +120,112 @@ fn run() -> Result<(), String> {
     // response round-trips in a couple of writes with backoff.
     let dax_fixture = DaxFixture::create("dax-test.bin", 2 * 1024 * 1024)?;
 
+    // Config-matrix knobs (see module docs). Defaults = the minimal probe.
+    let knobs = Knobs::from_env()?;
+
     println!("[cfg] kernel:  {}", kernel_path.display());
     println!("[cfg] rootfs:  {}", rootfs_path.display());
     println!("[cfg] share:   {}", share_dir.display());
     println!("[cfg] fixture: {}", dax_fixture.host_dir.path().display());
     println!("[cfg] cid:     {GUEST_CID}");
     println!("[cfg] timeout: {}s", boot_timeout.as_secs());
+    println!(
+        "[cfg] knobs:   vcpus={} memory_mb={} balloon={} networking={} data_img_mb={} extra_shares={} bridge={} boot_only={} loglevel={}",
+        knobs.vcpus,
+        knobs.memory_mb,
+        knobs.balloon,
+        knobs.networking,
+        knobs.data_img_mb,
+        knobs.extra_shares,
+        knobs.bridge,
+        knobs.boot_only,
+        knobs.loglevel,
+    );
     println!();
 
+    let mut shared_dirs = vec![
+        SharedDirConfig {
+            host_path: share_dir,
+            tag: "arcbox".to_string(),
+            read_only: false,
+        },
+        SharedDirConfig {
+            // The fixture lives in its own ephemeral share so the guest
+            // can reach it at /run/arcbox-dax without touching the live data
+            // directory.
+            host_path: dax_fixture.host_dir.path().to_path_buf(),
+            tag: "arcbox-dax".to_string(),
+            read_only: false,
+        },
+    ];
+    // Keep the extra shares' tempdirs alive for the VM's lifetime.
+    let mut extra_share_dirs = Vec::new();
+    for i in 0..knobs.extra_shares {
+        let dir = TempDir::new().map_err(|e| format!("extra share tempdir: {e}"))?;
+        shared_dirs.push(SharedDirConfig {
+            host_path: dir.path().to_path_buf(),
+            tag: format!("extra{i}"),
+            read_only: false,
+        });
+        extra_share_dirs.push(dir);
+    }
+
+    let mut block_devices = vec![BlockDeviceConfig {
+        path: rootfs_path,
+        read_only: true,
+    }];
+    // A writable sparse image mirrors the daemon's docker.img second disk.
+    let _data_img_dir: Option<TempDir> = if knobs.data_img_mb > 0 {
+        let dir = TempDir::new().map_err(|e| format!("data img tempdir: {e}"))?;
+        let path = dir.path().join("data.img");
+        let file = std::fs::File::create(&path).map_err(|e| format!("data img create: {e}"))?;
+        file.set_len(knobs.data_img_mb * 1024 * 1024)
+            .map_err(|e| format!("data img set_len: {e}"))?;
+        block_devices.push(BlockDeviceConfig {
+            path,
+            read_only: false,
+        });
+        Some(dir)
+    } else {
+        None
+    };
+
     let config = VmmConfig {
-        vcpu_count: 2,
-        memory_size: 1024 * 1024 * 1024, // 1 GiB — enough for a smoke test
+        vcpu_count: knobs.vcpus,
+        memory_size: knobs.memory_mb * 1024 * 1024,
         kernel_path,
-        kernel_cmdline:
-            "console=hvc0 root=/dev/vda ro rootfstype=erofs earlycon=pl011,0x0b000000 loglevel=4 panic=10"
-                .to_string(),
+        kernel_cmdline: format!(
+            "console=hvc0 root=/dev/vda ro rootfstype=erofs earlycon=pl011,0x0b000000 loglevel={} panic=10",
+            knobs.loglevel
+        ),
         initrd_path: None,
         enable_rosetta: false,
         serial_console: true,
         virtio_console: true,
-        shared_dirs: vec![
-            SharedDirConfig {
-                host_path: share_dir,
-                tag: "arcbox".to_string(),
-                read_only: false,
-            },
-            SharedDirConfig {
-                // The fixture lives in its own ephemeral share so the guest
-                // can reach it at /run/arcbox-dax without touching the live data
-                // directory.
-                host_path: dax_fixture.host_dir.path().to_path_buf(),
-                tag: "arcbox-dax".to_string(),
-                read_only: false,
-            },
-        ],
-        networking: false,
+        shared_dirs,
+        networking: knobs.networking,
         vsock: true,
         guest_cid: Some(GUEST_CID),
-        balloon: false,
-        block_devices: vec![BlockDeviceConfig {
-            path: rootfs_path,
-            read_only: true,
-        }],
-        bridge_nic_mac: None,
+        balloon: knobs.balloon,
+        block_devices,
+        // The daemon's System VM carries a second (bridge) NIC; a fixed
+        // locally-administered MAC is enough to materialize the device.
+        bridge_nic_mac: knobs.bridge.then(|| "02:AB:CD:00:00:99".to_string()),
         backend: VmBackend::Hv,
         debug_console_socket: None,
     };
 
     let mut metrics = arcbox_e2e::metrics::RunMetrics::new("hv_vmm", Some("hv"));
+
+    // The NAT datapath spawns tokio tasks at start; give it a reactor
+    // context like the daemon's, but only when the knob asks for it so
+    // the minimal probe stays runtime-free.
+    let tokio_rt = if knobs.networking {
+        Some(tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?)
+    } else {
+        None
+    };
+    let _enter = tokio_rt.as_ref().map(tokio::runtime::Runtime::enter);
 
     println!("[phase 1] create VMM");
     let t = Instant::now();
@@ -172,7 +245,14 @@ fn run() -> Result<(), String> {
         t.elapsed().as_secs_f64() * 1000.0
     );
 
-    let result = run_phases(&mut vmm, &dax_fixture, boot_timeout, &mut metrics);
+    let result = run_phases(
+        &mut vmm,
+        &dax_fixture,
+        boot_timeout,
+        knobs.boot_only,
+        &mut metrics,
+    );
+    drop(extra_share_dirs);
     if result.is_err() {
         // Dump the virtio queue snapshot while the VM is still alive —
         // a wedged ring (avail ahead of used, interrupt pending but
@@ -200,6 +280,7 @@ fn run_phases(
     vmm: &mut Vmm,
     dax_fixture: &DaxFixture,
     boot_timeout: Duration,
+    boot_only: bool,
     metrics: &mut arcbox_e2e::metrics::RunMetrics,
 ) -> Result<(), String> {
     println!("[phase 3] wait for agent on vsock port {AGENT_PORT}");
@@ -215,6 +296,19 @@ fn run_phases(
         "          agent responded after {:.1}s",
         t.elapsed().as_secs_f64()
     );
+
+    if boot_only {
+        println!("[boot-only] skipping phases 4-6");
+        println!("[phase 7] stop VM");
+        let t = Instant::now();
+        vmm.stop().map_err(|e| format!("Vmm::stop: {e}"))?;
+        metrics.record("stop_vm", t.elapsed().as_secs_f64());
+        println!(
+            "          ok in {:.0}ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+        return Ok(());
+    }
 
     println!("[phase 4] get system info");
     let info = get_system_info(vmm)?;
@@ -267,6 +361,46 @@ fn run_phases(
     );
 
     Ok(())
+}
+
+/// Config-matrix knobs (see module docs). Each dimension shifts the boot
+/// config from the minimal probe toward the daemon's System VM shape.
+struct Knobs {
+    vcpus: u32,
+    memory_mb: u64,
+    balloon: bool,
+    networking: bool,
+    data_img_mb: u64,
+    extra_shares: usize,
+    bridge: bool,
+    boot_only: bool,
+    loglevel: u32,
+}
+
+impl Knobs {
+    fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            vcpus: env_parse("ARCBOX_HV_E2E_VCPUS", 2)?,
+            memory_mb: env_parse("ARCBOX_HV_E2E_MEMORY_MB", 1024)?,
+            balloon: arcbox_e2e::env_flag("ARCBOX_HV_E2E_BALLOON"),
+            networking: arcbox_e2e::env_flag("ARCBOX_HV_E2E_NETWORKING"),
+            data_img_mb: env_parse("ARCBOX_HV_E2E_DATA_IMG_MB", 0)?,
+            extra_shares: env_parse("ARCBOX_HV_E2E_EXTRA_SHARES", 0)?,
+            bridge: arcbox_e2e::env_flag("ARCBOX_HV_E2E_BRIDGE"),
+            boot_only: arcbox_e2e::env_flag("ARCBOX_HV_E2E_BOOT_ONLY"),
+            loglevel: env_parse("ARCBOX_HV_E2E_LOGLEVEL", 4)?,
+        })
+    }
+}
+
+/// Parses an env var, falling back to `default` when unset.
+fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map_err(|_| format!("invalid {name}: '{value}'")),
+        Err(_) => Ok(default),
+    }
 }
 
 /// Repeatedly opens a fresh vsock connection and tries a ping until one
