@@ -29,6 +29,10 @@ pub struct BootAssetsConfig {
     /// System VM backend for the daemon under test. `None` leaves the
     /// daemon's own default (VZ) in effect.
     pub backend: Option<arcbox_vmm::VmBackend>,
+    /// Container image the lifecycle tests pull and run. Override via
+    /// `ARCBOX_E2E_IMAGE` (e.g. a mirror ref) on networks where
+    /// docker.io is unreachable from the guest.
+    pub image: String,
 }
 
 impl BootAssetsConfig {
@@ -53,6 +57,7 @@ impl BootAssetsConfig {
                 Err(error) => return Err(error).context("reading ARCBOX_GUEST_DOCKER_VSOCK_PORT"),
             },
             backend,
+            image: env::var("ARCBOX_E2E_IMAGE").unwrap_or_else(|_| "alpine:latest".to_owned()),
         })
     }
 }
@@ -65,6 +70,7 @@ struct TestContext {
     label: String,
     guest_docker_vsock_port: u32,
     backend: Option<arcbox_vmm::VmBackend>,
+    image: String,
     keep_test_dir: bool,
     daemon: Option<DaemonHandle>,
 }
@@ -91,6 +97,7 @@ impl TestContext {
             label,
             guest_docker_vsock_port: config.guest_docker_vsock_port,
             backend: config.backend,
+            image: config.image,
             keep_test_dir: config.keep_test_dir,
             daemon: None,
         })
@@ -222,7 +229,7 @@ fn run_scenario(ctx: &mut TestContext, metrics: &mut RunMetrics) -> Result<()> {
     setup_test_env(ctx)?;
     metrics.time("daemon_ready", || start_daemon(ctx))?;
 
-    metrics.time("image_pull", || pull_alpine(ctx))?;
+    metrics.time("image_pull", || pull_image(ctx))?;
     metrics.time("container_create_smoke", || smoke_container_create(ctx))?;
 
     metrics.time("container_run", || {
@@ -387,9 +394,9 @@ fn start_daemon(ctx: &mut TestContext) -> Result<()> {
     Ok(())
 }
 
-fn pull_alpine(ctx: &TestContext) -> Result<()> {
-    info!("pulling alpine image");
-    match ctx.docker_output(&["pull", "alpine:latest"], Duration::from_secs(90)) {
+fn pull_image(ctx: &TestContext) -> Result<()> {
+    info!(image = %ctx.image, "pulling test image");
+    match ctx.docker_output(&["pull", &ctx.image], Duration::from_secs(90)) {
         Ok(output) => {
             fs::write(ctx.test_dir.join("pull.log"), output)
                 .with_context(|| format!("writing {}", ctx.test_dir.join("pull.log").display()))?;
@@ -410,7 +417,7 @@ fn smoke_container_create(ctx: &TestContext) -> Result<()> {
     info!("creating container against the ready daemon");
     let cid = ctx
         .docker_output(
-            &["create", "--label", &ctx.label, "alpine", "echo", "test"],
+            &["create", "--label", &ctx.label, &ctx.image, "echo", "test"],
             DOCKER_TIMEOUT,
         )?
         .lines()
@@ -428,7 +435,7 @@ fn test_container_run(ctx: &TestContext) -> Result<()> {
     info!("[test] container run: docker run alpine echo hello");
     let cid = ctx
         .docker_output(
-            &["create", "--label", &ctx.label, "alpine", "echo", "hello"],
+            &["create", "--label", &ctx.label, &ctx.image, "echo", "hello"],
             DOCKER_TIMEOUT,
         )?
         .lines()
@@ -451,7 +458,9 @@ fn test_background_container(ctx: &TestContext) -> Result<()> {
     info!("[test] background container: docker run -d + docker ps");
     let cid = ctx
         .docker_output(
-            &["run", "-d", "--label", &ctx.label, "alpine", "sleep", "300"],
+            &[
+                "run", "-d", "--label", &ctx.label, &ctx.image, "sleep", "300",
+            ],
             DOCKER_TIMEOUT,
         )?
         .lines()
@@ -485,7 +494,7 @@ fn test_docker_logs(ctx: &TestContext) -> Result<()> {
                 "-d",
                 "--label",
                 &ctx.label,
-                "alpine",
+                &ctx.image,
                 "sh",
                 "-c",
                 "echo 'log-output-test'; sleep 10",
@@ -520,7 +529,9 @@ fn test_docker_exec(ctx: &TestContext) -> Result<()> {
     info!("[test] docker exec: run command in running container");
     let cid = ctx
         .docker_output(
-            &["run", "-d", "--label", &ctx.label, "alpine", "sleep", "300"],
+            &[
+                "run", "-d", "--label", &ctx.label, &ctx.image, "sleep", "300",
+            ],
             DOCKER_TIMEOUT,
         )?
         .lines()
@@ -546,7 +557,9 @@ fn test_stop_rm(ctx: &TestContext) -> Result<()> {
     info!("[test] stop/rm: graceful stop and remove");
     let cid = ctx
         .docker_output(
-            &["run", "-d", "--label", &ctx.label, "alpine", "sleep", "300"],
+            &[
+                "run", "-d", "--label", &ctx.label, &ctx.image, "sleep", "300",
+            ],
             DOCKER_TIMEOUT,
         )?
         .lines()
