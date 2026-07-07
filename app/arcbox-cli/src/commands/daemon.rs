@@ -274,14 +274,22 @@ fn spawn_background(args: &DaemonArgs) -> Result<()> {
 /// Polls until the spawned daemon holds `daemon.lock`, it exits, or the
 /// handoff times out (timeout is a warning, not an error — a slow start
 /// is not a failed one).
+///
+/// Handoff is detected by the lock file's PID content matching the child,
+/// not by a flock probe: the daemon writes its PID only after acquiring
+/// the lock, and probing with `flock(LOCK_EX | LOCK_NB)` here could win
+/// the lock in the instant the daemon attempts its own non-blocking
+/// acquire, shunting it into the stale-daemon takeover path against
+/// whatever old PID the file still holds.
 fn wait_for_lock_handoff(
     lock_file: &Path,
     child: &mut std::process::Child,
     daemon_log: &Path,
 ) -> Result<()> {
     let deadline = std::time::Instant::now() + SPAWN_HANDOFF_TIMEOUT;
+    let child_pid = i32::try_from(child.id()).unwrap_or(-1);
     loop {
-        if daemon_is_alive(lock_file) {
+        if read_lock_file(lock_file).unwrap_or(None) == Some(child_pid) {
             return Ok(());
         }
         if let Some(status) = child
@@ -544,31 +552,47 @@ mod tests {
     }
 
     #[test]
-    fn lock_handoff_succeeds_once_lock_is_held() {
+    fn lock_handoff_succeeds_once_child_pid_is_written() {
         let dir = tempdir().expect("failed to create temp dir");
         let lock_file = dir.path().join("daemon.lock");
         let daemon_log = dir.path().join("daemon.log");
-
-        // Simulate the daemon owning daemon.lock with a separate open
-        // file description (flock conflicts across OFDs in one process).
-        let holder = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_file)
-            .expect("open lock file");
-        assert!(flock_nb(&holder));
 
         let mut child = std::process::Command::new("sleep")
             .arg("5")
             .spawn()
             .expect("spawn test child");
 
+        // The daemon writes its own PID into daemon.lock after acquiring
+        // the flock — handoff keys on that content, never on the flock
+        // itself (a probe could race the daemon's non-blocking acquire).
+        fs::write(&lock_file, format!("{}\n", child.id())).expect("write lock file pid");
+
         wait_for_lock_handoff(&lock_file, &mut child, &daemon_log)
-            .expect("handoff should succeed while the lock is held");
+            .expect("handoff should succeed once the child pid is in the lock file");
 
         child.kill().expect("kill test child");
         child.wait().expect("reap test child");
+    }
+
+    #[test]
+    fn lock_handoff_ignores_stale_foreign_pid() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let lock_file = dir.path().join("daemon.lock");
+        let daemon_log = dir.path().join("daemon.log");
+
+        // Stale content from a previous daemon must not be mistaken for
+        // the handoff; the child exiting is then reported as a failure.
+        fs::write(&lock_file, "99999\n").expect("write stale pid");
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn test child");
+        child.wait().expect("child wait");
+
+        let err = wait_for_lock_handoff(&lock_file, &mut child, &daemon_log)
+            .expect_err("stale pid must not count as handoff");
+        assert!(err.to_string().contains("exited during startup"));
     }
 
     #[test]
