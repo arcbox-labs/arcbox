@@ -106,14 +106,23 @@ impl Default for SetupState {
 pub struct SystemServiceImpl {
     setup_state: Arc<SetupState>,
     runtime: SharedRuntime,
+    /// Diagnostics handle, filled as soon as the runtime is constructed
+    /// (before the VM boots) so `GetVirtioDebug` can observe a stuck
+    /// boot while `runtime` is still empty.
+    early_runtime: SharedRuntime,
 }
 
 impl SystemServiceImpl {
     /// Creates a new system service.
-    pub fn new(setup_state: Arc<SetupState>, runtime: SharedRuntime) -> Self {
+    pub fn new(
+        setup_state: Arc<SetupState>,
+        runtime: SharedRuntime,
+        early_runtime: SharedRuntime,
+    ) -> Self {
         Self {
             setup_state,
             runtime,
+            early_runtime,
         }
     }
 }
@@ -258,7 +267,9 @@ impl SystemService for SystemServiceImpl {
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<VirtioDebugInfo>, Status> {
-        let runtime = self.runtime.ready()?;
+        // The early handle exists as soon as the runtime is constructed —
+        // a boot that never reaches READY is this RPC's main use case.
+        let runtime = self.early_runtime.ready()?;
         let devices = runtime
             .system_vm_virtio_debug()
             .map_err(|e| Status::failed_precondition(e.to_string()))?

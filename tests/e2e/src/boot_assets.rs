@@ -267,11 +267,78 @@ fn check_prerequisites(ctx: &TestContext) -> Result<()> {
     Ok(())
 }
 
-fn prepare_dev_boot_assets(ctx: &TestContext) -> Result<()> {
-    let shell = xshell::Shell::new()?;
-    shell.change_dir(&ctx.root);
-    let version = &ctx.version;
-    xshell::cmd!(shell, "cargo xtask dev boot-assets --version {version}").run()?;
+/// Resolves the boot asset version for a test run: the
+/// `ARCBOX_BOOT_ASSET_VERSION` override, or `assets.lock`.
+pub fn resolve_boot_version(root: &Path) -> Result<String> {
+    match env::var("ARCBOX_BOOT_ASSET_VERSION") {
+        Ok(version) => Ok(version),
+        Err(_) => boot_version(&root.join("assets.lock")),
+    }
+}
+
+/// Stages the development boot assets under `<data_dir>/boot/<version>`.
+///
+/// A daemon pointed at `data_dir` then boots without downloading.
+/// Refreshes `boot-assets/dev` via xtask if incomplete.
+pub fn stage_dev_boot_assets(root: &Path, data_dir: &Path, version: &str) -> Result<()> {
+    let test_boot_dir = data_dir.join("boot").join(version);
+    fs::create_dir_all(&test_boot_dir)
+        .with_context(|| format!("creating {}", test_boot_dir.display()))?;
+
+    let dev_boot_dir = root.join("boot-assets/dev");
+    if !dev_boot_dir.join("kernel").is_file()
+        || !dev_boot_dir.join("rootfs.erofs").is_file()
+        || !dev_boot_dir.join("manifest.json").is_file()
+    {
+        warn!("development boot assets incomplete; refreshing");
+        let shell = xshell::Shell::new()?;
+        shell.change_dir(root);
+        xshell::cmd!(shell, "cargo xtask dev boot-assets --version {version}").run()?;
+    }
+
+    copy_file(&dev_boot_dir.join("kernel"), &test_boot_dir.join("kernel"))?;
+    copy_file(
+        &dev_boot_dir.join("rootfs.erofs"),
+        &test_boot_dir.join("rootfs.erofs"),
+    )?;
+    copy_file(
+        &dev_boot_dir.join("manifest.json"),
+        &test_boot_dir.join("manifest.json"),
+    )?;
+
+    // The daemon installs `boot/<version>/arcbox-agent` into `bin/` at
+    // startup (its boot-cache fallback; the bundle path doesn't apply to
+    // a bare test daemon, and the CDN ships no standalone agent). Stage
+    // the freshest agent found locally: the dev tree, a local
+    // cross-compile, or the one an installed ArcBox app seeded — newest
+    // mtime wins, since a stale agent fails the boot in confusing ways.
+    let agent_candidates = [
+        dev_boot_dir.join("arcbox-agent"),
+        root.join("target/aarch64-unknown-linux-musl/release/arcbox-agent"),
+        arcbox_constants::paths::ArcboxProfile::Production
+            .default_data_dir()
+            .join("bin/arcbox-agent"),
+    ];
+    let freshest_agent = agent_candidates
+        .iter()
+        .filter_map(|path| {
+            let mtime = fs::metadata(path).ok()?.modified().ok()?;
+            Some((path, mtime))
+        })
+        .max_by_key(|(_, mtime)| *mtime)
+        .map(|(path, _)| path);
+    match freshest_agent {
+        Some(agent) => {
+            copy_file(agent, &test_boot_dir.join("arcbox-agent"))?;
+            info!(agent = %agent.display(), "staged guest agent");
+        }
+        None => warn!(
+            "no arcbox-agent found (looked in boot-assets/dev, musl target, ~/.arcbox/bin); \
+             the daemon will fail at runtime init"
+        ),
+    }
+
+    info!(dev_boot_dir = %dev_boot_dir.display(), "using development boot assets");
     Ok(())
 }
 
@@ -287,30 +354,7 @@ fn copy_file(from: &Path, to: &Path) -> Result<()> {
 
 fn setup_test_env(ctx: &TestContext) -> Result<()> {
     info!(test_dir = %ctx.test_dir.display(), "setting up test environment");
-    let test_boot_dir = ctx.test_dir.join("boot").join(&ctx.version);
-    fs::create_dir_all(&test_boot_dir)
-        .with_context(|| format!("creating {}", test_boot_dir.display()))?;
-
-    let dev_boot_dir = ctx.root.join("boot-assets/dev");
-    if !dev_boot_dir.join("kernel").is_file()
-        || !dev_boot_dir.join("rootfs.erofs").is_file()
-        || !dev_boot_dir.join("manifest.json").is_file()
-    {
-        warn!("development boot assets incomplete; refreshing");
-        prepare_dev_boot_assets(ctx)?;
-    }
-
-    copy_file(&dev_boot_dir.join("kernel"), &test_boot_dir.join("kernel"))?;
-    copy_file(
-        &dev_boot_dir.join("rootfs.erofs"),
-        &test_boot_dir.join("rootfs.erofs"),
-    )?;
-    copy_file(
-        &dev_boot_dir.join("manifest.json"),
-        &test_boot_dir.join("manifest.json"),
-    )?;
-    info!(dev_boot_dir = %dev_boot_dir.display(), "using development boot assets");
-    Ok(())
+    stage_dev_boot_assets(&ctx.root, &ctx.test_dir, &ctx.version)
 }
 
 /// Spawns the daemon and blocks until it reports READY on the setup

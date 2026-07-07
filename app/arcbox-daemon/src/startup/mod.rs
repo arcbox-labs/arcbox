@@ -59,6 +59,7 @@ async fn init_early(args: DaemonArgs, setup_state: Arc<SetupState>) -> Result<Ea
         profile,
         layout,
         shared_runtime: Arc::new(std::sync::OnceLock::new()),
+        early_runtime: Arc::new(std::sync::OnceLock::new()),
         setup_state,
         shutdown: CancellationToken::new(),
         dns_domain,
@@ -89,6 +90,7 @@ async fn acquire_lock(early: EarlyContext) -> Result<DaemonContext> {
         layout: early.layout,
         daemon_lock: lock,
         shared_runtime: early.shared_runtime,
+        early_runtime: early.early_runtime,
         setup_state: early.setup_state,
         shutdown: early.shutdown,
         dns_domain: early.dns_domain,
@@ -198,6 +200,12 @@ async fn init_runtime(ctx: &DaemonContext) -> Result<Arc<Runtime>> {
     }
 
     let runtime = Arc::new(Runtime::new(config).context("Failed to create runtime")?);
+    // Publish the diagnostics handle before the VM boots: a stuck boot
+    // must stay observable via GetVirtioDebug while `shared_runtime`
+    // (the general RPC gate) is still empty.
+    ctx.early_runtime
+        .set(Arc::clone(&runtime))
+        .map_err(|_| anyhow::anyhow!("init_runtime called twice"))?;
     runtime
         .init()
         .await
