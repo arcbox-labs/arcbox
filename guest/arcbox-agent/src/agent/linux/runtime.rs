@@ -272,7 +272,12 @@ async fn collect_runtime_status() -> RuntimeStatusResponse {
     } else {
         false
     };
-    let docker_ready = docker_api_ok;
+    let docker_probe = DockerProbe {
+        socket_exists: Path::new(DOCKER_API_UNIX_SOCKET).exists(),
+        socket_ok: docker_socket_ok,
+        api_ok: docker_api_ok,
+    };
+    let docker_ready = docker_probe.ready();
     let runtime_dir = PathBuf::from(ARCBOX_RUNTIME_BIN_DIR);
     let missing_runtime_binaries = missing_runtime_binaries_at(&runtime_dir);
 
@@ -304,12 +309,6 @@ async fn collect_runtime_status() -> RuntimeStatusResponse {
             detail: format!("no reachable socket found; checked: {}", socket_paths),
         }
     });
-
-    let docker_probe = DockerProbe {
-        socket_exists: Path::new(DOCKER_API_UNIX_SOCKET).exists(),
-        socket_ok: docker_socket_ok,
-        api_ok: docker_api_ok,
-    };
 
     services.push(docker_probe.service_status());
 
