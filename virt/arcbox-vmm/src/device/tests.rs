@@ -244,3 +244,32 @@ fn queue_config_beyond_eight_round_trips() {
     state.write(virtio_mmio::regs::QUEUE_SEL, 12);
     assert_eq!(state.read(virtio_mmio::regs::QUEUE_NUM_MAX), 1024);
 }
+
+/// A guest can program arbitrary garbage as a ring address; the debug
+/// snapshot must survive it (no overflow panic, no out-of-bounds read)
+/// and report the fields as unreadable.
+#[test]
+fn virtio_debug_survives_garbage_ring_addresses() {
+    const GPA_BASE: u64 = 0x1000;
+    let mut ram = vec![0u8; 0x1000];
+    let mut manager = DeviceManager::new();
+    // SAFETY: `ram` outlives the manager use below and covers the range.
+    unsafe { manager.set_guest_memory(ram.as_mut_ptr(), ram.len(), GPA_BASE) };
+    let id = manager.register(DeviceType::VirtioBlock, "blk0").unwrap();
+
+    let mut state = VirtioMmioState::new(2, 0);
+    state.driver_features = arcbox_virtio::queue::VIRTIO_F_EVENT_IDX;
+    state.queue_num[0] = u16::MAX;
+    state.queue_ready[0] = true;
+    // Near-u64::MAX addresses: adding field offsets overflows if unchecked.
+    state.queue_driver[0] = u64::MAX - 1;
+    state.queue_device[0] = u64::MAX - 3;
+    manager.devices.get_mut(&id).unwrap().mmio_state = Some(Arc::new(RwLock::new(state)));
+
+    let snapshot = manager.virtio_debug();
+    let q0 = &snapshot[0].queues[0];
+    assert_eq!(q0.avail_idx, None);
+    assert_eq!(q0.used_idx, None);
+    assert_eq!(q0.used_event, None);
+    assert_eq!(q0.avail_event, None);
+}

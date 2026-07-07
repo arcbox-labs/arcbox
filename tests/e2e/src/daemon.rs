@@ -281,7 +281,11 @@ fn assert_isolated(data_dir: &Path) -> Result<()> {
     });
     for profile in [ArcboxProfile::Production, ArcboxProfile::Development] {
         let root = profile.default_data_dir();
-        if resolved.starts_with(&root) {
+        // A profile root that is itself a symlink (e.g. ~/.arcbox →
+        // another volume) must match by its canonical form too, or a
+        // data dir given via the symlink target would slip through.
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if resolved.starts_with(&root) || resolved.starts_with(&canonical_root) {
             bail!(
                 "refusing to run a daemon under test in {} — it is inside the default \
                  {profile} data dir {} and would clobber a real daemon's state; \

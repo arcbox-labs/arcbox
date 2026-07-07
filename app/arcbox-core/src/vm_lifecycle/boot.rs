@@ -166,15 +166,29 @@ impl LifecycleShared {
     async fn sync_guest_clock(&self) {
         let machine_manager = self.machine_manager.clone();
         let machine_name = self.machine_name.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let mut agent = machine_manager.connect_agent(&machine_name)?;
-            agent.ping_blocking().map(|_| ())
-        })
-        .await;
+        // `connect_agent` yields a blocking transport on the HV AF_UNIX
+        // socketpair and an async one on AF_VSOCK (VZ) / Linux; ping over
+        // whichever the client actually has.
+        let connected =
+            tokio::task::spawn_blocking(move || machine_manager.connect_agent(&machine_name)).await;
+        let result = match connected {
+            Ok(Ok(mut agent)) => {
+                if agent.is_blocking() {
+                    tokio::task::spawn_blocking(move || agent.ping_blocking().map(|_| ()))
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(CoreError::Vm(format!("clock sync task panicked: {e}")))
+                        })
+                } else {
+                    agent.ping().await.map(|_| ())
+                }
+            }
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(CoreError::Vm(format!("clock sync task panicked: {e}"))),
+        };
         match result {
-            Ok(Ok(())) => tracing::info!("guest wall clock synced from host"),
-            Ok(Err(e)) => tracing::warn!(error = %e, "guest clock sync ping failed"),
-            Err(e) => tracing::warn!(error = %e, "guest clock sync task panicked"),
+            Ok(()) => tracing::info!("guest wall clock synced from host"),
+            Err(e) => tracing::warn!(error = %e, "guest clock sync ping failed"),
         }
     }
 

@@ -93,6 +93,10 @@ impl DeviceManager {
                         state.queue_num[qi] != 0 || state.queue_ready[qi] || state.kicks[qi] != 0
                     })
                     .map(|qi| {
+                        // `size` is a u16 widened to u64, so `4 + 2*size` /
+                        // `4 + 8*size` cannot overflow; the base addresses
+                        // are raw guest-written u64s, so base + offset is
+                        // checked inside `read_guest_u16`.
                         let size = u64::from(state.queue_num[qi]);
                         let avail = state.queue_driver[qi];
                         let used = state.queue_device[qi];
@@ -101,18 +105,18 @@ impl DeviceManager {
                             size: state.queue_num[qi],
                             ready: state.queue_ready[qi],
                             kicks: state.kicks[qi],
-                            avail_flags: self.read_guest_u16(avail),
-                            avail_idx: self.read_guest_u16(avail + 2),
-                            used_flags: self.read_guest_u16(used),
-                            used_idx: self.read_guest_u16(used + 2),
+                            avail_flags: self.read_guest_u16(avail, 0),
+                            avail_idx: self.read_guest_u16(avail, 2),
+                            used_flags: self.read_guest_u16(used, 0),
+                            used_idx: self.read_guest_u16(used, 2),
                             // Split-ring trailers (virtio 1.1 §2.6):
                             // used_event lives after the avail ring,
                             // avail_event after the used ring.
                             used_event: event_idx
-                                .then(|| self.read_guest_u16(avail + 4 + 2 * size))
+                                .then(|| self.read_guest_u16(avail, 4 + 2 * size))
                                 .flatten(),
                             avail_event: event_idx
-                                .then(|| self.read_guest_u16(used + 4 + 8 * size))
+                                .then(|| self.read_guest_u16(used, 4 + 8 * size))
                                 .flatten(),
                         }
                     })
@@ -132,25 +136,32 @@ impl DeviceManager {
             .collect()
     }
 
-    /// Reads a `u16` from guest memory by GPA. Returns `None` when guest
-    /// RAM is not set, the address is out of bounds, misaligned, or zero
-    /// (ring address never configured).
+    /// Reads a `u16` from guest memory at `base_gpa + field_offset`.
+    ///
+    /// `base_gpa` is a raw guest-programmed ring address — arbitrary bits,
+    /// including values that overflow when offset — so every step is
+    /// checked: this is the exact garbage-ring input the snapshot exists
+    /// to diagnose. Returns `None` when guest RAM is not set, the base is
+    /// zero (never configured), or the final address overflows, falls out
+    /// of guest RAM, or is misaligned.
     #[allow(
         clippy::cast_ptr_alignment,
         reason = "pointer alignment is checked at runtime just above the cast"
     )]
-    fn read_guest_u16(&self, gpa: u64) -> Option<u16> {
+    fn read_guest_u16(&self, base_gpa: u64, field_offset: u64) -> Option<u16> {
         let base = self.guest_ram_base?;
-        if gpa == 0 {
+        if base_gpa == 0 {
             return None;
         }
+        let gpa = base_gpa.checked_add(field_offset)?;
         let offset = gpa.checked_sub(self.guest_ram_gpa)?;
-        if offset + 2 > self.guest_ram_size as u64 {
+        let end = offset.checked_add(2)?;
+        if end > self.guest_ram_size as u64 {
             return None;
         }
         // SAFETY: `base` is the host mapping of guest RAM, valid for
-        // `guest_ram_size` bytes for the VM's lifetime; the offset is
-        // bounds-checked above.
+        // `guest_ram_size` bytes for the VM's lifetime; `offset + 2` was
+        // bounds-checked without overflow above.
         let ptr = unsafe { base.add(offset as usize) };
         if ptr as usize % 2 != 0 {
             return None;
