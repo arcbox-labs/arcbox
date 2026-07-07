@@ -69,8 +69,8 @@ impl DaemonHandle {
         // captures the process's stdout/stderr (panics, early failures that
         // precede logging init).
         let log_path = config.data_dir.join("harness-daemon.log");
-        let log = File::create(&log_path)
-            .with_context(|| format!("creating {}", log_path.display()))?;
+        let log =
+            File::create(&log_path).with_context(|| format!("creating {}", log_path.display()))?;
         let stderr = log.try_clone()?;
 
         let mut command = Command::new(&config.binary);
@@ -85,9 +85,9 @@ impl DaemonHandle {
             command.env(key, value);
         }
 
-        let child = command.spawn().with_context(|| {
-            format!("spawning arcbox-daemon from {}", config.binary.display())
-        })?;
+        let child = command
+            .spawn()
+            .with_context(|| format!("spawning arcbox-daemon from {}", config.binary.display()))?;
         info!(pid = child.id(), data_dir = %config.data_dir.display(), "daemon spawned");
 
         Ok(Self {
@@ -177,7 +177,7 @@ impl DaemonHandle {
                 },
                 // Stream ended or errored — the daemon is going away; the
                 // next liveness check reports its exit status and log tail.
-                Ok(Ok(None)) | Ok(Err(_)) => {
+                Ok(Ok(None) | Err(_)) => {
                     tokio::time::sleep(POLL_TICK).await;
                 }
             }
@@ -218,7 +218,7 @@ impl DaemonHandle {
         }
         // SAFETY: the pid belongs to a child we own; SIGTERM to a dead pid
         // is harmless (kill(2) returns ESRCH).
-        unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) };
+        unsafe { libc::kill(self.child.id().cast_signed(), libc::SIGTERM) };
 
         let deadline = Instant::now() + SHUTDOWN_GRACE;
         while Instant::now() < deadline {

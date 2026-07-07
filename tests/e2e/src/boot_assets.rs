@@ -83,10 +83,7 @@ impl TestContext {
 
     fn docker_host(&self) -> String {
         // Default HostLayout: the Docker socket lives under <data_dir>/run.
-        format!(
-            "unix://{}",
-            self.test_dir.join("run/docker.sock").display()
-        )
+        format!("unix://{}", self.test_dir.join("run/docker.sock").display())
     }
 
     fn docker_output(&self, args: &[&str], timeout: Duration) -> Result<String> {
@@ -277,10 +274,7 @@ fn start_daemon(ctx: &mut TestContext) -> Result<()> {
             "--guest-docker-vsock-port".to_owned(),
             ctx.guest_docker_vsock_port.to_string(),
         ],
-        env: vec![(
-            "ARCBOX_BOOT_ASSET_VERSION".to_owned(),
-            ctx.version.clone(),
-        )],
+        env: vec![("ARCBOX_BOOT_ASSET_VERSION".to_owned(), ctx.version.clone())],
     })?;
 
     let started = Instant::now();
