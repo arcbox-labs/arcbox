@@ -13,7 +13,7 @@ use crate::credentials::CredentialStore;
 
 /// Production gateway endpoint. Overridable via `ARCBOX_FLEET_GATEWAY` for
 /// local/e2e testing (e.g. `http://127.0.0.1:50061`).
-pub const DEFAULT_GATEWAY: &str = "https://fleet.arcbox.dev";
+pub const DEFAULT_GATEWAY: &str = "https://gateway.fleet.arcbox.dev";
 
 const ENV_GATEWAY: &str = "ARCBOX_FLEET_GATEWAY";
 const ENV_RUNNER_SCRIPT: &str = "ARCBOX_FLEET_RUNNER_SCRIPT";
