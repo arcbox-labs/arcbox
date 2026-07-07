@@ -38,13 +38,21 @@ pub(super) async fn boot_sandbox(
                 }
                 inst.process = Some(process);
                 inst.vm = Some(vm);
-                inst.vsock_uds_path = Some(vsock_uds_path);
+                inst.vsock_uds_path = Some(vsock_uds_path.clone());
                 inst.cow_handle = cow_handle;
                 inst.state = SandboxState::Ready;
                 inst.ready_at = Some(ready_at);
             }
             let _ = events_tx.send(SandboxEvent::new(&id, "ready"));
             info!(sandbox_id = %id, "sandbox booted and ready");
+
+            // Launch the initial workload, if the spec carries one. The
+            // sandbox stays alive when it exits (Running → Ready + "idle"),
+            // exactly like an explicit Run. A start failure is logged and
+            // leaves the sandbox Ready — the caller can still Run/Exec.
+            if !spec.cmd.is_empty() {
+                run_initial_cmd(&id, spec, &vsock_uds_path, &instances, &events_tx).await;
+            }
         }
         Err(e) => {
             let value = instances.read().unwrap().get(&id).cloned();
@@ -60,6 +68,40 @@ pub(super) async fn boot_sandbox(
             let _ =
                 events_tx.send(SandboxEvent::new(&id, "failed").with_attr("error", &e.to_string()));
             error!(sandbox_id = %id, error = %e, "sandbox boot failed");
+        }
+    }
+}
+
+/// Start the initial `cmd` from the creation spec and drain its output.
+///
+/// Uses the same workload path as `Run` (`start_run_workload`), so state
+/// transitions and events are identical; the output itself has no consumer
+/// and is discarded chunk by chunk to keep the exit handler flowing.
+async fn run_initial_cmd(
+    id: &SandboxId,
+    spec: SandboxSpec,
+    vsock_uds_path: &Path,
+    instances: &Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>,
+    events_tx: &broadcast::Sender<SandboxEvent>,
+) {
+    let start = StartCommand {
+        cmd: spec.cmd,
+        env: spec.env,
+        working_dir: spec.working_dir,
+        user: spec.user,
+        tty: false,
+        tty_width: 80,
+        tty_height: 24,
+        timeout_seconds: 0,
+    };
+    match super::workload::start_run_workload(id, vsock_uds_path, start, instances, events_tx).await
+    {
+        Ok(mut rx) => {
+            info!(sandbox_id = %id, "initial cmd started");
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        }
+        Err(e) => {
+            warn!(sandbox_id = %id, error = %e, "initial cmd failed to start; sandbox stays ready");
         }
     }
 }
