@@ -22,7 +22,8 @@ use arcbox_protocol::sandbox_v1::{
     DeleteSnapshotRequest, ExecOutput, ExecRequest, FileChunk, InspectSandboxRequest,
     ListSandboxesRequest, ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse,
     ReadFileRequest, RemoveSandboxRequest, RestoreRequest, RestoreResponse, RunOutput, RunRequest,
-    SandboxEvent, SandboxEventsRequest, SandboxInfo, StopSandboxRequest, TerminalSize,
+    SandboxEvent, SandboxEventsRequest, SandboxInfo, SandboxPortForwardRemoveRequest,
+    SandboxPortForwardRequest, SandboxPortForwardResponse, StopSandboxRequest, TerminalSize,
     WriteFileOpen,
 };
 use arcbox_transport::Transport;
@@ -740,6 +741,40 @@ impl AgentClient {
             MessageType::SandboxCreateResponse,
         )
         .await
+    }
+
+    /// Asks the guest agent to DNAT a reserved guest port to a sandbox port.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_port_forward(
+        &mut self,
+        req: SandboxPortForwardRequest,
+    ) -> Result<SandboxPortForwardResponse> {
+        let payload = req.encode_to_vec();
+        self.unary_rpc(
+            MessageType::SandboxPortForwardRequest,
+            &payload,
+            MessageType::SandboxPortForwardResponse,
+        )
+        .await
+    }
+
+    /// Asks the guest agent to remove a sandbox DNAT mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn sandbox_port_forward_remove(
+        &mut self,
+        req: SandboxPortForwardRemoveRequest,
+    ) -> Result<()> {
+        let payload = req.encode_to_vec();
+        let (resp_type, _) = self
+            .rpc_call(MessageType::SandboxPortForwardRemoveRequest, &payload)
+            .await?;
+        Self::expect_ack_response_type(resp_type, MessageType::SandboxPortForwardRemoveResponse)
     }
 
     /// Stops a sandbox in the guest VM.

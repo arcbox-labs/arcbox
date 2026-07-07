@@ -83,6 +83,9 @@ pub struct Runtime {
     /// Port forwarders for each container (non-macOS fallback).
     #[cfg(not(target_os = "macos"))]
     port_forwarders: Arc<TokioRwLock<HashMap<String, PortForwarder>>>,
+    /// Host listener keys of exposed sandbox ports, keyed by sandbox ID, so
+    /// Stop/Remove can tear down every listener a sandbox owns.
+    sandbox_port_keys: Arc<TokioRwLock<HashMap<String, Vec<String>>>>,
     /// Tracks DNS registrations: canonical container ID → hostnames.
     dns_entries: Arc<TokioRwLock<HashMap<String, Vec<String>>>>,
     /// Maps a container's unique name to its canonical ID, so teardown can
@@ -90,6 +93,23 @@ pub struct Runtime {
     /// round-trip. Populated at registration, updated on rename, cleared with
     /// the rest of the container's host state.
     container_aliases: Arc<TokioRwLock<HashMap<String, String>>>,
+}
+
+/// Parameters of one sandbox port exposure (the host listener half).
+///
+/// The guest half — DNAT from `guest_port` to the sandbox — is installed by
+/// the guest agent before this is applied.
+pub struct SandboxPortExposure {
+    /// Sandbox that owns the mapping.
+    pub sandbox_id: String,
+    /// Port the workload listens on inside the sandbox.
+    pub sandbox_port: u16,
+    /// `"tcp"` or `"udp"`.
+    pub protocol: String,
+    /// Host port to bind (loopback-reachable).
+    pub host_port: u16,
+    /// Reserved-range guest relay port the agent allocated.
+    pub guest_port: u16,
 }
 
 impl Runtime {
@@ -174,6 +194,7 @@ impl Runtime {
             inbound_rules: Arc::new(TokioRwLock::new(HashMap::new())),
             #[cfg(not(target_os = "macos"))]
             port_forwarders: Arc::new(TokioRwLock::new(HashMap::new())),
+            sandbox_port_keys: Arc::new(TokioRwLock::new(HashMap::new())),
             dns_entries: Arc::new(TokioRwLock::new(HashMap::new())),
             container_aliases: Arc::new(TokioRwLock::new(HashMap::new())),
         })
@@ -872,6 +893,63 @@ impl Runtime {
                 tracing::debug!("Stopped port forwarding for container {}", container_id);
             }
         }
+    }
+
+    /// Binds the host listener half of a sandbox port exposure.
+    ///
+    /// The guest half (reserved-port DNAT to the sandbox IP) is installed by
+    /// the agent; this forwards `host_port` into the guest relay port using
+    /// the same machinery as published container ports. Listeners are keyed
+    /// per exposure so `unexpose_sandbox_port` removes exactly one mapping.
+    pub async fn expose_sandbox_port(
+        &self,
+        machine_name: &str,
+        exposure: &SandboxPortExposure,
+    ) -> Result<()> {
+        let key = Self::sandbox_port_key(
+            &exposure.sandbox_id,
+            exposure.sandbox_port,
+            &exposure.protocol,
+        );
+        self.start_port_forwarding_for(
+            machine_name,
+            &key,
+            &[(
+                String::new(),
+                exposure.host_port,
+                exposure.guest_port,
+                exposure.protocol.clone(),
+            )],
+        )
+        .await?;
+        self.sandbox_port_keys
+            .write()
+            .await
+            .entry(exposure.sandbox_id.clone())
+            .or_default()
+            .push(key);
+        Ok(())
+    }
+
+    /// Removes the host listener of one sandbox port exposure.
+    pub async fn unexpose_sandbox_port(&self, sandbox_id: &str, sandbox_port: u16, protocol: &str) {
+        let key = Self::sandbox_port_key(sandbox_id, sandbox_port, protocol);
+        self.stop_port_forwarding_by_id(&key).await;
+        if let Some(keys) = self.sandbox_port_keys.write().await.get_mut(sandbox_id) {
+            keys.retain(|k| k != &key);
+        }
+    }
+
+    /// Removes every host listener a sandbox owns (Stop/Remove teardown).
+    pub async fn remove_sandbox_ports(&self, sandbox_id: &str) {
+        let keys = self.sandbox_port_keys.write().await.remove(sandbox_id);
+        for key in keys.unwrap_or_default() {
+            self.stop_port_forwarding_by_id(&key).await;
+        }
+    }
+
+    fn sandbox_port_key(sandbox_id: &str, sandbox_port: u16, protocol: &str) -> String {
+        format!("sandbox:{sandbox_id}:{sandbox_port}/{protocol}")
     }
 
     /// Registers DNS entries for a container.
