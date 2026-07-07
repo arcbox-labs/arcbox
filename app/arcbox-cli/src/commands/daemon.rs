@@ -212,11 +212,25 @@ fn lock_file_uptime(lock_file: &Path) -> Option<Duration> {
     SystemTime::now().duration_since(modified_at).ok()
 }
 
+/// How long to wait for the spawned daemon to take ownership of
+/// `daemon.lock` before reporting the spawn as complete (or failed, if
+/// the process already exited).
+const SPAWN_HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn spawn_background(args: &DaemonArgs) -> Result<()> {
     let layout = resolve_layout(args);
 
     std::fs::create_dir_all(&layout.run_dir).context("Failed to create daemon run directory")?;
     std::fs::create_dir_all(&layout.log_dir).context("Failed to create daemon log directory")?;
+
+    // Serialize concurrent `arcbox daemon start` invocations. The alive
+    // probe releases its flock immediately, so two racing starts could
+    // both see "not running" and both spawn a daemon — the flock loser
+    // then SIGTERMs the winner mid-boot via the stale-daemon takeover.
+    // The spawn lock is held from the alive check until the spawned
+    // daemon owns daemon.lock, closing that window. It is a separate
+    // file because daemon.lock is the daemon's own resource.
+    let _spawn_lock = SpawnLock::acquire(&layout.run_dir.join("daemon-spawn.lock"))?;
 
     if daemon_is_alive(&layout.lock_file) {
         let pid = read_lock_file(&layout.lock_file)?;
@@ -230,7 +244,7 @@ fn spawn_background(args: &DaemonArgs) -> Result<()> {
     // Daemon writes its own log files via tracing-appender — no fd
     // redirection needed. Discard stdout/stderr to avoid launchd capturing
     // duplicate output.
-    let child = Command::new(&daemon_binary)
+    let mut child = Command::new(&daemon_binary)
         .args(&daemon_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -246,11 +260,101 @@ fn spawn_background(args: &DaemonArgs) -> Result<()> {
     // The daemon acquires the flock and writes its own PID into
     // daemon.lock (see startup::lock::DaemonLock::acquire). The CLI
     // must not write to the lock file — it is the daemon's resource.
+    // Hold the spawn lock until that handoff completes; also catches a
+    // daemon that dies immediately (bad args, unwritable data dir)
+    // instead of reporting a successful start for a dead process.
+    wait_for_lock_handoff(&layout.lock_file, &mut child, &layout.daemon_log)?;
 
     println!("ArcBox daemon started (PID {})", child.id());
     println!("  Lock file: {}", layout.lock_file.display());
     println!("  Logs:     {}", layout.daemon_log.display());
     Ok(())
+}
+
+/// Polls until the spawned daemon holds `daemon.lock`, it exits, or the
+/// handoff times out (timeout is a warning, not an error — a slow start
+/// is not a failed one).
+///
+/// Handoff is detected by the lock file's PID content matching the child,
+/// not by a flock probe: the daemon writes its PID only after acquiring
+/// the lock, and probing with `flock(LOCK_EX | LOCK_NB)` here could win
+/// the lock in the instant the daemon attempts its own non-blocking
+/// acquire, shunting it into the stale-daemon takeover path against
+/// whatever old PID the file still holds.
+fn wait_for_lock_handoff(
+    lock_file: &Path,
+    child: &mut std::process::Child,
+    daemon_log: &Path,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + SPAWN_HANDOFF_TIMEOUT;
+    let child_pid = i32::try_from(child.id()).unwrap_or(-1);
+    loop {
+        if read_lock_file(lock_file).unwrap_or(None) == Some(child_pid) {
+            return Ok(());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("Failed to check spawned daemon status")?
+        {
+            bail!(
+                "Daemon exited during startup ({status}); see {}",
+                daemon_log.display()
+            );
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                "Daemon did not take the lock within {}s; it may still be starting",
+                SPAWN_HANDOFF_TIMEOUT.as_secs()
+            );
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Exclusive lock serializing `arcbox daemon start` spawners.
+///
+/// Held via RAII; the flock is released when the value drops. A held
+/// lock means another start is mid-spawn: acquisition blocks (the
+/// holder's critical section is bounded by [`SPAWN_HANDOFF_TIMEOUT`]),
+/// after which the daemon-alive re-check reports the actual outcome.
+struct SpawnLock {
+    _file: std::fs::File,
+}
+
+impl SpawnLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        use std::os::unix::io::AsRawFd;
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("Failed to open spawn lock {}", path.display()))?;
+
+        // SAFETY: flock on a valid owned fd.
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK)
+                || err.raw_os_error() == Some(libc::EAGAIN)
+            {
+                println!("Another `arcbox daemon start` is in progress, waiting...");
+                // SAFETY: blocking flock on the same valid fd; bounded by
+                // the holder's spawn-handoff timeout.
+                let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+                if ret != 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .with_context(|| format!("Failed to lock {}", path.display()));
+                }
+            } else {
+                return Err(err).with_context(|| format!("Failed to lock {}", path.display()));
+            }
+        }
+        Ok(Self { _file: file })
+    }
 }
 
 fn resolve_daemon_binary() -> Result<PathBuf> {
@@ -389,9 +493,107 @@ fn send_sigterm(pid: i32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::read_lock_file;
+    use super::{SpawnLock, read_lock_file, wait_for_lock_handoff};
     use std::fs;
+    use std::os::unix::io::AsRawFd;
     use tempfile::tempdir;
+
+    fn flock_nb(file: &fs::File) -> bool {
+        // SAFETY: flock on a valid fd owned by the test.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    }
+
+    #[test]
+    fn spawn_lock_excludes_second_holder_until_dropped() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("daemon-spawn.lock");
+
+        let lock = SpawnLock::acquire(&path).expect("first acquire should succeed");
+
+        // A second open file description must conflict while the lock is
+        // held, and succeed once it drops.
+        let probe = fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open probe fd");
+        assert!(!flock_nb(&probe), "spawn lock should be exclusive");
+
+        drop(lock);
+        // Release may lag by a fork window: a concurrent test spawning a
+        // child between acquire and drop briefly duplicates the fd into
+        // the child (closed again at exec via CLOEXEC). Poll instead of
+        // asserting instant release.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !flock_nb(&probe) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drop should release the flock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn lock_handoff_reports_daemon_that_died_during_startup() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let lock_file = dir.path().join("daemon.lock");
+        let daemon_log = dir.path().join("daemon.log");
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .expect("spawn test child");
+        // Let it exit before polling so the failure branch is deterministic.
+        child.wait().expect("child wait");
+
+        let err = wait_for_lock_handoff(&lock_file, &mut child, &daemon_log)
+            .expect_err("dead child must be reported");
+        assert!(err.to_string().contains("exited during startup"));
+    }
+
+    #[test]
+    fn lock_handoff_succeeds_once_child_pid_is_written() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let lock_file = dir.path().join("daemon.lock");
+        let daemon_log = dir.path().join("daemon.log");
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn test child");
+
+        // The daemon writes its own PID into daemon.lock after acquiring
+        // the flock — handoff keys on that content, never on the flock
+        // itself (a probe could race the daemon's non-blocking acquire).
+        fs::write(&lock_file, format!("{}\n", child.id())).expect("write lock file pid");
+
+        wait_for_lock_handoff(&lock_file, &mut child, &daemon_log)
+            .expect("handoff should succeed once the child pid is in the lock file");
+
+        child.kill().expect("kill test child");
+        child.wait().expect("reap test child");
+    }
+
+    #[test]
+    fn lock_handoff_ignores_stale_foreign_pid() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let lock_file = dir.path().join("daemon.lock");
+        let daemon_log = dir.path().join("daemon.log");
+
+        // Stale content from a previous daemon must not be mistaken for
+        // the handoff; the child exiting is then reported as a failure.
+        fs::write(&lock_file, "99999\n").expect("write stale pid");
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn test child");
+        child.wait().expect("child wait");
+
+        let err = wait_for_lock_handoff(&lock_file, &mut child, &daemon_log)
+            .expect_err("stale pid must not count as handoff");
+        assert!(err.to_string().contains("exited during startup"));
+    }
 
     #[test]
     fn read_lock_file_returns_none_when_missing() {

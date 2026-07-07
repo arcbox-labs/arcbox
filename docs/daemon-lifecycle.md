@@ -217,3 +217,20 @@ original holder's fd was closed on exit) and proceeds immediately.
 The CLI (`arcbox daemon status/stop/start`) also uses `flock` probing
 (`LOCK_EX | LOCK_NB`) rather than `kill(pid, 0)` for liveness detection.
 PID is only read from the lock file for SIGTERM delivery and display.
+
+### Spawn serialization (`daemon-spawn.lock`)
+
+The alive probe releases its flock immediately, so two racing
+`arcbox daemon start` invocations could both observe "not running" and
+both spawn a daemon — the flock loser would then displace the winner
+mid-boot via the stale-daemon takeover. To close this TOCTOU, the CLI
+holds a separate `daemon-spawn.lock` (in the run directory) from the
+alive check until the spawned daemon owns `daemon.lock` (bounded by a
+10 s handoff timeout). A concurrent start blocks on the spawn lock and
+then re-checks liveness, reporting "already running" instead of
+spawning a duplicate. `daemon.lock` itself remains exclusively the
+daemon's resource.
+
+launchd (`RunAtLoad`/`KeepAlive`) does not take the spawn lock; a
+launchd-vs-CLI race still resolves through the daemon-side takeover,
+which is orderly now that signals are handled during startup.
