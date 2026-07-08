@@ -129,14 +129,10 @@ pub struct Vmm {
     /// Times the IRQ callback unparked all vCPU threads.
     #[cfg(target_os = "macos")]
     hv_unpark_broadcasts: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// PSCI CPU_ON channel senders for secondary vCPUs (custom HV).
+    /// PSCI per-vCPU power registry (custom HV): power states plus the
+    /// CPU_ON wake channels for secondary vCPUs.
     #[cfg(target_os = "macos")]
-    #[allow(clippy::type_complexity)]
-    hv_cpu_on_senders: Option<
-        std::sync::Arc<
-            std::sync::Mutex<Vec<Option<std::sync::mpsc::Sender<darwin_hv::CpuOnRequest>>>>,
-        >,
-    >,
+    hv_cpu_power: Option<darwin_hv::CpuPower>,
     /// vmnet bridge interface for the bridge NIC (`vmnet` feature only).
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
     vmnet_bridge: Option<std::sync::Arc<arcbox_vmnet::Vmnet>>,
@@ -327,7 +323,7 @@ impl Vmm {
             #[cfg(target_os = "macos")]
             hv_unpark_broadcasts: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(target_os = "macos")]
-            hv_cpu_on_senders: None,
+            hv_cpu_power: None,
             #[cfg(all(target_os = "macos", feature = "vmnet"))]
             vmnet_bridge: None,
             #[cfg(all(target_os = "macos", feature = "vmnet"))]

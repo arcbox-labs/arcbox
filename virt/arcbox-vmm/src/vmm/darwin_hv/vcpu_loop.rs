@@ -15,7 +15,7 @@ use super::hvc_blk::{
     ARCBOX_HVC_BLK_FLUSH, ARCBOX_HVC_BLK_READ, ARCBOX_HVC_BLK_WRITE, ARCBOX_HVC_PROBE,
     handle_hvc_blk_flush, handle_hvc_blk_io,
 };
-use super::psci::{CpuOnSenders, handle_psci};
+use super::psci::{CpuPower, PsciExit, handle_psci};
 use super::{HvVcpuIds, Pl011, Pl031, VcpuThreadHandles};
 
 /// ARM64 register IDs re-exported from arcbox-hv.
@@ -57,9 +57,9 @@ pub(super) struct VcpuContext {
     pub pl011: Arc<std::sync::Mutex<Pl011>>,
     /// Shared PL031 RTC emulator backed by the host wall clock.
     pub pl031: Arc<std::sync::Mutex<Pl031>>,
-    /// Channel senders for waking secondary vCPUs via PSCI CPU_ON.
+    /// Per-vCPU power registry (states + CPU_ON wake channels).
     /// `None` when the VM has only one vCPU.
-    pub cpu_on_senders: Option<CpuOnSenders>,
+    pub cpu_power: Option<CpuPower>,
     /// Registry of vCPU thread handles used by the IRQ callback to
     /// unpark WFI-blocked threads.
     pub vcpu_thread_handles: VcpuThreadHandles,
@@ -139,6 +139,17 @@ fn complete_mmio_read(vcpu: &HvVcpu, vcpu_id: u32, mmio: &MmioInfo, raw: u64) {
     }
 }
 
+/// Why [`vcpu_run_loop`] returned.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum VcpuLoopExit {
+    /// VM shutdown or an unrecoverable setup failure: the thread must exit.
+    Shutdown,
+    /// The guest powered this CPU off via PSCI CPU_OFF. The thread should
+    /// park on its CPU_ON receiver and call [`vcpu_run_loop`] again when a
+    /// new request arrives (secondaries only; the BSP is never offlined).
+    CpuOff,
+}
+
 /// Runs a single vCPU in a loop, dispatching MMIO traps to the device manager.
 ///
 /// This function is intended to be called from a dedicated thread per vCPU.
@@ -154,7 +165,12 @@ fn complete_mmio_read(vcpu: &HvVcpu, vcpu_id: u32, mmio: &MmioInfo, raw: u64) {
 /// * `x0_value` — Initial value of X0. For the BSP this is the FDT address;
 ///   for a secondary vCPU it is the context_id from PSCI CPU_ON.
 /// * `ctx` — Shared resources for the vCPU (device manager, IRQ state, etc.).
-pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: VcpuContext) {
+pub(super) fn vcpu_run_loop(
+    vcpu_id: u32,
+    entry_addr: u64,
+    x0_value: u64,
+    ctx: VcpuContext,
+) -> VcpuLoopExit {
     let VcpuContext {
         device_manager,
         running,
@@ -162,7 +178,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
         paused,
         pl011,
         pl031,
-        cpu_on_senders,
+        cpu_power,
         vcpu_thread_handles,
         hv_vcpu_ids,
         hvc_blk_fds,
@@ -173,7 +189,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
         Ok(v) => v,
         Err(e) => {
             tracing::error!("vCPU {vcpu_id}: creation failed: {e}");
-            return;
+            return VcpuLoopExit::Shutdown;
         }
     };
 
@@ -184,18 +200,18 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
     //   CPSR = EL1h, DAIF masked
     if let Err(e) = vcpu.set_reg(reg::PC, entry_addr) {
         tracing::error!("vCPU {vcpu_id}: set PC failed: {e}");
-        return;
+        return VcpuLoopExit::Shutdown;
     }
     if let Err(e) = vcpu.set_reg(reg::X0, x0_value) {
         tracing::error!("vCPU {vcpu_id}: set X0 failed: {e}");
-        return;
+        return VcpuLoopExit::Shutdown;
     }
     let _ = vcpu.set_reg(reg::X1, 0);
     let _ = vcpu.set_reg(reg::X2, 0);
     let _ = vcpu.set_reg(reg::X3, 0);
     if let Err(e) = vcpu.set_reg(reg::CPSR, CPSR_EL1H) {
         tracing::error!("vCPU {vcpu_id}: set CPSR failed: {e}");
-        return;
+        return VcpuLoopExit::Shutdown;
     }
 
     // ARM64 boot protocol: MMU must be off, caches can be on or off.
@@ -216,7 +232,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
     if let Err(e) = vcpu.set_sys_reg(arcbox_hv::sys_reg::HV_SYS_REG_MPIDR_EL1, mpidr) {
         tracing::error!("vCPU {vcpu_id}: set MPIDR_EL1 failed: {e}; aborting boot");
         running.store(false, Ordering::SeqCst);
-        return;
+        return VcpuLoopExit::Shutdown;
     }
     match vcpu.get_sys_reg(arcbox_hv::sys_reg::HV_SYS_REG_MPIDR_EL1) {
         Ok(v) if v & 0xFF == u64::from(vcpu_id) => {}
@@ -227,12 +243,12 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                 v & 0xFF,
             );
             running.store(false, Ordering::SeqCst);
-            return;
+            return VcpuLoopExit::Shutdown;
         }
         Err(e) => {
             tracing::error!("vCPU {vcpu_id}: MPIDR_EL1 readback failed: {e}; aborting boot");
             running.store(false, Ordering::SeqCst);
-            return;
+            return VcpuLoopExit::Shutdown;
         }
     }
 
@@ -264,6 +280,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
         SCTLR_EL1_RESET,
     );
 
+    let mut loop_exit = VcpuLoopExit::Shutdown;
     loop {
         if !running.load(Ordering::Relaxed) {
             tracing::info!("vCPU {vcpu_id}: shutdown requested");
@@ -510,15 +527,19 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                     }
                     _ => {
                         // PSCI and other standard calls.
-                        handle_psci(
+                        let psci_exit = handle_psci(
                             vcpu_id,
                             func_id,
                             &vcpu,
                             &running,
                             &reset_requested,
-                            cpu_on_senders.as_ref(),
+                            cpu_power.as_ref(),
                         );
                         if !running.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if psci_exit == PsciExit::CpuOff {
+                            loop_exit = VcpuLoopExit::CpuOff;
                             break;
                         }
                     }
@@ -535,15 +556,19 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                handle_psci(
+                let psci_exit = handle_psci(
                     vcpu_id,
                     func_id,
                     &vcpu,
                     &running,
                     &reset_requested,
-                    cpu_on_senders.as_ref(),
+                    cpu_power.as_ref(),
                 );
                 if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                if psci_exit == PsciExit::CpuOff {
+                    loop_exit = VcpuLoopExit::CpuOff;
                     break;
                 }
             }
@@ -624,7 +649,27 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
     // Flush any remaining UART output.
     pl011.lock().unwrap().flush();
 
-    tracing::info!("vCPU {vcpu_id}: exited");
+    if loop_exit == VcpuLoopExit::CpuOff {
+        // Unregister before dropping the HvVcpu: a stale raw handle in the
+        // ID registry would make the next `hv_vcpus_exit` pass a dangling
+        // handle to Apple's framework (UB per its contract, ABX-367), and a
+        // stale thread handle would take unparks meant for live vCPUs. The
+        // re-onlined loop re-registers both after setup succeeds.
+        let raw = vcpu.raw_handle();
+        hv_vcpu_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|&id| id != raw);
+        let self_id = std::thread::current().id();
+        vcpu_thread_handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|t| t.id() != self_id);
+        tracing::info!("vCPU {vcpu_id}: offline (CPU_OFF), awaiting CPU_ON");
+    } else {
+        tracing::info!("vCPU {vcpu_id}: exited");
+    }
+    loop_exit
 }
 
 #[cfg(test)]

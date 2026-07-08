@@ -1,11 +1,11 @@
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 
 use crate::error::{Result, VmmError};
 
 use super::pl011::Pl011;
 use super::pl031::Pl031;
-use super::psci::{CpuOnRequest, CpuOnSenders};
-use super::vcpu_loop::{VcpuContext, vcpu_run_loop};
+use super::psci::{CpuOnRequest, CpuPower, CpuPowerRegistry};
+use super::vcpu_loop::{VcpuContext, VcpuLoopExit, vcpu_run_loop};
 use super::*;
 
 impl Vmm {
@@ -258,27 +258,25 @@ impl Vmm {
             .collect();
         self.hv_vcpu_stats.clone_from(&vcpu_stats);
 
-        // --- Set up PSCI CPU_ON channels for secondary vCPUs ---
+        // --- Set up the PSCI power registry for secondary vCPUs ---
         // The registry is shared with *every* vCPU thread — the BSP and each
         // secondary — so a CPU_ON issued from any CPU can reach any target.
         // Linux may bring a secondary online from a CPU other than the BSP
         // (CPU hotplug, some resume paths); handing the secondaries `None`
         // here made every such call return NOT_SUPPORTED.
-        let cpu_on_senders: Option<CpuOnSenders> = if vcpu_count > 1 {
-            let senders: CpuOnSenders =
-                Arc::new(Mutex::new(Vec::with_capacity(vcpu_count as usize)));
-            senders
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(None); // Slot 0 = BSP
-
-            for i in 1..vcpu_count {
+        let cpu_power: Option<CpuPower> = if vcpu_count > 1 {
+            let mut senders: Vec<Option<mpsc::Sender<CpuOnRequest>>> =
+                Vec::with_capacity(vcpu_count as usize);
+            senders.push(None); // Slot 0 = BSP
+            let mut receivers = Vec::with_capacity(vcpu_count as usize - 1);
+            for _ in 1..vcpu_count {
                 let (tx, rx) = mpsc::channel::<CpuOnRequest>();
-                senders
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(Some(tx));
+                senders.push(Some(tx));
+                receivers.push(rx);
+            }
+            let registry = CpuPowerRegistry::from_senders(senders);
 
+            for (i, rx) in (1..vcpu_count).zip(receivers) {
                 let r = running.clone();
                 let p = paused.clone();
                 let rr = reset_requested.clone();
@@ -289,45 +287,50 @@ impl Vmm {
                 let rtc = pl031.clone();
                 let hvc_fds_clone = self.hvc_blk_fds.clone();
                 let stats = vcpu_stats[i as usize].clone();
-                let senders_for_thread = senders.clone();
+                let registry_for_thread = registry.clone();
 
+                // The thread parks on its receiver until CPU_ON, runs the
+                // vCPU, and — when the guest offlines it via CPU_OFF —
+                // parks again for the next CPU_ON. It exits when the
+                // registry is closed (stop) or the VM shuts down.
                 let t = std::thread::Builder::new()
                     .name(format!("hv-vcpu-{i}"))
-                    .spawn(move || match rx.recv() {
-                        Ok(req) => {
+                    .spawn(move || {
+                        while let Ok(req) = rx.recv() {
                             tracing::info!(
                                 "vCPU {i}: received CPU_ON, starting at {:#x}",
                                 req.entry_point
                             );
-                            vcpu_run_loop(
+                            let exit = vcpu_run_loop(
                                 i,
                                 req.entry_point,
                                 req.context_id,
                                 VcpuContext {
-                                    device_manager: dm,
-                                    running: r,
-                                    reset_requested: rr,
-                                    paused: p,
-                                    pl011: uart,
-                                    pl031: rtc,
-                                    cpu_on_senders: Some(senders_for_thread),
-                                    vcpu_thread_handles: th,
-                                    hv_vcpu_ids: ids,
-                                    hvc_blk_fds: hvc_fds_clone,
-                                    stats,
+                                    device_manager: dm.clone(),
+                                    running: r.clone(),
+                                    reset_requested: rr.clone(),
+                                    paused: p.clone(),
+                                    pl011: uart.clone(),
+                                    pl031: rtc.clone(),
+                                    cpu_power: Some(registry_for_thread.clone()),
+                                    vcpu_thread_handles: th.clone(),
+                                    hv_vcpu_ids: ids.clone(),
+                                    hvc_blk_fds: hvc_fds_clone.clone(),
+                                    stats: stats.clone(),
                                 },
                             );
+                            if exit != VcpuLoopExit::CpuOff {
+                                return;
+                            }
                         }
-                        Err(_) => {
-                            tracing::debug!("vCPU {i}: channel closed, never started");
-                        }
+                        tracing::debug!("vCPU {i}: channel closed, exiting");
                     })
                     .map_err(|e| VmmError::Vcpu(format!("spawn vcpu-{i}: {e}")))?;
                 self.hv_vcpu_threads.push(t);
             }
 
-            self.hv_cpu_on_senders = Some(senders.clone());
-            Some(senders)
+            self.hv_cpu_power = Some(registry.clone());
+            Some(registry)
         } else {
             None
         };
@@ -351,7 +354,7 @@ impl Vmm {
                             paused,
                             pl011,
                             pl031,
-                            cpu_on_senders,
+                            cpu_power,
                             vcpu_thread_handles,
                             hv_vcpu_ids: bsp_hv_vcpu_ids,
                             hvc_blk_fds,
@@ -378,14 +381,17 @@ impl Vmm {
         self.running
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
-        // Drop the PSCI CPU_ON channel senders. Secondary vCPU threads
-        // spawn with `rx.recv()` waiting for a CPU_ON request; when the
-        // guest only brought up the BSP they stay parked indefinitely.
-        // Dropping the senders makes their `recv()` return `Err(RecvError)`
-        // so they exit the recv and hit the `running=false` check. See
-        // ABX-364 — before this drop the secondary vCPU join could take
-        // 20+ seconds.
-        self.hv_cpu_on_senders.take();
+        // Close the PSCI power registry. Secondary vCPU threads park on
+        // `rx.recv()` while off (never CPU_ON'd, or offlined via CPU_OFF);
+        // closing drops every sender under the registry lock so their
+        // `recv()` returns `Err(RecvError)` and the threads exit. See
+        // ABX-364 — before this the secondary vCPU join could take 20+
+        // seconds. `close()` (not just dropping our handle) is required
+        // because every vCPU thread holds its own registry Arc, which
+        // keeps the senders alive.
+        if let Some(registry) = self.hv_cpu_power.take() {
+            registry.close();
+        }
 
         // Drop block-I/O worker senders so `rx.recv()` in
         // `blk_io_worker_loop` returns `Err(RecvError)` and the workers

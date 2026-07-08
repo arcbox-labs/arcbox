@@ -46,7 +46,7 @@ pub(super) use pl011::Pl011;
 #[cfg(test)]
 use pl011::{PL011_BASE, PL011_DR, PL011_FR, PL011_SIZE};
 pub(super) use pl031::Pl031;
-pub use psci::CpuOnRequest;
+pub use psci::CpuPower;
 
 /// Shared registry of vCPU thread handles for WFI unparking.
 ///
