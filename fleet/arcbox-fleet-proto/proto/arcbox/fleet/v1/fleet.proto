@@ -123,6 +123,7 @@ message AttachResponse {
     CancelRunner cancel = 2;
     Drain drain = 3;
     OfferVerdictAck offer_verdict_ack = 4;
+    Keepalive keepalive = 5;
   }
 }
 
@@ -158,3 +159,9 @@ message CancelRunner {
 
 // Stop accepting new work ahead of removal.
 message Drain {}
+
+// No-op the gateway sends back for every Heartbeat, riding the agent's own
+// cadence so a proxy in front of the gateway (e.g. Cloudflare) sees
+// server->client traffic and never idle-times-out the stream. The agent
+// ignores it.
+message Keepalive {}

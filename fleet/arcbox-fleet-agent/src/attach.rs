@@ -331,6 +331,10 @@ fn dispatch(supervisor: &RunnerSupervisor, msg: Option<attach_response::Msg>) {
         Some(attach_response::Msg::OfferVerdictAck(ack)) => {
             supervisor.handle_ack(&ack.offer_token);
         }
+        // No-op the gateway acks each heartbeat with, purely so a proxy in
+        // front of the gateway (e.g. Cloudflare) sees server->client traffic
+        // and never idle-times-out the stream.
+        Some(attach_response::Msg::Keepalive(_)) => {}
         None => {}
     }
 }
