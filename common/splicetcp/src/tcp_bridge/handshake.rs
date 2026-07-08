@@ -421,10 +421,11 @@ impl TcpBridge {
                 let conn = self.handshake_conns.remove(&key)?;
                 let our_seq = conn.our_isn.wrapping_add(1);
                 let last_ack = conn.peer_isn.wrapping_add(1);
+                let peer_mss = conn.peer_mss;
                 let Some(stream) = conn.host_stream else {
                     return Some(Vec::new());
                 };
-                self.promote_to_fast_path(key, stream, our_seq, last_ack);
+                self.promote_to_fast_path(key, stream, our_seq, last_ack, peer_mss);
                 Some(Vec::new())
             }
             HandshakeRole::ActiveOpen => {
@@ -452,6 +453,12 @@ impl TcpBridge {
                 if peer_opts.sack_permitted {
                     conn.peer_sack = true;
                 }
+                // Record the guest endpoint's real MSS so host→guest segments
+                // are sized to what it can forward (a bridged container behind
+                // eth0 advertises its own, smaller, veth MSS here).
+                if let Some(mss) = peer_opts.mss {
+                    conn.peer_mss = mss;
+                }
 
                 // Build ACK completing the handshake.
                 let our_seq = conn.our_isn.wrapping_add(1);
@@ -470,10 +477,11 @@ impl TcpBridge {
                         dst_mac: conn.guest_mac,
                     });
 
+                let peer_mss = conn.peer_mss;
                 let Some(stream) = conn.host_stream else {
                     return Some(vec![ack_frame]);
                 };
-                self.promote_to_fast_path(key, stream, our_seq, last_ack);
+                self.promote_to_fast_path(key, stream, our_seq, last_ack, peer_mss);
                 Some(vec![ack_frame])
             }
         }

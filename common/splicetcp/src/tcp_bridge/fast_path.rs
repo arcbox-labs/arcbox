@@ -1,4 +1,4 @@
-use super::{FastPathConn, SynFlowKey, TcpBridge};
+use super::{FastPathConn, SynFlowKey, TCP_MIN_MSS, TcpBridge};
 use crate::ethernet::ETH_HEADER_LEN;
 use std::net::Ipv4Addr;
 
@@ -240,11 +240,19 @@ impl TcpBridge {
                             .fetch_add(data.len() as u32, std::sync::atomic::Ordering::Relaxed);
                         frames.push(data_frame);
                     } else {
-                        // Non-GSO path: segment at the configured guest MSS so
-                        // each emitted IP packet fits the consumer's MTU.
+                        // Non-GSO path: segment at the smaller of the configured
+                        // guest MSS and the MSS the peer advertised, so each
+                        // emitted IP packet fits every link on the path to the
+                        // guest endpoint — including a 1500-MTU docker bridge
+                        // behind a 4000-MTU eth0. Without the peer_mss bound a
+                        // container silently drops these oversized frames and
+                        // Host→VM stalls.
+                        let seg = self
+                            .fast_path_guest_mss
+                            .min(conn.peer_mss.max(TCP_MIN_MSS) as usize);
                         let mut offset = 0;
                         while offset < data.len() {
-                            let chunk_end = (offset + self.fast_path_guest_mss).min(data.len());
+                            let chunk_end = (offset + seg).min(data.len());
                             let chunk = &data[offset..chunk_end];
                             let seq_now = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
                             let data_frame = crate::ethernet::build_tcp_data_frame(
@@ -329,6 +337,7 @@ impl TcpBridge {
         stream: std::net::TcpStream,
         our_seq: u32,
         last_ack: u32,
+        peer_mss: u16,
     ) {
         // Set non-blocking for polling in the event loop.
         stream.set_nonblocking(true).ok();
@@ -407,6 +416,7 @@ impl TcpBridge {
                 guest_ip: key.src_ip,
                 remote_port: key.dst_port,
                 guest_port: key.src_port,
+                peer_mss,
                 read_buf: if inline_owned {
                     Vec::new()
                 } else {
