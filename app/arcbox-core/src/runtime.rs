@@ -770,6 +770,7 @@ impl Runtime {
         }
 
         let mut added_rules = Vec::new();
+        let mut bind_errors: Vec<String> = Vec::new();
 
         for (host_ip_str, host_port, container_port, protocol) in bindings {
             let proto = match protocol.to_lowercase().as_str() {
@@ -802,9 +803,21 @@ impl Runtime {
                     protocol,
                     e,
                 );
+                bind_errors.push(format!("{host_ip_str}:{host_port}/{protocol}: {e}"));
                 continue;
             }
             added_rules.push((host_ip, *host_port, proto));
+        }
+
+        // Surface a total bind failure instead of reporting success. A sandbox
+        // expose is a single binding, so a swallowed port conflict would claim
+        // "exposed on localhost" while nothing is actually listening. Docker
+        // multi-port publish stays best-effort as long as one port binds.
+        if added_rules.is_empty() && !bindings.is_empty() {
+            return Err(CoreError::Machine(format!(
+                "no requested port could be bound: {}",
+                bind_errors.join("; ")
+            )));
         }
 
         if !added_rules.is_empty() {
