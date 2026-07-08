@@ -24,6 +24,10 @@ use tokio::process::Command;
 const PORT_RANGE_START: u16 = 40000;
 /// Last port of the reserved guest relay range (inclusive).
 const PORT_RANGE_END: u16 = 49999;
+/// iptables `--comment` tag stamped on every sandbox DNAT rule, so rules left
+/// behind by a crashed/restarted agent can be identified and flushed (they are
+/// otherwise untracked kernel state that would misroute after IP reuse).
+const RULE_COMMENT: &str = "arcbox-sbx";
 
 /// Transport protocol of a forwarded port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -114,19 +118,20 @@ impl PortForwardManager {
         protocol: Protocol,
     ) -> Result<()> {
         let key = (sandbox_id.to_owned(), sandbox_port, protocol);
-        if let Some(rule) = self.rules.remove(&key) {
-            run_iptables(&prepend(
-                &["-t", "nat", "-D", "PREROUTING"],
-                &rule.rule_args,
-            ))
+        let Some(rule) = self.rules.get(&key) else {
+            return Ok(()); // idempotent: nothing to remove
+        };
+        let del_args = prepend(&["-t", "nat", "-D", "PREROUTING"], &rule.rule_args);
+        let guest_port = rule.guest_port;
+
+        // Delete the kernel rule BEFORE dropping the record. If the delete fails
+        // (e.g. transient lock contention) the record is kept so a retry can
+        // still remove the rule instead of leaking it and reporting success.
+        run_iptables(&del_args)
             .await
             .context("removing DNAT rule")?;
-            tracing::info!(
-                sandbox_id,
-                guest_port = rule.guest_port,
-                "sandbox port forward removed"
-            );
-        }
+        self.rules.remove(&key);
+        tracing::info!(sandbox_id, guest_port, "sandbox port forward removed");
         Ok(())
     }
 
@@ -172,11 +177,68 @@ fn dnat_rule_args(
         protocol.iptables_name().into(),
         "--dport".into(),
         guest_port.to_string(),
+        "-m".into(),
+        "comment".into(),
+        "--comment".into(),
+        RULE_COMMENT.into(),
         "-j".into(),
         "DNAT".into(),
         "--to-destination".into(),
         format!("{sandbox_ip}:{sandbox_port}"),
     ]
+}
+
+/// If `line` (an `iptables -t nat -S PREROUTING` entry) is an arcbox sandbox
+/// DNAT rule, return the argv that deletes it. Used by [`flush_orphan_rules`]
+/// to reap rules a previous agent left behind.
+fn orphan_delete_args(line: &str) -> Option<Vec<String>> {
+    let spec = line.strip_prefix("-A PREROUTING ")?;
+    if !spec.contains(RULE_COMMENT) {
+        return None;
+    }
+    let mut args = vec![
+        "-t".to_owned(),
+        "nat".to_owned(),
+        "-D".to_owned(),
+        "PREROUTING".to_owned(),
+    ];
+    args.extend(spec.split_whitespace().map(str::to_owned));
+    Some(args)
+}
+
+/// Delete every arcbox sandbox DNAT rule left in `PREROUTING` by a previous
+/// agent process.
+///
+/// In-memory [`PortForwardManager`] state is authoritative and is empty at
+/// startup, so any tagged rule still in the kernel is an orphan: the sandbox it
+/// pointed at was torn down by the crash-recovery sweep, and leaving the rule
+/// would misroute traffic once its `172.20.x` IP is reassigned. Best-effort —
+/// a missing `iptables` (no rules to leak) or an individual delete failure only
+/// degrades cleanup.
+pub async fn flush_orphan_rules() {
+    let output = match Command::new("/sbin/iptables")
+        .args(["-t", "nat", "-S", "PREROUTING"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let mut removed = 0usize;
+    for line in listing.lines() {
+        if let Some(args) = orphan_delete_args(line)
+            && run_iptables(&args).await.is_ok()
+        {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(
+            removed,
+            "flushed orphaned sandbox DNAT rules from a previous agent"
+        );
+    }
 }
 
 fn prepend(head: &[&str], tail: &[String]) -> Vec<String> {
@@ -215,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn dnat_spec_is_symmetric_for_install_and_delete() {
+    fn dnat_spec_is_symmetric_and_tagged() {
         let args = dnat_rule_args(40000, Ipv4Addr::new(172, 20, 0, 2), 8080, Protocol::Tcp);
         assert_eq!(
             args,
@@ -224,12 +286,36 @@ mod tests {
                 "tcp",
                 "--dport",
                 "40000",
+                "-m",
+                "comment",
+                "--comment",
+                "arcbox-sbx",
                 "-j",
                 "DNAT",
                 "--to-destination",
                 "172.20.0.2:8080"
             ]
         );
+    }
+
+    #[test]
+    fn orphan_delete_targets_only_tagged_prerouting_rules() {
+        // A tagged arcbox rule (as `iptables -S` prints it, with the implicit
+        // `-m tcp`) is converted from -A to a -D argv.
+        let line = "-A PREROUTING -p tcp -m tcp --dport 40000 -m comment \
+                    --comment arcbox-sbx -j DNAT --to-destination 172.20.0.2:8080";
+        let args = orphan_delete_args(line).expect("tagged rule should match");
+        assert_eq!(args[..4], ["-t", "nat", "-D", "PREROUTING"]);
+        assert_eq!(args.last().unwrap(), "172.20.0.2:8080");
+        assert!(args.iter().any(|a| a == "arcbox-sbx"));
+
+        // A foreign rule (e.g. Docker's) is left untouched.
+        let docker = "-A PREROUTING -p tcp -m tcp --dport 8080 -j DNAT \
+                      --to-destination 172.17.0.2:80";
+        assert!(orphan_delete_args(docker).is_none());
+
+        // A non-PREROUTING line is ignored.
+        assert!(orphan_delete_args("-N DOCKER").is_none());
     }
 
     #[test]

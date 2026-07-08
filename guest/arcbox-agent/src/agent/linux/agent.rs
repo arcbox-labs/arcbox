@@ -32,6 +32,11 @@ impl Agent {
         // rather than on the first sandbox request.
         let _ = sandbox_service();
 
+        // Flush sandbox DNAT rules left over from a previous agent process: the
+        // in-memory forward table starts empty, so any tagged rule still in the
+        // kernel is an orphan whose sandbox the crash-recovery sweep destroyed.
+        super::port_forward::flush_orphan_rules().await;
+
         // Start guest-side Docker API proxy (vsock -> unix socket).
         tokio::spawn(async {
             if let Err(e) = run_docker_api_proxy().await {
