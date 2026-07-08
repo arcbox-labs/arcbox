@@ -507,3 +507,67 @@ async fn poll_fast_path_clamps_segments_to_peer_mss() {
         frames.len()
     );
 }
+
+/// Regression: the GSO/large-frame path (HV) is gated on the peer accepting the
+/// fixed 1460-byte GSO segments. A peer that advertised a smaller MSS (e.g. a
+/// sub-1500 overlay bridge) must fall back to the clamped polling path instead
+/// of a single super-frame the guest would re-segment at 1460 and drop.
+#[tokio::test]
+async fn large_frames_below_gso_mss_falls_back_to_clamped_segmentation() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+    bridge.enable_large_frames(); // HV-style large-frame mode…
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let client = client.unwrap();
+    let (mut accepted, _) = accepted.unwrap();
+
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 12345,
+        dst_ip: Ipv4Addr::new(198, 18, 30, 95),
+        dst_port: 443,
+    };
+    // …but the peer advertised MSS 1400, below the 1460 GSO segment size.
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 1400);
+
+    let payload = vec![0xAB; 5000];
+    accepted.write_all(&payload).await.unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let batch = bridge.poll_fast_path();
+        let had_new = !batch.is_empty();
+        frames.extend(batch);
+        let received: usize = frames
+            .iter()
+            .map(|frame| frame.len().saturating_sub(ETH_HEADER_LEN + 40))
+            .sum();
+        if received >= payload.len() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        if !had_new {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    // Not a single 5000-byte super-frame: clamped to the 1400 peer MSS.
+    assert!(
+        frames.iter().all(|frame| {
+            let ip_len = u16::from_be_bytes([frame[ETH_HEADER_LEN + 2], frame[ETH_HEADER_LEN + 3]]);
+            ip_len <= 1440 // 1400 payload + 20 IP + 20 TCP
+        }),
+        "sub-GSO-MSS peer must stay on the clamped path, not emit a super-frame",
+    );
+    assert!(
+        frames.len() >= 4,
+        "expected ≥4 clamped segments, got {}",
+        frames.len()
+    );
+}

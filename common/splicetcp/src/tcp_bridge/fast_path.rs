@@ -1,4 +1,4 @@
-use super::{FastPathConn, SynFlowKey, TCP_MIN_MSS, TcpBridge};
+use super::{FastPathConn, GSO_SEGMENT_MSS, SynFlowKey, TCP_MIN_MSS, TcpBridge};
 use crate::ethernet::ETH_HEADER_LEN;
 use std::net::Ipv4Addr;
 
@@ -215,9 +215,11 @@ impl TcpBridge {
                     conn.down_bytes += n as u64;
                     // Channel/inject path: send the entire read as one large
                     // frame (the inject thread's GSO hint lets the guest
-                    // re-segment at MSS).
+                    // re-segment at MSS). Gated on the peer accepting the fixed
+                    // 1460-byte GSO segments; a smaller-MSS peer falls through to
+                    // the clamped segmentation below.
                     let data = &conn.read_buf[..n];
-                    if self.large_frames_enabled {
+                    if self.large_frames_enabled && conn.peer_mss >= GSO_SEGMENT_MSS {
                         let large = ETH_HEADER_LEN + 40 + data.len() > 1500;
                         let seq_now = conn.our_seq.load(std::sync::atomic::Ordering::Relaxed);
                         let params = crate::ethernet::TcpFrameParams {
@@ -359,7 +361,12 @@ impl TcpBridge {
         // immediately for zero-copy host→guest reads.
         let mut inline_owned = false;
 
-        if let Some(ref sink) = self.conn_sink {
+        // Only hand a flow to the inline/GSO inject path when its peer can accept
+        // the fixed 1460-byte GSO segments that path emits. A smaller-MSS peer
+        // (e.g. a sub-1500 overlay bridge behind eth0) stays on the clamped
+        // polling path below, where each segment matches its advertised MSS.
+        let inline_eligible = peer_mss >= GSO_SEGMENT_MSS;
+        if let Some(sink) = self.conn_sink.as_ref().filter(|_| inline_eligible) {
             match stream.try_clone() {
                 Ok(cloned) => {
                     let gw_mac = self.fast_path_gateway_mac;

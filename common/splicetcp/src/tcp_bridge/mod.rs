@@ -70,6 +70,14 @@ const SHIM_MSS: u16 = 1460;
 /// guards against a missing or malformed MSS option collapsing segments to 0.
 const TCP_MIN_MSS: u16 = 536;
 
+/// Fixed segment size the GSO/inline injection paths let the guest re-segment
+/// at (the `gso_size` stamped by `arcbox-net-inject`'s `write_inline_headers`
+/// and `inject_one_frame` — keep in sync). A flow whose peer advertised a
+/// smaller MSS must NOT take the GSO path, or the guest re-segments at 1460 and
+/// drops frames it can't forward onto its smaller link; such flows stay on the
+/// non-GSO polling path where each segment is clamped to the exact peer MSS.
+const GSO_SEGMENT_MSS: u16 = 1460;
+
 /// Monotonically advancing ISN source. Stepped by a large odd constant
 /// (Knuth multiplicative) for well-distributed values without a `rand`
 /// dependency.
