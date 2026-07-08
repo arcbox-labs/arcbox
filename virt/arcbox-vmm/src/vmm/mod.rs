@@ -129,14 +129,10 @@ pub struct Vmm {
     /// Times the IRQ callback unparked all vCPU threads.
     #[cfg(target_os = "macos")]
     hv_unpark_broadcasts: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// PSCI CPU_ON channel senders for secondary vCPUs (custom HV).
+    /// PSCI per-vCPU power registry (custom HV): power states plus the
+    /// CPU_ON wake channels for secondary vCPUs.
     #[cfg(target_os = "macos")]
-    #[allow(clippy::type_complexity)]
-    hv_cpu_on_senders: Option<
-        std::sync::Arc<
-            std::sync::Mutex<Vec<Option<std::sync::mpsc::Sender<darwin_hv::CpuOnRequest>>>>,
-        >,
-    >,
+    hv_cpu_power: Option<darwin_hv::CpuPower>,
     /// vmnet bridge interface for the bridge NIC (`vmnet` feature only).
     #[cfg(all(target_os = "macos", feature = "vmnet"))]
     vmnet_bridge: Option<std::sync::Arc<arcbox_vmnet::Vmnet>>,
@@ -327,7 +323,7 @@ impl Vmm {
             #[cfg(target_os = "macos")]
             hv_unpark_broadcasts: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(target_os = "macos")]
-            hv_cpu_on_senders: None,
+            hv_cpu_power: None,
             #[cfg(all(target_os = "macos", feature = "vmnet"))]
             vmnet_bridge: None,
             #[cfg(all(target_os = "macos", feature = "vmnet"))]
@@ -842,6 +838,14 @@ impl Vmm {
     /// macOS-only: the VF stop call can crash when the guest has already
     /// halted via ACPI. FDs and network resources are still cleaned up.
     /// Must only be called after ACPI shutdown.
+    ///
+    /// Only the VZ backend honors the skip: on the custom HV backend the
+    /// full stop path still runs on drop, because guest halt does not tear
+    /// down the host side — the io workers (vsock, blk, net-rx, console)
+    /// keep referencing guest RAM and must be joined before the mapping
+    /// drops (ABX-415), and `stop_darwin_hv` is safe after a guest halt
+    /// (the vCPU threads have already exited, so its cancel loop and joins
+    /// return immediately).
     #[cfg(target_os = "macos")]
     pub fn set_skip_hypervisor_stop(&mut self) {
         self.skip_hypervisor_stop = true;
@@ -852,13 +856,21 @@ impl Vmm {
 impl Drop for Vmm {
     fn drop(&mut self) {
         if self.state != VmmState::Stopped && self.state != VmmState::Created {
-            if self.skip_hypervisor_stop {
-                // The hypervisor stop path is unsafe (VF may crash when guest
-                // already halted). Only clean up network resources.
+            #[cfg(target_os = "macos")]
+            let skip = self.skip_hypervisor_stop && self.config.backend == VmBackend::Vz;
+            #[cfg(not(target_os = "macos"))]
+            let skip = self.skip_hypervisor_stop;
+            if skip {
+                // The VZ framework stop path is unsafe (VF may crash when
+                // the guest already halted). Only clean up network resources.
                 #[cfg(target_os = "macos")]
                 self.stop_network();
                 self.state = VmmState::Stopped;
             } else {
+                // Full teardown. On the HV backend this MUST run even when
+                // `skip_hypervisor_stop` is set: dropping guest memory while
+                // the io workers still run is a use-after-free that crashed
+                // the daemon on every guest-initiated poweroff (ABX-415).
                 let _ = self.stop();
             }
         }

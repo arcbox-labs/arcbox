@@ -46,9 +46,25 @@ impl VmnetRelay {
     ///
     /// Returns an error if the `AsyncFd` cannot be created.
     pub async fn run(self, guest_fd: OwnedFd) -> std::io::Result<()> {
+        // The fd MUST be non-blocking: `AsyncFd` requires it, and a blocking
+        // `read` here wedges the task inside the syscall — the select below
+        // never regains control, cancellation cannot propagate to the
+        // vmnet→guest worker, and the tokio blocking pool then waits forever
+        // in `Runtime::drop`, hanging daemon shutdown. (The write side
+        // already assumes non-blocking: it treats `WouldBlock` as guest
+        // backpressure.) `dup` shares the file status flags, so this covers
+        // the cloned writer fd too.
+        let raw_fd = guest_fd.as_raw_fd();
+        // SAFETY: fcntl F_GETFL/F_SETFL on a valid, owned fd.
+        unsafe {
+            let flags = libc::fcntl(raw_fd, libc::F_GETFL);
+            if flags < 0 || libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+
         // Clone the fd for the blocking thread (vmnet → guest direction).
         // SAFETY: dup is safe on a valid fd.
-        let raw_fd = guest_fd.as_raw_fd();
         let dup_fd = unsafe { libc::dup(raw_fd) };
         if dup_fd < 0 {
             return Err(std::io::Error::last_os_error());

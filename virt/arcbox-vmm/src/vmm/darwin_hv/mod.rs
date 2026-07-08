@@ -36,6 +36,7 @@ mod inline_sink;
 mod lifecycle;
 mod network;
 pub(super) mod pl011;
+pub(super) mod pl031;
 mod psci;
 mod setup;
 mod vcpu_loop;
@@ -44,7 +45,8 @@ mod vsock;
 pub(super) use pl011::Pl011;
 #[cfg(test)]
 use pl011::{PL011_BASE, PL011_DR, PL011_FR, PL011_SIZE};
-pub use psci::CpuOnRequest;
+pub(super) use pl031::Pl031;
+pub use psci::CpuPower;
 
 /// Shared registry of vCPU thread handles for WFI unparking.
 ///
@@ -75,6 +77,14 @@ const VIRTIO_MMIO_SIZE: u64 = 0x200;
 
 /// Maximum number of VirtIO MMIO devices.
 const VIRTIO_MMIO_MAX_DEVICES: u64 = 32;
+
+/// The PL031 alarm SPI must stay past a fully populated VirtIO device
+/// table: the allocator hands out INTIDs 32.. (FDT SPI 0..), one per
+/// device, so any SPI below the device cap can alias a live device line.
+const _: () = assert!(
+    pl031::PL031_FDT_SPI as u64 >= VIRTIO_MMIO_MAX_DEVICES,
+    "PL031 alarm SPI aliases the VirtIO IRQ range"
+);
 
 /// First SPI interrupt number for VirtIO devices (GIC SPI numbering).
 #[cfg(test)]
@@ -417,5 +427,20 @@ mod tests {
                 || PL011_BASE + PL011_SIZE <= virtio_start,
             "PL011 and VirtIO MMIO regions overlap"
         );
+        // PL031 sits in its own page between PL011 and the VirtIO region.
+        const {
+            assert!(
+                pl031::PL031_BASE >= PL011_BASE + PL011_SIZE,
+                "PL031 overlaps PL011"
+            );
+            assert!(
+                pl031::PL031_BASE + pl031::PL031_SIZE <= VIRTIO_MMIO_BASE,
+                "PL031 overlaps VirtIO MMIO region"
+            );
+            assert!(
+                pl031::PL031_BASE + pl031::PL031_SIZE <= RAM_BASE_IPA,
+                "PL031 must be below guest RAM"
+            );
+        };
     }
 }
