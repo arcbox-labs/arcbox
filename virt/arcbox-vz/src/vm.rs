@@ -90,35 +90,41 @@ impl VirtualMachine {
 
     /// Returns the current state of the VM.
     pub fn state(&self) -> VirtualMachineState {
-        // SAFETY: self.inner is a valid VZVirtualMachine pointer. Sending state returns an i64 enum value.
-        unsafe {
+        // SAFETY: self.inner is a valid VZVirtualMachine pointer; dispatched
+        // onto the VM's queue (VZVirtualMachine properties are queue-affine
+        // and assert when read from any other thread).
+        self.queue.sync(|| unsafe {
             let state = msg_send_i64!(self.inner, state);
             VirtualMachineState::from(state)
-        }
+        })
     }
 
     /// Returns whether the VM can be started.
     pub fn can_start(&self) -> bool {
-        // SAFETY: Sending canStart to a valid VZVirtualMachine.
-        unsafe { msg_send_bool!(self.inner, canStart).as_bool() }
+        // SAFETY: Sending canStart to a valid VZVirtualMachine on its queue.
+        self.queue
+            .sync(|| unsafe { msg_send_bool!(self.inner, canStart).as_bool() })
     }
 
     /// Returns whether the VM can be stopped.
     pub fn can_stop(&self) -> bool {
-        // SAFETY: Sending canStop to a valid VZVirtualMachine.
-        unsafe { msg_send_bool!(self.inner, canStop).as_bool() }
+        // SAFETY: Sending canStop to a valid VZVirtualMachine on its queue.
+        self.queue
+            .sync(|| unsafe { msg_send_bool!(self.inner, canStop).as_bool() })
     }
 
     /// Returns whether the VM can be paused.
     pub fn can_pause(&self) -> bool {
-        // SAFETY: Sending canPause to a valid VZVirtualMachine.
-        unsafe { msg_send_bool!(self.inner, canPause).as_bool() }
+        // SAFETY: Sending canPause to a valid VZVirtualMachine on its queue.
+        self.queue
+            .sync(|| unsafe { msg_send_bool!(self.inner, canPause).as_bool() })
     }
 
     /// Returns whether the VM can be resumed.
     pub fn can_resume(&self) -> bool {
-        // SAFETY: Sending canResume to a valid VZVirtualMachine.
-        unsafe { msg_send_bool!(self.inner, canResume).as_bool() }
+        // SAFETY: Sending canResume to a valid VZVirtualMachine on its queue.
+        self.queue
+            .sync(|| unsafe { msg_send_bool!(self.inner, canResume).as_bool() })
     }
 
     /// Starts the virtual machine.
@@ -399,9 +405,10 @@ impl VirtualMachine {
     ///
     /// These can be used for vsock communication with the guest.
     pub fn socket_devices(&self) -> Vec<VirtioSocketDevice> {
-        // SAFETY: Sending socketDevices to a valid VZVirtualMachine. NSArray elements are valid
-        // VZVirtioSocketDevice pointers retained by the framework.
-        unsafe {
+        // SAFETY: Sending socketDevices to a valid VZVirtualMachine on its
+        // queue (device-array properties are queue-affine). NSArray elements
+        // are valid VZVirtioSocketDevice pointers retained by the framework.
+        self.queue.sync(|| unsafe {
             let devices: *mut AnyObject = msg_send!(self.inner, socketDevices);
             if devices.is_null() {
                 return Vec::new();
@@ -418,7 +425,7 @@ impl VirtualMachine {
             }
 
             result
-        }
+        })
     }
 
     /// Returns the memory balloon devices configured on this VM.
@@ -426,7 +433,8 @@ impl VirtualMachine {
     /// These can be used for dynamic memory management between host and guest.
     #[must_use]
     pub fn memory_balloon_devices(&self) -> Vec<MemoryBalloonDevice> {
-        vm_memory_balloon_devices(self.inner)
+        self.queue
+            .sync(|| vm_memory_balloon_devices(self.inner, self.queue.as_ptr()))
     }
 
     /// Returns the first memory balloon device, if any.
