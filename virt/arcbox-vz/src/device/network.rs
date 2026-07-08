@@ -6,7 +6,8 @@ use crate::{msg_send, msg_send_void, msg_send_void_u64};
 use objc2::runtime::AnyObject;
 use std::os::unix::io::RawFd;
 
-/// MTU configured on VZ network devices.
+/// MTU configured on VZ network devices when `setMaximumTransmissionUnit:` is
+/// available (macOS 13+). Exported so the VMM can pass it to the datapath.
 ///
 /// 4000 is chosen based on macOS XNU internals: the kernel has a 4096-byte
 /// internal threshold above which performance degrades for loopback/utun paths.
@@ -15,8 +16,6 @@ use std::os::unix::io::RawFd;
 ///
 /// This reduces frame count by ~2.7x vs the default 1500, directly reducing
 /// per-frame overhead through the entire datapath.
-/// The enhanced MTU value set on VZ network devices when the selector is
-/// available (macOS 13+). Exported so the VMM can pass it to the datapath.
 pub const VZ_NETWORK_MTU: u64 = 4000;
 
 /// Configuration for a `VirtIO` network device.
