@@ -43,8 +43,55 @@ pub(super) async fn remove_sandbox_impl(
         warn!(sandbox_id = %id, err = %e, "failed to remove restore origin dir");
     }
 
-    instances.write().unwrap().remove(id);
+    // Only drop the map entry if it is still the instance we tore down. A
+    // concurrent re-create under the same id installs a different Arc that this
+    // removal must not evict.
+    {
+        let mut map = instances.write().unwrap();
+        if map.get(id).is_some_and(|cur| Arc::ptr_eq(cur, &arc)) {
+            map.remove(id);
+        }
+    }
     let _ = events_tx.send(SandboxEvent::new(id, "removed"));
+}
+
+/// True when `armed_for` still refers to the instance currently registered
+/// under the id. Used to decide whether a fired TTL timer applies.
+fn is_armed_instance(
+    armed_for: &std::sync::Weak<Mutex<SandboxInstance>>,
+    current: Option<&Arc<Mutex<SandboxInstance>>>,
+) -> bool {
+    match (armed_for.upgrade(), current) {
+        (Some(mine), Some(cur)) => Arc::ptr_eq(&mine, cur),
+        _ => false,
+    }
+}
+
+/// TTL expiry: force-remove `id`, but only if the instance registered under it
+/// is still the one this timer was armed for.
+///
+/// A sandbox that was removed and re-created under the same id (deterministic
+/// caller-supplied ids make this common) installs a fresh `Arc`. The captured
+/// `Weak` then points at a different — or dropped — instance, so the stale
+/// timer becomes a no-op instead of force-removing the unrelated new sandbox.
+#[allow(
+    clippy::type_complexity,
+    reason = "manager storage type is shared here"
+)]
+pub(super) async fn expire_sandbox(
+    id: &str,
+    armed_for: &std::sync::Weak<Mutex<SandboxInstance>>,
+    instances: &Arc<RwLock<HashMap<SandboxId, Arc<Mutex<SandboxInstance>>>>>,
+    network: &Arc<NetworkManager>,
+    events_tx: &broadcast::Sender<SandboxEvent>,
+    config: &Arc<VmmConfig>,
+    cow_manager: &Arc<CowManager>,
+) {
+    let current = instances.read().unwrap().get(id).cloned();
+    if !is_armed_instance(armed_for, current.as_ref()) {
+        return;
+    }
+    remove_sandbox_impl(id, true, instances, network, events_tx, config, cow_manager).await;
 }
 
 /// Free every runtime resource a sandbox holds: the Firecracker process
@@ -113,6 +160,42 @@ pub(super) async fn release_runtime_resources(
         {
             warn!(sandbox_id = %id, err = %e, "failed to remove jailer chroot dir");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn instance(id: &str) -> Arc<Mutex<SandboxInstance>> {
+        Arc::new(Mutex::new(SandboxInstance::new(
+            id.to_owned(),
+            SandboxSpec::default(),
+            None,
+            PathBuf::from("/tmp/x"),
+        )))
+    }
+
+    #[test]
+    fn ttl_applies_only_to_the_armed_generation() {
+        let original = instance("job");
+        let armed_for = Arc::downgrade(&original);
+
+        // Same instance still registered → timer applies.
+        assert!(is_armed_instance(&armed_for, Some(&original)));
+
+        // Removed and re-created under the same id → a different Arc; the stale
+        // timer must NOT match the new generation.
+        let recreated = instance("job");
+        assert!(!is_armed_instance(&armed_for, Some(&recreated)));
+
+        // Removed with nothing re-created → no match.
+        assert!(!is_armed_instance(&armed_for, None));
+
+        // Original fully dropped → the Weak is dead, no match even if some
+        // other instance is present.
+        drop(original);
+        assert!(!is_armed_instance(&armed_for, Some(&recreated)));
     }
 }
 

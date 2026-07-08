@@ -2,7 +2,6 @@ use super::boot::{
     chroot_root, cleanup_pending_restore, create_rootfs_symlink, kill_and_reap_fc,
     stage_kernel_for_jailer, stage_rootfs_copy_for_jailer, stage_rootfs_device_for_jailer,
 };
-use super::cleanup::remove_sandbox_impl;
 use super::*;
 
 /// Move a file even when source and destination sit on different mounts.
@@ -529,10 +528,12 @@ impl SandboxManager {
             super::reconcile::write_state_record(&inst.vm_dir, &record);
         }
         reservation.commit();
+        let ttl_armed_for = Arc::downgrade(&arc);
 
         let _ = self.events_tx.send(SandboxEvent::new(&new_id, "ready"));
 
-        // TTL expiry task.
+        // TTL expiry task — identity-guarded so a stale timer can't remove a
+        // same-id sandbox re-created after this one (see expire_sandbox).
         if spec.ttl_seconds > 0 {
             let instances = Arc::clone(&self.instances);
             let network = Arc::clone(&self.network);
@@ -541,10 +542,11 @@ impl SandboxManager {
             let cow2 = Arc::clone(&self.cow_manager);
             let id2 = new_id.clone();
             let ttl = spec.ttl_seconds;
+            let armed_for = ttl_armed_for;
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(ttl as u64)).await;
-                remove_sandbox_impl(
-                    &id2, true, &instances, &network, &events_tx, &config2, &cow2,
+                super::cleanup::expire_sandbox(
+                    &id2, &armed_for, &instances, &network, &events_tx, &config2, &cow2,
                 )
                 .await;
             });
