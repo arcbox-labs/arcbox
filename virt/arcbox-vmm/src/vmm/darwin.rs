@@ -10,6 +10,17 @@ use arcbox_hypervisor::darwin::DarwinVm;
 use arcbox_hypervisor::traits::VirtualMachine;
 use tokio_util::sync::CancellationToken;
 
+/// Socket buffer size (`SO_SNDBUF`/`SO_RCVBUF`) for both ends of a network
+/// socketpair. 8 MiB accommodates burst traffic.
+///
+/// Both ends must be sized, not just the VZ side: on macOS a `SOCK_DGRAM` unix
+/// socket rejects any datagram larger than its `SO_SNDBUF` with `EMSGSIZE`. The
+/// host datapath end is the *sender* of guest-inbound frames, so once VZ's
+/// `setMaximumTransmissionUnit:` raises the link to `VZ_NETWORK_MTU` (4000) a
+/// default-sized (~2 KiB) host end would silently drop every frame above the
+/// default 1500 MTU.
+const NET_SOCKET_BUF_BYTES: libc::c_int = 8 * 1024 * 1024;
+
 impl Vmm {
     /// Darwin-specific initialization using Virtualization.framework.
     pub(super) fn initialize_darwin(&mut self) -> Result<()> {
@@ -228,6 +239,36 @@ impl Vmm {
         Ok(())
     }
 
+    /// Enlarges `SO_SNDBUF` and `SO_RCVBUF` to `NET_SOCKET_BUF_BYTES` on `fd`.
+    ///
+    /// Failures are logged and tolerated — the socket still works with default
+    /// buffers, only with less headroom (see `NET_SOCKET_BUF_BYTES` for why the
+    /// host end in particular must be sized once the enhanced MTU is active).
+    fn set_socket_buffers(fd: libc::c_int) {
+        let size = NET_SOCKET_BUF_BYTES;
+        // SAFETY: setsockopt on a valid fd with a correctly-sized `c_int` value.
+        unsafe {
+            for (opt, name) in [
+                (libc::SO_SNDBUF, "SO_SNDBUF"),
+                (libc::SO_RCVBUF, "SO_RCVBUF"),
+            ] {
+                if libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    opt,
+                    (&raw const size).cast::<libc::c_void>(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                ) != 0
+                {
+                    tracing::warn!(
+                        "setsockopt {name} failed: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+        }
+    }
+
     /// Creates the network device configuration for Darwin.
     ///
     /// Sets up a socketpair for `VZFileHandleNetworkDeviceAttachment` and a
@@ -272,38 +313,11 @@ impl Vmm {
         // SAFETY: fds are valid file descriptors returned by socketpair.
         let host_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
 
-        // Set a large socket buffer for the VZ side to avoid drops.
-        // 8 MB accommodates burst traffic (increased from 2 MB).
-        // SAFETY: setsockopt with valid fd and parameters.
-        let buf_size: libc::c_int = 8 * 1024 * 1024;
-        unsafe {
-            if libc::setsockopt(
-                vz_fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                (&raw const buf_size).cast::<libc::c_void>(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            ) != 0
-            {
-                tracing::warn!(
-                    "setsockopt SO_SNDBUF failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            if libc::setsockopt(
-                vz_fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                (&raw const buf_size).cast::<libc::c_void>(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            ) != 0
-            {
-                tracing::warn!(
-                    "setsockopt SO_RCVBUF failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
+        // Size both ends of the pair: the VZ side buffers bursts, and the host
+        // datapath side must be able to *send* a full enhanced-MTU frame to the
+        // guest (see NET_SOCKET_BUF_BYTES).
+        Self::set_socket_buffers(vz_fd.as_raw_fd());
+        Self::set_socket_buffers(host_fd.as_raw_fd());
 
         // 2. Cancellation token shared by all spawned network tasks.
         let cancel = CancellationToken::new();
@@ -339,12 +353,12 @@ impl Vmm {
         // 5. Build the datapath and spawn it on the tokio runtime.
 
         // NOTE(MTU): Hardcoded to 4000 intentionally — our platform target is
-        // macOS 14+ Apple Silicon (P0) where VZ's setMaximumTransmissionUnit:
-        // always succeeds. On macOS <14 the VZ setter is skipped via
+        // macOS 13+ Apple Silicon (P0) where VZ's setMaximumTransmissionUnit:
+        // always succeeds. On macOS <13 the VZ setter is skipped via
         // respondsToSelector: (see arcbox-vz/device/network.rs), and the VZ
         // device stays at 1500 while the classifier gets 4000. This mismatch
-        // would cause frames >1500 to be dropped — acceptable since macOS <14
-        // is not a supported target. If macOS <14 support is ever needed,
+        // would cause frames >1500 to be dropped — acceptable since macOS <13
+        // is not a supported target. If macOS <13 support is ever needed,
         // plumb the actual MTU from NetworkDeviceConfiguration::mtu() through
         // the hypervisor abstraction layer.
         let net_mtu = arcbox_net::darwin::classifier::ENHANCED_ETHERNET_MTU;
@@ -435,37 +449,11 @@ impl Vmm {
         // SAFETY: fds are valid from socketpair.
         let relay_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
 
-        // Set large buffers on the VZ side (8 MB, matching primary NIC).
-        let buf_size: libc::c_int = 8 * 1024 * 1024;
-        // SAFETY: setsockopt with valid fd and parameters.
-        unsafe {
-            if libc::setsockopt(
-                vz_fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                (&raw const buf_size).cast::<libc::c_void>(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            ) != 0
-            {
-                tracing::warn!(
-                    "setsockopt SO_SNDBUF (vmnet bridge) failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            if libc::setsockopt(
-                vz_fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                (&raw const buf_size).cast::<libc::c_void>(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            ) != 0
-            {
-                tracing::warn!(
-                    "setsockopt SO_RCVBUF (vmnet bridge) failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-        }
+        // Size both ends (matching the primary NIC): the bridge guest NIC also
+        // negotiates the enhanced MTU, so the relay end must be able to send a
+        // full-size frame to the guest.
+        Self::set_socket_buffers(vz_fd.as_raw_fd());
+        Self::set_socket_buffers(relay_fd.as_raw_fd());
 
         // Spawn the relay task.
         let cancel = CancellationToken::new();
@@ -804,5 +792,62 @@ impl Vmm {
         }
 
         Some(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+
+    /// A `SOCK_DGRAM` unix socket caps datagram size at `SO_SNDBUF`; the host
+    /// end of the network socketpair must be enlarged or a full enhanced-MTU
+    /// frame (4000 + 14-byte Ethernet header) to the guest fails with
+    /// `EMSGSIZE` and is silently dropped. Guards the host-side sizing that
+    /// pairs with VZ's `setMaximumTransmissionUnit:`.
+    #[test]
+    fn enlarged_socket_buffer_accepts_enhanced_mtu_frame() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: socketpair with a valid out pointer.
+        let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(ret, 0, "socketpair failed");
+        // SAFETY: fds are valid file descriptors returned by socketpair.
+        let send = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: fds are valid file descriptors returned by socketpair.
+        let _recv = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let send_fd = send.as_raw_fd();
+
+        // Enhanced MTU (4000) plus a 14-byte Ethernet header.
+        let frame = vec![0u8; arcbox_net::darwin::classifier::ENHANCED_ETHERNET_MTU + 14];
+
+        // Precondition: a small send buffer rejects the frame with EMSGSIZE.
+        let small: libc::c_int = 1024;
+        // SAFETY: setsockopt on a valid fd with a `c_int` option value.
+        unsafe {
+            libc::setsockopt(
+                send_fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw const small).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        // SAFETY: send on a valid fd from a valid buffer.
+        let n = unsafe { libc::send(send_fd, frame.as_ptr().cast(), frame.len(), 0) };
+        assert!(
+            n < 0,
+            "small SO_SNDBUF should reject a {}-byte datagram",
+            frame.len()
+        );
+
+        // Enlarging the buffers lets the same frame through.
+        Vmm::set_socket_buffers(send_fd);
+        // SAFETY: send on a valid fd from a valid buffer.
+        let n = unsafe { libc::send(send_fd, frame.as_ptr().cast(), frame.len(), 0) };
+        assert_eq!(
+            n,
+            isize::try_from(frame.len()).unwrap(),
+            "enlarged SO_SNDBUF must accept a full enhanced-MTU frame"
+        );
     }
 }

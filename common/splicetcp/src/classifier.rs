@@ -29,7 +29,7 @@ use crate::ethernet::{ArpResponder, ETH_HEADER_LEN};
 #[cfg(test)]
 const DEFAULT_ETHERNET_MTU: usize = 1500;
 
-/// Enhanced MTU for VZ framework with `maximumTransmissionUnit` (macOS 14+).
+/// Enhanced MTU for VZ framework with `maximumTransmissionUnit` (macOS 13+).
 /// Reduces frame count by ~2.7x vs 1500.
 pub const ENHANCED_ETHERNET_MTU: usize = 4000;
 
