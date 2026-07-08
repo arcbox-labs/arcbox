@@ -37,6 +37,9 @@ impl Agent {
         // kernel is an orphan whose sandbox the crash-recovery sweep destroyed.
         super::port_forward::flush_orphan_rules().await;
 
+        // Drop half-written rootfs build artifacts from a previous crash.
+        crate::rootfs_builder::sweep_stale_tmp().await;
+
         // Start guest-side Docker API proxy (vsock -> unix socket).
         tokio::spawn(async {
             if let Err(e) = run_docker_api_proxy().await {
