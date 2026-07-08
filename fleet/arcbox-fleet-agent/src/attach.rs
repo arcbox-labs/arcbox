@@ -17,6 +17,7 @@ use arcbox_fleet_proto::v1::{
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tonic::Request;
 use tonic::metadata::MetadataValue;
 use tracing::{info, warn};
@@ -247,6 +248,19 @@ async fn connect_and_serve(
     let gateway = state.gateway_target();
     let (req_tx, req_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
 
+    // Start heartbeating before the request is even sent, not after the
+    // response arrives. The gateway acks each heartbeat on the response
+    // stream (its only keepalive signal for a proxy/load balancer sitting in
+    // front), so if the client waits for a response before saying anything,
+    // neither side ever sends a byte: the connection sits fully idle until
+    // an intermediary's own idle-connection timeout (AWS ALB defaults to
+    // 60s) resets it, and the response headers the origin sent immediately
+    // are only ever delivered bundled with that reset. Speaking first breaks
+    // the standoff.
+    // Held only for its abort-on-drop side effect: it must outlive every exit
+    // path of this function, not be read.
+    let _heartbeat = spawn_heartbeat(req_tx.clone(), capabilities.to_vec(), state.clone());
+
     // The connect + Attach-RPC handshake can block indefinitely — no connect
     // timeout is configured on the tonic `Endpoint` — and, unlike the
     // message loop below, has no cancellation awareness of its own. Without
@@ -273,6 +287,8 @@ async fn connect_and_serve(
             .context("Attach RPC failed")
             .map(|response| response.into_inner())
     };
+    // `_heartbeat` (an `AbortOnDropHandle`) is aborted automatically on every
+    // exit from this function, including `?` above and the early return here.
     let mut inbound = tokio::select! {
         biased;
         () = shutdown.cancelled() => return Ok(()),
@@ -291,9 +307,7 @@ async fn connect_and_serve(
         }
     }
 
-    let heartbeat = spawn_heartbeat(req_tx.clone(), capabilities.to_vec(), state.clone());
-
-    let outcome = loop {
+    loop {
         tokio::select! {
             () = shutdown.cancelled() => break Ok(()),
             event = egress_rx.recv() => match event {
@@ -309,15 +323,15 @@ async fn connect_and_serve(
                 None => break Ok(()),
             },
             message = inbound.message() => match message {
-                Ok(Some(message)) => dispatch(supervisor, message.msg),
+                Ok(Some(message)) => {
+                    tracing::debug!(msg = ?message.msg, "inbound attach message");
+                    dispatch(supervisor, message.msg);
+                }
                 Ok(None) => break Ok(()),
                 Err(status) => break Err(anyhow::Error::from(status)),
             },
         }
-    };
-
-    heartbeat.abort();
-    outcome
+    }
 }
 
 /// Route one inbound `AttachResponse` to the supervisor. Synchronous: every
@@ -336,7 +350,9 @@ fn dispatch(supervisor: &RunnerSupervisor, msg: Option<attach_response::Msg>) {
         // No-op the gateway acks each heartbeat with, purely so a proxy in
         // front of the gateway (e.g. Cloudflare) sees server->client traffic
         // and never idle-times-out the stream.
-        Some(attach_response::Msg::Keepalive(_)) => {}
+        Some(attach_response::Msg::Keepalive(_)) => {
+            tracing::debug!("received keepalive from gateway");
+        }
         None => {}
     }
 }
@@ -376,8 +392,8 @@ fn spawn_heartbeat(
     outbound: mpsc::Sender<AttachRequest>,
     capabilities: Vec<Capability>,
     state: AgentState,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> AbortOnDropHandle<()> {
+    AbortOnDropHandle::new(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             ticker.tick().await;
@@ -396,7 +412,7 @@ fn spawn_heartbeat(
                 break;
             }
         }
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -531,6 +547,130 @@ mod tests {
             .expect("parked loop exits on shutdown")
             .expect("attach task must not panic")
             .expect("clean exit");
+    }
+
+    /// A gateway that never sends a response until it has read the agent's
+    /// first request message — replicating a load balancer that won't relay
+    /// a quiet response and instead idle-times it out (PLAT-34: the real
+    /// deployment held the response for a full 60s, then reset the stream,
+    /// because neither side ever sent anything first).
+    struct SilentUntilFirstMessageGateway;
+
+    #[tonic::async_trait]
+    impl arcbox_fleet_proto::v1::fleet_gateway_service_server::FleetGatewayService
+        for SilentUntilFirstMessageGateway
+    {
+        async fn enroll(
+            &self,
+            _: Request<arcbox_fleet_proto::v1::EnrollRequest>,
+        ) -> Result<tonic::Response<arcbox_fleet_proto::v1::EnrollResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+
+        type AttachStream = tokio_stream::wrappers::ReceiverStream<
+            Result<arcbox_fleet_proto::v1::AttachResponse, tonic::Status>,
+        >;
+
+        async fn attach(
+            &self,
+            request: Request<tonic::Streaming<AttachRequest>>,
+        ) -> Result<tonic::Response<Self::AttachStream>, tonic::Status> {
+            request
+                .into_inner()
+                .message()
+                .await
+                .map_err(|e| tonic::Status::internal(e.to_string()))?
+                .ok_or_else(|| tonic::Status::internal("closed before any message arrived"))?;
+            // Empty, immediately-closed response: this test only cares that
+            // headers were unblocked, not about dispatch.
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(tonic::Response::new(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ))
+        }
+
+        async fn unenroll(
+            &self,
+            _: Request<arcbox_fleet_proto::v1::UnenrollRequest>,
+        ) -> Result<tonic::Response<arcbox_fleet_proto::v1::UnenrollResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used by this test"))
+        }
+    }
+
+    /// Regression test for PLAT-34: if the agent waits for the gateway's
+    /// response before sending anything, and the gateway (or a proxy in
+    /// front of it) withholds its response until it sees the agent send
+    /// something, both sides deadlock — silently, until whatever's fronting
+    /// the connection eventually resets it on its own idle timeout. The
+    /// agent must speak first.
+    #[tokio::test]
+    async fn connect_and_serve_sends_a_message_before_the_gateway_ever_responds() {
+        use arcbox_fleet_proto::v1::fleet_gateway_service_server::FleetGatewayServiceServer;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(FleetGatewayServiceServer::new(
+                    SilentUntilFirstMessageGateway,
+                ))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+
+        // `connect_and_serve` dials `state.gateway_target()`, not
+        // `config.gateway` (see that fn's own doc) — the state must be
+        // seeded with the mock's address, matching how enrollment does it.
+        let state = AgentState::new(&PersistedSettings {
+            gateway: gateway.clone(),
+            ..seed()
+        });
+        let (events, _rx) = mpsc::channel(1);
+        let supervisor = RunnerSupervisor::new(
+            events,
+            None,
+            None,
+            None,
+            Vec::new(),
+            AgentState::new(&seed()),
+        );
+        let (_egress_tx, mut egress_rx) = mpsc::channel::<AttachRequest>(1);
+        let mut pending = None;
+        let mut backoff = INITIAL_BACKOFF;
+        let shutdown = CancellationToken::new();
+
+        let config = AgentConfig {
+            gateway,
+            ..config()
+        };
+        let credential = credential();
+
+        // A generous-but-bounded deadline distinguishes "worked" from
+        // "deadlocked with the mock" without depending on any real network
+        // timeout.
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            connect_and_serve(
+                &config,
+                &credential,
+                &supervisor,
+                &mut egress_rx,
+                &mut pending,
+                &mut backoff,
+                &[],
+                &shutdown,
+                &state,
+            ),
+        )
+        .await
+        .expect("must send a message before waiting on the response, not deadlock with the gateway")
+        .expect("clean exit once the mock's response stream closes");
+
+        assert_eq!(
+            state.current().enrollment,
+            control_proto::Enrollment::Attached as i32,
+        );
     }
 
     /// The verdict-resend loop is attachment-scoped: cancelling the shutdown
