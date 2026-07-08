@@ -18,7 +18,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::codec::Streaming;
 use tonic::{Request, Response, Status};
 
-use arcbox_core::{ExecSessionInput, SandboxPortExposure};
+use arcbox_core::{ExecSessionInput, SandboxPortExposure, WriteFileChunk};
 
 use crate::ApiError;
 
@@ -270,18 +270,31 @@ impl SandboxService for SandboxServiceImpl {
             }
         };
 
-        // Bridge gRPC chunks into the agent write stream; dropping the
-        // sender ends the transfer and triggers the terminating frame.
+        // Bridge gRPC chunks into the agent write stream. A clean end (the
+        // client's `done` chunk) closes the channel, which triggers the
+        // terminating frame; a client error or a stream that ends *before*
+        // `done` sends `Abort` so the partial upload is never finalized.
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
-            while let Some(Ok(msg)) = stream.next().await {
-                if let Some(write_file_request::Payload::Chunk(chunk)) = msg.payload {
-                    let done = chunk.done;
-                    if !chunk.data.is_empty() && tx.send(chunk.data.clone()).await.is_err() {
-                        return;
+            loop {
+                match stream.next().await {
+                    Some(Ok(msg)) => {
+                        if let Some(write_file_request::Payload::Chunk(chunk)) = msg.payload {
+                            let done = chunk.done;
+                            if !chunk.data.is_empty()
+                                && tx.send(WriteFileChunk::Data(chunk.data)).await.is_err()
+                            {
+                                return;
+                            }
+                            if done {
+                                return; // clean completion: drop tx → done frame
+                            }
+                        }
                     }
-                    if done {
-                        break;
+                    // Client RST/cancel, or the stream closed without `done`.
+                    Some(Err(_)) | None => {
+                        let _ = tx.send(WriteFileChunk::Abort).await;
+                        return;
                     }
                 }
             }

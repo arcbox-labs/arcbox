@@ -197,3 +197,25 @@ fn test_runtime_new_propagates_config_vm_defaults() {
         Some(PathBuf::from("/tmp/arcbox-test-kernel"))
     );
 }
+
+#[test]
+fn resolve_bind_ip_defaults_and_loopback() {
+    use std::net::Ipv4Addr;
+    // Sandbox exposures pass "127.0.0.1" and must bind loopback only.
+    assert_eq!(
+        super::resolve_bind_ip("127.0.0.1"),
+        Some(Ipv4Addr::LOCALHOST)
+    );
+    // Published container ports (empty / explicit 0.0.0.0) bind all interfaces.
+    assert_eq!(super::resolve_bind_ip(""), Some(Ipv4Addr::UNSPECIFIED));
+    assert_eq!(
+        super::resolve_bind_ip("0.0.0.0"),
+        Some(Ipv4Addr::UNSPECIFIED)
+    );
+    // A specific address is honored; garbage is rejected.
+    assert_eq!(
+        super::resolve_bind_ip("10.0.0.5"),
+        Some(Ipv4Addr::new(10, 0, 0, 5))
+    );
+    assert_eq!(super::resolve_bind_ip("not-an-ip"), None);
+}
