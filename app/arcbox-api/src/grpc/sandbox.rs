@@ -14,7 +14,7 @@ use arcbox_protocol::sandbox_v1::{
 };
 use tokio_stream::Stream;
 use tokio_stream::StreamExt as _;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::codec::Streaming;
 use tonic::{Request, Response, Status};
 
@@ -82,8 +82,8 @@ impl SandboxService for SandboxServiceImpl {
             .sandbox_run(request.into_inner())
             .await
             .map_err(ApiError::from)?;
-        let stream = UnboundedReceiverStream::new(rx)
-            .map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
+        let stream =
+            ReceiverStream::new(rx).map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -138,8 +138,8 @@ impl SandboxService for SandboxServiceImpl {
             .await
             .map_err(ApiError::from)?;
 
-        let out_stream = UnboundedReceiverStream::new(out_rx)
-            .map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
+        let out_stream =
+            ReceiverStream::new(out_rx).map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
         Ok(Response::new(Box::pin(out_stream)))
     }
 
@@ -239,8 +239,8 @@ impl SandboxService for SandboxServiceImpl {
             .sandbox_read_file(request.into_inner())
             .await
             .map_err(ApiError::from)?;
-        let stream = UnboundedReceiverStream::new(rx)
-            .map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
+        let stream =
+            ReceiverStream::new(rx).map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -438,8 +438,8 @@ impl SandboxService for SandboxServiceImpl {
             .sandbox_events(request.into_inner())
             .await
             .map_err(ApiError::from)?;
-        let stream = UnboundedReceiverStream::new(rx)
-            .map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
+        let stream =
+            ReceiverStream::new(rx).map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
         Ok(Response::new(Box::pin(stream)))
     }
 }
