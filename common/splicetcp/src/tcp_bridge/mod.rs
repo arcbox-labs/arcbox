@@ -65,6 +65,11 @@ const SHIM_WSCALE: u8 = 7;
 /// GSO are unaffected — MSS only bounds the *guest's* segment size.
 const SHIM_MSS: u16 = 1460;
 
+/// Floor for a peer-advertised MSS when sizing host→guest segments. 536 is the
+/// IPv4 minimum (576-byte MTU − 40), so it is always safe to send; it also
+/// guards against a missing or malformed MSS option collapsing segments to 0.
+const TCP_MIN_MSS: u16 = 536;
+
 /// Monotonically advancing ISN source. Stepped by a large odd constant
 /// (Knuth multiplicative) for well-distributed values without a `rand`
 /// dependency.
@@ -109,7 +114,7 @@ pub(super) enum HandshakeRole {
 /// peer options to mirror/record, the ISNs on both sides, and retransmit
 /// bookkeeping. No send/recv buffers, no sliding window state, no
 /// congestion control — those are the host and guest kernels' responsibility.
-#[allow(dead_code)] // `flow_key` mirrors the HashMap key; `peer_mss` reserved for frame sizing
+#[allow(dead_code)] // `flow_key` mirrors the HashMap key
 pub(super) struct HandshakeConn {
     flow_key: SynFlowKey,
     role: HandshakeRole,
@@ -209,6 +214,11 @@ pub(super) struct FastPathConn {
     remote_port: u16,
     /// Guest port.
     guest_port: u16,
+    /// MSS the guest peer advertised for this flow (from its SYN / SYN-ACK).
+    /// Bounds the host→guest segment size so emitted frames never exceed the
+    /// path the guest can forward them over (e.g. a 1500-MTU docker bridge
+    /// behind a 4000-MTU `eth0`). See `poll_fast_path`.
+    peer_mss: u16,
     /// Read buffer for host → guest data (reused across polls).
     read_buf: Vec<u8>,
     /// True if host stream has reached EOF.

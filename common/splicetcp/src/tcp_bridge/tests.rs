@@ -344,7 +344,8 @@ async fn poll_fast_path_segments_frames_for_unix_dgram_limit() {
         dst_ip: Ipv4Addr::new(198, 18, 30, 95),
         dst_port: 443,
     };
-    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1);
+    // Jumbo peer MSS so the dgram limit — not the peer bound — drives sizing.
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 9000);
 
     let payload = vec![0xAB; FAST_PATH_GUEST_MSS * 2 + 128];
     accepted.write_all(&payload).await.unwrap();
@@ -407,7 +408,8 @@ async fn poll_fast_path_segments_frames_for_configured_mtu() {
         dst_ip: Ipv4Addr::new(198, 18, 30, 95),
         dst_port: 443,
     };
-    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1);
+    // Jumbo peer MSS so the configured MTU — not the peer bound — drives sizing.
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 9000);
 
     let payload = vec![0xAB; 5000];
     accepted.write_all(&payload).await.unwrap();
@@ -438,4 +440,70 @@ async fn poll_fast_path_segments_frames_for_configured_mtu() {
         u16::from_be_bytes([frames[1][ETH_HEADER_LEN + 2], frames[1][ETH_HEADER_LEN + 3]]);
     assert_eq!(first_ip_len, 4000);
     assert_eq!(second_ip_len, 1080);
+}
+
+/// Regression: even with a jumbo configured MTU, host→guest segments must be
+/// bounded by the peer's advertised MSS. A container behind a 1500-MTU docker
+/// bridge advertises MSS 1460; without this clamp the shim emits ~4000-byte
+/// frames the guest cannot forward onto the bridge and Host→VM stalls.
+#[tokio::test]
+async fn poll_fast_path_clamps_segments_to_peer_mss() {
+    use tokio::io::AsyncWriteExt;
+
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+    bridge.set_fast_path_mtu(4000); // jumbo host-side budget…
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let client = client.unwrap();
+    let (mut accepted, _) = accepted.unwrap();
+
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 12345,
+        dst_ip: Ipv4Addr::new(198, 18, 30, 95),
+        dst_port: 443,
+    };
+    // …but the peer (a 1500-MTU bridged container) advertised MSS 1460.
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1, 1, 1460);
+
+    let payload = vec![0xAB; 5000];
+    accepted.write_all(&payload).await.unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let batch = bridge.poll_fast_path();
+        let had_new = !batch.is_empty();
+        frames.extend(batch);
+        let received: usize = frames
+            .iter()
+            .map(|frame| frame.len().saturating_sub(ETH_HEADER_LEN + 40))
+            .sum();
+        if received >= payload.len() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        if !had_new {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    // Every emitted IP packet must fit a 1500-MTU link (20 IP + 20 TCP + ≤1460).
+    assert!(
+        frames.iter().all(|frame| {
+            let ip_len = u16::from_be_bytes([frame[ETH_HEADER_LEN + 2], frame[ETH_HEADER_LEN + 3]]);
+            ip_len <= 1500
+        }),
+        "peer MSS 1460 must bound every host→guest frame to ≤1500 bytes",
+    );
+    // 5000 bytes at ≤1460 payload each ⇒ at least 4 segments (not the 2 the
+    // jumbo budget alone would produce).
+    assert!(
+        frames.len() >= 4,
+        "expected ≥4 segments, got {}",
+        frames.len()
+    );
 }
