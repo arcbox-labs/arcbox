@@ -35,7 +35,7 @@ dirs = { workspace = true }
 hostname = { workspace = true }
 sysinfo = { workspace = true }
 command-group = { version = "5.0.1", features = ["with-tokio"] }
-tokio-util = "0.7.18"
+tokio-util = { version = "0.7.18", features = ["rt"] }
 bollard = "0.21.0"
 hyper-util = "0.1"
 arcbox-grpc.workspace = true
