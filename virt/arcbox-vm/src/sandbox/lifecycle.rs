@@ -69,12 +69,15 @@ impl SandboxManager {
             .join(&id);
         std::fs::create_dir_all(&vm_dir).map_err(VmmError::Io)?;
 
-        // Insert instance in Starting state.
+        // Insert instance in Starting state. Keep a Weak to identify this exact
+        // generation when its TTL timer fires (see expire_sandbox).
         let instance =
             SandboxInstance::new(id.clone(), spec.clone(), net_alloc.clone(), vm_dir.clone());
+        let arc = Arc::new(Mutex::new(instance));
+        let ttl_armed_for = Arc::downgrade(&arc);
         {
             let mut instances = self.instances.write().unwrap();
-            instances.insert(id.clone(), Arc::new(Mutex::new(instance)));
+            instances.insert(id.clone(), arc);
         }
 
         // Broadcast "created" event.
@@ -115,10 +118,11 @@ impl SandboxManager {
             let cow2 = Arc::clone(&self.cow_manager);
             let id2 = id.clone();
             let ttl = spec.ttl_seconds;
+            let armed_for = ttl_armed_for;
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(ttl as u64)).await;
-                remove_sandbox_impl(
-                    &id2, true, &instances, &network, &events_tx, &config2, &cow2,
+                super::cleanup::expire_sandbox(
+                    &id2, &armed_for, &instances, &network, &events_tx, &config2, &cow2,
                 )
                 .await;
             });
