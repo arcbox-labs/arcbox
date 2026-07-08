@@ -140,11 +140,19 @@ impl Vmm {
         // with a concrete list (arm64 requires that; see ABX-367).
         let hv_vcpu_ids: HvVcpuIds = Arc::new(Mutex::new(Vec::new()));
 
+        // Per-vCPU run-state registry: the IRQ callback below uses it to
+        // wake exactly the vCPUs that need waking (unpark the WFI-parked,
+        // `hv_vcpus_exit` the in-guest) instead of unparking every thread
+        // and broadcasting an exit — the R2 hot-path cost (ABX-397).
+        let vcpu_wake = Arc::new(crate::vcpu_wake::VcpuWakeRegistry::new(
+            self.config.vcpu_count as usize,
+        ));
+        self.hv_vcpu_wake = Some(vcpu_wake.clone());
+
         #[cfg(feature = "gic")]
         if let Some(ref gic_ref) = gic {
             let gic_weak = Arc::downgrade(gic_ref);
-            let threads_weak = Arc::downgrade(&vcpu_thread_handles);
-            let unpark_broadcasts = self.hv_unpark_broadcasts.clone();
+            let wake_weak = Arc::downgrade(&vcpu_wake);
             let callback: IrqTriggerCallback = Box::new(move |gsi: Gsi, level: bool| {
                 if let Some(g) = gic_weak.upgrade() {
                     g.set_spi(gsi, level).map_err(|e| {
@@ -154,15 +162,30 @@ impl Vmm {
                 } else {
                     tracing::warn!("GIC: dropped, cannot inject SPI {gsi}");
                 }
-                // Wake any WFI-parked vCPU threads so they can service the
-                // interrupt. Only unpark on assertion (level=true) to avoid
-                // spurious wakeups on de-assertion.
+                // Wake the vCPUs that need to observe the interrupt. Only on
+                // assertion (level=true) — de-assertion wakes nobody. The
+                // in-kernel GIC does not interrupt a vCPU inside
+                // `hv_vcpu_run` on its own (verified: removing the exit
+                // wedges bulk RX, ABX-420), so in-guest vCPUs get one
+                // targeted `hv_vcpus_exit`; WFI-parked threads get an
+                // unpark; vCPUs in the VMM see the interrupt on their next
+                // run entry and are left alone.
                 if level {
-                    if let Some(handles) = threads_weak.upgrade() {
-                        if let Ok(handles) = handles.lock() {
-                            unpark_broadcasts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            for t in handles.iter() {
-                                t.unpark();
+                    if let Some(wake) = wake_weak.upgrade() {
+                        let mut kick: Vec<u64> = Vec::with_capacity(4);
+                        wake.wake_targets(&mut kick);
+                        if !kick.is_empty() {
+                            // SAFETY: `kick` holds live framework vCPU
+                            // handles registered by their owning threads;
+                            // the Vec outlives the FFI call.
+                            #[allow(clippy::cast_possible_truncation)]
+                            let ret = unsafe {
+                                arcbox_hv::ffi::hv_vcpus_exit(kick.as_ptr(), kick.len() as u32)
+                            };
+                            if let Err(e) = arcbox_hv::check(ret) {
+                                tracing::warn!("targeted hv_vcpus_exit failed: {e}");
+                            } else {
+                                wake.note_kicked(kick.len() as u64);
                             }
                         }
                     }
@@ -170,7 +193,7 @@ impl Vmm {
                 Ok(())
             });
             irq_chip.set_trigger_callback(Arc::new(callback));
-            tracing::debug!("IRQ callback wired to hardware GIC (with WFI unpark)");
+            tracing::debug!("IRQ callback wired to hardware GIC (targeted wake)");
         }
 
         // --- 6. Initialize managers ---

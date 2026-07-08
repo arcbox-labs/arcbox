@@ -129,6 +129,11 @@ pub struct Vmm {
     /// Times the IRQ callback unparked all vCPU threads.
     #[cfg(target_os = "macos")]
     hv_unpark_broadcasts: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Per-vCPU run-state registry for targeted interrupt wakeups (custom
+    /// HV). Created in initialize_darwin_hv; shared with the GIC IRQ
+    /// callback and every vCPU thread.
+    #[cfg(target_os = "macos")]
+    hv_vcpu_wake: Option<std::sync::Arc<crate::vcpu_wake::VcpuWakeRegistry>>,
     /// PSCI per-vCPU power registry (custom HV): power states plus the
     /// CPU_ON wake channels for secondary vCPUs.
     #[cfg(target_os = "macos")]
@@ -322,6 +327,8 @@ impl Vmm {
             hv_kick_broadcasts: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(target_os = "macos")]
             hv_unpark_broadcasts: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(target_os = "macos")]
+            hv_vcpu_wake: None,
             #[cfg(target_os = "macos")]
             hv_cpu_power: None,
             #[cfg(all(target_os = "macos", feature = "vmnet"))]
@@ -704,6 +711,20 @@ impl Vmm {
                 .load(std::sync::atomic::Ordering::Relaxed),
             #[cfg(not(target_os = "macos"))]
             unpark_broadcasts: 0,
+            #[cfg(target_os = "macos")]
+            targeted_unparks: self
+                .hv_vcpu_wake
+                .as_ref()
+                .map_or(0, |wake| wake.targeted_unparks()),
+            #[cfg(not(target_os = "macos"))]
+            targeted_unparks: 0,
+            #[cfg(target_os = "macos")]
+            targeted_kicks: self
+                .hv_vcpu_wake
+                .as_ref()
+                .map_or(0, |wake| wake.targeted_kicks()),
+            #[cfg(not(target_os = "macos"))]
+            targeted_kicks: 0,
         }
     }
 

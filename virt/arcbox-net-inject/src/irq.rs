@@ -25,6 +25,13 @@ impl IrqHandle {
     /// Fires the interrupt: set MMIO interrupt_status + GIC SPI + exit vCPUs.
     pub fn trigger(&self) {
         let _ = (self.callback)(self.irq, true);
-        (self.exit_vcpus)();
+        // ABX-397 A/B experiment toggle (LOCAL ONLY, never commit): skip the
+        // all-vCPU force exit to measure whether the in-kernel GICv3 already
+        // interrupts running vCPUs.
+        static SKIP_EXIT: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("ARCBOX_NET_NO_EXIT_VCPUS").is_some());
+        if !*SKIP_EXIT {
+            (self.exit_vcpus)();
+        }
     }
 }

@@ -17,6 +17,7 @@ use super::hvc_blk::{
 };
 use super::psci::{CpuPower, PsciExit, handle_psci};
 use super::{HvVcpuIds, Pl011, Pl031, VcpuThreadHandles};
+use crate::vcpu_wake::VcpuRunState;
 
 /// ARM64 register IDs re-exported from arcbox-hv.
 pub(super) mod reg {
@@ -72,6 +73,8 @@ pub(super) struct VcpuContext {
     /// This vCPU's exit counters (diagnostics; written Relaxed by this
     /// thread only).
     pub stats: Arc<crate::vcpu_stats::VcpuStats>,
+    /// Per-vCPU run-state registry for targeted interrupt wakeups.
+    pub wake: Arc<crate::vcpu_wake::VcpuWakeRegistry>,
 }
 
 /// Reads the value of an MMIO write source register, handling the ARM64
@@ -191,6 +194,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, boot: VcpuBoot, ctx: VcpuContext) {
         hv_vcpu_ids,
         hvc_blk_fds,
         stats,
+        wake,
     } = ctx;
 
     let vcpu = match HvVcpu::new() {
@@ -256,6 +260,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, boot: VcpuBoot, ctx: VcpuContext) {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         handles.push(std::thread::current());
     }
+    wake.register_current_thread(vcpu_id, vcpu.raw_handle());
 
     // Resolve the first power-on: the BSP boots immediately; a secondary
     // parks until the guest's first CPU_ON for it.
@@ -353,7 +358,10 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, boot: VcpuBoot, ctx: VcpuContext) {
             if !running.load(Ordering::Relaxed) {
                 tracing::trace!("vCPU {vcpu_id}: iteration during shutdown (before vcpu.run)");
             }
-            let exit = match vcpu.run() {
+            wake.set_state(vcpu_id, VcpuRunState::InGuest);
+            let run_result = vcpu.run();
+            wake.set_state(vcpu_id, VcpuRunState::InVmm);
+            let exit = match run_result {
                 Ok(e) => e,
                 Err(e) => {
                     tracing::error!("vCPU {vcpu_id}: run failed: {e}");
@@ -520,8 +528,14 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, boot: VcpuBoot, ctx: VcpuContext) {
                         }
                         continue; // Re-enter run loop immediately.
                     }
-                    // No pending data — park with timeout.
+                    // No pending data — park with timeout. Publish ParkedWfi
+                    // first so the targeted IRQ wake path unparks this thread;
+                    // the 1 ms timeout bounds the window where the wake reads
+                    // the state before this store lands (R3 will replace it
+                    // with an explicit handshake).
+                    wake.set_state(vcpu_id, VcpuRunState::ParkedWfi);
                     std::thread::park_timeout(std::time::Duration::from_millis(1));
+                    wake.set_state(vcpu_id, VcpuRunState::InVmm);
                     // Re-check `running` immediately after the park returns so
                     // that `stop_darwin_hv` does not have to race a fresh
                     // `vcpu.run()` re-entry. Without this, a vCPU parked in WFI

@@ -90,4 +90,10 @@ pub struct VmDebugSnapshot {
     /// Times the IRQ callback unparked ALL vCPU threads on an SPI
     /// assertion (the other half of the broadcast-wakeup pattern).
     pub unpark_broadcasts: u64,
+    /// Cumulative WFI-parked threads unparked by the targeted IRQ wake
+    /// path (replaces the unpark broadcast; ABX-397).
+    pub targeted_unparks: u64,
+    /// Cumulative in-guest vCPUs kicked out of `hv_vcpu_run` by a targeted
+    /// `hv_vcpus_exit` (replaces the kick broadcast; ABX-397).
+    pub targeted_kicks: u64,
 }

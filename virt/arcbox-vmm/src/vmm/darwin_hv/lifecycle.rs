@@ -258,6 +258,15 @@ impl Vmm {
             .collect();
         self.hv_vcpu_stats.clone_from(&vcpu_stats);
 
+        // Per-vCPU run-state registry for targeted interrupt wakeups. The
+        // GIC IRQ callback (setup) holds a Weak to it; each vCPU thread
+        // registers itself and publishes its state around `hv_vcpu_run`
+        // and the WFI park.
+        let wake = self
+            .hv_vcpu_wake
+            .clone()
+            .expect("hv_vcpu_wake created in initialize_darwin_hv");
+
         // --- Set up the PSCI power registry for secondary vCPUs ---
         // The registry is shared with *every* vCPU thread — the BSP and each
         // secondary — so a CPU_ON issued from any CPU can reach any target.
@@ -287,6 +296,7 @@ impl Vmm {
                 let rtc = pl031.clone();
                 let hvc_fds_clone = self.hvc_blk_fds.clone();
                 let stats = vcpu_stats[i as usize].clone();
+                let wake_for_thread = wake.clone();
                 let registry_for_thread = registry.clone();
 
                 // The thread creates its HvVcpu once, parks on its receiver
@@ -312,6 +322,7 @@ impl Vmm {
                                 hv_vcpu_ids: ids,
                                 hvc_blk_fds: hvc_fds_clone,
                                 stats,
+                                wake: wake_for_thread,
                             },
                         );
                     })
@@ -351,6 +362,7 @@ impl Vmm {
                             hv_vcpu_ids: bsp_hv_vcpu_ids,
                             hvc_blk_fds,
                             stats: bsp_stats,
+                            wake,
                         },
                     );
                 })
