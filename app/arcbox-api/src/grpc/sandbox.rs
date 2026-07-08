@@ -83,7 +83,7 @@ impl SandboxService for SandboxServiceImpl {
             .await
             .map_err(ApiError::from)?;
         let stream = UnboundedReceiverStream::new(rx)
-            .map(|r| r.map_err(|e| Status::internal(e.to_string())));
+            .map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -139,7 +139,7 @@ impl SandboxService for SandboxServiceImpl {
             .map_err(ApiError::from)?;
 
         let out_stream = UnboundedReceiverStream::new(out_rx)
-            .map(|r| r.map_err(|e| Status::internal(e.to_string())));
+            .map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
         Ok(Response::new(Box::pin(out_stream)))
     }
 
@@ -439,7 +439,7 @@ impl SandboxService for SandboxServiceImpl {
             .await
             .map_err(ApiError::from)?;
         let stream = UnboundedReceiverStream::new(rx)
-            .map(|r| r.map_err(|e| Status::internal(e.to_string())));
+            .map(|r| r.map_err(|e| Status::from(ApiError::from(e))));
         Ok(Response::new(Box::pin(stream)))
     }
 }
