@@ -39,7 +39,7 @@ mod agent {
     use std::io::{Read, Write};
     use std::os::unix::io::RawFd;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock, mpsc};
     use std::thread;
 
     use serde::Deserialize;
@@ -421,6 +421,70 @@ mod agent {
         let _ = write_frame(conn, MSG_EXIT, &exit_code.to_le_bytes());
     }
 
+    // -------------------------------------------------------------------------
+    // Child reaping (this agent is guest PID 1)
+    // -------------------------------------------------------------------------
+
+    /// Registry of workload children awaiting their exit status, keyed by pid.
+    ///
+    /// `vm-agent` runs as init, so every process in the guest is (eventually)
+    /// its child, including grandchildren reparented by double-forking daemons.
+    /// A single reaper thread owns *all* `waitpid` calls: workloads that exit
+    /// have their status routed back to the waiting handler via the registered
+    /// sender; reparented orphans are simply reaped and dropped. Handlers must
+    /// therefore never call `waitpid`/`Child::wait` themselves — that would race
+    /// the reaper and either lose an exit code or double-reap.
+    fn reap_registry() -> &'static Mutex<HashMap<libc::pid_t, mpsc::Sender<i32>>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<libc::pid_t, mpsc::Sender<i32>>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Narrow a `std::process::Child::id()` (u32) to a `pid_t`. Linux pids are
+    /// bounded well below `i32::MAX`, so this never wraps.
+    #[allow(clippy::cast_possible_wrap, reason = "pids fit in pid_t")]
+    fn as_pid(id: u32) -> libc::pid_t {
+        id as libc::pid_t
+    }
+
+    /// Map a raw `wait` status to an exit code (128 + signal when killed).
+    fn wait_status_to_code(status: libc::c_int) -> Option<i32> {
+        if libc::WIFEXITED(status) {
+            Some(libc::WEXITSTATUS(status))
+        } else if libc::WIFSIGNALED(status) {
+            Some(128 + libc::WTERMSIG(status))
+        } else {
+            None // stopped / continued — not a termination
+        }
+    }
+
+    /// Start the single reaper thread. Reaps every child; routes the exit code
+    /// of registered workloads to their handler and discards orphan statuses.
+    fn start_reaper() {
+        thread::spawn(|| {
+            loop {
+                let mut status: libc::c_int = 0;
+                // SAFETY: waitpid with a valid status pointer; -1 waits on any child.
+                let pid = unsafe { libc::waitpid(-1, &raw mut status, 0) };
+                if pid <= 0 {
+                    // ECHILD (no children yet) or EINTR — back off briefly so we
+                    // don't spin while the guest is idle.
+                    thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                let Some(code) = wait_status_to_code(status) else {
+                    continue;
+                };
+                // Drop the registry lock before sending so a handler's recv
+                // never contends with it.
+                let waiter = reap_registry().lock().unwrap().remove(&pid);
+                if let Some(tx) = waiter {
+                    let _ = tx.send(code);
+                }
+                // Otherwise a reparented orphan: reaped above, nothing to route.
+            }
+        });
+    }
+
     fn handle_piped(mut conn: VsockStream, start: StartCommand) {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
@@ -433,7 +497,11 @@ mod agent {
             }
         };
 
-        let mut cmd = Command::new(start.cmd.first().expect("empty cmd"));
+        let Some(program) = start.cmd.first() else {
+            report_start_failure(&mut conn, 127, "empty command");
+            return;
+        };
+        let mut cmd = Command::new(program);
         cmd.args(start.cmd.get(1..).unwrap_or(&[]));
         cmd.envs(&start.env);
         if !start.working_dir.is_empty() {
@@ -446,14 +514,26 @@ mod agent {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("agent: spawn {:?}: {e}", start.cmd);
-                report_start_failure(&mut conn, 127, &format!("spawn {:?}: {e}", start.cmd));
-                return;
+        // Spawn and register for reaping under one lock: if the child exits
+        // immediately, the reaper blocks on the registry lock until the insert
+        // below completes, so its exit code is never lost as an "orphan".
+        let (exit_tx, exit_rx) = mpsc::channel::<i32>();
+        let mut child = {
+            let mut registry = reap_registry().lock().unwrap();
+            match cmd.spawn() {
+                Ok(c) => {
+                    registry.insert(as_pid(c.id()), exit_tx);
+                    c
+                }
+                Err(e) => {
+                    drop(registry);
+                    eprintln!("agent: spawn {:?}: {e}", start.cmd);
+                    report_start_failure(&mut conn, 127, &format!("spawn {:?}: {e}", start.cmd));
+                    return;
+                }
             }
         };
+        let child_pid = as_pid(child.id());
 
         let mut child_stdin = child.stdin.take().unwrap();
         let child_stdout = child.stdout.take().unwrap();
@@ -491,29 +571,14 @@ mod agent {
         });
 
         if start.timeout_seconds > 0 {
-            let pid = child.id();
-            let timeout = start.timeout_seconds;
-            thread::spawn(move || {
-                // Sleep for the configured timeout, then check if the process still exists
-                // before attempting to send SIGKILL. This reduces the risk of killing a
-                // different process if the PID has been recycled.
-                thread::sleep(std::time::Duration::from_secs(timeout as u64));
-                unsafe {
-                    // Probe the process with signal 0. If this fails with ESRCH, the PID
-                    // is not currently in use and we must not send SIGKILL.
-                    #[allow(clippy::cast_possible_wrap)]
-                    let pid_i32 = pid as i32;
-                    if libc::kill(pid_i32, 0) == 0 {
-                        let _ = libc::kill(pid_i32, libc::SIGKILL);
-                    }
-                }
-            });
+            spawn_timeout_killer(child_pid, start.timeout_seconds);
         }
 
         // Read stdin frames from the host and forward to the child.
         // SAFETY: dup gives us a second fd for reading while the Arc owns the write fd.
         let read_fd = unsafe { libc::dup(writer.lock().unwrap().fd) };
         let mut reader = unsafe { VsockStream::from_raw_fd(read_fd) };
+        let mut host_disconnected = false;
         loop {
             match read_frame(&mut reader) {
                 Ok((MSG_STDIN, data)) => {
@@ -521,22 +586,53 @@ mod agent {
                         break;
                     }
                 }
-                Ok((MSG_EOF, _)) | Err(_) => {
+                Ok((MSG_EOF, _)) => {
+                    // Clean stdin EOF: stop forwarding but let the process run to
+                    // completion (its output still flows back).
                     drop(child_stdin);
+                    break;
+                }
+                Err(_) => {
+                    // Host connection gone: don't leave the workload running
+                    // headless — kill it and let the reaper collect it.
+                    host_disconnected = true;
                     break;
                 }
                 Ok(_) => {}
             }
         }
+        if host_disconnected {
+            kill_if_alive(child_pid);
+        }
 
         let _ = t_stdout.join();
         let _ = t_stderr.join();
-        let exit_code = child.wait().map_or(-1, |s| s.code().unwrap_or(-1));
+        // The reaper owns waitpid; block on the routed exit code.
+        let exit_code = exit_rx.recv().unwrap_or(-1);
         let _ = write_frame(
             &mut *writer.lock().unwrap(),
             MSG_EXIT,
             &exit_code.to_le_bytes(),
         );
+    }
+
+    /// SIGKILL `pid` after `timeout_seconds`, if it is still alive.
+    fn spawn_timeout_killer(pid: libc::pid_t, timeout_seconds: u32) {
+        thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_secs(u64::from(timeout_seconds)));
+            kill_if_alive(pid);
+        });
+    }
+
+    /// SIGKILL `pid` only if a signal-0 probe shows it is still alive, to avoid
+    /// killing a recycled pid. The reaper collects the terminated child.
+    fn kill_if_alive(pid: libc::pid_t) {
+        // SAFETY: kill with a valid pid; signal 0 only probes for existence.
+        unsafe {
+            if libc::kill(pid, 0) == 0 {
+                let _ = libc::kill(pid, libc::SIGKILL);
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -581,14 +677,22 @@ mod agent {
         let master_fd: RawFd = master.into_raw_fd();
         let slave_fd: RawFd = slave.as_raw_fd();
 
+        // Hold the reap registry lock across fork + register so the single
+        // reaper thread can't route (and discard) the child's exit status
+        // before it is registered below.
+        let (exit_tx, exit_rx) = mpsc::channel::<i32>();
+        let mut registry = reap_registry().lock().unwrap();
         match unsafe { fork() } {
             Err(e) => {
+                drop(registry);
                 // SAFETY: fork failed; close the unowned master fd to prevent leak.
                 unsafe { libc::close(master_fd) };
                 eprintln!("agent: fork: {e}");
             }
 
             Ok(ForkResult::Child) => {
+                // The child never touches `registry` (a COW guard copy); it
+                // execs or _exits below.
                 // SAFETY: close the inherited master fd in the child process.
                 unsafe { libc::close(master_fd) };
                 let _ = setsid();
@@ -651,6 +755,14 @@ mod agent {
             }
 
             Ok(ForkResult::Parent { child }) => {
+                let child_pid = child.as_raw();
+                registry.insert(child_pid, exit_tx);
+                drop(registry); // release before the (long-lived) session loop
+
+                if start.timeout_seconds > 0 {
+                    spawn_timeout_killer(child_pid, start.timeout_seconds);
+                }
+
                 drop(slave);
                 let writer: Arc<Mutex<VsockStream>> = Arc::new(Mutex::new(conn));
 
@@ -693,21 +805,21 @@ mod agent {
                             // SAFETY: master_fd is valid.
                             unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &winsize) };
                         }
-                        Ok((MSG_EOF, _)) | Err(_) => break,
+                        Ok((MSG_EOF, _)) => break,
+                        Err(_) => {
+                            // Host gone: kill the session's process group leader
+                            // rather than leave the interactive shell running.
+                            kill_if_alive(child_pid);
+                            break;
+                        }
                         Ok(_) => {}
                     }
                 }
 
                 let _ = t_pty.join();
 
-                let mut status: libc::c_int = 0;
-                // SAFETY: child.as_raw() is a valid pid returned from fork.
-                unsafe { libc::waitpid(child.as_raw(), &raw mut status, 0) };
-                let exit_code = if libc::WIFEXITED(status) {
-                    libc::WEXITSTATUS(status)
-                } else {
-                    -1
-                };
+                // The reaper owns waitpid; block on the routed exit code.
+                let exit_code = exit_rx.recv().unwrap_or(-1);
                 let _ = write_frame(
                     &mut *writer.lock().unwrap(),
                     MSG_EXIT,
@@ -853,6 +965,9 @@ mod agent {
     pub fn run() {
         mount_filesystems();
         setup_dns();
+        // This process is guest PID 1: start the reaper so exiting workloads and
+        // reparented double-fork orphans are collected instead of zombifying.
+        start_reaper();
         eprintln!("vm-agent: listening on vsock ports {AGENT_PORT} (exec), {FILE_PORT} (file I/O)");
         let exec_fd = create_vsock_listener(AGENT_PORT);
         let file_fd = create_vsock_listener(FILE_PORT);
@@ -923,6 +1038,32 @@ mod agent {
             assert!(
                 err.kind() == std::io::ErrorKind::Interrupted,
                 "accept: {err}"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn normal_exit_decodes_to_its_code() {
+            // Linux wait status encodes a normal exit as `code << 8`.
+            assert_eq!(wait_status_to_code(0), Some(0));
+            assert_eq!(wait_status_to_code(42 << 8), Some(42));
+            assert_eq!(wait_status_to_code(127 << 8), Some(127));
+        }
+
+        #[test]
+        fn signal_death_maps_to_128_plus_signal() {
+            // A process killed by signal N has N in the low 7 status bits.
+            assert_eq!(
+                wait_status_to_code(libc::SIGKILL),
+                Some(128 + libc::SIGKILL)
+            );
+            assert_eq!(
+                wait_status_to_code(libc::SIGTERM),
+                Some(128 + libc::SIGTERM)
             );
         }
     }

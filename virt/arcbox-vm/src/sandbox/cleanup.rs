@@ -163,6 +163,26 @@ pub(super) async fn release_runtime_resources(
     }
 }
 
+pub(super) fn inst_to_info(inst: &SandboxInstance) -> SandboxInfo {
+    SandboxInfo {
+        id: inst.id.clone(),
+        state: inst.state,
+        labels: inst.labels.clone(),
+        vcpus: inst.spec.vcpus,
+        memory_mib: inst.spec.memory_mib,
+        network: inst.network.as_ref().map(|n| SandboxNetworkInfo {
+            ip_address: n.ip_address.to_string(),
+            gateway: n.gateway.to_string(),
+            tap_name: n.tap_name.clone(),
+        }),
+        created_at: inst.created_at,
+        ready_at: inst.ready_at,
+        last_exited_at: inst.last_exited_at,
+        last_exit_code: inst.last_exit_code,
+        error: inst.error.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,25 +216,5 @@ mod tests {
         // other instance is present.
         drop(original);
         assert!(!is_armed_instance(&armed_for, Some(&recreated)));
-    }
-}
-
-pub(super) fn inst_to_info(inst: &SandboxInstance) -> SandboxInfo {
-    SandboxInfo {
-        id: inst.id.clone(),
-        state: inst.state,
-        labels: inst.labels.clone(),
-        vcpus: inst.spec.vcpus,
-        memory_mib: inst.spec.memory_mib,
-        network: inst.network.as_ref().map(|n| SandboxNetworkInfo {
-            ip_address: n.ip_address.to_string(),
-            gateway: n.gateway.to_string(),
-            tap_name: n.tap_name.clone(),
-        }),
-        created_at: inst.created_at,
-        ready_at: inst.ready_at,
-        last_exited_at: inst.last_exited_at,
-        last_exit_code: inst.last_exit_code,
-        error: inst.error.clone(),
     }
 }
