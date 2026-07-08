@@ -838,6 +838,14 @@ impl Vmm {
     /// macOS-only: the VF stop call can crash when the guest has already
     /// halted via ACPI. FDs and network resources are still cleaned up.
     /// Must only be called after ACPI shutdown.
+    ///
+    /// Only the VZ backend honors the skip: on the custom HV backend the
+    /// full stop path still runs on drop, because guest halt does not tear
+    /// down the host side — the io workers (vsock, blk, net-rx, console)
+    /// keep referencing guest RAM and must be joined before the mapping
+    /// drops (ABX-415), and `stop_darwin_hv` is safe after a guest halt
+    /// (the vCPU threads have already exited, so its cancel loop and joins
+    /// return immediately).
     #[cfg(target_os = "macos")]
     pub fn set_skip_hypervisor_stop(&mut self) {
         self.skip_hypervisor_stop = true;
@@ -848,13 +856,21 @@ impl Vmm {
 impl Drop for Vmm {
     fn drop(&mut self) {
         if self.state != VmmState::Stopped && self.state != VmmState::Created {
-            if self.skip_hypervisor_stop {
-                // The hypervisor stop path is unsafe (VF may crash when guest
-                // already halted). Only clean up network resources.
+            #[cfg(target_os = "macos")]
+            let skip = self.skip_hypervisor_stop && self.config.backend == VmBackend::Vz;
+            #[cfg(not(target_os = "macos"))]
+            let skip = self.skip_hypervisor_stop;
+            if skip {
+                // The VZ framework stop path is unsafe (VF may crash when
+                // the guest already halted). Only clean up network resources.
                 #[cfg(target_os = "macos")]
                 self.stop_network();
                 self.state = VmmState::Stopped;
             } else {
+                // Full teardown. On the HV backend this MUST run even when
+                // `skip_hypervisor_stop` is set: dropping guest memory while
+                // the io workers still run is a use-after-free that crashed
+                // the daemon on every guest-initiated poweroff (ABX-415).
                 let _ = self.stop();
             }
         }
