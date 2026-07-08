@@ -42,10 +42,21 @@ impl VmnetRelay {
     /// - **vmnet → guest**: dedicated blocking thread (vmnet read is blocking)
     /// - **guest → vmnet**: async via `AsyncFd` on the socketpair
     ///
+    /// `guest_wake`, when set, is invoked after each frame written toward
+    /// the guest. The custom HV backend needs it: the socketpair's guest
+    /// side is drained by the BSP's bridge poll, which only runs when the
+    /// vCPU takes a VM exit — without an explicit wake a quiet guest sleeps
+    /// inside `hv_vcpu_run` and bridge RX stalls indefinitely (ABX-420).
+    /// VZ consumes the socketpair in-framework and passes `None`.
+    ///
     /// # Errors
     ///
     /// Returns an error if the `AsyncFd` cannot be created.
-    pub async fn run(self, guest_fd: OwnedFd) -> std::io::Result<()> {
+    pub async fn run(
+        self,
+        guest_fd: OwnedFd,
+        guest_wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> std::io::Result<()> {
         // The fd MUST be non-blocking: `AsyncFd` requires it, and a blocking
         // `read` here wedges the task inside the syscall — the select below
         // never regains control, cancellation cannot propagate to the
@@ -77,6 +88,7 @@ impl VmnetRelay {
         // vmnet → guest: blocking thread
         let vmnet_read = Arc::clone(&self.vmnet);
         let cancel_read = self.cancel.clone();
+        let wake_read = guest_wake;
         let mut vmnet_to_guest = tokio::task::spawn_blocking(move || {
             let mut buf = vec![0u8; MAX_FRAME_SIZE];
             loop {
@@ -103,6 +115,8 @@ impl VmnetRelay {
                                 std::io::ErrorKind::WouldBlock => {}
                                 _ => tracing::debug!("vmnet→guest write error: {err}"),
                             }
+                        } else if let Some(wake) = &wake_read {
+                            wake();
                         }
                     }
                     Err(e) => {

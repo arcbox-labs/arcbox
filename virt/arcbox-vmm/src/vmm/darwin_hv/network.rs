@@ -380,16 +380,25 @@ impl Vmm {
         // Wire the bridge fd to the DeviceManager.
         device_manager.set_bridge_host_fd(hv_fd.as_raw_fd(), bridge_device_id);
 
-        // Spawn vmnet relay task.
+        // Spawn vmnet relay task. The relay must wake the guest after each
+        // frame it writes toward the socketpair: the guest side is drained
+        // by the BSP's bridge poll, which only runs on a VM exit, and a
+        // quiet guest sleeps inside `hv_vcpu_run` — without this wake,
+        // bridge RX stalls as soon as traffic pauses (ABX-420).
         let cancel = tokio_util::sync::CancellationToken::new();
         let relay = VmnetRelay::new(std::sync::Arc::clone(&vmnet), cancel.clone());
+        let guest_wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>> =
+            self.hv_vcpu_wake.clone().map(|wake| {
+                std::sync::Arc::new(move || wake.wake_for_interrupt())
+                    as std::sync::Arc<dyn Fn() + Send + Sync>
+            });
 
         let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
             VmmError::Device(format!("tokio runtime not available for vmnet relay: {e}"))
         })?;
 
         runtime.spawn(async move {
-            if let Err(e) = relay.run(relay_fd).await {
+            if let Err(e) = relay.run(relay_fd, guest_wake).await {
                 tracing::error!("HV vmnet relay exited with error: {e}");
             }
         });

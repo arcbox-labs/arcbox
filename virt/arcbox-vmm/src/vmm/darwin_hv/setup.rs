@@ -165,29 +165,15 @@ impl Vmm {
                 // Wake the vCPUs that need to observe the interrupt. Only on
                 // assertion (level=true) — de-assertion wakes nobody. The
                 // in-kernel GIC does not interrupt a vCPU inside
-                // `hv_vcpu_run` on its own (verified: removing the exit
-                // wedges bulk RX, ABX-420), so in-guest vCPUs get one
+                // `hv_vcpu_run` on its own (the framework parks WFI in
+                // `wait_for_interrupt` internally; verified: removing the
+                // exit wedges bulk RX, ABX-420), so in-guest vCPUs get one
                 // targeted `hv_vcpus_exit`; WFI-parked threads get an
                 // unpark; vCPUs in the VMM see the interrupt on their next
                 // run entry and are left alone.
                 if level {
                     if let Some(wake) = wake_weak.upgrade() {
-                        let mut kick: Vec<u64> = Vec::with_capacity(4);
-                        wake.wake_targets(&mut kick);
-                        if !kick.is_empty() {
-                            // SAFETY: `kick` holds live framework vCPU
-                            // handles registered by their owning threads;
-                            // the Vec outlives the FFI call.
-                            #[allow(clippy::cast_possible_truncation)]
-                            let ret = unsafe {
-                                arcbox_hv::ffi::hv_vcpus_exit(kick.as_ptr(), kick.len() as u32)
-                            };
-                            if let Err(e) = arcbox_hv::check(ret) {
-                                tracing::warn!("targeted hv_vcpus_exit failed: {e}");
-                            } else {
-                                wake.note_kicked(kick.len() as u64);
-                            }
-                        }
+                        wake.wake_for_interrupt();
                     }
                 }
                 Ok(())

@@ -137,6 +137,29 @@ impl VcpuWakeRegistry {
         self.targeted_kicks.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Performs a full targeted interrupt wake: unparks the WFI-parked
+    /// threads and issues one `hv_vcpus_exit` over the in-guest subset.
+    /// This is the step every interrupt-delivery site must take after
+    /// asserting the SPI — a vCPU sleeping inside `hv_vcpu_run` (the
+    /// framework parks WFI in `wait_for_interrupt` internally) only wakes
+    /// via `hv_vcpus_exit`.
+    #[cfg(target_os = "macos")]
+    pub fn wake_for_interrupt(&self) {
+        let mut kick: Vec<u64> = Vec::with_capacity(4);
+        self.wake_targets(&mut kick);
+        if !kick.is_empty() {
+            // SAFETY: `kick` holds live framework vCPU handles registered
+            // by their owning threads; the Vec outlives the FFI call.
+            #[allow(clippy::cast_possible_truncation)]
+            let ret = unsafe { arcbox_hv::ffi::hv_vcpus_exit(kick.as_ptr(), kick.len() as u32) };
+            if let Err(e) = arcbox_hv::check(ret) {
+                tracing::warn!("targeted hv_vcpus_exit failed: {e}");
+            } else {
+                self.note_kicked(kick.len() as u64);
+            }
+        }
+    }
+
     /// Cumulative targeted unparks (diagnostics; never reset).
     #[must_use]
     pub fn targeted_unparks(&self) -> u64 {

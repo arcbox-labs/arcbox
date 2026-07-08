@@ -476,7 +476,7 @@ impl Vmm {
         })?;
 
         runtime.spawn(async move {
-            if let Err(e) = relay.run(relay_fd).await {
+            if let Err(e) = relay.run(relay_fd, None).await {
                 tracing::error!("vmnet relay exited with error: {e}");
             }
         });
