@@ -39,15 +39,23 @@ impl SandboxManager {
         // jailer --id, dm/TAP names). Auto-generated UUIDs pass unchanged.
         super::validate_id("sandbox id", &id)?;
 
-        // Uniqueness check.
-        {
-            let instances = self.instances.read().unwrap();
-            if instances.contains_key(&id) {
-                return Err(VmmError::AlreadyExists(id));
-            }
-        }
+        let vm_dir = PathBuf::from(&self.config.firecracker.data_dir)
+            .join("sandboxes")
+            .join(&id);
 
-        // Allocate network resources (point-to-point TAP).
+        // Reserve the id atomically BEFORE allocating any per-id resource, so
+        // two concurrent creates of the same id can't both pass a uniqueness
+        // check and race — the loser fails with AlreadyExists instead of
+        // overwriting the map entry and leaking the winner's TAP/instance
+        // (mirrors restore; unwound on any early return via Drop).
+        let reservation = super::reserve_id(
+            &self.instances,
+            &id,
+            SandboxInstance::new(id.clone(), spec.clone(), None, vm_dir.clone()),
+        )?;
+
+        // Allocate network resources (point-to-point TAP). The id is claimed,
+        // so a concurrent create already failed at reserve_id above.
         let net_alloc = if spec.network.mode == "none" {
             None
         } else {
@@ -59,22 +67,21 @@ impl SandboxManager {
             .map(|n| n.ip_address.to_string())
             .unwrap_or_default();
 
-        // Create the VM working directory.
-        let vm_dir = PathBuf::from(&self.config.firecracker.data_dir)
-            .join("sandboxes")
-            .join(&id);
-        std::fs::create_dir_all(&vm_dir).map_err(VmmError::Io)?;
-
-        // Insert instance in Starting state. Keep a Weak to identify this exact
-        // generation when its TTL timer fires (see expire_sandbox).
-        let instance =
-            SandboxInstance::new(id.clone(), spec.clone(), net_alloc.clone(), vm_dir.clone());
-        let arc = Arc::new(Mutex::new(instance));
-        let ttl_armed_for = Arc::downgrade(&arc);
-        {
-            let mut instances = self.instances.write().unwrap();
-            instances.insert(id.clone(), arc);
+        // Create the VM working directory; release the TAP if this fails (the
+        // reservation itself unwinds the placeholder on the early return).
+        if let Err(e) = std::fs::create_dir_all(&vm_dir) {
+            if let Some(net) = &net_alloc {
+                self.network.release(net);
+            }
+            return Err(VmmError::Io(e));
         }
+
+        // Populate the reserved instance and commit it. Keep a Weak to identify
+        // this exact generation when its TTL timer fires (see expire_sandbox).
+        let arc = reservation.instance();
+        arc.lock().unwrap().network.clone_from(&net_alloc);
+        let ttl_armed_for = Arc::downgrade(&arc);
+        reservation.commit();
 
         // Broadcast "created" event.
         let _ = self.events_tx.send(SandboxEvent::new(&id, "created"));
