@@ -12,6 +12,10 @@ use crate::irq::IrqChip;
 #[cfg(feature = "gic")]
 use crate::irq::{Gsi, IrqTriggerCallback};
 use crate::vmm::darwin_hv::pl011::{PL011_BASE, PL011_SIZE};
+use crate::vmm::darwin_hv::pl031::{PL031_BASE, PL031_FDT_SPI, PL031_SIZE};
+
+/// FDT phandle for the fixed APB clock node (the GIC owns phandle 1).
+const APB_PCLK_PHANDLE: u32 = 2;
 
 use super::*;
 
@@ -667,6 +671,43 @@ impl Vmm {
             fdt.property_u32("clock-frequency", 24_000_000)
                 .map_err(fdt_err)?;
             fdt.end_node(uart).map_err(fdt_err)?;
+
+            // Fixed APB clock for AMBA PrimeCell peripherals. The AMBA bus
+            // core refuses to bind a driver (rtc-pl031) without an
+            // "apb_pclk" clock reference, so the PL031 node below needs
+            // this even though the emulated RTC has no real clock input.
+            let apb_pclk = fdt.begin_node("apb-pclk").map_err(fdt_err)?;
+            fdt.property_string("compatible", "fixed-clock")
+                .map_err(fdt_err)?;
+            fdt.property_u32("#clock-cells", 0).map_err(fdt_err)?;
+            fdt.property_u32("clock-frequency", 24_000_000)
+                .map_err(fdt_err)?;
+            fdt.property_phandle(APB_PCLK_PHANDLE).map_err(fdt_err)?;
+            fdt.end_node(apb_pclk).map_err(fdt_err)?;
+
+            // PL031 RTC: lets the guest kernel set CLOCK_REALTIME from the
+            // host wall clock at boot (CONFIG_RTC_HCTOSYS) instead of
+            // waiting for the post-readiness agent ping (ABX-416).
+            let rtc = fdt
+                .begin_node(&format!("pl031@{PL031_BASE:x}"))
+                .map_err(fdt_err)?;
+            fdt.property_string_list(
+                "compatible",
+                vec!["arm,pl031".into(), "arm,primecell".into()],
+            )
+            .map_err(fdt_err)?;
+            let mut rtc_reg = Vec::new();
+            rtc_reg.extend_from_slice(&PL031_BASE.to_be_bytes());
+            rtc_reg.extend_from_slice(&PL031_SIZE.to_be_bytes());
+            fdt.property("reg", &rtc_reg).map_err(fdt_err)?;
+            // Alarm interrupt line; the emulator never asserts it.
+            fdt.property_array_u32("interrupts", &[0, PL031_FDT_SPI, 4])
+                .map_err(fdt_err)?;
+            fdt.property_u32("clocks", APB_PCLK_PHANDLE)
+                .map_err(fdt_err)?;
+            fdt.property_string("clock-names", "apb_pclk")
+                .map_err(fdt_err)?;
+            fdt.end_node(rtc).map_err(fdt_err)?;
 
             // VirtIO MMIO devices from DeviceManager
             for entry in &fdt_entries {

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use crate::error::{Result, VmmError};
 
 use super::pl011::Pl011;
+use super::pl031::Pl031;
 use super::psci::{CpuOnRequest, CpuOnSenders};
 use super::vcpu_loop::{VcpuContext, vcpu_run_loop};
 use super::*;
@@ -240,6 +241,7 @@ impl Vmm {
         paused.store(false, std::sync::atomic::Ordering::SeqCst);
         let vcpu_count = self.config.vcpu_count;
         let pl011 = Arc::new(std::sync::Mutex::new(Pl011::new()));
+        let pl031 = Arc::new(std::sync::Mutex::new(Pl031::new()));
 
         let vcpu_thread_handles = self
             .hv_vcpu_thread_handles
@@ -284,6 +286,7 @@ impl Vmm {
                 let th = vcpu_thread_handles.clone();
                 let ids = hv_vcpu_ids.clone();
                 let uart = pl011.clone();
+                let rtc = pl031.clone();
                 let hvc_fds_clone = self.hvc_blk_fds.clone();
                 let stats = vcpu_stats[i as usize].clone();
                 let senders_for_thread = senders.clone();
@@ -306,6 +309,7 @@ impl Vmm {
                                     reset_requested: rr,
                                     paused: p,
                                     pl011: uart,
+                                    pl031: rtc,
                                     cpu_on_senders: Some(senders_for_thread),
                                     vcpu_thread_handles: th,
                                     hv_vcpu_ids: ids,
@@ -346,6 +350,7 @@ impl Vmm {
                             reset_requested,
                             paused,
                             pl011,
+                            pl031,
                             cpu_on_senders,
                             vcpu_thread_handles,
                             hv_vcpu_ids: bsp_hv_vcpu_ids,

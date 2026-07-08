@@ -16,7 +16,7 @@ use super::hvc_blk::{
     handle_hvc_blk_flush, handle_hvc_blk_io,
 };
 use super::psci::{CpuOnSenders, handle_psci};
-use super::{HvVcpuIds, Pl011, VcpuThreadHandles};
+use super::{HvVcpuIds, Pl011, Pl031, VcpuThreadHandles};
 
 /// ARM64 register IDs re-exported from arcbox-hv.
 pub(super) mod reg {
@@ -55,6 +55,8 @@ pub(super) struct VcpuContext {
     pub paused: Arc<AtomicBool>,
     /// Shared PL011 UART emulator for early console output.
     pub pl011: Arc<std::sync::Mutex<Pl011>>,
+    /// Shared PL031 RTC emulator backed by the host wall clock.
+    pub pl031: Arc<std::sync::Mutex<Pl031>>,
     /// Channel senders for waking secondary vCPUs via PSCI CPU_ON.
     /// `None` when the VM has only one vCPU.
     pub cpu_on_senders: Option<CpuOnSenders>,
@@ -159,6 +161,7 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
         reset_requested,
         paused,
         pl011,
+        pl031,
         cpu_on_senders,
         vcpu_thread_handles,
         hv_vcpu_ids,
@@ -370,7 +373,34 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, entry_addr: u64, x0_value: u64, ctx: V
                     }
                 };
 
-                if !handled_by_pl011 {
+                let handled_by_pl031 = !handled_by_pl011 && {
+                    let rtc_match = {
+                        let guard = pl031.lock().unwrap();
+                        guard.contains(mmio.address)
+                    };
+                    if rtc_match {
+                        if mmio.is_write {
+                            let value =
+                                read_mmio_write_reg(&vcpu, vcpu_id, mmio.register).unwrap_or(0);
+                            pl031.lock().unwrap().write(
+                                mmio.address,
+                                mmio.access_size as usize,
+                                value,
+                            );
+                        } else {
+                            let value = pl031
+                                .lock()
+                                .unwrap()
+                                .read(mmio.address, mmio.access_size as usize);
+                            complete_mmio_read(&vcpu, vcpu_id, mmio, value);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                if !handled_by_pl011 && !handled_by_pl031 {
                     // Dispatch to DeviceManager for VirtIO MMIO devices.
                     if mmio.is_write {
                         let Some(value) = read_mmio_write_reg(&vcpu, vcpu_id, mmio.register) else {
