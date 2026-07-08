@@ -37,6 +37,20 @@ use tokio::sync::RwLock as TokioRwLock;
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_GUEST_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 64, 2);
 
+/// Resolve a host-IP binding string for a forwarded port.
+///
+/// Empty or `"0.0.0.0"` means "all interfaces" (`UNSPECIFIED`); anything else
+/// must parse as an IPv4 address (returns `None` if it does not). Sandbox
+/// exposures pass `"127.0.0.1"` so untrusted workloads are reachable only on
+/// loopback, while published container ports keep binding all interfaces.
+fn resolve_bind_ip(host_ip_str: &str) -> Option<Ipv4Addr> {
+    if host_ip_str.is_empty() || host_ip_str == "0.0.0.0" {
+        Some(Ipv4Addr::UNSPECIFIED)
+    } else {
+        host_ip_str.parse().ok()
+    }
+}
+
 /// Inbound port-forwarding rules per container.
 ///
 /// Maps the canonical container ID to the machine that holds the rules and
@@ -763,11 +777,7 @@ impl Runtime {
                 _ => InboundProtocol::Tcp,
             };
 
-            let host_ip: Ipv4Addr = if host_ip_str.is_empty() || host_ip_str == "0.0.0.0" {
-                Ipv4Addr::UNSPECIFIED
-            } else if let Ok(ip) = host_ip_str.parse() {
-                ip
-            } else {
+            let Some(host_ip) = resolve_bind_ip(host_ip_str) else {
                 tracing::warn!(
                     "Skipping inbound rule: invalid HostIp '{}' for port {}:{}",
                     host_ip_str,
@@ -820,21 +830,14 @@ impl Runtime {
         let mut forwarder = PortForwarder::new();
 
         for (host_ip_str, host_port, container_port, protocol) in bindings {
-            let host_ip: Ipv4Addr = if host_ip_str.is_empty() || host_ip_str == "0.0.0.0" {
-                Ipv4Addr::UNSPECIFIED
-            } else {
-                match host_ip_str.parse() {
-                    Ok(ip) => ip,
-                    Err(_) => {
-                        tracing::warn!(
-                            "Skipping port forward rule: invalid HostIp '{}' for port {}:{}",
-                            host_ip_str,
-                            host_port,
-                            protocol,
-                        );
-                        continue;
-                    }
-                }
+            let Some(host_ip) = resolve_bind_ip(host_ip_str) else {
+                tracing::warn!(
+                    "Skipping port forward rule: invalid HostIp '{}' for port {}:{}",
+                    host_ip_str,
+                    host_port,
+                    protocol,
+                );
+                continue;
             };
 
             let host_addr = SocketAddr::V4(SocketAddrV4::new(host_ip, *host_port));
@@ -911,11 +914,15 @@ impl Runtime {
             exposure.sandbox_port,
             &exposure.protocol,
         );
+        // Bind the exposed port on loopback only. A sandbox runs untrusted
+        // code; unlike published container ports (which intentionally bind all
+        // interfaces), a sandbox port must not be reachable from the LAN. The
+        // proto/docs/CLI all promise "localhost".
         self.start_port_forwarding_for(
             machine_name,
             &key,
             &[(
-                String::new(),
+                "127.0.0.1".to_owned(),
                 exposure.host_port,
                 exposure.guest_port,
                 exposure.protocol.clone(),

@@ -48,6 +48,17 @@ pub enum ExecSessionInput {
     },
 }
 
+/// A chunk in a sandbox file-write stream.
+#[derive(Debug)]
+pub enum WriteFileChunk {
+    /// Payload bytes to append to the file.
+    Data(Vec<u8>),
+    /// The client stream ended without a terminating `done` chunk (a cancelled
+    /// or reset upload). The write must be aborted rather than finalized, so a
+    /// partially-received file is never committed as if it were complete.
+    Abort,
+}
+
 /// Agent client for a single VM.
 pub struct AgentClient {
     /// VM CID (Context ID).
@@ -905,7 +916,7 @@ impl AgentClient {
     pub async fn sandbox_write_file(
         mut self,
         open: WriteFileOpen,
-        mut data_rx: mpsc::Receiver<Vec<u8>>,
+        mut data_rx: mpsc::Receiver<WriteFileChunk>,
     ) -> Result<()> {
         if !self.connected {
             self.connect().await?;
@@ -918,7 +929,19 @@ impl AgentClient {
             .await
             .map_err(|e| CoreError::Machine(format!("failed to send write-file open: {e}")))?;
 
-        while let Some(data) = data_rx.recv().await {
+        while let Some(item) = data_rx.recv().await {
+            let data = match item {
+                WriteFileChunk::Data(data) => data,
+                WriteFileChunk::Abort => {
+                    // Do not send the terminating `done` frame. Returning drops
+                    // the connection; the guest sees the stream end before
+                    // `done` and discards the partial file instead of
+                    // committing a truncated one.
+                    return Err(CoreError::Machine(
+                        "write_file aborted: client stream ended before completion".to_owned(),
+                    ));
+                }
+            };
             let chunk = FileChunk { data, done: false };
             let frame =
                 wire::build_message(MessageType::SandboxFileChunk, "", &chunk.encode_to_vec());
