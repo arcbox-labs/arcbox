@@ -78,6 +78,14 @@ const VIRTIO_MMIO_SIZE: u64 = 0x200;
 /// Maximum number of VirtIO MMIO devices.
 const VIRTIO_MMIO_MAX_DEVICES: u64 = 32;
 
+/// The PL031 alarm SPI must stay past a fully populated VirtIO device
+/// table: the allocator hands out INTIDs 32.. (FDT SPI 0..), one per
+/// device, so any SPI below the device cap can alias a live device line.
+const _: () = assert!(
+    pl031::PL031_FDT_SPI as u64 >= VIRTIO_MMIO_MAX_DEVICES,
+    "PL031 alarm SPI aliases the VirtIO IRQ range"
+);
+
 /// First SPI interrupt number for VirtIO devices (GIC SPI numbering).
 #[cfg(test)]
 const VIRTIO_IRQ_BASE: u32 = 48;

@@ -16,10 +16,11 @@
 pub const PL031_BASE: u64 = 0x0B00_1000;
 /// PL031 MMIO region size.
 pub const PL031_SIZE: u64 = 0x1000;
-/// FDT SPI number for the (never asserted) alarm interrupt. Kept far above
-/// the VirtIO allocator's range (INTIDs from 32 == FDT SPI 0 upward) so the
-/// node's `interrupts` property never aliases a live device line.
-pub const PL031_FDT_SPI: u32 = 31;
+/// FDT SPI number for the (never asserted) alarm interrupt. The VirtIO
+/// allocator hands out INTIDs 32..(32 + VIRTIO_MMIO_MAX_DEVICES), i.e. FDT
+/// SPIs 0..=31, so SPI 32 (INTID 64) sits just past a fully populated
+/// device table and can never alias a live device line.
+pub const PL031_FDT_SPI: u32 = 32;
 
 // PL031 register offsets (ARM DDI 0224C).
 /// Data register: current time in seconds (read-only).
