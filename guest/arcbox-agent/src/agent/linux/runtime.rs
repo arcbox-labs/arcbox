@@ -223,6 +223,22 @@ pub(super) async fn ensure_containerd_ready(
     false
 }
 
+/// Reads the primary NIC's MTU so dockerd's default bridge can match the
+/// host-negotiated link MTU.
+fn primary_nic_mtu() -> Option<u32> {
+    docker_bridge_mtu(&std::fs::read_to_string("/sys/class/net/eth0/mtu").ok()?)
+}
+
+/// Parses a `/sys/class/net/*/mtu` value into a dockerd `--mtu` override.
+///
+/// Returns `None` for an unparseable value or the default 1500 (nothing to
+/// override), so links that stay at 1500 keep Docker's own default and only a
+/// jumbo link (e.g. the VZ 4000 MTU) forces the bridge to match.
+fn docker_bridge_mtu(raw: &str) -> Option<u32> {
+    let mtu: u32 = raw.trim().parse().ok()?;
+    (mtu > 1500).then_some(mtu)
+}
+
 async fn ensure_dockerd_ready(runtime_bin_dir: &Path, notes: &mut Vec<String>) {
     if probe_unix_socket(DOCKER_API_UNIX_SOCKET).await {
         return;
@@ -237,8 +253,20 @@ async fn ensure_dockerd_ready(runtime_bin_dir: &Path, notes: &mut Vec<String>) {
         .arg("--exec-root=/var/run/docker")
         .arg(format!("--data-root={DOCKER_DATA_MOUNT_POINT}"))
         .arg("--userland-proxy=false")
-        .arg(format!("--init-path={}", init_bin.display()))
-        .env("PATH", &path_env)
+        .arg(format!("--init-path={}", init_bin.display()));
+
+    // Match the default bridge MTU to the primary NIC. The VZ backend raises
+    // eth0 above 1500 (macOS 13+), but Docker keeps its bridge at 1500, so the
+    // guest silently drops host→container frames it cannot forward onto the
+    // smaller bridge — host→VM traffic to a bridged container stalls. Deriving
+    // from the live interface keeps dockerd in lockstep with whatever MTU the
+    // host negotiated, with no override on links that stay at 1500.
+    if let Some(mtu) = primary_nic_mtu() {
+        cmd.arg(format!("--mtu={mtu}"));
+        tracing::info!(mtu, "dockerd bridge MTU matched to primary NIC");
+    }
+
+    cmd.env("PATH", &path_env)
         .stdin(Stdio::null())
         .stdout(daemon_log_file("dockerd"))
         .stderr(daemon_log_file("dockerd"));
@@ -658,7 +686,17 @@ async fn try_start_bundled_runtime() -> String {
 mod tests {
     use arcbox_constants::status::{SERVICE_ERROR, SERVICE_NOT_READY, SERVICE_READY};
 
-    use super::{DockerProbe, shared_containerd_config};
+    use super::{DockerProbe, docker_bridge_mtu, shared_containerd_config};
+
+    #[test]
+    fn docker_bridge_mtu_overrides_only_above_default() {
+        assert_eq!(docker_bridge_mtu("4000\n"), Some(4000));
+        assert_eq!(docker_bridge_mtu("  4000  "), Some(4000));
+        assert_eq!(docker_bridge_mtu("1500"), None); // default — no override
+        assert_eq!(docker_bridge_mtu("1400"), None); // never below default
+        assert_eq!(docker_bridge_mtu(""), None);
+        assert_eq!(docker_bridge_mtu("garbage"), None);
+    }
 
     #[test]
     fn shared_containerd_config_uses_k3s_cni_paths() {
