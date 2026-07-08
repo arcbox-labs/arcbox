@@ -507,8 +507,28 @@ mod agent {
         if !start.working_dir.is_empty() {
             cmd.current_dir(&start.working_dir);
         }
-        if let Some(u) = user {
-            cmd.uid(u.uid).gid(u.gid);
+        // Run in a fresh session/process group and drop privileges in pre_exec,
+        // mirroring handle_tty: setsid so a timeout/disconnect kill can target
+        // the whole process group (descendants included), then supplementary
+        // groups → gid → uid, fail-closed. std's .uid()/.gid() skip setgroups,
+        // leaving the workload with root's supplementary group list.
+        let creds = user.map(|u| (u.uid as libc::uid_t, u.gid as libc::gid_t));
+        // SAFETY: the closure runs in the forked child before exec and calls
+        // only async-signal-safe syscalls.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if let Some((uid, gid)) = creds
+                    && (libc::setgroups(1, &raw const gid) != 0
+                        || libc::setgid(gid) != 0
+                        || libc::setuid(uid) != 0)
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -624,13 +644,18 @@ mod agent {
         });
     }
 
-    /// SIGKILL `pid` only if a signal-0 probe shows it is still alive, to avoid
-    /// killing a recycled pid. The reaper collects the terminated child.
+    /// SIGKILL the workload's process group if its leader is still alive.
+    ///
+    /// Both exec paths `setsid` the child, so its pgid equals its pid; killing
+    /// the group (`-pid`) takes down descendants a plain child-pid SIGKILL would
+    /// orphan. The signal-0 probe on the leader avoids killing a recycled pid.
+    /// The reaper collects the terminated children.
     fn kill_if_alive(pid: libc::pid_t) {
-        // SAFETY: kill with a valid pid; signal 0 only probes for existence.
+        // SAFETY: kill with a valid pid; signal 0 only probes for existence,
+        // and a negative pid targets the process group led by `pid`.
         unsafe {
             if libc::kill(pid, 0) == 0 {
-                let _ = libc::kill(pid, libc::SIGKILL);
+                let _ = libc::kill(-pid, libc::SIGKILL);
             }
         }
     }
