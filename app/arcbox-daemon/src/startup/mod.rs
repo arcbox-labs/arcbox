@@ -47,6 +47,15 @@ async fn init_early(args: DaemonArgs, handles: StartupHandles) -> Result<EarlyCo
 
     std::fs::create_dir_all(&layout.data_dir).context("Failed to create data directory")?;
     std::fs::create_dir_all(&layout.run_dir).context("Failed to create run directory")?;
+    // The gRPC/Docker sockets live in run_dir and are the daemon's only access
+    // control (a connected client gets full sandbox read/write/exec). Restrict
+    // the directory to the owner so the posture doesn't depend on the umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&layout.run_dir, std::fs::Permissions::from_mode(0o700))
+            .context("Failed to restrict run directory permissions")?;
+    }
     std::fs::create_dir_all(&layout.log_dir).context("Failed to create log directory")?;
     std::fs::create_dir_all(&layout.data_subdir)
         .context("Failed to create persistent data directory")?;

@@ -110,8 +110,46 @@ pub async fn convert_layer_to_rootfs(layer_path: &str) -> Result<String> {
 /// Ensure the default busybox + vm-agent rootfs exists at `path` and is
 /// newer than its source binaries. Returns without touching the image when
 /// it is already up to date.
+/// Serializes default-rootfs builds so concurrent `create` requests don't each
+/// rebuild the 512 MiB image. The atomic rename already prevents corruption;
+/// this only avoids the redundant work.
+fn build_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Remove leftover `*.ext4.tmp` build artifacts from the rootfs cache dir.
+///
+/// A rootfs build that crashed or panicked leaves a `.default-<uuid>.ext4.tmp`
+/// or `.rootfs-<id>.ext4.tmp` (each up to the image size) with no owner; sweep
+/// them at agent startup so repeated failures don't accrue disk usage.
+pub async fn sweep_stale_tmp() {
+    let Ok(mut entries) = tokio::fs::read_dir(ROOTFS_CACHE_DIR).await else {
+        return;
+    };
+    let mut removed = 0usize;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_name().to_string_lossy().ends_with(".ext4.tmp")
+            && tokio::fs::remove_file(entry.path()).await.is_ok()
+        {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, "swept stale rootfs build artifacts");
+    }
+}
+
 pub async fn ensure_default_rootfs(path: &str) -> Result<()> {
     let image = Path::new(path);
+    if is_default_rootfs_fresh(image) {
+        return Ok(());
+    }
+
+    // Single-flight: a concurrent create for the same default image waits here,
+    // then the re-check lets it reuse the just-built image instead of
+    // redundantly rebuilding 512 MiB.
+    let _build = build_lock().lock().await;
     if is_default_rootfs_fresh(image) {
         return Ok(());
     }
