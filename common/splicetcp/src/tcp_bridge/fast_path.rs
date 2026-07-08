@@ -377,6 +377,7 @@ impl TcpBridge {
                         guest_ip: key.src_ip,
                         remote_port: key.dst_port,
                         guest_port: key.src_port,
+                        peer_mss,
                         our_seq: std::sync::Arc::clone(&our_seq_atomic),
                         last_ack: std::sync::Arc::clone(&last_ack_atomic),
                         down_bytes: down_shared.clone(),

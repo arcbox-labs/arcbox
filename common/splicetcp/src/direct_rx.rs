@@ -71,6 +71,10 @@ pub struct PromotedConn {
     pub remote_port: u16,
     /// Guest TCP port.
     pub guest_port: u16,
+    /// MSS the guest peer advertised. A sink that segments by its own MTU must
+    /// clamp to this so it never emits a frame the guest can't forward onto its
+    /// link (e.g. a 4000-MTU sink feeding a 1460-MSS bridged container).
+    pub peer_mss: u16,
     /// Our SEQ number for frames sent TO guest (shared atomic so both
     /// the inject thread's writes and the fast-path intercept's ACK
     /// frames stay in sync).
@@ -167,6 +171,7 @@ impl ConnSink for TokioFrameConnSink {
             guest_ip,
             remote_port,
             guest_port,
+            peer_mss,
             our_seq,
             last_ack,
             down_bytes,
@@ -186,7 +191,11 @@ impl ConnSink for TokioFrameConnSink {
             down_bytes,
             gw_mac,
             guest_mac,
-            guest_mss: self.guest_mss,
+            // Bound this sink's own MTU-derived segmentation by the peer's MSS so
+            // a high-MTU sink never oversizes frames for a smaller-link guest.
+            guest_mss: self
+                .guest_mss
+                .min((peer_mss as usize).max(crate::tcp_bridge::TCP_MIN_MSS as usize)),
         };
         tokio::spawn(read_promoted_conn(stream, conn, self.tx.clone()));
         true
@@ -304,6 +313,7 @@ mod tests {
             guest_ip: std::net::Ipv4Addr::new(192, 168, 64, 2),
             remote_port: 443,
             guest_port: 50000,
+            peer_mss: 1460,
             our_seq: our_seq.clone(),
             last_ack,
             down_bytes: Some(down.clone()),
@@ -350,6 +360,7 @@ mod tests {
             guest_ip: std::net::Ipv4Addr::new(192, 168, 64, 2),
             remote_port: 443,
             guest_port: 50000,
+            peer_mss: 9000, // jumbo → the configured 4000 MTU drives sizing
             our_seq: our_seq.clone(),
             last_ack: Arc::new(AtomicU32::new(2000)),
             down_bytes: None,
@@ -376,5 +387,63 @@ mod tests {
         assert_eq!(first_ip_len, 4000);
         assert_eq!(second_ip_len, 1080);
         assert_eq!(our_seq.load(Ordering::Relaxed), 6000);
+    }
+
+    /// Regression: a sink configured for a jumbo MTU must still clamp its
+    /// segments to the peer's advertised MSS, or it re-introduces the Host→VM
+    /// stall for a bridged container (1460 MSS) behind a 4000-MTU eth0.
+    #[tokio::test]
+    async fn tokio_frame_conn_sink_clamps_to_peer_mss() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut upstream, accepted) = tokio::join!(async { client }, async {
+            listener.accept().await.unwrap().0
+        },);
+
+        // Jumbo 4000-MTU sink, but the peer advertised only MSS 1460.
+        let (sink, mut rx) = TokioFrameConnSink::channel_with_mtu(8, 4000);
+        let accepted_conn = PromotedConn {
+            stream: accepted.into_std().unwrap(),
+            remote_ip: std::net::Ipv4Addr::new(203, 0, 113, 10),
+            guest_ip: std::net::Ipv4Addr::new(192, 168, 64, 2),
+            remote_port: 443,
+            guest_port: 50000,
+            peer_mss: 1460,
+            our_seq: Arc::new(AtomicU32::new(1000)),
+            last_ack: Arc::new(AtomicU32::new(2000)),
+            down_bytes: None,
+            gw_mac: [0x02, 0, 0, 0, 0, 1],
+            guest_mac: [0x02, 0, 0, 0, 0, 2],
+        };
+        assert!(sink.send_conn(accepted_conn));
+
+        upstream.write_all(&vec![0xAB; 5000]).await.unwrap();
+        // Drain frames until the whole payload arrives (or time out).
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut got = 0usize;
+        while got < 5000 && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Some(f)) => {
+                    got += f.len().saturating_sub(ETH_HEADER_LEN + 40);
+                    frames.push(f);
+                }
+                _ => break,
+            }
+        }
+
+        assert!(
+            frames.iter().all(|f| {
+                let ip_len = u16::from_be_bytes([f[ETH_HEADER_LEN + 2], f[ETH_HEADER_LEN + 3]]);
+                ip_len <= 1500
+            }),
+            "peer MSS 1460 must clamp every frame to ≤1500 despite the 4000 sink MTU",
+        );
+        assert!(
+            frames.len() >= 4,
+            "expected ≥4 clamped frames, got {}",
+            frames.len()
+        );
     }
 }
