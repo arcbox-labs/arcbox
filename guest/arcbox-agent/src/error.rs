@@ -12,6 +12,9 @@ use std::fmt;
 pub enum SandboxError {
     /// The request payload could not be decoded (protobuf parse failure).
     Decode(String),
+    /// The request is malformed or violates a constraint (e.g. an invalid
+    /// sandbox id or an out-of-range field).
+    InvalidArgument(String),
     /// The referenced sandbox / snapshot does not exist.
     NotFound(String),
     /// A sandbox with the requested ID already exists.
@@ -28,7 +31,8 @@ impl fmt::Display for SandboxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Decode(msg) => write!(f, "decode error: {msg}"),
-            Self::NotFound(msg)
+            Self::InvalidArgument(msg)
+            | Self::NotFound(msg)
             | Self::AlreadyExists(msg)
             | Self::WrongState(msg)
             | Self::Unsupported(msg)
@@ -45,7 +49,7 @@ impl SandboxError {
     /// 503 → `UNAVAILABLE`, anything else → `INTERNAL`.
     pub const fn status_code(&self) -> i32 {
         match self {
-            Self::Decode(_) => 400,
+            Self::Decode(_) | Self::InvalidArgument(_) => 400,
             Self::NotFound(_) => 404,
             Self::AlreadyExists(_) => 409,
             Self::WrongState(_) | Self::Unsupported(_) => 412,
@@ -61,7 +65,28 @@ impl From<arcbox_vm::VmmError> for SandboxError {
             VmmError::NotFound(_) => Self::NotFound(e.to_string()),
             VmmError::AlreadyExists(_) => Self::AlreadyExists(e.to_string()),
             VmmError::WrongState { .. } => Self::WrongState(e.to_string()),
+            // Invalid caller input (e.g. a rejected sandbox id) is a 400, not a
+            // 500 — otherwise a bad request surfaces as INTERNAL to the client.
+            VmmError::Config(_) => Self::InvalidArgument(e.to_string()),
             _ => Self::Internal(e.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_config_maps_to_400_not_500() {
+        let err = SandboxError::from(arcbox_vm::VmmError::Config("bad id".into()));
+        assert!(matches!(err, SandboxError::InvalidArgument(_)));
+        assert_eq!(err.status_code(), 400);
+    }
+
+    #[test]
+    fn runtime_errors_stay_500() {
+        let err = SandboxError::from(arcbox_vm::VmmError::Vsock("boom".into()));
+        assert_eq!(err.status_code(), 500);
     }
 }
