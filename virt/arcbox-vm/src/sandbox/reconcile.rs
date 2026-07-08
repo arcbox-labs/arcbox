@@ -58,19 +58,30 @@ impl CowRecord {
 }
 
 /// Crash-recovery record of one live sandbox.
+///
+/// Every field except `id` is `#[serde(default)]`, and new fields must keep
+/// that convention: it lets a newer agent read an older record (missing fields
+/// default) and an older agent read a newer one (unknown fields are ignored),
+/// so a schema change never silently disables reconciliation of a pre-upgrade
+/// sandbox — which would leak its resources.
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct SandboxStateRecord {
     /// Sandbox ID (also the directory name).
     pub id: String,
     /// Firecracker PID at boot time.
+    #[serde(default)]
     pub pid: Option<i32>,
     /// Network allocation to release (TAP + IP).
+    #[serde(default)]
     pub network: Option<NetworkAllocation>,
     /// dm-snapshot CoW resources to tear down.
+    #[serde(default)]
     cow: Option<CowRecord>,
     /// Whether a jailer chroot was created for this sandbox.
+    #[serde(default)]
     pub jailer: bool,
     /// For restored sandboxes: the recreated origin directory to remove.
+    #[serde(default)]
     pub restore_origin_dir: Option<PathBuf>,
 }
 
