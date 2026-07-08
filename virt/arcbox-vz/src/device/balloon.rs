@@ -83,23 +83,39 @@ impl Drop for MemoryBalloonDeviceConfiguration {
 ///
 /// This represents an active balloon device on a running VM.
 /// Use `set_target_memory_size()` to adjust the balloon.
+///
+/// Every accessor dispatches onto the VM's serial queue: Virtualization
+/// framework device objects are queue-affine, and calling them from any
+/// other thread trips `dispatch_assert_queue` inside the framework and
+/// aborts the process (observed on the idle-state balloon shrink).
 pub struct MemoryBalloonDevice {
     inner: *mut AnyObject,
+    /// The owning VM's dispatch queue (non-owned handle).
+    queue: crate::ffi::DispatchQueue,
 }
 
-// SAFETY: The inner pointer refers to a VZ framework-managed object. Access is synchronized by the framework's internal dispatch queue.
+// SAFETY: The inner pointer refers to a VZ framework-managed object and is
+// only messaged through `queue.sync`, which serializes access on the VM's
+// queue as the framework requires.
 unsafe impl Send for MemoryBalloonDevice {}
-// SAFETY: See above — access is synchronized by the framework's dispatch queue.
+// SAFETY: See above — every method dispatches onto the VM's serial queue.
 unsafe impl Sync for MemoryBalloonDevice {}
 
 impl MemoryBalloonDevice {
-    /// Creates a balloon device wrapper from a raw pointer.
+    /// Creates a balloon device wrapper from a raw pointer plus the owning
+    /// VM's dispatch queue.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that `ptr` is a valid `VZVirtioTraditionalMemoryBalloonDevice`.
-    pub(crate) fn from_raw(ptr: *mut AnyObject) -> Self {
-        Self { inner: ptr }
+    /// The caller must ensure that `ptr` is a valid
+    /// `VZVirtioTraditionalMemoryBalloonDevice` and `queue_ptr` is the
+    /// owning VM's dispatch queue, both outliving this wrapper.
+    pub(crate) unsafe fn from_raw(ptr: *mut AnyObject, queue_ptr: *mut AnyObject) -> Self {
+        Self {
+            inner: ptr,
+            // SAFETY: caller guarantees `queue_ptr` outlives the wrapper.
+            queue: unsafe { crate::ffi::DispatchQueue::from_raw(queue_ptr) },
+        }
     }
 
     /// Sets the target virtual machine memory size.
@@ -116,10 +132,13 @@ impl MemoryBalloonDevice {
             tracing::warn!("set_target_memory_size called on null device");
             return;
         }
-        // SAFETY: self.inner is checked non-null above. Sending setTargetVirtualMachineMemorySize: with a u64 value.
-        unsafe {
-            msg_send_void_u64!(self.inner, setTargetVirtualMachineMemorySize: bytes);
-        }
+        self.queue.sync(|| {
+            // SAFETY: self.inner is checked non-null above; we are on the
+            // VM's dispatch queue as the framework requires.
+            unsafe {
+                msg_send_void_u64!(self.inner, setTargetVirtualMachineMemorySize: bytes);
+            }
+        });
         tracing::debug!(
             "Set balloon target memory to {} bytes ({}MB)",
             bytes,
@@ -135,8 +154,10 @@ impl MemoryBalloonDevice {
             tracing::warn!("target_memory_size called on null device");
             return 0;
         }
-        // SAFETY: self.inner is checked non-null above. Sending targetVirtualMachineMemorySize to a valid balloon device.
-        unsafe { msg_send_u64!(self.inner, targetVirtualMachineMemorySize) }
+        // SAFETY: self.inner is checked non-null above; dispatched onto the
+        // VM's queue as the framework requires.
+        self.queue
+            .sync(|| unsafe { msg_send_u64!(self.inner, targetVirtualMachineMemorySize) })
     }
 
     /// Returns the raw object pointer.
@@ -155,11 +176,16 @@ impl MemoryBalloonDevice {
 /// # Arguments
 ///
 /// * `vm_ptr` - Raw pointer to `VZVirtualMachine`
+/// * `queue_ptr` - The VM's dispatch queue, which every returned wrapper
+///   uses for its (queue-affine) framework calls
 ///
 /// # Returns
 ///
 /// A vector of `MemoryBalloonDevice` wrappers.
-pub fn vm_memory_balloon_devices(vm_ptr: *mut AnyObject) -> Vec<MemoryBalloonDevice> {
+pub fn vm_memory_balloon_devices(
+    vm_ptr: *mut AnyObject,
+    queue_ptr: *mut AnyObject,
+) -> Vec<MemoryBalloonDevice> {
     if vm_ptr.is_null() {
         return Vec::new();
     }
@@ -177,7 +203,7 @@ pub fn vm_memory_balloon_devices(vm_ptr: *mut AnyObject) -> Vec<MemoryBalloonDev
         for i in 0..count {
             let device = crate::ffi::nsarray_object_at_index(devices, i);
             if !device.is_null() {
-                result.push(MemoryBalloonDevice::from_raw(device));
+                result.push(MemoryBalloonDevice::from_raw(device, queue_ptr));
             }
         }
 

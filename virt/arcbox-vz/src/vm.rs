@@ -426,7 +426,7 @@ impl VirtualMachine {
     /// These can be used for dynamic memory management between host and guest.
     #[must_use]
     pub fn memory_balloon_devices(&self) -> Vec<MemoryBalloonDevice> {
-        vm_memory_balloon_devices(self.inner)
+        vm_memory_balloon_devices(self.inner, self.queue.as_ptr())
     }
 
     /// Returns the first memory balloon device, if any.
