@@ -13,6 +13,10 @@ async fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
     match tokio::fs::rename(from, to).await {
         Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
             tokio::fs::copy(from, to).await?;
+            // fsync the destination before removing the source: a crash between
+            // the copy and the remove must not leave a zero-length/partial
+            // snapshot file registered in the catalog.
+            tokio::fs::File::open(to).await?.sync_all().await?;
             tokio::fs::remove_file(from).await
         }
         other => other,
@@ -158,16 +162,11 @@ impl SandboxManager {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        if new_id.contains('/')
-            || new_id.contains('\\')
-            || new_id.contains('\0')
-            || new_id == "."
-            || new_id == ".."
-        {
-            return Err(VmmError::Config(format!(
-                "invalid sandbox ID: {new_id:?} (must not contain path separators)"
-            )));
-        }
+        super::validate_id("sandbox id", &new_id)?;
+        // The snapshot id is caller-supplied and flows into snapshot dir paths
+        // (create_dir_all / copy / remove_dir_all) — validate it too, or a
+        // `../` id would traverse out of the snapshots directory.
+        super::validate_id("snapshot id", &spec.snapshot_id)?;
 
         // Reserve the id atomically so a concurrent restore/create of the same
         // id fails fast with AlreadyExists instead of both proceeding to set up

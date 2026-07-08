@@ -35,13 +35,9 @@ impl SandboxManager {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        // Sanitize caller-supplied IDs: reject path separators and other
-        // dangerous characters to prevent directory traversal.
-        if id.contains('/') || id.contains('\\') || id.contains('\0') || id == "." || id == ".." {
-            return Err(VmmError::Config(format!(
-                "invalid sandbox ID: {id:?} (must not contain path separators)"
-            )));
-        }
+        // Restrict caller-supplied ids to a safe charset (path components,
+        // jailer --id, dm/TAP names). Auto-generated UUIDs pass unchanged.
+        super::validate_id("sandbox id", &id)?;
 
         // Uniqueness check.
         {
@@ -270,10 +266,14 @@ impl SandboxManager {
         state_filter: Option<&str>,
         label_filter: &HashMap<String, String>,
     ) -> Vec<SandboxSummary> {
-        self.instances
-            .read()
-            .unwrap()
-            .values()
+        // Snapshot the Arcs under the map read guard, then release it before
+        // locking any instance. The manager's discipline is "never hold the
+        // instances map lock while holding an instance lock"; taking both here
+        // (as before) is the one place that could deadlock a future writer that
+        // locks in the opposite order.
+        let instances: Vec<_> = self.instances.read().unwrap().values().cloned().collect();
+        instances
+            .iter()
             .filter_map(|arc| {
                 let inst = arc.lock().unwrap();
                 // State filter.

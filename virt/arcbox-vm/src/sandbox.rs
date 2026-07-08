@@ -132,6 +132,27 @@ impl SandboxManager {
     }
 }
 
+/// Validate a caller-supplied sandbox or snapshot id.
+///
+/// Ids become filesystem path components, jailer `--id` values, and dm/TAP name
+/// fragments, so they are restricted to `[A-Za-z0-9_-]`. This rejects path
+/// traversal (`/`, `\`, `..`), NUL, whitespace, and anything the jailer would
+/// otherwise reject much later with an opaque boot failure.
+pub(super) fn validate_id(kind: &str, id: &str) -> Result<()> {
+    if id.is_empty() {
+        return Err(VmmError::Config(format!("{kind} must not be empty")));
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(VmmError::Config(format!(
+            "invalid {kind} {id:?}: only ASCII letters, digits, '-' and '_' are allowed"
+        )));
+    }
+    Ok(())
+}
+
 /// Atomically reserve `id` in the instance map with a placeholder instance.
 ///
 /// Create and restore both derive per-sandbox resources deterministically from
@@ -217,6 +238,19 @@ mod tests {
         ));
         first.commit();
         assert!(instances.read().unwrap().contains_key("dup"));
+    }
+
+    #[test]
+    fn validate_id_accepts_safe_ids_and_rejects_traversal() {
+        for ok in ["sandbox1", "a-b_c", "0f3e9d16-1234", "A_B-9"] {
+            assert!(validate_id("id", ok).is_ok(), "{ok} should be valid");
+        }
+        for bad in ["", "..", ".", "a/b", "a\\b", "a b", "a.b", "a\0b", "../etc"] {
+            assert!(
+                validate_id("id", bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
     }
 
     #[test]
