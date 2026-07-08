@@ -68,7 +68,7 @@ const SHIM_MSS: u16 = 1460;
 /// Floor for a peer-advertised MSS when sizing host→guest segments. 536 is the
 /// IPv4 minimum (576-byte MTU − 40), so it is always safe to send; it also
 /// guards against a missing or malformed MSS option collapsing segments to 0.
-const TCP_MIN_MSS: u16 = 536;
+pub(crate) const TCP_MIN_MSS: u16 = 536;
 
 /// Fixed segment size the GSO/inline injection paths let the guest re-segment
 /// at (the `gso_size` stamped by `arcbox-net-inject`'s `write_inline_headers`
