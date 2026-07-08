@@ -238,3 +238,28 @@ fn resolve_bind_ip_defaults_and_loopback() {
     );
     assert_eq!(super::resolve_bind_ip("not-an-ip"), None);
 }
+
+#[test]
+fn sandbox_capability_gates_on_nested_virt_and_backend() {
+    use arcbox_vmm::VmBackend;
+
+    // VZ backend on nested-virt-capable hardware: sandboxes run.
+    let (supported, reason) = super::evaluate_sandbox_capability(VmBackend::Vz, true);
+    assert!(supported);
+    assert!(reason.is_empty());
+
+    // HV backend on capable hardware: actionable "switch to VZ" message.
+    let (supported, reason) = super::evaluate_sandbox_capability(VmBackend::Hv, true);
+    assert!(!supported);
+    assert!(reason.contains("HV"));
+    assert!(reason.contains("backend vz"));
+
+    // No host nested-virt support: hardware message regardless of backend,
+    // since switching backends cannot help.
+    for backend in [VmBackend::Vz, VmBackend::Hv] {
+        let (supported, reason) = super::evaluate_sandbox_capability(backend, false);
+        assert!(!supported);
+        assert!(reason.contains("nested virtualization"));
+        assert!(reason.contains("M3"));
+    }
+}

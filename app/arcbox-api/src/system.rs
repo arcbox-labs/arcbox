@@ -9,9 +9,9 @@ use std::sync::Arc;
 use arcbox_grpc::SystemService;
 use arcbox_protocol::v1::{
     Empty, ResolveContainerFsRequest, ResolveContainerFsResponse, ResolveImageFsRequest,
-    ResolveImageFsResponse, SetSystemVmBackendRequest, SetupStatus, SystemVmBackend,
-    SystemVmBackendInfo, VcpuDebug, VirtioDebugInfo, VirtioDeviceDebug, VirtioQueueDebug,
-    setup_status,
+    ResolveImageFsResponse, SandboxCapability, SetSystemVmBackendRequest, SetupStatus,
+    SystemVmBackend, SystemVmBackendInfo, VcpuDebug, VirtioDebugInfo, VirtioDeviceDebug,
+    VirtioQueueDebug, setup_status,
 };
 use tokio::sync::watch;
 use tokio_stream::Stream;
@@ -262,6 +262,19 @@ impl SystemService for SystemServiceImpl {
         let runtime = self.runtime.ready()?;
         Ok(Response::new(SystemVmBackendInfo {
             backend: backend_to_proto(runtime.system_vm_backend()) as i32,
+        }))
+    }
+
+    async fn get_sandbox_capability(
+        &self,
+        _request: Request<Empty>,
+    ) -> Result<Response<SandboxCapability>, Status> {
+        let runtime = self.runtime.ready()?;
+        let cap = runtime.sandbox_capability();
+        Ok(Response::new(SandboxCapability {
+            supported: cap.supported,
+            reason: cap.reason,
+            backend: backend_to_proto(cap.backend) as i32,
         }))
     }
 

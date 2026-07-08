@@ -37,6 +37,33 @@ async fn sandbox_channel() -> Result<Channel> {
         })
 }
 
+/// Fails fast when the daemon reports that sandboxes cannot run on this host
+/// or System VM backend, instead of booting a microVM that would land in
+/// `failed` with an opaque KVM error. This is a host-side check — no round-trip
+/// into the guest. Transport errors (e.g. an older daemon without the RPC) fall
+/// through so the create still proceeds, where the guest agent remains the
+/// backstop.
+async fn ensure_sandbox_supported(channel: &Channel) -> Result<()> {
+    use arcbox_grpc::SystemServiceClient;
+
+    let mut client = SystemServiceClient::new(channel.clone());
+    match client
+        .get_sandbox_capability(tonic::Request::new(arcbox_protocol::v1::Empty {}))
+        .await
+    {
+        Ok(resp) => {
+            let cap = resp.into_inner();
+            if !cap.supported {
+                anyhow::bail!("{}", cap.reason);
+            }
+            Ok(())
+        }
+        // The capability RPC is unavailable (older daemon, not ready); let the
+        // create proceed rather than blocking on a missing pre-check.
+        Err(_) => Ok(()),
+    }
+}
+
 /// Attaches the default `x-machine` metadata header to a tonic request for
 /// daemon-side routing to the guest VM agent.
 fn attach_machine<T>(mut request: tonic::Request<T>) -> tonic::Request<T> {
@@ -294,6 +321,10 @@ fn parse_labels(raw: &[String]) -> Result<HashMap<String, String>> {
 
 async fn execute_create(args: CreateArgs) -> Result<()> {
     let channel = sandbox_channel().await?;
+
+    // Reject unsupported hosts/backends up front with an actionable message.
+    ensure_sandbox_supported(&channel).await?;
+
     let mut client = SandboxServiceClient::new(channel);
 
     let labels = parse_labels(&args.label)?;

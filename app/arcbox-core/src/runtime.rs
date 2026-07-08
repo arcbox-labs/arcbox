@@ -145,6 +145,49 @@ pub struct SandboxPortExposure {
     pub guest_port: u16,
 }
 
+/// Whether this host and System VM backend can run sandboxes.
+///
+/// Produced by [`Runtime::sandbox_capability`].
+#[derive(Debug, Clone)]
+pub struct SandboxCapability {
+    /// Whether sandboxes are runnable on the current host and backend.
+    pub supported: bool,
+    /// Actionable reason when unsupported; empty when supported.
+    pub reason: String,
+    /// The System VM backend the capability was evaluated against.
+    pub backend: arcbox_vmm::VmBackend,
+}
+
+/// Pure decision behind [`Runtime::sandbox_capability`], split out for testing.
+///
+/// Host nested-virt support is the hard gate (M3+ / macOS 15+ hardware), so it
+/// is checked first: on hardware that lacks it, switching backends cannot help.
+/// Only when the hardware is capable does the HV backend become the actionable
+/// blocker (nested virtualization is unavailable under Hypervisor.framework).
+fn evaluate_sandbox_capability(
+    backend: arcbox_vmm::VmBackend,
+    host_nested_virt: bool,
+) -> (bool, String) {
+    if !host_nested_virt {
+        return (
+            false,
+            "sandbox requires nested virtualization: the VZ backend on Apple \
+             Silicon M3 or newer with macOS 15+; this host does not support it"
+                .to_string(),
+        );
+    }
+    if backend == arcbox_vmm::VmBackend::Hv {
+        return (
+            false,
+            "sandbox requires nested virtualization, which is unavailable under \
+             the HV backend (current backend: HV); switch with \
+             `arcbox system backend vz`"
+                .to_string(),
+        );
+    }
+    (true, String::new())
+}
+
 impl Runtime {
     /// Creates a new runtime with the given configuration.
     ///
@@ -413,6 +456,25 @@ impl Runtime {
     #[must_use]
     pub fn system_vm_backend(&self) -> arcbox_vmm::VmBackend {
         self.vm_lifecycle.backend()
+    }
+
+    /// Reports whether this host and System VM backend can run sandboxes.
+    ///
+    /// Sandboxes are nested Firecracker microVMs; they need `/dev/kvm` inside
+    /// the System VM, which the host exposes only with nested virtualization
+    /// enabled (VZ backend on Apple Silicon M3+ with macOS 15+). Computing this
+    /// on the host lets `arcbox sandbox create` and clients fail fast without a
+    /// round-trip into the guest.
+    #[must_use]
+    pub fn sandbox_capability(&self) -> SandboxCapability {
+        let backend = self.system_vm_backend();
+        let (supported, reason) =
+            evaluate_sandbox_capability(backend, arcbox_hypervisor::host_supports_nested_virt());
+        SandboxCapability {
+            supported,
+            reason,
+            backend,
+        }
     }
 
     /// Switches the System VM's hypervisor backend (HV <-> VZ) and restarts the

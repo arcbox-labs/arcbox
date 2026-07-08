@@ -97,11 +97,8 @@ impl KvmHypervisor {
         // Determine supported architectures
         let supported_archs = vec![CpuArch::native()];
 
-        // Check for nested virtualization support
-        #[cfg(target_arch = "x86_64")]
-        let nested_virt = Self::check_nested_virt();
-        #[cfg(not(target_arch = "x86_64"))]
-        let nested_virt = false;
+        // Check for nested virtualization support.
+        let nested_virt = super::host_supports_nested_virt();
 
         Ok(PlatformCapabilities {
             supported_archs,
@@ -110,26 +107,6 @@ impl KvmHypervisor {
             nested_virt,
             rosetta: false, // Not applicable on Linux
         })
-    }
-
-    /// Checks if nested virtualization is supported (x86 only).
-    #[cfg(target_arch = "x86_64")]
-    fn check_nested_virt() -> bool {
-        // Check Intel VMX nested support
-        if let Ok(content) = std::fs::read_to_string("/sys/module/kvm_intel/parameters/nested") {
-            if content.trim() == "Y" || content.trim() == "1" {
-                return true;
-            }
-        }
-
-        // Check AMD SVM nested support
-        if let Ok(content) = std::fs::read_to_string("/sys/module/kvm_amd/parameters/nested") {
-            if content.trim() == "Y" || content.trim() == "1" {
-                return true;
-            }
-        }
-
-        false
     }
 
     /// Returns the KVM system handle.

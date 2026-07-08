@@ -344,6 +344,21 @@ pub struct ResolveImageFsResponse {
     #[prost(string, repeated, tag = "1")]
     pub lower_dirs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
+/// Whether sandboxes (nested-virtualization microVMs) can run on this host.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SandboxCapability {
+    /// Whether sandboxes are runnable on the current host and backend.
+    #[prost(bool, tag = "1")]
+    pub supported: bool,
+    /// Actionable reason when unsupported; empty when supported.
+    #[prost(string, tag = "2")]
+    pub reason: ::prost::alloc::string::String,
+    /// The System VM backend the capability was evaluated against.
+    #[prost(enumeration = "SystemVmBackend", tag = "3")]
+    pub backend: i32,
+}
 /// Diagnostic snapshot of the System VM's virtio devices and vCPUs.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

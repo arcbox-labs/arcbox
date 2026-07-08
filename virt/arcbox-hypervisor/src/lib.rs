@@ -86,3 +86,28 @@ pub fn create_hypervisor() -> Result<impl Hypervisor> {
         compile_error!("Unsupported platform: only macOS and Linux are supported")
     }
 }
+
+/// Reports whether the host supports nested virtualization for guest VMs.
+///
+/// This gates ArcBox sandboxes: nested Firecracker microVMs need `/dev/kvm`
+/// inside the System VM, which the host exposes only when it enables nested
+/// virtualization — Apple Silicon M3 or newer on macOS 15+ under the VZ
+/// backend. Detection is a cheap static query and does not construct a
+/// hypervisor.
+#[must_use]
+pub fn host_supports_nested_virt() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        arcbox_vz::GenericPlatform::is_nested_virt_supported()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        linux::host_supports_nested_virt()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}

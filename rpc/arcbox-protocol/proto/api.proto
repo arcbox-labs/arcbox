@@ -194,6 +194,12 @@ service SystemService {
     // Gets the System VM's current hypervisor backend.
     rpc GetSystemVmBackend(Empty) returns (SystemVmBackendInfo);
 
+    // Reports whether this host and System VM backend can run sandboxes
+    // (nested-virtualization microVMs). Lets clients pre-check and grey out
+    // sandbox features without booting a microVM that would fail with an
+    // opaque KVM error.
+    rpc GetSandboxCapability(Empty) returns (SandboxCapability);
+
     // Switches the System VM's hypervisor backend (HV <-> VZ). The choice is
     // persisted; the System VM is restarted so it takes effect, which stops
     // running containers. Returns the resulting backend.
@@ -266,6 +272,16 @@ message ResolveImageFsRequest {
 message ResolveImageFsResponse {
     // Read-only layer directories, top-most first.
     repeated string lower_dirs = 1;
+}
+
+// Whether sandboxes (nested-virtualization microVMs) can run on this host.
+message SandboxCapability {
+    // Whether sandboxes are runnable on the current host and backend.
+    bool supported = 1;
+    // Actionable reason when unsupported; empty when supported.
+    string reason = 2;
+    // The System VM backend the capability was evaluated against.
+    SystemVmBackend backend = 3;
 }
 
 // Diagnostic snapshot of the System VM's virtio devices and vCPUs.
