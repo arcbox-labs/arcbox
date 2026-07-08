@@ -5,7 +5,7 @@ use crate::error::{Result, VmmError};
 use super::pl011::Pl011;
 use super::pl031::Pl031;
 use super::psci::{CpuOnRequest, CpuPower, CpuPowerRegistry};
-use super::vcpu_loop::{VcpuContext, VcpuLoopExit, vcpu_run_loop};
+use super::vcpu_loop::{VcpuBoot, VcpuContext, vcpu_run_loop};
 use super::*;
 
 impl Vmm {
@@ -289,41 +289,31 @@ impl Vmm {
                 let stats = vcpu_stats[i as usize].clone();
                 let registry_for_thread = registry.clone();
 
-                // The thread parks on its receiver until CPU_ON, runs the
-                // vCPU, and — when the guest offlines it via CPU_OFF —
-                // parks again for the next CPU_ON. It exits when the
-                // registry is closed (stop) or the VM shuts down.
+                // The thread creates its HvVcpu once, parks on its receiver
+                // until CPU_ON, and — when the guest offlines it via
+                // CPU_OFF — parks again for the next CPU_ON without
+                // destroying the vCPU (see vcpu_run_loop). It exits when
+                // the registry is closed (stop) or the VM shuts down.
                 let t = std::thread::Builder::new()
                     .name(format!("hv-vcpu-{i}"))
                     .spawn(move || {
-                        while let Ok(req) = rx.recv() {
-                            tracing::info!(
-                                "vCPU {i}: received CPU_ON, starting at {:#x}",
-                                req.entry_point
-                            );
-                            let exit = vcpu_run_loop(
-                                i,
-                                req.entry_point,
-                                req.context_id,
-                                VcpuContext {
-                                    device_manager: dm.clone(),
-                                    running: r.clone(),
-                                    reset_requested: rr.clone(),
-                                    paused: p.clone(),
-                                    pl011: uart.clone(),
-                                    pl031: rtc.clone(),
-                                    cpu_power: Some(registry_for_thread.clone()),
-                                    vcpu_thread_handles: th.clone(),
-                                    hv_vcpu_ids: ids.clone(),
-                                    hvc_blk_fds: hvc_fds_clone.clone(),
-                                    stats: stats.clone(),
-                                },
-                            );
-                            if exit != VcpuLoopExit::CpuOff {
-                                return;
-                            }
-                        }
-                        tracing::debug!("vCPU {i}: channel closed, exiting");
+                        vcpu_run_loop(
+                            i,
+                            VcpuBoot::AwaitCpuOn(rx),
+                            VcpuContext {
+                                device_manager: dm,
+                                running: r,
+                                reset_requested: rr,
+                                paused: p,
+                                pl011: uart,
+                                pl031: rtc,
+                                cpu_power: Some(registry_for_thread),
+                                vcpu_thread_handles: th,
+                                hv_vcpu_ids: ids,
+                                hvc_blk_fds: hvc_fds_clone,
+                                stats,
+                            },
+                        );
                     })
                     .map_err(|e| VmmError::Vcpu(format!("spawn vcpu-{i}: {e}")))?;
                 self.hv_vcpu_threads.push(t);
@@ -345,8 +335,10 @@ impl Vmm {
                 .spawn(move || {
                     vcpu_run_loop(
                         0,
-                        kernel_entry,
-                        fdt_addr,
+                        VcpuBoot::Immediate {
+                            entry: kernel_entry,
+                            x0: fdt_addr,
+                        },
                         VcpuContext {
                             device_manager,
                             running,
