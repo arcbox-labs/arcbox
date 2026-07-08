@@ -5,6 +5,103 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.17](https://github.com/arcboxlabs/arcbox/compare/v0.4.16...v0.4.17) (2026-07-08)
+
+
+### Features
+
+* **api:** gRPC server reflection + sandbox API reference (CORE-15, CORE-4) ([60f2ca1](https://github.com/arcboxlabs/arcbox/commit/60f2ca1358d1fd4cc3fdc5f4109cb21e0e597f2b))
+* **daemon:** seed vm-agent from the app bundle (CORE-5) ([50f5233](https://github.com/arcboxlabs/arcbox/commit/50f5233c97a977ac5410841521de32aece4bd6ac))
+* **e2e:** daemon harness with gRPC readiness, signing fixture, and startup failure channel ([#362](https://github.com/arcboxlabs/arcbox/issues/362)) ([49a75fb](https://github.com/arcboxlabs/arcbox/commit/49a75fb915824bf5aea59fdbf0b529519e8a9bb2))
+* **fleet:** fall back to local Docker on macOS when ArcBox is unresponsive ([7ec107e](https://github.com/arcboxlabs/arcbox/commit/7ec107eea46098c881b6c5a640b82826b1cd474b))
+* **fleet:** hold offer verdicts until the gateway settles them ([5b7b71e](https://github.com/arcboxlabs/arcbox/commit/5b7b71e9581411b8c3626dbd4cb50de26684d19e))
+* **fleet:** offer/reject protocol, agent as admission authority ([cb44fae](https://github.com/arcboxlabs/arcbox/commit/cb44faef3661929302bdee2a2725b6272b843e0a))
+* **fleet:** port process-group cancel, graceful shutdown, token-file to offer/reject agent ([a63efc7](https://github.com/arcboxlabs/arcbox/commit/a63efc77ce2a108ec7802fe955a3292150661d76))
+* **fleet:** resend offer verdicts until the gateway acks ([2e8d376](https://github.com/arcboxlabs/arcbox/commit/2e8d376ba8d572078357af4fac008ccd13b61944))
+* **fleet:** store the machine credential in the OS keychain on macOS/Windows ([2390f3d](https://github.com/arcboxlabs/arcbox/commit/2390f3d566b212745ddafb5814171c5660aa3342))
+* **hv,e2e:** HV boot root fixes + parallel/dual-backend harness ([#363](https://github.com/arcboxlabs/arcbox/issues/363)) ([634ebc3](https://github.com/arcboxlabs/arcbox/commit/634ebc3862fcb2c0f1cbed43ecc8d7c13a990460))
+* **hv:** PL031 RTC, PSCI CPU_OFF, and guest-halt teardown fixes (ABX-416, ABX-403, ABX-415) ([#373](https://github.com/arcboxlabs/arcbox/issues/373)) ([8fda13f](https://github.com/arcboxlabs/arcbox/commit/8fda13f9a7d983865067b18415cbebc3231b5bd1))
+* **rpc:** daemon↔agent protocol handshake + buf breaking CI gate (ABX-410) ([#368](https://github.com/arcboxlabs/arcbox/issues/368)) ([b90d236](https://github.com/arcboxlabs/arcbox/commit/b90d2368fb5697e0bf18f1df842381becf0a63f4))
+* **sandbox:** expose file I/O through the host chain (CORE-7) ([001c879](https://github.com/arcboxlabs/arcbox/commit/001c87901058d390dab1e385c138c7707240aa1f))
+* **sandbox:** expose sandbox ports on the host (CORE-2) ([fb4bbcf](https://github.com/arcboxlabs/arcbox/commit/fb4bbcf239697b7da25ee57ae5e02624aff1404c))
+* **sandbox:** fail fast without nested virt + typed agent error codes (CORE-13) ([d5b2152](https://github.com/arcboxlabs/arcbox/commit/d5b2152aac8c11844c9ebccd910a34e73db3d65e))
+* **sandbox:** launch the initial cmd after boot (CORE-6) ([fd6e792](https://github.com/arcboxlabs/arcbox/commit/fd6e79209c05374f155be710297219a26510a93e))
+* **sandbox:** plumb exec TTY resize end-to-end + honor user (CORE-8) ([d38212e](https://github.com/arcboxlabs/arcbox/commit/d38212e4ca369fa53f12a84f80fdb300d87cbe73))
+* **sandbox:** reconcile orphaned resources after agent restart (CORE-14) ([e58a4e1](https://github.com/arcboxlabs/arcbox/commit/e58a4e10027cf03c58b489fe47b8ff29b9c84c3f))
+
+
+### Bug Fixes
+
+* **agent:** gate docker readiness on API /_ping, not socket-connectable (ABX-408) ([#366](https://github.com/arcboxlabs/arcbox/issues/366)) ([46dcd12](https://github.com/arcboxlabs/arcbox/commit/46dcd12dd9adc79944c57b28cc1b75974ff312d8))
+* **agent:** tag sandbox DNAT rules and flush orphans on startup ([2e1fd9d](https://github.com/arcboxlabs/arcbox/commit/2e1fd9def569559c9a754fafadbf811e05b52d59))
+* **asset:** unique download temp files + manifest pin in prepare_binaries (ABX-411, ABX-412) ([#369](https://github.com/arcboxlabs/arcbox/issues/369)) ([ddae777](https://github.com/arcboxlabs/arcbox/commit/ddae777959cb8bcfc2082b22b4f89d2f35d1e175))
+* **ci:** update vmm-guest-agent bin references + borrow_as_ptr lint ([fa111e8](https://github.com/arcboxlabs/arcbox/commit/fa111e83c314db6ac2fee082c44f33c0aff75629))
+* **cli:** serialize daemon spawns — hold a spawn lock across the handoff (ABX-409) ([#367](https://github.com/arcboxlabs/arcbox/issues/367)) ([98ad123](https://github.com/arcboxlabs/arcbox/commit/98ad123fd9b3ca684ba06cf7903a9cec991d0d3a))
+* **core:** pick the agent transport from the VM backend, not the fd domain ([878215d](https://github.com/arcboxlabs/arcbox/commit/878215dba79d7d7514c12010e2d3a0f44d219b64))
+* **daemon:** arm signal handling for the whole startup window (ABX-407) ([#365](https://github.com/arcboxlabs/arcbox/issues/365)) ([66344e0](https://github.com/arcboxlabs/arcbox/commit/66344e0ee99f81bef81da3a29cafcbf6b9d7277d))
+* **example:** update hv_coldboot_once to from_fd_blocking ([795ca02](https://github.com/arcboxlabs/arcbox/commit/795ca028ffc41957b37483927745f7e85795acdb))
+* **fleet:** make CredentialStore::new infallible ([0866ea1](https://github.com/arcboxlabs/arcbox/commit/0866ea1c368d943854d2fc0d31b36922ff91149d))
+* **fleet:** observe cancellation at every stage and await runner teardown ([0f4015a](https://github.com/arcboxlabs/arcbox/commit/0f4015aa5572914f8e41db5372f4bf82bd762f5f))
+* **fleet:** reject non-positive load ceiling at config parse ([989df8b](https://github.com/arcboxlabs/arcbox/commit/989df8b84d4b14aaf2f2f38563f77a50c19bcd1c))
+* **fleet:** release in-flight job on runner task panic ([22ed07e](https://github.com/arcboxlabs/arcbox/commit/22ed07e51a1f3e4f43e087b46b43320fdd54d64b))
+* **fleet:** require finite load ceiling, scope keychain credential by gateway ([f7c58e1](https://github.com/arcboxlabs/arcbox/commit/f7c58e1726180523240f51db33d534caf8dce0da))
+* **fleet:** treat redelivered offers as duplicates until the verdict settles ([3bd37c0](https://github.com/arcboxlabs/arcbox/commit/3bd37c058195270442616c85d970cd37a06b250e))
+* **hv:** platform correctness + guest-initiated reboot (ABX-402..405) ([#372](https://github.com/arcboxlabs/arcbox/issues/372)) ([e15f70a](https://github.com/arcboxlabs/arcbox/commit/e15f70ad0c878bf7c29a52d0a0050514b25aa4b6))
+* **net:** carry peer MSS into PromotedConn so sinks clamp their own segments ([ba9f0ca](https://github.com/arcboxlabs/arcbox/commit/ba9f0ca76de5b6f577480b55d4d4e563a013a465))
+* **net:** clamp host→guest TCP segments to the peer's advertised MSS ([400b3d9](https://github.com/arcboxlabs/arcbox/commit/400b3d941000ed6fe028316f29f77d407d24d26c))
+* **net:** keep sub-1460-MSS flows off the GSO/inline inject path ([d435f31](https://github.com/arcboxlabs/arcbox/commit/d435f312bdae95394e5a59e7eca4cc42eb6e1c18))
+* **sandbox:** bind exposed ports on loopback + abort truncated file writes ([11008b6](https://github.com/arcboxlabs/arcbox/commit/11008b6d1cfd3c5035a5eb4e5ed228dde4e5c71d))
+* **sandbox:** bound streaming channels and stop draining dropped consumers ([4c626b5](https://github.com/arcboxlabs/arcbox/commit/4c626b5e5b77ab58b1beedcb682ea47bc5bd121b))
+* **sandbox:** claim the workload slot before dispatching into the guest ([c971bb5](https://github.com/arcboxlabs/arcbox/commit/c971bb5d7384e2be60861e1dba7b7e78a5a4324b))
+* **sandbox:** close the create/create id TOCTOU with reserve_id ([1faff10](https://github.com/arcboxlabs/arcbox/commit/1faff10bff96ea857ccca8729298d1fb84f616d5))
+* **sandbox:** fail expose when no port could be bound ([9155b7e](https://github.com/arcboxlabs/arcbox/commit/9155b7e3ba7111bb93df2b1d0a926a1d15f56cce))
+* **sandbox:** gate create/restore on the orphan sweep + stop the boot-race CoW leak ([cbe7f68](https://github.com/arcboxlabs/arcbox/commit/cbe7f68dfef482b181e2df90d59a645a716200a7))
+* **sandbox:** guarantee checkpoint resume + reserve the id before restore ([f21ca1f](https://github.com/arcboxlabs/arcbox/commit/f21ca1fd2d03cda256a8a78cf54d0d4e458ed6e4))
+* **sandbox:** guard workload state transitions against a racing stop (pullfrog) ([ebba955](https://github.com/arcboxlabs/arcbox/commit/ebba9558aa924fb32a136342f3c7febb8a50d59f))
+* **sandbox:** identity-guard TTL expiry against same-id re-creation ([40bbecc](https://github.com/arcboxlabs/arcbox/commit/40bbeccf7f4bed74262cca64d775d1876ded2fbb))
+* **sandbox:** make Stop graceful and release resources on Stopped (CORE-9) ([e543a30](https://github.com/arcboxlabs/arcbox/commit/e543a30eee7e4b2a0b38782bd171728b29a4f4b4))
+* **sandbox:** preserve agent error codes (400 for bad input, streaming too) ([ed92284](https://github.com/arcboxlabs/arcbox/commit/ed922844f022deda47caf31e308e19283419037a))
+* **sandbox:** reject unimplemented create fields explicitly (CORE-11, CORE-12) ([fbe5136](https://github.com/arcboxlabs/arcbox/commit/fbe5136a0c1159e6185feb1f245de37ff1a07c40))
+* **sandbox:** repair asset pipeline — real paths, in-agent rootfs builds (CORE-5) ([c340ddd](https://github.com/arcboxlabs/arcbox/commit/c340dddb1f2bae858e6000eb61ce4403b22b5785))
+* **sandbox:** reuse an existing default rootfs when build sources are absent ([913050b](https://github.com/arcboxlabs/arcbox/commit/913050b1fe39e5b61bfe441f16882eb761bc1003))
+* **sandbox:** single-flight rootfs builds, sweep tmp, restrict run dir ([f248346](https://github.com/arcboxlabs/arcbox/commit/f2483464144949920baa90e376cf0659c3532f01))
+* **sandbox:** tolerate EXDEV when collecting jailer checkpoints ([423ffa8](https://github.com/arcboxlabs/arcbox/commit/423ffa8829cf2fca6ca45065c4727c1098c5a59b))
+* **sandbox:** validate ids strictly, fsync EXDEV moves, tolerate record schema drift ([51bf7e9](https://github.com/arcboxlabs/arcbox/commit/51bf7e9ebeea3a201be0648905e68ad2c3a2c944))
+* **vm-agent:** drop supplementary groups and kill the whole process group ([d473223](https://github.com/arcboxlabs/arcbox/commit/d4732239a1886ebb5fcc6318fe69c2c826101f4e))
+* **vm-agent:** reap orphans, enforce TTY timeout, kill on host disconnect ([222f66f](https://github.com/arcboxlabs/arcbox/commit/222f66f47b7747eb7a0cca6d9e5b81e2cd7c5a19))
+* **vz:** dispatch queue-affine VZ calls onto the VM's queue ([#374](https://github.com/arcboxlabs/arcbox/issues/374)) ([8fa80dd](https://github.com/arcboxlabs/arcbox/commit/8fa80dd8b5644d1a5acbd85d44b978b3a4665f4e))
+* **vz:** fix MTU override selector detection ([#361](https://github.com/arcboxlabs/arcbox/issues/361)) ([65dc0a0](https://github.com/arcboxlabs/arcbox/commit/65dc0a035f2d434cdf8a69a93b70b61b07809175))
+* **vz:** size host-side network socket for enhanced MTU ([#376](https://github.com/arcboxlabs/arcbox/issues/376)) ([0856f4b](https://github.com/arcboxlabs/arcbox/commit/0856f4b6986a5076fa14386485e32f5a9af81454))
+* **xtask:** resolve the boot-asset user cache at ~/.arcbox ([57cf9b0](https://github.com/arcboxlabs/arcbox/commit/57cf9b077f8b294d9665f272ca8699b0d0b60fa3))
+
+
+### Code Refactoring
+
+* **net-inject:** drive RX injection through the unified SplitQueue ([6cb382b](https://github.com/arcboxlabs/arcbox/commit/6cb382b9543ce8c0038bac2eecb9315e0f1f1293))
+* **virtio-core:** delete the dead queue_guest module ([360916c](https://github.com/arcboxlabs/arcbox/commit/360916ce081b184fd876e674f592d347078ad9de))
+* **vmm:** migrate the legacy net RX worker onto SplitQueue ([c8d1266](https://github.com/arcboxlabs/arcbox/commit/c8d126644bff8f5a3b36f8212287c74909fe210f))
+
+
+### Tests
+
+* **e2e:** sandbox smoke — full stack over real gRPC (CORE-10) ([0b4c91f](https://github.com/arcboxlabs/arcbox/commit/0b4c91f8ee34f4c278bc7b791296944889bd5918))
+* **e2e:** stop origin before restore; clean up agent clippy in sandbox.rs ([78d5872](https://github.com/arcboxlabs/arcbox/commit/78d58727aead99044091a538f803c31ca6ddcff3))
+
+
+### Documentation
+
+* **agents:** per-directory AGENTS.md rules from the HV campaign ([1098454](https://github.com/arcboxlabs/arcbox/commit/1098454c5889093700e1e6c53224d7fcfb4100d2))
+
+
+### Styles
+
+* rustfmt the hv_coldboot_once example after from_fd_blocking rename ([f17753a](https://github.com/arcboxlabs/arcbox/commit/f17753ae7cc9d47045176dfd29f1bb43c15aa5e1))
+
+
+### Miscellaneous Chores
+
+* sync Cargo.lock with merged e2e manifest deps ([5f63cec](https://github.com/arcboxlabs/arcbox/commit/5f63cec8c97654a22184897b9e6d766d6000b336))
+
 ## [0.4.16](https://github.com/arcboxlabs/arcbox/compare/v0.4.15...v0.4.16) (2026-07-01)
 
 
