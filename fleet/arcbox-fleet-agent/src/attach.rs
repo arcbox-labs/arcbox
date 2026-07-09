@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use arcbox_fleet_control_proto::v1 as control_proto;
 use arcbox_fleet_proto::v1::fleet_gateway_service_client::FleetGatewayServiceClient;
 use arcbox_fleet_proto::v1::{
-    AttachRequest, Capability, Heartbeat, HostTelemetry, attach_request, attach_response,
+    Attach, AttachRequest, Capability, Heartbeat, HostTelemetry, attach_request, attach_response,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -22,7 +22,7 @@ use tonic::Request;
 use tonic::metadata::MetadataValue;
 use tracing::{info, warn};
 
-use crate::config::{AgentConfig, PROTOCOL_VERSION};
+use crate::config::AgentConfig;
 use crate::credentials::Credential;
 use crate::docker;
 use crate::host;
@@ -38,30 +38,38 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const OUTBOUND_CAPACITY: usize = 64;
 const MACHINE_TOKEN_HEADER: &str = "x-arcbox-machine-token";
-const PROTOCOL_VERSION_HEADER: &str = "x-arcbox-protocol-version";
 /// How long to wait for runners to be torn down and reaped on shutdown before
 /// giving up. Killing a process group or container is near-instant, so this is a
 /// generous ceiling rather than an expected wait.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 
-/// Wrap `message` with the machine-credential and protocol-version metadata
-/// every authenticated gateway RPC carries (`Attach` here,
-/// `enroll::unenroll`'s `Unenroll`).
+/// Wrap `message` with the machine-credential metadata every authenticated
+/// gateway RPC carries (`Attach` here, `enroll::unenroll`'s `Unenroll`). The
+/// agent build identity travels as the first in-band `Attach` message rather
+/// than as a metadata header; see [`connect_and_serve`].
 pub fn authenticated_request<T>(message: T, machine_token: &str) -> Result<Request<T>> {
     let mut request = Request::new(message);
     let token: MetadataValue<_> = machine_token
         .parse()
         .context("machine token is not a valid metadata value")?;
     request.metadata_mut().insert(MACHINE_TOKEN_HEADER, token);
-    // Protocol-version handshake: the gateway rejects an unsupported version.
-    let version: MetadataValue<_> = PROTOCOL_VERSION
-        .to_string()
-        .parse()
-        .expect("protocol version is a valid metadata value");
-    request
-        .metadata_mut()
-        .insert(PROTOCOL_VERSION_HEADER, version);
     Ok(request)
+}
+
+/// Terminal error returned by the attach loop when the gateway refuses the
+/// build. The reconnect loop matches on this to park visibly (analogous to
+/// [`is_unauthenticated`]) instead of retrying — a different binary is what's
+/// required, not another connection attempt.
+#[derive(Debug, thiserror::Error)]
+#[error("gateway refused agent build; expected version {expected_version}")]
+struct AgentUpdateRequired {
+    expected_version: String,
+}
+
+fn as_agent_update_required(error: &anyhow::Error) -> Option<&AgentUpdateRequired> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<AgentUpdateRequired>())
 }
 
 /// Whether the error chain contains an `UNAUTHENTICATED` gRPC status — the
@@ -190,6 +198,29 @@ pub async fn run(
                 shutdown.cancelled().await;
                 break;
             }
+            Err(e) if as_agent_update_required(&e).is_some() => {
+                // The gateway pins a specific agent build and this binary
+                // isn't it. Retrying will keep hitting the same rejection;
+                // park until the operator installs the expected binary.
+                // Reuses `CredentialRejected` for the parked-state signal
+                // because it's the closest existing variant — a proper
+                // "update required" state can land alongside push-update.
+                let expected = as_agent_update_required(&e)
+                    .expect("just matched above")
+                    .expected_version
+                    .clone();
+                warn!(
+                    expected = %expected,
+                    current = env!("CARGO_PKG_VERSION"),
+                    "gateway refused the agent build; parked until the expected binary is installed"
+                );
+                state.set_enrollment(
+                    control_proto::Enrollment::CredentialRejected,
+                    &credential.machine_id,
+                );
+                shutdown.cancelled().await;
+                break;
+            }
             Err(e) => {
                 warn!(error = %e, backoff_secs = backoff.as_secs(), "attach failed; retrying");
             }
@@ -248,18 +279,27 @@ async fn connect_and_serve(
     let gateway = state.gateway_target();
     let (req_tx, req_rx) = mpsc::channel::<AttachRequest>(OUTBOUND_CAPACITY);
 
-    // Start heartbeating before the request is even sent, not after the
-    // response arrives. The gateway acks each heartbeat on the response
-    // stream (its only keepalive signal for a proxy/load balancer sitting in
-    // front), so if the client waits for a response before saying anything,
-    // neither side ever sends a byte: the connection sits fully idle until
-    // an intermediary's own idle-connection timeout (AWS ALB defaults to
-    // 60s) resets it, and the response headers the origin sent immediately
-    // are only ever delivered bundled with that reset. Speaking first breaks
-    // the standoff.
-    // Held only for its abort-on-drop side effect: it must outlive every exit
-    // path of this function, not be read.
-    let _heartbeat = spawn_heartbeat(req_tx.clone(), capabilities.to_vec(), state.clone());
+    // Send `Attach` as the very first outbound message, buffered on `req_tx`
+    // before the gRPC call runs. Three reasons: it's the handshake message
+    // the gateway checks agent_version against; it declares the capabilities
+    // and host facts that are constant for this process's lifetime (so
+    // Heartbeat can carry only what actually changes); and it satisfies the
+    // PLAT-34 "speak first" property — the gateway (or a proxy in front)
+    // will not release its response headers until it sees the client say
+    // something, and if the client waits for the response before sending
+    // anything the whole stream idle-times-out. The mpsc buffer holds the
+    // message until tonic drains it once the stream opens.
+    let attach_msg = AttachRequest {
+        msg: Some(attach_request::Msg::Attach(Attach {
+            agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+            capabilities: capabilities.to_vec(),
+            host_info_json: host::host_info_json(),
+        })),
+    };
+    req_tx
+        .send(attach_msg)
+        .await
+        .context("outbound stream closed before Attach could be buffered")?;
 
     // The connect + Attach-RPC handshake can block indefinitely — no connect
     // timeout is configured on the tonic `Endpoint` — and, unlike the
@@ -287,13 +327,36 @@ async fn connect_and_serve(
             .context("Attach RPC failed")
             .map(|response| response.into_inner())
     };
-    // `_heartbeat` (an `AbortOnDropHandle`) is aborted automatically on every
-    // exit from this function, including `?` above and the early return here.
     let mut inbound = tokio::select! {
         biased;
         () = shutdown.cancelled() => return Ok(()),
         result = connect => result?,
     };
+
+    // First inbound message is the handshake result: `AttachAccepted` and we
+    // proceed, or `AttachRejected(AgentUpdate)` and we park the reconnect
+    // loop by returning [`AgentUpdateRequired`].
+    let handshake = inbound
+        .message()
+        .await
+        .context("Attach handshake response failed")?
+        .ok_or_else(|| anyhow::anyhow!("attach stream closed before handshake response"))?;
+    match handshake.msg {
+        Some(attach_response::Msg::AttachAccepted(_)) => {}
+        Some(attach_response::Msg::AttachRejected(update)) => {
+            return Err(anyhow::Error::new(AgentUpdateRequired {
+                expected_version: update.expected_version,
+            }));
+        }
+        other => anyhow::bail!("unexpected first response from gateway: {other:?}"),
+    }
+
+    // Only start heartbeating once the handshake succeeded; a rejected
+    // machine has no business pushing telemetry, and the mpsc would fill
+    // with heartbeats a closing stream can never deliver. Held only for its
+    // abort-on-drop side effect: it must outlive every exit path below.
+    let _heartbeat = spawn_heartbeat(req_tx.clone(), state.clone());
+
     *backoff = INITIAL_BACKOFF;
     state.set_enrollment(control_proto::Enrollment::Attached, &credential.machine_id);
     state.set_gateway_current(&gateway);
@@ -336,7 +399,9 @@ async fn connect_and_serve(
 
 /// Route one inbound `AttachResponse` to the supervisor. Synchronous: every
 /// handler only mutates supervisor state and spawns work, so dispatch can never
-/// stall the stream loop.
+/// stall the stream loop. The handshake variants (`AttachAccepted`/
+/// `AttachRejected`) are consumed by [`connect_and_serve`] before this runs;
+/// seeing either mid-stream is a gateway bug, logged and ignored.
 fn dispatch(supervisor: &RunnerSupervisor, msg: Option<attach_response::Msg>) {
     match msg {
         Some(attach_response::Msg::ProvisionRunner(order)) => {
@@ -347,11 +412,17 @@ fn dispatch(supervisor: &RunnerSupervisor, msg: Option<attach_response::Msg>) {
         Some(attach_response::Msg::OfferVerdictAck(ack)) => {
             supervisor.handle_ack(&ack.offer_token);
         }
-        // No-op the gateway acks each heartbeat with, purely so a proxy in
-        // front of the gateway (e.g. Cloudflare) sees server->client traffic
-        // and never idle-times-out the stream.
-        Some(attach_response::Msg::Keepalive(_)) => {
-            tracing::debug!("received keepalive from gateway");
+        // Each heartbeat gets an ack, whose sole purpose is to keep
+        // server->client traffic flowing so a proxy in front of the gateway
+        // (e.g. Cloudflare) doesn't idle-cut the stream (PLAT-34).
+        Some(attach_response::Msg::HeartbeatAck(_)) => {
+            tracing::debug!("received heartbeat ack from gateway");
+        }
+        Some(attach_response::Msg::AttachAccepted(_)) => {
+            warn!("unexpected AttachAccepted after handshake; ignoring");
+        }
+        Some(attach_response::Msg::AttachRejected(_)) => {
+            warn!("unexpected AttachRejected after handshake; ignoring");
         }
         None => {}
     }
@@ -382,15 +453,15 @@ fn spawn_verdict_resend(
     })
 }
 
-/// Periodically push a declarative capability + telemetry heartbeat until the
-/// channel closes.
+/// Periodically push a live telemetry pulse until the channel closes.
 ///
 /// Heartbeats are connection-scoped: the task is spawned per connection and
 /// aborted when it drops, so a momentary disconnect does not leave stale
-/// heartbeats queued for the next stream.
+/// heartbeats queued for the next stream. Capability set and host facts are
+/// declared once per stream in the `Attach` handshake (they're constant for
+/// the process lifetime), so this loop carries only what actually changes.
 fn spawn_heartbeat(
     outbound: mpsc::Sender<AttachRequest>,
-    capabilities: Vec<Capability>,
     state: AgentState,
 ) -> AbortOnDropHandle<()> {
     AbortOnDropHandle::new(tokio::spawn(async move {
@@ -400,8 +471,6 @@ fn spawn_heartbeat(
             let telemetry = host::telemetry();
             state.set_telemetry(telemetry_to_control(&telemetry));
             let msg = attach_request::Msg::Heartbeat(Heartbeat {
-                capabilities: capabilities.clone(),
-                host_info_json: host::host_info_json(),
                 telemetry: Some(telemetry),
             });
             if outbound
@@ -582,9 +651,19 @@ mod tests {
                 .await
                 .map_err(|e| tonic::Status::internal(e.to_string()))?
                 .ok_or_else(|| tonic::Status::internal("closed before any message arrived"))?;
-            // Empty, immediately-closed response: this test only cares that
-            // headers were unblocked, not about dispatch.
-            let (_tx, rx) = mpsc::channel(1);
+            // Send AttachAccepted then immediately close — under the redesigned
+            // handshake, the client waits for this before proceeding. Without
+            // it the client would treat the empty stream as a handshake
+            // failure. This test only cares that response headers were
+            // unblocked once the client spoke first, not about dispatch.
+            let (tx, rx) = mpsc::channel(1);
+            let _ = tx
+                .send(Ok(arcbox_fleet_proto::v1::AttachResponse {
+                    msg: Some(attach_response::Msg::AttachAccepted(
+                        arcbox_fleet_proto::v1::AttachAccepted {},
+                    )),
+                }))
+                .await;
             Ok(tonic::Response::new(
                 tokio_stream::wrappers::ReceiverStream::new(rx),
             ))

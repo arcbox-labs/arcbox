@@ -35,9 +35,6 @@ const DEFAULT_LINUX_RUNNER_IMAGE: &str = "ghcr.io/actions/actions-runner:latest"
 /// Published macOS base-image stream with the Actions runner baked in.
 pub const DEFAULT_MACOS_RUNNER_IMAGE: &str = "tahoe-base";
 
-/// Wire-protocol version this agent speaks; the gateway rejects a mismatch.
-pub const PROTOCOL_VERSION: u32 = 1;
-
 /// Whether Docker-based Linux job execution is enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DockerMode {
