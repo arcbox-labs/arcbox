@@ -35,6 +35,8 @@ mod enroll;
 mod fsutil;
 mod host;
 mod runner;
+#[cfg(target_os = "macos")]
+mod service;
 mod settings;
 mod state;
 mod vm;
@@ -106,6 +108,16 @@ enum Command {
         /// supports.
         kinds: Vec<String>,
     },
+    /// Install a per-user LaunchAgent so `serve` starts on login (macOS).
+    ///
+    /// Renders the plist against the invoking binary (`env::current_exe()`)
+    /// and the agent's data-dir log path, writes it to
+    /// `~/Library/LaunchAgents/`, and `launchctl bootstrap`s it into the
+    /// current GUI session. Re-run after moving the binary.
+    InstallService,
+    /// Remove the LaunchAgent installed by `install-service` (macOS).
+    /// Idempotent — safe to run when nothing is installed.
+    UninstallService,
 }
 
 #[derive(Debug, Subcommand)]
@@ -474,7 +486,39 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             }
             Ok(())
         }
+        Command::InstallService => install_service(&config),
+        Command::UninstallService => uninstall_service(),
     }
+}
+
+/// macOS: install the LaunchAgent via [`service::install`]. Other Unix
+/// targets (Linux) bail with a pointer to the planned systemd support;
+/// keeping the subcommand in the CLI shape lets docs and tab-completion
+/// stay uniform across hosts.
+#[cfg(target_os = "macos")]
+fn install_service(config: &AgentConfig) -> Result<()> {
+    service::install(config)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_service(_config: &AgentConfig) -> Result<()> {
+    anyhow::bail!(
+        "install-service is only implemented for macOS; Linux systemd (user unit) support \
+         is planned as a follow-up"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_service() -> Result<()> {
+    service::uninstall()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn uninstall_service() -> Result<()> {
+    anyhow::bail!(
+        "uninstall-service is only implemented for macOS; Linux systemd (user unit) support \
+         is planned as a follow-up"
+    )
 }
 
 /// Build a `CancellationToken` cancelled on the first termination signal
