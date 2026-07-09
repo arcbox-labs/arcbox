@@ -3,5 +3,9 @@
 # copy from the registry with `make fleet-proto-sync`
 # (buf export buf.build/arcboxlabs/fleet -o proto).
 version: v2
+modules:
+  # Module root is proto/ so file paths (arcbox/fleet/v1/…) match the
+  # declared package name for buf lint's PACKAGE_DIRECTORY_MATCH rule.
+  - path: proto
 deps:
   - buf.build/arcboxlabs/fleet

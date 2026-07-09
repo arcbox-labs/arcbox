@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arcbox_fleet_proto::v1::fleet_gateway_service_client::FleetGatewayServiceClient;
-use arcbox_fleet_proto::v1::{Capability, EnrollRequest, UnenrollRequest};
+use arcbox_fleet_proto::v1::{Capability, EnrollRequest, UnenrollRequest, enroll_response};
 use tracing::{info, warn};
 
 use crate::attach::authenticated_request;
-use crate::config::{AgentConfig, PROTOCOL_VERSION};
+use crate::config::AgentConfig;
 use crate::credentials::Credential;
 use crate::host;
 
@@ -28,6 +28,10 @@ const GATEWAY_UNENROLL_TIMEOUT: Duration = Duration::from_secs(10);
 /// `gateway`: `quick enroll` uses the persisted-settings (or configured
 /// default) gateway; the RPC uses its `control_plane` override if given, else
 /// the current settings target.
+///
+/// A gateway that expects a different agent build refuses enrollment with
+/// `EnrollResponse::update_required`; surface the expected version so the
+/// operator installs the right binary instead of a stringly-typed error.
 pub async fn enroll(
     config: &AgentConfig,
     token: String,
@@ -49,7 +53,7 @@ pub async fn enroll(
         mem_mib: host::mem_mib(),
         capabilities,
         host_info_json: host::host_info_json(),
-        protocol_version: PROTOCOL_VERSION,
+        agent_version: env!("CARGO_PKG_VERSION").to_owned(),
     };
 
     let response = client
@@ -58,12 +62,24 @@ pub async fn enroll(
         .context("Enroll RPC failed")?
         .into_inner();
 
-    let credential = Credential {
-        machine_id: response.machine_id,
-        machine_token: response.machine_token,
-    };
-    info!(machine_id = %credential.machine_id, "enrolled");
-    Ok(credential)
+    match response.result {
+        Some(enroll_response::Result::Enrolled(enrolled)) => {
+            let credential = Credential {
+                machine_id: enrolled.machine_id,
+                machine_token: enrolled.machine_token,
+            };
+            info!(machine_id = %credential.machine_id, "enrolled");
+            Ok(credential)
+        }
+        Some(enroll_response::Result::UpdateRequired(update)) => {
+            anyhow::bail!(
+                "enrollment refused: gateway expects agent version {}, this binary is {}",
+                update.expected_version,
+                env!("CARGO_PKG_VERSION"),
+            );
+        }
+        None => anyhow::bail!("gateway returned an empty EnrollResponse"),
+    }
 }
 
 /// Decommission the machine at `gateway` on a best-effort, time-bounded basis,

@@ -11,7 +11,11 @@ service FleetGatewayService {
   rpc Enroll(EnrollRequest) returns (EnrollResponse);
 
   // Long-lived bidirectional stream. Authenticated with the machine
-  // credential in the `x-arcbox-machine-token` metadata key.
+  // credential in the `x-arcbox-machine-token` metadata key. The client's
+  // first message must be `Attach`; the gateway replies with `AttachAccepted`
+  // (steady state proceeds with Heartbeats) or `AgentUpdate` (build version
+  // mismatch — client logs the expected version, disconnects, does not
+  // reconnect on the same binary).
   // (Named Attach because tonic reserves `connect` on generated clients.)
   rpc Attach(stream AttachRequest) returns (stream AttachResponse);
 
@@ -40,16 +44,44 @@ message EnrollRequest {
   repeated Capability capabilities = 6;
   // Free-form host facts as JSON (macOS version, chip, ...).
   string host_info_json = 7;
-  // Wire-protocol version the agent speaks; the gateway rejects unsupported.
-  uint32 protocol_version = 8;
+  // Agent build version (semver, `CARGO_PKG_VERSION`). The gateway pins one
+  // expected build at a time; a mismatch is answered with `AgentUpdate` in
+  // place of `Enrolled`, so a mis-versioned agent fails at enrollment
+  // rather than joining and then being kicked at Attach.
+  string agent_version = 8;
 }
 
 message EnrollResponse {
+  oneof result {
+    // Enrollment succeeded — machine credential minted.
+    Enrolled enrolled = 1;
+    // Enrollment refused because the agent's build doesn't match the
+    // expected version. Client should surface the expected version to the
+    // operator and exit non-zero.
+    AgentUpdate update_required = 2;
+  }
+}
+
+message Enrolled {
   // Prefixed machine id (`fltm_...`).
   string machine_id = 1;
   // Long-lived machine credential; transmitted exactly once, only its
   // hash is stored server-side.
   string machine_token = 2;
+}
+
+// Server → client. "Your build isn't what I expect; here's what you should
+// be running." Fires from both `EnrollResponse.result.update_required` and
+// `AttachResponse.msg.attach_rejected`, so the client's update-handling code
+// lives in one place. Grows into the push-update payload without touching
+// the wire shape — future fields:
+//   string tarball_url = 2;
+//   string tarball_sha256 = 3;
+message AgentUpdate {
+  // The build version the gateway expects. Empty when the gateway is
+  // pre-versioning (should not happen in practice; kept nullable so the
+  // client tolerates a stub server).
+  string expected_version = 1;
 }
 
 // What execution backend serves a capability. Routing only — capacity is the
@@ -83,19 +115,41 @@ message HostTelemetry {
 
 message AttachRequest {
   oneof msg {
-    Heartbeat heartbeat = 1;
-    RunnerAccepted runner_accepted = 2;
-    RunnerRejected runner_rejected = 3;
+    // First message on the stream. Carries the client's build identity so
+    // the gateway can gate participation on version.
+    Attach attach = 1;
+    Heartbeat heartbeat = 2;
+    RunnerAccepted runner_accepted = 3;
+    RunnerRejected runner_rejected = 4;
   }
 }
 
-// Periodic capability + liveness report. The reported capability set is
-// declarative — it replaces what is stored, so losing a backend (e.g. Docker
-// dies) simply drops the capabilities it served.
+// First client-initiated message after stream open. Auth stays in gRPC
+// metadata (`x-arcbox-machine-token`); this message carries everything
+// about the connecting agent that is constant for the process lifetime —
+// the build identity the gateway gates on, and the declarative
+// (capability set, host facts) state the machine row should reflect
+// while this stream is live.
+message Attach {
+  // Agent build version (semver, `CARGO_PKG_VERSION`).
+  string agent_version = 1;
+  // What the host can serve, e.g. darwin/arm64 via vm + linux/arm64 via
+  // docker. Declarative — the gateway replaces the stored set on handshake
+  // and any subsequent reconnect refreshes it. Not resent on Heartbeat
+  // because backends are frozen at process start (docker_mode /
+  // runner_script only apply on a full restart).
+  repeated Capability capabilities = 2;
+  // Free-form host facts as JSON (macOS version, chip, ...). Same
+  // "constant for the process lifetime" reasoning as `capabilities` —
+  // reported once here, not on every Heartbeat.
+  string host_info_json = 3;
+}
+
+// Live telemetry pulse. The only wire field that changes over time; sent
+// every ~15s so the gateway (and any proxy in front of it) sees liveness
+// and the server has a fresh utilization snapshot for placement ranking.
 message Heartbeat {
-  repeated Capability capabilities = 1;
-  string host_info_json = 2;
-  HostTelemetry telemetry = 3;
+  HostTelemetry telemetry = 1;
 }
 
 // The agent admitted the offer and has started the runner. Echoes the offer
@@ -119,13 +173,30 @@ message RunnerRejected {
 
 message AttachResponse {
   oneof msg {
-    ProvisionRunner provision_runner = 1;
-    CancelRunner cancel = 2;
-    Drain drain = 3;
-    OfferVerdictAck offer_verdict_ack = 4;
-    Keepalive keepalive = 5;
+    // Handshake success — client proceeds to the heartbeat loop.
+    AttachAccepted attach_accepted = 1;
+    // Handshake refused because the agent's build doesn't match. Client
+    // logs the expected version and disconnects; no reconnect loop.
+    AgentUpdate attach_rejected = 2;
+    // Per-heartbeat ack. Empty today; grows into a push-update signal
+    // channel later without inventing a new variant.
+    HeartbeatAck heartbeat_ack = 3;
+    ProvisionRunner provision_runner = 4;
+    CancelRunner cancel = 5;
+    Drain drain = 6;
+    OfferVerdictAck offer_verdict_ack = 7;
   }
 }
+
+// Marker for a successful Attach handshake. Empty today; kept as a distinct
+// message so future admit-time signals (fleet-scoped tunables, target
+// version hint, etc.) grow here without piggy-backing on HeartbeatAck.
+message AttachAccepted {}
+
+// Server's ack for each heartbeat. Empty in steady state. Doubles as the
+// server→client keepalive on the stream so a proxy in front of the gateway
+// (e.g. Cloudflare) does not idle-cut the direction (PLAT-34).
+message HeartbeatAck {}
 
 // Tells the agent to stop resending an offer verdict
 // (RunnerAccepted/RunnerRejected): the gateway either durably handed it off to
@@ -159,9 +230,3 @@ message CancelRunner {
 
 // Stop accepting new work ahead of removal.
 message Drain {}
-
-// No-op the gateway sends back for every Heartbeat, riding the agent's own
-// cadence so a proxy in front of the gateway (e.g. Cloudflare) sees
-// server->client traffic and never idle-times-out the stream. The agent
-// ignores it.
-message Keepalive {}
