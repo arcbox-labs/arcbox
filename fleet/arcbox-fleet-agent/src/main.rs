@@ -111,10 +111,11 @@ enum Command {
     },
     /// Install a per-user LaunchAgent so `serve` starts on login (macOS).
     ///
-    /// Renders the plist against the invoking binary (`env::current_exe()`)
-    /// and the agent's data-dir log path, writes it to
+    /// Installs the invoking binary into the managed path
+    /// (`<data_dir>/bin/arcbox-fleet-agent`) that self-update owns, renders
+    /// the plist against it and the agent's data-dir log path, writes it to
     /// `~/Library/LaunchAgents/`, and `launchctl bootstrap`s it into the
-    /// current GUI session. Re-run after moving the binary.
+    /// current GUI session.
     InstallService,
     /// Remove the LaunchAgent installed by `install-service` (macOS).
     /// Idempotent — safe to run when nothing is installed.

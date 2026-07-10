@@ -129,6 +129,10 @@ enum Enrollment {
   // credential on disk until an explicit Unenroll, so a server-side auth
   // regression can never make agents wipe their own credentials.
   ENROLLMENT_CREDENTIAL_REJECTED = 5;
+  // The gateway pinned a different agent build and pushed its download; the
+  // agent is draining in-flight jobs, then swaps its binary and re-execs.
+  // Transient: the replacement process reports Attaching → Attached.
+  ENROLLMENT_UPDATING = 6;
 }
 
 // What execution backend serves a capability. Deliberately redefined here

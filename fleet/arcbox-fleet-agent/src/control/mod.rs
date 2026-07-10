@@ -674,6 +674,10 @@ impl AgentSupervisor {
             Enrollment::Unspecified | Enrollment::Unenrolled => ConnectionState::Unenrolled,
             Enrollment::Detached => ConnectionState::Detached,
             Enrollment::CredentialRejected => ConnectionState::CredentialRejected,
+            // A self-update drains before it swaps, so "not accepting new
+            // offers" is exactly what a status consumer should see; the
+            // swap itself replaces the process within seconds.
+            Enrollment::Updating => ConnectionState::Draining,
             Enrollment::Attaching | Enrollment::Attached if snapshot.draining => {
                 ConnectionState::Draining
             }
