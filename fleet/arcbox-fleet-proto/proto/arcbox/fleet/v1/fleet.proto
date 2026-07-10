@@ -14,8 +14,9 @@ service FleetGatewayService {
   // credential in the `x-arcbox-machine-token` metadata key. The client's
   // first message must be `Attach`; the gateway replies with `AttachAccepted`
   // (steady state proceeds with Heartbeats) or `AgentUpdate` (build version
-  // mismatch — client logs the expected version, disconnects, does not
-  // reconnect on the same binary).
+  // mismatch — the client self-updates to the carried binary and re-attaches,
+  // or parks on the expected version when the payload has no URL; it never
+  // re-attaches on the same binary).
   // (Named Attach because tonic reserves `connect` on generated clients.)
   rpc Attach(stream AttachRequest) returns (stream AttachResponse);
 
@@ -47,8 +48,13 @@ message EnrollRequest {
   // Agent build version (semver, `CARGO_PKG_VERSION`). The gateway pins one
   // expected build at a time; a mismatch is answered with `AgentUpdate` in
   // place of `Enrolled`, so a mis-versioned agent fails at enrollment
-  // rather than joining and then being kicked at Attach.
+  // rather than joining and then being kicked at Attach. When the payload
+  // carries a `binary_url` the agent self-updates and retries enrollment
+  // on the new build (the enrollment token is multi-use).
   string agent_version = 8;
+  // The platform the agent binary runs on (`darwin` | `linux`, lowercase
+  // RunnerOs). Pairs with `host_arch` to select `AgentUpdate.binary_url`.
+  string host_os = 9;
 }
 
 message EnrollResponse {
@@ -71,17 +77,26 @@ message Enrolled {
 }
 
 // Server → client. "Your build isn't what I expect; here's what you should
-// be running." Fires from both `EnrollResponse.result.update_required` and
-// `AttachResponse.msg.attach_rejected`, so the client's update-handling code
-// lives in one place. Grows into the push-update payload without touching
-// the wire shape — future fields:
-//   string tarball_url = 2;
-//   string tarball_sha256 = 3;
+// be running — and where to get it." Fires from
+// `EnrollResponse.result.update_required`, `AttachResponse.msg.attach_rejected`,
+// `AttachAccepted.update`, and `HeartbeatAck.update`, so the client's
+// update-handling code lives in one place. A payload with a `binary_url`
+// drives the agent's self-update (download → verify → swap → re-exec); an
+// empty `binary_url` (gateway has no registered release for the platform)
+// makes the agent log the expected version and park for the operator.
 message AgentUpdate {
   // The build version the gateway expects. Empty when the gateway is
   // pre-versioning (should not happen in practice; kept nullable so the
   // client tolerates a stub server).
   string expected_version = 1;
+  // Download URL of the raw agent binary for the requesting machine's
+  // (host_os, host_arch). Resolved from the registered release for
+  // `expected_version`.
+  string binary_url = 2;
+  // Hex SHA-256 of the binary at `binary_url`. The agent verifies the
+  // download against this value — the gateway, not the download host, is
+  // the integrity root.
+  string binary_sha256 = 3;
 }
 
 // What execution backend serves a capability. Routing only — capacity is the
@@ -143,6 +158,14 @@ message Attach {
   // "constant for the process lifetime" reasoning as `capabilities` —
   // reported once here, not on every Heartbeat.
   string host_info_json = 3;
+  // The platform the agent binary itself runs on (`darwin` | `linux`,
+  // lowercase RunnerOs), as opposed to `capabilities`, which describe what
+  // the host can serve (a darwin host serves linux jobs via docker but
+  // still needs the darwin binary). Selects the `AgentUpdate.binary_url`.
+  string host_os = 4;
+  // The agent binary's CPU architecture (`arm64` | `amd64`, lowercase
+  // RunnerArch). Together with `host_os` this names the release asset.
+  string host_arch = 5;
 }
 
 // Live telemetry pulse. The only wire field that changes over time; sent
@@ -189,14 +212,21 @@ message AttachResponse {
 }
 
 // Marker for a successful Attach handshake. Empty today; kept as a distinct
-// message so future admit-time signals (fleet-scoped tunables, target
-// version hint, etc.) grow here without piggy-backing on HeartbeatAck.
+// message so future admit-time signals (fleet-scoped tunables, etc.) grow
+// here without piggy-backing on HeartbeatAck.
 message AttachAccepted {}
 
 // Server's ack for each heartbeat. Empty in steady state. Doubles as the
 // server→client keepalive on the stream so a proxy in front of the gateway
 // (e.g. Cloudflare) does not idle-cut the direction (PLAT-34).
-message HeartbeatAck {}
+message HeartbeatAck {
+  // Set when the pinned target version moved while this agent was attached.
+  // The agent drains (finishes in-flight jobs, takes no new offers), then
+  // self-updates and re-attaches with the new build. Attach itself still
+  // hard-gates on exact version — this field exists so already-connected
+  // agents converge gracefully instead of being evicted.
+  AgentUpdate update = 1;
+}
 
 // Tells the agent to stop resending an offer verdict
 // (RunnerAccepted/RunnerRejected): the gateway either durably handed it off to

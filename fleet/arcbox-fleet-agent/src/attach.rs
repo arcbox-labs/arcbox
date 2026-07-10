@@ -294,6 +294,8 @@ async fn connect_and_serve(
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
             capabilities: capabilities.to_vec(),
             host_info_json: host::host_info_json(),
+            host_os: host::host_os(),
+            host_arch: host::host_arch(),
         })),
     };
     req_tx

@@ -54,6 +54,7 @@ pub async fn enroll(
         capabilities,
         host_info_json: host::host_info_json(),
         agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+        host_os: host::host_os(),
     };
 
     let response = client
