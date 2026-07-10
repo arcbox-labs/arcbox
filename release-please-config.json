@@ -25,6 +25,18 @@
           "path": "Cargo.toml"
         }
       ],
+      "changelog-path": "CHANGELOG.md",
+      "exclude-paths": ["fleet"]
+    },
+    "fleet": {
+      "component": "fleet-agent",
+      "include-component-in-tag": true,
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "arcbox-fleet-agent/Cargo.toml"
+        }
+      ],
       "changelog-path": "CHANGELOG.md"
     }
   }

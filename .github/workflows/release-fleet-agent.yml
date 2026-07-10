@@ -1,0 +1,223 @@
+name: Fleet Agent Release
+
+# Builds and publishes arcbox-fleet-agent on its own cadence, independent of
+# the desktop release train. Assets are raw binaries (plus .sha256 files),
+# named arcbox-fleet-agent-<os>-<arch> in the fleet capability vocabulary —
+# the download URL is a pure function of (tag, host_os, host_arch), which is
+# exactly what the gateway constructs for AgentUpdate.binary_url.
+
+on:
+  push:
+    tags:
+      - 'fleet-agent-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. fleet-agent-v0.5.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  APPLE_TEAM_ID: "422ACSY6Y5"
+
+jobs:
+  version:
+    name: Determine tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Building tag: $TAG"
+
+  build-macos-arm64:
+    name: Build macOS ARM64
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install Protobuf compiler
+        timeout-minutes: 5
+        run: brew install protobuf
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-fleet-agent-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fleet-agent-
+
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Create temporary keychain.
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate.
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          # Allow codesign to access the key without UI prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Add to search list.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          # Verify.
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Build arcbox-fleet-agent (release)
+        timeout-minutes: 15
+        run: cargo build --release --locked -p arcbox-fleet-agent
+
+      - name: Codesign arcbox-fleet-agent
+        run: |
+          codesign --force --options runtime \
+            --identifier com.arcboxlabs.fleet.agent \
+            --sign "Developer ID Application: ArcBox, Inc. ($APPLE_TEAM_ID)" \
+            target/release/arcbox-fleet-agent
+          codesign -v --deep --strict target/release/arcbox-fleet-agent
+
+      - name: Verify artifact
+        run: |
+          ls -lh target/release/arcbox-fleet-agent
+          file target/release/arcbox-fleet-agent
+          codesign -d -v target/release/arcbox-fleet-agent
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-agent-binary-darwin-arm64
+          path: target/release/arcbox-fleet-agent
+          retention-days: 5
+
+  build-linux:
+    name: Build Linux ${{ matrix.arch }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain and protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools protobuf-compiler
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-fleet-agent-musl-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fleet-agent-musl-${{ matrix.arch }}-
+
+      - name: Build arcbox-fleet-agent
+        timeout-minutes: 10
+        run: cargo build --release --locked -p arcbox-fleet-agent --target ${{ matrix.target }}
+
+      - name: Verify artifact
+        run: |
+          ls -lh target/${{ matrix.target }}/release/arcbox-fleet-agent
+          file target/${{ matrix.target }}/release/arcbox-fleet-agent
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-agent-binary-linux-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/arcbox-fleet-agent
+          retention-days: 5
+
+  publish:
+    name: Publish Release Assets
+    needs: [version, build-macos-arm64, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fleet-agent-binary-*
+          path: artifacts/
+
+      - name: Prepare release assets
+        run: |
+          set -eu
+          for platform in darwin-arm64 linux-amd64 linux-arm64; do
+            cargo xtask release fleet-asset \
+              --platform "$platform" \
+              --binary "artifacts/fleet-agent-binary-$platform/arcbox-fleet-agent"
+          done
+          ls -lh arcbox-fleet-agent-*
+
+      - name: Upload assets to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          make_latest: false
+          files: |
+            arcbox-fleet-agent-*
