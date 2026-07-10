@@ -13,6 +13,29 @@ use crate::attach::authenticated_request;
 use crate::config::AgentConfig;
 use crate::credentials::Credential;
 use crate::host;
+use crate::update::UpdatePayload;
+
+/// Enrollment refused because the gateway pins a different build. Carries
+/// the pushed download (when the gateway had one for this platform) so the
+/// CLI enroll path can self-update and re-exec into a retry.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "enrollment refused: gateway expects agent version {expected_version}, \
+     this binary is {current}",
+    current = env!("CARGO_PKG_VERSION")
+)]
+pub struct EnrollUpdateRequired {
+    pub expected_version: String,
+    pub payload: Option<UpdatePayload>,
+}
+
+/// The downloadable update carried by an [`enroll`] refusal, if any.
+pub fn update_payload(error: &anyhow::Error) -> Option<UpdatePayload> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<EnrollUpdateRequired>())
+        .and_then(|refused| refused.payload.clone())
+}
 
 /// Bound on the best-effort gateway `Unenroll` call. Generous for a healthy
 /// round-trip, but a blackholed gateway must not prevent the terminal local
@@ -30,8 +53,9 @@ const GATEWAY_UNENROLL_TIMEOUT: Duration = Duration::from_secs(10);
 /// the current settings target.
 ///
 /// A gateway that expects a different agent build refuses enrollment with
-/// `EnrollResponse::update_required`; surface the expected version so the
-/// operator installs the right binary instead of a stringly-typed error.
+/// `EnrollResponse::update_required`, surfaced as [`EnrollUpdateRequired`]:
+/// the CLI enroll path self-updates and retries when the refusal carries a
+/// download, and otherwise shows the operator the expected version.
 pub async fn enroll(
     config: &AgentConfig,
     token: String,
@@ -73,11 +97,10 @@ pub async fn enroll(
             Ok(credential)
         }
         Some(enroll_response::Result::UpdateRequired(update)) => {
-            anyhow::bail!(
-                "enrollment refused: gateway expects agent version {}, this binary is {}",
-                update.expected_version,
-                env!("CARGO_PKG_VERSION"),
-            );
+            Err(anyhow::Error::new(EnrollUpdateRequired {
+                payload: UpdatePayload::from_wire(&update),
+                expected_version: update.expected_version,
+            }))
         }
         None => anyhow::bail!("gateway returned an empty EnrollResponse"),
     }

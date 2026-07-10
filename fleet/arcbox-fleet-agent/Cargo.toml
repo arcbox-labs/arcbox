@@ -45,9 +45,14 @@ russh = { version = "0.62.1", default-features = false, features = ["ring", "fla
 thiserror.workspace = true
 plist = "1.10.0"
 libc.workspace = true
+sha2.workspace = true
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 
 [lints]
 workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = "4"
+
+[dev-dependencies]
+tempfile.workspace = true

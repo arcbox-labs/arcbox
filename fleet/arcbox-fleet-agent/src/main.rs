@@ -39,6 +39,7 @@ mod runner;
 mod service;
 mod settings;
 mod state;
+mod update;
 mod vm;
 
 use std::path::PathBuf;
@@ -237,7 +238,26 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             // by the first heartbeat once the agent attaches, so we advertise
             // what we know without probing the runtimes.
             let capabilities = capabilities(seed.runner_script.is_some(), None, None);
-            let credential = enroll::enroll(&config, token, capabilities, &seed.gateway).await?;
+            let credential = match enroll::enroll(&config, token, capabilities, &seed.gateway).await
+            {
+                Ok(credential) => credential,
+                Err(error) => {
+                    // A version-refused enrollment that carries a download
+                    // self-updates and re-execs this same `enroll`
+                    // invocation on the new build (the join token is
+                    // multi-use). Managed-path and probe failures fall
+                    // through to the original refusal.
+                    if let Some(payload) = enroll::update_payload(&error) {
+                        info!(
+                            expected = %payload.expected_version,
+                            "gateway requires a different build; self-updating before enrolling"
+                        );
+                        let update_error = update::apply_and_exec(&config, &payload).await;
+                        warn!(error = %update_error, "self-update failed");
+                    }
+                    return Err(error);
+                }
+            };
             config
                 .credential_store_for(&seed.gateway)
                 .store(&credential)?;
