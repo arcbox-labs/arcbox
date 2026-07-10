@@ -20,15 +20,17 @@ use crate::config::AgentConfig;
 const LABEL: &str = "com.arcboxlabs.fleet.agent";
 
 /// Install the LaunchAgent so `arcbox-fleet-agent serve` starts on the next
-/// user login (and immediately if the user is already logged in). Renders
-/// the plist against the binary that invoked this command
-/// (`env::current_exe()`) and the agent's configured data directory, writes
-/// it to `~/Library/LaunchAgents/`, and bootstraps it into the current GUI
-/// session. Idempotent-refusal on second run: if the job is already loaded,
-/// prints an actionable message asking the operator to `uninstall-service`
-/// first instead of silently overwriting a live install.
+/// user login (and immediately if the user is already logged in). The
+/// invoking binary is first installed into the managed path
+/// (`<data_dir>/bin/arcbox-fleet-agent`) — the location the self-updater
+/// owns and the plist points at, so binary swaps never invalidate the
+/// service definition. Writes the plist to `~/Library/LaunchAgents/` and
+/// bootstraps it into the current GUI session. Idempotent-refusal on second
+/// run: if the job is already loaded, prints an actionable message asking
+/// the operator to `uninstall-service` first instead of silently
+/// overwriting a live install.
 pub fn install(config: &AgentConfig) -> Result<()> {
-    let binary = std::env::current_exe().context("resolving the current binary path")?;
+    let binary = install_managed_binary(config)?;
 
     let plist_path = plist_path()?;
     let plist_dir = plist_path
@@ -117,8 +119,36 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
-/// Compose the LaunchAgent plist. `binary` is the absolute path to the
-/// current agent binary (so a rename or move requires re-installing);
+/// Copy the invoking binary into the managed path the self-updater owns.
+/// A no-op when already running from there (a re-exec'd updated binary, or
+/// an operator invoking the managed install directly). The copy goes
+/// through a sibling temp file + rename so a crash mid-copy can never leave
+/// a truncated binary at the path launchd starts.
+fn install_managed_binary(config: &AgentConfig) -> Result<PathBuf> {
+    let current = std::env::current_exe().context("resolving the current binary path")?;
+    let managed = crate::update::managed_binary(config);
+    if current
+        .canonicalize()
+        .ok()
+        .is_some_and(|c| managed.canonicalize().is_ok_and(|m| c == m))
+    {
+        return Ok(managed);
+    }
+    let bin_dir = managed
+        .parent()
+        .ok_or_else(|| anyhow!("managed binary path has no parent"))?;
+    std::fs::create_dir_all(bin_dir).with_context(|| format!("creating {}", bin_dir.display()))?;
+    let staging = bin_dir.join("arcbox-fleet-agent.installing");
+    std::fs::copy(&current, &staging)
+        .with_context(|| format!("copying {} to {}", current.display(), staging.display()))?;
+    std::fs::rename(&staging, &managed)
+        .with_context(|| format!("installing {}", managed.display()))?;
+    println!("installed binary at {}", managed.display());
+    Ok(managed)
+}
+
+/// Compose the LaunchAgent plist. `binary` is the managed binary path (the
+/// self-updater swaps it in place, so the plist survives every update);
 /// `log_dir` is where launchd tees stdout/stderr — ideally the same
 /// directory the agent's own logger uses, so early-startup output before
 /// [`arcbox_logging::init`] has a chance to land in the same place.
