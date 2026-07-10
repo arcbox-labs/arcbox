@@ -4,8 +4,17 @@
 //! emulators or the host shell.
 
 use std::os::unix::io::RawFd;
+use std::sync::{Mutex, PoisonError};
 
 use crate::ConsoleIo;
+
+/// Serializes PTY allocation.
+///
+/// macOS's `openpty` resolves the slave name through `ptsname`'s
+/// process-global static buffer before opening it, so two concurrent calls
+/// can open the wrong (or an already-recycled) slave and fail with `ENOENT`.
+/// Holding this lock across the allocate-and-name sequence makes it atomic.
+static PTY_ALLOC_LOCK: Mutex<()> = Mutex::new(());
 
 /// PTY (pseudo-terminal) console backend.
 ///
@@ -32,6 +41,12 @@ impl PtyConsole {
         let mut master_fd: libc::c_int = -1;
         let mut slave_fd: libc::c_int = -1;
 
+        // The guarded section carries no invariants a panicking thread could
+        // break, so a poisoned lock is safe to reuse.
+        let alloc = PTY_ALLOC_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
         // SAFETY: openpty writes the new master/slave fds via the out-pointers
         // we provided. Any failure is reported via the return code, in which
         // case we propagate `last_os_error()` without using the (uninitialised) fds.
@@ -49,20 +64,24 @@ impl PtyConsole {
             return Err(std::io::Error::last_os_error());
         }
 
-        // SAFETY: ttyname returns a pointer into a static buffer owned by libc;
-        // we only borrow it long enough to copy into an owned String. On error
-        // (null pointer) we close the fds before returning.
-        let slave_path = unsafe {
-            let path_ptr = libc::ttyname(slave_fd);
-            if path_ptr.is_null() {
+        let mut name_buf = [0 as libc::c_char; 256];
+        // SAFETY: ttyname_r writes a NUL-terminated path into name_buf, bounded
+        // by the length we pass; on failure it returns the error number and the
+        // buffer contents are not used.
+        let err = unsafe { libc::ttyname_r(slave_fd, name_buf.as_mut_ptr(), name_buf.len()) };
+        drop(alloc);
+        if err != 0 {
+            // SAFETY: closing the fds openpty just handed us; no aliases exist.
+            unsafe {
                 libc::close(master_fd);
                 libc::close(slave_fd);
-                return Err(std::io::Error::last_os_error());
             }
-            std::ffi::CStr::from_ptr(path_ptr)
-                .to_string_lossy()
-                .into_owned()
-        };
+            return Err(std::io::Error::from_raw_os_error(err));
+        }
+        // SAFETY: ttyname_r succeeded, so name_buf holds a NUL-terminated C string.
+        let slave_path = unsafe { std::ffi::CStr::from_ptr(name_buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
 
         tracing::info!(
             "Created PTY console: master_fd={}, slave={}",
@@ -266,5 +285,25 @@ mod tests {
     fn test_pty_console_flush() {
         let mut pty = PtyConsole::new().unwrap();
         assert!(pty.flush().is_ok());
+    }
+
+    /// Allocation used to race: macOS's `openpty` resolves the slave name via
+    /// a process-global static buffer, so parallel creations could open a
+    /// wrong or stale slave and fail with ENOENT.
+    #[test]
+    fn test_pty_console_concurrent_creation() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..8 {
+                        let pty = PtyConsole::new().unwrap();
+                        assert!(pty.slave_path().starts_with("/dev/"));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
     }
 }
