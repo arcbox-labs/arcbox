@@ -297,8 +297,7 @@ jobs:
           name: agent-binary-linux-arm64
           path: artifacts/agent/
 
-      - name: Create tarball
-        id: tarball
+      - name: Create desktop tarball
         run: cargo xtask release package-tarball --version "${{ needs.version.outputs.version }}"
 
       - name: Upload assets to GitHub Release
@@ -306,8 +305,8 @@ jobs:
         with:
           tag_name: ${{ needs.version.outputs.version }}
           files: |
-            ${{ steps.tarball.outputs.tarball }}
-            ${{ steps.tarball.outputs.tarball }}.sha256
+            *.tar.gz
+            *.tar.gz.sha256
 
   # ==========================================================================
   # Sync shipped issues to Linear Releases (continuous pipeline)

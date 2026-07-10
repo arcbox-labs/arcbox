@@ -24,3 +24,6 @@ xtask-kit = { version = "0.1.4", features = ["apple", "github-actions"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

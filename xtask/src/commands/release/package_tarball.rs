@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use anyhow::{Context, Result};
 use flate2::{Compression, write::GzEncoder};
 use tar::Builder;
-use xtask_kit::{fs as xtask_fs, github_actions, hash::sha256_file};
+use xtask_kit::{fs as xtask_fs, hash::sha256_file};
 
 use crate::PackageTarballArgs;
 
@@ -14,19 +14,19 @@ pub fn run(args: PackageTarballArgs) -> Result<()> {
     let staging = args.output_dir.join(&staging_name);
     xtask_fs::remove_path(&staging)?;
 
-    xtask_fs::copy_file(
+    super::stage_executable(
         args.host_artifacts.join("target/release/abctl"),
         staging.join("abctl"),
     )?;
-    xtask_fs::copy_file(
+    super::stage_executable(
         args.host_artifacts.join("target/release/arcbox-daemon"),
         staging.join("arcbox-daemon"),
     )?;
-    xtask_fs::copy_file(
+    super::stage_executable(
         args.host_artifacts.join("target/release/arcbox-helper"),
         staging.join("arcbox-helper"),
     )?;
-    xtask_fs::copy_file(
+    super::stage_executable(
         args.agent_artifacts.join("arcbox-agent"),
         staging.join("arcbox-agent"),
     )?;
@@ -60,10 +60,6 @@ pub fn run(args: PackageTarballArgs) -> Result<()> {
     println!("{}", tarball.display());
     println!("{}", checksum.display());
 
-    if let Some(github_output) = args.github_output {
-        github_actions::append_output(&github_output, "tarball", &tarball_name)?;
-    }
-
     Ok(())
 }
 
@@ -84,4 +80,66 @@ fn print_tree(dir: &Path, prefix: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+
+    use super::*;
+
+    fn write_mode_644(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent");
+        }
+        fs::write(path, bytes).expect("write file");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    }
+
+    /// CI artifact downloads deliver every file as `0644`; the tarball must
+    /// still ship binaries executable (regression: v0.4.x tarballs shipped
+    /// `rw-r--r--` binaries) while bundle files stay non-executable.
+    #[test]
+    fn packaged_binaries_are_executable_and_bundle_files_are_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = dir.path().join("host");
+        let agent = dir.path().join("agent");
+        for bin in ["abctl", "arcbox-daemon", "arcbox-helper"] {
+            write_mode_644(&host.join("target/release").join(bin), b"bin");
+        }
+        write_mode_644(&host.join("bundle/arcbox.entitlements"), b"plist");
+        write_mode_644(
+            &host.join("bundle/com.arcboxlabs.desktop.helper.plist"),
+            b"plist",
+        );
+        write_mode_644(&agent.join("arcbox-agent"), b"bin");
+
+        let output_dir = dir.path().join("out");
+        run(PackageTarballArgs {
+            version: "v0.0.1".to_owned(),
+            host_artifacts: host,
+            agent_artifacts: agent,
+            output_dir: output_dir.clone(),
+        })
+        .expect("packaging succeeds");
+
+        let tarball = output_dir.join("arcbox-darwin-arm64-v0.0.1.tar.gz");
+        let archive = fs::File::open(&tarball).expect("tarball exists");
+        let mut entries = Archive::new(GzDecoder::new(archive));
+        for entry in entries.entries().expect("read entries") {
+            let entry = entry.expect("entry readable");
+            if entry.header().entry_type().is_dir() {
+                continue;
+            }
+            let path = PathBuf::from(&*entry.path().expect("entry path"));
+            let mode = entry.header().mode().expect("mode set") & 0o777;
+            let in_bundle = path.parent().is_some_and(|p| p.ends_with("bundle"));
+            let expected = if in_bundle { 0o644 } else { 0o755 };
+            assert_eq!(mode, expected, "unexpected mode for {}", path.display());
+        }
+    }
 }
