@@ -103,6 +103,10 @@ struct Inner {
     backends: HashMap<(String, String), Backend>,
     /// Set once `Drain` is received; no new jobs are accepted.
     draining: std::sync::atomic::AtomicBool,
+    /// Set while a self-update is pending; no new jobs are accepted. Kept
+    /// separate from `draining` so a moot update (the pin moved back to this
+    /// build before the swap) can resume without clearing an operator drain.
+    draining_for_update: std::sync::atomic::AtomicBool,
     /// Observable state mirrored to `FleetStateService.Watch` subscribers.
     state: AgentState,
 }
@@ -162,6 +166,7 @@ impl RunnerSupervisor {
                 vm,
                 backends,
                 draining: std::sync::atomic::AtomicBool::new(false),
+                draining_for_update: std::sync::atomic::AtomicBool::new(false),
                 state,
             }),
         }
@@ -235,6 +240,10 @@ impl RunnerSupervisor {
             .inner
             .draining
             .load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .inner
+                .draining_for_update
+                .load(std::sync::atomic::Ordering::Relaxed)
         {
             return Admission::Reject("host is draining".to_owned());
         }
@@ -310,8 +319,67 @@ impl RunnerSupervisor {
         self.inner
             .draining
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.inner.state.set_draining(false);
+        self.inner.state.set_draining(self.draining_for_update());
         info!("resumed: accepting new offers");
+    }
+
+    fn draining_for_update(&self) -> bool {
+        self.inner
+            .draining_for_update
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Stop accepting new offers because a self-update is pending. The
+    /// operator's own drain flag is untouched, so
+    /// [`Self::resume_after_moot_update`] can undo exactly this without
+    /// cancelling a deliberate local drain.
+    pub fn drain_for_update(&self) {
+        self.inner
+            .draining_for_update
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.inner.state.set_draining(true);
+        info!("draining for self-update: no new offers will be accepted");
+    }
+
+    /// Clear the update drain after the update became moot — the pin moved
+    /// back to this build before the swap happened (a rollback racing the
+    /// drain). An operator drain, if any, stays in force.
+    pub fn resume_after_moot_update(&self) {
+        self.inner
+            .draining_for_update
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let operator_drain = self
+            .inner
+            .draining
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.inner.state.set_draining(operator_drain);
+        info!("self-update became moot; resuming");
+    }
+
+    /// True when nothing runs here and no verdict awaits its ack — the
+    /// point at which the process can be replaced without losing work.
+    pub fn is_settled(&self) -> bool {
+        self.inner.in_flight.is_empty() && self.inner.outstanding.is_empty()
+    }
+
+    /// Wait until every in-flight job releases its slot. Unbounded — a
+    /// self-update must never kill a customer's running job — and polled,
+    /// like [`Self::shutdown`]'s drain. Used off-stream, where `outstanding`
+    /// verdicts cannot drain (delivering them needs a live attach), so only
+    /// `in_flight` gates.
+    pub async fn drained_of_jobs(&self) {
+        while !self.inner.in_flight.is_empty() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Wait for [`Self::is_settled`]. Only meaningful while attached (acks
+    /// must be able to arrive); polled for the same reason as
+    /// [`Self::drained_of_jobs`].
+    pub async fn settled(&self) {
+        while !self.is_settled() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     /// Begin graceful shutdown: stop accepting offers, cancel every in-flight

@@ -28,6 +28,7 @@ use crate::docker;
 use crate::host;
 use crate::runner::RunnerSupervisor;
 use crate::state::AgentState;
+use crate::update;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// How often to resend verdicts still awaiting an `OfferVerdictAck`. Comfortably
@@ -56,14 +57,27 @@ pub fn authenticated_request<T>(message: T, machine_token: &str) -> Result<Reque
     Ok(request)
 }
 
-/// Terminal error returned by the attach loop when the gateway refuses the
-/// build. The reconnect loop matches on this to park visibly (analogous to
-/// [`is_unauthenticated`]) instead of retrying — a different binary is what's
+/// Error returned by the attach loop when the gateway requires a different
+/// build — at the handshake (`AttachRejected`) or pushed mid-stream on a
+/// `HeartbeatAck` after draining. The reconnect loop matches on this: with a
+/// `payload` it self-updates and re-execs; without one it parks visibly
+/// (analogous to [`is_unauthenticated`]) — a different binary is what's
 /// required, not another connection attempt.
 #[derive(Debug, thiserror::Error)]
 #[error("gateway refused agent build; expected version {expected_version}")]
 struct AgentUpdateRequired {
     expected_version: String,
+    /// The pushed download, when the gateway carried one.
+    payload: Option<update::UpdatePayload>,
+}
+
+impl From<arcbox_fleet_proto::v1::AgentUpdate> for AgentUpdateRequired {
+    fn from(update: arcbox_fleet_proto::v1::AgentUpdate) -> Self {
+        Self {
+            payload: update::UpdatePayload::from_wire(&update),
+            expected_version: update.expected_version,
+        }
+    }
 }
 
 fn as_agent_update_required(error: &anyhow::Error) -> Option<&AgentUpdateRequired> {
@@ -153,6 +167,10 @@ pub async fn run(
     // connection dropped; re-sent first on the next connection so a terminal
     // event is never lost to a closed stream.
     let mut pending: Option<AttachRequest> = None;
+    // Whether the supervisor is draining for a self-update. Spans reconnects
+    // so a successful re-attach (the pin moved back to this build) can undo
+    // exactly the update drain and nothing else.
+    let mut drained_for_update = false;
 
     // Attachment-scoped: resend unacked verdicts across reconnects within this
     // attachment, exiting when `shutdown` fires. Tied to the attachment rather
@@ -173,6 +191,7 @@ pub async fn run(
             &capabilities,
             &shutdown,
             &state,
+            &mut drained_for_update,
         )
         .await;
         // A shutdown during the connection is a clean exit, not a failure to log
@@ -199,27 +218,64 @@ pub async fn run(
                 break;
             }
             Err(e) if as_agent_update_required(&e).is_some() => {
-                // The gateway pins a specific agent build and this binary
-                // isn't it. Retrying will keep hitting the same rejection;
-                // park until the operator installs the expected binary.
-                // Reuses `CredentialRejected` for the parked-state signal
-                // because it's the closest existing variant — a proper
-                // "update required" state can land alongside push-update.
-                let expected = as_agent_update_required(&e)
-                    .expect("just matched above")
-                    .expected_version
-                    .clone();
-                warn!(
-                    expected = %expected,
+                let required = as_agent_update_required(&e).expect("just matched above");
+                let Some(payload) = required.payload.clone() else {
+                    // The gateway pins a different build but carried no
+                    // download (pre-registry gateway, or no asset for this
+                    // platform). Retrying will keep hitting the same
+                    // rejection; park until the operator installs the
+                    // expected binary. Reuses `CredentialRejected` for the
+                    // parked-state signal — `Updating` is the in-progress
+                    // state, not this dead end.
+                    warn!(
+                        expected = %required.expected_version,
+                        current = env!("CARGO_PKG_VERSION"),
+                        "gateway refused the agent build; parked until the expected binary is installed"
+                    );
+                    state.set_enrollment(
+                        control_proto::Enrollment::CredentialRejected,
+                        &credential.machine_id,
+                    );
+                    shutdown.cancelled().await;
+                    break;
+                };
+                info!(
+                    expected = %payload.expected_version,
                     current = env!("CARGO_PKG_VERSION"),
-                    "gateway refused the agent build; parked until the expected binary is installed"
+                    "gateway requires a different build; self-updating"
                 );
-                state.set_enrollment(
-                    control_proto::Enrollment::CredentialRejected,
-                    &credential.machine_id,
-                );
-                shutdown.cancelled().await;
-                break;
+                state.set_enrollment(control_proto::Enrollment::Updating, &credential.machine_id);
+                // Off-stream no new offers can arrive, but jobs may still be
+                // running (a mid-stream drain that lost its connection, or a
+                // reconnect that got version-rejected). Never kill them for
+                // an update.
+                supervisor.drain_for_update();
+                drained_for_update = true;
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => break,
+                    () = supervisor.drained_of_jobs() => {}
+                }
+                // Returns only on failure; success replaces this process.
+                let error = update::apply_and_exec(&config, &payload).await;
+                if error
+                    .chain()
+                    .any(|c| c.downcast_ref::<update::UnmanagedBinary>().is_some())
+                {
+                    // Not our binary to manage — same dead end as an update
+                    // without a download: park for the operator.
+                    warn!(
+                        error = %error,
+                        "self-update declined; parked until the expected binary is installed"
+                    );
+                    state.set_enrollment(
+                        control_proto::Enrollment::CredentialRejected,
+                        &credential.machine_id,
+                    );
+                    shutdown.cancelled().await;
+                    break;
+                }
+                warn!(error = %error, backoff_secs = backoff.as_secs(), "self-update failed; retrying");
             }
             Err(e) => {
                 warn!(error = %e, backoff_secs = backoff.as_secs(), "attach failed; retrying");
@@ -256,7 +312,8 @@ pub async fn run(
     reason = "one connection's lifecycle genuinely needs all of: endpoint config, \
               credential, the persistent supervisor, the cross-reconnect egress queue \
               and its pending slot, the mutable backoff, advertised capabilities, the \
-              shutdown token, and the observable state handle"
+              shutdown token, the observable state handle, and the cross-reconnect \
+              update-drain flag"
 )]
 async fn connect_and_serve(
     config: &AgentConfig,
@@ -268,6 +325,7 @@ async fn connect_and_serve(
     capabilities: &[Capability],
     shutdown: &CancellationToken,
     state: &AgentState,
+    drained_for_update: &mut bool,
 ) -> Result<()> {
     // The desired (`target`) gateway, not `config.gateway` directly —
     // `AgentSupervisor` seeds it from config, and an `Enroll` gateway
@@ -344,11 +402,17 @@ async fn connect_and_serve(
         .context("Attach handshake response failed")?
         .ok_or_else(|| anyhow::anyhow!("attach stream closed before handshake response"))?;
     match handshake.msg {
-        Some(attach_response::Msg::AttachAccepted(_)) => {}
+        Some(attach_response::Msg::AttachAccepted(_)) => {
+            // A drain begun for an update that never happened (the pin moved
+            // back to this build before the swap) is moot once the gateway
+            // accepts this build again.
+            if *drained_for_update {
+                supervisor.resume_after_moot_update();
+                *drained_for_update = false;
+            }
+        }
         Some(attach_response::Msg::AttachRejected(update)) => {
-            return Err(anyhow::Error::new(AgentUpdateRequired {
-                expected_version: update.expected_version,
-            }));
+            return Err(anyhow::Error::new(AgentUpdateRequired::from(update)));
         }
         other => anyhow::bail!("unexpected first response from gateway: {other:?}"),
     }
@@ -372,9 +436,20 @@ async fn connect_and_serve(
         }
     }
 
+    // A mid-stream update pushed on a HeartbeatAck. The stream stays live
+    // while the supervisor drains — cancels keep arriving and verdicts keep
+    // delivering — and only once everything is settled does the loop leave
+    // with `AgentUpdateRequired`, handing the swap to the reconnect loop.
+    let mut pending_update: Option<AgentUpdateRequired> = None;
+
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break Ok(()),
+            () = supervisor.settled(), if pending_update.is_some() => {
+                break Err(anyhow::Error::new(
+                    pending_update.take().expect("guarded by is_some"),
+                ));
+            }
             event = egress_rx.recv() => match event {
                 Some(msg) => {
                     if let Err(err) = req_tx.send(msg).await {
@@ -390,12 +465,39 @@ async fn connect_and_serve(
             message = inbound.message() => match message {
                 Ok(Some(message)) => {
                     tracing::debug!(msg = ?message.msg, "inbound attach message");
+                    if let Some(update) = pushed_update(&message) {
+                        if pending_update.is_none()
+                            && update.expected_version != env!("CARGO_PKG_VERSION")
+                        {
+                            info!(
+                                expected = %update.expected_version,
+                                current = env!("CARGO_PKG_VERSION"),
+                                "gateway pushed an update; draining before the swap"
+                            );
+                            supervisor.drain_for_update();
+                            *drained_for_update = true;
+                            pending_update = Some(AgentUpdateRequired::from(update.clone()));
+                        }
+                        continue;
+                    }
                     dispatch(supervisor, message.msg);
                 }
                 Ok(None) => break Ok(()),
                 Err(status) => break Err(anyhow::Error::from(status)),
             },
         }
+    }
+}
+
+/// The update payload riding on a `HeartbeatAck`, if any. Extracted before
+/// [`dispatch`] because acting on it (drain, then leave the stream) belongs
+/// to the connection loop, not the synchronous dispatcher.
+fn pushed_update(
+    message: &arcbox_fleet_proto::v1::AttachResponse,
+) -> Option<&arcbox_fleet_proto::v1::AgentUpdate> {
+    match &message.msg {
+        Some(attach_response::Msg::HeartbeatAck(ack)) => ack.update.as_ref(),
+        _ => None,
     }
 }
 
@@ -730,6 +832,7 @@ mod tests {
         // A generous-but-bounded deadline distinguishes "worked" from
         // "deadlocked with the mock" without depending on any real network
         // timeout.
+        let mut drained_for_update = false;
         tokio::time::timeout(
             Duration::from_secs(3),
             connect_and_serve(
@@ -742,6 +845,7 @@ mod tests {
                 &[],
                 &shutdown,
                 &state,
+                &mut drained_for_update,
             ),
         )
         .await
@@ -833,6 +937,7 @@ mod tests {
         let config = config();
         let credential = credential();
 
+        let mut drained_for_update = false;
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             connect_and_serve(
@@ -845,6 +950,7 @@ mod tests {
                 &[],
                 &shutdown,
                 &state,
+                &mut drained_for_update,
             ),
         )
         .await
