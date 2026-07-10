@@ -149,7 +149,7 @@ struct ReleaseArgs {
 enum ReleaseCommand {
     /// Check Docker/Kubernetes tool updates and rewrite assets.lock.
     CheckToolUpdates(CheckToolUpdatesArgs),
-    /// Package release artifacts into a tar.gz and matching .sha256 file.
+    /// Package the desktop release artifacts into a tar.gz and matching .sha256 file.
     PackageTarball(PackageTarballArgs),
 }
 
@@ -174,9 +174,6 @@ struct PackageTarballArgs {
     /// Directory to write the tarball and checksum into.
     #[arg(long, default_value = ".")]
     output_dir: PathBuf,
-    /// GitHub Actions output file. Defaults to GITHUB_OUTPUT when present.
-    #[arg(long, env = "GITHUB_OUTPUT")]
-    github_output: Option<PathBuf>,
 }
 
 fn main() {
