@@ -22,6 +22,11 @@ env:
   RUST_BACKTRACE: 1
   APPLE_TEAM_ID: "422ACSY6Y5"
 
+# Build jobs only read the repo; the publish job re-declares the
+# contents: write it needs to attach release assets.
+permissions:
+  contents: read
+
 jobs:
   version:
     name: Determine tag
@@ -42,12 +47,18 @@ jobs:
 
   build-macos-arm64:
     name: Build macOS ARM64
+    needs: version
     runs-on: macos-26
     timeout-minutes: 30
 
     steps:
+      # Check out the tag being released, not the dispatching ref — a
+      # workflow_dispatch from master must still build the tag's tree, or
+      # the published assets would not match the release they're attached to.
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -128,6 +139,7 @@ jobs:
 
   build-linux:
     name: Build Linux ${{ matrix.arch }}
+    needs: version
     strategy:
       matrix:
         include:
@@ -141,8 +153,11 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      # Same tag-ref discipline as build-macos-arm64.
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -192,8 +207,12 @@ jobs:
       contents: write
 
     steps:
+      # Same tag-ref discipline as the build jobs, so the xtask staging the
+      # assets is the tag's own.
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
