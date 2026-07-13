@@ -779,6 +779,41 @@ mod tests {
         }
     }
 
+    /// A local TCP endpoint that accepts a gateway connection and holds it
+    /// open without ever speaking gRPC, so an enroll round-trip against it
+    /// blocks in `State::Enrolling` rather than failing fast — which a refused
+    /// port (`127.0.0.1:1`) does too quickly for the mid-round-trip state to
+    /// be observed reliably. Aborting the returned task drops the held sockets,
+    /// failing the in-flight round-trip so the enroll can then roll back.
+    async fn stalling_gateway() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind stalling gateway listener");
+        let addr = listener.local_addr().expect("stalling gateway addr");
+        let task = tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                // Hold the connection open without ever speaking gRPC; parking
+                // here keeps the round-trip blocked, and dropping `sock` on
+                // task abort closes it so the round-trip fails.
+                let _sock = sock;
+                std::future::pending::<()>().await;
+            }
+        });
+        (format!("http://{addr}"), task)
+    }
+
+    /// Poll until the observable enrollment reaches `Attaching`, bounded so a
+    /// stuck transition fails the test instead of hanging it.
+    async fn wait_for_attaching(agent_state: &AgentState) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while agent_state.current().enrollment != Enrollment::Attaching as i32 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("enroll must flip observable state to Attaching");
+    }
+
     /// The reconciler realizes `participate=false` by detaching — the
     /// credential is kept in the `Detached` state, the enrollment shows
     /// Detached, and `current` flips false — and realizes `true` again by
@@ -1015,14 +1050,18 @@ mod tests {
         let agent_state = AgentState::new(&seed());
         let supervisor = test_supervisor(&dir, agent_state.clone()).await;
 
-        // The gateway seed points at an unreachable local port — connect
-        // stalls long enough for the mid-round-trip assertions below to
-        // observe the transient state.
+        // A stalling gateway keeps the round-trip in flight so the transient
+        // state below is observable; aborting it later fails the round-trip.
+        let (gateway, gateway_task) = stalling_gateway().await;
         let enroll = {
             let supervisor = Arc::clone(&supervisor);
-            tokio::spawn(async move { supervisor.enroll("flt_join_test".to_owned(), None).await })
+            tokio::spawn(async move {
+                supervisor
+                    .enroll("flt_join_test".to_owned(), Some(&gateway))
+                    .await
+            })
         };
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_for_attaching(&agent_state).await;
 
         assert_eq!(
             agent_state.current().enrollment,
@@ -1031,10 +1070,12 @@ mod tests {
         );
         assert!(matches!(*supervisor.state.lock().await, State::Enrolling));
 
+        // Release the stalled round-trip so it fails and the enroll rolls back.
+        gateway_task.abort();
         let err = enroll
             .await
             .expect("enroll task")
-            .expect_err("gateway is unreachable");
+            .expect_err("gateway round-trip fails once released");
         assert_ne!(err.code(), tonic::Code::FailedPrecondition, "{err}");
 
         // Rollback: both the supervisor state and observable enrollment
@@ -1057,13 +1098,20 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("fleet-enroll-concurrent-{}", std::process::id()));
         let agent_state = AgentState::new(&seed());
-        let supervisor = test_supervisor(&dir, agent_state).await;
+        let supervisor = test_supervisor(&dir, agent_state.clone()).await;
 
+        // The first enroll stalls at the gateway, holding the enrollment gate
+        // closed for the whole window the second enroll races against.
+        let (gateway, gateway_task) = stalling_gateway().await;
         let first = {
             let supervisor = Arc::clone(&supervisor);
-            tokio::spawn(async move { supervisor.enroll("flt_join_first".to_owned(), None).await })
+            tokio::spawn(async move {
+                supervisor
+                    .enroll("flt_join_first".to_owned(), Some(&gateway))
+                    .await
+            })
         };
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_for_attaching(&agent_state).await;
 
         let err = supervisor
             .enroll("flt_join_second".to_owned(), None)
@@ -1072,8 +1120,9 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("enroll in progress"), "{err}");
 
-        // The first enroll still fails at the unreachable gateway; the
-        // point is that the second one was gated *before* even trying.
+        // Release the first enroll; the point is that the second one was gated
+        // *before* even trying, not by the round-trip re-check that came after.
+        gateway_task.abort();
         let _ = first.await.expect("enroll task");
         let _ = std::fs::remove_dir_all(dir);
     }
