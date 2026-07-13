@@ -1,7 +1,8 @@
 name: Fleet Agent Release
 
 # Builds and publishes arcbox-fleet-agent on its own cadence, independent of
-# the desktop release train. Assets are raw binaries (plus .sha256 files),
+# the desktop release train. macOS builds run natively on Apple Silicon and
+# Intel runners. Assets are raw binaries (plus .sha256 files),
 # named arcbox-fleet-agent-<os>-<arch> in the fleet capability vocabulary —
 # the download URL is a pure function of (tag, host_os, host_arch), which is
 # exactly what the gateway constructs for AgentUpdate.binary_url.
@@ -45,10 +46,17 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Building tag: $TAG"
 
-  build-macos-arm64:
-    name: Build macOS ARM64
+  build-macos:
+    name: Build macOS ${{ matrix.arch }}
     needs: version
-    runs-on: macos-26
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-26
+          - arch: amd64
+            runner: macos-26-intel
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
 
     steps:
@@ -78,9 +86,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-fleet-agent-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-fleet-agent-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-fleet-agent-
+            ${{ runner.os }}-cargo-fleet-agent-${{ matrix.arch }}-
 
       - name: Import signing certificate
         env:
@@ -133,7 +141,7 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: fleet-agent-binary-darwin-arm64
+          name: fleet-agent-binary-darwin-${{ matrix.arch }}
           path: target/release/arcbox-fleet-agent
           retention-days: 5
 
@@ -153,7 +161,7 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      # Same tag-ref discipline as build-macos-arm64.
+      # Same tag-ref discipline as build-macos.
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -201,7 +209,7 @@ jobs:
 
   publish:
     name: Publish Release Assets
-    needs: [version, build-macos-arm64, build-linux]
+    needs: [version, build-macos, build-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -226,7 +234,7 @@ jobs:
       - name: Prepare release assets
         run: |
           set -eu
-          for platform in darwin-arm64 linux-amd64 linux-arm64; do
+          for platform in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64; do
             cargo xtask release fleet-asset \
               --platform "$platform" \
               --binary "artifacts/fleet-agent-binary-$platform/arcbox-fleet-agent"
