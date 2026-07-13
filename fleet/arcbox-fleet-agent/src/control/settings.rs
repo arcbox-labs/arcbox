@@ -50,6 +50,22 @@ impl FleetSettingsServiceTrait for SettingsService {
         let req = request.into_inner();
         validate(&req, &self.state).map_err(Status::invalid_argument)?;
 
+        // Apply the fallible gateway write first so the whole in-memory
+        // phase is all-or-nothing: `try_set_gateway_target` is the only
+        // setter in this method that can refuse (a concurrent `Enroll`
+        // flipped enrollment to `Attaching` between `validate` and here),
+        // and returning after any infallible setter has already written
+        // in-memory state would show up as a partial update on
+        // `Watch`/`GetSettings` while the response says failure and
+        // `settings.json` is never written.
+        if let Some(v) = &req.gateway {
+            if let Err(observed) = self.state.try_set_gateway_target(v) {
+                return Err(Status::failed_precondition(format!(
+                    "gateway change refused: enrollment is {observed:?} — unenroll first, then \
+                     set the gateway and re-enroll"
+                )));
+            }
+        }
         if let Some(v) = req.load_ceiling {
             self.state.set_load_ceiling(v);
         }
@@ -60,21 +76,6 @@ impl FleetSettingsServiceTrait for SettingsService {
         // image and promotes it to `current`.
         if let Some(v) = &req.linux_runner_image {
             self.state.set_linux_runner_image_target(v);
-        }
-        if let Some(v) = &req.gateway {
-            // Atomic re-check: `validate` above already refused a gateway
-            // change while enrolled, but a concurrent `Enroll` may have
-            // flipped enrollment to `Attaching` between that read and this
-            // write. `try_set_gateway_target` performs the enrollment check
-            // and the write inside a single `send_modify`, so the two
-            // cannot interleave — the credential and settings.json always
-            // land on the same gateway key.
-            if let Err(observed) = self.state.try_set_gateway_target(v) {
-                return Err(Status::failed_precondition(format!(
-                    "gateway change refused: enrollment is {observed:?} — unenroll first, then \
-                     set the gateway and re-enroll"
-                )));
-            }
         }
         if let Some(v) = req.docker_mode {
             self.state.set_docker_mode_target(docker_mode_from_wire(v));
