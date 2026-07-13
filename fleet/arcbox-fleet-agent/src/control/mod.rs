@@ -150,9 +150,9 @@ async fn join_or_abort(mut task: tokio::task::JoinHandle<Result<()>>, grace: Dur
 }
 
 /// The `Enroll` admission check: only `Unenrolled` may proceed. Applied
-/// twice — before the gateway round-trip and again after re-locking — so
-/// both an already-live attachment and an `Unenroll` that started
-/// mid-round-trip refuse the enrollment.
+/// once, at the start of [`AgentSupervisor::enroll`] — the transition into
+/// [`State::Enrolling`] under the same lock then keeps every concurrent
+/// admission out, including a straggling `Unenroll`.
 ///
 /// Returns a plain message rather than `Status` — every failure here maps
 /// to the same `FAILED_PRECONDITION` code, so the caller does that one
@@ -160,6 +160,7 @@ async fn join_or_abort(mut task: tokio::task::JoinHandle<Result<()>>, grace: Dur
 fn check_enrollable(state: &State) -> Result<(), &'static str> {
     match state {
         State::Unenrolled => Ok(()),
+        State::Enrolling => Err("enroll in progress — retry shortly"),
         State::Unenrolling => Err("unenroll in progress — retry shortly"),
         State::Detaching => Err("detach in progress — retry shortly"),
         State::Detached { .. } => {
@@ -193,6 +194,16 @@ struct Attachment {
 
 enum State {
     Unenrolled,
+    /// An `Enroll` is between the initial admission check and either
+    /// success (transition to [`State::Attached`]) or failure (rollback to
+    /// [`State::Unenrolled`]). Held across the gateway round-trip so
+    /// [`check_enrollable`] refuses a concurrent `Enroll`, and mirrored as
+    /// observable [`Enrollment::Attaching`] on [`AgentState`] so
+    /// `settings::validate` refuses a gateway change during the same
+    /// window — without that mirror, a settings write could move the
+    /// gateway target under our feet and leave the credential (persisted
+    /// under the enrolling gateway's key) unreachable to the next startup.
+    Enrolling,
     /// An `Unenroll` is tearing its attachment down (bounded by
     /// [`TEARDOWN_GRACE`]). `Enroll` is refused while here: an enrollment
     /// that raced into the teardown window would have its observable state
@@ -345,11 +356,51 @@ impl AgentSupervisor {
         token: String,
         control_plane: Option<&str>,
     ) -> Result<String, Status> {
-        check_enrollable(&*self.state.lock().await).map_err(Status::failed_precondition)?;
+        // Enter `Enrolling` under the state lock so `check_enrollable`
+        // refuses every concurrent admission for the whole round-trip, and
+        // mirror the observable state as `Attaching` on `AgentState` so
+        // `settings::validate` refuses a racing gateway change against the
+        // same window. Without the observable write here, a settings-time
+        // gateway move could land between our target read and the credential
+        // persist, splitting the gateway keys of settings.json and the
+        // credential store — the next startup would then miss the credential.
+        {
+            let mut state = self.state.lock().await;
+            check_enrollable(&state).map_err(Status::failed_precondition)?;
+            *state = State::Enrolling;
+            self.agent_state.set_enrollment(Enrollment::Attaching, "");
+        }
 
-        // Resolve the gateway to dial without mutating shared state yet: a
-        // concurrent Enroll may still win the race check below, and a losing
-        // attempt must not leave its gateway override applied or persisted.
+        // Any early return past this point must roll `Enrolling` back to
+        // `Unenrolled` — otherwise the gate stays closed to future enrolls.
+        let outcome = self.finish_enroll(token, control_plane).await;
+        if outcome.is_err() {
+            let mut state = self.state.lock().await;
+            // Only roll back the state we own. `attach()` transitions to
+            // `Attached` (with a real machine_id in `set_enrollment`), so
+            // if we're still `Enrolling`, no one else has advanced the
+            // observable state either.
+            if matches!(*state, State::Enrolling) {
+                *state = State::Unenrolled;
+                self.agent_state.set_enrollment(Enrollment::Unenrolled, "");
+            }
+        }
+        outcome
+    }
+
+    /// Body of [`Self::enroll`] between entering `State::Enrolling` and
+    /// the `Attached` transition. Split out so the caller can roll the
+    /// state back on any `?`-early return uniformly, without repeating the
+    /// cleanup at every fallible site.
+    async fn finish_enroll(
+        &self,
+        token: String,
+        control_plane: Option<&str>,
+    ) -> Result<String, Status> {
+        // Resolve the gateway to dial. Because `Enrolling` is now held and
+        // `settings::validate` refuses gateway changes while enrollment is
+        // live, this value is stable across the round-trip below — the
+        // credential and settings.json will end up under the same key.
         let gateway =
             control_plane.map_or_else(|| self.agent_state.gateway_target(), str::to_owned);
 
@@ -359,19 +410,17 @@ impl AgentSupervisor {
             .map_err(Internal)?;
 
         let mut state = self.state.lock().await;
-        // Lost a race with a concurrent Enroll (or a Unenroll started
-        // mid-round-trip). The credential just fetched is dropped here
-        // without ever being persisted — only the winner, below, writes to
-        // the credential store — so it cannot clobber the winner's
-        // persisted credential.
-        check_enrollable(&state).map_err(Status::failed_precondition)?;
+        // `check_enrollable` refuses `Enrolling`, so nothing else can
+        // transition it while we're away — assert defensively in case a
+        // future path breaks that invariant.
+        debug_assert!(
+            matches!(*state, State::Enrolling),
+            "state left Enrolling behind our back"
+        );
 
-        // Won the race. Persist the credential now, and only now: a losing
-        // concurrent Enroll returned above without writing, so what lands on
-        // disk always matches the attachment started just below — a later
-        // restart reattaches as the same machine. Scoped to the gateway just
-        // enrolled against, which the settings write below makes the target,
-        // so the restart load finds it under the same key.
+        // Scoped to the gateway just enrolled against, which the settings
+        // write below makes the target — so the restart load finds it under
+        // the same key.
         self.credential_store_for(&gateway)
             .store(&credential)
             .map_err(Internal)?;
@@ -417,6 +466,11 @@ impl AgentSupervisor {
             match &*state {
                 State::Unenrolled => {
                     return Err(Status::failed_precondition("not enrolled"));
+                }
+                State::Enrolling => {
+                    return Err(Status::failed_precondition(
+                        "enroll in progress — retry shortly",
+                    ));
                 }
                 State::Unenrolling => {
                     return Err(Status::failed_precondition("unenroll already in progress"));
@@ -591,7 +645,7 @@ impl AgentSupervisor {
                 a.supervisor.handle_drain();
                 Ok(())
             }
-            State::Unenrolled | State::Unenrolling => {
+            State::Unenrolled | State::Enrolling | State::Unenrolling => {
                 Err(Status::failed_precondition("not enrolled"))
             }
             State::Detaching | State::Detached { .. } => Err(Status::failed_precondition(
@@ -607,7 +661,7 @@ impl AgentSupervisor {
                 a.supervisor.resume();
                 Ok(())
             }
-            State::Unenrolled | State::Unenrolling => {
+            State::Unenrolled | State::Enrolling | State::Unenrolling => {
                 Err(Status::failed_precondition("not enrolled"))
             }
             State::Detaching | State::Detached { .. } => Err(Status::failed_precondition(
@@ -646,10 +700,11 @@ impl AgentSupervisor {
             let mut state = self.state.lock().await;
             match std::mem::replace(&mut *state, State::Unenrolled) {
                 State::Attached(a) => Some(a),
-                // During `Unenrolling`/`Detaching` the transition owns the
-                // attachment handle and awaits it itself; `Detached` has no
-                // task at all. Nothing to join.
+                // During `Enrolling`/`Unenrolling`/`Detaching` the transition
+                // owns any handle involved and awaits it itself; `Unenrolled`
+                // and `Detached` have no task at all. Nothing to join.
                 State::Unenrolled
+                | State::Enrolling
                 | State::Unenrolling
                 | State::Detaching
                 | State::Detached { .. } => None,
@@ -943,6 +998,83 @@ mod tests {
             .expect_err("gateway is unreachable");
         assert_ne!(err.code(), tonic::Code::FailedPrecondition, "{err}");
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `enroll` must mirror its `State::Enrolling` transition onto
+    /// `agent_state.enrollment = Attaching` before releasing the state
+    /// lock — that mirror is what makes `settings::validate` refuse a
+    /// gateway change while the gateway round-trip is in flight. If the
+    /// round-trip then fails, both the supervisor state and the observable
+    /// enrollment must roll back to `Unenrolled`, or the gate stays closed
+    /// to every future enroll.
+    #[tokio::test]
+    async fn enroll_marks_state_attaching_across_the_gateway_round_trip() {
+        let dir =
+            std::env::temp_dir().join(format!("fleet-enroll-observability-{}", std::process::id()));
+        let agent_state = AgentState::new(&seed());
+        let supervisor = test_supervisor(&dir, agent_state.clone()).await;
+
+        // The gateway seed points at an unreachable local port — connect
+        // stalls long enough for the mid-round-trip assertions below to
+        // observe the transient state.
+        let enroll = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move { supervisor.enroll("flt_join_test".to_owned(), None).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            agent_state.current().enrollment,
+            Enrollment::Attaching as i32,
+            "observable state must flip to Attaching before the round-trip yields"
+        );
+        assert!(matches!(*supervisor.state.lock().await, State::Enrolling));
+
+        let err = enroll
+            .await
+            .expect("enroll task")
+            .expect_err("gateway is unreachable");
+        assert_ne!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+
+        // Rollback: both the supervisor state and observable enrollment
+        // must return to Unenrolled so future enrolls can proceed.
+        assert!(matches!(*supervisor.state.lock().await, State::Unenrolled));
+        assert_eq!(
+            agent_state.current().enrollment,
+            Enrollment::Unenrolled as i32
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Two `enroll` RPCs racing against the same supervisor: the second
+    /// must be refused by `State::Enrolling` (not by the round-trip
+    /// re-check that came after it), so its token is never used and its
+    /// credential is never persisted alongside the first one.
+    #[tokio::test]
+    async fn concurrent_enroll_is_refused_by_the_enrolling_gate() {
+        let dir =
+            std::env::temp_dir().join(format!("fleet-enroll-concurrent-{}", std::process::id()));
+        let agent_state = AgentState::new(&seed());
+        let supervisor = test_supervisor(&dir, agent_state).await;
+
+        let first = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move { supervisor.enroll("flt_join_first".to_owned(), None).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let err = supervisor
+            .enroll("flt_join_second".to_owned(), None)
+            .await
+            .expect_err("concurrent enroll must be refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("enroll in progress"), "{err}");
+
+        // The first enroll still fails at the unreachable gateway; the
+        // point is that the second one was gated *before* even trying.
+        let _ = first.await.expect("enroll task");
         let _ = std::fs::remove_dir_all(dir);
     }
 
