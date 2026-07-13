@@ -418,13 +418,6 @@ impl AgentSupervisor {
             "state left Enrolling behind our back"
         );
 
-        // Scoped to the gateway just enrolled against, which the settings
-        // write below makes the target — so the restart load finds it under
-        // the same key.
-        self.credential_store_for(&gateway)
-            .store(&credential)
-            .map_err(Internal)?;
-
         // Enrolling is an explicit act of participation: override a stale
         // participate=false so the reconciler doesn't immediately detach
         // the attachment started below. Persisted together with an explicit
@@ -436,8 +429,24 @@ impl AgentSupervisor {
             self.agent_state.set_gateway_target(control_plane);
             self.agent_state.set_gateway_current(control_plane);
         }
+
+        // Settings before the credential — order matters. On a crash or
+        // failure between these two writes we prefer "settings on the new
+        // gateway, no credential" (next startup loads the new gateway,
+        // finds nothing under the same key, and starts cleanly Unenrolled)
+        // over "credential under the new gateway, settings still on the
+        // old" (next startup reads the old gateway, misses the entry keyed
+        // by the new one on the macOS keychain backend, and the machine
+        // token is orphaned — invisible to `Unenroll`, which also keys by
+        // the settings gateway).
         self.settings_store
             .store(&self.agent_state.persisted_settings())
+            .map_err(Internal)?;
+
+        // Scoped to the gateway just persisted above, so the restart load
+        // finds it under the same key.
+        self.credential_store_for(&gateway)
+            .store(&credential)
             .map_err(Internal)?;
 
         let machine_id = credential.machine_id.clone();
