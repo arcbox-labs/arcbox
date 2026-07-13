@@ -62,7 +62,19 @@ impl FleetSettingsServiceTrait for SettingsService {
             self.state.set_linux_runner_image_target(v);
         }
         if let Some(v) = &req.gateway {
-            self.state.set_gateway_target(v);
+            // Atomic re-check: `validate` above already refused a gateway
+            // change while enrolled, but a concurrent `Enroll` may have
+            // flipped enrollment to `Attaching` between that read and this
+            // write. `try_set_gateway_target` performs the enrollment check
+            // and the write inside a single `send_modify`, so the two
+            // cannot interleave — the credential and settings.json always
+            // land on the same gateway key.
+            if let Err(observed) = self.state.try_set_gateway_target(v) {
+                return Err(Status::failed_precondition(format!(
+                    "gateway change refused: enrollment is {observed:?} — unenroll first, then \
+                     set the gateway and re-enroll"
+                )));
+            }
         }
         if let Some(v) = req.docker_mode {
             self.state.set_docker_mode_target(docker_mode_from_wire(v));

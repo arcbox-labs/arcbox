@@ -370,6 +370,37 @@ impl AgentState {
         });
     }
 
+    /// Set `gateway.target` iff the enrollment snapshot at the moment of
+    /// the write is `Unenrolled`. Both the check and the write happen
+    /// inside the same `send_modify` closure, so a concurrent
+    /// [`Self::set_enrollment`] (which uses the same watch sender) cannot
+    /// interleave between them.
+    ///
+    /// This is what closes the race that a plain
+    /// `validate() ... set_gateway_target(...)` pair leaks: an `Enroll`
+    /// entering its round-trip flips enrollment to `Attaching` between
+    /// validate's read and the write, and by the time the write lands the
+    /// credential would be persisted under one gateway while the settings
+    /// wrote the other. Returns the observed enrollment on refusal.
+    pub fn try_set_gateway_target(&self, value: &str) -> Result<(), Enrollment> {
+        let mut observed: Result<(), Enrollment> = Ok(());
+        self.tx.send_modify(|s| {
+            let enrollment = Enrollment::try_from(s.enrollment).unwrap_or(Enrollment::Unenrolled);
+            if enrollment != Enrollment::Unenrolled {
+                observed = Err(enrollment);
+                return;
+            }
+            value.clone_into(
+                &mut settings_mut(s)
+                    .gateway
+                    .as_mut()
+                    .expect(SETTINGS_INVARIANT)
+                    .target,
+            );
+        });
+        observed
+    }
+
     pub fn set_gateway_current(&self, value: &str) {
         self.tx.send_modify(|s| {
             value.clone_into(
@@ -521,6 +552,40 @@ mod tests {
 
         state.set_gateway_current("https://staging.fleet.arcbox.dev");
         assert_eq!(gateway_current(&state), state.gateway_target());
+    }
+
+    /// The atomic setter that closes the `settings::validate` race: it must
+    /// accept a write while `Unenrolled` and refuse (leaving the target
+    /// unchanged) for every non-`Unenrolled` enrollment. The check and the
+    /// write both happen inside one `send_modify`, so a concurrent
+    /// `set_enrollment` cannot slip between them.
+    #[test]
+    fn try_set_gateway_target_gates_on_enrollment() {
+        let state = AgentState::new(&seed());
+        assert!(
+            state
+                .try_set_gateway_target("https://staging.fleet.arcbox.dev")
+                .is_ok()
+        );
+        assert_eq!(state.gateway_target(), "https://staging.fleet.arcbox.dev");
+
+        for enrollment in [
+            Enrollment::Attaching,
+            Enrollment::Attached,
+            Enrollment::Detached,
+            Enrollment::CredentialRejected,
+        ] {
+            state.set_enrollment(enrollment, "fltm_test");
+            assert_eq!(
+                state.try_set_gateway_target("https://other.gateway.test"),
+                Err(enrollment)
+            );
+            assert_eq!(
+                state.gateway_target(),
+                "https://staging.fleet.arcbox.dev",
+                "{enrollment:?}: refused write must not mutate the target"
+            );
+        }
     }
 
     #[test]
