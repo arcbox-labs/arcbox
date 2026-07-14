@@ -197,17 +197,23 @@ jobs:
           key: musl-cross-${{ matrix.musl_prefix }}-${{ matrix.musl_sha256 }}
 
       - name: Install musl-cross toolchain
-        # Pinned by sha256: this toolchain links the released binaries, and
+        # Downloaded from our own vendored release (mirror of the same
+        # musl.cc tarballs, verified by sha256 at upload time). Points off
+        # musl.cc's single-maintainer host — it's been unreliable from
+        # GHA runners — and keeps release bandwidth on GitHub's CDN.
+        # Pinned by sha256: this toolchain links the released binaries and
         # Linux release artifacts aren't codesigned, so a bad tarball would
-        # silently backdoor every Linux release. musl.cc is a single-
-        # maintainer host — retry + cache handle transient outages, the
-        # digest handles bad content.
+        # silently backdoor every Linux release. The digest is also baked
+        # into the cache key above, so bumping the tarball auto-invalidates
+        # any previously-cached toolchain.
         if: steps.musl-cross-cache.outputs.cache-hit != 'true'
+        env:
+          MUSL_CROSS_RELEASE: musl-cross-2021-11-23
         run: |
           set -euo pipefail
           curl -fsSL --retry 5 --retry-all-errors \
             -o /tmp/musl-cross.tgz \
-            "https://musl.cc/${{ matrix.musl_prefix }}-cross.tgz"
+            "https://github.com/${{ github.repository }}/releases/download/${MUSL_CROSS_RELEASE}/${{ matrix.musl_prefix }}-cross.tgz"
           echo "${{ matrix.musl_sha256 }}  /tmp/musl-cross.tgz" | sha256sum -c -
           sudo tar -xf /tmp/musl-cross.tgz -C /opt
           rm /tmp/musl-cross.tgz
