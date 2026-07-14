@@ -161,8 +161,9 @@ jobs:
             target: x86_64-unknown-linux-musl
             musl_prefix: x86_64-linux-musl
             # sha256 of https://musl.cc/x86_64-linux-musl-cross.tgz
-            # (Last-Modified: 2021-11-23). Bump both hash and cache key
-            # version if the upstream tarball is refreshed.
+            # (Last-Modified: 2021-11-23). The digest is also baked into
+            # the cache key below, so refreshing the tarball auto-
+            # invalidates any previously-cached toolchain.
             musl_sha256: c5d410d9f82a4f24c549fe5d24f988f85b2679b452413a9f7e5f7b956f2fe7ea
           - arch: arm64
             target: aarch64-unknown-linux-musl
@@ -186,11 +187,14 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache musl-cross toolchain
+        # Cache key includes the pinned sha256, so bumping the digest
+        # auto-invalidates any previously-cached toolchain — no coupled
+        # version bump required.
         id: musl-cross-cache
         uses: actions/cache@v4
         with:
           path: /opt/${{ matrix.musl_prefix }}-cross
-          key: musl-cross-${{ matrix.musl_prefix }}-v1
+          key: musl-cross-${{ matrix.musl_prefix }}-${{ matrix.musl_sha256 }}
 
       - name: Install musl-cross toolchain
         # Pinned by sha256: this toolchain links the released binaries, and
