@@ -46,7 +46,7 @@ jobs:
             --json headRefName,number |
           jq -c '.[]' |
           while read -r pr; do
-            PR_BRANCH=$(jq -r '.headBranchName' <<< "$pr")
+            PR_BRANCH=$(jq -r '.headRefName' <<< "$pr")
             PR_NUMBER=$(jq -r '.number' <<< "$pr")
             echo "::group::Update Cargo.lock for PR #${PR_NUMBER} (${PR_BRANCH})"
             workdir=$(mktemp -d)
