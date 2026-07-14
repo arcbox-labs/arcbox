@@ -28,22 +28,24 @@ jobs:
           manifest-file: .release-please-manifest.json
           token: ${{ steps.app-token.outputs.token }}
 
-      # After release-please creates/updates release PRs, regenerate
-      # Cargo.lock on each so the release tag can build with --locked.
-      # Iterates the `prs` array — under separate-pull-requests each
-      # component has its own PR, and `outputs.pr` (singular) only
-      # exposes one of them.
+      # Regenerate Cargo.lock on every open release PR so its release tag
+      # can build with --locked. The release-please `prs` output only
+      # includes PRs created or updated during the current run.
       - name: Update Cargo.lock on release PRs
-        if: steps.release.outputs.prs_created == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          # Passed via env, not inline interpolation: the JSON contains
-          # changelog bodies, whose quotes would break the shell script.
-          RELEASE_PRS: ${{ steps.release.outputs.prs }}
         run: |
           git config --global user.name "arcbox-labs[bot]"
           git config --global user.email "254083426+arcbox-labs[bot]@users.noreply.github.com"
-          echo "$RELEASE_PRS" | jq -c '.[]' | while read -r pr; do
+          gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base "$GITHUB_REF_NAME" \
+            --state open \
+            --label "autorelease: pending" \
+            --limit 100 \
+            --json headRefName,number |
+          jq -c '.[]' |
+          while read -r pr; do
             PR_BRANCH=$(jq -r '.headBranchName' <<< "$pr")
             PR_NUMBER=$(jq -r '.number' <<< "$pr")
             echo "::group::Update Cargo.lock for PR #${PR_NUMBER} (${PR_BRANCH})"
