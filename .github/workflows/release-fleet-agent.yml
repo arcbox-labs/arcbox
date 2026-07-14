@@ -263,6 +263,93 @@ jobs:
           path: target/${{ matrix.target }}/release/arcbox-fleet-agent
           retention-days: 5
 
+  # Mirror the fleet-agent binaries to the release CDN
+  # (release.arcboxcdn.com, backed by Backblaze B2). This is the primary
+  # distribution channel the gateway resolves for AgentUpdate.binary_url —
+  # the URL is a pure function of (version, host_os, host_arch):
+  #
+  #   https://release.arcboxcdn.com/runner/${version}/arcbox-fleet-agent-${os}-${arch}
+  #
+  # `${version}` is the git tag with the `fleet-agent-` component prefix
+  # stripped (so `fleet-agent-v0.1.0` → `v0.1.0`) — under `runner/` the
+  # component prefix is redundant, and the leading `v` matches semver-tag
+  # convention. `--size-only` on the sync is safe because the artifacts
+  # under a version are immutable; re-releasing the same version is a
+  # workflow re-dispatch, not a content-differs replace.
+  upload-cdn:
+    name: Upload to CDN
+    needs: [version, build-macos, build-linux]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fleet-agent-binary-*
+          path: artifacts/
+
+      - name: Stage assets
+        id: stage
+        run: |
+          set -eu
+          TAG="${{ needs.version.outputs.tag }}"
+          VERSION="${TAG#fleet-agent-}"
+          mkdir -p "cdn-staging/runner/${VERSION}"
+          for platform in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64; do
+            cargo xtask release fleet-asset \
+              --platform "$platform" \
+              --binary "artifacts/fleet-agent-binary-$platform/arcbox-fleet-agent"
+          done
+          mv arcbox-fleet-agent-* "cdn-staging/runner/${VERSION}/"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "=== CDN staging ==="
+          find "cdn-staging/runner/${VERSION}" -type f | sort
+
+      - name: Upload to B2 (size-only, immutable)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.RELEASE_B2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RELEASE_B2_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.RELEASE_B2_REGION }}
+        run: |
+          VERSION="${{ steps.stage.outputs.version }}"
+          aws s3 sync \
+            "cdn-staging/runner/${VERSION}/" \
+            "s3://${{ secrets.RELEASE_B2_BUCKET }}/runner/${VERSION}/" \
+            --endpoint-url "https://s3.${{ secrets.RELEASE_B2_REGION }}.backblazeb2.com" \
+            --size-only
+
+      - name: Verify CDN URLs
+        uses: actions/github-script@v7
+        env:
+          VERSION: ${{ steps.stage.outputs.version }}
+        with:
+          script: |
+            const { VERSION } = process.env;
+            await new Promise((r) => setTimeout(r, 5000));
+            const platforms = ['darwin-arm64', 'darwin-amd64', 'linux-amd64', 'linux-arm64'];
+            let failed = false;
+            for (const p of platforms) {
+              const url = `https://release.arcboxcdn.com/runner/${VERSION}/arcbox-fleet-agent-${p}`;
+              let status = 0;
+              try {
+                status = (await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(15000) })).status;
+              } catch { /* status stays 0 */ }
+              core.info(`CDN check: ${url} -> HTTP ${status}`);
+              if (status !== 200) {
+                core.warning(`CDN returned HTTP ${status} for ${url}`);
+                failed = true;
+              }
+            }
+            if (failed) core.warning('Some CDN URLs did not return HTTP 200 — check propagation');
+
   publish:
     name: Publish Release Assets
     needs: [version, build-macos, build-linux]
