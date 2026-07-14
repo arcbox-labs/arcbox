@@ -263,6 +263,140 @@ jobs:
           path: target/${{ matrix.target }}/release/arcbox-fleet-agent
           retention-days: 5
 
+  # Mirror the fleet-agent binaries to the release CDN
+  # (release.arcboxcdn.com, backed by Backblaze B2). This is the primary
+  # distribution channel the gateway resolves for AgentUpdate.binary_url —
+  # the URL is a pure function of (version, host_os, host_arch):
+  #
+  #   https://release.arcboxcdn.com/runner/fleet-agent/${version}/arcbox-fleet-agent-${os}-${arch}
+  #
+  # Layout: `runner/` is the top-level namespace for runner-side
+  # components; `fleet-agent/` is this specific component, leaving room
+  # for sibling components at `runner/<other>/...` without collision.
+  # `${version}` is the git tag with the `fleet-agent-` prefix stripped
+  # (so `fleet-agent-v0.1.0` → `v0.1.0`). `--size-only` on the sync is
+  # safe because the artifacts under a version are immutable;
+  # re-releasing the same version is a workflow re-dispatch, not a
+  # content-differs replace.
+  upload-cdn:
+    name: Upload to CDN
+    needs: [version, build-macos, build-linux]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fleet-agent-binary-*
+          path: artifacts/
+
+      - name: Stage assets
+        id: stage
+        # Also writes runner/fleet-agent/latest.json for stable releases so
+        # consumers can resolve the current version without hitting the
+        # GitHub API. A pre-release tag (`v0.1.0-rc.1`, `v0.2.0-beta.2`,
+        # etc. — anything with a `-` in the version string) keeps its
+        # binaries uploaded but does NOT clobber latest.json.
+        run: |
+          set -eu
+          TAG="${{ needs.version.outputs.tag }}"
+          VERSION="${TAG#fleet-agent-}"
+          mkdir -p "cdn-staging/runner/fleet-agent/${VERSION}"
+          for platform in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64; do
+            cargo xtask release fleet-asset \
+              --platform "$platform" \
+              --binary "artifacts/fleet-agent-binary-$platform/arcbox-fleet-agent"
+          done
+          mv arcbox-fleet-agent-* "cdn-staging/runner/fleet-agent/${VERSION}/"
+
+          IS_STABLE=false
+          if [[ "$VERSION" != *-* ]]; then
+            IS_STABLE=true
+            printf '{"version":"%s"}\n' "$VERSION" \
+              > "cdn-staging/runner/fleet-agent/latest.json"
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "is_stable=${IS_STABLE}" >> "$GITHUB_OUTPUT"
+          echo "=== CDN staging ==="
+          find "cdn-staging/runner/fleet-agent" -type f | sort
+
+      - name: Upload binaries to B2 (size-only, immutable)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.RELEASE_B2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RELEASE_B2_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.RELEASE_B2_REGION }}
+        run: |
+          VERSION="${{ steps.stage.outputs.version }}"
+          aws s3 sync \
+            "cdn-staging/runner/fleet-agent/${VERSION}/" \
+            "s3://${{ secrets.RELEASE_B2_BUCKET }}/runner/fleet-agent/${VERSION}/" \
+            --endpoint-url "https://s3.${{ secrets.RELEASE_B2_REGION }}.backblazeb2.com" \
+            --size-only
+
+      - name: Upload latest.json to B2
+        if: steps.stage.outputs.is_stable == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.RELEASE_B2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RELEASE_B2_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.RELEASE_B2_REGION }}
+        run: |
+          aws s3 cp \
+            "cdn-staging/runner/fleet-agent/latest.json" \
+            "s3://${{ secrets.RELEASE_B2_BUCKET }}/runner/fleet-agent/latest.json" \
+            --endpoint-url "https://s3.${{ secrets.RELEASE_B2_REGION }}.backblazeb2.com" \
+            --content-type "application/json"
+
+      - name: Verify CDN URLs
+        uses: actions/github-script@v7
+        env:
+          VERSION: ${{ steps.stage.outputs.version }}
+          IS_STABLE: ${{ steps.stage.outputs.is_stable }}
+        with:
+          script: |
+            const { VERSION, IS_STABLE } = process.env;
+            await new Promise((r) => setTimeout(r, 5000));
+            const platforms = ['darwin-arm64', 'darwin-amd64', 'linux-amd64', 'linux-arm64'];
+            let failed = false;
+            for (const p of platforms) {
+              const url = `https://release.arcboxcdn.com/runner/fleet-agent/${VERSION}/arcbox-fleet-agent-${p}`;
+              let status = 0;
+              try {
+                status = (await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(15000) })).status;
+              } catch { /* status stays 0 */ }
+              core.info(`CDN check: ${url} -> HTTP ${status}`);
+              if (status !== 200) {
+                core.warning(`CDN returned HTTP ${status} for ${url}`);
+                failed = true;
+              }
+            }
+            if (IS_STABLE === 'true') {
+              const url = 'https://release.arcboxcdn.com/runner/fleet-agent/latest.json';
+              let status = 0, body = null;
+              try {
+                const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+                status = res.status;
+                if (res.ok) body = await res.json();
+              } catch { /* status stays 0 */ }
+              core.info(`CDN check: ${url} -> HTTP ${status} (body: ${JSON.stringify(body)})`);
+              if (status !== 200) {
+                core.warning(`latest.json returned HTTP ${status}`);
+                failed = true;
+              } else if (body?.version !== VERSION) {
+                core.warning(`latest.json version=${body?.version}, expected ${VERSION} (propagation lag likely)`);
+                failed = true;
+              }
+            }
+            if (failed) core.warning('Some CDN URLs did not return the expected state — check propagation');
+
   publish:
     name: Publish Release Assets
     needs: [version, build-macos, build-linux]
