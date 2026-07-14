@@ -1,7 +1,7 @@
 name: Fleet Agent Release
 
 # Builds and publishes arcbox-fleet-agent on its own cadence, independent of
-# the desktop release train. macOS builds run natively on Apple Silicon and
+# the main arcbox release train. macOS builds run natively on Apple Silicon and
 # Intel runners. Assets are raw binaries (plus .sha256 files),
 # named arcbox-fleet-agent-<os>-<arch> in the fleet capability vocabulary —
 # the download URL is a pure function of (tag, host_os, host_arch), which is
@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to build (e.g. fleet-agent-v0.5.0)'
+        description: 'Tag to build (e.g. fleet-agent-v0.1.0)'
         required: true
         type: string
 
