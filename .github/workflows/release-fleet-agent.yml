@@ -145,6 +145,12 @@ jobs:
           path: target/release/arcbox-fleet-agent
           retention-days: 5
 
+  # Cross-compile both Linux targets from a single x86_64 runner using the
+  # musl-cross-make prebuilt toolchains from musl.cc — the same toolchain
+  # FiloSottile's Homebrew tap builds on macOS, with the same tool naming
+  # (${target}-linux-musl-{gcc,ar,ld}) and the same fully-static defaults.
+  # Keeps `.cargo/config.toml` as the single source of truth across host OSes
+  # and avoids Ubuntu `musl-tools`' PIE-against-ld-musl default.
   build-linux:
     name: Build Linux ${{ matrix.arch }}
     needs: version
@@ -152,12 +158,12 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-latest
             target: x86_64-unknown-linux-musl
+            musl_prefix: x86_64-linux-musl
           - arch: arm64
-            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-    runs-on: ${{ matrix.runner }}
+            musl_prefix: aarch64-linux-musl
+    runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
@@ -173,10 +179,28 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Install musl toolchain and protobuf compiler
+      - name: Cache musl-cross toolchain
+        id: musl-cross-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/${{ matrix.musl_prefix }}-cross
+          key: musl-cross-${{ matrix.musl_prefix }}-v1
+
+      - name: Install musl-cross toolchain
+        if: steps.musl-cross-cache.outputs.cache-hit != 'true'
         run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 --retry-all-errors \
+            -o /tmp/musl-cross.tgz \
+            "https://musl.cc/${{ matrix.musl_prefix }}-cross.tgz"
+          sudo tar -xf /tmp/musl-cross.tgz -C /opt
+          rm /tmp/musl-cross.tgz
+
+      - name: Add musl-cross to PATH and install protoc
+        run: |
+          echo "/opt/${{ matrix.musl_prefix }}-cross/bin" >> "$GITHUB_PATH"
           sudo apt-get update
-          sudo apt-get install -y musl-tools protobuf-compiler
+          sudo apt-get install -y protobuf-compiler
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -187,18 +211,28 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-fleet-agent-musl-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-fleet-agent-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-fleet-agent-musl-${{ matrix.arch }}-
+            ${{ runner.os }}-cargo-fleet-agent-${{ matrix.arch }}-
 
       - name: Build arcbox-fleet-agent
         timeout-minutes: 10
         run: cargo build --release --locked -p arcbox-fleet-agent --target ${{ matrix.target }}
 
-      - name: Verify artifact
+      - name: Verify artifact is fully static
+        # A stray ELF interpreter (PT_INTERP) means the binary needs a
+        # dynamic loader at runtime — defeats the point of a musl build.
+        # Regression-catch it here.
         run: |
-          ls -lh target/${{ matrix.target }}/release/arcbox-fleet-agent
-          file target/${{ matrix.target }}/release/arcbox-fleet-agent
+          set -euo pipefail
+          bin=target/${{ matrix.target }}/release/arcbox-fleet-agent
+          ls -lh "$bin"
+          file "$bin"
+          if readelf -l "$bin" | grep -q INTERP; then
+            echo "::error::binary has PT_INTERP; not fully static"
+            readelf -l "$bin" | grep -E '(INTERP|Requesting)'
+            exit 1
+          fi
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
