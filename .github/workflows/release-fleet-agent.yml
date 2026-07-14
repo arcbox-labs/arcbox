@@ -268,14 +268,16 @@ jobs:
   # distribution channel the gateway resolves for AgentUpdate.binary_url —
   # the URL is a pure function of (version, host_os, host_arch):
   #
-  #   https://release.arcboxcdn.com/runner/${version}/arcbox-fleet-agent-${os}-${arch}
+  #   https://release.arcboxcdn.com/runner/fleet-agent/${version}/arcbox-fleet-agent-${os}-${arch}
   #
-  # `${version}` is the git tag with the `fleet-agent-` component prefix
-  # stripped (so `fleet-agent-v0.1.0` → `v0.1.0`) — under `runner/` the
-  # component prefix is redundant, and the leading `v` matches semver-tag
-  # convention. `--size-only` on the sync is safe because the artifacts
-  # under a version are immutable; re-releasing the same version is a
-  # workflow re-dispatch, not a content-differs replace.
+  # Layout: `runner/` is the top-level namespace for runner-side
+  # components; `fleet-agent/` is this specific component, leaving room
+  # for sibling components at `runner/<other>/...` without collision.
+  # `${version}` is the git tag with the `fleet-agent-` prefix stripped
+  # (so `fleet-agent-v0.1.0` → `v0.1.0`). `--size-only` on the sync is
+  # safe because the artifacts under a version are immutable;
+  # re-releasing the same version is a workflow re-dispatch, not a
+  # content-differs replace.
   upload-cdn:
     name: Upload to CDN
     needs: [version, build-macos, build-linux]
@@ -302,16 +304,16 @@ jobs:
           set -eu
           TAG="${{ needs.version.outputs.tag }}"
           VERSION="${TAG#fleet-agent-}"
-          mkdir -p "cdn-staging/runner/${VERSION}"
+          mkdir -p "cdn-staging/runner/fleet-agent/${VERSION}"
           for platform in darwin-arm64 darwin-amd64 linux-amd64 linux-arm64; do
             cargo xtask release fleet-asset \
               --platform "$platform" \
               --binary "artifacts/fleet-agent-binary-$platform/arcbox-fleet-agent"
           done
-          mv arcbox-fleet-agent-* "cdn-staging/runner/${VERSION}/"
+          mv arcbox-fleet-agent-* "cdn-staging/runner/fleet-agent/${VERSION}/"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "=== CDN staging ==="
-          find "cdn-staging/runner/${VERSION}" -type f | sort
+          find "cdn-staging/runner/fleet-agent/${VERSION}" -type f | sort
 
       - name: Upload to B2 (size-only, immutable)
         env:
@@ -321,8 +323,8 @@ jobs:
         run: |
           VERSION="${{ steps.stage.outputs.version }}"
           aws s3 sync \
-            "cdn-staging/runner/${VERSION}/" \
-            "s3://${{ secrets.RELEASE_B2_BUCKET }}/runner/${VERSION}/" \
+            "cdn-staging/runner/fleet-agent/${VERSION}/" \
+            "s3://${{ secrets.RELEASE_B2_BUCKET }}/runner/fleet-agent/${VERSION}/" \
             --endpoint-url "https://s3.${{ secrets.RELEASE_B2_REGION }}.backblazeb2.com" \
             --size-only
 
@@ -337,7 +339,7 @@ jobs:
             const platforms = ['darwin-arm64', 'darwin-amd64', 'linux-amd64', 'linux-arm64'];
             let failed = false;
             for (const p of platforms) {
-              const url = `https://release.arcboxcdn.com/runner/${VERSION}/arcbox-fleet-agent-${p}`;
+              const url = `https://release.arcboxcdn.com/runner/fleet-agent/${VERSION}/arcbox-fleet-agent-${p}`;
               let status = 0;
               try {
                 status = (await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(15000) })).status;
