@@ -160,9 +160,15 @@ jobs:
           - arch: amd64
             target: x86_64-unknown-linux-musl
             musl_prefix: x86_64-linux-musl
+            # sha256 of https://musl.cc/x86_64-linux-musl-cross.tgz
+            # (Last-Modified: 2021-11-23). Bump both hash and cache key
+            # version if the upstream tarball is refreshed.
+            musl_sha256: c5d410d9f82a4f24c549fe5d24f988f85b2679b452413a9f7e5f7b956f2fe7ea
           - arch: arm64
             target: aarch64-unknown-linux-musl
             musl_prefix: aarch64-linux-musl
+            # sha256 of https://musl.cc/aarch64-linux-musl-cross.tgz
+            musl_sha256: c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -187,12 +193,18 @@ jobs:
           key: musl-cross-${{ matrix.musl_prefix }}-v1
 
       - name: Install musl-cross toolchain
+        # Pinned by sha256: this toolchain links the released binaries, and
+        # Linux release artifacts aren't codesigned, so a bad tarball would
+        # silently backdoor every Linux release. musl.cc is a single-
+        # maintainer host — retry + cache handle transient outages, the
+        # digest handles bad content.
         if: steps.musl-cross-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           curl -fsSL --retry 5 --retry-all-errors \
             -o /tmp/musl-cross.tgz \
             "https://musl.cc/${{ matrix.musl_prefix }}-cross.tgz"
+          echo "${{ matrix.musl_sha256 }}  /tmp/musl-cross.tgz" | sha256sum -c -
           sudo tar -xf /tmp/musl-cross.tgz -C /opt
           rm /tmp/musl-cross.tgz
 
