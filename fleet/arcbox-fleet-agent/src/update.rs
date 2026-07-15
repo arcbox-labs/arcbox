@@ -9,9 +9,9 @@
 //!
 //! Self-update only manages binaries it owns: the running executable must be
 //! the managed path (`<data_dir>/bin/arcbox-fleet-agent`, where
-//! `install-service` and the install script place it). A dev build or a
-//! hand-installed binary elsewhere parks on the expected version exactly as
-//! before self-update existed.
+//! `quick install-service` and the install script place it). A dev build or
+//! a hand-installed binary elsewhere parks on the expected version exactly
+//! as before self-update existed.
 
 use std::path::{Path, PathBuf};
 
@@ -62,7 +62,7 @@ pub struct UnmanagedBinary {
     managed: String,
 }
 
-/// The path `install-service` and the self-updater own.
+/// The path `quick install-service` and the self-updater own.
 pub fn managed_binary(config: &AgentConfig) -> PathBuf {
     config.data_dir.join("bin").join("arcbox-fleet-agent")
 }

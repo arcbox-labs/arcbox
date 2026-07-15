@@ -1,7 +1,7 @@
-//! `install-service` / `uninstall-service` — user LaunchAgent installer for
-//! macOS. Renders the plist with runtime-resolved paths
+//! `quick install-service` / `quick uninstall-service` — user LaunchAgent
+//! installer for macOS. Renders the plist with runtime-resolved paths
 //! (`env::current_exe()`, `$HOME`) and drives `launchctl`, so a plain
-//! `arcbox-fleet-agent install-service` sets up start-on-login without
+//! `arcbox-fleet-agent quick install-service` sets up start-on-login without
 //! sudo, static plist files, or manual `launchctl` incantations.
 //!
 //! macOS-only for now. Linux systemd (user unit) is planned as a follow-up.
@@ -27,7 +27,7 @@ const LABEL: &str = "com.arcboxlabs.fleet.agent";
 /// service definition. Writes the plist to `~/Library/LaunchAgents/` and
 /// bootstraps it into the current GUI session. Idempotent-refusal on second
 /// run: if the job is already loaded, prints an actionable message asking
-/// the operator to `uninstall-service` first instead of silently
+/// the operator to `quick uninstall-service` first instead of silently
 /// overwriting a live install.
 pub fn install(config: &AgentConfig) -> Result<()> {
     let binary = install_managed_binary(config)?;
@@ -41,7 +41,7 @@ pub fn install(config: &AgentConfig) -> Result<()> {
 
     if plist_path.exists() {
         bail!(
-            "{LABEL} is already installed at {}; run `arcbox-fleet-agent uninstall-service` \
+            "{LABEL} is already installed at {}; run `arcbox-fleet-agent quick uninstall-service` \
              first (or delete the plist by hand) before reinstalling",
             plist_path.display()
         );
@@ -64,7 +64,7 @@ pub fn install(config: &AgentConfig) -> Result<()> {
         .context("invoking `launchctl bootstrap`")?;
     if !output.status.success() {
         // Leave the plist on disk — the operator can inspect it and either
-        // fix the environment or `uninstall-service` to clean up.
+        // fix the environment or `quick uninstall-service` to clean up.
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "`launchctl bootstrap {target} {}` failed ({}): {}",
