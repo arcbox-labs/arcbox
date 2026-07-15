@@ -14,8 +14,10 @@
 //!
 //! - Free page reporting (`VIRTIO_BALLOON_F_REPORTING`, bit 5) — the guest
 //!   kernel periodically hands batches of currently-free pages to the host
-//!   on `reporting_vq` (fixed index 4); the host `madvise(MADV_DONTNEED)`s
-//!   the ranges and completes the buffers. Combined with
+//!   on `reporting_vq` (transport index computed from the negotiated
+//!   feature set — see [`reporting_queue_index`]); the host
+//!   `madvise(MADV_DONTNEED)`s the ranges and completes the buffers.
+//!   Combined with
 //!   `DEFLATE_ON_OOM` this lets the guest kernel self-manage: idle memory
 //!   drains back to the host with no balloon-target policy at all.
 //!
