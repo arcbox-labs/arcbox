@@ -14,13 +14,13 @@ use crate::host;
 
 /// Call `Enroll` on `gateway` and return the machine credential — persisting
 /// it is the caller's job, done only once the caller has committed to the
-/// result: the CLI `enroll` subcommand stores it straight away, while the
-/// control-plane `Enroll` RPC stores it only after winning the enrollment
+/// result: the CLI `quick enroll` subcommand stores it straight away, while
+/// the control-plane `Enroll` RPC stores it only after winning the enrollment
 /// race, so a losing concurrent enroll never overwrites the winner's
 /// credential (see `AgentSupervisor::enroll`). The caller also resolves
-/// `gateway`: the CLI uses the persisted-settings (or configured default)
-/// gateway; the RPC uses its `control_plane` override if given, else the
-/// current settings target.
+/// `gateway`: `quick enroll` uses the persisted-settings (or configured
+/// default) gateway; the RPC uses its `control_plane` override if given, else
+/// the current settings target.
 pub async fn enroll(
     config: &AgentConfig,
     token: String,

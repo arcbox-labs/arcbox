@@ -227,10 +227,10 @@ enum State {
 
 /// Owns the agent's enrollment state machine.
 ///
-/// `Run` no longer requires a credential up front: with none on disk the
+/// The `serve` command does not require a credential up front: with none on disk the
 /// agent starts `Unenrolled` and idles until `Enroll` delivers one — the
-/// desktop-managed handoff (RUN-8) — while the CLI's one-shot `enroll`
-/// subcommand still works entirely offline, before this process even starts.
+/// desktop-managed handoff (RUN-8) — while the CLI's `quick enroll`
+/// subcommand works entirely offline, before this process even starts.
 pub struct AgentSupervisor {
     config: AgentConfig,
     docker: Option<DockerRunner>,

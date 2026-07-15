@@ -70,7 +70,7 @@ pub struct AgentConfig {
     pub gateway: String,
     /// Direct path to the pre-installed GitHub Actions runner's entry point
     /// (`run.sh`) — not its containing directory. `None` until set; required
-    /// only by the `run` command.
+    /// only by the `quick run` command.
     pub runner_script: Option<PathBuf>,
     /// Reject an offer when 1-minute load average per core exceeds this.
     pub load_ceiling: f64,

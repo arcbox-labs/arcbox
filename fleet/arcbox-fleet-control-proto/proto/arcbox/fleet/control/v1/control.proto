@@ -17,7 +17,7 @@ service FleetLifecycleService {
   // handoff: the machine credential is created and persisted here, in the
   // agent — never in the desktop. Fails if already enrolled; Unenroll
   // first. The headless/farm path instead uses the `arcbox-fleet-agent
-  // enroll` CLI subcommand before this process is even running.
+  // quick enroll` CLI subcommand before this process is even running.
   rpc Enroll(EnrollRequest) returns (EnrollResponse);
 
   // Stops accepting new offers; in-flight jobs finish normally.
