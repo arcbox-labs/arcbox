@@ -138,6 +138,15 @@ enum QuickCommand {
     /// Remove the LaunchAgent installed by `quick install-service` (macOS).
     /// Idempotent — safe to run when nothing is installed.
     UninstallService,
+    /// Self-update to the latest published fleet-agent build.
+    ///
+    /// Recovery/bootstrap path: resolves the current version from the
+    /// release CDN's `latest.json`, downloads the platform binary, verifies
+    /// its pinned sha256, and re-execs on the new build. Gateway pushes
+    /// remain the authoritative routine-rollout mechanism; run this only
+    /// when the gateway is unreachable, before enrollment, or to escape a
+    /// bad pinned version.
+    SelfUpdate,
 }
 
 #[derive(Debug, Args)]
@@ -509,7 +518,26 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
         }
         Command::Quick(QuickCommand::InstallService) => install_service(&config),
         Command::Quick(QuickCommand::UninstallService) => uninstall_service(),
+        Command::Quick(QuickCommand::SelfUpdate) => self_update(&config).await,
     }
+}
+
+/// Manual self-update: resolve `latest.json` on the CDN, compare against
+/// `CARGO_PKG_VERSION`, and hand off to [`update::apply_and_exec`] when
+/// a newer build exists. Returns `Ok(())` on the already-latest no-op;
+/// the update path only returns on failure (success re-execs).
+async fn self_update(config: &AgentConfig) -> Result<()> {
+    let payload = update::resolve_latest(&host::host_os(), &host::host_arch()).await?;
+    if payload.expected_version == env!("CARGO_PKG_VERSION") {
+        println!("already at latest ({})", payload.expected_version);
+        return Ok(());
+    }
+    info!(
+        current = env!("CARGO_PKG_VERSION"),
+        expected = %payload.expected_version,
+        "self-updating from CDN's latest"
+    );
+    Err(update::apply_and_exec(config, &payload).await)
 }
 
 /// macOS: install the LaunchAgent via [`service::install`]. Other Unix
