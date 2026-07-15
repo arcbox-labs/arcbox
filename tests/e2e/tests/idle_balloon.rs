@@ -40,9 +40,10 @@ const RESTORE_BUDGET: Duration = Duration::from_secs(150);
 /// Ceiling for one docker CLI invocation.
 const DOCKER_ATTEMPT: Duration = Duration::from_secs(30);
 /// Delay inside the ballast container before it grows its memory. Sized
-/// past the idle timeout (~20s) + ticker (10s) + shrink + the agent's 30s
-/// detector warm-up, so growth hits a shrunk, settled guest.
-const BALLAST_GROW_DELAY_SECS: u64 = 90;
+/// past the idle timeout (~20s) + ticker (10s) + the full staged descent
+/// (~7 steps × 15s dwell) + the final step's settle, so growth hits a
+/// shrunk, settled, armed guest and exercises the fast pressure path.
+const BALLAST_GROW_DELAY_SECS: u64 = 180;
 
 fn init_tracing() {
     TRACING.call_once(|| {
@@ -104,9 +105,7 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
     metrics.time("daemon_ready", || daemon.wait_ready_blocking(READY_TIMEOUT))?;
 
     let image = std::env::var("ARCBOX_E2E_IMAGE").unwrap_or_else(|_| "alpine:latest".to_owned());
-    metrics.time("docker_pull", || {
-        docker_output(data_dir, &["pull", &image], Duration::from_secs(120)).context("docker pull")
-    })?;
+    metrics.time("docker_pull", || ensure_image(data_dir, &image))?;
 
     // The ballast: hold ~256 MB immediately (tmpfs pages persist regardless
     // of process lifetime), then grow by 2 GiB after the VM has idled and
@@ -115,7 +114,7 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
     // default /dev/shm is 64 MB, which silently neuters the ballast.
     let ballast_script = format!(
         "dd if=/dev/zero of=/dev/shm/hold bs=1M count=256 && sleep {BALLAST_GROW_DELAY_SECS} && \
-         dd if=/dev/zero of=/dev/shm/grow bs=1M count=2048; sleep 600"
+         dd if=/dev/zero of=/dev/shm/grow bs=1M count=2048; sleep 900"
     );
     metrics.time("ballast_start", || {
         docker_output(
@@ -147,9 +146,14 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
     })?;
     let target_mb =
         extract_u64_field(&shrink, "target_mb").context("shrink log line carries no target_mb")?;
-    tracing::info!(target_mb, "idle balloon shrunk");
-    if target_mb < 384 {
-        bail!("idle target {target_mb}MB below the 384MB floor (incident-style blind shrink?)");
+    let final_mb =
+        extract_u64_field(&shrink, "final_mb").context("shrink log line carries no final_mb")?;
+    tracing::info!(target_mb, final_mb, "idle balloon descent started");
+    if final_mb < 384 {
+        bail!("final target {final_mb}MB below the 384MB floor (incident-style blind shrink?)");
+    }
+    if final_mb >= 16384 {
+        bail!("final target {final_mb}MB is not usage-aware (no reclaim planned)");
     }
 
     // The staged dev agent must support the pressure watch; a fallback to
@@ -187,6 +191,19 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
     tracing::info!(line = %restored, latency_secs = restore_latency.as_secs(), "balloon restored");
     metrics.record("pressure_restore_latency", restore_latency.as_secs_f64());
 
+    // The fast (armed) pressure path must have answered — not the bounded
+    // never-settled cap. The staged descent exists precisely so the guest
+    // settles and arms before real pressure can arrive.
+    if !agent_log_contains(data_dir, "memory pressure detector armed")? {
+        bail!("guest never armed — staged descent did not settle before growth");
+    }
+    if restore_latency > Duration::from_secs(30) {
+        bail!(
+            "restore took {}s — cap path, not the armed fast path",
+            restore_latency.as_secs()
+        );
+    }
+
     // Phase 4 — the incident signature must be absent and Docker must be
     // responsive right after the restore.
     let storm_lines = count_log_matches(data_dir, "Out of puff")?;
@@ -206,6 +223,49 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
     Ok(())
 }
 
+/// Makes `image` available in the daemon under test, without depending on
+/// registry reachability more than once per machine: the first successful
+/// pull is cached as a tarball under `target/`, and later runs `docker load`
+/// it (guest registry access is environment-dependent; pulls here have been
+/// observed to black-hole intermittently).
+fn ensure_image(data_dir: &Path, image: &str) -> Result<()> {
+    let cache_dir = arcbox_e2e::repo_root().join("target/e2e-image-cache");
+    let tar = cache_dir.join(format!(
+        "{}.tar",
+        image.replace(['/', ':'], "_").replace('.', "-")
+    ));
+    if tar.exists() {
+        docker_output(
+            data_dir,
+            &["load", "-i", &tar.display().to_string()],
+            Duration::from_secs(60),
+        )
+        .context("docker load from cache")?;
+        return Ok(());
+    }
+
+    let mut last_err = None;
+    for attempt in 1..=3 {
+        match docker_output(data_dir, &["pull", image], Duration::from_secs(90)) {
+            Ok(_) => {
+                std::fs::create_dir_all(&cache_dir)?;
+                docker_output(
+                    data_dir,
+                    &["save", "-o", &tar.display().to_string(), image],
+                    Duration::from_secs(60),
+                )
+                .context("docker save to cache")?;
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(attempt, "docker pull failed: {e:#}");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap()).context("docker pull (3 attempts)")
+}
+
 /// The daemon's own rotating log (structured JSON lines).
 fn daemon_log_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("log/daemon.log")
@@ -221,6 +281,17 @@ fn read_log(data_dir: &Path) -> Result<String> {
 
 fn log_contains(data_dir: &Path, needle: &str) -> Result<bool> {
     Ok(read_log(data_dir)?.contains(needle))
+}
+
+/// The guest agent's log, exported to the host via VirtioFS.
+fn agent_log_contains(data_dir: &Path, needle: &str) -> Result<bool> {
+    let path = data_dir.join("log/agent.log");
+    if !path.exists() {
+        return Ok(false);
+    }
+    Ok(std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .contains(needle))
 }
 
 fn count_log_matches(data_dir: &Path, needle: &str) -> Result<usize> {
