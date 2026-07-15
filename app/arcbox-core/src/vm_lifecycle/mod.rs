@@ -193,10 +193,6 @@ impl VmLifecycleManager {
             backend: AtomicU8::new(seeded_backend as u8),
             restart_generation: AtomicU64::new(0),
             last_activity_ms: AtomicU64::new(now_ms),
-            balloon_shrunk: AtomicBool::new(false),
-            balloon_target: AtomicU64::new(0),
-            balloon_epoch: AtomicU64::new(0),
-            balloon_apply: Mutex::new(()),
             kubernetes_hold: AtomicBool::new(false),
         });
 
@@ -231,8 +227,12 @@ impl VmLifecycleManager {
                 .expect("lifecycle actor seed lock poisoned")
                 .take();
             if let Some(seed) = seed {
-                let actor =
-                    LifecycleActor::new(Arc::clone(&self.shared), seed.commands, seed.state_tx);
+                let actor = LifecycleActor::new(
+                    Arc::clone(&self.shared),
+                    seed.commands,
+                    self.cmd_tx.clone(),
+                    seed.state_tx,
+                );
                 drop(tokio::spawn(actor.run()));
             }
         });

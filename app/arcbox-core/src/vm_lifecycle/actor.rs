@@ -23,12 +23,13 @@ use tokio::task::JoinHandle;
 use crate::boot_assets::BootAssetProvider;
 use crate::error::{CoreError, Result};
 use crate::event::{Event, EventBus};
-#[cfg(target_os = "macos")]
-use crate::machine::MachineInfo;
 use crate::machine::MachineManager;
 
 use super::balloon;
-use super::machine::{BalloonTarget, Effect, Effects, Notify, VmEvent, VmLifecycle};
+use super::balloon::controller::{
+    BalloonCommand, BalloonController, BalloonDeps, PressureWatch, WatchFrame,
+};
+use super::machine::{Effect, Effects, Notify, VmEvent, VmLifecycle};
 use super::{
     BALLOON_SHRINK_DELAY_SECS, HealthMonitor, RecoveryPolicy, VmLifecycleConfig, VmLifecycleState,
 };
@@ -115,18 +116,6 @@ pub(super) struct LifecycleShared {
     pub(super) restart_generation: std::sync::atomic::AtomicU64,
     /// Timestamp of last activity (epoch millis, for idle detection).
     pub(super) last_activity_ms: std::sync::atomic::AtomicU64,
-    /// Whether the balloon is currently shrunk for the idle state.
-    pub(super) balloon_shrunk: std::sync::atomic::AtomicBool,
-    /// Applied idle balloon target in bytes; meaningful while `balloon_shrunk`.
-    pub(super) balloon_target: std::sync::atomic::AtomicU64,
-    /// Balloon epoch, bumped on every restore-to-full. An idle probe records
-    /// the epoch when it starts; a result from an older epoch is stale (the
-    /// VM exited idle meanwhile) and must not be applied.
-    pub(super) balloon_epoch: std::sync::atomic::AtomicU64,
-    /// Serializes balloon applications between the actor (restore on idle
-    /// exit) and idle probe sub-tasks (shrink/retarget). Never held across
-    /// an await point.
-    pub(super) balloon_apply: std::sync::Mutex<()>,
     /// Whether Kubernetes holds the VM in the active state.
     pub(super) kubernetes_hold: std::sync::atomic::AtomicBool,
 }
@@ -160,32 +149,57 @@ impl LifecycleShared {
         }
     }
 
-    /// Spawns an idle balloon probe: queries guest memory, feeds the policy
-    /// in [`balloon`], and applies the decision — unless the VM exited idle
-    /// while the probe was in flight (balloon epoch advanced).
-    #[cfg(target_os = "macos")]
-    fn spawn_idle_balloon_probe(self: &Arc<Self>, purpose: balloon::ProbePurpose) {
-        let shared = Arc::clone(self);
-        drop(tokio::spawn(async move {
-            let epoch = shared.balloon_epoch.load(Ordering::Acquire);
-            let stats = shared.guest_mem_stats().await;
-            shared.apply_balloon_decision(purpose, stats, epoch);
-        }));
+    /// Gets the agent CID for this lifecycle's machine.
+    fn get_cid(&self) -> Result<u32> {
+        self.machine_manager
+            .get_cid(&self.machine_name)
+            .ok_or_else(|| CoreError::Machine("default machine has no CID".to_string()))
+    }
+}
+
+/// Production [`BalloonDeps`]: agent RPCs for guest stats and the pressure
+/// watch, the VM manager for balloon targets.
+pub(super) struct RealBalloonDeps {
+    pub(super) shared: Arc<LifecycleShared>,
+}
+
+impl RealBalloonDeps {
+    fn connect_agent(&self) -> Result<crate::agent_client::AgentClient> {
+        self.shared
+            .machine_manager
+            .connect_agent(&self.shared.machine_name)
+    }
+}
+
+impl BalloonDeps for RealBalloonDeps {
+    type Watch = AgentPressureWatch;
+
+    fn full_memory_bytes(&self) -> Option<u64> {
+        self.shared
+            .machine_manager
+            .get(&self.shared.machine_name)
+            .map(|info| info.memory_mb * 1024 * 1024)
     }
 
-    /// Queries guest memory via the agent, with a hard budget of
-    /// [`balloon::GUEST_STATS_TIMEOUT_SECS`].
-    ///
+    fn set_balloon_target(&self, bytes: u64) -> Result<()> {
+        let info = self
+            .shared
+            .machine_manager
+            .get(&self.shared.machine_name)
+            .ok_or_else(|| CoreError::Machine("machine record missing".to_string()))?;
+        self.shared
+            .machine_manager
+            .vm_manager()
+            .set_balloon_target(&info.vm_id, bytes)
+    }
+
     /// Any failure (connect, RPC, timeout) folds to `None`: the policy treats
-    /// "unknown" as its own signal — never shrink on it, and fail open (give
-    /// memory back) while shrunk, since a reclaim-thrashing guest is exactly
-    /// one that cannot answer.
-    #[cfg(target_os = "macos")]
-    async fn guest_mem_stats(&self) -> Option<balloon::MemStats> {
-        let machine_manager = Arc::clone(&self.machine_manager);
-        let name = self.machine_name.clone();
+    /// "unknown" as its own signal — never shrink on it, and fail open while
+    /// shrunk, since a reclaim-thrashing guest is exactly one that cannot
+    /// answer.
+    async fn guest_stats(&self, budget: Duration) -> Option<balloon::GuestStats> {
+        let mut agent = self.connect_agent().ok()?;
         let query = async move {
-            let mut agent = machine_manager.connect_agent(&name).ok()?;
             let info = if agent.is_blocking() {
                 tokio::task::spawn_blocking(move || agent.get_system_info_blocking())
                     .await
@@ -194,118 +208,53 @@ impl LifecycleShared {
             } else {
                 agent.get_system_info().await.ok()?
             };
-            Some(balloon::MemStats {
+            Some(balloon::GuestStats {
                 total: info.total_memory,
                 available: info.available_memory,
+                loadavg1: info.load_average.first().copied().unwrap_or(0.0),
             })
         };
-        tokio::time::timeout(
-            Duration::from_secs(balloon::GUEST_STATS_TIMEOUT_SECS),
-            query,
-        )
-        .await
-        .ok()
-        .flatten()
+        tokio::time::timeout(budget, query).await.ok().flatten()
     }
 
-    /// Applies the policy decision for a probe started at `epoch`.
-    #[cfg(target_os = "macos")]
-    fn apply_balloon_decision(
-        &self,
-        purpose: balloon::ProbePurpose,
-        stats: Option<balloon::MemStats>,
-        epoch: u64,
-    ) {
-        let Some(info) = self.machine_manager.get(&self.machine_name) else {
-            return;
-        };
-        let full = info.memory_mb * 1024 * 1024;
-        let current = if self.balloon_shrunk.load(Ordering::Relaxed) {
-            self.balloon_target.load(Ordering::Relaxed)
-        } else {
-            full
-        };
-        let decision = match purpose {
-            balloon::ProbePurpose::IdleEntry => balloon::on_idle_entry(stats, full),
-            balloon::ProbePurpose::IdleRetarget => balloon::on_idle_retarget(stats, current, full),
+    async fn open_pressure_watch(&self) -> Result<AgentPressureWatch> {
+        use super::balloon::controller::{
+            PRESSURE_MAX_REFAULT_RATE, PRESSURE_MIN_AVAILABLE, WATCH_KEEPALIVE, WATCH_WINDOW,
         };
 
-        let _guard = self.balloon_apply.lock().unwrap_or_else(|e| e.into_inner());
-        if self.balloon_epoch.load(Ordering::Acquire) != epoch {
-            // The VM exited idle while we probed; the restore already ran.
-            return;
-        }
-        match decision {
-            balloon::BalloonDecision::Keep => {}
-            balloon::BalloonDecision::Set(target) => {
-                match self
-                    .machine_manager
-                    .vm_manager()
-                    .set_balloon_target(&info.vm_id, target)
-                {
-                    Ok(()) => {
-                        self.balloon_shrunk.store(true, Ordering::Relaxed);
-                        self.balloon_target.store(target, Ordering::Relaxed);
-                        tracing::info!(
-                            target_mb = target / (1024 * 1024),
-                            "Idle balloon target applied"
-                        );
-                    }
-                    Err(e) => tracing::debug!("Failed to set idle balloon target: {e}"),
-                }
-            }
-            balloon::BalloonDecision::RestoreFull => self.restore_balloon_locked(&info, full),
-        }
+        let mut agent = self.connect_agent()?;
+        agent
+            .watch_memory_pressure(arcbox_protocol::agent::WatchMemoryPressureRequest {
+                timeout_ms: u32::try_from(WATCH_WINDOW.as_millis()).unwrap_or(u32::MAX),
+                min_available_bytes: PRESSURE_MIN_AVAILABLE,
+                max_refault_rate: PRESSURE_MAX_REFAULT_RATE,
+                keepalive_ms: u32::try_from(WATCH_KEEPALIVE.as_millis()).unwrap_or(u32::MAX),
+            })
+            .await?;
+        let mut watch = AgentPressureWatch { agent };
+        // The agent acks with an immediate frame; anything else (an error
+        // frame from an old agent, silence) means "unsupported" and the
+        // controller degrades to stats polling.
+        watch.next_frame(Duration::from_secs(5)).await?;
+        Ok(watch)
     }
+}
 
-    /// Restores the balloon to the full configured memory size.
-    ///
-    /// Called when the VM exits idle state (new container activity). Bumps
-    /// the balloon epoch first so any in-flight probe result is dropped.
-    #[cfg(target_os = "macos")]
-    fn restore_balloon(&self) {
-        let Some(info) = self.machine_manager.get(&self.machine_name) else {
-            return;
-        };
-        let full = info.memory_mb * 1024 * 1024;
-        let _guard = self.balloon_apply.lock().unwrap_or_else(|e| e.into_inner());
-        self.balloon_epoch.fetch_add(1, Ordering::AcqRel);
-        self.restore_balloon_locked(&info, full);
-    }
+/// [`PressureWatch`] over the agent's `WatchMemoryPressure` event stream.
+pub(super) struct AgentPressureWatch {
+    agent: crate::agent_client::AgentClient,
+}
 
-    /// Restore body shared by the idle-exit path and the fail-open decision.
-    /// Caller must hold `balloon_apply`.
-    #[cfg(target_os = "macos")]
-    fn restore_balloon_locked(&self, info: &MachineInfo, full: u64) {
-        if !self.balloon_shrunk.load(Ordering::Relaxed) {
-            return;
-        }
-        match self
-            .machine_manager
-            .vm_manager()
-            .set_balloon_target(&info.vm_id, full)
-        {
-            Ok(()) => {
-                self.balloon_shrunk.store(false, Ordering::Relaxed);
-                tracing::info!("Balloon restored to {}MB", info.memory_mb);
-            }
-            Err(e) => {
-                tracing::debug!("Failed to restore balloon: {}", e);
-            }
-        }
-    }
+impl PressureWatch for AgentPressureWatch {
+    async fn next_frame(&mut self, max_wait: Duration) -> Result<WatchFrame> {
+        use arcbox_protocol::agent::memory_pressure_event::Reason;
 
-    #[cfg(not(target_os = "macos"))]
-    fn spawn_idle_balloon_probe(self: &Arc<Self>, _purpose: balloon::ProbePurpose) {}
-
-    #[cfg(not(target_os = "macos"))]
-    fn restore_balloon(&self) {}
-
-    /// Gets the agent CID for this lifecycle's machine.
-    fn get_cid(&self) -> Result<u32> {
-        self.machine_manager
-            .get_cid(&self.machine_name)
-            .ok_or_else(|| CoreError::Machine("default machine has no CID".to_string()))
+        let event = self.agent.next_memory_pressure_event(max_wait).await?;
+        Ok(match event.reason() {
+            Reason::Keepalive => WatchFrame::Keepalive,
+            Reason::LowAvailable | Reason::RefaultSpike => WatchFrame::Pressure,
+            Reason::WindowElapsed => WatchFrame::WindowElapsed,
+        })
     }
 }
 
@@ -340,8 +289,14 @@ pub(super) struct LifecycleActor {
     /// The detached machine-removal task of a force stop, joined by the
     /// force-stop reply so callers still observe "removed" on return.
     removal: Option<JoinHandle<()>>,
-    /// Idle ticks since the last balloon re-evaluation (see `on_idle_tick`).
-    retarget_ticks: u64,
+    /// Command sender back into this actor, cloned into the balloon
+    /// controller's activity callback so pressure exits ride the state
+    /// machine like any other activity.
+    cmd_tx: mpsc::UnboundedSender<Command>,
+    /// Drives the balloon controller (EnterIdle / ExitIdle).
+    balloon_tx: mpsc::UnboundedSender<BalloonCommand>,
+    /// Controller receiver, consumed when `run` spawns the controller.
+    balloon_seed: Option<mpsc::UnboundedReceiver<BalloonCommand>>,
 }
 
 impl LifecycleActor {
@@ -349,9 +304,11 @@ impl LifecycleActor {
     pub(super) fn new(
         shared: Arc<LifecycleShared>,
         commands: mpsc::UnboundedReceiver<Command>,
+        cmd_tx: mpsc::UnboundedSender<Command>,
         state_tx: watch::Sender<VmLifecycleState>,
     ) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (balloon_tx, balloon_rx) = mpsc::unbounded_channel();
         Self {
             shared,
             commands,
@@ -366,7 +323,9 @@ impl LifecycleActor {
             inflight: None,
             epoch: 0,
             removal: None,
-            retarget_ticks: 0,
+            cmd_tx,
+            balloon_tx,
+            balloon_seed: Some(balloon_rx),
         }
     }
 
@@ -375,6 +334,23 @@ impl LifecycleActor {
         let mut machine = VmLifecycle
             .uninitialized_state_machine()
             .init_with_context(&mut self.effects);
+
+        // The balloon controller lives exactly as long as the actor: its
+        // command channel closes when the actor drops `balloon_tx`.
+        if let Some(balloon_rx) = self.balloon_seed.take() {
+            let deps = RealBalloonDeps {
+                shared: Arc::clone(&self.shared),
+            };
+            let shared = Arc::clone(&self.shared);
+            let cmd_tx = self.cmd_tx.clone();
+            let activity = Arc::new(move || {
+                shared.record_activity();
+                let _ = cmd_tx.send(Command::Activity);
+            });
+            drop(tokio::spawn(
+                BalloonController::new(balloon_rx, deps, activity).run(),
+            ));
+        }
 
         let mut idle_ticker = tokio::time::interval(Duration::from_secs(BALLOON_SHRINK_DELAY_SECS));
         idle_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -437,6 +413,15 @@ impl LifecycleActor {
                 "VM lifecycle transition"
             );
             self.state_tx.send_replace(after);
+
+            // Balloon control derives from the Idle transitions themselves,
+            // so every path out of idle (activity, stop, reboot, force-stop)
+            // restores memory without each transition having to say so.
+            if after == VmLifecycleState::Idle {
+                let _ = self.balloon_tx.send(BalloonCommand::EnterIdle);
+            } else if before == VmLifecycleState::Idle {
+                let _ = self.balloon_tx.send(BalloonCommand::ExitIdle);
+            }
         }
 
         for effect in self.effects.take() {
@@ -487,10 +472,6 @@ impl LifecycleActor {
                     let _ = shared.machine_manager.remove(&shared.machine_name, true);
                 }));
             }
-            Effect::Balloon(BalloonTarget::Idle) => self
-                .shared
-                .spawn_idle_balloon_probe(balloon::ProbePurpose::IdleEntry),
-            Effect::Balloon(BalloonTarget::Full) => self.shared.restore_balloon(),
             Effect::BumpGeneration => {
                 self.shared
                     .restart_generation
@@ -699,36 +680,18 @@ impl LifecycleActor {
     }
 
     fn on_idle_tick(&mut self, machine: &mut Machine) {
-        if !self.shared.config.auto_stop || self.shared.kubernetes_hold.load(Ordering::Relaxed) {
+        if !self.shared.config.auto_stop
+            || self.shared.kubernetes_hold.load(Ordering::Relaxed)
+            || self.public() != VmLifecycleState::Running
+        {
             return;
         }
-        match self.public() {
-            VmLifecycleState::Running => {
-                self.retarget_ticks = 0;
-                if self.shared.idle_seconds() >= self.shared.config.idle_timeout.as_secs() {
-                    tracing::info!(
-                        "VM entered idle state after {}s of inactivity",
-                        self.shared.idle_seconds()
-                    );
-                    self.dispatch(machine, VmEvent::IdleTimeout);
-                }
-            }
-            VmLifecycleState::Idle => {
-                // While idle, periodically re-evaluate the balloon against
-                // live guest memory: raise the target when the workload
-                // grows, and fail open (restore full) when the agent cannot
-                // answer — a guest thrashing in reclaim is exactly one that
-                // cannot answer.
-                const RETARGET_TICKS: u64 =
-                    balloon::IDLE_RETARGET_INTERVAL_SECS / BALLOON_SHRINK_DELAY_SECS;
-                self.retarget_ticks += 1;
-                if self.retarget_ticks >= RETARGET_TICKS {
-                    self.retarget_ticks = 0;
-                    self.shared
-                        .spawn_idle_balloon_probe(balloon::ProbePurpose::IdleRetarget);
-                }
-            }
-            _ => self.retarget_ticks = 0,
+        if self.shared.idle_seconds() >= self.shared.config.idle_timeout.as_secs() {
+            tracing::info!(
+                "VM entered idle state after {}s of inactivity",
+                self.shared.idle_seconds()
+            );
+            self.dispatch(machine, VmEvent::IdleTimeout);
         }
     }
 
