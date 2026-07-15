@@ -67,6 +67,70 @@ pub fn managed_binary(config: &AgentConfig) -> PathBuf {
     config.data_dir.join("bin").join("arcbox-fleet-agent")
 }
 
+/// Root of the release CDN's fleet-agent layout. The manual self-update
+/// path (`quick self-update`) resolves versions and asset URLs here, in
+/// lockstep with the publish pipeline (see `.github/workflows/
+/// release-fleet-agent.yml`). Gateway-pushed updates use the URL the
+/// gateway sends and don't depend on this constant.
+const CDN_FLEET_AGENT_BASE: &str = "https://release.arcboxcdn.com/runner/fleet-agent";
+
+/// Resolve the latest published version from the CDN and build the
+/// corresponding [`UpdatePayload`] for this host's platform. Two client →
+/// CDN contracts are pinned here: `latest.json`'s `{"version": "vX.Y.Z"}`
+/// schema, and the `arcbox-fleet-agent-<os>-<arch>` asset layout with a
+/// `<hex>  <name>` `.sha256` sidecar. Kept narrow: this is the
+/// recovery/bootstrap path — gateway pushes remain the authoritative
+/// rollout mechanism.
+pub async fn resolve_latest(host_os: &str, host_arch: &str) -> Result<UpdatePayload> {
+    #[derive(serde::Deserialize)]
+    struct Latest {
+        version: String,
+    }
+
+    let latest_url = format!("{CDN_FLEET_AGENT_BASE}/latest.json");
+    let latest_body = reqwest::get(&latest_url)
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .with_context(|| format!("fetching {latest_url}"))?
+        .text()
+        .await
+        .with_context(|| format!("reading body of {latest_url}"))?;
+    let latest: Latest = serde_json::from_str(&latest_body)
+        .with_context(|| format!("parsing {latest_url}"))?;
+
+    let asset_name = format!("arcbox-fleet-agent-{host_os}-{host_arch}");
+    let binary_url = format!("{CDN_FLEET_AGENT_BASE}/{}/{asset_name}", latest.version);
+    let sha_url = format!("{binary_url}.sha256");
+    let sha_body = reqwest::get(&sha_url)
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .with_context(|| format!("fetching {sha_url}"))?
+        .text()
+        .await
+        .with_context(|| format!("reading body of {sha_url}"))?;
+    // `shasum -a 256`-style sidecar: `<hex>  <name>`, hash first.
+    let binary_sha256 = sha_body
+        .split_whitespace()
+        .next()
+        .with_context(|| format!("empty sha256 sidecar at {sha_url}"))?
+        .to_owned();
+
+    // `latest.json`'s `version` carries the `v` prefix (the tag minus
+    // `fleet-agent-`); `--version` output is bare `CARGO_PKG_VERSION`, and
+    // `probe_version` compares the two directly.
+    let expected_version = latest
+        .version
+        .strip_prefix('v')
+        .unwrap_or(&latest.version)
+        .to_owned();
+
+    Ok(UpdatePayload {
+        expected_version,
+        binary_url,
+        binary_sha256,
+    })
+}
+
 /// Download, verify, probe, and swap `payload` into the managed path, then
 /// re-exec it with this process's arguments. Returns only on failure; on
 /// success the process image is replaced (same PID, so launchd's job
