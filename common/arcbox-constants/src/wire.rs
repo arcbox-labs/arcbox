@@ -55,6 +55,9 @@ pub enum MessageType {
     /// exercising the supervision path. Used by the hv_e2e harness; not wired to
     /// any production CLI path.
     KillAgentRequest = 0x000E,
+    /// Opens a guest-driven memory pressure event stream (used by the host
+    /// while the idle balloon is shrunk).
+    WatchMemoryPressureRequest = 0x000F,
 
     // Sandbox CRUD request types (0x0020 - 0x0026).
     SandboxCreateRequest = 0x0020,
@@ -115,6 +118,8 @@ pub enum MessageType {
     ReadinessEvent = 0x100D,
     /// Test-only: acknowledgement for `KillAgentRequest`.
     KillAgentResponse = 0x100E,
+    /// Guest-driven memory pressure event frame.
+    MemoryPressureEvent = 0x100F,
     PortBindingsChanged = 0x1030,
     PortBindingsRemoved = 0x1031,
 
@@ -170,6 +175,7 @@ impl MessageType {
             0x000C => Some(Self::DiskTrimRequest),
             0x000D => Some(Self::WatchReadinessRequest),
             0x000E => Some(Self::KillAgentRequest),
+            0x000F => Some(Self::WatchMemoryPressureRequest),
             // Sandbox CRUD requests.
             0x0020 => Some(Self::SandboxCreateRequest),
             0x0021 => Some(Self::SandboxStopRequest),
@@ -207,6 +213,7 @@ impl MessageType {
             0x100C => Some(Self::DiskTrimResponse),
             0x100D => Some(Self::ReadinessEvent),
             0x100E => Some(Self::KillAgentResponse),
+            0x100F => Some(Self::MemoryPressureEvent),
             0x1030 => Some(Self::PortBindingsChanged),
             0x1031 => Some(Self::PortBindingsRemoved),
             // Sandbox CRUD responses.
@@ -294,6 +301,8 @@ mod tests {
             (0x000C, MessageType::DiskTrimRequest),
             (0x000D, MessageType::WatchReadinessRequest),
             (0x000E, MessageType::KillAgentRequest),
+            (0x000F, MessageType::WatchMemoryPressureRequest),
+            (0x100F, MessageType::MemoryPressureEvent),
             (0x1001, MessageType::PingResponse),
             (0x1002, MessageType::GetSystemInfoResponse),
             (0x1003, MessageType::EnsureRuntimeResponse),

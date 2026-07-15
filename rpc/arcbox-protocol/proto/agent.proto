@@ -47,6 +47,9 @@ service AgentService {
 
     // Streams guest readiness events until the requested runtime is ready or failed.
     rpc WatchReadiness(WatchReadinessRequest) returns (stream ReadinessEvent);
+
+    // Streams guest memory pressure events while the balloon is shrunk.
+    rpc WatchMemoryPressure(WatchMemoryPressureRequest) returns (stream MemoryPressureEvent);
 }
 
 // Ping request.
@@ -143,6 +146,47 @@ message ReadinessEvent {
     string detail = 3;
     // Per-service status entries for fine-grained observability.
     repeated ServiceStatus services = 4;
+}
+
+// Request for a guest-driven memory pressure event stream.
+//
+// The agent samples in-guest memory signals (`MemAvailable`, workingset
+// refault rate) and emits an event when a threshold trips, plus periodic
+// keepalives so the host can distinguish "no pressure" from "guest too
+// starved to answer". The watch returns after `timeout_ms`; the host
+// re-issues the request to keep watching.
+message WatchMemoryPressureRequest {
+    // Watch window in milliseconds; the agent ends the stream with a
+    // WINDOW_ELAPSED frame when it passes.
+    uint32 timeout_ms = 1;
+    // Trip when MemAvailable falls below this many bytes. 0 disables.
+    uint64 min_available_bytes = 2;
+    // Trip when the page refault rate (pages/second) stays at or above this
+    // for consecutive samples. 0 disables.
+    uint64 max_refault_rate = 3;
+    // Keepalive cadence in milliseconds (0 = agent default).
+    uint32 keepalive_ms = 4;
+}
+
+// One frame on the memory pressure stream.
+message MemoryPressureEvent {
+    enum Reason {
+        // Watch established (first frame) or periodic keepalive.
+        KEEPALIVE = 0;
+        // MemAvailable fell below the requested floor.
+        LOW_AVAILABLE = 1;
+        // Page refault rate exceeded the requested threshold.
+        REFAULT_SPIKE = 2;
+        // The watch window elapsed without pressure.
+        WINDOW_ELAPSED = 3;
+    }
+
+    // Why this frame was emitted.
+    Reason reason = 1;
+    // MemAvailable at sample time, in bytes.
+    uint64 available_bytes = 2;
+    // Observed refault rate, pages/second.
+    uint64 refault_rate = 3;
 }
 
 // Runtime status report.

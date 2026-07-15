@@ -81,6 +81,11 @@ where
                 handle_watch_readiness(&mut stream, req, &trace_id).await?;
                 continue;
             }
+            Ok(RpcRequest::WatchMemoryPressure(req)) => {
+                super::memory_pressure::handle_watch_memory_pressure(&mut stream, req, &trace_id)
+                    .await?;
+                continue;
+            }
             Ok(request) => handle_request(request).await,
             Err(e) => {
                 tracing::warn!(trace_id = %trace_id, "Failed to parse request: {}", e);
@@ -126,6 +131,9 @@ async fn handle_request(request: RpcRequest) -> RequestResult {
         RpcRequest::DiskTrim(_) => RequestResult::Single(handle_disk_trim().await),
         RpcRequest::KillAgent => RequestResult::Single(handle_kill_agent()),
         RpcRequest::WatchReadiness(_) => unreachable!("watch readiness is streaming"),
+        RpcRequest::WatchMemoryPressure(_) => {
+            unreachable!("watch memory pressure is streaming")
+        }
     }
 }
 
