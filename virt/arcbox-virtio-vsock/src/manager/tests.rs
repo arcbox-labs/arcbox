@@ -87,8 +87,8 @@ fn connected_fds_only_returns_connected() {
 #[test]
 fn remove_closes_fd() {
     let mut mgr = VsockConnectionManager::new();
-    let (_, internal) = make_socketpair();
-    let fd_raw = internal.as_raw_fd();
+    let (peer, internal) = make_socketpair();
+    let peer_raw = peer.as_raw_fd();
     let (id, _rx) = mgr.allocate(1024, 3, internal);
 
     mgr.mark_connected(id.guest_port, id.host_port);
@@ -98,9 +98,13 @@ fn remove_closes_fd() {
     assert!(mgr.fd_for(1024, id.host_port).is_none());
     assert_eq!(mgr.len(), 0);
 
-    // Verify fd is actually closed (write should fail with EBADF).
-    let ret = unsafe { libc::fcntl(fd_raw, libc::F_GETFD) };
-    assert_eq!(ret, -1);
+    // Removal drops the manager's `internal_fd`, closing that end of the
+    // socketpair; the peer end we still hold then reads EOF. Observing the
+    // close through the peer (rather than probing the raw fd number, which a
+    // parallel test can reuse the instant it closes) keeps this deterministic.
+    let mut buf = [0u8; 1];
+    let n = unsafe { libc::read(peer_raw, buf.as_mut_ptr().cast(), buf.len()) };
+    assert_eq!(n, 0);
 }
 
 #[test]

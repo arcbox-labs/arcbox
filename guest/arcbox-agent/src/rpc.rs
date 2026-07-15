@@ -17,10 +17,11 @@ use arcbox_protocol::agent::{
     DiskTrimRequest, DiskTrimResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
     KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
     KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
-    KubernetesStopRequest, KubernetesStopResponse, MmapReadFileRequest, MmapReadFileResponse,
-    PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved, ReadinessEvent,
-    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
-    ShutdownRequest, ShutdownResponse, SystemInfo, WatchReadinessRequest,
+    KubernetesStopRequest, KubernetesStopResponse, MemoryPressureEvent, MmapReadFileRequest,
+    MmapReadFileResponse, PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved,
+    ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
+    RuntimeStatusResponse, ShutdownRequest, ShutdownResponse, SystemInfo,
+    WatchMemoryPressureRequest, WatchReadinessRequest,
 };
 
 /// Agent version string.
@@ -81,6 +82,7 @@ pub enum RpcRequest {
     MmapReadFile(MmapReadFileRequest),
     DiskTrim(DiskTrimRequest),
     WatchReadiness(WatchReadinessRequest),
+    WatchMemoryPressure(WatchMemoryPressureRequest),
     /// Test-only: exit the agent so PID 1 (busybox init) respawns it.
     KillAgent,
 }
@@ -103,6 +105,7 @@ pub enum RpcResponse {
     PortBindingsChanged(PortBindingsChanged),
     PortBindingsRemoved(PortBindingsRemoved),
     ReadinessEvent(ReadinessEvent),
+    MemoryPressureEvent(MemoryPressureEvent),
     Error(ErrorResponse),
     MmapReadFile(MmapReadFileResponse),
     /// Test-only: acknowledgement for [`RpcRequest::KillAgent`].
@@ -128,6 +131,7 @@ impl RpcResponse {
             Self::PortBindingsChanged(_) => MessageType::PortBindingsChanged,
             Self::PortBindingsRemoved(_) => MessageType::PortBindingsRemoved,
             Self::ReadinessEvent(_) => MessageType::ReadinessEvent,
+            Self::MemoryPressureEvent(_) => MessageType::MemoryPressureEvent,
             Self::Error(_) => MessageType::Error,
             Self::MmapReadFile(_) => MessageType::MmapReadFileResponse,
             Self::KillAgent => MessageType::KillAgentResponse,
@@ -152,6 +156,7 @@ impl RpcResponse {
             Self::PortBindingsChanged(msg) => msg.encode_to_vec(),
             Self::PortBindingsRemoved(msg) => msg.encode_to_vec(),
             Self::ReadinessEvent(msg) => msg.encode_to_vec(),
+            Self::MemoryPressureEvent(msg) => msg.encode_to_vec(),
             Self::Error(err) => err.encode(),
             Self::MmapReadFile(msg) => msg.encode_to_vec(),
             Self::KillAgent => Empty::default().encode_to_vec(),
@@ -329,6 +334,10 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
         MessageType::WatchReadinessRequest => {
             let req = WatchReadinessRequest::decode(payload)?;
             Ok(RpcRequest::WatchReadiness(req))
+        }
+        MessageType::WatchMemoryPressureRequest => {
+            let req = WatchMemoryPressureRequest::decode(payload)?;
+            Ok(RpcRequest::WatchMemoryPressure(req))
         }
         MessageType::KillAgentRequest => Ok(RpcRequest::KillAgent),
         _ => anyhow::bail!("unexpected message type: {:?}", msg_type),

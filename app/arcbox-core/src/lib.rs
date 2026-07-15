@@ -69,6 +69,6 @@ pub use migration::MigrationManager;
 pub use runtime::{Runtime, SandboxPortExposure};
 pub use vm::{SharedDirConfig, VmConfig, VmManager};
 pub use vm_lifecycle::{
-    DEFAULT_MACHINE_NAME, DefaultVmConfig, HealthMonitor, VmLifecycleConfig, VmLifecycleManager,
-    VmLifecycleState,
+    ActivityScope, DEFAULT_MACHINE_NAME, DefaultVmConfig, HealthMonitor, VmLifecycleConfig,
+    VmLifecycleManager, VmLifecycleState,
 };

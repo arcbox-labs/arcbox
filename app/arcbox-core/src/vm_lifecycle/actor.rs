@@ -25,10 +25,13 @@ use crate::error::{CoreError, Result};
 use crate::event::{Event, EventBus};
 use crate::machine::MachineManager;
 
-use super::machine::{BalloonTarget, Effect, Effects, Notify, VmEvent, VmLifecycle};
+use super::balloon;
+use super::balloon::controller::{
+    BalloonCommand, BalloonController, BalloonDeps, PressureWatch, WatchFrame,
+};
+use super::machine::{Effect, Effects, Notify, VmEvent, VmLifecycle};
 use super::{
-    BALLOON_SHRINK_DELAY_SECS, HealthMonitor, IDLE_BALLOON_TARGET_MB, RecoveryPolicy,
-    VmLifecycleConfig, VmLifecycleState,
+    BALLOON_SHRINK_DELAY_SECS, HealthMonitor, RecoveryPolicy, VmLifecycleConfig, VmLifecycleState,
 };
 
 /// A command sent from the facade to the lifecycle actor.
@@ -50,7 +53,8 @@ pub(super) enum Command {
         /// Resolved once the machine record is removed.
         reply: oneshot::Sender<Result<()>>,
     },
-    /// Activity signal (e.g. a Kubernetes hold): exit `Idle` if applicable.
+    /// Activity signal (a proxied Docker request, a Kubernetes hold):
+    /// exit `Idle` if applicable.
     Activity,
 }
 
@@ -112,8 +116,10 @@ pub(super) struct LifecycleShared {
     pub(super) restart_generation: std::sync::atomic::AtomicU64,
     /// Timestamp of last activity (epoch millis, for idle detection).
     pub(super) last_activity_ms: std::sync::atomic::AtomicU64,
-    /// Whether the balloon is currently shrunk for the idle state.
-    pub(super) balloon_shrunk: std::sync::atomic::AtomicBool,
+    /// Live host-side operations (proxied Docker requests in flight). The
+    /// idle gate never fires while this is non-zero — a VM serving a pull
+    /// or build is not idle no matter how old the last activity stamp is.
+    pub(super) active_ops: std::sync::atomic::AtomicUsize,
     /// Whether Kubernetes holds the VM in the active state.
     pub(super) kubernetes_hold: std::sync::atomic::AtomicBool,
 }
@@ -147,72 +153,115 @@ impl LifecycleShared {
         }
     }
 
-    /// Shrinks the balloon to reclaim guest memory during idle.
-    ///
-    /// Sets the balloon target to [`IDLE_BALLOON_TARGET_MB`] so the guest
-    /// returns memory to the host, reducing idle footprint.
-    #[cfg(target_os = "macos")]
-    fn shrink_balloon(&self) {
-        if self.balloon_shrunk.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let target_bytes = IDLE_BALLOON_TARGET_MB * 1024 * 1024;
-        if let Some(info) = self.machine_manager.get(&self.machine_name) {
-            match self
-                .machine_manager
-                .vm_manager()
-                .set_balloon_target(&info.vm_id, target_bytes)
-            {
-                Ok(()) => {
-                    self.balloon_shrunk.store(true, Ordering::Relaxed);
-                    tracing::info!("Balloon shrunk to {}MB for idle VM", IDLE_BALLOON_TARGET_MB);
-                }
-                Err(e) => {
-                    tracing::debug!("Failed to shrink balloon: {}", e);
-                }
-            }
-        }
-    }
-
-    /// Restores the balloon to the full configured memory size.
-    ///
-    /// Called when the VM exits idle state (new container activity).
-    #[cfg(target_os = "macos")]
-    fn restore_balloon(&self) {
-        if !self.balloon_shrunk.load(Ordering::Relaxed) {
-            return;
-        }
-
-        if let Some(info) = self.machine_manager.get(&self.machine_name) {
-            let full_bytes = info.memory_mb * 1024 * 1024;
-            match self
-                .machine_manager
-                .vm_manager()
-                .set_balloon_target(&info.vm_id, full_bytes)
-            {
-                Ok(()) => {
-                    self.balloon_shrunk.store(false, Ordering::Relaxed);
-                    tracing::info!("Balloon restored to {}MB", info.memory_mb);
-                }
-                Err(e) => {
-                    tracing::debug!("Failed to restore balloon: {}", e);
-                }
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn shrink_balloon(&self) {}
-
-    #[cfg(not(target_os = "macos"))]
-    fn restore_balloon(&self) {}
-
     /// Gets the agent CID for this lifecycle's machine.
     fn get_cid(&self) -> Result<u32> {
         self.machine_manager
             .get_cid(&self.machine_name)
             .ok_or_else(|| CoreError::Machine("default machine has no CID".to_string()))
+    }
+}
+
+/// Production [`BalloonDeps`]: agent RPCs for guest stats and the pressure
+/// watch, the VM manager for balloon targets.
+pub(super) struct RealBalloonDeps {
+    pub(super) shared: Arc<LifecycleShared>,
+}
+
+impl RealBalloonDeps {
+    fn connect_agent(&self) -> Result<crate::agent_client::AgentClient> {
+        self.shared
+            .machine_manager
+            .connect_agent(&self.shared.machine_name)
+    }
+}
+
+impl BalloonDeps for RealBalloonDeps {
+    type Watch = AgentPressureWatch;
+
+    fn full_memory_bytes(&self) -> Option<u64> {
+        self.shared
+            .machine_manager
+            .get(&self.shared.machine_name)
+            .map(|info| info.memory_mb * 1024 * 1024)
+    }
+
+    fn set_balloon_target(&self, bytes: u64) -> Result<()> {
+        let info = self
+            .shared
+            .machine_manager
+            .get(&self.shared.machine_name)
+            .ok_or_else(|| CoreError::Machine("machine record missing".to_string()))?;
+        self.shared
+            .machine_manager
+            .vm_manager()
+            .set_balloon_target(&info.vm_id, bytes)
+    }
+
+    /// Any failure (connect, RPC, timeout) folds to `None`: the policy treats
+    /// "unknown" as its own signal — never shrink on it, and fail open while
+    /// shrunk, since a reclaim-thrashing guest is exactly one that cannot
+    /// answer.
+    async fn guest_stats(&self, budget: Duration) -> Option<balloon::GuestStats> {
+        let mut agent = self.connect_agent().ok()?;
+        let query = async move {
+            let info = if agent.is_blocking() {
+                tokio::task::spawn_blocking(move || agent.get_system_info_blocking())
+                    .await
+                    .ok()?
+                    .ok()?
+            } else {
+                agent.get_system_info().await.ok()?
+            };
+            Some(balloon::GuestStats {
+                total: info.total_memory,
+                available: info.available_memory,
+                loadavg1: info.load_average.first().copied().unwrap_or(0.0),
+            })
+        };
+        tokio::time::timeout(budget, query).await.ok().flatten()
+    }
+
+    async fn open_pressure_watch(&self) -> Result<AgentPressureWatch> {
+        use super::balloon::controller::{
+            PRESSURE_MAX_REFAULT_RATE, PRESSURE_MIN_AVAILABLE, PRESSURE_PSI_FULL_STALL_US,
+            WATCH_KEEPALIVE, WATCH_WINDOW,
+        };
+
+        let mut agent = self.connect_agent()?;
+        agent
+            .watch_memory_pressure(arcbox_protocol::agent::WatchMemoryPressureRequest {
+                timeout_ms: u32::try_from(WATCH_WINDOW.as_millis()).unwrap_or(u32::MAX),
+                min_available_bytes: PRESSURE_MIN_AVAILABLE,
+                max_refault_rate: PRESSURE_MAX_REFAULT_RATE,
+                keepalive_ms: u32::try_from(WATCH_KEEPALIVE.as_millis()).unwrap_or(u32::MAX),
+                psi_full_stall_us: PRESSURE_PSI_FULL_STALL_US,
+            })
+            .await?;
+        let mut watch = AgentPressureWatch { agent };
+        // The agent acks with an immediate frame; anything else (an error
+        // frame from an old agent, silence) means "unsupported" and the
+        // controller degrades to stats polling.
+        watch.next_frame(Duration::from_secs(5)).await?;
+        Ok(watch)
+    }
+}
+
+/// [`PressureWatch`] over the agent's `WatchMemoryPressure` event stream.
+pub(super) struct AgentPressureWatch {
+    agent: crate::agent_client::AgentClient,
+}
+
+impl PressureWatch for AgentPressureWatch {
+    async fn next_frame(&mut self, max_wait: Duration) -> Result<WatchFrame> {
+        use arcbox_protocol::agent::memory_pressure_event::Reason;
+
+        let event = self.agent.next_memory_pressure_event(max_wait).await?;
+        Ok(match event.reason() {
+            Reason::Keepalive => WatchFrame::Keepalive,
+            Reason::LowAvailable | Reason::RefaultSpike => WatchFrame::Pressure,
+            Reason::Settled => WatchFrame::Settled,
+            Reason::WindowElapsed => WatchFrame::WindowElapsed,
+        })
     }
 }
 
@@ -247,6 +296,14 @@ pub(super) struct LifecycleActor {
     /// The detached machine-removal task of a force stop, joined by the
     /// force-stop reply so callers still observe "removed" on return.
     removal: Option<JoinHandle<()>>,
+    /// Command sender back into this actor, cloned into the balloon
+    /// controller's activity callback so pressure exits ride the state
+    /// machine like any other activity.
+    cmd_tx: mpsc::UnboundedSender<Command>,
+    /// Drives the balloon controller (EnterIdle / ExitIdle).
+    balloon_tx: mpsc::UnboundedSender<BalloonCommand>,
+    /// Controller receiver, consumed when `run` spawns the controller.
+    balloon_seed: Option<mpsc::UnboundedReceiver<BalloonCommand>>,
 }
 
 impl LifecycleActor {
@@ -254,9 +311,11 @@ impl LifecycleActor {
     pub(super) fn new(
         shared: Arc<LifecycleShared>,
         commands: mpsc::UnboundedReceiver<Command>,
+        cmd_tx: mpsc::UnboundedSender<Command>,
         state_tx: watch::Sender<VmLifecycleState>,
     ) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let (balloon_tx, balloon_rx) = mpsc::unbounded_channel();
         Self {
             shared,
             commands,
@@ -271,6 +330,9 @@ impl LifecycleActor {
             inflight: None,
             epoch: 0,
             removal: None,
+            cmd_tx,
+            balloon_tx,
+            balloon_seed: Some(balloon_rx),
         }
     }
 
@@ -279,6 +341,23 @@ impl LifecycleActor {
         let mut machine = VmLifecycle
             .uninitialized_state_machine()
             .init_with_context(&mut self.effects);
+
+        // The balloon controller lives exactly as long as the actor: its
+        // command channel closes when the actor drops `balloon_tx`.
+        if let Some(balloon_rx) = self.balloon_seed.take() {
+            let deps = RealBalloonDeps {
+                shared: Arc::clone(&self.shared),
+            };
+            let shared = Arc::clone(&self.shared);
+            let cmd_tx = self.cmd_tx.clone();
+            let activity = Arc::new(move || {
+                shared.record_activity();
+                let _ = cmd_tx.send(Command::Activity);
+            });
+            drop(tokio::spawn(
+                BalloonController::new(balloon_rx, deps, activity).run(),
+            ));
+        }
 
         let mut idle_ticker = tokio::time::interval(Duration::from_secs(BALLOON_SHRINK_DELAY_SECS));
         idle_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -341,6 +420,15 @@ impl LifecycleActor {
                 "VM lifecycle transition"
             );
             self.state_tx.send_replace(after);
+
+            // Balloon control derives from the Idle transitions themselves,
+            // so every path out of idle (activity, stop, reboot, force-stop)
+            // restores memory without each transition having to say so.
+            if after == VmLifecycleState::Idle {
+                let _ = self.balloon_tx.send(BalloonCommand::EnterIdle);
+            } else if before == VmLifecycleState::Idle {
+                let _ = self.balloon_tx.send(BalloonCommand::ExitIdle);
+            }
         }
 
         for effect in self.effects.take() {
@@ -391,8 +479,6 @@ impl LifecycleActor {
                     let _ = shared.machine_manager.remove(&shared.machine_name, true);
                 }));
             }
-            Effect::Balloon(BalloonTarget::Idle) => self.shared.shrink_balloon(),
-            Effect::Balloon(BalloonTarget::Full) => self.shared.restore_balloon(),
             Effect::BumpGeneration => {
                 self.shared
                     .restart_generation
@@ -603,6 +689,7 @@ impl LifecycleActor {
     fn on_idle_tick(&mut self, machine: &mut Machine) {
         if !self.shared.config.auto_stop
             || self.shared.kubernetes_hold.load(Ordering::Relaxed)
+            || self.shared.active_ops.load(Ordering::Acquire) > 0
             || self.public() != VmLifecycleState::Running
         {
             return;

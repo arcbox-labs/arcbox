@@ -29,6 +29,7 @@
 //! ```
 
 mod actor;
+mod balloon;
 mod boot;
 mod health;
 mod machine;
@@ -44,7 +45,7 @@ use crate::error::{CoreError, Result};
 use crate::event::EventBus;
 use crate::machine::{MachineInfo, MachineManager};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -70,12 +71,9 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 /// Maximum retry attempts for recovery.
 const DEFAULT_MAX_RETRIES: u32 = 3;
 
-/// Minimum balloon target in MB when VM is idle.
-/// Below this, the guest may become unstable.
-const IDLE_BALLOON_TARGET_MB: u64 = 128;
-
-/// Interval of the actor's idle ticker, and thereby the delay before the
-/// balloon shrinks once the idle timeout has elapsed.
+/// Interval of the actor's idle ticker: the delay before the balloon
+/// shrinks once the idle timeout has elapsed, and the granularity of the
+/// idle re-target cadence (`balloon::IDLE_RETARGET_INTERVAL_SECS`).
 const BALLOON_SHRINK_DELAY_SECS: u64 = 10;
 
 /// Persistent guest dockerd data image name.
@@ -90,6 +88,22 @@ const DOCKER_DATA_IMAGE_SIZE_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
 pub use health::HealthMonitor;
 pub use recovery::{BackoffStrategy, RecoveryAction, RecoveryPolicy};
 pub use types::{DefaultVmConfig, VmLifecycleConfig, VmLifecycleState};
+
+/// Holds the VM out of idle while a host-side operation is in flight.
+///
+/// Returned by [`VmLifecycleManager::begin_activity`]; dropping it releases
+/// the hold and stamps fresh activity (the idle clock starts from the
+/// operation's *end*).
+pub struct ActivityScope {
+    shared: Arc<LifecycleShared>,
+}
+
+impl Drop for ActivityScope {
+    fn drop(&mut self) {
+        self.shared.active_ops.fetch_sub(1, Ordering::AcqRel);
+        self.shared.record_activity();
+    }
+}
 
 /// Deferred actor state, consumed when the actor is first started.
 ///
@@ -195,7 +209,7 @@ impl VmLifecycleManager {
             backend: AtomicU8::new(seeded_backend as u8),
             restart_generation: AtomicU64::new(0),
             last_activity_ms: AtomicU64::new(now_ms),
-            balloon_shrunk: AtomicBool::new(false),
+            active_ops: AtomicUsize::new(0),
             kubernetes_hold: AtomicBool::new(false),
         });
 
@@ -230,8 +244,12 @@ impl VmLifecycleManager {
                 .expect("lifecycle actor seed lock poisoned")
                 .take();
             if let Some(seed) = seed {
-                let actor =
-                    LifecycleActor::new(Arc::clone(&self.shared), seed.commands, seed.state_tx);
+                let actor = LifecycleActor::new(
+                    Arc::clone(&self.shared),
+                    seed.commands,
+                    self.cmd_tx.clone(),
+                    seed.state_tx,
+                );
                 drop(tokio::spawn(actor.run()));
             }
         });
@@ -328,6 +346,34 @@ impl VmLifecycleManager {
         let (reply, reply_rx) = oneshot::channel();
         self.request(Command::EnsureReady { timeout, reply }, reply_rx)
             .await
+    }
+
+    /// Records external activity (e.g. a proxied Docker API request),
+    /// resetting the idle clock and exiting idle if the VM is there.
+    ///
+    /// Cheap and non-blocking — safe to call on every request. Unlike
+    /// [`Self::ensure_ready`] it never boots a stopped VM.
+    pub fn note_activity(&self) {
+        self.shared.record_activity();
+        if *self.state_rx.borrow() == VmLifecycleState::Idle {
+            // Exit idle so the balloon is restored to full memory.
+            let _ = self.cmd_tx.send(Command::Activity);
+        }
+    }
+
+    /// Like [`Self::note_activity`], but additionally holds the VM out of
+    /// idle until the returned scope is dropped.
+    ///
+    /// For long-lived proxied operations (image pulls, builds, log
+    /// streams): a request in flight is activity for its whole duration,
+    /// not just at its first byte — the 2026-07-15 follow-up incident had
+    /// an idle shrink squeeze a guest mid-pull.
+    pub fn begin_activity(&self) -> ActivityScope {
+        self.note_activity();
+        self.shared.active_ops.fetch_add(1, Ordering::AcqRel);
+        ActivityScope {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     /// Enables or disables the Kubernetes lifecycle hold.

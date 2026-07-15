@@ -1834,6 +1834,103 @@ pub mod readiness_event {
         }
     }
 }
+/// Request for a guest-driven memory pressure event stream.
+///
+/// The agent samples in-guest memory signals (`MemAvailable`, workingset
+/// refault rate) and emits an event when a threshold trips, plus periodic
+/// keepalives so the host can distinguish "no pressure" from "guest too
+/// starved to answer". The watch returns after `timeout_ms`; the host
+/// re-issues the request to keep watching.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct WatchMemoryPressureRequest {
+    /// Watch window in milliseconds; the agent ends the stream with a
+    /// WINDOW_ELAPSED frame when it passes.
+    #[prost(uint32, tag = "1")]
+    pub timeout_ms: u32,
+    /// Trip when MemAvailable falls below this many bytes. 0 disables.
+    #[prost(uint64, tag = "2")]
+    pub min_available_bytes: u64,
+    /// Trip when the page refault rate (pages/second) stays at or above this
+    /// for consecutive samples. 0 disables.
+    #[prost(uint64, tag = "3")]
+    pub max_refault_rate: u64,
+    /// Keepalive cadence in milliseconds (0 = agent default).
+    #[prost(uint32, tag = "4")]
+    pub keepalive_ms: u32,
+    /// PSI trigger threshold: microseconds of full (all non-idle tasks)
+    /// memory stall within the agent's 1s window before pressure fires.
+    /// 0 = agent default. Used only on kernels with CONFIG_PSI; older
+    /// kernels fall back to MemAvailable/refault sampling.
+    #[prost(uint64, tag = "5")]
+    pub psi_full_stall_us: u64,
+}
+/// One frame on the memory pressure stream.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct MemoryPressureEvent {
+    /// Why this frame was emitted.
+    #[prost(enumeration = "memory_pressure_event::Reason", tag = "1")]
+    pub reason: i32,
+    /// MemAvailable at sample time, in bytes.
+    #[prost(uint64, tag = "2")]
+    pub available_bytes: u64,
+    /// Observed refault rate, pages/second.
+    #[prost(uint64, tag = "3")]
+    pub refault_rate: u64,
+}
+/// Nested message and enum types in `MemoryPressureEvent`.
+pub mod memory_pressure_event {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Reason {
+        /// Watch established (first frame) or periodic keepalive.
+        Keepalive = 0,
+        /// MemAvailable fell below the requested floor. PSI stall trips
+        /// are also reported under this reason: a new enum value would be
+        /// decoded as KEEPALIVE by older hosts (proto3 open enums), which
+        /// must never happen to a pressure frame. The agent log records
+        /// the true trigger.
+        LowAvailable = 1,
+        /// Page refault rate exceeded the requested threshold.
+        RefaultSpike = 2,
+        /// The watch window elapsed without pressure.
+        WindowElapsed = 3,
+        /// The detector armed: the guest settled at the current balloon
+        /// target. The host uses this to continue a staged shrink.
+        Settled = 4,
+    }
+    impl Reason {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Keepalive => "KEEPALIVE",
+                Self::LowAvailable => "LOW_AVAILABLE",
+                Self::RefaultSpike => "REFAULT_SPIKE",
+                Self::WindowElapsed => "WINDOW_ELAPSED",
+                Self::Settled => "SETTLED",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "KEEPALIVE" => Some(Self::Keepalive),
+                "LOW_AVAILABLE" => Some(Self::LowAvailable),
+                "REFAULT_SPIKE" => Some(Self::RefaultSpike),
+                "WINDOW_ELAPSED" => Some(Self::WindowElapsed),
+                "SETTLED" => Some(Self::Settled),
+                _ => None,
+            }
+        }
+    }
+}
 /// Runtime status report.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

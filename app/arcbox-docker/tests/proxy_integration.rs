@@ -232,3 +232,53 @@ async fn upgrade_forwards_request_body() {
     assert_eq!(observed.as_deref(), Some(payload.as_bytes()));
     guest.cancel.cancel();
 }
+
+// =============================================================================
+// Tests — activity hook (idle-thrash regression, 2026-07-15 incident)
+// =============================================================================
+
+/// Every proxied request must note VM activity, *including* when endpoint
+/// readiness is already cached. The incident: with a warm readiness cache,
+/// `docker` traffic bypassed `ensure_system_vm_ready` (the only path that
+/// recorded activity), so the lifecycle idled a loaded VM and ballooned it
+/// into an 18-hour reclaim thrash.
+#[tokio::test]
+async fn ensure_endpoint_verified_notes_activity_even_when_cached() {
+    use arcbox_docker::proxy::ProxyState;
+    use std::sync::atomic::AtomicUsize;
+
+    let (connector, guest, _tmp) = setup().await;
+
+    let activity = Arc::new(AtomicUsize::new(0));
+    let hook: arcbox_docker::proxy::ActivityHook = {
+        let activity = Arc::clone(&activity);
+        Arc::new(move || {
+            activity.fetch_add(1, Ordering::SeqCst);
+            Box::new(()) as _
+        })
+    };
+    let proxy = ProxyState::new(Arc::new(connector)).with_activity_hook(hook);
+
+    let prepared = Arc::new(AtomicUsize::new(0));
+    let prepare = || {
+        let prepared = Arc::clone(&prepared);
+        async move {
+            prepared.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    };
+
+    // First request: full verification (prepare + `_ping` against the mock).
+    proxy.ensure_endpoint_verified(1, prepare()).await.unwrap();
+    // Second request: readiness is cached — prepare must NOT rerun...
+    proxy.ensure_endpoint_verified(1, prepare()).await.unwrap();
+    assert_eq!(prepared.load(Ordering::SeqCst), 1, "readiness cache broken");
+
+    // ...but activity must be noted on BOTH requests.
+    assert_eq!(
+        activity.load(Ordering::SeqCst),
+        2,
+        "proxied requests must note activity even with warm readiness cache"
+    );
+    guest.cancel.cancel();
+}

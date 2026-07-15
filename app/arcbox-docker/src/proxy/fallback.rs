@@ -4,7 +4,7 @@ use super::headers::HeaderMapProxyExt;
 use super::{forward, upgrade, upload};
 use crate::api::AppState;
 use crate::error::Result;
-use crate::handlers::ensure_system_vm_ready;
+use crate::handlers::{ensure_system_vm_ready, hold_activity_for_response};
 use axum::body::Body;
 use axum::extract::{OriginalUri, State};
 use axum::http::Response;
@@ -48,7 +48,8 @@ pub async fn proxy_fallback(
         return invalidate_on_guest_error(
             &state,
             upload::proxy_streaming_upload(state.proxy.connector(), &uri, req).await,
-        );
+        )
+        .map(|resp| hold_activity_for_response(&state, resp));
     }
 
     tracing::Span::current().record("protocol", "http");
@@ -56,6 +57,7 @@ pub async fn proxy_fallback(
         &state,
         forward::proxy_to_guest_stream_pooled(state.proxy.client(), &uri, req).await,
     )
+    .map(|resp| hold_activity_for_response(&state, resp))
 }
 
 /// Drops the cached endpoint readiness when — and only when — the proxy error

@@ -13,9 +13,10 @@ use arcbox_protocol::agent::{
     DiskTrimRequest, DiskTrimResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
     KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
     KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
-    KubernetesStopRequest, KubernetesStopResponse, MmapReadFileRequest, MmapReadFileResponse,
-    PingRequest, PingResponse, ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse,
-    RuntimeStatusRequest, RuntimeStatusResponse, SystemInfo, WatchReadinessRequest,
+    KubernetesStopRequest, KubernetesStopResponse, MemoryPressureEvent, MmapReadFileRequest,
+    MmapReadFileResponse, PingRequest, PingResponse, ReadinessEvent, RuntimeEnsureRequest,
+    RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, SystemInfo,
+    WatchMemoryPressureRequest, WatchReadinessRequest,
 };
 use arcbox_protocol::sandbox_v1::{
     CheckpointRequest, CheckpointResponse, CreateSandboxRequest, CreateSandboxResponse,
@@ -623,6 +624,79 @@ impl AgentClient {
                 return Ok(event);
             }
         }
+    }
+
+    /// Opens a guest memory pressure watch (`WatchMemoryPressure`).
+    ///
+    /// The agent answers with an immediate keepalive frame and then streams
+    /// pressure events; consume them with
+    /// [`Self::next_memory_pressure_event`]. The connection is dedicated to
+    /// the watch until the agent closes the window.
+    pub async fn watch_memory_pressure(&mut self, req: WatchMemoryPressureRequest) -> Result<()> {
+        if !self.connected {
+            self.connect().await?;
+        }
+
+        let payload = req.encode_to_vec();
+        let buf = Self::build_message(MessageType::WatchMemoryPressureRequest, "", &payload);
+
+        match &mut self.transport {
+            AgentTransport::Async(t) => t.send(buf).await.map_err(|e| {
+                CoreError::Machine(format!("failed to send memory pressure watch request: {e}"))
+            }),
+            AgentTransport::Blocking(t) => tokio::task::block_in_place(|| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                t.send(&buf, deadline).map_err(|e| {
+                    CoreError::Machine(format!("failed to send memory pressure watch request: {e}"))
+                })
+            }),
+        }
+    }
+
+    /// Receives the next frame on an open memory pressure watch, waiting at
+    /// most `max_wait`.
+    ///
+    /// A timeout means the agent went silent past its keepalive budget — the
+    /// caller treats that exactly like a pressure event (fail open), because
+    /// a guest too starved to answer is the incident signature.
+    pub async fn next_memory_pressure_event(
+        &mut self,
+        max_wait: Duration,
+    ) -> Result<MemoryPressureEvent> {
+        match &mut self.transport {
+            AgentTransport::Async(t) => {
+                let raw = tokio::time::timeout(max_wait, t.recv())
+                    .await
+                    .map_err(|_| {
+                        CoreError::Machine("timeout waiting for memory pressure event".to_string())
+                    })?
+                    .map_err(|e| {
+                        CoreError::Machine(format!("failed to receive memory pressure event: {e}"))
+                    })?;
+                Self::decode_memory_pressure_event(&raw)
+            }
+            AgentTransport::Blocking(t) => tokio::task::block_in_place(|| {
+                let raw = t.recv(Instant::now() + max_wait).map_err(|e| {
+                    CoreError::Machine(format!("failed to receive memory pressure event: {e}"))
+                })?;
+                Self::decode_memory_pressure_event(&raw)
+            }),
+        }
+    }
+
+    fn decode_memory_pressure_event(raw: &[u8]) -> Result<MemoryPressureEvent> {
+        let (resp_type, _, resp_payload) = wire::parse_response(raw)?;
+        if resp_type == MessageType::Error as u32 {
+            let (code, message) = wire::parse_error_response(&resp_payload)?;
+            return Err(CoreError::Agent { code, message });
+        }
+        if resp_type != MessageType::MemoryPressureEvent as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected memory pressure response type: 0x{resp_type:04x}"
+            )));
+        }
+        MemoryPressureEvent::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode memory pressure event: {e}")))
     }
 
     fn decode_readiness_event(raw: &[u8]) -> Result<ReadinessEvent> {

@@ -68,15 +68,6 @@ pub(super) enum VmEvent {
     },
 }
 
-/// Balloon target requested by a transition; the actor applies it idempotently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BalloonTarget {
-    /// Shrink to the idle reservation to return memory to the host.
-    Idle,
-    /// Restore to the VM's full configured memory.
-    Full,
-}
-
 /// Lifecycle notification a transition asks the actor to publish on the bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Notify {
@@ -114,8 +105,6 @@ pub(super) enum Effect {
     AbortInflight,
     /// Remove the machine record (force path).
     RemoveMachine,
-    /// Apply a balloon target.
-    Balloon(BalloonTarget),
     /// Bump the VM incarnation counter (the Docker proxy watches it to detect
     /// restarts and reset cached readiness + pooled connections).
     BumpGeneration,
@@ -272,11 +261,14 @@ impl VmLifecycle {
         }
     }
 
+    // Balloon control is not an effect: the actor derives EnterIdle/ExitIdle
+    // for the balloon controller from the Idle transitions themselves, so
+    // every path out of `idle` (activity, stop, reboot, force-stop) restores
+    // memory without each transition having to remember to say so.
     #[state(superstate = "active")]
     fn running(event: &VmEvent, context: &mut Effects) -> Outcome {
         match event {
             VmEvent::IdleTimeout => {
-                context.emit(Effect::Balloon(BalloonTarget::Idle));
                 context.emit(Effect::Publish(Notify::Idle));
                 Transition(State::idle())
             }
@@ -287,12 +279,9 @@ impl VmLifecycle {
     }
 
     #[state(superstate = "active")]
-    fn idle(event: &VmEvent, context: &mut Effects) -> Outcome {
+    fn idle(event: &VmEvent) -> Outcome {
         match event {
-            VmEvent::Activity | VmEvent::Start { .. } => {
-                context.emit(Effect::Balloon(BalloonTarget::Full));
-                Transition(State::running())
-            }
+            VmEvent::Activity | VmEvent::Start { .. } => Transition(State::running()),
             _ => Super,
         }
     }
@@ -445,23 +434,19 @@ mod machine_tests {
     }
 
     #[test]
-    fn idle_round_trip_shrinks_then_restores_balloon() {
+    fn idle_round_trip_returns_to_running_on_activity() {
         let mut fx = Effects::default();
         let mut sm = running_machine(&mut fx);
 
+        // Balloon moves are not effects: the actor derives them from the
+        // Idle transitions and drives the balloon controller directly.
         let (state, effects) = step(&mut sm, &mut fx, VmEvent::IdleTimeout);
         assert_eq!(state, VmLifecycleState::Idle);
-        assert_eq!(
-            effects,
-            vec![
-                Effect::Balloon(BalloonTarget::Idle),
-                Effect::Publish(Notify::Idle)
-            ]
-        );
+        assert_eq!(effects, vec![Effect::Publish(Notify::Idle)]);
 
         let (state, effects) = step(&mut sm, &mut fx, VmEvent::Activity);
         assert_eq!(state, VmLifecycleState::Running);
-        assert_eq!(effects, vec![Effect::Balloon(BalloonTarget::Full)]);
+        assert!(effects.is_empty());
     }
 
     #[test]

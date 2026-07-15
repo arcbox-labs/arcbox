@@ -149,6 +149,15 @@ impl Runtime {
             vm_lifecycle_config.default_vm.kernel = Some(kernel.clone());
         }
 
+        // Dev/test knob (e.g. the idle-balloon e2e): shorten the idle
+        // timeout so an idle shrink happens within a test budget.
+        if let Ok(secs) = std::env::var(arcbox_constants::env::IDLE_TIMEOUT_SECS)
+            && let Ok(secs) = secs.parse::<u64>()
+            && secs > 0
+        {
+            vm_lifecycle_config.idle_timeout = std::time::Duration::from_secs(secs);
+        }
+
         Self::with_vm_lifecycle_config(config, vm_lifecycle_config)
     }
 
@@ -308,6 +317,18 @@ impl Runtime {
     /// unhealthy.
     pub async fn ensure_system_vm_ready(&self) -> Result<u32> {
         self.container_backend.ensure_ready().await
+    }
+
+    /// Notes host-side activity on the System VM (idle-clock reset + idle
+    /// exit). Called per proxied Docker request; never boots a stopped VM.
+    pub fn note_system_vm_activity(&self) {
+        self.vm_lifecycle.note_activity();
+    }
+
+    /// Notes activity and holds the System VM out of idle until the scope
+    /// drops. For long-lived proxied operations (pulls, builds, streams).
+    pub fn begin_system_vm_activity(&self) -> crate::vm_lifecycle::ActivityScope {
+        self.vm_lifecycle.begin_activity()
     }
 
     /// Captures a debug snapshot (virtio queues + vCPU exit counters)

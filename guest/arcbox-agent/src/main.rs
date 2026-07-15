@@ -14,6 +14,11 @@ mod agent;
 mod init;
 mod supervisor;
 
+// Consumed by the Linux agent's WatchMemoryPressure handler; the library
+// target compiles it everywhere so the logic stays unit-testable on hosts.
+#[cfg(target_os = "linux")]
+mod memory_pressure;
+
 #[cfg(target_os = "linux")]
 mod error;
 
