@@ -83,6 +83,13 @@ impl DaemonHandle {
             .args(&config.args)
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
+        // The DNS service binds a fixed localhost port (5553 by default) —
+        // the one host-global a test daemon would still fight an installed
+        // ArcBox (or a sibling test) over. Give each daemon its own port
+        // unless the scenario pinned one.
+        if !config.env.iter().any(|(key, _)| key == "ARCBOX_DNS_PORT") {
+            command.env("ARCBOX_DNS_PORT", ephemeral_udp_port()?.to_string());
+        }
         for (key, value) in &config.env {
             command.env(key, value);
         }
@@ -332,6 +339,14 @@ impl Service<Uri> for UnixConnector {
             Ok(TokioIo::new(stream))
         })
     }
+}
+
+/// Reserves an OS-assigned localhost UDP port and releases it for the
+/// daemon's DNS service to claim. Racy in principle; in practice ephemeral
+/// ports don't collide within the spawn window.
+fn ephemeral_udp_port() -> Result<u16> {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").context("probing for a free UDP port")?;
+    Ok(socket.local_addr()?.port())
 }
 
 #[cfg(test)]
