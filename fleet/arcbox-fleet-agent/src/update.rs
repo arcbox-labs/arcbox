@@ -1,11 +1,24 @@
 //! Self-update executor: download → verify → probe → swap → re-exec.
 //!
-//! Runs when the gateway pushes an [`AgentUpdate`] carrying a download
-//! (`binary_url` + `binary_sha256`). The checksum from the gateway — not the
-//! download host — is the integrity root; the `--version` probe of the
-//! downloaded binary is the loop-breaker (a mis-registered release whose
-//! binary reports the wrong version can never be installed, so the agent can
-//! never exec itself into an update cycle).
+//! Two trigger paths feed the same download-verify-swap pipeline, and they
+//! rest on **different trust models** — reason about them separately:
+//!
+//! - **Gateway-push** ([`UpdatePayload::from_wire`]): the gateway supplies
+//!   both the URL and the sha256, and the CDN only supplies the bytes. A
+//!   compromised CDN can't serve a payload the gateway hasn't sanctioned —
+//!   the checksum is an independent integrity root.
+//! - **Manual/recovery** ([`resolve_latest`]): the CDN is the sole authority
+//!   — the `.sha256` sidecar is fetched from the same origin as the binary,
+//!   so verification only adds TLS-transport + corruption integrity beyond
+//!   what HTTPS already provides. The trust model is equivalent to
+//!   `curl https://cdn/... | sh` from that origin. Acceptable for a
+//!   recovery/bootstrap path that the operator invokes deliberately; the
+//!   gateway path remains the authoritative rollout mechanism.
+//!
+//! Common to both: the `--version` probe of the downloaded binary is the
+//! loop-breaker — a mis-registered release whose binary reports the wrong
+//! version can never be installed, so the agent can never exec itself into
+//! an update cycle.
 //!
 //! Self-update only manages binaries it owns: the running executable must be
 //! the managed path (`<data_dir>/bin/arcbox-fleet-agent`, where
@@ -160,9 +173,15 @@ async fn apply(config: &AgentConfig, payload: &UpdatePayload) -> Result<PathBuf>
     let staged = download_verified(config, payload).await?;
     probe_version(&staged, &payload.expected_version).await?;
 
-    // Two renames, not a copy: the running image keeps its (now unlinked
-    // via .prev) inode, and the managed path atomically becomes the new
-    // binary — there is no instant where the path is missing or truncated.
+    // Two same-directory renames, not a copy: the running image keeps its
+    // (now unlinked via .prev) inode, and the managed path becomes the new
+    // binary. A single-syscall atomic swap would eliminate the transient
+    // absence between the two renames, but macOS's `renamex_np` and Linux's
+    // `renameat2` diverge enough that going through them is not worth the
+    // portability tax for a window that only opens on same-fs `rename(2)`
+    // failure — effectively ENOSPC/EIO. Recovery from a failed second
+    // rename is `quick install-service` (or manually moving `.prev` back
+    // into place); the caller sees the propagated error.
     let previous = managed.with_file_name(PREVIOUS_SUFFIX);
     tokio::fs::rename(&managed, &previous)
         .await
