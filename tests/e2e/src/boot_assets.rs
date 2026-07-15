@@ -281,6 +281,29 @@ pub fn stage_dev_boot_assets(root: &Path, data_dir: &Path, version: &str) -> Res
         xshell::cmd!(shell, "cargo xtask dev boot-assets --version {version}").run()?;
     }
 
+    // Stale-but-complete dev assets are staged as-is (kernel-dev flows rely
+    // on that), but a version mismatch almost always means the daemon will
+    // refuse the manifest against its pinned assets.lock SHA — say so
+    // up front instead of leaving only the daemon's mismatch error.
+    let manifest_version = fs::read(dev_boot_dir.join("manifest.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|json| {
+            json.get("asset_version")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    if let Some(found) = manifest_version
+        && found != version
+    {
+        warn!(
+            found,
+            requested = version,
+            "boot-assets/dev is a different asset version; if the daemon \
+             rejects the manifest SHA, refresh with `cargo xtask dev boot-assets`"
+        );
+    }
+
     copy_file(&dev_boot_dir.join("kernel"), &test_boot_dir.join("kernel"))?;
     copy_file(
         &dev_boot_dir.join("rootfs.erofs"),
