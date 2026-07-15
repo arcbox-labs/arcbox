@@ -322,6 +322,16 @@ impl<D: BalloonDeps> BalloonController<D> {
             return Mode::IdleUnshrunk;
         };
         let stats = self.deps.guest_stats(GUEST_STATS_TIMEOUT).await;
+        // Commands that arrived while the probe was in flight outrank its
+        // result: a Docker request during the (up to 3s) stats query must
+        // not see its VM shrunk right after exiting idle.
+        loop {
+            match self.commands.try_recv() {
+                Ok(BalloonCommand::ExitIdle) => return Mode::Active,
+                Ok(BalloonCommand::EnterIdle) => {}
+                Err(_) => break,
+            }
+        }
         match entry_decision(stats, full) {
             EntryDecision::NotIdle => {
                 tracing::info!("guest is busy; exiting idle instead of shrinking");
@@ -397,21 +407,40 @@ impl<D: BalloonDeps> BalloonController<D> {
     }
 
     /// Restores the balloon to the machine's full configured memory.
+    ///
+    /// Retried a few times on failure; if all attempts fail, the shrunk
+    /// bookkeeping is kept so the next idle entry knows memory was never
+    /// given back (a restore that silently "succeeds" in bookkeeping only
+    /// would leave the guest squeezed with nobody retrying).
     fn restore(&mut self, reason: &str) {
-        self.applied = None;
-        self.final_target = None;
-        self.step_applied_at = None;
         let Some(full) = self.deps.full_memory_bytes() else {
+            // No machine record: the VM is gone, and so is its balloon.
+            self.applied = None;
+            self.final_target = None;
+            self.step_applied_at = None;
             return;
         };
-        match self.deps.set_balloon_target(full) {
-            Ok(()) => tracing::info!(
-                full_mb = full / (1024 * 1024),
-                reason,
-                "balloon restored to full memory"
-            ),
-            Err(e) => tracing::debug!("failed to restore balloon ({reason}): {e}"),
+        const RESTORE_ATTEMPTS: u32 = 3;
+        for attempt in 1..=RESTORE_ATTEMPTS {
+            match self.deps.set_balloon_target(full) {
+                Ok(()) => {
+                    self.applied = None;
+                    self.final_target = None;
+                    self.step_applied_at = None;
+                    tracing::info!(
+                        full_mb = full / (1024 * 1024),
+                        reason,
+                        "balloon restored to full memory"
+                    );
+                    return;
+                }
+                Err(e) => tracing::warn!(attempt, "failed to restore balloon ({reason}): {e}"),
+            }
         }
+        tracing::error!(
+            reason,
+            "balloon restore failed; guest remains shrunk until the next idle cycle"
+        );
     }
 }
 
@@ -446,7 +475,12 @@ mod tests {
     struct FakeDeps {
         full: Option<u64>,
         stats: Mutex<Vec<Option<GuestStats>>>,
+        /// Injected latency for `guest_stats` (probe-race tests).
+        stats_delay: Duration,
         targets: Arc<Mutex<Vec<u64>>>,
+        /// When set, `set_balloon_target` fails (attempts still counted).
+        fail_set_target: std::sync::atomic::AtomicBool,
+        set_attempts: Arc<AtomicUsize>,
         watch_supported: bool,
         watch_frames: Mutex<Vec<mpsc::UnboundedReceiver<WatchFrame>>>,
         watch_senders: Mutex<Vec<mpsc::UnboundedSender<WatchFrame>>>,
@@ -458,7 +492,10 @@ mod tests {
             Self {
                 full,
                 stats: Mutex::new(Vec::new()),
+                stats_delay: Duration::ZERO,
                 targets: Arc::new(Mutex::new(Vec::new())),
+                fail_set_target: std::sync::atomic::AtomicBool::new(false),
+                set_attempts: Arc::new(AtomicUsize::new(0)),
                 watch_supported: true,
                 watch_frames: Mutex::new(Vec::new()),
                 watch_senders: Mutex::new(Vec::new()),
@@ -489,11 +526,18 @@ mod tests {
         }
 
         fn set_balloon_target(&self, bytes: u64) -> Result<()> {
+            self.set_attempts.fetch_add(1, Ordering::SeqCst);
+            if self.fail_set_target.load(Ordering::SeqCst) {
+                return Err(CoreError::Machine("injected balloon failure".into()));
+            }
             self.targets.lock().unwrap().push(bytes);
             Ok(())
         }
 
         async fn guest_stats(&self, _budget: Duration) -> Option<GuestStats> {
+            if self.stats_delay > Duration::ZERO {
+                tokio::time::sleep(self.stats_delay).await;
+            }
             let mut stats = self.stats.lock().unwrap();
             if stats.is_empty() {
                 None
@@ -853,6 +897,58 @@ mod tests {
 
         assert_eq!(h.targets(), vec![FIRST_STEP, FULL]);
         assert_eq!(h.activity_count(), 1);
+    }
+
+    /// Review finding (greptile): a Docker request that lands during the
+    /// entry probe must outrank the probe's result — the VM just exited
+    /// idle and must not be shrunk behind the request's back.
+    #[tokio::test(start_paused = true)]
+    async fn exit_idle_during_entry_probe_wins_over_shrink() {
+        let mut deps = FakeDeps::new(Some(FULL));
+        deps.stats_delay = Duration::from_secs(2);
+        deps.push_stats(Some(idle_stats()));
+        let h = Harness::spawn(deps);
+
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+        // The probe is mid-flight; activity exits idle.
+        h.commands.send(BalloonCommand::ExitIdle).unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        h.settle().await;
+
+        assert!(h.targets().is_empty(), "stale probe must not shrink");
+        assert_eq!(h.activity_count(), 0);
+    }
+
+    /// Review finding (greptile): a failing restore must be retried, and a
+    /// still-failing one must not be booked as restored.
+    #[tokio::test(start_paused = true)]
+    async fn failed_restore_retries_and_keeps_bookkeeping() {
+        let deps = FakeDeps::new(Some(FULL));
+        deps.push_stats(Some(idle_stats()));
+        let watch = deps.push_watch();
+        let h = Harness::spawn(deps);
+
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+        assert_eq!(h.targets(), vec![FIRST_STEP]);
+
+        let attempts_before = h.deps.set_attempts.load(Ordering::SeqCst);
+        h.deps.fail_set_target.store(true, Ordering::SeqCst);
+        watch.send(WatchFrame::Pressure).unwrap();
+        h.settle().await;
+
+        assert_eq!(
+            h.deps.set_attempts.load(Ordering::SeqCst) - attempts_before,
+            3,
+            "restore must be retried"
+        );
+        assert_eq!(h.targets(), vec![FIRST_STEP], "no restore was booked");
+        assert_eq!(
+            h.activity_count(),
+            1,
+            "idle exit still rides the state machine"
+        );
     }
 
     #[tokio::test(start_paused = true)]

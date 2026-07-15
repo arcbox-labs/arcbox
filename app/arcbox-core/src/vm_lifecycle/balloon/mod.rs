@@ -96,6 +96,12 @@ pub(super) fn entry_decision(stats: Option<GuestStats>, full: u64) -> EntryDecis
     let Some(stats) = stats else {
         return EntryDecision::Keep;
     };
+    // A zero total is not a reading (the agent reports 0 when /proc/meminfo
+    // is unreadable); without one, "used + headroom" would degenerate to
+    // the floor and shrink a guest of unknown load.
+    if stats.total == 0 {
+        return EntryDecision::Keep;
+    }
     if stats.loadavg1 >= IDLE_BUSY_LOADAVG {
         return EntryDecision::NotIdle;
     }
@@ -181,6 +187,12 @@ mod tests {
     fn next_step_clamps_at_final_target() {
         assert_eq!(next_step(5 * GIB, 4 * GIB), 4 * GIB);
         assert_eq!(next_step(4 * GIB, 4 * GIB), 4 * GIB);
+    }
+
+    #[test]
+    fn entry_zero_total_is_not_a_reading() {
+        let d = entry_decision(Some(stats(0, 0)), FULL);
+        assert_eq!(d, EntryDecision::Keep);
     }
 
     /// Incident guard #3: the compose stack was *running* the whole time —

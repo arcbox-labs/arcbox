@@ -89,6 +89,13 @@ impl PsiTrigger {
                 // SAFETY: pfd is a valid pollfd for the duration of the call;
                 // `file` (and thus fd) lives for the whole loop.
                 let n = unsafe { libc::poll(&mut pfd, 1, tick_ms) };
+                if n < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    // A signal is not a lost trigger; a spurious Lost would
+                    // make the host fail open and undo the shrink.
+                    continue;
+                }
                 let event = match n {
                     0 => PsiEvent::Tick,
                     n if n > 0 && pfd.revents & libc::POLLERR == 0 => PsiEvent::Stall,
