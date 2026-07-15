@@ -2,12 +2,12 @@
 /// Empty message for requests/responses that don't need data.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Empty {}
 /// Timestamp with nanosecond precision.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Timestamp {
     /// Seconds since Unix epoch.
     #[prost(int64, tag = "1")]
@@ -19,7 +19,7 @@ pub struct Timestamp {
 /// Key-value pair for labels, environment variables, etc.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KeyValue {
     #[prost(string, tag = "1")]
     pub key: ::prost::alloc::string::String,
@@ -29,7 +29,7 @@ pub struct KeyValue {
 /// Mount specification for bind mounts and volumes.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Mount {
     /// Source path on host.
     #[prost(string, tag = "1")]
@@ -47,7 +47,7 @@ pub struct Mount {
 /// Port binding specification.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PortBinding {
     /// Port inside the container.
     #[prost(uint32, tag = "1")]
@@ -128,7 +128,7 @@ pub struct CreateMachineRequest {
 /// Request that targets a machine's guest agent.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MachineAgentRequest {
     /// Machine ID or name.
     #[prost(string, tag = "1")]
@@ -137,7 +137,7 @@ pub struct MachineAgentRequest {
 /// Ping response from machine guest agent.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MachinePingResponse {
     /// Response payload.
     #[prost(string, tag = "1")]
@@ -188,7 +188,7 @@ pub struct MachineSystemInfo {
 /// Directory mount configuration.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DirectoryMount {
     /// Host directory path.
     #[prost(string, tag = "1")]
@@ -203,7 +203,7 @@ pub struct DirectoryMount {
 /// Response to create machine.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateMachineResponse {
     /// Machine ID.
     #[prost(string, tag = "1")]
@@ -212,7 +212,7 @@ pub struct CreateMachineResponse {
 /// Request to start a machine.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StartMachineRequest {
     /// Machine ID or name.
     #[prost(string, tag = "1")]
@@ -221,7 +221,7 @@ pub struct StartMachineRequest {
 /// Request to stop a machine.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StopMachineRequest {
     /// Machine ID or name.
     #[prost(string, tag = "1")]
@@ -233,7 +233,7 @@ pub struct StopMachineRequest {
 /// Request to remove a machine.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RemoveMachineRequest {
     /// Machine ID or name.
     #[prost(string, tag = "1")]
@@ -248,7 +248,7 @@ pub struct RemoveMachineRequest {
 /// Request to list machines.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListMachinesRequest {
     /// Show all machines (including stopped).
     #[prost(bool, tag = "1")]
@@ -266,7 +266,7 @@ pub struct ListMachinesResponse {
 /// Summary information about a machine.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MachineSummary {
     /// Machine ID.
     #[prost(string, tag = "1")]
@@ -296,7 +296,7 @@ pub struct MachineSummary {
 /// Request to inspect a machine.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InspectMachineRequest {
     /// Machine ID or name.
     #[prost(string, tag = "1")]
@@ -341,7 +341,7 @@ pub struct MachineInfo {
 /// Machine hardware configuration.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MachineHardware {
     /// Number of CPUs.
     #[prost(uint32, tag = "1")]
@@ -356,7 +356,7 @@ pub struct MachineHardware {
 /// Machine network configuration.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MachineNetwork {
     /// IP address.
     #[prost(string, tag = "1")]
@@ -377,7 +377,7 @@ pub struct MachineNetwork {
 /// Machine storage configuration.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MachineStorage {
     /// Disk size in bytes.
     #[prost(uint64, tag = "1")]
@@ -392,7 +392,7 @@ pub struct MachineStorage {
 /// Machine OS information.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MachineOs {
     /// Distribution name.
     #[prost(string, tag = "1")]
@@ -432,7 +432,7 @@ pub struct MachineExecRequest {
 /// Exec output from a machine.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MachineExecOutput {
     /// Stream type: stdout or stderr.
     #[prost(string, tag = "1")]
@@ -450,7 +450,7 @@ pub struct MachineExecOutput {
 /// Request for SSH connection info.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SshInfoRequest {
     /// Machine ID or name.
     #[prost(string, tag = "1")]
@@ -459,7 +459,7 @@ pub struct SshInfoRequest {
 /// SSH connection information.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SshInfoResponse {
     /// Host to connect to.
     #[prost(string, tag = "1")]
@@ -480,7 +480,7 @@ pub struct SshInfoResponse {
 /// Request to create a macOS guest from a base image.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateMacosMachineRequest {
     /// Guest name (unique).
     #[prost(string, tag = "1")]
@@ -498,7 +498,7 @@ pub struct CreateMacosMachineRequest {
 /// Request to start a macOS guest.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StartMacosMachineRequest {
     /// Guest name.
     #[prost(string, tag = "1")]
@@ -507,7 +507,7 @@ pub struct StartMacosMachineRequest {
 /// Request to stop a macOS guest.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StopMacosMachineRequest {
     /// Guest name.
     #[prost(string, tag = "1")]
@@ -516,7 +516,7 @@ pub struct StopMacosMachineRequest {
 /// Request to remove a macOS guest.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RemoveMacosMachineRequest {
     /// Guest name.
     #[prost(string, tag = "1")]
@@ -528,7 +528,7 @@ pub struct RemoveMacosMachineRequest {
 /// Request to inspect a macOS guest.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InspectMacosMachineRequest {
     /// Guest name.
     #[prost(string, tag = "1")]
@@ -537,7 +537,7 @@ pub struct InspectMacosMachineRequest {
 /// Summary of a macOS guest.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MacosMachineSummary {
     /// Guest name.
     #[prost(string, tag = "1")]
@@ -570,7 +570,7 @@ pub struct MacosMachineListResponse {
 /// Detailed information about a macOS guest.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MacosMachineInfo {
     /// Guest name.
     #[prost(string, tag = "1")]
@@ -605,7 +605,7 @@ pub struct MacosMachineInfo {
 /// characteristics come from the published manifest, not the request.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MacosImagePullRequest {
     /// Image reference: a stream name with an optional pinned version,
     /// e.g. "tahoe-base" or "tahoe-base@2026.07.02".
@@ -637,7 +637,7 @@ pub struct MacosImagePullEvent {
 /// MacosImagePullRequest: exactly one of `reference` / `manifest_url`.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MacosImageResolveRequest {
     /// Image reference: a stream name with an optional pinned version.
     #[prost(string, tag = "1")]
@@ -649,7 +649,7 @@ pub struct MacosImageResolveRequest {
 /// What a reference resolves to, without pulling.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MacosImageResolveResponse {
     /// Stream name (e.g. "tahoe-base").
     #[prost(string, tag = "1")]
@@ -676,7 +676,7 @@ pub struct MacosImageResolveResponse {
 /// Summary of a macOS base image.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MacosImageSummary {
     /// Image name.
     #[prost(string, tag = "1")]
@@ -715,7 +715,7 @@ pub struct MacosImageListResponse {
 /// Request to remove a macOS base image.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MacosImageRemoveRequest {
     /// Image name.
     #[prost(string, tag = "1")]
@@ -777,7 +777,7 @@ pub struct CreateContainerRequest {
 /// Response to create container.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateContainerResponse {
     /// Container ID.
     #[prost(string, tag = "1")]
@@ -789,7 +789,7 @@ pub struct CreateContainerResponse {
 /// Request to start a container.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StartContainerRequest {
     /// Container ID or name.
     #[prost(string, tag = "1")]
@@ -798,7 +798,7 @@ pub struct StartContainerRequest {
 /// Request to stop a container.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StopContainerRequest {
     /// Container ID or name.
     #[prost(string, tag = "1")]
@@ -810,7 +810,7 @@ pub struct StopContainerRequest {
 /// Request to kill a container.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KillContainerRequest {
     /// Container ID or name.
     #[prost(string, tag = "1")]
@@ -822,7 +822,7 @@ pub struct KillContainerRequest {
 /// Request to remove a container.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RemoveContainerRequest {
     /// Container ID or name.
     #[prost(string, tag = "1")]
@@ -837,7 +837,7 @@ pub struct RemoveContainerRequest {
 /// Request to list containers.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListContainersRequest {
     /// Show all containers (not just running).
     #[prost(bool, tag = "1")]
@@ -907,7 +907,7 @@ pub struct ContainerSummary {
 /// Request to inspect a container.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InspectContainerRequest {
     /// Container ID or name.
     #[prost(string, tag = "1")]
@@ -955,7 +955,7 @@ pub struct ContainerInfo {
 /// Container state information.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ContainerState {
     /// Current status.
     #[prost(string, tag = "1")]
@@ -1034,7 +1034,7 @@ pub struct ContainerConfig {
 /// Network settings.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NetworkSettings {
     /// IP address.
     #[prost(string, tag = "1")]
@@ -1052,7 +1052,7 @@ pub struct NetworkSettings {
 /// Mount point information.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MountPoint {
     /// Mount type.
     #[prost(string, tag = "1")]
@@ -1070,7 +1070,7 @@ pub struct MountPoint {
 /// Request for container logs.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LogsRequest {
     /// Container ID or name.
     #[prost(string, tag = "1")]
@@ -1100,7 +1100,7 @@ pub struct LogsRequest {
 /// Log entry.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LogEntry {
     /// Stream type: stdout or stderr.
     #[prost(string, tag = "1")]
@@ -1115,7 +1115,7 @@ pub struct LogEntry {
 /// Request to create an exec instance.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecCreateRequest {
     /// Container ID or name.
     #[prost(string, tag = "1")]
@@ -1151,7 +1151,7 @@ pub struct ExecCreateRequest {
 /// Response to create exec.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecCreateResponse {
     /// Exec ID.
     #[prost(string, tag = "1")]
@@ -1160,7 +1160,7 @@ pub struct ExecCreateResponse {
 /// Request to start an exec instance.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecStartRequest {
     /// Exec ID.
     #[prost(string, tag = "1")]
@@ -1178,7 +1178,7 @@ pub struct ExecStartRequest {
 /// Exec output.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecOutput {
     /// Stream type: stdout or stderr.
     #[prost(string, tag = "1")]
@@ -1190,7 +1190,7 @@ pub struct ExecOutput {
 /// Attach input.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AttachInput {
     /// Input data.
     #[prost(bytes = "vec", tag = "1")]
@@ -1208,7 +1208,7 @@ pub struct AttachInput {
 /// Attach output.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AttachOutput {
     /// Stream type.
     #[prost(string, tag = "1")]
@@ -1220,7 +1220,7 @@ pub struct AttachOutput {
 /// Request to wait for a container.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WaitContainerRequest {
     /// Container ID or name.
     #[prost(string, tag = "1")]
@@ -1232,7 +1232,7 @@ pub struct WaitContainerRequest {
 /// Response when container exits.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WaitContainerResponse {
     /// Exit code.
     #[prost(int64, tag = "1")]
@@ -1244,7 +1244,7 @@ pub struct WaitContainerResponse {
 /// Request to pause a container.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PauseContainerRequest {
     /// Container ID or name.
     #[prost(string, tag = "1")]
@@ -1253,7 +1253,7 @@ pub struct PauseContainerRequest {
 /// Request to unpause a container.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UnpauseContainerRequest {
     /// Container ID or name.
     #[prost(string, tag = "1")]
@@ -1262,7 +1262,7 @@ pub struct UnpauseContainerRequest {
 /// Request for container stats.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ContainerStatsRequest {
     /// Container ID or name.
     #[prost(string, tag = "1")]
@@ -1271,7 +1271,7 @@ pub struct ContainerStatsRequest {
 /// Container stats response.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ContainerStatsResponse {
     /// CPU usage in nanoseconds.
     #[prost(uint64, tag = "1")]
@@ -1307,7 +1307,7 @@ pub struct ContainerStatsResponse {
 /// Request for container top (process list).
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ContainerTopRequest {
     /// Container ID or name.
     #[prost(string, tag = "1")]
@@ -1331,7 +1331,7 @@ pub struct ContainerTopResponse {
 /// A single process row.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ProcessRow {
     /// Values for each column.
     #[prost(string, repeated, tag = "1")]
@@ -1340,7 +1340,7 @@ pub struct ProcessRow {
 /// Request to pull an image.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PullImageRequest {
     /// Image reference (e.g., "ubuntu:22.04", "docker.io/library/nginx:latest").
     #[prost(string, tag = "1")]
@@ -1355,7 +1355,7 @@ pub struct PullImageRequest {
 /// Progress update during pull.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PullProgress {
     /// Layer ID or digest.
     #[prost(string, tag = "1")]
@@ -1376,7 +1376,7 @@ pub struct PullProgress {
 /// Request to push an image.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PushImageRequest {
     /// Image reference to push.
     #[prost(string, tag = "1")]
@@ -1388,7 +1388,7 @@ pub struct PushImageRequest {
 /// Progress update during push.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PushProgress {
     /// Layer ID.
     #[prost(string, tag = "1")]
@@ -1409,7 +1409,7 @@ pub struct PushProgress {
 /// Request to list images.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListImagesRequest {
     /// Show all images (including intermediate layers).
     #[prost(bool, tag = "1")]
@@ -1464,7 +1464,7 @@ pub struct ImageSummary {
 /// Request to inspect an image.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InspectImageRequest {
     /// Image ID or reference.
     #[prost(string, tag = "1")]
@@ -1558,7 +1558,7 @@ pub struct ImageConfig {
 /// Root filesystem information.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RootFs {
     /// Type (usually "layers").
     #[prost(string, tag = "1")]
@@ -1570,7 +1570,7 @@ pub struct RootFs {
 /// Request to remove an image.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RemoveImageRequest {
     /// Image ID or reference.
     #[prost(string, tag = "1")]
@@ -1585,7 +1585,7 @@ pub struct RemoveImageRequest {
 /// Response to remove image.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RemoveImageResponse {
     /// Deleted image IDs.
     #[prost(string, repeated, tag = "1")]
@@ -1597,7 +1597,7 @@ pub struct RemoveImageResponse {
 /// Request to tag an image.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TagImageRequest {
     /// Source image ID or reference.
     #[prost(string, tag = "1")]
@@ -1612,7 +1612,7 @@ pub struct TagImageRequest {
 /// Build context chunk.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BuildContext {
     /// Tar archive chunk.
     #[prost(bytes = "vec", tag = "1")]
@@ -1624,7 +1624,7 @@ pub struct BuildContext {
 /// Progress update during build.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BuildProgress {
     /// Stream type.
     #[prost(string, tag = "1")]
@@ -1645,7 +1645,7 @@ pub struct BuildProgress {
 /// Request to check if an image exists.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExistsImageRequest {
     /// Image reference.
     #[prost(string, tag = "1")]
@@ -1654,7 +1654,7 @@ pub struct ExistsImageRequest {
 /// Response to exists check.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExistsImageResponse {
     /// Whether the image exists.
     #[prost(bool, tag = "1")]
@@ -1666,7 +1666,7 @@ pub struct ExistsImageResponse {
 /// Ping request.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AgentPingRequest {
     /// Optional payload.
     #[prost(string, tag = "1")]
@@ -1678,7 +1678,7 @@ pub struct AgentPingRequest {
 /// Ping response.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AgentPingResponse {
     /// Response payload.
     #[prost(string, tag = "1")]
@@ -1735,7 +1735,7 @@ pub struct SystemInfo {
 /// Request to ensure runtime services are available.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RuntimeEnsureRequest {
     /// Whether to attempt starting services when not ready.
     #[prost(bool, tag = "1")]
@@ -1744,7 +1744,7 @@ pub struct RuntimeEnsureRequest {
 /// Response from runtime ensure operation.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RuntimeEnsureResponse {
     /// Whether runtime is ready for Docker API requests.
     #[prost(bool, tag = "1")]
@@ -1762,12 +1762,12 @@ pub struct RuntimeEnsureResponse {
 /// Request for runtime status.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RuntimeStatusRequest {}
 /// Request for guest-driven readiness events.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatchReadinessRequest {
     /// Whether the agent should start the runtime if it is not ready.
     #[prost(bool, tag = "1")]
@@ -1843,7 +1843,7 @@ pub mod readiness_event {
 /// re-issues the request to keep watching.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatchMemoryPressureRequest {
     /// Watch window in milliseconds; the agent ends the stream with a
     /// WINDOW_ELAPSED frame when it passes.
@@ -1869,7 +1869,7 @@ pub struct WatchMemoryPressureRequest {
 /// One frame on the memory pressure stream.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MemoryPressureEvent {
     /// Why this frame was emitted.
     #[prost(enumeration = "memory_pressure_event::Reason", tag = "1")]
@@ -1955,12 +1955,12 @@ pub struct RuntimeStatusResponse {
 /// Request to trigger an immediate fstrim on data mount points.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DiskTrimRequest {}
 /// Response from a disk trim operation.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DiskTrimResponse {
     /// Human-readable result summary (e.g. bytes trimmed per mount).
     #[prost(string, tag = "1")]
@@ -1981,7 +1981,7 @@ pub struct PortBindingsChanged {
 /// Notification that a container no longer has active published ports.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PortBindingsRemoved {
     /// Container ID.
     #[prost(string, tag = "1")]
@@ -1990,7 +1990,7 @@ pub struct PortBindingsRemoved {
 /// Individual service status within the guest runtime stack.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ServiceStatus {
     /// Service name (e.g. "containerd", "dockerd", "runc").
     #[prost(string, tag = "1")]
@@ -2005,12 +2005,12 @@ pub struct ServiceStatus {
 /// Request to start the native Kubernetes cluster.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KubernetesStartRequest {}
 /// Response from starting the native Kubernetes cluster.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KubernetesStartResponse {
     /// Whether the cluster process is running.
     #[prost(bool, tag = "1")]
@@ -2028,12 +2028,12 @@ pub struct KubernetesStartResponse {
 /// Request to stop the native Kubernetes cluster.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KubernetesStopRequest {}
 /// Response from stopping the native Kubernetes cluster.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KubernetesStopResponse {
     /// Whether the cluster is fully stopped.
     #[prost(bool, tag = "1")]
@@ -2045,12 +2045,12 @@ pub struct KubernetesStopResponse {
 /// Request to delete the native Kubernetes cluster state.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KubernetesDeleteRequest {}
 /// Response from deleting the native Kubernetes cluster state.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KubernetesDeleteResponse {
     /// Human-readable detail for diagnostics.
     #[prost(string, tag = "1")]
@@ -2059,7 +2059,7 @@ pub struct KubernetesDeleteResponse {
 /// Request for Kubernetes cluster status.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KubernetesStatusRequest {}
 /// Runtime status report for the native Kubernetes cluster.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2085,12 +2085,12 @@ pub struct KubernetesStatusResponse {
 /// Request for managed kubeconfig content.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KubernetesKubeconfigRequest {}
 /// Managed kubeconfig payload exported from the guest cluster.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KubernetesKubeconfigResponse {
     /// Raw kubeconfig YAML.
     #[prost(string, tag = "1")]
@@ -2105,7 +2105,7 @@ pub struct KubernetesKubeconfigResponse {
 /// Graceful shutdown request from host.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ShutdownRequest {
     /// Grace period in seconds for processes to exit after SIGTERM.
     /// 0 means use the agent's default (currently 25 seconds).
@@ -2115,7 +2115,7 @@ pub struct ShutdownRequest {
 /// Shutdown acknowledgement. Sent before the agent begins teardown.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ShutdownResponse {
     /// Always true when the agent accepts the request.
     #[prost(bool, tag = "1")]
@@ -2126,7 +2126,7 @@ pub struct ShutdownResponse {
 /// Used by the ABX-362 E2E harness. Not intended for production callers.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MmapReadFileRequest {
     /// Absolute guest path (typically a file inside a VirtioFS mount).
     #[prost(string, tag = "1")]
@@ -2142,12 +2142,12 @@ pub struct MmapReadFileRequest {
 /// Response to `MmapReadFileRequest`.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MmapReadFileResponse {
     /// Bytes read, trimmed to the originally requested length.
     #[prost(bytes = "vec", tag = "1")]
     pub data: ::prost::alloc::vec::Vec<u8>,
-    /// Number of bytes actually read (<= length). Short if file smaller
+    /// Number of bytes actually read (\<= length). Short if file smaller
     /// than offset+length.
     #[prost(uint64, tag = "2")]
     pub bytes_read: u64,
@@ -2196,7 +2196,7 @@ pub struct IpamConfig {
 /// IPAM subnet configuration.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct IpamSubnet {
     /// Subnet in CIDR format.
     #[prost(string, tag = "1")]
@@ -2211,7 +2211,7 @@ pub struct IpamSubnet {
 /// Response to create network.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateNetworkResponse {
     /// Network ID.
     #[prost(string, tag = "1")]
@@ -2223,7 +2223,7 @@ pub struct CreateNetworkResponse {
 /// Request to remove a network.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RemoveNetworkRequest {
     /// Network ID or name.
     #[prost(string, tag = "1")]
@@ -2282,7 +2282,7 @@ pub struct NetworkSummary {
 /// Request to inspect a network.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InspectNetworkRequest {
     /// Network ID or name.
     #[prost(string, tag = "1")]
@@ -2335,7 +2335,7 @@ pub struct NetworkInfo {
 /// Container connected to a network.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NetworkContainer {
     /// Container name.
     #[prost(string, tag = "1")]
@@ -2356,7 +2356,7 @@ pub struct NetworkContainer {
 /// The System VM's hypervisor backend.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SystemVmBackendInfo {
     #[prost(enumeration = "SystemVmBackend", tag = "1")]
     pub backend: i32,
@@ -2364,7 +2364,7 @@ pub struct SystemVmBackendInfo {
 /// Request to switch the System VM's hypervisor backend.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SetSystemVmBackendRequest {
     #[prost(enumeration = "SystemVmBackend", tag = "1")]
     pub backend: i32,
@@ -2389,7 +2389,7 @@ pub struct VirtioDebugInfo {
 /// Cumulative exit counters for one vCPU.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VcpuDebug {
     #[prost(uint32, tag = "1")]
     pub vcpu: u32,
@@ -2455,7 +2455,7 @@ pub struct VirtioDeviceDebug {
 /// address was configured and lies inside guest RAM.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VirtioQueueDebug {
     /// Queue index within the device.
     #[prost(uint32, tag = "1")]
@@ -2492,12 +2492,12 @@ pub struct VirtioQueueDebug {
 /// Request to get system info.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetInfoRequest {}
 /// Response to get system info.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetInfoResponse {
     /// Number of containers.
     #[prost(int64, tag = "1")]
@@ -2554,12 +2554,12 @@ pub struct GetInfoResponse {
 /// Request to get version.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetVersionRequest {}
 /// Response to get version.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetVersionResponse {
     /// Version string.
     #[prost(string, tag = "1")]
@@ -2589,12 +2589,12 @@ pub struct GetVersionResponse {
 /// Request to ping the server.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SystemPingRequest {}
 /// Response to ping.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SystemPingResponse {
     /// API version.
     #[prost(string, tag = "1")]
@@ -2669,7 +2669,7 @@ pub struct PruneRequest {
 /// Response to prune.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PruneResponse {
     /// Space reclaimed in bytes.
     #[prost(uint64, tag = "1")]
@@ -2690,7 +2690,7 @@ pub struct PruneResponse {
 /// Request to get the icon URL for a container image.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetImageIconRequest {
     /// Fully qualified image name (e.g., "nginx", "localstack/localstack", "ghcr.io/astral-sh/uv").
     #[prost(string, tag = "1")]
@@ -2699,7 +2699,7 @@ pub struct GetImageIconRequest {
 /// Response containing the icon URL.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetImageIconResponse {
     /// Icon URL, empty if not found.
     #[prost(string, tag = "1")]
@@ -2731,7 +2731,7 @@ pub struct CreateVolumeRequest {
 /// Response to create volume.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateVolumeResponse {
     /// Volume name.
     #[prost(string, tag = "1")]
@@ -2746,7 +2746,7 @@ pub struct CreateVolumeResponse {
 /// Request to remove a volume.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RemoveVolumeRequest {
     /// Volume name.
     #[prost(string, tag = "1")]
@@ -2780,7 +2780,7 @@ pub struct ListVolumesResponse {
 /// Request to inspect a volume.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InspectVolumeRequest {
     /// Volume name.
     #[prost(string, tag = "1")]
@@ -2825,7 +2825,7 @@ pub struct VolumeInfo {
 /// Volume usage data.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct VolumeUsage {
     /// Size in bytes.
     #[prost(int64, tag = "1")]
@@ -2837,7 +2837,7 @@ pub struct VolumeUsage {
 /// Request to prepare a migration.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PrepareMigrationRequest {
     /// Stable source runtime identifier (for example, "docker-desktop" or "orbstack").
     #[prost(string, tag = "1")]
@@ -2852,7 +2852,7 @@ pub struct PrepareMigrationRequest {
 /// Prepared migration summary.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PrepareMigrationResponse {
     /// Opaque identifier for the prepared plan.
     #[prost(string, tag = "1")]
@@ -2888,7 +2888,7 @@ pub struct PrepareMigrationResponse {
 /// Request to run a prepared migration.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RunMigrationRequest {
     /// Opaque identifier returned by PrepareMigration.
     #[prost(string, tag = "1")]
@@ -2900,7 +2900,7 @@ pub struct RunMigrationRequest {
 /// Streaming migration progress event.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RunMigrationEvent {
     /// Opaque identifier of the plan being executed.
     #[prost(string, tag = "1")]
@@ -2930,7 +2930,7 @@ pub struct RunMigrationEvent {
 /// Shell input for interactive sessions.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ShellInput {
     /// Input data.
     #[prost(bytes = "vec", tag = "1")]
@@ -2942,7 +2942,7 @@ pub struct ShellInput {
 /// Shell output for interactive sessions.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ShellOutput {
     /// Output data.
     #[prost(bytes = "vec", tag = "1")]
@@ -2957,7 +2957,7 @@ pub struct ShellOutput {
 /// Terminal size.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TerminalSize {
     /// Terminal width.
     #[prost(uint32, tag = "1")]
@@ -2971,7 +2971,7 @@ pub struct TerminalSize {
 /// without managing its lifecycle.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SetupStatus {
     /// Current daemon phase.
     #[prost(enumeration = "setup_status::Phase", tag = "1")]

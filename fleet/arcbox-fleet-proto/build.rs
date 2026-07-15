@@ -8,7 +8,7 @@
 fn main() {
     let proto = "proto/arcbox/fleet/v1/fleet.proto";
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
         .compile_protos(&[proto], &["proto"])
