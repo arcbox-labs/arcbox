@@ -71,7 +71,8 @@ pub(super) enum VmEvent {
 /// Balloon target requested by a transition; the actor applies it idempotently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BalloonTarget {
-    /// Shrink to the idle reservation to return memory to the host.
+    /// Start the usage-aware idle shrink (guest memory probe + policy in
+    /// `balloon.rs`); returns unused memory to the host.
     Idle,
     /// Restore to the VM's full configured memory.
     Full,

@@ -29,6 +29,7 @@
 //! ```
 
 mod actor;
+mod balloon;
 mod boot;
 mod health;
 mod machine;
@@ -70,12 +71,9 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 /// Maximum retry attempts for recovery.
 const DEFAULT_MAX_RETRIES: u32 = 3;
 
-/// Minimum balloon target in MB when VM is idle.
-/// Below this, the guest may become unstable.
-const IDLE_BALLOON_TARGET_MB: u64 = 128;
-
-/// Interval of the actor's idle ticker, and thereby the delay before the
-/// balloon shrinks once the idle timeout has elapsed.
+/// Interval of the actor's idle ticker: the delay before the balloon
+/// shrinks once the idle timeout has elapsed, and the granularity of the
+/// idle re-target cadence (`balloon::IDLE_RETARGET_INTERVAL_SECS`).
 const BALLOON_SHRINK_DELAY_SECS: u64 = 10;
 
 /// Persistent guest dockerd data image name.
@@ -196,6 +194,9 @@ impl VmLifecycleManager {
             restart_generation: AtomicU64::new(0),
             last_activity_ms: AtomicU64::new(now_ms),
             balloon_shrunk: AtomicBool::new(false),
+            balloon_target: AtomicU64::new(0),
+            balloon_epoch: AtomicU64::new(0),
+            balloon_apply: Mutex::new(()),
             kubernetes_hold: AtomicBool::new(false),
         });
 
