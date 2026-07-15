@@ -126,6 +126,11 @@ pub(in crate::vm_lifecycle) const PRESSURE_MIN_AVAILABLE: u64 = 128 * 1024 * 102
 /// tunable for a future smarter signal (e.g. PSI).
 pub(in crate::vm_lifecycle) const PRESSURE_MAX_REFAULT_RATE: u64 = 0;
 
+/// PSI trigger threshold requested from the agent: microseconds of full
+/// (all non-idle tasks) memory stall within the agent's 1s window. Only
+/// effective on kernels with `CONFIG_PSI`; older guests sample instead.
+pub(in crate::vm_lifecycle) const PRESSURE_PSI_FULL_STALL_US: u64 = 100_000;
+
 /// Watch window requested from the agent; the watch is re-opened when it
 /// elapses.
 pub(in crate::vm_lifecycle) const WATCH_WINDOW: Duration = Duration::from_secs(300);

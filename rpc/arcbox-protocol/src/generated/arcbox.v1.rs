@@ -1615,6 +1615,12 @@ pub struct WatchMemoryPressureRequest {
     /// Keepalive cadence in milliseconds (0 = agent default).
     #[prost(uint32, tag = "4")]
     pub keepalive_ms: u32,
+    /// PSI trigger threshold: microseconds of full (all non-idle tasks)
+    /// memory stall within the agent's 1s window before pressure fires.
+    /// 0 = agent default. Used only on kernels with CONFIG_PSI; older
+    /// kernels fall back to MemAvailable/refault sampling.
+    #[prost(uint64, tag = "5")]
+    pub psi_full_stall_us: u64,
 }
 /// One frame on the memory pressure stream.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1640,7 +1646,11 @@ pub mod memory_pressure_event {
     pub enum Reason {
         /// Watch established (first frame) or periodic keepalive.
         Keepalive = 0,
-        /// MemAvailable fell below the requested floor.
+        /// MemAvailable fell below the requested floor. PSI stall trips
+        /// are also reported under this reason: a new enum value would be
+        /// decoded as KEEPALIVE by older hosts (proto3 open enums), which
+        /// must never happen to a pressure frame. The agent log records
+        /// the true trigger.
         LowAvailable = 1,
         /// Page refault rate exceeded the requested threshold.
         RefaultSpike = 2,

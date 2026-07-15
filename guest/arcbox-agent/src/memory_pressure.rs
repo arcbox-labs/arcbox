@@ -41,6 +41,27 @@ pub const ARM_AFTER_HEALTHY_SAMPLES: u32 = 3;
 /// this cap bounds the worst-case self-heal latency.
 pub const SETTLE_CAP_SAMPLES: u32 = 60;
 
+/// PSI trigger window in microseconds. Fixed at 1s: the kernel accepts
+/// windows of 500ms–10s, and 1s matches the sampler cadence the trigger
+/// replaces.
+pub const PSI_WINDOW_US: u32 = 1_000_000;
+
+/// Default PSI trigger threshold: 100ms of full (all non-idle tasks)
+/// memory stall within [`PSI_WINDOW_US`].
+pub const PSI_DEFAULT_FULL_STALL_US: u32 = 100_000;
+
+/// Resolves the host-requested PSI stall threshold (µs): 0 means the
+/// agent default, and the kernel rejects thresholds above the window.
+#[must_use]
+pub fn psi_stall_threshold_us(requested: u64) -> u32 {
+    if requested == 0 {
+        return PSI_DEFAULT_FULL_STALL_US;
+    }
+    u32::try_from(requested)
+        .unwrap_or(PSI_WINDOW_US)
+        .min(PSI_WINDOW_US)
+}
+
 /// Thresholds for a pressure watch, provided by the host per request.
 ///
 /// A zero threshold disables that signal.
@@ -286,6 +307,25 @@ mod tests {
             d.evaluate(64 * MIB, 5000),
             Some(PressureSignal::LowAvailable)
         );
+    }
+
+    #[test]
+    fn psi_threshold_zero_uses_default() {
+        assert_eq!(psi_stall_threshold_us(0), PSI_DEFAULT_FULL_STALL_US);
+    }
+
+    #[test]
+    fn psi_threshold_clamps_to_window() {
+        assert_eq!(
+            psi_stall_threshold_us(u64::from(PSI_WINDOW_US) * 10),
+            PSI_WINDOW_US
+        );
+        assert_eq!(psi_stall_threshold_us(u64::MAX), PSI_WINDOW_US);
+    }
+
+    #[test]
+    fn psi_threshold_passes_sane_values() {
+        assert_eq!(psi_stall_threshold_us(150_000), 150_000);
     }
 
     /// Hardware-validated regression #1: balloon inflation evicts the page

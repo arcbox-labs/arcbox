@@ -223,7 +223,8 @@ impl BalloonDeps for RealBalloonDeps {
 
     async fn open_pressure_watch(&self) -> Result<AgentPressureWatch> {
         use super::balloon::controller::{
-            PRESSURE_MAX_REFAULT_RATE, PRESSURE_MIN_AVAILABLE, WATCH_KEEPALIVE, WATCH_WINDOW,
+            PRESSURE_MAX_REFAULT_RATE, PRESSURE_MIN_AVAILABLE, PRESSURE_PSI_FULL_STALL_US,
+            WATCH_KEEPALIVE, WATCH_WINDOW,
         };
 
         let mut agent = self.connect_agent()?;
@@ -233,6 +234,7 @@ impl BalloonDeps for RealBalloonDeps {
                 min_available_bytes: PRESSURE_MIN_AVAILABLE,
                 max_refault_rate: PRESSURE_MAX_REFAULT_RATE,
                 keepalive_ms: u32::try_from(WATCH_KEEPALIVE.as_millis()).unwrap_or(u32::MAX),
+                psi_full_stall_us: PRESSURE_PSI_FULL_STALL_US,
             })
             .await?;
         let mut watch = AgentPressureWatch { agent };

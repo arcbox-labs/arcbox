@@ -16,8 +16,8 @@ use arcbox_protocol::agent::memory_pressure_event::Reason;
 use arcbox_protocol::agent::{MemoryPressureEvent, WatchMemoryPressureRequest};
 
 use crate::memory_pressure::{
-    PressureDetector, PressureSignal, PressureThresholds, parse_mem_available,
-    parse_workingset_refaults,
+    PSI_WINDOW_US, PressureDetector, PressureSignal, PressureThresholds, parse_mem_available,
+    parse_workingset_refaults, psi_stall_threshold_us,
 };
 use crate::rpc::{MessageType, write_message};
 
@@ -29,6 +29,85 @@ const DEFAULT_WINDOW: Duration = Duration::from_secs(300);
 
 /// Default keepalive cadence when the request leaves `keepalive_ms` at 0.
 const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(10);
+
+/// An event observed by the PSI trigger thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PsiEvent {
+    /// The kernel reported the stall threshold crossed.
+    Stall,
+    /// Poll timeout: time for a keepalive (and a floor check).
+    Tick,
+    /// The trigger fd failed; PSI watching cannot continue.
+    Lost,
+}
+
+/// A registered trigger on `/proc/pressure/memory`, delivering
+/// [`PsiEvent`]s from a dedicated blocking poll thread.
+///
+/// While the trigger is armed and the guest is quiet, the agent wakes only
+/// on the poll timeout (keepalive cadence) — versus every second in the
+/// sampling fallback — and the kernel itself decides when stall time
+/// crosses the threshold.
+struct PsiTrigger {
+    events: tokio::sync::mpsc::Receiver<PsiEvent>,
+}
+
+impl PsiTrigger {
+    /// Registers a `full <stall_us> <window>` trigger and spawns the poll
+    /// thread. Fails on kernels without `CONFIG_PSI` (or with PSI disabled),
+    /// in which case the caller stays on the sampling path.
+    fn open(stall_us: u32, tick: Duration) -> std::io::Result<Self> {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/proc/pressure/memory")?;
+        // "full": all non-idle tasks stalled simultaneously — a single
+        // thrashing task still accrues it, while plain heavy I/O does not.
+        //
+        // The registration must reach the kernel as ONE write(2): psi_write
+        // parses each write as a complete trigger spec (`write!` on an
+        // unbuffered File would issue one syscall per format fragment and
+        // the first, "full ", fails with EINVAL). It must also be
+        // NUL-terminated — the kernel replaces the last written byte with
+        // a NUL before parsing, per the PSI docs' `strlen + 1` example.
+        let trigger = format!("full {stall_us} {PSI_WINDOW_US}\0");
+        file.write_all(trigger.as_bytes())?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let tick_ms = i32::try_from(tick.as_millis()).unwrap_or(i32::MAX);
+        std::thread::spawn(move || {
+            let fd = file.as_raw_fd();
+            loop {
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLPRI,
+                    revents: 0,
+                };
+                // SAFETY: pfd is a valid pollfd for the duration of the call;
+                // `file` (and thus fd) lives for the whole loop.
+                let n = unsafe { libc::poll(&mut pfd, 1, tick_ms) };
+                let event = match n {
+                    0 => PsiEvent::Tick,
+                    n if n > 0 && pfd.revents & libc::POLLERR == 0 => PsiEvent::Stall,
+                    _ => PsiEvent::Lost,
+                };
+                // Receiver dropped (watch ended) or trigger lost: exit; the
+                // fd closes with `file`.
+                if tx.blocking_send(event).is_err() || event == PsiEvent::Lost {
+                    return;
+                }
+            }
+        });
+        Ok(Self { events: rx })
+    }
+
+    async fn next(&mut self) -> PsiEvent {
+        self.events.recv().await.unwrap_or(PsiEvent::Lost)
+    }
+}
 
 /// One `/proc` sample: available bytes and the cumulative refault counter.
 fn read_sample() -> Option<(u64, u64)> {
@@ -130,6 +209,38 @@ where
             );
             last_keepalive = now;
             write_event(stream, trace_id, Reason::Settled, available, refault_rate).await?;
+
+            // Armed: upgrade to a kernel PSI trigger when the kernel has
+            // one. The trigger is registered only now, so inflation-phase
+            // stall never feeds it, and the sampling loop below is fully
+            // replaced (keepalives ride the poll timeout).
+            let stall_us = psi_stall_threshold_us(req.psi_full_stall_us);
+            match PsiTrigger::open(stall_us, keepalive) {
+                Ok(psi) => {
+                    tracing::info!(
+                        trace_id = %trace_id,
+                        stall_us,
+                        "PSI trigger armed; sampling paused"
+                    );
+                    return watch_armed_psi(
+                        stream,
+                        psi,
+                        req.min_available_bytes,
+                        window,
+                        started,
+                        trace_id,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    // Mode selection is a load-bearing observability event:
+                    // ops must be able to tell which detection path runs.
+                    tracing::info!(
+                        trace_id = %trace_id,
+                        "PSI unavailable ({e}); staying on the sampling path"
+                    );
+                }
+            }
         }
         match signal {
             Some(signal) => {
@@ -152,6 +263,63 @@ where
                 write_event(stream, trace_id, Reason::Keepalive, available, refault_rate).await?;
             }
             None => {}
+        }
+    }
+}
+
+/// Armed-phase loop over a PSI trigger: the agent sleeps in the poll
+/// thread and wakes only on kernel stall events or the keepalive tick
+/// (which doubles as a coarse `MemAvailable` floor check).
+async fn watch_armed_psi<S>(
+    stream: &mut S,
+    mut psi: PsiTrigger,
+    min_available_bytes: u64,
+    window: Duration,
+    started: tokio::time::Instant,
+    trace_id: &str,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    loop {
+        if started.elapsed() >= window {
+            write_event(stream, trace_id, Reason::WindowElapsed, 0, 0).await?;
+            return Ok(());
+        }
+        match psi.next().await {
+            PsiEvent::Stall => {
+                let available = read_sample().map_or(0, |(available, _)| available);
+                tracing::info!(
+                    trace_id = %trace_id,
+                    available_bytes = available,
+                    "Memory pressure detected (PSI full-stall trigger)"
+                );
+                write_event(stream, trace_id, Reason::LowAvailable, available, 0).await?;
+            }
+            PsiEvent::Tick => {
+                // Unreadable signals must not trip the floor — a keepalive
+                // still means "agent alive", matching the sampling path.
+                let Some((available, _)) = read_sample() else {
+                    write_event(stream, trace_id, Reason::Keepalive, 0, 0).await?;
+                    continue;
+                };
+                if min_available_bytes > 0 && available < min_available_bytes {
+                    tracing::info!(
+                        trace_id = %trace_id,
+                        available_bytes = available,
+                        "Memory pressure detected (available floor, PSI mode)"
+                    );
+                    write_event(stream, trace_id, Reason::LowAvailable, available, 0).await?;
+                } else {
+                    write_event(stream, trace_id, Reason::Keepalive, available, 0).await?;
+                }
+            }
+            PsiEvent::Lost => {
+                // Ending the watch makes the host fail open (restore full),
+                // which is the safe direction when pressure can no longer
+                // be observed.
+                anyhow::bail!("PSI trigger lost");
+            }
         }
     }
 }
