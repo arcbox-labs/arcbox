@@ -11,6 +11,11 @@
 //! incident) and require the guest-driven pressure exit: balloon restored,
 //! Docker responsive, no reclaim storm.
 //!
+//! The whole cycle runs under a persistent `docker events` subscription —
+//! the desktop UI holds one for its entire lifetime, and counting that
+//! passive stream as VM activity once pinned `active_ops` and disabled
+//! idle reclaim outright on desktop installs.
+//!
 //! Balloon moves have no RPC surface; the daemon log is the only oracle
 //! for them. That is an explicit exception to the "readiness only via
 //! `WatchSetupStatus`" rule — readiness itself still uses `wait_ready`.
@@ -22,7 +27,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use arcbox_e2e::boot_assets::{resolve_boot_version, stage_dev_boot_assets};
 use arcbox_e2e::daemon::{DaemonConfig, DaemonHandle};
-use arcbox_e2e::docker::docker_output;
+use arcbox_e2e::docker::{docker_output, docker_stream};
 use arcbox_e2e::metrics::RunMetrics;
 
 static TRACING: Once = Once::new();
@@ -106,6 +111,10 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
 
     let image = std::env::var("ARCBOX_E2E_IMAGE").unwrap_or_else(|_| "alpine:latest".to_owned());
     metrics.time("docker_pull", || ensure_image(data_dir, &image))?;
+
+    // Persistent observer, held open for the whole cycle: the idle shrink
+    // below must engage despite this live `/events` subscription.
+    let mut events = docker_stream(data_dir, &["events"]).context("subscribing to events")?;
 
     // The ballast: hold ~256 MB immediately (tmpfs pages persist regardless
     // of process lifetime), then grow by 2 GiB after the VM has idled and
@@ -218,6 +227,12 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
     if !log_contains(data_dir, r#""from":"idle","to":"running""#)? {
         bail!("balloon restore did not ride the lifecycle state machine");
     }
+
+    // The whole cycle ran under a live events subscription — prove the
+    // observer survived, so the shrink above really happened despite it.
+    events
+        .assert_alive()
+        .context("events subscription died mid-scenario")?;
 
     docker_output(data_dir, &["rm", "-f", "ballast"], DOCKER_ATTEMPT).ok();
     Ok(())
