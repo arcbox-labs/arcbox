@@ -57,13 +57,33 @@ const VIRTIO_BALLOON_F_REPORTING: u64 = 1 << 5;
 const QUEUE_INFLATE: u16 = 0;
 /// Deflate queue index.
 const QUEUE_DEFLATE: u16 = 1;
-/// Free page reporting queue index. Fixed per the virtio spec / Linux
-/// driver (`VIRTIO_BALLOON_VQ_REPORTING = 4`); indices 2 (stats) and 3
-/// (free-page hinting) exist as slots even when those features are not
-/// negotiated.
-const QUEUE_REPORTING: u16 = 4;
+/// Stats virtqueue feature bit — not advertised, but its bit position
+/// participates in [`reporting_queue_index`].
+const VIRTIO_BALLOON_F_STATS_VQ: u64 = 1 << 1;
+/// Free-page-hinting feature bit — not advertised; see above.
+const VIRTIO_BALLOON_F_FREE_PAGE_HINT: u64 = 1 << 3;
 
-/// Number of per-queue cursor slots ([`QUEUE_REPORTING`] is the highest).
+/// Transport-level index of the reporting queue for a negotiated feature
+/// set.
+///
+/// The driver-side `VIRTIO_BALLOON_VQ_*` enum is only an array position:
+/// the MMIO transport numbers queues *densely* over the virtqueues that
+/// actually exist (`vm_find_vqs` skips NULL-named entries without
+/// consuming an index). With neither stats nor free-page hinting
+/// negotiated, reporting is queue 2, right after inflate/deflate.
+const fn reporting_queue_index(features: u64) -> u16 {
+    let mut idx = 2;
+    if features & VIRTIO_BALLOON_F_STATS_VQ != 0 {
+        idx += 1;
+    }
+    if features & VIRTIO_BALLOON_F_FREE_PAGE_HINT != 0 {
+        idx += 1;
+    }
+    idx
+}
+
+/// Number of per-queue cursor slots (the reporting queue is the highest,
+/// at most index 4 with every optional queue negotiated).
 const QUEUE_SLOTS: usize = 5;
 
 /// Traditional-balloon page size — fixed 4 KiB per spec §5.5.6.
@@ -223,9 +243,10 @@ impl VirtioDevice for VirtioBalloon {
             return Ok(Vec::new());
         }
         let reporting_negotiated = self.features & VIRTIO_BALLOON_F_REPORTING != 0;
+        let queue_reporting = reporting_queue_index(self.features);
         let known = queue_idx == QUEUE_INFLATE
             || queue_idx == QUEUE_DEFLATE
-            || (queue_idx == QUEUE_REPORTING && reporting_negotiated);
+            || (queue_idx == queue_reporting && reporting_negotiated);
         if !known {
             return Ok(Vec::new());
         }
@@ -266,7 +287,7 @@ impl VirtioDevice for VirtioBalloon {
                     // device-writable descriptor directly addresses a free
                     // range the guest promises not to touch until the chain
                     // completes. Release the backing and complete.
-                    QUEUE_REPORTING if desc.is_write() => {
+                    q if q == queue_reporting && desc.is_write() => {
                         let ram_ptr = queue.mem().ptr();
                         let ram_len = queue.mem().len();
                         chain_pages_handled +=
@@ -557,6 +578,29 @@ mod tests {
         let mut b = VirtioBalloon::new();
         b.ack_features(b.features());
         b
+    }
+
+    /// The queue index the driver will use for reporting under this
+    /// device's advertised feature set (no stats, no hinting → dense 2).
+    const QUEUE_REPORTING: u16 = 2;
+
+    #[test]
+    fn reporting_queue_index_is_dense() {
+        // Transport numbering skips queues whose features were not
+        // negotiated (vm_find_vqs does not consume an index for them).
+        assert_eq!(reporting_queue_index(VirtioBalloon::new().features()), 2);
+        assert_eq!(
+            reporting_queue_index(VIRTIO_BALLOON_F_REPORTING | VIRTIO_BALLOON_F_STATS_VQ),
+            3
+        );
+        assert_eq!(
+            reporting_queue_index(
+                VIRTIO_BALLOON_F_REPORTING
+                    | VIRTIO_BALLOON_F_STATS_VQ
+                    | VIRTIO_BALLOON_F_FREE_PAGE_HINT
+            ),
+            4
+        );
     }
 
     #[test]
