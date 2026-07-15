@@ -74,8 +74,8 @@ enum Command {
     /// Start the local control-plane API (`agent.sock`) and, once enrolled,
     /// attach to the gateway and run dispatched jobs until terminated.
     ///
-    /// Unlike `run`, a credential is not required at startup: if one is
-    /// already persisted this behaves like `run`, but with none it idles
+    /// Unlike `quick run`, a credential is not required at startup: if one is
+    /// already persisted this behaves like `quick run`, but with none it idles
     /// until an `Enroll` call arrives over the socket (the desktop-managed
     /// handoff) or `unenroll`/`enroll` change that from another
     /// invocation. This is what a launchd LaunchAgent should invoke.
@@ -235,7 +235,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             // runners once this fires.
             let shutdown = spawn_shutdown_signal("termination signal received; draining runners");
 
-            // `run` opens no control socket, so nothing ever subscribes to
+            // `quick run` opens no control socket, so nothing ever subscribes to
             // this over `Watch` — but `RunnerSupervisor` still reads
             // admission thresholds live from it, so it's load-bearing.
             let agent_state = AgentState::new(&seed);
