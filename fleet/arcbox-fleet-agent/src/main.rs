@@ -109,17 +109,6 @@ enum Command {
         /// supports.
         kinds: Vec<String>,
     },
-    /// Install a per-user LaunchAgent so `serve` starts on login (macOS).
-    ///
-    /// Installs the invoking binary into the managed path
-    /// (`<data_dir>/bin/arcbox-fleet-agent`) that self-update owns, renders
-    /// the plist against it and the agent's data-dir log path, writes it to
-    /// `~/Library/LaunchAgents/`, and `launchctl bootstrap`s it into the
-    /// current GUI session.
-    InstallService,
-    /// Remove the LaunchAgent installed by `install-service` (macOS).
-    /// Idempotent — safe to run when nothing is installed.
-    UninstallService,
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,6 +127,17 @@ enum QuickCommand {
     ///
     /// Does not stop a concurrently running `quick run` process.
     Unenroll,
+    /// Install a per-user LaunchAgent so `serve` starts on login (macOS).
+    ///
+    /// Installs the invoking binary into the managed path
+    /// (`<data_dir>/bin/arcbox-fleet-agent`) that self-update owns, renders
+    /// the plist against it and the agent's data-dir log path, writes it to
+    /// `~/Library/LaunchAgents/`, and `launchctl bootstrap`s it into the
+    /// current GUI session.
+    InstallService,
+    /// Remove the LaunchAgent installed by `quick install-service` (macOS).
+    /// Idempotent — safe to run when nothing is installed.
+    UninstallService,
 }
 
 #[derive(Debug, Args)]
@@ -507,8 +507,8 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             }
             Ok(())
         }
-        Command::InstallService => install_service(&config),
-        Command::UninstallService => uninstall_service(),
+        Command::Quick(QuickCommand::InstallService) => install_service(&config),
+        Command::Quick(QuickCommand::UninstallService) => uninstall_service(),
     }
 }
 
@@ -524,8 +524,8 @@ fn install_service(config: &AgentConfig) -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn install_service(_config: &AgentConfig) -> Result<()> {
     anyhow::bail!(
-        "install-service is only implemented for macOS; Linux systemd (user unit) support \
-         is planned as a follow-up"
+        "quick install-service is only implemented for macOS; Linux systemd (user unit) \
+         support is planned as a follow-up"
     )
 }
 
@@ -537,8 +537,8 @@ fn uninstall_service() -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn uninstall_service() -> Result<()> {
     anyhow::bail!(
-        "uninstall-service is only implemented for macOS; Linux systemd (user unit) support \
-         is planned as a follow-up"
+        "quick uninstall-service is only implemented for macOS; Linux systemd (user unit) \
+         support is planned as a follow-up"
     )
 }
 
