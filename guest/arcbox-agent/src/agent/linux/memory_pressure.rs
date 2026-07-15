@@ -106,6 +106,7 @@ where
             continue;
         };
 
+        let was_armed = detector.is_armed();
         let refault_rate = match previous {
             Some((at, count)) => {
                 let elapsed = now.duration_since(at).as_secs_f64();
@@ -119,7 +120,16 @@ where
         };
         previous = Some((now, refaults));
 
-        match detector.evaluate(available, refault_rate) {
+        let signal = detector.evaluate(available, refault_rate);
+        if !was_armed && detector.is_armed() {
+            tracing::info!(
+                trace_id = %trace_id,
+                available_bytes = available,
+                elapsed_secs = started.elapsed().as_secs(),
+                "memory pressure detector armed (guest settled after shrink)"
+            );
+        }
+        match signal {
             Some(signal) => {
                 let reason = match signal {
                     PressureSignal::LowAvailable => Reason::LowAvailable,

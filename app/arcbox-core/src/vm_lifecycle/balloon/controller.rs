@@ -100,8 +100,13 @@ const DEGRADED_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// and the degraded-poll check. Safely below the entry headroom (256 MiB).
 pub(in crate::vm_lifecycle) const PRESSURE_MIN_AVAILABLE: u64 = 128 * 1024 * 1024;
 
-/// Refault-rate threshold (pages/second) for the watch request.
-pub(in crate::vm_lifecycle) const PRESSURE_MAX_REFAULT_RATE: u64 = 2000;
+/// Refault-rate threshold (pages/second) for the watch request. Disabled:
+/// hardware validation showed the post-shrink page-cache rewarm produces
+/// refault bursts that outlive any warm-up, and refaulting with healthy
+/// `MemAvailable` is cache warming, not pressure — the floor plus the
+/// silence fail-open cover the thrash class. The plumbing stays host-
+/// tunable for a future smarter signal (e.g. PSI).
+pub(in crate::vm_lifecycle) const PRESSURE_MAX_REFAULT_RATE: u64 = 0;
 
 /// Watch window requested from the agent; the watch is re-opened when it
 /// elapses.

@@ -19,6 +19,26 @@
 /// text pages in) that are not sustained thrash.
 pub const REFAULT_CONSECUTIVE_SAMPLES: u32 = 2;
 
+/// Healthy samples (`MemAvailable` at or above the floor) required before
+/// the detector arms.
+///
+/// A watch opens right after the host sets a lower balloon target, and the
+/// inflation itself pollutes both signals until it converges: it evicts the
+/// page cache (a large refault burst as background daemons re-touch their
+/// mappings) and pins `MemAvailable` near zero for the whole inflation —
+/// tens of seconds for a many-GiB shrink, hardware-validated. Fixed-length
+/// warm-ups cannot cover a duration set by inflation speed, so the detector
+/// instead *arms* on the first evidence of a settled guest: consecutive
+/// healthy readings.
+pub const ARM_AFTER_HEALTHY_SAMPLES: u32 = 3;
+
+/// Samples after which a detector that never armed trips anyway.
+///
+/// A guest that never reaches a healthy reading is not still inflating —
+/// its entry target was undersized (usage grew between the probe and the
+/// inflation). Restoring then is the correct fail-safe.
+pub const SETTLE_CAP_SAMPLES: u32 = 180;
+
 /// Thresholds for a pressure watch, provided by the host per request.
 ///
 /// A zero threshold disables that signal.
@@ -41,9 +61,19 @@ pub enum PressureSignal {
 }
 
 /// Stateful trip decision across successive samples.
+///
+/// Starts in a *settling* phase while balloon inflation converges: the
+/// refault signal is ignored and only [`SETTLE_CAP_SAMPLES`] going by
+/// without a single healthy streak trips (as `LowAvailable`). After
+/// [`ARM_AFTER_HEALTHY_SAMPLES`] consecutive healthy readings the detector
+/// arms: the floor trips instantly, refault after
+/// [`REFAULT_CONSECUTIVE_SAMPLES`] consecutive hits.
 #[derive(Debug)]
 pub struct PressureDetector {
     thresholds: PressureThresholds,
+    armed: bool,
+    samples_seen: u32,
+    healthy_streak: u32,
     refault_hits: u32,
 }
 
@@ -53,8 +83,17 @@ impl PressureDetector {
     pub fn new(thresholds: PressureThresholds) -> Self {
         Self {
             thresholds,
+            armed: false,
+            samples_seen: 0,
+            healthy_streak: 0,
             refault_hits: 0,
         }
+    }
+
+    /// Whether the settling phase has completed.
+    #[must_use]
+    pub fn is_armed(&self) -> bool {
+        self.armed
     }
 
     /// Feeds one sample. `refault_rate` is pages/second since the previous
@@ -63,11 +102,34 @@ impl PressureDetector {
     pub fn evaluate(&mut self, available_bytes: u64, refault_rate: u64) -> Option<PressureSignal> {
         let floor = self.thresholds.min_available_bytes;
         let refault = self.thresholds.max_refault_rate;
+        self.samples_seen = self.samples_seen.saturating_add(1);
 
-        if refault > 0 && refault_rate >= refault {
-            self.refault_hits += 1;
-        } else {
+        if !self.armed {
+            if available_bytes >= floor {
+                self.healthy_streak += 1;
+                if self.healthy_streak >= ARM_AFTER_HEALTHY_SAMPLES {
+                    self.armed = true;
+                }
+            } else {
+                self.healthy_streak = 0;
+            }
+            if !self.armed {
+                // Never-settled guests get their memory back after the cap;
+                // anything before that is inflation still converging. A
+                // healthy sample mid-streak is progress, not a trip.
+                if self.samples_seen >= SETTLE_CAP_SAMPLES && available_bytes < floor {
+                    return Some(PressureSignal::LowAvailable);
+                }
+                return None;
+            }
+            // Freshly armed on a healthy sample: nothing to trip yet.
+            return None;
+        }
+
+        if refault == 0 || refault_rate < refault {
             self.refault_hits = 0;
+        } else {
+            self.refault_hits += 1;
         }
 
         if floor > 0 && available_bytes < floor {
@@ -127,6 +189,16 @@ mod tests {
         }
     }
 
+    /// A detector armed by three healthy samples.
+    fn armed(min_available: u64, max_refault: u64) -> PressureDetector {
+        let mut d = PressureDetector::new(thresholds(min_available, max_refault));
+        for _ in 0..ARM_AFTER_HEALTHY_SAMPLES {
+            assert_eq!(d.evaluate(u64::MAX, 0), None);
+        }
+        assert!(d.is_armed(), "three healthy samples must arm the detector");
+        d
+    }
+
     #[test]
     fn meminfo_parses_mem_available_kb() {
         let meminfo = "MemTotal:       16384000 kB\nMemFree:          262144 kB\nMemAvailable:     524288 kB\nBuffers:            1024 kB\n";
@@ -164,26 +236,20 @@ mod tests {
     }
 
     #[test]
-    fn low_available_trips_immediately() {
-        let mut d = PressureDetector::new(thresholds(128 * MIB, 0));
+    fn low_available_trips_immediately_once_armed() {
+        let mut d = armed(128 * MIB, 0);
         assert_eq!(d.evaluate(64 * MIB, 0), Some(PressureSignal::LowAvailable));
     }
 
     #[test]
     fn available_above_floor_does_not_trip() {
-        let mut d = PressureDetector::new(thresholds(128 * MIB, 0));
+        let mut d = armed(128 * MIB, 0);
         assert_eq!(d.evaluate(256 * MIB, 0), None);
     }
 
     #[test]
-    fn zero_floor_disables_available_signal() {
-        let mut d = PressureDetector::new(thresholds(0, 0));
-        assert_eq!(d.evaluate(0, 0), None);
-    }
-
-    #[test]
     fn refault_spike_requires_consecutive_samples() {
-        let mut d = PressureDetector::new(thresholds(0, 2000));
+        let mut d = armed(0, 2000);
         assert_eq!(d.evaluate(u64::MAX, 5000), None, "first hit must not trip");
         assert_eq!(
             d.evaluate(u64::MAX, 5000),
@@ -194,7 +260,7 @@ mod tests {
 
     #[test]
     fn refault_dip_resets_consecutive_count() {
-        let mut d = PressureDetector::new(thresholds(0, 2000));
+        let mut d = armed(0, 2000);
         assert_eq!(d.evaluate(u64::MAX, 5000), None);
         assert_eq!(d.evaluate(u64::MAX, 100), None, "dip resets the streak");
         assert_eq!(d.evaluate(u64::MAX, 5000), None, "streak restarts");
@@ -206,17 +272,82 @@ mod tests {
 
     #[test]
     fn zero_refault_threshold_disables_refault_signal() {
-        let mut d = PressureDetector::new(thresholds(0, 0));
+        let mut d = armed(0, 0);
         assert_eq!(d.evaluate(u64::MAX, u64::MAX), None);
     }
 
     #[test]
     fn low_available_wins_over_refault_spike() {
-        let mut d = PressureDetector::new(thresholds(128 * MIB, 2000));
+        let mut d = armed(128 * MIB, 2000);
         assert_eq!(d.evaluate(u64::MAX, 5000), None);
         assert_eq!(
             d.evaluate(64 * MIB, 5000),
             Some(PressureSignal::LowAvailable)
         );
+    }
+
+    /// Hardware-validated regression #1: balloon inflation evicts the page
+    /// cache, and the refault burst from background daemons re-warming it
+    /// must not trip a restore while the guest is still settling. (The
+    /// burst can outlive arming, which is why the host disables the
+    /// refault signal by default and relies on the floor.)
+    #[test]
+    fn settling_ignores_post_inflation_refault_burst() {
+        let mut d = PressureDetector::new(thresholds(128 * MIB, 2000));
+        // Healthy memory + refault burst: settling, then arming, no trip.
+        assert_eq!(d.evaluate(256 * MIB, 50_000), None);
+        assert_eq!(d.evaluate(256 * MIB, 50_000), None);
+        assert_eq!(d.evaluate(256 * MIB, 50_000), None);
+        assert!(d.is_armed());
+        // Once armed, a sustained burst counts as thrash again.
+        assert_eq!(d.evaluate(256 * MIB, 50_000), None);
+        assert_eq!(
+            d.evaluate(256 * MIB, 50_000),
+            Some(PressureSignal::RefaultSpike)
+        );
+    }
+
+    /// Hardware-validated regression #2: `MemAvailable` is pinned near zero
+    /// for the whole inflation (tens of seconds for a many-GiB shrink). The
+    /// floor must not trip until the guest has settled once, however long
+    /// the inflation takes.
+    #[test]
+    fn settling_tolerates_arbitrarily_long_inflation() {
+        let mut d = PressureDetector::new(thresholds(128 * MIB, 0));
+        for _ in 0..(SETTLE_CAP_SAMPLES - 1) {
+            assert_eq!(d.evaluate(0, 0), None, "inflation must not trip the floor");
+        }
+        assert!(!d.is_armed());
+        // Inflation converges; the guest settles and the detector arms.
+        for _ in 0..ARM_AFTER_HEALTHY_SAMPLES {
+            assert_eq!(d.evaluate(256 * MIB, 0), None);
+        }
+        assert!(d.is_armed());
+        // Armed: real pressure now trips instantly.
+        assert_eq!(d.evaluate(64 * MIB, 0), Some(PressureSignal::LowAvailable));
+    }
+
+    /// A guest that never settles was undersized by the entry probe;
+    /// restoring at the cap is the fail-safe.
+    #[test]
+    fn never_settling_trips_at_the_cap() {
+        let mut d = PressureDetector::new(thresholds(128 * MIB, 0));
+        for _ in 0..(SETTLE_CAP_SAMPLES - 1) {
+            assert_eq!(d.evaluate(0, 0), None);
+        }
+        assert_eq!(d.evaluate(0, 0), Some(PressureSignal::LowAvailable));
+    }
+
+    #[test]
+    fn settling_healthy_streak_resets_on_dip() {
+        let mut d = PressureDetector::new(thresholds(128 * MIB, 0));
+        assert_eq!(d.evaluate(256 * MIB, 0), None);
+        assert_eq!(d.evaluate(256 * MIB, 0), None);
+        assert_eq!(d.evaluate(0, 0), None, "dip resets the healthy streak");
+        assert!(!d.is_armed());
+        for _ in 0..ARM_AFTER_HEALTHY_SAMPLES {
+            assert_eq!(d.evaluate(256 * MIB, 0), None);
+        }
+        assert!(d.is_armed());
     }
 }
