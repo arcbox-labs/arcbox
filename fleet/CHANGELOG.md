@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.1.1](https://github.com/arcboxlabs/arcbox/compare/fleet-agent-v0.1.0...fleet-agent-v0.1.1) (2026-07-15)
+
+
+### Features
+
+* **fleet:** drain and self-update on gateway update pushes ([72f4e5d](https://github.com/arcboxlabs/arcbox/commit/72f4e5d5c22ffd6fa062ded3707052c3db3cac86))
+* **fleet:** install-service — user LaunchAgent for start-on-login on macOS ([082a663](https://github.com/arcboxlabs/arcbox/commit/082a663d13a218659057ca4bb885504476c4f79c))
+* **fleet:** prepare macos_runner_image through the daemon's ImagePull ([192a230](https://github.com/arcboxlabs/arcbox/commit/192a2300bee770c09b546700ce7263f0e47b7e97))
+* **fleet:** quick self-update — CDN-driven manual update ([cab36b7](https://github.com/arcboxlabs/arcbox/commit/cab36b77d04e1df82e53727c83c035724eb640c9))
+* **fleet:** redesign gateway handshake around agent_version ([8a4e68e](https://github.com/arcboxlabs/arcbox/commit/8a4e68efa75d622985aa72a9502f6abde03a9423))
+* **fleet:** route darwin jobs through the macOS VM backend ([6f416e8](https://github.com/arcboxlabs/arcbox/commit/6f416e8882f8d1f490089fce2c6ba3540e1cb268))
+* **fleet:** self-update executor and managed binary layout ([73844b3](https://github.com/arcboxlabs/arcbox/commit/73844b35bef529cca5b954aabe2649667ad2e373))
+* **fleet:** sync self-update proto and report host platform ([4836062](https://github.com/arcboxlabs/arcbox/commit/4836062730722c4449de6dffadcfe8c739f32186))
+* **fleet:** vm_mode and macos_runner_image settings (RUN-31) ([1200a49](https://github.com/arcboxlabs/arcbox/commit/1200a49c1958cfd5fcf696efe689d2434e6284ba))
+* **fleet:** VmRunner — daemon probe, ephemeral macOS guest lifecycle, ssh exec ([2167dd5](https://github.com/arcboxlabs/arcbox/commit/2167dd5cf7ccf73a2f5f0e5a879fd2b087c3e7e7))
+
+
+### Bug Fixes
+
+* **fleet:** point default gateway at gateway.fleet.arcbox.dev ([d419b46](https://github.com/arcboxlabs/arcbox/commit/d419b467785e25c6134a3064a81eb7d685dbd8af))
+* **fleet:** send the first heartbeat before waiting on the Attach response ([b4cd6cf](https://github.com/arcboxlabs/arcbox/commit/b4cd6cffee50ec5d3f3cd74840d52de3bce6a7f2))
+
+
+### Code Refactoring
+
+* **fleet:** isolate socketless lifecycle commands under quick ([#391](https://github.com/arcboxlabs/arcbox/issues/391)) ([2245979](https://github.com/arcboxlabs/arcbox/commit/22459798a2ed0bd92f633f6bcfe1cc4deba81cee))
+* **fleet:** move install-service under quick ([2102d79](https://github.com/arcboxlabs/arcbox/commit/2102d790f02b59e1a970902b9983a21a0fdc36be))
+
+
+### Tests
+
+* **fleet:** ignored end-to-end VM round-trip against a live daemon ([5092827](https://github.com/arcboxlabs/arcbox/commit/5092827a55402696ea348a98d50123ae9764b370))
+
+
+### Documentation
+
+* **fleet:** correct self-update trust model and swap semantics ([224eedb](https://github.com/arcboxlabs/arcbox/commit/224eedbd7a11b41d68a1592593bb505123ea0d8b))
+
+
+### Styles
+
+* **fleet:** rustfmt update.rs ([7d6fb40](https://github.com/arcboxlabs/arcbox/commit/7d6fb40e6c5a322af49f25bf053d568be5dfac12))
+
 ## 0.1.0 (2026-07-14)
 
 
