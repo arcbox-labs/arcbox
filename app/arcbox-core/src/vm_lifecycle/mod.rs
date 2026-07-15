@@ -330,6 +330,19 @@ impl VmLifecycleManager {
             .await
     }
 
+    /// Records external activity (e.g. a proxied Docker API request),
+    /// resetting the idle clock and exiting idle if the VM is there.
+    ///
+    /// Cheap and non-blocking — safe to call on every request. Unlike
+    /// [`Self::ensure_ready`] it never boots a stopped VM.
+    pub fn note_activity(&self) {
+        self.shared.record_activity();
+        if *self.state_rx.borrow() == VmLifecycleState::Idle {
+            // Exit idle so the balloon is restored to full memory.
+            let _ = self.cmd_tx.send(Command::Activity);
+        }
+    }
+
     /// Enables or disables the Kubernetes lifecycle hold.
     #[allow(clippy::unused_async, reason = "public API compatibility")]
     pub async fn set_kubernetes_hold(&self, active: bool) {

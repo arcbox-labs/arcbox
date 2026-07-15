@@ -91,7 +91,11 @@ impl DockerApiServer {
         shutdown: CancellationToken,
     ) -> Result<()> {
         let connector = Arc::new(VsockConnector::new(Arc::clone(&self.runtime)));
-        let proxy = Arc::new(ProxyState::new(connector));
+        let activity_hook: crate::proxy::ActivityHook = {
+            let runtime = Arc::clone(&self.runtime);
+            Arc::new(move || runtime.note_system_vm_activity())
+        };
+        let proxy = Arc::new(ProxyState::new(connector).with_activity_hook(activity_hook));
 
         // Backstop host-networking teardown for containers that stop without a
         // stop/kill/remove API call (natural exit, --rm, prune, OOM, guest-side

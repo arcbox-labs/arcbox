@@ -293,6 +293,12 @@ impl Runtime {
         self.container_backend.ensure_ready().await
     }
 
+    /// Notes host-side activity on the System VM (idle-clock reset + idle
+    /// exit). Called per proxied Docker request; never boots a stopped VM.
+    pub fn note_system_vm_activity(&self) {
+        self.vm_lifecycle.note_activity();
+    }
+
     /// Captures a debug snapshot (virtio queues + vCPU exit counters)
     /// of the System VM.
     ///

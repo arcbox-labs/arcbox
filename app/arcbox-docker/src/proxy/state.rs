@@ -12,20 +12,34 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Notify;
 
+/// Callback invoked once per proxied Docker request, before any readiness
+/// caching. Wired to the VM lifecycle's activity tracking so host-side API
+/// traffic keeps the System VM out of idle memory reclaim.
+pub type ActivityHook = Arc<dyn Fn() + Send + Sync>;
+
 /// Guest proxy transport state shared by handlers.
 pub struct ProxyState {
     connector: Arc<dyn GuestConnector>,
     guest_http_client: GuestHttpClient,
     endpoint_readiness: EndpointReadiness,
+    activity_hook: Option<ActivityHook>,
 }
 
 impl ProxyState {
-    pub(crate) fn new(connector: Arc<dyn GuestConnector>) -> Self {
+    pub fn new(connector: Arc<dyn GuestConnector>) -> Self {
         Self {
             guest_http_client: GuestHttpClient::new(Arc::clone(&connector)),
             connector,
             endpoint_readiness: EndpointReadiness::new(),
+            activity_hook: None,
         }
+    }
+
+    /// Attaches the per-request activity hook.
+    #[must_use]
+    pub fn with_activity_hook(mut self, hook: ActivityHook) -> Self {
+        self.activity_hook = Some(hook);
+        self
     }
 
     pub(crate) fn connector(&self) -> &dyn GuestConnector {
@@ -48,7 +62,7 @@ impl ProxyState {
     /// they are reset before verifying. Because this check is synchronous with
     /// the request, it cannot race the restart the way an out-of-band event
     /// watcher would.
-    pub(crate) async fn ensure_endpoint_verified<F>(
+    pub async fn ensure_endpoint_verified<F>(
         &self,
         generation: u64,
         prepare_runtime: F,
@@ -56,6 +70,13 @@ impl ProxyState {
     where
         F: Future<Output = Result<()>>,
     {
+        // Before any caching: every proxied request is VM activity. With a
+        // warm readiness cache `prepare_runtime` (the lifecycle's activity
+        // path) never runs, and a loaded VM would otherwise be idled and
+        // ballooned into reclaim thrash (2026-07-15 incident).
+        if let Some(hook) = &self.activity_hook {
+            hook();
+        }
         self.reset_if_restarted(generation);
         self.endpoint_readiness
             .ensure_verified(prepare_runtime, || self.ping_guest())
