@@ -2,15 +2,22 @@
 //! machine credential) and unenroll (decommission the machine, revoking
 //! that credential server-side).
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use arcbox_fleet_proto::v1::fleet_gateway_service_client::FleetGatewayServiceClient;
 use arcbox_fleet_proto::v1::{Capability, EnrollRequest, UnenrollRequest};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::attach::authenticated_request;
 use crate::config::{AgentConfig, PROTOCOL_VERSION};
 use crate::credentials::Credential;
 use crate::host;
+
+/// Bound on the best-effort gateway `Unenroll` call. Generous for a healthy
+/// round-trip, but a blackholed gateway must not prevent the terminal local
+/// credential clear.
+const GATEWAY_UNENROLL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Call `Enroll` on `gateway` and return the machine credential — persisting
 /// it is the caller's job, done only once the caller has committed to the
@@ -59,12 +66,43 @@ pub async fn enroll(
     Ok(credential)
 }
 
-/// Call `Unenroll` on `gateway`, authenticated with `machine_token` — the
-/// server half of leaving the fleet: marks the machine decommissioned and
-/// revokes this credential. `UNAUTHENTICATED` means the credential is
-/// already revoked, which is exactly the state unenrolling wants, so it
-/// counts as success.
-pub async fn unenroll(config: &AgentConfig, gateway: &str, machine_token: &str) -> Result<()> {
+/// Decommission the machine at `gateway` on a best-effort, time-bounded basis,
+/// then remove its persisted credential unconditionally. Both control-plane
+/// and socketless unenrollment use this terminal workflow so remote failures
+/// cannot leave the host believing it is still enrolled.
+pub async fn unenroll_and_clear(
+    config: &AgentConfig,
+    gateway: &str,
+    credential: &Credential,
+) -> Result<()> {
+    match tokio::time::timeout(
+        GATEWAY_UNENROLL_TIMEOUT,
+        unenroll_gateway(config, gateway, &credential.machine_token),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(
+                error = %e,
+                gateway,
+                "gateway unenroll failed; clearing the local credential anyway"
+            );
+        }
+        Err(_) => {
+            warn!(
+                gateway,
+                "gateway unenroll timed out; clearing the local credential anyway"
+            );
+        }
+    }
+
+    config.credential_store_for(gateway).clear()
+}
+
+/// Call `Unenroll` on `gateway`, authenticated with `machine_token`. An
+/// already-revoked credential is the desired outcome and counts as success.
+async fn unenroll_gateway(config: &AgentConfig, gateway: &str, machine_token: &str) -> Result<()> {
     let channel = config
         .endpoint_for(gateway)?
         .connect()

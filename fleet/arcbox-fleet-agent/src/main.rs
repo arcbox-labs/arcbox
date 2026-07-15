@@ -53,7 +53,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::config::{AgentConfig, DockerMode};
-use crate::credentials::CredentialStore;
 use crate::docker::DockerRunner;
 use crate::settings::{PersistedSettings, SettingsStore};
 use crate::state::AgentState;
@@ -117,6 +116,11 @@ enum QuickCommand {
     /// Requires a credential from a prior `quick enroll` and does not expose
     /// the local control-plane API.
     Run,
+    /// Decommission the machine and remove its persisted credential without
+    /// contacting a running control server.
+    ///
+    /// Does not stop a concurrently running `quick run` process.
+    Unenroll,
 }
 
 #[derive(Debug, Args)]
@@ -212,12 +216,9 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             // without probing the runtime.
             let capabilities = capabilities(seed.runner_script.is_some(), None);
             let credential = enroll::enroll(&config, token, capabilities, &seed.gateway).await?;
-            CredentialStore::new(
-                config.credential_store,
-                config.credentials_path(),
-                &seed.gateway,
-            )
-            .store(&credential)?;
+            config
+                .credential_store_for(&seed.gateway)
+                .store(&credential)?;
             Ok(())
         }
         Command::Quick(QuickCommand::Run) => {
@@ -225,13 +226,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             let seed = load_or_seed_settings(&settings_store, &config)?;
             let docker = init_docker(seed.docker_mode, &seed.linux_runner_image).await?;
             let capabilities = capabilities(seed.runner_script.is_some(), docker.as_ref());
-            let credential = CredentialStore::new(
-                config.credential_store,
-                config.credentials_path(),
-                &seed.gateway,
-            )
-            .load()?
-            .context(
+            let credential = config.credential_store_for(&seed.gateway).load()?.context(
                 "no credential found — run `arcbox-fleet-agent quick enroll --token-file …` first",
             )?;
             info!(machine_id = %credential.machine_id, "starting fleet agent");
@@ -260,6 +255,17 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 agent_state,
             )
             .await
+        }
+        Command::Quick(QuickCommand::Unenroll) => {
+            let settings_store = SettingsStore::new(config.settings_path());
+            let seed = load_or_seed_settings(&settings_store, &config)?;
+            let credential = config
+                .credential_store_for(&seed.gateway)
+                .load()?
+                .context("not enrolled")?;
+            enroll::unenroll_and_clear(&config, &seed.gateway, &credential).await?;
+            println!("unenrolled");
+            Ok(())
         }
         Command::Serve => {
             let settings_store = SettingsStore::new(config.settings_path());
