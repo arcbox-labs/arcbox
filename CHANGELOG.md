@@ -5,6 +5,126 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.18](https://github.com/arcboxlabs/arcbox/compare/v0.4.17...v0.4.18) (2026-07-15)
+
+
+### Features
+
+* **api:** cancel a macOS image pull when the client disconnects ([97480f5](https://github.com/arcboxlabs/arcbox/commit/97480f5ca87bafc69bf6f3f5ab96091db714c253))
+* **api:** ImageResolve RPC and landed-image summary on ImagePull ([3eab275](https://github.com/arcboxlabs/arcbox/commit/3eab2759630357558547dc9f49c375eafb04b104))
+* **api:** route macOS machines + image ops in MachineService (slice 6) ([782a52d](https://github.com/arcboxlabs/arcbox/commit/782a52d98e65d8f9747a72b8ef0c33327794e0c3))
+* **api:** serve macOS guests via dedicated MacosService ([ff125d0](https://github.com/arcboxlabs/arcbox/commit/ff125d0b07e40bdc5046944bb274698a46381117))
+* **balloon:** free page reporting on the HV backend ([#392](https://github.com/arcboxlabs/arcbox/issues/392)) ([a45bceb](https://github.com/arcboxlabs/arcbox/commit/a45bcebc85b5bb13133e73389ba42f27afdf5f09))
+* **ci:** mirror fleet-agent binaries to release CDN ([#389](https://github.com/arcboxlabs/arcbox/issues/389)) ([dae1dc4](https://github.com/arcboxlabs/arcbox/commit/dae1dc46b9c6fec06d8ea471f1c213a93e3076f5))
+* **cli:** full macOS guest lifecycle under `arcbox macos` ([29b0f4a](https://github.com/arcboxlabs/arcbox/commit/29b0f4ac586c061f9b4f615545e679cfcad03429))
+* **cli:** macOS machine create + macos image commands (slice 6) ([f33f49a](https://github.com/arcboxlabs/arcbox/commit/f33f49a80b3135e9ae412d6f9f307cf389f8e3d0))
+* **core:** add macOS base image registry + CoW clone (slice 4) ([daf226c](https://github.com/arcboxlabs/arcbox/commit/daf226c6aa69a2a4cb049aba395efa7bab0aa7df))
+* **core:** install macOS base images via the vz installer (slice 4) ([b20e365](https://github.com/arcboxlabs/arcbox/commit/b20e365cbf807618a8df8513fe8b8db1e97088a8))
+* **core:** macOS machine lifecycle — boot clones, 2-guest cap (slice 5) ([5f6f51a](https://github.com/arcboxlabs/arcbox/commit/5f6f51a55ed39f0bb0d9f60895bbbe1033e696e7))
+* **core:** published macOS image index/manifest schema and locations ([87003b3](https://github.com/arcboxlabs/arcbox/commit/87003b3180897270e6b1374892124b715753907c))
+* **core:** record stream/version/os provenance in macOS image metadata ([7c91d1c](https://github.com/arcboxlabs/arcbox/commit/7c91d1c3079432f216e7d34a27c2da1f757b735f))
+* **core:** resolve macOS image references without pulling ([5b25bf3](https://github.com/arcboxlabs/arcbox/commit/5b25bf3d99c19b272ff4f08bef0f2abcbef3ef7e))
+* **core:** resume pulls mid-stream and clean staging on cancellation ([021d6d0](https://github.com/arcboxlabs/arcbox/commit/021d6d0e02030cbf285cfc353a531cd3709a557d))
+* **core:** streaming macOS image pull with sparse zstd restore ([eeb82b5](https://github.com/arcboxlabs/arcbox/commit/eeb82b5b7b789c88db680599123549e18d1b2dae))
+* **core:** wire MacMachineManager into Runtime (slice 6) ([08cbf9e](https://github.com/arcboxlabs/arcbox/commit/08cbf9ebc7f90e8b5a0eb106fa876be1cb898763))
+* **daemon:** add --no-linux-vm (VM-host-only mode) ([fbd57e8](https://github.com/arcboxlabs/arcbox/commit/fbd57e8e6bb5866cd70eb93000af6df58834bc9e))
+* **fleet:** AgentState — push observable agent state to Watch subscribers ([cf4da21](https://github.com/arcboxlabs/arcbox/commit/cf4da215e2102fdf0602e6fc3d2c3fc1bc64843e))
+* **fleet:** install-service — user LaunchAgent for start-on-login on macOS ([082a663](https://github.com/arcboxlabs/arcbox/commit/082a663d13a218659057ca4bb885504476c4f79c))
+* **fleet:** local gRPC control-plane API on agent.sock (RUN-35 slice 1) ([1b70b37](https://github.com/arcboxlabs/arcbox/commit/1b70b3717ca4f87e3d6c970d1324faf176859868))
+* **fleet:** prepare macos_runner_image through the daemon's ImagePull ([192a230](https://github.com/arcboxlabs/arcbox/commit/192a2300bee770c09b546700ce7263f0e47b7e97))
+* **fleet:** redesign gateway handshake around agent_version ([8a4e68e](https://github.com/arcboxlabs/arcbox/commit/8a4e68efa75d622985aa72a9502f6abde03a9423))
+* **fleet:** scaffold local control-plane proto crate (RUN-35) ([1561507](https://github.com/arcboxlabs/arcbox/commit/15615071871d286e795f8889047ec00c1eb89af0))
+* **fleet:** self-update executor and managed binary layout ([73844b3](https://github.com/arcboxlabs/arcbox/commit/73844b35bef529cca5b954aabe2649667ad2e373))
+* **fleet:** VmRunner — daemon probe, ephemeral macOS guest lifecycle, ssh exec ([2167dd5](https://github.com/arcboxlabs/arcbox/commit/2167dd5cf7ccf73a2f5f0e5a879fd2b087c3e7e7))
+* **macos:** align image pull with schema-2 chunked CDN layout ([6dbb493](https://github.com/arcboxlabs/arcbox/commit/6dbb4939b4f7d09625887e9b8a2c9d9e740f10a4))
+* **macos:** attach NAT NIC so guests have working internet ([44a728f](https://github.com/arcboxlabs/arcbox/commit/44a728f4da2f460e7bf6c17e25d90c776ab6fd2a))
+* **macos:** download the latest IPSW for image pull ([346f47c](https://github.com/arcboxlabs/arcbox/commit/346f47c3f737b7e22d0fdcd64b56e42c32faf039))
+* **macos:** pinned guest MAC, DHCP-lease IP discovery, arcbox macos ip ([ff014d3](https://github.com/arcboxlabs/arcbox/commit/ff014d33f735a29472f395c88957424158b37ada))
+* **macos:** point image pulls at darwin.arcboxcdn.com ([9bd84a2](https://github.com/arcboxlabs/arcbox/commit/9bd84a26e42dfae4bad06be7498d6d566ab45d0a))
+* **macos:** pull base images by reference with streamed progress ([e366a2d](https://github.com/arcboxlabs/arcbox/commit/e366a2d6877cc99effd90b06a19f492eadc3970f))
+* **proto:** add dedicated MacosService for macOS guests ([0078e58](https://github.com/arcboxlabs/arcbox/commit/0078e58c54428bc82ba4599a4a880bbbb409a9cf))
+* **proto:** add macOS guest_os + macOS image RPCs to MachineService (slice 6) ([8683558](https://github.com/arcboxlabs/arcbox/commit/868355870521a0b3cbf3a54f2dcad984589fae1e))
+* **release:** build fleet agent for Intel macOS ([fb0aa74](https://github.com/arcboxlabs/arcbox/commit/fb0aa74c8fa939eab987c6d1b365e71661f6f670))
+* **release:** independent fleet-agent release train ([2e97137](https://github.com/arcboxlabs/arcbox/commit/2e971370c52326da304545cd4c7c8484cb48b45d))
+* **vz:** add graceful stop and save/restore to VM lifecycle ([5f4e3a7](https://github.com/arcboxlabs/arcbox/commit/5f4e3a7ae4cff9395964ff6bc66325d72b13568e))
+* **vz:** add macOS graphics device configuration ([eaa4f69](https://github.com/arcboxlabs/arcbox/commit/eaa4f6984b6aa651f07f8d9db0d8e942cb9c9bff))
+* **vz:** add macOS guest configuration surface ([399d133](https://github.com/arcboxlabs/arcbox/commit/399d1330a3158a616015906b0d96634300dd2efc))
+* **vz:** add macOS restore image + Gate A validate example ([8a7e115](https://github.com/arcboxlabs/arcbox/commit/8a7e11599fe4c03562222e4d338cd03d031017c1))
+* **vz:** add macos_probe fast config diagnostic ([8e19b19](https://github.com/arcboxlabs/arcbox/commit/8e19b19218dc808751f50d87272eb46ef9abd5df))
+* **vz:** add VZMacOSInstaller + Gate B install example ([cd0a305](https://github.com/arcboxlabs/arcbox/commit/cd0a3057fef5826bdb9f72b18248ce34884d0742))
+* **vz:** enrich NSError diagnostics for completion errors ([d53bda0](https://github.com/arcboxlabs/arcbox/commit/d53bda0259c823a097dc35965a5ce7341a1543fc))
+* **vz:** expose restore image URL + latest-url example ([a8ca25e](https://github.com/arcboxlabs/arcbox/commit/a8ca25e1515e8c914459716d6ecef36fd49a6e10))
+* **vz:** macOS install example reaches Gate B ([f2bd911](https://github.com/arcboxlabs/arcbox/commit/f2bd91139ead0972df861f0e7bf282026e38d4b1))
+
+
+### Bug Fixes
+
+* **ci:** bake musl sha256 into cache key ([758c370](https://github.com/arcboxlabs/arcbox/commit/758c3706c24af11508d87bfa0fb037e8a9e04449))
+* **ci:** build portable static fleet-agent with musl-cross on Ubuntu ([241bfef](https://github.com/arcboxlabs/arcbox/commit/241bfefa109577bc3f07e82efffbb77e71e653f1))
+* **ci:** pin sha256 of musl-cross toolchain ([c73c9fe](https://github.com/arcboxlabs/arcbox/commit/c73c9fe484aa9aa6d62f8fd4d7e2be5765a46b2a))
+* **ci:** vendor musl-cross toolchain to a GitHub Release ([#387](https://github.com/arcboxlabs/arcbox/issues/387)) ([218b8ca](https://github.com/arcboxlabs/arcbox/commit/218b8cad01058c76119607f5f8f8e8dc12f7213c))
+* **cli:** make macos image pull name a --name flag ([a9a0ace](https://github.com/arcboxlabs/arcbox/commit/a9a0aceeb9a146efee428321b698ff28d8454fc9))
+* **core:** drop redundant test import ([b83ee8c](https://github.com/arcboxlabs/arcbox/commit/b83ee8c47aab40268464e1862a1bee896d362a5b))
+* **core:** harden macOS machine lifecycle from code review ([b51692d](https://github.com/arcboxlabs/arcbox/commit/b51692db5d48862119e22b95996cd02b2c9dc6f8))
+* **core:** make local-file pulls cancellable ([b919133](https://github.com/arcboxlabs/arcbox/commit/b9191332e45ca179337bfa4d293a40e47b8ba056))
+* **fleet:** persist settings before credential in Enroll (RUN-35) ([c867b9a](https://github.com/arcboxlabs/arcbox/commit/c867b9a8e6c064a9b2d627c661479db6602dfc1c))
+* **fleet:** send the first heartbeat before waiting on the Attach response ([b4cd6cf](https://github.com/arcboxlabs/arcbox/commit/b4cd6cffee50ec5d3f3cd74840d52de3bce6a7f2))
+* **macos:** harden guest lifecycle against traversal and create/pull races ([0c8e09f](https://github.com/arcboxlabs/arcbox/commit/0c8e09fc43faed9a258c50fefd2bb8a8e7c8ea92))
+* **macos:** serialize machine lifecycle through runtime slot placeholders ([af6ec8f](https://github.com/arcboxlabs/arcbox/commit/af6ec8ffe18a4a1850bad56beb519de5c1e3333c))
+* **macos:** verify each disk chunk before decoding into the image ([fd28afb](https://github.com/arcboxlabs/arcbox/commit/fd28afb7f91747ddc5d9a489efb96ef9d3441250))
+* **release:** build the released tag, not the dispatching ref ([1836d60](https://github.com/arcboxlabs/arcbox/commit/1836d606bced7f3dfd6bf6a0e551fb9b5671e71c))
+* **release:** iterate all release PRs when refreshing Cargo.lock ([7d83b8d](https://github.com/arcboxlabs/arcbox/commit/7d83b8ddbca36231e4bcbfa4982d815ff52710a2))
+* **release:** mark packaged binaries executable in release tarballs ([5cce452](https://github.com/arcboxlabs/arcbox/commit/5cce452f6a44f5e1ebb6f537116a20ad6ec504a6))
+* **release:** read gh head branch field ([adca844](https://github.com/arcboxlabs/arcbox/commit/adca844569a93b3659acdbdcb7bece5c9705495f))
+* **release:** refresh every open release PR ([eb7155c](https://github.com/arcboxlabs/arcbox/commit/eb7155cff40d7227e839ba3b96f97a417dd9c922))
+* **release:** separate release PRs and bootstrap fleet-agent at 0.1.0 ([9ba2ad4](https://github.com/arcboxlabs/arcbox/commit/9ba2ad48650a824b9bcd0b6e1f8054114029802a))
+* structural idle-balloon redesign — guest-driven pressure exit + per-request activity ([#390](https://github.com/arcboxlabs/arcbox/issues/390)) ([d101071](https://github.com/arcboxlabs/arcbox/commit/d101071af7e85c477c9fbdd1f1e5fb2c863d0bec))
+* **virtio-console:** make PTY allocation thread-safe ([26638b2](https://github.com/arcboxlabs/arcbox/commit/26638b255fc65a7f118b8e63c9930ddbf26523ad))
+* **vz:** construct VZMacOSInstaller on the VM's dispatch queue ([66b5707](https://github.com/arcboxlabs/arcbox/commit/66b5707c32d33c9b098305658e18139117972572))
+* **vz:** release leaked NSURLs and return promptly on install completion ([a6ef602](https://github.com/arcboxlabs/arcbox/commit/a6ef60220121cd80235afc7f37334ccd27a286a3))
+* **vz:** use correct VZMacOSRestoreImage selectors ([0ac38d9](https://github.com/arcboxlabs/arcbox/commit/0ac38d99311eba9c3bc3af937cf28c29fd571a84))
+
+
+### Code Refactoring
+
+* **macos:** gate IPSW installer behind macos-ipsw-install feature ([17f974e](https://github.com/arcboxlabs/arcbox/commit/17f974e54f95aaea1631b12f19c45457b02360c3))
+* remove macOS from MachineService, leaving it Linux-only ([8ad89f1](https://github.com/arcboxlabs/arcbox/commit/8ad89f1158c560430b3aa95ccdcffb2d44446110))
+
+
+### Tests
+
+* **vz:** add macos_clone_boot diagnostic (verifies CoW clone + boot) ([6759d8a](https://github.com/arcboxlabs/arcbox/commit/6759d8a2835e96cb27c58adfb0151b07adf5fedc))
+
+
+### Documentation
+
+* **macos:** add macOS guest VM navigation map ([cffbf1c](https://github.com/arcboxlabs/arcbox/commit/cffbf1c27e9117c40a5a88564c0df3c8c0065e4d))
+* **macos:** document dedicated MacosService + `arcbox macos` noun ([2034153](https://github.com/arcboxlabs/arcbox/commit/2034153ab3154eff228ac235d7c0aa6308f3c230))
+* **macos:** usage, verification status, and zero-trust model (slice 7) ([e1a8060](https://github.com/arcboxlabs/arcbox/commit/e1a8060997ce0ac817f89a46a8f2a4008678e1a9))
+* **readme:** rewrite around container runtime positioning ([#351](https://github.com/arcboxlabs/arcbox/issues/351)) ([4e8374d](https://github.com/arcboxlabs/arcbox/commit/4e8374d863d0a88bf1a4dbb151f208283f19e08e))
+
+
+### Styles
+
+* **daemon:** rustfmt VM-host-only notice ([1b3dd7c](https://github.com/arcboxlabs/arcbox/commit/1b3dd7cfff267f8c5461a11c30de526adb9846b0))
+
+
+### Continuous Integration
+
+* **fleet:** enforce additive-only control-plane proto with buf breaking ([0637f19](https://github.com/arcboxlabs/arcbox/commit/0637f1923a042ee29f2ed046bec32e74cf1e6d1c))
+* **fleet:** move proto breaking check to its own parallel job ([6b23561](https://github.com/arcboxlabs/arcbox/commit/6b235616ef3591c78618b59a73c96fe00bf0b88b))
+* limit GITHUB_TOKEN to contents:read ([5fb0ede](https://github.com/arcboxlabs/arcbox/commit/5fb0ede756caeb19f7b135479c5aa9bce4b39814))
+
+
+### Miscellaneous Chores
+
+* **assets:** bump boot assets to 0.6.2 (kernel v0.0.17, PSI) ([#393](https://github.com/arcboxlabs/arcbox/issues/393)) ([f71df3c](https://github.com/arcboxlabs/arcbox/commit/f71df3c5d183c49cc8486b234508071f1a6d4d8e))
+* **master:** release fleet-agent 0.1.0 ([e77f65d](https://github.com/arcboxlabs/arcbox/commit/e77f65da32d628c7adf1d2fd00a9c5daeb147a1c))
+* **proto:** regenerate arcbox.v1.rs for ImageResolve ([216b2ff](https://github.com/arcboxlabs/arcbox/commit/216b2ffa19bec337a34d75138759a8258e8674f9))
+* **release-please:** drop release-as pin for fleet-agent ([#388](https://github.com/arcboxlabs/arcbox/issues/388)) ([5b83a46](https://github.com/arcboxlabs/arcbox/commit/5b83a464dd5e0cf4c0191ee408f13ac38f8cb4de))
+* **release:** reset fleet-agent version train to 0.0.0 ([e21516a](https://github.com/arcboxlabs/arcbox/commit/e21516aaf5bcad1e441f46e3203a833dab6c1a8a))
+* update Cargo.lock for release ([f563ddb](https://github.com/arcboxlabs/arcbox/commit/f563ddb1d7e81f1f1be3c2165b90f83e5c589e52))
+
 ## [0.4.17](https://github.com/arcboxlabs/arcbox/compare/v0.4.16...v0.4.17) (2026-07-08)
 
 
