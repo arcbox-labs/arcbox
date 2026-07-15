@@ -3,6 +3,7 @@
 //! Provides HTTP/1.1 client over vsock to forward requests, with support
 //! for streaming responses and HTTP upgrades (attach, exec, BuildKit).
 
+mod activity;
 mod connector;
 mod fallback;
 mod forward;
@@ -13,6 +14,7 @@ mod upgrade;
 mod upload;
 mod uri;
 
+pub use activity::ActivityClass;
 pub use connector::VsockConnector;
 pub(crate) use fallback::invalidate_on_guest_error;
 pub use fallback::proxy_fallback;

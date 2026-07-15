@@ -1,5 +1,6 @@
 //! Catch-all proxy handler for unmatched Docker API routes.
 
+use super::activity::{self, ActivityClass};
 use super::headers::HeaderMapProxyExt;
 use super::{forward, upgrade, upload};
 use crate::api::AppState;
@@ -25,6 +26,7 @@ use axum::http::Response;
         uri = %uri,
         utility_vm = "native",
         protocol = tracing::field::Empty,
+        idle_activity = tracing::field::Empty,
     ),
     err
 )]
@@ -33,7 +35,13 @@ pub async fn proxy_fallback(
     OriginalUri(uri): OriginalUri,
     req: axum::http::Request<Body>,
 ) -> Result<Response<Body>> {
-    ensure_system_vm_ready(&state).await?;
+    // Classified on the version-stripped URI; the versioned `uri` above is
+    // what gets forwarded to guest dockerd.
+    let class = activity::classify(req.method(), req.uri());
+    if class == ActivityClass::PassiveObservation {
+        tracing::Span::current().record("idle_activity", "passive");
+    }
+    ensure_system_vm_ready(&state, class).await?;
 
     if req.headers().wants_upgrade() {
         tracing::Span::current().record("protocol", "upgrade");
@@ -49,7 +57,7 @@ pub async fn proxy_fallback(
             &state,
             upload::proxy_streaming_upload(state.proxy.connector(), &uri, req).await,
         )
-        .map(|resp| hold_activity_for_response(&state, resp));
+        .map(|resp| hold_activity_for_response(&state, class, resp));
     }
 
     tracing::Span::current().record("protocol", "http");
@@ -57,7 +65,7 @@ pub async fn proxy_fallback(
         &state,
         forward::proxy_to_guest_stream_pooled(state.proxy.client(), &uri, req).await,
     )
-    .map(|resp| hold_activity_for_response(&state, resp))
+    .map(|resp| hold_activity_for_response(&state, class, resp))
 }
 
 /// Drops the cached endpoint readiness when — and only when — the proxy error

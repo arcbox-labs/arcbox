@@ -3,7 +3,7 @@
 use crate::api::AppState;
 use crate::error::{DockerError, Result};
 use crate::proxy;
-use crate::proxy::ActivityLease;
+use crate::proxy::{ActivityClass, ActivityLease};
 use axum::body::Body;
 use axum::http::{Request, Uri};
 use axum::response::Response;
@@ -13,12 +13,16 @@ use std::task::{Context, Poll};
 
 /// Ensures the system VM is up before any request reaches the connector, then
 /// verifies guest dockerd with a real Docker `_ping`.
-pub async fn ensure_system_vm_ready(state: &AppState) -> Result<()> {
+///
+/// `activity` decides whether this request counts toward idle tracking;
+/// passive observation streams verify the endpoint without touching the
+/// idle clock (see [`ActivityClass`]).
+pub async fn ensure_system_vm_ready(state: &AppState, activity: ActivityClass) -> Result<()> {
     let runtime = Arc::clone(&state.runtime);
     let generation = runtime.system_vm_restart_generation();
     state
         .proxy
-        .ensure_endpoint_verified(generation, async move {
+        .ensure_endpoint_verified(generation, activity, async move {
             runtime
                 .ensure_system_vm_ready()
                 .await
@@ -36,12 +40,12 @@ pub async fn proxy_to_system_vm(
     uri: &Uri,
     req: Request<Body>,
 ) -> Result<Response> {
-    ensure_system_vm_ready(state).await?;
+    ensure_system_vm_ready(state, ActivityClass::Active).await?;
     proxy::invalidate_on_guest_error(
         state,
         proxy::proxy_to_guest_stream_pooled(state.proxy.client(), uri, req).await,
     )
-    .map(|resp| hold_activity_for_response(state, resp))
+    .map(|resp| hold_activity_for_response(state, ActivityClass::Active, resp))
 }
 
 /// Forward an upload request to guest dockerd.
@@ -50,19 +54,28 @@ pub async fn proxy_upload_to_system_vm(
     uri: &Uri,
     req: Request<Body>,
 ) -> Result<Response> {
-    ensure_system_vm_ready(state).await?;
+    ensure_system_vm_ready(state, ActivityClass::Active).await?;
     proxy::invalidate_on_guest_error(
         state,
         proxy::proxy_streaming_upload(state.proxy.connector(), uri, req).await,
     )
-    .map(|resp| hold_activity_for_response(state, resp))
+    .map(|resp| hold_activity_for_response(state, ActivityClass::Active, resp))
 }
 
 /// Ties an activity lease to the response body, so a streaming operation
-/// (pull progress, build output, log follow) holds the VM out of idle until
-/// its last byte. Plain bodies drop the lease when they finish; either way
-/// the idle clock restarts at the operation's end.
-pub fn hold_activity_for_response(state: &AppState, resp: Response) -> Response {
+/// (pull progress, build output) holds the VM out of idle until its last
+/// byte. Plain bodies drop the lease when they finish; either way the idle
+/// clock restarts at the operation's end. Passive observation streams pass
+/// through untouched — watching the VM must not hold it out of idle (see
+/// [`ActivityClass`]).
+pub fn hold_activity_for_response(
+    state: &AppState,
+    activity: ActivityClass,
+    resp: Response,
+) -> Response {
+    if activity == ActivityClass::PassiveObservation {
+        return resp;
+    }
     let Some(lease) = state.proxy.activity_lease() else {
         return resp;
     };
