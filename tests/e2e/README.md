@@ -60,6 +60,15 @@ agent RPC, DAX, agent supervision, pause/resume, stop:
 cargo test -p arcbox-e2e --test hv_vmm -- --ignored --nocapture
 ```
 
+Idle-balloon regression (2026-07-15 incident) — boots a VZ daemon with a
+short idle timeout, holds a memory workload, lets the VM idle-shrink, then
+grows the workload inside the guest and requires the guest-driven pressure
+restore (no reclaim storm, Docker responsive):
+
+```bash
+cargo test -p arcbox-e2e --test idle_balloon -- --ignored --nocapture
+```
+
 Dual-backend matrix — the boot-assets scenario once per backend, VZ first.
 VZ is the oracle: HV-only red means an HV implementation bug, double red means
 the bug is above the hypervisor layer:
@@ -102,6 +111,8 @@ Environment variables read by the tests:
   guest cannot reach docker.io.
 - `ARCBOX_GUEST_DOCKER_VSOCK_PORT=<port>` — pass a custom guest Docker vsock
   port to `arcbox-daemon`.
+- `ARCBOX_IDLE_TIMEOUT_SECS=<secs>` — shorten the daemon's VM idle timeout
+  (default 300); the idle-balloon test sets it to 20.
 - `ARCBOX_HV_E2E_KERNEL` / `ARCBOX_HV_E2E_ROOTFS` / `ARCBOX_HV_E2E_TIMEOUT` /
   `ARCBOX_DATA_DIR` — HV probe overrides; see `src/bin/hv_e2e.rs`.
 - `ARCBOX_E2E_METRICS_DIR` / `ARCBOX_E2E_RUN_LABEL` — archive per-run phase

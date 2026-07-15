@@ -144,6 +144,15 @@ impl Runtime {
             vm_lifecycle_config.default_vm.kernel = Some(kernel.clone());
         }
 
+        // Dev/test knob (e.g. the idle-balloon e2e): shorten the idle
+        // timeout so an idle shrink happens within a test budget.
+        if let Ok(secs) = std::env::var(arcbox_constants::env::IDLE_TIMEOUT_SECS)
+            && let Ok(secs) = secs.parse::<u64>()
+            && secs > 0
+        {
+            vm_lifecycle_config.idle_timeout = std::time::Duration::from_secs(secs);
+        }
+
         Self::with_vm_lifecycle_config(config, vm_lifecycle_config)
     }
 
