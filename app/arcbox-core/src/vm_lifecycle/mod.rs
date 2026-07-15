@@ -45,7 +45,7 @@ use crate::error::{CoreError, Result};
 use crate::event::EventBus;
 use crate::machine::{MachineInfo, MachineManager};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -88,6 +88,22 @@ const DOCKER_DATA_IMAGE_SIZE_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
 pub use health::HealthMonitor;
 pub use recovery::{BackoffStrategy, RecoveryAction, RecoveryPolicy};
 pub use types::{DefaultVmConfig, VmLifecycleConfig, VmLifecycleState};
+
+/// Holds the VM out of idle while a host-side operation is in flight.
+///
+/// Returned by [`VmLifecycleManager::begin_activity`]; dropping it releases
+/// the hold and stamps fresh activity (the idle clock starts from the
+/// operation's *end*).
+pub struct ActivityScope {
+    shared: Arc<LifecycleShared>,
+}
+
+impl Drop for ActivityScope {
+    fn drop(&mut self) {
+        self.shared.active_ops.fetch_sub(1, Ordering::AcqRel);
+        self.shared.record_activity();
+    }
+}
 
 /// Deferred actor state, consumed when the actor is first started.
 ///
@@ -193,6 +209,7 @@ impl VmLifecycleManager {
             backend: AtomicU8::new(seeded_backend as u8),
             restart_generation: AtomicU64::new(0),
             last_activity_ms: AtomicU64::new(now_ms),
+            active_ops: AtomicUsize::new(0),
             kubernetes_hold: AtomicBool::new(false),
         });
 
@@ -341,6 +358,21 @@ impl VmLifecycleManager {
         if *self.state_rx.borrow() == VmLifecycleState::Idle {
             // Exit idle so the balloon is restored to full memory.
             let _ = self.cmd_tx.send(Command::Activity);
+        }
+    }
+
+    /// Like [`Self::note_activity`], but additionally holds the VM out of
+    /// idle until the returned scope is dropped.
+    ///
+    /// For long-lived proxied operations (image pulls, builds, log
+    /// streams): a request in flight is activity for its whole duration,
+    /// not just at its first byte — the 2026-07-15 follow-up incident had
+    /// an idle shrink squeeze a guest mid-pull.
+    pub fn begin_activity(&self) -> ActivityScope {
+        self.note_activity();
+        self.shared.active_ops.fetch_add(1, Ordering::AcqRel);
+        ActivityScope {
+            shared: Arc::clone(&self.shared),
         }
     }
 

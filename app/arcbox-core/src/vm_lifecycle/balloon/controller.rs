@@ -11,13 +11,19 @@
 //! Active ──EnterIdle──▶ probe guest (entry_decision)
 //!    ▲                     ├─ NotIdle ──activity()──▶ Active
 //!    │                     ├─ Keep ────────────────▶ IdleUnshrunk (retry 30s)
-//!    │                     └─ Shrink ─▶ set target ─▶ Watching
-//!    │                                                  │
-//!    │        pressure / watch error / silence ≥ 25s    │ watch unavailable
+//!    │                     └─ Shrink ─▶ step target ─▶ Watching ◀─┐
+//!    │                                                  │  Settled + more to
+//!    │                                                  │  shrink: next step,
+//!    │        pressure / watch error / silence ≥ 25s    │  fresh watch ──────┘
 //!    └────── restore full + activity() ◀───────────┬────▼
 //!                                                  └─ Polling (30s stats,
+//!                                                     step on healthy poll,
 //!                                                     fail open on silence)
 //! ```
+//!
+//! The descent is staged ([`super::SHRINK_STEP`] per move) because inflation
+//! speed is not under host control and each step's scarcity window should be
+//! short; the guest's `SETTLED` frame gates each further step.
 //!
 //! Exits always ride the lifecycle state machine: pressure and fail-open
 //! paths restore full memory immediately, then note activity, which exits
@@ -51,6 +57,8 @@ pub(in crate::vm_lifecycle) enum WatchFrame {
     Keepalive,
     /// Guest memory pressure detected.
     Pressure,
+    /// The guest settled at the current balloon target (detector armed).
+    Settled,
     /// The watch window elapsed; re-open to keep watching.
     WindowElapsed,
 }
@@ -89,6 +97,16 @@ pub(in crate::vm_lifecycle) trait BalloonDeps:
 /// Retry cadence while idle but not (yet) shrunk.
 const IDLE_ENTRY_RETRY: Duration = Duration::from_secs(30);
 
+/// Minimum dwell at each descent step before taking the next one.
+///
+/// The guest's `SETTLED` frame proves the guest is healthy at the current
+/// *memory level*, not that inflation caught up with the target — inflation
+/// lags and its speed is not under host control. Hardware-validated: without
+/// a dwell the descent outran inflation by many GiB and the deferred squeeze
+/// OOM-killed the workload faster than the 1s sampler could see. The dwell
+/// keeps the un-inflated lag bounded to roughly one step.
+const STEP_DWELL: Duration = Duration::from_secs(15);
+
 /// Maximum silence on an open watch before failing open. Must exceed the
 /// agent keepalive cadence (10s) with margin.
 const WATCH_SILENCE_DEADLINE: Duration = Duration::from_secs(25);
@@ -125,6 +143,12 @@ pub(in crate::vm_lifecycle) struct BalloonController<D: BalloonDeps> {
     deps: D,
     /// Notes lifecycle activity: resets the idle clock and exits `Idle`.
     activity: Arc<dyn Fn() + Send + Sync>,
+    /// Currently applied balloon target while shrunk.
+    applied: Option<u64>,
+    /// Final descent target; `applied > final` means more steps pending.
+    final_target: Option<u64>,
+    /// When the current step was applied (dwell pacing).
+    step_applied_at: Option<tokio::time::Instant>,
 }
 
 /// Controller mode; holds the open watch so drops cancel it naturally.
@@ -136,6 +160,14 @@ enum Mode<W> {
     IdleUnshrunk,
     /// Balloon shrunk; guest pressure watch open.
     Watching(W),
+    /// Guest settled before the step dwell elapsed: keep watching for
+    /// pressure, take the next step when the dwell timer fires.
+    Dwelling {
+        /// The open watch (pressure still exits during the dwell).
+        watch: W,
+        /// When the dwell completes.
+        until: tokio::time::Instant,
+    },
     /// Balloon shrunk; watch unavailable — polling stats instead.
     Polling,
 }
@@ -150,6 +182,9 @@ impl<D: BalloonDeps> BalloonController<D> {
             commands,
             deps,
             activity,
+            applied: None,
+            final_target: None,
+            step_applied_at: None,
         }
     }
 
@@ -186,7 +221,56 @@ impl<D: BalloonDeps> BalloonController<D> {
                         },
                         frame = watch.next_frame(WATCH_SILENCE_DEADLINE) => match frame {
                             Ok(WatchFrame::Keepalive) => Mode::Watching(watch),
+                            Ok(WatchFrame::Settled) => {
+                                if self.next_pending_step().is_none() {
+                                    // Final target reached; keep watching.
+                                    Mode::Watching(watch)
+                                } else {
+                                    // The guest settled at this memory level,
+                                    // but inflation lags the target: hold the
+                                    // remaining dwell (still watching for
+                                    // pressure) before the next step.
+                                    let applied_at = self
+                                        .step_applied_at
+                                        .unwrap_or_else(tokio::time::Instant::now);
+                                    Mode::Dwelling {
+                                        watch,
+                                        until: applied_at + STEP_DWELL,
+                                    }
+                                }
+                            }
                             Ok(WatchFrame::WindowElapsed) => self.open_watch().await,
+                            Ok(WatchFrame::Pressure) => self.fail_open("guest memory pressure"),
+                            Err(e) => self.fail_open(&format!(
+                                "pressure watch lost ({e}); guest may be too starved to answer"
+                            )),
+                        },
+                    }
+                }
+                Mode::Dwelling { mut watch, until } => {
+                    tokio::select! {
+                        cmd = self.commands.recv() => match cmd {
+                            Some(BalloonCommand::ExitIdle) => {
+                                self.restore("idle exit");
+                                Mode::Active
+                            }
+                            Some(BalloonCommand::EnterIdle) => Mode::Dwelling { watch, until },
+                            None => return,
+                        },
+                        () = tokio::time::sleep_until(until) => {
+                            // Each further step needs a fresh settling
+                            // detector: drop this watch before moving.
+                            drop(watch);
+                            self.continue_descent().await
+                        }
+                        frame = watch.next_frame(WATCH_SILENCE_DEADLINE) => match frame {
+                            Ok(WatchFrame::Keepalive | WatchFrame::Settled) => {
+                                Mode::Dwelling { watch, until }
+                            }
+                            Ok(WatchFrame::WindowElapsed) => match self.open_watch().await {
+                                Mode::Watching(watch) => Mode::Dwelling { watch, until },
+                                other => other,
+                            },
                             Ok(WatchFrame::Pressure) => self.fail_open("guest memory pressure"),
                             Err(e) => self.fail_open(&format!(
                                 "pressure watch lost ({e}); guest may be too starved to answer"
@@ -210,7 +294,15 @@ impl<D: BalloonDeps> BalloonController<D> {
                                 Some(s) if s.available < PRESSURE_MIN_AVAILABLE => {
                                     self.fail_open("guest available memory below floor")
                                 }
-                                Some(_) => Mode::Polling,
+                                // A healthy poll is the degraded mode's
+                                // settle signal: take the next step.
+                                Some(_) => match self.next_pending_step() {
+                                    Some(next) => {
+                                        self.apply_step(next);
+                                        Mode::Polling
+                                    }
+                                    None => Mode::Polling,
+                                },
                             }
                         }
                     }
@@ -220,7 +312,7 @@ impl<D: BalloonDeps> BalloonController<D> {
     }
 
     /// Entry probe: size the balloon from clean (balloon-empty) stats.
-    async fn enter_idle(&self) -> Mode<D::Watch> {
+    async fn enter_idle(&mut self) -> Mode<D::Watch> {
         let Some(full) = self.deps.full_memory_bytes() else {
             return Mode::IdleUnshrunk;
         };
@@ -232,18 +324,51 @@ impl<D: BalloonDeps> BalloonController<D> {
                 Mode::Active
             }
             EntryDecision::Keep => Mode::IdleUnshrunk,
-            EntryDecision::Shrink(target) => {
-                if let Err(e) = self.deps.set_balloon_target(target) {
+            EntryDecision::Shrink(final_target) => {
+                let first = super::next_step(full, final_target);
+                if let Err(e) = self.deps.set_balloon_target(first) {
                     tracing::warn!("failed to shrink idle balloon: {e}");
                     return Mode::IdleUnshrunk;
                 }
+                self.applied = Some(first);
+                self.final_target = Some(final_target);
+                self.step_applied_at = Some(tokio::time::Instant::now());
                 tracing::info!(
-                    target_mb = target / (1024 * 1024),
+                    target_mb = first / (1024 * 1024),
+                    final_mb = final_target / (1024 * 1024),
                     "idle balloon shrunk to guest usage + headroom"
                 );
                 self.open_watch().await
             }
         }
+    }
+
+    /// The next descent step, if the applied target is above the final one.
+    fn next_pending_step(&self) -> Option<u64> {
+        let (applied, final_target) = (self.applied?, self.final_target?);
+        (applied > final_target).then(|| super::next_step(applied, final_target))
+    }
+
+    /// Applies one descent step (best effort — a failed step leaves the
+    /// current, already-settled target in place).
+    fn apply_step(&mut self, next: u64) {
+        match self.deps.set_balloon_target(next) {
+            Ok(()) => {
+                self.applied = Some(next);
+                self.step_applied_at = Some(tokio::time::Instant::now());
+                tracing::info!(target_mb = next / (1024 * 1024), "idle balloon step");
+            }
+            Err(e) => tracing::warn!("failed to step idle balloon: {e}"),
+        }
+    }
+
+    /// Continues the staged descent after the guest settled, or keeps
+    /// watching at the final target.
+    async fn continue_descent(&mut self) -> Mode<D::Watch> {
+        if let Some(next) = self.next_pending_step() {
+            self.apply_step(next);
+        }
+        self.open_watch().await
     }
 
     /// Opens (or re-opens) the pressure watch, degrading to polling when
@@ -259,7 +384,7 @@ impl<D: BalloonDeps> BalloonController<D> {
     }
 
     /// Restores full memory and exits idle via the state machine.
-    fn fail_open(&self, reason: &str) -> Mode<D::Watch> {
+    fn fail_open(&mut self, reason: &str) -> Mode<D::Watch> {
         tracing::info!(reason, "restoring full memory");
         self.restore(reason);
         (self.activity)();
@@ -267,7 +392,10 @@ impl<D: BalloonDeps> BalloonController<D> {
     }
 
     /// Restores the balloon to the machine's full configured memory.
-    fn restore(&self, reason: &str) {
+    fn restore(&mut self, reason: &str) {
+        self.applied = None;
+        self.final_target = None;
+        self.step_applied_at = None;
         let Some(full) = self.deps.full_memory_bytes() else {
             return;
         };
@@ -316,6 +444,7 @@ mod tests {
         targets: Arc<Mutex<Vec<u64>>>,
         watch_supported: bool,
         watch_frames: Mutex<Vec<mpsc::UnboundedReceiver<WatchFrame>>>,
+        watch_senders: Mutex<Vec<mpsc::UnboundedSender<WatchFrame>>>,
         watches_opened: Arc<AtomicUsize>,
     }
 
@@ -327,6 +456,7 @@ mod tests {
                 targets: Arc::new(Mutex::new(Vec::new())),
                 watch_supported: true,
                 watch_frames: Mutex::new(Vec::new()),
+                watch_senders: Mutex::new(Vec::new()),
                 watches_opened: Arc::new(AtomicUsize::new(0)),
             }
         }
@@ -341,6 +471,7 @@ mod tests {
         fn push_watch(&self) -> mpsc::UnboundedSender<WatchFrame> {
             let (tx, rx) = mpsc::unbounded_channel();
             self.watch_frames.lock().unwrap().push(rx);
+            self.watch_senders.lock().unwrap().push(tx.clone());
             tx
         }
     }
@@ -386,6 +517,12 @@ mod tests {
                     frames: queued.remove(0),
                 })
             }
+        }
+    }
+
+    impl Harness {
+        fn watch_senders(&self) -> Vec<mpsc::UnboundedSender<WatchFrame>> {
+            self.deps.watch_senders.lock().unwrap().clone()
         }
     }
 
@@ -449,10 +586,13 @@ mod tests {
         }
     }
 
-    const IDLE_TARGET: u64 = 4 * GIB + super::super::IDLE_BALLOON_HEADROOM;
+    /// Final descent target for `idle_stats` (usage + headroom).
+    const FINAL_TARGET: u64 = 4 * GIB + super::super::IDLE_BALLOON_HEADROOM;
+    /// First staged step from 16 GiB full memory.
+    const FIRST_STEP: u64 = FULL - super::super::SHRINK_STEP;
 
     #[tokio::test(start_paused = true)]
-    async fn enter_idle_shrinks_to_usage_aware_target_and_watches() {
+    async fn enter_idle_takes_first_staged_step_and_watches() {
         let deps = FakeDeps::new(Some(FULL));
         deps.push_stats(Some(idle_stats()));
         let _watch = deps.push_watch();
@@ -461,9 +601,81 @@ mod tests {
         h.commands.send(BalloonCommand::EnterIdle).unwrap();
         h.settle().await;
 
-        assert_eq!(h.targets(), vec![IDLE_TARGET]);
+        // Usage-aware final, but only one SHRINK_STEP applied up front.
+        assert_eq!(h.targets(), vec![FIRST_STEP]);
         assert_eq!(h.deps.watches_opened.load(Ordering::SeqCst), 1);
         assert_eq!(h.activity_count(), 0);
+    }
+
+    /// Each guest `Settled` frame gates the next step; every step gets a
+    /// fresh watch (fresh settling detector).
+    #[tokio::test(start_paused = true)]
+    async fn staged_descent_steps_on_settled_frames() {
+        const STEP: u64 = super::super::SHRINK_STEP;
+        let deps = FakeDeps::new(Some(FULL));
+        deps.push_stats(Some(idle_stats()));
+        let watches: Vec<_> = (0..6).map(|_| deps.push_watch()).collect();
+        let h = Harness::spawn(deps);
+
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+
+        let expected = [
+            FULL - STEP,     // 14 GiB
+            FULL - 2 * STEP, // 12 GiB
+            FULL - 3 * STEP, // 10 GiB
+            FULL - 4 * STEP, // 8 GiB
+            FULL - 5 * STEP, // 6 GiB
+            FINAL_TARGET,    // clamp
+        ];
+        for (i, watch) in watches.iter().enumerate().take(expected.len() - 1) {
+            watch.send(WatchFrame::Settled).unwrap();
+            h.settle().await;
+            assert_eq!(
+                h.targets(),
+                expected[..=i].to_vec(),
+                "settling alone must not step — the dwell paces the descent"
+            );
+            tokio::time::advance(STEP_DWELL).await;
+            h.settle().await;
+            assert_eq!(h.targets(), expected[..i + 2].to_vec());
+        }
+        assert_eq!(
+            h.deps.watches_opened.load(Ordering::SeqCst),
+            expected.len(),
+            "each step must get a fresh watch"
+        );
+        assert_eq!(h.activity_count(), 0, "descent is not activity");
+
+        // At the final target, further Settled frames change nothing.
+        watches[5].send(WatchFrame::Settled).unwrap();
+        h.settle().await;
+        assert_eq!(h.targets(), expected.to_vec());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pressure_mid_descent_restores_full() {
+        let deps = FakeDeps::new(Some(FULL));
+        deps.push_stats(Some(idle_stats()));
+        let first = deps.push_watch();
+        let _second = deps.push_watch();
+        let h = Harness::spawn(deps);
+
+        h.commands.send(BalloonCommand::EnterIdle).unwrap();
+        h.settle().await;
+        first.send(WatchFrame::Settled).unwrap();
+        h.settle().await;
+        tokio::time::advance(STEP_DWELL).await;
+        h.settle().await;
+
+        // Pressure during the second step: full restore, not a re-step.
+        h.watch_senders()[1].send(WatchFrame::Pressure).unwrap();
+        h.settle().await;
+        assert_eq!(
+            h.targets(),
+            vec![FIRST_STEP, FULL - 2 * super::super::SHRINK_STEP, FULL]
+        );
+        assert_eq!(h.activity_count(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -499,7 +711,7 @@ mod tests {
 
         tokio::time::advance(IDLE_ENTRY_RETRY).await;
         h.settle().await;
-        assert_eq!(h.targets(), vec![IDLE_TARGET], "retry must re-probe");
+        assert_eq!(h.targets(), vec![FIRST_STEP], "retry must re-probe");
     }
 
     #[tokio::test(start_paused = true)]
@@ -515,7 +727,7 @@ mod tests {
         watch.send(WatchFrame::Pressure).unwrap();
         h.settle().await;
 
-        assert_eq!(h.targets(), vec![IDLE_TARGET, FULL]);
+        assert_eq!(h.targets(), vec![FIRST_STEP, FULL]);
         assert_eq!(h.activity_count(), 1);
     }
 
@@ -530,13 +742,13 @@ mod tests {
 
         h.commands.send(BalloonCommand::EnterIdle).unwrap();
         h.settle().await;
-        assert_eq!(h.targets(), vec![IDLE_TARGET]);
+        assert_eq!(h.targets(), vec![FIRST_STEP]);
 
         // No frames at all: silence past the deadline.
         tokio::time::advance(WATCH_SILENCE_DEADLINE + Duration::from_secs(1)).await;
         h.settle().await;
 
-        assert_eq!(h.targets(), vec![IDLE_TARGET, FULL]);
+        assert_eq!(h.targets(), vec![FIRST_STEP, FULL]);
         assert_eq!(h.activity_count(), 1);
         drop(watch);
     }
@@ -551,10 +763,13 @@ mod tests {
         h.commands.send(BalloonCommand::EnterIdle).unwrap();
         h.settle().await;
 
-        drop(watch); // channel closes → transport error
+        // Close the channel from every end (the deps keep a clone of each
+        // sender for mid-descent scripting) → transport error.
+        drop(watch);
+        h.deps.watch_senders.lock().unwrap().clear();
         h.settle().await;
 
-        assert_eq!(h.targets(), vec![IDLE_TARGET, FULL]);
+        assert_eq!(h.targets(), vec![FIRST_STEP, FULL]);
         assert_eq!(h.activity_count(), 1);
     }
 
@@ -573,7 +788,11 @@ mod tests {
         h.settle().await;
 
         assert_eq!(h.deps.watches_opened.load(Ordering::SeqCst), 2);
-        assert_eq!(h.targets(), vec![IDLE_TARGET], "no spurious restore");
+        assert_eq!(
+            h.targets(),
+            vec![FIRST_STEP],
+            "no spurious restore, no step"
+        );
         assert_eq!(h.activity_count(), 0);
     }
 
@@ -590,15 +809,23 @@ mod tests {
 
         h.commands.send(BalloonCommand::EnterIdle).unwrap();
         h.settle().await;
-        assert_eq!(h.targets(), vec![IDLE_TARGET]);
+        assert_eq!(h.targets(), vec![FIRST_STEP]);
 
         tokio::time::advance(DEGRADED_POLL_INTERVAL).await;
         h.settle().await;
         assert_eq!(h.activity_count(), 0, "healthy poll must not fail open");
+        assert_eq!(
+            h.targets(),
+            vec![FIRST_STEP, FULL - 2 * super::super::SHRINK_STEP],
+            "a healthy poll is the degraded mode's settle signal"
+        );
 
         tokio::time::advance(DEGRADED_POLL_INTERVAL).await;
         h.settle().await;
-        assert_eq!(h.targets(), vec![IDLE_TARGET, FULL]);
+        assert_eq!(
+            h.targets(),
+            vec![FIRST_STEP, FULL - 2 * super::super::SHRINK_STEP, FULL]
+        );
         assert_eq!(h.activity_count(), 1);
     }
 
@@ -619,7 +846,7 @@ mod tests {
         tokio::time::advance(DEGRADED_POLL_INTERVAL).await;
         h.settle().await;
 
-        assert_eq!(h.targets(), vec![IDLE_TARGET, FULL]);
+        assert_eq!(h.targets(), vec![FIRST_STEP, FULL]);
         assert_eq!(h.activity_count(), 1);
     }
 
@@ -635,7 +862,7 @@ mod tests {
         h.commands.send(BalloonCommand::ExitIdle).unwrap();
         h.settle().await;
 
-        assert_eq!(h.targets(), vec![IDLE_TARGET, FULL]);
+        assert_eq!(h.targets(), vec![FIRST_STEP, FULL]);
         assert_eq!(h.activity_count(), 0, "plain exit is not new activity");
     }
 

@@ -179,6 +179,9 @@ message MemoryPressureEvent {
         REFAULT_SPIKE = 2;
         // The watch window elapsed without pressure.
         WINDOW_ELAPSED = 3;
+        // The detector armed: the guest settled at the current balloon
+        // target. The host uses this to continue a staged shrink.
+        SETTLED = 4;
     }
 
     // Why this frame was emitted.

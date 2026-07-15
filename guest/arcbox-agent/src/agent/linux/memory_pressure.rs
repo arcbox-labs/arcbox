@@ -128,6 +128,8 @@ where
                 elapsed_secs = started.elapsed().as_secs(),
                 "memory pressure detector armed (guest settled after shrink)"
             );
+            last_keepalive = now;
+            write_event(stream, trace_id, Reason::Settled, available, refault_rate).await?;
         }
         match signal {
             Some(signal) => {

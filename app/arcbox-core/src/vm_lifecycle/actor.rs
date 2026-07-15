@@ -116,6 +116,10 @@ pub(super) struct LifecycleShared {
     pub(super) restart_generation: std::sync::atomic::AtomicU64,
     /// Timestamp of last activity (epoch millis, for idle detection).
     pub(super) last_activity_ms: std::sync::atomic::AtomicU64,
+    /// Live host-side operations (proxied Docker requests in flight). The
+    /// idle gate never fires while this is non-zero — a VM serving a pull
+    /// or build is not idle no matter how old the last activity stamp is.
+    pub(super) active_ops: std::sync::atomic::AtomicUsize,
     /// Whether Kubernetes holds the VM in the active state.
     pub(super) kubernetes_hold: std::sync::atomic::AtomicBool,
 }
@@ -253,6 +257,7 @@ impl PressureWatch for AgentPressureWatch {
         Ok(match event.reason() {
             Reason::Keepalive => WatchFrame::Keepalive,
             Reason::LowAvailable | Reason::RefaultSpike => WatchFrame::Pressure,
+            Reason::Settled => WatchFrame::Settled,
             Reason::WindowElapsed => WatchFrame::WindowElapsed,
         })
     }
@@ -682,6 +687,7 @@ impl LifecycleActor {
     fn on_idle_tick(&mut self, machine: &mut Machine) {
         if !self.shared.config.auto_stop
             || self.shared.kubernetes_hold.load(Ordering::Relaxed)
+            || self.shared.active_ops.load(Ordering::Acquire) > 0
             || self.public() != VmLifecycleState::Running
         {
             return;

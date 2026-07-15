@@ -35,9 +35,11 @@ pub const ARM_AFTER_HEALTHY_SAMPLES: u32 = 3;
 /// Samples after which a detector that never armed trips anyway.
 ///
 /// A guest that never reaches a healthy reading is not still inflating —
-/// its entry target was undersized (usage grew between the probe and the
-/// inflation). Restoring then is the correct fail-safe.
-pub const SETTLE_CAP_SAMPLES: u32 = 180;
+/// staged descent bounds each step to ~2 GiB (seconds of inflation), so a
+/// minute without a single healthy streak means the step was undersized
+/// (usage grew mid-step). Restoring then is the correct fail-safe, and
+/// this cap bounds the worst-case self-heal latency.
+pub const SETTLE_CAP_SAMPLES: u32 = 60;
 
 /// Thresholds for a pressure watch, provided by the host per request.
 ///

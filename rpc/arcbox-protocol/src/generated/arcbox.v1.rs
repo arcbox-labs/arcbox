@@ -1646,6 +1646,9 @@ pub mod memory_pressure_event {
         RefaultSpike = 2,
         /// The watch window elapsed without pressure.
         WindowElapsed = 3,
+        /// The detector armed: the guest settled at the current balloon
+        /// target. The host uses this to continue a staged shrink.
+        Settled = 4,
     }
     impl Reason {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -1658,6 +1661,7 @@ pub mod memory_pressure_event {
                 Self::LowAvailable => "LOW_AVAILABLE",
                 Self::RefaultSpike => "REFAULT_SPIKE",
                 Self::WindowElapsed => "WINDOW_ELAPSED",
+                Self::Settled => "SETTLED",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1667,6 +1671,7 @@ pub mod memory_pressure_event {
                 "LOW_AVAILABLE" => Some(Self::LowAvailable),
                 "REFAULT_SPIKE" => Some(Self::RefaultSpike),
                 "WINDOW_ELAPSED" => Some(Self::WindowElapsed),
+                "SETTLED" => Some(Self::Settled),
                 _ => None,
             }
         }

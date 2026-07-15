@@ -40,6 +40,21 @@ pub(super) const IDLE_BUSY_LOADAVG: f64 = 1.0;
 /// this window is treated as unreachable.
 pub(super) const GUEST_STATS_TIMEOUT_SECS: u64 = 3;
 
+/// Maximum balloon movement per shrink step.
+///
+/// Inflation pins guest `MemAvailable` near zero until it converges, and its
+/// speed is not under host control — a 15 GB single-step shrink was measured
+/// to stay unsettled for minutes on VZ. Stepping bounds each scarcity window
+/// to a couple of seconds and lets the pressure detector arm between steps,
+/// so the fast (armed) pressure path guards nearly the whole descent.
+pub(super) const SHRINK_STEP: u64 = 2 * 1024 * MIB;
+
+/// Next target when stepping the balloon from `current` toward
+/// `final_target`.
+pub(super) fn next_step(current: u64, final_target: u64) -> u64 {
+    current.saturating_sub(SHRINK_STEP).max(final_target)
+}
+
 /// Guest memory + load snapshot, taken from the agent's `GetSystemInfo`
 /// reply while the balloon is empty.
 #[derive(Debug, Clone, Copy)]
@@ -154,6 +169,18 @@ mod tests {
         // Usage + headroom ≥ full: nothing to reclaim.
         let d = entry_decision(Some(stats(FULL, 100 * MIB)), FULL);
         assert_eq!(d, EntryDecision::Keep);
+    }
+
+    #[test]
+    fn next_step_descends_by_step_size() {
+        assert_eq!(next_step(16 * GIB, 4 * GIB), 14 * GIB);
+        assert_eq!(next_step(14 * GIB, 4 * GIB), 12 * GIB);
+    }
+
+    #[test]
+    fn next_step_clamps_at_final_target() {
+        assert_eq!(next_step(5 * GIB, 4 * GIB), 4 * GIB);
+        assert_eq!(next_step(4 * GIB, 4 * GIB), 4 * GIB);
     }
 
     /// Incident guard #3: the compose stack was *running* the whole time —
