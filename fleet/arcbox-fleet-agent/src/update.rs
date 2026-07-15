@@ -95,8 +95,8 @@ pub async fn resolve_latest(host_os: &str, host_arch: &str) -> Result<UpdatePayl
         .text()
         .await
         .with_context(|| format!("reading body of {latest_url}"))?;
-    let latest: Latest = serde_json::from_str(&latest_body)
-        .with_context(|| format!("parsing {latest_url}"))?;
+    let latest: Latest =
+        serde_json::from_str(&latest_body).with_context(|| format!("parsing {latest_url}"))?;
 
     let asset_name = format!("arcbox-fleet-agent-{host_os}-{host_arch}");
     let binary_url = format!("{CDN_FLEET_AGENT_BASE}/{}/{asset_name}", latest.version);
