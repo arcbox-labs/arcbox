@@ -93,7 +93,7 @@ impl DockerApiServer {
         let connector = Arc::new(VsockConnector::new(Arc::clone(&self.runtime)));
         let activity_hook: crate::proxy::ActivityHook = {
             let runtime = Arc::clone(&self.runtime);
-            Arc::new(move || runtime.note_system_vm_activity())
+            Arc::new(move || Box::new(runtime.begin_system_vm_activity()) as _)
         };
         let proxy = Arc::new(ProxyState::new(connector).with_activity_hook(activity_hook));
 

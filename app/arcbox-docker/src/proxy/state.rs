@@ -12,10 +12,19 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Notify;
 
+/// Opaque RAII lease holding the System VM out of idle while a proxied
+/// operation is in flight (dropping it releases the hold).
+pub type ActivityLease = Box<dyn std::any::Any + Send>;
+
 /// Callback invoked once per proxied Docker request, before any readiness
-/// caching. Wired to the VM lifecycle's activity tracking so host-side API
-/// traffic keeps the System VM out of idle memory reclaim.
-pub type ActivityHook = Arc<dyn Fn() + Send + Sync>;
+/// caching.
+///
+/// Wired to the VM lifecycle's activity tracking so host-side API traffic
+/// keeps the System VM out of idle memory reclaim. The returned lease is
+/// attached to the response body so long-lived operations (pulls, builds,
+/// log streams) count as activity for their entire duration — an idle
+/// shrink once squeezed a guest mid-pull.
+pub type ActivityHook = Arc<dyn Fn() -> ActivityLease + Send + Sync>;
 
 /// Guest proxy transport state shared by handlers.
 pub struct ProxyState {
@@ -40,6 +49,12 @@ impl ProxyState {
     pub fn with_activity_hook(mut self, hook: ActivityHook) -> Self {
         self.activity_hook = Some(hook);
         self
+    }
+
+    /// Takes an activity lease for an in-flight proxied operation, when a
+    /// hook is attached.
+    pub(crate) fn activity_lease(&self) -> Option<ActivityLease> {
+        self.activity_hook.as_ref().map(|hook| hook())
     }
 
     pub(crate) fn connector(&self) -> &dyn GuestConnector {
@@ -73,10 +88,10 @@ impl ProxyState {
         // Before any caching: every proxied request is VM activity. With a
         // warm readiness cache `prepare_runtime` (the lifecycle's activity
         // path) never runs, and a loaded VM would otherwise be idled and
-        // ballooned into reclaim thrash (2026-07-15 incident).
-        if let Some(hook) = &self.activity_hook {
-            hook();
-        }
+        // ballooned into reclaim thrash (2026-07-15 incident). The short
+        // lease covers verification; the caller re-leases for the response
+        // body's lifetime.
+        let _lease = self.activity_hook.as_ref().map(|hook| hook());
         self.reset_if_restarted(generation);
         self.endpoint_readiness
             .ensure_verified(prepare_runtime, || self.ping_guest())

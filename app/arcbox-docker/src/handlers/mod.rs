@@ -13,7 +13,10 @@ mod proxying;
 
 pub(crate) use admission::require_amd64_runtime;
 pub(crate) use identity::extract_container_id;
-pub(crate) use proxying::{ensure_system_vm_ready, proxy_to_system_vm, proxy_upload_to_system_vm};
+pub(crate) use proxying::{
+    ensure_system_vm_ready, hold_activity_for_response, proxy_to_system_vm,
+    proxy_upload_to_system_vm,
+};
 
 pub(crate) use build::build_image;
 pub(crate) use container::{

@@ -250,10 +250,11 @@ async fn ensure_endpoint_verified_notes_activity_even_when_cached() {
     let (connector, guest, _tmp) = setup().await;
 
     let activity = Arc::new(AtomicUsize::new(0));
-    let hook = {
+    let hook: arcbox_docker::proxy::ActivityHook = {
         let activity = Arc::clone(&activity);
         Arc::new(move || {
             activity.fetch_add(1, Ordering::SeqCst);
+            Box::new(()) as _
         })
     };
     let proxy = ProxyState::new(Arc::new(connector)).with_activity_hook(hook);

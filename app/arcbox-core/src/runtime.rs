@@ -308,6 +308,12 @@ impl Runtime {
         self.vm_lifecycle.note_activity();
     }
 
+    /// Notes activity and holds the System VM out of idle until the scope
+    /// drops. For long-lived proxied operations (pulls, builds, streams).
+    pub fn begin_system_vm_activity(&self) -> crate::vm_lifecycle::ActivityScope {
+        self.vm_lifecycle.begin_activity()
+    }
+
     /// Captures a debug snapshot (virtio queues + vCPU exit counters)
     /// of the System VM.
     ///

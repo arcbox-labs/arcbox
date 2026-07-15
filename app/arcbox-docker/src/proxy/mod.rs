@@ -18,7 +18,7 @@ pub(crate) use fallback::invalidate_on_guest_error;
 pub use fallback::proxy_fallback;
 pub use forward::{proxy_to_guest_pooled, proxy_to_guest_stream_pooled};
 pub use session::GuestHttpClient;
-pub use state::{ActivityHook, ProxyState};
+pub use state::{ActivityHook, ActivityLease, ProxyState};
 pub use upgrade::proxy_with_upgrade;
 pub use upload::proxy_streaming_upload;
 
