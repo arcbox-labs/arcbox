@@ -6,17 +6,18 @@
 //! is available; other jobs run via the pre-installed runner
 //! (`run.sh --jitconfig …`).
 //!
-//! Configuration is environment-driven (`ARCBOX_FLEET_*`). The `enroll`
-//! subcommand reads the fleet join token from a file (`--token-file`) or stdin
-//! by default; `--token` is accepted for convenience but discouraged, as it
-//! leaks the token through the process argument list and shell history.
+//! Configuration is environment-driven (`ARCBOX_FLEET_*`). The `enroll` and
+//! `quick enroll` subcommands read the fleet join token from a file
+//! (`--token-file`) or stdin by default; `--token` is accepted for convenience
+//! but discouraged, as it leaks the token through the process argument list
+//! and shell history.
 //!
-//! Two ways to run: `run` requires a credential from a prior `enroll` (the
-//! headless/farm path) and does nothing else. `serve` additionally exposes
-//! the local control-plane API on `agent.sock`, and does not require a
-//! credential up front — `enroll`/`drain`/`resume`/`unenroll` can drive it
-//! from another invocation of this CLI, or from the desktop app, while it
-//! runs.
+//! Two ways to run: `quick run` requires a credential from a prior
+//! `quick enroll` (the socketless headless/farm path) and does nothing else.
+//! `serve` additionally exposes the local control-plane API on `agent.sock`,
+//! and does not require a credential up front — `enroll`/`drain`/`resume`/
+//! `unenroll` can drive it from another invocation of this CLI, or from the
+//! desktop app, while it runs.
 
 // The local control-plane API (agent.sock) is a Unix domain socket with no
 // Windows equivalent implemented, so this crate targets macOS and Linux
@@ -47,12 +48,11 @@ use arcbox_fleet_control_proto::v1::fleet_lifecycle_service_client::FleetLifecyc
 use arcbox_fleet_control_proto::v1::fleet_settings_service_client::FleetSettingsServiceClient;
 use arcbox_fleet_proto::v1::Capability;
 use arcbox_logging::LogConfig;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::config::{AgentConfig, DockerMode};
-use crate::credentials::CredentialStore;
 use crate::docker::DockerRunner;
 use crate::settings::{PersistedSettings, SettingsStore};
 use crate::state::AgentState;
@@ -66,35 +66,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Exchange an enrollment token for the machine credential and persist it.
-    ///
-    /// The token is a multi-use fleet join token (valid until it expires or is
-    /// rotated). Provide it via `--token-file`, on stdin, or — discouraged —
-    /// `--token`.
-    Enroll {
-        /// File holding the enrollment token (recommended). Keeps the token out
-        /// of the process argument list, shell history, and service logs.
-        #[arg(long, value_name = "PATH")]
-        token_file: Option<PathBuf>,
-
-        /// Enrollment token passed directly. Convenient but insecure: it leaks
-        /// via the process argument list and shell history. Prefer
-        /// `--token-file`, or pipe the token on stdin.
-        #[arg(long, conflicts_with = "token_file")]
-        token: Option<String>,
-    },
-    /// Attach to the gateway and run dispatched jobs until terminated.
-    ///
-    /// Requires a credential from a prior `enroll` — the headless/farm path,
-    /// unchanged by the local control-plane API. For the desktop-managed
-    /// handoff, where enrollment arrives later over `agent.sock`, use `serve`
-    /// instead.
-    Run,
+    /// Enroll through the running agent's local control socket.
+    Enroll(EnrollArgs),
+    /// Run socketless actions for headless and farm deployments.
+    #[command(subcommand)]
+    Quick(QuickCommand),
     /// Start the local control-plane API (`agent.sock`) and, once enrolled,
     /// attach to the gateway and run dispatched jobs until terminated.
     ///
-    /// Unlike `run`, a credential is not required at startup: if one is
-    /// already persisted this behaves like `run`, but with none it idles
+    /// Unlike `quick run`, a credential is not required at startup: if one is
+    /// already persisted this behaves like `quick run`, but with none it idles
     /// until an `Enroll` call arrives over the socket (the desktop-managed
     /// handoff) or `unenroll`/`enroll` change that from another
     /// invocation. This is what a launchd LaunchAgent should invoke.
@@ -108,7 +89,7 @@ enum Command {
     Resume,
     /// Leave the fleet — terminal. Stops attaching and removes the machine
     /// credential; the server keeps the machine record, so a fresh `enroll`
-    /// (or the control-plane `Enroll` RPC) joins as a new machine.
+    /// joins as a new machine.
     Unenroll,
     /// Get or update the running agent's live-settable configuration.
     #[command(subcommand)]
@@ -122,6 +103,38 @@ enum Command {
         /// every kind the agent supports.
         kinds: Vec<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum QuickCommand {
+    /// Exchange an enrollment token directly with the Fleet gateway and
+    /// persist the resulting machine credential.
+    Enroll(EnrollArgs),
+    /// Attach directly to the gateway and run dispatched jobs until
+    /// terminated.
+    ///
+    /// Requires a credential from a prior `quick enroll` and does not expose
+    /// the local control-plane API.
+    Run,
+    /// Decommission the machine and remove its persisted credential without
+    /// contacting a running control server.
+    ///
+    /// Does not stop a concurrently running `quick run` process.
+    Unenroll,
+}
+
+#[derive(Debug, Args)]
+struct EnrollArgs {
+    /// File holding the enrollment token (recommended). Keeps the token out
+    /// of the process argument list, shell history, and service logs.
+    #[arg(long, value_name = "PATH")]
+    token_file: Option<PathBuf>,
+
+    /// Enrollment token passed directly. Convenient but insecure: it leaks
+    /// via the process argument list and shell history. Prefer `--token-file`,
+    /// or pipe the token on stdin.
+    #[arg(long, conflicts_with = "token_file")]
+    token: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -177,7 +190,22 @@ fn main() -> Result<()> {
 
 async fn run(command: Command, config: AgentConfig) -> Result<()> {
     match command {
-        Command::Enroll { token_file, token } => {
+        Command::Enroll(EnrollArgs { token_file, token }) => {
+            let token = resolve_enrollment_token(token_file, token)?;
+            let channel = control::client::connect_default(&config).await?;
+            let mut client = FleetLifecycleServiceClient::new(channel);
+            let response = client
+                .enroll(control_proto::EnrollRequest {
+                    enrollment_token: token,
+                    control_plane: String::new(),
+                })
+                .await
+                .context("Enroll RPC failed")?
+                .into_inner();
+            println!("enrolled (machine_id={})", response.machine_id);
+            Ok(())
+        }
+        Command::Quick(QuickCommand::Enroll(EnrollArgs { token_file, token })) => {
             let token = resolve_enrollment_token(token_file, token)?;
             let settings_store = SettingsStore::new(config.settings_path());
             let seed = load_or_seed_settings(&settings_store, &config)?;
@@ -188,27 +216,18 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             // without probing the runtime.
             let capabilities = capabilities(seed.runner_script.is_some(), None);
             let credential = enroll::enroll(&config, token, capabilities, &seed.gateway).await?;
-            CredentialStore::new(
-                config.credential_store,
-                config.credentials_path(),
-                &seed.gateway,
-            )
-            .store(&credential)?;
+            config
+                .credential_store_for(&seed.gateway)
+                .store(&credential)?;
             Ok(())
         }
-        Command::Run => {
+        Command::Quick(QuickCommand::Run) => {
             let settings_store = SettingsStore::new(config.settings_path());
             let seed = load_or_seed_settings(&settings_store, &config)?;
             let docker = init_docker(seed.docker_mode, &seed.linux_runner_image).await?;
             let capabilities = capabilities(seed.runner_script.is_some(), docker.as_ref());
-            let credential = CredentialStore::new(
-                config.credential_store,
-                config.credentials_path(),
-                &seed.gateway,
-            )
-            .load()?
-            .context(
-                "no credential found — run `arcbox-fleet-agent enroll --token-file …` first",
+            let credential = config.credential_store_for(&seed.gateway).load()?.context(
+                "no credential found — run `arcbox-fleet-agent quick enroll --token-file …` first",
             )?;
             info!(machine_id = %credential.machine_id, "starting fleet agent");
 
@@ -216,7 +235,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             // runners once this fires.
             let shutdown = spawn_shutdown_signal("termination signal received; draining runners");
 
-            // `run` opens no control socket, so nothing ever subscribes to
+            // `quick run` opens no control socket, so nothing ever subscribes to
             // this over `Watch` — but `RunnerSupervisor` still reads
             // admission thresholds live from it, so it's load-bearing.
             let agent_state = AgentState::new(&seed);
@@ -236,6 +255,17 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 agent_state,
             )
             .await
+        }
+        Command::Quick(QuickCommand::Unenroll) => {
+            let settings_store = SettingsStore::new(config.settings_path());
+            let seed = load_or_seed_settings(&settings_store, &config)?;
+            let credential = config
+                .credential_store_for(&seed.gateway)
+                .load()?
+                .context("not enrolled")?;
+            enroll::unenroll_and_clear(&config, &seed.gateway, &credential).await?;
+            println!("unenrolled");
+            Ok(())
         }
         Command::Serve => {
             let settings_store = SettingsStore::new(config.settings_path());
@@ -414,7 +444,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
 
 /// Build a `CancellationToken` cancelled on the first termination signal
 /// (see [`shutdown_signal`]), logging `message` when it fires. Shared by
-/// `run` and `serve`, whose shutdown trigger is otherwise identical.
+/// `quick run` and `serve`, whose shutdown trigger is otherwise identical.
 fn spawn_shutdown_signal(message: &'static str) -> CancellationToken {
     let shutdown = CancellationToken::new();
     let signal_token = shutdown.clone();

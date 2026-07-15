@@ -9,6 +9,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tonic::transport::{ClientTlsConfig, Endpoint};
 
+use crate::credentials::CredentialStore;
+
 /// Production gateway endpoint. Overridable via `ARCBOX_FLEET_GATEWAY` for
 /// local/e2e testing (e.g. `http://127.0.0.1:50061`).
 pub const DEFAULT_GATEWAY: &str = "https://fleet.arcbox.dev";
@@ -70,7 +72,7 @@ pub struct AgentConfig {
     pub gateway: String,
     /// Direct path to the pre-installed GitHub Actions runner's entry point
     /// (`run.sh`) — not its containing directory. `None` until set; required
-    /// only by the `run` command.
+    /// only by the `quick run` command.
     pub runner_script: Option<PathBuf>,
     /// Reject an offer when 1-minute load average per core exceeds this.
     pub load_ceiling: f64,
@@ -153,6 +155,13 @@ impl AgentConfig {
     /// Path to the persisted machine credential.
     pub fn credentials_path(&self) -> PathBuf {
         self.data_dir.join("credentials.json")
+    }
+
+    /// Build the credential store scoped to `gateway`. Stores are constructed
+    /// per operation because the keychain backend keys entries by gateway URI,
+    /// and the effective gateway can change over the process lifetime.
+    pub fn credential_store_for(&self, gateway: &str) -> CredentialStore {
+        CredentialStore::new(self.credential_store, self.credentials_path(), gateway)
     }
 
     /// Path to the local control-plane Unix socket.

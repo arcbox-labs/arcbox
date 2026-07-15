@@ -32,7 +32,7 @@ use tonic::transport::Server;
 use tracing::{info, warn};
 
 use crate::config::AgentConfig;
-use crate::credentials::{Credential, CredentialStore};
+use crate::credentials::Credential;
 use crate::docker::DockerRunner;
 use crate::runner::RunnerSupervisor;
 use crate::settings::SettingsStore;
@@ -115,12 +115,6 @@ pub async fn serve(
 /// own runner teardown is separately bounded by `attach::run`'s
 /// `SHUTDOWN_GRACE`; this only needs to cover that plus scheduling overhead.
 const TEARDOWN_GRACE: Duration = Duration::from_secs(20);
-
-/// Bound on the best-effort gateway `Unenroll` call inside
-/// [`AgentSupervisor::unenroll`]. Generous for a healthy round-trip, but a
-/// blackholed gateway (no connect timeout is configured on the endpoint)
-/// must not hang the RPC — the local clear proceeds without the server half.
-const GATEWAY_UNENROLL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Wait up to `grace` for `task` to finish on its own; if it doesn't, abort
 /// it and wait for that reap too, so `task` is guaranteed stopped by the
@@ -227,10 +221,10 @@ enum State {
 
 /// Owns the agent's enrollment state machine.
 ///
-/// `Run` no longer requires a credential up front: with none on disk the
+/// The `serve` command does not require a credential up front: with none on disk the
 /// agent starts `Unenrolled` and idles until `Enroll` delivers one — the
-/// desktop-managed handoff (RUN-8) — while the CLI's one-shot `enroll`
-/// subcommand still works entirely offline, before this process even starts.
+/// desktop-managed handoff (RUN-8) — while the CLI's `quick enroll`
+/// subcommand works entirely offline, before this process even starts.
 pub struct AgentSupervisor {
     config: AgentConfig,
     docker: Option<DockerRunner>,
@@ -269,7 +263,7 @@ impl AgentSupervisor {
             settings_store,
         };
         let gateway = this.agent_state.gateway_target();
-        let existing = this.credential_store_for(&gateway).load()?;
+        let existing = this.config.credential_store_for(&gateway).load()?;
         if let Some(credential) = existing {
             if this.agent_state.participate_target() {
                 info!(machine_id = %credential.machine_id, "starting fleet agent (credential on disk)");
@@ -287,19 +281,6 @@ impl AgentSupervisor {
             }
         }
         Ok(this)
-    }
-
-    /// The credential store scoped to `gateway`. Built per operation rather
-    /// than held: the keychain backend keys its entry by gateway URI, and the
-    /// effective gateway can change over this supervisor's lifetime (an
-    /// `Enroll` `control_plane` override, or a settings update), so a store
-    /// captured at startup could read or clear the wrong entry.
-    fn credential_store_for(&self, gateway: &str) -> CredentialStore {
-        CredentialStore::new(
-            self.config.credential_store,
-            self.config.credentials_path(),
-            gateway,
-        )
     }
 
     /// A handle to the process-lifetime Docker runtime, if configured — read
@@ -445,7 +426,8 @@ impl AgentSupervisor {
 
         // Scoped to the gateway just persisted above, so the restart load
         // finds it under the same key.
-        self.credential_store_for(&gateway)
+        self.config
+            .credential_store_for(&gateway)
             .store(&credential)
             .map_err(Internal)?;
 
@@ -533,35 +515,14 @@ impl AgentSupervisor {
             self.agent_state.set_enrollment(Enrollment::Unenrolled, "");
         }
 
-        // The server half, best-effort and time-bounded: decommission the
-        // machine and revoke the credential at the gateway (RUN-40). An
-        // unreachable gateway must not block leaving — proceed with the
-        // local clear, and the org can decommission the leftover record
-        // from its side.
-        match tokio::time::timeout(
-            GATEWAY_UNENROLL_TIMEOUT,
-            enroll::unenroll(&self.config, &credential_gateway, &credential.machine_token),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                warn!(error = %e, gateway = %credential_gateway,
-                      "gateway unenroll failed; clearing the local credential anyway");
-            }
-            Err(_) => {
-                warn!(gateway = %credential_gateway,
-                      "gateway unenroll timed out; clearing the local credential anyway");
-            }
-        }
-
         // Keyed by the gateway this attachment enrolled against, not the
         // live `gateway_target`, which a settings update may have moved
         // while attached (see `Attachment::credential_gateway`).
-        Ok(self
-            .credential_store_for(&credential_gateway)
-            .clear()
-            .map_err(Internal)?)
+        Ok(
+            enroll::unenroll_and_clear(&self.config, &credential_gateway, &credential)
+                .await
+                .map_err(Internal)?,
+        )
     }
 
     /// Converge the attachment onto the `participate` target: detach (keep
@@ -898,7 +859,7 @@ mod tests {
         let agent_state = AgentState::new(&seed());
         let supervisor = test_supervisor(&dir, agent_state.clone()).await;
 
-        let store = supervisor.credential_store_for("http://127.0.0.1:1");
+        let store = supervisor.config.credential_store_for("http://127.0.0.1:1");
         store
             .store(&test_credential())
             .expect("persist test credential");
@@ -926,13 +887,10 @@ mod tests {
     async fn startup_honors_persisted_participate_false() {
         let dir = std::env::temp_dir().join(format!("fleet-start-det-{}", std::process::id()));
         let config = test_config(dir.clone());
-        CredentialStore::new(
-            config.credential_store,
-            config.credentials_path(),
-            "http://127.0.0.1:1",
-        )
-        .store(&test_credential())
-        .expect("persist test credential");
+        config
+            .credential_store_for("http://127.0.0.1:1")
+            .store(&test_credential())
+            .expect("persist test credential");
 
         let agent_state = AgentState::new(&PersistedSettings {
             participate: false,
@@ -1002,7 +960,7 @@ mod tests {
             machine_id: "fltm_test".to_owned(),
             machine_token: "flt_token_test".to_owned(),
         };
-        let store = supervisor.credential_store_for("http://127.0.0.1:1");
+        let store = supervisor.config.credential_store_for("http://127.0.0.1:1");
         store.store(&credential).expect("persist test credential");
         *supervisor.state.lock().await = State::Attached(Attachment {
             supervisor: runner,

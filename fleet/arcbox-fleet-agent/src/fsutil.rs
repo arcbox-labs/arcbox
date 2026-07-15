@@ -1,7 +1,7 @@
 //! Small filesystem helper shared by anything that persists state to the
 //! data directory with an owner-only file mode. The directory itself gets
 //! the same owner-only barrier: callers persist secrets here from paths
-//! that never run `control::serve` (the headless `enroll`), so the helper
+//! that never run `control::serve` (the headless `quick enroll`), so the helper
 //! cannot rely on the socket startup's chmod.
 
 use std::path::{Path, PathBuf};
@@ -46,7 +46,7 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         // Owner-only like the file below, and unconditional (not just on
         // creation) so a dir left behind by an older or umask-lenient run
         // gets the same traversal barrier `control::serve` applies at
-        // startup — the headless `enroll` persists here without `serve`.
+        // startup — the headless `quick enroll` persists here without `serve`.
         std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("chmod 0700 {}", parent.display()))?;
     }
@@ -65,7 +65,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     /// The parent directory must come out owner-only even when this write is
-    /// what creates it (the headless `enroll` path, which never runs
+    /// what creates it (the headless `quick enroll` path, which never runs
     /// `control::serve`), and even when it pre-exists with a lenient mode.
     #[test]
     fn write_json_atomic_makes_the_parent_owner_only() {
