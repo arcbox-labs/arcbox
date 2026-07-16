@@ -6,9 +6,12 @@
 #   - group "desktop": host-only binaries embedded in the app bundle
 #     (e.g. pstramp for PTY session isolation).
 #
-# Because both paths read from this single lockfile, the Docker CLI and the
-# guest dockerd are always the same version — there is no CLI/daemon version
-# skew to worry about when upgrading.
+# The guest runtime binaries (dockerd, containerd, …) come from the boot
+# manifest pinned under [boot], NOT from [[tools]]. Keep the "docker" tool
+# below on the same version as the boot bundle's dockerd when bumping either
+# side — the CLI tolerates an older daemon through API negotiation, but the
+# two pins should only diverge for the short window between a bundle release
+# and the [boot] bump.
 
 [boot]
 version = "0.6.2"
