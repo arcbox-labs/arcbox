@@ -315,6 +315,52 @@ fn sample_daemon(data_dir: &Path, pid: u32) {
 /// interface addresses, and small-transfer probes that distinguish a total
 /// datapath freeze from a per-connection loss.
 fn capture_guest_forensics(data_dir: &Path, image: &str) {
+    // ABX-423 mitigation experiment (ARCBOX_E2E_TRY_LINK_BOUNCE): FIRST in
+    // the sequence — the freeze often ends ~30 s after onset, and the other
+    // probes would eat the remaining live window. Tries guest-side recovery
+    // actions in escalating order — a link bounce (NAPI/queue re-enable)
+    // and a virtio driver unbind/rebind (full device reset + feature
+    // renegotiation), statically reconfiguring eth0 after each. If either
+    // revives the datapath in seconds, an agent-side watchdog becomes a
+    // shippable mitigation.
+    if std::env::var_os("ARCBOX_E2E_TRY_LINK_BOUNCE").is_some() {
+        let script = r#"
+probe() { wget -q -O /dev/null -T 3 http://10.0.2.1:9/ 2>&1 | grep -q "timed out" && echo "$1: FROZEN" || echo "$1: alive"; }
+restore() { ip link set eth0 up; ip addr replace 10.0.2.2/24 dev eth0; ip route replace default via 10.0.2.1 dev eth0; }
+echo "t=$(date +%s)"
+if ! probe baseline | tee /dev/stderr | grep -q FROZEN; then
+  echo "freeze already over; skipping recovery actions"
+  exit 0
+fi
+ip link set eth0 down; restore; sleep 1
+echo "t=$(date +%s)"; probe after-link-bounce
+d=$(basename $(dirname $(dirname $(ls -d /sys/bus/virtio/devices/*/net/eth0 2>/dev/null | head -1))))
+if [ -n "$d" ]; then
+  echo "$d" > /sys/bus/virtio/drivers/virtio_net/unbind; sleep 1
+  echo "$d" > /sys/bus/virtio/drivers/virtio_net/bind; sleep 1
+  restore
+  echo "t=$(date +%s)"; probe after-driver-rebind
+fi
+"#;
+        match docker_output(
+            data_dir,
+            &[
+                "run",
+                "--rm",
+                "--net=host",
+                "--privileged",
+                image,
+                "sh",
+                "-c",
+                script,
+            ],
+            Duration::from_secs(60),
+        ) {
+            Ok(out) => tracing::info!("link-bounce experiment:\n{}", out.trim_end()),
+            Err(error) => tracing::warn!("link-bounce experiment failed: {error:#}"),
+        }
+    }
+
     // Two eth0 counter samples 2 s apart: tx_packets advancing while the
     // datapath sees nothing means the guest transmits into a black hole
     // (VZ consuming and dropping); frozen tx_packets means the guest-side
