@@ -69,6 +69,15 @@ restore (no reclaim storm, Docker responsive):
 cargo test -p arcbox-e2e --test idle_balloon -- --ignored --nocapture
 ```
 
+Machine stats stream — boots a VZ daemon, subscribes to
+`StatsService.Watch`, and asserts sane progressing samples plus the
+StatsHub lifecycle (concurrent subscribers share one guest stream; the
+pump stops when the last one leaves):
+
+```bash
+cargo test -p arcbox-e2e --test stats_watch -- --ignored --nocapture
+```
+
 Dual-backend matrix — the boot-assets scenario once per backend, VZ first.
 VZ is the oracle: HV-only red means an HV implementation bug, double red means
 the bug is above the hypervisor layer:
