@@ -2,12 +2,12 @@
 /// Empty response / request.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Empty {}
 /// Network configuration for a sandbox.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NetworkSpec {
     /// Network mode: "tap" (default, TAP + IP pool) or "none" (no network).
     #[prost(string, tag = "1")]
@@ -16,7 +16,7 @@ pub struct NetworkSpec {
 /// A single bind mount into the sandbox.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Mount {
     /// Source path on the host.
     #[prost(string, tag = "1")]
@@ -31,7 +31,7 @@ pub struct Mount {
 /// CPU and memory resource limits.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ResourceLimits {
     /// Number of vCPUs (0 = daemon default).
     #[prost(uint32, tag = "1")]
@@ -43,7 +43,7 @@ pub struct ResourceLimits {
 /// Terminal size for TTY resize events.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TerminalSize {
     /// Terminal width in columns.
     #[prost(uint32, tag = "1")]
@@ -126,7 +126,7 @@ pub struct CreateSandboxRequest {
 /// Returned immediately; the sandbox may still be booting (state "starting").
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CreateSandboxResponse {
     /// Assigned or caller-supplied sandbox ID.
     #[prost(string, tag = "1")]
@@ -172,7 +172,7 @@ pub struct RunRequest {
 /// A single chunk of streaming output from Run.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RunOutput {
     /// Stream name: "stdout" | "stderr" | "exit".
     #[prost(string, tag = "1")]
@@ -246,7 +246,7 @@ pub struct ExecRequest {
 /// A single chunk of streaming output from Exec.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExecOutput {
     /// Stream name: "stdout" | "stderr" | "exit".
     #[prost(string, tag = "1")]
@@ -264,7 +264,7 @@ pub struct ExecOutput {
 /// Request to read a file from a sandbox.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadFileRequest {
     /// Sandbox ID.
     #[prost(string, tag = "1")]
@@ -276,7 +276,7 @@ pub struct ReadFileRequest {
 /// One chunk of file data in a ReadFile / WriteFile stream.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FileChunk {
     /// Raw bytes (may be empty on the final chunk).
     #[prost(bytes = "vec", tag = "1")]
@@ -288,7 +288,7 @@ pub struct FileChunk {
 /// Opens a WriteFile stream. Must be the first WriteFileRequest message.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WriteFileOpen {
     /// Sandbox ID.
     #[prost(string, tag = "1")]
@@ -303,7 +303,7 @@ pub struct WriteFileOpen {
 /// A single client message in a WriteFile stream.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WriteFileRequest {
     #[prost(oneof = "write_file_request::Payload", tags = "1, 2")]
     pub payload: ::core::option::Option<write_file_request::Payload>,
@@ -312,7 +312,7 @@ pub struct WriteFileRequest {
 pub mod write_file_request {
     #[derive(serde::Serialize, serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Payload {
         /// Stream header — sandbox, path, and mode.
         #[prost(message, tag = "1")]
@@ -325,7 +325,7 @@ pub mod write_file_request {
 /// Request to expose a sandbox port on the host.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExposePortRequest {
     /// Sandbox ID.
     #[prost(string, tag = "1")]
@@ -343,7 +343,7 @@ pub struct ExposePortRequest {
 /// Response to ExposePort.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExposePortResponse {
     /// Host port the service is reachable on (via loopback).
     #[prost(uint32, tag = "1")]
@@ -355,7 +355,7 @@ pub struct ExposePortResponse {
 /// Request to remove an exposed port mapping.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct UnexposePortRequest {
     /// Sandbox ID.
     #[prost(string, tag = "1")]
@@ -370,7 +370,7 @@ pub struct UnexposePortRequest {
 /// Ask the guest agent to DNAT a reserved guest port to a sandbox port.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SandboxPortForwardRequest {
     /// Sandbox ID.
     #[prost(string, tag = "1")]
@@ -385,7 +385,7 @@ pub struct SandboxPortForwardRequest {
 /// Guest agent's answer: the allocated reserved-range guest port.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SandboxPortForwardResponse {
     /// Guest port now DNATed to the sandbox.
     #[prost(uint32, tag = "1")]
@@ -394,7 +394,7 @@ pub struct SandboxPortForwardResponse {
 /// Ask the guest agent to remove a DNAT mapping.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SandboxPortForwardRemoveRequest {
     /// Sandbox ID.
     #[prost(string, tag = "1")]
@@ -409,7 +409,7 @@ pub struct SandboxPortForwardRemoveRequest {
 /// Request to stop a sandbox gracefully.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StopSandboxRequest {
     /// Sandbox ID.
     #[prost(string, tag = "1")]
@@ -422,7 +422,7 @@ pub struct StopSandboxRequest {
 /// Request to forcibly remove a sandbox.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RemoveSandboxRequest {
     /// Sandbox ID.
     #[prost(string, tag = "1")]
@@ -434,7 +434,7 @@ pub struct RemoveSandboxRequest {
 /// Request to inspect a sandbox.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct InspectSandboxRequest {
     /// Sandbox ID.
     #[prost(string, tag = "1")]
@@ -491,7 +491,7 @@ pub struct SandboxInfo {
 /// Network details of a sandbox.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SandboxNetwork {
     /// Assigned IP address.
     #[prost(string, tag = "1")]
@@ -549,7 +549,7 @@ pub struct SandboxSummary {
 /// Request to subscribe to sandbox lifecycle events.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SandboxEventsRequest {
     /// Filter by sandbox ID (empty = all sandboxes).
     #[prost(string, tag = "1")]
@@ -607,7 +607,7 @@ pub struct CheckpointRequest {
 /// Response to Checkpoint.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CheckpointResponse {
     /// Snapshot ID.
     #[prost(string, tag = "1")]
@@ -652,7 +652,7 @@ pub struct RestoreRequest {
 /// The restored sandbox starts in "ready" state immediately.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RestoreResponse {
     /// ID of the newly created sandbox.
     #[prost(string, tag = "1")]
@@ -710,7 +710,7 @@ pub struct SnapshotSummary {
 /// Request to delete a snapshot.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteSnapshotRequest {
     /// Snapshot ID.
     #[prost(string, tag = "1")]

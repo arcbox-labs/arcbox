@@ -321,8 +321,7 @@ mod tests {
         assert_eq!(state_of("s", &instances), SandboxState::Ready);
         let last_exit_code = {
             let guard = instances.read().unwrap();
-            let code = guard["s"].lock().unwrap().last_exit_code;
-            code
+            guard["s"].lock().unwrap().last_exit_code
         };
         assert_eq!(last_exit_code, Some(7));
     }
