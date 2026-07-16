@@ -99,6 +99,14 @@ impl DefaultEgress {
         dst_port: u16,
         domain: Option<&str>,
     ) -> Option<(String, String, u16, &'static str)> {
+        // The gateway IP means "the host itself" (`host.docker.internal`):
+        // it is translated to loopback at connect time and must never be
+        // tunnelled through a proxy — the proxy would dial a virtual
+        // address that exists only inside the datapath.
+        if dst_ip == self.gateway_ip {
+            return None;
+        }
+
         let env = self.proxy_env.as_ref()?;
 
         // No proxy configured → always direct.
@@ -260,6 +268,19 @@ mod tests {
         let eg = egress(Some(env(true, true, true)));
         let got = eg.resolve_proxy_target(Ipv4Addr::new(1, 2, 3, 4), 443, None);
         assert_eq!(got.unwrap().3, "socks5");
+    }
+
+    // Regression: the gateway IP (`host.docker.internal`) is translated to
+    // loopback at connect time and must stay direct even when a system proxy
+    // is configured — tunnelling it would make the proxy dial a virtual
+    // address that exists only inside the datapath.
+    #[test]
+    fn gateway_dst_is_direct_despite_proxy() {
+        let eg = egress(Some(env(true, true, true)));
+        assert_eq!(
+            eg.resolve_proxy_target(Ipv4Addr::new(10, 0, 0, 1), 8080, None),
+            None,
+        );
     }
 
     // No usable proxy → direct, regardless of domain.
