@@ -21,7 +21,6 @@
 //! by the in-shim `TcpBridge`; data frames flow via the fast path or the
 //! zero-copy inline inject thread.
 
-use std::collections::VecDeque;
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -37,7 +36,6 @@ use crate::darwin::classifier::FrameClassifier;
 use crate::darwin::egress::HostEgress;
 use crate::darwin::inbound_relay::InboundCommand;
 use crate::darwin::tcp_bridge::TcpBridge;
-use crate::datapath::FrameBuf;
 use crate::dhcp::DhcpServer;
 use crate::dns::DnsForwarder;
 
@@ -47,8 +45,8 @@ mod intercept;
 #[cfg(test)]
 mod tests;
 
-use fd::{FdWrapper, fd_write, set_nonblocking};
-use guest_tx::{drain_cmd_rx, drain_reply_rx, send_to_guest};
+use fd::{FdWrapper, set_nonblocking};
+use guest_tx::{DeliveryClass, GuestTx, NOBUFS_RETRY_DELAY, drain_cmd_rx, drain_reply_rx};
 use intercept::{handle_intercepted_frame, process_inbound_cmd};
 
 /// Async network datapath bridging guest ↔ host via `FrameClassifier`
@@ -219,9 +217,16 @@ impl NetworkDatapath {
 
         let mut guest_mac: Option<[u8; 6]> = None;
 
-        // Write queue: buffers frames that couldn't be written to the guest FD
-        // due to EWOULDBLOCK. Drained when the FD becomes writable again.
-        let mut write_queue: VecDeque<FrameBuf> = VecDeque::new();
+        // Guest-bound frame sink: owns the pending queue and the lossless
+        // backpressure state machine (see the guest_tx module docs).
+        let mut guest_tx = GuestTx::new(frame_sink);
+
+        // Retry driver for an ENOBUFS-blocked backlog. A persistent interval
+        // (rather than a per-iteration `sleep`) survives other select! arms
+        // firing more often than the retry period — a fresh sleep would be
+        // reset every iteration and never complete under load.
+        let mut nobufs_retry = tokio::time::interval(NOBUFS_RETRY_DELAY);
+        nobufs_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         // Unified timer wheel for flow timeout management (1s tick).
         // Replaces per-flow tokio::time::timeout() objects with a single
@@ -238,7 +243,8 @@ impl NetworkDatapath {
         tracing::info!("Network datapath started (TCP shim + socket proxy mode)");
 
         loop {
-            let has_pending = !write_queue.is_empty();
+            let awaits_writable = guest_tx.awaits_writable();
+            let awaits_retry = guest_tx.awaits_retry();
 
             tokio::select! {
                 biased;
@@ -248,31 +254,23 @@ impl NetworkDatapath {
                     break;
                 }
 
-                // Drain pending writes when the guest FD becomes writable.
-                writable = guest_async.writable(), if has_pending => {
+                // Drain an EAGAIN-blocked backlog when the guest FD becomes
+                // writable. An ENOBUFS-blocked backlog is timer-driven below:
+                // write-readiness is not a reliable signal for a full peer
+                // receive buffer on a macOS AF_UNIX datagram socket.
+                writable = guest_async.writable(), if awaits_writable => {
                     let mut guard = writable?;
-                    while let Some(frame) = write_queue.front() {
-                        match guard.try_io(|inner| fd_write(inner.get_ref().as_raw_fd(), frame)) {
-                            Ok(Ok(n)) if n >= frame.len() => { write_queue.pop_front(); }
-                            Ok(Ok(n)) => {
-                                // SOCK_DGRAM delivers whole frames or fails — a short
-                                // write should never happen and indicates a broken
-                                // invariant. Drop the frame to avoid corrupting L2
-                                // boundaries.
-                                tracing::error!(
-                                    "Guest write: short datagram ({n}/{} bytes), dropping frame",
-                                    frame.len(),
-                                );
-                                write_queue.pop_front();
-                            }
-                            Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => break,
-                            Ok(Err(e)) => {
-                                tracing::warn!("Guest write error: {}", e);
-                                write_queue.pop_front();
-                            }
-                            Err(_) => break,
-                        }
+                    guest_tx.drain(guest_raw_fd);
+                    if guest_tx.awaits_writable() {
+                        // Still blocked: clear readiness so the next poll
+                        // waits for a fresh writability edge.
+                        guard.clear_ready();
                     }
+                }
+
+                // Retry an ENOBUFS-blocked backlog after a short delay.
+                _ = nobufs_retry.tick(), if awaits_retry => {
+                    guest_tx.drain(guest_raw_fd);
                 }
 
                 // Guest → Host: read frames, classify, and dispatch.
@@ -301,7 +299,7 @@ impl NetworkDatapath {
                         tcp_bridge.try_fast_path_intercept(frame_data)
                     });
                     for ack in fast_acks {
-                        send_to_guest(frame_sink.as_ref(), &guest_async, &ack, &mut write_queue);
+                        guest_tx.send(guest_raw_fd, &ack, DeliveryClass::Reliable);
                     }
 
                     // Handshake intercept: complete in-progress shim handshakes
@@ -312,12 +310,12 @@ impl NetworkDatapath {
                         tcp_bridge.try_complete_handshake(frame_data)
                     });
                     for reply in hs_replies {
-                        send_to_guest(frame_sink.as_ref(), &guest_async, &reply, &mut write_queue);
+                        guest_tx.send(guest_raw_fd, &reply, DeliveryClass::Reliable);
                     }
 
                     // Flush ARP replies produced inline by the classifier.
                     for reply in device.take_arp_replies() {
-                        send_to_guest(frame_sink.as_ref(), &guest_async, &reply, &mut write_queue);
+                        guest_tx.send(guest_raw_fd, &reply, DeliveryClass::Lossy);
                     }
 
                     // Discard any TCP frames left in the rx queue that didn't
@@ -330,9 +328,8 @@ impl NetworkDatapath {
                     for intercepted_frame in &intercepted {
                         handle_intercepted_frame(
                             intercepted_frame,
-                            frame_sink.as_ref(),
-                            &guest_async,
-                            &mut write_queue,
+                            &mut guest_tx,
+                            guest_raw_fd,
                             &mut egress,
                             &mut dhcp_server,
                             &dns_forwarder,
@@ -353,7 +350,7 @@ impl NetworkDatapath {
                     let gmac = guest_mac.unwrap_or([0xFF; 6]);
                     for syn in &gated_syns {
                         if let Some(rst) = tcp_bridge.handle_outbound_syn(&syn.frame, gateway_mac, gmac) {
-                            send_to_guest(frame_sink.as_ref(), &guest_async, &rst, &mut write_queue);
+                            guest_tx.send(guest_raw_fd, &rst, DeliveryClass::Reliable);
                         }
                     }
 
@@ -361,9 +358,9 @@ impl NetworkDatapath {
 
                 // Proxy → Guest: relay reply frames from socket proxy.
                 // Always poll — the bounded channel (256) provides natural backpressure
-                // to spawned tasks. Gating on write_queue depth starved DNS replies.
+                // to spawned tasks. Gating on backlog depth starved DNS replies.
                 Some(reply_frame) = reply_rx.recv() => {
-                    send_to_guest(frame_sink.as_ref(), &guest_async, &reply_frame, &mut write_queue);
+                    guest_tx.send(guest_raw_fd, &reply_frame, DeliveryClass::Lossy);
                 }
 
                 // Inbound commands from InboundListenerManager.
@@ -419,7 +416,7 @@ impl NetworkDatapath {
             //    active-open (ActiveOpen), and retransmits under loss.
             let hs_frames = tcp_bridge.poll_handshakes();
             for frame in hs_frames {
-                send_to_guest(frame_sink.as_ref(), &guest_async, &frame, &mut write_queue);
+                guest_tx.send(guest_raw_fd, &frame, DeliveryClass::Reliable);
             }
 
             // 1.5. Drain inbound listener commands so `cmd_rx.recv()` cannot be
@@ -434,17 +431,22 @@ impl NetworkDatapath {
             );
 
             // 2. Poll fast-path host streams for inbound data and inject
-            //    constructed frames directly to guest.
-            for frame in tcp_bridge.poll_fast_path() {
-                send_to_guest(frame_sink.as_ref(), &guest_async, &frame, &mut write_queue);
+            //    constructed frames directly to guest — but only when no
+            //    backlog is pending. Skipping the poll leaves host-socket
+            //    data in the host kernel's receive buffer, closing the
+            //    host-side TCP window so the remote sender throttles instead
+            //    of the datapath dropping frames (lossless backpressure; the
+            //    shim has no retransmission, so a dropped data frame would
+            //    stall the connection permanently).
+            if guest_tx.has_backlog() {
+                guest_tx.stats.gated_polls += 1;
+            } else {
+                for frame in tcp_bridge.poll_fast_path() {
+                    guest_tx.send(guest_raw_fd, &frame, DeliveryClass::Reliable);
+                }
             }
 
-            drain_reply_rx(
-                &mut reply_rx,
-                frame_sink.as_ref(),
-                &guest_async,
-                &mut write_queue,
-            );
+            drain_reply_rx(&mut reply_rx, &mut guest_tx, guest_raw_fd);
 
             // Yield to the tokio runtime so spawned tasks (e.g. host relay
             // read/write) get a chance to run on this worker thread. Without

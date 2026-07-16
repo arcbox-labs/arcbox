@@ -1,8 +1,8 @@
 use super::fd::{fd_read, fd_write, set_nonblocking, write_to_guest};
-use super::guest_tx::enqueue_or_write;
+use super::guest_tx::{DeliveryClass, GuestTx, LOSSY_QUEUE_CAP};
 use super::intercept::build_dns_servfail_response;
 use super::*;
-use std::os::fd::FromRawFd;
+use std::os::fd::{FromRawFd, RawFd};
 
 /// Creates a SOCK_DGRAM socketpair, returning (fd_a, fd_b) as OwnedFds.
 fn socketpair() -> (OwnedFd, OwnedFd) {
@@ -12,6 +12,38 @@ fn socketpair() -> (OwnedFd, OwnedFd) {
     assert_eq!(ret, 0, "socketpair() failed");
     // SAFETY: fds are valid file descriptors from socketpair.
     unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+}
+
+/// Shrinks a socket's send/receive buffers so overflow is reached quickly.
+fn shrink_socket_buffers(fd: RawFd) {
+    let size: libc::c_int = 8192;
+    for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        // SAFETY: setsockopt on a valid fd with a valid c_int payload.
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                (&raw const size).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(ret, 0, "setsockopt failed");
+    }
+}
+
+/// Sends reliable frames until the socketpair overflows and a backlog forms.
+/// Returns the number of frames sent. Panics if overflow is never reached.
+fn send_until_backlog(tx: &mut GuestTx, fd: RawFd, frame: &[u8]) -> usize {
+    let mut sent = 0usize;
+    for _ in 0..10_000 {
+        tx.send(fd, frame, DeliveryClass::Reliable);
+        sent += 1;
+        if tx.has_backlog() {
+            return sent;
+        }
+    }
+    panic!("socketpair never overflowed; cannot exercise backpressure");
 }
 
 #[test]
@@ -68,44 +100,138 @@ fn test_fd_write_roundtrip() {
     assert_eq!(&buf[..n], data);
 }
 
-#[tokio::test]
-async fn test_enqueue_or_write_direct() {
+#[test]
+fn guest_tx_direct_write_when_unblocked() {
     let (a, b) = socketpair();
     set_nonblocking(a.as_raw_fd()).unwrap();
-    let guest_async = AsyncFd::new(FdWrapper(a)).unwrap();
 
-    let mut queue = VecDeque::new();
+    let mut tx = GuestTx::new(None);
     let frame_data = b"direct write frame";
-    enqueue_or_write(
-        &guest_async,
-        FrameBuf::from(frame_data.to_vec()),
-        &mut queue,
-    );
+    tx.send(a.as_raw_fd(), frame_data, DeliveryClass::Reliable);
 
-    assert!(queue.is_empty(), "Queue should be empty after direct write");
+    assert!(
+        !tx.has_backlog(),
+        "queue should be empty after direct write"
+    );
 
     let mut buf = [0u8; 128];
     let n = fd_read(b.as_raw_fd(), &mut buf).unwrap();
     assert_eq!(&buf[..n], frame_data.as_slice());
 }
 
-#[tokio::test]
-async fn test_enqueue_or_write_queues_when_nonempty() {
-    let (a, _b) = socketpair();
+/// Regression test for the container-egress black hole: when the socketpair
+/// overflows (macOS returns `ENOBUFS`, not `EAGAIN`), reliable frames must
+/// be queued — never dropped — and delivered in order once the peer drains.
+/// The shim has no retransmission, so a single lost frame stalls its TCP
+/// connection permanently.
+#[test]
+fn guest_tx_reliable_survives_socketpair_overflow() {
+    let (a, b) = socketpair();
     set_nonblocking(a.as_raw_fd()).unwrap();
-    let guest_async = AsyncFd::new(FdWrapper(a)).unwrap();
+    set_nonblocking(b.as_raw_fd()).unwrap();
+    shrink_socket_buffers(a.as_raw_fd());
+    shrink_socket_buffers(b.as_raw_fd());
 
-    let mut queue: VecDeque<FrameBuf> = VecDeque::new();
-    queue.push_back(FrameBuf::from(b"already queued".to_vec()));
+    let mut tx = GuestTx::new(None);
+    // Each frame carries its sequence number so ordering is verifiable.
+    let make_frame = |seq: u32| {
+        let mut f = vec![0xAB_u8; 2048];
+        f[..4].copy_from_slice(&seq.to_be_bytes());
+        f
+    };
 
-    enqueue_or_write(
-        &guest_async,
-        FrameBuf::from(b"new frame".to_vec()),
-        &mut queue,
+    let mut sent = 0usize;
+    for _ in 0..10_000 {
+        tx.send(
+            a.as_raw_fd(),
+            &make_frame(sent as u32),
+            DeliveryClass::Reliable,
+        );
+        sent += 1;
+        if tx.has_backlog() {
+            break;
+        }
+    }
+    assert!(tx.has_backlog(), "socketpair never overflowed");
+    // Exactly one resume mechanism must be armed for the blocked state.
+    assert!(
+        tx.awaits_writable() ^ tx.awaits_retry(),
+        "blocked backlog must arm exactly one resume mechanism"
+    );
+    // Keep producing while blocked — everything must queue.
+    for _ in 0..16 {
+        tx.send(
+            a.as_raw_fd(),
+            &make_frame(sent as u32),
+            DeliveryClass::Reliable,
+        );
+        sent += 1;
+    }
+
+    // Alternately drain the peer and retry until everything is delivered.
+    let mut buf = vec![0u8; 4096];
+    let mut received = 0usize;
+    let mut idle_rounds = 0;
+    while received < sent && idle_rounds < 1_000 {
+        let mut progressed = false;
+        while let Ok(n) = fd_read(b.as_raw_fd(), &mut buf) {
+            if n == 0 {
+                break;
+            }
+            assert_eq!(
+                u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
+                received as u32,
+                "frames must arrive in send order"
+            );
+            received += 1;
+            progressed = true;
+        }
+        tx.drain(a.as_raw_fd());
+        if !progressed {
+            idle_rounds += 1;
+        }
+    }
+
+    assert_eq!(received, sent, "reliable frames were lost across overflow");
+    assert!(!tx.has_backlog(), "queue must fully drain");
+    assert!(
+        tx.stats.enobufs_events + tx.stats.would_block_events >= 1,
+        "the overflow path was never exercised"
+    );
+    assert_eq!(tx.stats.lossy_dropped, 0);
+    assert_eq!(tx.stats.io_errors, 0);
+    assert_eq!(tx.stats.short_writes, 0);
+}
+
+/// Lossy frames are bounded at `LOSSY_QUEUE_CAP` and dropped beyond it;
+/// reliable frames are still accepted past the cap.
+#[test]
+fn guest_tx_lossy_capped_reliable_uncapped() {
+    let (a, b) = socketpair();
+    set_nonblocking(a.as_raw_fd()).unwrap();
+    set_nonblocking(b.as_raw_fd()).unwrap();
+    shrink_socket_buffers(a.as_raw_fd());
+    shrink_socket_buffers(b.as_raw_fd());
+
+    let mut tx = GuestTx::new(None);
+    let frame = vec![0xCD_u8; 2048];
+    send_until_backlog(&mut tx, a.as_raw_fd(), &frame);
+
+    for _ in 0..(LOSSY_QUEUE_CAP + 100) {
+        tx.send(a.as_raw_fd(), &frame, DeliveryClass::Lossy);
+    }
+    assert!(
+        tx.stats.lossy_dropped >= 100,
+        "lossy frames must drop at the cap (dropped: {})",
+        tx.stats.lossy_dropped
     );
 
-    assert_eq!(queue.len(), 2);
-    assert_eq!(&queue[1][..], b"new frame");
+    let hwm_before = tx.stats.queue_high_water;
+    tx.send(a.as_raw_fd(), &frame, DeliveryClass::Reliable);
+    assert!(
+        tx.stats.queue_high_water > hwm_before,
+        "reliable frames must still be accepted past the lossy cap"
+    );
 }
 
 #[test]
