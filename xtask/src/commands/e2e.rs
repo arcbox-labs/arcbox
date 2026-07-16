@@ -153,6 +153,11 @@ fn prebuild(root: &std::path::Path, test: &str) -> Result<bool> {
             .run()?;
             Ok(true)
         }
+        // Must match tests/e2e/tests/egress_throughput.rs's own build.
+        "egress_throughput" => {
+            xshell::cmd!(shell, "cargo build --release -p arcbox-daemon").run()?;
+            Ok(true)
+        }
         // Must match tests/e2e/src/sandbox.rs::build_binaries exactly
         // (packages AND profiles), or SKIP_BUILD runs stale binaries.
         "sandbox" => {

@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use arcbox_e2e::boot_assets::{resolve_boot_version, stage_dev_boot_assets};
 use arcbox_e2e::daemon::{DaemonConfig, DaemonHandle};
-use arcbox_e2e::docker::{docker_output, docker_stream};
+use arcbox_e2e::docker::{docker_output, docker_stream, ensure_image};
 use arcbox_e2e::metrics::RunMetrics;
 
 static TRACING: Once = Once::new();
@@ -236,49 +236,6 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
 
     docker_output(data_dir, &["rm", "-f", "ballast"], DOCKER_ATTEMPT).ok();
     Ok(())
-}
-
-/// Makes `image` available in the daemon under test, without depending on
-/// registry reachability more than once per machine: the first successful
-/// pull is cached as a tarball under `target/`, and later runs `docker load`
-/// it (guest registry access is environment-dependent; pulls here have been
-/// observed to black-hole intermittently).
-fn ensure_image(data_dir: &Path, image: &str) -> Result<()> {
-    let cache_dir = arcbox_e2e::repo_root().join("target/e2e-image-cache");
-    let tar = cache_dir.join(format!(
-        "{}.tar",
-        image.replace(['/', ':'], "_").replace('.', "-")
-    ));
-    if tar.exists() {
-        docker_output(
-            data_dir,
-            &["load", "-i", &tar.display().to_string()],
-            Duration::from_secs(60),
-        )
-        .context("docker load from cache")?;
-        return Ok(());
-    }
-
-    let mut last_err = None;
-    for attempt in 1..=3 {
-        match docker_output(data_dir, &["pull", image], Duration::from_secs(90)) {
-            Ok(_) => {
-                std::fs::create_dir_all(&cache_dir)?;
-                docker_output(
-                    data_dir,
-                    &["save", "-o", &tar.display().to_string(), image],
-                    Duration::from_secs(60),
-                )
-                .context("docker save to cache")?;
-                return Ok(());
-            }
-            Err(e) => {
-                tracing::warn!(attempt, "docker pull failed: {e:#}");
-                last_err = Some(e);
-            }
-        }
-    }
-    Err(last_err.unwrap()).context("docker pull (3 attempts)")
 }
 
 /// The daemon's own rotating log (structured JSON lines).
