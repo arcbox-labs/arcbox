@@ -218,7 +218,18 @@ pub fn parse_cgroup_io_bytes(io_stat: &str) -> (u64, u64) {
 /// own control files and any non-container entries.
 #[must_use]
 pub fn is_container_id(name: &str) -> bool {
-    name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// The first PID listed in a cgroup v2 `cgroup.procs` (one PID per line).
+/// A container's network stats are read through any of its processes'
+/// network namespace, so the first live PID suffices.
+#[must_use]
+pub fn parse_first_pid(cgroup_procs: &str) -> Option<u32> {
+    cgroup_procs.lines().next()?.trim().parse().ok()
 }
 
 #[cfg(test)]
@@ -373,5 +384,13 @@ veth1a2b3c: 8000     80    0    0    0     0          0         0  8000     80  
         assert!(!is_container_id("buildkit"));
         assert!(!is_container_id(&id[..12])); // short id is not a cgroup dir
         assert!(!is_container_id(&id.to_uppercase()));
+    }
+
+    #[test]
+    fn first_pid_reads_leading_line() {
+        assert_eq!(parse_first_pid("4242\n4243\n4244\n"), Some(4242));
+        assert_eq!(parse_first_pid("777"), Some(777));
+        assert_eq!(parse_first_pid(""), None); // empty cgroup: no process
+        assert_eq!(parse_first_pid("notapid\n"), None);
     }
 }

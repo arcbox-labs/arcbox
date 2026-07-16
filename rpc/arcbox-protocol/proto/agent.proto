@@ -257,10 +257,11 @@ message MachineStats {
 
 // One container's cgroup v2 resource sample.
 //
-// Sourced from the container's cgroup (cpu.stat, memory.current,
-// memory.max, io.stat, pids.current). CPU and disk fields are cumulative;
-// memory and pids are gauges. Per-container network is not a cgroup
-// counter (it lives in the network namespace) and is not reported here.
+// CPU, disk, and network fields are cumulative; memory and pids are
+// gauges. CPU/memory/disk/pids come from the container's cgroup
+// (cpu.stat, memory.current, memory.max, io.stat, pids.current). Network
+// is not a cgroup counter — it lives in the container's network
+// namespace, read via /proc/<pid>/net/dev for a process in the container.
 message ContainerStats {
     // Full container ID (the cgroup directory name).
     string id = 1;
@@ -280,6 +281,12 @@ message ContainerStats {
     uint64 disk_written_bytes = 7;
     // Current process/thread count (pids.current).
     uint32 pids = 8;
+    // Cumulative bytes across the container's non-loopback interfaces,
+    // from /proc/<pid>/net/dev in its network namespace. Zero for a
+    // host-networked container (its traffic is the machine's, already
+    // counted in MachineStats) or when no process is readable.
+    uint64 net_rx_bytes = 9;
+    uint64 net_tx_bytes = 10;
 }
 
 // Runtime status report.

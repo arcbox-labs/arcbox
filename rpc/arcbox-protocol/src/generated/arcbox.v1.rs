@@ -2003,10 +2003,11 @@ pub struct MachineStats {
 }
 /// One container's cgroup v2 resource sample.
 ///
-/// Sourced from the container's cgroup (cpu.stat, memory.current,
-/// memory.max, io.stat, pids.current). CPU and disk fields are cumulative;
-/// memory and pids are gauges. Per-container network is not a cgroup
-/// counter (it lives in the network namespace) and is not reported here.
+/// CPU, disk, and network fields are cumulative; memory and pids are
+/// gauges. CPU/memory/disk/pids come from the container's cgroup
+/// (cpu.stat, memory.current, memory.max, io.stat, pids.current). Network
+/// is not a cgroup counter — it lives in the container's network
+/// namespace, read via /proc/<pid>/net/dev for a process in the container.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2037,6 +2038,14 @@ pub struct ContainerStats {
     /// Current process/thread count (pids.current).
     #[prost(uint32, tag = "8")]
     pub pids: u32,
+    /// Cumulative bytes across the container's non-loopback interfaces,
+    /// from /proc/<pid>/net/dev in its network namespace. Zero for a
+    /// host-networked container (its traffic is the machine's, already
+    /// counted in MachineStats) or when no process is readable.
+    #[prost(uint64, tag = "9")]
+    pub net_rx_bytes: u64,
+    #[prost(uint64, tag = "10")]
+    pub net_tx_bytes: u64,
 }
 /// Runtime status report.
 #[derive(serde::Serialize, serde::Deserialize)]

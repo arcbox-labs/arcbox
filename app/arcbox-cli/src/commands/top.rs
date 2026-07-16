@@ -112,6 +112,8 @@ struct ComputedContainer {
     memory_limit_bytes: u64,
     disk_read_bytes_per_sec: f64,
     disk_write_bytes_per_sec: f64,
+    net_rx_bytes_per_sec: f64,
+    net_tx_bytes_per_sec: f64,
     pids: u32,
 }
 
@@ -180,8 +182,8 @@ impl ComputedStats {
         if !self.containers.is_empty() {
             let _ = writeln!(
                 out,
-                "\n{:<24} {:>7}  {:>10}  {:>18}  {:>5}",
-                "CONTAINER", "CPU%", "MEM", "DISK R/W/s", "PIDS"
+                "\n{:<24} {:>7}  {:>10}  {:>18}  {:>18}  {:>5}",
+                "CONTAINER", "CPU%", "MEM", "DISK R/W/s", "NET ↓/↑/s", "PIDS"
             );
             for c in &self.containers {
                 let mem = if c.memory_limit_bytes == 0 {
@@ -195,12 +197,14 @@ impl ComputedStats {
                 };
                 let _ = writeln!(
                     out,
-                    "{:<24} {:>6.1}%  {:>10}  {:>8}/{:<8}  {:>5}",
+                    "{:<24} {:>6.1}%  {:>10}  {:>8}/{:<8}  {:>8}/{:<8}  {:>5}",
                     truncate(&c.name, 24),
                     c.cpu_percent,
                     mem,
                     fmt_bytes(c.disk_read_bytes_per_sec as u64),
                     fmt_bytes(c.disk_write_bytes_per_sec as u64),
+                    fmt_bytes(c.net_rx_bytes_per_sec as u64),
+                    fmt_bytes(c.net_tx_bytes_per_sec as u64),
                     c.pids,
                 );
             }
@@ -243,6 +247,8 @@ fn computed_containers(prev: &MachineStats, cur: &MachineStats, dt: f64) -> Vec<
                     c.disk_written_bytes,
                     before.map(|p| p.disk_written_bytes),
                 ),
+                net_rx_bytes_per_sec: rate(c.net_rx_bytes, before.map(|p| p.net_rx_bytes)),
+                net_tx_bytes_per_sec: rate(c.net_tx_bytes, before.map(|p| p.net_tx_bytes)),
                 pids: c.pids,
             }
         })
@@ -314,6 +320,8 @@ mod tests {
             disk_read_bytes: 0,
             disk_written_bytes: 0,
             pids: 3,
+            net_rx_bytes: 0,
+            net_tx_bytes: 0,
         }
     }
 
@@ -362,6 +370,24 @@ mod tests {
         assert_eq!(c.containers[0].name, "busy");
         assert!((c.containers[0].cpu_percent - 50.0).abs() < 0.01);
         assert!((c.containers[1].cpu_percent - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn container_network_rate_from_deltas() {
+        let mut prev = sample(10_000, 100, 1000);
+        let mut cur = sample(12_000, 150, 1200); // +2s
+        let mut p = container("net", 0, 100);
+        p.net_rx_bytes = 1000;
+        p.net_tx_bytes = 2000;
+        prev.containers = vec![p];
+        let mut n = container("net", 0, 100);
+        n.net_rx_bytes = 1000 + 4096; // +2 KiB/s
+        n.net_tx_bytes = 2000 + 1024; // +512 B/s
+        cur.containers = vec![n];
+
+        let c = ComputedStats::from_delta(&prev, &cur).unwrap();
+        assert!((c.containers[0].net_rx_bytes_per_sec - 2048.0).abs() < 0.001);
+        assert!((c.containers[0].net_tx_bytes_per_sec - 512.0).abs() < 0.001);
     }
 
     #[test]

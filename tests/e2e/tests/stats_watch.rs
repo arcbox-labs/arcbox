@@ -231,10 +231,18 @@ async fn assert_probe_container(stream: &mut Streaming<MachineStats>) -> Result<
         if probe.pids == 0 {
             bail!("probe container reports zero pids");
         }
+        // A bridged container's eth0 always accrues setup/DHCP traffic, so
+        // its netns-read counters must be non-zero — proving per-container
+        // network (P4) is wired, not just the cgroup metrics.
+        if probe.net_rx_bytes == 0 {
+            bail!("probe container reports zero network rx (netns read failed?)");
+        }
         tracing::info!(
             id = %probe.id,
             memory = probe.memory_current_bytes,
             pids = probe.pids,
+            net_rx = probe.net_rx_bytes,
+            net_tx = probe.net_tx_bytes,
             "probe container stats present and enriched"
         );
         return Ok(());
