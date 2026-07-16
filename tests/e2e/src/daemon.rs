@@ -80,6 +80,9 @@ impl DaemonHandle {
             .arg("--data-dir")
             .arg(&config.data_dir)
             .arg("--foreground")
+            // Keep the guest-data NFS mount off the shared ~/ArcBox by pointing
+            // it inside the isolated data dir. A caller can override via env.
+            .env("ARCBOX_HOST_MOUNT_DIR", config.data_dir.join("ArcBox"))
             .args(&config.args)
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));

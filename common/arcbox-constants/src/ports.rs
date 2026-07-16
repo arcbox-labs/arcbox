@@ -12,3 +12,10 @@ pub const KUBERNETES_API_HOST_PORT: u16 = 16443;
 
 /// Guest localhost port for the Kubernetes API server.
 pub const KUBERNETES_API_GUEST_PORT: u16 = 6443;
+
+/// Guest vsock port relaying to the in-guest kernel nfsd (NFS protocol).
+///
+/// The host daemon bridges a localhost TCP proxy to this port; the guest relay
+/// forwards it to `127.0.0.1:2049`. NFSv4 serves everything on this one port,
+/// so no separate MOUNT-protocol relay is needed.
+pub const NFS_NFSD_RELAY_PORT: u32 = 2049;

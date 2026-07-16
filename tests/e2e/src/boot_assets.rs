@@ -206,6 +206,9 @@ fn run_scenario(ctx: &mut TestContext, metrics: &mut RunMetrics) -> Result<()> {
     check_prerequisites(ctx)?;
     setup_test_env(ctx)?;
     metrics.time("daemon_ready", || start_daemon(ctx))?;
+    metrics.time("nfs_export", || {
+        verify_nfs_export(ctx).context("guest data NFS export read-through test")
+    })?;
 
     metrics.time("image_pull", || pull_image(ctx))?;
     metrics.time("container_create_smoke", || smoke_container_create(ctx))?;
@@ -228,6 +231,73 @@ fn run_scenario(ctx: &mut TestContext, metrics: &mut RunMetrics) -> Result<()> {
 
     info!(daemon_log = %ctx.test_dir.join("log/daemon.log").display(), "boot assets integration test passed");
     Ok(())
+}
+
+/// Verifies the guest-data NFS export end to end by reading the guest's docker
+/// data root through the host mount the daemon established (isolated at
+/// `<data_dir>/ArcBox` via `ARCBOX_HOST_MOUNT_DIR`). Registry-independent — it
+/// reads data dockerd creates on startup, so it does not need a pulled image.
+fn verify_nfs_export(ctx: &TestContext) -> Result<()> {
+    info!("[test] nfs export: read guest docker data through the host ~/ArcBox mount");
+    let mount_dir = ctx.test_dir.join("ArcBox");
+    wait_for_nfs_mount(&mount_dir)?;
+
+    // Strongest signal: read a real guest file's contents through NFS. dockerd
+    // writes engine-id (0644) on startup; fall back to a directory read-through
+    // in case a future dockerd stops writing it. The agent ends the NFSv4
+    // grace period as soon as nfsd starts, so opens normally succeed at once;
+    // the window covers the 10s fallback grace if that ever fails, plus
+    // attribute-cache propagation.
+    let engine_id = mount_dir.join("engine-id");
+    if let Ok(content) = read_file_with_retry(&engine_id, Duration::from_secs(20)) {
+        if content.trim().is_empty() {
+            bail!("engine-id read through ~/ArcBox was empty");
+        }
+        info!(path = %engine_id.display(), "nfs export file read-through OK");
+        return Ok(());
+    }
+
+    let entries = fs::read_dir(&mount_dir)
+        .with_context(|| format!("reading {} via NFS", mount_dir.display()))?
+        .count();
+    if entries < 2 {
+        bail!("~/ArcBox export listed only {entries} entries; expected the docker data root");
+    }
+    info!(entries, "nfs export directory read-through OK");
+    Ok(())
+}
+
+/// Waits until the daemon's NFS mount is populated with docker's data root.
+fn wait_for_nfs_mount(mount_dir: &Path) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if mount_dir.join("volumes").is_dir() || mount_dir.join("overlay2").is_dir() {
+            info!(mount = %mount_dir.display(), "host NFS mount is populated");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "guest data NFS mount not populated at {} within timeout",
+                mount_dir.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Reads `path`, retrying briefly while the just-written file propagates
+/// through the NFS attribute cache.
+fn read_file_with_retry(path: &Path, timeout: Duration) -> Result<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match fs::read_to_string(path) {
+            Ok(content) => return Ok(content),
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(300)),
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", path.display()));
+            }
+        }
+    }
 }
 
 pub fn boot_version(lockfile: &Path) -> Result<String> {
@@ -312,8 +382,34 @@ pub fn stage_dev_boot_assets(root: &Path, data_dir: &Path, version: &str) -> Res
         warn!("no vm-agent found; sandbox create will fail inside the guest");
     }
 
+    // Seed the guest runtime binaries from an installed ArcBox so a bare test
+    // daemon boots without reaching the CDN. Best-effort: prepare_binaries
+    // downloads anything still missing.
+    stage_runtime_binaries(&data_dir.join("runtime/bin"));
+
     info!(dev_boot_dir = %dev_boot_dir.display(), "using development boot assets");
     Ok(())
+}
+
+/// Copies every guest runtime binary from the installed ArcBox's data dir into
+/// the test data dir, so the daemon's binary prepare finds them locally instead
+/// of downloading. Best-effort — anything still missing or version-mismatched
+/// falls back to the daemon's own download.
+fn stage_runtime_binaries(dest_dir: &Path) {
+    let src_dir = arcbox_constants::paths::ArcboxProfile::Production
+        .default_data_dir()
+        .join("runtime/bin");
+    let Ok(entries) = fs::read_dir(&src_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let src = entry.path();
+        if src.is_file() {
+            if let Err(error) = copy_file(&src, &dest_dir.join(entry.file_name())) {
+                warn!(binary = %entry.file_name().to_string_lossy(), %error, "failed to stage runtime binary");
+            }
+        }
+    }
 }
 
 /// Copy the newest-mtime copy of `name` (dev boot dir, musl target dir, or an

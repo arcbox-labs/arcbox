@@ -40,6 +40,7 @@ arcbox-docker-tools.workspace = true
 filetime = "0.2.29"
 arcbox-grpc = { version = "0.4.16", path = "../../rpc/arcbox-grpc" }
 tonic-reflection = "0.14"
+arcbox-transport.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-resolver = { workspace = true }

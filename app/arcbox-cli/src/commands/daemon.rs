@@ -65,6 +65,10 @@ pub struct DaemonArgs {
     /// Guest dockerd API vsock port.
     #[arg(long)]
     pub guest_docker_vsock_port: Option<u32>,
+
+    /// Do not mount the guest docker data export at ~/ArcBox.
+    #[arg(long)]
+    pub no_mount_nfs: bool,
 }
 
 /// Daemon actions.
@@ -422,6 +426,9 @@ fn build_daemon_args(args: &DaemonArgs) -> Vec<OsString> {
     if let Some(port) = args.guest_docker_vsock_port {
         daemon_args.push(OsString::from("--guest-docker-vsock-port"));
         daemon_args.push(OsString::from(port.to_string()));
+    }
+    if args.no_mount_nfs {
+        daemon_args.push(OsString::from("--no-mount-nfs"));
     }
     daemon_args
 }

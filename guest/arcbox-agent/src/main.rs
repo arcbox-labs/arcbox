@@ -29,6 +29,10 @@ mod shutdown;
 #[cfg(target_os = "linux")]
 mod mount;
 
+// NFSv3 export of the docker data mount + vsock relays (Linux-only: kernel nfsd).
+#[cfg(target_os = "linux")]
+mod nfs;
+
 // VMM config loading and sandbox service are Linux-only.
 #[cfg(target_os = "linux")]
 mod config;
@@ -190,12 +194,25 @@ async fn main() -> Result<()> {
         })
     };
 
+    // Bridge the guest NFSv4 server (nfsd on 2049) to the host over vsock. The
+    // export itself is set up lazily once dockerd's data mount exists (see
+    // agent::linux::runtime); the relay just waits for it. NFSv4 needs only
+    // this one port — no MOUNT protocol.
+    #[cfg(target_os = "linux")]
+    let nfs_handle = tokio::spawn(nfs::run_nfs_relay(
+        cancel.clone(),
+        arcbox_constants::ports::NFS_NFSD_RELAY_PORT,
+        nfs::NFSD_PORT,
+    ));
+
     // Run the agent (vsock listener + RPC handler).
     let result = agent::run().await;
 
     // Shut down background tasks.
     cancel.cancel();
     let _ = tokio::join!(dns_handle, docker_handle);
+    #[cfg(target_os = "linux")]
+    let _ = nfs_handle.await;
 
     result
 }

@@ -74,6 +74,7 @@ async fn init_early(args: DaemonArgs, handles: StartupHandles) -> Result<EarlyCo
         dns_domain,
         dns_port,
         docker_integration: args.docker_integration,
+        mount_nfs: !args.no_mount_nfs,
         vm_args: VmArgs {
             guest_docker_vsock_port: args.guest_docker_vsock_port,
             kernel: args.kernel,
@@ -114,6 +115,7 @@ async fn acquire_lock(early: EarlyContext) -> Result<DaemonContext> {
         dns_domain: early.dns_domain,
         dns_port: early.dns_port,
         docker_integration: early.docker_integration,
+        mount_nfs: early.mount_nfs,
         vm_args: early.vm_args,
     })
 }

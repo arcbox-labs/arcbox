@@ -3,6 +3,7 @@
 mod context;
 mod dns_service;
 mod kubernetes_proxy;
+mod nfs_mount;
 mod recovery;
 mod self_setup;
 mod services;
@@ -58,6 +59,10 @@ pub struct DaemonArgs {
     /// Guest dockerd API vsock port.
     #[arg(long)]
     pub guest_docker_vsock_port: Option<u32>,
+
+    /// Do not mount the guest docker data export at ~/ArcBox.
+    #[arg(long)]
+    pub no_mount_nfs: bool,
 }
 
 fn main() -> Result<()> {
