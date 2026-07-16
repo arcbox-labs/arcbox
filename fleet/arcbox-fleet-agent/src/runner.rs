@@ -7,7 +7,9 @@
 //! Backend is chosen from the agent's own advertised capabilities: Linux jobs a
 //! Docker capability serves run in a container (isolation); darwin jobs a `vm`
 //! capability serves run in a disposable macOS guest via the local daemon
-//! (isolation); a `host_runner` capability runs via the pre-installed runner.
+//! (isolation); a `host_runner` capability runs via the pre-installed runner —
+//! directly for the native platform, or across the WSL interop boundary for a
+//! windows capability served from inside WSL2.
 //! Capacity is never a number — admission gates on live load and free memory,
 //! so a busy host simply rejects and the platform re-offers elsewhere.
 
@@ -29,6 +31,7 @@ use tracing::{info, warn};
 
 use crate::docker::{DockerRunner, RunSpec};
 use crate::host;
+use crate::interop::InteropRunner;
 use crate::state::AgentState;
 use crate::vm::VmRunner;
 
@@ -87,7 +90,8 @@ struct Inner {
     /// Jobs currently running here, each with its cancellation token — one map
     /// for duplicate detection, cancel delivery, and release. Cancelling a token
     /// makes the job's `run_job` tear down the runner — the whole process group
-    /// (host) or the container (Docker) — awaited, before the entry is released.
+    /// (host), the container (Docker), the guest (VM), or the Windows process
+    /// tree (interop) — awaited, before the entry is released.
     /// The token is level-triggered, so a cancel that lands while the runner is
     /// still starting is observed at the next cancellation point rather than
     /// lost; see [`RunnerSupervisor::handle_cancel`].
@@ -99,6 +103,8 @@ struct Inner {
     docker: Option<DockerRunner>,
     /// macOS VM backend for darwin jobs, if the local daemon serves it.
     vm: Option<VmRunner>,
+    /// WSL interop backend for windows jobs, if the startup probe passed.
+    interop: Option<InteropRunner>,
     /// The backend serving each advertised `(os, arch)` — the routing table.
     backends: HashMap<(String, String), Backend>,
     /// Set once `Drain` is received; no new jobs are accepted.
@@ -142,6 +148,7 @@ impl RunnerSupervisor {
         runner_script: Option<PathBuf>,
         docker: Option<DockerRunner>,
         vm: Option<VmRunner>,
+        interop: Option<InteropRunner>,
         capabilities: Vec<Capability>,
         state: AgentState,
     ) -> Self {
@@ -164,6 +171,7 @@ impl RunnerSupervisor {
                 runner_script,
                 docker,
                 vm,
+                interop,
                 backends,
                 draining: std::sync::atomic::AtomicBool::new(false),
                 draining_for_update: std::sync::atomic::AtomicBool::new(false),
@@ -426,6 +434,13 @@ impl RunnerSupervisor {
         let job_id = order.job_id.clone();
         match backend {
             Backend::Docker => self.run_docker_job(&job_id, &order, &token, cancel).await,
+            // A windows capability is host_runner-backed on the wire (it IS
+            // the host's pre-installed runner, reached across the WSL
+            // interop boundary), but its process management is different
+            // enough to be its own path — see `crate::interop`.
+            Backend::HostRunner if order.os == "windows" => {
+                self.run_interop_job(&job_id, &order, &token, cancel).await;
+            }
             Backend::HostRunner => self.run_host_job(&job_id, &order, &token, cancel).await,
             Backend::Vm => self.run_vm_job(&job_id, &order, &token, cancel).await,
             // Never advertised, so admit() never routes here; reject
@@ -518,6 +533,60 @@ impl RunnerSupervisor {
             // the in-flight slot outlives the guest — never the reverse.
             None => {
                 running.destroy().await;
+                info!(job_id, "runner canceled");
+            }
+        }
+    }
+
+    /// Run a windows job on the WSL host via interop. The offer is accepted
+    /// only after the `WINPID=` handshake proves the Windows process is
+    /// running; cancellation tears down the Windows tree via `taskkill`
+    /// (a Unix process-group kill would only orphan it — see
+    /// [`crate::interop`]), awaited, so the slot outlives the runner.
+    async fn run_interop_job(
+        &self,
+        job_id: &str,
+        order: &ProvisionRunner,
+        token: &str,
+        cancel: CancellationToken,
+    ) {
+        // Invariant: a windows capability is only advertised when the
+        // interop probe passed, so admit() routes here only with `interop`
+        // set; reject defensively rather than panic if that ever breaks.
+        let Some(interop) = &self.inner.interop else {
+            self.reject(job_id, token, "windows jobs are not served by this agent");
+            return;
+        };
+
+        let mut job = match interop.spawn(&order.encoded_jit_config).await {
+            Ok(job) => job,
+            Err(e) => {
+                self.reject(
+                    job_id,
+                    token,
+                    &format!("failed to spawn windows runner: {e:#}"),
+                );
+                return;
+            }
+        };
+
+        self.accept(job_id, token);
+        info!(
+            job_id,
+            windows_pid = job.windows_pid(),
+            "runner started (windows interop)"
+        );
+
+        tokio::select! {
+            result = job.wait() => match result {
+                Ok(status) => info!(job_id, success = status.success(), "runner exited"),
+                Err(e) => warn!(job_id, error = %e, "waiting on runner failed"),
+            },
+            // CancelRunner: taskkill the Windows tree and reap the relay,
+            // awaited. The token is level-triggered, so a cancel that fired
+            // during the spawn handshake is observed here immediately.
+            () = cancel.cancelled() => {
+                job.kill().await;
                 info!(job_id, "runner canceled");
             }
         }
@@ -767,6 +836,7 @@ mod tests {
             Some(PathBuf::from("/nonexistent")),
             None,
             None,
+            None,
             capabilities,
             AgentState::new(&seed()),
         )
@@ -881,6 +951,7 @@ mod tests {
             Some(PathBuf::from("/nonexistent")),
             None,
             None,
+            None,
             vec![capability("darwin", "arm64", Backend::HostRunner)],
             AgentState::new(&seed()),
         );
@@ -898,6 +969,7 @@ mod tests {
         let sup = RunnerSupervisor::new(
             events,
             Some(PathBuf::from("/nonexistent")),
+            None,
             None,
             None,
             vec![capability("darwin", "arm64", Backend::HostRunner)],
@@ -1118,7 +1190,8 @@ mod tests {
     async fn shutdown_does_not_flip_observable_draining_but_drain_does() {
         let drained = AgentState::new(&seed());
         let (events, _rx) = mpsc::channel(1);
-        RunnerSupervisor::new(events, None, None, None, Vec::new(), drained.clone()).handle_drain();
+        RunnerSupervisor::new(events, None, None, None, None, Vec::new(), drained.clone())
+            .handle_drain();
         assert!(
             drained.current().draining,
             "Drain flips the observable flag"
@@ -1126,9 +1199,17 @@ mod tests {
 
         let torn_down = AgentState::new(&seed());
         let (events, _rx) = mpsc::channel(1);
-        RunnerSupervisor::new(events, None, None, None, Vec::new(), torn_down.clone())
-            .shutdown(Duration::from_secs(1))
-            .await;
+        RunnerSupervisor::new(
+            events,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            torn_down.clone(),
+        )
+        .shutdown(Duration::from_secs(1))
+        .await;
         assert!(
             !torn_down.current().draining,
             "teardown must not flip the observable flag",

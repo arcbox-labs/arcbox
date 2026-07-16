@@ -230,6 +230,7 @@ pub struct AgentSupervisor {
     config: AgentConfig,
     docker: Option<DockerRunner>,
     vm: Option<crate::vm::VmRunner>,
+    interop: Option<crate::interop::InteropRunner>,
     capabilities: Vec<Capability>,
     /// Cancelled on process shutdown (SIGTERM/Ctrl-C); every attachment's
     /// `shutdown` is a child of this token.
@@ -247,10 +248,17 @@ pub struct AgentSupervisor {
 impl AgentSupervisor {
     /// Build the supervisor, immediately attaching if a credential is
     /// already persisted — the existing headless/farm behavior.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "construction genuinely needs the config, all three optional job backends \
+                  (docker/vm/interop), the advertised capabilities, and the three process-wide \
+                  handles; same shape as attach::run"
+    )]
     pub async fn new(
         config: AgentConfig,
         docker: Option<DockerRunner>,
         vm: Option<crate::vm::VmRunner>,
+        interop: Option<crate::interop::InteropRunner>,
         capabilities: Vec<Capability>,
         process_shutdown: CancellationToken,
         agent_state: AgentState,
@@ -260,6 +268,7 @@ impl AgentSupervisor {
             config,
             docker,
             vm,
+            interop,
             capabilities,
             process_shutdown,
             state: Mutex::new(State::Unenrolled),
@@ -329,6 +338,7 @@ impl AgentSupervisor {
             &self.config,
             self.docker.clone(),
             self.vm.clone(),
+            self.interop.clone(),
             self.capabilities.clone(),
             self.agent_state.clone(),
         );
@@ -767,6 +777,7 @@ mod tests {
                 test_config(dir.to_path_buf()),
                 None,
                 None,
+                None,
                 Vec::new(),
                 CancellationToken::new(),
                 agent_state,
@@ -839,6 +850,7 @@ mod tests {
         let (events, _events_rx) = tokio::sync::mpsc::channel(1);
         let runner = crate::runner::RunnerSupervisor::new(
             events,
+            None,
             None,
             None,
             None,
@@ -936,6 +948,7 @@ mod tests {
             config,
             None,
             None,
+            None,
             Vec::new(),
             CancellationToken::new(),
             agent_state.clone(),
@@ -970,6 +983,7 @@ mod tests {
                 test_config(dir.clone()),
                 None,
                 None,
+                None,
                 Vec::new(),
                 CancellationToken::new(),
                 agent_state.clone(),
@@ -989,8 +1003,15 @@ mod tests {
             Ok(())
         });
         let (events, _events_rx) = tokio::sync::mpsc::channel(1);
-        let runner =
-            crate::runner::RunnerSupervisor::new(events, None, None, None, Vec::new(), agent_state);
+        let runner = crate::runner::RunnerSupervisor::new(
+            events,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            agent_state,
+        );
         // A persisted credential, so the completed unenroll can prove the
         // local clear happens even though this gateway is unreachable (the
         // server-side call is best-effort).

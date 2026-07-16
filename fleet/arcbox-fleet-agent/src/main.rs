@@ -59,6 +59,7 @@ use tracing::{info, warn};
 
 use crate::config::{AgentConfig, DockerMode, VmMode};
 use crate::docker::DockerRunner;
+use crate::interop::InteropRunner;
 use crate::settings::{PersistedSettings, SettingsStore};
 use crate::state::AgentState;
 use crate::vm::VmRunner;
@@ -294,6 +295,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 &config.vm.daemon_socket,
             )
             .await?;
+            let interop = init_interop(seed.windows_runner_script.as_deref()).await;
             let capabilities =
                 capabilities(seed.runner_script.is_some(), docker.as_ref(), vm.as_ref());
             let credential = config.credential_store_for(&seed.gateway).load()?.context(
@@ -313,6 +315,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 &config,
                 docker,
                 vm,
+                interop,
                 capabilities.clone(),
                 agent_state.clone(),
             );
@@ -348,6 +351,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 &config.vm.daemon_socket,
             )
             .await?;
+            let interop = init_interop(seed.windows_runner_script.as_deref()).await;
             let capabilities =
                 capabilities(seed.runner_script.is_some(), docker.as_ref(), vm.as_ref());
             let socket_path = config.control_socket_path();
@@ -363,6 +367,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                     config,
                     docker,
                     vm,
+                    interop,
                     capabilities,
                     shutdown.clone(),
                     agent_state.clone(),
@@ -717,6 +722,26 @@ async fn init_vm(
                 Ok(None)
             }
         },
+    }
+}
+
+/// Probe the WSL interop backend for windows jobs, Auto semantics only: an
+/// unset `windows_runner_script` means not wanted, and a failed probe (not
+/// WSL, interop disabled, script missing) logs and falls through — the
+/// windows capability is simply not advertised. There is no Enabled mode:
+/// unlike Docker/VM, nothing else can serve windows jobs, so failing
+/// startup would only take the host's other capabilities down with it.
+async fn init_interop(windows_runner_script: Option<&str>) -> Option<InteropRunner> {
+    let script = windows_runner_script?;
+    match InteropRunner::new(script).await {
+        Ok(runner) => Some(runner),
+        Err(e) => {
+            warn!(
+                error = format!("{e:#}"),
+                "WSL interop not available; the windows capability will not be advertised"
+            );
+            None
+        }
     }
 }
 

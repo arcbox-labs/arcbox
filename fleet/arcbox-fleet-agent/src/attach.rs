@@ -124,6 +124,7 @@ pub fn spawn_supervisor(
     config: &AgentConfig,
     docker: Option<docker::DockerRunner>,
     vm: Option<crate::vm::VmRunner>,
+    interop: Option<crate::interop::InteropRunner>,
     capabilities: Vec<Capability>,
     state: AgentState,
 ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
@@ -133,6 +134,7 @@ pub fn spawn_supervisor(
         config.runner_script.clone(),
         docker,
         vm,
+        interop,
         capabilities,
         state,
     );
@@ -687,7 +689,7 @@ mod tests {
             machine_token: "flt_revoked".to_owned(),
         };
         let (supervisor, egress_rx) =
-            spawn_supervisor(&config, None, None, Vec::new(), state.clone());
+            spawn_supervisor(&config, None, None, None, Vec::new(), state.clone());
         let shutdown = CancellationToken::new();
         let run = tokio::spawn(run(
             config,
@@ -817,6 +819,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             AgentState::new(&seed()),
         );
@@ -869,6 +872,7 @@ mod tests {
         let (events, _rx) = mpsc::channel(1);
         let supervisor = RunnerSupervisor::new(
             events,
+            None,
             None,
             None,
             None,
@@ -925,6 +929,7 @@ mod tests {
         let (events, _rx) = mpsc::channel(1);
         let supervisor = RunnerSupervisor::new(
             events,
+            None,
             None,
             None,
             None,
