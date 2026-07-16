@@ -126,6 +126,9 @@ impl core::fmt::Display for ArcboxProfile {
     }
 }
 
+/// Gated on the `std` feature: the error message is an allocated `String`,
+/// which `no_std` builds of this crate don't have.
+#[cfg(feature = "std")]
 impl core::str::FromStr for ArcboxProfile {
     type Err = String;
 
