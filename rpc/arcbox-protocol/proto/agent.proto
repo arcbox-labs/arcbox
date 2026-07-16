@@ -249,6 +249,37 @@ message MachineStats {
     // traffic is not counted once per internal hop).
     uint64 net_rx_bytes = 11;
     uint64 net_tx_bytes = 12;
+    // Per-container samples, one per running Docker container (cgroup v2
+    // tree under /sys/fs/cgroup/docker). Empty when no containers run or
+    // the subscriber did not request them.
+    repeated ContainerStats containers = 13;
+}
+
+// One container's cgroup v2 resource sample.
+//
+// Sourced from the container's cgroup (cpu.stat, memory.current,
+// memory.max, io.stat, pids.current). CPU and disk fields are cumulative;
+// memory and pids are gauges. Per-container network is not a cgroup
+// counter (it lives in the network namespace) and is not reported here.
+message ContainerStats {
+    // Full container ID (the cgroup directory name).
+    string id = 1;
+    // Human-readable name, filled by the daemon from its container
+    // registry. Empty on the guest→host hop and when the daemon has no
+    // name for the ID (the consumer falls back to the short ID).
+    string name = 2;
+    // Cumulative CPU time in microseconds (cpu.stat usage_usec).
+    uint64 cpu_usage_usec = 3;
+    // Current memory charge in bytes (memory.current).
+    uint64 memory_current_bytes = 4;
+    // Memory limit in bytes (memory.max); 0 means unlimited ("max").
+    uint64 memory_limit_bytes = 5;
+    // Cumulative block I/O bytes summed across devices (io.stat
+    // rbytes/wbytes).
+    uint64 disk_read_bytes = 6;
+    uint64 disk_written_bytes = 7;
+    // Current process/thread count (pids.current).
+    uint32 pids = 8;
 }
 
 // Runtime status report.

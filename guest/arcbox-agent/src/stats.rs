@@ -165,6 +165,62 @@ fn is_physical_nic(name: &str) -> bool {
     name.starts_with("eth") || name.starts_with("en")
 }
 
+/// Cumulative CPU time in microseconds from a cgroup v2 `cpu.stat`
+/// (`usage_usec` line).
+#[must_use]
+pub fn parse_cgroup_cpu_usage_usec(cpu_stat: &str) -> Option<u64> {
+    cpu_stat
+        .lines()
+        .find_map(|l| l.strip_prefix("usage_usec "))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// A cgroup v2 memory limit from `memory.max`: `"max"` (unlimited) maps to
+/// 0, any other value parses as a byte count.
+#[must_use]
+pub fn parse_cgroup_memory_max(memory_max: &str) -> u64 {
+    let trimmed = memory_max.trim();
+    if trimmed == "max" {
+        0
+    } else {
+        trimmed.parse().unwrap_or(0)
+    }
+}
+
+/// A bare unsigned integer file (`memory.current`, `pids.current`).
+#[must_use]
+pub fn parse_u64_file(content: &str) -> Option<u64> {
+    content.trim().parse().ok()
+}
+
+/// Cumulative `(read, written)` bytes summed across every device line in a
+/// cgroup v2 `io.stat` (`MAJ:MIN rbytes=… wbytes=… …`).
+#[must_use]
+pub fn parse_cgroup_io_bytes(io_stat: &str) -> (u64, u64) {
+    let mut read = 0u64;
+    let mut written = 0u64;
+    for line in io_stat.lines() {
+        for field in line.split_ascii_whitespace() {
+            if let Some(v) = field.strip_prefix("rbytes=") {
+                read = read.saturating_add(v.parse().unwrap_or(0));
+            } else if let Some(v) = field.strip_prefix("wbytes=") {
+                written = written.saturating_add(v.parse().unwrap_or(0));
+            }
+        }
+    }
+    (read, written)
+}
+
+/// Whether a name under `/sys/fs/cgroup/docker` is a container cgroup: a
+/// full 64-character lowercase-hex container ID. Filters out the parent's
+/// own control files and any non-container entries.
+#[must_use]
+pub fn is_container_id(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +339,39 @@ veth1a2b3c: 8000     80    0    0    0     0          0         0  8000     80  
         ] {
             assert!(!is_physical_nic(virt), "{virt}");
         }
+    }
+
+    #[test]
+    fn cgroup_cpu_reads_usage_usec() {
+        let cpu_stat = "usage_usec 123456789\nuser_usec 80000000\nsystem_usec 40000000\n\
+                        nr_periods 0\nnr_throttled 0\n";
+        assert_eq!(parse_cgroup_cpu_usage_usec(cpu_stat), Some(123_456_789));
+        assert!(parse_cgroup_cpu_usage_usec("user_usec 5\n").is_none());
+    }
+
+    #[test]
+    fn cgroup_memory_max_treats_max_as_unlimited() {
+        assert_eq!(parse_cgroup_memory_max("max\n"), 0);
+        assert_eq!(parse_cgroup_memory_max("2147483648\n"), 2_147_483_648);
+        assert_eq!(parse_u64_file("536870912\n"), Some(536_870_912));
+        assert_eq!(parse_u64_file("42\n"), Some(42));
+    }
+
+    #[test]
+    fn cgroup_io_sums_bytes_across_devices() {
+        let io_stat = "254:0 rbytes=1000 wbytes=2000 rios=10 wios=20 dbytes=0 dios=0\n\
+                       254:16 rbytes=500 wbytes=700 rios=5 wios=7 dbytes=0 dios=0\n";
+        assert_eq!(parse_cgroup_io_bytes(io_stat), (1500, 2700));
+        assert_eq!(parse_cgroup_io_bytes(""), (0, 0));
+    }
+
+    #[test]
+    fn container_id_matches_full_hex_only() {
+        let id = "e8b0e6ed2660238f9cb327d7b8b2ab3b7ff088920b9fa9efe0118c6ec1fa6474";
+        assert!(is_container_id(id));
+        assert!(!is_container_id("cgroup.procs"));
+        assert!(!is_container_id("buildkit"));
+        assert!(!is_container_id(&id[..12])); // short id is not a cgroup dir
+        assert!(!is_container_id(&id.to_uppercase()));
     }
 }

@@ -1954,7 +1954,7 @@ pub struct WatchStatsRequest {
 /// and stream restarts.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MachineStats {
     /// Guest monotonic clock at sample time (from /proc/uptime), in
     /// milliseconds. Rate denominators come from deltas of this field, not
@@ -1995,6 +1995,48 @@ pub struct MachineStats {
     pub net_rx_bytes: u64,
     #[prost(uint64, tag = "12")]
     pub net_tx_bytes: u64,
+    /// Per-container samples, one per running Docker container (cgroup v2
+    /// tree under /sys/fs/cgroup/docker). Empty when no containers run or
+    /// the subscriber did not request them.
+    #[prost(message, repeated, tag = "13")]
+    pub containers: ::prost::alloc::vec::Vec<ContainerStats>,
+}
+/// One container's cgroup v2 resource sample.
+///
+/// Sourced from the container's cgroup (cpu.stat, memory.current,
+/// memory.max, io.stat, pids.current). CPU and disk fields are cumulative;
+/// memory and pids are gauges. Per-container network is not a cgroup
+/// counter (it lives in the network namespace) and is not reported here.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ContainerStats {
+    /// Full container ID (the cgroup directory name).
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Human-readable name, filled by the daemon from its container
+    /// registry. Empty on the guest→host hop and when the daemon has no
+    /// name for the ID (the consumer falls back to the short ID).
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    /// Cumulative CPU time in microseconds (cpu.stat usage_usec).
+    #[prost(uint64, tag = "3")]
+    pub cpu_usage_usec: u64,
+    /// Current memory charge in bytes (memory.current).
+    #[prost(uint64, tag = "4")]
+    pub memory_current_bytes: u64,
+    /// Memory limit in bytes (memory.max); 0 means unlimited ("max").
+    #[prost(uint64, tag = "5")]
+    pub memory_limit_bytes: u64,
+    /// Cumulative block I/O bytes summed across devices (io.stat
+    /// rbytes/wbytes).
+    #[prost(uint64, tag = "6")]
+    pub disk_read_bytes: u64,
+    #[prost(uint64, tag = "7")]
+    pub disk_written_bytes: u64,
+    /// Current process/thread count (pids.current).
+    #[prost(uint32, tag = "8")]
+    pub pids: u32,
 }
 /// Runtime status report.
 #[derive(serde::Serialize, serde::Deserialize)]

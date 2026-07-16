@@ -93,7 +93,7 @@ pub mod image {
 /// Re-exports all agent-related types for backward compatibility.
 pub mod agent {
     pub use super::v1::{
-        AgentPingRequest, AgentPingResponse, DiskTrimRequest, DiskTrimResponse,
+        AgentPingRequest, AgentPingResponse, ContainerStats, DiskTrimRequest, DiskTrimResponse,
         KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
         KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
         KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,

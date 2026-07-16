@@ -12,13 +12,18 @@ use anyhow::Result;
 use prost::Message as _;
 use tokio::io::AsyncWrite;
 
-use arcbox_protocol::agent::{MachineStats, WatchStatsRequest};
+use arcbox_protocol::agent::{ContainerStats, MachineStats, WatchStatsRequest};
 
 use crate::rpc::{MessageType, write_message};
 use crate::stats::{
+    is_container_id, parse_cgroup_cpu_usage_usec, parse_cgroup_io_bytes, parse_cgroup_memory_max,
     parse_cpu_ticks, parse_diskstats, parse_loadavg1, parse_meminfo, parse_net_dev,
-    parse_psi_full_avg10, parse_uptime_ms,
+    parse_psi_full_avg10, parse_u64_file, parse_uptime_ms,
 };
+
+/// cgroup v2 parent that Docker (cgroupfs driver) places one child cgroup
+/// per container under, named by the full container ID.
+const DOCKER_CGROUP_ROOT: &str = "/sys/fs/cgroup/docker";
 
 /// Default watch window when the request leaves `timeout_ms` at 0.
 const DEFAULT_WINDOW: Duration = Duration::from_secs(300);
@@ -127,5 +132,40 @@ fn read_machine_stats() -> Option<MachineStats> {
         disk_written_bytes,
         net_rx_bytes,
         net_tx_bytes,
+        containers: read_container_stats(),
     })
+}
+
+/// Reads one [`ContainerStats`] per Docker container cgroup.
+///
+/// Returns an empty vec when no containers run or the cgroup tree is
+/// absent — never an error, since machine stats must still flow. The
+/// `name` field is left empty for the daemon to fill from its registry.
+fn read_container_stats() -> Vec<ContainerStats> {
+    let Ok(entries) = std::fs::read_dir(DOCKER_CGROUP_ROOT) else {
+        return Vec::new();
+    };
+    let mut containers = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !is_container_id(&name) {
+            continue;
+        }
+        let dir = entry.path();
+        let read = |leaf: &str| std::fs::read_to_string(dir.join(leaf)).unwrap_or_default();
+        let (disk_read_bytes, disk_written_bytes) = parse_cgroup_io_bytes(&read("io.stat"));
+        containers.push(ContainerStats {
+            id: name,
+            name: String::new(),
+            cpu_usage_usec: parse_cgroup_cpu_usage_usec(&read("cpu.stat")).unwrap_or(0),
+            memory_current_bytes: parse_u64_file(&read("memory.current")).unwrap_or(0),
+            memory_limit_bytes: parse_cgroup_memory_max(&read("memory.max")),
+            disk_read_bytes,
+            disk_written_bytes,
+            pids: parse_u64_file(&read("pids.current")).unwrap_or(0) as u32,
+        });
+    }
+    containers
 }
