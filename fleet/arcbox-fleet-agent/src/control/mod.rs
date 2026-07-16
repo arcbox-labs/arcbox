@@ -321,6 +321,13 @@ impl AgentSupervisor {
         self.vm.clone()
     }
 
+    /// Whether the WSL interop backend for windows jobs is active — the
+    /// startup probe passed. Reported as a `GetAgentInfo` feature, same
+    /// rationale as [`Self::vm_active`]; restart-scoped like every backend.
+    pub fn interop_active(&self) -> bool {
+        self.interop.is_some()
+    }
+
     /// Spawn the attach task for `credential` and build its [`Attachment`].
     /// `credential_gateway` is the store key the credential is persisted
     /// under (see [`Attachment::credential_gateway`]).

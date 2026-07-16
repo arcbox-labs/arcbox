@@ -141,9 +141,10 @@ impl InteropRunner {
 
     /// Test constructor bypassing `wslpath` and the probe, so the spawn/
     /// wait/kill contract is exercisable anywhere with stub executables
-    /// standing in for powershell and taskkill.
+    /// standing in for powershell and taskkill. Crate-visible for the
+    /// runner's routing tests.
     #[cfg(test)]
-    fn with_paths(powershell: PathBuf, taskkill: PathBuf, script: &str) -> Self {
+    pub(crate) fn with_paths(powershell: PathBuf, taskkill: PathBuf, script: &str) -> Self {
         Self {
             powershell,
             taskkill,

@@ -875,6 +875,104 @@ mod tests {
         );
     }
 
+    /// A supervisor advertising windows/amd64 (host_runner-backed, as the
+    /// interop capability is on the wire), with thresholds that can never
+    /// reject — `handle_provision` reads real `host::telemetry()`.
+    fn windows_supervisor_with_rx(
+        interop: Option<InteropRunner>,
+    ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
+        let (events, rx) = mpsc::channel(8);
+        let sup = RunnerSupervisor::new(
+            events,
+            None,
+            None,
+            None,
+            interop,
+            vec![capability("windows", "amd64", Backend::HostRunner)],
+            AgentState::new(&crate::settings::PersistedSettings {
+                load_ceiling: f64::MAX,
+                mem_floor_mib: 0,
+                ..seed()
+            }),
+        );
+        (sup, rx)
+    }
+
+    /// Write an executable stub standing in for powershell/taskkill.
+    fn interop_stub(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Full dispatch for a windows offer: `handle_provision` routes the
+    /// host_runner-backed windows capability to the interop path, which
+    /// accepts only after the WINPID handshake and releases the slot when
+    /// the runner exits.
+    #[tokio::test]
+    async fn windows_offer_runs_through_the_interop_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let powershell = interop_stub(dir.path(), "powershell", "echo 'WINPID=4242'\nexit 0");
+        let taskkill = interop_stub(dir.path(), "taskkill", "exit 0");
+        let interop = InteropRunner::with_paths(powershell, taskkill, r"C:\r\run.cmd");
+        let (sup, mut rx) = windows_supervisor_with_rx(Some(interop));
+
+        sup.handle_provision(ProvisionRunner {
+            job_id: "rjob_win".to_owned(),
+            os: "windows".to_owned(),
+            arch: "amd64".to_owned(),
+            encoded_jit_config: "dGVzdA==".to_owned(),
+            offer_token: "tok1".to_owned(),
+        });
+
+        let verdict = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("verdict within the handshake budget")
+            .expect("egress channel open");
+        match verdict.msg {
+            Some(attach_request::Msg::RunnerAccepted(a)) => assert_eq!(a.job_id, "rjob_win"),
+            other => panic!("expected RunnerAccepted, got {other:?}"),
+        }
+
+        // The stub exits immediately, so the slot drains without a cancel.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sup.inner.in_flight.contains_key("rjob_win") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("slot released once the runner exited");
+    }
+
+    /// The defensive arm: a windows offer admitted while no interop backend
+    /// exists (a broken capability set) must reject, not panic or accept a
+    /// ghost job.
+    #[tokio::test]
+    async fn windows_offer_without_interop_is_rejected() {
+        let (sup, mut rx) = windows_supervisor_with_rx(None);
+
+        sup.handle_provision(ProvisionRunner {
+            job_id: "rjob_win".to_owned(),
+            os: "windows".to_owned(),
+            arch: "amd64".to_owned(),
+            encoded_jit_config: "dGVzdA==".to_owned(),
+            offer_token: "tok1".to_owned(),
+        });
+
+        let verdict = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("verdict promptly")
+            .expect("egress channel open");
+        match verdict.msg {
+            Some(attach_request::Msg::RunnerRejected(r)) => {
+                assert!(r.reason.contains("not served"), "{}", r.reason);
+            }
+            other => panic!("expected RunnerRejected, got {other:?}"),
+        }
+    }
+
     #[test]
     fn rejects_unservable_os_arch() {
         let sup = supervisor(vec![capability("darwin", "arm64", Backend::HostRunner)]);

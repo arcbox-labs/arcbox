@@ -40,6 +40,11 @@ impl FleetLifecycleService for LifecycleService {
             // jobs (see crate::vm).
             features.push("vm-backend".to_owned());
         }
+        if self.supervisor.interop_active() {
+            // Windows jobs run on the WSL host across the interop boundary
+            // (see crate::interop).
+            features.push("wsl-interop".to_owned());
+        }
         Ok(Response::new(GetAgentInfoResponse {
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
             api_version: API_VERSION,

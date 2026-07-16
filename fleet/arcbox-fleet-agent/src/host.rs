@@ -90,10 +90,17 @@ pub fn telemetry() -> HostTelemetry {
 ///   pre-installed runner, backed by `host_runner`. Omitted when no runner
 ///   script is configured, or when the native pair is already served by
 ///   Docker (a Linux host) or by the VM backend (above).
+/// - **Windows-via-interop capability.** `interop_active` means this Linux
+///   agent runs inside WSL2 and the interop probe passed (see
+///   `crate::interop`); `windows` on the native arch (WSL always matches the
+///   Windows host's arch) is then served across the interop boundary.
+///   Additive and host_runner-backed on the wire — it IS the host's
+///   pre-installed Windows runner.
 pub fn capabilities(
     runner_script_present: bool,
     docker_arches: &[String],
     vm_active: bool,
+    interop_active: bool,
 ) -> Vec<Capability> {
     build_capabilities(
         &host_os(),
@@ -101,6 +108,7 @@ pub fn capabilities(
         runner_script_present,
         docker_arches,
         vm_active,
+        interop_active,
     )
 }
 
@@ -112,6 +120,7 @@ fn build_capabilities(
     runner_script_present: bool,
     docker_arches: &[String],
     vm_active: bool,
+    interop_active: bool,
 ) -> Vec<Capability> {
     let mut caps = Vec::new();
 
@@ -120,6 +129,14 @@ fn build_capabilities(
             os: "linux".to_owned(),
             arch: arch.clone(),
             backed_by: Backend::Docker as i32,
+        });
+    }
+
+    if interop_active {
+        caps.push(Capability {
+            os: "windows".to_owned(),
+            arch: native_arch.to_owned(),
+            backed_by: Backend::HostRunner as i32,
         });
     }
 
@@ -162,7 +179,7 @@ mod tests {
 
     #[test]
     fn host_only_without_docker() {
-        let caps = build_capabilities("darwin", "arm64", true, &[], false);
+        let caps = build_capabilities("darwin", "arm64", true, &[], false, false);
         assert_eq!(caps.len(), 1);
         assert_eq!(
             triple(&caps[0]),
@@ -173,7 +190,7 @@ mod tests {
     #[test]
     fn macos_adds_docker_linux_capabilities() {
         let arches = vec!["arm64".to_owned(), "amd64".to_owned()];
-        let caps = build_capabilities("darwin", "arm64", true, &arches, false);
+        let caps = build_capabilities("darwin", "arm64", true, &arches, false, false);
         // Two docker linux capabilities plus the darwin host-runner one.
         assert_eq!(caps.len(), 3);
         assert_eq!(triple(&caps[0]), ("linux", "arm64", Backend::Docker as i32));
@@ -188,7 +205,7 @@ mod tests {
     fn linux_host_capability_is_docker_served() {
         // On a Linux host with Docker the native capability IS the docker linux
         // one — no separate host-runner capability is added.
-        let caps = build_capabilities("linux", "amd64", true, &["amd64".to_owned()], false);
+        let caps = build_capabilities("linux", "amd64", true, &["amd64".to_owned()], false, false);
         assert_eq!(caps.len(), 1);
         assert_eq!(triple(&caps[0]), ("linux", "amd64", Backend::Docker as i32));
     }
@@ -196,7 +213,14 @@ mod tests {
     #[test]
     fn omits_host_capability_without_runner_script() {
         // Docker-only macOS: no runner script means no darwin capability.
-        let caps = build_capabilities("darwin", "arm64", false, &["arm64".to_owned()], false);
+        let caps = build_capabilities(
+            "darwin",
+            "arm64",
+            false,
+            &["arm64".to_owned()],
+            false,
+            false,
+        );
         assert_eq!(caps.len(), 1);
         assert_eq!(triple(&caps[0]), ("linux", "arm64", Backend::Docker as i32));
     }
@@ -205,15 +229,41 @@ mod tests {
     fn vm_backend_serves_the_native_pair_and_wins_over_host_runner() {
         // With the VM backend active, darwin/arm64 is VM-served even though a
         // runner script is configured — isolation wins.
-        let caps = build_capabilities("darwin", "arm64", true, &["arm64".to_owned()], true);
+        let caps = build_capabilities("darwin", "arm64", true, &["arm64".to_owned()], true, false);
         assert_eq!(caps.len(), 2);
         assert_eq!(triple(&caps[0]), ("linux", "arm64", Backend::Docker as i32));
         assert_eq!(triple(&caps[1]), ("darwin", "arm64", Backend::Vm as i32));
     }
 
+    /// The interop windows capability is additive: a WSL Linux host with
+    /// Docker advertises its linux capability as before, plus windows on
+    /// the native arch, host_runner-backed on the wire.
+    #[test]
+    fn interop_adds_a_windows_capability_alongside_docker_linux() {
+        let caps = build_capabilities("linux", "amd64", false, &["amd64".to_owned()], false, true);
+        assert_eq!(caps.len(), 2);
+        assert_eq!(triple(&caps[0]), ("linux", "amd64", Backend::Docker as i32));
+        assert_eq!(
+            triple(&caps[1]),
+            ("windows", "amd64", Backend::HostRunner as i32)
+        );
+    }
+
+    /// Interop alone (no Docker, no runner script) still serves windows —
+    /// the WSL distro exists purely to host the agent.
+    #[test]
+    fn interop_alone_serves_only_windows() {
+        let caps = build_capabilities("linux", "amd64", false, &[], false, true);
+        assert_eq!(caps.len(), 1);
+        assert_eq!(
+            triple(&caps[0]),
+            ("windows", "amd64", Backend::HostRunner as i32)
+        );
+    }
+
     #[test]
     fn vm_backend_without_runner_script_still_serves_darwin() {
-        let caps = build_capabilities("darwin", "arm64", false, &[], true);
+        let caps = build_capabilities("darwin", "arm64", false, &[], true, false);
         assert_eq!(caps.len(), 1);
         assert_eq!(triple(&caps[0]), ("darwin", "arm64", Backend::Vm as i32));
     }
