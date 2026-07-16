@@ -186,7 +186,7 @@ impl ComputedStats {
             // right-aligned as a whole.
             let _ = writeln!(
                 out,
-                "\n{:<24} {:>7} {:>19} {:>21} {:>21} {:>5}",
+                "\n{:<24} {:>7} {:>21} {:>21} {:>21} {:>5}",
                 "CONTAINER", "CPU%", "MEM", "DISK R/W/s", "NET ↓/↑/s", "PIDS"
             );
             for c in &self.containers {
@@ -211,7 +211,7 @@ impl ComputedStats {
                 );
                 let _ = writeln!(
                     out,
-                    "{:<24} {:>6.1}% {:>19} {:>21} {:>21} {:>5}",
+                    "{:<24} {:>6.1}% {:>21} {:>21} {:>21} {:>5}",
                     truncate(&c.name, 24),
                     c.cpu_percent,
                     mem,
