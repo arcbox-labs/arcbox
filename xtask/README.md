@@ -30,13 +30,8 @@ devenv shell -- cargo xtask <command>
   development.
 - `cargo xtask release check-tool-updates` — check Docker/Kubernetes tool
   updates, compute SHA-256 checksums, and rewrite `assets.lock`.
-- `cargo xtask release package-tarball` — build the desktop release `.tar.gz`
-  from CI artifacts and write the matching `.sha256` file.
-- `cargo xtask release fleet-asset` — stage a CI-built `arcbox-fleet-agent`
-  binary as a raw per-platform release asset (`arcbox-fleet-agent-<os>-<arch>`)
-  and write the matching `.sha256` file. The fleet agent ships as a bare
-  binary: the release tag carries the version, and the checksum is what the
-  gateway pins for agent self-update.
+- `cargo xtask release package-tarball` — build the release `.tar.gz` from CI
+  artifacts and write the matching `.sha256` file.
 
 ## Layout
 
@@ -48,15 +43,17 @@ xtask/
     commands/
       mod.rs
       dev.rs                 # development orchestration
-      e2e.rs                 # e2e stress-run orchestration
-      idle.rs                # idle CPU/memory sampling
+      e2e.rs                 # e2e stress runner (prebuild + artifact archive)
+      idle.rs                # idle CPU/RSS sampler
       macos.rs               # macOS build/sign/run tasks
       release.rs             # release command dispatch
       release/
         check_tool_updates.rs
-        fleet_asset.rs
         package_tarball.rs
 ```
+
+Shared helpers (process running, fs utilities) come from the external
+`xtask-kit` crate, not a local `support/` module.
 
 `commands/<domain>.rs` is the domain entrypoint. Split a subcommand into
 `commands/<domain>/<subcommand>.rs` once the implementation has real substance.

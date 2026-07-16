@@ -22,6 +22,14 @@ re-exported through:
 | `agent` | `agent.proto` | Guest agent health/runtime messages |
 | `api` | `api.proto` | Network/system/volume/migration API messages |
 
+## Generated code
+
+`build.rs` writes prost output into `src/generated/` (not `OUT_DIR`) and
+runs rustfmt on it; the result is committed. After any `.proto` edit,
+rebuild (`cargo build -p arcbox-protocol`) and commit the regenerated
+files in the same change. A new `.proto` file must be registered in both
+`arcbox-protocol/build.rs` and `arcbox-grpc/build.rs`.
+
 ## Protocol evolution
 
 The daemon and the in-VM `arcbox-agent` are distributed separately, so a

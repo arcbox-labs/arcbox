@@ -114,7 +114,13 @@ Environment variables read by the tests:
   `[boot].version`.
 - `ARCBOX_VM_BACKEND=vz|hv` — System VM backend for the daemon under test
   (first-boot default; the daemon reads the same variable). The matrix test
-  overrides it per run.
+  overrides it per run. To pin the guest vCPU count at this level, set
+  `ARCBOX_VM_CPUS=N` in the environment (default: host core count) — the
+  spawned daemon inherits it via the config env layer. The isolated data
+  dir's `config.toml` is NOT read (`Config::load_for_profile` merges only
+  the user/system config files plus `ARCBOX_*` env), and editing the user
+  config would leak state across parallel runs. The `ARCBOX_HV_E2E_VCPUS`
+  knob only drives the bare `hv_e2e` probe, not daemon-level tests.
 - `ARCBOX_E2E_IMAGE=<ref>` — container image for the lifecycle tests
   (default `alpine:latest`). Point it at a mirror on networks where the
   guest cannot reach docker.io.
