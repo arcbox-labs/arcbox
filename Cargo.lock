@@ -790,7 +790,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tonic",
- "tonic-build",
 ]
 
 [[package]]
