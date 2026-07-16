@@ -240,16 +240,6 @@ local      tpi_cots_ord  -     loopback  -       -       -
         Ok(())
     }
 
-    /// Brings up kernel nfsd by writing `/proc/fs/nfsd` directly rather than
-    /// via `rpc.nfsd`.
-    ///
-    /// `rpc.nfsd` registers each listener with the portmapper and aborts with
-    /// errno 111 when no `rpcbind` is running; the in-kernel path only logs a
-    /// failed registration and serves anyway. Clients reach us through pinned
-    /// ports (`port=`/`mountport=`), so rpcbind is unnecessary. NFSv4 is
-    /// disabled to avoid its state machine; NFSv2 is absent from the kernel.
-    /// Writing a positive thread count makes the kernel open the default 2049
-    /// TCP/UDP listeners.
     /// Brings up kernel nfsd by writing `/proc/fs/nfsd` directly.
     ///
     /// NFSv4 only: it serves on the well-known port 2049 and does not register
