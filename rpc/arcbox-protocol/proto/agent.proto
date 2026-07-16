@@ -50,6 +50,9 @@ service AgentService {
 
     // Streams guest memory pressure events while the balloon is shrunk.
     rpc WatchMemoryPressure(WatchMemoryPressureRequest) returns (stream MemoryPressureEvent);
+
+    // Streams machine-level resource samples (CPU/memory/disk/network).
+    rpc WatchStats(WatchStatsRequest) returns (stream MachineStats);
 }
 
 // Ping request.
@@ -199,6 +202,51 @@ message MemoryPressureEvent {
     uint64 available_bytes = 2;
     // Observed refault rate, pages/second.
     uint64 refault_rate = 3;
+}
+
+// Request for a guest-driven machine resource stats stream.
+//
+// The agent reads /proc once per interval and emits one MachineStats frame
+// per tick; every frame doubles as a keepalive. The stream ends after
+// `timeout_ms`; the host re-issues the request to keep watching.
+message WatchStatsRequest {
+    // Watch window in milliseconds (0 = agent default).
+    uint32 timeout_ms = 1;
+    // Sample interval in milliseconds (0 = agent default, 1000).
+    uint32 interval_ms = 2;
+}
+
+// One machine-level resource sample.
+//
+// Counter fields are cumulative since guest boot; consumers derive rates
+// from deltas between samples, which stays correct across missed samples
+// and stream restarts.
+message MachineStats {
+    // Guest monotonic clock at sample time (from /proc/uptime), in
+    // milliseconds. Rate denominators come from deltas of this field, not
+    // from host receive times (delivery jitter would distort rates).
+    uint64 monotonic_ms = 1;
+    // Aggregate CPU ticks since boot across all CPUs (/proc/stat "cpu"):
+    // busy = everything except idle + iowait.
+    uint64 cpu_busy_ticks = 2;
+    uint64 cpu_total_ticks = 3;
+    // Online CPU count.
+    uint32 online_cpus = 4;
+    // 1-minute load average.
+    double loadavg1 = 5;
+    // Bytes, from /proc/meminfo.
+    uint64 memory_total_bytes = 6;
+    uint64 memory_available_bytes = 7;
+    // PSI memory "full avg10" percentage (0-100), from
+    // /proc/pressure/memory. Negative when the kernel lacks CONFIG_PSI.
+    double memory_psi_full_avg10 = 8;
+    // Cumulative bytes across whole physical disks (/proc/diskstats,
+    // partitions excluded so traffic is not double-counted).
+    uint64 disk_read_bytes = 9;
+    uint64 disk_written_bytes = 10;
+    // Cumulative bytes across non-loopback interfaces (/proc/net/dev).
+    uint64 net_rx_bytes = 11;
+    uint64 net_tx_bytes = 12;
 }
 
 // Runtime status report.
