@@ -176,6 +176,41 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
     let url = format!("http://{GUEST_GATEWAY_IP}:{port}/blob");
     tracing::info!(%url, blob_mb = BLOB_BYTES / (1024 * 1024), "blob server up");
 
+    // ABX-423 experiment (ARCBOX_E2E_GUEST_SAMPLER): a persistent in-guest
+    // 1 Hz sampler recording eth0 packet counters and virtio interrupt
+    // counts for the whole scenario. Its timeline across a freeze is the
+    // guest-side vs device-side discriminator: frozen tx_packets = the
+    // guest driver stopped transmitting (NAPI/interrupt wedge in the
+    // guest); advancing tx_packets with a silent host datapath = frames
+    // vanish on the device side. Read back with `docker logs` (vsock,
+    // unaffected by the freeze).
+    let sampler = std::env::var_os("ARCBOX_E2E_GUEST_SAMPLER").is_some();
+    if sampler {
+        let script = r#"while true; do
+  echo "t=$(date +%s) tx=$(cat /sys/class/net/eth0/statistics/tx_packets) rx=$(cat /sys/class/net/eth0/statistics/rx_packets)"
+  grep virtio /proc/interrupts | awk '{s=0; for(i=2;i<=NF;i++) if ($i+0==$i) s+=$i; printf "  irq %s %s\n", $1, s}'
+  sleep 1
+done"#;
+        docker_output(
+            data_dir,
+            &[
+                "run",
+                "-d",
+                "--name",
+                "abx423-sampler",
+                "--net=host",
+                "--privileged",
+                &image,
+                "sh",
+                "-c",
+                script,
+            ],
+            Duration::from_secs(30),
+        )
+        .context("starting guest sampler")?;
+        tracing::info!("guest sampler started (1 Hz eth0 + virtio irq counters)");
+    }
+
     // ABX-423 experiment (ARCBOX_E2E_CANARY_PING): a 1 Hz gateway pinger
     // running for the whole scenario forces a guest virtio-net TX kick every
     // second. If a guest-side kick revives the frozen device, stalls shrink
@@ -206,6 +241,12 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
         arcbox_e2e::docker::docker_ignore(
             data_dir,
             &["rm".into(), "-f".into(), "abx423-canary".into()],
+        );
+    }
+    if sampler {
+        arcbox_e2e::docker::docker_ignore(
+            data_dir,
+            &["rm".into(), "-f".into(), "abx423-sampler".into()],
         );
     }
     downloads?;
@@ -315,6 +356,19 @@ fn sample_daemon(data_dir: &Path, pid: u32) {
 /// interface addresses, and small-transfer probes that distinguish a total
 /// datapath freeze from a per-connection loss.
 fn capture_guest_forensics(data_dir: &Path, image: &str) {
+    // Dump the in-guest sampler's timeline first — it covers the freeze
+    // onset retroactively, so it has no live-window race at all.
+    if std::env::var_os("ARCBOX_E2E_GUEST_SAMPLER").is_some() {
+        match docker_output(
+            data_dir,
+            &["logs", "--tail", "400", "abx423-sampler"],
+            Duration::from_secs(30),
+        ) {
+            Ok(out) => tracing::info!("guest sampler timeline:\n{}", out.trim_end()),
+            Err(error) => tracing::warn!("guest sampler read failed: {error:#}"),
+        }
+    }
+
     // ABX-423 mitigation experiment (ARCBOX_E2E_TRY_LINK_BOUNCE): FIRST in
     // the sequence — the freeze often ends ~30 s after onset, and the other
     // probes would eat the remaining live window. Tries guest-side recovery
