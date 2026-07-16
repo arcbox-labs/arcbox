@@ -44,6 +44,7 @@ pub mod persistence;
 #[cfg(target_os = "macos")]
 pub mod route_reconciler;
 pub mod runtime;
+pub mod stats_hub;
 pub mod trace;
 pub mod vm;
 pub mod vm_lifecycle;

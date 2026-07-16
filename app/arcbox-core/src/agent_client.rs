@@ -13,10 +13,10 @@ use arcbox_protocol::agent::{
     DiskTrimRequest, DiskTrimResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
     KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
     KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
-    KubernetesStopRequest, KubernetesStopResponse, MemoryPressureEvent, MmapReadFileRequest,
-    MmapReadFileResponse, PingRequest, PingResponse, ReadinessEvent, RuntimeEnsureRequest,
-    RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, SystemInfo,
-    WatchMemoryPressureRequest, WatchReadinessRequest,
+    KubernetesStopRequest, KubernetesStopResponse, MachineStats, MemoryPressureEvent,
+    MmapReadFileRequest, MmapReadFileResponse, PingRequest, PingResponse, ReadinessEvent,
+    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
+    SystemInfo, WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
 };
 use arcbox_protocol::sandbox_v1::{
     CheckpointRequest, CheckpointResponse, CreateSandboxRequest, CreateSandboxResponse,
@@ -682,6 +682,71 @@ impl AgentClient {
                 Self::decode_memory_pressure_event(&raw)
             }),
         }
+    }
+
+    /// Opens a guest machine stats watch (`WatchStats`).
+    ///
+    /// The agent streams one [`MachineStats`] frame per sample interval;
+    /// consume them with [`Self::next_machine_stats`]. The connection is
+    /// dedicated to the watch until the agent closes the window.
+    pub async fn watch_stats(&mut self, req: WatchStatsRequest) -> Result<()> {
+        if !self.connected {
+            self.connect().await?;
+        }
+
+        let payload = req.encode_to_vec();
+        let buf = Self::build_message(MessageType::WatchStatsRequest, "", &payload);
+
+        match &mut self.transport {
+            AgentTransport::Async(t) => t.send(buf).await.map_err(|e| {
+                CoreError::Machine(format!("failed to send stats watch request: {e}"))
+            }),
+            AgentTransport::Blocking(t) => tokio::task::block_in_place(|| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                t.send(&buf, deadline).map_err(|e| {
+                    CoreError::Machine(format!("failed to send stats watch request: {e}"))
+                })
+            }),
+        }
+    }
+
+    /// Receives the next frame on an open stats watch, waiting at most
+    /// `max_wait`. Frames double as keepalives, so a timeout means the
+    /// stream is stale (window elapsed or agent gone) and the caller
+    /// should re-open the watch.
+    pub async fn next_machine_stats(&mut self, max_wait: Duration) -> Result<MachineStats> {
+        match &mut self.transport {
+            AgentTransport::Async(t) => {
+                let raw = tokio::time::timeout(max_wait, t.recv())
+                    .await
+                    .map_err(|_| CoreError::Machine("timeout waiting for stats frame".to_string()))?
+                    .map_err(|e| {
+                        CoreError::Machine(format!("failed to receive stats frame: {e}"))
+                    })?;
+                Self::decode_machine_stats(&raw)
+            }
+            AgentTransport::Blocking(t) => tokio::task::block_in_place(|| {
+                let raw = t.recv(Instant::now() + max_wait).map_err(|e| {
+                    CoreError::Machine(format!("failed to receive stats frame: {e}"))
+                })?;
+                Self::decode_machine_stats(&raw)
+            }),
+        }
+    }
+
+    fn decode_machine_stats(raw: &[u8]) -> Result<MachineStats> {
+        let (resp_type, _, resp_payload) = wire::parse_response(raw)?;
+        if resp_type == MessageType::Error as u32 {
+            let (code, message) = wire::parse_error_response(&resp_payload)?;
+            return Err(CoreError::Agent { code, message });
+        }
+        if resp_type != MessageType::MachineStats as u32 {
+            return Err(CoreError::Machine(format!(
+                "unexpected stats response type: 0x{resp_type:04x}"
+            )));
+        }
+        MachineStats::decode(&resp_payload[..])
+            .map_err(|e| CoreError::Machine(format!("failed to decode machine stats: {e}")))
     }
 
     fn decode_memory_pressure_event(raw: &[u8]) -> Result<MemoryPressureEvent> {
