@@ -387,6 +387,24 @@ pub fn stage_dev_boot_assets(root: &Path, data_dir: &Path, version: &str) -> Res
     // downloads anything still missing.
     stage_runtime_binaries(&data_dir.join("runtime/bin"));
 
+    // Then pre-seed runtime binaries staged in boot-assets/dev/runtime-bin
+    // (put there by hand or by `boot-assets sync-binaries` in the sibling
+    // repo), overwriting the installed-app copies where both exist. The
+    // daemon's checksum check treats matching files as cached, so an
+    // unreleased runtime bundle can be validated end-to-end before the CDN
+    // carries it — pair with a matching dev manifest and a blanked
+    // assets.lock manifest pin.
+    let seed_dir = dev_boot_dir.join("runtime-bin");
+    if seed_dir.is_dir() {
+        let bin_dir = data_dir.join("runtime/bin");
+        fs::create_dir_all(&bin_dir)?;
+        for entry in fs::read_dir(&seed_dir)? {
+            let entry = entry?;
+            copy_file(&entry.path(), &bin_dir.join(entry.file_name()))?;
+        }
+        info!(seed = %seed_dir.display(), "pre-seeded runtime binaries");
+    }
+
     info!(dev_boot_dir = %dev_boot_dir.display(), "using development boot assets");
     Ok(())
 }

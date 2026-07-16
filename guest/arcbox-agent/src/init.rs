@@ -876,6 +876,13 @@ const NOFILE_LIMIT: u64 = 1_048_576;
 /// Extracted as a pure function so the output contract (DNS + default
 /// ulimits + containerd image store) is testable independently of the
 /// filesystem and platform.
+///
+/// `containerd-snapshotter` stays explicitly `true` even though dockerd ≥ 29
+/// defaults to the containerd image store: without the explicit flag, dockerd
+/// falls back to the graphdriver whenever it finds prior graphdriver state on
+/// the data volume (`graphdriver-prior`), which would silently flip a machine
+/// with stale overlay2 remnants back to the legacy store. dockerd 29 logs a
+/// benign "no longer needed" warning for it.
 #[cfg(any(target_os = "linux", test))]
 fn docker_daemon_json() -> String {
     serde_json::json!({
