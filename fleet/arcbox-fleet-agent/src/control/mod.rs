@@ -230,6 +230,7 @@ pub struct AgentSupervisor {
     config: AgentConfig,
     docker: Option<DockerRunner>,
     vm: Option<crate::vm::VmRunner>,
+    interop: Option<crate::interop::InteropRunner>,
     capabilities: Vec<Capability>,
     /// Cancelled on process shutdown (SIGTERM/Ctrl-C); every attachment's
     /// `shutdown` is a child of this token.
@@ -247,10 +248,17 @@ pub struct AgentSupervisor {
 impl AgentSupervisor {
     /// Build the supervisor, immediately attaching if a credential is
     /// already persisted — the existing headless/farm behavior.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "construction genuinely needs the config, all three optional job backends \
+                  (docker/vm/interop), the advertised capabilities, and the three process-wide \
+                  handles; same shape as attach::run"
+    )]
     pub async fn new(
         config: AgentConfig,
         docker: Option<DockerRunner>,
         vm: Option<crate::vm::VmRunner>,
+        interop: Option<crate::interop::InteropRunner>,
         capabilities: Vec<Capability>,
         process_shutdown: CancellationToken,
         agent_state: AgentState,
@@ -260,6 +268,7 @@ impl AgentSupervisor {
             config,
             docker,
             vm,
+            interop,
             capabilities,
             process_shutdown,
             state: Mutex::new(State::Unenrolled),
@@ -312,6 +321,13 @@ impl AgentSupervisor {
         self.vm.clone()
     }
 
+    /// Whether the WSL interop backend for windows jobs is active — the
+    /// startup probe passed. Reported as a `GetAgentInfo` feature, same
+    /// rationale as [`Self::vm_active`]; restart-scoped like every backend.
+    pub fn interop_active(&self) -> bool {
+        self.interop.is_some()
+    }
+
     /// Spawn the attach task for `credential` and build its [`Attachment`].
     /// `credential_gateway` is the store key the credential is persisted
     /// under (see [`Attachment::credential_gateway`]).
@@ -329,6 +345,7 @@ impl AgentSupervisor {
             &self.config,
             self.docker.clone(),
             self.vm.clone(),
+            self.interop.clone(),
             self.capabilities.clone(),
             self.agent_state.clone(),
         );
@@ -729,6 +746,7 @@ mod tests {
             gateway: "http://127.0.0.1:1".to_owned(),
             docker_mode: DockerMode::Disabled,
             runner_script: None,
+            windows_runner_script: None,
             participate: true,
             vm_mode: crate::config::VmMode::Auto,
             macos_runner_image: "tahoe-base".to_owned(),
@@ -739,6 +757,7 @@ mod tests {
         AgentConfig {
             gateway: "http://127.0.0.1:1".to_owned(),
             runner_script: None,
+            windows_runner_script: None,
             load_ceiling: 0.9,
             mem_floor_mib: 2048,
             data_dir,
@@ -763,6 +782,7 @@ mod tests {
         Arc::new(
             AgentSupervisor::new(
                 test_config(dir.to_path_buf()),
+                None,
                 None,
                 None,
                 Vec::new(),
@@ -837,6 +857,7 @@ mod tests {
         let (events, _events_rx) = tokio::sync::mpsc::channel(1);
         let runner = crate::runner::RunnerSupervisor::new(
             events,
+            None,
             None,
             None,
             None,
@@ -934,6 +955,7 @@ mod tests {
             config,
             None,
             None,
+            None,
             Vec::new(),
             CancellationToken::new(),
             agent_state.clone(),
@@ -968,6 +990,7 @@ mod tests {
                 test_config(dir.clone()),
                 None,
                 None,
+                None,
                 Vec::new(),
                 CancellationToken::new(),
                 agent_state.clone(),
@@ -987,8 +1010,15 @@ mod tests {
             Ok(())
         });
         let (events, _events_rx) = tokio::sync::mpsc::channel(1);
-        let runner =
-            crate::runner::RunnerSupervisor::new(events, None, None, None, Vec::new(), agent_state);
+        let runner = crate::runner::RunnerSupervisor::new(
+            events,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            agent_state,
+        );
         // A persisted credential, so the completed unenroll can prove the
         // local clear happens even though this gateway is unreachable (the
         // server-side call is best-effort).

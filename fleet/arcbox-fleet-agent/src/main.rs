@@ -34,6 +34,7 @@ mod docker;
 mod enroll;
 mod fsutil;
 mod host;
+mod interop;
 mod runner;
 #[cfg(target_os = "macos")]
 mod service;
@@ -58,6 +59,7 @@ use tracing::{info, warn};
 
 use crate::config::{AgentConfig, DockerMode, VmMode};
 use crate::docker::DockerRunner;
+use crate::interop::InteropRunner;
 use crate::settings::{PersistedSettings, SettingsStore};
 use crate::state::AgentState;
 use crate::vm::VmRunner;
@@ -164,6 +166,11 @@ struct EnrollArgs {
 }
 
 #[derive(Debug, Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one value, parsed once at startup and consumed immediately — the Set variant's \
+              size is irrelevant, and boxing fights the clap derive"
+)]
 enum SettingsCommand {
     /// Show every setting's current (in-effect) and target (requested) value.
     Get,
@@ -198,6 +205,11 @@ enum SettingsCommand {
         /// "auto" | "enabled" | "disabled".
         #[arg(long)]
         vm_mode: Option<String>,
+        /// Windows-style path to the Windows runner entry point (e.g.
+        /// "C:\actions-runner\run.cmd"), run via WSL interop. Requires a WSL
+        /// host; "" clears. Applies on the next full restart.
+        #[arg(long)]
+        windows_runner_script: Option<String>,
     },
 }
 
@@ -247,7 +259,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             // The capabilities sent here are an initial hint, replaced wholesale
             // by the first heartbeat once the agent attaches, so we advertise
             // what we know without probing the runtimes.
-            let capabilities = capabilities(seed.runner_script.is_some(), None, None);
+            let capabilities = capabilities(seed.runner_script.is_some(), None, None, None);
             let credential = match enroll::enroll(&config, token, capabilities, &seed.gateway).await
             {
                 Ok(credential) => credential,
@@ -283,8 +295,13 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 &config.vm.daemon_socket,
             )
             .await?;
-            let capabilities =
-                capabilities(seed.runner_script.is_some(), docker.as_ref(), vm.as_ref());
+            let interop = init_interop(seed.windows_runner_script.as_deref()).await;
+            let capabilities = capabilities(
+                seed.runner_script.is_some(),
+                docker.as_ref(),
+                vm.as_ref(),
+                interop.as_ref(),
+            );
             let credential = config.credential_store_for(&seed.gateway).load()?.context(
                 "no credential found — run `arcbox-fleet-agent quick enroll --token-file …` first",
             )?;
@@ -302,6 +319,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 &config,
                 docker,
                 vm,
+                interop,
                 capabilities.clone(),
                 agent_state.clone(),
             );
@@ -337,8 +355,13 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                 &config.vm.daemon_socket,
             )
             .await?;
-            let capabilities =
-                capabilities(seed.runner_script.is_some(), docker.as_ref(), vm.as_ref());
+            let interop = init_interop(seed.windows_runner_script.as_deref()).await;
+            let capabilities = capabilities(
+                seed.runner_script.is_some(),
+                docker.as_ref(),
+                vm.as_ref(),
+                interop.as_ref(),
+            );
             let socket_path = config.control_socket_path();
 
             // Cascades to every attach task's child token, so runners still
@@ -352,6 +375,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                     config,
                     docker,
                     vm,
+                    interop,
                     capabilities,
                     shutdown.clone(),
                     agent_state.clone(),
@@ -464,6 +488,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             participate,
             macos_runner_image,
             vm_mode,
+            windows_runner_script,
         }) => {
             let docker_mode = docker_mode
                 .as_deref()
@@ -488,6 +513,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                     participate,
                     macos_runner_image,
                     vm_mode,
+                    windows_runner_script,
                 })
                 .await
                 .context("UpdateSettings RPC failed")?
@@ -642,16 +668,23 @@ fn resolve_enrollment_token(token_file: Option<PathBuf>, token: Option<String>) 
 }
 
 /// Build the capabilities this agent advertises: any Docker-served Linux
-/// capabilities, plus the native pair — VM-served when the daemon backend
-/// is active, else the host runner (if a runner script is configured).
-/// Capacity is decided per offer from live telemetry, not here.
+/// capabilities, windows via WSL interop when that probe passed, plus the
+/// native pair — VM-served when the daemon backend is active, else the host
+/// runner (if a runner script is configured). Capacity is decided per offer
+/// from live telemetry, not here.
 fn capabilities(
     runner_script_present: bool,
     docker: Option<&DockerRunner>,
     vm: Option<&VmRunner>,
+    interop: Option<&InteropRunner>,
 ) -> Vec<Capability> {
     let docker_arches = docker.map(DockerRunner::linux_arches).unwrap_or_default();
-    host::capabilities(runner_script_present, &docker_arches, vm.is_some())
+    host::capabilities(
+        runner_script_present,
+        &docker_arches,
+        vm.is_some(),
+        interop.is_some(),
+    )
 }
 
 /// Probe Docker availability according to `mode`.
@@ -704,6 +737,32 @@ async fn init_vm(
                 Ok(None)
             }
         },
+    }
+}
+
+/// Probe the WSL interop backend for windows jobs, Auto semantics only: an
+/// unset `windows_runner_script` means not wanted, and a failed probe (not
+/// WSL, interop disabled, script missing) logs and falls through — the
+/// windows capability is simply not advertised. There is no Enabled mode:
+/// unlike Docker/VM, nothing else can serve windows jobs, so failing
+/// startup would only take the host's other capabilities down with it.
+async fn init_interop(windows_runner_script: Option<&str>) -> Option<InteropRunner> {
+    let script = windows_runner_script?;
+    match InteropRunner::new(script).await {
+        Ok(runner) => {
+            info!(
+                script,
+                "WSL interop available; advertising the windows capability"
+            );
+            Some(runner)
+        }
+        Err(e) => {
+            warn!(
+                error = format!("{e:#}"),
+                "WSL interop not available; the windows capability will not be advertised"
+            );
+            None
+        }
     }
 }
 
@@ -828,18 +887,7 @@ fn print_settings(s: control_proto::AgentSettings) {
         );
     }
     if let Some(v) = s.runner_script {
-        let none = "(none)".to_owned();
-        let current = if v.current.is_empty() {
-            &none
-        } else {
-            &v.current
-        };
-        let target = if v.target.is_empty() {
-            &none
-        } else {
-            &v.target
-        };
-        print_setting("runner_script", current, target);
+        print_script_setting("runner_script", &v);
     }
     if let Some(v) = s.macos_runner_image {
         print_setting("macos_runner_image", &v.current, &v.target);
@@ -847,6 +895,22 @@ fn print_settings(s: control_proto::AgentSettings) {
     if let Some(v) = s.vm_mode {
         print_setting("vm_mode", vm_mode_label(v.current), vm_mode_label(v.target));
     }
+    if let Some(v) = s.windows_runner_script {
+        print_script_setting("windows_runner_script", &v);
+    }
+}
+
+/// [`print_setting`] for the script settings, whose empty string encodes
+/// "unset" and prints as `(none)`.
+fn print_script_setting(name: &str, v: &control_proto::StringSetting) {
+    let or_none = |s: &str| {
+        if s.is_empty() {
+            "(none)".to_owned()
+        } else {
+            s.to_owned()
+        }
+    };
+    print_setting(name, &or_none(&v.current), &or_none(&v.target));
 }
 
 #[cfg(test)]

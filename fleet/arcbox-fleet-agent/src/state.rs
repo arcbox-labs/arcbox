@@ -101,6 +101,13 @@ fn setting_value_to_path(value: &str) -> Option<PathBuf> {
     (!value.is_empty()).then(|| PathBuf::from(value))
 }
 
+/// Same empty-means-unset encoding as [`setting_value_to_path`], for settings
+/// that are opaque strings rather than local paths (the Windows-style
+/// `windows_runner_script`).
+fn setting_value_to_string(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
 /// The always-present settings block. Every accessor goes through these two
 /// helpers so the outer [`SETTINGS_INVARIANT`] assertion is spelled once here
 /// rather than at each of the ~15 call sites (and each new settable field
@@ -129,6 +136,7 @@ impl AgentState {
     /// separately.
     pub fn new(seed: &PersistedSettings) -> Self {
         let runner_script = path_to_setting_value(seed.runner_script.as_deref());
+        let windows_runner_script = seed.windows_runner_script.clone().unwrap_or_default();
         let docker_mode = docker_mode_to_control(seed.docker_mode) as i32;
         let vm_mode = vm_mode_to_control(seed.vm_mode);
         let settings = AgentSettings {
@@ -167,6 +175,10 @@ impl AgentState {
             vm_mode: Some(VmModeSetting {
                 current: vm_mode as i32,
                 target: vm_mode as i32,
+            }),
+            windows_runner_script: Some(StringSetting {
+                current: windows_runner_script.clone(),
+                target: windows_runner_script,
             }),
         };
         let (tx, _) = watch::channel(AgentStateSnapshot {
@@ -221,6 +233,12 @@ impl AgentState {
             ),
             runner_script: setting_value_to_path(
                 &s.runner_script.as_ref().expect(SETTINGS_INVARIANT).target,
+            ),
+            windows_runner_script: setting_value_to_string(
+                &s.windows_runner_script
+                    .as_ref()
+                    .expect(SETTINGS_INVARIANT)
+                    .target,
             ),
             participate: s.participate.as_ref().expect(SETTINGS_INVARIANT).target,
             vm_mode: vm_mode_from_wire(s.vm_mode.as_ref().expect(SETTINGS_INVARIANT).target),
@@ -536,6 +554,19 @@ impl AgentState {
         });
     }
 
+    /// Restart-scoped like `runner_script`: `current` stays what the process
+    /// started with. `script` uses the same empty-means-unset encoding.
+    pub fn set_windows_runner_script_target(&self, script: &str) {
+        let value = script.to_owned();
+        self.tx.send_modify(|s| {
+            settings_mut(s)
+                .windows_runner_script
+                .as_mut()
+                .expect(SETTINGS_INVARIANT)
+                .target = value;
+        });
+    }
+
     pub fn set_participate_target(&self, value: bool) {
         self.tx.send_modify(|s| {
             settings_mut(s)
@@ -574,6 +605,7 @@ mod tests {
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: DockerMode::Auto,
             runner_script: None,
+            windows_runner_script: None,
             participate: true,
             vm_mode: crate::config::VmMode::Auto,
             macos_runner_image: "tahoe-base".to_owned(),

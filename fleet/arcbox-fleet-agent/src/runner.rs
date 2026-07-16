@@ -7,7 +7,9 @@
 //! Backend is chosen from the agent's own advertised capabilities: Linux jobs a
 //! Docker capability serves run in a container (isolation); darwin jobs a `vm`
 //! capability serves run in a disposable macOS guest via the local daemon
-//! (isolation); a `host_runner` capability runs via the pre-installed runner.
+//! (isolation); a `host_runner` capability runs via the pre-installed runner —
+//! directly for the native platform, or across the WSL interop boundary for a
+//! windows capability served from inside WSL2.
 //! Capacity is never a number — admission gates on live load and free memory,
 //! so a busy host simply rejects and the platform re-offers elsewhere.
 
@@ -29,6 +31,7 @@ use tracing::{info, warn};
 
 use crate::docker::{DockerRunner, RunSpec};
 use crate::host;
+use crate::interop::InteropRunner;
 use crate::state::AgentState;
 use crate::vm::VmRunner;
 
@@ -87,7 +90,8 @@ struct Inner {
     /// Jobs currently running here, each with its cancellation token — one map
     /// for duplicate detection, cancel delivery, and release. Cancelling a token
     /// makes the job's `run_job` tear down the runner — the whole process group
-    /// (host) or the container (Docker) — awaited, before the entry is released.
+    /// (host), the container (Docker), the guest (VM), or the Windows process
+    /// tree (interop) — awaited, before the entry is released.
     /// The token is level-triggered, so a cancel that lands while the runner is
     /// still starting is observed at the next cancellation point rather than
     /// lost; see [`RunnerSupervisor::handle_cancel`].
@@ -99,6 +103,8 @@ struct Inner {
     docker: Option<DockerRunner>,
     /// macOS VM backend for darwin jobs, if the local daemon serves it.
     vm: Option<VmRunner>,
+    /// WSL interop backend for windows jobs, if the startup probe passed.
+    interop: Option<InteropRunner>,
     /// The backend serving each advertised `(os, arch)` — the routing table.
     backends: HashMap<(String, String), Backend>,
     /// Set once `Drain` is received; no new jobs are accepted.
@@ -142,6 +148,7 @@ impl RunnerSupervisor {
         runner_script: Option<PathBuf>,
         docker: Option<DockerRunner>,
         vm: Option<VmRunner>,
+        interop: Option<InteropRunner>,
         capabilities: Vec<Capability>,
         state: AgentState,
     ) -> Self {
@@ -164,6 +171,7 @@ impl RunnerSupervisor {
                 runner_script,
                 docker,
                 vm,
+                interop,
                 backends,
                 draining: std::sync::atomic::AtomicBool::new(false),
                 draining_for_update: std::sync::atomic::AtomicBool::new(false),
@@ -426,6 +434,13 @@ impl RunnerSupervisor {
         let job_id = order.job_id.clone();
         match backend {
             Backend::Docker => self.run_docker_job(&job_id, &order, &token, cancel).await,
+            // A windows capability is host_runner-backed on the wire (it IS
+            // the host's pre-installed runner, reached across the WSL
+            // interop boundary), but its process management is different
+            // enough to be its own path — see `crate::interop`.
+            Backend::HostRunner if order.os == "windows" => {
+                self.run_interop_job(&job_id, &order, &token, cancel).await;
+            }
             Backend::HostRunner => self.run_host_job(&job_id, &order, &token, cancel).await,
             Backend::Vm => self.run_vm_job(&job_id, &order, &token, cancel).await,
             // Never advertised, so admit() never routes here; reject
@@ -518,6 +533,87 @@ impl RunnerSupervisor {
             // the in-flight slot outlives the guest — never the reverse.
             None => {
                 running.destroy().await;
+                info!(job_id, "runner canceled");
+            }
+        }
+    }
+
+    /// Run a windows job on the WSL host via interop. The offer is accepted
+    /// only after the `WINPID=` handshake proves the Windows process is
+    /// running; cancellation tears down the Windows tree via `taskkill`
+    /// (a Unix process-group kill would only orphan it — see
+    /// [`crate::interop`]), awaited, so the slot outlives the runner.
+    async fn run_interop_job(
+        &self,
+        job_id: &str,
+        order: &ProvisionRunner,
+        token: &str,
+        cancel: CancellationToken,
+    ) {
+        // Invariant: a windows capability is only advertised when the
+        // interop probe passed, so admit() routes here only with `interop`
+        // set; reject defensively rather than panic if that ever breaks.
+        let Some(interop) = &self.inner.interop else {
+            self.reject(job_id, token, "windows jobs are not served by this agent");
+            return;
+        };
+
+        // The spawn + WINPID handshake can block for up to HANDSHAKE_TIMEOUT
+        // on degraded interop and must not make the agent deaf to
+        // CancelRunner — mirror the VM startup path.
+        let spawned = {
+            let spawn = std::pin::pin!(interop.spawn(&order.encoded_jit_config));
+            tokio::select! {
+                result = spawn => Some(result),
+                () = cancel.cancelled() => None,
+            }
+        };
+        let mut job = match spawned {
+            Some(Ok(job)) => job,
+            Some(Err(e)) => {
+                self.reject(
+                    job_id,
+                    token,
+                    &format!("failed to spawn windows runner: {e:#}"),
+                );
+                return;
+            }
+            None => {
+                // Canceled mid-spawn: no verdict is owed (the platform
+                // already concluded the job). Dropping the spawn future
+                // kills the relay (`kill_on_drop`); without a completed
+                // WINPID handshake there is no Windows tree to taskkill —
+                // the same orphan tolerance as a failed handshake.
+                info!(job_id, "runner canceled during interop spawn");
+                return;
+            }
+        };
+
+        // A cancel that landed while the spawn was completing: the platform
+        // already concluded the job, so don't resolve the offer — tear the
+        // job down instead of accepting it just to kill it.
+        if cancel.is_cancelled() {
+            job.kill().await;
+            info!(job_id, "runner canceled during interop spawn");
+            return;
+        }
+
+        self.accept(job_id, token);
+        info!(
+            job_id,
+            windows_pid = job.windows_pid(),
+            "runner started (windows interop)"
+        );
+
+        tokio::select! {
+            result = job.wait() => match result {
+                Ok(status) => info!(job_id, success = status.success(), "runner exited"),
+                Err(e) => warn!(job_id, error = %e, "waiting on runner failed"),
+            },
+            // CancelRunner: taskkill the Windows tree and reap the relay,
+            // awaited, so the slot outlives the teardown.
+            () = cancel.cancelled() => {
+                job.kill().await;
                 info!(job_id, "runner canceled");
             }
         }
@@ -753,6 +849,7 @@ mod tests {
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: crate::config::DockerMode::Auto,
             runner_script: None,
+            windows_runner_script: None,
             participate: true,
             vm_mode: crate::config::VmMode::Auto,
             macos_runner_image: "tahoe-base".to_owned(),
@@ -764,6 +861,7 @@ mod tests {
         RunnerSupervisor::new(
             events,
             Some(PathBuf::from("/nonexistent")),
+            None,
             None,
             None,
             capabilities,
@@ -802,6 +900,167 @@ mod tests {
             sup.admit("rjob_a", "darwin", "arm64", &idle()),
             Admission::Accept(Backend::Vm)
         );
+    }
+
+    /// A supervisor advertising windows/amd64 (host_runner-backed, as the
+    /// interop capability is on the wire), with thresholds that can never
+    /// reject — `handle_provision` reads real `host::telemetry()`.
+    fn windows_supervisor_with_rx(
+        interop: Option<InteropRunner>,
+    ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
+        let (events, rx) = mpsc::channel(8);
+        let sup = RunnerSupervisor::new(
+            events,
+            None,
+            None,
+            None,
+            interop,
+            vec![capability("windows", "amd64", Backend::HostRunner)],
+            AgentState::new(&crate::settings::PersistedSettings {
+                load_ceiling: f64::MAX,
+                mem_floor_mib: 0,
+                ..seed()
+            }),
+        );
+        (sup, rx)
+    }
+
+    /// Write an executable stub standing in for powershell/taskkill.
+    fn interop_stub(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Full dispatch for a windows offer: `handle_provision` routes the
+    /// host_runner-backed windows capability to the interop path, which
+    /// accepts only after the WINPID handshake and releases the slot when
+    /// the runner exits.
+    #[tokio::test]
+    async fn windows_offer_runs_through_the_interop_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let powershell = interop_stub(dir.path(), "powershell", "echo 'WINPID=4242'\nexit 0");
+        let taskkill = interop_stub(dir.path(), "taskkill", "exit 0");
+        let interop = InteropRunner::with_paths(powershell, taskkill, r"C:\r\run.cmd");
+
+        // Warm the freshly written stub through the ETXTBSY window (a
+        // concurrently forking test can hold it open for writing until its
+        // own exec) so the spawn inside handle_provision can't hit it.
+        for _ in 0..100 {
+            match interop.spawn("dGVzdA==").await {
+                Ok(mut job) => {
+                    let _ = job.wait().await;
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+
+        let (sup, mut rx) = windows_supervisor_with_rx(Some(interop));
+
+        sup.handle_provision(ProvisionRunner {
+            job_id: "rjob_win".to_owned(),
+            os: "windows".to_owned(),
+            arch: "amd64".to_owned(),
+            encoded_jit_config: "dGVzdA==".to_owned(),
+            offer_token: "tok1".to_owned(),
+        });
+
+        let verdict = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("verdict within the handshake budget")
+            .expect("egress channel open");
+        match verdict.msg {
+            Some(attach_request::Msg::RunnerAccepted(a)) => assert_eq!(a.job_id, "rjob_win"),
+            other => panic!("expected RunnerAccepted, got {other:?}"),
+        }
+
+        // The stub exits immediately, so the slot drains without a cancel.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sup.inner.in_flight.contains_key("rjob_win") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("slot released once the runner exited");
+    }
+
+    /// A cancel that arrives while the interop spawn is still in the WINPID
+    /// handshake must not resolve the offer: the platform already concluded
+    /// the job, so no `RunnerAccepted` is owed and the slot must drain.
+    #[tokio::test]
+    async fn windows_offer_canceled_mid_spawn_sends_no_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        // The handshake stalls long enough for the cancel to land first.
+        let powershell = interop_stub(
+            dir.path(),
+            "powershell",
+            "sleep 3\necho 'WINPID=4242'\nexit 0",
+        );
+        let taskkill = interop_stub(dir.path(), "taskkill", "exit 0");
+        let interop = InteropRunner::with_paths(powershell, taskkill, r"C:\r\run.cmd");
+
+        let (sup, mut rx) = windows_supervisor_with_rx(Some(interop));
+
+        sup.handle_provision(ProvisionRunner {
+            job_id: "rjob_win".to_owned(),
+            os: "windows".to_owned(),
+            arch: "amd64".to_owned(),
+            encoded_jit_config: "dGVzdA==".to_owned(),
+            offer_token: "tok1".to_owned(),
+        });
+
+        // Cancel while the wrapper is still sleeping pre-handshake.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !sup.inner.in_flight.contains_key("rjob_win") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("job registered in_flight");
+        sup.handle_cancel("rjob_win");
+
+        // The slot drains without any verdict having been sent.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sup.inner.in_flight.contains_key("rjob_win") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("slot released after the mid-spawn cancel");
+        assert!(
+            rx.try_recv().is_err(),
+            "no verdict may resolve a canceled offer"
+        );
+    }
+
+    /// The defensive arm: a windows offer admitted while no interop backend
+    /// exists (a broken capability set) must reject, not panic or accept a
+    /// ghost job.
+    #[tokio::test]
+    async fn windows_offer_without_interop_is_rejected() {
+        let (sup, mut rx) = windows_supervisor_with_rx(None);
+
+        sup.handle_provision(ProvisionRunner {
+            job_id: "rjob_win".to_owned(),
+            os: "windows".to_owned(),
+            arch: "amd64".to_owned(),
+            encoded_jit_config: "dGVzdA==".to_owned(),
+            offer_token: "tok1".to_owned(),
+        });
+
+        let verdict = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("verdict promptly")
+            .expect("egress channel open");
+        match verdict.msg {
+            Some(attach_request::Msg::RunnerRejected(r)) => {
+                assert!(r.reason.contains("not served"), "{}", r.reason);
+            }
+            other => panic!("expected RunnerRejected, got {other:?}"),
+        }
     }
 
     #[test]
@@ -880,6 +1139,7 @@ mod tests {
             Some(PathBuf::from("/nonexistent")),
             None,
             None,
+            None,
             vec![capability("darwin", "arm64", Backend::HostRunner)],
             AgentState::new(&seed()),
         );
@@ -897,6 +1157,7 @@ mod tests {
         let sup = RunnerSupervisor::new(
             events,
             Some(PathBuf::from("/nonexistent")),
+            None,
             None,
             None,
             vec![capability("darwin", "arm64", Backend::HostRunner)],
@@ -1117,7 +1378,8 @@ mod tests {
     async fn shutdown_does_not_flip_observable_draining_but_drain_does() {
         let drained = AgentState::new(&seed());
         let (events, _rx) = mpsc::channel(1);
-        RunnerSupervisor::new(events, None, None, None, Vec::new(), drained.clone()).handle_drain();
+        RunnerSupervisor::new(events, None, None, None, None, Vec::new(), drained.clone())
+            .handle_drain();
         assert!(
             drained.current().draining,
             "Drain flips the observable flag"
@@ -1125,9 +1387,17 @@ mod tests {
 
         let torn_down = AgentState::new(&seed());
         let (events, _rx) = mpsc::channel(1);
-        RunnerSupervisor::new(events, None, None, None, Vec::new(), torn_down.clone())
-            .shutdown(Duration::from_secs(1))
-            .await;
+        RunnerSupervisor::new(
+            events,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            torn_down.clone(),
+        )
+        .shutdown(Duration::from_secs(1))
+        .await;
         assert!(
             !torn_down.current().draining,
             "teardown must not flip the observable flag",

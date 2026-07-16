@@ -124,6 +124,7 @@ pub fn spawn_supervisor(
     config: &AgentConfig,
     docker: Option<docker::DockerRunner>,
     vm: Option<crate::vm::VmRunner>,
+    interop: Option<crate::interop::InteropRunner>,
     capabilities: Vec<Capability>,
     state: AgentState,
 ) -> (RunnerSupervisor, mpsc::Receiver<AttachRequest>) {
@@ -133,6 +134,7 @@ pub fn spawn_supervisor(
         config.runner_script.clone(),
         docker,
         vm,
+        interop,
         capabilities,
         state,
     );
@@ -602,6 +604,7 @@ mod tests {
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: DockerMode::Disabled,
             runner_script: None,
+            windows_runner_script: None,
             participate: true,
             vm_mode: crate::config::VmMode::Auto,
             macos_runner_image: "tahoe-base".to_owned(),
@@ -666,6 +669,7 @@ mod tests {
         let config = AgentConfig {
             gateway,
             runner_script: None,
+            windows_runner_script: None,
             load_ceiling: 0.9,
             mem_floor_mib: 2048,
             data_dir: std::env::temp_dir(),
@@ -685,7 +689,7 @@ mod tests {
             machine_token: "flt_revoked".to_owned(),
         };
         let (supervisor, egress_rx) =
-            spawn_supervisor(&config, None, None, Vec::new(), state.clone());
+            spawn_supervisor(&config, None, None, None, Vec::new(), state.clone());
         let shutdown = CancellationToken::new();
         let run = tokio::spawn(run(
             config,
@@ -815,6 +819,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             AgentState::new(&seed()),
         );
@@ -870,6 +875,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Vec::new(),
             AgentState::new(&seed()),
         );
@@ -887,6 +893,7 @@ mod tests {
         AgentConfig {
             gateway: "http://127.0.0.1:1".to_owned(),
             runner_script: None,
+            windows_runner_script: None,
             load_ceiling: 0.9,
             mem_floor_mib: 2048,
             data_dir: std::env::temp_dir(),
@@ -922,6 +929,7 @@ mod tests {
         let (events, _rx) = mpsc::channel(1);
         let supervisor = RunnerSupervisor::new(
             events,
+            None,
             None,
             None,
             None,

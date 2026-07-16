@@ -17,6 +17,7 @@ pub const DEFAULT_GATEWAY: &str = "https://gateway.fleet.arcbox.dev";
 
 const ENV_GATEWAY: &str = "ARCBOX_FLEET_GATEWAY";
 const ENV_RUNNER_SCRIPT: &str = "ARCBOX_FLEET_RUNNER_SCRIPT";
+const ENV_WINDOWS_RUNNER_SCRIPT: &str = "ARCBOX_FLEET_WINDOWS_RUNNER_SCRIPT";
 const ENV_LOAD_CEILING: &str = "ARCBOX_FLEET_LOAD_CEILING";
 const ENV_MEM_FLOOR_MIB: &str = "ARCBOX_FLEET_MEM_FLOOR_MIB";
 const ENV_DATA_DIR: &str = "ARCBOX_FLEET_DATA_DIR";
@@ -101,6 +102,11 @@ pub struct AgentConfig {
     /// (`run.sh`) — not its containing directory. `None` until set; required
     /// only by the `quick run` command.
     pub runner_script: Option<PathBuf>,
+    /// Windows-style path to the Windows runner entry point (e.g.
+    /// `C:\actions-runner\run.cmd`), executed across the WSL interop
+    /// boundary. Only meaningful on a Linux agent inside WSL2; the interop
+    /// probe at startup decides whether windows jobs are actually advertised.
+    pub windows_runner_script: Option<String>,
     /// Reject an offer when 1-minute load average per core exceeds this.
     pub load_ceiling: f64,
     /// Reject an offer when available memory (MiB) is below this.
@@ -121,6 +127,7 @@ impl AgentConfig {
         let gateway = std::env::var(ENV_GATEWAY).unwrap_or_else(|_| DEFAULT_GATEWAY.to_string());
 
         let runner_script = std::env::var_os(ENV_RUNNER_SCRIPT).map(PathBuf::from);
+        let windows_runner_script = std::env::var(ENV_WINDOWS_RUNNER_SCRIPT).ok();
 
         let load_ceiling = match std::env::var(ENV_LOAD_CEILING) {
             Ok(v) => parse_load_ceiling(&v)?,
@@ -185,6 +192,7 @@ impl AgentConfig {
         Ok(Self {
             gateway,
             runner_script,
+            windows_runner_script,
             load_ceiling,
             mem_floor_mib,
             data_dir,

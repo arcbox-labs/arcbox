@@ -84,6 +84,9 @@ impl FleetSettingsServiceTrait for SettingsService {
             let path = (!v.is_empty()).then_some(Path::new(v));
             self.state.set_runner_script_target(path);
         }
+        if let Some(v) = &req.windows_runner_script {
+            self.state.set_windows_runner_script_target(v);
+        }
         // Target only — the supervisor's participation reconciler performs
         // the detach/reattach and flips `current` when it completes.
         if let Some(v) = req.participate {
@@ -157,6 +160,21 @@ fn validate(req: &UpdateSettingsRequest, state: &AgentState) -> Result<(), Strin
             return Err("macos_runner_image must not be empty".to_owned());
         }
     }
+    // Deliberately absent from the servability cross-field check below:
+    // like an Auto mode, the windows capability is probe-dependent (WSL
+    // interop must resolve at startup), so it is never a guarantee.
+    if let Some(script) = &req.windows_runner_script
+        && !script.is_empty()
+    {
+        let unix_view = crate::interop::windows_path_to_unix(script)
+            .map_err(|e| format!("windows_runner_script: {e:#}"))?;
+        if !unix_view.is_file() {
+            return Err(format!(
+                "windows_runner_script {script} does not exist (checked {})",
+                unix_view.display()
+            ));
+        }
+    }
     if let Some(vm_mode) = req.vm_mode
         && vm_mode_from_wire(vm_mode) == VmMode::Enabled
         && std::env::consts::OS != "macos"
@@ -221,6 +239,7 @@ mod tests {
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: DockerMode::Auto,
             runner_script: None,
+            windows_runner_script: None,
             participate: true,
             vm_mode: crate::config::VmMode::Auto,
             macos_runner_image: "tahoe-base".to_owned(),
@@ -238,6 +257,7 @@ mod tests {
             participate: None,
             macos_runner_image: None,
             vm_mode: None,
+            windows_runner_script: None,
         }
     }
 
@@ -346,6 +366,27 @@ mod tests {
             ..request()
         };
         assert!(validate(&req, &state).is_err());
+    }
+
+    /// The Windows-path shape check fires before `wslpath` is consulted, so
+    /// this rejection is host-independent; clearing (empty string) never
+    /// touches `wslpath` at all. A real WSL translation is exercised by the
+    /// interop module's live test instead — it needs a Windows host below.
+    #[test]
+    fn windows_runner_script_rejects_non_windows_paths_and_accepts_clear() {
+        let state = AgentState::new(&seed());
+        let req = UpdateSettingsRequest {
+            windows_runner_script: Some("/opt/actions-runner/run.sh".to_owned()),
+            ..request()
+        };
+        let err = validate(&req, &state).expect_err("unix path must be rejected");
+        assert!(err.contains("not an absolute Windows path"), "{err}");
+
+        let clear = UpdateSettingsRequest {
+            windows_runner_script: Some(String::new()),
+            ..request()
+        };
+        assert!(validate(&clear, &state).is_ok());
     }
 
     #[test]
