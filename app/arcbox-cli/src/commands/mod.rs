@@ -64,6 +64,7 @@ pub mod sandbox;
 pub mod setup;
 pub mod symlink;
 pub mod system;
+pub mod top;
 #[cfg(target_os = "macos")]
 pub mod uninstall;
 pub mod version;
@@ -166,6 +167,9 @@ pub enum Commands {
 
     /// Run diagnostic checks on the ArcBox runtime
     Doctor,
+
+    /// Live resource monitor for the System VM
+    Top(top::TopArgs),
 
     /// Internal: install helper + register daemon (used by brew/DMG installers)
     #[cfg(target_os = "macos")]
