@@ -112,6 +112,9 @@ pub struct Runtime {
     /// round-trip. Populated at registration, updated on rename, cleared with
     /// the rest of the container's host state.
     container_aliases: Arc<TokioRwLock<HashMap<String, String>>>,
+    /// Fan-out for System VM machine stats: one guest stream shared by all
+    /// subscribers, none while nobody watches.
+    stats_hub: Arc<crate::stats_hub::StatsHub<crate::stats_hub::AgentStatsSource>>,
 }
 
 /// Parameters of one sandbox port exposure (the host listener half).
@@ -210,6 +213,11 @@ impl Runtime {
         #[cfg(target_os = "macos")]
         let mac_machine_manager = Arc::new(MacMachineManager::new(&config.data_dir));
 
+        let stats_hub = crate::stats_hub::StatsHub::new(crate::stats_hub::AgentStatsSource::new(
+            Arc::clone(&machine_manager),
+            DEFAULT_MACHINE_NAME,
+        ));
+
         Ok(Self {
             config,
             event_bus,
@@ -230,7 +238,18 @@ impl Runtime {
             sandbox_port_keys: Arc::new(TokioRwLock::new(HashMap::new())),
             dns_entries: Arc::new(TokioRwLock::new(HashMap::new())),
             container_aliases: Arc::new(TokioRwLock::new(HashMap::new())),
+            stats_hub,
         })
+    }
+
+    /// Subscribes to live System VM machine stats (see
+    /// [`crate::stats_hub::StatsHub::subscribe`]). Passive observation:
+    /// subscribing never records VM activity or blocks idle reclaim.
+    #[must_use]
+    pub fn subscribe_machine_stats(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<arcbox_protocol::agent::MachineStats> {
+        self.stats_hub.subscribe()
     }
 
     /// Returns the configuration.
