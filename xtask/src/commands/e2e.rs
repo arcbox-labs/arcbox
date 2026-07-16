@@ -142,9 +142,15 @@ fn prebuild(root: &std::path::Path, test: &str) -> Result<bool> {
             xshell::cmd!(shell, "cargo build --release -p arcbox-e2e --bin hv_e2e").run()?;
             Ok(true)
         }
-        // Must match tests/e2e/tests/stats_watch.rs's own build.
+        // Must match tests/e2e/tests/stats_watch.rs's own build: the daemon
+        // plus the musl guest agent (the scenario needs WatchStats support).
         "stats_watch" => {
             xshell::cmd!(shell, "cargo build --release -p arcbox-daemon").run()?;
+            xshell::cmd!(
+                shell,
+                "cargo build --release -p arcbox-agent --target aarch64-unknown-linux-musl"
+            )
+            .run()?;
             Ok(true)
         }
         // Must match tests/e2e/src/sandbox.rs::build_binaries exactly

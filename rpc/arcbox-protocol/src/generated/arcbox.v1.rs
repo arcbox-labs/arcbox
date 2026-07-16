@@ -1988,7 +1988,9 @@ pub struct MachineStats {
     pub disk_read_bytes: u64,
     #[prost(uint64, tag = "10")]
     pub disk_written_bytes: u64,
-    /// Cumulative bytes across non-loopback interfaces (/proc/net/dev).
+    /// Cumulative bytes across the VM's physical/uplink interfaces
+    /// (/proc/net/dev; container bridges and veths are excluded so their
+    /// traffic is not counted once per internal hop).
     #[prost(uint64, tag = "11")]
     pub net_rx_bytes: u64,
     #[prost(uint64, tag = "12")]
