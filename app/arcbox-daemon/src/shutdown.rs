@@ -96,6 +96,8 @@ async fn cleanup(ctx: &DaemonContext) {
         }
     }
 
+    crate::nfs_mount::cleanup(ctx);
+
     remove_sockets(ctx);
 }
 

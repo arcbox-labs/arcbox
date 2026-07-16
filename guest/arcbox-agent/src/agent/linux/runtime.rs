@@ -617,8 +617,12 @@ pub(super) fn daemon_log_file(name: &str) -> Stdio {
 async fn try_start_bundled_runtime() -> String {
     let _guard = runtime_start_lock().lock().await;
 
+    // Whenever dockerd is up its data mount exists, so the NFS export can be
+    // (re)established on warm boots too — set it up before the early return.
     if probe_unix_socket(DOCKER_API_UNIX_SOCKET).await {
-        return "docker socket already ready".to_string();
+        let mut notes = vec!["docker socket already ready".to_string()];
+        setup_nfs_export(&mut notes);
+        return notes.join("; ");
     }
 
     let Some(runtime_bin_dir) = detect_runtime_bin_dir() else {
@@ -643,6 +647,9 @@ async fn try_start_bundled_runtime() -> String {
         Err(e) => return format!("data volume setup failed: {}", e),
     }
 
+    // The docker data mount now exists; export it read-only over NFS.
+    setup_nfs_export(&mut notes);
+
     ensure_shared_runtime_dirs(&mut notes);
 
     if !ensure_containerd_ready(&runtime_bin_dir, &mut notes).await {
@@ -652,6 +659,17 @@ async fn try_start_bundled_runtime() -> String {
     ensure_dockerd_ready(&runtime_bin_dir, &mut notes).await;
 
     notes.join("; ")
+}
+
+/// Establishes the read-only NFSv3 export of the docker data mount, best-effort.
+///
+/// The export is an auxiliary feature (host `~/ArcBox` browsing); its failure
+/// must never block the container runtime, so errors are logged, not returned.
+fn setup_nfs_export(notes: &mut Vec<String>) {
+    match crate::nfs::ensure_docker_export() {
+        Ok(export_notes) => notes.extend(export_notes),
+        Err(e) => tracing::warn!(error = %e, "nfs export setup failed (non-fatal)"),
+    }
 }
 
 #[cfg(test)]

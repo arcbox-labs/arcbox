@@ -400,6 +400,7 @@ dependencies = [
  "arcbox-helper",
  "arcbox-logging",
  "arcbox-net",
+ "arcbox-transport",
  "async-trait",
  "axum 0.8.8",
  "bytes",

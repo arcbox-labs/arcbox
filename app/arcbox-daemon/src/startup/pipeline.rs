@@ -145,6 +145,7 @@ impl RuntimeBooted {
         let handles = record_startup_phase("start_runtime_services", async {
             let handles = services::start_services(&self.ctx, &self.runtime, self.grpc).await?;
             recovery::run(&self.ctx, &self.runtime).await;
+            crate::nfs_mount::spawn(&self.ctx, &self.runtime);
             Ok(handles)
         })
         .await?;

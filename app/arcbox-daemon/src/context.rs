@@ -82,6 +82,8 @@ pub struct EarlyContext {
     pub dns_domain: String,
     pub dns_port: u16,
     pub docker_integration: bool,
+    /// Mount the guest docker data export at `~/ArcBox` once ready.
+    pub mount_nfs: bool,
     pub vm_args: VmArgs,
 }
 
@@ -107,6 +109,8 @@ pub struct DaemonContext {
     pub dns_domain: String,
     pub dns_port: u16,
     pub docker_integration: bool,
+    /// Mount the guest docker data export at `~/ArcBox` once ready.
+    pub mount_nfs: bool,
     pub vm_args: VmArgs,
 }
 
