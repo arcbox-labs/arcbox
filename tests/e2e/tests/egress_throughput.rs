@@ -127,6 +127,15 @@ fn sustained_egress_downloads_do_not_stall() -> Result<()> {
         .tempdir()?;
     stage_dev_boot_assets(&root, data_dir.path(), &version)?;
 
+    // Probe a free port for the daemon's host DNS service so this test can
+    // run alongside a developer's live daemon (fixed 5553) and parallel
+    // test runs. The bind is dropped before the daemon starts — a benign
+    // TOCTOU for a test harness.
+    let dns_port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|s| s.local_addr())
+        .context("probing a free DNS port")?
+        .port();
+
     let mut daemon = DaemonHandle::spawn(DaemonConfig {
         binary: root.join("target/release/arcbox-daemon"),
         data_dir: data_dir.path().to_owned(),
@@ -134,9 +143,7 @@ fn sustained_egress_downloads_do_not_stall() -> Result<()> {
         env: vec![
             ("ARCBOX_BOOT_ASSET_VERSION".to_owned(), version),
             ("ARCBOX_VM_BACKEND".to_owned(), "vz".to_owned()),
-            // Avoid the host DNS service port (5553) so this test daemon can
-            // run alongside a developer's live daemon.
-            ("ARCBOX_DNS_PORT".to_owned(), "15553".to_owned()),
+            ("ARCBOX_DNS_PORT".to_owned(), dns_port.to_string()),
             // Per-SYN datapath tracing: stall forensics need the gated-SYN,
             // handshake-retransmit, and RST decisions, which log at debug.
             (
@@ -169,14 +176,53 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
     let url = format!("http://{GUEST_GATEWAY_IP}:{port}/blob");
     tracing::info!(%url, blob_mb = BLOB_BYTES / (1024 * 1024), "blob server up");
 
-    run_downloads(data_dir, metrics, &image, &url, "download")?;
+    // ABX-423 experiment (ARCBOX_E2E_CANARY_PING): a 1 Hz gateway pinger
+    // running for the whole scenario forces a guest virtio-net TX kick every
+    // second. If a guest-side kick revives the frozen device, stalls shrink
+    // from ~60-75 s to ~1-2 s and downloads stop failing.
+    let canary = std::env::var_os("ARCBOX_E2E_CANARY_PING").is_some();
+    if canary {
+        docker_output(
+            data_dir,
+            &[
+                "run",
+                "-d",
+                "--name",
+                "abx423-canary",
+                &image,
+                "ping",
+                "-i",
+                "1",
+                GUEST_GATEWAY_IP,
+            ],
+            Duration::from_secs(30),
+        )
+        .context("starting canary pinger")?;
+        tracing::info!("canary pinger started (1 Hz guest TX kicks)");
+    }
+
+    let downloads = run_downloads(data_dir, metrics, &image, &url, "download", daemon.pid());
+    if canary {
+        arcbox_e2e::docker::docker_ignore(
+            data_dir,
+            &["rm".into(), "-f".into(), "abx423-canary".into()],
+        );
+    }
+    downloads?;
 
     // Optional second phase: a real external URL (e.g. a fast CDN, possibly
     // through a host VPN). Environment-dependent, so never run in CI — set
     // ARCBOX_E2E_EGRESS_URL to enable during manual validation.
     if let Ok(external) = std::env::var("ARCBOX_E2E_EGRESS_URL") {
         tracing::info!(url = %external, "external egress phase");
-        run_downloads(data_dir, metrics, &image, &external, "external_download")?;
+        run_downloads(
+            data_dir,
+            metrics,
+            &image,
+            &external,
+            "external_download",
+            daemon.pid(),
+        )?;
     }
 
     Ok(())
@@ -191,7 +237,16 @@ fn run_downloads(
     image: &str,
     url: &str,
     label_prefix: &str,
+    daemon_pid: u32,
 ) -> Result<()> {
+    // Default 60 s tolerates slow CI. The ABX-423 hunt sets a short timeout
+    // (e.g. 15 s) so a stall is detected while the ~60-75 s freeze is still
+    // live and the forensics below observe it, not its aftermath.
+    let wget_timeout = std::env::var("ARCBOX_E2E_WGET_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(60)
+        .to_string();
     let mut failures = Vec::new();
     for attempt in 1..=DOWNLOADS {
         let label = format!("{label_prefix}_{attempt}");
@@ -207,7 +262,7 @@ fn run_downloads(
                     "-O",
                     "/dev/null",
                     "-T",
-                    "60",
+                    &wget_timeout,
                     url,
                 ],
                 DOWNLOAD_TIMEOUT,
@@ -218,6 +273,10 @@ fn run_downloads(
             Err(error) => {
                 tracing::warn!(attempt, label_prefix, "download stalled: {error:#}");
                 if failures.is_empty() {
+                    // Thread census FIRST — the freeze may end within seconds
+                    // of the wget timeout, and the VZ-internal thread states
+                    // are the most perishable evidence.
+                    sample_daemon(data_dir, daemon_pid);
                     capture_guest_forensics(data_dir, image);
                 }
                 failures.push(attempt);
@@ -228,6 +287,27 @@ fn run_downloads(
         Ok(())
     } else {
         anyhow::bail!("{label_prefix}: attempts {failures:?} of {DOWNLOADS} stalled")
+    }
+}
+
+/// Samples the daemon's threads (Virtualization.framework internals
+/// included) into `<data_dir>/freeze-sample.txt` — the ABX-423 hunt's view
+/// into where Apple's file-handle device threads are parked during a
+/// freeze.
+fn sample_daemon(data_dir: &Path, pid: u32) {
+    let out = data_dir.join("freeze-sample.txt");
+    match std::process::Command::new("sample")
+        .args([&pid.to_string(), "2", "-file", &out.display().to_string()])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            tracing::info!(path = %out.display(), "daemon thread sample captured");
+        }
+        Ok(o) => tracing::warn!(
+            "sample failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim_end()
+        ),
+        Err(e) => tracing::warn!("sample not available: {e}"),
     }
 }
 
