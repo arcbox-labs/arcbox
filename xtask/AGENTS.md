@@ -32,6 +32,8 @@ Current recipe ↔ self-build mapping (keep both columns identical):
 | `boot_assets`    | `cargo build --release -p arcbox-cli -p arcbox-daemon` | `boot_assets.rs::build_release_binaries` (same) |
 | `backend_matrix` | same as above                                     | `build_release_binaries` (same)              |
 | `hv_vmm`         | `cargo build --release -p arcbox-e2e --bin hv_e2e`| `hv_vmm.rs` (same)                           |
+| `stats_watch`    | release daemon + musl `arcbox-agent`              | `stats_watch.rs` (same)                      |
+| `sandbox`        | release cli+daemon + musl `arcbox-agent`/`arcbox-vm` bins | `sandbox.rs::build_binaries` (same)   |
 | `virtio_debug`   | none (self-builds)                                | `cargo build --release -p arcbox-daemon` (RELEASE only) |
 | `daemon_failure` | none (self-builds)                                | `cargo build -p arcbox-daemon` (**DEBUG**)   |
 | anything else    | none — fallback notice, no `SKIP_BUILD`           | its own build                                |
