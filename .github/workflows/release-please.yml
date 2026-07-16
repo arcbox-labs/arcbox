@@ -41,7 +41,7 @@ jobs:
         run: |
           git config --global user.name "arcbox-labs[bot]"
           git config --global user.email "254083426+arcbox-labs[bot]@users.noreply.github.com"
-          gh api "repos/${GITHUB_REPOSITORY}/pulls?base=${GITHUB_REF_NAME}&state=open&per_page=100" |
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls?base=${GITHUB_REF_NAME}&state=open&per_page=100" |
           jq -c '.[]
             | select(any(.labels[]; .name == "autorelease: pending"))
             | {number, headRefName: .head.ref}' |
