@@ -268,7 +268,10 @@ impl NetworkDatapath {
                     }
                 }
 
-                // Retry an ENOBUFS-blocked backlog after a short delay.
+                // Timer-driven drain for any pending backlog. This is the
+                // sole resume path for ENOBUFS and the safety net for
+                // EAGAIN, where a missed writability edge would otherwise
+                // wedge all guest-bound traffic permanently.
                 _ = nobufs_retry.tick(), if awaits_retry => {
                     guest_tx.drain(guest_raw_fd);
                 }
@@ -404,6 +407,7 @@ impl NetworkDatapath {
 
                 _ = maintenance.tick() => {
                     egress.maintenance();
+                    guest_tx.log_stats();
                 }
             }
 

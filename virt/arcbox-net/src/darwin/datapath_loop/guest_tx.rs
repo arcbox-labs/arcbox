@@ -153,14 +153,19 @@ impl GuestTx {
         !self.queue.is_empty()
     }
 
-    /// True when draining should resume on `AsyncFd::writable()`.
+    /// True when draining can additionally resume on `AsyncFd::writable()`
+    /// (`EAGAIN`-blocked). The retry timer remains armed as a fallback —
+    /// kqueue write-readiness has not proven trustworthy for a datagram
+    /// socketpair, and a missed edge here would wedge all guest-bound
+    /// traffic permanently.
     pub(super) fn awaits_writable(&self) -> bool {
         self.has_backlog() && self.blocked == Some(WriteBlock::WouldBlock)
     }
 
-    /// True when draining should resume on the [`NOBUFS_RETRY_DELAY`] timer.
+    /// True when the [`NOBUFS_RETRY_DELAY`] timer should drive drain
+    /// attempts: any pending backlog, regardless of which errno blocked it.
     pub(super) fn awaits_retry(&self) -> bool {
-        self.has_backlog() && self.blocked == Some(WriteBlock::NoBufs)
+        self.has_backlog()
     }
 
     /// Sends one frame to the guest.
@@ -255,6 +260,26 @@ impl GuestTx {
     fn push(&mut self, frame: &[u8]) {
         self.queue.push_back(FrameBuf::from(frame.to_vec()));
         self.stats.queue_high_water = self.stats.queue_high_water.max(self.queue.len());
+    }
+
+    /// Logs a delivery-counter snapshot. Called from the maintenance tick;
+    /// a backlog that persists across consecutive reports indicates a
+    /// wedged drain (post-mortem signal, see ABX-420).
+    pub(super) fn log_stats(&self) {
+        let s = &self.stats;
+        tracing::info!(
+            queue_len = self.queue.len(),
+            blocked = ?self.blocked,
+            enobufs = s.enobufs_events,
+            would_block = s.would_block_events,
+            lossy_dropped = s.lossy_dropped,
+            short_writes = s.short_writes,
+            io_errors = s.io_errors,
+            sink_send_failures = s.sink_send_failures,
+            gated_polls = s.gated_polls,
+            queue_high_water = s.queue_high_water,
+            "guest-tx delivery counters"
+        );
     }
 }
 

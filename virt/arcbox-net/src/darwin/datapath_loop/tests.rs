@@ -153,11 +153,9 @@ fn guest_tx_reliable_survives_socketpair_overflow() {
         }
     }
     assert!(tx.has_backlog(), "socketpair never overflowed");
-    // Exactly one resume mechanism must be armed for the blocked state.
-    assert!(
-        tx.awaits_writable() ^ tx.awaits_retry(),
-        "blocked backlog must arm exactly one resume mechanism"
-    );
+    // The retry timer must always be armed for a pending backlog — it is
+    // the safety net against unreliable datagram writability signals.
+    assert!(tx.awaits_retry(), "backlog must arm the retry timer");
     // Keep producing while blocked — everything must queue.
     for _ in 0..16 {
         tx.send(
