@@ -43,6 +43,50 @@ pub fn docker_output(data_dir: &Path, args: &[&str], timeout: Duration) -> Resul
     }
 }
 
+/// A long-lived `docker <args>` child (an `/events` subscription, a log
+/// follow) held open across a scenario, mimicking a persistent observer
+/// like the desktop UI. Killed on drop.
+pub struct DockerStream {
+    child: std::process::Child,
+    args: String,
+}
+
+/// Spawns `docker <args>` against the daemon under `data_dir` and leaves it
+/// running. Output is discarded — callers assert on daemon behavior, not on
+/// the stream's content.
+pub fn docker_stream(data_dir: &Path, args: &[&str]) -> Result<DockerStream> {
+    let child = Command::new("docker")
+        .env("DOCKER_HOST", docker_host(data_dir))
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawning docker {}", args.join(" ")))?;
+    Ok(DockerStream {
+        child,
+        args: args.join(" "),
+    })
+}
+
+impl DockerStream {
+    /// Fails if the stream exited: a dead subscriber would silently weaken
+    /// any scenario using it as a persistent-observer regression guard.
+    pub fn assert_alive(&mut self) -> Result<()> {
+        match self.child.try_wait()? {
+            None => Ok(()),
+            Some(status) => bail!("docker {} exited early with {status}", self.args),
+        }
+    }
+}
+
+impl Drop for DockerStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Best-effort `docker <args>` for cleanup paths; failures are ignored.
 pub fn docker_ignore(data_dir: &Path, args: &[String]) {
     let _ = Command::new("docker")

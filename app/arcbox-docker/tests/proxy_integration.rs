@@ -8,7 +8,8 @@ mod support;
 use support::mock_guest::{self, MockGuest, UnixSocketConnector};
 
 use arcbox_docker::proxy::{
-    GuestHttpClient, proxy_to_guest_pooled, proxy_to_guest_stream_pooled, proxy_with_upgrade,
+    ActivityClass, GuestHttpClient, proxy_to_guest_pooled, proxy_to_guest_stream_pooled,
+    proxy_with_upgrade,
 };
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri, header};
@@ -269,9 +270,15 @@ async fn ensure_endpoint_verified_notes_activity_even_when_cached() {
     };
 
     // First request: full verification (prepare + `_ping` against the mock).
-    proxy.ensure_endpoint_verified(1, prepare()).await.unwrap();
+    proxy
+        .ensure_endpoint_verified(1, ActivityClass::Active, prepare())
+        .await
+        .unwrap();
     // Second request: readiness is cached — prepare must NOT rerun...
-    proxy.ensure_endpoint_verified(1, prepare()).await.unwrap();
+    proxy
+        .ensure_endpoint_verified(1, ActivityClass::Active, prepare())
+        .await
+        .unwrap();
     assert_eq!(prepared.load(Ordering::SeqCst), 1, "readiness cache broken");
 
     // ...but activity must be noted on BOTH requests.
@@ -279,6 +286,46 @@ async fn ensure_endpoint_verified_notes_activity_even_when_cached() {
         activity.load(Ordering::SeqCst),
         2,
         "proxied requests must note activity even with warm readiness cache"
+    );
+    guest.cancel.cancel();
+}
+
+/// Passive observation (an `/events` subscription, a log follow) verifies
+/// the endpoint like any request but must never touch the activity hook:
+/// the desktop UI holds `/events` open for its whole lifetime, and counting
+/// it as activity would pin the VM out of idle reclaim permanently.
+#[tokio::test]
+async fn passive_observation_never_touches_the_activity_hook() {
+    use arcbox_docker::proxy::ProxyState;
+    use std::sync::atomic::AtomicUsize;
+
+    let (connector, guest, _tmp) = setup().await;
+
+    let activity = Arc::new(AtomicUsize::new(0));
+    let hook: arcbox_docker::proxy::ActivityHook = {
+        let activity = Arc::clone(&activity);
+        Arc::new(move || {
+            activity.fetch_add(1, Ordering::SeqCst);
+            Box::new(()) as _
+        })
+    };
+    let proxy = ProxyState::new(Arc::new(connector)).with_activity_hook(hook);
+
+    // Cold cache: the passive request still performs the full verification…
+    proxy
+        .ensure_endpoint_verified(1, ActivityClass::PassiveObservation, async { Ok(()) })
+        .await
+        .unwrap();
+    // …and a warm-cache passive request stays silent too.
+    proxy
+        .ensure_endpoint_verified(1, ActivityClass::PassiveObservation, async { Ok(()) })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        activity.load(Ordering::SeqCst),
+        0,
+        "passive observation must not count as VM activity"
     );
     guest.cancel.cancel();
 }

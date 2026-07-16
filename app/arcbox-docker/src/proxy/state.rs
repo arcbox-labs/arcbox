@@ -1,7 +1,7 @@
 //! Guest proxy transport state: connector, pooled client, and the cached
 //! endpoint-readiness state machine.
 
-use super::{GuestConnector, GuestHttpClient, proxy_to_guest_pooled};
+use super::{ActivityClass, GuestConnector, GuestHttpClient, proxy_to_guest_pooled};
 use crate::error::{DockerError, Result};
 use axum::http::{HeaderMap, Method, StatusCode};
 use bytes::Bytes;
@@ -16,14 +16,15 @@ use tokio::sync::Notify;
 /// operation is in flight (dropping it releases the hold).
 pub type ActivityLease = Box<dyn std::any::Any + Send>;
 
-/// Callback invoked once per proxied Docker request, before any readiness
-/// caching.
+/// Callback invoked once per activity-bearing ([`ActivityClass::Active`])
+/// proxied Docker request, before any readiness caching.
 ///
 /// Wired to the VM lifecycle's activity tracking so host-side API traffic
 /// keeps the System VM out of idle memory reclaim. The returned lease is
-/// attached to the response body so long-lived operations (pulls, builds,
-/// log streams) count as activity for their entire duration — an idle
-/// shrink once squeezed a guest mid-pull.
+/// attached to the response body so long-lived operations (pulls, builds)
+/// count as activity for their entire duration — an idle shrink once
+/// squeezed a guest mid-pull. Passive observation streams take no lease
+/// (see [`ActivityClass`]).
 pub type ActivityHook = Arc<dyn Fn() -> ActivityLease + Send + Sync>;
 
 /// Guest proxy transport state shared by handlers.
@@ -80,18 +81,22 @@ impl ProxyState {
     pub async fn ensure_endpoint_verified<F>(
         &self,
         generation: u64,
+        activity: ActivityClass,
         prepare_runtime: F,
     ) -> Result<()>
     where
         F: Future<Output = Result<()>>,
     {
-        // Before any caching: every proxied request is VM activity. With a
-        // warm readiness cache `prepare_runtime` (the lifecycle's activity
-        // path) never runs, and a loaded VM would otherwise be idled and
-        // ballooned into reclaim thrash (2026-07-15 incident). The short
-        // lease covers verification; the caller re-leases for the response
-        // body's lifetime.
-        let _lease = self.activity_hook.as_ref().map(|hook| hook());
+        // Before any caching: every active proxied request is VM activity.
+        // With a warm readiness cache `prepare_runtime` (the lifecycle's
+        // activity path) never runs, and a loaded VM would otherwise be
+        // idled and ballooned into reclaim thrash (2026-07-15 incident).
+        // The short lease covers verification; the caller re-leases for the
+        // response body's lifetime. Passive observation takes no lease:
+        // a permanent `/events` subscriber must not disable idle reclaim.
+        let _lease = (activity == ActivityClass::Active)
+            .then(|| self.activity_hook.as_ref().map(|hook| hook()))
+            .flatten();
         self.reset_if_restarted(generation);
         self.endpoint_readiness
             .ensure_verified(prepare_runtime, || self.ping_guest())

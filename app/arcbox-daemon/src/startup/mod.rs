@@ -25,6 +25,9 @@ use crate::context::{DaemonContext, EarlyContext, StartupHandles, VmArgs};
 
 const DNS_PREFIX: &str = "arcbox";
 const DEFAULT_DNS_DOMAIN: &str = "arcbox.local";
+/// Canonical host DNS port. Only the daemon serving this port owns the
+/// `/etc/resolver/<domain>` entry (see `recovery::run`).
+pub const DEFAULT_DNS_PORT: u16 = 5553;
 
 /// Phase 1: directories, config, sockets. No runtime, no lock yet.
 ///
@@ -264,7 +267,7 @@ fn dns_port() -> u16 {
     std::env::var(key)
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(5553)
+        .unwrap_or(DEFAULT_DNS_PORT)
 }
 
 fn dns_domain() -> String {
