@@ -1111,7 +1111,7 @@ impl Runtime {
                 .entry(id.clone())
                 .and_modify(|existing| {
                     if name.len() < existing.len() {
-                        *existing = name.clone();
+                        existing.clone_from(name);
                     }
                 })
                 .or_insert_with(|| name.clone());

@@ -159,7 +159,9 @@ async fn container_names_invert_aliases_and_prefer_the_shortest() {
     let id = "0a1b2c3d4e5f00112233445566778899";
     // A container accreting two names: the short primary and a longer alias.
     runtime.register_container_alias("db", id).await;
-    runtime.register_container_alias("arcbox-postgres-1", id).await;
+    runtime
+        .register_container_alias("arcbox-postgres-1", id)
+        .await;
     // A second container with a single name.
     runtime.register_container_alias("cache", "beef5678").await;
 
@@ -167,7 +169,7 @@ async fn container_names_invert_aliases_and_prefer_the_shortest() {
     assert_eq!(names.get(id).map(String::as_str), Some("db"));
     assert_eq!(names.get("beef5678").map(String::as_str), Some("cache"));
     // Unknown IDs have no name (the consumer falls back to the short ID).
-    assert!(names.get("unknown").is_none());
+    assert!(!names.contains_key("unknown"));
 }
 
 #[tokio::test]
