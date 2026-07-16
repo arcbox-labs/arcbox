@@ -130,12 +130,15 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
         );
         Ok::<_, anyhow::Error>(())
     })?;
-    // Both streams (and their broadcast receivers) died with the runtime's
-    // connections above.
-
     if count_log_matches(data_dir, "stats pump started")? != 1 {
         bail!("concurrent subscribers did not share a single stats pump");
     }
+
+    // Dropping the runtime tears down the client's connection tasks and
+    // closes the gRPC socket — merely letting `block_on` return would
+    // freeze (not drop) them, and the daemon would keep both response
+    // streams (and their broadcast receivers) alive indefinitely.
+    drop(runtime);
 
     // Phase 2 — the pump winds down without subscribers, and a later
     // subscriber gets a fresh one.
