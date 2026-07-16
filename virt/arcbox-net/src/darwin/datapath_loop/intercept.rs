@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
+use std::os::fd::RawFd;
 use std::time::Duration;
 
-use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -13,18 +13,14 @@ use crate::dhcp::DhcpServer;
 use crate::dns::DnsForwarder;
 use crate::ethernet::{ETH_HEADER_LEN, build_udp_ip_ethernet};
 
-use super::fd::FdWrapper;
-use super::guest_tx::send_to_guest;
-use crate::datapath::FrameBuf;
-use std::collections::VecDeque;
+use super::guest_tx::{DeliveryClass, GuestTx};
 
 /// Dispatches an intercepted frame to the appropriate handler.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_intercepted_frame(
     intercepted: &crate::darwin::classifier::InterceptedFrame,
-    frame_sink: Option<&std::sync::Arc<dyn crate::direct_rx::FrameSink>>,
-    guest_async: &AsyncFd<FdWrapper>,
-    write_queue: &mut VecDeque<FrameBuf>,
+    guest_tx: &mut GuestTx,
+    guest_fd: RawFd,
     egress: &mut HostEgress,
     dhcp_server: &mut DhcpServer,
     dns_forwarder: &DnsForwarder,
@@ -40,9 +36,8 @@ pub(super) fn handle_intercepted_frame(
         InterceptedKind::Dhcp => {
             handle_dhcp(
                 frame,
-                frame_sink,
-                guest_async,
-                write_queue,
+                guest_tx,
+                guest_fd,
                 dhcp_server,
                 gateway_ip,
                 gateway_mac,
@@ -98,12 +93,10 @@ pub(super) fn process_inbound_cmd(
 }
 
 /// Handles a DHCP packet from the guest.
-#[allow(clippy::too_many_arguments)]
 fn handle_dhcp(
     frame: &[u8],
-    frame_sink: Option<&std::sync::Arc<dyn crate::direct_rx::FrameSink>>,
-    guest_async: &AsyncFd<FdWrapper>,
-    write_queue: &mut VecDeque<FrameBuf>,
+    guest_tx: &mut GuestTx,
+    guest_fd: RawFd,
     dhcp_server: &mut DhcpServer,
     gateway_ip: Ipv4Addr,
     gateway_mac: [u8; 6],
@@ -132,7 +125,7 @@ fn handle_dhcp(
                 guest_mac,
             );
             tracing::info!("Sending DHCP reply frame: {} bytes", reply_frame.len());
-            send_to_guest(frame_sink, guest_async, &reply_frame, write_queue);
+            guest_tx.send(guest_fd, &reply_frame, DeliveryClass::Lossy);
         }
         Ok(None) => {
             tracing::info!("DHCP: no response needed");

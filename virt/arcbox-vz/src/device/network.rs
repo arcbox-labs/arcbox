@@ -125,10 +125,17 @@ impl NetworkDeviceConfiguration {
                 )
                 .as_bool()
             };
-            let mtu = if responds {
+            // ARCBOX_DIAG_NET_MTU_1500 skips the MTU raise — a diagnostic
+            // knob for the ABX-423 freeze bisection (4000-byte frames are an
+            // uncommon VZ configuration and a bisection dimension).
+            let diag_mtu_1500 = std::env::var_os("ARCBOX_DIAG_NET_MTU_1500").is_some();
+            let mtu = if responds && !diag_mtu_1500 {
                 msg_send_void_u64!(attachment, setMaximumTransmissionUnit: VZ_NETWORK_MTU);
                 tracing::info!("VZ network MTU set to {VZ_NETWORK_MTU}");
                 VZ_NETWORK_MTU as usize
+            } else if diag_mtu_1500 {
+                tracing::warn!("VZ network MTU left at 1500 (ARCBOX_DIAG_NET_MTU_1500)");
+                1500
             } else {
                 tracing::info!(
                     "VZ network MTU setter unavailable (macOS < 13), using default 1500"

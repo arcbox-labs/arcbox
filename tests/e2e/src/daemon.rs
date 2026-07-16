@@ -109,6 +109,12 @@ impl DaemonHandle {
         })
     }
 
+    /// The daemon's process ID (for external diagnostics such as `sample`).
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// The Docker API socket under the handle's data directory.
     pub fn docker_socket(&self) -> PathBuf {
         self.data_dir.join("run/docker.sock")

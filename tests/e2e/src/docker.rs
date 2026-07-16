@@ -95,6 +95,51 @@ pub fn docker_ignore(data_dir: &Path, args: &[String]) {
         .status();
 }
 
+/// Makes `image` available in the daemon under test.
+///
+/// Avoids depending on registry reachability more than once per machine:
+/// the first successful pull is cached as a tarball under `target/`, and
+/// later runs `docker load` it (guest registry access is
+/// environment-dependent; pulls here have been observed to black-hole
+/// intermittently).
+pub fn ensure_image(data_dir: &Path, image: &str) -> Result<()> {
+    let cache_dir = crate::repo_root().join("target/e2e-image-cache");
+    let tar = cache_dir.join(format!(
+        "{}.tar",
+        image.replace(['/', ':'], "_").replace('.', "-")
+    ));
+    if tar.exists() {
+        docker_output(
+            data_dir,
+            &["load", "-i", &tar.display().to_string()],
+            Duration::from_secs(60),
+        )
+        .context("docker load from cache")?;
+        return Ok(());
+    }
+
+    let mut last_err = None;
+    for attempt in 1..=3 {
+        match docker_output(data_dir, &["pull", image], Duration::from_secs(90)) {
+            Ok(_) => {
+                std::fs::create_dir_all(&cache_dir)?;
+                docker_output(
+                    data_dir,
+                    &["save", "-o", &tar.display().to_string(), image],
+                    Duration::from_secs(60),
+                )
+                .context("docker save to cache")?;
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(attempt, "docker pull failed: {e:#}");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("loop ran at least once")).context("docker pull (3 attempts)")
+}
+
 /// Runs a command, killing it once `timeout` passes.
 pub fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<std::process::Output> {
     let mut child = command
