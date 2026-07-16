@@ -142,6 +142,11 @@ fn prebuild(root: &std::path::Path, test: &str) -> Result<bool> {
             xshell::cmd!(shell, "cargo build --release -p arcbox-e2e --bin hv_e2e").run()?;
             Ok(true)
         }
+        // Must match tests/e2e/tests/stats_watch.rs's own build.
+        "stats_watch" => {
+            xshell::cmd!(shell, "cargo build --release -p arcbox-daemon").run()?;
+            Ok(true)
+        }
         // Must match tests/e2e/src/sandbox.rs::build_binaries exactly
         // (packages AND profiles), or SKIP_BUILD runs stale binaries.
         "sandbox" => {
