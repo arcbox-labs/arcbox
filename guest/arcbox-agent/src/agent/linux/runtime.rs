@@ -583,33 +583,43 @@ pub(super) fn daemon_log_file(name: &str) -> Stdio {
     let arcbox_path = format!("{}/{}.log", log_dir, name);
     let tmp_log_path = format!("/tmp/{}.log", name);
 
-    // Ensure the log directory exists inside the VirtioFS share.
-    if Path::new("/arcbox").exists() {
-        let _ = std::fs::create_dir_all(&log_dir);
-    }
-
-    let log_path = if Path::new("/arcbox").exists() {
-        &arcbox_path
-    } else {
-        &tmp_log_path
+    let open_append = |path: &str| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
     };
 
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-    {
-        Ok(f) => f.into(),
-        Err(_) => {
-            // Fallback to /tmp/ if /arcbox/log/ write fails.
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&tmp_log_path)
-            {
-                Ok(f) => f.into(),
-                Err(_) => Stdio::null(),
+    // Prefer the VirtioFS share so the host can read the log; warn loudly on each
+    // degradation so a virtiofs failure doesn't silently hide service logs.
+    if Path::new("/arcbox").exists() {
+        let _ = std::fs::create_dir_all(&log_dir);
+        match open_append(&arcbox_path) {
+            Ok(f) => return f.into(),
+            Err(e) => {
+                tracing::warn!(
+                    service = name,
+                    error = %e,
+                    "failed to open {arcbox_path} for {name} logs; falling back to {tmp_log_path}"
+                );
             }
+        }
+    } else {
+        tracing::warn!(
+            service = name,
+            "/arcbox VirtioFS share not mounted; {name} logs go to {tmp_log_path} (guest-local, not visible from the host)"
+        );
+    }
+
+    match open_append(&tmp_log_path) {
+        Ok(f) => f.into(),
+        Err(e) => {
+            tracing::error!(
+                service = name,
+                error = %e,
+                "failed to open {tmp_log_path} for {name} logs; discarding to /dev/null"
+            );
+            Stdio::null()
         }
     }
 }

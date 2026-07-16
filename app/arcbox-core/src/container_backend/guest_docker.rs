@@ -37,7 +37,11 @@ impl GuestDockerBackend {
         let timeout = Duration::from_millis(self.config.startup_timeout_ms);
         let agent = self.machine_manager.connect_agent(self.machine_name)?;
 
-        match agent.watch_readiness(true, timeout).await {
+        // Correlate with the triggering Docker API request via its trace id.
+        match agent
+            .watch_readiness(true, timeout, &crate::trace::current_trace_id())
+            .await
+        {
             Ok(event) if Kind::try_from(event.kind) == Ok(Kind::RuntimeReady) => {
                 validate_reported_vsock_endpoint(&event.endpoint, port)?;
                 tracing::debug!(port, "guest docker runtime is ready");

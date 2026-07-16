@@ -52,6 +52,11 @@ mod dns;
 mod dns_server;
 mod docker_events;
 
+/// Max bytes for `agent.log` before it rotates (matches the daemon's 10 MiB).
+const AGENT_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// Number of rotated `agent.log.N` files to retain (matches the daemon).
+const AGENT_LOG_MAX_FILES: usize = 5;
+
 /// Startup mode selected from the process arguments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -91,7 +96,15 @@ async fn main() -> Result<()> {
     let _log_guard = if std::path::Path::new("/arcbox").exists() {
         match std::fs::create_dir_all(&log_dir) {
             Ok(()) => {
-                let file_appender = tracing_appender::rolling::never(&log_dir, "agent.log");
+                // Size-based rotation (10 MiB x 5) reusing the daemon's writer:
+                // keeps the active file named `agent.log` (so `abctl logs
+                // --component agent` still finds it) while bounding growth.
+                let log_path = std::path::Path::new(&log_dir).join("agent.log");
+                let file_appender = arcbox_logging::SizeRotatingWriter::new(
+                    log_path,
+                    AGENT_LOG_MAX_BYTES,
+                    AGENT_LOG_MAX_FILES,
+                );
                 let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
                 tracing_subscriber::registry()
                     .with(

@@ -43,6 +43,7 @@ arcbox-dns = { workspace = true }
 wait-timeout = "0.2.1"
 oci2rootfs = { version = "0.2.1", default-features = false }
 arcbox-ext4 = "0.1.2"
+arcbox-logging.workspace = true
 
 # vsock and arcbox-vm are Linux-only
 [target.'cfg(target_os = "linux")'.dependencies]
