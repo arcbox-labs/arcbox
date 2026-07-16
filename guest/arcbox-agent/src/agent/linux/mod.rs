@@ -15,6 +15,7 @@ mod proxy;
 mod rpc;
 mod runtime;
 mod sandbox;
+mod stats;
 mod system_info;
 mod vsock;
 

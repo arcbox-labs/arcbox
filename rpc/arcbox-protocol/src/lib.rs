@@ -97,11 +97,11 @@ pub mod agent {
         KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
         KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
         KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
-        KubernetesStopResponse, MemoryPressureEvent, MmapReadFileRequest, MmapReadFileResponse,
-        PortBindingsChanged, PortBindingsRemoved, ReadinessEvent, RuntimeEnsureRequest,
-        RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, ServiceStatus,
-        ShutdownRequest, ShutdownResponse, SystemInfo, WatchMemoryPressureRequest,
-        WatchReadinessRequest, memory_pressure_event, readiness_event,
+        KubernetesStopResponse, MachineStats, MemoryPressureEvent, MmapReadFileRequest,
+        MmapReadFileResponse, PortBindingsChanged, PortBindingsRemoved, ReadinessEvent,
+        RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
+        ServiceStatus, ShutdownRequest, ShutdownResponse, SystemInfo, WatchMemoryPressureRequest,
+        WatchReadinessRequest, WatchStatsRequest, memory_pressure_event, readiness_event,
     };
 
     // Backward compatibility type aliases (short names without Agent prefix).

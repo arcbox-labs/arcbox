@@ -19,6 +19,10 @@ mod supervisor;
 #[cfg(target_os = "linux")]
 mod memory_pressure;
 
+// Same arrangement for the WatchStats handler's /proc parsers.
+#[cfg(target_os = "linux")]
+mod stats;
+
 #[cfg(target_os = "linux")]
 mod error;
 

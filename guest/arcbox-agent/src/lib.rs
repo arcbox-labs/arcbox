@@ -13,5 +13,6 @@ pub mod dns_server;
 pub mod error;
 pub mod memory_pressure;
 pub mod rootfs_builder;
+pub mod stats;
 #[cfg(target_os = "linux")]
 pub mod sandbox;
