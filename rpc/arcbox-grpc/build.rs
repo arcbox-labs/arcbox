@@ -1,7 +1,7 @@
 //! Build script for gRPC service code generation.
 //!
 //! This generates Rust client and server code for gRPC services
-//! defined in the proto files using tonic-build.
+//! defined in the proto files using tonic-prost-build.
 //!
 //! Message types are imported from arcbox-protocol (prost-generated).
 //! All protos use the unified `arcbox.v1` package namespace.
