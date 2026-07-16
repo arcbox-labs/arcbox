@@ -30,21 +30,21 @@ jobs:
 
       # Regenerate Cargo.lock on every open release PR so its release tag
       # can build with --locked. The release-please `prs` output only
-      # includes PRs created or updated during the current run.
+      # includes PRs created or updated during the current run. Discovery
+      # must use the REST list endpoint with client-side label filtering:
+      # a label-filtered `gh pr list` routes through the eventually
+      # consistent search API and misses PRs release-please created
+      # seconds earlier in this same run.
       - name: Update Cargo.lock on release PRs
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           git config --global user.name "arcbox-labs[bot]"
           git config --global user.email "254083426+arcbox-labs[bot]@users.noreply.github.com"
-          gh pr list \
-            --repo "$GITHUB_REPOSITORY" \
-            --base "$GITHUB_REF_NAME" \
-            --state open \
-            --label "autorelease: pending" \
-            --limit 100 \
-            --json headRefName,number |
-          jq -c '.[]' |
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls?base=${GITHUB_REF_NAME}&state=open&per_page=100" |
+          jq -c '.[]
+            | select(any(.labels[]; .name == "autorelease: pending"))
+            | {number, headRefName: .head.ref}' |
           while read -r pr; do
             PR_BRANCH=$(jq -r '.headRefName' <<< "$pr")
             PR_NUMBER=$(jq -r '.number' <<< "$pr")
