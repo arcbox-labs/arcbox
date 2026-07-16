@@ -2147,7 +2147,7 @@ pub struct MmapReadFileResponse {
     /// Bytes read, trimmed to the originally requested length.
     #[prost(bytes = "vec", tag = "1")]
     pub data: ::prost::alloc::vec::Vec<u8>,
-    /// Number of bytes actually read (\<= length). Short if file smaller
+    /// Number of bytes actually read (<= length). Short if file smaller
     /// than offset+length.
     #[prost(uint64, tag = "2")]
     pub bytes_read: u64,

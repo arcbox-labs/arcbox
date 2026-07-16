@@ -130,7 +130,10 @@ clap_complete = "4"
 tonic = "0.14"
 tonic-prost = "0.14"
 prost = "0.14"
-tonic-prost-build = "0.14"
+# default-features = false drops cleanup-markdown: it must stay off so proto
+# codegen output does not depend on which crates build together (feature
+# unification would otherwise mangle checked-in generated doc comments).
+tonic-prost-build = { version = "0.14", default-features = false, features = ["transport"] }
 prost-build = "0.14"
 
 # HTTP server (Docker REST API)

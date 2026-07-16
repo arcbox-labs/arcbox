@@ -444,11 +444,11 @@ pub struct InspectSandboxRequest {
 ///
 /// State machine:
 ///
-/// starting ──► ready ──► running ──► ready   (cmd/Run exited, sandbox alive)
-/// │          │
-/// └──────────┴──► stopping ──► stopped
-/// │
-/// failed
+///    starting ──► ready ──► running ──► ready   (cmd/Run exited, sandbox alive)
+///                   │          │
+///                   └──────────┴──► stopping ──► stopped
+///                                        │
+///                                     failed
 ///
 /// "idle" is an alias for "ready" used in event payloads to signal that a
 /// previously running workload has just finished.
@@ -567,22 +567,22 @@ pub struct SandboxEvent {
     #[prost(string, tag = "1")]
     pub sandbox_id: ::prost::alloc::string::String,
     /// Action:
-    /// "created"  — sandbox record created, VM booting
-    /// "ready"    — VM booted, sandbox accepting workloads
-    /// "running"  — a workload (cmd or Run) started
-    /// "idle"     — active workload exited, sandbox back to ready
-    /// "stopping" — Stop called, draining workload
-    /// "stopped"  — VM shut down
-    /// "failed"   — unrecoverable error
-    /// "removed"  — sandbox deleted
+    ///    "created"  — sandbox record created, VM booting
+    ///    "ready"    — VM booted, sandbox accepting workloads
+    ///    "running"  — a workload (cmd or Run) started
+    ///    "idle"     — active workload exited, sandbox back to ready
+    ///    "stopping" — Stop called, draining workload
+    ///    "stopped"  — VM shut down
+    ///    "failed"   — unrecoverable error
+    ///    "removed"  — sandbox deleted
     #[prost(string, tag = "2")]
     pub action: ::prost::alloc::string::String,
     /// Unix nanoseconds.
     #[prost(int64, tag = "3")]
     pub timestamp: i64,
     /// Additional context, e.g.:
-    /// "exit_code" on "idle" / "stopped"
-    /// "error"     on "failed"
+    ///    "exit_code" on "idle" / "stopped"
+    ///    "error"     on "failed"
     #[prost(map = "string, string", tag = "4")]
     pub attributes:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
