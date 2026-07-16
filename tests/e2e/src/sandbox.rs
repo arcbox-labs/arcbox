@@ -260,12 +260,41 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
     );
     info!(%snapshot_id, "checkpoint taken");
 
-    // Stop the origin before restoring: with `network_override: false` the
-    // restored sandbox reuses the recorded NIC (the origin's TAP), so the
-    // origin must release it first. Fresh-network restore (a new TAP while
-    // the origin keeps running) relies on FC's `network_overrides`
-    // snapshot-load field, which the pinned Firecracker 1.10.1 predates —
-    // see docs/sandbox-api.md.
+    // -- Fresh-network restore (origin still running) ----------------------
+    // `network_override: true` gives the clone a new TAP via FC's
+    // `network_overrides` snapshot-load field (Firecracker >= 1.12), so the
+    // origin keeps its NIC and both run side by side.
+    let fresh_net_started = Instant::now();
+    let cloned = snapshots
+        .restore(with_machine(RestoreRequest {
+            id: "smoke3".into(),
+            snapshot_id: snapshot_id.clone(),
+            network_override: true,
+            ..Default::default()
+        }))
+        .await
+        .context("Fresh-network restore failed")?
+        .into_inner();
+    info!(id = %cloned.id, "sandbox restored with fresh network while origin runs");
+    let stdout = run_and_collect(&mut sandboxes, "smoke3", &["/bin/echo", "hello-clone"]).await?;
+    if !stdout.contains("hello-clone") {
+        bail!("fresh-network clone run output missing marker: {stdout:?}");
+    }
+    let origin = inspect(&mut sandboxes, "smoke1").await?;
+    if origin.state != "ready" {
+        bail!(
+            "origin should keep running through a fresh-network restore, state={}",
+            origin.state
+        );
+    }
+    metrics.record(
+        "sandbox_restore_fresh_net",
+        fresh_net_started.elapsed().as_secs_f64(),
+    );
+
+    // Stop the origin before the reuse-NIC restore: with
+    // `network_override: false` the restored sandbox reuses the recorded NIC
+    // (the origin's TAP), so the origin must release it first.
     let restore_started = Instant::now();
     sandboxes
         .stop(with_machine(StopSandboxRequest {
@@ -303,7 +332,7 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
 
     // -- Teardown -----------------------------------------------------------
     let teardown_started = Instant::now();
-    for id in ["smoke1", "smoke2"] {
+    for id in ["smoke1", "smoke2", "smoke3"] {
         sandboxes
             .remove(with_machine(RemoveSandboxRequest {
                 id: id.into(),

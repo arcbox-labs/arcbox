@@ -423,7 +423,19 @@ pub fn stage_dev_boot_assets(root: &Path, data_dir: &Path, version: &str) -> Res
         fs::create_dir_all(&bin_dir)?;
         for entry in fs::read_dir(&seed_dir)? {
             let entry = entry?;
-            copy_file(&entry.path(), &bin_dir.join(entry.file_name()))?;
+            if entry.path().is_dir() {
+                // Subdirectories mirror `install_dir` binaries, which land as
+                // siblings of bin/ (e.g. runtime-bin/kernel/vmlinux →
+                // runtime/kernel/vmlinux).
+                let sibling = data_dir.join("runtime").join(entry.file_name());
+                fs::create_dir_all(&sibling)?;
+                for sub in fs::read_dir(entry.path())? {
+                    let sub = sub?;
+                    copy_file(&sub.path(), &sibling.join(sub.file_name()))?;
+                }
+            } else {
+                copy_file(&entry.path(), &bin_dir.join(entry.file_name()))?;
+            }
         }
         info!(seed = %seed_dir.display(), "pre-seeded runtime binaries");
     }
