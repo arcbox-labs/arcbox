@@ -29,6 +29,7 @@ fn main() {
         "proto/api.proto",
         "proto/kubernetes.proto",
         "proto/sandbox.proto",
+        "proto/stats.proto",
     ];
 
     // Configure prost-build (no tonic - services are in arcbox-grpc).

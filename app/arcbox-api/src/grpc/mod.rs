@@ -13,6 +13,7 @@ mod machine;
 mod macos;
 mod sandbox;
 mod snapshot;
+mod stats;
 
 pub use icon::IconServiceImpl;
 pub use kubernetes::KubernetesServiceImpl;
@@ -21,6 +22,7 @@ pub use machine::MachineServiceImpl;
 pub use macos::MacosServiceImpl;
 pub use sandbox::SandboxServiceImpl;
 pub use snapshot::SandboxSnapshotServiceImpl;
+pub use stats::StatsServiceImpl;
 
 use std::sync::{Arc, OnceLock};
 

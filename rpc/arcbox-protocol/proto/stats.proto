@@ -1,0 +1,28 @@
+// Machine resource stats service.
+//
+// Serves the live resource monitor (desktop Activity Monitor, `abctl top`).
+// Samples originate from the guest agent's WatchStats stream (agent.proto);
+// the daemon fans a single guest stream out to every subscriber.
+
+syntax = "proto3";
+
+package arcbox.v1;
+
+import "agent.proto";
+
+// StatsService streams live resource stats.
+service StatsService {
+    // Streams machine-level samples while the client stays subscribed.
+    //
+    // Samples carry cumulative counters (see MachineStats); consumers
+    // derive rates from deltas between consecutive samples. Subscribing is
+    // passive observation — it never counts as VM activity, so a monitor
+    // left open does not block idle reclaim.
+    rpc Watch(StatsWatchRequest) returns (stream MachineStats);
+}
+
+// Subscription request for machine stats.
+message StatsWatchRequest {
+    // Machine to watch. Empty selects the System VM.
+    string machine_id = 1;
+}

@@ -19,6 +19,7 @@ fn main() {
         "../arcbox-protocol/proto/api.proto",
         "../arcbox-protocol/proto/kubernetes.proto",
         "../arcbox-protocol/proto/sandbox.proto",
+        "../arcbox-protocol/proto/stats.proto",
     ];
 
     let descriptor_path =
