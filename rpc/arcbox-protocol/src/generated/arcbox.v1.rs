@@ -1931,6 +1931,69 @@ pub mod memory_pressure_event {
         }
     }
 }
+/// Request for a guest-driven machine resource stats stream.
+///
+/// The agent reads /proc once per interval and emits one MachineStats frame
+/// per tick; every frame doubles as a keepalive. The stream ends after
+/// `timeout_ms`; the host re-issues the request to keep watching.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct WatchStatsRequest {
+    /// Watch window in milliseconds (0 = agent default).
+    #[prost(uint32, tag = "1")]
+    pub timeout_ms: u32,
+    /// Sample interval in milliseconds (0 = agent default, 1000).
+    #[prost(uint32, tag = "2")]
+    pub interval_ms: u32,
+}
+/// One machine-level resource sample.
+///
+/// Counter fields are cumulative since guest boot; consumers derive rates
+/// from deltas between samples, which stays correct across missed samples
+/// and stream restarts.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct MachineStats {
+    /// Guest monotonic clock at sample time (from /proc/uptime), in
+    /// milliseconds. Rate denominators come from deltas of this field, not
+    /// from host receive times (delivery jitter would distort rates).
+    #[prost(uint64, tag = "1")]
+    pub monotonic_ms: u64,
+    /// Aggregate CPU ticks since boot across all CPUs (/proc/stat "cpu"):
+    /// busy = everything except idle + iowait.
+    #[prost(uint64, tag = "2")]
+    pub cpu_busy_ticks: u64,
+    #[prost(uint64, tag = "3")]
+    pub cpu_total_ticks: u64,
+    /// Online CPU count.
+    #[prost(uint32, tag = "4")]
+    pub online_cpus: u32,
+    /// 1-minute load average.
+    #[prost(double, tag = "5")]
+    pub loadavg1: f64,
+    /// Bytes, from /proc/meminfo.
+    #[prost(uint64, tag = "6")]
+    pub memory_total_bytes: u64,
+    #[prost(uint64, tag = "7")]
+    pub memory_available_bytes: u64,
+    /// PSI memory "full avg10" percentage (0-100), from
+    /// /proc/pressure/memory. Negative when the kernel lacks CONFIG_PSI.
+    #[prost(double, tag = "8")]
+    pub memory_psi_full_avg10: f64,
+    /// Cumulative bytes across whole physical disks (/proc/diskstats,
+    /// partitions excluded so traffic is not double-counted).
+    #[prost(uint64, tag = "9")]
+    pub disk_read_bytes: u64,
+    #[prost(uint64, tag = "10")]
+    pub disk_written_bytes: u64,
+    /// Cumulative bytes across non-loopback interfaces (/proc/net/dev).
+    #[prost(uint64, tag = "11")]
+    pub net_rx_bytes: u64,
+    #[prost(uint64, tag = "12")]
+    pub net_tx_bytes: u64,
+}
 /// Runtime status report.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
