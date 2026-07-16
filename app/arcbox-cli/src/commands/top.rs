@@ -180,9 +180,13 @@ impl ComputedStats {
             fmt_bytes(self.net_tx_bytes_per_sec as u64),
         );
         if !self.containers.is_empty() {
+            // Header and rows share the same width spec so columns stay
+            // aligned; the size/rate cells are pre-formatted into "a/b"
+            // strings (worst case ~"1023.9 MiB/1023.9 MiB") and
+            // right-aligned as a whole.
             let _ = writeln!(
                 out,
-                "\n{:<24} {:>7}  {:>10}  {:>18}  {:>18}  {:>5}",
+                "\n{:<24} {:>7} {:>19} {:>21} {:>21} {:>5}",
                 "CONTAINER", "CPU%", "MEM", "DISK R/W/s", "NET ↓/↑/s", "PIDS"
             );
             for c in &self.containers {
@@ -195,16 +199,24 @@ impl ComputedStats {
                         fmt_bytes(c.memory_limit_bytes)
                     )
                 };
+                let disk = format!(
+                    "{}/{}",
+                    fmt_bytes(c.disk_read_bytes_per_sec as u64),
+                    fmt_bytes(c.disk_write_bytes_per_sec as u64)
+                );
+                let net = format!(
+                    "{}/{}",
+                    fmt_bytes(c.net_rx_bytes_per_sec as u64),
+                    fmt_bytes(c.net_tx_bytes_per_sec as u64)
+                );
                 let _ = writeln!(
                     out,
-                    "{:<24} {:>6.1}%  {:>10}  {:>8}/{:<8}  {:>8}/{:<8}  {:>5}",
+                    "{:<24} {:>6.1}% {:>19} {:>21} {:>21} {:>5}",
                     truncate(&c.name, 24),
                     c.cpu_percent,
                     mem,
-                    fmt_bytes(c.disk_read_bytes_per_sec as u64),
-                    fmt_bytes(c.disk_write_bytes_per_sec as u64),
-                    fmt_bytes(c.net_rx_bytes_per_sec as u64),
-                    fmt_bytes(c.net_tx_bytes_per_sec as u64),
+                    disk,
+                    net,
                     c.pids,
                 );
             }
