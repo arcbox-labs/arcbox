@@ -244,7 +244,9 @@ message MachineStats {
     // partitions excluded so traffic is not double-counted).
     uint64 disk_read_bytes = 9;
     uint64 disk_written_bytes = 10;
-    // Cumulative bytes across non-loopback interfaces (/proc/net/dev).
+    // Cumulative bytes across the VM's physical/uplink interfaces
+    // (/proc/net/dev; container bridges and veths are excluded so their
+    // traffic is not counted once per internal hop).
     uint64 net_rx_bytes = 11;
     uint64 net_tx_bytes = 12;
 }

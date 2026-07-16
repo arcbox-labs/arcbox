@@ -49,6 +49,16 @@ fn stats_watch_streams_sane_shared_samples() -> Result<()> {
         let shell = xshell::Shell::new()?;
         shell.change_dir(&root);
         xshell::cmd!(shell, "cargo build --release -p arcbox-daemon").run()?;
+        // The scenario exercises the WatchStats agent RPC, so the guest
+        // must run a matching agent. Build it here rather than relying on
+        // a pre-staged one — an older agent lacks WatchStats and the stream
+        // never yields. Keep this in sync with the xtask `stats_watch`
+        // prebuild recipe.
+        xshell::cmd!(
+            shell,
+            "cargo build --release -p arcbox-agent --target aarch64-unknown-linux-musl"
+        )
+        .run()?;
     }
 
     let version = resolve_boot_version(&root)?;

@@ -123,8 +123,16 @@ fn is_whole_disk(name: &str) -> bool {
     false
 }
 
-/// Cumulative `(rx, tx)` bytes across non-loopback interfaces from
+/// Cumulative `(rx, tx)` bytes across physical/uplink interfaces from
 /// `/proc/net/dev`.
+///
+/// Only real NICs are counted (see [`is_physical_nic`]). The System VM's
+/// root netns also carries container bridges and veths (`docker0`,
+/// `br-<hash>`, `veth<hash>`, `cni0`, …); summing those would count the
+/// same bytes once per internal hop (veth → bridge → uplink), inflating
+/// the machine's reported throughput — the same double-count the disk
+/// parser avoids with [`is_whole_disk`]. In a container's own netns this
+/// leaves just its `eth0`, so per-container reads are unaffected.
 #[must_use]
 pub fn parse_net_dev(net_dev: &str) -> (u64, u64) {
     let mut rx = 0u64;
@@ -133,7 +141,7 @@ pub fn parse_net_dev(net_dev: &str) -> (u64, u64) {
         let Some((name, rest)) = line.split_once(':') else {
             continue; // header lines
         };
-        if name.trim() == "lo" {
+        if !is_physical_nic(name.trim()) {
             continue;
         }
         let fields: Vec<&str> = rest.split_ascii_whitespace().collect();
@@ -145,6 +153,16 @@ pub fn parse_net_dev(net_dev: &str) -> (u64, u64) {
         tx = tx.saturating_add(tx_bytes.parse().unwrap_or(0));
     }
     (rx, tx)
+}
+
+/// Whether an interface name is a physical/uplink NIC, as opposed to a
+/// container bridge or veth. An allowlist of the kernel's predictable NIC
+/// prefixes (`eth`, `en*`) is robust because virtual-interface naming
+/// varies widely (`docker0`, `br-<hash>`, `veth<hash>`, `cni0`,
+/// `flannel.1`, `vxlan*`, `virbr*`, `tap*`, …) and none of them share
+/// these prefixes — `veth` starts with `v`, not `e`.
+fn is_physical_nic(name: &str) -> bool {
+    name.starts_with("eth") || name.starts_with("en")
 }
 
 #[cfg(test)]
@@ -229,13 +247,41 @@ mod tests {
     }
 
     #[test]
-    fn net_dev_sums_everything_but_loopback() {
+    fn net_dev_counts_uplinks_and_skips_bridges_veths() {
+        // The System VM's root netns: real uplinks (eth0/eth1) plus the
+        // container bridges/veths whose bytes would otherwise be counted
+        // again on the uplink.
         let net_dev = "\
 Inter-|   Receive                                                |  Transmit\n\
  face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
-    lo: 9999999    100    0    0    0     0          0         0  9999999    100    0    0    0     0       0          0\n\
-  eth0: 1000     10    0    0    0     0          0         0  2000     20    0    0    0     0       0          0\n\
-  eth1:  500      5    0    0    0     0          0         0   700      7    0    0    0     0       0          0\n";
+       lo: 9999999    100    0    0    0     0          0         0  9999999    100    0    0    0     0       0          0\n\
+     eth0: 1000     10    0    0    0     0          0         0  2000     20    0    0    0     0       0          0\n\
+     eth1:  500      5    0    0    0     0          0         0   700      7    0    0    0     0       0          0\n\
+  docker0: 8000     80    0    0    0     0          0         0  8000     80    0    0    0     0       0          0\n\
+veth1a2b3c: 8000     80    0    0    0     0          0         0  8000     80    0    0    0     0       0          0\n\
+ br-abc123: 8000     80    0    0    0     0          0         0  8000     80    0    0    0     0       0          0\n";
+        // Only eth0 + eth1 count; the bridges/veths are excluded.
         assert_eq!(parse_net_dev(net_dev), (1500, 2700));
+    }
+
+    #[test]
+    fn physical_nic_allowlist() {
+        for nic in ["eth0", "eth1", "en0", "ens1", "enp0s5"] {
+            assert!(is_physical_nic(nic), "{nic}");
+        }
+        for virt in [
+            "lo",
+            "docker0",
+            "br-abc123",
+            "veth1a2b",
+            "cni0",
+            "flannel.1",
+            "vxlan.calico",
+            "virbr0",
+            "tap0",
+            "tun0",
+        ] {
+            assert!(!is_physical_nic(virt), "{virt}");
+        }
     }
 }
