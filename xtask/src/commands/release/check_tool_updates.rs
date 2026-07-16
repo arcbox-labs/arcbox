@@ -118,7 +118,7 @@ fn latest_version(client: &Client, tool: &Tool) -> Result<String> {
             .with_context(|| format!("GitHub latest release request failed for {repo}"))?
             .json::<GithubRelease>()
             .with_context(|| format!("decoding latest release for {repo}"))?;
-        Ok(release.tag_name.trim_start_matches('v').to_owned())
+        Ok(version_from_tag(&release.tag_name))
     } else {
         Ok(client
             .get("https://dl.k8s.io/release/stable.txt")
@@ -131,6 +131,16 @@ fn latest_version(client: &Client, tool: &Tool) -> Result<String> {
             .trim()
             .trim_start_matches('v')
             .to_owned())
+    }
+}
+
+/// Extracts the bare version from a release tag by dropping everything up to
+/// the first digit: `v0.35.0` → `0.35.0`, and moby's post-split scheme
+/// `docker-v29.6.1` → `29.6.1`.
+fn version_from_tag(tag: &str) -> String {
+    match tag.find(|c: char| c.is_ascii_digit()) {
+        Some(idx) => tag[idx..].to_owned(),
+        None => tag.to_owned(),
     }
 }
 
@@ -185,4 +195,16 @@ fn update_tool(
     tool["arch"]["arm64"]["sha256"] = value(arm_sha);
     tool["arch"]["x86_64"]["sha256"] = value(x86_sha);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_from_tag;
+
+    #[test]
+    fn version_from_tag_handles_all_upstream_schemes() {
+        assert_eq!(version_from_tag("v0.35.0"), "0.35.0");
+        assert_eq!(version_from_tag("docker-v29.6.1"), "29.6.1");
+        assert_eq!(version_from_tag("29.3.1"), "29.3.1");
+    }
 }
