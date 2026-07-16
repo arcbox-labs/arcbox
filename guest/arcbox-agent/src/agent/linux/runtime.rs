@@ -583,47 +583,43 @@ pub(super) fn daemon_log_file(name: &str) -> Stdio {
     let arcbox_path = format!("{}/{}.log", log_dir, name);
     let tmp_log_path = format!("/tmp/{}.log", name);
 
+    let open_append = |path: &str| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    };
+
     // Prefer the VirtioFS share so the host can read the log; warn loudly on each
     // degradation so a virtiofs failure doesn't silently hide service logs.
-    let arcbox_available = Path::new("/arcbox").exists();
-    let primary = if arcbox_available {
+    if Path::new("/arcbox").exists() {
         let _ = std::fs::create_dir_all(&log_dir);
-        &arcbox_path
+        match open_append(&arcbox_path) {
+            Ok(f) => return f.into(),
+            Err(e) => {
+                tracing::warn!(
+                    service = name,
+                    error = %e,
+                    "failed to open {arcbox_path} for {name} logs; falling back to {tmp_log_path}"
+                );
+            }
+        }
     } else {
         tracing::warn!(
             service = name,
             "/arcbox VirtioFS share not mounted; {name} logs go to {tmp_log_path} (guest-local, not visible from the host)"
         );
-        &tmp_log_path
-    };
+    }
 
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(primary)
-    {
+    match open_append(&tmp_log_path) {
         Ok(f) => f.into(),
         Err(e) => {
-            tracing::warn!(
+            tracing::error!(
                 service = name,
                 error = %e,
-                "failed to open {primary} for {name} logs; falling back to {tmp_log_path}"
+                "failed to open {tmp_log_path} for {name} logs; discarding to /dev/null"
             );
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&tmp_log_path)
-            {
-                Ok(f) => f.into(),
-                Err(e2) => {
-                    tracing::error!(
-                        service = name,
-                        error = %e2,
-                        "failed to open {tmp_log_path} for {name} logs; discarding to /dev/null"
-                    );
-                    Stdio::null()
-                }
-            }
+            Stdio::null()
         }
     }
 }
