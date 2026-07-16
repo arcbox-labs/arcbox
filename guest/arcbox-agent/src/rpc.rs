@@ -21,7 +21,7 @@ use arcbox_protocol::agent::{
     MmapReadFileResponse, PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved,
     ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
     RuntimeStatusResponse, ShutdownRequest, ShutdownResponse, SystemInfo,
-    WatchMemoryPressureRequest, WatchReadinessRequest,
+    WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
 };
 
 /// Agent version string.
@@ -83,6 +83,7 @@ pub enum RpcRequest {
     DiskTrim(DiskTrimRequest),
     WatchReadiness(WatchReadinessRequest),
     WatchMemoryPressure(WatchMemoryPressureRequest),
+    WatchStats(WatchStatsRequest),
     /// Test-only: exit the agent so PID 1 (busybox init) respawns it.
     KillAgent,
 }
@@ -339,6 +340,10 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
             let req = WatchMemoryPressureRequest::decode(payload)?;
             Ok(RpcRequest::WatchMemoryPressure(req))
         }
+        MessageType::WatchStatsRequest => {
+            let req = WatchStatsRequest::decode(payload)?;
+            Ok(RpcRequest::WatchStats(req))
+        }
         MessageType::KillAgentRequest => Ok(RpcRequest::KillAgent),
         _ => anyhow::bail!("unexpected message type: {:?}", msg_type),
     }
@@ -397,8 +402,8 @@ mod tests {
     #[test]
     fn test_message_type_from_u32_invalid() {
         assert_eq!(MessageType::from_u32(0x9999), None);
-        assert_eq!(MessageType::from_u32(0x0010), None);
-        assert_eq!(MessageType::from_u32(0x1010), None);
+        assert_eq!(MessageType::from_u32(0x0011), None);
+        assert_eq!(MessageType::from_u32(0x1011), None);
     }
 
     #[test]
