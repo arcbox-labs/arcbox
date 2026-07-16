@@ -108,6 +108,8 @@ pub(super) struct GuestTxStats {
     pub gated_polls: u64,
     /// High-water mark of the pending queue.
     pub queue_high_water: usize,
+    /// Frames successfully written to the guest FD (or inject sink).
+    pub tx_frames: u64,
 }
 
 /// Outcome of a single non-blocking write attempt.
@@ -179,7 +181,9 @@ impl GuestTx {
             // Inject-thread path (HV): bounded channel, drop-on-full.
             // TODO(ABX-420): reliable frames need the lossless contract on
             // this path too; count failures so post-mortems can see them.
-            if !sink.send(frame.to_vec()) {
+            if sink.send(frame.to_vec()) {
+                self.stats.tx_frames += 1;
+            } else {
                 self.stats.sink_send_failures += 1;
                 tracing::debug!("Guest frame sink full, frame dropped ({class:?})");
             }
@@ -227,7 +231,10 @@ impl GuestTx {
     /// Attempts one non-blocking write of `frame` to `guest_fd`.
     fn try_write(&mut self, guest_fd: RawFd, frame: &[u8]) -> WriteOutcome {
         match fd_write(guest_fd, frame) {
-            Ok(n) if n >= frame.len() => WriteOutcome::Consumed,
+            Ok(n) if n >= frame.len() => {
+                self.stats.tx_frames += 1;
+                WriteOutcome::Consumed
+            }
             Ok(n) => {
                 // SOCK_DGRAM delivers whole datagrams or fails — a short
                 // write indicates a broken invariant. The partial frame is
@@ -264,12 +271,17 @@ impl GuestTx {
 
     /// Logs a delivery-counter snapshot. Called from the maintenance tick;
     /// a backlog that persists across consecutive reports indicates a
-    /// wedged drain (post-mortem signal, see ABX-420).
-    pub(super) fn log_stats(&self) {
+    /// wedged drain, and `tx_frames` advancing while a connection is
+    /// stalled means frames vanish beyond the socketpair (post-mortem
+    /// signals, see ABX-420). `rx_frames` counts guest→host frames read by
+    /// the loop, to spot one-directional freezes.
+    pub(super) fn log_stats(&self, rx_frames: u64) {
         let s = &self.stats;
         tracing::info!(
             queue_len = self.queue.len(),
             blocked = ?self.blocked,
+            tx_frames = s.tx_frames,
+            rx_frames,
             enobufs = s.enobufs_events,
             would_block = s.would_block_events,
             lossy_dropped = s.lossy_dropped,

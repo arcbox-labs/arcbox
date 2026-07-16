@@ -1,18 +1,27 @@
 //! Sustained-egress regression e2e (container→external download black hole).
 //!
 //! The incident: multi-MB container downloads from fast CDNs stalled
-//! permanently mid-transfer (~40-100% of attempts), while the same URL
-//! downloaded fine on the host. Root cause: the TCP shim terminates guest
-//! connections and re-injects host→guest data over the VZ socketpair with
-//! no retransmission; under sustained throughput the socketpair overflowed
-//! (macOS `ENOBUFS`) and frames were dropped — a permanent sequence gap.
+//! permanently (~40-100% of attempts), while the same URL downloaded fine
+//! on the host. Two distinct defects produced the shape:
 //!
-//! This scenario reproduces the shape without external network dependence:
-//! a host-local HTTP server serves large blobs, and a container downloads
-//! them through the full egress datapath (guest eth0 → classifier →
-//! TcpBridge fast path → host socket). Loopback burst rates exceed any CDN,
-//! so the backpressure path is exercised harder than the original repro.
-//! Every download must complete; a stall means frames were lost.
+//! 1. **Frame drops under backpressure** (fixed): the TCP shim terminates
+//!    guest connections and never retransmits, and the socketpair write
+//!    path dropped frames on `ENOBUFS`/queue-cap — a permanent sequence
+//!    gap. Covered by the `GuestTx` lossless contract; the delivery
+//!    counters in the daemon log must stay at zero drops during this test.
+//! 2. **VZ virtio-net freeze** (open, ABX-420): the device stops moving
+//!    frames in both directions for ~60-75 s and self-heals — during the
+//!    freeze the socketpair is empty, guest routing is intact, and no
+//!    guest kernel errors appear. Reproduces here on roughly 1 in 5
+//!    downloads, so this scenario currently FAILS intermittently; the
+//!    forensics it captures (eth0 counter deltas, recovery-time probe,
+//!    delivery counters) are the post-mortem record for the hunt.
+//!
+//! The scenario needs no external network: a host-local HTTP server serves
+//! large blobs and a container downloads them through the full egress
+//! datapath (guest eth0 → classifier → TcpBridge fast path → host socket)
+//! via the gateway-IP→loopback translation, which also regression-tests
+//! `host.docker.internal` staying direct under a configured system proxy.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -128,6 +137,12 @@ fn sustained_egress_downloads_do_not_stall() -> Result<()> {
             // Avoid the host DNS service port (5553) so this test daemon can
             // run alongside a developer's live daemon.
             ("ARCBOX_DNS_PORT".to_owned(), "15553".to_owned()),
+            // Per-SYN datapath tracing: stall forensics need the gated-SYN,
+            // handshake-retransmit, and RST decisions, which log at debug.
+            (
+                "RUST_LOG".to_owned(),
+                "info,arcbox_net=debug,splicetcp=debug".to_owned(),
+            ),
         ],
     })?;
 
@@ -167,6 +182,9 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
     Ok(())
 }
 
+/// Runs all `DOWNLOADS` attempts (not aborting on the first stall, so the
+/// failure pattern is visible), captures guest-side forensics after any
+/// failure, and errors if any attempt stalled.
 fn run_downloads(
     data_dir: &Path,
     metrics: &mut RunMetrics,
@@ -174,9 +192,10 @@ fn run_downloads(
     url: &str,
     label_prefix: &str,
 ) -> Result<()> {
+    let mut failures = Vec::new();
     for attempt in 1..=DOWNLOADS {
         let label = format!("{label_prefix}_{attempt}");
-        metrics.time(&label, || {
+        let result = metrics.time(&label, || {
             docker_output(
                 data_dir,
                 &[
@@ -193,9 +212,121 @@ fn run_downloads(
                 ],
                 DOWNLOAD_TIMEOUT,
             )
-            .with_context(|| format!("{label_prefix} {attempt}/{DOWNLOADS} stalled or failed"))
-        })?;
-        tracing::info!(attempt, label_prefix, "download completed");
+        });
+        match result {
+            Ok(_) => tracing::info!(attempt, label_prefix, "download completed"),
+            Err(error) => {
+                tracing::warn!(attempt, label_prefix, "download stalled: {error:#}");
+                if failures.is_empty() {
+                    capture_guest_forensics(data_dir, image);
+                }
+                failures.push(attempt);
+            }
+        }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{label_prefix}: attempts {failures:?} of {DOWNLOADS} stalled")
+    }
+}
+
+/// Captures guest network state right after a stall: routing table,
+/// interface addresses, and small-transfer probes that distinguish a total
+/// datapath freeze from a per-connection loss.
+fn capture_guest_forensics(data_dir: &Path, image: &str) {
+    // Two eth0 counter samples 2 s apart: tx_packets advancing while the
+    // datapath sees nothing means the guest transmits into a black hole
+    // (VZ consuming and dropping); frozen tx_packets means the guest-side
+    // virtio TX queue is wedged (VZ not consuming the ring).
+    let eth0_stats = "for f in tx_packets rx_packets tx_dropped rx_dropped; do \
+         echo \"$f=$(cat /sys/class/net/eth0/statistics/$f)\"; done; \
+         sleep 2; echo ---; \
+         for f in tx_packets rx_packets tx_dropped rx_dropped; do \
+         echo \"$f=$(cat /sys/class/net/eth0/statistics/$f)\"; done";
+    let probes: [(&str, &[&str]); 4] = [
+        (
+            "ip route",
+            &["run", "--rm", "--net=host", image, "ip", "route"],
+        ),
+        (
+            "eth0 stats (2 samples, 2s apart)",
+            &["run", "--rm", "--net=host", image, "sh", "-c", eth0_stats],
+        ),
+        (
+            "ping gateway",
+            &[
+                "run",
+                "--rm",
+                image,
+                "ping",
+                "-c",
+                "2",
+                "-W",
+                "3",
+                GUEST_GATEWAY_IP,
+            ],
+        ),
+        (
+            "small http probe",
+            &[
+                "run",
+                "--rm",
+                image,
+                "wget",
+                "-q",
+                "-O",
+                "/dev/null",
+                "-T",
+                "5",
+                "http://10.0.2.1:80/",
+            ],
+        ),
+    ];
+    for (name, args) in probes {
+        match docker_output(data_dir, args, Duration::from_secs(30)) {
+            Ok(out) => tracing::info!(probe = name, "forensics:\n{}", out.trim_end()),
+            Err(error) => tracing::warn!(probe = name, "forensics probe failed: {error:#}"),
+        }
+    }
+
+    // Measure the freeze duration: retry a tiny gateway probe until the
+    // datapath answers again (connection refused counts as alive — an RST
+    // made the round trip).
+    let started = std::time::Instant::now();
+    for _ in 0..30 {
+        let alive = match docker_output(
+            data_dir,
+            &[
+                "run",
+                "--rm",
+                image,
+                "wget",
+                "-q",
+                "-O",
+                "/dev/null",
+                "-T",
+                "3",
+                "http://10.0.2.1:9/",
+            ],
+            Duration::from_secs(20),
+        ) {
+            Ok(_) => true,
+            Err(error) => {
+                let msg = format!("{error:#}");
+                !msg.contains("timed out") && !msg.contains("timeout")
+            }
+        };
+        if alive {
+            tracing::info!(
+                elapsed_secs = started.elapsed().as_secs(),
+                "datapath recovered (probe answered)"
+            );
+            return;
+        }
+    }
+    tracing::warn!(
+        elapsed_secs = started.elapsed().as_secs(),
+        "datapath still frozen after probe window"
+    );
 }

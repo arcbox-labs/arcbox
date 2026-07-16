@@ -217,6 +217,9 @@ impl NetworkDatapath {
 
         let mut guest_mac: Option<[u8; 6]> = None;
 
+        // Guest→host frame counter (diagnostics; see GuestTx::log_stats).
+        let mut rx_frames: u64 = 0;
+
         // Guest-bound frame sink: owns the pending queue and the lossless
         // backpressure state machine (see the guest_tx module docs).
         let mut guest_tx = GuestTx::new(frame_sink);
@@ -283,7 +286,10 @@ impl NetworkDatapath {
                     // Drain all available frames from the source, classifying each.
                     // This is the FdFrameSource + classify_frame composition that
                     // replaced the classifier's old fd-owning drain_guest_fd.
-                    source.drain(|frame| device.classify_frame(frame, &mut guest_mac));
+                    source.drain(|frame| {
+                        rx_frames += 1;
+                        device.classify_frame(frame, &mut guest_mac);
+                    });
                     // We drained until WouldBlock; clear readiness to avoid
                     // spinning on the biased readable arm.
                     guard.clear_ready();
@@ -407,7 +413,7 @@ impl NetworkDatapath {
 
                 _ = maintenance.tick() => {
                     egress.maintenance();
-                    guest_tx.log_stats();
+                    guest_tx.log_stats(rx_frames);
                 }
             }
 
