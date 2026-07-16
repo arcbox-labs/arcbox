@@ -8,10 +8,10 @@
 //! port 2049 and does not register with the portmapper, so the guest needs no
 //! `rpcbind` — which it does not ship and which the in-kernel NFSv3 server
 //! fatally requires. It also removes the MOUNT protocol, so a single relay
-//! suffices. The cost is NFSv4's grace period, which is shortened here (there
-//! is a single read-only client with no lock state to reclaim); the
-//! `nfsdcld`/`rpc_pipefs` client-tracking machinery that stalled the earlier
-//! attempt is not used.
+//! suffices. NFSv4's grace period is ended immediately after nfsd starts
+//! (there is a single read-only client with no lock state to reclaim), so
+//! file opens are never deferred; the `nfsdcld`/`rpc_pipefs` client-tracking
+//! machinery that stalled the earlier attempt is not used.
 //!
 //! `rpc.mountd` still runs locally: the kernel calls it to authorize export
 //! access even under NFSv4, but the client never contacts it.
@@ -249,22 +249,31 @@ local      tpi_cots_ord  -     loopback  -       -       -
     /// the kernel open the 2049 listener.
     fn ensure_nfsd_threads(cfg: &ExportConfig<'_>) -> Result<(), String> {
         write_proc("/proc/fs/nfsd/versions", "+4 -3")?;
-        set_short_grace();
-        write_proc("/proc/fs/nfsd/threads", cfg.threads)
+        set_grace_fallback();
+        write_proc("/proc/fs/nfsd/threads", cfg.threads)?;
+        end_grace_early();
+        Ok(())
     }
 
-    /// Best-effort: shorten the NFSv4 lease/grace before threads start, so a
-    /// browsing client is not blocked from opening files for the kernel
-    /// default (90s). A single read-only client has no lock state to reclaim.
-    fn set_short_grace() {
-        // lease must be <= grace; set lease first.
-        for (path, value) in [
-            ("/proc/fs/nfsd/nfsv4leasetime", "10"),
-            ("/proc/fs/nfsd/nfsv4gracetime", "10"),
-        ] {
-            if let Err(e) = fs::write(path, value) {
-                tracing::debug!(path, error = %e, "nfs export: could not shorten v4 grace (non-fatal)");
-            }
+    /// Best-effort: cap the grace period at the kernel minimum (10s) before
+    /// threads start. Only a fallback — [`end_grace_early`] normally ends the
+    /// grace period outright the moment nfsd is up. The lease time is left at
+    /// the kernel default (90s) so the host client renews it rarely instead of
+    /// every few seconds.
+    fn set_grace_fallback() {
+        if let Err(e) = fs::write("/proc/fs/nfsd/nfsv4gracetime", "10") {
+            tracing::debug!(error = %e, "nfs export: could not cap v4 grace (non-fatal)");
+        }
+    }
+
+    /// Best-effort: end the NFSv4 grace period immediately. During grace the
+    /// server defers new OPENs to let prior clients reclaim state, but this
+    /// export has a single read-only client with nothing to reclaim. Requires
+    /// running nfsd threads (the kernel returns EBUSY otherwise); repeat
+    /// writes are no-ops once grace has ended.
+    fn end_grace_early() {
+        if let Err(e) = fs::write("/proc/fs/nfsd/v4_end_grace", "Y") {
+            tracing::debug!(error = %e, "nfs export: could not end v4 grace early (non-fatal)");
         }
     }
 

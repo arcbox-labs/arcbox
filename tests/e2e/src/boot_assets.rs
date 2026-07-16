@@ -244,8 +244,10 @@ fn verify_nfs_export(ctx: &TestContext) -> Result<()> {
 
     // Strongest signal: read a real guest file's contents through NFS. dockerd
     // writes engine-id (0644) on startup; fall back to a directory read-through
-    // in case a future dockerd stops writing it. The window covers the
-    // shortened NFSv4 grace period, during which file opens are deferred.
+    // in case a future dockerd stops writing it. The agent ends the NFSv4
+    // grace period as soon as nfsd starts, so opens normally succeed at once;
+    // the window covers the 10s fallback grace if that ever fails, plus
+    // attribute-cache propagation.
     let engine_id = mount_dir.join("engine-id");
     if let Ok(content) = read_file_with_retry(&engine_id, Duration::from_secs(20)) {
         if content.trim().is_empty() {
