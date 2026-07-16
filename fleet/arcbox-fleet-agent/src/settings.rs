@@ -36,6 +36,11 @@ pub struct PersistedSettings {
     /// Direct path to the runner entry point (`run.sh`), not its containing
     /// directory.
     pub runner_script: Option<PathBuf>,
+    /// Windows-style path to the Windows runner entry point (e.g.
+    /// `C:\actions-runner\run.cmd`), executed across the WSL interop
+    /// boundary. Meaningful only inside WSL2 with interop enabled.
+    #[serde(default)]
+    pub windows_runner_script: Option<String>,
     /// Whether this machine takes part in the fleet; `false` keeps the
     /// credential but stays detached. Persisted so a launchd restart honors
     /// an operator's detach instead of silently reattaching.
@@ -58,6 +63,7 @@ impl From<&AgentConfig> for PersistedSettings {
             gateway: config.gateway.clone(),
             docker_mode: config.docker.mode,
             runner_script: config.runner_script.clone(),
+            windows_runner_script: config.windows_runner_script.clone(),
             // No env seed: a fresh install participates; only an explicit
             // UpdateSettings opts a machine out.
             participate: true,
@@ -121,6 +127,7 @@ mod tests {
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: DockerMode::Auto,
             runner_script: Some(PathBuf::from("/opt/actions-runner/run.sh")),
+            windows_runner_script: Some("C:\\actions-runner\\run.cmd".to_owned()),
             participate: true,
             vm_mode: crate::config::VmMode::Auto,
             macos_runner_image: "tahoe-base".to_owned(),
@@ -154,6 +161,7 @@ mod tests {
         let config = AgentConfig {
             gateway: "https://example.test".to_owned(),
             runner_script: Some(PathBuf::from("/opt/runner/run.sh")),
+            windows_runner_script: Some("C:\\runner\\run.cmd".to_owned()),
             load_ceiling: 0.5,
             mem_floor_mib: 1024,
             data_dir: PathBuf::from("/tmp/does-not-matter"),
@@ -178,10 +186,11 @@ mod tests {
         assert_eq!(seeded.linux_runner_image, config.docker.linux_runner_image);
         assert_eq!(seeded.vm_mode, config.vm.mode);
         assert_eq!(seeded.macos_runner_image, config.vm.macos_runner_image);
+        assert_eq!(seeded.windows_runner_script, config.windows_runner_script);
     }
 
-    /// A settings.json written before the VM-backend fields existed must
-    /// load as if those fields were seeded fresh.
+    /// A settings.json written before the VM-backend and WSL-interop fields
+    /// existed must load as if those fields were seeded fresh.
     #[test]
     fn pre_vm_fields_settings_file_loads_with_defaults() {
         let json = r#"{
@@ -196,5 +205,6 @@ mod tests {
         let settings: PersistedSettings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.vm_mode, crate::config::VmMode::Auto);
         assert_eq!(settings.macos_runner_image, DEFAULT_MACOS_RUNNER_IMAGE);
+        assert_eq!(settings.windows_runner_script, None);
     }
 }

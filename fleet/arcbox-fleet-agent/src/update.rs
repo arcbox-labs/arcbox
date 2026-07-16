@@ -307,6 +307,7 @@ mod tests {
         AgentConfig {
             gateway: "http://127.0.0.1:1".to_owned(),
             runner_script: None,
+            windows_runner_script: None,
             load_ceiling: 0.9,
             mem_floor_mib: 2048,
             data_dir: data_dir.to_path_buf(),

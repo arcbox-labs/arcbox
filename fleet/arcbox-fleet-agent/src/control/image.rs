@@ -199,6 +199,7 @@ mod tests {
             gateway: "https://fleet.arcbox.dev".to_owned(),
             docker_mode: DockerMode::Disabled,
             runner_script: None,
+            windows_runner_script: None,
             participate: true,
             vm_mode: crate::config::VmMode::Auto,
             macos_runner_image: "tahoe-base".to_owned(),

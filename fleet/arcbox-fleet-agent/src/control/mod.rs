@@ -729,6 +729,7 @@ mod tests {
             gateway: "http://127.0.0.1:1".to_owned(),
             docker_mode: DockerMode::Disabled,
             runner_script: None,
+            windows_runner_script: None,
             participate: true,
             vm_mode: crate::config::VmMode::Auto,
             macos_runner_image: "tahoe-base".to_owned(),
@@ -739,6 +740,7 @@ mod tests {
         AgentConfig {
             gateway: "http://127.0.0.1:1".to_owned(),
             runner_script: None,
+            windows_runner_script: None,
             load_ceiling: 0.9,
             mem_floor_mib: 2048,
             data_dir,

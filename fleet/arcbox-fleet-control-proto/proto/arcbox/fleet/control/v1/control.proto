@@ -254,6 +254,12 @@ message UpdateSettingsRequest {
   // FleetImageService.Prepare pulls it through the daemon and promotes.
   optional string macos_runner_image = 8;
   optional VmMode vm_mode = 9;
+  // Windows-style path to the Windows runner entry point (e.g.
+  // `C:\actions-runner\run.cmd`), executed across the WSL interop boundary.
+  // Only meaningful on a Linux agent running inside WSL2 with interop
+  // enabled; rejected elsewhere. Empty string clears. Restart-scoped, like
+  // runner_script.
+  optional string windows_runner_script = 10;
 }
 
 // Reused across every setting regardless of type, so a client's rendering
@@ -301,6 +307,10 @@ message AgentSettings {
   // semantics as linux_runner_image; prepared through the daemon.
   StringSetting macos_runner_image = 8;
   VmModeSetting vm_mode = 9;
+  // Windows-style path to the Windows runner entry point, run via WSL
+  // interop (see UpdateSettingsRequest.windows_runner_script). Empty when
+  // unset.
+  StringSetting windows_runner_script = 10;
 }
 
 // Long-running image preparation, split out of FleetSettingsService so

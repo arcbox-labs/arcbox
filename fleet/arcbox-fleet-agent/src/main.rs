@@ -34,6 +34,7 @@ mod docker;
 mod enroll;
 mod fsutil;
 mod host;
+mod interop;
 mod runner;
 #[cfg(target_os = "macos")]
 mod service;
@@ -164,6 +165,11 @@ struct EnrollArgs {
 }
 
 #[derive(Debug, Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one value, parsed once at startup and consumed immediately — the Set variant's \
+              size is irrelevant, and boxing fights the clap derive"
+)]
 enum SettingsCommand {
     /// Show every setting's current (in-effect) and target (requested) value.
     Get,
@@ -198,6 +204,11 @@ enum SettingsCommand {
         /// "auto" | "enabled" | "disabled".
         #[arg(long)]
         vm_mode: Option<String>,
+        /// Windows-style path to the Windows runner entry point (e.g.
+        /// "C:\actions-runner\run.cmd"), run via WSL interop. Requires a WSL
+        /// host; "" clears. Applies on the next full restart.
+        #[arg(long)]
+        windows_runner_script: Option<String>,
     },
 }
 
@@ -464,6 +475,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
             participate,
             macos_runner_image,
             vm_mode,
+            windows_runner_script,
         }) => {
             let docker_mode = docker_mode
                 .as_deref()
@@ -488,6 +500,7 @@ async fn run(command: Command, config: AgentConfig) -> Result<()> {
                     participate,
                     macos_runner_image,
                     vm_mode,
+                    windows_runner_script,
                 })
                 .await
                 .context("UpdateSettings RPC failed")?
@@ -828,18 +841,7 @@ fn print_settings(s: control_proto::AgentSettings) {
         );
     }
     if let Some(v) = s.runner_script {
-        let none = "(none)".to_owned();
-        let current = if v.current.is_empty() {
-            &none
-        } else {
-            &v.current
-        };
-        let target = if v.target.is_empty() {
-            &none
-        } else {
-            &v.target
-        };
-        print_setting("runner_script", current, target);
+        print_script_setting("runner_script", &v);
     }
     if let Some(v) = s.macos_runner_image {
         print_setting("macos_runner_image", &v.current, &v.target);
@@ -847,6 +849,22 @@ fn print_settings(s: control_proto::AgentSettings) {
     if let Some(v) = s.vm_mode {
         print_setting("vm_mode", vm_mode_label(v.current), vm_mode_label(v.target));
     }
+    if let Some(v) = s.windows_runner_script {
+        print_script_setting("windows_runner_script", &v);
+    }
+}
+
+/// [`print_setting`] for the script settings, whose empty string encodes
+/// "unset" and prints as `(none)`.
+fn print_script_setting(name: &str, v: &control_proto::StringSetting) {
+    let or_none = |s: &str| {
+        if s.is_empty() {
+            "(none)".to_owned()
+        } else {
+            s.to_owned()
+        }
+    };
+    print_setting(name, &or_none(&v.current), &or_none(&v.target));
 }
 
 #[cfg(test)]
