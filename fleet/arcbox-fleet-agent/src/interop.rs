@@ -392,6 +392,23 @@ mod tests {
         path
     }
 
+    /// [`InteropRunner::spawn`], retrying the brief ETXTBSY window: a
+    /// concurrently forking test can hold a just-written stub open for
+    /// writing until its own exec, and executing a file open for writing
+    /// fails with "Text file busy". Test-suite artifact only — production
+    /// spawns long-existing Windows binaries, never freshly written ones.
+    async fn spawn_retrying(runner: &InteropRunner, jit: &str) -> Result<InteropJob> {
+        for _ in 0..100 {
+            match runner.spawn(jit).await {
+                Err(e) if format!("{e:#}").contains("Text file busy") => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => return other,
+            }
+        }
+        panic!("spawn kept hitting ETXTBSY");
+    }
+
     /// The spawn handshake parses `WINPID=` from the wrapper's stdout, and
     /// a normal exit propagates the exit code through `wait`.
     #[tokio::test]
@@ -401,7 +418,9 @@ mod tests {
         let taskkill = stub(dir.path(), "taskkill", "exit 0");
         let runner = InteropRunner::with_paths(powershell, taskkill, r"C:\r\run.cmd");
 
-        let mut job = runner.spawn("dGVzdA==").await.expect("handshake");
+        let mut job = spawn_retrying(&runner, "dGVzdA==")
+            .await
+            .expect("handshake");
         assert_eq!(job.windows_pid(), 4242);
         let status = job.wait().await.expect("wait");
         assert_eq!(status.code(), Some(7));
@@ -420,7 +439,9 @@ mod tests {
         let taskkill = stub(dir.path(), "taskkill", "exit 0");
         let runner = InteropRunner::with_paths(powershell, taskkill, r"C:\r\run.cmd");
 
-        let job = runner.spawn("dGVzdA==").await.expect("handshake");
+        let job = spawn_retrying(&runner, "dGVzdA==")
+            .await
+            .expect("handshake");
         assert_eq!(job.windows_pid(), 7);
     }
 
@@ -433,7 +454,9 @@ mod tests {
         let taskkill = stub(dir.path(), "taskkill", "exit 0");
         let runner = InteropRunner::with_paths(powershell, taskkill, r"C:\r\run.cmd");
 
-        let err = runner.spawn("dGVzdA==").await.expect_err("no handshake");
+        let err = spawn_retrying(&runner, "dGVzdA==")
+            .await
+            .expect_err("no handshake");
         assert!(
             err.to_string().contains("without reporting WINPID"),
             "{err}"
@@ -462,7 +485,9 @@ mod tests {
         );
         let runner = InteropRunner::with_paths(powershell, taskkill, r"C:\r\run.cmd");
 
-        let mut job = runner.spawn("dGVzdA==").await.expect("handshake");
+        let mut job = spawn_retrying(&runner, "dGVzdA==")
+            .await
+            .expect("handshake");
         let pid = job.windows_pid();
         let start = tokio::time::Instant::now();
         job.kill().await;
@@ -474,18 +499,25 @@ mod tests {
         assert_eq!(recorded.trim(), format!("/T /F /PID {pid}"));
     }
 
-    /// Live end-to-end against real interop — requires a WSL2 host with a
-    /// stub `run.cmd` staged on the Windows side, so it is ignored by
-    /// default: `cargo test -p arcbox-fleet-agent -- --ignored interop`.
+    /// Live end-to-end against real interop — requires a WSL2 host, so it
+    /// is ignored by default:
+    /// `cargo test -p arcbox-fleet-agent -- --ignored interop`.
+    /// Stages a stub `run.cmd` in the Windows user's `%TEMP%` (resolved
+    /// across the same interop boundary under test).
     #[tokio::test]
     #[ignore = "requires a WSL2 host with Windows interop enabled"]
     async fn live_wsl_spawn_and_kill_round_trip() {
-        let staged = PathBuf::from("/mnt/c/Temp/arcbox-interop-test.cmd");
-        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        let cmd_exe = windows_path_to_unix(r"C:\Windows\System32\cmd.exe").expect("wslpath");
+        let output = std::process::Command::new(cmd_exe)
+            .args(["/c", "echo %TEMP%"])
+            .output()
+            .expect("resolving %TEMP% via interop");
+        let temp_win = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let script = format!("{temp_win}\\arcbox-interop-test.cmd");
+        let staged = windows_path_to_unix(&script).expect("translate %TEMP%");
         std::fs::write(&staged, "@echo off\r\nping -n 60 127.0.0.1 >NUL\r\n").unwrap();
-        let script = r"C:\Temp\arcbox-interop-test.cmd";
 
-        let runner = InteropRunner::new(script).await.expect("probe");
+        let runner = InteropRunner::new(&script).await.expect("probe");
         let mut job = runner.spawn("dGVzdA==").await.expect("spawn");
         assert!(job.windows_pid() > 0);
 

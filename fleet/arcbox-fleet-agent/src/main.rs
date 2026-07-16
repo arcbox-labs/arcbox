@@ -749,7 +749,13 @@ async fn init_vm(
 async fn init_interop(windows_runner_script: Option<&str>) -> Option<InteropRunner> {
     let script = windows_runner_script?;
     match InteropRunner::new(script).await {
-        Ok(runner) => Some(runner),
+        Ok(runner) => {
+            info!(
+                script,
+                "WSL interop available; advertising the windows capability"
+            );
+            Some(runner)
+        }
         Err(e) => {
             warn!(
                 error = format!("{e:#}"),

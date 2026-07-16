@@ -917,6 +917,20 @@ mod tests {
         let powershell = interop_stub(dir.path(), "powershell", "echo 'WINPID=4242'\nexit 0");
         let taskkill = interop_stub(dir.path(), "taskkill", "exit 0");
         let interop = InteropRunner::with_paths(powershell, taskkill, r"C:\r\run.cmd");
+
+        // Warm the freshly written stub through the ETXTBSY window (a
+        // concurrently forking test can hold it open for writing until its
+        // own exec) so the spawn inside handle_provision can't hit it.
+        for _ in 0..100 {
+            match interop.spawn("dGVzdA==").await {
+                Ok(mut job) => {
+                    let _ = job.wait().await;
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+
         let (sup, mut rx) = windows_supervisor_with_rx(Some(interop));
 
         sup.handle_provision(ProvisionRunner {
