@@ -1,18 +1,16 @@
-//! Host-side NFSv3 mount of the guest docker data export at `~/ArcBox`.
+//! Host-side NFSv4 mount of the guest docker data export at `~/ArcBox`.
 //!
-//! The guest agent exports `/var/lib/docker` read-only over NFSv3. NFSv3 needs
-//! two services — the NFS protocol (kernel nfsd) and the MOUNT protocol
-//! (`rpc.mountd`) — on separate ports, so this module runs one localhost TCP
-//! proxy per service and bridges each to the guest over its own vsock relay:
+//! The guest agent exports `/var/lib/docker` read-only over NFSv4, which serves
+//! everything on the single well-known port 2049 (no MOUNT protocol). This
+//! module runs one localhost TCP proxy and bridges it to the guest over vsock:
 //!
 //! ```text
-//! mount_nfs -o vers=3,port=<nfsd>,mountport=<mountd> 127.0.0.1:/…/docker ~/ArcBox
-//!   ├─ 127.0.0.1:<nfsd>   → vsock NFS_NFSD_RELAY_PORT   → guest 127.0.0.1:2049
-//!   └─ 127.0.0.1:<mountd> → vsock NFS_MOUNTD_RELAY_PORT → guest 127.0.0.1:20048
+//! mount_nfs -o vers=4,port=<nfsd> 127.0.0.1:/ ~/ArcBox
+//!   └─ 127.0.0.1:<nfsd> → vsock NFS_NFSD_RELAY_PORT → guest 127.0.0.1:2049
 //! ```
 //!
 //! Readiness needs no separate probe: the reconcile simply retries `mount_nfs`
-//! until the guest services answer, so the mount is its own liveness check and
+//! until the guest server answers, so the mount is its own liveness check and
 //! the path works identically on the HV and VZ backends.
 
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -22,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use arcbox_constants::ports::{NFS_MOUNTD_RELAY_PORT, NFS_NFSD_RELAY_PORT};
+use arcbox_constants::ports::NFS_NFSD_RELAY_PORT;
 use arcbox_core::{DEFAULT_MACHINE_NAME, Runtime};
 use arcbox_transport::vsock::{VsockShutdown, VsockStream};
 use tokio::io::copy_bidirectional;
@@ -32,8 +30,6 @@ use tracing::{debug, info, warn};
 
 use crate::context::DaemonContext;
 
-/// Guest path served over NFS — the read-only bind of the docker data mount.
-const EXPORT_PATH: &str = "/run/arcbox/nfs-export/docker";
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 const MOUNT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -76,14 +72,13 @@ async fn reconcile(runtime: Arc<Runtime>, shutdown: CancellationToken) -> Result
         bail!("could not determine home directory for ~/ArcBox mount");
     };
 
-    // One localhost TCP proxy per NFS service, each bridged to the guest.
+    // One localhost TCP proxy to the guest nfsd, bridged over vsock.
     let nfsd_port = spawn_proxy(&runtime, &shutdown, NFS_NFSD_RELAY_PORT).await?;
-    let mountd_port = spawn_proxy(&runtime, &shutdown, NFS_MOUNTD_RELAY_PORT).await?;
 
     reconcile_existing_mount(&mount_path)?;
     std::fs::create_dir_all(&mount_path)?;
 
-    mount_with_retry(&mount_path, nfsd_port, mountd_port, &shutdown).await
+    mount_with_retry(&mount_path, nfsd_port, &shutdown).await
 }
 
 /// Binds a localhost TCP proxy that relays each connection to `vsock_port` on
@@ -159,11 +154,10 @@ async fn relay_connection(
 async fn mount_with_retry(
     mount_path: &Path,
     nfsd_port: u16,
-    mountd_port: u16,
     shutdown: &CancellationToken,
 ) -> Result<()> {
     let source = mount_source();
-    let opts = render_mount_opts(nfsd_port, mountd_port);
+    let opts = render_mount_opts(nfsd_port);
     let deadline = tokio::time::Instant::now() + MOUNT_TIMEOUT;
 
     loop {
@@ -176,8 +170,7 @@ async fn mount_with_retry(
                 info!(
                     path = %mount_path.display(),
                     nfsd_port,
-                    mountd_port,
-                    "mounted guest docker data at ~/ArcBox (NFSv3, read-only)"
+                    "mounted guest docker data at ~/ArcBox (NFSv4, read-only)"
                 );
                 return Ok(());
             }
@@ -219,25 +212,28 @@ async fn run_mount(opts: &str, source: &str, mount_path: &Path) -> Result<(), St
     .map_err(|e| format!("mount_nfs task panicked: {e}"))?
 }
 
-/// The `host:/path` source string for `mount_nfs`.
+/// The `host:/path` source string for `mount_nfs`. The export carries
+/// `fsid=0`, so it is the NFSv4 pseudo-root at `/`.
 fn mount_source() -> String {
-    format!("127.0.0.1:{EXPORT_PATH}")
+    "127.0.0.1:/".to_string()
 }
 
-/// Read-only NFSv3 mount options with both service ports pinned.
+/// Read-only NFSv4 mount options with the nfsd port pinned.
 ///
-/// - `nolocks`: no NLM (matches the export; needs no guest `rpc.statd`).
-/// - `soft` + `ro`: a vanished VM fails I/O instead of hanging Finder
-///   (read-only soft mounts get `deadtimeout=60s`).
-/// - `rdirplus`: fetch attributes with directory entries — fewer round trips
-///   when browsing.
-fn render_mount_opts(nfsd_port: u16, mountd_port: u16) -> String {
-    format!(
-        "ro,nolocks,vers=3,tcp,rdirplus,soft,actimeo=10,port={nfsd_port},mountport={mountd_port}"
-    )
+/// - `deadtimeout=60`: a vanished VM makes the mount fail I/O after 60s instead
+///   of hanging Finder forever (macOS rejects `soft` with `vers=4`).
+/// - `rdirplus`: fetch attributes with directory entries — fewer round trips.
+/// - `actimeo=10`: modest attribute cache for a browse mount.
+fn render_mount_opts(nfsd_port: u16) -> String {
+    format!("ro,vers=4,rdirplus,actimeo=10,deadtimeout=60,port={nfsd_port}")
 }
 
+/// Host mount point: `$ARCBOX_HOST_MOUNT_DIR` when set (so a test daemon stays
+/// off the shared `~/ArcBox`), otherwise `~/ArcBox`.
 fn resolve_mount_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("ARCBOX_HOST_MOUNT_DIR") {
+        return Some(PathBuf::from(dir));
+    }
     dirs::home_dir().map(|home| resolve_mount_path_from_home(&home))
 }
 
@@ -328,20 +324,18 @@ mod tests {
     }
 
     #[test]
-    fn mount_opts_are_readonly_v3_with_both_ports_pinned() {
-        let opts = render_mount_opts(51000, 51001);
-        assert!(opts.contains("vers=3"));
+    fn mount_opts_are_readonly_v4_with_nfsd_port_pinned() {
+        let opts = render_mount_opts(51000);
+        assert!(opts.contains("vers=4"));
         assert!(opts.contains("ro,"));
-        assert!(opts.contains("nolocks"));
         assert!(opts.contains("port=51000"));
-        assert!(opts.contains("mountport=51001"));
         // Must never request write access to a read-only export.
         assert!(!opts.contains("rw"));
     }
 
     #[test]
-    fn mount_source_targets_the_guest_export_path() {
-        assert_eq!(mount_source(), "127.0.0.1:/run/arcbox/nfs-export/docker");
+    fn mount_source_is_the_v4_pseudo_root() {
+        assert_eq!(mount_source(), "127.0.0.1:/");
     }
 
     #[test]
