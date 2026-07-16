@@ -61,10 +61,23 @@ pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
     }
 
     // Best-effort self-setup (non-blocking).
-    let dns_task = self_setup::DnsResolver {
-        domain: ctx.dns_domain.clone(),
-        port: ctx.dns_port,
-    };
+    //
+    // The `/etc/resolver/<domain>` entry belongs to the daemon serving the
+    // canonical DNS port. A daemon on any other port (an e2e harness daemon
+    // with an ephemeral port, an ad-hoc dev run) must never rewrite the
+    // host-global resolver away from the installed daemon — after it exits,
+    // host DNS would point at a dead port.
+    let dns_task =
+        (ctx.dns_port == crate::startup::DEFAULT_DNS_PORT).then(|| self_setup::DnsResolver {
+            domain: ctx.dns_domain.clone(),
+            port: ctx.dns_port,
+        });
+    if dns_task.is_none() {
+        tracing::debug!(
+            port = ctx.dns_port,
+            "non-default DNS port; skipping /etc/resolver self-setup"
+        );
+    }
     let socket_task = self_setup::DockerSocket {
         target: ctx.layout.docker_socket.clone(),
     };
@@ -88,12 +101,17 @@ pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
 
     let setup_state_self = Arc::clone(&ctx.setup_state);
     tokio::spawn(async move {
-        let mut tasks: Vec<&dyn self_setup::SetupTask> = vec![&dns_task, &socket_task];
+        let mut tasks: Vec<&dyn self_setup::SetupTask> = vec![&socket_task];
+        if let Some(dns) = &dns_task {
+            tasks.insert(0, dns);
+        }
         for t in &cli_tasks {
             tasks.push(t.as_ref());
         }
         self_setup::run(&tasks).await;
-        setup_state_self.set_dns_installed(dns_task.is_satisfied());
+        if let Some(dns) = &dns_task {
+            setup_state_self.set_dns_installed(dns.is_satisfied());
+        }
         setup_state_self.set_docker_socket_linked(socket_task.is_satisfied());
     });
 
