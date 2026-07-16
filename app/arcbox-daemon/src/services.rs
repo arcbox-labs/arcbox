@@ -11,9 +11,9 @@ use anyhow::{Context, Result};
 use arcbox_api::{
     IconServiceImpl, IconServiceServer, KubernetesServiceImpl, MachineServiceImpl,
     MigrationServiceImpl, MigrationServiceServer, SandboxServiceImpl, SandboxServiceServer,
-    SandboxSnapshotServiceImpl, SandboxSnapshotServiceServer, SharedRuntime, SystemServiceImpl,
-    SystemServiceServer, kubernetes_service_server::KubernetesServiceServer,
-    machine_service_server::MachineServiceServer,
+    SandboxSnapshotServiceImpl, SandboxSnapshotServiceServer, SharedRuntime, StatsServiceImpl,
+    SystemServiceImpl, SystemServiceServer, kubernetes_service_server::KubernetesServiceServer,
+    machine_service_server::MachineServiceServer, stats_service_server::StatsServiceServer,
 };
 #[cfg(target_os = "macos")]
 use arcbox_api::{MacosServiceImpl, macos_service_server::MacosServiceServer};
@@ -63,6 +63,7 @@ pub async fn start_grpc(
         Arc::clone(&shared_runtime),
         Arc::clone(&ctx.early_runtime),
     );
+    let stats_service = StatsServiceImpl::new(Arc::clone(&shared_runtime));
     let icon_service = IconServiceImpl::new();
 
     // Server reflection lets SDK authors and grpcurl discover the API
@@ -86,6 +87,7 @@ pub async fn start_grpc(
             .add_service(SandboxServiceServer::new(sandbox_service))
             .add_service(SandboxSnapshotServiceServer::new(sandbox_snapshot_service))
             .add_service(SystemServiceServer::new(system_service))
+            .add_service(StatsServiceServer::new(stats_service))
             .add_service(IconServiceServer::new(icon_service));
         // macOS guests are served only on Apple Silicon hosts; on other
         // platforms the service is simply absent (the CLI `macos` noun is

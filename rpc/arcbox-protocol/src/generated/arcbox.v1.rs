@@ -3159,3 +3159,12 @@ impl SystemVmBackend {
         }
     }
 }
+/// Subscription request for machine stats.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StatsWatchRequest {
+    /// Machine to watch. Empty selects the System VM.
+    #[prost(string, tag = "1")]
+    pub machine_id: ::prost::alloc::string::String,
+}

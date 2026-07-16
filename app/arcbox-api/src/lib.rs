@@ -17,6 +17,7 @@ pub mod system;
 pub use arcbox_grpc::v1::{
     kubernetes_service_client, kubernetes_service_server, machine_service_client,
     machine_service_server, migration_service_client, migration_service_server,
+    stats_service_client, stats_service_server,
 };
 #[cfg(target_os = "macos")]
 pub use arcbox_grpc::v1::{macos_service_client, macos_service_server};
@@ -32,7 +33,7 @@ pub use error::{ApiError, Result};
 pub use grpc::MacosServiceImpl;
 pub use grpc::{
     IconServiceImpl, KubernetesServiceImpl, MachineServiceImpl, SandboxServiceImpl,
-    SandboxSnapshotServiceImpl, SharedRuntime,
+    SandboxSnapshotServiceImpl, SharedRuntime, StatsServiceImpl,
 };
 pub use migration::MigrationServiceImpl;
 pub use system::{SetupState, SystemServiceImpl};

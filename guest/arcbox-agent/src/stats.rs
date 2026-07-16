@@ -177,7 +177,8 @@ mod tests {
 
     #[test]
     fn meminfo_scales_kb_to_bytes() {
-        let meminfo = "MemTotal:       16296128 kB\nMemFree:         1234 kB\nMemAvailable:   15000000 kB\n";
+        let meminfo =
+            "MemTotal:       16296128 kB\nMemFree:         1234 kB\nMemAvailable:   15000000 kB\n";
         let (total, available) = parse_meminfo(meminfo).unwrap();
         assert_eq!(total, 16_296_128 * 1024);
         assert_eq!(available, 15_000_000 * 1024);
@@ -211,8 +212,17 @@ mod tests {
             assert!(is_whole_disk(disk), "{disk}");
         }
         for other in [
-            "vda1", "sdb2", "nvme0n1p1", "mmcblk0p2", "loop0", "ram0", "dm-0", "zram0", "md0",
-            "sr0", "vd",
+            "vda1",
+            "sdb2",
+            "nvme0n1p1",
+            "mmcblk0p2",
+            "loop0",
+            "ram0",
+            "dm-0",
+            "zram0",
+            "md0",
+            "sr0",
+            "vd",
         ] {
             assert!(!is_whole_disk(other), "{other}");
         }
