@@ -558,9 +558,19 @@ impl RunnerSupervisor {
             return;
         };
 
-        let mut job = match interop.spawn(&order.encoded_jit_config).await {
-            Ok(job) => job,
-            Err(e) => {
+        // The spawn + WINPID handshake can block for up to HANDSHAKE_TIMEOUT
+        // on degraded interop and must not make the agent deaf to
+        // CancelRunner — mirror the VM startup path.
+        let spawned = {
+            let spawn = std::pin::pin!(interop.spawn(&order.encoded_jit_config));
+            tokio::select! {
+                result = spawn => Some(result),
+                () = cancel.cancelled() => None,
+            }
+        };
+        let mut job = match spawned {
+            Some(Ok(job)) => job,
+            Some(Err(e)) => {
                 self.reject(
                     job_id,
                     token,
@@ -568,7 +578,25 @@ impl RunnerSupervisor {
                 );
                 return;
             }
+            None => {
+                // Canceled mid-spawn: no verdict is owed (the platform
+                // already concluded the job). Dropping the spawn future
+                // kills the relay (`kill_on_drop`); without a completed
+                // WINPID handshake there is no Windows tree to taskkill —
+                // the same orphan tolerance as a failed handshake.
+                info!(job_id, "runner canceled during interop spawn");
+                return;
+            }
         };
+
+        // A cancel that landed while the spawn was completing: the platform
+        // already concluded the job, so don't resolve the offer — tear the
+        // job down instead of accepting it just to kill it.
+        if cancel.is_cancelled() {
+            job.kill().await;
+            info!(job_id, "runner canceled during interop spawn");
+            return;
+        }
 
         self.accept(job_id, token);
         info!(
@@ -583,8 +611,7 @@ impl RunnerSupervisor {
                 Err(e) => warn!(job_id, error = %e, "waiting on runner failed"),
             },
             // CancelRunner: taskkill the Windows tree and reap the relay,
-            // awaited. The token is level-triggered, so a cancel that fired
-            // during the spawn handshake is observed here immediately.
+            // awaited, so the slot outlives the teardown.
             () = cancel.cancelled() => {
                 job.kill().await;
                 info!(job_id, "runner canceled");
@@ -958,6 +985,55 @@ mod tests {
         })
         .await
         .expect("slot released once the runner exited");
+    }
+
+    /// A cancel that arrives while the interop spawn is still in the WINPID
+    /// handshake must not resolve the offer: the platform already concluded
+    /// the job, so no `RunnerAccepted` is owed and the slot must drain.
+    #[tokio::test]
+    async fn windows_offer_canceled_mid_spawn_sends_no_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        // The handshake stalls long enough for the cancel to land first.
+        let powershell = interop_stub(
+            dir.path(),
+            "powershell",
+            "sleep 3\necho 'WINPID=4242'\nexit 0",
+        );
+        let taskkill = interop_stub(dir.path(), "taskkill", "exit 0");
+        let interop = InteropRunner::with_paths(powershell, taskkill, r"C:\r\run.cmd");
+
+        let (sup, mut rx) = windows_supervisor_with_rx(Some(interop));
+
+        sup.handle_provision(ProvisionRunner {
+            job_id: "rjob_win".to_owned(),
+            os: "windows".to_owned(),
+            arch: "amd64".to_owned(),
+            encoded_jit_config: "dGVzdA==".to_owned(),
+            offer_token: "tok1".to_owned(),
+        });
+
+        // Cancel while the wrapper is still sleeping pre-handshake.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !sup.inner.in_flight.contains_key("rjob_win") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("job registered in_flight");
+        sup.handle_cancel("rjob_win");
+
+        // The slot drains without any verdict having been sent.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sup.inner.in_flight.contains_key("rjob_win") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("slot released after the mid-spawn cancel");
+        assert!(
+            rx.try_recv().is_err(),
+            "no verdict may resolve a canceled offer"
+        );
     }
 
     /// The defensive arm: a windows offer admitted while no interop backend

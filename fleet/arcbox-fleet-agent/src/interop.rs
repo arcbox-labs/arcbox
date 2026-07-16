@@ -47,6 +47,11 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// does any work.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Budget for each interop-boundary call in the cancel path (`taskkill`,
+/// relay reap). A wedged interop layer must not block the cancel arm in
+/// `run_interop_job` forever — that would leak the in-flight job slot.
+const KILL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Ceiling for the composed `cmd.exe` command line. cmd refuses lines over
 /// 8191 chars; staying under with margin turns a too-large JIT config into
 /// a clean upfront rejection instead of a cryptic mid-spawn failure.
@@ -189,11 +194,11 @@ impl InteropRunner {
         let windows_pid = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
             Ok(Ok(pid)) => pid,
             Ok(Err(e)) => {
-                reap(&mut child).await;
+                reap(&mut child, KILL_TIMEOUT).await;
                 return Err(e);
             }
             Err(_) => {
-                reap(&mut child).await;
+                reap(&mut child, KILL_TIMEOUT).await;
                 bail!("interop wrapper did not report WINPID within {HANDSHAKE_TIMEOUT:?}");
             }
         };
@@ -219,16 +224,25 @@ impl InteropRunner {
             windows_pid,
             child,
             taskkill: self.taskkill.clone(),
+            kill_timeout: KILL_TIMEOUT,
         })
     }
 }
 
-/// Kill and reap the relay after a failed handshake. Losing the Windows
-/// process is acceptable here: either it never started (`Start-Process`
-/// failed) or the wrapper is defective — there is no PID to taskkill.
-async fn reap(child: &mut tokio::process::Child) {
-    if let Err(e) = child.kill().await {
-        warn!(error = %e, "killing the interop wrapper failed");
+/// Kill and reap the relay after a failed handshake or a failed/hung
+/// taskkill. Losing the Windows process is acceptable here: either it
+/// never started (`Start-Process` failed), the wrapper is defective, or
+/// the tree teardown already ran. Bounded: if even SIGKILL delivery/reap
+/// wedges (degraded interop), the kill signal is left pending and the
+/// caller proceeds — releasing the job slot outranks reaping the zombie.
+async fn reap(child: &mut tokio::process::Child, timeout: Duration) {
+    match tokio::time::timeout(timeout, child.kill()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(error = %e, "killing the interop wrapper failed"),
+        Err(_) => {
+            let _ = child.start_kill();
+            warn!("interop wrapper did not reap within {timeout:?}; leaving the kill pending");
+        }
     }
 }
 
@@ -239,6 +253,10 @@ pub struct InteropJob {
     windows_pid: u32,
     child: tokio::process::Child,
     taskkill: PathBuf,
+    /// Per-call budget for the teardown in [`Self::kill`]. Always
+    /// [`KILL_TIMEOUT`] in production; tests shrink it to exercise the
+    /// hung-taskkill path quickly.
+    kill_timeout: Duration,
 }
 
 impl InteropJob {
@@ -256,35 +274,53 @@ impl InteropJob {
     /// (whose `WaitForExit` returns once the tree is gone). Killing the
     /// relay instead would orphan the Windows process — see the module doc.
     /// Falls back to exactly that (with a warning) if taskkill itself
-    /// fails, so the job slot is always released either way.
+    /// fails or hangs, so the job slot is always released either way:
+    /// every interop-boundary call here is bounded by [`KILL_TIMEOUT`] —
+    /// an unbounded wait would wedge the cancel arm in `run_interop_job`
+    /// and leak the slot.
     pub async fn kill(&mut self) {
-        let killed = tokio::process::Command::new(&self.taskkill)
+        let taskkill = tokio::process::Command::new(&self.taskkill)
             .args(["/T", "/F", "/PID", &self.windows_pid.to_string()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .status()
-            .await;
-        match killed {
-            Ok(status) if status.success() => {}
-            Ok(status) => {
+            .status();
+        match tokio::time::timeout(self.kill_timeout, taskkill).await {
+            Ok(Ok(status)) if status.success() => {}
+            Ok(Ok(status)) => {
                 warn!(
                     windows_pid = self.windows_pid,
                     %status,
                     "taskkill failed; killing the relay (the Windows tree may be orphaned)"
                 );
-                reap(&mut self.child).await;
+                reap(&mut self.child, self.kill_timeout).await;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(
                     windows_pid = self.windows_pid,
                     error = %e,
                     "spawning taskkill failed; killing the relay (the Windows tree may be orphaned)"
                 );
-                reap(&mut self.child).await;
+                reap(&mut self.child, self.kill_timeout).await;
+            }
+            Err(_) => {
+                warn!(
+                    windows_pid = self.windows_pid,
+                    "taskkill hung past {:?}; killing the relay (the Windows tree may be orphaned)",
+                    self.kill_timeout
+                );
+                reap(&mut self.child, self.kill_timeout).await;
             }
         }
-        if let Err(e) = self.child.wait().await {
-            warn!(error = %e, "reaping the interop relay failed");
+        match tokio::time::timeout(self.kill_timeout, self.child.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!(error = %e, "reaping the interop relay failed"),
+            Err(_) => {
+                warn!(
+                    "interop relay did not exit within {:?}; killing it",
+                    self.kill_timeout
+                );
+                reap(&mut self.child, self.kill_timeout).await;
+            }
         }
     }
 }
@@ -497,6 +533,41 @@ mod tests {
         );
         let recorded = std::fs::read_to_string(&log).expect("taskkill invoked");
         assert_eq!(recorded.trim(), format!("/T /F /PID {pid}"));
+    }
+
+    /// A hung taskkill (degraded interop) must not wedge `kill`: the
+    /// per-call [`InteropJob::kill_timeout`] expires, the relay is reaped
+    /// via the fallback, and the caller — the cancel arm in
+    /// `run_interop_job` — gets control back so the job slot is released.
+    #[tokio::test]
+    async fn kill_survives_a_hung_taskkill_and_still_reaps_the_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        let powershell = stub(
+            dir.path(),
+            "powershell",
+            "echo \"WINPID=$$\"\nexec sleep 30",
+        );
+        // A taskkill that never returns and never kills the tree.
+        let taskkill = stub(dir.path(), "taskkill", "exec sleep 30");
+        let runner = InteropRunner::with_paths(powershell, taskkill, r"C:\r\run.cmd");
+
+        let mut job = spawn_retrying(&runner, "dGVzdA==")
+            .await
+            .expect("handshake");
+        job.kill_timeout = Duration::from_millis(300);
+
+        let start = tokio::time::Instant::now();
+        job.kill().await;
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "kill must not wait out the hung taskkill"
+        );
+        // The relay was reaped by the fallback: wait() returns immediately.
+        let status = tokio::time::timeout(Duration::from_secs(5), job.wait())
+            .await
+            .expect("relay already reaped")
+            .expect("wait");
+        assert!(!status.success(), "relay was killed, not exited");
     }
 
     /// Live end-to-end against real interop — requires a WSL2 host, so it
