@@ -16,7 +16,7 @@
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -33,6 +33,11 @@ use crate::context::DaemonContext;
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 const MOUNT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Path this daemon successfully mounted, set once by the reconcile task.
+/// [`cleanup`] only unmounts what this process created — a daemon that never
+/// completed its mount must not unmount whatever else sits at `~/ArcBox`.
+static MOUNTED_PATH: OnceLock<PathBuf> = OnceLock::new();
+
 /// Spawns the background task that mounts the guest export at `~/ArcBox`.
 pub fn spawn(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
     if !ctx.mount_nfs {
@@ -48,18 +53,21 @@ pub fn spawn(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
     });
 }
 
-/// Unmounts `~/ArcBox` on shutdown if it is our NFS mount.
+/// Unmounts `~/ArcBox` on shutdown, but only the mount this daemon created.
 pub fn cleanup(ctx: &DaemonContext) {
     if !ctx.mount_nfs {
         return;
     }
 
-    let Some(mount_path) = resolve_mount_path() else {
+    // Never mounted (startup raced shutdown, or the mount failed): whatever
+    // sits at the path is not ours to touch.
+    let Some(mount_path) = MOUNTED_PATH.get() else {
         return;
     };
 
-    match current_mount_info(&mount_path) {
-        Some(info) if info.fstype == "nfs" => match unmount(&mount_path) {
+    // Re-check the shape in case the user replaced the mount since.
+    match current_mount_info(mount_path) {
+        Some(info) if is_arcbox_nfs_mount(&info) => match unmount(mount_path) {
             Ok(()) => info!(path = %mount_path.display(), "unmounted ~/ArcBox host NFS mount"),
             Err(e) => warn!(path = %mount_path.display(), error = %e, "failed to unmount ~/ArcBox"),
         },
@@ -167,6 +175,7 @@ async fn mount_with_retry(
 
         match run_mount(&opts, &source, mount_path).await {
             Ok(()) => {
+                let _ = MOUNTED_PATH.set(mount_path.to_path_buf());
                 info!(
                     path = %mount_path.display(),
                     nfsd_port,
@@ -242,9 +251,14 @@ fn resolve_mount_path_from_home(home: &Path) -> PathBuf {
 }
 
 /// Removes a stale ArcBox NFS mount, or errors if the path is otherwise taken.
+///
+/// Only a mount matching our exact shape (`nfs` from `127.0.0.1:/`) is
+/// replaced — that is a leftover from a previous daemon whose local proxy is
+/// gone, so it is dead weight. Anything else at the path, including a foreign
+/// NFS mount, is someone else's and makes the reconcile bail.
 fn reconcile_existing_mount(mount_path: &Path) -> Result<()> {
     match current_mount_info(mount_path) {
-        Some(info) if info.fstype == "nfs" => {
+        Some(info) if is_arcbox_nfs_mount(&info) => {
             info!(path = %mount_path.display(), "replacing stale ~/ArcBox NFS mount");
             unmount(mount_path)
         }
@@ -256,6 +270,12 @@ fn reconcile_existing_mount(mount_path: &Path) -> Result<()> {
         ),
         None => Ok(()),
     }
+}
+
+/// True when the mount at the path has exactly the shape this daemon creates:
+/// NFS from the v4 pseudo-root of the localhost proxy.
+fn is_arcbox_nfs_mount(info: &MountInfo) -> bool {
+    info.fstype == "nfs" && info.source == mount_source()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,9 +331,32 @@ fn unmount(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MountInfo, mount_source, parse_mount_line, render_mount_opts, resolve_mount_path_from_home,
+        MountInfo, is_arcbox_nfs_mount, mount_source, parse_mount_line, render_mount_opts,
+        resolve_mount_path_from_home,
     };
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn only_our_exact_mount_shape_is_reclaimed() {
+        let ours = MountInfo {
+            source: "127.0.0.1:/".to_string(),
+            fstype: "nfs".to_string(),
+        };
+        assert!(is_arcbox_nfs_mount(&ours));
+
+        // A user's own NFS mount at ~/ArcBox must never be unmounted.
+        let foreign_nfs = MountInfo {
+            source: "fileserver:/export/home".to_string(),
+            fstype: "nfs".to_string(),
+        };
+        assert!(!is_arcbox_nfs_mount(&foreign_nfs));
+
+        let smb = MountInfo {
+            source: "//user@server/share".to_string(),
+            fstype: "smbfs".to_string(),
+        };
+        assert!(!is_arcbox_nfs_mount(&smb));
+    }
 
     #[test]
     fn mount_path_is_arcbox_under_home() {
