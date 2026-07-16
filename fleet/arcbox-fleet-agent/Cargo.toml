@@ -2,7 +2,7 @@
 name = "arcbox-fleet-agent"
 publish = false
 description = "Cross-platform Fleet runner agent: enrolls, attaches to the gateway, and runs GitHub Actions jobs"
-version = "0.1.1" # x-release-please-version
+version = "0.1.2" # x-release-please-version
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -18,7 +18,7 @@ arcbox-fleet-proto = { workspace = true }
 arcbox-fleet-control-proto = { workspace = true }
 arcbox-logging = { workspace = true }
 
-tonic = { workspace = true, features = ["tls", "tls-webpki-roots"] }
+tonic = { workspace = true, features = ["tls-aws-lc", "tls-webpki-roots"] }
 prost = { workspace = true }
 
 tokio = { workspace = true }
@@ -41,7 +41,7 @@ hyper-util = "0.1"
 arcbox-grpc.workspace = true
 arcbox-protocol.workspace = true
 arcbox-constants.workspace = true
-russh = { version = "0.62.1", default-features = false, features = ["ring", "flate2"] }
+russh = { version = "0.62.1", default-features = false, features = ["aws-lc-rs", "flate2"] }
 thiserror.workspace = true
 plist = "1.10.0"
 libc.workspace = true

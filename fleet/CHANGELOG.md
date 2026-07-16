@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/arcboxlabs/arcbox/compare/fleet-agent-v0.1.1...fleet-agent-v0.1.2) (2026-07-16)
+
+
+### Bug Fixes
+
+* **fleet:** dedup TLS crypto stack on aws-lc-rs (tonic 0.14, russh aws-lc-rs) ([#395](https://github.com/arcboxlabs/arcbox/issues/395)) ([9542819](https://github.com/arcboxlabs/arcbox/commit/9542819448d02e60d1a5c406d4d272ea35ac684d))
+
 ## [0.1.1](https://github.com/arcboxlabs/arcbox/compare/fleet-agent-v0.1.0...fleet-agent-v0.1.1) (2026-07-15)
 
 

@@ -1,7 +1,7 @@
 //! Build script for gRPC service code generation.
 //!
 //! This generates Rust client and server code for gRPC services
-//! defined in the proto files using tonic-build.
+//! defined in the proto files using tonic-prost-build.
 //!
 //! Message types are imported from arcbox-protocol (prost-generated).
 //! All protos use the unified `arcbox.v1` package namespace.
@@ -25,8 +25,8 @@ fn main() {
         std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR set by cargo"))
             .join("arcbox_descriptor.bin");
 
-    // Configure tonic-build
-    tonic_build::configure()
+    // Configure tonic-prost-build (tonic 0.14 split prost integration out of tonic-build)
+    tonic_prost_build::configure()
         // Emit the file descriptor set for gRPC server reflection.
         .file_descriptor_set_path(&descriptor_path)
         // Map arcbox.v1 package to arcbox_protocol::v1 types

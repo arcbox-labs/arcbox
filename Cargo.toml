@@ -124,11 +124,17 @@ sentry = { version = "0.46", default-features = false, features = [
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 
-# gRPC
-tonic = "0.12"
-prost = "0.13"
-tonic-build = "0.12"
-prost-build = "0.13"
+# gRPC — tonic 0.14 split prost integration into tonic-prost / tonic-prost-build.
+# Service-stub crates use tonic-prost for the runtime codec and
+# tonic-prost-build instead of `tonic_build::configure()` for code generation.
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+# default-features = false drops cleanup-markdown: it must stay off so proto
+# codegen output does not depend on which crates build together (feature
+# unification would otherwise mangle checked-in generated doc comments).
+tonic-prost-build = { version = "0.14", default-features = false, features = ["transport"] }
+prost-build = "0.14"
 
 # HTTP server (Docker REST API)
 axum = { version = "0.8", features = ["macros"] }
