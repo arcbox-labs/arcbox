@@ -107,7 +107,15 @@ impl Vmm {
         //
         // Without: use VZNATNetworkDeviceAttachment (Apple creates bridge100,
         // requiring FDB scanning to discover it).
-        if self.config.networking {
+        //
+        // ARCBOX_DIAG_DISABLE_BRIDGE_NIC skips the second NIC entirely — a
+        // diagnostic knob for the ABX-423 freeze bisection (host→container
+        // inbound routing is lost while set).
+        let diag_disable_bridge = std::env::var_os("ARCBOX_DIAG_DISABLE_BRIDGE_NIC").is_some();
+        if diag_disable_bridge {
+            tracing::warn!("bridge NIC disabled via ARCBOX_DIAG_DISABLE_BRIDGE_NIC (diagnostic)");
+        }
+        if self.config.networking && !diag_disable_bridge {
             #[cfg(feature = "vmnet")]
             {
                 match self.create_vmnet_bridge_nic() {
@@ -245,7 +253,19 @@ impl Vmm {
     /// buffers, only with less headroom (see `NET_SOCKET_BUF_BYTES` for why the
     /// host end in particular must be sized once the enhanced MTU is active).
     fn set_socket_buffers(fd: libc::c_int) {
-        let size = NET_SOCKET_BUF_BYTES;
+        // ABX-423 bisection knobs: ARCBOX_DIAG_NET_BUF_DEFAULT skips the
+        // enlargement entirely; ARCBOX_DIAG_NET_BUF_BYTES overrides the size
+        // (buffer sizing is the first dimension found to change the freeze
+        // incidence).
+        if std::env::var_os("ARCBOX_DIAG_NET_BUF_DEFAULT").is_some() {
+            tracing::warn!("socket buffers left at defaults (ARCBOX_DIAG_NET_BUF_DEFAULT)");
+            return;
+        }
+        let size = std::env::var("ARCBOX_DIAG_NET_BUF_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<libc::c_int>().ok())
+            .inspect(|v| tracing::warn!("socket buffers overridden to {v} (diagnostic)"))
+            .unwrap_or(NET_SOCKET_BUF_BYTES);
         // SAFETY: setsockopt on a valid fd with a correctly-sized `c_int` value.
         unsafe {
             for (opt, name) in [

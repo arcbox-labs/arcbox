@@ -45,9 +45,15 @@ use super::intercept::process_inbound_cmd;
 
 /// Cap on queued [`DeliveryClass::Lossy`] frames. Datagram replies are small
 /// and loss-recoverable; bounding them keeps a stalled guest FD from growing
-/// the queue without bound. Reliable frames are not capped — their producers
-/// are gated on [`GuestTx::has_backlog`], which bounds the backlog to one
-/// event-loop iteration of bulk production.
+/// the queue without bound. Reliable frames are not capped: the bulk
+/// producer (fast-path host-socket reads) is gated on
+/// [`GuestTx::has_backlog`], bounding it to one event-loop iteration, while
+/// the remaining reliable producers (ACKs, handshake frames, RSTs) are
+/// reactive — they only emit in response to guest activity, which itself
+/// stops when the guest FD is wedged. This is a deliberate
+/// memory-vs-correctness tradeoff: a dropped TCP-shim frame is a permanent
+/// connection stall, and `queue_high_water` records how close the practical
+/// bound comes.
 pub(super) const LOSSY_QUEUE_CAP: usize = 1024;
 
 /// Retry interval for a queue blocked on `ENOBUFS`. The VZ reader drains the
