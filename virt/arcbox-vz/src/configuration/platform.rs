@@ -1,8 +1,6 @@
 //! Platform configurations.
 
-use crate::error::{VZError, VZResult};
-use crate::ffi::{get_class, release};
-use crate::{msg_send, msg_send_void};
+use crate::error::VZResult;
 use objc2::runtime::AnyObject;
 
 use super::mac::{MacAuxiliaryStorage, MacHardwareModel, MacMachineIdentifier};
@@ -105,29 +103,18 @@ impl MacPlatform {
         machine_identifier: &MacMachineIdentifier,
         auxiliary_storage: &MacAuxiliaryStorage,
     ) -> VZResult<Self> {
-        // SAFETY: ObjC alloc/init on VZMacPlatformConfiguration, then strong-property
-        // setters that retain their arguments. Result checked non-null.
-        unsafe {
-            let cls = get_class("VZMacPlatformConfiguration").ok_or_else(|| VZError::Internal {
-                code: -1,
-                message: "VZMacPlatformConfiguration class not found".into(),
-            })?;
-            let alloc = msg_send!(cls, alloc);
-            let obj = msg_send!(alloc, init);
-
-            if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to create VZMacPlatformConfiguration".into(),
-                });
-            }
-
-            msg_send_void!(obj, setHardwareModel: hardware_model.as_ptr());
-            msg_send_void!(obj, setMachineIdentifier: machine_identifier.as_ptr());
-            msg_send_void!(obj, setAuxiliaryStorage: auxiliary_storage.as_ptr());
-
-            Ok(Self { inner: obj })
-        }
+        // SAFETY: all three are valid handles; the platform's properties are
+        // strong, so the arguments may be dropped after this returns.
+        let obj = unsafe {
+            crate::shim_ffi::abx_platform_mac_new(
+                hardware_model.as_ptr().cast(),
+                machine_identifier.as_ptr().cast(),
+                auxiliary_storage.as_ptr().cast(),
+            )
+        };
+        Ok(Self {
+            inner: obj as *mut AnyObject,
+        })
     }
 }
 
@@ -140,7 +127,8 @@ impl Platform for MacPlatform {
 impl Drop for MacPlatform {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            release(self.inner);
+            // SAFETY: releasing the +1 handle returned by the shim.
+            unsafe { crate::shim_ffi::abx_object_release(self.inner.cast()) };
         }
     }
 }

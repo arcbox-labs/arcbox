@@ -7,16 +7,40 @@
 //! hardware model and the machine identifier round-trip through an opaque data
 //! representation so a base image can be reconstructed for every clone.
 
-use std::ffi::c_void;
+use std::ffi::{CString, c_void};
 use std::path::Path;
+use std::ptr;
 
 use objc2::runtime::AnyObject;
 
 use crate::error::{VZError, VZResult};
-use crate::ffi::{
-    extract_nserror, get_class, nsdata_from_bytes, nsdata_to_vec, nsurl_file_path, release, retain,
-};
-use crate::{msg_send, msg_send_bool};
+use crate::ffi::retain;
+use crate::shim_ffi;
+
+/// Converts a path to a `CString`, rejecting interior NUL bytes.
+fn path_cstring(path: &Path) -> VZResult<CString> {
+    CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
+        VZError::InvalidConfiguration(format!("path contains NUL: {}", path.display()))
+    })
+}
+
+/// Takes ownership of a shim-malloc'd byte buffer as a `Vec<u8>`.
+///
+/// # Safety
+///
+/// `bytes` must be null (with `len == 0`) or a shim-allocated buffer of `len`
+/// bytes that has not been freed yet.
+unsafe fn take_bytes(bytes: *mut c_void, len: usize) -> Vec<u8> {
+    if bytes.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: per contract, `bytes` points to `len` readable bytes owned by us.
+    unsafe {
+        let out = std::slice::from_raw_parts(bytes as *const u8, len).to_vec();
+        shim_ffi::abx_bytes_free(bytes);
+        out
+    }
+}
 
 /// A macOS guest hardware model.
 ///
@@ -27,7 +51,8 @@ pub struct MacHardwareModel {
     inner: *mut AnyObject,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an immutable ObjC identity object created by
+// the shim (or retained from the framework).
 unsafe impl Send for MacHardwareModel {}
 
 impl MacHardwareModel {
@@ -35,42 +60,37 @@ impl MacHardwareModel {
     ///
     /// # Errors
     ///
-    /// Returns an error if `VZMacHardwareModel` is unavailable or the data is not a
-    /// valid representation.
+    /// Returns an error if the data is not a valid representation.
     pub fn from_data(data: &[u8]) -> VZResult<Self> {
-        // SAFETY: alloc/initWithDataRepresentation: on VZMacHardwareModel with an NSData
-        // built from a valid slice. The temporary NSData is released after init.
-        unsafe {
-            let cls = get_class("VZMacHardwareModel").ok_or_else(|| VZError::Internal {
-                code: -1,
-                message: "VZMacHardwareModel class not found".into(),
-            })?;
-            let nsdata = nsdata_from_bytes(data);
-            let alloc = msg_send!(cls, alloc);
-            let obj = msg_send!(alloc, initWithDataRepresentation: nsdata);
-            release(nsdata);
-            if obj.is_null() {
-                return Err(VZError::InvalidConfiguration(
-                    "invalid macOS hardware model data representation".into(),
-                ));
-            }
-            Ok(Self { inner: obj })
+        // SAFETY: the slice is valid for the duration of the call; the shim
+        // returns null for invalid representations.
+        let obj = unsafe { shim_ffi::abx_mac_hw_model_from_data(data.as_ptr().cast(), data.len()) };
+        if obj.is_null() {
+            return Err(VZError::InvalidConfiguration(
+                "invalid macOS hardware model data representation".into(),
+            ));
         }
+        Ok(Self {
+            inner: obj as *mut AnyObject,
+        })
     }
 
     /// Returns whether this hardware model is supported by the current host.
     #[must_use]
     pub fn is_supported(&self) -> bool {
-        // SAFETY: Sending isSupported to a valid VZMacHardwareModel.
-        unsafe { msg_send_bool!(self.inner, isSupported).as_bool() }
+        // SAFETY: self.inner is a valid hardware-model handle.
+        unsafe { shim_ffi::abx_mac_hw_model_supported(self.inner.cast()) }
     }
 
     /// Returns the opaque data representation for persistence.
     #[must_use]
     pub fn data_representation(&self) -> Vec<u8> {
-        // SAFETY: dataRepresentation returns an NSData owned by the model; nsdata_to_vec only reads it.
-        let data = unsafe { msg_send!(self.inner, dataRepresentation) };
-        nsdata_to_vec(data)
+        // SAFETY: valid handle; the shim mallocs the buffer that take_bytes frees.
+        unsafe {
+            let mut len: usize = 0;
+            let bytes = shim_ffi::abx_mac_hw_model_data(self.inner.cast(), &mut len);
+            take_bytes(bytes, len)
+        }
     }
 
     /// Wraps a hardware-model pointer borrowed from the framework (for example a
@@ -91,7 +111,8 @@ impl MacHardwareModel {
 impl Drop for MacHardwareModel {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            release(self.inner);
+            // SAFETY: releasing the +1 held by this wrapper.
+            unsafe { shim_ffi::abx_object_release(self.inner.cast()) };
         }
     }
 }
@@ -105,67 +126,49 @@ pub struct MacMachineIdentifier {
     inner: *mut AnyObject,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an immutable ObjC identity object created by
+// the shim.
 unsafe impl Send for MacMachineIdentifier {}
 
 impl MacMachineIdentifier {
     /// Creates a new random machine identifier.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `VZMacMachineIdentifier` is unavailable.
     pub fn new() -> VZResult<Self> {
-        // SAFETY: ObjC alloc/init pattern on VZMacMachineIdentifier. Result checked non-null.
-        unsafe {
-            let cls = get_class("VZMacMachineIdentifier").ok_or_else(|| VZError::Internal {
-                code: -1,
-                message: "VZMacMachineIdentifier class not found".into(),
-            })?;
-            let alloc = msg_send!(cls, alloc);
-            let obj = msg_send!(alloc, init);
-            if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to create VZMacMachineIdentifier".into(),
-                });
-            }
-            Ok(Self { inner: obj })
-        }
+        // SAFETY: the shim returns a +1 handle, released by Drop.
+        let obj = unsafe { shim_ffi::abx_mac_machine_id_new() };
+        Ok(Self {
+            inner: obj as *mut AnyObject,
+        })
     }
 
     /// Reconstructs a machine identifier from its opaque data representation.
     ///
     /// # Errors
     ///
-    /// Returns an error if `VZMacMachineIdentifier` is unavailable or the data is not
-    /// a valid representation.
+    /// Returns an error if the data is not a valid representation.
     pub fn from_data(data: &[u8]) -> VZResult<Self> {
-        // SAFETY: alloc/initWithDataRepresentation: on VZMacMachineIdentifier with an
-        // NSData built from a valid slice. The temporary NSData is released after init.
-        unsafe {
-            let cls = get_class("VZMacMachineIdentifier").ok_or_else(|| VZError::Internal {
-                code: -1,
-                message: "VZMacMachineIdentifier class not found".into(),
-            })?;
-            let nsdata = nsdata_from_bytes(data);
-            let alloc = msg_send!(cls, alloc);
-            let obj = msg_send!(alloc, initWithDataRepresentation: nsdata);
-            release(nsdata);
-            if obj.is_null() {
-                return Err(VZError::InvalidConfiguration(
-                    "invalid macOS machine identifier data representation".into(),
-                ));
-            }
-            Ok(Self { inner: obj })
+        // SAFETY: the slice is valid for the duration of the call; the shim
+        // returns null for invalid representations.
+        let obj =
+            unsafe { shim_ffi::abx_mac_machine_id_from_data(data.as_ptr().cast(), data.len()) };
+        if obj.is_null() {
+            return Err(VZError::InvalidConfiguration(
+                "invalid macOS machine identifier data representation".into(),
+            ));
         }
+        Ok(Self {
+            inner: obj as *mut AnyObject,
+        })
     }
 
     /// Returns the opaque data representation for persistence.
     #[must_use]
     pub fn data_representation(&self) -> Vec<u8> {
-        // SAFETY: dataRepresentation returns an NSData owned by the identifier; nsdata_to_vec only reads it.
-        let data = unsafe { msg_send!(self.inner, dataRepresentation) };
-        nsdata_to_vec(data)
+        // SAFETY: valid handle; the shim mallocs the buffer that take_bytes frees.
+        unsafe {
+            let mut len: usize = 0;
+            let bytes = shim_ffi::abx_mac_machine_id_data(self.inner.cast(), &mut len);
+            take_bytes(bytes, len)
+        }
     }
 
     pub(crate) fn as_ptr(&self) -> *mut AnyObject {
@@ -176,7 +179,8 @@ impl MacMachineIdentifier {
 impl Drop for MacMachineIdentifier {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            release(self.inner);
+            // SAFETY: releasing the +1 handle returned by the shim.
+            unsafe { shim_ffi::abx_object_release(self.inner.cast()) };
         }
     }
 }
@@ -186,7 +190,8 @@ pub struct MacAuxiliaryStorage {
     inner: *mut AnyObject,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an ObjC object created by the shim; it is not
+// mutated concurrently.
 unsafe impl Send for MacAuxiliaryStorage {}
 
 impl MacAuxiliaryStorage {
@@ -194,30 +199,15 @@ impl MacAuxiliaryStorage {
     ///
     /// # Errors
     ///
-    /// Returns an error if `VZMacAuxiliaryStorage` is unavailable or the storage
-    /// cannot be opened.
+    /// Returns an error if the path is not representable; whether the file is
+    /// usable is checked when the VM configuration is validated.
     pub fn open(path: impl AsRef<Path>) -> VZResult<Self> {
-        let path_str = path.as_ref().to_string_lossy();
-        // SAFETY: ObjC alloc/initWithURL: pattern on VZMacAuxiliaryStorage with an NSURL
-        // built from a valid path. Result checked non-null.
-        unsafe {
-            let cls = get_class("VZMacAuxiliaryStorage").ok_or_else(|| VZError::Internal {
-                code: -1,
-                message: "VZMacAuxiliaryStorage class not found".into(),
-            })?;
-            let url = nsurl_file_path(&path_str);
-            let alloc = msg_send!(cls, alloc);
-            let obj = msg_send!(alloc, initWithURL: url);
-            // initWithURL: retains the NSURL; release the +1 from nsurl_file_path
-            // (also covers the error path below).
-            release(url);
-            if obj.is_null() {
-                return Err(VZError::InvalidConfiguration(format!(
-                    "failed to open macOS auxiliary storage: {path_str}"
-                )));
-            }
-            Ok(Self { inner: obj })
-        }
+        let c_path = path_cstring(path.as_ref())?;
+        // SAFETY: c_path is valid; the shim returns a +1 handle.
+        let obj = unsafe { shim_ffi::abx_aux_storage_open(c_path.as_ptr()) };
+        Ok(Self {
+            inner: obj as *mut AnyObject,
+        })
     }
 
     /// Creates new auxiliary storage at `path` for `hardware_model`.
@@ -226,51 +216,29 @@ impl MacAuxiliaryStorage {
     ///
     /// # Errors
     ///
-    /// Returns an error if `VZMacAuxiliaryStorage` is unavailable or the storage
-    /// cannot be created.
+    /// Returns an error if the storage cannot be created.
     pub fn create(
         path: impl AsRef<Path>,
         hardware_model: &MacHardwareModel,
         overwrite: bool,
     ) -> VZResult<Self> {
-        let path_str = path.as_ref().to_string_lossy();
-        // SAFETY: alloc + initCreatingStorageAtURL:hardwareModel:options:error: on
-        // VZMacAuxiliaryStorage. The error out-parameter is written only on failure.
+        let c_path = path_cstring(path.as_ref())?;
+        // SAFETY: both arguments are valid; on failure the shim writes a
+        // strdup'd message that take_error_string frees.
         unsafe {
-            let cls = get_class("VZMacAuxiliaryStorage").ok_or_else(|| VZError::Internal {
-                code: -1,
-                message: "VZMacAuxiliaryStorage class not found".into(),
-            })?;
-            let url = nsurl_file_path(&path_str);
-            let alloc = msg_send!(cls, alloc);
-            // VZMacAuxiliaryStorageInitializationOptionAllowOverwrite = 1 << 0.
-            let options: u64 = u64::from(overwrite);
-            let mut error: *mut AnyObject = std::ptr::null_mut();
-            let sel = objc2::sel!(initCreatingStorageAtURL:hardwareModel:options:error:);
-            let func: unsafe extern "C" fn(
-                *mut AnyObject,
-                objc2::runtime::Sel,
-                *const AnyObject,
-                *const AnyObject,
-                u64,
-                *mut *mut AnyObject,
-            ) -> *mut AnyObject =
-                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            let obj = func(
-                alloc,
-                sel,
-                url as *const AnyObject,
-                hardware_model.as_ptr() as *const AnyObject,
-                options,
+            let mut error: *mut std::ffi::c_char = ptr::null_mut();
+            let obj = shim_ffi::abx_aux_storage_create(
+                c_path.as_ptr(),
+                hardware_model.as_ptr().cast(),
+                overwrite,
                 &mut error,
             );
-            // The initializer retains the NSURL; release the +1 from nsurl_file_path
-            // (also covers the error path below).
-            release(url);
             if obj.is_null() {
-                return Err(extract_nserror(error));
+                return Err(VZError::OperationFailed(shim_ffi::take_error_string(error)));
             }
-            Ok(Self { inner: obj })
+            Ok(Self {
+                inner: obj as *mut AnyObject,
+            })
         }
     }
 
@@ -282,7 +250,8 @@ impl MacAuxiliaryStorage {
 impl Drop for MacAuxiliaryStorage {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            release(self.inner);
+            // SAFETY: releasing the +1 handle returned by the shim.
+            unsafe { shim_ffi::abx_object_release(self.inner.cast()) };
         }
     }
 }
