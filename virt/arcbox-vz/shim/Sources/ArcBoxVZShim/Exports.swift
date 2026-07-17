@@ -309,3 +309,22 @@ public func abxPlatformMacNew(
 ) -> UnsafeMutableRawPointer {
     platformMacNew(hardwareModel, machineIdentifier, auxiliaryStorage)
 }
+
+// MARK: - Vsock
+
+@_cdecl("abx_socket_device_box_from_raw")
+public func abxSocketDeviceBoxFromRaw(
+    _ device: UnsafeMutableRawPointer, _ queue: UnsafeMutableRawPointer
+) -> UnsafeMutableRawPointer {
+    socketDeviceBoxFromRaw(device, queue)
+}
+
+@_cdecl("abx_vsock_connect")
+public func abxVsockConnect(
+    _ box: UnsafeMutableRawPointer,
+    _ port: UInt32,
+    _ ctx: UnsafeMutableRawPointer?,
+    _ callback: ABXVsockCallback
+) {
+    vsockConnect(box, port, ctx, callback)
+}

@@ -23,65 +23,51 @@
 //! ```
 
 use crate::error::{VZError, VZResult};
-use crate::ffi::block::{_Block_release, VsockResult, create_blocking_vsock_context_block};
+use crate::shim_ffi;
 use objc2::runtime::AnyObject;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::os::unix::io::RawFd;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
-// ============================================================================
-// FFI Declarations
-// ============================================================================
-
-// SAFETY: dispatch_async_f is a GCD function from libdispatch, always available on macOS.
-unsafe extern "C" {
-    fn dispatch_async_f(
-        queue: *mut AnyObject,
-        context: *mut c_void,
-        work: unsafe extern "C" fn(*mut c_void),
-    );
+/// Result of a vsock connect delivered by the shim callback.
+struct VsockConnectionInfo {
+    fd: RawFd,
+    source_port: u32,
+    destination_port: u32,
 }
 
-// ============================================================================
-// Connect Context
-// ============================================================================
+type VsockResult = Result<VsockConnectionInfo, String>;
 
-/// Context passed to `dispatch_async_f` for vsock connection.
-struct ConnectContext {
-    /// Socket device pointer.
-    device: *mut AnyObject,
-    /// Port to connect to.
-    port: u32,
-    /// Block pointer (will be released after use).
-    block: *const c_void,
-}
-
-// SAFETY: The pointers are only used on the VM's dispatch queue
-unsafe impl Send for ConnectContext {}
-
-/// Work function executed on VM's dispatch queue.
-unsafe extern "C" fn connect_work(ctx: *mut c_void) {
-    // SAFETY: ctx is a valid pointer to a Box<ConnectContext> leaked via Box::into_raw in connect_blocking().
-    // We reclaim ownership here. objc_msgSend is called with a valid device pointer and selector.
+/// Shim callback trampoline: consumes the boxed sender exactly once.
+///
+/// A timed-out `connect_blocking` drops the receiver; the late send then
+/// fails harmlessly (the dup'd fd is closed here in that case, see below).
+unsafe extern "C" fn vsock_trampoline(
+    ctx: *mut c_void,
+    fd: i32,
+    src_port: u32,
+    dst_port: u32,
+    err: *mut c_char,
+) {
+    // SAFETY: ctx is the Box<Sender> leaked in connect_blocking; the shim
+    // guarantees exactly-once invocation. err is null or a shim string that
+    // take_error_string frees.
     unsafe {
-        let context = Box::from_raw(ctx as *mut ConnectContext);
-
-        tracing::debug!(
-            "connect_work: calling connectToPort:{} on device {:?}",
-            context.port,
-            context.device
-        );
-
-        // Call [device connectToPort:port completionHandler:block]
-        let sel = objc2::sel!(connectToPort:completionHandler:);
-        let func: unsafe extern "C" fn(*mut AnyObject, objc2::runtime::Sel, u32, *const c_void) =
-            std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-
-        func(context.device, sel, context.port, context.block);
-
-        // Note: The block will be released by the runtime after completion handler is called.
-        // We don't release it here because VZ Framework retains it during the async operation.
+        let sender = Box::from_raw(ctx as *mut std_mpsc::Sender<VsockResult>);
+        let result = if err.is_null() {
+            Ok(VsockConnectionInfo {
+                fd,
+                source_port: src_port,
+                destination_port: dst_port,
+            })
+        } else {
+            Err(shim_ffi::take_error_string(err))
+        };
+        if let Err(std_mpsc::SendError(Ok(info))) = sender.send(result) {
+            // Receiver gone (timeout path): close the dup'd fd, or it leaks.
+            libc::close(info.fd);
+        }
     }
 }
 
@@ -107,12 +93,12 @@ unsafe extern "C" fn connect_work(ctx: *mut c_void) {
 /// }
 /// ```
 pub struct VirtioSocketDevice {
-    inner: *mut AnyObject,
-    queue: *mut AnyObject,
+    /// ABXSocketDeviceBox handle (pairs the VZ device with the VM's queue).
+    device_box: *mut c_void,
 }
 
-// SAFETY: The inner ObjC pointer is only accessed via Virtualization.framework's dispatch queue.
-// queue is a thread-safe GCD queue pointer.
+// SAFETY: The box handle is only used through the shim, which issues every
+// device operation on the VM's dispatch queue.
 unsafe impl Send for VirtioSocketDevice {}
 // SAFETY: See above — all access goes through the VM's dispatch queue.
 unsafe impl Sync for VirtioSocketDevice {}
@@ -120,12 +106,14 @@ unsafe impl Sync for VirtioSocketDevice {}
 impl VirtioSocketDevice {
     /// Creates a device wrapper from raw pointers.
     ///
-    /// # Safety
-    ///
     /// The caller must ensure that `ptr` is a valid `VZVirtioSocketDevice`
     /// and `queue` is the VM's dispatch queue.
     pub(crate) fn from_raw(ptr: *mut AnyObject, queue: *mut AnyObject) -> Self {
-        Self { inner: ptr, queue }
+        // SAFETY: per the caller contract both pointers are valid; the shim
+        // box retains them, released by Drop.
+        let device_box =
+            unsafe { shim_ffi::abx_socket_device_box_from_raw(ptr.cast(), queue.cast()) };
+        Self { device_box }
     }
 
     /// Connects to a guest port without using Tokio.
@@ -140,27 +128,16 @@ impl VirtioSocketDevice {
         tracing::debug!("VirtioSocketDevice::connect_blocking(port={})", port);
 
         let (tx, rx) = std_mpsc::channel::<VsockResult>();
-        let block = create_blocking_vsock_context_block(tx);
+        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
 
-        let context = Box::new(ConnectContext {
-            device: self.inner,
-            port,
-            block,
-        });
-        let context_ptr = Box::into_raw(context);
-
+        // SAFETY: device_box is valid; ctx ownership transfers to the
+        // exactly-once trampoline.
         unsafe {
-            tracing::debug!("Dispatching blocking connect to VM queue {:?}", self.queue);
-            dispatch_async_f(self.queue, context_ptr as *mut c_void, connect_work);
+            shim_ffi::abx_vsock_connect(self.device_box, port, ctx, vsock_trampoline);
         }
 
         match rx.recv_timeout(timeout) {
             Ok(Ok(info)) => {
-                // SAFETY: block was heap-allocated by create_blocking_vsock_context_block
-                // via _Block_copy and the completion handler has already fired.
-                unsafe {
-                    _Block_release(block);
-                }
                 tracing::info!(
                     "Vsock connected: fd={}, src_port={}, dst_port={}",
                     info.fd,
@@ -173,47 +150,35 @@ impl VirtioSocketDevice {
                     destination_port: info.destination_port,
                 })
             }
-            Ok(Err(e)) => {
-                // SAFETY: block was heap-allocated by create_blocking_vsock_context_block
-                // via _Block_copy and the completion handler has already fired.
-                unsafe {
-                    _Block_release(block);
-                }
-                if is_transient_connect_error(&e.message) {
-                    tracing::debug!(
-                        port,
-                        error = %e.message,
-                        "Vsock connection not ready yet"
-                    );
+            Ok(Err(message)) => {
+                if is_transient_connect_error(&message) {
+                    tracing::debug!(port, error = %message, "Vsock connection not ready yet");
                 } else {
-                    tracing::warn!(
-                        port,
-                        error = %e.message,
-                        "Vsock connection failed"
-                    );
+                    tracing::warn!(port, error = %message, "Vsock connection failed");
                 }
-                Err(VZError::ConnectionFailed(e.message))
+                Err(VZError::ConnectionFailed(message))
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                // Do not release the block here. Virtualization.framework may
-                // still invoke the completion handler later, and the block owns
-                // the sender that callback will consume.
+                // The completion may still fire later; the trampoline then
+                // frees its context and closes the fd.
                 tracing::warn!("Vsock connection timed out after {:?}", timeout);
                 Err(VZError::Timeout(format!(
                     "Vsock connection to port {port} timed out"
                 )))
             }
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                // SAFETY: the sender side is already gone, so the block has
-                // completed or been disposed and our retained copy can be released.
-                unsafe {
-                    _Block_release(block);
-                }
-                Err(VZError::Internal {
-                    code: -1,
-                    message: "Connection channel closed unexpectedly".into(),
-                })
-            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(VZError::Internal {
+                code: -1,
+                message: "Connection channel closed unexpectedly".into(),
+            }),
+        }
+    }
+}
+
+impl Drop for VirtioSocketDevice {
+    fn drop(&mut self) {
+        if !self.device_box.is_null() {
+            // SAFETY: releasing the +1 box handle returned by the shim.
+            unsafe { shim_ffi::abx_object_release(self.device_box) };
         }
     }
 }
