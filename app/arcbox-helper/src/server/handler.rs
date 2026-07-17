@@ -52,6 +52,18 @@ impl HelperService for HelperServer {
         mutations::dns::status(&domain)
     }
 
+    async fn hosts_alias_install(self, _: tarpc::context::Context) -> Result<(), String> {
+        mutations::hosts::install()
+    }
+
+    async fn hosts_alias_uninstall(self, _: tarpc::context::Context) -> Result<(), String> {
+        mutations::hosts::uninstall()
+    }
+
+    async fn hosts_alias_status(self, _: tarpc::context::Context) -> Result<bool, String> {
+        mutations::hosts::status()
+    }
+
     async fn socket_link(self, _: tarpc::context::Context, target: String) -> Result<(), String> {
         let target: SocketTarget = target.parse()?;
         mutations::socket::link(&target)

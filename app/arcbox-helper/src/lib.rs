@@ -47,6 +47,18 @@ pub trait HelperService {
     /// Removes the `/var/run/docker.sock` symlink.
     async fn socket_unlink() -> Result<(), String>;
 
+    /// Appends the fixed `127.0.0.1 ArcBox` alias to `/etc/hosts` so the
+    /// guest-data NFS mount can use `ArcBox:/` as its source (Finder shows
+    /// a mount by its source host name). Takes no arguments — the helper
+    /// never writes caller-controlled hosts entries.
+    async fn hosts_alias_install() -> Result<(), String>;
+
+    /// Removes the ArcBox alias line from `/etc/hosts`.
+    async fn hosts_alias_uninstall() -> Result<(), String>;
+
+    /// Checks whether the ArcBox `/etc/hosts` alias is installed.
+    async fn hosts_alias_status() -> Result<bool, String>;
+
     /// Creates `/usr/local/bin/{name}` symlink pointing to `target`.
     /// Used to expose Docker CLI tools from the app bundle.
     async fn cli_link(name: String, target: String) -> Result<(), String>;
