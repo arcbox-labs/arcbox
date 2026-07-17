@@ -1938,7 +1938,7 @@ pub mod memory_pressure_event {
 /// `timeout_ms`; the host re-issues the request to keep watching.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct WatchStatsRequest {
     /// Watch window in milliseconds (0 = agent default).
     #[prost(uint32, tag = "1")]
@@ -2010,7 +2010,7 @@ pub struct MachineStats {
 /// namespace, read via /proc/<pid>/net/dev for a process in the container.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ContainerStats {
     /// Full container ID (the cgroup directory name).
     #[prost(string, tag = "1")]
@@ -3215,7 +3215,7 @@ impl SystemVmBackend {
 /// Subscription request for machine stats.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StatsWatchRequest {
     /// Machine to watch. Empty selects the System VM.
     #[prost(string, tag = "1")]
