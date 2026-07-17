@@ -47,9 +47,11 @@ pub struct InlineConn {
     pub guest_mac: [u8; 6],
     /// Whether host stream has reached EOF.
     pub host_eof: bool,
-    /// Shared with the bridge's `FastPathConn`: set once this conn will
-    /// produce no further guest-bound frames (EOF or error) so the bridge
-    /// reaps its inline-owned entry (ABX-431).
+    /// Shared with the bridge's `FastPathConn`: set only when the host
+    /// stream died mid-stream (error, not clean EOF) and the guest was
+    /// RST-terminated, so the bridge reaps its inline-owned entry
+    /// (ABX-431). After a clean EOF the flag stays unset — the entry
+    /// survives for the guest's close handshake.
     pub dead: Arc<std::sync::atomic::AtomicBool>,
 }
 
