@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 
 #[cfg(feature = "tokio-frame-sink")]
 use arcbox_packet::ethernet::{
-    ETH_HEADER_LEN, TcpFrameParams, build_tcp_data_frame, build_tcp_fin_frame,
+    ETH_HEADER_LEN, TcpFrameParams, build_tcp_data_frame, build_tcp_fin_frame, build_tcp_rst_frame,
 };
 #[cfg(feature = "tokio-frame-sink")]
 use tokio::io::AsyncReadExt;
@@ -91,6 +91,12 @@ pub struct PromotedConn {
     pub gw_mac: [u8; 6],
     /// Guest MAC for Ethernet destination.
     pub guest_mac: [u8; 6],
+    /// Set by the sink owner when the host stream dies (EOF or error) and no
+    /// further guest-bound frames will be produced. The bridge polls this to
+    /// reap its inline-owned `FastPathConn` entry — without it the entry
+    /// leaks, because `poll_fast_path` skips inline-owned flows and a
+    /// RST-terminated guest never sends another frame for the flow (ABX-431).
+    pub dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Accepts promoted fast-path connections and delivers them to the RX
@@ -177,7 +183,10 @@ impl ConnSink for TokioFrameConnSink {
             down_bytes,
             gw_mac,
             guest_mac,
+            dead,
         } = conn;
+        // A `false` return means "not accepted": the flow stays on the
+        // bridge's slow path, so `dead` must NOT be set here.
         let Ok(stream) = tokio::net::TcpStream::from_std(stream) else {
             return false;
         };
@@ -189,6 +198,7 @@ impl ConnSink for TokioFrameConnSink {
             our_seq,
             last_ack,
             down_bytes,
+            dead,
             gw_mac,
             guest_mac,
             // Bound this sink's own MTU-derived segmentation by the peer's MSS so
@@ -211,6 +221,7 @@ struct AsyncPromotedConn {
     our_seq: Arc<std::sync::atomic::AtomicU32>,
     last_ack: Arc<std::sync::atomic::AtomicU32>,
     down_bytes: Option<Arc<std::sync::atomic::AtomicU64>>,
+    dead: Arc<std::sync::atomic::AtomicBool>,
     gw_mac: [u8; 6],
     guest_mac: [u8; 6],
     guest_mss: usize,
@@ -229,6 +240,9 @@ async fn read_promoted_conn(
     frames: mpsc::Sender<Vec<u8>>,
 ) {
     let mut buf = vec![0u8; 32 * 1024];
+    // Every exit from this loop marks the conn dead so the bridge reaps its
+    // inline-owned entry (ABX-431).
+    let _dead_guard = SetOnDrop(Arc::clone(&conn.dead));
     loop {
         match stream.read(&mut buf).await {
             Ok(0) => {
@@ -280,8 +294,46 @@ async fn read_promoted_conn(
                     offset = chunk_end;
                 }
             }
-            Err(_) => return,
+            Err(e) => {
+                // Upstream died mid-stream (reset, tunnel killed by a proxy,
+                // …). Data may be lost, so propagate as RST — a FIN would
+                // let the guest mistake a truncated stream for a complete
+                // one — and never drop the upstream silently: without a
+                // guest-bound frame the guest socket stays ESTABLISHED
+                // forever (ABX-431).
+                tracing::debug!(
+                    "promoted conn {}:{} → {}:{} read error, RST to guest: {e}",
+                    conn.remote_ip,
+                    conn.remote_port,
+                    conn.guest_ip,
+                    conn.guest_port
+                );
+                let rst = build_tcp_rst_frame(&TcpFrameParams {
+                    src_ip: conn.remote_ip,
+                    dst_ip: conn.guest_ip,
+                    src_port: conn.remote_port,
+                    dst_port: conn.guest_port,
+                    seq: conn.our_seq.load(Ordering::Relaxed),
+                    ack: conn.last_ack.load(Ordering::Relaxed),
+                    window: 0,
+                    src_mac: conn.gw_mac,
+                    dst_mac: conn.guest_mac,
+                });
+                let _ = frames.send(rst).await;
+                return;
+            }
         }
+    }
+}
+
+/// Sets the flag when the owning task exits, however it exits.
+#[cfg(feature = "tokio-frame-sink")]
+struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(feature = "tokio-frame-sink")]
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -319,6 +371,7 @@ mod tests {
             down_bytes: Some(down.clone()),
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
+            dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         assert!(sink.send_conn(accepted_conn));
 
@@ -366,6 +419,7 @@ mod tests {
             down_bytes: None,
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
+            dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         assert!(sink.send_conn(accepted_conn));
 
@@ -415,6 +469,7 @@ mod tests {
             down_bytes: None,
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
+            dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         assert!(sink.send_conn(accepted_conn));
 
@@ -445,5 +500,64 @@ mod tests {
             "expected ≥4 clamped frames, got {}",
             frames.len()
         );
+    }
+
+    /// Upstream mid-stream death must reach the guest as a RST and mark the
+    /// shared `dead` flag so the bridge reaps its inline-owned entry
+    /// (ABX-431). A clean EOF (covered above) sends FIN instead.
+    #[tokio::test]
+    async fn read_error_sends_rst_and_sets_dead() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(tokio::net::TcpStream::connect(addr), async {
+            listener.accept().await.unwrap().0
+        },);
+        let client = client.unwrap();
+
+        let (sink, mut rx) = TokioFrameConnSink::channel(4);
+        let our_seq = Arc::new(AtomicU32::new(1000));
+        let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let conn = PromotedConn {
+            stream: accepted.into_std().unwrap(),
+            remote_ip: std::net::Ipv4Addr::new(203, 0, 113, 10),
+            guest_ip: std::net::Ipv4Addr::new(192, 168, 64, 2),
+            remote_port: 443,
+            guest_port: 50000,
+            peer_mss: 1460,
+            our_seq: our_seq.clone(),
+            last_ack: Arc::new(AtomicU32::new(2000)),
+            down_bytes: None,
+            gw_mac: [0x02, 0, 0, 0, 0, 1],
+            guest_mac: [0x02, 0, 0, 0, 0, 2],
+            dead: Arc::clone(&dead),
+        };
+        assert!(sink.send_conn(conn));
+
+        // Abortive close: SO_LINGER(0) turns the peer's close into a RST,
+        // so the read task sees ECONNRESET instead of a clean EOF.
+        let client = client.into_std().unwrap();
+        socket2::SockRef::from(&client)
+            .set_linger(Some(std::time::Duration::ZERO))
+            .unwrap();
+        drop(client);
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("frame within deadline")
+            .expect("a guest-bound frame");
+        let flags = frame[ETH_HEADER_LEN + 20 + 13];
+        assert_ne!(flags & 0x04, 0, "must be a RST (flags {flags:#04x})");
+        assert_eq!(
+            our_seq.load(Ordering::Relaxed),
+            1000,
+            "RST consumes no sequence number"
+        );
+
+        // The exiting task marks the conn dead for the bridge's reaper.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !dead.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(dead.load(Ordering::Relaxed));
     }
 }

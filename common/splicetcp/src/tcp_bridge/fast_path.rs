@@ -111,9 +111,25 @@ impl TcpBridge {
                         );
                     }
                     Err(e) => {
-                        tracing::warn!("Fast path TX write error: {e}");
+                        tracing::warn!("Fast path TX write error, RST to guest: {e}");
+                        // Mirror the RX-error path: the host stream is dead,
+                        // so tear the guest side down with RST instead of
+                        // leaving it ESTABLISHED forever (ABX-431).
+                        let rst = crate::ethernet::build_tcp_rst_frame(
+                            &crate::ethernet::TcpFrameParams {
+                                src_ip: conn.remote_ip,
+                                dst_ip: conn.guest_ip,
+                                src_port: conn.remote_port,
+                                dst_port: conn.guest_port,
+                                seq: conn.our_seq.load(std::sync::atomic::Ordering::Relaxed),
+                                ack: conn.last_ack,
+                                window: 0,
+                                src_mac: self.fast_path_gateway_mac,
+                                dst_mac: self.fast_path_guest_mac.unwrap_or([0xFF; 6]),
+                            },
+                        );
                         self.close_fast_path(&key);
-                        return None;
+                        return Some(rst);
                     }
                 }
             } else {
@@ -181,7 +197,22 @@ impl TcpBridge {
         let gw_mac = self.fast_path_gateway_mac;
 
         for (key, conn) in &mut self.fast_path_conns {
-            if conn.host_eof || conn.inline_owned {
+            if conn.inline_owned {
+                // The inline inject thread owns the socket and has already
+                // emitted the guest-bound FIN/RST when it marks the flow
+                // dead. Reap the entry here — a RST-terminated guest sends
+                // no further frames for the flow, so no other path removes
+                // it (ABX-431).
+                if conn
+                    .dead
+                    .as_ref()
+                    .is_some_and(|d| d.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    to_remove.push(*key);
+                }
+                continue;
+            }
+            if conn.host_eof {
                 continue;
             }
 
@@ -285,12 +316,29 @@ impl TcpBridge {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "Fast path RX error {}:{} → {}:{}: {e}",
+                        "Fast path RX error {}:{} → {}:{}, RST to guest: {e}",
                         conn.remote_ip,
                         conn.remote_port,
                         conn.guest_ip,
                         conn.guest_port
                     );
+                    // Upstream died mid-stream — propagate as RST. Data may
+                    // be lost, so a FIN would let the guest mistake a
+                    // truncated stream for a complete one, and no frame at
+                    // all leaves the guest ESTABLISHED forever (ABX-431).
+                    let rst =
+                        crate::ethernet::build_tcp_rst_frame(&crate::ethernet::TcpFrameParams {
+                            src_ip: conn.remote_ip,
+                            dst_ip: conn.guest_ip,
+                            src_port: conn.remote_port,
+                            dst_port: conn.guest_port,
+                            seq: conn.our_seq.load(std::sync::atomic::Ordering::Relaxed),
+                            ack: conn.last_ack,
+                            window: 0,
+                            src_mac: gw_mac,
+                            dst_mac: guest_mac,
+                        });
+                    frames.push(rst);
                     to_remove.push(*key);
                 }
             }
@@ -366,11 +414,13 @@ impl TcpBridge {
         // (e.g. a sub-1500 overlay bridge behind eth0) stays on the clamped
         // polling path below, where each segment matches its advertised MSS.
         let inline_eligible = peer_mss >= GSO_SEGMENT_MSS;
+        let mut dead: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
         if let Some(sink) = self.conn_sink.as_ref().filter(|_| inline_eligible) {
             match stream.try_clone() {
                 Ok(cloned) => {
                     let gw_mac = self.fast_path_gateway_mac;
                     let guest_mac = self.fast_path_guest_mac.unwrap_or([0xFF; 6]);
+                    let dead_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let promoted = crate::direct_rx::PromotedConn {
                         stream: cloned,
                         remote_ip: key.dst_ip,
@@ -383,9 +433,11 @@ impl TcpBridge {
                         down_bytes: down_shared.clone(),
                         gw_mac,
                         guest_mac,
+                        dead: std::sync::Arc::clone(&dead_flag),
                     };
                     if sink.send_conn(promoted) {
                         inline_owned = true;
+                        dead = Some(dead_flag);
                         tracing::info!(
                             "Fast path: promoted INLINE {}:{} → {}:{} (seq={our_seq}, ack={last_ack})",
                             key.src_ip,
@@ -435,6 +487,7 @@ impl TcpBridge {
                 up_bytes: 0,
                 down_bytes: 0,
                 down_shared: if inline_owned { down_shared } else { None },
+                dead,
             },
         );
     }

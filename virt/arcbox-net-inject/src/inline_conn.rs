@@ -47,6 +47,10 @@ pub struct InlineConn {
     pub guest_mac: [u8; 6],
     /// Whether host stream has reached EOF.
     pub host_eof: bool,
+    /// Shared with the bridge's `FastPathConn`: set once this conn will
+    /// produce no further guest-bound frames (EOF or error) so the bridge
+    /// reaps its inline-owned entry (ABX-431).
+    pub dead: Arc<std::sync::atomic::AtomicBool>,
 }
 
 // SAFETY: TcpStream is Send, all other fields are Send+Sync.
@@ -159,6 +163,21 @@ pub fn read_payload_to_guest(conn: &mut InlineConn, buf: &mut [u8]) -> std::io::
 /// must increment `conn.our_seq` by 1 after injection (FIN consumes
 /// one sequence number, per RFC 793).
 pub fn write_fin_headers(buf: &mut [u8], conn: &InlineConn) -> usize {
+    write_ctrl_headers(buf, conn, 0x11, 65535) // FIN | ACK
+}
+
+/// Writes a RST+ACK control frame (66 header bytes, no payload).
+///
+/// Used when the host stream died mid-stream (error, not clean EOF): data
+/// may be lost, so the guest must see a reset — a FIN would present the
+/// truncated stream as complete, and no frame at all leaves the guest
+/// ESTABLISHED forever (ABX-431). RST consumes no sequence number.
+pub fn write_rst_headers(buf: &mut [u8], conn: &InlineConn) -> usize {
+    write_ctrl_headers(buf, conn, 0x14, 0) // RST | ACK
+}
+
+/// Shared body for the payload-less control frames (FIN/RST).
+fn write_ctrl_headers(buf: &mut [u8], conn: &InlineConn, tcp_flags: u8, window: u16) -> usize {
     if buf.len() < TOTAL_HDR_LEN {
         return 0;
     }
@@ -195,7 +214,7 @@ pub fn write_fin_headers(buf: &mut [u8], conn: &InlineConn) -> usize {
     let ip_cksum = ipv4_header_checksum(&buf[ip..ip + 20]);
     buf[ip + 10..ip + 12].copy_from_slice(&ip_cksum.to_be_bytes());
 
-    // -- TCP: FIN+ACK --
+    // -- TCP: control flags, no payload --
     let tcp = ip + 20;
     let our_seq = conn.our_seq.load(Ordering::Relaxed);
     buf[tcp..tcp + 2].copy_from_slice(&conn.remote_port.to_be_bytes());
@@ -203,8 +222,8 @@ pub fn write_fin_headers(buf: &mut [u8], conn: &InlineConn) -> usize {
     buf[tcp + 4..tcp + 8].copy_from_slice(&our_seq.to_be_bytes());
     buf[tcp + 8..tcp + 12].copy_from_slice(&last_ack.to_be_bytes());
     buf[tcp + 12] = 0x50; // data offset = 5 (20 bytes)
-    buf[tcp + 13] = 0x11; // FIN | ACK
-    buf[tcp + 14..tcp + 16].copy_from_slice(&65535u16.to_be_bytes());
+    buf[tcp + 13] = tcp_flags;
+    buf[tcp + 14..tcp + 16].copy_from_slice(&window.to_be_bytes());
     buf[tcp + 16..tcp + 18].fill(0);
     buf[tcp + 18..tcp + 20].fill(0);
     let pseudo_cksum = tcp_pseudo_header_checksum(conn.remote_ip, conn.guest_ip, tcp_total_len);

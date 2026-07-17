@@ -571,3 +571,153 @@ async fn large_frames_below_gso_mss_falls_back_to_clamped_segmentation() {
         frames.len()
     );
 }
+
+/// Upstream mid-stream death (reset, proxy-killed tunnel) must reach the
+/// guest as a RST and reap the flow — silence leaves the guest socket
+/// ESTABLISHED forever (ABX-431).
+#[tokio::test]
+async fn poll_fast_path_read_error_emits_rst_and_removes_flow() {
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let client = client.unwrap();
+    let (accepted, _) = accepted.unwrap();
+
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 12345,
+        dst_ip: Ipv4Addr::new(198, 18, 30, 95),
+        dst_port: 443,
+    };
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1000, 2000, 1460);
+    assert_eq!(bridge.fast_path_count(), 1);
+
+    // Abortive close: SO_LINGER(0) turns the peer's close into a RST, so
+    // the bridge's next read fails with ECONNRESET instead of a clean EOF.
+    let accepted = accepted.into_std().unwrap();
+    socket2::SockRef::from(&accepted)
+        .set_linger(Some(std::time::Duration::ZERO))
+        .unwrap();
+    drop(accepted);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut frames: Vec<Vec<u8>> = Vec::new();
+    while frames.is_empty() && std::time::Instant::now() < deadline {
+        frames = bridge.poll_fast_path();
+        if frames.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    assert_eq!(
+        frames.len(),
+        1,
+        "upstream reset must produce one guest frame"
+    );
+    let flags = frames[0][ETH_HEADER_LEN + 20 + 13];
+    assert_ne!(flags & 0x04, 0, "frame must be a RST (flags {flags:#04x})");
+    assert_eq!(bridge.fast_path_count(), 0, "flow must be reaped");
+}
+
+/// The inline inject thread owns a promoted socket's teardown; when it
+/// marks the shared `dead` flag, `poll_fast_path` must reap the bridge's
+/// inline-owned entry — nothing else removes it (ABX-431).
+#[tokio::test]
+async fn inline_dead_flag_reaps_bridge_entry() {
+    struct CaptureSink(std::sync::Mutex<Option<crate::direct_rx::PromotedConn>>);
+    impl crate::direct_rx::ConnSink for CaptureSink {
+        fn send_conn(&self, conn: crate::direct_rx::PromotedConn) -> bool {
+            *self.0.lock().unwrap() = Some(conn);
+            true
+        }
+    }
+
+    let sink = std::sync::Arc::new(CaptureSink(std::sync::Mutex::new(None)));
+    let mut bridge = TcpBridge::new(GW_IP);
+    bridge.set_fast_path_macs(GW_MAC, GUEST_MAC);
+    bridge.set_conn_sink(std::sync::Arc::clone(&sink) as _);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connect = tokio::net::TcpStream::connect(addr);
+    let (client, accepted) = tokio::join!(connect, listener.accept());
+    let client = client.unwrap();
+    let _accepted = accepted.unwrap();
+
+    let key = SynFlowKey {
+        src_ip: GUEST_IP,
+        src_port: 23456,
+        dst_ip: Ipv4Addr::new(198, 18, 30, 96),
+        dst_port: 443,
+    };
+    // peer_mss ≥ GSO_SEGMENT_MSS → inline-eligible, handed to the sink.
+    bridge.promote_to_fast_path(key, client.into_std().unwrap(), 1000, 2000, 9000);
+    assert_eq!(bridge.fast_path_count(), 1);
+    let promoted = sink
+        .0
+        .lock()
+        .unwrap()
+        .take()
+        .expect("conn handed to the sink");
+
+    // Alive: the inline-owned entry stays.
+    assert!(bridge.poll_fast_path().is_empty());
+    assert_eq!(bridge.fast_path_count(), 1);
+
+    // Sink owner marks the flow dead (it already emitted the FIN/RST).
+    promoted
+        .dead
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(bridge.poll_fast_path().is_empty());
+    assert_eq!(
+        bridge.fast_path_count(),
+        0,
+        "dead inline flow must be reaped"
+    );
+}
+
+/// A handshake abort (TTL expiry) must RST the guest so its socket dies
+/// immediately instead of retrying SYNs against a flow the bridge already
+/// gave up on (ABX-431).
+#[tokio::test]
+async fn handshake_ttl_abort_emits_rst() {
+    let mut bridge = TcpBridge::new(GW_IP);
+    // TEST-NET-3 destination: the spawned connect never resolves quickly,
+    // and the entry is expired manually below.
+    let syn = make_guest_syn_frame(40000, Ipv4Addr::new(203, 0, 113, 1), 443, 7777, &[]);
+    assert!(
+        bridge
+            .handle_outbound_syn(&syn, GW_MAC, GUEST_MAC)
+            .is_none()
+    );
+    assert_eq!(bridge.handshake_count(), 1);
+
+    for conn in bridge.handshake_conns.values_mut() {
+        conn.created = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(30))
+            .unwrap();
+    }
+
+    let out = bridge.poll_handshakes();
+    assert_eq!(
+        bridge.handshake_count(),
+        0,
+        "expired handshake must be evicted"
+    );
+    let rst = out
+        .iter()
+        .find(|f| f[ETH_HEADER_LEN + 20 + 13] & 0x04 != 0)
+        .expect("TTL abort must emit a RST toward the guest");
+    // ACKing the guest ISN + 1 keeps the RST acceptable in SYN-SENT.
+    let ack = u32::from_be_bytes([
+        rst[ETH_HEADER_LEN + 20 + 8],
+        rst[ETH_HEADER_LEN + 20 + 9],
+        rst[ETH_HEADER_LEN + 20 + 10],
+        rst[ETH_HEADER_LEN + 20 + 11],
+    ]);
+    assert_eq!(ack, 7778);
+}
