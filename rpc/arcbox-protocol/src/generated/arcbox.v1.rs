@@ -2511,6 +2511,28 @@ pub struct SetSystemVmBackendRequest {
     #[prost(enumeration = "SystemVmBackend", tag = "1")]
     pub backend: i32,
 }
+/// Request to resolve a container's filesystem layer directories.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResolveContainerFsRequest {
+    /// Full container ID.
+    #[prost(string, tag = "1")]
+    pub container_id: ::prost::alloc::string::String,
+}
+/// A container's filesystem layer directories, as guest paths under the
+/// containerd data mount.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResolveContainerFsResponse {
+    /// Writable layer directory. Empty for read-only snapshots.
+    #[prost(string, tag = "1")]
+    pub upper_dir: ::prost::alloc::string::String,
+    /// Read-only layer directories, top-most first.
+    #[prost(string, repeated, tag = "2")]
+    pub lower_dirs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
 /// Diagnostic snapshot of the System VM's virtio devices and vCPUs.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

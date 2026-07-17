@@ -205,6 +205,13 @@ service SystemService {
     // empty under VZ, where the devices belong to
     // Virtualization.framework.
     rpc GetVirtioDebug(Empty) returns (VirtioDebugInfo);
+
+    // Resolves a container's filesystem layer directories from containerd
+    // snapshot metadata in the guest. With dockerd's containerd image
+    // store `docker inspect` exposes no layer paths, so filesystem
+    // browsers call this and read the returned guest paths through the
+    // read-only ~/ArcBox NFS export.
+    rpc ResolveContainerFs(ResolveContainerFsRequest) returns (ResolveContainerFsResponse);
 }
 
 // Hypervisor backend for the single System VM.
@@ -225,6 +232,21 @@ message SystemVmBackendInfo {
 // Request to switch the System VM's hypervisor backend.
 message SetSystemVmBackendRequest {
     SystemVmBackend backend = 1;
+}
+
+// Request to resolve a container's filesystem layer directories.
+message ResolveContainerFsRequest {
+    // Full container ID.
+    string container_id = 1;
+}
+
+// A container's filesystem layer directories, as guest paths under the
+// containerd data mount.
+message ResolveContainerFsResponse {
+    // Writable layer directory. Empty for read-only snapshots.
+    string upper_dir = 1;
+    // Read-only layer directories, top-most first.
+    repeated string lower_dirs = 2;
 }
 
 // Diagnostic snapshot of the System VM's virtio devices and vCPUs.

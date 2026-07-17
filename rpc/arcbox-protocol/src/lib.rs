@@ -134,7 +134,8 @@ pub mod api {
     // System service types
     pub use super::v1::{
         Event, EventActor, EventsRequest, GetInfoRequest, GetInfoResponse, GetVersionRequest,
-        GetVersionResponse, PruneRequest, PruneResponse, SystemPingRequest, SystemPingResponse,
+        GetVersionResponse, PruneRequest, PruneResponse, ResolveContainerFsRequest,
+        ResolveContainerFsResponse, SystemPingRequest, SystemPingResponse,
     };
 
     // Volume service types
@@ -203,7 +204,8 @@ pub use v1::{
 // API types - System
 pub use v1::{
     Event, EventActor, EventsRequest, GetInfoRequest, GetInfoResponse, GetVersionRequest,
-    GetVersionResponse, PruneRequest, PruneResponse, SystemPingRequest, SystemPingResponse,
+    GetVersionResponse, PruneRequest, PruneResponse, ResolveContainerFsRequest,
+    ResolveContainerFsResponse, SystemPingRequest, SystemPingResponse,
 };
 
 // API types - Volume

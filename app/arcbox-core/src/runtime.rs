@@ -22,8 +22,8 @@ use arcbox_net::darwin::inbound_relay::{InboundListenerManager, InboundProtocol}
 #[cfg(not(target_os = "macos"))]
 use arcbox_net::port_forward::{PortForwardRule, PortForwarder};
 use arcbox_protocol::agent::{
-    KubernetesDeleteResponse, KubernetesKubeconfigResponse, KubernetesStartResponse,
-    KubernetesStatusResponse, KubernetesStopResponse, ServiceStatus,
+    ContainerFsPathsResponse, KubernetesDeleteResponse, KubernetesKubeconfigResponse,
+    KubernetesStartResponse, KubernetesStatusResponse, KubernetesStopResponse, ServiceStatus,
 };
 use assets::ensure_guest_binaries;
 use kubeconfig::{KUBERNETES_HOST_ENDPOINT, rewrite_kubeconfig_server};
@@ -501,6 +501,26 @@ impl Runtime {
     /// Returns an error if the machine is not running or the vsock port is not reachable.
     pub fn connect_vsock_port(&self, machine_name: &str, port: u32) -> Result<std::os::fd::RawFd> {
         self.machine_manager.connect_vsock_port(machine_name, port)
+    }
+
+    /// Resolves a container's filesystem layer directories (guest paths)
+    /// from containerd snapshot metadata in the System VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the System VM is not running, the agent is
+    /// unreachable, or the container has no snapshot.
+    pub async fn container_fs_paths(&self, container_id: &str) -> Result<ContainerFsPathsResponse> {
+        let mut agent = self.get_agent(DEFAULT_MACHINE_NAME)?;
+        // Blocking transport on the HV socketpair, async on VZ/Linux vsock.
+        if agent.is_blocking() {
+            let id = container_id.to_string();
+            tokio::task::spawn_blocking(move || agent.container_fs_paths_blocking(&id))
+                .await
+                .map_err(|e| CoreError::Vm(format!("container fs paths task panicked: {e}")))?
+        } else {
+            agent.container_fs_paths(container_id).await
+        }
     }
 
     /// Starts the native Kubernetes cluster in the default VM.
