@@ -50,6 +50,7 @@ build-helper:
 
 build-agent:
 	cargo build -p arcbox-agent --target $(AGENT_TARGET) --release
+	cargo build -p arcbox-vm --bin vm-agent --target $(AGENT_TARGET) --release
 
 build-fleet-agent:
 	cargo build -p arcbox-fleet-agent $(CARGO_FLAGS)

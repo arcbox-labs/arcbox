@@ -30,6 +30,10 @@ pub fn run(args: PackageTarballArgs) -> Result<()> {
         args.agent_artifacts.join("arcbox-agent"),
         staging.join("arcbox-agent"),
     )?;
+    super::stage_executable(
+        args.agent_artifacts.join("vm-agent"),
+        staging.join("vm-agent"),
+    )?;
     xtask_fs::copy_file(
         args.host_artifacts.join("bundle/arcbox.entitlements"),
         staging.join("bundle/arcbox.entitlements"),
@@ -117,6 +121,7 @@ mod tests {
             b"plist",
         );
         write_mode_644(&agent.join("arcbox-agent"), b"bin");
+        write_mode_644(&agent.join("vm-agent"), b"bin");
 
         let output_dir = dir.path().join("out");
         run(PackageTarballArgs {
