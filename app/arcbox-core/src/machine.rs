@@ -72,6 +72,15 @@ pub struct MachineInfo {
     pub created_at: DateTime<Utc>,
 }
 
+/// A pulled distro rootfs image a machine boots from.
+#[derive(Debug, Clone)]
+pub struct MachineRootfs {
+    /// Host path of the rootfs image (from the machine image registry).
+    pub path: PathBuf,
+    /// Image format (`squashfs`), used for the kernel `rootfstype=`.
+    pub format: String,
+}
+
 /// Machine configuration.
 #[derive(Debug, Clone)]
 pub struct MachineConfig {
@@ -89,6 +98,11 @@ pub struct MachineConfig {
     pub cmdline: Option<String>,
     /// Block devices (e.g., EROFS rootfs image).
     pub block_devices: Vec<crate::vm::BlockDeviceConfig>,
+    /// Pulled distro rootfs image to boot from. When set, `create` attaches
+    /// it read-only as the first block device (vda), provisions a sparse
+    /// per-machine data disk after it, and defaults the kernel command line
+    /// to mount it as root.
+    pub rootfs: Option<MachineRootfs>,
     /// Distribution name (e.g., "alpine", "ubuntu").
     pub distro: Option<String>,
     /// Distribution version (e.g., "3.21", "24.04").
@@ -117,12 +131,24 @@ impl Default for MachineConfig {
             kernel: None,
             cmdline: None,
             block_devices: Vec::new(),
+            rootfs: None,
             distro: None,
             distro_version: None,
             backend: arcbox_vmm::VmBackend::default(),
             enable_rosetta: false,
         }
     }
+}
+
+/// Kernel command line for a distro machine: root on the read-only rootfs
+/// image at vda. The console device follows the boot-assets convention for
+/// the host architecture.
+fn default_distro_cmdline(rootfs_format: &str) -> String {
+    #[cfg(target_arch = "x86_64")]
+    let console = "ttyS0";
+    #[cfg(not(target_arch = "x86_64"))]
+    let console = "hvc0";
+    format!("console={console} root=/dev/vda ro rootfstype={rootfs_format} earlycon")
 }
 
 /// Machine manager.
@@ -280,14 +306,45 @@ impl MachineManager {
             shared_dirs.push(SharedDirConfig::new(MOUNT_PRIVATE, TAG_PRIVATE));
         }
 
+        // Distro machines boot the pulled rootfs image as read-only vda with
+        // a sparse per-machine data disk after it; plain VMs keep the
+        // caller-provided block devices untouched.
+        let (block_devices, cmdline, disk_path) = match &config.rootfs {
+            Some(rootfs) => {
+                let data_disk = machine_dir.join("data.img");
+                crate::vm_lifecycle::ensure_sparse_block_image(
+                    &data_disk,
+                    config.disk_gb.saturating_mul(1024 * 1024 * 1024),
+                )?;
+                let mut devices = config.block_devices.clone();
+                devices.insert(
+                    0,
+                    crate::vm::BlockDeviceConfig {
+                        path: rootfs.path.to_string_lossy().into_owned(),
+                        read_only: true,
+                    },
+                );
+                devices.push(crate::vm::BlockDeviceConfig {
+                    path: data_disk.to_string_lossy().into_owned(),
+                    read_only: false,
+                });
+                let cmdline = config
+                    .cmdline
+                    .clone()
+                    .or_else(|| Some(default_distro_cmdline(&rootfs.format)));
+                (devices, cmdline, Some(data_disk))
+            }
+            None => (config.block_devices.clone(), config.cmdline.clone(), None),
+        };
+
         // Create underlying VM
         let vm_config = VmConfig {
             cpus: config.cpus,
             memory_mb: config.memory_mb,
             kernel: config.kernel.clone(),
-            cmdline: config.cmdline.clone(),
+            cmdline: cmdline.clone(),
             shared_dirs,
-            block_devices: config.block_devices.clone(),
+            block_devices: block_devices.clone(),
             rosetta: config.enable_rosetta,
             backend: config.backend,
             ..Default::default()
@@ -303,11 +360,11 @@ impl MachineManager {
             memory_mb: config.memory_mb,
             disk_gb: config.disk_gb,
             kernel: config.kernel,
-            cmdline: config.cmdline,
-            block_devices: config.block_devices,
+            cmdline,
+            block_devices,
             distro: config.distro,
             distro_version: config.distro_version,
-            disk_path: None,
+            disk_path,
             ssh_key_path: None,
             ip_address: None,
             backend: config.backend,

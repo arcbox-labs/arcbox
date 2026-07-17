@@ -2,6 +2,7 @@
 
 use std::pin::Pin;
 
+use arcbox_core::machine_image;
 use arcbox_grpc::v1::machine_service_server;
 use arcbox_protocol::v1::{
     CreateMachineRequest, CreateMachineResponse, Empty, InspectMachineRequest, ListMachinesRequest,
@@ -40,6 +41,44 @@ impl machine_service_server::MachineService for MachineServiceImpl {
         let memory_mb = req.memory / (1024 * 1024);
         let disk_gb = req.disk_size / (1024 * 1024 * 1024);
 
+        // Distro machines boot a published rootfs image: resolve and pull it
+        // (a cached image is a no-op) before registering the machine.
+        let rootfs = if req.distro.is_empty() {
+            None
+        } else {
+            let arch = if req.arch.is_empty() {
+                machine_image::host_image_arch().to_string()
+            } else {
+                machine_image::image_arch(&req.arch).to_string()
+            };
+            let selector = machine_image::ImageSelector::Distro {
+                distro: req.distro.clone(),
+                release: (!req.version.is_empty()).then(|| req.version.clone()),
+                arch,
+            };
+            let image = runtime
+                .machine_image_manager()
+                .pull(&selector, |done, total| {
+                    tracing::debug!(machine = %req.name, done, total, "machine image pull");
+                })
+                .await
+                .map_err(|e| match &e {
+                    arcbox_core::error::CoreError::Common(c) if c.is_not_found() => {
+                        Status::not_found(e.to_string())
+                    }
+                    _ => Status::internal(e.to_string()),
+                })?;
+            tracing::info!(
+                machine = %req.name,
+                image = %format!("{}@{}", image.manifest.name, image.manifest.version),
+                "machine image ready"
+            );
+            Some(arcbox_core::machine::MachineRootfs {
+                path: image.rootfs_path(),
+                format: image.manifest.rootfs.format,
+            })
+        };
+
         let config = arcbox_core::machine::MachineConfig {
             name: req.name.clone(),
             // 0 on the wire means "use the daemon-configured default".
@@ -71,6 +110,7 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 Some(req.version)
             },
             block_devices: Vec::new(),
+            rootfs,
             backend: arcbox_core::VmBackend::default(),
             enable_rosetta: false,
         };

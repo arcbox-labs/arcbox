@@ -37,10 +37,12 @@ pub mod container_backend;
 pub mod error;
 pub mod event;
 pub mod machine;
+pub mod machine_image;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod migration;
 pub mod persistence;
+pub mod remote_image;
 #[cfg(target_os = "macos")]
 pub mod route_reconciler;
 pub mod runtime;

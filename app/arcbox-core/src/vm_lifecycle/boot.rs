@@ -376,6 +376,7 @@ impl LifecycleShared {
             kernel: Some(boot.kernel),
             cmdline: Some(boot.cmdline),
             block_devices,
+            rootfs: None,
             distro: None,
             distro_version: None,
             backend: self.backend(),
@@ -714,7 +715,11 @@ pub(super) fn agent_timeout_error(last_error: Option<&str>) -> CoreError {
 /// and a regression against OrbStack on idle footprint. APFS/Btrfs allocate
 /// on write lazily, so the working set still benefits from CoW without the
 /// upfront cost. An existing image is never shrunk.
-pub(super) fn ensure_sparse_block_image(path: &Path, size_bytes: u64) -> Result<()> {
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "re-exported at the vm_lifecycle root so MachineManager can provision per-machine data disks"
+)]
+pub(crate) fn ensure_sparse_block_image(path: &Path, size_bytes: u64) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             CoreError::config(format!(
