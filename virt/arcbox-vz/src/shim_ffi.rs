@@ -55,6 +55,45 @@ unsafe extern "C" {
     pub fn abx_vz_max_cpu_count() -> u64;
     pub fn abx_vz_min_memory_size() -> u64;
     pub fn abx_vz_max_memory_size() -> u64;
+
+    // Configuration
+    pub fn abx_config_new() -> *mut c_void;
+    pub fn abx_config_set_cpu_count(config: *mut c_void, count: u64);
+    pub fn abx_config_cpu_count(config: *mut c_void) -> u64;
+    pub fn abx_config_set_memory_size(config: *mut c_void, bytes: u64);
+    pub fn abx_config_memory_size(config: *mut c_void) -> u64;
+    pub fn abx_config_set_boot_loader(config: *mut c_void, boot_loader: *mut c_void);
+    pub fn abx_config_set_platform(config: *mut c_void, platform: *mut c_void);
+    pub fn abx_config_validate(config: *mut c_void, error_out: *mut *mut c_char) -> bool;
+
+    // Boot loaders
+    pub fn abx_bootloader_linux_new(kernel_path: *const c_char) -> *mut c_void;
+    pub fn abx_bootloader_linux_set_initrd(boot_loader: *mut c_void, path: *const c_char);
+    pub fn abx_bootloader_linux_set_cmdline(boot_loader: *mut c_void, cmdline: *const c_char);
+    pub fn abx_bootloader_macos_new() -> *mut c_void;
+
+    // Platforms (generic; MacPlatform arrives with the identity types)
+    pub fn abx_platform_generic_new() -> *mut c_void;
+    pub fn abx_platform_generic_nested_supported() -> bool;
+    pub fn abx_platform_generic_set_nested(platform: *mut c_void, enabled: bool);
+}
+
+/// Takes ownership of a shim-returned error string and frees it.
+///
+/// # Safety
+///
+/// `err` must be null or a string allocated by the shim (strdup'd) that has
+/// not been freed yet.
+pub unsafe fn take_error_string(err: *mut c_char) -> String {
+    if err.is_null() {
+        return "unknown error".to_string();
+    }
+    // SAFETY: per contract, `err` is a valid NUL-terminated C string owned by us.
+    unsafe {
+        let message = std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned();
+        abx_string_free(err);
+        message
+    }
 }
 
 #[cfg(test)]
@@ -75,11 +114,26 @@ mod tests {
         abx_vz_max_cpu_count as *const (),
         abx_vz_min_memory_size as *const (),
         abx_vz_max_memory_size as *const (),
+        abx_config_new as *const (),
+        abx_config_set_cpu_count as *const (),
+        abx_config_cpu_count as *const (),
+        abx_config_set_memory_size as *const (),
+        abx_config_memory_size as *const (),
+        abx_config_set_boot_loader as *const (),
+        abx_config_set_platform as *const (),
+        abx_config_validate as *const (),
+        abx_bootloader_linux_new as *const (),
+        abx_bootloader_linux_set_initrd as *const (),
+        abx_bootloader_linux_set_cmdline as *const (),
+        abx_bootloader_macos_new as *const (),
+        abx_platform_generic_new as *const (),
+        abx_platform_generic_nested_supported as *const (),
+        abx_platform_generic_set_nested as *const (),
     ];
 
     /// Update when symbols are added; a mismatch means Exports.swift and this
     /// file have drifted.
-    const EXPECTED_SYMBOL_COUNT: usize = 9;
+    const EXPECTED_SYMBOL_COUNT: usize = 24;
 
     #[test]
     fn link_coverage() {
@@ -103,6 +157,49 @@ mod tests {
             abx_string_free(ptr::null_mut());
             abx_bytes_free(ptr::null_mut());
             abx_object_release(ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn config_create_free_roundtrip() {
+        // SAFETY: configuration objects are plain allocations — the
+        // virtualization entitlement is enforced at VM init, not here.
+        unsafe {
+            let cfg = abx_config_new();
+            assert!(!cfg.is_null());
+            abx_config_set_cpu_count(cfg, 2);
+            assert_eq!(abx_config_cpu_count(cfg), 2);
+            abx_config_set_memory_size(cfg, 512 * 1024 * 1024);
+            assert_eq!(abx_config_memory_size(cfg), 512 * 1024 * 1024);
+
+            let platform = abx_platform_generic_new();
+            assert!(!platform.is_null());
+            abx_config_set_platform(cfg, platform);
+            // Reading the class support flag must not crash regardless of host.
+            let _ = abx_platform_generic_nested_supported();
+
+            abx_object_release(platform);
+            abx_object_release(cfg);
+        }
+    }
+
+    #[test]
+    fn linux_boot_loader_roundtrip() {
+        let dir = std::env::temp_dir().join("abx-shim-ffi-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let kernel = dir.join("fake-kernel");
+        std::fs::write(&kernel, b"not a kernel").unwrap();
+        let c_path = std::ffi::CString::new(kernel.to_str().unwrap()).unwrap();
+        let c_cmdline = std::ffi::CString::new("console=hvc0").unwrap();
+
+        // SAFETY: boot-loader objects are plain allocations; the paths are
+        // valid NUL-terminated strings for the duration of the calls.
+        unsafe {
+            let bl = abx_bootloader_linux_new(c_path.as_ptr());
+            assert!(!bl.is_null());
+            abx_bootloader_linux_set_initrd(bl, c_path.as_ptr());
+            abx_bootloader_linux_set_cmdline(bl, c_cmdline.as_ptr());
+            abx_object_release(bl);
         }
     }
 

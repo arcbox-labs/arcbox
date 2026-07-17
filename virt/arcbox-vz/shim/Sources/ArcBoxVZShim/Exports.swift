@@ -55,3 +55,95 @@ public func abxVzMinMemorySize() -> UInt64 {
 public func abxVzMaxMemorySize() -> UInt64 {
     vzMaxMemorySize()
 }
+
+// MARK: - Configuration
+
+@_cdecl("abx_config_new")
+public func abxConfigNew() -> UnsafeMutableRawPointer {
+    configNew()
+}
+
+@_cdecl("abx_config_set_cpu_count")
+public func abxConfigSetCPUCount(_ config: UnsafeMutableRawPointer, _ count: UInt64) {
+    configSetCPUCount(config, count)
+}
+
+@_cdecl("abx_config_cpu_count")
+public func abxConfigCPUCount(_ config: UnsafeMutableRawPointer) -> UInt64 {
+    configCPUCount(config)
+}
+
+@_cdecl("abx_config_set_memory_size")
+public func abxConfigSetMemorySize(_ config: UnsafeMutableRawPointer, _ bytes: UInt64) {
+    configSetMemorySize(config, bytes)
+}
+
+@_cdecl("abx_config_memory_size")
+public func abxConfigMemorySize(_ config: UnsafeMutableRawPointer) -> UInt64 {
+    configMemorySize(config)
+}
+
+@_cdecl("abx_config_set_boot_loader")
+public func abxConfigSetBootLoader(
+    _ config: UnsafeMutableRawPointer, _ bootLoader: UnsafeMutableRawPointer
+) {
+    configSetBootLoader(config, bootLoader)
+}
+
+@_cdecl("abx_config_set_platform")
+public func abxConfigSetPlatform(
+    _ config: UnsafeMutableRawPointer, _ platform: UnsafeMutableRawPointer
+) {
+    configSetPlatform(config, platform)
+}
+
+@_cdecl("abx_config_validate")
+public func abxConfigValidate(
+    _ config: UnsafeMutableRawPointer,
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Bool {
+    configValidate(config, errorOut)
+}
+
+// MARK: - Boot loaders
+
+@_cdecl("abx_bootloader_linux_new")
+public func abxBootLoaderLinuxNew(_ kernelPath: UnsafePointer<CChar>) -> UnsafeMutableRawPointer {
+    bootLoaderLinuxNew(kernelPath)
+}
+
+@_cdecl("abx_bootloader_linux_set_initrd")
+public func abxBootLoaderLinuxSetInitrd(
+    _ bootLoader: UnsafeMutableRawPointer, _ path: UnsafePointer<CChar>
+) {
+    bootLoaderLinuxSetInitrd(bootLoader, path)
+}
+
+@_cdecl("abx_bootloader_linux_set_cmdline")
+public func abxBootLoaderLinuxSetCmdline(
+    _ bootLoader: UnsafeMutableRawPointer, _ cmdline: UnsafePointer<CChar>
+) {
+    bootLoaderLinuxSetCmdline(bootLoader, cmdline)
+}
+
+@_cdecl("abx_bootloader_macos_new")
+public func abxBootLoaderMacOSNew() -> UnsafeMutableRawPointer {
+    bootLoaderMacOSNew()
+}
+
+// MARK: - Platforms (generic; MacPlatform arrives with the identity types)
+
+@_cdecl("abx_platform_generic_new")
+public func abxPlatformGenericNew() -> UnsafeMutableRawPointer {
+    platformGenericNew()
+}
+
+@_cdecl("abx_platform_generic_nested_supported")
+public func abxPlatformGenericNestedSupported() -> Bool {
+    platformGenericNestedSupported()
+}
+
+@_cdecl("abx_platform_generic_set_nested")
+public func abxPlatformGenericSetNested(_ platform: UnsafeMutableRawPointer, _ enabled: Bool) {
+    platformGenericSetNested(platform, enabled)
+}

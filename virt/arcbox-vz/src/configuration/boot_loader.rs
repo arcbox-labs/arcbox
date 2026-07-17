@@ -1,10 +1,17 @@
 //! Boot loader configurations.
 
 use crate::error::{VZError, VZResult};
-use crate::ffi::{get_class, nsurl_file_path, release};
-use crate::{msg_send, msg_send_void};
+use crate::shim_ffi;
 use objc2::runtime::AnyObject;
+use std::ffi::CString;
 use std::path::Path;
+
+/// Converts a path to a `CString`, rejecting interior NUL bytes.
+fn path_cstring(path: &Path) -> VZResult<CString> {
+    CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
+        VZError::InvalidConfiguration(format!("path contains NUL: {}", path.display()))
+    })
+}
 
 /// Trait for boot loader configurations.
 pub trait BootLoader {
@@ -40,26 +47,13 @@ impl LinuxBootLoader {
             return Err(VZError::NotFound(path.display().to_string()));
         }
 
-        let path_str = path.to_string_lossy();
-
-        // SAFETY: ObjC alloc/init pattern on valid VZLinuxBootLoader class. Result is checked non-null.
-        unsafe {
-            let cls = get_class("VZLinuxBootLoader").ok_or_else(|| VZError::Internal {
-                code: -1,
-                message: "VZLinuxBootLoader class not found".into(),
-            })?;
-            let kernel_url = nsurl_file_path(&path_str);
-            let alloc = msg_send!(cls, alloc);
-            let obj = msg_send!(alloc, initWithKernelURL: kernel_url);
-
-            if obj.is_null() {
-                return Err(VZError::InvalidConfiguration(format!(
-                    "Failed to create boot loader for kernel: {path_str}"
-                )));
-            }
-
-            Ok(Self { inner: obj })
-        }
+        let c_path = path_cstring(path)?;
+        // SAFETY: c_path is a valid NUL-terminated string; the shim returns
+        // a +1 VZLinuxBootLoader handle, released by Drop.
+        let obj = unsafe { shim_ffi::abx_bootloader_linux_new(c_path.as_ptr()) };
+        Ok(Self {
+            inner: obj as *mut AnyObject,
+        })
     }
 
     /// Sets the initial ramdisk (initrd) path.
@@ -69,12 +63,12 @@ impl LinuxBootLoader {
     /// * `path` - Path to the initrd/initramfs image
     pub fn set_initial_ramdisk(&mut self, path: impl AsRef<Path>) -> &mut Self {
         let path = path.as_ref();
-        if path.exists() {
-            let path_str = path.to_string_lossy();
-            // SAFETY: self.inner is a valid VZLinuxBootLoader. NSURL is created from a validated path.
+        if path.exists()
+            && let Ok(c_path) = path_cstring(path)
+        {
+            // SAFETY: valid handle and NUL-terminated path string.
             unsafe {
-                let url = nsurl_file_path(&path_str);
-                msg_send_void!(self.inner, setInitialRamdiskURL: url);
+                shim_ffi::abx_bootloader_linux_set_initrd(self.inner.cast(), c_path.as_ptr());
             }
         }
         self
@@ -86,10 +80,11 @@ impl LinuxBootLoader {
     ///
     /// * `cmdline` - Kernel command line string (e.g., "console=hvc0 root=/dev/vda")
     pub fn set_command_line(&mut self, cmdline: &str) -> &mut Self {
-        // SAFETY: self.inner is a valid VZLinuxBootLoader. NSString is created from a valid Rust str.
-        unsafe {
-            let s = crate::ffi::nsstring(cmdline);
-            msg_send_void!(self.inner, setCommandLine: s);
+        if let Ok(c_cmdline) = CString::new(cmdline) {
+            // SAFETY: valid handle and NUL-terminated command-line string.
+            unsafe {
+                shim_ffi::abx_bootloader_linux_set_cmdline(self.inner.cast(), c_cmdline.as_ptr());
+            }
         }
         self
     }
@@ -104,7 +99,8 @@ impl BootLoader for LinuxBootLoader {
 impl Drop for LinuxBootLoader {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            release(self.inner);
+            // SAFETY: releasing the +1 handle returned by the shim.
+            unsafe { shim_ffi::abx_object_release(self.inner.cast()) };
         }
     }
 }
@@ -129,24 +125,13 @@ impl MacOSBootLoader {
     /// Returns an error if `VZMacOSBootLoader` is unavailable (non-Apple-Silicon hosts
     /// or macOS versions without macOS-guest support) or cannot be created.
     pub fn new() -> VZResult<Self> {
-        // SAFETY: ObjC alloc/init pattern on the VZMacOSBootLoader class. Result checked non-null.
-        unsafe {
-            let cls = get_class("VZMacOSBootLoader").ok_or_else(|| VZError::Internal {
-                code: -1,
-                message: "VZMacOSBootLoader class not found".into(),
-            })?;
-            let alloc = msg_send!(cls, alloc);
-            let obj = msg_send!(alloc, init);
-
-            if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to create VZMacOSBootLoader".into(),
-                });
-            }
-
-            Ok(Self { inner: obj })
-        }
+        // SAFETY: the shim returns a +1 VZMacOSBootLoader handle, released by
+        // Drop. Construction cannot fail; guest support is checked by
+        // configuration validation.
+        let obj = unsafe { shim_ffi::abx_bootloader_macos_new() };
+        Ok(Self {
+            inner: obj as *mut AnyObject,
+        })
     }
 }
 
@@ -159,7 +144,8 @@ impl BootLoader for MacOSBootLoader {
 impl Drop for MacOSBootLoader {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            release(self.inner);
+            // SAFETY: releasing the +1 handle returned by the shim.
+            unsafe { shim_ffi::abx_object_release(self.inner.cast()) };
         }
     }
 }

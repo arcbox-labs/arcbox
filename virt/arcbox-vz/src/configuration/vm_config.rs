@@ -8,7 +8,7 @@ use crate::device::{
 use crate::error::{VZError, VZResult};
 use crate::ffi::{DispatchQueue, get_class, nsarray, release};
 use crate::vm::VirtualMachine;
-use crate::{msg_send, msg_send_bool, msg_send_u64, msg_send_void, msg_send_void_u64};
+use crate::{msg_send, msg_send_void};
 use objc2::runtime::AnyObject;
 use std::ptr;
 
@@ -36,35 +36,20 @@ unsafe impl Send for VirtualMachineConfiguration {}
 impl VirtualMachineConfiguration {
     /// Creates a new VM configuration with default settings.
     pub fn new() -> VZResult<Self> {
-        // SAFETY: ObjC alloc/init pattern on valid VZVirtualMachineConfiguration class. Result is checked non-null.
-        unsafe {
-            let cls =
-                get_class("VZVirtualMachineConfiguration").ok_or_else(|| VZError::Internal {
-                    code: -1,
-                    message: "VZVirtualMachineConfiguration class not found".into(),
-                })?;
-            let alloc = msg_send!(cls, alloc);
-            let obj = msg_send!(alloc, init);
-
-            if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to create VZVirtualMachineConfiguration".into(),
-                });
-            }
-
-            Ok(Self {
-                inner: obj,
-                storage_devices: Vec::new(),
-                network_devices: Vec::new(),
-                serial_ports: Vec::new(),
-                socket_devices: Vec::new(),
-                entropy_devices: Vec::new(),
-                directory_sharing_devices: Vec::new(),
-                memory_balloon_devices: Vec::new(),
-                graphics_devices: Vec::new(),
-            })
-        }
+        // SAFETY: shim allocates a VZVirtualMachineConfiguration and returns
+        // it at +1; released by Drop.
+        let obj = unsafe { crate::shim_ffi::abx_config_new() };
+        Ok(Self {
+            inner: obj as *mut AnyObject,
+            storage_devices: Vec::new(),
+            network_devices: Vec::new(),
+            serial_ports: Vec::new(),
+            socket_devices: Vec::new(),
+            entropy_devices: Vec::new(),
+            directory_sharing_devices: Vec::new(),
+            memory_balloon_devices: Vec::new(),
+            graphics_devices: Vec::new(),
+        })
     }
 
     /// Sets the number of CPUs for the VM.
@@ -75,17 +60,17 @@ impl VirtualMachineConfiguration {
     /// Use `arcbox_vz::min_cpu_count()` and `arcbox_vz::max_cpu_count()`
     /// to get the valid range.
     pub fn set_cpu_count(&mut self, count: usize) -> &mut Self {
-        // SAFETY: self.inner is a valid VZVirtualMachineConfiguration. The selector matches the expected argument type.
+        // SAFETY: self.inner is a valid configuration handle.
         unsafe {
-            msg_send_void_u64!(self.inner, setCPUCount: count as u64);
+            crate::shim_ffi::abx_config_set_cpu_count(self.inner.cast(), count as u64);
         }
         self
     }
 
     /// Gets the configured CPU count.
     pub fn cpu_count(&self) -> u64 {
-        // SAFETY: self.inner is a valid VZVirtualMachineConfiguration. The selector matches the expected argument type.
-        unsafe { msg_send_u64!(self.inner, CPUCount) }
+        // SAFETY: self.inner is a valid configuration handle.
+        unsafe { crate::shim_ffi::abx_config_cpu_count(self.inner.cast()) }
     }
 
     /// Sets the memory size in bytes.
@@ -96,33 +81,38 @@ impl VirtualMachineConfiguration {
     /// Use `arcbox_vz::min_memory_size()` and `arcbox_vz::max_memory_size()`
     /// to get the valid range.
     pub fn set_memory_size(&mut self, bytes: u64) -> &mut Self {
-        // SAFETY: self.inner is a valid VZVirtualMachineConfiguration. The selector matches the expected argument type.
+        // SAFETY: self.inner is a valid configuration handle.
         unsafe {
-            msg_send_void_u64!(self.inner, setMemorySize: bytes);
+            crate::shim_ffi::abx_config_set_memory_size(self.inner.cast(), bytes);
         }
         self
     }
 
     /// Gets the configured memory size in bytes.
     pub fn memory_size(&self) -> u64 {
-        // SAFETY: self.inner is a valid VZVirtualMachineConfiguration. The selector matches the expected argument type.
-        unsafe { msg_send_u64!(self.inner, memorySize) }
+        // SAFETY: self.inner is a valid configuration handle.
+        unsafe { crate::shim_ffi::abx_config_memory_size(self.inner.cast()) }
     }
 
     /// Sets the boot loader for the VM.
     pub fn set_boot_loader(&mut self, boot_loader: impl BootLoader) -> &mut Self {
-        // SAFETY: self.inner is a valid VZVirtualMachineConfiguration. The selector matches the expected argument type.
+        // SAFETY: both arguments are valid handles; the config retains the
+        // boot loader (strong property), so dropping `boot_loader` is fine.
         unsafe {
-            msg_send_void!(self.inner, setBootLoader: boot_loader.as_ptr());
+            crate::shim_ffi::abx_config_set_boot_loader(
+                self.inner.cast(),
+                boot_loader.as_ptr().cast(),
+            );
         }
         self
     }
 
     /// Sets the platform configuration.
     pub fn set_platform(&mut self, platform: impl Platform) -> &mut Self {
-        // SAFETY: self.inner is a valid VZVirtualMachineConfiguration. The selector matches the expected argument type.
+        // SAFETY: both arguments are valid handles; the config retains the
+        // platform (strong property), so dropping `platform` is fine.
         unsafe {
-            msg_send_void!(self.inner, setPlatform: platform.as_ptr());
+            crate::shim_ffi::abx_config_set_platform(self.inner.cast(), platform.as_ptr().cast());
         }
         self
     }
@@ -196,14 +186,16 @@ impl VirtualMachineConfiguration {
     /// This is called automatically by `build()`, but can be called
     /// manually to check for configuration errors early.
     pub fn validate(&self) -> VZResult<()> {
-        // SAFETY: self.inner is a valid VZVirtualMachineConfiguration. validateWithError: writes to the error out-parameter only on failure.
+        // SAFETY: self.inner is a valid configuration handle; on failure the
+        // shim writes a strdup'd message that take_error_string frees.
         unsafe {
-            let mut error: *mut AnyObject = ptr::null_mut();
-            let valid = msg_send_bool!(self.inner, validateWithError: &mut error);
-            if valid.as_bool() {
+            let mut error: *mut std::ffi::c_char = ptr::null_mut();
+            if crate::shim_ffi::abx_config_validate(self.inner.cast(), &mut error) {
                 Ok(())
             } else {
-                Err(crate::ffi::extract_nserror(error))
+                Err(VZError::InvalidConfiguration(
+                    crate::shim_ffi::take_error_string(error),
+                ))
             }
         }
     }
