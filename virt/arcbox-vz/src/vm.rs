@@ -3,11 +3,11 @@
 use crate::device::{MemoryBalloonDevice, vm_memory_balloon_devices};
 use crate::error::{VZError, VZResult};
 use crate::ffi::{
-    _Block_copy, _Block_release, _NSConcreteStackBlock, BlockPtr, DispatchQueue,
-    SIMPLE_BLOCK_DESCRIPTOR, create_state_completion_block, extract_nserror, nsstring_to_string,
+    _Block_copy, _NSConcreteStackBlock, BlockPtr, DispatchQueue, SIMPLE_BLOCK_DESCRIPTOR,
+    nsstring_to_string,
 };
+use crate::msg_send;
 use crate::socket::VirtioSocketDevice;
-use crate::{msg_send, msg_send_bool, msg_send_i64};
 use objc2::runtime::AnyObject;
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -73,6 +73,8 @@ impl From<i64> for VirtualMachineState {
 pub struct VirtualMachine {
     inner: *mut AnyObject,
     queue: DispatchQueue,
+    /// ABXVMBox handle pairing the VM with its queue for shim calls.
+    vm_box: *mut c_void,
 }
 
 // SAFETY: The VZ handles are properly synchronized through the dispatch queue.
@@ -80,12 +82,36 @@ unsafe impl Send for VirtualMachine {}
 // SAFETY: See above — all VZ operations are dispatched to the VM's serial queue.
 unsafe impl Sync for VirtualMachine {}
 
+/// Shim lifecycle-completion trampoline: consumes the boxed sender exactly once.
+unsafe extern "C" fn state_trampoline(ctx: *mut c_void, err: *mut std::ffi::c_char) {
+    // SAFETY: ctx is the Box<Sender> leaked by the caller; the shim
+    // guarantees exactly-once invocation. err is null or a shim string that
+    // take_error_string frees.
+    unsafe {
+        let sender = Box::from_raw(ctx as *mut oneshot::Sender<Result<(), String>>);
+        let result = if err.is_null() {
+            Ok(())
+        } else {
+            Err(crate::shim_ffi::take_error_string(err))
+        };
+        let _ = sender.send(result);
+    }
+}
+
 impl VirtualMachine {
     /// Creates a `VirtualMachine` from raw pointers.
     ///
     /// This is called internally by `VirtualMachineConfiguration::build()`.
     pub(crate) fn from_raw(ptr: *mut AnyObject, queue: DispatchQueue) -> Self {
-        Self { inner: ptr, queue }
+        // SAFETY: both pointers are valid per the caller contract; the box
+        // retains them and is released in Drop.
+        let vm_box =
+            unsafe { crate::shim_ffi::abx_vm_box_from_raw(ptr.cast(), queue.as_ptr().cast()) };
+        Self {
+            inner: ptr,
+            queue,
+            vm_box,
+        }
     }
 
     /// Returns the underlying `VZVirtualMachine` pointer.
@@ -107,34 +133,26 @@ impl VirtualMachine {
 
     /// Returns the current state of the VM.
     pub fn state(&self) -> VirtualMachineState {
-        // SAFETY: self.inner is a valid VZVirtualMachine pointer; dispatched
-        // onto the VM's queue (VZVirtualMachine properties are queue-affine
-        // and assert when read from any other thread).
-        self.queue.sync(|| unsafe {
-            let state = msg_send_i64!(self.inner, state);
-            VirtualMachineState::from(state)
-        })
+        // SAFETY: vm_box is a valid handle; the shim queue-syncs the read.
+        VirtualMachineState::from(unsafe { crate::shim_ffi::abx_vm_state(self.vm_box) })
     }
 
     /// Returns whether the VM can be stopped.
     pub fn can_stop(&self) -> bool {
-        // SAFETY: Sending canStop to a valid VZVirtualMachine on its queue.
-        self.queue
-            .sync(|| unsafe { msg_send_bool!(self.inner, canStop).as_bool() })
+        // SAFETY: vm_box is a valid handle; the shim queue-syncs the read.
+        unsafe { crate::shim_ffi::abx_vm_can_stop(self.vm_box) }
     }
 
     /// Returns whether the VM can be paused (internal pre-check for `pause`).
     fn can_pause(&self) -> bool {
-        // SAFETY: Sending canPause to a valid VZVirtualMachine on its queue.
-        self.queue
-            .sync(|| unsafe { msg_send_bool!(self.inner, canPause).as_bool() })
+        // SAFETY: vm_box is a valid handle; the shim queue-syncs the read.
+        unsafe { crate::shim_ffi::abx_vm_can_pause(self.vm_box) }
     }
 
     /// Returns whether the VM can be resumed (internal pre-check for `resume`).
     fn can_resume(&self) -> bool {
-        // SAFETY: Sending canResume to a valid VZVirtualMachine on its queue.
-        self.queue
-            .sync(|| unsafe { msg_send_bool!(self.inner, canResume).as_bool() })
+        // SAFETY: vm_box is a valid handle; the shim queue-syncs the read.
+        unsafe { crate::shim_ffi::abx_vm_can_resume(self.vm_box) }
     }
 
     /// Starts the virtual machine.
@@ -142,34 +160,21 @@ impl VirtualMachine {
     /// This is an async operation that completes when the VM reaches
     /// the Running state.
     pub async fn start(&self) -> VZResult<()> {
-        // Per-call oneshot; the block captures the sender so multiple
-        // concurrent VM instances don't clobber each other's completion
-        // state (unlike the previous global-static approach).
-        let (tx, rx) = oneshot::channel::<crate::ffi::StateResult>();
-        let block_ptr = create_state_completion_block(tx);
+        let (tx, rx) = oneshot::channel::<Result<(), String>>();
+        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
 
-        let inner = self.inner;
-        // SAFETY: Sending startWithCompletionHandler: to a valid VZVirtualMachine on its
-        // dispatch queue; `block_ptr` is a freshly heap-copied block.
-        self.queue.sync(|| unsafe {
-            let sel = objc2::sel!(startWithCompletionHandler:);
-            let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel, *const c_void) =
-                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            func(inner as *const AnyObject, sel, block_ptr);
-        });
+        // SAFETY: vm_box is valid; ctx ownership transfers to the
+        // exactly-once trampoline. Dropping this future before the callback
+        // fires is leak-free: the trampoline consumes ctx and its send to the
+        // dropped receiver fails harmlessly.
+        unsafe {
+            crate::shim_ffi::abx_vm_start(self.vm_box, ctx, state_trampoline);
+        }
 
-        // Wait for completion. The block will fire at most once; its dispose
-        // helper cleans up the captured sender on any remaining reference.
         let result = rx.await.map_err(|_| VZError::Internal {
             code: -1,
             message: "Start operation cancelled".into(),
         })?;
-
-        // Release our reference. VZ has retained its own copy; the block will
-        // survive until VZ releases it too (normally right after invoke).
-        // SAFETY: block_ptr was returned by create_state_completion_block and
-        // has not been released elsewhere.
-        unsafe { _Block_release(block_ptr) };
 
         result.map_err(|msg| VZError::Internal {
             code: -1,
@@ -422,19 +427,18 @@ impl VirtualMachine {
     /// Returns an error if the guest cannot be asked to stop (for example, the VM is
     /// not running).
     pub fn request_stop(&self) -> VZResult<()> {
-        let inner = self.inner;
-        self.queue.sync(|| {
-            // SAFETY: requestStopWithError: on a valid VZVirtualMachine; the error
-            // out-parameter is written only when the call returns NO.
-            unsafe {
-                let mut error: *mut AnyObject = std::ptr::null_mut();
-                if msg_send_bool!(inner, requestStopWithError: &mut error).as_bool() {
-                    Ok(())
-                } else {
-                    Err(extract_nserror(error))
-                }
+        // SAFETY: vm_box is valid; on failure the shim writes a strdup'd
+        // message that take_error_string frees.
+        unsafe {
+            let mut error: *mut std::ffi::c_char = std::ptr::null_mut();
+            if crate::shim_ffi::abx_vm_request_stop(self.vm_box, &mut error) {
+                Ok(())
+            } else {
+                Err(VZError::OperationFailed(
+                    crate::shim_ffi::take_error_string(error),
+                ))
             }
-        })
+        }
     }
 
     /// Returns the socket devices configured on this VM.
@@ -484,6 +488,10 @@ impl VirtualMachine {
 
 impl Drop for VirtualMachine {
     fn drop(&mut self) {
+        if !self.vm_box.is_null() {
+            // SAFETY: releasing the +1 box handle returned by the shim.
+            unsafe { crate::shim_ffi::abx_object_release(self.vm_box) };
+        }
         if !self.inner.is_null() {
             crate::ffi::release(self.inner);
         }

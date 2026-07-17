@@ -22,6 +22,11 @@ use std::ffi::{c_char, c_void};
 pub type VsockCb =
     unsafe extern "C" fn(ctx: *mut c_void, fd: i32, src_port: u32, dst_port: u32, err: *mut c_char);
 
+/// Lifecycle completion: fires exactly once from the VM's dispatch queue with
+/// null on success or a strdup'd error message (freed via
+/// [`take_error_string`]).
+pub type StateCb = unsafe extern "C" fn(ctx: *mut c_void, err: *mut c_char);
+
 /// Mirrors `abxShimABIVersion` in the shim; bump both on any signature change.
 #[allow(
     dead_code,
@@ -139,6 +144,17 @@ unsafe extern "C" {
     /// (device, queue) pointers into an ABXSocketDeviceBox handle.
     pub fn abx_socket_device_box_from_raw(device: *mut c_void, queue: *mut c_void) -> *mut c_void;
     pub fn abx_vsock_connect(device_box: *mut c_void, port: u32, ctx: *mut c_void, cb: VsockCb);
+
+    // VM lifecycle
+    /// Migration-only (dies when build() hands out boxes): wraps raw
+    /// (vm, queue) pointers into an ABXVMBox handle.
+    pub fn abx_vm_box_from_raw(vm: *mut c_void, queue: *mut c_void) -> *mut c_void;
+    pub fn abx_vm_state(vm_box: *mut c_void) -> i64;
+    pub fn abx_vm_can_stop(vm_box: *mut c_void) -> bool;
+    pub fn abx_vm_can_pause(vm_box: *mut c_void) -> bool;
+    pub fn abx_vm_can_resume(vm_box: *mut c_void) -> bool;
+    pub fn abx_vm_request_stop(vm_box: *mut c_void, error_out: *mut *mut c_char) -> bool;
+    pub fn abx_vm_start(vm_box: *mut c_void, ctx: *mut c_void, cb: StateCb);
 }
 
 /// Takes ownership of a shim-returned error string and frees it.
@@ -217,11 +233,18 @@ mod tests {
         abx_platform_mac_new as *const (),
         abx_socket_device_box_from_raw as *const (),
         abx_vsock_connect as *const (),
+        abx_vm_box_from_raw as *const (),
+        abx_vm_state as *const (),
+        abx_vm_can_stop as *const (),
+        abx_vm_can_pause as *const (),
+        abx_vm_can_resume as *const (),
+        abx_vm_request_stop as *const (),
+        abx_vm_start as *const (),
     ];
 
     /// Update when symbols are added; a mismatch means Exports.swift and this
     /// file have drifted.
-    const EXPECTED_SYMBOL_COUNT: usize = 49;
+    const EXPECTED_SYMBOL_COUNT: usize = 56;
 
     #[test]
     fn link_coverage() {

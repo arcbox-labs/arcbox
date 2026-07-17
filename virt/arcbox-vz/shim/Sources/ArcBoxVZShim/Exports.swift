@@ -328,3 +328,49 @@ public func abxVsockConnect(
 ) {
     vsockConnect(box, port, ctx, callback)
 }
+
+// MARK: - VM lifecycle
+
+@_cdecl("abx_vm_box_from_raw")
+public func abxVmBoxFromRaw(
+    _ vm: UnsafeMutableRawPointer, _ queue: UnsafeMutableRawPointer
+) -> UnsafeMutableRawPointer {
+    vmBoxFromRaw(vm, queue)
+}
+
+@_cdecl("abx_vm_state")
+public func abxVmState(_ box: UnsafeMutableRawPointer) -> Int64 {
+    vmState(box)
+}
+
+@_cdecl("abx_vm_can_stop")
+public func abxVmCanStop(_ box: UnsafeMutableRawPointer) -> Bool {
+    vmCanStop(box)
+}
+
+@_cdecl("abx_vm_can_pause")
+public func abxVmCanPause(_ box: UnsafeMutableRawPointer) -> Bool {
+    vmCanPause(box)
+}
+
+@_cdecl("abx_vm_can_resume")
+public func abxVmCanResume(_ box: UnsafeMutableRawPointer) -> Bool {
+    vmCanResume(box)
+}
+
+@_cdecl("abx_vm_request_stop")
+public func abxVmRequestStop(
+    _ box: UnsafeMutableRawPointer,
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Bool {
+    vmRequestStop(box, errorOut)
+}
+
+@_cdecl("abx_vm_start")
+public func abxVmStart(
+    _ box: UnsafeMutableRawPointer,
+    _ ctx: UnsafeMutableRawPointer?,
+    _ callback: @escaping ABXStateCallback
+) {
+    vmStart(box, ctx, callback)
+}
