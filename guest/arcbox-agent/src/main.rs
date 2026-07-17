@@ -37,6 +37,10 @@ mod mount;
 #[cfg(target_os = "linux")]
 mod nfs;
 
+// containerd snapshots client for container filesystem-path resolution.
+#[cfg(target_os = "linux")]
+mod containerd;
+
 // VMM config loading and sandbox service are Linux-only.
 #[cfg(target_os = "linux")]
 mod config;

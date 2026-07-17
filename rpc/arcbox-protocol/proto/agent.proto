@@ -435,3 +435,22 @@ message MmapReadFileResponse {
     // than offset+length.
     uint64 bytes_read = 2;
 }
+
+// Resolve a container's filesystem layer directories from containerd's
+// snapshot metadata. With dockerd's containerd image store the layer
+// paths are absent from `docker inspect`, so filesystem browsers obtain
+// them here and read the directories through the read-only NFS export.
+message ContainerFsPathsRequest {
+    // Full container ID (also the containerd snapshot key in the moby
+    // namespace).
+    string container_id = 1;
+}
+
+// Response to `ContainerFsPathsRequest`. All paths are guest paths under
+// the containerd data mount.
+message ContainerFsPathsResponse {
+    // Writable layer directory. Empty for read-only snapshots.
+    string upper_dir = 1;
+    // Read-only layer directories, top-most first.
+    repeated string lower_dirs = 2;
+}

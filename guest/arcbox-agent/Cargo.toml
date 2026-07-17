@@ -49,6 +49,11 @@ arcbox-logging.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = "0.5"
 arcbox-vm = { workspace = true }
+tonic.workspace = true
+tonic-prost.workspace = true
+tower.workspace = true
+http = "1"
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -133,6 +133,9 @@ async fn handle_request(request: RpcRequest) -> RequestResult {
         RpcRequest::Shutdown(req) => RequestResult::Single(handle_shutdown(req)),
         RpcRequest::MmapReadFile(req) => RequestResult::Single(handle_mmap_read_file(req)),
         RpcRequest::DiskTrim(_) => RequestResult::Single(handle_disk_trim().await),
+        RpcRequest::ContainerFsPaths(req) => {
+            RequestResult::Single(handle_container_fs_paths(req).await)
+        }
         RpcRequest::KillAgent => RequestResult::Single(handle_kill_agent()),
         RpcRequest::WatchReadiness(_) => unreachable!("watch readiness is streaming"),
         RpcRequest::WatchMemoryPressure(_) => {
@@ -305,6 +308,38 @@ fn handle_kill_agent() -> RpcResponse {
         std::process::exit(1);
     });
     RpcResponse::KillAgent
+}
+
+/// Handles a `ContainerFsPaths` request.
+///
+/// Resolves the container's snapshot layer directories from containerd (the
+/// snapshot key in the moby namespace is the container ID). The host reads
+/// the returned guest paths through the read-only NFS export.
+async fn handle_container_fs_paths(
+    req: arcbox_protocol::agent::ContainerFsPathsRequest,
+) -> RpcResponse {
+    let id = req.container_id.as_str();
+    // Container IDs are 64 hex chars; bound and charset-check the untrusted
+    // input before handing it to containerd as a snapshot key.
+    if id.is_empty() || id.len() > 128 || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return RpcResponse::Error(crate::rpc::ErrorResponse::new(
+            libc::EINVAL,
+            format!("invalid container id {id:?}"),
+        ));
+    }
+
+    match crate::containerd::container_snapshot_paths(id).await {
+        Ok(paths) => {
+            RpcResponse::ContainerFsPaths(arcbox_protocol::agent::ContainerFsPathsResponse {
+                upper_dir: paths.upper_dir.unwrap_or_default(),
+                lower_dirs: paths.lower_dirs,
+            })
+        }
+        Err(e) => RpcResponse::Error(crate::rpc::ErrorResponse::new(
+            libc::EIO,
+            format!("container fs paths: {e}"),
+        )),
+    }
 }
 
 /// Sets CLOCK_REALTIME from the given timestamp (seconds since UNIX epoch).

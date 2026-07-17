@@ -1938,7 +1938,7 @@ pub mod memory_pressure_event {
 /// `timeout_ms`; the host re-issues the request to keep watching.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatchStatsRequest {
     /// Watch window in milliseconds (0 = agent default).
     #[prost(uint32, tag = "1")]
@@ -2010,7 +2010,7 @@ pub struct MachineStats {
 /// namespace, read via /proc/<pid>/net/dev for a process in the container.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ContainerStats {
     /// Full container ID (the cgroup directory name).
     #[prost(string, tag = "1")]
@@ -2267,6 +2267,32 @@ pub struct MmapReadFileResponse {
     /// than offset+length.
     #[prost(uint64, tag = "2")]
     pub bytes_read: u64,
+}
+/// Resolve a container's filesystem layer directories from containerd's
+/// snapshot metadata. With dockerd's containerd image store the layer
+/// paths are absent from `docker inspect`, so filesystem browsers obtain
+/// them here and read the directories through the read-only NFS export.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ContainerFsPathsRequest {
+    /// Full container ID (also the containerd snapshot key in the moby
+    /// namespace).
+    #[prost(string, tag = "1")]
+    pub container_id: ::prost::alloc::string::String,
+}
+/// Response to `ContainerFsPathsRequest`. All paths are guest paths under
+/// the containerd data mount.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ContainerFsPathsResponse {
+    /// Writable layer directory. Empty for read-only snapshots.
+    #[prost(string, tag = "1")]
+    pub upper_dir: ::prost::alloc::string::String,
+    /// Read-only layer directories, top-most first.
+    #[prost(string, repeated, tag = "2")]
+    pub lower_dirs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Request to create a network.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -3215,7 +3241,7 @@ impl SystemVmBackend {
 /// Subscription request for machine stats.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StatsWatchRequest {
     /// Machine to watch. Empty selects the System VM.
     #[prost(string, tag = "1")]
