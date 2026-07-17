@@ -337,7 +337,7 @@ mod agent {
             fd: &OwnedFd,
             request: libc::c_ulong,
             arg: *mut libc::c_void,
-        ) -> Result<(), String> {
+        ) -> Result<(), std::io::Error> {
             #[allow(
                 clippy::cast_possible_truncation,
                 clippy::cast_possible_wrap,
@@ -347,7 +347,7 @@ mod agent {
             // SAFETY: fd is a valid socket; arg points at a properly sized,
             // initialized kernel struct owned by the caller.
             if unsafe { libc::ioctl(fd.as_raw_fd(), request, arg) } < 0 {
-                return Err(std::io::Error::last_os_error().to_string());
+                return Err(std::io::Error::last_os_error());
             }
             Ok(())
         }
@@ -370,8 +370,22 @@ mod agent {
             ioctl(&fd, libc::SIOCSIFNETMASK, (&raw mut req).cast())
                 .map_err(|e| format!("SIOCSIFNETMASK: {e}"))?;
 
-            // Changing the address drops routes through the interface; add the
-            // default route back via the new gateway.
+            // The kernel flushes routes through the interface when its
+            // primary address changes, but don't rely on that implicit
+            // behavior: drop any surviving default route first so the add
+            // below never races an EEXIST. ESRCH just means none survived.
+            // SAFETY: rtentry is POD; fields set below, rest zeroed.
+            let mut stale: libc::rtentry = unsafe { std::mem::zeroed() };
+            stale.rt_dst = sockaddr_in(Ipv4Addr::UNSPECIFIED);
+            stale.rt_genmask = sockaddr_in(Ipv4Addr::UNSPECIFIED);
+            stale.rt_flags = libc::RTF_UP;
+            if let Err(e) = ioctl(&fd, libc::SIOCDELRT, (&raw mut stale).cast()) {
+                if e.raw_os_error() != Some(libc::ESRCH) {
+                    eprintln!("agent: net reconfig: SIOCDELRT stale default: {e}");
+                }
+            }
+
+            // Add the default route via the new gateway.
             // SAFETY: rtentry is POD; fields set below, rest zeroed.
             let mut route: libc::rtentry = unsafe { std::mem::zeroed() };
             route.rt_dst = sockaddr_in(Ipv4Addr::UNSPECIFIED);
