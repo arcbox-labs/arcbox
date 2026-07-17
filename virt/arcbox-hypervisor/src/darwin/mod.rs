@@ -26,6 +26,10 @@ pub use memory::DarwinMemory;
 pub use vcpu::DarwinVcpu;
 pub use vm::DarwinVm;
 
+/// The MTU the VZ network device will be configured with — the VMM sizes its
+/// datapath from this before the device exists (see `arcbox-vz`).
+pub use arcbox_vz::desired_network_mtu;
+
 /// Checks if virtualization is supported on this system.
 ///
 /// Uses `arcbox-vz` to query the Virtualization.framework.

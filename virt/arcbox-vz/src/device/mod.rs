@@ -20,7 +20,7 @@ pub use filesystem::{
     SharedDirectory, SingleDirectoryShare, VirtioFileSystemDeviceConfiguration,
 };
 pub use graphics::MacGraphicsDeviceConfiguration;
-pub use network::NetworkDeviceConfiguration;
+pub use network::{NetworkDeviceConfiguration, desired_network_mtu};
 pub use serial::SerialPortConfiguration;
 pub use socket::SocketDeviceConfiguration;
 pub use storage::StorageDeviceConfiguration;

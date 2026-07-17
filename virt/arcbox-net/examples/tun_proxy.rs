@@ -173,6 +173,7 @@ mod macos {
             guest_ip,
             reply_tx.clone(),
             cancel.clone(),
+            UTUN_MTU as usize,
         );
 
         let async_fd = AsyncFd::new(RawFdWrapper(fd)).context("register utun with reactor")?;
@@ -316,7 +317,7 @@ mod macos {
                 tracing::debug!(%domain, ?ips, "recorded DNS resolution");
                 log.record(&domain, &ips);
             }
-            let reply_frame = build_udp_ip_ethernet(
+            let reply_frames = build_udp_ip_ethernet(
                 gateway_ip,
                 src_ip,
                 53,
@@ -324,8 +325,13 @@ mod macos {
                 response,
                 GATEWAY_MAC,
                 guest_mac,
+                UTUN_MTU as usize,
             );
-            let _ = reply_tx.send(reply_frame).await;
+            for reply_frame in reply_frames {
+                if reply_tx.send(reply_frame).await.is_err() {
+                    return;
+                }
+            }
         });
     }
 

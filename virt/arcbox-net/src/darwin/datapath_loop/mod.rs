@@ -78,8 +78,8 @@ pub struct NetworkDatapath {
     pub guest_ip: Ipv4Addr,
     /// Cancellation token for graceful shutdown.
     pub cancel: CancellationToken,
-    /// Buffer-sizing MTU (at least the device's configured MTU; see
-    /// `splicetcp`'s `ENHANCED_ETHERNET_MTU`).
+    /// Guest link MTU. Guest-bound UDP datagrams above it are IPv4-fragmented
+    /// so no injected frame exceeds what the NIC delivers (ABX-428).
     pub mtu: usize,
     /// Frame sink for host-to-guest RX injection. When set, all frames
     /// destined for the guest go through this sink (to the inject thread)
@@ -349,6 +349,7 @@ impl NetworkDatapath {
                             gateway_ip,
                             gateway_mac,
                             guest_mac.unwrap_or([0xFF; 6]),
+                            mtu,
                         );
                     }
 

@@ -90,7 +90,11 @@ fn test_finalize_virtio_net_checksum_repairs_ipv4_udp_frame() {
     let payload = b"hello dns";
     let src_mac = [0x52, 0x54, 0xAB, 0xFA, 0x2A, 0x70];
     let dst_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
-    let mut frame = build_udp_ip_ethernet(src_ip, dst_ip, 49152, 53, payload, src_mac, dst_mac);
+    let frames = build_udp_ip_ethernet(src_ip, dst_ip, 49152, 53, payload, src_mac, dst_mac, 1500);
+    let mut frame = frames
+        .into_iter()
+        .next()
+        .expect("small payload yields one frame");
     let udp_start = 14 + 20;
     frame[udp_start + 6..udp_start + 8].fill(0);
 
