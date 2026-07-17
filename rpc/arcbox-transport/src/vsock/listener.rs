@@ -83,7 +83,7 @@ impl TransportListener for VsockListener {
             if self.handle.is_none() {
                 return Err(TransportError::Protocol(
                     "macOS vsock requires VZVirtioSocketDevice. Use VsockListener::from_channel() \
-                     with a channel connected to VirtioSocketListener."
+                     with a channel fed by a caller-provided accept source."
                         .to_string(),
                 ));
             }

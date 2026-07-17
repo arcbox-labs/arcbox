@@ -96,26 +96,6 @@ pub struct VsockConnectionError {
 /// Result type for vsock connection.
 pub type VsockResult = Result<VsockConnectionInfo, VsockConnectionError>;
 
-/// Block structure for vsock completion with captured context.
-///
-/// This block captures a pointer to a `oneshot::Sender` that will receive
-/// the connection result.
-#[repr(C)]
-pub struct VsockContextBlock {
-    /// ISA pointer.
-    pub isa: *const c_void,
-    /// Block flags.
-    pub flags: i32,
-    /// Reserved.
-    pub reserved: i32,
-    /// Invoke function pointer.
-    pub invoke: unsafe extern "C" fn(*mut Self, *mut AnyObject, *mut AnyObject),
-    /// Block descriptor.
-    pub descriptor: *const BlockDescriptorWithHelpers,
-    /// Captured context: raw pointer to Box<`oneshot::Sender`<VsockResult>>.
-    pub sender_ptr: *mut c_void,
-}
-
 /// Block structure for vsock completion with captured std sender.
 ///
 /// Used by blocking host-side connect paths that must not re-enter Tokio.
@@ -135,14 +115,6 @@ pub struct BlockingVsockContextBlock {
     pub sender_ptr: *mut c_void,
 }
 
-/// Descriptor for `VsockContextBlock`.
-static VSOCK_CONTEXT_BLOCK_DESCRIPTOR: BlockDescriptorWithHelpers = BlockDescriptorWithHelpers {
-    reserved: 0,
-    size: std::mem::size_of::<VsockContextBlock>() as u64,
-    copy_helper: vsock_block_copy,
-    dispose_helper: vsock_block_dispose,
-};
-
 /// Descriptor for `BlockingVsockContextBlock`.
 static BLOCKING_VSOCK_CONTEXT_BLOCK_DESCRIPTOR: BlockDescriptorWithHelpers =
     BlockDescriptorWithHelpers {
@@ -152,33 +124,8 @@ static BLOCKING_VSOCK_CONTEXT_BLOCK_DESCRIPTOR: BlockDescriptorWithHelpers =
         dispose_helper: blocking_vsock_block_dispose,
     };
 
-/// Copy helper for `VsockContextBlock`.
-///
-/// When a block is copied from stack to heap, this function is called.
-/// We don't need to do anything special since we're using raw pointers.
-unsafe extern "C" fn vsock_block_copy(_dst: *mut c_void, _src: *const c_void) {
-    // The sender_ptr is already a raw pointer, no need to copy
-    // The ownership is transferred with the block
-}
-
 /// Copy helper for `BlockingVsockContextBlock`.
 unsafe extern "C" fn blocking_vsock_block_copy(_dst: *mut c_void, _src: *const c_void) {}
-
-/// Dispose helper for `VsockContextBlock`.
-///
-/// When a block is released, this function is called.
-/// We need to drop the sender if it hasn't been used.
-unsafe extern "C" fn vsock_block_dispose(block: *mut c_void) {
-    // SAFETY: block is a valid VsockContextBlock pointer provided by the block runtime. sender_ptr is either null (already consumed) or a valid Box pointer from create_vsock_context_block.
-    unsafe {
-        let block = block as *mut VsockContextBlock;
-        let sender_ptr = (*block).sender_ptr;
-        if !sender_ptr.is_null() {
-            // Drop the boxed sender
-            let _ = Box::from_raw(sender_ptr as *mut oneshot::Sender<VsockResult>);
-        }
-    }
-}
 
 /// Dispose helper for `BlockingVsockContextBlock`.
 unsafe extern "C" fn blocking_vsock_block_dispose(block: *mut c_void) {
@@ -188,88 +135,6 @@ unsafe extern "C" fn blocking_vsock_block_dispose(block: *mut c_void) {
         if !sender_ptr.is_null() {
             let _ = Box::from_raw(sender_ptr as *mut std_mpsc::Sender<VsockResult>);
         }
-    }
-}
-
-/// Invoke function for `VsockContextBlock`.
-///
-/// This is called when the block is invoked by Virtualization.framework.
-unsafe extern "C" fn vsock_block_invoke(
-    block: *mut VsockContextBlock,
-    connection: *mut AnyObject,
-    error: *mut AnyObject,
-) {
-    // SAFETY: block is a valid VsockContextBlock pointer invoked by Virtualization.framework. sender_ptr was set by create_vsock_context_block. We take ownership via Box::from_raw and null out the pointer to prevent double-free in dispose.
-    unsafe {
-        let sender_ptr = (*block).sender_ptr;
-        if sender_ptr.is_null() {
-            tracing::error!("vsock_block_invoke: sender_ptr is null");
-            return;
-        }
-
-        // Take ownership of the sender (it will be consumed)
-        let sender = Box::from_raw(sender_ptr as *mut oneshot::Sender<VsockResult>);
-        // Clear the pointer so dispose won't double-free
-        (*block).sender_ptr = ptr::null_mut();
-
-        let result = if !error.is_null() {
-            // Get error description
-            let desc: *mut AnyObject = crate::msg_send!(error, localizedDescription);
-            let message = crate::ffi::nsstring_to_string(desc);
-            tracing::debug!("vsock connection error: {}", message);
-            Err(VsockConnectionError { message })
-        } else if !connection.is_null() {
-            // Get file descriptor from VZVirtioSocketConnection
-            let original_fd: i32 = crate::msg_send_i32!(connection, fileDescriptor);
-
-            // IMPORTANT: We must dup() the fd because VZVirtioSocketConnection will close
-            // the original fd when it's released (after this callback returns).
-            let fd = libc::dup(original_fd);
-            if fd < 0 {
-                let err = std::io::Error::last_os_error();
-                tracing::error!("Failed to dup vsock fd: {}", err);
-                let _ = sender.send(Err(VsockConnectionError {
-                    message: format!("Failed to dup fd: {err}"),
-                }));
-                return;
-            }
-            tracing::debug!("Duplicated vsock fd: {} -> {}", original_fd, fd);
-
-            // Get source and destination ports
-            let src_port: u32 = {
-                let sel = objc2::sel!(sourcePort);
-                let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel) -> u32 =
-                    std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-                func(connection as *const AnyObject, sel)
-            };
-            let dst_port: u32 = {
-                let sel = objc2::sel!(destinationPort);
-                let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel) -> u32 =
-                    std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-                func(connection as *const AnyObject, sel)
-            };
-
-            tracing::debug!(
-                "vsock connection success: fd={}, src_port={}, dst_port={}",
-                fd,
-                src_port,
-                dst_port
-            );
-
-            Ok(VsockConnectionInfo {
-                fd,
-                source_port: src_port,
-                destination_port: dst_port,
-            })
-        } else {
-            tracing::error!("vsock_block_invoke: both connection and error are null");
-            Err(VsockConnectionError {
-                message: "Connection and error are both null".to_string(),
-            })
-        };
-
-        // Send result (ignore error if receiver is dropped)
-        let _ = sender.send(result);
     }
 }
 
@@ -340,38 +205,6 @@ unsafe extern "C" fn blocking_vsock_block_invoke(
         };
 
         let _ = sender.send(result);
-    }
-}
-
-/// Creates a vsock completion block with captured oneshot sender.
-///
-/// The returned block will send the connection result through the sender
-/// when the block is invoked.
-///
-/// # Safety
-///
-/// The returned block must be used with Virtualization.framework's
-/// `connectToPort:completionHandler:` method.
-#[must_use]
-pub fn create_vsock_context_block(sender: oneshot::Sender<VsockResult>) -> *const c_void {
-    // Box the sender and get a raw pointer
-    let sender_box = Box::new(sender);
-    let sender_ptr = Box::into_raw(sender_box) as *mut c_void;
-
-    // SAFETY: Constructing a stack block with the correct ABI layout (isa, flags, invoke, descriptor). _NSConcreteStackBlock is the correct ISA for stack-allocated blocks. _Block_copy copies it to the heap, making the returned pointer valid for the block's lifetime.
-    unsafe {
-        // Create block on stack
-        let stack_block = VsockContextBlock {
-            isa: _NSConcreteStackBlock,
-            flags: BLOCK_HAS_COPY_DISPOSE,
-            reserved: 0,
-            invoke: vsock_block_invoke,
-            descriptor: &VSOCK_CONTEXT_BLOCK_DESCRIPTOR,
-            sender_ptr,
-        };
-
-        // Copy to heap
-        _Block_copy(&stack_block as *const VsockContextBlock as *const c_void)
     }
 }
 

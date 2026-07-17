@@ -45,9 +45,6 @@ pub fn desired_network_mtu() -> usize {
 /// Configuration for a `VirtIO` network device.
 pub struct NetworkDeviceConfiguration {
     inner: *mut AnyObject,
-    /// Actual MTU that was configured (1500 by default; 4000 only under
-    /// `ARCBOX_DIAG_NET_MTU_4000` when the setter is available).
-    mtu: usize,
 }
 
 // SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
@@ -133,7 +130,7 @@ impl NetworkDeviceConfiguration {
             // throughput A/B runs; raising needs setMaximumTransmissionUnit:
             // (macOS 13+), so check respondsToSelector: to avoid an
             // unrecognized-selector crash.
-            let mtu = if desired_network_mtu() > VZ_DEFAULT_MTU {
+            if desired_network_mtu() > VZ_DEFAULT_MTU {
                 let mtu_sel = objc2::sel!(setMaximumTransmissionUnit:);
                 // msg_send_bool! doesn't support Sel arguments, so dispatch manually.
                 let responds: bool = {
@@ -158,18 +155,15 @@ impl NetworkDeviceConfiguration {
                         "VZ network MTU raised to {VZ_ENHANCED_MTU} (ARCBOX_DIAG_NET_MTU_4000; \
                          expect ABX-423 device stalls under sustained bulk transfer)"
                     );
-                    VZ_ENHANCED_MTU as usize
                 } else {
                     tracing::warn!(
                         "ARCBOX_DIAG_NET_MTU_4000 set but the MTU setter is unavailable \
                          (macOS < 13); MTU stays at {VZ_DEFAULT_MTU}"
                     );
-                    VZ_DEFAULT_MTU
                 }
             } else {
                 tracing::info!("VZ network MTU at default {VZ_DEFAULT_MTU} (ABX-423 mitigation)");
-                VZ_DEFAULT_MTU
-            };
+            }
 
             let mac = match mac_address {
                 Some(mac_address) => create_mac_address(mac_address)?,
@@ -179,20 +173,13 @@ impl NetworkDeviceConfiguration {
                 msg_send_void!(obj, setMACAddress: mac);
             }
 
-            Ok(Self { inner: obj, mtu })
+            Ok(Self { inner: obj })
         }
-    }
-
-    /// Returns the actual MTU that was configured (1500 unless raised via
-    /// `ARCBOX_DIAG_NET_MTU_4000`).
-    #[must_use]
-    pub fn mtu(&self) -> usize {
-        self.mtu
     }
 
     /// Consumes the configuration and returns the raw pointer.
     #[must_use]
-    pub fn into_ptr(self) -> *mut AnyObject {
+    pub(crate) fn into_ptr(self) -> *mut AnyObject {
         let ptr = self.inner;
         std::mem::forget(self);
         ptr
