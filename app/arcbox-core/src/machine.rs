@@ -79,6 +79,21 @@ pub struct MachineRootfs {
     pub path: PathBuf,
     /// Image format (`squashfs`), used for the kernel `rootfstype=`.
     pub format: String,
+    /// Boot shim staging the rootfs (see
+    /// `internal-docs/plans/machine-boot-shim.md`). When set, devices are
+    /// vda=shim EROFS / vdb=rootfs / vdc=data and the kernel command line
+    /// follows the machine-init contract; when `None`, the rootfs itself
+    /// boots as vda (custom-kernel testing).
+    pub shim: Option<BootShim>,
+}
+
+/// The boot-assets artifacts that stage a distro machine's boot.
+#[derive(Debug, Clone)]
+pub struct BootShim {
+    /// Boot-assets kernel image path.
+    pub kernel: PathBuf,
+    /// Boot-assets EROFS rootfs path (ships `/sbin/arcbox-machine-init`).
+    pub rootfs: PathBuf,
 }
 
 /// Machine configuration.
@@ -140,15 +155,40 @@ impl Default for MachineConfig {
     }
 }
 
-/// Kernel command line for a distro machine: root on the read-only rootfs
-/// image at vda. The console device follows the boot-assets convention for
-/// the host architecture.
-fn default_distro_cmdline(rootfs_format: &str) -> String {
+/// Console device for the host architecture, following the boot-assets
+/// convention.
+const fn boot_console() -> &'static str {
     #[cfg(target_arch = "x86_64")]
-    let console = "ttyS0";
+    {
+        "ttyS0"
+    }
     #[cfg(not(target_arch = "x86_64"))]
-    let console = "hvc0";
+    {
+        "hvc0"
+    }
+}
+
+/// Kernel command line for a shim-less distro machine: root on the read-only
+/// rootfs image at vda (custom-kernel testing).
+fn default_distro_cmdline(rootfs_format: &str) -> String {
+    let console = boot_console();
     format!("console={console} root=/dev/vda ro rootfstype={rootfs_format} earlycon")
+}
+
+/// Kernel command line for the machine boot shim: the shim EROFS boots as
+/// root and stages the distro rootfs + data disk named by the `arcbox.*`
+/// keys (see `internal-docs/plans/machine-boot-shim.md`).
+fn machine_shim_cmdline(rootfs_format: &str) -> String {
+    use arcbox_constants::cmdline::{
+        MACHINE_DATA_KEY, MACHINE_INIT_PATH, MACHINE_ROOTFS_KEY, MACHINE_ROOTFS_TYPE_KEY,
+    };
+    let console = boot_console();
+    format!(
+        "console={console} root=/dev/vda ro rootfstype=erofs earlycon \
+         init={MACHINE_INIT_PATH} \
+         {MACHINE_ROOTFS_KEY}/dev/vdb {MACHINE_ROOTFS_TYPE_KEY}{rootfs_format} \
+         {MACHINE_DATA_KEY}/dev/vdc"
+    )
 }
 
 /// Machine manager.
@@ -306,10 +346,12 @@ impl MachineManager {
             shared_dirs.push(SharedDirConfig::new(MOUNT_PRIVATE, TAG_PRIVATE));
         }
 
-        // Distro machines boot the pulled rootfs image as read-only vda with
-        // a sparse per-machine data disk after it; plain VMs keep the
-        // caller-provided block devices untouched.
-        let (block_devices, cmdline, disk_path) = match &config.rootfs {
+        // Distro machines boot the pulled rootfs image (behind the boot shim
+        // when configured) with a sparse per-machine data disk; plain VMs
+        // keep the caller-provided kernel and block devices untouched.
+        // Device contract: [shim?, rootfs, data, ..extras] so the shim's
+        // vda/vdb/vdc expectations hold regardless of extra devices.
+        let (kernel, block_devices, cmdline, disk_path) = match &config.rootfs {
             Some(rootfs) => {
                 // A distro rootfs carries no kernel; without an explicit one
                 // the VM would boot with an empty kernel path and fail
@@ -326,32 +368,50 @@ impl MachineManager {
                     &data_disk,
                     config.disk_gb.saturating_mul(1024 * 1024 * 1024),
                 )?;
-                let mut devices = config.block_devices.clone();
-                devices.insert(
-                    0,
-                    crate::vm::BlockDeviceConfig {
-                        path: rootfs.path.to_string_lossy().into_owned(),
+                let mut devices = Vec::new();
+                if let Some(shim) = &rootfs.shim {
+                    devices.push(crate::vm::BlockDeviceConfig {
+                        path: shim.rootfs.to_string_lossy().into_owned(),
                         read_only: true,
-                    },
-                );
+                    });
+                }
+                devices.push(crate::vm::BlockDeviceConfig {
+                    path: rootfs.path.to_string_lossy().into_owned(),
+                    read_only: true,
+                });
                 devices.push(crate::vm::BlockDeviceConfig {
                     path: data_disk.to_string_lossy().into_owned(),
                     read_only: false,
                 });
-                let cmdline = config
-                    .cmdline
-                    .clone()
-                    .or_else(|| Some(default_distro_cmdline(&rootfs.format)));
-                (devices, cmdline, Some(data_disk))
+                devices.extend(config.block_devices.clone());
+
+                let kernel = config.kernel.clone().or_else(|| {
+                    rootfs
+                        .shim
+                        .as_ref()
+                        .map(|s| s.kernel.to_string_lossy().into_owned())
+                });
+                let cmdline = config.cmdline.clone().or_else(|| {
+                    Some(match &rootfs.shim {
+                        Some(_) => machine_shim_cmdline(&rootfs.format),
+                        None => default_distro_cmdline(&rootfs.format),
+                    })
+                });
+                (kernel, devices, cmdline, Some(data_disk))
             }
-            None => (config.block_devices.clone(), config.cmdline.clone(), None),
+            None => (
+                config.kernel.clone(),
+                config.block_devices.clone(),
+                config.cmdline.clone(),
+                None,
+            ),
         };
 
         // Create underlying VM
         let vm_config = VmConfig {
             cpus: config.cpus,
             memory_mb: config.memory_mb,
-            kernel: config.kernel.clone(),
+            kernel: kernel.clone(),
             cmdline: cmdline.clone(),
             shared_dirs,
             block_devices: block_devices.clone(),
@@ -369,7 +429,7 @@ impl MachineManager {
             cpus: config.cpus,
             memory_mb: config.memory_mb,
             disk_gb: config.disk_gb,
-            kernel: config.kernel,
+            kernel,
             cmdline,
             block_devices,
             distro: config.distro,

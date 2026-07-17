@@ -138,3 +138,124 @@ async fn test_create_concurrent_same_name_no_duplicate() {
     );
     assert_eq!(machines[0].name, name);
 }
+
+#[tokio::test]
+async fn test_create_with_shim_assembles_boot_contract() {
+    let temp_dir = tempdir().unwrap();
+    let machine_manager = test_machine_manager(temp_dir.path());
+
+    let rootfs_img = temp_dir.path().join("rootfs.squashfs");
+    std::fs::write(&rootfs_img, b"squash").unwrap();
+    let shim_kernel = temp_dir.path().join("kernel");
+    let shim_rootfs = temp_dir.path().join("shim.erofs");
+
+    machine_manager
+        .create(MachineConfig {
+            name: "shimmed".to_string(),
+            disk_gb: 1,
+            rootfs: Some(MachineRootfs {
+                path: rootfs_img.clone(),
+                format: "squashfs".to_string(),
+                shim: Some(BootShim {
+                    kernel: shim_kernel.clone(),
+                    rootfs: shim_rootfs.clone(),
+                }),
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let machine = machine_manager.get("shimmed").unwrap();
+
+    // Device contract: vda=shim EROFS ro, vdb=distro rootfs ro, vdc=data rw.
+    let devices = &machine.block_devices;
+    assert_eq!(devices.len(), 3);
+    assert_eq!(devices[0].path, shim_rootfs.to_string_lossy());
+    assert!(devices[0].read_only);
+    assert_eq!(devices[1].path, rootfs_img.to_string_lossy());
+    assert!(devices[1].read_only);
+    assert!(devices[2].path.ends_with("data.img"));
+    assert!(!devices[2].read_only);
+
+    // The data disk was provisioned sparse at the requested size.
+    let data_disk = machine.disk_path.as_ref().unwrap();
+    assert_eq!(
+        std::fs::metadata(data_disk).unwrap().len(),
+        1024 * 1024 * 1024
+    );
+
+    // Kernel comes from the shim; cmdline follows the machine-init contract.
+    assert_eq!(
+        machine.kernel.as_deref(),
+        Some(&*shim_kernel.to_string_lossy())
+    );
+    let cmdline = machine.cmdline.as_deref().unwrap();
+    assert!(
+        cmdline.contains("root=/dev/vda ro rootfstype=erofs"),
+        "{cmdline}"
+    );
+    assert!(
+        cmdline.contains(&format!(
+            "init={}",
+            arcbox_constants::cmdline::MACHINE_INIT_PATH
+        )),
+        "{cmdline}"
+    );
+    assert!(
+        cmdline.contains(&format!(
+            "{}/dev/vdb",
+            arcbox_constants::cmdline::MACHINE_ROOTFS_KEY
+        )),
+        "{cmdline}"
+    );
+    assert!(
+        cmdline.contains(&format!(
+            "{}squashfs",
+            arcbox_constants::cmdline::MACHINE_ROOTFS_TYPE_KEY
+        )),
+        "{cmdline}"
+    );
+    assert!(
+        cmdline.contains(&format!(
+            "{}/dev/vdc",
+            arcbox_constants::cmdline::MACHINE_DATA_KEY
+        )),
+        "{cmdline}"
+    );
+}
+
+#[tokio::test]
+async fn test_create_without_shim_boots_rootfs_directly() {
+    let temp_dir = tempdir().unwrap();
+    let machine_manager = test_machine_manager(temp_dir.path());
+
+    let rootfs_img = temp_dir.path().join("rootfs.squashfs");
+    std::fs::write(&rootfs_img, b"squash").unwrap();
+
+    machine_manager
+        .create(MachineConfig {
+            name: "plain-distro".to_string(),
+            disk_gb: 1,
+            rootfs: Some(MachineRootfs {
+                path: rootfs_img.clone(),
+                format: "squashfs".to_string(),
+                shim: None,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let machine = machine_manager.get("plain-distro").unwrap();
+    let devices = &machine.block_devices;
+    assert_eq!(devices.len(), 2);
+    assert_eq!(devices[0].path, rootfs_img.to_string_lossy());
+    assert!(machine.kernel.is_none());
+    let cmdline = machine.cmdline.as_deref().unwrap();
+    assert!(
+        cmdline.contains("root=/dev/vda ro rootfstype=squashfs"),
+        "{cmdline}"
+    );
+    assert!(!cmdline.contains("init="), "{cmdline}");
+}

@@ -13,6 +13,26 @@ pub const DOCKER_DATA_DEVICE_KEY: &str = "arcbox.docker_data_device=";
 /// hangs before networking.
 pub const DEBUG_CONSOLE_KEY: &str = "arcbox.debug_console=";
 
+/// Guest path of the machine boot shim executed as PID 1 via `init=`.
+///
+/// Packaged into the boot-assets EROFS; the shim stages the distro rootfs
+/// (overlay over squashfs), spawns the agent, and `switch_root`s into the
+/// distro's own init.
+pub const MACHINE_INIT_PATH: &str = "/sbin/arcbox-machine-init";
+
+/// Kernel cmdline key carrying the distro rootfs block device (`/dev/vdb`)
+/// the machine boot shim mounts as the overlay lower layer.
+pub const MACHINE_ROOTFS_KEY: &str = "arcbox.machine_rootfs=";
+
+/// Kernel cmdline key carrying the distro rootfs filesystem type
+/// (`squashfs`), from the machine image manifest.
+pub const MACHINE_ROOTFS_TYPE_KEY: &str = "arcbox.machine_rootfs_type=";
+
+/// Kernel cmdline key carrying the per-machine data block device
+/// (`/dev/vdc`) the shim first-boot-formats as btrfs and uses as the overlay
+/// upper layer.
+pub const MACHINE_DATA_KEY: &str = "arcbox.machine_data=";
+
 /// Explicit `earlycon` directive pinning the kernel's early console to the
 /// custom-HV PL011 UART emulator at `0x0B00_0000` (see
 /// `arcbox_vmm::vmm::darwin_hv::pl011::PL011_BASE`).

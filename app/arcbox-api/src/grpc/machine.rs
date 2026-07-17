@@ -73,9 +73,27 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 image = %format!("{}@{}", image.manifest.name, image.manifest.version),
                 "machine image ready"
             );
+
+            // Resolve the boot shim (kernel + EROFS with
+            // /sbin/arcbox-machine-init) from the same boot-assets cache the
+            // daemon populates for the System VM; a warm cache is a no-op.
+            let shim = async {
+                let provider = arcbox_core::boot_assets::BootAssetProvider::new(
+                    runtime.config().data_dir.join("boot"),
+                )?;
+                let assets = provider.get_assets().await?;
+                Ok::<_, arcbox_core::error::CoreError>(arcbox_core::machine::BootShim {
+                    kernel: assets.kernel,
+                    rootfs: assets.rootfs_image,
+                })
+            }
+            .await
+            .map_err(|e| Status::internal(format!("resolve boot shim: {e}")))?;
+
             Some(arcbox_core::machine::MachineRootfs {
                 path: image.rootfs_path(),
                 format: image.manifest.rootfs.format,
+                shim: Some(shim),
             })
         };
 
