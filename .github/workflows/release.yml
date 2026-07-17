@@ -219,10 +219,12 @@ jobs:
           retention-days: 5
 
   # ==========================================================================
-  # Build arcbox-agent (Linux guest binary, cross-compiled via musl)
+  # Build guest binaries (Linux, cross-compiled via musl): arcbox-agent (the
+  # System VM agent) and vm-agent (the sandbox microVM init, staged by the
+  # daemon next to arcbox-agent — see app/arcbox-daemon/src/startup/assets.rs).
   # ==========================================================================
   build-agent:
-    name: Build arcbox-agent (Linux musl)
+    name: Build guest binaries (Linux musl)
     runs-on: macos-26
     timeout-minutes: 20
 
@@ -252,20 +254,26 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-agent-musl-
 
-      - name: Build arcbox-agent
+      - name: Build guest binaries
         timeout-minutes: 10
-        run: cargo build --release --locked -p arcbox-agent --target aarch64-unknown-linux-musl
-
-      - name: Verify artifact
         run: |
-          ls -lh target/aarch64-unknown-linux-musl/release/arcbox-agent
-          file target/aarch64-unknown-linux-musl/release/arcbox-agent
+          cargo build --release --locked -p arcbox-agent --target aarch64-unknown-linux-musl
+          cargo build --release --locked -p arcbox-vm --bin vm-agent --target aarch64-unknown-linux-musl
 
-      - name: Upload agent binary
+      - name: Verify artifacts
+        run: |
+          for bin in arcbox-agent vm-agent; do
+            ls -lh "target/aarch64-unknown-linux-musl/release/$bin"
+            file "target/aarch64-unknown-linux-musl/release/$bin"
+          done
+
+      - name: Upload guest binaries
         uses: actions/upload-artifact@v4
         with:
           name: agent-binary-linux-arm64
-          path: target/aarch64-unknown-linux-musl/release/arcbox-agent
+          path: |
+            target/aarch64-unknown-linux-musl/release/arcbox-agent
+            target/aarch64-unknown-linux-musl/release/vm-agent
           retention-days: 5
 
   # ==========================================================================
