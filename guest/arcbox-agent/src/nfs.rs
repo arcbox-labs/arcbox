@@ -237,6 +237,11 @@ local      tpi_cots_ord  -     loopback  -       -       -
         );
         std::thread::spawn(move || match child.wait() {
             Ok(status) => tracing::warn!(%status, "nfs export: rpc.mountd exited"),
+            // On the legacy PID-1 path the supervisor's global waitpid(-1)
+            // reaper can win the race; its own log line carries the status.
+            Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {
+                tracing::debug!("nfs export: rpc.mountd reaped by the global reaper");
+            }
             Err(e) => tracing::warn!(error = %e, "nfs export: rpc.mountd wait failed"),
         });
         // Let the listener bind before returning so a repeat setup pass sees
