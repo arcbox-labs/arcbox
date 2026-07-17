@@ -2,8 +2,8 @@
 
 use crate::error::{VZError, VZResult};
 use crate::ffi::{get_class, release};
-use crate::{msg_send, msg_send_bool, msg_send_void, msg_send_void_bool};
-use objc2::runtime::{AnyObject, Bool};
+use crate::{msg_send, msg_send_void};
+use objc2::runtime::AnyObject;
 
 use super::mac::{MacAuxiliaryStorage, MacHardwareModel, MacMachineIdentifier};
 
@@ -26,64 +26,32 @@ unsafe impl Send for GenericPlatform {}
 impl GenericPlatform {
     /// Creates a new generic platform configuration.
     pub fn new() -> VZResult<Self> {
-        // SAFETY: ObjC alloc/init pattern on valid VZGenericPlatformConfiguration class. Result is checked non-null. retain prevents autorelease.
-        unsafe {
-            let cls =
-                get_class("VZGenericPlatformConfiguration").ok_or_else(|| VZError::Internal {
-                    code: -1,
-                    message: "VZGenericPlatformConfiguration class not found".into(),
-                })?;
-            let obj = msg_send!(cls, new);
-
-            if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to create generic platform".into(),
-                });
-            }
-
-            // Retain to prevent autorelease
-            let _: *mut AnyObject = msg_send!(obj, retain);
-
-            Ok(Self { inner: obj })
-        }
+        // SAFETY: the shim returns a +1 VZGenericPlatformConfiguration
+        // handle, released by Drop.
+        let obj = unsafe { crate::shim_ffi::abx_platform_generic_new() };
+        Ok(Self {
+            inner: obj as *mut AnyObject,
+        })
     }
 
     /// Returns whether the hardware supports nested virtualization.
     ///
-    /// Requires macOS 15+ and Apple M3 or later. On older systems, the
-    /// selector does not exist and this returns `false`.
+    /// Requires macOS 15+ and Apple M3 or later; the shim's `#available`
+    /// guard returns `false` on older systems.
     pub fn is_nested_virt_supported() -> bool {
-        let Some(cls) = get_class("VZGenericPlatformConfiguration") else {
-            return false;
-        };
-        // `isNestedVirtualizationSupported` is a *class* method.
-        // `AnyClass::responds_to` checks instance methods, so use
-        // `class_method` which queries the metaclass instead.
-        let sel = objc2::sel!(isNestedVirtualizationSupported);
-        if cls.class_method(sel).is_none() {
-            return false;
-        }
-        // SAFETY: Selector existence is checked above via class_method. Sending to a valid class pointer.
-        unsafe { msg_send_bool!(cls, isNestedVirtualizationSupported).as_bool() }
+        // SAFETY: class-property read behind an availability guard.
+        unsafe { crate::shim_ffi::abx_platform_generic_nested_supported() }
     }
 
     /// Enables or disables nested virtualization for this platform config.
     ///
-    /// Only has effect when [`Self::is_nested_virt_supported()`] returns `true`.
+    /// Only has effect when [`Self::is_nested_virt_supported()`] returns
+    /// `true`; on older systems the shim's `#available` guard makes this a
+    /// no-op.
     pub fn set_nested_virt_enabled(&self, enabled: bool) {
-        // Guard: the setter selector only exists on macOS 15+.
-        let sel = objc2::sel!(setNestedVirtualizationEnabled:);
-        // SAFETY: self.inner is a valid ObjC object pointer; casting to &AnyObject to query its class.
-        if !unsafe { &*(self.inner as *const AnyObject) }
-            .class()
-            .responds_to(sel)
-        {
-            return;
-        }
-        // SAFETY: Selector existence is checked above via responds_to. self.inner is a valid VZGenericPlatformConfiguration.
+        // SAFETY: self.inner is a valid platform handle.
         unsafe {
-            msg_send_void_bool!(self.inner, setNestedVirtualizationEnabled: Bool::new(enabled));
+            crate::shim_ffi::abx_platform_generic_set_nested(self.inner.cast(), enabled);
         }
     }
 }
@@ -103,7 +71,8 @@ impl Platform for GenericPlatform {
 impl Drop for GenericPlatform {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            release(self.inner);
+            // SAFETY: releasing the +1 handle returned by the shim.
+            unsafe { crate::shim_ffi::abx_object_release(self.inner.cast()) };
         }
     }
 }

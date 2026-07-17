@@ -23,7 +23,7 @@ include = [
 objc2 = { version = "0.6", features = ["exception"] }
 
 # Async runtime
-tokio = { version = "1", features = ["sync", "rt", "io-util", "net", "time"] }
+tokio = { version = "1", features = ["sync", "rt", "io-util", "net", "time", "macros"] }
 
 # Error handling
 thiserror = "2"
