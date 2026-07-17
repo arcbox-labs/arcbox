@@ -21,6 +21,14 @@ rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]
 
+# Doctests are linked and run by rustdoc, which honors rustdocflags rather than
+# the per-target rustflags above. Rust's merged-doctest harness runs a single
+# binary even when every example is `no_run`, so that binary still loads the
+# shim's @rpath'd concurrency runtime at startup and needs the same rpath.
+# (`rustdocflags` has no per-target form; the flag is inert on non-Swift links.)
+[build]
+rustdocflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]
+
 # C build scripts (cc crate) must use the same musl toolchain as the linker
 # above; the host clang cannot compile for *-linux-musl (no musl headers).
 [env]
