@@ -245,3 +245,67 @@ public func abxVirtiofsSetShare(
 ) {
     virtiofsSetShare(config, share)
 }
+
+// MARK: - macOS identity + platform
+
+@_cdecl("abx_mac_hw_model_from_data")
+public func abxMacHwModelFromData(
+    _ bytes: UnsafeRawPointer, _ length: UInt
+) -> UnsafeMutableRawPointer? {
+    macHardwareModelFromData(bytes, length)
+}
+
+@_cdecl("abx_mac_hw_model_supported")
+public func abxMacHwModelSupported(_ handle: UnsafeMutableRawPointer) -> Bool {
+    macHardwareModelSupported(handle)
+}
+
+@_cdecl("abx_mac_hw_model_data")
+public func abxMacHwModelData(
+    _ handle: UnsafeMutableRawPointer, _ lengthOut: UnsafeMutablePointer<UInt>?
+) -> UnsafeMutableRawPointer? {
+    macHardwareModelData(handle, lengthOut)
+}
+
+@_cdecl("abx_mac_machine_id_new")
+public func abxMacMachineIdNew() -> UnsafeMutableRawPointer {
+    macMachineIdNew()
+}
+
+@_cdecl("abx_mac_machine_id_from_data")
+public func abxMacMachineIdFromData(
+    _ bytes: UnsafeRawPointer, _ length: UInt
+) -> UnsafeMutableRawPointer? {
+    macMachineIdFromData(bytes, length)
+}
+
+@_cdecl("abx_mac_machine_id_data")
+public func abxMacMachineIdData(
+    _ handle: UnsafeMutableRawPointer, _ lengthOut: UnsafeMutablePointer<UInt>?
+) -> UnsafeMutableRawPointer? {
+    macMachineIdData(handle, lengthOut)
+}
+
+@_cdecl("abx_aux_storage_open")
+public func abxAuxStorageOpen(_ path: UnsafePointer<CChar>) -> UnsafeMutableRawPointer {
+    auxStorageOpen(path)
+}
+
+@_cdecl("abx_aux_storage_create")
+public func abxAuxStorageCreate(
+    _ path: UnsafePointer<CChar>,
+    _ hardwareModel: UnsafeMutableRawPointer,
+    _ overwrite: Bool,
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> UnsafeMutableRawPointer? {
+    auxStorageCreate(path, hardwareModel, overwrite, errorOut)
+}
+
+@_cdecl("abx_platform_mac_new")
+public func abxPlatformMacNew(
+    _ hardwareModel: UnsafeMutableRawPointer,
+    _ machineIdentifier: UnsafeMutableRawPointer,
+    _ auxiliaryStorage: UnsafeMutableRawPointer
+) -> UnsafeMutableRawPointer {
+    platformMacNew(hardwareModel, machineIdentifier, auxiliaryStorage)
+}

@@ -107,6 +107,26 @@ unsafe extern "C" {
     pub fn abx_rosetta_share_new(error_out: *mut *mut c_char) -> *mut c_void;
     pub fn abx_virtiofs_new(tag: *const c_char, error_out: *mut *mut c_char) -> *mut c_void;
     pub fn abx_virtiofs_set_share(config: *mut c_void, share: *mut c_void);
+
+    // macOS identity + platform
+    pub fn abx_mac_hw_model_from_data(bytes: *const c_void, length: usize) -> *mut c_void;
+    pub fn abx_mac_hw_model_supported(handle: *mut c_void) -> bool;
+    pub fn abx_mac_hw_model_data(handle: *mut c_void, length_out: *mut usize) -> *mut c_void;
+    pub fn abx_mac_machine_id_new() -> *mut c_void;
+    pub fn abx_mac_machine_id_from_data(bytes: *const c_void, length: usize) -> *mut c_void;
+    pub fn abx_mac_machine_id_data(handle: *mut c_void, length_out: *mut usize) -> *mut c_void;
+    pub fn abx_aux_storage_open(path: *const c_char) -> *mut c_void;
+    pub fn abx_aux_storage_create(
+        path: *const c_char,
+        hardware_model: *mut c_void,
+        overwrite: bool,
+        error_out: *mut *mut c_char,
+    ) -> *mut c_void;
+    pub fn abx_platform_mac_new(
+        hardware_model: *mut c_void,
+        machine_identifier: *mut c_void,
+        auxiliary_storage: *mut c_void,
+    ) -> *mut c_void;
 }
 
 /// Takes ownership of a shim-returned error string and frees it.
@@ -174,11 +194,20 @@ mod tests {
         abx_rosetta_share_new as *const (),
         abx_virtiofs_new as *const (),
         abx_virtiofs_set_share as *const (),
+        abx_mac_hw_model_from_data as *const (),
+        abx_mac_hw_model_supported as *const (),
+        abx_mac_hw_model_data as *const (),
+        abx_mac_machine_id_new as *const (),
+        abx_mac_machine_id_from_data as *const (),
+        abx_mac_machine_id_data as *const (),
+        abx_aux_storage_open as *const (),
+        abx_aux_storage_create as *const (),
+        abx_platform_mac_new as *const (),
     ];
 
     /// Update when symbols are added; a mismatch means Exports.swift and this
     /// file have drifted.
-    const EXPECTED_SYMBOL_COUNT: usize = 38;
+    const EXPECTED_SYMBOL_COUNT: usize = 47;
 
     #[test]
     fn link_coverage() {
@@ -245,6 +274,40 @@ mod tests {
             abx_bootloader_linux_set_initrd(bl, c_path.as_ptr());
             abx_bootloader_linux_set_cmdline(bl, c_cmdline.as_ptr());
             abx_object_release(bl);
+        }
+    }
+
+    #[test]
+    fn machine_id_data_roundtrip() {
+        // SAFETY: identity objects are plain allocations (no entitlement);
+        // buffers are shim-malloc'd and freed via abx_bytes_free.
+        unsafe {
+            let id = abx_mac_machine_id_new();
+            assert!(!id.is_null());
+
+            let mut len: usize = 0;
+            let bytes = abx_mac_machine_id_data(id, &mut len);
+            assert!(!bytes.is_null());
+            assert!(len > 0);
+
+            let id2 = abx_mac_machine_id_from_data(bytes, len);
+            assert!(!id2.is_null(), "round-trip through data representation");
+            let mut len2: usize = 0;
+            let bytes2 = abx_mac_machine_id_data(id2, &mut len2);
+            assert_eq!(len, len2);
+            let a = std::slice::from_raw_parts(bytes as *const u8, len);
+            let b = std::slice::from_raw_parts(bytes2 as *const u8, len2);
+            assert_eq!(a, b);
+
+            abx_bytes_free(bytes);
+            abx_bytes_free(bytes2);
+            abx_object_release(id2);
+            abx_object_release(id);
+
+            // Garbage bytes must be rejected, not crash.
+            let garbage = [0u8; 16];
+            let bad = abx_mac_machine_id_from_data(garbage.as_ptr().cast(), garbage.len());
+            assert!(bad.is_null());
         }
     }
 
