@@ -41,6 +41,10 @@ mod nfs;
 #[cfg(target_os = "linux")]
 mod containerd;
 
+// Finder volume-icon files for the NFS export root.
+#[cfg(target_os = "linux")]
+mod volume_icon;
+
 // VMM config loading and sandbox service are Linux-only.
 #[cfg(target_os = "linux")]
 mod config;

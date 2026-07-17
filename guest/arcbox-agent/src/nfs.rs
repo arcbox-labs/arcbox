@@ -136,6 +136,13 @@ local      tpi_cots_ord  -     loopback  -       -       -
             ensure_containerd_child_export(export_containerd, &mut notes)?;
         }
 
+        // Written through the writable docker data mount; the read-only
+        // export serves the same files. A failed icon never fails the export.
+        match crate::volume_icon::install(Path::new(DOCKER_DATA_MOUNT_POINT)) {
+            Ok(()) => notes.push("ensured volume icon".to_string()),
+            Err(e) => tracing::warn!(error = %e, "nfs export: volume icon install failed"),
+        }
+
         write_exports(&cfg).map_err(|e| format!("write {} failed({e})", cfg.exports_path))?;
         refresh_exports()?;
         notes.push("refreshed exportfs".to_string());
