@@ -220,8 +220,10 @@ impl MacOSInstaller {
 
     /// Installs macOS, invoking `on_progress` with the current fraction as it runs.
     ///
-    /// `virtual_machine` must be the VM passed to [`new`](Self::new); the install is
-    /// dispatched on that VM's queue (retained inside the installer box).
+    /// The install runs on the queue retained inside the installer box (the
+    /// VM's queue, captured at [`new`](Self::new)). `_virtual_machine` is kept
+    /// for public-API stability but is no longer read — the queue no longer
+    /// comes from this argument, so passing a different VM has no effect.
     ///
     /// # Errors
     ///
