@@ -7,6 +7,16 @@ description = "Safe Rust bindings for Apple's Virtualization.framework"
 repository.workspace = true
 keywords = ["virtualization", "macos", "apple", "vm", "hypervisor"]
 categories = ["os::macos-apis", "virtualization"]
+# The published crate must carry the Swift shim sources: build.rs compiles
+# them with SwiftPM on macOS (Xcode CLT required). Examples are not packaged.
+include = [
+    "src/**",
+    "build.rs",
+    "shim/Package.swift",
+    "shim/.swift-format",
+    "shim/Sources/**",
+    "README.md",
+]
 
 [dependencies]
 # Objective-C runtime
@@ -30,14 +40,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS-specific dependencies (none for now, using FFI directly)
-
-[[example]]
-name = "simple_vm"
-path = "examples/simple_vm.rs"
-
-[[example]]
-name = "vsock_echo"
-path = "examples/vsock_echo.rs"
 
 [lints]
 workspace = true

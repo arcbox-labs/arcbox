@@ -79,6 +79,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Lint Swift shim (swift-format, strict)
+        run: xcrun swift-format lint --strict --parallel --recursive virt/arcbox-vz/shim
+
       - name: Smoke test cargo xtask alias
         run: cargo xtask --help
 

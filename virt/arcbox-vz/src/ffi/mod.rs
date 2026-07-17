@@ -21,98 +21,43 @@ pub use runtime::*;
 
 use crate::error::VZError;
 use objc2::runtime::AnyObject;
-use std::sync::Once;
 
 // ============================================================================
-// Framework Loading
+// System Queries (served by the ArcBoxVZShim Swift static library)
 // ============================================================================
-
-static FRAMEWORK_INIT: Once = Once::new();
-
-/// Ensures Virtualization.framework is loaded.
-fn ensure_framework_loaded() {
-    // SAFETY: dlopen loads the system Virtualization.framework. Called once via Once. dlerror is checked only when handle is null.
-    FRAMEWORK_INIT.call_once(|| unsafe {
-        let path = std::ffi::CString::new(
-            "/System/Library/Frameworks/Virtualization.framework/Virtualization",
-        )
-        .unwrap();
-        let handle = libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
-        if handle.is_null() {
-            let err = libc::dlerror();
-            if !err.is_null() {
-                let err_str = std::ffi::CStr::from_ptr(err).to_string_lossy();
-                tracing::error!("Failed to load Virtualization.framework: {}", err_str);
-            }
-        } else {
-            tracing::debug!("Virtualization.framework loaded successfully");
-        }
-    });
-}
-
-// ============================================================================
-// System Queries
-// ============================================================================
+//
+// Virtualization.framework is linked at build time (build.rs emits
+// `-framework Virtualization`), so it is loaded before main; the old runtime
+// dlopen is gone and `get_class` lookups work unconditionally.
 
 /// Checks if virtualization is supported on this system.
 pub fn is_supported() -> bool {
-    ensure_framework_loaded();
-    // SAFETY: Sending isSupported to a valid VZVirtualMachine class pointer obtained from get_class.
-    unsafe {
-        let cls = match get_class("VZVirtualMachine") {
-            Some(c) => c,
-            None => return false,
-        };
-        msg_send_bool!(cls, isSupported).as_bool()
-    }
+    // SAFETY: shim reads a class property; no preconditions.
+    unsafe { crate::shim_ffi::abx_vz_supported() }
 }
 
 /// Gets the maximum supported CPU count.
 pub fn max_cpu_count() -> u64 {
-    ensure_framework_loaded();
-    // SAFETY: Sending maximumAllowedCPUCount to a valid VZVirtualMachineConfiguration class pointer.
-    unsafe {
-        let Some(cls) = get_class("VZVirtualMachineConfiguration") else {
-            return 0;
-        };
-        msg_send_u64!(cls, maximumAllowedCPUCount)
-    }
+    // SAFETY: shim reads a class property; no preconditions.
+    unsafe { crate::shim_ffi::abx_vz_max_cpu_count() }
 }
 
 /// Gets the minimum supported CPU count.
 pub fn min_cpu_count() -> u64 {
-    ensure_framework_loaded();
-    // SAFETY: Sending minimumAllowedCPUCount to a valid VZVirtualMachineConfiguration class pointer.
-    unsafe {
-        let Some(cls) = get_class("VZVirtualMachineConfiguration") else {
-            return 0;
-        };
-        msg_send_u64!(cls, minimumAllowedCPUCount)
-    }
+    // SAFETY: shim reads a class property; no preconditions.
+    unsafe { crate::shim_ffi::abx_vz_min_cpu_count() }
 }
 
 /// Gets the maximum supported memory size.
 pub fn max_memory_size() -> u64 {
-    ensure_framework_loaded();
-    // SAFETY: Sending maximumAllowedMemorySize to a valid VZVirtualMachineConfiguration class pointer.
-    unsafe {
-        let Some(cls) = get_class("VZVirtualMachineConfiguration") else {
-            return 0;
-        };
-        msg_send_u64!(cls, maximumAllowedMemorySize)
-    }
+    // SAFETY: shim reads a class property; no preconditions.
+    unsafe { crate::shim_ffi::abx_vz_max_memory_size() }
 }
 
 /// Gets the minimum supported memory size.
 pub fn min_memory_size() -> u64 {
-    ensure_framework_loaded();
-    // SAFETY: Sending minimumAllowedMemorySize to a valid VZVirtualMachineConfiguration class pointer.
-    unsafe {
-        let Some(cls) = get_class("VZVirtualMachineConfiguration") else {
-            return 0;
-        };
-        msg_send_u64!(cls, minimumAllowedMemorySize)
-    }
+    // SAFETY: shim reads a class property; no preconditions.
+    unsafe { crate::shim_ffi::abx_vz_min_memory_size() }
 }
 
 // ============================================================================

@@ -3,16 +3,16 @@
 use objc2::ffi::objc_getClass;
 use objc2::runtime::AnyClass;
 
-use super::ensure_framework_loaded;
-
 // ============================================================================
 // Class Access
 // ============================================================================
 
 /// Gets an Objective-C class by name.
+///
+/// Virtualization.framework is linked at build time (build.rs), so its
+/// classes are registered before `main` and lookups need no load step.
 #[must_use]
 pub fn get_class(name: &str) -> Option<&'static AnyClass> {
-    ensure_framework_loaded();
     let name_cstr = std::ffi::CString::new(name).ok()?;
     // SAFETY: objc_getClass returns null for unknown classes (checked below) or a valid class pointer that lives for the program's lifetime.
     unsafe {

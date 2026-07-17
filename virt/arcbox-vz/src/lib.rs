@@ -61,6 +61,7 @@
 
 pub mod error;
 pub mod ffi;
+mod shim_ffi;
 
 pub mod configuration;
 pub mod device;
