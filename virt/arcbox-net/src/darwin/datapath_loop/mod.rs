@@ -78,7 +78,8 @@ pub struct NetworkDatapath {
     pub guest_ip: Ipv4Addr,
     /// Cancellation token for graceful shutdown.
     pub cancel: CancellationToken,
-    /// Negotiated MTU (from VZ `setMaximumTransmissionUnit:` result).
+    /// Buffer-sizing MTU (at least the device's configured MTU; see
+    /// `splicetcp`'s `ENHANCED_ETHERNET_MTU`).
     pub mtu: usize,
     /// Frame sink for host-to-guest RX injection. When set, all frames
     /// destined for the guest go through this sink (to the inject thread)
