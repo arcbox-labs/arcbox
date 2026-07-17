@@ -214,9 +214,15 @@ local      tpi_cots_ord  -     loopback  -       -       -
     /// no client contacts it, but the kernel still calls it to authorize
     /// export access. Registration with a portmapper is not needed (and there
     /// is no `rpcbind`); the listener is created directly.
+    ///
+    /// A watcher thread reaps the child and logs its exit: a dead mountd
+    /// leaves every kernel export upcall unanswered, which wedges the host's
+    /// `mount_nfs` in uninterruptible sleep with zero diagnostics. Reaping
+    /// also keeps the zombie from satisfying the [`mountd_running`] respawn
+    /// guard forever.
     fn spawn_mountd(cfg: &ExportConfig<'_>) -> Result<(), String> {
         let port = cfg.mountd_port.to_string();
-        let child = Command::new("/sbin/rpc.mountd")
+        let mut child = Command::new("/sbin/rpc.mountd")
             .args(["-F", "-p", &port])
             .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
             .stdin(Stdio::null())
@@ -229,6 +235,10 @@ local      tpi_cots_ord  -     loopback  -       -       -
             port = cfg.mountd_port,
             "nfs export: rpc.mountd spawned"
         );
+        std::thread::spawn(move || match child.wait() {
+            Ok(status) => tracing::warn!(%status, "nfs export: rpc.mountd exited"),
+            Err(e) => tracing::warn!(error = %e, "nfs export: rpc.mountd wait failed"),
+        });
         // Let the listener bind before returning so a repeat setup pass sees
         // the port taken and does not spawn a second, conflicting mountd.
         for _ in 0..20 {
@@ -305,6 +315,9 @@ local      tpi_cots_ord  -     loopback  -       -       -
         process_named("rpc.mountd")
     }
 
+    /// True when a live (non-zombie) process with this comm exists. Zombies
+    /// keep their comm until reaped, and a zombie mountd must not satisfy the
+    /// respawn guard — that is exactly the state that wedges the host mount.
     fn process_named(name: &str) -> bool {
         let Ok(entries) = fs::read_dir("/proc") else {
             return false;
@@ -321,7 +334,18 @@ local      tpi_cots_ord  -     loopback  -       -       -
             let Ok(comm) = fs::read_to_string(entry.path().join("comm")) else {
                 continue;
             };
-            if comm.trim() == name {
+            if comm.trim() != name {
+                continue;
+            }
+            let is_zombie = fs::read_to_string(entry.path().join("stat"))
+                .ok()
+                .and_then(|stat| {
+                    // State is the first field after the parenthesized comm.
+                    let after = stat.rsplit_once(')')?.1.trim_start();
+                    after.chars().next()
+                })
+                .is_some_and(|state| state == 'Z');
+            if !is_zombie {
                 return true;
             }
         }
