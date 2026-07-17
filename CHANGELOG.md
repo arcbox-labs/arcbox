@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.20](https://github.com/arcboxlabs/arcbox/compare/v0.4.19...v0.4.20) (2026-07-17)
+
+
+### Features
+
+* **release:** ship vm-agent alongside arcbox-agent ([#426](https://github.com/arcboxlabs/arcbox/issues/426)) ([eadca16](https://github.com/arcboxlabs/arcbox/commit/eadca162285d2f782fc1eafd87d3b115a9211387))
+* **sandbox:** fresh-network restore re-addresses the guest (Firecracker 1.16.1) ([#404](https://github.com/arcboxlabs/arcbox/issues/404)) ([fec0b5f](https://github.com/arcboxlabs/arcbox/commit/fec0b5f831257c6922c37de5c918e963b305add8))
+
+
+### Bug Fixes
+
+* **agent:** reap rpc.mountd and skip zombies in the respawn guard ([#411](https://github.com/arcboxlabs/arcbox/issues/411)) ([1c0ad54](https://github.com/arcboxlabs/arcbox/commit/1c0ad542a53d2fbec0a6d72fc4091446b8de0a46))
+* **net:** default the VZ network MTU to 1500 (ABX-423 mitigation) ([b1f2e9c](https://github.com/arcboxlabs/arcbox/commit/b1f2e9c47b4ecfa91a120fcaee47a7c2d0a8c7ea))
+* **net:** IPv4-fragment guest-bound UDP datagrams above the link MTU (ABX-428) ([#412](https://github.com/arcboxlabs/arcbox/issues/412)) ([b71bcff](https://github.com/arcboxlabs/arcbox/commit/b71bcff6b70e2910615eaed867dbb4108746b2a4))
+* **net:** reassemble guest-originated IPv4 fragments in the classifier (ABX-429) ([#425](https://github.com/arcboxlabs/arcbox/issues/425)) ([feb4fda](https://github.com/arcboxlabs/arcbox/commit/feb4fda9e35c9f402f6fcbbcea0df6851f7e8d4d))
+
+
+### Code Refactoring
+
+* **daemon:** unify graceful-stop force race into stop_runtime ([#408](https://github.com/arcboxlabs/arcbox/issues/408)) ([539bed9](https://github.com/arcboxlabs/arcbox/commit/539bed9f6f5514e3c2f640aecfc29a5db14cd7d9))
+
+
+### Documentation
+
+* **net:** reframe NetworkDatapath.mtu doc as buffer sizing ([e44ae1b](https://github.com/arcboxlabs/arcbox/commit/e44ae1baca94dae693484b551b89e4aef925249e))
+
 ## [0.4.19](https://github.com/arcboxlabs/arcbox/compare/v0.4.18...v0.4.19) (2026-07-17)
 
 
