@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use arcbox_core::Runtime;
 use arcbox_docker::DockerContextManager;
 use tokio::signal;
 use tracing::{info, warn};
@@ -36,52 +37,83 @@ pub async fn run(ctx: DaemonContext, mut handles: ServiceHandles) -> Result<()> 
 
     drain(&mut handles).await;
 
-    // runtime.shutdown() calls graceful_stop() which sends a vsock shutdown
-    // RPC and blocks waiting for the VM to stop. It must run in a separate
-    // task — otherwise select! can't poll the signal branch while the
-    // blocking call holds the current task.
-    let forced = if let Some(runtime) = ctx.shared_runtime.get() {
-        let runtime = runtime.clone();
-        let shutdown_task = tokio::spawn(async move { runtime.shutdown().await });
-
-        tokio::select! {
-            result = shutdown_task => {
-                match result {
-                    Ok(Err(e)) => warn!("Runtime shutdown error: {e}"),
-                    Err(e) => warn!("Runtime shutdown task panicked: {e}"),
-                    _ => {}
-                }
-                false
-            }
-            () = wait_for_signal() => {
-                println!("Force shutting down...");
-                warn!("Second signal received, forcing shutdown");
-                true
-            }
-        }
-    } else {
-        false
+    let forced = match ctx.shared_runtime.get() {
+        Some(runtime) => stop_runtime(Arc::clone(runtime), None).await,
+        None => false,
     };
-
-    // Force path: shutdown_force does everything except the graceful VM
-    // stop (port forwarding, force VM kill, other machines, network manager).
-    if forced {
-        if let Some(runtime) = ctx.shared_runtime.get() {
-            let _ = runtime.shutdown_force().await;
-        }
-    }
 
     cleanup(&ctx).await;
     info!("ArcBox daemon stopped");
 
     if forced {
-        // The spawned graceful shutdown task may still be blocked waiting
-        // for the VM to stop (no locks held, but still occupies a tokio
-        // worker thread). process::exit avoids hanging in runtime drop.
+        // See `stop_runtime`: the abandoned graceful-stop task may still
+        // occupy a worker thread; process::exit avoids hanging in runtime
+        // drop.
         std::process::exit(0);
     }
 
     Ok(())
+}
+
+/// Stops the runtime, racing the graceful stop against a second signal
+/// and an optional `grace` deadline.
+///
+/// `runtime.shutdown()` sends a vsock shutdown RPC and blocks waiting for
+/// the VM to stop, so it runs in its own task — otherwise `select!` could
+/// not poll the signal branch. On a forced stop (second signal, deadline,
+/// or a panicked graceful task — the VM state is then unknown),
+/// `shutdown_force` does everything except the graceful VM stop: port
+/// forwarding, force VM kill, other machines, network manager.
+///
+/// Returns `true` when the stop was forced. The abandoned graceful task
+/// may then still be blocked waiting for the VM (no locks held, but it
+/// occupies a tokio worker thread), so after its remaining cleanup the
+/// caller must leave via `std::process::exit` rather than returning
+/// through runtime drop.
+async fn stop_runtime(runtime: Arc<Runtime>, grace: Option<Duration>) -> bool {
+    let graceful = tokio::spawn({
+        let runtime = Arc::clone(&runtime);
+        async move { runtime.shutdown().await }
+    });
+    let graceful = async move {
+        match grace {
+            Some(limit) => tokio::time::timeout(limit, graceful)
+                .await
+                .map_err(|_| limit),
+            None => Ok(graceful.await),
+        }
+    };
+
+    let forced = tokio::select! {
+        result = graceful => match result {
+            Ok(Ok(Ok(()))) => false,
+            Ok(Ok(Err(e))) => {
+                warn!("Runtime shutdown error: {e}");
+                false
+            }
+            Ok(Err(e)) => {
+                warn!("Runtime shutdown task panicked: {e}");
+                true
+            }
+            Err(limit) => {
+                warn!(
+                    "Graceful stop did not finish within {}s, forcing",
+                    limit.as_secs()
+                );
+                true
+            }
+        },
+        () = wait_for_signal() => {
+            println!("Force shutting down...");
+            warn!("Second signal received, forcing shutdown");
+            true
+        }
+    };
+
+    if forced {
+        let _ = runtime.shutdown_force().await;
+    }
+    forced
 }
 
 async fn cleanup(ctx: &DaemonContext) {
@@ -144,49 +176,14 @@ pub async fn interrupt_startup(handles: &StartupHandles) -> Result<()> {
         info!("ArcBox daemon stopped");
         return Ok(());
     };
-    let runtime = Arc::clone(runtime);
-
-    let graceful = tokio::spawn({
-        let runtime = Arc::clone(&runtime);
-        async move { runtime.shutdown().await }
-    });
-
-    let forced = tokio::select! {
-        result = tokio::time::timeout(STARTUP_ABORT_GRACE, graceful) => match result {
-            Ok(Ok(Err(e))) => {
-                warn!("Runtime shutdown error during startup abort: {e}");
-                false
-            }
-            Ok(Err(e)) => {
-                warn!("Runtime shutdown task panicked during startup abort: {e}");
-                true
-            }
-            Err(_) => {
-                warn!(
-                    "Graceful stop did not finish within {}s during startup abort, forcing",
-                    STARTUP_ABORT_GRACE.as_secs()
-                );
-                true
-            }
-            Ok(Ok(Ok(()))) => false,
-        },
-        () = wait_for_signal() => {
-            println!("Force shutting down...");
-            warn!("Second signal received during startup abort, forcing shutdown");
-            true
-        }
-    };
-
-    if forced {
-        let _ = runtime.shutdown_force().await;
-    }
+    let forced = stop_runtime(Arc::clone(runtime), Some(STARTUP_ABORT_GRACE)).await;
 
     info!("ArcBox daemon stopped");
 
     if forced {
-        // The abandoned graceful-stop task may still be blocked waiting for
-        // the VM (it occupies a worker thread); exit directly rather than
-        // hanging in runtime drop, mirroring the force path of `run`.
+        // See `stop_runtime`: the abandoned graceful-stop task may still
+        // occupy a worker thread; exit directly rather than hanging in
+        // runtime drop, mirroring the force path of `run`.
         std::process::exit(0);
     }
 
