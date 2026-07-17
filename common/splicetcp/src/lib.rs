@@ -26,6 +26,7 @@
 pub mod classifier;
 pub mod direct_rx;
 pub mod egress;
+mod fragment;
 pub mod frame_source;
 pub mod shim;
 pub mod tcp_bridge;

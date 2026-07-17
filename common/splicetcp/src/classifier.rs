@@ -23,6 +23,7 @@ use arcbox_datapath::FrameBuf;
 use arcbox_datapath::pool::PacketPool;
 
 use crate::ethernet::{ArpResponder, ETH_HEADER_LEN};
+use crate::fragment::FragmentReassembler;
 
 /// Default Ethernet MTU (excludes Ethernet header).
 #[cfg(test)]
@@ -31,10 +32,9 @@ const DEFAULT_ETHERNET_MTU: usize = 1500;
 /// Enhanced MTU (excludes Ethernet header), ~2.7x fewer frames than 1500.
 ///
 /// No longer a negotiated link MTU by default: the VZ device stays at 1500
-/// (ABX-423 — see `arcbox-vz/src/device/network.rs`). The VMMs still pass
-/// this value as the classifier `mtu`, where it only sizes buffers — pure
-/// headroom on a 1500 link — and covers the `ARCBOX_DIAG_NET_MTU_4000`
-/// reproduction mode.
+/// (ABX-423 — see `arcbox-vz/src/device/network.rs`) and the VMMs pass the
+/// actual link MTU to the datapath since ABX-428. This constant remains the
+/// `ARCBOX_DIAG_NET_MTU_4000` reproduction-mode value and a sizing reference.
 pub const ENHANCED_ETHERNET_MTU: usize = 4000;
 
 /// Protocol numbers.
@@ -108,6 +108,9 @@ pub struct FrameClassifier {
     /// configured MTU; see [`ENHANCED_ETHERNET_MTU`].
     #[allow(dead_code)]
     mtu: usize,
+    /// Reassembles guest IPv4 fragments into whole frames before L4
+    /// classification (ABX-429).
+    reassembler: FragmentReassembler,
 }
 
 impl FrameClassifier {
@@ -168,6 +171,7 @@ impl FrameClassifier {
             arp: ArpResponder::new(gateway_ip, [0; 6]),
             pool,
             mtu,
+            reassembler: FragmentReassembler::new(),
         }
     }
 
@@ -310,6 +314,18 @@ impl FrameClassifier {
         let protocol = frame[ip_start + 9];
         let ihl = ((frame[ip_start] & 0x0F) as usize) * 4;
         let l4_start = ip_start + ihl;
+
+        // A fragment (MF set or nonzero offset) carries at most a partial L4
+        // datagram, and downstream consumers parse one datagram per frame —
+        // reassemble first (ABX-429). A completed datagram re-enters here
+        // with its fragment field cleared.
+        let flags_frag = u16::from_be_bytes([frame[ip_start + 6], frame[ip_start + 7]]);
+        if flags_frag & 0x3FFF != 0 {
+            if let Some(reassembled) = self.reassembler.push(frame, std::time::Instant::now()) {
+                self.classify_ipv4(&reassembled);
+            }
+            return;
+        }
 
         match protocol {
             PROTO_TCP => {
@@ -654,6 +670,66 @@ mod tests {
         assert!(device.rx_queue.is_empty());
         assert_eq!(device.intercepted.len(), 1);
         assert_eq!(device.intercepted[0].kind, InterceptedKind::Udp);
+    }
+
+    #[test]
+    fn fragmented_udp_reassembles_into_one_intercept() {
+        let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
+        let mut device = FrameClassifier::new(gateway_ip, DEFAULT_ETHERNET_MTU);
+        let mut guest_mac = None;
+
+        // A 3000-byte UDP datagram fragmented at MTU 1500, as the guest
+        // kernel would emit it (3 fragments).
+        let payload = vec![0xA5u8; 3000];
+        let frags = crate::ethernet::build_udp_ip_ethernet(
+            Ipv4Addr::new(192, 168, 64, 2),
+            Ipv4Addr::new(1, 1, 1, 1),
+            40000,
+            9999,
+            &payload,
+            [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            1500,
+        );
+        assert_eq!(frags.len(), 3);
+
+        for f in &frags {
+            device.classify_frame(f, &mut guest_mac);
+        }
+
+        // Exactly one intercepted frame, carrying the whole datagram.
+        assert_eq!(device.intercepted.len(), 1);
+        assert_eq!(device.intercepted[0].kind, InterceptedKind::Udp);
+        let frame = &device.intercepted[0].frame;
+        assert_eq!(frame.len(), ETH_HEADER_LEN + 20 + 8 + payload.len());
+        assert_eq!(&frame[ETH_HEADER_LEN + 28..], &payload[..]);
+    }
+
+    #[test]
+    fn fragmented_dns_to_gateway_classifies_as_dns() {
+        let gateway_ip = Ipv4Addr::new(192, 168, 64, 1);
+        let mut device = FrameClassifier::new(gateway_ip, DEFAULT_ETHERNET_MTU);
+        let mut guest_mac = None;
+
+        // Oversized DNS query to the gateway: the kind must be decided on
+        // the reassembled datagram, not on any single fragment.
+        let payload = vec![0u8; 2000];
+        let frags = crate::ethernet::build_udp_ip_ethernet(
+            Ipv4Addr::new(192, 168, 64, 2),
+            gateway_ip,
+            40000,
+            53,
+            &payload,
+            [0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+            1500,
+        );
+        for f in &frags {
+            device.classify_frame(f, &mut guest_mac);
+        }
+
+        assert_eq!(device.intercepted.len(), 1);
+        assert_eq!(device.intercepted[0].kind, InterceptedKind::Dns);
     }
 
     #[test]
