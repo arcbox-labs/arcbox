@@ -4,6 +4,13 @@
 //! over NFSv4, reachable from the macOS host through a single vsock relay (see
 //! `run_nfs_relay`). The host mounts it at `~/ArcBox`.
 //!
+//! The containerd data mount (`/var/lib/containerd`) is re-exported as a
+//! child of the docker export. With dockerd's containerd image store every
+//! container/image snapshot lives there rather than under `/var/lib/docker`,
+//! so without it the docker export carries no layer data at all. The child
+//! export sits inside the NFSv4 root, so the host client crosses into it at
+//! `~/ArcBox/containerd` without a second mount.
+//!
 //! NFSv4 (not v3) is deliberate. NFSv4 serves everything on the well-known
 //! port 2049 and does not register with the portmapper, so the guest needs no
 //! `rpcbind` — which it does not ship and which the in-kernel NFSv3 server
@@ -33,12 +40,15 @@ mod platform {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    use arcbox_constants::paths::DOCKER_DATA_MOUNT_POINT;
+    use arcbox_constants::paths::{CONTAINERD_DATA_MOUNT_POINT, DOCKER_DATA_MOUNT_POINT};
     use nix::mount::{MsFlags, mount};
 
     use super::{MOUNTD_PORT, NFSD_PORT};
 
     const EXPORT_DOCKER: &str = "/run/arcbox/nfs-export/docker";
+    /// Child export of the containerd data mount, inside the NFSv4 root so the
+    /// host client can traverse into it without a second mount.
+    const EXPORT_CONTAINERD: &str = "/run/arcbox/nfs-export/docker/containerd";
     const NFSD_MOUNTPOINT: &str = "/proc/fs/nfsd";
     const NFS_STATE_DIR: &str = "/var/lib/nfs";
     const EXPORTS_PATH: &str = "/etc/exports";
@@ -62,6 +72,9 @@ local      tpi_cots_ord  -     loopback  -       -       -
     /// pinned mountd port needs to be carried here.
     pub struct ExportConfig<'a> {
         pub export_docker: &'a str,
+        /// Child export of the containerd data mount; `None` when the guest
+        /// has no `/var/lib/containerd` mount (pre-btrfs boot assets).
+        pub export_containerd: Option<&'a str>,
         pub exports_path: &'a str,
         pub mountd_port: u16,
         pub threads: &'a str,
@@ -71,6 +84,7 @@ local      tpi_cots_ord  -     loopback  -       -       -
         fn default() -> Self {
             Self {
                 export_docker: EXPORT_DOCKER,
+                export_containerd: Some(EXPORT_CONTAINERD),
                 exports_path: EXPORTS_PATH,
                 mountd_port: MOUNTD_PORT,
                 threads: NFSD_THREADS,
@@ -83,8 +97,19 @@ local      tpi_cots_ord  -     loopback  -       -       -
     /// Idempotent: every step checks for an existing mount/process first, so
     /// re-running after a partial setup converges rather than erroring.
     pub fn ensure_docker_export() -> Result<Vec<String>, String> {
-        let cfg = ExportConfig::default();
+        let mut cfg = ExportConfig::default();
         let mut notes = Vec::new();
+
+        if !Path::new(CONTAINERD_DATA_MOUNT_POINT).is_dir() {
+            tracing::info!(
+                path = CONTAINERD_DATA_MOUNT_POINT,
+                "nfs export: containerd data mount absent, skipping child export"
+            );
+            notes.push(format!(
+                "no {CONTAINERD_DATA_MOUNT_POINT}, child export skipped"
+            ));
+            cfg.export_containerd = None;
+        }
 
         // Writable dirs on the tmpfs layers over the read-only EROFS root.
         fs::create_dir_all(cfg.export_docker)
@@ -105,6 +130,10 @@ local      tpi_cots_ord  -     loopback  -       -       -
                 "bound {DOCKER_DATA_MOUNT_POINT} -> {} (ro)",
                 cfg.export_docker
             ));
+        }
+
+        if let Some(export_containerd) = cfg.export_containerd {
+            ensure_containerd_child_export(export_containerd, &mut notes)?;
         }
 
         write_exports(&cfg).map_err(|e| format!("write {} failed({e})", cfg.exports_path))?;
@@ -190,6 +219,32 @@ local      tpi_cots_ord  -     loopback  -       -       -
             None::<&str>,
         )
         .map_err(|e| format!("remount readonly {target} failed({e})"))
+    }
+
+    /// Re-exports the containerd data mount under the docker export root.
+    ///
+    /// The docker export bind is read-only, so the child mountpoint directory
+    /// is created through the writable docker data mount (bind mounts share
+    /// the superblock, so it appears inside the export immediately); dockerd
+    /// normally has already created it. The containerd mount is then bound
+    /// read-only on top.
+    fn ensure_containerd_child_export(target: &str, notes: &mut Vec<String>) -> Result<(), String> {
+        let mountpoint_rw = format!("{DOCKER_DATA_MOUNT_POINT}/containerd");
+        fs::create_dir_all(&mountpoint_rw)
+            .map_err(|e| format!("mkdir {mountpoint_rw} failed({e})"))?;
+
+        if !is_mounted(target) {
+            tracing::info!(
+                source = CONTAINERD_DATA_MOUNT_POINT,
+                target,
+                "nfs export: binding containerd data mount read-only"
+            );
+            bind_readonly(CONTAINERD_DATA_MOUNT_POINT, target)?;
+            notes.push(format!(
+                "bound {CONTAINERD_DATA_MOUNT_POINT} -> {target} (ro)"
+            ));
+        }
+        Ok(())
     }
 
     fn write_exports(cfg: &ExportConfig<'_>) -> io::Result<()> {
@@ -388,19 +443,24 @@ local      tpi_cots_ord  -     loopback  -       -       -
         })
     }
 
-    /// Renders the single `/etc/exports` entry.
+    /// Renders the `/etc/exports` entries.
     ///
     /// - `127.0.0.1/32`: only the guest-local vsock relay ever connects.
     /// - `ro`: read-only export.
     /// - `insecure`: the relay's source port is unprivileged (>1024).
     /// - `all_squash,anonuid=0,anongid=0`: nfsd reads as root, so every layer
     ///   and volume is served regardless of on-disk ownership.
-    /// - `fsid=0`: a fixed id keeps file handles stable across daemon restarts.
+    /// - `fsid=0`: a fixed id keeps file handles stable across daemon
+    ///   restarts, and marks the NFSv4 pseudo-root. The containerd child
+    ///   export gets its own fixed `fsid=1` — it is a separate btrfs
+    ///   subvolume, and nfsd cannot derive a stable id for those on its own.
     fn render_exports(cfg: &ExportConfig<'_>) -> String {
-        format!(
-            "{} 127.0.0.1/32(ro,fsid=0,no_subtree_check,insecure,all_squash,anonuid=0,anongid=0)\n",
-            cfg.export_docker
-        )
+        const OPTS: &str = "no_subtree_check,insecure,all_squash,anonuid=0,anongid=0";
+        let docker = format!("{} 127.0.0.1/32(ro,fsid=0,{OPTS})\n", cfg.export_docker);
+        match cfg.export_containerd {
+            Some(child) => format!("{docker}{child} 127.0.0.1/32(ro,fsid=1,{OPTS})\n"),
+            None => docker,
+        }
     }
 
     fn daemon_log_file(name: &str) -> Stdio {
@@ -450,9 +510,38 @@ local      tpi_cots_ord  -     loopback  -       -       -
         }
 
         #[test]
+        fn containerd_child_export_is_inside_the_v4_root_with_its_own_fsid() {
+            let rendered = render_exports(&ExportConfig::default());
+            let child = rendered
+                .lines()
+                .nth(1)
+                .expect("default config renders the containerd child export");
+            // NFSv4 clients can only reach exports under the fsid=0 root.
+            assert!(child.starts_with("/run/arcbox/nfs-export/docker/containerd 127.0.0.1/32("));
+            assert!(child.contains("ro,"));
+            assert!(child.contains("fsid=1"));
+            assert!(!child.contains("fsid=0"));
+        }
+
+        #[test]
+        fn missing_containerd_mount_renders_only_the_docker_export() {
+            let cfg = ExportConfig {
+                export_containerd: None,
+                ..ExportConfig::default()
+            };
+            let rendered = render_exports(&cfg);
+            assert_eq!(rendered.lines().count(), 1);
+            assert!(!rendered.contains("containerd"));
+        }
+
+        #[test]
         fn default_export_targets_the_docker_bind() {
             let cfg = ExportConfig::default();
             assert_eq!(cfg.export_docker, "/run/arcbox/nfs-export/docker");
+            assert_eq!(
+                cfg.export_containerd,
+                Some("/run/arcbox/nfs-export/docker/containerd")
+            );
             assert_eq!(cfg.mountd_port, 20048);
         }
     }
