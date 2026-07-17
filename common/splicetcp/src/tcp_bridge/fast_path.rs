@@ -198,11 +198,14 @@ impl TcpBridge {
 
         for (key, conn) in &mut self.fast_path_conns {
             if conn.inline_owned {
-                // The inline inject thread owns the socket and has already
-                // emitted the guest-bound FIN/RST when it marks the flow
-                // dead. Reap the entry here — a RST-terminated guest sends
-                // no further frames for the flow, so no other path removes
-                // it (ABX-431).
+                // The inline inject thread owns the socket. It marks the
+                // flow dead only after RST-terminating the guest on an
+                // upstream ERROR — reap the entry here, since the guest
+                // sends no further frames for it (ABX-431). After a clean
+                // EOF the flag stays unset and the entry survives so the
+                // guest's ACK/FIN and half-close writes still reach
+                // try_fast_path_intercept (parity with the non-inline
+                // path's host_eof handling).
                 if conn
                     .dead
                     .as_ref()

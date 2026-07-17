@@ -30,4 +30,4 @@ tokio-frame-sink = []
 workspace = true
 
 [dev-dependencies]
-socket2 = "0.6.5"
+socket2 = "0.6"
