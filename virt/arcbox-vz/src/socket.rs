@@ -24,7 +24,6 @@
 
 use crate::error::{VZError, VZResult};
 use crate::shim_ffi;
-use objc2::runtime::AnyObject;
 use std::ffi::{c_char, c_void};
 use std::os::unix::io::RawFd;
 use std::sync::mpsc as std_mpsc;
@@ -121,15 +120,8 @@ unsafe impl Send for VirtioSocketDevice {}
 unsafe impl Sync for VirtioSocketDevice {}
 
 impl VirtioSocketDevice {
-    /// Creates a device wrapper from raw pointers.
-    ///
-    /// The caller must ensure that `ptr` is a valid `VZVirtioSocketDevice`
-    /// and `queue` is the VM's dispatch queue.
-    pub(crate) fn from_raw(ptr: *mut AnyObject, queue: *mut AnyObject) -> Self {
-        // SAFETY: per the caller contract both pointers are valid; the shim
-        // box retains them, released by Drop.
-        let device_box =
-            unsafe { shim_ffi::abx_socket_device_box_from_raw(ptr.cast(), queue.cast()) };
+    /// Wraps a +1 `ABXSocketDeviceBox` handle produced by the shim.
+    pub(crate) fn from_box(device_box: *mut c_void) -> Self {
         Self { device_box }
     }
 

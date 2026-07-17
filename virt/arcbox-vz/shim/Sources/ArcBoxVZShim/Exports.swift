@@ -312,13 +312,6 @@ public func abxPlatformMacNew(
 
 // MARK: - Vsock
 
-@_cdecl("abx_socket_device_box_from_raw")
-public func abxSocketDeviceBoxFromRaw(
-    _ device: UnsafeMutableRawPointer, _ queue: UnsafeMutableRawPointer
-) -> UnsafeMutableRawPointer {
-    socketDeviceBoxFromRaw(device, queue)
-}
-
 @_cdecl("abx_vsock_connect")
 public func abxVsockConnect(
     _ box: UnsafeMutableRawPointer,
@@ -331,11 +324,23 @@ public func abxVsockConnect(
 
 // MARK: - VM lifecycle
 
-@_cdecl("abx_vm_box_from_raw")
-public func abxVmBoxFromRaw(
-    _ vm: UnsafeMutableRawPointer, _ queue: UnsafeMutableRawPointer
+@_cdecl("abx_config_set_devices")
+public func abxConfigSetDevices(
+    _ config: UnsafeMutableRawPointer,
+    _ kind: UInt32,
+    _ items: UnsafePointer<UnsafeMutableRawPointer?>?,
+    _ count: UInt
+) {
+    configSetDevices(config, kind, items, count)
+}
+
+@_cdecl("abx_vm_new")
+public func abxVmNew(
+    _ config: UnsafeMutableRawPointer,
+    _ rawVmOut: UnsafeMutablePointer<UnsafeMutableRawPointer?>?,
+    _ rawQueueOut: UnsafeMutablePointer<UnsafeMutableRawPointer?>?
 ) -> UnsafeMutableRawPointer {
-    vmBoxFromRaw(vm, queue)
+    vmNew(config, rawVmOut, rawQueueOut)
 }
 
 @_cdecl("abx_vm_state")
@@ -373,4 +378,65 @@ public func abxVmStart(
     _ callback: @escaping ABXStateCallback
 ) {
     vmStart(box, ctx, callback)
+}
+
+@_cdecl("abx_vm_stop")
+public func abxVmStop(
+    _ box: UnsafeMutableRawPointer,
+    _ ctx: UnsafeMutableRawPointer?,
+    _ callback: @escaping ABXStateCallback
+) {
+    vmStop(box, ctx, callback)
+}
+
+@_cdecl("abx_vm_pause")
+public func abxVmPause(
+    _ box: UnsafeMutableRawPointer,
+    _ ctx: UnsafeMutableRawPointer?,
+    _ callback: @escaping ABXStateCallback
+) {
+    vmPause(box, ctx, callback)
+}
+
+@_cdecl("abx_vm_resume")
+public func abxVmResume(
+    _ box: UnsafeMutableRawPointer,
+    _ ctx: UnsafeMutableRawPointer?,
+    _ callback: @escaping ABXStateCallback
+) {
+    vmResume(box, ctx, callback)
+}
+
+@_cdecl("abx_vm_socket_device_count")
+public func abxVmSocketDeviceCount(_ box: UnsafeMutableRawPointer) -> UInt64 {
+    vmSocketDeviceCount(box)
+}
+
+@_cdecl("abx_vm_socket_device_at")
+public func abxVmSocketDeviceAt(
+    _ box: UnsafeMutableRawPointer, _ index: UInt64
+) -> UnsafeMutableRawPointer? {
+    vmSocketDeviceAt(box, index)
+}
+
+@_cdecl("abx_vm_balloon_count")
+public func abxVmBalloonCount(_ box: UnsafeMutableRawPointer) -> UInt64 {
+    vmBalloonCount(box)
+}
+
+@_cdecl("abx_vm_balloon_at")
+public func abxVmBalloonAt(
+    _ box: UnsafeMutableRawPointer, _ index: UInt64
+) -> UnsafeMutableRawPointer? {
+    vmBalloonAt(box, index)
+}
+
+@_cdecl("abx_balloon_target")
+public func abxBalloonTarget(_ box: UnsafeMutableRawPointer) -> UInt64 {
+    balloonTarget(box)
+}
+
+@_cdecl("abx_balloon_set_target")
+public func abxBalloonSetTarget(_ box: UnsafeMutableRawPointer, _ bytes: UInt64) {
+    balloonSetTarget(box, bytes)
 }

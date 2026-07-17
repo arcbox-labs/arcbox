@@ -6,9 +6,7 @@ use crate::device::{
     StorageDeviceConfiguration, VirtioFileSystemDeviceConfiguration,
 };
 use crate::error::{VZError, VZResult};
-use crate::ffi::{DispatchQueue, get_class, nsarray, release};
 use crate::vm::VirtualMachine;
-use crate::{msg_send, msg_send_void};
 use objc2::runtime::AnyObject;
 use std::ptr;
 
@@ -205,79 +203,53 @@ impl VirtualMachineConfiguration {
     /// This finalizes all device configurations and creates the
     /// `VirtualMachine` instance.
     pub fn build(mut self) -> VZResult<VirtualMachine> {
-        // Apply device arrays
         self.apply_devices();
-
-        // Validate
         self.validate()?;
 
-        // Create dispatch queue
-        let queue = DispatchQueue::new("com.arcbox.vz.vm");
-
-        // Create VM with queue
-        // SAFETY: ObjC alloc/init pattern on VZVirtualMachine with a validated configuration and a valid dispatch queue.
-        let vm_ptr = unsafe {
-            let cls = get_class("VZVirtualMachine").ok_or_else(|| VZError::Internal {
-                code: -1,
-                message: "VZVirtualMachine class not found".into(),
-            })?;
-            let alloc = msg_send!(cls, alloc);
-            let obj = msg_send!(alloc, initWithConfiguration: self.inner, queue: queue.as_ptr());
-
-            if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to create VZVirtualMachine".into(),
-                });
-            }
-            obj
-        };
-
-        Ok(VirtualMachine::from_raw(vm_ptr, queue))
+        // SAFETY: self.inner is a validated configuration handle. The shim
+        // creates the VM on a fresh serial queue and returns a +1 box; the
+        // raw out-pointers are transitional borrows kept alive by that box.
+        unsafe {
+            let mut raw_vm: *mut std::ffi::c_void = ptr::null_mut();
+            let mut raw_queue: *mut std::ffi::c_void = ptr::null_mut();
+            let vm_box =
+                crate::shim_ffi::abx_vm_new(self.inner.cast(), &mut raw_vm, &mut raw_queue);
+            Ok(VirtualMachine::from_box(
+                vm_box,
+                raw_vm as *mut AnyObject,
+                raw_queue as *mut AnyObject,
+            ))
+        }
     }
 
     /// Applies all device configurations to the VZ configuration.
+    ///
+    /// The shim borrows each handle (the configuration retains); ownership of
+    /// the +1s stays in the vectors, released by Drop.
     fn apply_devices(&mut self) {
-        // SAFETY: self.inner is a valid VZVirtualMachineConfiguration. Each device pointer was obtained from a valid VZ configuration object's into_ptr().
-        unsafe {
-            if !self.storage_devices.is_empty() {
-                let array = nsarray(&self.storage_devices);
-                msg_send_void!(self.inner, setStorageDevices: array);
-            }
-
-            if !self.network_devices.is_empty() {
-                let array = nsarray(&self.network_devices);
-                msg_send_void!(self.inner, setNetworkDevices: array);
-            }
-
-            if !self.serial_ports.is_empty() {
-                let array = nsarray(&self.serial_ports);
-                msg_send_void!(self.inner, setSerialPorts: array);
-            }
-
-            if !self.socket_devices.is_empty() {
-                let array = nsarray(&self.socket_devices);
-                msg_send_void!(self.inner, setSocketDevices: array);
-            }
-
-            if !self.entropy_devices.is_empty() {
-                let array = nsarray(&self.entropy_devices);
-                msg_send_void!(self.inner, setEntropyDevices: array);
-            }
-
-            if !self.directory_sharing_devices.is_empty() {
-                let array = nsarray(&self.directory_sharing_devices);
-                msg_send_void!(self.inner, setDirectorySharingDevices: array);
-            }
-
-            if !self.memory_balloon_devices.is_empty() {
-                let array = nsarray(&self.memory_balloon_devices);
-                msg_send_void!(self.inner, setMemoryBalloonDevices: array);
-            }
-
-            if !self.graphics_devices.is_empty() {
-                let array = nsarray(&self.graphics_devices);
-                msg_send_void!(self.inner, setGraphicsDevices: array);
+        // Kind values mirror the shim's ABXDeviceKind.
+        let arrays: [(u32, &Vec<*mut AnyObject>); 8] = [
+            (0, &self.storage_devices),
+            (1, &self.network_devices),
+            (2, &self.serial_ports),
+            (3, &self.socket_devices),
+            (4, &self.entropy_devices),
+            (5, &self.directory_sharing_devices),
+            (6, &self.memory_balloon_devices),
+            (7, &self.graphics_devices),
+        ];
+        for (kind, handles) in arrays {
+            if !handles.is_empty() {
+                // SAFETY: every element is a valid +1 device handle produced
+                // by the shim; the slice is valid for the duration of the call.
+                unsafe {
+                    crate::shim_ffi::abx_config_set_devices(
+                        self.inner.cast(),
+                        kind,
+                        handles.as_ptr().cast(),
+                        handles.len(),
+                    );
+                }
             }
         }
     }
@@ -285,8 +257,29 @@ impl VirtualMachineConfiguration {
 
 impl Drop for VirtualMachineConfiguration {
     fn drop(&mut self) {
+        // Release the stored device handles: the configuration (if built)
+        // holds its own retains, and unbuilt configurations would otherwise
+        // leak every added device.
+        for handles in [
+            &self.storage_devices,
+            &self.network_devices,
+            &self.serial_ports,
+            &self.socket_devices,
+            &self.entropy_devices,
+            &self.directory_sharing_devices,
+            &self.memory_balloon_devices,
+            &self.graphics_devices,
+        ] {
+            for &handle in handles {
+                if !handle.is_null() {
+                    // SAFETY: each entry is an unconsumed +1 shim handle.
+                    unsafe { crate::shim_ffi::abx_object_release(handle.cast()) };
+                }
+            }
+        }
         if !self.inner.is_null() {
-            release(self.inner);
+            // SAFETY: releasing the +1 configuration handle from the shim.
+            unsafe { crate::shim_ffi::abx_object_release(self.inner.cast()) };
         }
     }
 }

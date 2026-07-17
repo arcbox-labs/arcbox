@@ -1,17 +1,11 @@
 //! Virtual machine runtime.
 
-use crate::device::{MemoryBalloonDevice, vm_memory_balloon_devices};
+use crate::device::MemoryBalloonDevice;
 use crate::error::{VZError, VZResult};
-use crate::ffi::{
-    _Block_copy, _NSConcreteStackBlock, BlockPtr, DispatchQueue, SIMPLE_BLOCK_DESCRIPTOR,
-    nsstring_to_string,
-};
-use crate::msg_send;
+use crate::ffi::DispatchQueue;
 use crate::socket::VirtioSocketDevice;
 use objc2::runtime::AnyObject;
 use std::ffi::c_void;
-use std::sync::OnceLock;
-use std::time::Duration;
 use tokio::sync::oneshot;
 
 // ============================================================================
@@ -99,17 +93,21 @@ unsafe extern "C" fn state_trampoline(ctx: *mut c_void, err: *mut std::ffi::c_ch
 }
 
 impl VirtualMachine {
-    /// Creates a `VirtualMachine` from raw pointers.
+    /// Creates a `VirtualMachine` from a shim box plus transitional raw views.
     ///
     /// This is called internally by `VirtualMachineConfiguration::build()`.
-    pub(crate) fn from_raw(ptr: *mut AnyObject, queue: DispatchQueue) -> Self {
-        // SAFETY: both pointers are valid per the caller contract; the box
-        // retains them and is released in Drop.
-        let vm_box =
-            unsafe { crate::shim_ffi::abx_vm_box_from_raw(ptr.cast(), queue.as_ptr().cast()) };
+    /// `raw_vm`/`raw_queue` are borrows kept alive by `vm_box`; they exist
+    /// only for the installer path and die with its migration.
+    pub(crate) fn from_box(
+        vm_box: *mut c_void,
+        raw_vm: *mut AnyObject,
+        raw_queue: *mut AnyObject,
+    ) -> Self {
         Self {
-            inner: ptr,
-            queue,
+            inner: raw_vm,
+            // SAFETY: raw_queue is a valid dispatch queue kept alive by
+            // vm_box; the wrapper is non-owning.
+            queue: unsafe { DispatchQueue::from_raw(raw_queue) },
             vm_box,
         }
     }
@@ -195,85 +193,20 @@ impl VirtualMachine {
             });
         }
 
-        // For simplicity, use polling instead of completion handler
-        let inner = self.inner;
-        // SAFETY: Calling stopWithCompletionHandler: on a valid VZVirtualMachine on its dispatch
-        // queue. ObjC exceptions are caught.
-        let stop_dispatch: VZResult<()> = self.queue.sync(|| unsafe {
-            // Create a simple completion block
-            static STOP_BLOCK: OnceLock<BlockPtr> = OnceLock::new();
-
-            let block_ptr = STOP_BLOCK.get_or_init(|| {
-                #[repr(C)]
-                struct CompletionBlock {
-                    isa: *const c_void,
-                    flags: i32,
-                    reserved: i32,
-                    invoke: unsafe extern "C" fn(*const c_void, *mut AnyObject),
-                    descriptor: *const crate::ffi::BlockDescriptor,
-                }
-
-                unsafe extern "C" fn stop_handler(_block: *const c_void, error: *mut AnyObject) {
-                    // SAFETY: error is checked non-null. Sending localizedDescription to a valid NSError.
-                    unsafe {
-                        if !error.is_null() {
-                            let desc = msg_send!(error, localizedDescription);
-                            tracing::error!("VM stop failed: {}", nsstring_to_string(desc));
-                        }
-                    }
-                }
-
-                let stack_block = CompletionBlock {
-                    isa: _NSConcreteStackBlock,
-                    flags: 0,
-                    reserved: 0,
-                    invoke: stop_handler,
-                    descriptor: &SIMPLE_BLOCK_DESCRIPTOR,
-                };
-
-                let heap_block =
-                    _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
-                BlockPtr(heap_block)
-            });
-
-            let sel = objc2::sel!(stopWithCompletionHandler:);
-            let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel, *const c_void) =
-                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            let result = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
-                func(inner as *const AnyObject, sel, block_ptr.0);
-            }));
-
-            match result {
-                Ok(()) => Ok(()),
-                Err(exception) => {
-                    let desc = match exception {
-                        Some(exc) => {
-                            let raw = &*exc as *const _ as *const AnyObject as *mut AnyObject;
-                            crate::ffi::nsstring_to_string(msg_send!(raw, description))
-                        }
-                        None => "unknown ObjC exception (nil)".to_string(),
-                    };
-                    Err(VZError::Internal {
-                        code: -2,
-                        message: format!("VM stop threw ObjC exception: {desc}"),
-                    })
-                }
-            }
-        });
-        stop_dispatch?;
-
-        // Poll for stopped state
-        let timeout = Duration::from_secs(10);
-        let start = std::time::Instant::now();
-
-        while self.state() != VirtualMachineState::Stopped {
-            if start.elapsed() > timeout {
-                return Err(VZError::Timeout("Stop operation timed out".into()));
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        let (tx, rx) = oneshot::channel::<Result<(), String>>();
+        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+        // SAFETY: vm_box is valid; ctx ownership transfers to the
+        // exactly-once trampoline. The completion fires when the VM has
+        // stopped (or on error) per the VZ contract — no state polling.
+        unsafe {
+            crate::shim_ffi::abx_vm_stop(self.vm_box, ctx, state_trampoline);
         }
 
-        Ok(())
+        let result = rx.await.map_err(|_| VZError::Internal {
+            code: -1,
+            message: "Stop operation cancelled".into(),
+        })?;
+        result.map_err(|msg| VZError::OperationFailed(format!("VM stop failed: {msg}")))
     }
 
     /// Pauses the virtual machine.
@@ -288,62 +221,20 @@ impl VirtualMachine {
             });
         }
 
-        let inner = self.inner;
-        // SAFETY: Calling pauseWithCompletionHandler: on a valid VZVirtualMachine on its dispatch queue.
-        self.queue.sync(|| unsafe {
-            static PAUSE_BLOCK: OnceLock<BlockPtr> = OnceLock::new();
-
-            let block_ptr = PAUSE_BLOCK.get_or_init(|| {
-                #[repr(C)]
-                struct CompletionBlock {
-                    isa: *const c_void,
-                    flags: i32,
-                    reserved: i32,
-                    invoke: unsafe extern "C" fn(*const c_void, *mut AnyObject),
-                    descriptor: *const crate::ffi::BlockDescriptor,
-                }
-
-                unsafe extern "C" fn pause_handler(_block: *const c_void, error: *mut AnyObject) {
-                    // SAFETY: error is checked non-null. Sending localizedDescription to a valid NSError.
-                    unsafe {
-                        if !error.is_null() {
-                            let desc = msg_send!(error, localizedDescription);
-                            tracing::error!("VM pause failed: {}", nsstring_to_string(desc));
-                        }
-                    }
-                }
-
-                let stack_block = CompletionBlock {
-                    isa: _NSConcreteStackBlock,
-                    flags: 0,
-                    reserved: 0,
-                    invoke: pause_handler,
-                    descriptor: &SIMPLE_BLOCK_DESCRIPTOR,
-                };
-
-                let heap_block =
-                    _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
-                BlockPtr(heap_block)
-            });
-
-            let sel = objc2::sel!(pauseWithCompletionHandler:);
-            let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel, *const c_void) =
-                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            func(inner as *const AnyObject, sel, block_ptr.0);
-        });
-
-        // Poll for paused state.
-        let timeout = Duration::from_secs(10);
-        let start = std::time::Instant::now();
-
-        while self.state() != VirtualMachineState::Paused {
-            if start.elapsed() > timeout {
-                return Err(VZError::Timeout("Pause operation timed out".into()));
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        let (tx, rx) = oneshot::channel::<Result<(), String>>();
+        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+        // SAFETY: vm_box is valid; ctx ownership transfers to the
+        // exactly-once trampoline. The completion fires once the VM is
+        // paused (or on error) — no state polling.
+        unsafe {
+            crate::shim_ffi::abx_vm_pause(self.vm_box, ctx, state_trampoline);
         }
 
-        Ok(())
+        let result = rx.await.map_err(|_| VZError::Internal {
+            code: -1,
+            message: "Pause operation cancelled".into(),
+        })?;
+        result.map_err(|msg| VZError::OperationFailed(format!("VM pause failed: {msg}")))
     }
 
     /// Resumes a paused virtual machine.
@@ -358,62 +249,20 @@ impl VirtualMachine {
             });
         }
 
-        let inner = self.inner;
-        // SAFETY: Calling resumeWithCompletionHandler: on a valid VZVirtualMachine on its dispatch queue.
-        self.queue.sync(|| unsafe {
-            static RESUME_BLOCK: OnceLock<BlockPtr> = OnceLock::new();
-
-            let block_ptr = RESUME_BLOCK.get_or_init(|| {
-                #[repr(C)]
-                struct CompletionBlock {
-                    isa: *const c_void,
-                    flags: i32,
-                    reserved: i32,
-                    invoke: unsafe extern "C" fn(*const c_void, *mut AnyObject),
-                    descriptor: *const crate::ffi::BlockDescriptor,
-                }
-
-                unsafe extern "C" fn resume_handler(_block: *const c_void, error: *mut AnyObject) {
-                    // SAFETY: error is checked non-null. Sending localizedDescription to a valid NSError.
-                    unsafe {
-                        if !error.is_null() {
-                            let desc = msg_send!(error, localizedDescription);
-                            tracing::error!("VM resume failed: {}", nsstring_to_string(desc));
-                        }
-                    }
-                }
-
-                let stack_block = CompletionBlock {
-                    isa: _NSConcreteStackBlock,
-                    flags: 0,
-                    reserved: 0,
-                    invoke: resume_handler,
-                    descriptor: &SIMPLE_BLOCK_DESCRIPTOR,
-                };
-
-                let heap_block =
-                    _Block_copy(&stack_block as *const CompletionBlock as *const c_void);
-                BlockPtr(heap_block)
-            });
-
-            let sel = objc2::sel!(resumeWithCompletionHandler:);
-            let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel, *const c_void) =
-                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            func(inner as *const AnyObject, sel, block_ptr.0);
-        });
-
-        // Poll for running state.
-        let timeout = Duration::from_secs(10);
-        let start = std::time::Instant::now();
-
-        while self.state() != VirtualMachineState::Running {
-            if start.elapsed() > timeout {
-                return Err(VZError::Timeout("Resume operation timed out".into()));
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        let (tx, rx) = oneshot::channel::<Result<(), String>>();
+        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+        // SAFETY: vm_box is valid; ctx ownership transfers to the
+        // exactly-once trampoline. The completion fires once the VM is
+        // running again (or on error) — no state polling.
+        unsafe {
+            crate::shim_ffi::abx_vm_resume(self.vm_box, ctx, state_trampoline);
         }
 
-        Ok(())
+        let result = rx.await.map_err(|_| VZError::Internal {
+            code: -1,
+            message: "Resume operation cancelled".into(),
+        })?;
+        result.map_err(|msg| VZError::OperationFailed(format!("VM resume failed: {msg}")))
     }
 
     /// Requests a graceful stop, asking the guest to shut down cleanly.
@@ -445,27 +294,17 @@ impl VirtualMachine {
     ///
     /// These can be used for vsock communication with the guest.
     pub fn socket_devices(&self) -> Vec<VirtioSocketDevice> {
-        // SAFETY: Sending socketDevices to a valid VZVirtualMachine on its
-        // queue (device-array properties are queue-affine). NSArray elements
-        // are valid VZVirtioSocketDevice pointers retained by the framework.
-        self.queue.sync(|| unsafe {
-            let devices: *mut AnyObject = msg_send!(self.inner, socketDevices);
-            if devices.is_null() {
-                return Vec::new();
-            }
-
-            let count = crate::ffi::nsarray_count(devices);
-            let mut result = Vec::with_capacity(count);
-
-            for i in 0..count {
-                let device = crate::ffi::nsarray_object_at_index(devices, i);
-                if !device.is_null() {
-                    result.push(VirtioSocketDevice::from_raw(device, self.queue.as_ptr()));
-                }
-            }
-
-            result
-        })
+        // SAFETY: vm_box is valid; the shim queue-syncs the reads and hands
+        // out +1 ABXSocketDeviceBox handles.
+        unsafe {
+            let count = crate::shim_ffi::abx_vm_socket_device_count(self.vm_box);
+            (0..count)
+                .filter_map(|i| {
+                    let device_box = crate::shim_ffi::abx_vm_socket_device_at(self.vm_box, i);
+                    (!device_box.is_null()).then(|| VirtioSocketDevice::from_box(device_box))
+                })
+                .collect()
+        }
     }
 
     /// Returns the memory balloon devices configured on this VM.
@@ -473,8 +312,17 @@ impl VirtualMachine {
     /// These can be used for dynamic memory management between host and guest.
     #[must_use]
     pub fn memory_balloon_devices(&self) -> Vec<MemoryBalloonDevice> {
-        self.queue
-            .sync(|| vm_memory_balloon_devices(self.inner, self.queue.as_ptr()))
+        // SAFETY: vm_box is valid; the shim queue-syncs the reads and hands
+        // out +1 ABXBalloonBox handles.
+        unsafe {
+            let count = crate::shim_ffi::abx_vm_balloon_count(self.vm_box);
+            (0..count)
+                .filter_map(|i| {
+                    let balloon_box = crate::shim_ffi::abx_vm_balloon_at(self.vm_box, i);
+                    (!balloon_box.is_null()).then(|| MemoryBalloonDevice::from_box(balloon_box))
+                })
+                .collect()
+        }
     }
 
     /// Returns the first memory balloon device, if any.
@@ -488,12 +336,11 @@ impl VirtualMachine {
 
 impl Drop for VirtualMachine {
     fn drop(&mut self) {
+        // `inner`/`queue` are borrows kept alive by the box — only the box's
+        // +1 is ours to release.
         if !self.vm_box.is_null() {
             // SAFETY: releasing the +1 box handle returned by the shim.
             unsafe { crate::shim_ffi::abx_object_release(self.vm_box) };
-        }
-        if !self.inner.is_null() {
-            crate::ffi::release(self.inner);
         }
     }
 }

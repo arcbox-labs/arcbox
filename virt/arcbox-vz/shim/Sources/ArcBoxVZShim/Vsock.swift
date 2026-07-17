@@ -26,18 +26,6 @@ final class ABXSocketDeviceBox {
     }
 }
 
-/// Migration-only: wraps raw (device, queue) ObjC pointers produced by the
-/// pre-shim `socket_devices()` path. Dies once the lifecycle PR hands out
-/// boxes directly.
-func socketDeviceBoxFromRaw(
-    _ device: UnsafeMutableRawPointer, _ queue: UnsafeMutableRawPointer
-) -> UnsafeMutableRawPointer {
-    abxRetainedHandle(
-        ABXSocketDeviceBox(
-            device: abxBorrow(device, as: VZVirtioSocketDevice.self),
-            queue: abxBorrow(queue, as: DispatchQueue.self)))
-}
-
 func vsockConnect(
     _ box: UnsafeMutableRawPointer,
     _ port: UInt32,
