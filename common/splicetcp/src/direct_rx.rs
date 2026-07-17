@@ -91,11 +91,14 @@ pub struct PromotedConn {
     pub gw_mac: [u8; 6],
     /// Guest MAC for Ethernet destination.
     pub guest_mac: [u8; 6],
-    /// Set by the sink owner when the host stream dies (EOF or error) and no
-    /// further guest-bound frames will be produced. The bridge polls this to
-    /// reap its inline-owned `FastPathConn` entry — without it the entry
-    /// leaks, because `poll_fast_path` skips inline-owned flows and a
-    /// RST-terminated guest never sends another frame for the flow (ABX-431).
+    /// Set by the sink owner when the host stream died mid-stream (error,
+    /// not clean EOF) and the guest has been RST-terminated. The bridge
+    /// polls this to reap its inline-owned `FastPathConn` entry — a
+    /// RST-terminated guest never sends another frame for the flow, so
+    /// nothing else removes it (ABX-431). After a clean EOF the flag stays
+    /// unset: the entry must survive so the guest's ACK/FIN and half-close
+    /// writes still reach `try_fast_path_intercept` (parity with the
+    /// non-inline path).
     pub dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -240,9 +243,6 @@ async fn read_promoted_conn(
     frames: mpsc::Sender<Vec<u8>>,
 ) {
     let mut buf = vec![0u8; 32 * 1024];
-    // Every exit from this loop marks the conn dead so the bridge reaps its
-    // inline-owned entry (ABX-431).
-    let _dead_guard = SetOnDrop(Arc::clone(&conn.dead));
     loop {
         match stream.read(&mut buf).await {
             Ok(0) => {
@@ -319,21 +319,16 @@ async fn read_promoted_conn(
                     src_mac: conn.gw_mac,
                     dst_mac: conn.guest_mac,
                 });
+                // RST-terminated: the guest sends no further frames for
+                // this flow, so tell the bridge to reap its inline-owned
+                // entry. A clean EOF deliberately leaves `dead` unset — the
+                // entry must survive for the guest's ACK/FIN and half-close
+                // writes (parity with the non-inline path).
+                conn.dead.store(true, Ordering::Relaxed);
                 let _ = frames.send(rst).await;
                 return;
             }
         }
-    }
-}
-
-/// Sets the flag when the owning task exits, however it exits.
-#[cfg(feature = "tokio-frame-sink")]
-struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
-
-#[cfg(feature = "tokio-frame-sink")]
-impl Drop for SetOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -500,6 +495,51 @@ mod tests {
             "expected ≥4 clamped frames, got {}",
             frames.len()
         );
+    }
+
+    /// A clean upstream EOF sends FIN but must NOT mark the conn dead — the
+    /// bridge entry stays alive for the guest's close handshake and
+    /// half-close writes (parity with the non-inline path).
+    #[tokio::test]
+    async fn clean_eof_sends_fin_without_setting_dead() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(tokio::net::TcpStream::connect(addr), async {
+            listener.accept().await.unwrap().0
+        },);
+        let client = client.unwrap();
+
+        let (sink, mut rx) = TokioFrameConnSink::channel(4);
+        let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let conn = PromotedConn {
+            stream: accepted.into_std().unwrap(),
+            remote_ip: std::net::Ipv4Addr::new(203, 0, 113, 10),
+            guest_ip: std::net::Ipv4Addr::new(192, 168, 64, 2),
+            remote_port: 443,
+            guest_port: 50000,
+            peer_mss: 1460,
+            our_seq: Arc::new(AtomicU32::new(1000)),
+            last_ack: Arc::new(AtomicU32::new(2000)),
+            down_bytes: None,
+            gw_mac: [0x02, 0, 0, 0, 0, 1],
+            guest_mac: [0x02, 0, 0, 0, 0, 2],
+            dead: Arc::clone(&dead),
+        };
+        assert!(sink.send_conn(conn));
+
+        drop(client); // clean FIN
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("frame within deadline")
+            .expect("a guest-bound frame");
+        let flags = frame[ETH_HEADER_LEN + 20 + 13];
+        assert_ne!(flags & 0x01, 0, "must be a FIN (flags {flags:#04x})");
+        assert_eq!(flags & 0x04, 0, "must not be a RST (flags {flags:#04x})");
+
+        // Give the read task time to exit, then confirm it left `dead` unset.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!dead.load(Ordering::Relaxed), "clean EOF must not set dead");
     }
 
     /// Upstream mid-stream death must reach the guest as a RST and mark the

@@ -215,15 +215,12 @@ impl RxInjectThread {
             return;
         }
 
-        // Prune closed connections from previous iteration, telling the
-        // bridge to reap its inline-owned entry — nothing else removes it
-        // once the guest has been FIN/RST-terminated (ABX-431).
-        inline_conns.retain(|c| {
-            if c.host_eof {
-                c.dead.store(true, Ordering::Relaxed);
-            }
-            !c.host_eof
-        });
+        // Prune closed connections from previous iteration. `dead` is NOT
+        // set here: after a clean EOF the bridge entry must survive so the
+        // guest's ACK/FIN and half-close writes still hit
+        // try_fast_path_intercept (parity with the non-inline path); only
+        // the error path marks `dead` (ABX-431).
+        inline_conns.retain(|c| !c.host_eof);
 
         // Fair-share pass: each conn gets at most PER_CONN_READS `readv`
         // calls per outer iteration. Each call can span up to MAX_MERGE
@@ -454,6 +451,11 @@ impl RxInjectThread {
                             conn.guest_port
                         );
                         conn.host_eof = true;
+                        // RST-terminated: the guest sends no further frames
+                        // for this flow, so tell the bridge to reap its
+                        // inline-owned entry (clean EOF leaves it alive for
+                        // the guest's close handshake instead).
+                        conn.dead.store(true, Ordering::Relaxed);
                         queue.set_last_avail_idx(gather_start.wrapping_add(1));
 
                         // SAFETY: first descriptor buffer is exclusive to us.
@@ -755,6 +757,15 @@ mod tests {
         // TCP flags byte in the injected frame: FIN | ACK.
         let first = ram.buffer(0, inline_conn::TOTAL_HDR_LEN);
         assert_eq!(first[12 + 14 + 20 + 13], 0x11);
+
+        // Clean EOF must NOT mark the flow dead: the bridge entry stays
+        // alive so the guest's ACK/FIN and half-close writes still reach
+        // try_fast_path_intercept (only the error path sets `dead`).
+        let dead = Arc::clone(&conns[0].dead);
+        let (mut batch2, mut fire2) = (0u16, false);
+        thread.poll_inline_conns(&mut queue, &mut conns, &mut batch2, &mut fire2);
+        assert!(conns.is_empty(), "EOF conn is pruned from the inject set");
+        assert!(!dead.load(Ordering::Relaxed), "clean EOF must not set dead");
     }
 
     /// Upstream mid-stream death must reach the guest as a RST (a FIN would
@@ -820,11 +831,12 @@ mod tests {
         // RST consumes no sequence number.
         assert_eq!(conns[0].our_seq.load(Ordering::Relaxed), 1000);
 
-        // The next poll's prune pass marks the conn dead for the bridge.
-        assert!(!dead.load(Ordering::Relaxed));
+        // The error branch marks the conn dead immediately (unlike clean
+        // EOF, which keeps the bridge entry alive for the guest's close
+        // handshake); the next poll's prune pass drops it.
+        assert!(dead.load(Ordering::Relaxed), "bridge reap flag must be set");
         let (mut batch2, mut fire2) = (0u16, false);
         thread.poll_inline_conns(&mut queue, &mut conns, &mut batch2, &mut fire2);
         assert!(conns.is_empty(), "errored conn must be pruned");
-        assert!(dead.load(Ordering::Relaxed), "bridge reap flag must be set");
     }
 }

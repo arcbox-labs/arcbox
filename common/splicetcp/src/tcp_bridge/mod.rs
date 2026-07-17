@@ -247,9 +247,11 @@ pub(super) struct FastPathConn {
     down_bytes: u64,
     /// Host→guest bytes counted by the inline inject thread, when `inline_owned`.
     down_shared: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
-    /// Set by the inline sink owner when the host stream died (EOF or error)
-    /// and no further guest-bound frames will be produced; `poll_fast_path`
-    /// reaps the entry. `Some` only when `inline_owned` (ABX-431).
+    /// Set by the inline sink owner when the host stream died mid-stream
+    /// (error, not clean EOF) and the guest was RST-terminated;
+    /// `poll_fast_path` reaps the entry. After a clean EOF the flag stays
+    /// unset so the entry survives for the guest's close handshake. `Some`
+    /// only when `inline_owned` (ABX-431).
     dead: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
