@@ -101,8 +101,12 @@ fn main() {
     // ITS SDK. The Swift runtime search path must therefore come from the
     // same SDK the linker uses: honor SDKROOT when set, else the toolchain
     // default. Mixing 6.3-compiled Swift objects with another SDK's runtime
-    // stubs is sound — the Swift ABI is stable and the dylibs resolve from
-    // the dyld shared cache at runtime (no rpath needed).
+    // stubs is sound — the Swift ABI is stable and the absolute-install-name
+    // dylibs (libswiftCore etc.) resolve from the dyld shared cache at
+    // runtime. NOTE: libswift_Concurrency's install name is `@rpath/...`, so
+    // it additionally needs an rpath to /usr/lib/swift on the FINAL binary —
+    // provided workspace-wide in `.cargo/config.toml` (a build-script link
+    // arg here would not propagate to downstream binaries).
     let swift_stub_dir = env::var("SDKROOT")
         .ok()
         .map(|s| format!("{s}/usr/lib/swift"))

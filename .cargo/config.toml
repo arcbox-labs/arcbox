@@ -7,6 +7,20 @@ linker = "aarch64-linux-musl-gcc"
 [target.x86_64-unknown-linux-musl]
 linker = "x86_64-linux-musl-gcc"
 
+# The arcbox-vz Swift shim autolinks libswift_Concurrency, whose install name
+# is `@rpath/libswift_Concurrency.dylib` (unlike libswiftCore's absolute
+# /usr/lib/swift path). Without an rpath, dyld cannot find it — the library
+# lives in the shared cache at /usr/lib/swift on macOS 13+ — and every
+# shim-linked binary (daemon, cli, and their test harnesses) aborts at load
+# with SIGABRT. rpath must sit on the FINAL binary, so it can't come from
+# arcbox-vz's build.rs (build-script link args don't propagate downstream);
+# it belongs here, workspace-wide. Harmless for binaries that don't link Swift.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]
+
 # C build scripts (cc crate) must use the same musl toolchain as the linker
 # above; the host clang cannot compile for *-linux-musl (no musl headers).
 [env]
