@@ -5,16 +5,13 @@
 //! KVM or Hypervisor.framework, there is no direct `run vCPU` API.
 //!
 //! The `DarwinVcpu` implementation adapts to this model:
-//! - `run()` waits for VM state changes (from Running to another state)
+//! - `run()` is a compatibility stub that returns `Halt` immediately; VM
+//!   lifecycle observation happens through `arcbox_vz::VirtualMachine`
 //! - Register access is not supported (Virtualization.framework doesn't expose this)
 //! - The actual vCPU execution is handled by `VZVirtualMachine.start()`
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-
-use arcbox_vz::VirtualMachineState;
-use objc2::runtime::AnyObject;
 
 use crate::{
     error::HypervisorError,
@@ -42,58 +39,15 @@ pub struct DarwinVcpu {
     /// Current register state (cached, not synced with actual vCPU).
     /// Note: Virtualization.framework doesn't expose register access.
     regs: Registers,
-    /// Raw pointer to the `VZVirtualMachine` for state queries.
-    /// This is safe to read from any thread (state property is thread-safe).
-    vz_vm: *mut AnyObject,
 }
-
-// Safety: The vz_vm pointer is only used for reading the state property,
-// which is documented as thread-safe by Apple.
-unsafe impl Send for DarwinVcpu {}
 
 impl DarwinVcpu {
     /// Creates a new vCPU.
-    ///
-    /// For managed execution VMs (Virtualization.framework), use `new_managed()`
-    /// to pass the VM pointer for state queries.
-    #[allow(dead_code)]
     pub(crate) fn new(id: u32) -> Self {
         Self {
             id,
             running: Arc::new(AtomicBool::new(false)),
             regs: Registers::default(),
-            vz_vm: std::ptr::null_mut(),
-        }
-    }
-
-    /// Creates a new vCPU with a reference to the VZ VM for state queries.
-    ///
-    /// This is the preferred constructor for Virtualization.framework VMs,
-    /// as it enables `run()` to properly wait for VM state changes.
-    pub(crate) fn new_managed(id: u32, vz_vm: *mut AnyObject) -> Self {
-        Self {
-            id,
-            running: Arc::new(AtomicBool::new(false)),
-            regs: Registers::default(),
-            vz_vm,
-        }
-    }
-
-    /// Queries the current VM state from Virtualization.framework.
-    ///
-    /// Returns `None` if no VZ VM pointer is available.
-    fn query_vm_state(&self) -> Option<VirtualMachineState> {
-        if self.vz_vm.is_null() {
-            return None;
-        }
-
-        unsafe {
-            // VZVirtualMachine.state is thread-safe to read
-            let sel = objc2::sel!(state);
-            let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel) -> i64 =
-                std::mem::transmute(objc2::ffi::objc_msgSend as *const std::ffi::c_void);
-            let state = func(self.vz_vm as *const AnyObject, sel);
-            Some(VirtualMachineState::from(state))
         }
     }
 
@@ -166,75 +120,18 @@ impl DarwinVcpu {
 
 impl Vcpu for DarwinVcpu {
     fn run(&mut self) -> Result<VcpuExit, HypervisorError> {
+        // Virtualization.framework manages vCPU execution internally; VM
+        // lifecycle is observed through `arcbox_vz::VirtualMachine::state()`.
+        // Every construction site historically passed a null VM pointer here,
+        // so this has always returned Halt immediately — now it does so
+        // without the vestigial state-poll machinery.
         self.running.store(true, Ordering::SeqCst);
-
-        // On Virtualization.framework, vCPU execution is managed internally.
-        // The run() method waits for VM state changes instead of executing guest code.
-        //
-        // This implementation polls the VM state until:
-        // - The VM exits Running state (pause, stop, error)
-        // - The VZ VM pointer is not available (legacy mode, return immediately)
-
-        let poll_interval = Duration::from_millis(100);
-
-        // If no VZ VM pointer, return immediately (legacy behavior or placeholder vCPU)
-        if self.vz_vm.is_null() {
-            tracing::warn!(
-                "vCPU {} run() called without VZ VM pointer, returning Halt",
-                self.id
-            );
-            self.running.store(false, Ordering::SeqCst);
-            return Ok(VcpuExit::Halt);
-        }
-
-        tracing::debug!("vCPU {} entering managed execution wait loop", self.id);
-
-        loop {
-            let state = if let Some(s) = self.query_vm_state() {
-                s
-            } else {
-                // VM pointer became invalid
-                self.running.store(false, Ordering::SeqCst);
-                return Ok(VcpuExit::Halt);
-            };
-
-            match state {
-                VirtualMachineState::Running => {
-                    // VM is still running, continue waiting
-                    std::thread::sleep(poll_interval);
-                }
-                VirtualMachineState::Stopped => {
-                    tracing::debug!("vCPU {} detected VM stopped", self.id);
-                    self.running.store(false, Ordering::SeqCst);
-                    return Ok(VcpuExit::Shutdown);
-                }
-                VirtualMachineState::Paused => {
-                    tracing::debug!("vCPU {} detected VM paused", self.id);
-                    self.running.store(false, Ordering::SeqCst);
-                    return Ok(VcpuExit::Halt);
-                }
-                VirtualMachineState::Error => {
-                    tracing::error!("vCPU {} detected VM error state", self.id);
-                    self.running.store(false, Ordering::SeqCst);
-                    return Err(HypervisorError::VcpuRunError(
-                        "VM entered error state".to_string(),
-                    ));
-                }
-                VirtualMachineState::Starting
-                | VirtualMachineState::Pausing
-                | VirtualMachineState::Resuming
-                | VirtualMachineState::Stopping => {
-                    // Transitional states, wait for final state
-                    tracing::trace!("vCPU {} VM in transitional state: {:?}", self.id, state);
-                    std::thread::sleep(poll_interval);
-                }
-                VirtualMachineState::Saving | VirtualMachineState::Restoring => {
-                    // Snapshot operations (macOS 14+), wait for completion
-                    tracing::trace!("vCPU {} VM performing snapshot operation", self.id);
-                    std::thread::sleep(poll_interval);
-                }
-            }
-        }
+        tracing::debug!(
+            "vCPU {} run() is a managed-execution stub, returning Halt",
+            self.id
+        );
+        self.running.store(false, Ordering::SeqCst);
+        Ok(VcpuExit::Halt)
     }
 
     fn get_regs(&self) -> Result<Registers, HypervisorError> {
@@ -460,16 +357,6 @@ mod tests {
         let vcpu = DarwinVcpu::new(0);
         assert_eq!(vcpu.id(), 0);
         assert!(!vcpu.is_running());
-        assert!(vcpu.vz_vm.is_null());
-    }
-
-    #[test]
-    fn test_vcpu_creation_managed() {
-        // Create with null pointer (for testing)
-        let vcpu = DarwinVcpu::new_managed(1, std::ptr::null_mut());
-        assert_eq!(vcpu.id(), 1);
-        assert!(!vcpu.is_running());
-        assert!(vcpu.vz_vm.is_null());
     }
 
     #[test]
@@ -575,18 +462,9 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_vcpu_run_without_vm() {
-        // When run() is called without a VZ VM pointer, it should return Halt immediately
+    fn test_vcpu_run_returns_halt() {
+        // run() is a managed-execution stub: Halt immediately, not running after.
         let mut vcpu = DarwinVcpu::new(0);
-        let exit = vcpu.run().unwrap();
-        assert!(matches!(exit, VcpuExit::Halt));
-        assert!(!vcpu.is_running());
-    }
-
-    #[test]
-    fn test_vcpu_run_with_null_managed() {
-        // new_managed with null pointer should also return Halt immediately
-        let mut vcpu = DarwinVcpu::new_managed(0, std::ptr::null_mut());
         let exit = vcpu.run().unwrap();
         assert!(matches!(exit, VcpuExit::Halt));
         assert!(!vcpu.is_running());
@@ -621,23 +499,6 @@ mod tests {
         // After run (which returns immediately with null VM), should be false again
         let _ = vcpu.run();
         assert!(!running_flag.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    // ========================================================================
-    // VM State Query Tests
-    // ========================================================================
-
-    #[test]
-    fn test_vcpu_query_vm_state_without_vm() {
-        let vcpu = DarwinVcpu::new(0);
-        // Without VZ VM pointer, should return None
-        assert!(vcpu.query_vm_state().is_none());
-    }
-
-    #[test]
-    fn test_vcpu_query_vm_state_null_managed() {
-        let vcpu = DarwinVcpu::new_managed(0, std::ptr::null_mut());
-        assert!(vcpu.query_vm_state().is_none());
     }
 
     // ========================================================================
@@ -792,6 +653,7 @@ mod tests {
 
     #[test]
     fn test_vz_state_from_i64() {
+        use arcbox_vz::VirtualMachineState;
         // Test VirtualMachineState::from(i64) mapping
         assert_eq!(VirtualMachineState::from(0), VirtualMachineState::Stopped);
         assert_eq!(VirtualMachineState::from(1), VirtualMachineState::Running);
