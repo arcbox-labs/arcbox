@@ -2,8 +2,11 @@
 //!
 //! CONTRACT: every extern declaration below stays in the same NORMATIVE SYMBOL
 //! ORDER as the `@_cdecl` exports in `shim/Sources/ArcBoxVZShim/Exports.swift`
-//! — review the two files side by side. Any signature or semantics change
-//! bumps [`ABX_SHIM_ABI_VERSION`] here and `abxShimABIVersion` in the shim.
+//! — review the two files side by side. The shim is statically linked from
+//! this same source tree in the same build, so version skew is impossible;
+//! `link_coverage` (below) catches symbol-presence drift at link time. There
+//! is no runtime ABI-version handshake because there is no separate artifact
+//! to handshake with.
 //!
 //! Conventions (mirrored in the shim's Errors.swift header):
 //! - C strings returned by the shim are malloc'd there and freed here via
@@ -31,38 +34,10 @@ pub type StateCb = unsafe extern "C" fn(ctx: *mut c_void, err: *mut c_char);
 /// (owned by the receiver) or a strdup'd error message.
 pub type ObjectCb = unsafe extern "C" fn(ctx: *mut c_void, handle: *mut c_void, err: *mut c_char);
 
-/// Mirrors `abxShimABIVersion` in the shim; bump both on any signature change.
-/// v2: `abx_vm_new` dropped its transitional raw vm/queue out-params.
-#[allow(
-    dead_code,
-    reason = "drift detector: compared against abx_shim_version() by the boundary tests"
-)]
-pub const ABX_SHIM_ABI_VERSION: u32 = 2;
-
 unsafe extern "C" {
     // Errors / strings / handles
-    //
-    // The four utility symbols below gain production callers as the shim
-    // migration lands (PR3+); today only the boundary tests exercise them.
-    #[allow(
-        dead_code,
-        reason = "consumed by later shim migration PRs; covered by boundary tests"
-    )]
-    pub fn abx_shim_version() -> u32;
-    #[allow(
-        dead_code,
-        reason = "consumed by later shim migration PRs; covered by boundary tests"
-    )]
     pub fn abx_string_free(ptr: *mut c_char);
-    #[allow(
-        dead_code,
-        reason = "consumed by later shim migration PRs; covered by boundary tests"
-    )]
     pub fn abx_bytes_free(ptr: *mut c_void);
-    #[allow(
-        dead_code,
-        reason = "consumed by later shim migration PRs; covered by boundary tests"
-    )]
     pub fn abx_object_release(handle: *mut c_void);
 
     // Support (host capability queries)
@@ -235,7 +210,6 @@ mod tests {
     /// the symbol to resolve at link time, so a renamed or dropped `@_cdecl`
     /// export breaks `cargo test -p arcbox-vz` instead of surfacing at e2e.
     const SYMBOLS: &[*const ()] = &[
-        abx_shim_version as *const (),
         abx_string_free as *const (),
         abx_bytes_free as *const (),
         abx_object_release as *const (),
@@ -311,7 +285,7 @@ mod tests {
 
     /// Update when symbols are added; a mismatch means Exports.swift and this
     /// file have drifted.
-    const EXPECTED_SYMBOL_COUNT: usize = 72;
+    const EXPECTED_SYMBOL_COUNT: usize = 71;
 
     #[test]
     fn link_coverage() {
@@ -319,13 +293,6 @@ mod tests {
         for (i, sym) in SYMBOLS.iter().enumerate() {
             assert!(!sym.is_null(), "symbol #{i} resolved to null");
         }
-    }
-
-    #[test]
-    fn shim_version_matches() {
-        // SAFETY: no preconditions; returns a constant.
-        let version = unsafe { abx_shim_version() };
-        assert_eq!(version, ABX_SHIM_ABI_VERSION);
     }
 
     #[test]

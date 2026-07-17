@@ -11,12 +11,13 @@ backend (`virt/AGENTS.md`): keep it boring and correct.
 - `shim/Sources/ArcBoxVZShim/Exports.swift` (`@_cdecl`) and `src/shim_ffi.rs`
   (extern declarations) mirror each other in a **normative symbol order** —
   review side by side. A symbol lands in the same PR as its Rust caller.
-- **Any signature or semantics change bumps BOTH** `abxShimABIVersion`
-  (Errors.swift) and `ABX_SHIM_ABI_VERSION` (shim_ffi.rs); the
-  `shim_version_matches` boundary test turns drift into a deterministic
-  failure. Adding symbols only updates `EXPECTED_SYMBOL_COUNT` + the
-  `link_coverage` address table (presence drift then fails at link time in
-  `cargo test -p arcbox-vz`).
+- The shim is statically linked from this same source tree in the same build,
+  so version skew is impossible and there is **no runtime ABI-version
+  handshake**. The drift defense is `link_coverage` (a `SYMBOLS` address
+  table + `EXPECTED_SYMBOL_COUNT`): a renamed or dropped `@_cdecl` export
+  fails `cargo test -p arcbox-vz` at **link time**. Adding a symbol updates
+  that table and the count; the C ABI does no signature checking across the
+  boundary, so keep the two files' declarations literally aligned.
 - Conventions (headers of Errors.swift / shim_ffi.rs are authoritative):
   strings crossing out of Swift are strdup'd and freed by Rust
   (`abx_string_free` / `take_string` / `take_error_string`); handles are
