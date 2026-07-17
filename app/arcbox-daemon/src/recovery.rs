@@ -4,6 +4,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use arcbox_constants::paths::HostLayout;
 use arcbox_core::Runtime;
 use tracing::info;
 
@@ -78,9 +79,23 @@ pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
             "non-default DNS port; skipping /etc/resolver self-setup"
         );
     }
-    let socket_task = self_setup::DockerSocket {
+    // The `/var/run/docker.sock` symlink likewise belongs to the daemon
+    // running its profile's canonical data dir: the link target embeds the
+    // data dir, so a daemon on an overridden one (an e2e harness daemon on
+    // a temp dir, an ad-hoc dev run) would re-point the host-global Docker
+    // socket at a path that dies with it. `ARCBOX_DATA_DIR` counts as
+    // canonical — it relocates the machine-wide installation, not one
+    // daemon instance.
+    let default_data_dir = HostLayout::resolve_for_profile_from_env(ctx.profile, None).data_dir;
+    let socket_task = (ctx.layout.data_dir == default_data_dir).then(|| self_setup::DockerSocket {
         target: ctx.layout.docker_socket.clone(),
-    };
+    });
+    if socket_task.is_none() {
+        tracing::debug!(
+            data_dir = %ctx.layout.data_dir.display(),
+            "non-default data dir; skipping /var/run/docker.sock self-setup"
+        );
+    }
 
     // Create /usr/local/bin/ symlinks for Docker CLI tools if running from
     // bundle with docker integration enabled.
@@ -101,18 +116,28 @@ pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
 
     let setup_state_self = Arc::clone(&ctx.setup_state);
     tokio::spawn(async move {
-        let mut tasks: Vec<&dyn self_setup::SetupTask> = vec![&socket_task];
+        let mut tasks: Vec<&dyn self_setup::SetupTask> = Vec::new();
         if let Some(dns) = &dns_task {
-            tasks.insert(0, dns);
+            tasks.push(dns);
+        }
+        if let Some(socket) = &socket_task {
+            tasks.push(socket);
         }
         for t in &cli_tasks {
             tasks.push(t.as_ref());
+        }
+        if tasks.is_empty() {
+            // Nothing to configure — don't launchd-activate the helper
+            // just to hang up (the common case for harness daemons).
+            return;
         }
         self_setup::run(&tasks).await;
         if let Some(dns) = &dns_task {
             setup_state_self.set_dns_installed(dns.is_satisfied());
         }
-        setup_state_self.set_docker_socket_linked(socket_task.is_satisfied());
+        if let Some(socket) = &socket_task {
+            setup_state_self.set_docker_socket_linked(socket.is_satisfied());
+        }
     });
 
     // Docker CLI tools installation (non-blocking, best-effort).
