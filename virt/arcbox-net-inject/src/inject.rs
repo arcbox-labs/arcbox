@@ -215,8 +215,15 @@ impl RxInjectThread {
             return;
         }
 
-        // Prune closed connections from previous iteration.
-        inline_conns.retain(|c| !c.host_eof);
+        // Prune closed connections from previous iteration, telling the
+        // bridge to reap its inline-owned entry — nothing else removes it
+        // once the guest has been FIN/RST-terminated (ABX-431).
+        inline_conns.retain(|c| {
+            if c.host_eof {
+                c.dead.store(true, Ordering::Relaxed);
+            }
+            !c.host_eof
+        });
 
         // Fair-share pass: each conn gets at most PER_CONN_READS `readv`
         // calls per outer iteration. Each call can span up to MAX_MERGE
@@ -433,9 +440,30 @@ impl RxInjectThread {
                         break;
                     }
                     Err(e) => {
-                        tracing::debug!("inline conn error: {e}");
-                        queue.set_last_avail_idx(gather_start);
+                        // Upstream died mid-stream — propagate as RST. Data
+                        // may be lost, so a FIN would let the guest mistake
+                        // the truncated stream for a complete one, and no
+                        // frame at all leaves the guest ESTABLISHED forever
+                        // (ABX-431). Mirrors the EOF branch above: consume
+                        // only the first buffer, return the rest.
+                        tracing::debug!(
+                            "inline {}:{}->{}:{} error, RST to guest: {e}",
+                            conn.remote_ip,
+                            conn.remote_port,
+                            conn.guest_ip,
+                            conn.guest_port
+                        );
                         conn.host_eof = true;
+                        queue.set_last_avail_idx(gather_start.wrapping_add(1));
+
+                        // SAFETY: first descriptor buffer is exclusive to us.
+                        let first_buf =
+                            unsafe { std::slice::from_raw_parts_mut(desc_ptrs[0], desc_lens[0]) };
+                        inline_conn::write_rst_headers(first_buf, conn);
+
+                        *fire |=
+                            queue.push_used(head_indices[0], inline_conn::TOTAL_HDR_LEN as u32);
+                        *batch += 1;
                         break;
                     }
                 }
@@ -576,6 +604,7 @@ mod tests {
             gw_mac: [0x02, 0, 0, 0, 0, 1],
             guest_mac: [0x02, 0, 0, 0, 0, 2],
             host_eof: false,
+            dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -726,5 +755,76 @@ mod tests {
         // TCP flags byte in the injected frame: FIN | ACK.
         let first = ram.buffer(0, inline_conn::TOTAL_HDR_LEN);
         assert_eq!(first[12 + 14 + 20 + 13], 0x11);
+    }
+
+    /// Upstream mid-stream death must reach the guest as a RST (a FIN would
+    /// present the truncated stream as complete; silence leaves the guest
+    /// ESTABLISHED forever) and must mark the shared `dead` flag so the
+    /// bridge reaps its inline-owned entry (ABX-431).
+    #[test]
+    fn read_error_emits_rst_and_marks_dead() {
+        let mut ram = TestRam::new();
+        ram.post_rx_buffer(0, 4096);
+        ram.post_rx_buffer(1, 4096);
+        ram.set_avail_idx(2);
+
+        let thread = inject_thread(&mut ram, false);
+        let mut queue = SplitQueue::new(
+            Arc::clone(&thread.guest_mem),
+            0,
+            &thread.queue,
+            thread.event_idx_enabled,
+        );
+
+        let (writer, reader) = tcp_pair();
+        // Abortive close: SO_LINGER(0) turns the peer's close into a RST,
+        // so the next read on `reader` fails with ECONNRESET, not EOF.
+        socket2::SockRef::from(&writer)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(writer);
+        // Wait until the reset is visible to a read probe.
+        let mut probe = [0u8; 1];
+        for _ in 0..500 {
+            match reader.peek(&mut probe) {
+                Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => break,
+                Ok(0) => break,
+                _ => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+
+        let mut conns = vec![inline_conn(reader)];
+        let dead = Arc::clone(&conns[0].dead);
+        let (mut batch, mut fire) = (0u16, false);
+        thread.poll_inline_conns(&mut queue, &mut conns, &mut batch, &mut fire);
+
+        assert!(conns[0].host_eof);
+        assert_eq!(batch, 1);
+        assert_eq!(ram.used_idx(), 1, "only the RST frame was published");
+        assert_eq!(
+            queue.last_avail_idx(),
+            1,
+            "the second gathered buffer went back to the guest"
+        );
+        assert_eq!(
+            ram.used_entry(0),
+            (0, inline_conn::TOTAL_HDR_LEN as u32),
+            "RST is a headers-only frame"
+        );
+        let first = ram.buffer(0, inline_conn::TOTAL_HDR_LEN);
+        assert_eq!(
+            first[12 + 14 + 20 + 13],
+            0x14,
+            "TCP flags must be RST | ACK"
+        );
+        // RST consumes no sequence number.
+        assert_eq!(conns[0].our_seq.load(Ordering::Relaxed), 1000);
+
+        // The next poll's prune pass marks the conn dead for the bridge.
+        assert!(!dead.load(Ordering::Relaxed));
+        let (mut batch2, mut fire2) = (0u16, false);
+        thread.poll_inline_conns(&mut queue, &mut conns, &mut batch2, &mut fire2);
+        assert!(conns.is_empty(), "errored conn must be pruned");
+        assert!(dead.load(Ordering::Relaxed), "bridge reap flag must be set");
     }
 }

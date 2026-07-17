@@ -195,9 +195,12 @@ impl TcpBridge {
         let now = StdInstant::now();
 
         for (key, conn) in &mut self.handshake_conns {
-            // Global TTL — abort stuck handshakes.
+            // Global TTL — abort stuck handshakes, telling the guest: without
+            // the RST it retries SYNs against a flow we already gave up on
+            // and its socket only dies by its own (much longer) timeout.
             if now.duration_since(conn.created) > HANDSHAKE_TOTAL_TTL {
-                tracing::warn!("Handshake shim: TTL exceeded for {key:?}, aborting");
+                tracing::warn!("Handshake shim: TTL exceeded for {key:?}, aborting with RST");
+                out.push(handshake_abort_rst(key, conn));
                 to_abort.push(*key);
                 continue;
             }
@@ -208,6 +211,7 @@ impl TcpBridge {
                     if conn.host_stream.is_none() {
                         let Some(rx) = conn.connect_rx.as_mut() else {
                             // No stream, no pending connect — aborted.
+                            out.push(handshake_abort_rst(key, conn));
                             to_abort.push(*key);
                             continue;
                         };
@@ -224,6 +228,7 @@ impl TcpBridge {
                                         tracing::debug!(
                                             "Handshake shim: into_std failed for {key:?}: {e}"
                                         );
+                                        out.push(handshake_abort_rst(key, conn));
                                         to_abort.push(*key);
                                         continue;
                                     }
@@ -235,20 +240,7 @@ impl TcpBridge {
                                 // socket sees an immediate ECONNREFUSED
                                 // instead of waiting for SYN retransmits.
                                 tracing::debug!("Handshake shim: host connect failed for {key:?}");
-                                let rst = crate::ethernet::build_tcp_rst_frame(
-                                    &crate::ethernet::TcpFrameParams {
-                                        src_ip: key.dst_ip,
-                                        dst_ip: key.src_ip,
-                                        src_port: key.dst_port,
-                                        dst_port: key.src_port,
-                                        seq: 0,
-                                        ack: conn.peer_isn.wrapping_add(1),
-                                        window: 0,
-                                        src_mac: conn.gw_mac,
-                                        dst_mac: conn.guest_mac,
-                                    },
-                                );
-                                out.push(rst);
+                                out.push(handshake_abort_rst(key, conn));
                                 to_abort.push(*key);
                                 continue;
                             }
@@ -256,6 +248,7 @@ impl TcpBridge {
                                 continue; // still connecting
                             }
                             Err(oneshot::error::TryRecvError::Closed) => {
+                                out.push(handshake_abort_rst(key, conn));
                                 to_abort.push(*key);
                                 continue;
                             }
@@ -486,4 +479,23 @@ impl TcpBridge {
             }
         }
     }
+}
+
+/// Builds the RST|ACK toward the guest for a handshake that will never
+/// complete — connect failure, TTL expiry, or a dropped egress channel.
+/// `seq` is 0 because our SYN-ACK may not have been sent yet; acknowledging
+/// the guest's ISN keeps the RST acceptable in SYN-SENT (RFC 793). Without
+/// this frame the guest's socket outlives the aborted flow (ABX-431).
+fn handshake_abort_rst(key: &SynFlowKey, conn: &HandshakeConn) -> Vec<u8> {
+    crate::ethernet::build_tcp_rst_frame(&crate::ethernet::TcpFrameParams {
+        src_ip: key.dst_ip,
+        dst_ip: key.src_ip,
+        src_port: key.dst_port,
+        dst_port: key.src_port,
+        seq: 0,
+        ack: conn.peer_isn.wrapping_add(1),
+        window: 0,
+        src_mac: conn.gw_mac,
+        dst_mac: conn.guest_mac,
+    })
 }

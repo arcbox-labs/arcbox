@@ -53,7 +53,12 @@ const HANDSHAKE_MAX_RETRANSMITS: u8 = 3;
 /// TTL for an in-progress handshake with no guest response. If the guest
 /// never ACKs our SYN-ACK (or never SYN-ACKs our SYN), we abort and evict
 /// after this much time total.
-const HANDSHAKE_TOTAL_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+///
+/// Must exceed `SYN_GATE_CONNECT_TIMEOUT_SECS` (5 s): the host connect —
+/// including a proxy CONNECT/SOCKS handshake — is allowed the full connect
+/// timeout, and a shorter TTL would abort slow-but-successful proxied
+/// connects while they were still legitimately pending (ABX-431).
+const HANDSHAKE_TOTAL_TTL: std::time::Duration = std::time::Duration::from_secs(7);
 
 /// Window scale we advertise to the guest. Shift by 7 = 128× scaling,
 /// giving an effective receive window of 65535 × 128 = 8 MiB. Sufficient
@@ -242,6 +247,10 @@ pub(super) struct FastPathConn {
     down_bytes: u64,
     /// Host→guest bytes counted by the inline inject thread, when `inline_owned`.
     down_shared: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Set by the inline sink owner when the host stream died (EOF or error)
+    /// and no further guest-bound frames will be produced; `poll_fast_path`
+    /// reaps the entry. `Some` only when `inline_owned` (ABX-431).
+    dead: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl FastPathConn {

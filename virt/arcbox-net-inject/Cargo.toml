@@ -15,3 +15,6 @@ tracing = "0.1"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+socket2 = "0.6.5"
