@@ -11,10 +11,12 @@
 mod cli_tools;
 mod dns_resolver;
 mod docker_socket;
+mod hosts_alias;
 
 pub use cli_tools::CliTools;
 pub use dns_resolver::DnsResolver;
 pub use docker_socket::DockerSocket;
+pub use hosts_alias::HostsAlias;
 
 use arcbox_helper::client::{Client, ClientError};
 

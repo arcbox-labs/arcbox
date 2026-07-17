@@ -9,11 +9,12 @@
 
 use std::fs;
 
+use arcbox_helper::{HOSTS_ALIAS_LINE as MANAGED_LINE, hosts_alias_installed};
+
 const HOSTS_PATH: &str = "/etc/hosts";
 /// Temp sibling for the atomic rewrite; same filesystem as `/etc/hosts`.
 const HOSTS_TMP_PATH: &str = "/etc/hosts.arcbox.tmp";
-/// The one managed line. The trailing comment marks it for uninstall.
-const MANAGED_LINE: &str = "127.0.0.1\tArcBox\t# managed by arcbox-helper";
+/// Uninstall matcher: any line tagged with this comment is ours.
 const MARKER: &str = "# managed by arcbox-helper";
 
 /// Appends the ArcBox alias line to `/etc/hosts`.
@@ -41,12 +42,12 @@ pub fn uninstall() -> Result<(), String> {
 
 /// Checks whether the ArcBox alias line is installed.
 pub fn status() -> Result<bool, String> {
-    Ok(read_hosts()?.lines().any(is_managed))
+    Ok(hosts_alias_installed(&read_hosts()?))
 }
 
 /// Returns the content with the alias appended, or `None` if present.
 fn with_alias(content: &str) -> Option<String> {
-    if content.lines().any(is_managed) {
+    if hosts_alias_installed(content) {
         return None;
     }
     let mut updated = content.to_string();
@@ -100,9 +101,16 @@ fn write_hosts(content: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MANAGED_LINE, with_alias, without_alias};
+    use super::{MANAGED_LINE, MARKER, with_alias, without_alias};
 
     const BASE: &str = "##\n127.0.0.1\tlocalhost\n255.255.255.255\tbroadcasthost\n";
+
+    #[test]
+    fn managed_line_carries_the_uninstall_marker() {
+        // `without_alias` matches on MARKER; the installed line must carry it
+        // or uninstall would strand the alias.
+        assert!(MANAGED_LINE.ends_with(MARKER));
+    }
 
     #[test]
     fn install_appends_one_managed_line() {
