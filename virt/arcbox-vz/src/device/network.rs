@@ -6,22 +6,29 @@ use crate::{msg_send, msg_send_void, msg_send_void_u64};
 use objc2::runtime::AnyObject;
 use std::os::unix::io::RawFd;
 
-/// MTU configured on VZ network devices when `setMaximumTransmissionUnit:` is
-/// available (macOS 13+). Exported so the VMM can pass it to the datapath.
+/// MTU a VZ network device uses when `setMaximumTransmissionUnit:` is not
+/// called — Apple's default, and since ABX-423 also ArcBox's default.
+pub const VZ_DEFAULT_MTU: usize = 1500;
+
+/// Enhanced MTU applied only under `ARCBOX_DIAG_NET_MTU_4000`.
 ///
-/// 4000 is chosen based on macOS XNU internals: the kernel has a 4096-byte
-/// internal threshold above which performance degrades for loopback/utun paths.
-/// Surge uses 4000, Shadowrocket/Quantumult X use 4064 (4096 - 32 for headers).
-/// We round to 4000 to stay safely under the threshold.
+/// 4000 was chosen from macOS XNU internals (the kernel has a 4096-byte
+/// threshold above which loopback/utun performance degrades; Surge uses 4000,
+/// Shadowrocket/Quantumult X use 4064) and reduces frame count ~2.7x vs 1500.
 ///
-/// This reduces frame count by ~2.7x vs the default 1500, directly reducing
-/// per-frame overhead through the entire datapath.
-pub const VZ_NETWORK_MTU: u64 = 4000;
+/// It is no longer the default: `VZFileHandleNetworkDeviceAttachment` enters
+/// an intermittent, self-healing whole-device stall under sustained bulk
+/// transfer once the link MTU is raised above 1500 (ABX-423). The stall was
+/// bisected to the VZ device layer, so the only host-side mitigation is to
+/// stay at 1500. Keep this constant and the diagnostic knob for reproducing
+/// the stall (Apple Feedback evidence) and for throughput A/B runs.
+pub const VZ_ENHANCED_MTU: u64 = 4000;
 
 /// Configuration for a `VirtIO` network device.
 pub struct NetworkDeviceConfiguration {
     inner: *mut AnyObject,
-    /// Actual MTU that was configured (4000 if setter succeeded, 1500 otherwise).
+    /// Actual MTU that was configured (1500 by default; 4000 only under
+    /// `ARCBOX_DIAG_NET_MTU_4000` when the setter is available).
     mtu: usize,
 }
 
@@ -102,45 +109,47 @@ impl NetworkDeviceConfiguration {
 
             msg_send_void!(obj, setAttachment: attachment);
 
-            // Set MTU to reduce frame count through the datapath (~2.7x fewer
-            // frames vs default 1500). Available since macOS 13 (Ventura).
-            // On older macOS, the selector doesn't exist — we must check
+            // The MTU stays at Apple's default 1500 (ABX-423 — see
+            // VZ_ENHANCED_MTU). ARCBOX_DIAG_NET_MTU_4000 opts back into the
+            // enhanced MTU for stall reproduction and throughput A/B runs;
+            // it needs setMaximumTransmissionUnit: (macOS 13+), so check
             // respondsToSelector: to avoid an unrecognized-selector crash.
-            // Check if the VZ config class supports the MTU setter (macOS 13+).
-            // msg_send_bool! doesn't support Sel arguments, so we dispatch manually.
-            let mtu_sel = objc2::sel!(setMaximumTransmissionUnit:);
-            let responds: bool = {
-                let check_sel = objc2::sel!(respondsToSelector:);
-                let func: unsafe extern "C" fn(
-                    *const objc2::runtime::AnyObject,
-                    objc2::runtime::Sel,
-                    objc2::runtime::Sel,
-                ) -> objc2::runtime::Bool = std::mem::transmute(
-                    crate::ffi::runtime::objc_msgSend as *const std::ffi::c_void,
-                );
-                func(
-                    attachment as *const _ as *const objc2::runtime::AnyObject,
-                    check_sel,
-                    mtu_sel,
-                )
-                .as_bool()
-            };
-            // ARCBOX_DIAG_NET_MTU_1500 skips the MTU raise — a diagnostic
-            // knob for the ABX-423 freeze bisection (4000-byte frames are an
-            // uncommon VZ configuration and a bisection dimension).
-            let diag_mtu_1500 = std::env::var_os("ARCBOX_DIAG_NET_MTU_1500").is_some();
-            let mtu = if responds && !diag_mtu_1500 {
-                msg_send_void_u64!(attachment, setMaximumTransmissionUnit: VZ_NETWORK_MTU);
-                tracing::info!("VZ network MTU set to {VZ_NETWORK_MTU}");
-                VZ_NETWORK_MTU as usize
-            } else if diag_mtu_1500 {
-                tracing::warn!("VZ network MTU left at 1500 (ARCBOX_DIAG_NET_MTU_1500)");
-                1500
+            let mtu = if std::env::var_os("ARCBOX_DIAG_NET_MTU_4000").is_some() {
+                let mtu_sel = objc2::sel!(setMaximumTransmissionUnit:);
+                // msg_send_bool! doesn't support Sel arguments, so dispatch manually.
+                let responds: bool = {
+                    let check_sel = objc2::sel!(respondsToSelector:);
+                    let func: unsafe extern "C" fn(
+                        *const objc2::runtime::AnyObject,
+                        objc2::runtime::Sel,
+                        objc2::runtime::Sel,
+                    ) -> objc2::runtime::Bool = std::mem::transmute(
+                        crate::ffi::runtime::objc_msgSend as *const std::ffi::c_void,
+                    );
+                    func(
+                        attachment as *const _ as *const objc2::runtime::AnyObject,
+                        check_sel,
+                        mtu_sel,
+                    )
+                    .as_bool()
+                };
+                if responds {
+                    msg_send_void_u64!(attachment, setMaximumTransmissionUnit: VZ_ENHANCED_MTU);
+                    tracing::warn!(
+                        "VZ network MTU raised to {VZ_ENHANCED_MTU} (ARCBOX_DIAG_NET_MTU_4000; \
+                         expect ABX-423 device stalls under sustained bulk transfer)"
+                    );
+                    VZ_ENHANCED_MTU as usize
+                } else {
+                    tracing::warn!(
+                        "ARCBOX_DIAG_NET_MTU_4000 set but the MTU setter is unavailable \
+                         (macOS < 13); MTU stays at {VZ_DEFAULT_MTU}"
+                    );
+                    VZ_DEFAULT_MTU
+                }
             } else {
-                tracing::info!(
-                    "VZ network MTU setter unavailable (macOS < 13), using default 1500"
-                );
-                1500
+                tracing::info!("VZ network MTU at default {VZ_DEFAULT_MTU} (ABX-423 mitigation)");
+                VZ_DEFAULT_MTU
             };
 
             let mac = match mac_address {
@@ -155,7 +164,8 @@ impl NetworkDeviceConfiguration {
         }
     }
 
-    /// Returns the actual MTU that was configured (4000 or 1500).
+    /// Returns the actual MTU that was configured (1500 unless raised via
+    /// `ARCBOX_DIAG_NET_MTU_4000`).
     #[must_use]
     pub fn mtu(&self) -> usize {
         self.mtu
