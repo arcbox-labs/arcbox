@@ -150,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = &socket_devices[0];
 
     // Try to connect to port 2222 (PUI PUI Linux socat)
-    match device.connect(2222).await {
+    match device.connect_blocking(2222, Duration::from_secs(10)) {
         Ok(conn) => {
             println!("       SUCCESS! Connected to port 2222");
             println!("         fd = {}", conn.as_raw_fd());
@@ -202,7 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Also try port 1024 (arcbox-agent default)
     println!();
     println!("       Also trying port 1024 (arcbox-agent)...");
-    match device.connect(1024).await {
+    match device.connect_blocking(1024, Duration::from_secs(10)) {
         Ok(conn) => {
             println!("       Connected to port 1024! fd={}", conn.as_raw_fd());
         }

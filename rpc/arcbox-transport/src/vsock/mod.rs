@@ -10,9 +10,10 @@
 //! - **macOS**: Uses Virtualization.framework (`VZVirtioSocketDevice`).
 //!   Requires integration with the hypervisor layer:
 //!   - For connections: Use [`VsockTransport::from_raw_fd()`] with an fd
-//!     obtained from `VirtioSocketDevice::connect()`.
+//!     obtained from `VirtioSocketDevice::connect_blocking()`.
 //!   - For listening: Use [`VsockListener::from_channel()`] with a channel
-//!     connected to `VirtioSocketListener::accept()`.
+//!     fed by a caller-provided accept source (arcbox-vz does not expose
+//!     guest-initiated listening).
 //!
 //! ## CID (Context ID) Values
 //!
@@ -24,44 +25,18 @@
 //! ## macOS Usage Example
 //!
 //! ```rust,ignore
-//! use arcbox_vz::{VirtualMachine, VirtioSocketDevice};
-//! use arcbox_transport::vsock::{VsockListener, VsockTransport, VsockAddr, IncomingVsockConnection};
-//! use tokio::sync::mpsc;
+//! use arcbox_vz::VirtualMachine;
+//! use arcbox_transport::vsock::{VsockTransport, VsockAddr};
+//! use std::time::Duration;
 //!
 //! // Get socket device from running VM
 //! let vm: VirtualMachine = /* ... */;
 //! let device = &vm.socket_devices()[0];
 //!
 //! // === Connecting to guest ===
-//! let conn = device.connect(1024).await?;
+//! let conn = device.connect_blocking(1024, Duration::from_secs(10))?;
 //! let fd = conn.into_raw_fd();
 //! let transport = VsockTransport::from_raw_fd(fd, VsockAddr::new(cid, 1024))?;
-//!
-//! // === Listening for guest connections ===
-//! let mut vz_listener = device.listen(1024)?;
-//! let (tx, rx) = mpsc::unbounded_channel();
-//!
-//! // Bridge VZ listener to transport layer
-//! tokio::spawn(async move {
-//!     loop {
-//!         match vz_listener.accept().await {
-//!             Ok(conn) => {
-//!                 let incoming = IncomingVsockConnection {
-//!                     fd: conn.into_raw_fd(),
-//!                     source_port: conn.source_port(),
-//!                     destination_port: conn.destination_port(),
-//!                 };
-//!                 if tx.send(incoming).is_err() {
-//!                     break;
-//!                 }
-//!             }
-//!             Err(_) => break,
-//!         }
-//!     }
-//! });
-//!
-//! let mut listener = VsockListener::from_channel(1024, rx);
-//! let transport = listener.accept().await?;
 //! ```
 
 mod addr;

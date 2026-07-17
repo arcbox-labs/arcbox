@@ -5,13 +5,11 @@ use crate::error::{VZError, VZResult};
 use crate::ffi::{
     _Block_copy, _Block_release, _NSConcreteStackBlock, BlockPtr, DispatchQueue,
     SIMPLE_BLOCK_DESCRIPTOR, create_state_completion_block, extract_nserror, nsstring_to_string,
-    nsurl_file_path, release,
 };
 use crate::socket::VirtioSocketDevice;
 use crate::{msg_send, msg_send_bool, msg_send_i64};
 use objc2::runtime::AnyObject;
 use std::ffi::c_void;
-use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -118,13 +116,6 @@ impl VirtualMachine {
         })
     }
 
-    /// Returns whether the VM can be started.
-    pub fn can_start(&self) -> bool {
-        // SAFETY: Sending canStart to a valid VZVirtualMachine on its queue.
-        self.queue
-            .sync(|| unsafe { msg_send_bool!(self.inner, canStart).as_bool() })
-    }
-
     /// Returns whether the VM can be stopped.
     pub fn can_stop(&self) -> bool {
         // SAFETY: Sending canStop to a valid VZVirtualMachine on its queue.
@@ -132,15 +123,15 @@ impl VirtualMachine {
             .sync(|| unsafe { msg_send_bool!(self.inner, canStop).as_bool() })
     }
 
-    /// Returns whether the VM can be paused.
-    pub fn can_pause(&self) -> bool {
+    /// Returns whether the VM can be paused (internal pre-check for `pause`).
+    fn can_pause(&self) -> bool {
         // SAFETY: Sending canPause to a valid VZVirtualMachine on its queue.
         self.queue
             .sync(|| unsafe { msg_send_bool!(self.inner, canPause).as_bool() })
     }
 
-    /// Returns whether the VM can be resumed.
-    pub fn can_resume(&self) -> bool {
+    /// Returns whether the VM can be resumed (internal pre-check for `resume`).
+    fn can_resume(&self) -> bool {
         // SAFETY: Sending canResume to a valid VZVirtualMachine on its queue.
         self.queue
             .sync(|| unsafe { msg_send_bool!(self.inner, canResume).as_bool() })
@@ -444,93 +435,6 @@ impl VirtualMachine {
                 }
             }
         })
-    }
-
-    /// Returns whether this host supports saving and restoring VM state (macOS 14+).
-    #[must_use]
-    pub fn supports_save_restore(&self) -> bool {
-        let sel = objc2::sel!(saveMachineStateToURL:completionHandler:);
-        // SAFETY: self.inner is a valid ObjC object; querying its class for a selector.
-        unsafe { &*(self.inner as *const AnyObject) }
-            .class()
-            .responds_to(sel)
-    }
-
-    /// Saves the state of a paused VM to a file for later restore (macOS 14+).
-    ///
-    /// The VM must be paused (see [`pause`](Self::pause)).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if save/restore is unsupported on this host or the save fails.
-    pub async fn save_state(&self, path: impl AsRef<Path>) -> VZResult<()> {
-        if !self.supports_save_restore() {
-            return Err(VZError::Internal {
-                code: -1,
-                message: "saving VM state requires macOS 14+".into(),
-            });
-        }
-        let path_str = path.as_ref().to_string_lossy().into_owned();
-        self.state_to_file(&path_str, true).await
-    }
-
-    /// Restores a stopped VM from a file written by [`save_state`](Self::save_state) (macOS 14+).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if save/restore is unsupported on this host or the restore
-    /// fails.
-    pub async fn restore_state(&self, path: impl AsRef<Path>) -> VZResult<()> {
-        if !self.supports_save_restore() {
-            return Err(VZError::Internal {
-                code: -1,
-                message: "restoring VM state requires macOS 14+".into(),
-            });
-        }
-        let path_str = path.as_ref().to_string_lossy().into_owned();
-        self.state_to_file(&path_str, false).await
-    }
-
-    /// Shared driver for save (`save = true`) and restore (`save = false`).
-    async fn state_to_file(&self, path: &str, save: bool) -> VZResult<()> {
-        let (tx, rx) = oneshot::channel::<crate::ffi::StateResult>();
-        let block = create_state_completion_block(tx);
-        let inner = self.inner;
-        let path = path.to_string();
-        self.queue.sync(|| {
-            // SAFETY: save/restoreMachineState…:completionHandler: take an NSURL and a
-            // heap-copied (NSError *) block; both selectors exist (checked by caller).
-            unsafe {
-                let url = nsurl_file_path(&path);
-                let sel = if save {
-                    objc2::sel!(saveMachineStateToURL:completionHandler:)
-                } else {
-                    objc2::sel!(restoreMachineStateFromURL:completionHandler:)
-                };
-                let func: unsafe extern "C" fn(
-                    *const AnyObject,
-                    objc2::runtime::Sel,
-                    *const AnyObject,
-                    *const c_void,
-                ) = std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-                func(
-                    inner as *const AnyObject,
-                    sel,
-                    url as *const AnyObject,
-                    block,
-                );
-                // The selector retains the NSURL synchronously; release the +1 from
-                // nsurl_file_path.
-                release(url);
-            }
-        });
-        let result = rx.await.map_err(|_| VZError::Internal {
-            code: -1,
-            message: "state operation cancelled".into(),
-        })?;
-        // SAFETY: `block` came from create_state_completion_block and is not released elsewhere.
-        unsafe { _Block_release(block) };
-        result.map_err(|message| VZError::Internal { code: -1, message })
     }
 
     /// Returns the socket devices configured on this VM.

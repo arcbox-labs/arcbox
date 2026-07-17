@@ -63,7 +63,6 @@ pub mod error;
 pub mod ffi;
 
 pub mod configuration;
-pub(crate) mod delegate;
 pub mod device;
 pub mod restore;
 pub mod socket;
@@ -80,12 +79,12 @@ pub use configuration::{
 pub use device::{
     DirectoryShare, EntropyDeviceConfiguration, LinuxRosettaDirectoryShare,
     MacGraphicsDeviceConfiguration, MemoryBalloonDevice, MemoryBalloonDeviceConfiguration,
-    MultipleDirectoryShare, NetworkDeviceConfiguration, RosettaAvailability,
-    SerialPortConfiguration, SharedDirectory, SingleDirectoryShare, SocketDeviceConfiguration,
-    StorageDeviceConfiguration, VirtioFileSystemDeviceConfiguration, desired_network_mtu,
+    NetworkDeviceConfiguration, RosettaAvailability, SerialPortConfiguration, SharedDirectory,
+    SingleDirectoryShare, SocketDeviceConfiguration, StorageDeviceConfiguration,
+    VirtioFileSystemDeviceConfiguration, desired_network_mtu,
 };
 
-pub use socket::{VirtioSocketConnection, VirtioSocketDevice, VirtioSocketListener};
+pub use socket::{VirtioSocketConnection, VirtioSocketDevice};
 
 pub use restore::{MacOSConfigurationRequirements, MacOSInstaller, MacOSRestoreImage};
 

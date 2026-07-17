@@ -31,15 +31,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS-specific dependencies (none for now, using FFI directly)
 
-[features]
-default = []
-# Enable macOS 12+ features
-macos-12 = []
-# Enable macOS 13+ features
-macos-13 = ["macos-12"]
-# Enable macOS 14+ features (save/restore)
-macos-14 = ["macos-13"]
-
 [[example]]
 name = "simple_vm"
 path = "examples/simple_vm.rs"

@@ -16,8 +16,8 @@ pub(crate) use balloon::vm_memory_balloon_devices;
 pub use balloon::{MemoryBalloonDevice, MemoryBalloonDeviceConfiguration};
 pub use entropy::EntropyDeviceConfiguration;
 pub use filesystem::{
-    DirectoryShare, LinuxRosettaDirectoryShare, MultipleDirectoryShare, RosettaAvailability,
-    SharedDirectory, SingleDirectoryShare, VirtioFileSystemDeviceConfiguration,
+    DirectoryShare, LinuxRosettaDirectoryShare, RosettaAvailability, SharedDirectory,
+    SingleDirectoryShare, VirtioFileSystemDeviceConfiguration,
 };
 pub use graphics::MacGraphicsDeviceConfiguration;
 pub use network::{NetworkDeviceConfiguration, desired_network_mtu};
