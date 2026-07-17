@@ -1,8 +1,7 @@
 //! Socket device configuration.
 
-use crate::error::{VZError, VZResult};
-use crate::ffi::get_class;
-use crate::msg_send;
+use crate::error::VZResult;
+use crate::shim_ffi;
 use objc2::runtime::AnyObject;
 
 /// Configuration for a `VirtIO` socket device.
@@ -12,36 +11,23 @@ pub struct SocketDeviceConfiguration {
     inner: *mut AnyObject,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an ObjC configuration object created by the
+// shim; it is not mutated concurrently.
 unsafe impl Send for SocketDeviceConfiguration {}
 
 impl SocketDeviceConfiguration {
     /// Creates a new socket device configuration.
     pub fn new() -> VZResult<Self> {
-        // SAFETY: ObjC new on valid VZVirtioSocketDeviceConfiguration class. Result is checked non-null.
-        unsafe {
-            let cls = get_class("VZVirtioSocketDeviceConfiguration").ok_or_else(|| {
-                VZError::Internal {
-                    code: -1,
-                    message: "VZVirtioSocketDeviceConfiguration class not found".into(),
-                }
-            })?;
-            let obj = msg_send!(cls, new);
-
-            if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to create socket device".into(),
-                });
-            }
-
-            Ok(Self { inner: obj })
-        }
+        // SAFETY: the shim returns a +1 handle, released by Drop.
+        let obj = unsafe { shim_ffi::abx_socket_device_config_new() };
+        Ok(Self {
+            inner: obj as *mut AnyObject,
+        })
     }
 
     /// Consumes the configuration and returns the raw pointer.
     #[must_use]
-    pub fn into_ptr(self) -> *mut AnyObject {
+    pub(crate) fn into_ptr(self) -> *mut AnyObject {
         let ptr = self.inner;
         std::mem::forget(self);
         ptr
@@ -57,7 +43,8 @@ impl Default for SocketDeviceConfiguration {
 impl Drop for SocketDeviceConfiguration {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            crate::ffi::release(self.inner);
+            // SAFETY: releasing the +1 handle returned by the shim.
+            unsafe { shim_ffi::abx_object_release(self.inner.cast()) };
         }
     }
 }

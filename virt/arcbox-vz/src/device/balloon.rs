@@ -4,8 +4,7 @@
 //! by "inflating" the balloon (reducing guest memory) or "deflating" it
 //! (returning memory to the guest).
 
-use crate::error::{VZError, VZResult};
-use crate::ffi::get_class;
+use crate::error::VZResult;
 use crate::{msg_send, msg_send_u64, msg_send_void_u64};
 use objc2::runtime::AnyObject;
 
@@ -28,33 +27,16 @@ unsafe impl Send for MemoryBalloonDeviceConfiguration {}
 impl MemoryBalloonDeviceConfiguration {
     /// Creates a new memory balloon device configuration.
     pub fn new() -> VZResult<Self> {
-        // SAFETY: ObjC new on valid VZVirtioTraditionalMemoryBalloonDeviceConfiguration class. retain prevents autorelease.
-        unsafe {
-            let cls = get_class("VZVirtioTraditionalMemoryBalloonDeviceConfiguration").ok_or_else(
-                || VZError::Internal {
-                    code: -1,
-                    message: "VZVirtioTraditionalMemoryBalloonDeviceConfiguration not found".into(),
-                },
-            )?;
-            let obj = msg_send!(cls, new);
-
-            if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to create balloon device configuration".into(),
-                });
-            }
-
-            // Retain to prevent autorelease
-            let _: *mut AnyObject = msg_send!(obj, retain);
-
-            Ok(Self { inner: obj })
-        }
+        // SAFETY: the shim returns a +1 handle, released by Drop.
+        let obj = unsafe { crate::shim_ffi::abx_balloon_config_new() };
+        Ok(Self {
+            inner: obj as *mut AnyObject,
+        })
     }
 
     /// Consumes the configuration and returns the raw pointer.
     #[must_use]
-    pub fn into_ptr(self) -> *mut AnyObject {
+    pub(crate) fn into_ptr(self) -> *mut AnyObject {
         let ptr = self.inner;
         std::mem::forget(self);
         ptr
@@ -70,7 +52,8 @@ impl Default for MemoryBalloonDeviceConfiguration {
 impl Drop for MemoryBalloonDeviceConfiguration {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            crate::ffi::release(self.inner);
+            // SAFETY: releasing the +1 handle returned by the shim.
+            unsafe { crate::shim_ffi::abx_object_release(self.inner.cast()) };
         }
     }
 }

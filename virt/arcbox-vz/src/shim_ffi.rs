@@ -76,6 +76,29 @@ unsafe extern "C" {
     pub fn abx_platform_generic_new() -> *mut c_void;
     pub fn abx_platform_generic_nested_supported() -> bool;
     pub fn abx_platform_generic_set_nested(platform: *mut c_void, enabled: bool);
+
+    // Device configurations
+    pub fn abx_storage_disk_image_new(
+        path: *const c_char,
+        read_only: bool,
+        error_out: *mut *mut c_char,
+    ) -> *mut c_void;
+    pub fn abx_network_nat_new(
+        mac: *const c_char,
+        mtu: u64,
+        error_out: *mut *mut c_char,
+    ) -> *mut c_void;
+    pub fn abx_network_file_handle_new(
+        fd: i32,
+        mac: *const c_char,
+        mtu: u64,
+        error_out: *mut *mut c_char,
+    ) -> *mut c_void;
+    pub fn abx_serial_console_new(read_fd: i32, write_fd: i32) -> *mut c_void;
+    pub fn abx_socket_device_config_new() -> *mut c_void;
+    pub fn abx_entropy_new() -> *mut c_void;
+    pub fn abx_balloon_config_new() -> *mut c_void;
+    pub fn abx_graphics_mac_new(width: i64, height: i64, ppi: i64) -> *mut c_void;
 }
 
 /// Takes ownership of a shim-returned error string and frees it.
@@ -129,11 +152,19 @@ mod tests {
         abx_platform_generic_new as *const (),
         abx_platform_generic_nested_supported as *const (),
         abx_platform_generic_set_nested as *const (),
+        abx_storage_disk_image_new as *const (),
+        abx_network_nat_new as *const (),
+        abx_network_file_handle_new as *const (),
+        abx_serial_console_new as *const (),
+        abx_socket_device_config_new as *const (),
+        abx_entropy_new as *const (),
+        abx_balloon_config_new as *const (),
+        abx_graphics_mac_new as *const (),
     ];
 
     /// Update when symbols are added; a mismatch means Exports.swift and this
     /// file have drifted.
-    const EXPECTED_SYMBOL_COUNT: usize = 24;
+    const EXPECTED_SYMBOL_COUNT: usize = 32;
 
     #[test]
     fn link_coverage() {

@@ -1,10 +1,8 @@
 //! macOS graphics device configuration.
 
-use crate::error::{VZError, VZResult};
-use crate::ffi::{get_class, nsarray, release};
-use crate::{msg_send, msg_send_void};
+use crate::error::VZResult;
+use crate::shim_ffi;
 use objc2::runtime::AnyObject;
-use std::ffi::c_void;
 
 /// Configuration for a macOS graphics device with a single display.
 ///
@@ -14,7 +12,8 @@ pub struct MacGraphicsDeviceConfiguration {
     inner: *mut AnyObject,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an ObjC configuration object created by the
+// shim; it is not mutated concurrently.
 unsafe impl Send for MacGraphicsDeviceConfiguration {}
 
 impl MacGraphicsDeviceConfiguration {
@@ -23,77 +22,28 @@ impl MacGraphicsDeviceConfiguration {
     ///
     /// # Errors
     ///
-    /// Returns an error if the graphics/display class is unavailable or cannot be
-    /// created.
+    /// Currently infallible (kept as `VZResult` for API stability).
     pub fn new(
         width_in_pixels: isize,
         height_in_pixels: isize,
         pixels_per_inch: isize,
     ) -> VZResult<Self> {
-        // SAFETY: alloc/init on VZMacGraphicsDisplayConfiguration (3 NSInteger args)
-        // and VZMacGraphicsDeviceConfiguration; setDisplays: takes an NSArray. The
-        // device's `displays` is a copy property, so the temporary display is
-        // released after it is set.
-        unsafe {
-            let display_cls = get_class("VZMacGraphicsDisplayConfiguration").ok_or_else(|| {
-                VZError::Internal {
-                    code: -1,
-                    message: "VZMacGraphicsDisplayConfiguration class not found".into(),
-                }
-            })?;
-            let display_alloc = msg_send!(display_cls, alloc);
-            let init_sel = objc2::sel!(initWithWidthInPixels:heightInPixels:pixelsPerInch:);
-            let init_fn: unsafe extern "C" fn(
-                *mut AnyObject,
-                objc2::runtime::Sel,
-                isize,
-                isize,
-                isize,
-            ) -> *mut AnyObject =
-                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            let display = init_fn(
-                display_alloc,
-                init_sel,
-                width_in_pixels,
-                height_in_pixels,
-                pixels_per_inch,
-            );
-            if display.is_null() {
-                return Err(VZError::InvalidConfiguration(
-                    "failed to create macOS graphics display".into(),
-                ));
-            }
-
-            let device_cls = match get_class("VZMacGraphicsDeviceConfiguration") {
-                Some(cls) => cls,
-                None => {
-                    release(display);
-                    return Err(VZError::Internal {
-                        code: -1,
-                        message: "VZMacGraphicsDeviceConfiguration class not found".into(),
-                    });
-                }
-            };
-            let device = msg_send!(msg_send!(device_cls, alloc), init);
-            if device.is_null() {
-                release(display);
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to create macOS graphics device".into(),
-                });
-            }
-
-            let displays = nsarray(&[display]);
-            msg_send_void!(device, setDisplays: displays);
-            release(display);
-
-            Ok(Self { inner: device })
-        }
+        // SAFETY: the shim returns a +1 handle, released by Drop.
+        let obj = unsafe {
+            shim_ffi::abx_graphics_mac_new(
+                width_in_pixels as i64,
+                height_in_pixels as i64,
+                pixels_per_inch as i64,
+            )
+        };
+        Ok(Self {
+            inner: obj as *mut AnyObject,
+        })
     }
 
     /// Consumes the configuration and returns the raw pointer.
     #[must_use]
-    pub fn into_ptr(self) -> *mut AnyObject {
+    pub(crate) fn into_ptr(self) -> *mut AnyObject {
         let ptr = self.inner;
         std::mem::forget(self);
         ptr
@@ -103,7 +53,8 @@ impl MacGraphicsDeviceConfiguration {
 impl Drop for MacGraphicsDeviceConfiguration {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            release(self.inner);
+            // SAFETY: releasing the +1 handle returned by the shim.
+            unsafe { shim_ffi::abx_object_release(self.inner.cast()) };
         }
     }
 }
