@@ -25,12 +25,16 @@ use arcbox_datapath::pool::PacketPool;
 use crate::ethernet::{ArpResponder, ETH_HEADER_LEN};
 
 /// Default Ethernet MTU (excludes Ethernet header).
-/// Used as fallback when VZ `setMaximumTransmissionUnit:` is unavailable.
 #[cfg(test)]
 const DEFAULT_ETHERNET_MTU: usize = 1500;
 
-/// Enhanced MTU for VZ framework with `maximumTransmissionUnit` (macOS 13+).
-/// Reduces frame count by ~2.7x vs 1500.
+/// Enhanced MTU (excludes Ethernet header), ~2.7x fewer frames than 1500.
+///
+/// No longer a negotiated link MTU by default: the VZ device stays at 1500
+/// (ABX-423 — see `arcbox-vz/src/device/network.rs`). The VMMs still pass
+/// this value as the classifier `mtu`, where it only sizes buffers — pure
+/// headroom on a 1500 link — and covers the `ARCBOX_DIAG_NET_MTU_4000`
+/// reproduction mode.
 pub const ENHANCED_ETHERNET_MTU: usize = 4000;
 
 /// Protocol numbers.
@@ -100,8 +104,8 @@ pub struct FrameClassifier {
     arp: ArpResponder,
     /// Pre-allocated packet pool for zero-alloc frame ownership.
     pool: Arc<PacketPool>,
-    /// Negotiated MTU (excludes Ethernet header). Set at construction time
-    /// based on whether the VZ `maximumTransmissionUnit` setter succeeded.
+    /// Buffer-sizing MTU (excludes Ethernet header). At least the device's
+    /// configured MTU; see [`ENHANCED_ETHERNET_MTU`].
     #[allow(dead_code)]
     mtu: usize,
 }
@@ -127,9 +131,9 @@ impl FrameClassifier {
     /// Creates a new classifier with the
     /// [default pool capacity](Self::DEFAULT_POOL_CAPACITY).
     ///
-    /// `mtu` should match the device's configured MTU. Use
-    /// `ENHANCED_ETHERNET_MTU` (4000) when VZ `setMaximumTransmissionUnit:`
-    /// succeeded, or 1500 otherwise.
+    /// `mtu` sizes internal buffers and must be at least the device's
+    /// configured MTU; `ENHANCED_ETHERNET_MTU` (4000) is safe headroom for a
+    /// default 1500 link.
     ///
     /// The gateway MAC (needed to synthesize ARP replies) is set later via
     /// [`set_gateway_mac`](Self::set_gateway_mac), once it is known.

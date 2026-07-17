@@ -15,10 +15,10 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Both ends must be sized, not just the VZ side: on macOS a `SOCK_DGRAM` unix
 /// socket rejects any datagram larger than its `SO_SNDBUF` with `EMSGSIZE`. The
-/// host datapath end is the *sender* of guest-inbound frames, so once VZ's
-/// `setMaximumTransmissionUnit:` raises the link to `VZ_NETWORK_MTU` (4000) a
-/// default-sized (~2 KiB) host end would silently drop every frame above the
-/// default 1500 MTU.
+/// host datapath end is the *sender* of guest-inbound frames; the default
+/// (~2 KiB) buffer leaves almost no headroom over a full 1514-byte frame, and
+/// none at all when `ARCBOX_DIAG_NET_MTU_4000` raises the link to the enhanced
+/// MTU (see `arcbox-vz/src/device/network.rs`).
 const NET_SOCKET_BUF_BYTES: libc::c_int = 8 * 1024 * 1024;
 
 impl Vmm {
@@ -372,15 +372,15 @@ impl Vmm {
 
         // 5. Build the datapath and spawn it on the tokio runtime.
 
-        // NOTE(MTU): Hardcoded to 4000 intentionally — our platform target is
-        // macOS 13+ Apple Silicon (P0) where VZ's setMaximumTransmissionUnit:
-        // always succeeds. On macOS <13 the VZ setter is skipped via
-        // respondsToSelector: (see arcbox-vz/device/network.rs), and the VZ
-        // device stays at 1500 while the classifier gets 4000. This mismatch
-        // would cause frames >1500 to be dropped — acceptable since macOS <13
-        // is not a supported target. If macOS <13 support is ever needed,
-        // plumb the actual MTU from NetworkDeviceConfiguration::mtu() through
-        // the hypervisor abstraction layer.
+        // NOTE(MTU): the VZ device stays at the default 1500 (ABX-423 — see
+        // arcbox-vz/src/device/network.rs), but the classifier deliberately
+        // keeps ENHANCED_ETHERNET_MTU (4000). For the datapath this value only
+        // sizes buffers and frame sinks — at a 1500 link it is pure headroom —
+        // and it keeps the ARCBOX_DIAG_NET_MTU_4000 reproduction mode working
+        // without plumbing the negotiated MTU from
+        // NetworkDeviceConfiguration::mtu() through the hypervisor abstraction
+        // layer. Guest-bound TCP segments are bounded by the peer's advertised
+        // MSS (TcpBridge peer_mss), not by this value.
         let net_mtu = arcbox_net::darwin::classifier::ENHANCED_ETHERNET_MTU;
 
         let datapath = NetworkDatapath::new(
@@ -824,7 +824,7 @@ mod tests {
     /// end of the network socketpair must be enlarged or a full enhanced-MTU
     /// frame (4000 + 14-byte Ethernet header) to the guest fails with
     /// `EMSGSIZE` and is silently dropped. Guards the host-side sizing that
-    /// pairs with VZ's `setMaximumTransmissionUnit:`.
+    /// the `ARCBOX_DIAG_NET_MTU_4000` reproduction mode relies on.
     #[test]
     fn enlarged_socket_buffer_accepts_enhanced_mtu_frame() {
         let mut fds = [0 as libc::c_int; 2];
