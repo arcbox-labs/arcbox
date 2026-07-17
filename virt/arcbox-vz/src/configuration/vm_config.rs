@@ -207,18 +207,10 @@ impl VirtualMachineConfiguration {
         self.validate()?;
 
         // SAFETY: self.inner is a validated configuration handle. The shim
-        // creates the VM on a fresh serial queue and returns a +1 box; the
-        // raw out-pointers are transitional borrows kept alive by that box.
+        // creates the VM on a fresh serial queue and returns a +1 box.
         unsafe {
-            let mut raw_vm: *mut std::ffi::c_void = ptr::null_mut();
-            let mut raw_queue: *mut std::ffi::c_void = ptr::null_mut();
-            let vm_box =
-                crate::shim_ffi::abx_vm_new(self.inner.cast(), &mut raw_vm, &mut raw_queue);
-            Ok(VirtualMachine::from_box(
-                vm_box,
-                raw_vm as *mut AnyObject,
-                raw_queue as *mut AnyObject,
-            ))
+            let vm_box = crate::shim_ffi::abx_vm_new(self.inner.cast());
+            Ok(VirtualMachine::from_box(vm_box))
         }
     }
 

@@ -2,9 +2,7 @@
 
 use crate::device::MemoryBalloonDevice;
 use crate::error::{VZError, VZResult};
-use crate::ffi::DispatchQueue;
 use crate::socket::VirtioSocketDevice;
-use objc2::runtime::AnyObject;
 use std::ffi::c_void;
 use tokio::sync::oneshot;
 
@@ -65,19 +63,18 @@ impl From<i64> for VirtualMachineState {
 /// This represents a VM that has been created from a `VirtualMachineConfiguration`.
 /// Use the async methods to control the VM lifecycle.
 pub struct VirtualMachine {
-    inner: *mut AnyObject,
-    queue: DispatchQueue,
-    /// ABXVMBox handle pairing the VM with its queue for shim calls.
+    /// ABXVMBox handle pairing the VM with its serial queue.
     vm_box: *mut c_void,
 }
 
-// SAFETY: The VZ handles are properly synchronized through the dispatch queue.
+// SAFETY: The box handle is only used through the shim, which serializes all
+// VZ operations on the VM's serial queue.
 unsafe impl Send for VirtualMachine {}
-// SAFETY: See above — all VZ operations are dispatched to the VM's serial queue.
+// SAFETY: See above — every operation dispatches onto the VM's serial queue.
 unsafe impl Sync for VirtualMachine {}
 
 /// Shim lifecycle-completion trampoline: consumes the boxed sender exactly once.
-unsafe extern "C" fn state_trampoline(ctx: *mut c_void, err: *mut std::ffi::c_char) {
+pub(crate) unsafe extern "C" fn state_trampoline(ctx: *mut c_void, err: *mut std::ffi::c_char) {
     // SAFETY: ctx is the Box<Sender> leaked by the caller; the shim
     // guarantees exactly-once invocation. err is null or a shim string that
     // take_error_string frees.
@@ -93,40 +90,17 @@ unsafe extern "C" fn state_trampoline(ctx: *mut c_void, err: *mut std::ffi::c_ch
 }
 
 impl VirtualMachine {
-    /// Creates a `VirtualMachine` from a shim box plus transitional raw views.
+    /// Wraps the +1 `ABXVMBox` handle produced by the shim.
     ///
     /// This is called internally by `VirtualMachineConfiguration::build()`.
-    /// `raw_vm`/`raw_queue` are borrows kept alive by `vm_box`; they exist
-    /// only for the installer path and die with its migration.
-    pub(crate) fn from_box(
-        vm_box: *mut c_void,
-        raw_vm: *mut AnyObject,
-        raw_queue: *mut AnyObject,
-    ) -> Self {
-        Self {
-            inner: raw_vm,
-            // SAFETY: raw_queue is a valid dispatch queue kept alive by
-            // vm_box; the wrapper is non-owning.
-            queue: unsafe { DispatchQueue::from_raw(raw_queue) },
-            vm_box,
-        }
+    pub(crate) fn from_box(vm_box: *mut c_void) -> Self {
+        Self { vm_box }
     }
 
-    /// Returns the underlying `VZVirtualMachine` pointer.
-    pub(crate) fn as_ptr(&self) -> *mut AnyObject {
-        self.inner
-    }
-
-    /// Runs `f` synchronously on the VM's dispatch queue.
-    ///
-    /// All operations on a `VZVirtualMachine` must be issued on the queue it was
-    /// created with; this lets associated objects (such as the macOS installer)
-    /// dispatch onto it.
-    pub(crate) fn dispatch_sync<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        self.queue.sync(f)
+    /// Returns the `ABXVMBox` handle for shim calls that target this VM
+    /// (e.g. installer construction).
+    pub(crate) fn vm_box(&self) -> *mut c_void {
+        self.vm_box
     }
 
     /// Returns the current state of the VM.

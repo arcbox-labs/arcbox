@@ -27,12 +27,17 @@ pub type VsockCb =
 /// [`take_error_string`]).
 pub type StateCb = unsafe extern "C" fn(ctx: *mut c_void, err: *mut c_char);
 
+/// Object-producing completion: fires exactly once with either a +1 handle
+/// (owned by the receiver) or a strdup'd error message.
+pub type ObjectCb = unsafe extern "C" fn(ctx: *mut c_void, handle: *mut c_void, err: *mut c_char);
+
 /// Mirrors `abxShimABIVersion` in the shim; bump both on any signature change.
+/// v2: `abx_vm_new` dropped its transitional raw vm/queue out-params.
 #[allow(
     dead_code,
     reason = "drift detector: compared against abx_shim_version() by the boundary tests"
 )]
-pub const ABX_SHIM_ABI_VERSION: u32 = 1;
+pub const ABX_SHIM_ABI_VERSION: u32 = 2;
 
 unsafe extern "C" {
     // Errors / strings / handles
@@ -152,13 +157,7 @@ unsafe extern "C" {
         items: *const *mut c_void,
         count: usize,
     );
-    /// The raw out-params are transitional borrows for the installer path
-    /// (kept alive by the returned box); they die with the installer PR.
-    pub fn abx_vm_new(
-        config: *mut c_void,
-        raw_vm_out: *mut *mut c_void,
-        raw_queue_out: *mut *mut c_void,
-    ) -> *mut c_void;
+    pub fn abx_vm_new(config: *mut c_void) -> *mut c_void;
     pub fn abx_vm_state(vm_box: *mut c_void) -> i64;
     pub fn abx_vm_can_stop(vm_box: *mut c_void) -> bool;
     pub fn abx_vm_can_pause(vm_box: *mut c_void) -> bool;
@@ -174,6 +173,39 @@ unsafe extern "C" {
     pub fn abx_vm_balloon_at(vm_box: *mut c_void, index: u64) -> *mut c_void;
     pub fn abx_balloon_target(balloon_box: *mut c_void) -> u64;
     pub fn abx_balloon_set_target(balloon_box: *mut c_void, bytes: u64);
+
+    // Restore images / installer
+    pub fn abx_restore_image_load(path: *const c_char, ctx: *mut c_void, cb: ObjectCb);
+    pub fn abx_restore_image_fetch_latest(ctx: *mut c_void, cb: ObjectCb);
+    pub fn abx_restore_image_requirements(
+        image: *mut c_void,
+        hardware_model_out: *mut *mut c_void,
+        min_cpu_out: *mut u64,
+        min_memory_out: *mut u64,
+        error_out: *mut *mut c_char,
+    ) -> bool;
+    pub fn abx_restore_image_url(image: *mut c_void) -> *mut c_char;
+    pub fn abx_installer_new(vm_box: *mut c_void, ipsw_path: *const c_char) -> *mut c_void;
+    pub fn abx_installer_fraction(installer_box: *mut c_void) -> f64;
+    pub fn abx_installer_install(installer_box: *mut c_void, ctx: *mut c_void, cb: StateCb);
+}
+
+/// Takes ownership of a shim-returned string, or `None` if null.
+///
+/// # Safety
+///
+/// `ptr` must be null or a string allocated by the shim (strdup'd) that has
+/// not been freed yet.
+pub unsafe fn take_string(ptr: *mut c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: per contract, `ptr` is a valid NUL-terminated C string owned by us.
+    unsafe {
+        let out = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
+        abx_string_free(ptr);
+        Some(out)
+    }
 }
 
 /// Takes ownership of a shim-returned error string and frees it.
@@ -268,11 +300,18 @@ mod tests {
         abx_vm_balloon_at as *const (),
         abx_balloon_target as *const (),
         abx_balloon_set_target as *const (),
+        abx_restore_image_load as *const (),
+        abx_restore_image_fetch_latest as *const (),
+        abx_restore_image_requirements as *const (),
+        abx_restore_image_url as *const (),
+        abx_installer_new as *const (),
+        abx_installer_fraction as *const (),
+        abx_installer_install as *const (),
     ];
 
     /// Update when symbols are added; a mismatch means Exports.swift and this
     /// file have drifted.
-    const EXPECTED_SYMBOL_COUNT: usize = 65;
+    const EXPECTED_SYMBOL_COUNT: usize = 72;
 
     #[test]
     fn link_coverage() {

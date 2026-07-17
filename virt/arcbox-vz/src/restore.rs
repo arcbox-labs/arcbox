@@ -6,22 +6,18 @@
 //! the inputs to a [`MacPlatform`](crate::MacPlatform) and a
 //! [`MacAuxiliaryStorage`](crate::MacAuxiliaryStorage).
 
-use std::ffi::c_void;
+use std::ffi::{CString, c_char, c_void};
 use std::path::Path;
+use std::ptr;
 use std::time::Duration;
 
-use objc2::runtime::{AnyClass, AnyObject};
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 
 use crate::configuration::MacHardwareModel;
 use crate::error::{VZError, VZResult};
-use crate::ffi::{
-    _Block_release, ObjectResult, StateResult, create_object_completion_block,
-    create_state_completion_block, get_class, nsstring_to_string, nsurl_file_path, release,
-};
-use crate::vm::VirtualMachine;
-use crate::{msg_send, msg_send_u64, msg_send_void};
+use crate::shim_ffi;
+use crate::vm::{VirtualMachine, state_trampoline};
 
 /// The most-featureful configuration a restore image supports.
 pub struct MacOSConfigurationRequirements {
@@ -33,12 +29,34 @@ pub struct MacOSConfigurationRequirements {
     pub minimum_memory_size: u64,
 }
 
-/// A macOS restore image — a local IPSW or the latest version Apple publishes.
-pub struct MacOSRestoreImage {
-    inner: *mut AnyObject,
+/// Shim object-completion trampoline: consumes the boxed sender exactly once.
+///
+/// If the receiver is gone (cancelled load), the +1 handle is released here
+/// so the object doesn't leak.
+unsafe extern "C" fn object_trampoline(ctx: *mut c_void, handle: *mut c_void, err: *mut c_char) {
+    // SAFETY: ctx is the Box<Sender> leaked by the caller; the shim
+    // guarantees exactly-once invocation. err is null or a shim string.
+    unsafe {
+        let sender = Box::from_raw(ctx as *mut oneshot::Sender<Result<usize, String>>);
+        let result = if err.is_null() {
+            Ok(handle as usize)
+        } else {
+            Err(shim_ffi::take_error_string(err))
+        };
+        if let Err(Ok(bits)) = sender.send(result) {
+            // Receiver dropped: release the orphaned +1 handle.
+            shim_ffi::abx_object_release(bits as *mut c_void);
+        }
+    }
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+/// A macOS restore image — a local IPSW or the latest version Apple publishes.
+pub struct MacOSRestoreImage {
+    inner: *mut c_void,
+}
+
+// SAFETY: The handle refers to an immutable VZMacOSRestoreImage; all access
+// goes through the shim.
 unsafe impl Send for MacOSRestoreImage {}
 
 impl MacOSRestoreImage {
@@ -49,66 +67,36 @@ impl MacOSRestoreImage {
     ///
     /// # Errors
     ///
-    /// Returns an error if `VZMacOSRestoreImage` is unavailable or the fetch fails.
+    /// Returns an error if the fetch fails.
     pub async fn latest_supported() -> VZResult<Self> {
-        let cls = get_class("VZMacOSRestoreImage").ok_or_else(|| VZError::Internal {
-            code: -1,
-            message: "VZMacOSRestoreImage class not found".into(),
-        })?;
-        let (tx, rx) = oneshot::channel::<ObjectResult>();
-        let block = create_object_completion_block(tx);
-        // SAFETY: +fetchLatestSupportedWithCompletionHandler: takes one block argument
-        // and returns void; `block` is a heap-copied block released after the await.
-        unsafe {
-            let sel = objc2::sel!(fetchLatestSupportedWithCompletionHandler:);
-            let func: unsafe extern "C" fn(*const AnyClass, objc2::runtime::Sel, *const c_void) =
-                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            func(cls, sel, block);
-        }
-        let received = rx.await;
-        // SAFETY: `block` was returned by create_object_completion_block and not released elsewhere.
-        unsafe { _Block_release(block) };
-        Self::from_received(received)
+        let (tx, rx) = oneshot::channel::<Result<usize, String>>();
+        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+        // SAFETY: ctx ownership transfers to the exactly-once trampoline.
+        unsafe { shim_ffi::abx_restore_image_fetch_latest(ctx, object_trampoline) };
+        Self::from_received(rx.await)
     }
 
     /// Loads a restore image from a local file (an IPSW).
     ///
     /// # Errors
     ///
-    /// Returns an error if `VZMacOSRestoreImage` is unavailable or the file cannot
-    /// be loaded as a restore image.
+    /// Returns an error if the file cannot be loaded as a restore image.
     pub async fn load_from_url(path: impl AsRef<Path>) -> VZResult<Self> {
-        let path_str = path.as_ref().to_string_lossy();
-        let cls = get_class("VZMacOSRestoreImage").ok_or_else(|| VZError::Internal {
-            code: -1,
-            message: "VZMacOSRestoreImage class not found".into(),
+        let c_path = CString::new(path.as_ref().to_string_lossy().as_bytes()).map_err(|_| {
+            VZError::InvalidConfiguration(format!("path contains NUL: {}", path.as_ref().display()))
         })?;
-        let (tx, rx) = oneshot::channel::<ObjectResult>();
-        let block = create_object_completion_block(tx);
-        // SAFETY: +loadFileURL:completionHandler: takes an NSURL and a block and returns
-        // void; `block` is a heap-copied block released after the await. The method
-        // retains the NSURL synchronously, so the +1 from nsurl_file_path is released
-        // immediately after the call.
-        unsafe {
-            let url = nsurl_file_path(&path_str);
-            let sel = objc2::sel!(loadFileURL:completionHandler:);
-            let func: unsafe extern "C" fn(
-                *const AnyClass,
-                objc2::runtime::Sel,
-                *const AnyObject,
-                *const c_void,
-            ) = std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            func(cls, sel, url as *const AnyObject, block);
-            release(url);
-        }
-        let received = rx.await;
-        // SAFETY: `block` was returned by create_object_completion_block and not released elsewhere.
-        unsafe { _Block_release(block) };
-        Self::from_received(received)
+        let (tx, rx) = oneshot::channel::<Result<usize, String>>();
+        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+        // SAFETY: c_path is valid for the duration of the call; ctx ownership
+        // transfers to the exactly-once trampoline.
+        unsafe { shim_ffi::abx_restore_image_load(c_path.as_ptr(), ctx, object_trampoline) };
+        Self::from_received(rx.await)
     }
 
-    /// Wraps the result delivered by the completion block into a restore image.
-    fn from_received(received: Result<ObjectResult, oneshot::error::RecvError>) -> VZResult<Self> {
+    /// Wraps the +1 handle delivered by the completion trampoline.
+    fn from_received(
+        received: Result<Result<usize, String>, oneshot::error::RecvError>,
+    ) -> VZResult<Self> {
         let bits = received
             .map_err(|_| VZError::Internal {
                 code: -1,
@@ -116,7 +104,7 @@ impl MacOSRestoreImage {
             })?
             .map_err(|message| VZError::Internal { code: -1, message })?;
         Ok(Self {
-            inner: bits as *mut AnyObject,
+            inner: bits as *mut c_void,
         })
     }
 
@@ -126,25 +114,33 @@ impl MacOSRestoreImage {
     ///
     /// Returns an error if the restore image exposes no supported configuration.
     pub fn requirements(&self) -> VZResult<MacOSConfigurationRequirements> {
-        // SAFETY: mostFeaturefulSupportedConfiguration and its properties are read from
-        // a valid VZMacOSRestoreImage; the returned objects are owned by the framework.
+        // SAFETY: inner is a valid image handle; on success the shim writes a
+        // +1 hardware-model handle owned by the returned wrapper.
         unsafe {
-            let reqs = msg_send!(self.inner, mostFeaturefulSupportedConfiguration);
-            if reqs.is_null() {
-                return Err(VZError::InvalidConfiguration(
-                    "restore image has no supported configuration".into(),
-                ));
+            let mut hw: *mut c_void = ptr::null_mut();
+            let mut min_cpu: u64 = 0;
+            let mut min_memory: u64 = 0;
+            let mut error: *mut c_char = ptr::null_mut();
+            if !shim_ffi::abx_restore_image_requirements(
+                self.inner,
+                &mut hw,
+                &mut min_cpu,
+                &mut min_memory,
+                &mut error,
+            ) {
+                return Err(VZError::InvalidConfiguration(shim_ffi::take_error_string(
+                    error,
+                )));
             }
-            let hw_ptr = msg_send!(reqs, hardwareModel);
-            let hardware_model = MacHardwareModel::from_retained_ptr(hw_ptr).ok_or_else(|| {
-                VZError::InvalidConfiguration("restore image has no hardware model".into())
-            })?;
-            let minimum_cpu_count = msg_send_u64!(reqs, minimumSupportedCPUCount);
-            let minimum_memory_size = msg_send_u64!(reqs, minimumSupportedMemorySize);
+            let hardware_model =
+                MacHardwareModel::from_owned_handle(hw).ok_or_else(|| VZError::Internal {
+                    code: -1,
+                    message: "restore image requirements returned no hardware model".into(),
+                })?;
             Ok(MacOSConfigurationRequirements {
                 hardware_model,
-                minimum_cpu_count,
-                minimum_memory_size,
+                minimum_cpu_count: min_cpu,
+                minimum_memory_size: min_memory,
             })
         }
     }
@@ -156,16 +152,11 @@ impl MacOSRestoreImage {
     /// [`load_from_url`](Self::load_from_url) it is the local file URL.
     #[must_use]
     pub fn url(&self) -> Option<String> {
-        // SAFETY: URL is a readonly property returning an NSURL owned by the image;
-        // absoluteString returns an NSString that nsstring_to_string only reads.
+        // SAFETY: inner is a valid image handle; the returned string is
+        // shim-allocated and consumed by take_string.
         unsafe {
-            let url = msg_send!(self.inner, URL);
-            if url.is_null() {
-                return None;
-            }
-            let s = msg_send!(url, absoluteString);
-            let out = nsstring_to_string(s);
-            if out.is_empty() { None } else { Some(out) }
+            let s = shim_ffi::abx_restore_image_url(self.inner);
+            shim_ffi::take_string(s).filter(|url| !url.is_empty())
         }
     }
 }
@@ -173,7 +164,8 @@ impl MacOSRestoreImage {
 impl Drop for MacOSRestoreImage {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            release(self.inner);
+            // SAFETY: releasing the +1 handle delivered by the trampoline.
+            unsafe { shim_ffi::abx_object_release(self.inner) };
         }
     }
 }
@@ -184,11 +176,11 @@ impl Drop for MacOSRestoreImage {
 /// local restore image (IPSW), then drive [`install`](Self::install) — a long
 /// operation (tens of minutes) that reports progress as it runs.
 pub struct MacOSInstaller {
-    inner: *mut AnyObject,
-    progress: *mut AnyObject,
+    inner: *mut c_void,
 }
 
-// SAFETY: Inner ObjC pointers are only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The box handle is only used through the shim, which serializes the
+// queue-affine installer operations on the VM's queue.
 unsafe impl Send for MacOSInstaller {}
 
 impl MacOSInstaller {
@@ -199,82 +191,52 @@ impl MacOSInstaller {
     ///
     /// # Errors
     ///
-    /// Returns an error if `VZMacOSInstaller` is unavailable or cannot be created.
+    /// Returns an error if the path is not representable.
     pub fn new(
         virtual_machine: &VirtualMachine,
         restore_image_path: impl AsRef<Path>,
     ) -> VZResult<Self> {
-        let path_str = restore_image_path.as_ref().to_string_lossy().into_owned();
-        let vm_ptr = virtual_machine.as_ptr();
-        // VZMacOSInstaller's initializer asserts (dispatch_assert_queue) that it runs on
-        // the VM's dispatch queue, so construct it there.
-        let (inner, progress) = virtual_machine.dispatch_sync(|| {
-            // SAFETY: alloc/initWithVirtualMachine:restoreImageURL: on VZMacOSInstaller with
-            // a valid VM pointer and an NSURL from a local path. Result checked non-null.
-            unsafe {
-                let cls = get_class("VZMacOSInstaller").ok_or_else(|| VZError::Internal {
-                    code: -1,
-                    message: "VZMacOSInstaller class not found".into(),
-                })?;
-                let url = nsurl_file_path(&path_str);
-                let alloc = msg_send!(cls, alloc);
-                let obj = msg_send!(
-                    alloc,
-                    initWithVirtualMachine: vm_ptr,
-                    restoreImageURL: url
-                );
-                // The initializer retains the NSURL; release the +1 from nsurl_file_path
-                // (also covers the error path below).
-                release(url);
-                if obj.is_null() {
-                    return Err(VZError::InvalidConfiguration(
-                        "failed to create VZMacOSInstaller".into(),
-                    ));
-                }
-                let progress = msg_send!(obj, progress);
-                Ok((obj, progress))
-            }
-        })?;
-        Ok(Self { inner, progress })
+        let c_path = CString::new(restore_image_path.as_ref().to_string_lossy().as_bytes())
+            .map_err(|_| {
+                VZError::InvalidConfiguration(format!(
+                    "path contains NUL: {}",
+                    restore_image_path.as_ref().display()
+                ))
+            })?;
+        // SAFETY: the VM box handle is valid; the shim constructs the
+        // installer on the VM's queue (its initializer asserts affinity) and
+        // returns a +1 installer box.
+        let obj = unsafe { shim_ffi::abx_installer_new(virtual_machine.vm_box(), c_path.as_ptr()) };
+        Ok(Self { inner: obj })
     }
 
     /// Returns installation progress as a fraction in `0.0..=1.0`.
     #[must_use]
     pub fn fraction_completed(&self) -> f64 {
-        if self.progress.is_null() {
-            return 0.0;
-        }
-        // SAFETY: fractionCompleted returns a double from a valid NSProgress.
-        unsafe {
-            let sel = objc2::sel!(fractionCompleted);
-            let func: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel) -> f64 =
-                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            func(self.progress as *const AnyObject, sel)
-        }
+        // SAFETY: inner is a valid installer box; NSProgress reads are
+        // queue-free.
+        unsafe { shim_ffi::abx_installer_fraction(self.inner) }
     }
 
     /// Installs macOS, invoking `on_progress` with the current fraction as it runs.
     ///
     /// `virtual_machine` must be the VM passed to [`new`](Self::new); the install is
-    /// dispatched on that VM's queue.
+    /// dispatched on that VM's queue (retained inside the installer box).
     ///
     /// # Errors
     ///
     /// Returns an error if installation fails.
     pub async fn install(
         &self,
-        virtual_machine: &VirtualMachine,
+        _virtual_machine: &VirtualMachine,
         mut on_progress: impl FnMut(f64),
     ) -> VZResult<()> {
-        let (tx, mut rx) = oneshot::channel::<StateResult>();
-        let block = create_state_completion_block(tx);
-        let installer = self.inner;
-        // Kick off the install on the VM's queue: the call returns immediately and the
-        // completion handler fires when installation finishes.
-        // SAFETY: installWithCompletionHandler: takes a heap-copied (NSError *) block.
-        virtual_machine.dispatch_sync(|| unsafe {
-            msg_send_void!(installer, installWithCompletionHandler: block);
-        });
+        let (tx, mut rx) = oneshot::channel::<Result<(), String>>();
+        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+        // SAFETY: inner is a valid installer box; ctx ownership transfers to
+        // the exactly-once trampoline. The shim issues the install on the
+        // VM's queue and the call returns after dispatching.
+        unsafe { shim_ffi::abx_installer_install(self.inner, ctx, state_trampoline) };
 
         let result = loop {
             tokio::select! {
@@ -290,8 +252,6 @@ impl MacOSInstaller {
                 }
             }
         };
-        // SAFETY: `block` was returned by create_state_completion_block and not released elsewhere.
-        unsafe { _Block_release(block) };
         result.map_err(|message| VZError::Internal { code: -1, message })
     }
 }
@@ -299,7 +259,8 @@ impl MacOSInstaller {
 impl Drop for MacOSInstaller {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            release(self.inner);
+            // SAFETY: releasing the +1 installer box handle from the shim.
+            unsafe { shim_ffi::abx_object_release(self.inner) };
         }
     }
 }
