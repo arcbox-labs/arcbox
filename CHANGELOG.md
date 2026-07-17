@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.21](https://github.com/arcboxlabs/arcbox/compare/v0.4.20...v0.4.21) (2026-07-17)
+
+
+### Features
+
+* **agent:** export the containerd data mount as an NFSv4 child export ([d9879f6](https://github.com/arcboxlabs/arcbox/commit/d9879f623871245e360135a4dd7443a7d7564e0a))
+* **agent:** resolve container fs layer paths from containerd snapshots ([1a1f696](https://github.com/arcboxlabs/arcbox/commit/1a1f6964df48351aaaab0beaef657ddfac0e092e))
+* **agent:** serve a Finder volume icon at the NFS export root ([65b09f6](https://github.com/arcboxlabs/arcbox/commit/65b09f633dba9b93e2927c38fec43df9254e4a96))
+* **api:** SystemService.ResolveContainerFs for filesystem browsers ([1707094](https://github.com/arcboxlabs/arcbox/commit/1707094150496c08b0172c87f6ed72edecdc08c4))
+* **daemon:** mount ~/ArcBox from the ArcBox hosts alias when installed ([b42305d](https://github.com/arcboxlabs/arcbox/commit/b42305d24ba53b26be2c2f359f59635b000b8f28))
+* **helper:** fixed /etc/hosts alias ops for the ArcBox NFS mount name ([3b56749](https://github.com/arcboxlabs/arcbox/commit/3b567495b2079ac692923fbeeaf12e79b87a171b))
+* **vz:** add the ArcBoxVZShim Swift package and its C ABI boundary ([b2e76d8](https://github.com/arcboxlabs/arcbox/commit/b2e76d88a5b20646ae07854ba9318910f471599f))
+* **vz:** route build, stop/pause/resume, and device accessors through the shim ([ec420b1](https://github.com/arcboxlabs/arcbox/commit/ec420b10c69b2396bbcb9c1cf45f0b0ffb467395))
+* **vz:** route config, boot loaders, and generic platform through the shim ([392c28d](https://github.com/arcboxlabs/arcbox/commit/392c28d353165d9a209a5e120a80a055e6d0849c))
+* **vz:** route device configuration constructors through the shim ([9c381be](https://github.com/arcboxlabs/arcbox/commit/9c381be1337d443fb5bacf0d07a183f8f1b11c4f))
+* **vz:** route directory shares and VirtioFS through the shim ([23d4192](https://github.com/arcboxlabs/arcbox/commit/23d419299b4d3379095a79c63fd32aece8165c6d))
+* **vz:** route macOS identity types and MacPlatform through the shim ([49906db](https://github.com/arcboxlabs/arcbox/commit/49906db05992ced4767f57f7dbfaf6d34186bcef))
+* **vz:** route restore images and the IPSW installer through the shim ([1434f33](https://github.com/arcboxlabs/arcbox/commit/1434f3373d25c4b5abb97f1da7bb58015217cde7))
+* **vz:** route VM state, start, and request_stop through the shim ([60a418a](https://github.com/arcboxlabs/arcbox/commit/60a418a2d80e3b2ff055152099f631416ce78b4f))
+* **vz:** route vsock connect through the shim ([4d22f5e](https://github.com/arcboxlabs/arcbox/commit/4d22f5e02dcea3502c22abb67fe845c7fc92d710))
+
+
+### Bug Fixes
+
+* **core:** run the agent connect for container fs paths off the async executor ([e3b31eb](https://github.com/arcboxlabs/arcbox/commit/e3b31ebce6cfb139df3d00349fafbe6b2318623f))
+* **helper,daemon:** review fixes — append-only tarpc ordinals, alias-before-mount ([688bea9](https://github.com/arcboxlabs/arcbox/commit/688bea99d38bc4845ca694bc00508335a1cfee9e))
+* **net:** cap disjoint fragment ranges per reassembly entry at 64 ([943dfa7](https://github.com/arcboxlabs/arcbox/commit/943dfa7d2d81d57169410f6cf4351fe685812136))
+* **net:** keep inline flows alive after clean EOF; reap only on error ([49db7ac](https://github.com/arcboxlabs/arcbox/commit/49db7ac614dadb487d65800494f1b7bfe3ef538e))
+* **net:** propagate upstream death to the guest as RST on every egress path (ABX-431) ([3359564](https://github.com/arcboxlabs/arcbox/commit/33595640fb48a2bea3b5131ae48386b222ea44e9))
+* **vz:** add /usr/lib/swift rpath so the shim's concurrency runtime loads ([f331811](https://github.com/arcboxlabs/arcbox/commit/f331811b4fcc5f139456fbd16914e2798d1e8716))
+* **vz:** also rpath doctest links for the shim concurrency runtime ([31511d5](https://github.com/arcboxlabs/arcbox/commit/31511d56ad746e610b7d19da79cd8433bbace7b6))
+* **vz:** close the vsock dup'd fd on every connect_blocking abandonment ([ff94d10](https://github.com/arcboxlabs/arcbox/commit/ff94d10fdb41e5bf61684a3a6160de424646ca49))
+
+
+### Code Refactoring
+
+* **hypervisor:** drop DarwinVcpu's dead VZ state-poll machinery ([5c77cc9](https://github.com/arcboxlabs/arcbox/commit/5c77cc9fdd407ae5c51d94fa5f6ce25d8e1514d8))
+
+
+### Tests
+
+* **e2e:** container fs resolution + containerd NFS read-through ([914a7b7](https://github.com/arcboxlabs/arcbox/commit/914a7b757d15e900232a5f063113a19fe48e1bd2))
+
+
+### Documentation
+
+* **net:** align InlineConn.dead doc with error-only semantics; drop stray generated-file churn ([fa84a5e](https://github.com/arcboxlabs/arcbox/commit/fa84a5e010c9e3f9386c02d9bb38ceed5a7cf81f))
+* **vz:** correct MacOSInstaller::install param doc (vestigial virtual_machine) ([cae9e75](https://github.com/arcboxlabs/arcbox/commit/cae9e75a7dcd7a2e324d369eaf37efc18167017c))
+* **vz:** drop stale ABI-version references after removing the handshake ([54d258d](https://github.com/arcboxlabs/arcbox/commit/54d258d8311398a7a49249ae3923557d533a5e7a))
+
+
+### Miscellaneous Chores
+
+* **vz:** drop the useless shim ABI-version handshake ([0e40e90](https://github.com/arcboxlabs/arcbox/commit/0e40e90d499dea044058ab1561f73d2de9ae6120))
+* **vz:** prune dead code ahead of Swift shim migration ([#413](https://github.com/arcboxlabs/arcbox/issues/413)) ([68f0a6f](https://github.com/arcboxlabs/arcbox/commit/68f0a6f2632b5c63d6781ef5bcfbc4466f9a4e42))
+* **vz:** remove the hand-written ObjC runtime interop ([459f41d](https://github.com/arcboxlabs/arcbox/commit/459f41d5228297f76160c1f099b42d60f465cd12))
+
 ## [0.4.20](https://github.com/arcboxlabs/arcbox/compare/v0.4.19...v0.4.20) (2026-07-17)
 
 
