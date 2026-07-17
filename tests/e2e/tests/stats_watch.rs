@@ -5,7 +5,8 @@
 //! sane values, concurrent subscribers share a single guest stream (the
 //! daemon log is the oracle for pump lifecycle, as with the idle-balloon
 //! scenario), and a later subscriber gets a fresh pump after the first
-//! generation wound down.
+//! generation wound down. It also runs one container and asserts its
+//! per-container cgroup stats appear in the frames, name-enriched (P2).
 
 use std::path::Path;
 use std::sync::Once;
@@ -14,6 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use arcbox_e2e::boot_assets::{resolve_boot_version, stage_dev_boot_assets};
 use arcbox_e2e::daemon::{DaemonConfig, DaemonHandle, connect_unix};
+use arcbox_e2e::docker::{docker_output, ensure_image};
 use arcbox_e2e::metrics::RunMetrics;
 use arcbox_grpc::v1::stats_service_client::StatsServiceClient;
 use arcbox_protocol::v1::{MachineStats, StatsWatchRequest};
@@ -27,6 +29,10 @@ const SAMPLE_BUDGET: Duration = Duration::from_secs(10);
 /// Budget for the first pump to stop after its subscribers disconnect
 /// (the pump notices within its frame patience).
 const PUMP_STOP_BUDGET: Duration = Duration::from_secs(15);
+/// Ceiling for one docker CLI invocation.
+const DOCKER_ATTEMPT: Duration = Duration::from_secs(30);
+/// Name of the probe container whose per-container stats we assert.
+const PROBE_NAME: &str = "stats-probe";
 
 fn init_tracing() {
     TRACING.call_once(|| {
@@ -97,12 +103,35 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
     metrics.time("daemon_ready", || daemon.wait_ready_blocking(READY_TIMEOUT))?;
     let socket = daemon.grpc_socket();
 
+    // A running container so the per-container assertions have a subject.
+    // It touches memory (a tmpfs write) so memory.current is non-trivial.
+    let image = std::env::var("ARCBOX_E2E_IMAGE").unwrap_or_else(|_| "alpine:latest".to_owned());
+    metrics.time("docker_pull", || ensure_image(data_dir, &image))?;
+    metrics.time("probe_start", || {
+        docker_output(
+            data_dir,
+            &[
+                "run",
+                "-d",
+                "--name",
+                PROBE_NAME,
+                &image,
+                "sh",
+                "-c",
+                "dd if=/dev/zero of=/tmp/hold bs=1M count=32; sleep 600",
+            ],
+            DOCKER_ATTEMPT,
+        )
+        .context("starting probe container")
+    })?;
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("building tokio runtime")?;
 
-    // Phase 1 — two concurrent subscribers, sane and progressing samples.
+    // Phase 1 — two concurrent subscribers, sane and progressing samples,
+    // and the probe container's per-container stats.
     runtime.block_on(async {
         let channel = connect_unix(&socket).await?;
         let mut client = StatsServiceClient::new(channel);
@@ -138,7 +167,11 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
             psi = second.memory_psi_full_avg10,
             "samples flow and progress"
         );
-        Ok::<_, anyhow::Error>(())
+
+        // The probe container's cgroup stats must appear (discovery is
+        // per-tick, so it may take a frame or two), name-enriched by the
+        // daemon from its registry.
+        assert_probe_container(&mut stream_a).await
     })?;
     if count_log_matches(data_dir, "stats pump started")? != 1 {
         bail!("concurrent subscribers did not share a single stats pump");
@@ -173,7 +206,48 @@ fn scenario(daemon: &mut DaemonHandle, data_dir: &Path, metrics: &mut RunMetrics
         bail!("resubscription did not start a fresh stats pump");
     }
 
+    docker_output(data_dir, &["rm", "-f", PROBE_NAME], DOCKER_ATTEMPT).ok();
     Ok(())
+}
+
+/// Consumes frames until the probe container appears, then asserts its
+/// cgroup stats are sane and the daemon enriched its name. Bounded by a
+/// few sample budgets so a never-appearing container fails instead of
+/// hanging.
+async fn assert_probe_container(stream: &mut Streaming<MachineStats>) -> Result<()> {
+    for _ in 0..5 {
+        let sample = next_sample(stream)
+            .await
+            .context("frame while awaiting probe")?;
+        let Some(probe) = sample.containers.iter().find(|c| c.name == PROBE_NAME) else {
+            continue;
+        };
+        if probe.id.len() != 64 {
+            bail!("probe container id is not a full cgroup id: {:?}", probe.id);
+        }
+        if probe.memory_current_bytes == 0 {
+            bail!("probe container reports zero memory");
+        }
+        if probe.pids == 0 {
+            bail!("probe container reports zero pids");
+        }
+        // A bridged container's eth0 always accrues setup/DHCP traffic, so
+        // its netns-read counters must be non-zero — proving per-container
+        // network (P4) is wired, not just the cgroup metrics.
+        if probe.net_rx_bytes == 0 {
+            bail!("probe container reports zero network rx (netns read failed?)");
+        }
+        tracing::info!(
+            id = %probe.id,
+            memory = probe.memory_current_bytes,
+            pids = probe.pids,
+            net_rx = probe.net_rx_bytes,
+            net_tx = probe.net_tx_bytes,
+            "probe container stats present and enriched"
+        );
+        return Ok(());
+    }
+    bail!("probe container never appeared in the stats stream");
 }
 
 async fn watch(

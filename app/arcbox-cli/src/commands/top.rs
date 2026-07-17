@@ -5,9 +5,12 @@
 //! between consecutive samples over the guest's monotonic clock, so a
 //! stalled stream never fabricates activity.
 
+use std::collections::HashMap;
+use std::fmt::Write as _;
+
 use anyhow::{Context, Result, bail};
 use arcbox_grpc::v1::stats_service_client::StatsServiceClient;
-use arcbox_protocol::v1::{MachineStats, StatsWatchRequest};
+use arcbox_protocol::v1::{ContainerStats, MachineStats, StatsWatchRequest};
 use clap::Args;
 use tonic::transport::Endpoint;
 
@@ -49,11 +52,16 @@ pub async fn execute(args: TopArgs, format: OutputFormat) -> Result<()> {
             Some(sample) => sample,
             None => bail!("stats stream ended (daemon shutting down?)"),
         };
-        let Some(prev) = previous.replace(sample) else {
-            continue; // baseline for the first delta
-        };
-        let Some(computed) = ComputedStats::from_delta(&prev, &sample) else {
-            continue; // counters reset (guest rebooted): rebaseline
+        // Compute against the prior sample (if any) before it becomes the
+        // new baseline. A first sample or a counter reset yields None and
+        // simply rebaselines. `MachineStats` owns a container Vec, so this
+        // borrows rather than copies.
+        let computed = previous
+            .as_ref()
+            .and_then(|prev| ComputedStats::from_delta(prev, &sample));
+        previous = Some(sample);
+        let Some(computed) = computed else {
+            continue;
         };
 
         match format {
@@ -89,6 +97,24 @@ struct ComputedStats {
     disk_write_bytes_per_sec: f64,
     net_rx_bytes_per_sec: f64,
     net_tx_bytes_per_sec: f64,
+    containers: Vec<ComputedContainer>,
+}
+
+/// Per-container rates and gauges, derived from the same two samples.
+#[derive(Debug, serde::Serialize)]
+struct ComputedContainer {
+    name: String,
+    /// Percent of one core (may exceed 100 for a multi-threaded container),
+    /// matching `docker stats`.
+    cpu_percent: f64,
+    memory_current_bytes: u64,
+    /// 0 means unlimited.
+    memory_limit_bytes: u64,
+    disk_read_bytes_per_sec: f64,
+    disk_write_bytes_per_sec: f64,
+    net_rx_bytes_per_sec: f64,
+    net_tx_bytes_per_sec: f64,
+    pids: u32,
 }
 
 impl ComputedStats {
@@ -124,6 +150,7 @@ impl ComputedStats {
             disk_write_bytes_per_sec: rate(cur.disk_written_bytes, prev.disk_written_bytes),
             net_rx_bytes_per_sec: rate(cur.net_rx_bytes, prev.net_rx_bytes),
             net_tx_bytes_per_sec: rate(cur.net_tx_bytes, prev.net_tx_bytes),
+            containers: computed_containers(prev, cur, dt),
         })
     }
 
@@ -133,7 +160,7 @@ impl ComputedStats {
         } else {
             format!("{:.2}%", self.memory_psi_full_avg10)
         };
-        format!(
+        let mut out = format!(
             "ArcBox System VM\n\
              \n\
              CPU     {:>6.1}%  of {} cpus   load {:.2}\n\
@@ -151,7 +178,109 @@ impl ComputedStats {
             fmt_bytes(self.disk_write_bytes_per_sec as u64),
             fmt_bytes(self.net_rx_bytes_per_sec as u64),
             fmt_bytes(self.net_tx_bytes_per_sec as u64),
-        )
+        );
+        if !self.containers.is_empty() {
+            // Header and rows share the same width spec so columns stay
+            // aligned; the size/rate cells are pre-formatted into "a/b"
+            // strings (worst case ~"1023.9 MiB/1023.9 MiB") and
+            // right-aligned as a whole.
+            let _ = writeln!(
+                out,
+                "\n{:<24} {:>7} {:>21} {:>21} {:>21} {:>5}",
+                "CONTAINER", "CPU%", "MEM", "DISK R/W/s", "NET ↓/↑/s", "PIDS"
+            );
+            for c in &self.containers {
+                let mem = if c.memory_limit_bytes == 0 {
+                    fmt_bytes(c.memory_current_bytes)
+                } else {
+                    format!(
+                        "{}/{}",
+                        fmt_bytes(c.memory_current_bytes),
+                        fmt_bytes(c.memory_limit_bytes)
+                    )
+                };
+                let disk = format!(
+                    "{}/{}",
+                    fmt_bytes(c.disk_read_bytes_per_sec as u64),
+                    fmt_bytes(c.disk_write_bytes_per_sec as u64)
+                );
+                let net = format!(
+                    "{}/{}",
+                    fmt_bytes(c.net_rx_bytes_per_sec as u64),
+                    fmt_bytes(c.net_tx_bytes_per_sec as u64)
+                );
+                let _ = writeln!(
+                    out,
+                    "{:<24} {:>6.1}% {:>21} {:>21} {:>21} {:>5}",
+                    truncate(&c.name, 24),
+                    c.cpu_percent,
+                    mem,
+                    disk,
+                    net,
+                    c.pids,
+                );
+            }
+        }
+        out
+    }
+}
+
+/// Joins each current container with its previous sample by ID, computes
+/// per-container rates, and sorts by CPU descending (top-style). A
+/// container with no prior sample (just started) reports 0% CPU until the
+/// next frame gives it a baseline.
+fn computed_containers(prev: &MachineStats, cur: &MachineStats, dt: f64) -> Vec<ComputedContainer> {
+    let previous: HashMap<&str, &ContainerStats> =
+        prev.containers.iter().map(|c| (c.id.as_str(), c)).collect();
+    let mut computed: Vec<ComputedContainer> = cur
+        .containers
+        .iter()
+        .map(|c| {
+            let before = previous.get(c.id.as_str());
+            let cpu_percent = before
+                .filter(|p| c.cpu_usage_usec > p.cpu_usage_usec)
+                .map_or(0.0, |p| {
+                    (c.cpu_usage_usec - p.cpu_usage_usec) as f64 / (dt * 1_000_000.0) * 100.0
+                });
+            let rate = |cur_b: u64, prev_b: Option<u64>| {
+                prev_b.map_or(0.0, |pb| cur_b.saturating_sub(pb) as f64 / dt)
+            };
+            ComputedContainer {
+                name: if c.name.is_empty() {
+                    short_id(&c.id)
+                } else {
+                    c.name.clone()
+                },
+                cpu_percent,
+                memory_current_bytes: c.memory_current_bytes,
+                memory_limit_bytes: c.memory_limit_bytes,
+                disk_read_bytes_per_sec: rate(c.disk_read_bytes, before.map(|p| p.disk_read_bytes)),
+                disk_write_bytes_per_sec: rate(
+                    c.disk_written_bytes,
+                    before.map(|p| p.disk_written_bytes),
+                ),
+                net_rx_bytes_per_sec: rate(c.net_rx_bytes, before.map(|p| p.net_rx_bytes)),
+                net_tx_bytes_per_sec: rate(c.net_tx_bytes, before.map(|p| p.net_tx_bytes)),
+                pids: c.pids,
+            }
+        })
+        .collect();
+    computed.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
+    computed
+}
+
+/// Docker-style 12-character short ID.
+fn short_id(id: &str) -> String {
+    id.chars().take(12).collect()
+}
+
+/// Truncates a display string to `width` columns, ellipsizing when longer.
+fn truncate(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        s.to_owned()
+    } else {
+        let kept: String = s.chars().take(width.saturating_sub(1)).collect();
+        format!("{kept}…")
     }
 }
 
@@ -189,6 +318,22 @@ mod tests {
             disk_written_bytes: 2000,
             net_rx_bytes: 3000,
             net_tx_bytes: 4000,
+            containers: vec![],
+        }
+    }
+
+    fn container(id: &str, cpu_usec: u64, mem: u64) -> ContainerStats {
+        ContainerStats {
+            id: id.to_owned(),
+            name: String::new(),
+            cpu_usage_usec: cpu_usec,
+            memory_current_bytes: mem,
+            memory_limit_bytes: 0,
+            disk_read_bytes: 0,
+            disk_written_bytes: 0,
+            pids: 3,
+            net_rx_bytes: 0,
+            net_tx_bytes: 0,
         }
     }
 
@@ -219,5 +364,65 @@ mod tests {
         assert_eq!(fmt_bytes(512), "512 B");
         assert_eq!(fmt_bytes(2048), "2.0 KiB");
         assert_eq!(fmt_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn container_cpu_from_usec_delta_and_sorted_desc() {
+        let mut prev = sample(10_000, 100, 1000);
+        let mut cur = sample(12_000, 150, 1200); // +2s
+        // busy: 1s of CPU over 2s = 50% of one core.
+        prev.containers = vec![container("busy", 0, 100), container("idle", 0, 50)];
+        cur.containers = vec![
+            container("idle", 0, 50),          // no CPU movement
+            container("busy", 1_000_000, 100), // +1s cpu
+        ];
+
+        let c = ComputedStats::from_delta(&prev, &cur).unwrap();
+        // Sorted CPU-descending: the busy one leads.
+        assert_eq!(c.containers[0].name, "busy");
+        assert!((c.containers[0].cpu_percent - 50.0).abs() < 0.01);
+        assert!((c.containers[1].cpu_percent - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn container_network_rate_from_deltas() {
+        let mut prev = sample(10_000, 100, 1000);
+        let mut cur = sample(12_000, 150, 1200); // +2s
+        let mut p = container("net", 0, 100);
+        p.net_rx_bytes = 1000;
+        p.net_tx_bytes = 2000;
+        prev.containers = vec![p];
+        let mut n = container("net", 0, 100);
+        n.net_rx_bytes = 1000 + 4096; // +2 KiB/s
+        n.net_tx_bytes = 2000 + 1024; // +512 B/s
+        cur.containers = vec![n];
+
+        let c = ComputedStats::from_delta(&prev, &cur).unwrap();
+        assert!((c.containers[0].net_rx_bytes_per_sec - 2048.0).abs() < 0.001);
+        assert!((c.containers[0].net_tx_bytes_per_sec - 512.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn newly_started_container_reports_zero_cpu_until_baseline() {
+        let prev = sample(10_000, 100, 1000);
+        let mut cur = sample(12_000, 150, 1200);
+        cur.containers = vec![container("fresh", 5_000_000, 128)];
+
+        let c = ComputedStats::from_delta(&prev, &cur).unwrap();
+        // No prior sample for "fresh": CPU% is 0, not a huge spike.
+        assert_eq!(c.containers.len(), 1);
+        assert!((c.containers[0].cpu_percent - 0.0).abs() < f64::EPSILON);
+        assert_eq!(c.containers[0].name, "fresh");
+    }
+
+    #[test]
+    fn empty_name_falls_back_to_short_id() {
+        let id = "0a1b2c3d4e5f00112233445566778899aabbccddeeff00112233445566778899";
+        let prev = sample(10_000, 100, 1000);
+        let mut cur = sample(12_000, 150, 1200);
+        cur.containers = vec![container(id, 0, 64)];
+
+        let c = ComputedStats::from_delta(&prev, &cur).unwrap();
+        assert_eq!(c.containers[0].name, "0a1b2c3d4e5f");
     }
 }

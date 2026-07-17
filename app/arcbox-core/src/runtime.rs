@@ -1099,6 +1099,26 @@ impl Runtime {
         );
     }
 
+    /// Maps canonical container ID → display name, inverting the registered
+    /// name aliases. Used to enrich per-container stats so a monitor can
+    /// show names instead of bare IDs. When a container has several
+    /// registered names, the shortest wins (the primary Docker name is
+    /// shorter than the alias set it accretes).
+    pub async fn container_names(&self) -> HashMap<String, String> {
+        let mut names: HashMap<String, String> = HashMap::new();
+        for (name, id) in self.container_aliases.read().await.iter() {
+            names
+                .entry(id.clone())
+                .and_modify(|existing| {
+                    if name.len() < existing.len() {
+                        existing.clone_from(name);
+                    }
+                })
+                .or_insert_with(|| name.clone());
+        }
+        names
+    }
+
     /// Records a container's unique name so later lifecycle calls can resolve
     /// it to the canonical ID without a guest round-trip.
     pub async fn register_container_alias(&self, name: &str, container_id: &str) {
