@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use arcbox_grpc::SystemService;
 use arcbox_protocol::v1::{
-    Empty, SetSystemVmBackendRequest, SetupStatus, SystemVmBackend, SystemVmBackendInfo, VcpuDebug,
-    VirtioDebugInfo, VirtioDeviceDebug, VirtioQueueDebug, setup_status,
+    Empty, ResolveContainerFsRequest, ResolveContainerFsResponse, SetSystemVmBackendRequest,
+    SetupStatus, SystemVmBackend, SystemVmBackendInfo, VcpuDebug, VirtioDebugInfo,
+    VirtioDeviceDebug, VirtioQueueDebug, setup_status,
 };
 use tokio::sync::watch;
 use tokio_stream::Stream;
@@ -297,6 +298,25 @@ impl SystemService for SystemServiceImpl {
                 .collect(),
             kick_broadcasts: snapshot.kick_broadcasts,
             unpark_broadcasts: snapshot.unpark_broadcasts,
+        }))
+    }
+
+    async fn resolve_container_fs(
+        &self,
+        request: Request<ResolveContainerFsRequest>,
+    ) -> Result<Response<ResolveContainerFsResponse>, Status> {
+        let runtime = self.runtime.ready()?;
+        let req = request.into_inner();
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id must not be empty"));
+        }
+        let paths = runtime
+            .container_fs_paths(&req.container_id)
+            .await
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        Ok(Response::new(ResolveContainerFsResponse {
+            upper_dir: paths.upper_dir,
+            lower_dirs: paths.lower_dirs,
         }))
     }
 
