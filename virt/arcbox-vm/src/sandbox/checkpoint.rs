@@ -492,6 +492,40 @@ impl SandboxManager {
             Ok(Ok(())) => {}
         }
 
+        // Re-address the guest to the fresh allocation. The restored kernel
+        // still carries the origin's `ip=` boot configuration, so without
+        // this the clone would squat the origin's IP on its new TAP and
+        // never own the address its DNAT/expose mappings target. Unlike the
+        // clock, a fresh-network restore without a working network is the
+        // silent breakage `network_override` exists to prevent — fail the
+        // restore rather than hand back a half-networked sandbox.
+        if let Some(ref net) = net_alloc {
+            let cmd = crate::boot_proto::NetReconfigCommand {
+                ip: net.ip_address,
+                netmask: net.netmask(),
+                gateway: net.gateway,
+            };
+            let reconfig = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                vsock::reconfigure_network(&actual_vsock_path, &cmd),
+            )
+            .await
+            .map_err(|_| VmmError::Vsock("net reconfig after restore timed out".into()))
+            .and_then(|r| r);
+            if let Err(e) = reconfig {
+                kill_and_reap_fc(&mut process).await;
+                cleanup_pending_restore(
+                    &self.cow_manager,
+                    &self.network,
+                    pending_cow.take(),
+                    net_alloc.as_ref(),
+                    pending_origin_dir.as_deref(),
+                )
+                .await;
+                return Err(e);
+            }
+        }
+
         // Populate the reserved instance in place, then commit the reservation
         // so it survives (the placeholder inserted by reserve_id is otherwise
         // removed on drop). All resources are now tracked on the instance and

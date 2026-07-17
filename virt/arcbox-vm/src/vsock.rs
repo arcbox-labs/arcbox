@@ -52,6 +52,9 @@ const MSG_EOF: u8 = 0x04;
 /// Synchronise the guest clock to the host after snapshot restore.
 /// Payload: `[i64 LE unix_seconds][u32 LE nanos]` (12 bytes).
 pub(crate) const MSG_CLOCK_SYNC: u8 = 0x05;
+/// Re-address the guest network after a fresh-network snapshot restore.
+/// Payload: JSON [`NetReconfigCommand`](crate::boot_proto::NetReconfigCommand).
+pub(crate) const MSG_NET_RECONFIG: u8 = 0x06;
 
 // Frame type constants — Agent → Host (exec channel).
 const MSG_STDOUT: u8 = 0x10;
@@ -440,6 +443,60 @@ async fn sync_clock_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWrite
     Ok(())
 }
 
+/// Re-address the guest network after a fresh-network snapshot restore.
+///
+/// Sends [`MSG_NET_RECONFIG`] to the exec channel (vsock port 52) and waits
+/// for `MSG_EXIT(0)`. A restored kernel still carries the origin's `ip=`
+/// boot configuration, so a restore that allocated a new TAP/IP must
+/// re-address the guest or the clone collides with the running origin.
+pub async fn reconfigure_network(
+    uds_path: &Path,
+    cmd: &crate::boot_proto::NetReconfigCommand,
+) -> Result<()> {
+    let mut stream = connect_to_agent(uds_path).await?;
+    net_reconfig_on_stream(&mut stream, cmd).await
+}
+
+/// Send a net-reconfig frame and validate the agent response.
+///
+/// Extracted from [`reconfigure_network`] so the wire protocol can be tested
+/// with `tokio::io::duplex` without needing a real vsock connection.
+async fn net_reconfig_on_stream<S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    cmd: &crate::boot_proto::NetReconfigCommand,
+) -> Result<()> {
+    let payload = serde_json::to_vec(cmd)
+        .map_err(|e| VmmError::Vsock(format!("encode NetReconfigCommand: {e}")))?;
+
+    write_frame(stream, MSG_NET_RECONFIG, &payload)
+        .await
+        .map_err(|e| VmmError::Vsock(format!("write MSG_NET_RECONFIG: {e}")))?;
+
+    let (msg_type, payload) = tokio::time::timeout(Duration::from_secs(5), read_frame(stream))
+        .await
+        .map_err(|_| VmmError::Vsock("net reconfig: timed out waiting for response".into()))?
+        .map_err(|e| VmmError::Vsock(format!("read net reconfig response: {e}")))?;
+
+    if msg_type != MSG_EXIT {
+        return Err(VmmError::Vsock(format!(
+            "net reconfig: unexpected response type 0x{msg_type:02x}"
+        )));
+    }
+    if payload.len() < 4 {
+        return Err(VmmError::Vsock(format!(
+            "net reconfig: payload too short ({} bytes, expected 4)",
+            payload.len()
+        )));
+    }
+    let code = i32::from_le_bytes(payload[..4].try_into().unwrap());
+    if code != 0 {
+        return Err(VmmError::Vsock(format!(
+            "net reconfig: agent returned exit code {code}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,6 +676,61 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("unexpected response type"),
+            "unexpected error: {msg}"
+        );
+        agent_handle.await.unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // reconfigure_network protocol tests
+    // -----------------------------------------------------------------
+
+    fn reconfig_cmd() -> crate::boot_proto::NetReconfigCommand {
+        crate::boot_proto::NetReconfigCommand {
+            ip: std::net::Ipv4Addr::new(172, 20, 0, 3),
+            netmask: std::net::Ipv4Addr::new(255, 255, 0, 0),
+            gateway: std::net::Ipv4Addr::new(172, 20, 0, 1),
+        }
+    }
+
+    /// Simulate a successful net-reconfig exchange, round-tripping the JSON.
+    #[tokio::test]
+    async fn test_net_reconfig_success() {
+        let (mut agent, mut host) = tokio::io::duplex(1024);
+
+        let agent_handle = tokio::spawn(async move {
+            let (ty, payload) = read_frame(&mut agent).await.unwrap();
+            assert_eq!(ty, MSG_NET_RECONFIG);
+            let cmd: crate::boot_proto::NetReconfigCommand =
+                serde_json::from_slice(&payload).unwrap();
+            assert_eq!(cmd, reconfig_cmd());
+
+            write_frame(&mut agent, MSG_EXIT, &0i32.to_le_bytes())
+                .await
+                .unwrap();
+        });
+
+        let result = net_reconfig_on_stream(&mut host, &reconfig_cmd()).await;
+        assert!(result.is_ok());
+        agent_handle.await.unwrap();
+    }
+
+    /// Agent reports failure to apply the new configuration.
+    #[tokio::test]
+    async fn test_net_reconfig_agent_error() {
+        let (mut agent, mut host) = tokio::io::duplex(1024);
+
+        let agent_handle = tokio::spawn(async move {
+            let _ = read_frame(&mut agent).await.unwrap();
+            write_frame(&mut agent, MSG_EXIT, &(-1i32).to_le_bytes())
+                .await
+                .unwrap();
+        });
+
+        let result = net_reconfig_on_stream(&mut host, &reconfig_cmd()).await;
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("agent returned exit code -1"),
             "unexpected error: {msg}"
         );
         agent_handle.await.unwrap();

@@ -275,11 +275,62 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
         .await
         .context("Fresh-network restore failed")?
         .into_inner();
-    info!(id = %cloned.id, "sandbox restored with fresh network while origin runs");
+    info!(id = %cloned.id, ip = %cloned.ip_address, "sandbox restored with fresh network while origin runs");
+    if cloned.ip_address.is_empty() || cloned.ip_address == created.ip_address {
+        bail!(
+            "fresh-network clone must get its own IP (origin {}, clone {:?})",
+            created.ip_address,
+            cloned.ip_address
+        );
+    }
     let stdout = run_and_collect(&mut sandboxes, "smoke3", &["/bin/echo", "hello-clone"]).await?;
     if !stdout.contains("hello-clone") {
         bail!("fresh-network clone run output missing marker: {stdout:?}");
     }
+
+    // The vsock channel working proves nothing about the new TAP. Assert the
+    // guest actually re-addressed eth0 to the fresh allocation…
+    wait_for_state(&mut sandboxes, "smoke3", "ready", Duration::from_secs(30)).await?;
+    let addr = run_and_collect(
+        &mut sandboxes,
+        "smoke3",
+        &["/bin/sh", "-c", "ip addr show eth0"],
+    )
+    .await?;
+    if !addr.contains(&cloned.ip_address) {
+        bail!(
+            "clone eth0 does not carry its allocated IP {} (got: {addr:?})",
+            cloned.ip_address
+        );
+    }
+    if addr.contains(&format!("{}/", created.ip_address)) {
+        bail!(
+            "clone eth0 still carries the origin's IP {} (got: {addr:?})",
+            created.ip_address
+        );
+    }
+
+    // …and that traffic flows through the new TAP: ping the gateway, which
+    // is the local address of the clone's own TAP (sandboxes are isolated
+    // point-to-point links, so peers are deliberately unreachable). Deriving
+    // the gateway from `ip route` also proves the reconfig re-installed the
+    // default route.
+    wait_for_state(&mut sandboxes, "smoke3", "ready", Duration::from_secs(30)).await?;
+    let ping = run_and_collect(
+        &mut sandboxes,
+        "smoke3",
+        &[
+            "/bin/sh",
+            "-c",
+            "gw=$(ip route | sed -n 's/^default via \\([0-9.]*\\).*/\\1/p' | head -1); \
+             echo \"gateway=$gw\"; ping -c 1 -W 2 \"$gw\"",
+        ],
+    )
+    .await?;
+    if !ping.contains(" 0% packet loss") {
+        bail!("clone could not reach its gateway over the new TAP: {ping:?}");
+    }
+
     let origin = inspect(&mut sandboxes, "smoke1").await?;
     if origin.state != "ready" {
         bail!(

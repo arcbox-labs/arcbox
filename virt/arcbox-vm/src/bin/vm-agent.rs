@@ -21,6 +21,8 @@
 //! | 0x02 | Host→Agent  | raw stdin bytes                  |
 //! | 0x03 | Host→Agent  | `[u16 LE width][u16 LE height]`  |
 //! | 0x04 | Host→Agent  | empty — stdin EOF                |
+//! | 0x05 | Host→Agent  | `[i64 LE secs][u32 LE nanos]` — clock sync |
+//! | 0x06 | Host→Agent  | JSON `NetReconfigCommand` — re-address eth0 |
 //! | 0x10 | Agent→Host  | raw stdout bytes                 |
 //! | 0x11 | Agent→Host  | raw stderr bytes                 |
 //! | 0x12 | Agent→Host  | `[i32 LE exit_code]`             |
@@ -56,12 +58,13 @@ mod agent {
     const MSG_RESIZE: u8 = 0x03;
     const MSG_EOF: u8 = 0x04;
     const MSG_CLOCK_SYNC: u8 = 0x05;
+    const MSG_NET_RECONFIG: u8 = 0x06;
     const MSG_STDOUT: u8 = 0x10;
     const MSG_STDERR: u8 = 0x11;
     const MSG_EXIT: u8 = 0x12;
 
     // File I/O channel (vsock:53) — imported from the shared proto module.
-    use arcbox_vm::boot_proto::KernelIpParam;
+    use arcbox_vm::boot_proto::{KernelIpParam, NetReconfigCommand};
     use arcbox_vm::file_io::proto::{
         FILE_ACK, FILE_DATA, FILE_DONE, FILE_ERR, FILE_PORT, FILE_READ_REQ, FILE_WRITE_REQ,
         MAX_FILE_SIZE,
@@ -207,6 +210,7 @@ mod agent {
 
         match msg_type {
             MSG_CLOCK_SYNC => handle_clock_sync(conn, &payload),
+            MSG_NET_RECONFIG => handle_net_reconfig(conn, &payload),
             MSG_START => {
                 let start: StartCommand = match serde_json::from_slice(&payload) {
                     Ok(s) => s,
@@ -256,6 +260,129 @@ mod agent {
             return;
         }
         let _ = write_frame(&mut conn, MSG_EXIT, &0i32.to_le_bytes());
+    }
+
+    fn handle_net_reconfig(mut conn: VsockStream, payload: &[u8]) {
+        let cmd: NetReconfigCommand = match serde_json::from_slice(payload) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("agent: parse NetReconfigCommand: {e}");
+                let _ = write_frame(&mut conn, MSG_EXIT, &(-1i32).to_le_bytes());
+                return;
+            }
+        };
+
+        if let Err(e) = net_reconfig::apply(&cmd) {
+            eprintln!("agent: net reconfig failed: {e}");
+            let _ = write_frame(&mut conn, MSG_EXIT, &(-1i32).to_le_bytes());
+            return;
+        }
+
+        // Repoint DNS at the new gateway, mirroring the boot-time setup_dns.
+        let content = format!("nameserver {}\n", cmd.gateway);
+        if let Err(e) = std::fs::write("/etc/resolv.conf", &content) {
+            eprintln!("agent: net reconfig: failed to write /etc/resolv.conf: {e}");
+        }
+
+        eprintln!(
+            "agent: reconfigured eth0 to {}/{} via {}",
+            cmd.ip, cmd.netmask, cmd.gateway
+        );
+        let _ = write_frame(&mut conn, MSG_EXIT, &0i32.to_le_bytes());
+    }
+
+    /// eth0 re-addressing via raw `ioctl(2)`, self-contained so it works on
+    /// any sandbox rootfs (no dependence on busybox `ip`/`route` applets).
+    mod net_reconfig {
+        use arcbox_vm::boot_proto::NetReconfigCommand;
+        use std::net::Ipv4Addr;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        const IFNAME: &[u8] = b"eth0";
+
+        fn sockaddr_in(ip: Ipv4Addr) -> libc::sockaddr {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: 0,
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from(ip).to_be(),
+                },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: sockaddr_in and sockaddr are layout-compatible for the
+            // kernel ABI; sockaddr is larger or equal, remainder zeroed below.
+            let mut sa: libc::sockaddr = unsafe { std::mem::zeroed() };
+            // SAFETY: copying sizeof(sockaddr_in) <= sizeof(sockaddr) bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (&raw const sin).cast::<u8>(),
+                    (&raw mut sa).cast::<u8>(),
+                    std::mem::size_of::<libc::sockaddr_in>(),
+                );
+            }
+            sa
+        }
+
+        fn ifreq_with_addr(addr: libc::sockaddr) -> libc::ifreq {
+            // SAFETY: ifreq is POD; fully initialized below.
+            let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+            for (dst, src) in req.ifr_name.iter_mut().zip(IFNAME) {
+                *dst = *src as libc::c_char;
+            }
+            req.ifr_ifru.ifru_addr = addr;
+            req
+        }
+
+        fn ioctl(
+            fd: &OwnedFd,
+            request: libc::c_ulong,
+            arg: *mut libc::c_void,
+        ) -> Result<(), String> {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                reason = "SIOC* request numbers fit musl's c_int ioctl request type"
+            )]
+            let request = request as libc::Ioctl;
+            // SAFETY: fd is a valid socket; arg points at a properly sized,
+            // initialized kernel struct owned by the caller.
+            if unsafe { libc::ioctl(fd.as_raw_fd(), request, arg) } < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            Ok(())
+        }
+
+        /// Set eth0's address + netmask and replace the default route.
+        pub fn apply(cmd: &NetReconfigCommand) -> Result<(), String> {
+            // SAFETY: plain socket(2) call; result checked below.
+            let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+            if raw < 0 {
+                return Err(format!("socket: {}", std::io::Error::last_os_error()));
+            }
+            // SAFETY: raw is a freshly opened, owned socket fd.
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+            let mut req = ifreq_with_addr(sockaddr_in(cmd.ip));
+            ioctl(&fd, libc::SIOCSIFADDR, (&raw mut req).cast())
+                .map_err(|e| format!("SIOCSIFADDR: {e}"))?;
+
+            let mut req = ifreq_with_addr(sockaddr_in(cmd.netmask));
+            ioctl(&fd, libc::SIOCSIFNETMASK, (&raw mut req).cast())
+                .map_err(|e| format!("SIOCSIFNETMASK: {e}"))?;
+
+            // Changing the address drops routes through the interface; add the
+            // default route back via the new gateway.
+            // SAFETY: rtentry is POD; fields set below, rest zeroed.
+            let mut route: libc::rtentry = unsafe { std::mem::zeroed() };
+            route.rt_dst = sockaddr_in(Ipv4Addr::UNSPECIFIED);
+            route.rt_genmask = sockaddr_in(Ipv4Addr::UNSPECIFIED);
+            route.rt_gateway = sockaddr_in(cmd.gateway);
+            route.rt_flags = libc::RTF_UP | libc::RTF_GATEWAY;
+            ioctl(&fd, libc::SIOCADDRT, (&raw mut route).cast())
+                .map_err(|e| format!("SIOCADDRT default via {}: {e}", cmd.gateway))?;
+
+            Ok(())
+        }
     }
 
     // -------------------------------------------------------------------------
