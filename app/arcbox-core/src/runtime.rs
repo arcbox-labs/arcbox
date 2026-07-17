@@ -511,8 +511,16 @@ impl Runtime {
     /// Returns an error if the System VM is not running, the agent is
     /// unreachable, or the container has no snapshot.
     pub async fn container_fs_paths(&self, container_id: &str) -> Result<ContainerFsPathsResponse> {
-        let mut agent = self.get_agent(DEFAULT_MACHINE_NAME)?;
-        // Blocking transport on the HV socketpair, async on VZ/Linux vsock.
+        // `connect_agent` is a blocking hypervisor call, so it runs off the
+        // async executor; the transport it yields is blocking on the HV
+        // socketpair and async on VZ/Linux vsock (`sync_guest_clock` is the
+        // reference pattern).
+        let machine_manager = Arc::clone(&self.machine_manager);
+        let mut agent = tokio::task::spawn_blocking(move || {
+            machine_manager.connect_agent(DEFAULT_MACHINE_NAME)
+        })
+        .await
+        .map_err(|e| CoreError::Vm(format!("agent connect task panicked: {e}")))??;
         if agent.is_blocking() {
             let id = container_id.to_string();
             tokio::task::spawn_blocking(move || agent.container_fs_paths_blocking(&id))
