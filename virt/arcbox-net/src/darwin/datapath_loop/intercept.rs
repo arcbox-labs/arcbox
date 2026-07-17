@@ -30,6 +30,7 @@ pub(super) fn handle_intercepted_frame(
     gateway_ip: Ipv4Addr,
     gateway_mac: [u8; 6],
     guest_mac: [u8; 6],
+    mtu: usize,
 ) {
     let frame = &intercepted.frame;
     match intercepted.kind {
@@ -42,6 +43,7 @@ pub(super) fn handle_intercepted_frame(
                 gateway_ip,
                 gateway_mac,
                 guest_mac,
+                mtu,
             );
         }
         InterceptedKind::Dns => {
@@ -54,6 +56,7 @@ pub(super) fn handle_intercepted_frame(
                 gateway_ip,
                 gateway_mac,
                 guest_mac,
+                mtu,
             );
         }
         InterceptedKind::Udp | InterceptedKind::Icmp => {
@@ -93,6 +96,7 @@ pub(super) fn process_inbound_cmd(
 }
 
 /// Handles a DHCP packet from the guest.
+#[allow(clippy::too_many_arguments)] // all parameters are required context for DHCP frame handling
 fn handle_dhcp(
     frame: &[u8],
     guest_tx: &mut GuestTx,
@@ -101,6 +105,7 @@ fn handle_dhcp(
     gateway_ip: Ipv4Addr,
     gateway_mac: [u8; 6],
     guest_mac: [u8; 6],
+    mtu: usize,
 ) {
     let ip_start = ETH_HEADER_LEN;
     let ihl = ((frame[ip_start] & 0x0F) as usize) * 4;
@@ -115,7 +120,7 @@ fn handle_dhcp(
 
     match dhcp_server.handle_packet(dhcp_data) {
         Ok(Some(response)) => {
-            let reply_frame = build_udp_ip_ethernet(
+            let reply_frames = build_udp_ip_ethernet(
                 gateway_ip,
                 Ipv4Addr::BROADCAST,
                 67,
@@ -123,9 +128,12 @@ fn handle_dhcp(
                 &response,
                 gateway_mac,
                 guest_mac,
+                mtu,
             );
-            tracing::info!("Sending DHCP reply frame: {} bytes", reply_frame.len());
-            guest_tx.send(guest_fd, &reply_frame, DeliveryClass::Lossy);
+            for reply_frame in reply_frames {
+                tracing::info!("Sending DHCP reply frame: {} bytes", reply_frame.len());
+                guest_tx.send(guest_fd, &reply_frame, DeliveryClass::Lossy);
+            }
         }
         Ok(None) => {
             tracing::info!("DHCP: no response needed");
@@ -153,6 +161,7 @@ fn handle_dns(
     gateway_ip: Ipv4Addr,
     gateway_mac: [u8; 6],
     guest_mac: [u8; 6],
+    mtu: usize,
 ) {
     let ip_start = ETH_HEADER_LEN;
     let ihl = ((frame[ip_start] & 0x0F) as usize) * 4;
@@ -173,7 +182,7 @@ fn handle_dns(
 
     // Fast path: resolve from local host mappings (no I/O).
     if let Some(response) = dns_forwarder.try_resolve_locally(dns_data) {
-        let reply_frame = build_udp_ip_ethernet(
+        let reply_frames = build_udp_ip_ethernet(
             gateway_ip,
             src_ip,
             53,
@@ -181,11 +190,15 @@ fn handle_dns(
             &response,
             gateway_mac,
             guest_mac,
+            mtu,
         );
         let tx = dns_reply_tx.clone();
         tokio::spawn(async move {
-            if tx.send(reply_frame).await.is_err() {
-                tracing::debug!("DNS reply channel closed");
+            for reply_frame in reply_frames {
+                if tx.send(reply_frame).await.is_err() {
+                    tracing::debug!("DNS reply channel closed");
+                    return;
+                }
             }
         });
         tracing::debug!("Queued local DNS response to guest");
@@ -220,7 +233,7 @@ fn handle_dns(
                     log.record(&domain, &ips);
                 }
 
-                let reply_frame = build_udp_ip_ethernet(
+                let reply_frames = build_udp_ip_ethernet(
                     gateway_ip,
                     src_ip,
                     53,
@@ -228,16 +241,20 @@ fn handle_dns(
                     &response,
                     gateway_mac,
                     guest_mac,
+                    mtu,
                 );
-                if tx.send(reply_frame).await.is_err() {
-                    tracing::debug!("DNS reply channel closed");
+                for reply_frame in reply_frames {
+                    if tx.send(reply_frame).await.is_err() {
+                        tracing::debug!("DNS reply channel closed");
+                        return;
+                    }
                 }
                 tracing::debug!("Sent forwarded DNS response to guest");
             }
             Err(e) => {
                 tracing::warn!("DNS forwarding failed: {e}");
                 if let Some(servfail) = build_dns_servfail_response(&data) {
-                    let reply_frame = build_udp_ip_ethernet(
+                    let reply_frames = build_udp_ip_ethernet(
                         gateway_ip,
                         src_ip,
                         53,
@@ -245,9 +262,13 @@ fn handle_dns(
                         &servfail,
                         gateway_mac,
                         guest_mac,
+                        mtu,
                     );
-                    if tx.send(reply_frame).await.is_err() {
-                        tracing::debug!("DNS reply channel closed");
+                    for reply_frame in reply_frames {
+                        if tx.send(reply_frame).await.is_err() {
+                            tracing::debug!("DNS reply channel closed");
+                            return;
+                        }
                     }
                 }
             }

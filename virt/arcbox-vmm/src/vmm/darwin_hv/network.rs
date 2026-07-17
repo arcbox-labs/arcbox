@@ -140,10 +140,22 @@ impl Vmm {
         let cancel = tokio_util::sync::CancellationToken::new();
         self.net_cancel = Some(cancel.clone());
 
+        // The HV virtio-net NIC advertises the NetConfig default MTU (1500,
+        // setup.rs constructs `NetConfig { .. Default::default() }`); the
+        // datapath fragments guest-bound UDP datagrams to it (ABX-428).
+        let net_mtu = arcbox_virtio::net::NetConfig::default().mtu as usize;
+
         // 3. Create socket proxy and channels.
         let (reply_tx, reply_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(256);
-        let egress = HostEgress::new(gateway_ip, gateway_mac, guest_ip, reply_tx, cancel.clone());
+        let egress = HostEgress::new(
+            gateway_ip,
+            gateway_mac,
+            guest_ip,
+            reply_tx,
+            cancel.clone(),
+            net_mtu,
+        );
 
         self.inbound_listener_manager = Some(InboundListenerManager::new(cmd_tx));
 
@@ -161,7 +173,6 @@ impl Vmm {
         };
 
         // 5. Build and spawn the datapath.
-        let net_mtu = arcbox_net::darwin::classifier::ENHANCED_ETHERNET_MTU;
         let mut datapath = NetworkDatapath::new(
             host_fd,
             egress,

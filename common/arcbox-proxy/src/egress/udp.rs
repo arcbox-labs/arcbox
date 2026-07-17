@@ -107,6 +107,8 @@ pub(super) struct UdpProxy {
     /// Gateway IP — connections to this IP are translated to loopback
     /// so they reach host services (host.docker.internal support).
     gateway_ip: Ipv4Addr,
+    /// Guest link MTU; replies above it are IPv4-fragmented.
+    mtu: usize,
     /// Shared fake-IP → domain log; reverses a fake-IP destination before the
     /// proxy decision so UDP routes by domain like TCP. `None` = no reversal.
     pub(super) dns_log: Option<DnsResolutionLog>,
@@ -120,12 +122,14 @@ impl UdpProxy {
         reply_tx: mpsc::Sender<Vec<u8>>,
         gateway_mac: [u8; 6],
         gateway_ip: Ipv4Addr,
+        mtu: usize,
     ) -> Self {
         Self {
             flows: HashMap::new(),
             reply_tx,
             gateway_mac,
             gateway_ip,
+            mtu,
             dns_log: None,
             proxy_env: None,
         }
@@ -198,6 +202,7 @@ impl UdpProxy {
 
         let reply_tx = self.reply_tx.clone();
         let gateway_mac = self.gateway_mac;
+        let mtu = self.mtu;
         // Translate gateway IP to loopback so host services are reachable.
         let connect_ip = if dst_ip == self.gateway_ip {
             Ipv4Addr::LOCALHOST
@@ -260,7 +265,7 @@ impl UdpProxy {
                             transport.recv(&mut buf),
                         ) => match recv {
                             Ok(Ok(Some(n))) => {
-                                let reply_frame = build_udp_ip_ethernet(
+                                let reply_frames = build_udp_ip_ethernet(
                                     dst_ip,
                                     src_ip,
                                     dst_port,
@@ -268,9 +273,12 @@ impl UdpProxy {
                                     &buf[..n],
                                     gateway_mac,
                                     guest_mac,
+                                    mtu,
                                 );
-                                if reply_tx.send(reply_frame).await.is_err() {
-                                    return;
+                                for frame in reply_frames {
+                                    if reply_tx.send(frame).await.is_err() {
+                                        return;
+                                    }
                                 }
                             }
                             // A fragmented / malformed relay datagram: skip it (the
@@ -339,7 +347,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
         let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
-        let mut proxy = UdpProxy::new(tx, gw_mac, gw_ip);
+        let mut proxy = UdpProxy::new(tx, gw_mac, gw_ip, 1500);
 
         // Insert a flow that is already expired.
         let key = (
@@ -370,7 +378,7 @@ mod tests {
         let (reply_tx, _reply_rx) = mpsc::channel(64);
         let gw_ip = Ipv4Addr::new(10, 0, 2, 1);
         let gw_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-        let mut proxy = UdpProxy::new(reply_tx, gw_mac, gw_ip);
+        let mut proxy = UdpProxy::new(reply_tx, gw_mac, gw_ip, 1500);
 
         // Bind a UDP listener on loopback.
         let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -439,7 +447,7 @@ mod tests {
         let (reply_tx, mut reply_rx) = mpsc::channel(16);
         let gw_ip = Ipv4Addr::new(10, 0, 2, 1);
         let gw_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-        let mut proxy = UdpProxy::new(reply_tx, gw_mac, gw_ip);
+        let mut proxy = UdpProxy::new(reply_tx, gw_mac, gw_ip, 1500);
         let (phost, pport) = (proxy_addr.ip().to_string(), proxy_addr.port());
         proxy.proxy_env = Some(ProxyEnvironment {
             socks_proxy: Some(arcbox_fakeip::proxy_detect::ProxyConfig {

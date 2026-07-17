@@ -125,10 +125,13 @@ fn test_build_udp_ip_ethernet_checksum() {
     let dst_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
     let payload = b"hello";
 
-    let frame = build_udp_ip_ethernet(src_ip, dst_ip, 1234, 5678, payload, src_mac, dst_mac);
+    let frames = build_udp_ip_ethernet(src_ip, dst_ip, 1234, 5678, payload, src_mac, dst_mac, 1500);
+    let [frame] = frames.as_slice() else {
+        panic!("small payload must yield exactly one frame");
+    };
 
     // Verify Ethernet header
-    let hdr = EthernetHeader::parse(&frame).unwrap();
+    let hdr = EthernetHeader::parse(frame).unwrap();
     assert_eq!(hdr.ethertype, EtherType::Ipv4);
 
     // Verify IP header
@@ -159,6 +162,166 @@ fn test_build_udp_ip_ethernet_checksum() {
     // Verify UDP checksum is non-zero
     let udp_cksum = u16::from_be_bytes([udp[6], udp[7]]);
     assert_ne!(udp_cksum, 0);
+}
+
+/// Reassembles IPv4 fragments back into the original IP payload, checking
+/// per-fragment invariants (MTU bound, shared IP ID, MF flag, byte offsets,
+/// header checksum) along the way.
+fn reassemble_fragments(frames: &[Vec<u8>], mtu: usize) -> Vec<u8> {
+    let first_ip = &frames[0][ETH_HEADER_LEN..];
+    let id = u16::from_be_bytes([first_ip[4], first_ip[5]]);
+    let mut out = Vec::new();
+    for (i, frame) in frames.iter().enumerate() {
+        assert!(
+            frame.len() <= ETH_HEADER_LEN + mtu,
+            "fragment {i} exceeds the link MTU"
+        );
+        let ip = &frame[ETH_HEADER_LEN..];
+        assert_eq!(ip[0], 0x45);
+        assert_eq!(ip[9], 17);
+        assert_eq!(
+            u16::from_be_bytes([ip[4], ip[5]]),
+            id,
+            "fragment {i} carries a different IP ID"
+        );
+        let mut sum: u32 = 0;
+        for j in (0..20).step_by(2) {
+            sum += u32::from(u16::from_be_bytes([ip[j], ip[j + 1]]));
+        }
+        while sum > 0xFFFF {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        assert_eq!(sum as u16, 0xFFFF, "fragment {i} IP header checksum");
+        let flags_frag = u16::from_be_bytes([ip[6], ip[7]]);
+        assert_eq!(
+            flags_frag & 0x2000 != 0,
+            i + 1 < frames.len(),
+            "fragment {i} MF flag"
+        );
+        assert_eq!(
+            usize::from(flags_frag & 0x1FFF) * 8,
+            out.len(),
+            "fragment {i} offset"
+        );
+        let ip_total = u16::from_be_bytes([ip[2], ip[3]]) as usize;
+        assert_eq!(ip_total, frame.len() - ETH_HEADER_LEN);
+        out.extend_from_slice(&ip[20..ip_total]);
+    }
+    out
+}
+
+/// Asserts `datagram` is a valid UDP datagram for `payload` with a correct
+/// checksum.
+fn assert_udp_datagram(datagram: &[u8], src_ip: Ipv4Addr, dst_ip: Ipv4Addr, payload: &[u8]) {
+    assert_eq!(datagram.len(), 8 + payload.len());
+    assert_eq!(
+        u16::from_be_bytes([datagram[4], datagram[5]]) as usize,
+        datagram.len()
+    );
+    assert_eq!(&datagram[8..], payload);
+    let stored = u16::from_be_bytes([datagram[6], datagram[7]]);
+    let mut zeroed = datagram.to_vec();
+    zeroed[6..8].fill(0);
+    assert_eq!(
+        stored,
+        super::checksum::udp_checksum(src_ip, dst_ip, &zeroed),
+        "UDP checksum over the reassembled datagram"
+    );
+}
+
+#[test]
+fn oversized_udp_datagram_fragments_and_reassembles() {
+    let src_ip = Ipv4Addr::new(10, 0, 2, 1);
+    let dst_ip = Ipv4Addr::new(10, 0, 2, 2);
+    let payload: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+
+    let frames = build_udp_ip_ethernet(src_ip, dst_ip, 53, 40000, &payload, [1; 6], [2; 6], 1500);
+
+    // 3008-byte datagram at 1480 bytes per fragment: 1480 + 1480 + 48.
+    assert_eq!(frames.len(), 3);
+    let datagram = reassemble_fragments(&frames, 1500);
+    assert_udp_datagram(&datagram, src_ip, dst_ip, &payload);
+}
+
+#[test]
+fn tail_fragment_can_be_a_single_byte() {
+    let src_ip = Ipv4Addr::new(10, 0, 2, 1);
+    let dst_ip = Ipv4Addr::new(10, 0, 2, 2);
+    // 1473-byte payload → 1481-byte datagram → 1480 + 1.
+    let payload = vec![0xA5u8; 1473];
+
+    let frames = build_udp_ip_ethernet(src_ip, dst_ip, 53, 40000, &payload, [1; 6], [2; 6], 1500);
+
+    assert_eq!(frames.len(), 2);
+    assert_eq!(frames[1].len(), ETH_HEADER_LEN + 20 + 1);
+    let datagram = reassemble_fragments(&frames, 1500);
+    assert_udp_datagram(&datagram, src_ip, dst_ip, &payload);
+}
+
+#[test]
+fn max_udp_payload_fragments_and_reassembles() {
+    let src_ip = Ipv4Addr::new(10, 0, 2, 1);
+    let dst_ip = Ipv4Addr::new(10, 0, 2, 2);
+    let payload = vec![0x5Au8; MAX_UDP_PAYLOAD];
+
+    let frames = build_udp_ip_ethernet(src_ip, dst_ip, 53, 40000, &payload, [1; 6], [2; 6], 1500);
+
+    // 65515-byte datagram at 1480 per fragment = ceil → 45 frames.
+    assert_eq!(frames.len(), 45);
+    let datagram = reassemble_fragments(&frames, 1500);
+    assert_udp_datagram(&datagram, src_ip, dst_ip, &payload);
+}
+
+#[test]
+fn payload_above_max_yields_no_frames() {
+    let payload = vec![0u8; MAX_UDP_PAYLOAD + 1];
+    let frames = build_udp_ip_ethernet(
+        Ipv4Addr::new(10, 0, 2, 1),
+        Ipv4Addr::new(10, 0, 2, 2),
+        53,
+        40000,
+        &payload,
+        [1; 6],
+        [2; 6],
+        1500,
+    );
+    assert!(frames.is_empty());
+}
+
+#[test]
+fn consecutive_datagrams_carry_distinct_ip_ids() {
+    let build = || {
+        build_udp_ip_ethernet(
+            Ipv4Addr::new(10, 0, 2, 1),
+            Ipv4Addr::new(10, 0, 2, 2),
+            53,
+            40000,
+            b"x",
+            [1; 6],
+            [2; 6],
+            1500,
+        )
+    };
+    let a = build();
+    let b = build();
+    let id =
+        |f: &[Vec<u8>]| u16::from_be_bytes([f[0][ETH_HEADER_LEN + 4], f[0][ETH_HEADER_LEN + 5]]);
+    assert_ne!(id(&a), id(&b));
+}
+
+#[test]
+#[should_panic(expected = "cannot carry an IPv4 fragment")]
+fn tiny_mtu_panics() {
+    let _ = build_udp_ip_ethernet(
+        Ipv4Addr::new(10, 0, 2, 1),
+        Ipv4Addr::new(10, 0, 2, 2),
+        53,
+        40000,
+        b"x",
+        [1; 6],
+        [2; 6],
+        35,
+    );
 }
 
 fn make_tcp_params(

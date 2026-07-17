@@ -19,7 +19,7 @@ pub use tcp::{
     build_tcp_rst_frame, build_tcp_syn_ack_frame, build_tcp_syn_frame, parse_tcp_syn_options,
     tcp_pseudo_header_checksum,
 };
-pub use udp::build_udp_ip_ethernet;
+pub use udp::{MAX_UDP_PAYLOAD, build_udp_ip_ethernet};
 
 use std::net::Ipv4Addr;
 

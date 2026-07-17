@@ -343,10 +343,24 @@ impl Vmm {
         let cancel = CancellationToken::new();
         self.net_cancel = Some(cancel.clone());
 
+        // NOTE(MTU): the MTU the VZ device will negotiate (1500 by default,
+        // ABX-423; 4000 under ARCBOX_DIAG_NET_MTU_4000 — see
+        // arcbox-vz/src/device/network.rs). The datapath fragments guest-bound
+        // UDP datagrams to it (ABX-428); guest-bound TCP segments are bounded
+        // by the peer's advertised MSS (TcpBridge peer_mss).
+        let net_mtu = arcbox_hypervisor::darwin::desired_network_mtu();
+
         // 3. Create the socket proxy, reply channel, and inbound command channel.
         let (reply_tx, reply_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(256);
-        let egress = HostEgress::new(gateway_ip, gateway_mac, guest_ip, reply_tx, cancel.clone());
+        let egress = HostEgress::new(
+            gateway_ip,
+            gateway_mac,
+            guest_ip,
+            reply_tx,
+            cancel.clone(),
+            net_mtu,
+        );
 
         // Create the inbound listener manager for port forwarding.
         self.inbound_listener_manager = Some(InboundListenerManager::new(cmd_tx));
@@ -371,18 +385,6 @@ impl Vmm {
         };
 
         // 5. Build the datapath and spawn it on the tokio runtime.
-
-        // NOTE(MTU): the VZ device stays at the default 1500 (ABX-423 — see
-        // arcbox-vz/src/device/network.rs), but the classifier deliberately
-        // keeps ENHANCED_ETHERNET_MTU (4000). For the datapath this value only
-        // sizes buffers and frame sinks — at a 1500 link it is pure headroom —
-        // and it keeps the ARCBOX_DIAG_NET_MTU_4000 reproduction mode working
-        // without plumbing the negotiated MTU from
-        // NetworkDeviceConfiguration::mtu() through the hypervisor abstraction
-        // layer. Guest-bound TCP segments are bounded by the peer's advertised
-        // MSS (TcpBridge peer_mss), not by this value.
-        let net_mtu = arcbox_net::darwin::classifier::ENHANCED_ETHERNET_MTU;
-
         let datapath = NetworkDatapath::new(
             host_fd,
             egress,

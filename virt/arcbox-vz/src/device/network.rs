@@ -24,6 +24,24 @@ pub const VZ_DEFAULT_MTU: usize = 1500;
 /// the stall (Apple Feedback evidence) and for throughput A/B runs.
 pub const VZ_ENHANCED_MTU: u64 = 4000;
 
+/// The MTU a VZ network device is configured with: [`VZ_DEFAULT_MTU`] unless
+/// `ARCBOX_DIAG_NET_MTU_4000` opts into [`VZ_ENHANCED_MTU`].
+///
+/// This is the policy half of the decision — the VMM sizes its datapath from
+/// it before the device exists. The mechanism half (the
+/// `setMaximumTransmissionUnit:` availability probe and the actual setter
+/// call) stays in [`NetworkDeviceConfiguration`]; on macOS < 13 with the knob
+/// set the device falls back to 1500 while the datapath assumes 4000, an
+/// accepted mismatch on that unsupported, diagnostic-only configuration.
+#[must_use]
+pub fn desired_network_mtu() -> usize {
+    if std::env::var_os("ARCBOX_DIAG_NET_MTU_4000").is_some() {
+        VZ_ENHANCED_MTU as usize
+    } else {
+        VZ_DEFAULT_MTU
+    }
+}
+
 /// Configuration for a `VirtIO` network device.
 pub struct NetworkDeviceConfiguration {
     inner: *mut AnyObject,
@@ -110,11 +128,12 @@ impl NetworkDeviceConfiguration {
             msg_send_void!(obj, setAttachment: attachment);
 
             // The MTU stays at Apple's default 1500 (ABX-423 — see
-            // VZ_ENHANCED_MTU). ARCBOX_DIAG_NET_MTU_4000 opts back into the
-            // enhanced MTU for stall reproduction and throughput A/B runs;
-            // it needs setMaximumTransmissionUnit: (macOS 13+), so check
-            // respondsToSelector: to avoid an unrecognized-selector crash.
-            let mtu = if std::env::var_os("ARCBOX_DIAG_NET_MTU_4000").is_some() {
+            // VZ_ENHANCED_MTU). desired_network_mtu() reads the
+            // ARCBOX_DIAG_NET_MTU_4000 opt-in for stall reproduction and
+            // throughput A/B runs; raising needs setMaximumTransmissionUnit:
+            // (macOS 13+), so check respondsToSelector: to avoid an
+            // unrecognized-selector crash.
+            let mtu = if desired_network_mtu() > VZ_DEFAULT_MTU {
                 let mtu_sel = objc2::sel!(setMaximumTransmissionUnit:);
                 // msg_send_bool! doesn't support Sel arguments, so dispatch manually.
                 let responds: bool = {

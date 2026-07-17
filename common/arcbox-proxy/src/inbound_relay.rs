@@ -136,6 +136,8 @@ pub(crate) struct InboundRelay {
     gateway_mac: [u8; 6],
     gateway_ip: Ipv4Addr,
     guest_ip: Ipv4Addr,
+    /// Guest link MTU; injected datagrams above it are IPv4-fragmented.
+    mtu: usize,
     ephemeral_ports: EphemeralPorts,
 }
 
@@ -145,6 +147,7 @@ impl InboundRelay {
         gateway_mac: [u8; 6],
         gateway_ip: Ipv4Addr,
         guest_ip: Ipv4Addr,
+        mtu: usize,
     ) -> Self {
         Self {
             udp_flows: HashMap::new(),
@@ -152,6 +155,7 @@ impl InboundRelay {
             gateway_mac,
             gateway_ip,
             guest_ip,
+            mtu,
             ephemeral_ports: EphemeralPorts::new(),
         }
     }
@@ -251,7 +255,7 @@ impl InboundRelay {
             },
         );
 
-        let frame = build_udp_ip_ethernet(
+        let frames = build_udp_ip_ethernet(
             self.gateway_ip,
             self.guest_ip,
             ephemeral_port,
@@ -259,9 +263,15 @@ impl InboundRelay {
             data,
             self.gateway_mac,
             guest_mac,
+            self.mtu,
         );
 
-        let _ = self.reply_tx.try_send(frame);
+        for frame in frames {
+            if self.reply_tx.try_send(frame).is_err() {
+                // Dropping a fragment kills the whole datagram; stop early.
+                break;
+            }
+        }
 
         tracing::debug!(
             "Inbound UDP: injected {} bytes  gw:{} → guest:{}",
@@ -561,7 +571,7 @@ mod tests {
     #[test]
     fn inbound_relay_rejects_non_ephemeral() {
         let (tx, _rx) = mpsc::channel(16);
-        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP);
+        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP, 1500);
 
         // Build a minimal TCP frame with dst_port=80 (not in ephemeral range).
         let mut frame = vec![0u8; ETH_HEADER_LEN + 40];
@@ -583,7 +593,7 @@ mod tests {
     #[tokio::test]
     async fn inject_udp_sends_frame_and_tracks_flow() {
         let (tx, mut rx) = mpsc::channel(16);
-        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP);
+        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP, 1500);
 
         let (client_tx, _client_rx) = mpsc::channel(16);
         relay.inject_udp(53, b"dns query", client_tx, GUEST_MAC);
@@ -610,7 +620,7 @@ mod tests {
     #[test]
     fn cleanup_removes_expired_udp_flows() {
         let (tx, _rx) = mpsc::channel(16);
-        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP);
+        let mut relay = InboundRelay::new(tx, GW_MAC, GW_IP, GUEST_IP, 1500);
 
         let (client_tx, _client_rx) = mpsc::channel(16);
         let key = (GW_IP, 61000, GUEST_IP, 53);

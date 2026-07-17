@@ -48,7 +48,14 @@ fn create_test_datapath() -> (NetworkDatapath, std::os::fd::OwnedFd, Cancellatio
     let (reply_tx, reply_rx) = mpsc::channel(256);
     let (_cmd_tx, cmd_rx) = mpsc::channel(64);
 
-    let egress = HostEgress::new(GATEWAY_IP, GATEWAY_MAC, GUEST_IP, reply_tx, cancel.clone());
+    let egress = HostEgress::new(
+        GATEWAY_IP,
+        GATEWAY_MAC,
+        GUEST_IP,
+        reply_tx,
+        cancel.clone(),
+        1500,
+    );
 
     let dhcp_config = DhcpConfig::new(GATEWAY_IP, Ipv4Addr::new(255, 255, 255, 0));
     let dhcp_server = arcbox_dhcp::DhcpServer::new(dhcp_config);

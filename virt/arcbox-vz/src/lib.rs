@@ -82,7 +82,7 @@ pub use device::{
     MacGraphicsDeviceConfiguration, MemoryBalloonDevice, MemoryBalloonDeviceConfiguration,
     MultipleDirectoryShare, NetworkDeviceConfiguration, RosettaAvailability,
     SerialPortConfiguration, SharedDirectory, SingleDirectoryShare, SocketDeviceConfiguration,
-    StorageDeviceConfiguration, VirtioFileSystemDeviceConfiguration,
+    StorageDeviceConfiguration, VirtioFileSystemDeviceConfiguration, desired_network_mtu,
 };
 
 pub use socket::{VirtioSocketConnection, VirtioSocketDevice, VirtioSocketListener};

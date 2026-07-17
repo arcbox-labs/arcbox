@@ -46,7 +46,8 @@ impl HostEgress {
     /// Creates a new host-socket egress.
     ///
     /// `reply_tx` is used by all sub-proxies to send L2 frames back to the
-    /// datapath for writing to the guest FD.
+    /// datapath for writing to the guest FD. `mtu` is the guest link MTU;
+    /// guest-bound UDP datagrams above it are IPv4-fragmented.
     #[must_use]
     pub fn new(
         gateway_ip: Ipv4Addr,
@@ -54,16 +55,18 @@ impl HostEgress {
         guest_ip: Ipv4Addr,
         reply_tx: mpsc::Sender<Vec<u8>>,
         cancel: CancellationToken,
+        mtu: usize,
     ) -> Self {
         let inbound = super::inbound_relay::InboundRelay::new(
             reply_tx.clone(),
             gateway_mac,
             gateway_ip,
             guest_ip,
+            mtu,
         );
         Self {
             icmp: IcmpProxy::new(reply_tx.clone(), gateway_mac),
-            udp: UdpProxy::new(reply_tx.clone(), gateway_mac, gateway_ip),
+            udp: UdpProxy::new(reply_tx.clone(), gateway_mac, gateway_ip, mtu),
             inbound,
             reply_tx,
             cancel,
@@ -163,7 +166,7 @@ mod tests {
         let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
         let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
         let guest_ip = Ipv4Addr::new(192, 168, 64, 2);
-        let _egress = HostEgress::new(gw_ip, gw_mac, guest_ip, tx, CancellationToken::new());
+        let _egress = HostEgress::new(gw_ip, gw_mac, guest_ip, tx, CancellationToken::new(), 1500);
     }
 
     #[test]
@@ -172,7 +175,8 @@ mod tests {
         let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
         let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
         let guest_ip = Ipv4Addr::new(192, 168, 64, 2);
-        let mut egress = HostEgress::new(gw_ip, gw_mac, guest_ip, tx, CancellationToken::new());
+        let mut egress =
+            HostEgress::new(gw_ip, gw_mac, guest_ip, tx, CancellationToken::new(), 1500);
 
         // Build a minimal Ethernet + IPv4 frame with protocol=50 (ESP).
         let mut frame = vec![0u8; ETH_HEADER_LEN + 20];
@@ -193,7 +197,8 @@ mod tests {
         let gw_ip = Ipv4Addr::new(192, 168, 64, 1);
         let gw_mac = [0x02, 0xAB, 0xCD, 0x00, 0x00, 0x01];
         let guest_ip = Ipv4Addr::new(192, 168, 64, 2);
-        let mut egress = HostEgress::new(gw_ip, gw_mac, guest_ip, tx, CancellationToken::new());
+        let mut egress =
+            HostEgress::new(gw_ip, gw_mac, guest_ip, tx, CancellationToken::new(), 1500);
 
         let guest_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
         // Frame shorter than Ethernet + IP minimum.
@@ -216,6 +221,6 @@ mod tests {
 
         // Verify the egress creates correctly with the same tx.
         let guest_ip = Ipv4Addr::new(192, 168, 64, 2);
-        let _egress = HostEgress::new(gw_ip, gw_mac, guest_ip, tx, CancellationToken::new());
+        let _egress = HostEgress::new(gw_ip, gw_mac, guest_ip, tx, CancellationToken::new(), 1500);
     }
 }
