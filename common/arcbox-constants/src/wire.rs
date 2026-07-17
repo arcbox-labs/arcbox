@@ -61,6 +61,9 @@ pub enum MessageType {
     /// Opens a guest-driven machine resource stats stream (payload:
     /// `arcbox.v1.WatchStatsRequest`).
     WatchStatsRequest = 0x0010,
+    /// Resolve a container's filesystem layer directories from containerd
+    /// snapshot metadata (payload: `arcbox.agent.ContainerFsPathsRequest`).
+    ContainerFsPathsRequest = 0x0011,
 
     // Sandbox CRUD request types (0x0020 - 0x0026).
     SandboxCreateRequest = 0x0020,
@@ -126,6 +129,9 @@ pub enum MessageType {
     /// One machine resource sample frame (payload:
     /// `arcbox.v1.MachineStats`).
     MachineStats = 0x1010,
+    /// Answers [`Self::ContainerFsPathsRequest`] (payload:
+    /// `arcbox.agent.ContainerFsPathsResponse`).
+    ContainerFsPathsResponse = 0x1011,
     PortBindingsChanged = 0x1030,
     PortBindingsRemoved = 0x1031,
 
@@ -183,6 +189,7 @@ impl MessageType {
             0x000E => Some(Self::KillAgentRequest),
             0x000F => Some(Self::WatchMemoryPressureRequest),
             0x0010 => Some(Self::WatchStatsRequest),
+            0x0011 => Some(Self::ContainerFsPathsRequest),
             // Sandbox CRUD requests.
             0x0020 => Some(Self::SandboxCreateRequest),
             0x0021 => Some(Self::SandboxStopRequest),
@@ -222,6 +229,7 @@ impl MessageType {
             0x100E => Some(Self::KillAgentResponse),
             0x100F => Some(Self::MemoryPressureEvent),
             0x1010 => Some(Self::MachineStats),
+            0x1011 => Some(Self::ContainerFsPathsResponse),
             0x1030 => Some(Self::PortBindingsChanged),
             0x1031 => Some(Self::PortBindingsRemoved),
             // Sandbox CRUD responses.
@@ -311,8 +319,10 @@ mod tests {
             (0x000E, MessageType::KillAgentRequest),
             (0x000F, MessageType::WatchMemoryPressureRequest),
             (0x0010, MessageType::WatchStatsRequest),
+            (0x0011, MessageType::ContainerFsPathsRequest),
             (0x100F, MessageType::MemoryPressureEvent),
             (0x1010, MessageType::MachineStats),
+            (0x1011, MessageType::ContainerFsPathsResponse),
             (0x1001, MessageType::PingResponse),
             (0x1002, MessageType::GetSystemInfoResponse),
             (0x1003, MessageType::EnsureRuntimeResponse),
@@ -379,7 +389,7 @@ mod tests {
     #[test]
     fn message_type_rejects_unknown_values() {
         assert_eq!(MessageType::from_u32(0x9999), None);
-        assert_eq!(MessageType::from_u32(0x1011), None);
+        assert_eq!(MessageType::from_u32(0x1F00), None);
     }
 
     #[test]

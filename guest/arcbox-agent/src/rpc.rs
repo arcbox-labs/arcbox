@@ -14,14 +14,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub use arcbox_constants::wire::MessageType;
 use arcbox_protocol::Empty;
 use arcbox_protocol::agent::{
-    DiskTrimRequest, DiskTrimResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
-    KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
-    KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
-    KubernetesStopRequest, KubernetesStopResponse, MemoryPressureEvent, MmapReadFileRequest,
-    MmapReadFileResponse, PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved,
-    ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
-    RuntimeStatusResponse, ShutdownRequest, ShutdownResponse, SystemInfo,
-    WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
+    ContainerFsPathsRequest, ContainerFsPathsResponse, DiskTrimRequest, DiskTrimResponse,
+    KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
+    KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
+    KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
+    KubernetesStopResponse, MemoryPressureEvent, MmapReadFileRequest, MmapReadFileResponse,
+    PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved, ReadinessEvent,
+    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
+    ShutdownRequest, ShutdownResponse, SystemInfo, WatchMemoryPressureRequest,
+    WatchReadinessRequest, WatchStatsRequest,
 };
 
 /// Agent version string.
@@ -81,6 +82,7 @@ pub enum RpcRequest {
     Shutdown(ShutdownRequest),
     MmapReadFile(MmapReadFileRequest),
     DiskTrim(DiskTrimRequest),
+    ContainerFsPaths(ContainerFsPathsRequest),
     WatchReadiness(WatchReadinessRequest),
     WatchMemoryPressure(WatchMemoryPressureRequest),
     WatchStats(WatchStatsRequest),
@@ -109,6 +111,7 @@ pub enum RpcResponse {
     MemoryPressureEvent(MemoryPressureEvent),
     Error(ErrorResponse),
     MmapReadFile(MmapReadFileResponse),
+    ContainerFsPaths(ContainerFsPathsResponse),
     /// Test-only: acknowledgement for [`RpcRequest::KillAgent`].
     KillAgent,
 }
@@ -135,6 +138,7 @@ impl RpcResponse {
             Self::MemoryPressureEvent(_) => MessageType::MemoryPressureEvent,
             Self::Error(_) => MessageType::Error,
             Self::MmapReadFile(_) => MessageType::MmapReadFileResponse,
+            Self::ContainerFsPaths(_) => MessageType::ContainerFsPathsResponse,
             Self::KillAgent => MessageType::KillAgentResponse,
         }
     }
@@ -160,6 +164,7 @@ impl RpcResponse {
             Self::MemoryPressureEvent(msg) => msg.encode_to_vec(),
             Self::Error(err) => err.encode(),
             Self::MmapReadFile(msg) => msg.encode_to_vec(),
+            Self::ContainerFsPaths(msg) => msg.encode_to_vec(),
             Self::KillAgent => Empty::default().encode_to_vec(),
         }
     }
@@ -332,6 +337,10 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
             let req = DiskTrimRequest::decode(payload)?;
             Ok(RpcRequest::DiskTrim(req))
         }
+        MessageType::ContainerFsPathsRequest => {
+            let req = ContainerFsPathsRequest::decode(payload)?;
+            Ok(RpcRequest::ContainerFsPaths(req))
+        }
         MessageType::WatchReadinessRequest => {
             let req = WatchReadinessRequest::decode(payload)?;
             Ok(RpcRequest::WatchReadiness(req))
@@ -402,8 +411,8 @@ mod tests {
     #[test]
     fn test_message_type_from_u32_invalid() {
         assert_eq!(MessageType::from_u32(0x9999), None);
-        assert_eq!(MessageType::from_u32(0x0011), None);
-        assert_eq!(MessageType::from_u32(0x1011), None);
+        assert_eq!(MessageType::from_u32(0x0FFF), None);
+        assert_eq!(MessageType::from_u32(0x1F00), None);
     }
 
     #[test]

@@ -10,13 +10,14 @@ use crate::error::{CoreError, Result};
 use arcbox_constants::ports::AGENT_PORT;
 use arcbox_constants::wire::MessageType;
 use arcbox_protocol::agent::{
-    DiskTrimRequest, DiskTrimResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
-    KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
-    KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
-    KubernetesStopRequest, KubernetesStopResponse, MachineStats, MemoryPressureEvent,
-    MmapReadFileRequest, MmapReadFileResponse, PingRequest, PingResponse, ReadinessEvent,
-    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
-    SystemInfo, WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
+    ContainerFsPathsRequest, ContainerFsPathsResponse, DiskTrimRequest, DiskTrimResponse,
+    KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
+    KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
+    KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
+    KubernetesStopResponse, MachineStats, MemoryPressureEvent, MmapReadFileRequest,
+    MmapReadFileResponse, PingRequest, PingResponse, ReadinessEvent, RuntimeEnsureRequest,
+    RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, SystemInfo,
+    WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
 };
 use arcbox_protocol::sandbox_v1::{
     CheckpointRequest, CheckpointResponse, CreateSandboxRequest, CreateSandboxResponse,
@@ -854,6 +855,51 @@ impl AgentClient {
             MessageType::KubernetesKubeconfigResponse,
         )
         .await
+    }
+
+    /// Resolves a container's filesystem layer directories (guest paths)
+    /// from containerd snapshot metadata in the guest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the container has no
+    /// snapshot (e.g. it was removed).
+    pub async fn container_fs_paths(
+        &mut self,
+        container_id: &str,
+    ) -> Result<ContainerFsPathsResponse> {
+        let payload = ContainerFsPathsRequest {
+            container_id: container_id.to_string(),
+        }
+        .encode_to_vec();
+        self.unary_rpc(
+            MessageType::ContainerFsPathsRequest,
+            &payload,
+            MessageType::ContainerFsPathsResponse,
+        )
+        .await
+    }
+
+    /// Blocking variant of [`Self::container_fs_paths`] for the HV
+    /// socketpair transport. Call from `spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the container has no
+    /// snapshot (e.g. it was removed).
+    pub fn container_fs_paths_blocking(
+        &mut self,
+        container_id: &str,
+    ) -> Result<ContainerFsPathsResponse> {
+        let payload = ContainerFsPathsRequest {
+            container_id: container_id.to_string(),
+        }
+        .encode_to_vec();
+        self.unary_rpc_blocking(
+            MessageType::ContainerFsPathsRequest,
+            &payload,
+            MessageType::ContainerFsPathsResponse,
+        )
     }
 
     /// Triggers an immediate fstrim on guest data mount points.
