@@ -99,6 +99,14 @@ unsafe extern "C" {
     pub fn abx_entropy_new() -> *mut c_void;
     pub fn abx_balloon_config_new() -> *mut c_void;
     pub fn abx_graphics_mac_new(width: i64, height: i64, ppi: i64) -> *mut c_void;
+
+    // Directory shares / VirtioFS
+    pub fn abx_shared_directory_new(path: *const c_char, read_only: bool) -> *mut c_void;
+    pub fn abx_single_share_new(directory: *mut c_void) -> *mut c_void;
+    pub fn abx_rosetta_availability() -> i64;
+    pub fn abx_rosetta_share_new(error_out: *mut *mut c_char) -> *mut c_void;
+    pub fn abx_virtiofs_new(tag: *const c_char, error_out: *mut *mut c_char) -> *mut c_void;
+    pub fn abx_virtiofs_set_share(config: *mut c_void, share: *mut c_void);
 }
 
 /// Takes ownership of a shim-returned error string and frees it.
@@ -160,11 +168,17 @@ mod tests {
         abx_entropy_new as *const (),
         abx_balloon_config_new as *const (),
         abx_graphics_mac_new as *const (),
+        abx_shared_directory_new as *const (),
+        abx_single_share_new as *const (),
+        abx_rosetta_availability as *const (),
+        abx_rosetta_share_new as *const (),
+        abx_virtiofs_new as *const (),
+        abx_virtiofs_set_share as *const (),
     ];
 
     /// Update when symbols are added; a mismatch means Exports.swift and this
     /// file have drifted.
-    const EXPECTED_SYMBOL_COUNT: usize = 32;
+    const EXPECTED_SYMBOL_COUNT: usize = 38;
 
     #[test]
     fn link_coverage() {

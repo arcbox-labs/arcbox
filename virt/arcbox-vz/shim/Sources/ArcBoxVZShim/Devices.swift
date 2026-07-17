@@ -92,3 +92,54 @@ func graphicsMacNew(_ width: Int64, _ height: Int64, _ ppi: Int64) -> UnsafeMuta
     device.displays = [display]
     return abxRetainedHandle(device)
 }
+
+// MARK: Directory shares / VirtioFS
+
+func sharedDirectoryNew(_ path: UnsafePointer<CChar>, _ readOnly: Bool) -> UnsafeMutableRawPointer {
+    let url = URL(fileURLWithPath: String(cString: path))
+    return abxRetainedHandle(VZSharedDirectory(url: url, readOnly: readOnly))
+}
+
+func singleShareNew(_ directory: UnsafeMutableRawPointer) -> UnsafeMutableRawPointer {
+    // VZSingleDirectoryShare retains the directory; the borrow does not
+    // consume the caller's +1.
+    abxRetainedHandle(
+        VZSingleDirectoryShare(directory: abxBorrow(directory, as: VZSharedDirectory.self)))
+}
+
+/// Raw values match `VZLinuxRosettaAvailability` (0 notSupported,
+/// 1 notInstalled, 2 installed) — the Rust side maps them.
+func rosettaAvailability() -> Int64 {
+    Int64(VZLinuxRosettaDirectoryShare.availability.rawValue)
+}
+
+func rosettaShareNew(
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> UnsafeMutableRawPointer? {
+    do {
+        return abxRetainedHandle(try VZLinuxRosettaDirectoryShare())
+    } catch {
+        errorOut?.pointee = abxErrorString(error)
+        return nil
+    }
+}
+
+func virtiofsNew(
+    _ tag: UnsafePointer<CChar>,
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> UnsafeMutableRawPointer? {
+    let tagString = String(cString: tag)
+    do {
+        try VZVirtioFileSystemDeviceConfiguration.validateTag(tagString)
+    } catch {
+        errorOut?.pointee = abxErrorString(error)
+        return nil
+    }
+    return abxRetainedHandle(VZVirtioFileSystemDeviceConfiguration(tag: tagString))
+}
+
+func virtiofsSetShare(_ config: UnsafeMutableRawPointer, _ share: UnsafeMutableRawPointer) {
+    // The config retains the share; the borrow does not consume the +1.
+    abxBorrow(config, as: VZVirtioFileSystemDeviceConfiguration.self).share =
+        abxBorrow(share, as: VZDirectoryShare.self)
+}
