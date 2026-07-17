@@ -260,12 +260,92 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
     );
     info!(%snapshot_id, "checkpoint taken");
 
-    // Stop the origin before restoring: with `network_override: false` the
-    // restored sandbox reuses the recorded NIC (the origin's TAP), so the
-    // origin must release it first. Fresh-network restore (a new TAP while
-    // the origin keeps running) relies on FC's `network_overrides`
-    // snapshot-load field, which the pinned Firecracker 1.10.1 predates —
-    // see docs/sandbox-api.md.
+    // -- Fresh-network restore (origin still running) ----------------------
+    // `network_override: true` gives the clone a new TAP via FC's
+    // `network_overrides` snapshot-load field (Firecracker >= 1.12), so the
+    // origin keeps its NIC and both run side by side.
+    let fresh_net_started = Instant::now();
+    let cloned = snapshots
+        .restore(with_machine(RestoreRequest {
+            id: "smoke3".into(),
+            snapshot_id: snapshot_id.clone(),
+            network_override: true,
+            ..Default::default()
+        }))
+        .await
+        .context("Fresh-network restore failed")?
+        .into_inner();
+    info!(id = %cloned.id, ip = %cloned.ip_address, "sandbox restored with fresh network while origin runs");
+    if cloned.ip_address.is_empty() || cloned.ip_address == created.ip_address {
+        bail!(
+            "fresh-network clone must get its own IP (origin {}, clone {:?})",
+            created.ip_address,
+            cloned.ip_address
+        );
+    }
+    let stdout = run_and_collect(&mut sandboxes, "smoke3", &["/bin/echo", "hello-clone"]).await?;
+    if !stdout.contains("hello-clone") {
+        bail!("fresh-network clone run output missing marker: {stdout:?}");
+    }
+
+    // The vsock channel working proves nothing about the new TAP. Assert the
+    // guest actually re-addressed eth0 to the fresh allocation…
+    wait_for_state(&mut sandboxes, "smoke3", "ready", Duration::from_secs(30)).await?;
+    let addr = run_and_collect(
+        &mut sandboxes,
+        "smoke3",
+        &["/bin/sh", "-c", "ip addr show eth0"],
+    )
+    .await?;
+    if !addr.contains(&cloned.ip_address) {
+        bail!(
+            "clone eth0 does not carry its allocated IP {} (got: {addr:?})",
+            cloned.ip_address
+        );
+    }
+    if addr.contains(&format!("{}/", created.ip_address)) {
+        bail!(
+            "clone eth0 still carries the origin's IP {} (got: {addr:?})",
+            created.ip_address
+        );
+    }
+
+    // …and that traffic flows through the new TAP: ping the gateway, which
+    // is the local address of the clone's own TAP (sandboxes are isolated
+    // point-to-point links, so peers are deliberately unreachable). Deriving
+    // the gateway from `ip route` also proves the reconfig re-installed the
+    // default route.
+    wait_for_state(&mut sandboxes, "smoke3", "ready", Duration::from_secs(30)).await?;
+    let ping = run_and_collect(
+        &mut sandboxes,
+        "smoke3",
+        &[
+            "/bin/sh",
+            "-c",
+            "gw=$(ip route | sed -n 's/^default via \\([0-9.]*\\).*/\\1/p' | head -1); \
+             echo \"gateway=$gw\"; ping -c 1 -W 2 \"$gw\"",
+        ],
+    )
+    .await?;
+    if !ping.contains(" 0% packet loss") {
+        bail!("clone could not reach its gateway over the new TAP: {ping:?}");
+    }
+
+    let origin = inspect(&mut sandboxes, "smoke1").await?;
+    if origin.state != "ready" {
+        bail!(
+            "origin should keep running through a fresh-network restore, state={}",
+            origin.state
+        );
+    }
+    metrics.record(
+        "sandbox_restore_fresh_net",
+        fresh_net_started.elapsed().as_secs_f64(),
+    );
+
+    // Stop the origin before the reuse-NIC restore: with
+    // `network_override: false` the restored sandbox reuses the recorded NIC
+    // (the origin's TAP), so the origin must release it first.
     let restore_started = Instant::now();
     sandboxes
         .stop(with_machine(StopSandboxRequest {
@@ -303,7 +383,7 @@ async fn drive_sandboxes(channel: Channel, metrics: &mut RunMetrics) -> Result<(
 
     // -- Teardown -----------------------------------------------------------
     let teardown_started = Instant::now();
-    for id in ["smoke1", "smoke2"] {
+    for id in ["smoke1", "smoke2", "smoke3"] {
         sandboxes
             .remove(with_machine(RemoveSandboxRequest {
                 id: id.into(),

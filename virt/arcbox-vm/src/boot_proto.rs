@@ -78,6 +78,24 @@ impl FromStr for KernelIpParam {
     }
 }
 
+/// Network reconfiguration command sent to `vm-agent` over the exec vsock
+/// channel (`MSG_NET_RECONFIG`) after a fresh-network snapshot restore.
+///
+/// A restored VM still carries the network the kernel configured from the
+/// origin's `ip=` boot parameter; when the restore allocated a new TAP/IP
+/// (`network_override`), the host sends this command so the guest
+/// re-addresses `eth0`, replaces the default route, and repoints DNS at the
+/// new gateway. Serialized as JSON, mirroring `StartCommand`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NetReconfigCommand {
+    /// New guest IP address for `eth0`.
+    pub ip: Ipv4Addr,
+    /// Subnet mask (e.g. 255.255.0.0).
+    pub netmask: Ipv4Addr,
+    /// Gateway IP (also serves as the guest DNS nameserver).
+    pub gateway: Ipv4Addr,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

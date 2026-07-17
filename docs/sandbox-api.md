@@ -171,12 +171,11 @@ Direct-mode (non-jailer) restores of the same snapshot cannot run
 concurrently with each other or the origin sandbox (the vmstate pins the
 origin vsock path); jailer-mode restores have no such constraint.
 
-`network_override` (a fresh TAP/IP for the restored sandbox) relies on
-Firecracker's `network_overrides` snapshot-load field, which the pinned
-Firecracker 1.10.1 predates — it currently fails with an
-`unknown field network_overrides` API error. Restore without
-`network_override` (reusing the recorded NIC) works today; fresh-network
-restore unlocks when the bundled Firecracker is upgraded.
+`network_override` (a fresh TAP/IP for the restored sandbox) uses
+Firecracker's `network_overrides` snapshot-load field (Firecracker ≥ 1.12;
+the bundle ships 1.16.1). With it, a clone restores and runs while the
+origin keeps its NIC. Restore without `network_override` reuses the
+recorded NIC, so the origin must be stopped first.
 
 ## Error model
 
