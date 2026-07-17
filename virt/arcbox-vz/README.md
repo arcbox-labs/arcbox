@@ -1,83 +1,61 @@
 # arcbox-vz
 
-Safe Rust bindings for Apple's Virtualization.framework.
+Safe Rust bindings for Apple's Virtualization.framework, implemented on a
+bundled Swift shim.
 
 ## Overview
 
-This crate provides ergonomic, async-first bindings to Apple's Virtualization.framework, allowing you to create and manage virtual machines on macOS.
+This crate provides ergonomic, async-first bindings to Apple's
+Virtualization.framework for creating and managing virtual machines on macOS.
+All framework interaction lives in **ArcBoxVZShim**, a SwiftPM static library
+under `shim/` that `build.rs` compiles and links into the crate. Rust and
+Swift meet at a hand-written C ABI: `shim/Sources/ArcBoxVZShim/Exports.swift`
+(`@_cdecl` exports) and `src/shim_ffi.rs` (extern declarations) mirror each
+other in a normative symbol order — review them side by side, and bump the
+ABI version in both on any signature change.
 
-## Features
+## Requirements
 
-- **Safe API**: Minimize unsafe code exposure with safe Rust abstractions
-- **Async-first**: Native async/await support for all asynchronous operations
-- **Complete Coverage**: Support all Virtualization.framework features (macOS 11+)
-
-## Platform Support
-
-This crate only supports macOS 11.0 (Big Sur) and later. Attempting to compile on other platforms will result in a compilation error.
-
-## Entitlements
-
-Your application must have the `com.apple.security.virtualization` entitlement to use this framework.
+- macOS 13+ (the shim's deployment target)
+- Xcode Command Line Tools (`xcode-select --install`) — `build.rs` invokes
+  `swift build`
+- The `com.apple.security.virtualization` entitlement on any binary that
+  creates VMs (configuration objects and capability queries work unsigned)
 
 ## Usage
 
 ```rust
-use arcbox_vz::{
-    VirtualMachineConfiguration, LinuxBootLoader, GenericPlatform,
-    SocketDeviceConfiguration, VZError,
-};
+use arcbox_vz::{LinuxBootLoader, VirtualMachineConfiguration, VZError};
 
 #[tokio::main]
 async fn main() -> Result<(), VZError> {
-    // Check if virtualization is supported
     if !arcbox_vz::is_supported() {
-        return Err(VZError::NotSupported);
+        return Err(VZError::OperationFailed("virtualization unsupported".into()));
     }
 
-    // Configure VM
     let mut config = VirtualMachineConfiguration::new()?;
     config
         .set_cpu_count(2)
         .set_memory_size(512 * 1024 * 1024);
+    config.set_boot_loader(LinuxBootLoader::new("/path/to/kernel")?);
 
-    // Set boot loader
-    let boot_loader = LinuxBootLoader::new("/path/to/kernel")?;
-    config.set_boot_loader(boot_loader);
-
-    // Build and start VM
     let vm = config.build()?;
     vm.start().await?;
 
-    // Graceful shutdown
     vm.request_stop()?;
-
     Ok(())
 }
-```
-
-### Device Configuration
-
-```rust
-use arcbox_vz::{SharedDirectory, SingleDirectoryShare, VirtioFileSystemDeviceConfiguration};
-
-// VirtioFS directory share
-let share = SharedDirectory::new("/host/path", false)?; // readonly=false
-let dir_share = SingleDirectoryShare::new(share);
-let fs_device = VirtioFileSystemDeviceConfiguration::new("myshare", dir_share);
-config.set_directory_sharing_devices(vec![fs_device]);
 ```
 
 ## VM Lifecycle
 
 | Method | Description |
 |--------|-------------|
-| `start()` | Async start, waits for Running state |
-| `stop()` | Force stop (destructive) |
-| `pause()` | Pause execution |
-| `resume()` | Resume from paused state |
-| `request_stop()` | Send graceful shutdown request to guest |
-| `state()` | Query current VirtualMachineState |
+| `start()` | Async start; resolves on the framework's completion |
+| `stop()` | Force stop (destructive); resolves on completion |
+| `pause()` / `resume()` | Pause / resume; resolve on completion |
+| `request_stop()` | Send a graceful shutdown request to the guest |
+| `state()` | Query the current `VirtualMachineState` |
 
 ## License
 

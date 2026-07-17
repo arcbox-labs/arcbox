@@ -5,7 +5,7 @@
 //! (returning memory to the guest).
 
 use crate::error::VZResult;
-use objc2::runtime::AnyObject;
+use std::ffi::c_void;
 
 // ============================================================================
 // Balloon Device Configuration
@@ -17,10 +17,11 @@ use objc2::runtime::AnyObject;
 /// The host can reclaim memory from the guest by inflating the balloon,
 /// or return memory to the guest by deflating it.
 pub struct MemoryBalloonDeviceConfiguration {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an ObjC object handle created by the shim;
+// all access goes through the shim.
 unsafe impl Send for MemoryBalloonDeviceConfiguration {}
 
 impl MemoryBalloonDeviceConfiguration {
@@ -28,14 +29,12 @@ impl MemoryBalloonDeviceConfiguration {
     pub fn new() -> VZResult<Self> {
         // SAFETY: the shim returns a +1 handle, released by Drop.
         let obj = unsafe { crate::shim_ffi::abx_balloon_config_new() };
-        Ok(Self {
-            inner: obj as *mut AnyObject,
-        })
+        Ok(Self { inner: obj })
     }
 
     /// Consumes the configuration and returns the raw pointer.
     #[must_use]
-    pub(crate) fn into_ptr(self) -> *mut AnyObject {
+    pub(crate) fn into_ptr(self) -> *mut c_void {
         let ptr = self.inner;
         std::mem::forget(self);
         ptr

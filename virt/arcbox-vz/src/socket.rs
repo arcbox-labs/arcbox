@@ -70,7 +70,7 @@ unsafe extern "C" fn vsock_trampoline(
     // guarantees exactly-once invocation. err is null or a shim string that
     // take_error_string frees.
     unsafe {
-        let sender = Box::from_raw(ctx as *mut std_mpsc::Sender<VsockResult>);
+        let sender = Box::from_raw(ctx.cast::<std_mpsc::Sender<VsockResult>>());
         let result = if err.is_null() {
             Ok(VsockConnectionInfo {
                 fd,
@@ -137,7 +137,7 @@ impl VirtioSocketDevice {
         tracing::debug!("VirtioSocketDevice::connect_blocking(port={})", port);
 
         let (tx, rx) = std_mpsc::channel::<VsockResult>();
-        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+        let ctx: *mut c_void = Box::into_raw(Box::new(tx)).cast();
 
         // SAFETY: device_box is valid; ctx ownership transfers to the
         // exactly-once trampoline.
@@ -275,7 +275,7 @@ impl VirtioSocketConnection {
     /// The number of bytes read, or an error.
     pub fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         // SAFETY: self.fd is a valid file descriptor. buf.as_mut_ptr() and buf.len() provide a valid write target.
-        let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+        let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast::<c_void>(), buf.len()) };
         if n < 0 {
             Err(std::io::Error::last_os_error())
         } else {
@@ -296,7 +296,7 @@ impl VirtioSocketConnection {
     /// The number of bytes written, or an error.
     pub fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
         // SAFETY: self.fd is a valid file descriptor. buf.as_ptr() and buf.len() provide valid read source.
-        let n = unsafe { libc::write(self.fd, buf.as_ptr() as *const c_void, buf.len()) };
+        let n = unsafe { libc::write(self.fd, buf.as_ptr().cast::<c_void>(), buf.len()) };
         if n < 0 {
             Err(std::io::Error::last_os_error())
         } else {

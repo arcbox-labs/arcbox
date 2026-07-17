@@ -390,14 +390,14 @@ mod tests {
             assert!(!id.is_null());
 
             let mut len: usize = 0;
-            let bytes = abx_mac_machine_id_data(id, &mut len);
+            let bytes = abx_mac_machine_id_data(id, &raw mut len);
             assert!(!bytes.is_null());
             assert!(len > 0);
 
             let id2 = abx_mac_machine_id_from_data(bytes, len);
             assert!(!id2.is_null(), "round-trip through data representation");
             let mut len2: usize = 0;
-            let bytes2 = abx_mac_machine_id_data(id2, &mut len2);
+            let bytes2 = abx_mac_machine_id_data(id2, &raw mut len2);
             assert_eq!(len, len2);
             let a = std::slice::from_raw_parts(bytes as *const u8, len);
             let b = std::slice::from_raw_parts(bytes2 as *const u8, len2);

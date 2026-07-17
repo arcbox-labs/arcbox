@@ -2,14 +2,13 @@
 
 use crate::error::{VZError, VZResult};
 use crate::shim_ffi;
-use objc2::runtime::AnyObject;
-use std::ffi::CString;
+use std::ffi::{CString, c_void};
 use std::path::Path;
 use std::ptr;
 
 /// Configuration for a `VirtIO` block storage device.
 pub struct StorageDeviceConfiguration {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
 }
 
 // SAFETY: The inner pointer is an ObjC configuration object created by the
@@ -36,21 +35,20 @@ impl StorageDeviceConfiguration {
         // message that take_error_string frees.
         unsafe {
             let mut error: *mut std::ffi::c_char = ptr::null_mut();
-            let obj = shim_ffi::abx_storage_disk_image_new(c_path.as_ptr(), read_only, &mut error);
+            let obj =
+                shim_ffi::abx_storage_disk_image_new(c_path.as_ptr(), read_only, &raw mut error);
             if obj.is_null() {
                 return Err(VZError::InvalidConfiguration(shim_ffi::take_error_string(
                     error,
                 )));
             }
-            Ok(Self {
-                inner: obj as *mut AnyObject,
-            })
+            Ok(Self { inner: obj })
         }
     }
 
     /// Consumes the configuration and returns the raw pointer.
     #[must_use]
-    pub(crate) fn into_ptr(self) -> *mut AnyObject {
+    pub(crate) fn into_ptr(self) -> *mut c_void {
         let ptr = self.inner;
         std::mem::forget(self);
         ptr

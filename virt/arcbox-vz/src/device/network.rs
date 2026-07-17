@@ -2,8 +2,7 @@
 
 use crate::error::{VZError, VZResult};
 use crate::shim_ffi;
-use objc2::runtime::AnyObject;
-use std::ffi::CString;
+use std::ffi::{CString, c_void};
 use std::os::unix::io::RawFd;
 use std::ptr;
 
@@ -60,7 +59,7 @@ fn mtu_override() -> u64 {
 
 /// Configuration for a `VirtIO` network device.
 pub struct NetworkDeviceConfiguration {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
 }
 
 // SAFETY: The inner pointer is an ObjC configuration object created by the
@@ -105,7 +104,7 @@ impl NetworkDeviceConfiguration {
         // failure the shim writes a strdup'd message.
         unsafe {
             let mut error: *mut std::ffi::c_char = ptr::null_mut();
-            let obj = shim_ffi::abx_network_nat_new(mac_ptr, mtu_override(), &mut error);
+            let obj = shim_ffi::abx_network_nat_new(mac_ptr, mtu_override(), &raw mut error);
             Self::from_shim(obj, error)
         }
     }
@@ -127,7 +126,7 @@ impl NetworkDeviceConfiguration {
         unsafe {
             let mut error: *mut std::ffi::c_char = ptr::null_mut();
             let obj =
-                shim_ffi::abx_network_file_handle_new(fd, mac_ptr, mtu_override(), &mut error);
+                shim_ffi::abx_network_file_handle_new(fd, mac_ptr, mtu_override(), &raw mut error);
             Self::from_shim(obj, error)
         }
     }
@@ -147,14 +146,12 @@ impl NetworkDeviceConfiguration {
                 shim_ffi::take_error_string(error)
             }));
         }
-        Ok(Self {
-            inner: obj as *mut AnyObject,
-        })
+        Ok(Self { inner: obj })
     }
 
     /// Consumes the configuration and returns the raw pointer.
     #[must_use]
-    pub(crate) fn into_ptr(self) -> *mut AnyObject {
+    pub(crate) fn into_ptr(self) -> *mut c_void {
         let ptr = self.inner;
         std::mem::forget(self);
         ptr

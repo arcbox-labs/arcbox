@@ -79,7 +79,7 @@ pub(crate) unsafe extern "C" fn state_trampoline(ctx: *mut c_void, err: *mut std
     // guarantees exactly-once invocation. err is null or a shim string that
     // take_error_string frees.
     unsafe {
-        let sender = Box::from_raw(ctx as *mut oneshot::Sender<Result<(), String>>);
+        let sender = Box::from_raw(ctx.cast::<oneshot::Sender<Result<(), String>>>());
         let result = if err.is_null() {
             Ok(())
         } else {
@@ -133,7 +133,7 @@ impl VirtualMachine {
     /// the Running state.
     pub async fn start(&self) -> VZResult<()> {
         let (tx, rx) = oneshot::channel::<Result<(), String>>();
-        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+        let ctx: *mut c_void = Box::into_raw(Box::new(tx)).cast();
 
         // SAFETY: vm_box is valid; ctx ownership transfers to the
         // exactly-once trampoline. Dropping this future before the callback
@@ -168,7 +168,7 @@ impl VirtualMachine {
         }
 
         let (tx, rx) = oneshot::channel::<Result<(), String>>();
-        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+        let ctx: *mut c_void = Box::into_raw(Box::new(tx)).cast();
         // SAFETY: vm_box is valid; ctx ownership transfers to the
         // exactly-once trampoline. The completion fires when the VM has
         // stopped (or on error) per the VZ contract — no state polling.
@@ -196,7 +196,7 @@ impl VirtualMachine {
         }
 
         let (tx, rx) = oneshot::channel::<Result<(), String>>();
-        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+        let ctx: *mut c_void = Box::into_raw(Box::new(tx)).cast();
         // SAFETY: vm_box is valid; ctx ownership transfers to the
         // exactly-once trampoline. The completion fires once the VM is
         // paused (or on error) — no state polling.
@@ -224,7 +224,7 @@ impl VirtualMachine {
         }
 
         let (tx, rx) = oneshot::channel::<Result<(), String>>();
-        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+        let ctx: *mut c_void = Box::into_raw(Box::new(tx)).cast();
         // SAFETY: vm_box is valid; ctx ownership transfers to the
         // exactly-once trampoline. The completion fires once the VM is
         // running again (or on error) — no state polling.
@@ -254,7 +254,7 @@ impl VirtualMachine {
         // message that take_error_string frees.
         unsafe {
             let mut error: *mut std::ffi::c_char = std::ptr::null_mut();
-            if crate::shim_ffi::abx_vm_request_stop(self.vm_box, &mut error) {
+            if crate::shim_ffi::abx_vm_request_stop(self.vm_box, &raw mut error) {
                 Ok(())
             } else {
                 Err(VZError::OperationFailed(

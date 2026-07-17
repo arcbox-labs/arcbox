@@ -2,13 +2,13 @@
 
 use crate::error::VZResult;
 use crate::shim_ffi;
-use objc2::runtime::AnyObject;
+use std::ffi::c_void;
 
 /// Configuration for a `VirtIO` entropy device.
 ///
 /// This device provides random number generation to the guest OS.
 pub struct EntropyDeviceConfiguration {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
 }
 
 // SAFETY: The inner pointer is an ObjC configuration object created by the
@@ -20,14 +20,12 @@ impl EntropyDeviceConfiguration {
     pub fn new() -> VZResult<Self> {
         // SAFETY: the shim returns a +1 handle, released by Drop.
         let obj = unsafe { shim_ffi::abx_entropy_new() };
-        Ok(Self {
-            inner: obj as *mut AnyObject,
-        })
+        Ok(Self { inner: obj })
     }
 
     /// Consumes the configuration and returns the raw pointer.
     #[must_use]
-    pub(crate) fn into_ptr(self) -> *mut AnyObject {
+    pub(crate) fn into_ptr(self) -> *mut c_void {
         let ptr = self.inner;
         std::mem::forget(self);
         ptr

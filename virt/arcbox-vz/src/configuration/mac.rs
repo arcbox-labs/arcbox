@@ -11,8 +11,6 @@ use std::ffi::{CString, c_void};
 use std::path::Path;
 use std::ptr;
 
-use objc2::runtime::AnyObject;
-
 use crate::error::{VZError, VZResult};
 use crate::shim_ffi;
 
@@ -47,7 +45,7 @@ unsafe fn take_bytes(bytes: *mut c_void, len: usize) -> Vec<u8> {
 /// [`data_representation`](Self::data_representation) so the same model can be
 /// reconstructed for every clone of a base image.
 pub struct MacHardwareModel {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
 }
 
 // SAFETY: The inner pointer is an immutable ObjC identity object created by
@@ -69,9 +67,7 @@ impl MacHardwareModel {
                 "invalid macOS hardware model data representation".into(),
             ));
         }
-        Ok(Self {
-            inner: obj as *mut AnyObject,
-        })
+        Ok(Self { inner: obj })
     }
 
     /// Returns whether this hardware model is supported by the current host.
@@ -87,7 +83,7 @@ impl MacHardwareModel {
         // SAFETY: valid handle; the shim mallocs the buffer that take_bytes frees.
         unsafe {
             let mut len: usize = 0;
-            let bytes = shim_ffi::abx_mac_hw_model_data(self.inner.cast(), &mut len);
+            let bytes = shim_ffi::abx_mac_hw_model_data(self.inner.cast(), &raw mut len);
             take_bytes(bytes, len)
         }
     }
@@ -98,12 +94,10 @@ impl MacHardwareModel {
         if handle.is_null() {
             return None;
         }
-        Some(Self {
-            inner: handle as *mut AnyObject,
-        })
+        Some(Self { inner: handle })
     }
 
-    pub(crate) fn as_ptr(&self) -> *mut AnyObject {
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
         self.inner
     }
 }
@@ -123,7 +117,7 @@ impl Drop for MacHardwareModel {
 /// via [`data_representation`](Self::data_representation) and restore with
 /// [`from_data`](Self::from_data) to keep a machine's identity stable across restarts.
 pub struct MacMachineIdentifier {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
 }
 
 // SAFETY: The inner pointer is an immutable ObjC identity object created by
@@ -135,9 +129,7 @@ impl MacMachineIdentifier {
     pub fn new() -> VZResult<Self> {
         // SAFETY: the shim returns a +1 handle, released by Drop.
         let obj = unsafe { shim_ffi::abx_mac_machine_id_new() };
-        Ok(Self {
-            inner: obj as *mut AnyObject,
-        })
+        Ok(Self { inner: obj })
     }
 
     /// Reconstructs a machine identifier from its opaque data representation.
@@ -155,9 +147,7 @@ impl MacMachineIdentifier {
                 "invalid macOS machine identifier data representation".into(),
             ));
         }
-        Ok(Self {
-            inner: obj as *mut AnyObject,
-        })
+        Ok(Self { inner: obj })
     }
 
     /// Returns the opaque data representation for persistence.
@@ -166,12 +156,12 @@ impl MacMachineIdentifier {
         // SAFETY: valid handle; the shim mallocs the buffer that take_bytes frees.
         unsafe {
             let mut len: usize = 0;
-            let bytes = shim_ffi::abx_mac_machine_id_data(self.inner.cast(), &mut len);
+            let bytes = shim_ffi::abx_mac_machine_id_data(self.inner.cast(), &raw mut len);
             take_bytes(bytes, len)
         }
     }
 
-    pub(crate) fn as_ptr(&self) -> *mut AnyObject {
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
         self.inner
     }
 }
@@ -187,7 +177,7 @@ impl Drop for MacMachineIdentifier {
 
 /// Auxiliary storage (the NVRAM-equivalent backing file) for a macOS guest.
 pub struct MacAuxiliaryStorage {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
 }
 
 // SAFETY: The inner pointer is an ObjC object created by the shim; it is not
@@ -205,9 +195,7 @@ impl MacAuxiliaryStorage {
         let c_path = path_cstring(path.as_ref())?;
         // SAFETY: c_path is valid; the shim returns a +1 handle.
         let obj = unsafe { shim_ffi::abx_aux_storage_open(c_path.as_ptr()) };
-        Ok(Self {
-            inner: obj as *mut AnyObject,
-        })
+        Ok(Self { inner: obj })
     }
 
     /// Creates new auxiliary storage at `path` for `hardware_model`.
@@ -231,18 +219,16 @@ impl MacAuxiliaryStorage {
                 c_path.as_ptr(),
                 hardware_model.as_ptr().cast(),
                 overwrite,
-                &mut error,
+                &raw mut error,
             );
             if obj.is_null() {
                 return Err(VZError::OperationFailed(shim_ffi::take_error_string(error)));
             }
-            Ok(Self {
-                inner: obj as *mut AnyObject,
-            })
+            Ok(Self { inner: obj })
         }
     }
 
-    pub(crate) fn as_ptr(&self) -> *mut AnyObject {
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
         self.inner
     }
 }

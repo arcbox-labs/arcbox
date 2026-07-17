@@ -2,14 +2,14 @@
 
 use crate::error::VZResult;
 use crate::shim_ffi;
-use objc2::runtime::AnyObject;
+use std::ffi::c_void;
 
 /// Configuration for a macOS graphics device with a single display.
 ///
 /// A macOS guest requires at least one graphics device to start. This creates a
 /// `VZMacGraphicsDeviceConfiguration` holding one `VZMacGraphicsDisplayConfiguration`.
 pub struct MacGraphicsDeviceConfiguration {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
 }
 
 // SAFETY: The inner pointer is an ObjC configuration object created by the
@@ -36,14 +36,12 @@ impl MacGraphicsDeviceConfiguration {
                 pixels_per_inch as i64,
             )
         };
-        Ok(Self {
-            inner: obj as *mut AnyObject,
-        })
+        Ok(Self { inner: obj })
     }
 
     /// Consumes the configuration and returns the raw pointer.
     #[must_use]
-    pub(crate) fn into_ptr(self) -> *mut AnyObject {
+    pub(crate) fn into_ptr(self) -> *mut c_void {
         let ptr = self.inner;
         std::mem::forget(self);
         ptr

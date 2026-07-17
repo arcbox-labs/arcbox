@@ -29,8 +29,7 @@
 
 use crate::error::{VZError, VZResult};
 use crate::shim_ffi;
-use objc2::runtime::AnyObject;
-use std::ffi::CString;
+use std::ffi::{CString, c_void};
 use std::path::Path;
 use std::ptr;
 
@@ -58,7 +57,7 @@ use std::ptr;
 /// # }
 /// ```
 pub struct SharedDirectory {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
 }
 
 // SAFETY: The inner pointer is an ObjC configuration object created by the
@@ -100,9 +99,7 @@ impl SharedDirectory {
             path,
             read_only
         );
-        Ok(Self {
-            inner: obj as *mut AnyObject,
-        })
+        Ok(Self { inner: obj })
     }
 }
 
@@ -125,7 +122,7 @@ impl Drop for SharedDirectory {
 /// attached to a `VirtioFS` device.
 pub trait DirectoryShare {
     /// Returns the raw pointer to the underlying share object.
-    fn as_ptr(&self) -> *mut AnyObject;
+    fn as_ptr(&self) -> *mut c_void;
 }
 
 // ============================================================================
@@ -149,7 +146,7 @@ pub trait DirectoryShare {
 /// # }
 /// ```
 pub struct SingleDirectoryShare {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
 }
 
 // SAFETY: The inner pointer is an ObjC configuration object created by the
@@ -167,14 +164,12 @@ impl SingleDirectoryShare {
         // `directory` (releasing its +1) after this call is correct.
         let obj = unsafe { shim_ffi::abx_single_share_new(directory.inner.cast()) };
         tracing::debug!("Created SingleDirectoryShare");
-        Ok(Self {
-            inner: obj as *mut AnyObject,
-        })
+        Ok(Self { inner: obj })
     }
 }
 
 impl DirectoryShare for SingleDirectoryShare {
-    fn as_ptr(&self) -> *mut AnyObject {
+    fn as_ptr(&self) -> *mut c_void {
         self.inner
     }
 }
@@ -221,7 +216,7 @@ impl Drop for SingleDirectoryShare {
 /// - Only contain alphanumeric characters and underscores
 /// - Be unique among all filesystem devices in the VM
 pub struct VirtioFileSystemDeviceConfiguration {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
     tag: String,
 }
 
@@ -253,7 +248,7 @@ impl VirtioFileSystemDeviceConfiguration {
         // writes a strdup'd message that take_error_string frees.
         unsafe {
             let mut error: *mut std::ffi::c_char = ptr::null_mut();
-            let obj = shim_ffi::abx_virtiofs_new(c_tag.as_ptr(), &mut error);
+            let obj = shim_ffi::abx_virtiofs_new(c_tag.as_ptr(), &raw mut error);
             if obj.is_null() {
                 return Err(VZError::InvalidConfiguration(shim_ffi::take_error_string(
                     error,
@@ -261,7 +256,7 @@ impl VirtioFileSystemDeviceConfiguration {
             }
             tracing::debug!("Created VirtioFileSystemDeviceConfiguration with tag '{tag}'");
             Ok(Self {
-                inner: obj as *mut AnyObject,
+                inner: obj,
                 tag: tag.to_string(),
             })
         }
@@ -290,7 +285,7 @@ impl VirtioFileSystemDeviceConfiguration {
 
     /// Consumes the configuration and returns the raw pointer.
     #[must_use]
-    pub(crate) fn into_ptr(self) -> *mut AnyObject {
+    pub(crate) fn into_ptr(self) -> *mut c_void {
         let ptr = self.inner;
         std::mem::forget(self);
         ptr
@@ -346,7 +341,7 @@ pub enum RosettaAvailability {
 /// # }
 /// ```
 pub struct LinuxRosettaDirectoryShare {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
 }
 
 // SAFETY: The inner pointer is an ObjC configuration object created by the
@@ -382,20 +377,18 @@ impl LinuxRosettaDirectoryShare {
         // take_error_string frees.
         unsafe {
             let mut error: *mut std::ffi::c_char = ptr::null_mut();
-            let obj = shim_ffi::abx_rosetta_share_new(&mut error);
+            let obj = shim_ffi::abx_rosetta_share_new(&raw mut error);
             if obj.is_null() {
                 return Err(VZError::OperationFailed(shim_ffi::take_error_string(error)));
             }
             tracing::debug!("Created LinuxRosettaDirectoryShare");
-            Ok(Self {
-                inner: obj as *mut AnyObject,
-            })
+            Ok(Self { inner: obj })
         }
     }
 }
 
 impl DirectoryShare for LinuxRosettaDirectoryShare {
-    fn as_ptr(&self) -> *mut AnyObject {
+    fn as_ptr(&self) -> *mut c_void {
         self.inner
     }
 }
