@@ -26,6 +26,13 @@ const MAX_REASSEMBLED_PAYLOAD: usize = 65_535 - 20;
 /// in flight; the cap bounds a hostile guest to ~2 MiB of buffer.
 const MAX_ENTRIES: usize = 32;
 
+/// Maximum disjoint received ranges per datagram. A benign sender needs at
+/// most ~45 (one per fully out-of-order 1480-byte fragment of a maximal
+/// datagram); only interleaved tiny-fragment probes exceed this. Crossing
+/// the cap drops the whole entry, bounding the O(ranges) merge work per
+/// fragment a hostile guest can trigger.
+const MAX_RANGES: usize = 64;
+
 /// How long an incomplete datagram may wait for its missing fragments.
 const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -148,6 +155,11 @@ impl FragmentReassembler {
         }
         entry.payload[offset..end].copy_from_slice(fragment);
         merge_range(&mut entry.ranges, offset, end);
+        if entry.ranges.len() > MAX_RANGES {
+            tracing::debug!("fragment pattern exceeds the range cap; entry dropped");
+            self.entries.remove(&key);
+            return None;
+        }
 
         if entry.is_complete() {
             let entry = self.entries.remove(&key)?;
@@ -395,5 +407,27 @@ mod tests {
         let truncated = &frags[0][..frags[0].len() - 100];
         assert!(r.push(truncated, now).is_none());
         assert!(r.entries.is_empty());
+    }
+
+    #[test]
+    fn interleaved_tiny_fragments_hit_range_cap() {
+        let mut r = FragmentReassembler::new();
+        let now = Instant::now();
+        let template = &fragments(3000)[0];
+        // Hostile pattern: 8-byte MF fragments at gapped offsets, each
+        // opening a new disjoint range. The entry must drop once the range
+        // count crosses MAX_RANGES instead of growing the merge work.
+        for i in 0..=MAX_RANGES {
+            let mut f = template[..ETH_HEADER_LEN + 20 + 8].to_vec();
+            let ip = ETH_HEADER_LEN;
+            f[ip + 2..ip + 4].copy_from_slice(&28u16.to_be_bytes());
+            let offset_units = (i * 2) as u16;
+            f[ip + 6..ip + 8].copy_from_slice(&(0x2000 | offset_units).to_be_bytes());
+            assert!(r.push(&f, now).is_none());
+        }
+        assert!(
+            r.entries.is_empty(),
+            "entry must drop once the range cap is crossed"
+        );
     }
 }
