@@ -90,6 +90,30 @@ impl Client {
             .map_err(ClientError::Helper)
     }
 
+    /// Appends the fixed `127.0.0.1 ArcBox` alias to `/etc/hosts`.
+    pub async fn hosts_alias_install(&self) -> Result<(), ClientError> {
+        self.inner
+            .hosts_alias_install(tarpc::context::current())
+            .await?
+            .map_err(ClientError::Helper)
+    }
+
+    /// Removes the ArcBox alias line from `/etc/hosts`.
+    pub async fn hosts_alias_uninstall(&self) -> Result<(), ClientError> {
+        self.inner
+            .hosts_alias_uninstall(tarpc::context::current())
+            .await?
+            .map_err(ClientError::Helper)
+    }
+
+    /// Checks whether the ArcBox `/etc/hosts` alias is installed.
+    pub async fn hosts_alias_status(&self) -> Result<bool, ClientError> {
+        self.inner
+            .hosts_alias_status(tarpc::context::current())
+            .await?
+            .map_err(ClientError::Helper)
+    }
+
     /// Creates the `/var/run/docker.sock` → `target` symlink.
     pub async fn socket_link(&self, target: &str) -> Result<(), ClientError> {
         self.inner

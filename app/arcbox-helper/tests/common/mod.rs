@@ -52,6 +52,18 @@ impl HelperService for MockHelperServer {
         Ok(false)
     }
 
+    async fn hosts_alias_install(self, _: tarpc::context::Context) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn hosts_alias_uninstall(self, _: tarpc::context::Context) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn hosts_alias_status(self, _: tarpc::context::Context) -> Result<bool, String> {
+        Ok(false)
+    }
+
     async fn socket_link(self, _: tarpc::context::Context, target: String) -> Result<(), String> {
         validate::validate_socket_target(&target)?;
         Ok(())
