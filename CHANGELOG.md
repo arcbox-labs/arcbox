@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.19](https://github.com/arcboxlabs/arcbox/compare/v0.4.18...v0.4.19) (2026-07-17)
+
+
+### Features
+
+* **agent:** WatchStats streaming handler with /proc samplers ([1ea321f](https://github.com/arcboxlabs/arcbox/commit/1ea321f30de115d4804db92a5927e424202d86a2))
+* **api:** StatsService.Watch server-streaming RPC ([7dfa53d](https://github.com/arcboxlabs/arcbox/commit/7dfa53d2feb7c20fe9c98410b6c6e3ecc93f3463))
+* browse guest Docker data at ~/ArcBox (NFSv4 export) ([#399](https://github.com/arcboxlabs/arcbox/issues/399)) ([38887c2](https://github.com/arcboxlabs/arcbox/commit/38887c2cd9e6365a6a406c9693aeb37ab72a450e))
+* **cli:** abctl top — live System VM resource monitor ([05cdd4b](https://github.com/arcboxlabs/arcbox/commit/05cdd4b8f508530c585a7e2b8e38590dff5f5bea))
+* **core:** StatsHub fans one guest WatchStats stream out to subscribers ([c35379f](https://github.com/arcboxlabs/arcbox/commit/c35379f2632832f72d53aa8cba83344649624942))
+* **proto:** WatchStats agent RPC for machine resource samples ([50ea51f](https://github.com/arcboxlabs/arcbox/commit/50ea51f3980298d2c2d36f70343ef1ef76b10bba))
+* **stats:** per-container resource stats (ABX-115 P2) ([#398](https://github.com/arcboxlabs/arcbox/issues/398)) ([ab54255](https://github.com/arcboxlabs/arcbox/commit/ab54255513d90c3dd7ebfe88206706f5f01f7972))
+
+
+### Bug Fixes
+
+* **ci:** discover release PRs via REST list, not search-backed gh pr list ([#401](https://github.com/arcboxlabs/arcbox/issues/401)) ([89dd68e](https://github.com/arcboxlabs/arcbox/commit/89dd68ef2a421b164b463159dbfa7796d650ee08))
+* **constants:** gate the ArcboxProfile FromStr impl on std ([9d6429c](https://github.com/arcboxlabs/arcbox/commit/9d6429cd2c07507f89609b7e5f7a049d1240f8d8))
+* **daemon:** gate docker.sock self-setup on the profile-default data dir ([#407](https://github.com/arcboxlabs/arcbox/issues/407)) ([b68e912](https://github.com/arcboxlabs/arcbox/commit/b68e912e8a41568e7de1ec8bb9ea6d4bbfa19b6b))
+* **docker:** exempt passive observation streams from idle activity ([#396](https://github.com/arcboxlabs/arcbox/issues/396)) ([47d7d1f](https://github.com/arcboxlabs/arcbox/commit/47d7d1fad9719571f78d9cc5d37a6e5dece52580))
+* **fleet:** dedup TLS crypto stack on aws-lc-rs (tonic 0.14, russh aws-lc-rs) ([#395](https://github.com/arcboxlabs/arcbox/issues/395)) ([9542819](https://github.com/arcboxlabs/arcbox/commit/9542819448d02e60d1a5c406d4d272ea35ac684d))
+* **net:** lossless guest-frame backpressure and direct gateway egress ([#403](https://github.com/arcboxlabs/arcbox/issues/403)) ([71d74c4](https://github.com/arcboxlabs/arcbox/commit/71d74c48f99285bd562bcb29dc39ca21e7af30cb))
+* **release:** add crate descriptions to unblock crates.io publish ([#348](https://github.com/arcboxlabs/arcbox/issues/348)) ([08fa700](https://github.com/arcboxlabs/arcbox/commit/08fa7003b0b3b86a3bdab0ef2766e1435487a011))
+* **stats:** count only physical NICs; build the agent in stats_watch e2e ([2868394](https://github.com/arcboxlabs/arcbox/commit/28683942e6ad119e09fdfbce415d7ae40740c79f))
+* **xtask:** parse moby's post-split docker-vX.Y.Z release tags ([5680c50](https://github.com/arcboxlabs/arcbox/commit/5680c506f944ea3b6525ebf899d6cf368eeede09))
+
+
+### Tests
+
+* **e2e:** drop the client runtime so pump-stop is observable ([2aa35fc](https://github.com/arcboxlabs/arcbox/commit/2aa35fc6e00b4caa823057a58d7fd78856423d93))
+* **e2e:** StatsService.Watch scenario on a real VZ daemon ([0115bff](https://github.com/arcboxlabs/arcbox/commit/0115bffb3f3b60c53ba35ac1b331e8ac9bad2c03))
+
+
+### Documentation
+
+* **agents:** consolidate the AGENTS.md handbook — audit, gap-fill, complete the index ([#370](https://github.com/arcboxlabs/arcbox/issues/370)) ([0b18787](https://github.com/arcboxlabs/arcbox/commit/0b18787db0fe9a058f4eb647128e90cbb9b6203a))
+* **assets:** describe the real tools/boot-bundle version contract ([70a1467](https://github.com/arcboxlabs/arcbox/commit/70a146725955d2c520626474ebc849e4a8e2d42b))
+* **e2e:** document the stats_watch scenario ([5e3a6a1](https://github.com/arcboxlabs/arcbox/commit/5e3a6a12789924362733af5e32f531d21a390c7b))
+
+
+### Miscellaneous Chores
+
+* **agent,e2e:** prep for docker 29.6.1 runtime bundle ([7efd1e9](https://github.com/arcboxlabs/arcbox/commit/7efd1e9bcb3cea2a4148dce3c1f70c0ca8f1cab2))
+* **assets:** bump host tools to latest upstream ([bc03dca](https://github.com/arcboxlabs/arcbox/commit/bc03dcae3cec3408ff3164080517baa9cad00a1b))
+* **assets:** pin boot bundle 0.6.3 (docker 29.6.1 era) ([20a262b](https://github.com/arcboxlabs/arcbox/commit/20a262b6aee8afe1659fbf687144087ae1534999))
+* **master:** release fleet-agent 0.1.1 ([#385](https://github.com/arcboxlabs/arcbox/issues/385)) ([e82fc36](https://github.com/arcboxlabs/arcbox/commit/e82fc361620811d1dcb7f0f85d833c6b9adeb807))
+* **master:** release fleet-agent 0.1.2 ([#400](https://github.com/arcboxlabs/arcbox/issues/400)) ([43cb0eb](https://github.com/arcboxlabs/arcbox/commit/43cb0eb5ad76d293510fcc460800fa49954e16ed))
+
 ## [0.4.18](https://github.com/arcboxlabs/arcbox/compare/v0.4.17...v0.4.18) (2026-07-15)
 
 
