@@ -59,10 +59,9 @@ impl VirtualMachine for DarwinVm {
 
         // Create vCPU for managed execution.
         // On Virtualization.framework, vCPU execution is managed internally by the framework.
-        // The vCPU struct is a lightweight handle that tracks vCPU ID and state.
-        // NOTE: We pass null_mut() because arcbox-vz doesn't expose VM's raw pointer.
-        // The VM state is queried through the DarwinVm's state() method instead.
-        let vcpu = DarwinVcpu::new_managed(id, std::ptr::null_mut());
+        // The vCPU struct is a lightweight handle that tracks vCPU ID and state;
+        // VM state is queried through the DarwinVm's state() method instead.
+        let vcpu = DarwinVcpu::new(id);
 
         // Record creation
         {
