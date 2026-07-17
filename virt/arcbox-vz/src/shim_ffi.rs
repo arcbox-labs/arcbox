@@ -140,21 +140,40 @@ unsafe extern "C" {
     ) -> *mut c_void;
 
     // Vsock
-    /// Migration-only (dies with the old socket_devices path): wraps raw
-    /// (device, queue) pointers into an ABXSocketDeviceBox handle.
-    pub fn abx_socket_device_box_from_raw(device: *mut c_void, queue: *mut c_void) -> *mut c_void;
     pub fn abx_vsock_connect(device_box: *mut c_void, port: u32, ctx: *mut c_void, cb: VsockCb);
 
     // VM lifecycle
-    /// Migration-only (dies when build() hands out boxes): wraps raw
-    /// (vm, queue) pointers into an ABXVMBox handle.
-    pub fn abx_vm_box_from_raw(vm: *mut c_void, queue: *mut c_void) -> *mut c_void;
+    /// `kind` values mirror the shim's `ABXDeviceKind` (storage=0, network=1,
+    /// serial=2, socket=3, entropy=4, directory_sharing=5, memory_balloon=6,
+    /// graphics=7). The configuration retains the borrowed handles.
+    pub fn abx_config_set_devices(
+        config: *mut c_void,
+        kind: u32,
+        items: *const *mut c_void,
+        count: usize,
+    );
+    /// The raw out-params are transitional borrows for the installer path
+    /// (kept alive by the returned box); they die with the installer PR.
+    pub fn abx_vm_new(
+        config: *mut c_void,
+        raw_vm_out: *mut *mut c_void,
+        raw_queue_out: *mut *mut c_void,
+    ) -> *mut c_void;
     pub fn abx_vm_state(vm_box: *mut c_void) -> i64;
     pub fn abx_vm_can_stop(vm_box: *mut c_void) -> bool;
     pub fn abx_vm_can_pause(vm_box: *mut c_void) -> bool;
     pub fn abx_vm_can_resume(vm_box: *mut c_void) -> bool;
     pub fn abx_vm_request_stop(vm_box: *mut c_void, error_out: *mut *mut c_char) -> bool;
     pub fn abx_vm_start(vm_box: *mut c_void, ctx: *mut c_void, cb: StateCb);
+    pub fn abx_vm_stop(vm_box: *mut c_void, ctx: *mut c_void, cb: StateCb);
+    pub fn abx_vm_pause(vm_box: *mut c_void, ctx: *mut c_void, cb: StateCb);
+    pub fn abx_vm_resume(vm_box: *mut c_void, ctx: *mut c_void, cb: StateCb);
+    pub fn abx_vm_socket_device_count(vm_box: *mut c_void) -> u64;
+    pub fn abx_vm_socket_device_at(vm_box: *mut c_void, index: u64) -> *mut c_void;
+    pub fn abx_vm_balloon_count(vm_box: *mut c_void) -> u64;
+    pub fn abx_vm_balloon_at(vm_box: *mut c_void, index: u64) -> *mut c_void;
+    pub fn abx_balloon_target(balloon_box: *mut c_void) -> u64;
+    pub fn abx_balloon_set_target(balloon_box: *mut c_void, bytes: u64);
 }
 
 /// Takes ownership of a shim-returned error string and frees it.
@@ -231,20 +250,29 @@ mod tests {
         abx_aux_storage_open as *const (),
         abx_aux_storage_create as *const (),
         abx_platform_mac_new as *const (),
-        abx_socket_device_box_from_raw as *const (),
         abx_vsock_connect as *const (),
-        abx_vm_box_from_raw as *const (),
+        abx_config_set_devices as *const (),
+        abx_vm_new as *const (),
         abx_vm_state as *const (),
         abx_vm_can_stop as *const (),
         abx_vm_can_pause as *const (),
         abx_vm_can_resume as *const (),
         abx_vm_request_stop as *const (),
         abx_vm_start as *const (),
+        abx_vm_stop as *const (),
+        abx_vm_pause as *const (),
+        abx_vm_resume as *const (),
+        abx_vm_socket_device_count as *const (),
+        abx_vm_socket_device_at as *const (),
+        abx_vm_balloon_count as *const (),
+        abx_vm_balloon_at as *const (),
+        abx_balloon_target as *const (),
+        abx_balloon_set_target as *const (),
     ];
 
     /// Update when symbols are added; a mismatch means Exports.swift and this
     /// file have drifted.
-    const EXPECTED_SYMBOL_COUNT: usize = 56;
+    const EXPECTED_SYMBOL_COUNT: usize = 65;
 
     #[test]
     fn link_coverage() {
