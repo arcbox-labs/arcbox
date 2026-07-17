@@ -42,6 +42,7 @@ govern, and are imported here:
 
 @virt/AGENTS.md
 @virt/arcbox-vmm/AGENTS.md
+@virt/arcbox-vz/AGENTS.md
 @virt/arcbox-virtio-blk/AGENTS.md
 @app/AGENTS.md
 @guest/AGENTS.md

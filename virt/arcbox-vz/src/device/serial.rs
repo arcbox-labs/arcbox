@@ -2,12 +2,12 @@
 
 use crate::error::{VZError, VZResult};
 use crate::shim_ffi;
-use objc2::runtime::AnyObject;
+use std::ffi::c_void;
 use std::os::unix::io::RawFd;
 
 /// Configuration for a serial port.
 pub struct SerialPortConfiguration {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
     /// File descriptors for the serial port (`read_fd`, `write_fd`).
     fds: Option<(RawFd, RawFd)>,
 }
@@ -51,7 +51,7 @@ impl SerialPortConfiguration {
         // Host-side ends: read guest output from output_pipe[0], write guest
         // input to input_pipe[1].
         Ok(Self {
-            inner: obj as *mut AnyObject,
+            inner: obj,
             fds: Some((output_pipe[0], input_pipe[1])),
         })
     }
@@ -73,7 +73,7 @@ impl SerialPortConfiguration {
     /// Note: The file descriptors are NOT closed when this is called.
     /// The caller is responsible for managing them.
     #[must_use]
-    pub(crate) fn into_ptr(self) -> *mut AnyObject {
+    pub(crate) fn into_ptr(self) -> *mut c_void {
         let ptr = self.inner;
         std::mem::forget(self);
         ptr

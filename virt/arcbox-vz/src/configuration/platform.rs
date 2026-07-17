@@ -1,24 +1,25 @@
 //! Platform configurations.
 
 use crate::error::VZResult;
-use objc2::runtime::AnyObject;
+use std::ffi::c_void;
 
 use super::mac::{MacAuxiliaryStorage, MacHardwareModel, MacMachineIdentifier};
 
 /// Trait for platform configurations.
 pub trait Platform {
     /// Returns the underlying Objective-C object pointer.
-    fn as_ptr(&self) -> *mut AnyObject;
+    fn as_ptr(&self) -> *mut c_void;
 }
 
 /// A generic platform configuration for Linux VMs.
 ///
 /// This platform works on both Apple Silicon and Intel Macs.
 pub struct GenericPlatform {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an ObjC object handle created by the shim;
+// all access goes through the shim.
 unsafe impl Send for GenericPlatform {}
 
 impl GenericPlatform {
@@ -27,9 +28,7 @@ impl GenericPlatform {
         // SAFETY: the shim returns a +1 VZGenericPlatformConfiguration
         // handle, released by Drop.
         let obj = unsafe { crate::shim_ffi::abx_platform_generic_new() };
-        Ok(Self {
-            inner: obj as *mut AnyObject,
-        })
+        Ok(Self { inner: obj })
     }
 
     /// Returns whether the hardware supports nested virtualization.
@@ -61,7 +60,7 @@ impl Default for GenericPlatform {
 }
 
 impl Platform for GenericPlatform {
-    fn as_ptr(&self) -> *mut AnyObject {
+    fn as_ptr(&self) -> *mut c_void {
         self.inner
     }
 }
@@ -81,10 +80,11 @@ impl Drop for GenericPlatform {
 /// platform required to boot a macOS guest. Pair it with a
 /// [`MacOSBootLoader`](crate::MacOSBootLoader) on the VM configuration.
 pub struct MacPlatform {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an ObjC object handle created by the shim;
+// all access goes through the shim.
 unsafe impl Send for MacPlatform {}
 
 impl MacPlatform {
@@ -112,14 +112,12 @@ impl MacPlatform {
                 auxiliary_storage.as_ptr().cast(),
             )
         };
-        Ok(Self {
-            inner: obj as *mut AnyObject,
-        })
+        Ok(Self { inner: obj })
     }
 }
 
 impl Platform for MacPlatform {
-    fn as_ptr(&self) -> *mut AnyObject {
+    fn as_ptr(&self) -> *mut c_void {
         self.inner
     }
 }

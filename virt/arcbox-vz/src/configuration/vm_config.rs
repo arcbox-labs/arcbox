@@ -7,7 +7,7 @@ use crate::device::{
 };
 use crate::error::{VZError, VZResult};
 use crate::vm::VirtualMachine;
-use objc2::runtime::AnyObject;
+use std::ffi::c_void;
 use std::ptr;
 
 use super::{BootLoader, Platform};
@@ -17,18 +17,19 @@ use super::{BootLoader, Platform};
 /// Use the builder methods to configure the VM, then call `build()` to
 /// create the `VirtualMachine` instance.
 pub struct VirtualMachineConfiguration {
-    inner: *mut AnyObject,
-    storage_devices: Vec<*mut AnyObject>,
-    network_devices: Vec<*mut AnyObject>,
-    serial_ports: Vec<*mut AnyObject>,
-    socket_devices: Vec<*mut AnyObject>,
-    entropy_devices: Vec<*mut AnyObject>,
-    directory_sharing_devices: Vec<*mut AnyObject>,
-    memory_balloon_devices: Vec<*mut AnyObject>,
-    graphics_devices: Vec<*mut AnyObject>,
+    inner: *mut c_void,
+    storage_devices: Vec<*mut c_void>,
+    network_devices: Vec<*mut c_void>,
+    serial_ports: Vec<*mut c_void>,
+    socket_devices: Vec<*mut c_void>,
+    entropy_devices: Vec<*mut c_void>,
+    directory_sharing_devices: Vec<*mut c_void>,
+    memory_balloon_devices: Vec<*mut c_void>,
+    graphics_devices: Vec<*mut c_void>,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an ObjC object handle created by the shim;
+// all access goes through the shim.
 unsafe impl Send for VirtualMachineConfiguration {}
 
 impl VirtualMachineConfiguration {
@@ -38,7 +39,7 @@ impl VirtualMachineConfiguration {
         // it at +1; released by Drop.
         let obj = unsafe { crate::shim_ffi::abx_config_new() };
         Ok(Self {
-            inner: obj as *mut AnyObject,
+            inner: obj,
             storage_devices: Vec::new(),
             network_devices: Vec::new(),
             serial_ports: Vec::new(),
@@ -188,7 +189,7 @@ impl VirtualMachineConfiguration {
         // shim writes a strdup'd message that take_error_string frees.
         unsafe {
             let mut error: *mut std::ffi::c_char = ptr::null_mut();
-            if crate::shim_ffi::abx_config_validate(self.inner.cast(), &mut error) {
+            if crate::shim_ffi::abx_config_validate(self.inner.cast(), &raw mut error) {
                 Ok(())
             } else {
                 Err(VZError::InvalidConfiguration(
@@ -220,7 +221,7 @@ impl VirtualMachineConfiguration {
     /// the +1s stays in the vectors, released by Drop.
     fn apply_devices(&mut self) {
         // Kind values mirror the shim's ABXDeviceKind.
-        let arrays: [(u32, &Vec<*mut AnyObject>); 8] = [
+        let arrays: [(u32, &Vec<*mut c_void>); 8] = [
             (0, &self.storage_devices),
             (1, &self.network_devices),
             (2, &self.serial_ports),

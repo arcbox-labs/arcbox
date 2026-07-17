@@ -2,8 +2,7 @@
 
 use crate::error::{VZError, VZResult};
 use crate::shim_ffi;
-use objc2::runtime::AnyObject;
-use std::ffi::CString;
+use std::ffi::{CString, c_void};
 use std::path::Path;
 
 /// Converts a path to a `CString`, rejecting interior NUL bytes.
@@ -16,7 +15,7 @@ fn path_cstring(path: &Path) -> VZResult<CString> {
 /// Trait for boot loader configurations.
 pub trait BootLoader {
     /// Returns the underlying Objective-C object pointer.
-    fn as_ptr(&self) -> *mut AnyObject;
+    fn as_ptr(&self) -> *mut c_void;
 }
 
 /// A boot loader for Linux kernels.
@@ -24,10 +23,11 @@ pub trait BootLoader {
 /// This boot loader loads a Linux kernel image directly, without
 /// requiring UEFI or other firmware.
 pub struct LinuxBootLoader {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime. Not shared across threads without external synchronization.
+// SAFETY: The inner pointer is an ObjC object handle created by the shim;
+// all access goes through the shim.
 unsafe impl Send for LinuxBootLoader {}
 
 impl LinuxBootLoader {
@@ -51,9 +51,7 @@ impl LinuxBootLoader {
         // SAFETY: c_path is a valid NUL-terminated string; the shim returns
         // a +1 VZLinuxBootLoader handle, released by Drop.
         let obj = unsafe { shim_ffi::abx_bootloader_linux_new(c_path.as_ptr()) };
-        Ok(Self {
-            inner: obj as *mut AnyObject,
-        })
+        Ok(Self { inner: obj })
     }
 
     /// Sets the initial ramdisk (initrd) path.
@@ -91,7 +89,7 @@ impl LinuxBootLoader {
 }
 
 impl BootLoader for LinuxBootLoader {
-    fn as_ptr(&self) -> *mut AnyObject {
+    fn as_ptr(&self) -> *mut c_void {
         self.inner
     }
 }
@@ -111,10 +109,11 @@ impl Drop for LinuxBootLoader {
 /// [`MacPlatform`](crate::MacPlatform) (hardware model, machine identifier, and
 /// auxiliary storage). Pair this with a `MacPlatform` on the VM configuration.
 pub struct MacOSBootLoader {
-    inner: *mut AnyObject,
+    inner: *mut c_void,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an ObjC object handle created by the shim;
+// all access goes through the shim.
 unsafe impl Send for MacOSBootLoader {}
 
 impl MacOSBootLoader {
@@ -129,14 +128,12 @@ impl MacOSBootLoader {
         // Drop. Construction cannot fail; guest support is checked by
         // configuration validation.
         let obj = unsafe { shim_ffi::abx_bootloader_macos_new() };
-        Ok(Self {
-            inner: obj as *mut AnyObject,
-        })
+        Ok(Self { inner: obj })
     }
 }
 
 impl BootLoader for MacOSBootLoader {
-    fn as_ptr(&self) -> *mut AnyObject {
+    fn as_ptr(&self) -> *mut c_void {
         self.inner
     }
 }

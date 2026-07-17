@@ -37,7 +37,7 @@ unsafe extern "C" fn object_trampoline(ctx: *mut c_void, handle: *mut c_void, er
     // SAFETY: ctx is the Box<Sender> leaked by the caller; the shim
     // guarantees exactly-once invocation. err is null or a shim string.
     unsafe {
-        let sender = Box::from_raw(ctx as *mut oneshot::Sender<Result<usize, String>>);
+        let sender = Box::from_raw(ctx.cast::<oneshot::Sender<Result<usize, String>>>());
         let result = if err.is_null() {
             Ok(handle as usize)
         } else {
@@ -70,7 +70,7 @@ impl MacOSRestoreImage {
     /// Returns an error if the fetch fails.
     pub async fn latest_supported() -> VZResult<Self> {
         let (tx, rx) = oneshot::channel::<Result<usize, String>>();
-        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+        let ctx: *mut c_void = Box::into_raw(Box::new(tx)).cast();
         // SAFETY: ctx ownership transfers to the exactly-once trampoline.
         unsafe { shim_ffi::abx_restore_image_fetch_latest(ctx, object_trampoline) };
         Self::from_received(rx.await)
@@ -86,7 +86,7 @@ impl MacOSRestoreImage {
             VZError::InvalidConfiguration(format!("path contains NUL: {}", path.as_ref().display()))
         })?;
         let (tx, rx) = oneshot::channel::<Result<usize, String>>();
-        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+        let ctx: *mut c_void = Box::into_raw(Box::new(tx)).cast();
         // SAFETY: c_path is valid for the duration of the call; ctx ownership
         // transfers to the exactly-once trampoline.
         unsafe { shim_ffi::abx_restore_image_load(c_path.as_ptr(), ctx, object_trampoline) };
@@ -123,10 +123,10 @@ impl MacOSRestoreImage {
             let mut error: *mut c_char = ptr::null_mut();
             if !shim_ffi::abx_restore_image_requirements(
                 self.inner,
-                &mut hw,
-                &mut min_cpu,
-                &mut min_memory,
-                &mut error,
+                &raw mut hw,
+                &raw mut min_cpu,
+                &raw mut min_memory,
+                &raw mut error,
             ) {
                 return Err(VZError::InvalidConfiguration(shim_ffi::take_error_string(
                     error,
@@ -182,6 +182,9 @@ pub struct MacOSInstaller {
 // SAFETY: The box handle is only used through the shim, which serializes the
 // queue-affine installer operations on the VM's queue.
 unsafe impl Send for MacOSInstaller {}
+// SAFETY: See above — shared access also funnels through the queue-syncing
+// shim (the fraction read is a queue-free NSProgress property).
+unsafe impl Sync for MacOSInstaller {}
 
 impl MacOSInstaller {
     /// Creates an installer for `virtual_machine` from a local restore image.
@@ -234,7 +237,7 @@ impl MacOSInstaller {
         mut on_progress: impl FnMut(f64),
     ) -> VZResult<()> {
         let (tx, mut rx) = oneshot::channel::<Result<(), String>>();
-        let ctx = Box::into_raw(Box::new(tx)) as *mut c_void;
+        let ctx: *mut c_void = Box::into_raw(Box::new(tx)).cast();
         // SAFETY: inner is a valid installer box; ctx ownership transfers to
         // the exactly-once trampoline. The shim issues the install on the
         // VM's queue and the call returns after dispatching.

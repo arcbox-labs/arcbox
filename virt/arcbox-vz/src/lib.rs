@@ -1,13 +1,15 @@
 //! Safe Rust bindings for Apple's Virtualization.framework.
 //!
 //! This crate provides ergonomic, async-first bindings to Apple's Virtualization.framework,
-//! allowing you to create and manage virtual machines on macOS.
+//! allowing you to create and manage virtual machines on macOS. All framework
+//! interaction happens in the bundled ArcBoxVZShim Swift static library
+//! (`shim/`), reached through the hand-written C ABI in `shim_ffi.rs` — see
+//! that file's header for the boundary conventions.
 //!
 //! # Features
 //!
 //! - **Safe API**: Minimize unsafe code exposure with safe Rust abstractions
 //! - **Async-first**: Native async/await support for all asynchronous operations
-//! - **Complete Coverage**: Support all Virtualization.framework features (macOS 11+)
 //!
 //! # Example
 //!
@@ -46,21 +48,8 @@
 
 #![cfg(target_os = "macos")]
 #![warn(missing_docs)]
-// FFI bindings require extensive pointer casts - these are intentional and safe.
-#![allow(clippy::ptr_as_ptr)]
-#![allow(clippy::ptr_cast_constness)]
-#![allow(clippy::ref_as_ptr)]
-#![allow(clippy::borrow_as_ptr)]
-#![allow(clippy::unnecessary_cast)]
-#![allow(clippy::type_complexity)]
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::map_unwrap_or)]
-// VM operations run on the main thread with ObjC FFI pointers (*const c_void,
-// *mut AnyObject) that are inherently not Send. This is by design.
-#![allow(clippy::future_not_send)]
 
 pub mod error;
-pub mod ffi;
 mod shim_ffi;
 
 pub mod configuration;
@@ -97,29 +86,34 @@ pub use vm::{VirtualMachine, VirtualMachineState};
 /// hardware supports virtualization.
 #[must_use]
 pub fn is_supported() -> bool {
-    ffi::is_supported()
+    // SAFETY: shim reads a class property; no preconditions.
+    unsafe { shim_ffi::abx_vz_supported() }
 }
 
 /// Get the minimum allowed CPU count for a virtual machine.
 #[must_use]
 pub fn min_cpu_count() -> u64 {
-    ffi::min_cpu_count()
+    // SAFETY: shim reads a class property; no preconditions.
+    unsafe { shim_ffi::abx_vz_min_cpu_count() }
 }
 
 /// Get the maximum allowed CPU count for a virtual machine.
 #[must_use]
 pub fn max_cpu_count() -> u64 {
-    ffi::max_cpu_count()
+    // SAFETY: shim reads a class property; no preconditions.
+    unsafe { shim_ffi::abx_vz_max_cpu_count() }
 }
 
 /// Get the minimum allowed memory size for a virtual machine (in bytes).
 #[must_use]
 pub fn min_memory_size() -> u64 {
-    ffi::min_memory_size()
+    // SAFETY: shim reads a class property; no preconditions.
+    unsafe { shim_ffi::abx_vz_min_memory_size() }
 }
 
 /// Get the maximum allowed memory size for a virtual machine (in bytes).
 #[must_use]
 pub fn max_memory_size() -> u64 {
-    ffi::max_memory_size()
+    // SAFETY: shim reads a class property; no preconditions.
+    unsafe { shim_ffi::abx_vz_max_memory_size() }
 }

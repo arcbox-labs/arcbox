@@ -181,6 +181,11 @@ Counters") or it falsifies the metrics.
 
 ## Pointers (reference material, not duplicated here)
 
+- `virt/arcbox-vz/AGENTS.md` — the VZ backend's Swift shim (ArcBoxVZShim):
+  the C ABI boundary contract (normative symbol order, ABI version, handle
+  and callback conventions), queue-affinity design, and build.rs landmines.
+  VZ has no Rust-side ObjC interop anymore; fix VZ bugs there.
+
 - `docs/net-perf-limits.md` — the settled multi-flow Host→VM ceiling
   (~10–12 Gbps combined vs ~22–29 Gbps single-flow) and its root cause
   (per-IRQ host-side cost: `hv_vcpus_exit` / `hv_gic_set_spi` /
