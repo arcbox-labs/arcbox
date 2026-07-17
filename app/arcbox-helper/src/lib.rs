@@ -18,6 +18,27 @@ pub fn socket_path() -> String {
     std::env::var(HELPER_SOCKET_ENV).unwrap_or_else(|_| HELPER_SOCKET.to_string())
 }
 
+/// Host name the managed `/etc/hosts` alias resolves to loopback.
+///
+/// The guest-data NFS mount uses `ArcBox:/` as its source when the alias
+/// is installed — Finder's Locations sidebar displays a network mount by
+/// its source host name.
+pub const HOSTS_ALIAS_NAME: &str = "ArcBox";
+
+/// The one `/etc/hosts` line the helper manages. The trailing comment
+/// tags the line so uninstall removes exactly what was installed.
+pub const HOSTS_ALIAS_LINE: &str = "127.0.0.1\tArcBox\t# managed by arcbox-helper";
+
+/// True when `hosts_content` (the text of `/etc/hosts`) carries the
+/// managed alias line. Shared by the helper mutation, the daemon's
+/// self-setup check, and the NFS mount's source selection.
+#[must_use]
+pub fn hosts_alias_installed(hosts_content: &str) -> bool {
+    hosts_content
+        .lines()
+        .any(|line| line.trim() == HOSTS_ALIAS_LINE)
+}
+
 /// The tarpc service definition for privileged host mutations.
 ///
 /// All methods perform input validation server-side before executing

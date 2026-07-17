@@ -99,6 +99,14 @@ pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
         );
     }
 
+    // The `/etc/hosts` ArcBox alias is host-global like the docker socket:
+    // only the daemon on its profile's canonical data dir installs it. It
+    // exists so the ~/ArcBox NFS mount can use `ArcBox:/` as its source
+    // (Finder shows the source host name); daemons without it simply mount
+    // from `127.0.0.1:/`.
+    let hosts_task = (ctx.mount_nfs && ctx.layout.data_dir == default_data_dir)
+        .then_some(self_setup::HostsAlias);
+
     // Create /usr/local/bin/ symlinks for Docker CLI tools if running from
     // bundle with docker integration enabled.
     let cli_tasks: Vec<Box<dyn self_setup::SetupTask>> = if ctx.docker_integration {
@@ -124,6 +132,9 @@ pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
         }
         if let Some(socket) = &socket_task {
             tasks.push(socket);
+        }
+        if let Some(hosts) = &hosts_task {
+            tasks.push(hosts);
         }
         for t in &cli_tasks {
             tasks.push(t.as_ref());

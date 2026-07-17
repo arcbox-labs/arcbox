@@ -164,7 +164,6 @@ async fn mount_with_retry(
     nfsd_port: u16,
     shutdown: &CancellationToken,
 ) -> Result<()> {
-    let source = mount_source();
     let opts = render_mount_opts(nfsd_port);
     let deadline = tokio::time::Instant::now() + MOUNT_TIMEOUT;
 
@@ -172,6 +171,11 @@ async fn mount_with_retry(
         if shutdown.is_cancelled() {
             bail!("daemon shutdown before ~/ArcBox mount completed");
         }
+
+        // Re-evaluated each attempt: on a fresh install the self-setup task
+        // writes the hosts alias concurrently with this retry loop, and the
+        // mount should pick the friendly source up as soon as it lands.
+        let source = mount_source();
 
         match run_mount(&opts, &source, mount_path).await {
             Ok(()) => {
@@ -223,8 +227,24 @@ async fn run_mount(opts: &str, source: &str, mount_path: &Path) -> Result<(), St
 
 /// The `host:/path` source string for `mount_nfs`. The export carries
 /// `fsid=0`, so it is the NFSv4 pseudo-root at `/`.
+///
+/// Finder's Locations sidebar displays a network mount by its source host
+/// name, so when the helper-managed `/etc/hosts` alias is present the
+/// source is `ArcBox:/` (an "ArcBox" location) rather than "127.0.0.1".
+/// The check reads `/etc/hosts` directly — never DNS — so a missing alias
+/// costs nothing and a user's own unrelated `ArcBox` entry is not trusted.
 fn mount_source() -> String {
-    "127.0.0.1:/".to_string()
+    let alias_installed = std::fs::read_to_string("/etc/hosts")
+        .is_ok_and(|content| arcbox_helper::hosts_alias_installed(&content));
+    mount_source_for(alias_installed)
+}
+
+fn mount_source_for(alias_installed: bool) -> String {
+    if alias_installed {
+        format!("{}:/", arcbox_helper::HOSTS_ALIAS_NAME)
+    } else {
+        "127.0.0.1:/".to_string()
+    }
 }
 
 /// Read-only NFSv4 mount options with the nfsd port pinned.
@@ -273,9 +293,12 @@ fn reconcile_existing_mount(mount_path: &Path) -> Result<()> {
 }
 
 /// True when the mount at the path has exactly the shape this daemon creates:
-/// NFS from the v4 pseudo-root of the localhost proxy.
+/// NFS from the v4 pseudo-root of the localhost proxy, under either source
+/// spelling (the loopback literal, or the `ArcBox` hosts alias) — a stale
+/// mount must be reclaimable regardless of which name it was created with.
 fn is_arcbox_nfs_mount(info: &MountInfo) -> bool {
-    info.fstype == "nfs" && info.source == mount_source()
+    info.fstype == "nfs"
+        && (info.source == mount_source_for(false) || info.source == mount_source_for(true))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,18 +354,22 @@ fn unmount(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MountInfo, is_arcbox_nfs_mount, mount_source, parse_mount_line, render_mount_opts,
+        MountInfo, is_arcbox_nfs_mount, mount_source_for, parse_mount_line, render_mount_opts,
         resolve_mount_path_from_home,
     };
     use std::path::{Path, PathBuf};
 
     #[test]
     fn only_our_exact_mount_shape_is_reclaimed() {
-        let ours = MountInfo {
-            source: "127.0.0.1:/".to_string(),
-            fstype: "nfs".to_string(),
-        };
-        assert!(is_arcbox_nfs_mount(&ours));
+        // Both source spellings are ours — loopback (no hosts alias) and
+        // the branded alias name.
+        for source in ["127.0.0.1:/", "ArcBox:/"] {
+            let ours = MountInfo {
+                source: source.to_string(),
+                fstype: "nfs".to_string(),
+            };
+            assert!(is_arcbox_nfs_mount(&ours), "{source} should be reclaimed");
+        }
 
         // A user's own NFS mount at ~/ArcBox must never be unmounted.
         let foreign_nfs = MountInfo {
@@ -377,8 +404,9 @@ mod tests {
     }
 
     #[test]
-    fn mount_source_is_the_v4_pseudo_root() {
-        assert_eq!(mount_source(), "127.0.0.1:/");
+    fn mount_source_is_the_v4_pseudo_root_under_both_names() {
+        assert_eq!(mount_source_for(false), "127.0.0.1:/");
+        assert_eq!(mount_source_for(true), "ArcBox:/");
     }
 
     #[test]
