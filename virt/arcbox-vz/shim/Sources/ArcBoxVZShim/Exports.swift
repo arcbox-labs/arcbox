@@ -335,12 +335,8 @@ public func abxConfigSetDevices(
 }
 
 @_cdecl("abx_vm_new")
-public func abxVmNew(
-    _ config: UnsafeMutableRawPointer,
-    _ rawVmOut: UnsafeMutablePointer<UnsafeMutableRawPointer?>?,
-    _ rawQueueOut: UnsafeMutablePointer<UnsafeMutableRawPointer?>?
-) -> UnsafeMutableRawPointer {
-    vmNew(config, rawVmOut, rawQueueOut)
+public func abxVmNew(_ config: UnsafeMutableRawPointer) -> UnsafeMutableRawPointer {
+    vmNew(config)
 }
 
 @_cdecl("abx_vm_state")
@@ -439,4 +435,62 @@ public func abxBalloonTarget(_ box: UnsafeMutableRawPointer) -> UInt64 {
 @_cdecl("abx_balloon_set_target")
 public func abxBalloonSetTarget(_ box: UnsafeMutableRawPointer, _ bytes: UInt64) {
     balloonSetTarget(box, bytes)
+}
+
+// MARK: - Restore images / installer
+
+@_cdecl("abx_restore_image_load")
+public func abxRestoreImageLoad(
+    _ path: UnsafePointer<CChar>,
+    _ ctx: UnsafeMutableRawPointer?,
+    _ callback: @escaping ABXObjectCallback
+) {
+    restoreImageLoad(path, ctx, callback)
+}
+
+@_cdecl("abx_restore_image_fetch_latest")
+public func abxRestoreImageFetchLatest(
+    _ ctx: UnsafeMutableRawPointer?,
+    _ callback: @escaping ABXObjectCallback
+) {
+    restoreImageFetchLatest(ctx, callback)
+}
+
+@_cdecl("abx_restore_image_requirements")
+public func abxRestoreImageRequirements(
+    _ image: UnsafeMutableRawPointer,
+    _ hardwareModelOut: UnsafeMutablePointer<UnsafeMutableRawPointer?>?,
+    _ minCPUOut: UnsafeMutablePointer<UInt64>?,
+    _ minMemoryOut: UnsafeMutablePointer<UInt64>?,
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> Bool {
+    restoreImageRequirements(image, hardwareModelOut, minCPUOut, minMemoryOut, errorOut)
+}
+
+@_cdecl("abx_restore_image_url")
+public func abxRestoreImageURL(
+    _ image: UnsafeMutableRawPointer
+) -> UnsafeMutablePointer<CChar>? {
+    restoreImageURL(image)
+}
+
+@_cdecl("abx_installer_new")
+public func abxInstallerNew(
+    _ vmBox: UnsafeMutableRawPointer, _ ipswPath: UnsafePointer<CChar>
+) -> UnsafeMutableRawPointer {
+    installerNew(vmBox, ipswPath)
+}
+
+@_cdecl("abx_installer_fraction")
+public func abxInstallerFraction(_ box: UnsafeMutableRawPointer) -> Double {
+    installerFraction(box)
+}
+
+@_cdecl("abx_installer_install")
+public func abxInstallerInstall(
+    _ box: UnsafeMutableRawPointer,
+    _ ctx: UnsafeMutableRawPointer?,
+    _ callback: @escaping ABXStateCallback
+) {
+    installerInstall(box, ctx, callback)
 }

@@ -98,20 +98,10 @@ func configSetDevices(
 }
 
 /// Creates the VM on a fresh serial queue and returns its box.
-///
-/// The raw out-params are transitional (the installer still drives the raw
-/// VZVirtualMachine on its queue from the Rust side); they die with the
-/// installer migration. Both are borrowed views kept alive by the box.
-func vmNew(
-    _ config: UnsafeMutableRawPointer,
-    _ rawVmOut: UnsafeMutablePointer<UnsafeMutableRawPointer?>?,
-    _ rawQueueOut: UnsafeMutablePointer<UnsafeMutableRawPointer?>?
-) -> UnsafeMutableRawPointer {
+func vmNew(_ config: UnsafeMutableRawPointer) -> UnsafeMutableRawPointer {
     let cfg = abxBorrow(config, as: VZVirtualMachineConfiguration.self)
     let queue = DispatchQueue(label: "com.arcbox.vz.vm")
     let vm = VZVirtualMachine(configuration: cfg, queue: queue)
-    rawVmOut?.pointee = Unmanaged.passUnretained(vm).toOpaque()
-    rawQueueOut?.pointee = Unmanaged.passUnretained(queue).toOpaque()
     return abxRetainedHandle(ABXVMBox(vm: vm, queue: queue))
 }
 

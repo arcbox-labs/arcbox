@@ -14,7 +14,8 @@ import Foundation
 
 /// Mirrors `ABX_SHIM_ABI_VERSION` in src/shim_ffi.rs.
 /// Bump BOTH on any change to an exported symbol's signature or semantics.
-let abxShimABIVersion: UInt32 = 1
+/// v2: abx_vm_new dropped its transitional raw vm/queue out-params.
+let abxShimABIVersion: UInt32 = 2
 
 /// Copies a Swift string into a malloc'd C string owned by the caller (Rust).
 func abxStrdup(_ string: String) -> UnsafeMutablePointer<CChar>? {

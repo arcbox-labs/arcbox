@@ -14,7 +14,6 @@ use std::ptr;
 use objc2::runtime::AnyObject;
 
 use crate::error::{VZError, VZResult};
-use crate::ffi::retain;
 use crate::shim_ffi;
 
 /// Converts a path to a `CString`, rejecting interior NUL bytes.
@@ -93,14 +92,15 @@ impl MacHardwareModel {
         }
     }
 
-    /// Wraps a hardware-model pointer borrowed from the framework (for example a
-    /// restore image's requirements), retaining it so it outlives its source.
-    pub(crate) fn from_retained_ptr(ptr: *mut AnyObject) -> Option<Self> {
-        if ptr.is_null() {
+    /// Wraps a +1 hardware-model handle produced by the shim (for example a
+    /// restore image's requirements); the handle is released by Drop.
+    pub(crate) fn from_owned_handle(handle: *mut c_void) -> Option<Self> {
+        if handle.is_null() {
             return None;
         }
-        // SAFETY: ptr is a valid VZMacHardwareModel; retain balances the release in Drop.
-        Some(Self { inner: retain(ptr) })
+        Some(Self {
+            inner: handle as *mut AnyObject,
+        })
     }
 
     pub(crate) fn as_ptr(&self) -> *mut AnyObject {
