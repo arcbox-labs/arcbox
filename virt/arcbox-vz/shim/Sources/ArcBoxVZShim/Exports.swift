@@ -1,17 +1,13 @@
 // ALL @_cdecl exports live in this file, in the NORMATIVE SYMBOL ORDER.
 //
 // CONTRACT: src/shim_ffi.rs declares these symbols in the exact same order —
-// review the two files side by side. Any signature or semantics change bumps
-// `abxShimABIVersion` (Errors.swift) and `ABX_SHIM_ABI_VERSION` (shim_ffi.rs).
+// review the two files side by side. The shim is statically linked from this
+// same source tree, so there is no runtime ABI-version handshake; symbol
+// drift is caught by the `link_coverage` test on the Rust side at link time.
 
 import Foundation
 
 // MARK: - Errors / strings / handles
-
-@_cdecl("abx_shim_version")
-public func abxShimVersion() -> UInt32 {
-    abxShimABIVersion
-}
 
 @_cdecl("abx_string_free")
 public func abxStringFree(_ ptr: UnsafeMutablePointer<CChar>?) {
