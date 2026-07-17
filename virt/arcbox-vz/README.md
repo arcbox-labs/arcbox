@@ -11,8 +11,9 @@ All framework interaction lives in **ArcBoxVZShim**, a SwiftPM static library
 under `shim/` that `build.rs` compiles and links into the crate. Rust and
 Swift meet at a hand-written C ABI: `shim/Sources/ArcBoxVZShim/Exports.swift`
 (`@_cdecl` exports) and `src/shim_ffi.rs` (extern declarations) mirror each
-other in a normative symbol order — review them side by side, and bump the
-ABI version in both on any signature change.
+other in a normative symbol order — review them side by side. The shim is
+statically linked from this same build, so symbol drift is caught at link
+time by the `link_coverage` test rather than a runtime version handshake.
 
 ## Requirements
 
