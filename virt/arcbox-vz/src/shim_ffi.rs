@@ -16,6 +16,12 @@
 
 use std::ffi::{c_char, c_void};
 
+/// Vsock connect completion: fires exactly once from the VM's dispatch queue
+/// with either a dup'd fd (+ ports, `err` null) or `fd == -1` and a strdup'd
+/// error message (freed by the receiver via [`take_error_string`]).
+pub type VsockCb =
+    unsafe extern "C" fn(ctx: *mut c_void, fd: i32, src_port: u32, dst_port: u32, err: *mut c_char);
+
 /// Mirrors `abxShimABIVersion` in the shim; bump both on any signature change.
 #[allow(
     dead_code,
@@ -127,6 +133,12 @@ unsafe extern "C" {
         machine_identifier: *mut c_void,
         auxiliary_storage: *mut c_void,
     ) -> *mut c_void;
+
+    // Vsock
+    /// Migration-only (dies with the old socket_devices path): wraps raw
+    /// (device, queue) pointers into an ABXSocketDeviceBox handle.
+    pub fn abx_socket_device_box_from_raw(device: *mut c_void, queue: *mut c_void) -> *mut c_void;
+    pub fn abx_vsock_connect(device_box: *mut c_void, port: u32, ctx: *mut c_void, cb: VsockCb);
 }
 
 /// Takes ownership of a shim-returned error string and frees it.
@@ -203,11 +215,13 @@ mod tests {
         abx_aux_storage_open as *const (),
         abx_aux_storage_create as *const (),
         abx_platform_mac_new as *const (),
+        abx_socket_device_box_from_raw as *const (),
+        abx_vsock_connect as *const (),
     ];
 
     /// Update when symbols are added; a mismatch means Exports.swift and this
     /// file have drifted.
-    const EXPECTED_SYMBOL_COUNT: usize = 47;
+    const EXPECTED_SYMBOL_COUNT: usize = 49;
 
     #[test]
     fn link_coverage() {
