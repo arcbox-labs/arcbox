@@ -219,6 +219,8 @@ fn register_daemon_service() -> Result<()> {
     // Daemon manages its own log files via tracing-appender, so we no
     // longer set StandardOutPath / StandardErrorPath. Stdout/stderr are
     // discarded to avoid launchd writing duplicate output.
+    let data_dir_env = arcbox_constants::env::DATA_DIR;
+    let data_dir_str = data_dir.display();
     let plist_content = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -232,8 +234,19 @@ fn register_daemon_service() -> Result<()> {
         <string>--profile</string>
         <string>{profile}</string>
         <string>--data-dir</string>
-        <string>{}</string>
+        <string>{data_dir_str}</string>
     </array>
+    <!--
+      Mirror the data dir into the daemon environment: recovery's host-global
+      self-setup treats {data_dir_env} as the machine-wide canonical layout,
+      so a relocated install keeps ownership of /var/run/docker.sock (the
+      argv flag alone reads as a scoped per-instance override there).
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>{data_dir_env}</key>
+        <string>{data_dir_str}</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -247,8 +260,7 @@ fn register_daemon_service() -> Result<()> {
     <integer>45</integer>
 </dict>
 </plist>
-"#,
-        data_dir.display()
+"#
     );
 
     std::fs::write(&plist_path, plist_content)

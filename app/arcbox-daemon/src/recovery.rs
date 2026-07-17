@@ -85,7 +85,9 @@ pub async fn run(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
     // a temp dir, an ad-hoc dev run) would re-point the host-global Docker
     // socket at a path that dies with it. `ARCBOX_DATA_DIR` counts as
     // canonical — it relocates the machine-wide installation, not one
-    // daemon instance.
+    // daemon instance; the installer persists it into the launchd plist's
+    // EnvironmentVariables so a relocated install still satisfies this
+    // check (its plist also passes the same path as `--data-dir`).
     let default_data_dir = HostLayout::resolve_for_profile_from_env(ctx.profile, None).data_dir;
     let socket_task = (ctx.layout.data_dir == default_data_dir).then(|| self_setup::DockerSocket {
         target: ctx.layout.docker_socket.clone(),
