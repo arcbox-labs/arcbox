@@ -204,3 +204,44 @@ public func abxGraphicsMacNew(
 ) -> UnsafeMutableRawPointer {
     graphicsMacNew(width, height, ppi)
 }
+
+// MARK: - Directory shares / VirtioFS
+
+@_cdecl("abx_shared_directory_new")
+public func abxSharedDirectoryNew(
+    _ path: UnsafePointer<CChar>, _ readOnly: Bool
+) -> UnsafeMutableRawPointer {
+    sharedDirectoryNew(path, readOnly)
+}
+
+@_cdecl("abx_single_share_new")
+public func abxSingleShareNew(_ directory: UnsafeMutableRawPointer) -> UnsafeMutableRawPointer {
+    singleShareNew(directory)
+}
+
+@_cdecl("abx_rosetta_availability")
+public func abxRosettaAvailability() -> Int64 {
+    rosettaAvailability()
+}
+
+@_cdecl("abx_rosetta_share_new")
+public func abxRosettaShareNew(
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> UnsafeMutableRawPointer? {
+    rosettaShareNew(errorOut)
+}
+
+@_cdecl("abx_virtiofs_new")
+public func abxVirtiofsNew(
+    _ tag: UnsafePointer<CChar>,
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> UnsafeMutableRawPointer? {
+    virtiofsNew(tag, errorOut)
+}
+
+@_cdecl("abx_virtiofs_set_share")
+public func abxVirtiofsSetShare(
+    _ config: UnsafeMutableRawPointer, _ share: UnsafeMutableRawPointer
+) {
+    virtiofsSetShare(config, share)
+}

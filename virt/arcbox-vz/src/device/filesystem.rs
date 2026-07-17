@@ -28,11 +28,11 @@
 //! ```
 
 use crate::error::{VZError, VZResult};
-use crate::ffi::{get_class, nsstring, nsurl_file_path, release};
-use crate::msg_send;
-use objc2::runtime::{AnyClass, AnyObject, Bool};
-use std::ffi::c_void;
+use crate::shim_ffi;
+use objc2::runtime::AnyObject;
+use std::ffi::CString;
 use std::path::Path;
+use std::ptr;
 
 // ============================================================================
 // SharedDirectory
@@ -61,7 +61,8 @@ pub struct SharedDirectory {
     inner: *mut AnyObject,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an ObjC configuration object created by the
+// shim; it is not mutated concurrently.
 unsafe impl Send for SharedDirectory {}
 
 impl SharedDirectory {
@@ -74,92 +75,42 @@ impl SharedDirectory {
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The path doesn't exist
-    /// - The path is not a directory
-    /// - The `VZSharedDirectory` class is not available
+    /// Returns an error if the path doesn't exist or is not a directory.
     pub fn new(path: impl AsRef<Path>, read_only: bool) -> VZResult<Self> {
         let path = path.as_ref();
 
-        // Validate path exists
         if !path.exists() {
             return Err(VZError::NotFound(path.display().to_string()));
         }
-
-        // Validate it's a directory
         if !path.is_dir() {
             return Err(VZError::InvalidConfiguration(format!(
                 "Path is not a directory: {}",
                 path.display()
             )));
         }
+        let c_path = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
+            VZError::InvalidConfiguration(format!("path contains NUL: {}", path.display()))
+        })?;
 
-        // SAFETY: ObjC alloc/init on valid VZSharedDirectory class. NSURL from validated path. readOnly is a Bool value.
-        unsafe {
-            let cls = get_class("VZSharedDirectory").ok_or_else(|| VZError::Internal {
-                code: -1,
-                message: "VZSharedDirectory class not found".into(),
-            })?;
-
-            // Create NSURL for the path
-            let url = nsurl_file_path(&path.to_string_lossy());
-            if url.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to create NSURL for path".into(),
-                });
-            }
-
-            // [VZSharedDirectory alloc]
-            let obj: *mut AnyObject = msg_send!(cls, alloc);
-            if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to allocate VZSharedDirectory".into(),
-                });
-            }
-
-            // [obj initWithURL:url readOnly:readOnly]
-            let init_sel = objc2::sel!(initWithURL:readOnly:);
-            let init_fn: unsafe extern "C" fn(
-                *mut AnyObject,
-                objc2::runtime::Sel,
-                *mut AnyObject,
-                Bool,
-            ) -> *mut AnyObject =
-                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            let obj = init_fn(obj, init_sel, url, Bool::new(read_only));
-
-            if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to initialize VZSharedDirectory".into(),
-                });
-            }
-
-            tracing::debug!(
-                "Created SharedDirectory for {:?} (read_only={})",
-                path,
-                read_only
-            );
-
-            Ok(Self { inner: obj })
-        }
-    }
-
-    /// Consumes the shared directory and returns the raw pointer.
-    #[must_use]
-    pub fn into_ptr(self) -> *mut AnyObject {
-        let ptr = self.inner;
-        std::mem::forget(self);
-        ptr
+        // SAFETY: c_path is a valid NUL-terminated string; the shim returns a
+        // +1 handle, released by Drop.
+        let obj = unsafe { shim_ffi::abx_shared_directory_new(c_path.as_ptr(), read_only) };
+        tracing::debug!(
+            "Created SharedDirectory for {:?} (read_only={})",
+            path,
+            read_only
+        );
+        Ok(Self {
+            inner: obj as *mut AnyObject,
+        })
     }
 }
 
 impl Drop for SharedDirectory {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            release(self.inner);
+            // SAFETY: releasing the +1 handle returned by the shim.
+            unsafe { shim_ffi::abx_object_release(self.inner.cast()) };
         }
     }
 }
@@ -175,9 +126,6 @@ impl Drop for SharedDirectory {
 pub trait DirectoryShare {
     /// Returns the raw pointer to the underlying share object.
     fn as_ptr(&self) -> *mut AnyObject;
-
-    /// Consumes the share and returns the raw pointer.
-    fn into_ptr(self) -> *mut AnyObject;
 }
 
 // ============================================================================
@@ -204,7 +152,8 @@ pub struct SingleDirectoryShare {
     inner: *mut AnyObject,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an ObjC configuration object created by the
+// shim; it is not mutated concurrently.
 unsafe impl Send for SingleDirectoryShare {}
 
 impl SingleDirectoryShare {
@@ -214,43 +163,13 @@ impl SingleDirectoryShare {
     ///
     /// * `directory` - The shared directory to expose
     pub fn new(directory: SharedDirectory) -> VZResult<Self> {
-        // SAFETY: ObjC alloc/init on valid VZSingleDirectoryShare class with a valid SharedDirectory pointer.
-        unsafe {
-            let cls = get_class("VZSingleDirectoryShare").ok_or_else(|| VZError::Internal {
-                code: -1,
-                message: "VZSingleDirectoryShare class not found".into(),
-            })?;
-
-            // [VZSingleDirectoryShare alloc]
-            let obj: *mut AnyObject = msg_send!(cls, alloc);
-            if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to allocate VZSingleDirectoryShare".into(),
-                });
-            }
-
-            // [obj initWithDirectory:directory]
-            let init_sel = objc2::sel!(initWithDirectory:);
-            let init_fn: unsafe extern "C" fn(
-                *mut AnyObject,
-                objc2::runtime::Sel,
-                *mut AnyObject,
-            ) -> *mut AnyObject =
-                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            let obj = init_fn(obj, init_sel, directory.into_ptr());
-
-            if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to initialize VZSingleDirectoryShare".into(),
-                });
-            }
-
-            tracing::debug!("Created SingleDirectoryShare");
-
-            Ok(Self { inner: obj })
-        }
+        // SAFETY: the share retains the directory internally, so dropping
+        // `directory` (releasing its +1) after this call is correct.
+        let obj = unsafe { shim_ffi::abx_single_share_new(directory.inner.cast()) };
+        tracing::debug!("Created SingleDirectoryShare");
+        Ok(Self {
+            inner: obj as *mut AnyObject,
+        })
     }
 }
 
@@ -258,18 +177,13 @@ impl DirectoryShare for SingleDirectoryShare {
     fn as_ptr(&self) -> *mut AnyObject {
         self.inner
     }
-
-    fn into_ptr(self) -> *mut AnyObject {
-        let ptr = self.inner;
-        std::mem::forget(self);
-        ptr
-    }
 }
 
 impl Drop for SingleDirectoryShare {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            release(self.inner);
+            // SAFETY: releasing the +1 handle returned by the shim.
+            unsafe { shim_ffi::abx_object_release(self.inner.cast()) };
         }
     }
 }
@@ -311,7 +225,8 @@ pub struct VirtioFileSystemDeviceConfiguration {
     tag: String,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an ObjC configuration object created by the
+// shim; it is not mutated concurrently.
 unsafe impl Send for VirtioFileSystemDeviceConfiguration {}
 
 impl VirtioFileSystemDeviceConfiguration {
@@ -323,88 +238,30 @@ impl VirtioFileSystemDeviceConfiguration {
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The tag is invalid (empty or contains invalid characters)
-    /// - The `VZVirtioFileSystemDeviceConfiguration` class is not available
+    /// Returns an error if the tag is invalid (empty, too long, or containing
+    /// invalid characters; validated by the framework).
     pub fn new(tag: &str) -> VZResult<Self> {
-        // Validate tag is not empty
         if tag.is_empty() {
             return Err(VZError::InvalidConfiguration(
                 "VirtioFS tag cannot be empty".into(),
             ));
         }
+        let c_tag = CString::new(tag)
+            .map_err(|_| VZError::InvalidConfiguration(format!("tag contains NUL: {tag}")))?;
 
-        // SAFETY: ObjC alloc/init on valid VZVirtioFileSystemDeviceConfiguration class. Tag is validated via validateTag:error: before use.
+        // SAFETY: c_tag is valid; the shim validates the tag and on failure
+        // writes a strdup'd message that take_error_string frees.
         unsafe {
-            let cls = get_class("VZVirtioFileSystemDeviceConfiguration").ok_or_else(|| {
-                VZError::Internal {
-                    code: -1,
-                    message: "VZVirtioFileSystemDeviceConfiguration class not found".into(),
-                }
-            })?;
-
-            // Validate tag using [VZVirtioFileSystemDeviceConfiguration validateTag:error:]
-            let tag_ns = nsstring(tag);
-            let mut error: *mut AnyObject = std::ptr::null_mut();
-
-            let validate_sel = objc2::sel!(validateTag:error:);
-            let validate_fn: unsafe extern "C" fn(
-                *const AnyObject,
-                objc2::runtime::Sel,
-                *mut AnyObject,
-                *mut *mut AnyObject,
-            ) -> Bool = std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-
-            let valid = validate_fn(
-                cls as *const AnyClass as *const AnyObject,
-                validate_sel,
-                tag_ns,
-                &mut error,
-            );
-
-            if !valid.as_bool() {
-                let error_msg = if error.is_null() {
-                    format!("Invalid VirtioFS tag: {tag}")
-                } else {
-                    let desc: *mut AnyObject = msg_send!(error, localizedDescription);
-                    crate::ffi::nsstring_to_string(desc)
-                };
-                return Err(VZError::InvalidConfiguration(error_msg));
-            }
-
-            // [VZVirtioFileSystemDeviceConfiguration alloc]
-            let obj: *mut AnyObject = msg_send!(cls, alloc);
+            let mut error: *mut std::ffi::c_char = ptr::null_mut();
+            let obj = shim_ffi::abx_virtiofs_new(c_tag.as_ptr(), &mut error);
             if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to allocate VZVirtioFileSystemDeviceConfiguration".into(),
-                });
+                return Err(VZError::InvalidConfiguration(shim_ffi::take_error_string(
+                    error,
+                )));
             }
-
-            // [obj initWithTag:tag]
-            let init_sel = objc2::sel!(initWithTag:);
-            let init_fn: unsafe extern "C" fn(
-                *mut AnyObject,
-                objc2::runtime::Sel,
-                *mut AnyObject,
-            ) -> *mut AnyObject =
-                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            let obj = init_fn(obj, init_sel, tag_ns);
-
-            if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to initialize VZVirtioFileSystemDeviceConfiguration".into(),
-                });
-            }
-
-            tracing::debug!(
-                "Created VirtioFileSystemDeviceConfiguration with tag '{}'",
-                tag
-            );
-
+            tracing::debug!("Created VirtioFileSystemDeviceConfiguration with tag '{tag}'");
             Ok(Self {
-                inner: obj,
+                inner: obj as *mut AnyObject,
                 tag: tag.to_string(),
             })
         }
@@ -416,15 +273,12 @@ impl VirtioFileSystemDeviceConfiguration {
     ///
     /// * `share` - The directory share configuration
     pub fn set_share<S: DirectoryShare>(&mut self, share: S) -> &mut Self {
-        // SAFETY: self.inner is a valid VZVirtioFileSystemDeviceConfiguration. share.into_ptr() provides a valid directory share object.
+        // SAFETY: both handles are valid; the config retains the share, so
+        // dropping `share` (releasing its +1) after this call is correct.
         unsafe {
-            let set_sel = objc2::sel!(setShare:);
-            let set_fn: unsafe extern "C" fn(*mut AnyObject, objc2::runtime::Sel, *mut AnyObject) =
-                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            set_fn(self.inner, set_sel, share.into_ptr());
-
-            tracing::debug!("Set share for VirtioFS device '{}'", self.tag);
+            shim_ffi::abx_virtiofs_set_share(self.inner.cast(), share.as_ptr().cast());
         }
+        tracing::debug!("Set share for VirtioFS device '{}'", self.tag);
         self
     }
 
@@ -436,7 +290,7 @@ impl VirtioFileSystemDeviceConfiguration {
 
     /// Consumes the configuration and returns the raw pointer.
     #[must_use]
-    pub fn into_ptr(self) -> *mut AnyObject {
+    pub(crate) fn into_ptr(self) -> *mut AnyObject {
         let ptr = self.inner;
         std::mem::forget(self);
         ptr
@@ -446,7 +300,8 @@ impl VirtioFileSystemDeviceConfiguration {
 impl Drop for VirtioFileSystemDeviceConfiguration {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            release(self.inner);
+            // SAFETY: releasing the +1 handle returned by the shim.
+            unsafe { shim_ffi::abx_object_release(self.inner.cast()) };
         }
     }
 }
@@ -494,35 +349,19 @@ pub struct LinuxRosettaDirectoryShare {
     inner: *mut AnyObject,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an ObjC configuration object created by the
+// shim; it is not mutated concurrently.
 unsafe impl Send for LinuxRosettaDirectoryShare {}
 
 impl LinuxRosettaDirectoryShare {
     /// Checks the availability of Rosetta on this system.
     pub fn availability() -> RosettaAvailability {
-        // SAFETY: cls is a valid VZLinuxRosettaDirectoryShare class pointer from get_class. Sending availability to it.
-        unsafe {
-            let cls = match get_class("VZLinuxRosettaDirectoryShare") {
-                Some(c) => c,
-                None => return RosettaAvailability::NotSupported,
-            };
-
-            // [VZLinuxRosettaDirectoryShare availability]
-            let avail_sel = objc2::sel!(availability);
-            let avail_fn: unsafe extern "C" fn(*const AnyObject, objc2::runtime::Sel) -> i64 =
-                std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-            let avail = avail_fn(cls as *const AnyClass as *const AnyObject, avail_sel);
-
-            // VZLinuxRosettaAvailability enum values:
-            // 0 = VZLinuxRosettaAvailabilityNotSupported
-            // 1 = VZLinuxRosettaAvailabilitySupported (installed)
-            // 2 = VZLinuxRosettaAvailabilityNotInstalled
-            match avail {
-                0 => RosettaAvailability::NotSupported,
-                1 => RosettaAvailability::Supported,
-                2 => RosettaAvailability::NotInstalled,
-                _ => RosettaAvailability::NotSupported,
-            }
+        // SAFETY: class-property read; no preconditions.
+        // VZLinuxRosettaAvailability: 0 notSupported, 1 notInstalled, 2 installed.
+        match unsafe { shim_ffi::abx_rosetta_availability() } {
+            2 => RosettaAvailability::Supported,
+            1 => RosettaAvailability::NotInstalled,
+            _ => RosettaAvailability::NotSupported,
         }
     }
 
@@ -539,28 +378,18 @@ impl LinuxRosettaDirectoryShare {
             )));
         }
 
-        // SAFETY: ObjC new on valid VZLinuxRosettaDirectoryShare class. Availability is checked above. retain prevents autorelease.
+        // SAFETY: on failure the shim writes a strdup'd message that
+        // take_error_string frees.
         unsafe {
-            let cls =
-                get_class("VZLinuxRosettaDirectoryShare").ok_or_else(|| VZError::Internal {
-                    code: -1,
-                    message: "VZLinuxRosettaDirectoryShare class not found".into(),
-                })?;
-
-            let obj: *mut AnyObject = msg_send!(cls, new);
+            let mut error: *mut std::ffi::c_char = ptr::null_mut();
+            let obj = shim_ffi::abx_rosetta_share_new(&mut error);
             if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to create VZLinuxRosettaDirectoryShare".into(),
-                });
+                return Err(VZError::OperationFailed(shim_ffi::take_error_string(error)));
             }
-
-            // Retain
-            let _: *mut AnyObject = msg_send!(obj, retain);
-
             tracing::debug!("Created LinuxRosettaDirectoryShare");
-
-            Ok(Self { inner: obj })
+            Ok(Self {
+                inner: obj as *mut AnyObject,
+            })
         }
     }
 }
@@ -569,18 +398,13 @@ impl DirectoryShare for LinuxRosettaDirectoryShare {
     fn as_ptr(&self) -> *mut AnyObject {
         self.inner
     }
-
-    fn into_ptr(self) -> *mut AnyObject {
-        let ptr = self.inner;
-        std::mem::forget(self);
-        ptr
-    }
 }
 
 impl Drop for LinuxRosettaDirectoryShare {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            release(self.inner);
+            // SAFETY: releasing the +1 handle returned by the shim.
+            unsafe { shim_ffi::abx_object_release(self.inner.cast()) };
         }
     }
 }
