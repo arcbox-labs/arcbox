@@ -17,3 +17,4 @@ pub mod rootfs_builder;
 #[cfg(target_os = "linux")]
 pub mod sandbox;
 pub mod stats;
+pub mod volume_icon;
