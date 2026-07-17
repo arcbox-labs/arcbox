@@ -1,10 +1,11 @@
 //! Network device configuration.
 
 use crate::error::{VZError, VZResult};
-use crate::ffi::{file_handle_for_fd, get_class, nsstring, release};
-use crate::{msg_send, msg_send_void, msg_send_void_u64};
+use crate::shim_ffi;
 use objc2::runtime::AnyObject;
+use std::ffi::CString;
 use std::os::unix::io::RawFd;
+use std::ptr;
 
 /// MTU a VZ network device uses when `setMaximumTransmissionUnit:` is not
 /// called — Apple's default, and since ABX-423 also ArcBox's default.
@@ -29,10 +30,9 @@ pub const VZ_ENHANCED_MTU: u64 = 4000;
 ///
 /// This is the policy half of the decision — the VMM sizes its datapath from
 /// it before the device exists. The mechanism half (the
-/// `setMaximumTransmissionUnit:` availability probe and the actual setter
-/// call) stays in [`NetworkDeviceConfiguration`]; on macOS < 13 with the knob
-/// set the device falls back to 1500 while the datapath assumes 4000, an
-/// accepted mismatch on that unsupported, diagnostic-only configuration.
+/// `setMaximumTransmissionUnit:` call in the shim, applied only to
+/// file-handle attachments and only above the default) reads the value passed
+/// through [`NetworkDeviceConfiguration`]'s constructors.
 #[must_use]
 pub fn desired_network_mtu() -> usize {
     if std::env::var_os("ARCBOX_DIAG_NET_MTU_4000").is_some() {
@@ -42,12 +42,29 @@ pub fn desired_network_mtu() -> usize {
     }
 }
 
+/// The MTU override forwarded to the shim: 0 (leave Apple's default) unless
+/// the diagnostic knob raises it.
+fn mtu_override() -> u64 {
+    let desired = desired_network_mtu();
+    if desired > VZ_DEFAULT_MTU {
+        tracing::warn!(
+            "VZ network MTU raised to {desired} (ARCBOX_DIAG_NET_MTU_4000; \
+             expect ABX-423 device stalls under sustained bulk transfer)"
+        );
+        desired as u64
+    } else {
+        tracing::info!("VZ network MTU at default {VZ_DEFAULT_MTU} (ABX-423 mitigation)");
+        0
+    }
+}
+
 /// Configuration for a `VirtIO` network device.
 pub struct NetworkDeviceConfiguration {
     inner: *mut AnyObject,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an ObjC configuration object created by the
+// shim; it is not mutated concurrently.
 unsafe impl Send for NetworkDeviceConfiguration {}
 
 impl NetworkDeviceConfiguration {
@@ -55,14 +72,12 @@ impl NetworkDeviceConfiguration {
     ///
     /// NAT allows the guest to access external networks through the host.
     pub fn nat() -> VZResult<Self> {
-        let attachment = create_nat_attachment()?;
-        Self::with_attachment(attachment, None)
+        Self::nat_inner(None)
     }
 
     /// Creates a network device with NAT attachment and an explicit MAC address.
     pub fn nat_with_mac(mac_address: &str) -> VZResult<Self> {
-        let attachment = create_nat_attachment()?;
-        Self::with_attachment(attachment, Some(mac_address))
+        Self::nat_inner(Some(mac_address))
     }
 
     /// Creates a network device with file handle attachment.
@@ -71,17 +86,7 @@ impl NetworkDeviceConfiguration {
     /// guest via a connected datagram socket. The caller is responsible for
     /// all network processing (ARP, DHCP, DNS, NAT) on the host side.
     pub fn file_handle(fd: RawFd) -> VZResult<Self> {
-        let net_handle = file_handle_for_fd(fd);
-
-        if net_handle.is_null() {
-            return Err(VZError::Internal {
-                code: -1,
-                message: "Failed to create NSFileHandle for network fd".into(),
-            });
-        }
-
-        let attachment = create_file_handle_attachment(net_handle)?;
-        Self::with_attachment(attachment, None)
+        Self::file_handle_inner(fd, None)
     }
 
     /// Creates a network device with file handle attachment and an explicit MAC
@@ -90,91 +95,61 @@ impl NetworkDeviceConfiguration {
     /// Use this when the VZ-side MAC must match an external interface (e.g.
     /// vmnet) so that bridge FDB lookups resolve correctly.
     pub fn file_handle_with_mac(fd: RawFd, mac_address: &str) -> VZResult<Self> {
-        let net_handle = file_handle_for_fd(fd);
-
-        if net_handle.is_null() {
-            return Err(VZError::Internal {
-                code: -1,
-                message: "Failed to create NSFileHandle for network fd".into(),
-            });
-        }
-
-        let attachment = create_file_handle_attachment(net_handle)?;
-        Self::with_attachment(attachment, Some(mac_address))
+        Self::file_handle_inner(fd, Some(mac_address))
     }
 
-    /// Creates a network device with the given attachment.
-    fn with_attachment(attachment: *mut AnyObject, mac_address: Option<&str>) -> VZResult<Self> {
-        // SAFETY: ObjC new on valid VZVirtioNetworkDeviceConfiguration class. Result is checked non-null.
+    fn nat_inner(mac_address: Option<&str>) -> VZResult<Self> {
+        let c_mac = mac_cstring(mac_address)?;
+        let mac_ptr = c_mac.as_ref().map_or(ptr::null(), |m| m.as_ptr());
+        // SAFETY: mac_ptr is null or a valid NUL-terminated string; on
+        // failure the shim writes a strdup'd message.
         unsafe {
-            let cls = get_class("VZVirtioNetworkDeviceConfiguration").ok_or_else(|| {
-                VZError::Internal {
-                    code: -1,
-                    message: "VZVirtioNetworkDeviceConfiguration class not found".into(),
-                }
-            })?;
-            let obj = msg_send!(cls, new);
-
-            if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to create network device".into(),
-                });
-            }
-
-            msg_send_void!(obj, setAttachment: attachment);
-
-            // The MTU stays at Apple's default 1500 (ABX-423 — see
-            // VZ_ENHANCED_MTU). desired_network_mtu() reads the
-            // ARCBOX_DIAG_NET_MTU_4000 opt-in for stall reproduction and
-            // throughput A/B runs; raising needs setMaximumTransmissionUnit:
-            // (macOS 13+), so check respondsToSelector: to avoid an
-            // unrecognized-selector crash.
-            if desired_network_mtu() > VZ_DEFAULT_MTU {
-                let mtu_sel = objc2::sel!(setMaximumTransmissionUnit:);
-                // msg_send_bool! doesn't support Sel arguments, so dispatch manually.
-                let responds: bool = {
-                    let check_sel = objc2::sel!(respondsToSelector:);
-                    let func: unsafe extern "C" fn(
-                        *const objc2::runtime::AnyObject,
-                        objc2::runtime::Sel,
-                        objc2::runtime::Sel,
-                    ) -> objc2::runtime::Bool = std::mem::transmute(
-                        crate::ffi::runtime::objc_msgSend as *const std::ffi::c_void,
-                    );
-                    func(
-                        attachment as *const _ as *const objc2::runtime::AnyObject,
-                        check_sel,
-                        mtu_sel,
-                    )
-                    .as_bool()
-                };
-                if responds {
-                    msg_send_void_u64!(attachment, setMaximumTransmissionUnit: VZ_ENHANCED_MTU);
-                    tracing::warn!(
-                        "VZ network MTU raised to {VZ_ENHANCED_MTU} (ARCBOX_DIAG_NET_MTU_4000; \
-                         expect ABX-423 device stalls under sustained bulk transfer)"
-                    );
-                } else {
-                    tracing::warn!(
-                        "ARCBOX_DIAG_NET_MTU_4000 set but the MTU setter is unavailable \
-                         (macOS < 13); MTU stays at {VZ_DEFAULT_MTU}"
-                    );
-                }
-            } else {
-                tracing::info!("VZ network MTU at default {VZ_DEFAULT_MTU} (ABX-423 mitigation)");
-            }
-
-            let mac = match mac_address {
-                Some(mac_address) => create_mac_address(mac_address)?,
-                None => create_random_mac()?,
-            };
-            if !mac.is_null() {
-                msg_send_void!(obj, setMACAddress: mac);
-            }
-
-            Ok(Self { inner: obj })
+            let mut error: *mut std::ffi::c_char = ptr::null_mut();
+            let obj = shim_ffi::abx_network_nat_new(mac_ptr, mtu_override(), &mut error);
+            Self::from_shim(obj, error)
         }
+    }
+
+    fn file_handle_inner(fd: RawFd, mac_address: Option<&str>) -> VZResult<Self> {
+        // Pre-validate the fd so a bad descriptor surfaces as an error here
+        // instead of undefined attachment behavior later.
+        // SAFETY: fcntl(F_GETFD) is safe on any integer fd value.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            return Err(VZError::InvalidConfiguration(format!(
+                "invalid network fd {fd}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let c_mac = mac_cstring(mac_address)?;
+        let mac_ptr = c_mac.as_ref().map_or(ptr::null(), |m| m.as_ptr());
+        // SAFETY: fd is validated above; mac_ptr is null or valid; on failure
+        // the shim writes a strdup'd message.
+        unsafe {
+            let mut error: *mut std::ffi::c_char = ptr::null_mut();
+            let obj =
+                shim_ffi::abx_network_file_handle_new(fd, mac_ptr, mtu_override(), &mut error);
+            Self::from_shim(obj, error)
+        }
+    }
+
+    /// Wraps a shim result, converting a null handle + error into `VZError`.
+    ///
+    /// # Safety
+    ///
+    /// `error` must be null or a shim-allocated string (consumed here).
+    unsafe fn from_shim(
+        obj: *mut std::ffi::c_void,
+        error: *mut std::ffi::c_char,
+    ) -> VZResult<Self> {
+        if obj.is_null() {
+            // SAFETY: per contract, `error` is a shim-allocated string.
+            return Err(VZError::InvalidConfiguration(unsafe {
+                shim_ffi::take_error_string(error)
+            }));
+        }
+        Ok(Self {
+            inner: obj as *mut AnyObject,
+        })
     }
 
     /// Consumes the configuration and returns the raw pointer.
@@ -186,132 +161,19 @@ impl NetworkDeviceConfiguration {
     }
 }
 
+/// Converts an optional MAC string, rejecting interior NUL bytes.
+fn mac_cstring(mac: Option<&str>) -> VZResult<Option<CString>> {
+    mac.map(|m| {
+        CString::new(m).map_err(|_| VZError::InvalidConfiguration(format!("MAC contains NUL: {m}")))
+    })
+    .transpose()
+}
+
 impl Drop for NetworkDeviceConfiguration {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            crate::ffi::release(self.inner);
+            // SAFETY: releasing the +1 handle returned by the shim.
+            unsafe { shim_ffi::abx_object_release(self.inner.cast()) };
         }
-    }
-}
-
-fn create_file_handle_attachment(file_handle: *mut AnyObject) -> VZResult<*mut AnyObject> {
-    // SAFETY: ObjC alloc/init on valid VZFileHandleNetworkDeviceAttachment. ObjC exceptions are caught to prevent abort.
-    unsafe {
-        let cls =
-            get_class("VZFileHandleNetworkDeviceAttachment").ok_or_else(|| VZError::Internal {
-                code: -1,
-                message: "VZFileHandleNetworkDeviceAttachment class not found".into(),
-            })?;
-
-        let obj = msg_send!(cls, alloc);
-
-        // Wrap the init call to catch ObjC exceptions (which would
-        // otherwise abort the process as "foreign exceptions").
-        let obj_safe = std::panic::AssertUnwindSafe(obj);
-        let fh_safe = std::panic::AssertUnwindSafe(file_handle);
-        let result = objc2::exception::catch(move || {
-            let obj = *obj_safe;
-            let fh = *fh_safe;
-            msg_send!(obj, initWithFileHandle: fh)
-        });
-
-        let attachment = match result {
-            Ok(ptr) => ptr,
-            Err(exception) => {
-                // Extract NSException description for diagnostics.
-                let desc = match exception {
-                    Some(exc) => {
-                        let raw = &*exc as *const _ as *const AnyObject as *mut AnyObject;
-                        crate::ffi::nsstring_to_string(msg_send!(raw, description))
-                    }
-                    None => "unknown ObjC exception (nil)".into(),
-                };
-                tracing::error!("VZFileHandleNetworkDeviceAttachment init threw: {}", desc);
-                return Err(VZError::Internal {
-                    code: -2,
-                    message: format!(
-                        "VZFileHandleNetworkDeviceAttachment init threw ObjC exception: {desc}"
-                    ),
-                });
-            }
-        };
-
-        if attachment.is_null() {
-            return Err(VZError::Internal {
-                code: -1,
-                message: "Failed to create file handle network attachment".into(),
-            });
-        }
-
-        Ok(attachment)
-    }
-}
-
-fn create_nat_attachment() -> VZResult<*mut AnyObject> {
-    // SAFETY: ObjC new on valid VZNATNetworkDeviceAttachment class. Result is checked non-null.
-    unsafe {
-        let cls = get_class("VZNATNetworkDeviceAttachment").ok_or_else(|| VZError::Internal {
-            code: -1,
-            message: "VZNATNetworkDeviceAttachment class not found".into(),
-        })?;
-        let obj = msg_send!(cls, new);
-
-        if obj.is_null() {
-            return Err(VZError::Internal {
-                code: -1,
-                message: "Failed to create NAT attachment".into(),
-            });
-        }
-
-        Ok(obj)
-    }
-}
-
-fn create_random_mac() -> VZResult<*mut AnyObject> {
-    // SAFETY: Sending randomLocallyAdministeredAddress to valid VZMACAddress class.
-    unsafe {
-        let cls = get_class("VZMACAddress").ok_or_else(|| VZError::Internal {
-            code: -1,
-            message: "VZMACAddress class not found".into(),
-        })?;
-        let obj = msg_send!(cls, randomLocallyAdministeredAddress);
-
-        if obj.is_null() {
-            return Err(VZError::Internal {
-                code: -1,
-                message: "Failed to create random MAC".into(),
-            });
-        }
-
-        Ok(obj)
-    }
-}
-
-fn create_mac_address(mac_address: &str) -> VZResult<*mut AnyObject> {
-    // SAFETY: ObjC alloc/init on a valid VZMACAddress class with a valid NSString argument.
-    unsafe {
-        let cls = get_class("VZMACAddress").ok_or_else(|| VZError::Internal {
-            code: -1,
-            message: "VZMACAddress class not found".into(),
-        })?;
-        let obj = msg_send!(cls, alloc);
-        if obj.is_null() {
-            return Err(VZError::Internal {
-                code: -1,
-                message: "Failed to allocate MAC address".into(),
-            });
-        }
-
-        let mac_ns = nsstring(mac_address);
-        let initialized = msg_send!(obj, initWithString: mac_ns);
-        release(mac_ns);
-
-        if initialized.is_null() {
-            return Err(VZError::InvalidConfiguration(format!(
-                "Invalid MAC address: {mac_address}"
-            )));
-        }
-
-        Ok(initialized)
     }
 }

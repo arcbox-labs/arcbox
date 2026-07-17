@@ -147,3 +147,60 @@ public func abxPlatformGenericNestedSupported() -> Bool {
 public func abxPlatformGenericSetNested(_ platform: UnsafeMutableRawPointer, _ enabled: Bool) {
     platformGenericSetNested(platform, enabled)
 }
+
+// MARK: - Device configurations
+
+@_cdecl("abx_storage_disk_image_new")
+public func abxStorageDiskImageNew(
+    _ path: UnsafePointer<CChar>,
+    _ readOnly: Bool,
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> UnsafeMutableRawPointer? {
+    storageDiskImageNew(path, readOnly, errorOut)
+}
+
+@_cdecl("abx_network_nat_new")
+public func abxNetworkNATNew(
+    _ mac: UnsafePointer<CChar>?,
+    _ mtu: UInt64,
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> UnsafeMutableRawPointer? {
+    networkNATNew(mac, mtu, errorOut)
+}
+
+@_cdecl("abx_network_file_handle_new")
+public func abxNetworkFileHandleNew(
+    _ fd: Int32,
+    _ mac: UnsafePointer<CChar>?,
+    _ mtu: UInt64,
+    _ errorOut: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?
+) -> UnsafeMutableRawPointer? {
+    networkFileHandleNew(fd, mac, mtu, errorOut)
+}
+
+@_cdecl("abx_serial_console_new")
+public func abxSerialConsoleNew(_ readFd: Int32, _ writeFd: Int32) -> UnsafeMutableRawPointer {
+    serialConsoleNew(readFd, writeFd)
+}
+
+@_cdecl("abx_socket_device_config_new")
+public func abxSocketDeviceConfigNew() -> UnsafeMutableRawPointer {
+    socketDeviceConfigNew()
+}
+
+@_cdecl("abx_entropy_new")
+public func abxEntropyNew() -> UnsafeMutableRawPointer {
+    entropyNew()
+}
+
+@_cdecl("abx_balloon_config_new")
+public func abxBalloonConfigNew() -> UnsafeMutableRawPointer {
+    balloonConfigNew()
+}
+
+@_cdecl("abx_graphics_mac_new")
+public func abxGraphicsMacNew(
+    _ width: Int64, _ height: Int64, _ ppi: Int64
+) -> UnsafeMutableRawPointer {
+    graphicsMacNew(width, height, ppi)
+}

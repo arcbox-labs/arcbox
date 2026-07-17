@@ -1,10 +1,9 @@
 //! Storage device configuration.
 
 use crate::error::{VZError, VZResult};
-use crate::ffi::{get_class, nsurl_file_path};
-use crate::msg_send;
-use objc2::runtime::{AnyObject, Bool};
-use std::ffi::c_void;
+use crate::shim_ffi;
+use objc2::runtime::AnyObject;
+use std::ffi::CString;
 use std::path::Path;
 use std::ptr;
 
@@ -13,7 +12,8 @@ pub struct StorageDeviceConfiguration {
     inner: *mut AnyObject,
 }
 
-// SAFETY: Inner ObjC pointer is only used via msg_send! which dispatches to the ObjC runtime.
+// SAFETY: The inner pointer is an ObjC configuration object created by the
+// shim; it is not mutated concurrently.
 unsafe impl Send for StorageDeviceConfiguration {}
 
 impl StorageDeviceConfiguration {
@@ -28,37 +28,29 @@ impl StorageDeviceConfiguration {
         if !path.exists() {
             return Err(VZError::NotFound(path.display().to_string()));
         }
+        let c_path = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
+            VZError::InvalidConfiguration(format!("path contains NUL: {}", path.display()))
+        })?;
 
-        let attachment = create_disk_attachment(&path.to_string_lossy(), read_only)?;
-        Self::with_attachment(attachment)
-    }
-
-    /// Creates a storage device with the given attachment.
-    fn with_attachment(attachment: *mut AnyObject) -> VZResult<Self> {
-        // SAFETY: ObjC alloc/init on valid VZVirtioBlockDeviceConfiguration class with a valid attachment pointer.
+        // SAFETY: c_path is valid; on failure the shim writes a strdup'd
+        // message that take_error_string frees.
         unsafe {
-            let cls =
-                get_class("VZVirtioBlockDeviceConfiguration").ok_or_else(|| VZError::Internal {
-                    code: -1,
-                    message: "VZVirtioBlockDeviceConfiguration class not found".into(),
-                })?;
-            let alloc = msg_send!(cls, alloc);
-            let obj = msg_send!(alloc, initWithAttachment: attachment);
-
+            let mut error: *mut std::ffi::c_char = ptr::null_mut();
+            let obj = shim_ffi::abx_storage_disk_image_new(c_path.as_ptr(), read_only, &mut error);
             if obj.is_null() {
-                return Err(VZError::Internal {
-                    code: -1,
-                    message: "Failed to create block device".into(),
-                });
+                return Err(VZError::InvalidConfiguration(shim_ffi::take_error_string(
+                    error,
+                )));
             }
-
-            Ok(Self { inner: obj })
+            Ok(Self {
+                inner: obj as *mut AnyObject,
+            })
         }
     }
 
     /// Consumes the configuration and returns the raw pointer.
     #[must_use]
-    pub fn into_ptr(self) -> *mut AnyObject {
+    pub(crate) fn into_ptr(self) -> *mut AnyObject {
         let ptr = self.inner;
         std::mem::forget(self);
         ptr
@@ -68,41 +60,8 @@ impl StorageDeviceConfiguration {
 impl Drop for StorageDeviceConfiguration {
     fn drop(&mut self) {
         if !self.inner.is_null() {
-            crate::ffi::release(self.inner);
+            // SAFETY: releasing the +1 handle returned by the shim.
+            unsafe { shim_ffi::abx_object_release(self.inner.cast()) };
         }
-    }
-}
-
-fn create_disk_attachment(path: &str, read_only: bool) -> VZResult<*mut AnyObject> {
-    // SAFETY: ObjC alloc/init on valid VZDiskImageStorageDeviceAttachment class. NSURL from validated path. Error out-parameter is checked.
-    unsafe {
-        let cls =
-            get_class("VZDiskImageStorageDeviceAttachment").ok_or_else(|| VZError::Internal {
-                code: -1,
-                message: "VZDiskImageStorageDeviceAttachment class not found".into(),
-            })?;
-
-        let url = nsurl_file_path(path);
-        let mut error: *mut AnyObject = ptr::null_mut();
-
-        let sel = objc2::sel!(initWithURL:readOnly:error:);
-        let alloc = msg_send!(cls, alloc);
-
-        let func: unsafe extern "C" fn(
-            *mut AnyObject,
-            objc2::runtime::Sel,
-            *mut AnyObject,
-            Bool,
-            *mut *mut AnyObject,
-        ) -> *mut AnyObject =
-            std::mem::transmute(crate::ffi::runtime::objc_msgSend as *const c_void);
-
-        let obj = func(alloc, sel, url, Bool::new(read_only), &mut error);
-
-        if obj.is_null() {
-            return Err(crate::ffi::extract_nserror(error));
-        }
-
-        Ok(obj)
     }
 }
