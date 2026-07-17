@@ -31,18 +31,35 @@ use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
 /// Result of a vsock connect delivered by the shim callback.
+///
+/// Owns the dup'd fd: closes it on drop unless [`connect_blocking`] transfers
+/// it into a [`VirtioSocketConnection`]. This makes every abandonment path
+/// leak-free — a send to a dropped receiver, and also the race where a late
+/// completion sends successfully into the channel just before the receiver is
+/// dropped (the buffered value then closes the fd when the channel drops).
 struct VsockConnectionInfo {
     fd: RawFd,
     source_port: u32,
     destination_port: u32,
 }
 
+impl Drop for VsockConnectionInfo {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            // SAFETY: self.fd is the dup'd fd this struct owns; -1 means it was
+            // transferred out and must not be closed here.
+            unsafe { libc::close(self.fd) };
+        }
+    }
+}
+
 type VsockResult = Result<VsockConnectionInfo, String>;
 
 /// Shim callback trampoline: consumes the boxed sender exactly once.
 ///
-/// A timed-out `connect_blocking` drops the receiver; the late send then
-/// fails harmlessly (the dup'd fd is closed here in that case, see below).
+/// On any abandonment (timed-out receiver dropped, or a late send that lands
+/// in a channel no one reads) the `VsockConnectionInfo`'s drop closes the
+/// dup'd fd, so no explicit close is needed here.
 unsafe extern "C" fn vsock_trampoline(
     ctx: *mut c_void,
     fd: i32,
@@ -64,10 +81,10 @@ unsafe extern "C" fn vsock_trampoline(
         } else {
             Err(shim_ffi::take_error_string(err))
         };
-        if let Err(std_mpsc::SendError(Ok(info))) = sender.send(result) {
-            // Receiver gone (timeout path): close the dup'd fd, or it leaks.
-            libc::close(info.fd);
-        }
+        // If the receiver is gone the result (and its owned fd) drops here and
+        // closes the fd; if it sends successfully but is never received, the
+        // channel's buffered value closes it when the channel drops.
+        let _ = sender.send(result);
     }
 }
 
@@ -137,15 +154,19 @@ impl VirtioSocketDevice {
         }
 
         match rx.recv_timeout(timeout) {
-            Ok(Ok(info)) => {
+            Ok(Ok(mut info)) => {
                 tracing::info!(
                     "Vsock connected: fd={}, src_port={}, dst_port={}",
                     info.fd,
                     info.source_port,
                     info.destination_port
                 );
+                // Transfer fd ownership to the connection; disarm info's drop
+                // so it isn't double-closed.
+                let fd = info.fd;
+                info.fd = -1;
                 Ok(VirtioSocketConnection {
-                    fd: info.fd,
+                    fd,
                     source_port: info.source_port,
                     destination_port: info.destination_port,
                 })
