@@ -44,10 +44,17 @@ pub fn spawn(ctx: &DaemonContext, runtime: &Arc<Runtime>) {
         return;
     }
 
+    // Same gate as the HostsAlias self-setup task in `recovery`: only a
+    // canonical-data-dir daemon has that task racing this reconcile, so only
+    // it should wait for the alias before the first mount attempt.
+    let expect_hosts_alias = ctx.layout.data_dir
+        == arcbox_constants::paths::HostLayout::resolve_for_profile_from_env(ctx.profile, None)
+            .data_dir;
+
     let runtime = Arc::clone(runtime);
     let shutdown = ctx.shutdown.clone();
     tokio::spawn(async move {
-        if let Err(e) = reconcile(runtime, shutdown).await {
+        if let Err(e) = reconcile(runtime, shutdown, expect_hosts_alias).await {
             warn!(error = %e, "failed to establish host NFS mount at ~/ArcBox");
         }
     });
@@ -75,7 +82,11 @@ pub fn cleanup(ctx: &DaemonContext) {
     }
 }
 
-async fn reconcile(runtime: Arc<Runtime>, shutdown: CancellationToken) -> Result<()> {
+async fn reconcile(
+    runtime: Arc<Runtime>,
+    shutdown: CancellationToken,
+    expect_hosts_alias: bool,
+) -> Result<()> {
     let Some(mount_path) = resolve_mount_path() else {
         bail!("could not determine home directory for ~/ArcBox mount");
     };
@@ -86,7 +97,32 @@ async fn reconcile(runtime: Arc<Runtime>, shutdown: CancellationToken) -> Result
     reconcile_existing_mount(&mount_path)?;
     std::fs::create_dir_all(&mount_path)?;
 
+    if expect_hosts_alias {
+        wait_for_hosts_alias(&shutdown).await;
+    }
+
     mount_with_retry(&mount_path, nfsd_port, &shutdown).await
+}
+
+/// Bounded wait for the `ArcBox` hosts alias the concurrent self-setup task
+/// installs on canonical daemons.
+///
+/// The retry loop exits on its first successful mount, so without this a
+/// fresh install whose guest export comes up before the helper finishes
+/// would stick with the `127.0.0.1:/` source until the next daemon restart.
+/// Bounded: a helperless setup (CLI-only install where self-setup is
+/// skipped) proceeds after the window and simply mounts by loopback.
+async fn wait_for_hosts_alias(shutdown: &CancellationToken) {
+    const ALIAS_WAIT: Duration = Duration::from_secs(10);
+
+    let deadline = tokio::time::Instant::now() + ALIAS_WAIT;
+    while !hosts_alias_installed() && !shutdown.is_cancelled() {
+        if tokio::time::Instant::now() >= deadline {
+            debug!("hosts alias did not appear; mounting by loopback");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// Binds a localhost TCP proxy that relays each connection to `vsock_port` on
@@ -234,9 +270,13 @@ async fn run_mount(opts: &str, source: &str, mount_path: &Path) -> Result<(), St
 /// The check reads `/etc/hosts` directly — never DNS — so a missing alias
 /// costs nothing and a user's own unrelated `ArcBox` entry is not trusted.
 fn mount_source() -> String {
-    let alias_installed = std::fs::read_to_string("/etc/hosts")
-        .is_ok_and(|content| arcbox_helper::hosts_alias_installed(&content));
-    mount_source_for(alias_installed)
+    mount_source_for(hosts_alias_installed())
+}
+
+/// True when `/etc/hosts` carries the helper-managed alias line right now.
+fn hosts_alias_installed() -> bool {
+    std::fs::read_to_string("/etc/hosts")
+        .is_ok_and(|content| arcbox_helper::hosts_alias_installed(&content))
 }
 
 fn mount_source_for(alias_installed: bool) -> String {

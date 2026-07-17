@@ -68,6 +68,21 @@ pub trait HelperService {
     /// Removes the `/var/run/docker.sock` symlink.
     async fn socket_unlink() -> Result<(), String>;
 
+    /// Creates `/usr/local/bin/{name}` symlink pointing to `target`.
+    /// Used to expose Docker CLI tools from the app bundle.
+    async fn cli_link(name: String, target: String) -> Result<(), String>;
+
+    /// Removes `/usr/local/bin/{name}` symlink if it points inside an ArcBox bundle.
+    async fn cli_unlink(name: String) -> Result<(), String>;
+
+    /// Returns the helper version string.
+    async fn version() -> String;
+
+    // New methods append ONLY: the bincode transport encodes the request
+    // enum's variant index, so inserting a method above shifts every later
+    // ordinal and an upgrade-window daemon talking to the previous helper
+    // (launchd keeps it until reinstall) misdecodes calls silently.
+
     /// Appends the fixed `127.0.0.1 ArcBox` alias to `/etc/hosts` so the
     /// guest-data NFS mount can use `ArcBox:/` as its source (Finder shows
     /// a mount by its source host name). Takes no arguments — the helper
@@ -79,16 +94,6 @@ pub trait HelperService {
 
     /// Checks whether the ArcBox `/etc/hosts` alias is installed.
     async fn hosts_alias_status() -> Result<bool, String>;
-
-    /// Creates `/usr/local/bin/{name}` symlink pointing to `target`.
-    /// Used to expose Docker CLI tools from the app bundle.
-    async fn cli_link(name: String, target: String) -> Result<(), String>;
-
-    /// Removes `/usr/local/bin/{name}` symlink if it points inside an ArcBox bundle.
-    async fn cli_unlink(name: String) -> Result<(), String>;
-
-    /// Returns the helper version string.
-    async fn version() -> String;
 }
 
 /// Low-level connect — use [`client::Client::connect()`] instead.
