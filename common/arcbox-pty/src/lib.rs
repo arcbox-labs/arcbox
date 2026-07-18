@@ -159,7 +159,11 @@ mod linux {
 
         #[test]
         fn openpty_applies_initial_size_and_resize() {
-            let pty = openpty_sized(Some(WinSize { cols: 120, rows: 40 })).unwrap();
+            let pty = openpty_sized(Some(WinSize {
+                cols: 120,
+                rows: 40,
+            }))
+            .unwrap();
             let mut ws = libc::winsize {
                 ws_col: 0,
                 ws_row: 0,
