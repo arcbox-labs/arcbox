@@ -395,13 +395,50 @@ impl machine_service_server::MachineService for MachineServiceImpl {
     type ExecStream =
         Pin<Box<dyn Stream<Item = Result<MachineExecOutput, Status>> + Send + 'static>>;
 
+    /// Runs a command in the machine root via the guest agent, streaming
+    /// stdout/stderr frames and a final exit-code frame.
+    ///
+    /// Non-interactive: the agent rejects `tty` requests until the bidi exec
+    /// session lands. Streaming requires the async agent transport (VZ);
+    /// the HV blocking transport shares the sandbox-streaming limitation.
     async fn exec(
         &self,
-        _request: Request<MachineExecRequest>,
+        request: Request<MachineExecRequest>,
     ) -> Result<Response<Self::ExecStream>, Status> {
-        Err(Status::unimplemented(
-            "machine exec is no longer supported by guest agent RPC",
-        ))
+        let req = request.into_inner();
+        let agent = self
+            .runtime
+            .ready()?
+            .get_agent(&req.id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let mut rx = agent
+            .machine_exec(req)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let stream = async_stream::stream! {
+            while let Some(item) = rx.recv().await {
+                match item {
+                    Ok(output) => {
+                        let done = output.done;
+                        yield Ok(output);
+                        if done {
+                            break;
+                        }
+                    }
+                    Err(arcbox_core::error::CoreError::Agent { code: 400, message }) => {
+                        yield Err(Status::invalid_argument(message));
+                        break;
+                    }
+                    Err(e) => {
+                        yield Err(Status::internal(e.to_string()));
+                        break;
+                    }
+                }
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn ssh_info(

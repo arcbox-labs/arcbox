@@ -1216,6 +1216,91 @@ impl AgentClient {
         Ok(())
     }
 
+    /// Runs a command in the machine root (the agent's own mount namespace)
+    /// and returns a channel of streaming output.
+    ///
+    /// Consumes the client because the stream task requires exclusive
+    /// transport access. Non-interactive: the guest rejects `tty` requests
+    /// until the bidi exec session lands.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the initial send fails.
+    pub async fn machine_exec(
+        mut self,
+        req: arcbox_protocol::v1::MachineExecRequest,
+    ) -> Result<mpsc::Receiver<Result<arcbox_protocol::v1::MachineExecOutput>>> {
+        if !self.connected {
+            self.connect().await?;
+        }
+
+        let payload = req.encode_to_vec();
+        let buf = wire::build_message(MessageType::MachineExecRequest, "", &payload);
+        self.transport
+            .async_send(buf)
+            .await
+            .map_err(|e| CoreError::Machine(format!("failed to send exec request: {}", e)))?;
+
+        let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            loop {
+                let raw = match self.transport.async_recv().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(CoreError::Machine(format!("recv error: {}", e))))
+                            .await;
+                        break;
+                    }
+                };
+
+                let (resp_type, _, resp_payload) = match wire::parse_response(&raw) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        break;
+                    }
+                };
+
+                if resp_type == MessageType::Error as u32 {
+                    let (code, message) = wire::parse_error_response(&resp_payload)
+                        .unwrap_or_else(|_| (500, "unknown error".to_string()));
+                    let _ = tx.send(Err(CoreError::Agent { code, message })).await;
+                    break;
+                }
+
+                if resp_type != MessageType::MachineExecOutput as u32 {
+                    let _ = tx
+                        .send(Err(CoreError::Machine(format!(
+                            "unexpected response type: 0x{:04x}",
+                            resp_type
+                        ))))
+                        .await;
+                    break;
+                }
+
+                match arcbox_protocol::v1::MachineExecOutput::decode(&resp_payload[..]) {
+                    Ok(output) => {
+                        let done = output.done;
+                        // Stop reading if the consumer dropped, so a spewing
+                        // process isn't drained into the void indefinitely.
+                        if tx.send(Ok(output)).await.is_err() || done {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(CoreError::Machine(format!("decode error: {}", e))))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
     /// Runs a command inside a sandbox and returns a channel of streaming output.
     ///
     /// Consumes the client because the stream task requires exclusive transport access.

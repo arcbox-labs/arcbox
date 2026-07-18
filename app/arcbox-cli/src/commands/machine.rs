@@ -552,13 +552,14 @@ async fn execute_info(args: InfoArgs) -> Result<()> {
 }
 
 async fn execute_ssh(args: SshArgs) -> Result<()> {
-    let (cmd, tty) = if args.command.is_empty() {
-        (vec!["/bin/sh".to_string(), "-l".to_string()], true)
-    } else {
-        (args.command.clone(), false)
-    };
-
-    exec_via_grpc(&args.name, cmd, HashMap::new(), tty).await
+    if args.command.is_empty() {
+        anyhow::bail!(
+            "interactive machine sessions are not available yet; \
+             run a command instead: arcbox machine ssh {} <command>",
+            args.name
+        );
+    }
+    exec_via_grpc(&args.name, args.command, HashMap::new(), false).await
 }
 
 async fn execute_exec(args: ExecArgs) -> Result<()> {
