@@ -14,9 +14,9 @@
 # and the [boot] bump.
 
 [boot]
-version = "0.6.4"
+version = "0.6.5"
 cdn = "https://boot.arcboxcdn.com"
-manifest_sha256 = "bb7885c381c5b5e76a22c10437a168624069f623a4096d691d1e592f151abfea"
+manifest_sha256 = "e5ffc47a2ecfd9f07e80199ad43f2963058cdb3e0bfd790c8b13afd538a8da22"
 
 [[tools]]
 name = "docker"
