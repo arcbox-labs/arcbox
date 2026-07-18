@@ -15,6 +15,18 @@ use tonic::{Request, Response, Status};
 
 use super::{SharedRuntime, SharedRuntimeExt};
 
+/// The NAT gateway every machine's primary interface routes through; it also
+/// serves DNS (same literal the guest agent's DHCP path documents).
+const NAT_GATEWAY: &str = "10.0.2.1";
+
+/// Converts a chrono timestamp to the wire `Timestamp`.
+fn timestamp(t: chrono::DateTime<chrono::Utc>) -> arcbox_protocol::v1::Timestamp {
+    arcbox_protocol::v1::Timestamp {
+        seconds: t.timestamp(),
+        nanos: i32::try_from(t.timestamp_subsec_nanos()).unwrap_or(0),
+    }
+}
+
 /// Machine service implementation.
 pub struct MachineServiceImpl {
     runtime: SharedRuntime,
@@ -159,13 +171,37 @@ impl machine_service_server::MachineService for MachineServiceImpl {
     }
 
     async fn stop(&self, request: Request<StopMachineRequest>) -> Result<Response<Empty>, Status> {
-        let id = request.into_inner().id;
+        let req = request.into_inner();
         let runtime = self.runtime.ready()?;
+        let manager = std::sync::Arc::clone(runtime.machine_manager());
 
-        runtime
-            .machine_manager()
-            .stop(&id)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        // Graceful stop (guest ACPI) with a force fallback, unless the caller
+        // asked for an immediate force stop. Both are synchronous VM calls
+        // that can block up to the shutdown window; keep them off the async
+        // workers.
+        let force = req.force;
+        let id = req.id;
+        tokio::task::spawn_blocking(move || {
+            if force {
+                return manager.stop(&id);
+            }
+            match manager.graceful_stop(
+                &id,
+                std::time::Duration::from_secs(
+                    arcbox_constants::timeouts::HOST_SHUTDOWN_TIMEOUT_SECS,
+                ),
+            ) {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    tracing::warn!(machine = %id, "graceful stop timed out; force stopping");
+                    manager.stop(&id)
+                }
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("stop task panicked: {e}")))?
+        .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(Empty {}))
     }
@@ -204,6 +240,8 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 disk_size: m.disk_gb * 1024 * 1024 * 1024,
                 ip_address: m.ip_address.unwrap_or_default(),
                 created: m.created_at.timestamp(),
+                distro: m.distro.unwrap_or_default(),
+                distro_version: m.distro_version.unwrap_or_default(),
             })
             .collect();
 
@@ -234,16 +272,31 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 arch: std::env::consts::ARCH.to_string(),
             }),
             network: Some(MachineNetwork {
+                // Gateway/DNS only exist once the guest has an address; both
+                // are the NAT gateway (which also serves DNS — the same
+                // topology the agent's DHCP path configures).
+                gateway: machine
+                    .ip_address
+                    .as_ref()
+                    .map(|_| NAT_GATEWAY.to_string())
+                    .unwrap_or_default(),
+                dns_servers: machine
+                    .ip_address
+                    .as_ref()
+                    .map(|_| vec![NAT_GATEWAY.to_string()])
+                    .unwrap_or_default(),
                 ip_address: machine.ip_address.clone().unwrap_or_default(),
-                gateway: String::new(),
                 mac_address: String::new(),
-                dns_servers: vec![],
                 bridge_mac_address: arcbox_core::vm::bridge_nic_mac_for_vm_id(&machine.vm_id),
             }),
             storage: Some(arcbox_protocol::v1::MachineStorage {
                 disk_size: machine.disk_gb * 1024 * 1024 * 1024,
                 disk_format: "raw".to_string(),
-                disk_path: String::new(),
+                disk_path: machine
+                    .disk_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
             }),
             os: Some(arcbox_protocol::v1::MachineOs {
                 distro: machine
@@ -253,8 +306,8 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                 version: machine.distro_version.clone().unwrap_or_default(),
                 kernel: machine.kernel.unwrap_or_default(),
             }),
-            created: None,
-            started_at: None,
+            created: Some(timestamp(machine.created_at)),
+            started_at: machine.started_at.map(timestamp),
             mounts: vec![],
         }))
     }
@@ -342,13 +395,50 @@ impl machine_service_server::MachineService for MachineServiceImpl {
     type ExecStream =
         Pin<Box<dyn Stream<Item = Result<MachineExecOutput, Status>> + Send + 'static>>;
 
+    /// Runs a command in the machine root via the guest agent, streaming
+    /// stdout/stderr frames and a final exit-code frame.
+    ///
+    /// Non-interactive: the agent rejects `tty` requests until the bidi exec
+    /// session lands. Streaming requires the async agent transport (VZ);
+    /// the HV blocking transport shares the sandbox-streaming limitation.
     async fn exec(
         &self,
-        _request: Request<MachineExecRequest>,
+        request: Request<MachineExecRequest>,
     ) -> Result<Response<Self::ExecStream>, Status> {
-        Err(Status::unimplemented(
-            "machine exec is no longer supported by guest agent RPC",
-        ))
+        let req = request.into_inner();
+        let agent = self
+            .runtime
+            .ready()?
+            .get_agent(&req.id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let mut rx = agent
+            .machine_exec(req)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let stream = async_stream::stream! {
+            while let Some(item) = rx.recv().await {
+                match item {
+                    Ok(output) => {
+                        let done = output.done;
+                        yield Ok(output);
+                        if done {
+                            break;
+                        }
+                    }
+                    Err(arcbox_core::error::CoreError::Agent { code: 400, message }) => {
+                        yield Err(Status::invalid_argument(message));
+                        break;
+                    }
+                    Err(e) => {
+                        yield Err(Status::internal(e.to_string()));
+                        break;
+                    }
+                }
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn ssh_info(

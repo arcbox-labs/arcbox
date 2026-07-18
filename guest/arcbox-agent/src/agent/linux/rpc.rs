@@ -75,6 +75,16 @@ where
             continue;
         }
 
+        // Machine-level exec also streams multiple frames on this connection.
+        if matches!(msg_type, crate::rpc::MessageType::MachineExecRequest) {
+            if let Err(e) =
+                super::machine_exec::handle_machine_exec(&mut stream, &trace_id, &payload).await
+            {
+                tracing::warn!(trace_id = %trace_id, error = %e, "machine exec handler error");
+            }
+            continue;
+        }
+
         // Parse and handle the request.
         let result = match parse_request(msg_type, &payload) {
             Ok(RpcRequest::WatchReadiness(req)) => {

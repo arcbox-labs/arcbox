@@ -70,6 +70,8 @@ pub struct MachineInfo {
     pub backend: arcbox_vmm::VmBackend,
     /// Creation time.
     pub created_at: DateTime<Utc>,
+    /// Last successful start time.
+    pub started_at: Option<DateTime<Utc>>,
 }
 
 /// A pulled distro rootfs image a machine boots from.
@@ -273,6 +275,7 @@ impl MachineManager {
                     ip_address: persisted.ip_address.clone(),
                     backend: persisted.backend,
                     created_at: persisted.created_at,
+                    started_at: persisted.started_at,
                 };
                 machines.insert(persisted.name.clone(), info);
             }
@@ -438,6 +441,7 @@ impl MachineManager {
             ip_address: None,
             backend: config.backend,
             created_at: Utc::now(),
+            started_at: None,
         };
 
         // Persist the machine config
@@ -473,6 +477,7 @@ impl MachineManager {
             .start(&vm_id, self.shared_dns_hosts.clone())?;
 
         // Update machine state
+        let started_at = Utc::now();
         {
             let mut machines = self.machines.write().map_err(|_| CoreError::LockPoisoned)?;
 
@@ -480,6 +485,7 @@ impl MachineManager {
                 machine.state = MachineState::Running;
                 machine.cid = Some(cid);
                 machine.ip_address = None;
+                machine.started_at = Some(started_at);
 
                 tracing::info!("Machine '{}' started with CID {}", name, cid);
             }
@@ -489,6 +495,7 @@ impl MachineManager {
         if let Err(e) = self.persistence.update(name, |m| {
             m.state = MachineState::Running.into();
             m.ip_address = None;
+            m.started_at = Some(started_at);
         }) {
             tracing::warn!("Failed to persist state for machine '{}': {}", name, e);
         }
@@ -570,7 +577,7 @@ impl MachineManager {
     }
 
     fn assign_cid_for_start(&self, name: &str) -> Result<(VmId, u32)> {
-        let (vm_id, running_count) = {
+        let (vm_id, cid) = {
             let machines = self.machines.read().map_err(|_| CoreError::LockPoisoned)?;
 
             let machine = machines
@@ -589,16 +596,21 @@ impl MachineManager {
                 )));
             }
 
-            // Count running machines. CIDs 0, 1 are reserved, 2 is the host. We start from 3.
-            let running_count = machines
-                .values()
-                .filter(|m| m.state == MachineState::Running && m.cid.is_some())
-                .count() as u32;
+            // Lowest CID not held by another machine. CIDs 0/1 are reserved
+            // and 2 is the host, so guests start at 3. Uniqueness across
+            // machines is cosmetic — vsock routing is per-VM device
+            // (`VmManager::connect_vsock` addresses by VM id, and the guest
+            // only sees its own CID) — but distinct CIDs keep guest-side
+            // identity unambiguous in logs and diagnostics.
+            let used: std::collections::HashSet<u32> =
+                machines.values().filter_map(|m| m.cid).collect();
+            let cid = (3..=u32::MAX)
+                .find(|c| !used.contains(c))
+                .expect("fewer than u32::MAX machines");
 
-            (machine.vm_id.clone(), running_count)
+            (machine.vm_id.clone(), cid)
         };
 
-        let cid = 3 + running_count;
         self.vm_manager.set_guest_cid(&vm_id, cid)?;
 
         Ok((vm_id, cid))
@@ -787,7 +799,11 @@ impl MachineManager {
         self.vm_manager.debug_snapshot(&machine.vm_id)
     }
 
-    /// Stops a machine.
+    /// Stops a machine (force).
+    ///
+    /// Accepts `Stopping` as well as `Running` so a force stop can preempt
+    /// an in-flight graceful stop instead of erroring for up to the whole
+    /// graceful-shutdown window.
     ///
     /// # Errors
     ///
@@ -799,7 +815,10 @@ impl MachineManager {
             .get_mut(name)
             .ok_or_else(|| CoreError::not_found(name.to_string()))?;
 
-        if machine.state != MachineState::Running {
+        if !matches!(
+            machine.state,
+            MachineState::Running | MachineState::Stopping
+        ) {
             return Err(CoreError::invalid_state(format!(
                 "machine '{name}' is not running"
             )));
@@ -953,20 +972,25 @@ impl MachineManager {
                 Ok(true)
             }
             Ok(false) => {
-                if let Ok(mut machines) = self.machines.write() {
-                    if let Some(machine) = machines.get_mut(name) {
-                        machine.state = MachineState::Running;
-                    }
-                }
+                self.rollback_stopping(name);
                 Ok(false)
             }
             Err(e) => {
-                if let Ok(mut machines) = self.machines.write() {
-                    if let Some(machine) = machines.get_mut(name) {
-                        machine.state = MachineState::Running;
-                    }
-                }
+                self.rollback_stopping(name);
                 Err(e)
+            }
+        }
+    }
+
+    /// Rolls a failed graceful stop back to `Running` — but only if the
+    /// machine is still `Stopping`: a concurrent force [`Self::stop`] may
+    /// have already stopped it, and its `Stopped` must not be overwritten.
+    fn rollback_stopping(&self, name: &str) {
+        if let Ok(mut machines) = self.machines.write() {
+            if let Some(machine) = machines.get_mut(name) {
+                if machine.state == MachineState::Stopping {
+                    machine.state = MachineState::Running;
+                }
             }
         }
     }
@@ -1096,6 +1120,7 @@ impl MachineManager {
             ip_address: None,
             backend: arcbox_vmm::VmBackend::default(),
             created_at: Utc::now(),
+            started_at: None,
         };
 
         machines.insert(name.to_string(), info);

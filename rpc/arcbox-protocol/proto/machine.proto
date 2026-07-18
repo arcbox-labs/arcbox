@@ -155,7 +155,8 @@ message RemoveMachineRequest {
     string id = 1;
     // Force removal.
     bool force = 2;
-    // Remove volumes.
+    // Ignored: machine removal always deletes the machine directory
+    // (including the data disk). Retained for wire compatibility.
     bool volumes = 3;
 }
 
@@ -189,6 +190,10 @@ message MachineSummary {
     string ip_address = 7;
     // Creation timestamp.
     int64 created = 8;
+    // Distribution name (e.g., "ubuntu"); empty for plain VMs.
+    string distro = 9;
+    // Distribution release (e.g., "noble").
+    string distro_version = 10;
 }
 
 // Request to inspect a machine.

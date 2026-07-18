@@ -160,6 +160,7 @@ fn sample_machine(cpus: u32, memory_mb: u64, kernel: &str, cmdline: &str) -> Mac
         ip_address: None,
         backend: arcbox_vmm::VmBackend::default(),
         created_at: chrono::Utc::now(),
+        started_at: None,
     }
 }
 

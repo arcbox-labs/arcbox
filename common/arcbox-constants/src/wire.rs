@@ -108,6 +108,12 @@ pub enum MessageType {
     SandboxListSnapshotsRequest = 0x0042,
     SandboxDeleteSnapshotRequest = 0x0043,
 
+    /// Starts a machine-level exec: runs a command in the machine root (the
+    /// agent's own mount namespace), streamed back as
+    /// [`Self::MachineExecOutput`] frames (payload:
+    /// `arcbox.v1.MachineExecRequest`).
+    MachineExecRequest = 0x0050,
+
     // Response types (0x1000 - 0x1FFF).
     PingResponse = 0x1001,
     GetSystemInfoResponse = 0x1002,
@@ -169,6 +175,10 @@ pub enum MessageType {
     SandboxListSnapshotsResponse = 0x1042,
     SandboxDeleteSnapshotResponse = 0x1043,
 
+    /// One machine exec output frame (payload: `arcbox.v1.MachineExecOutput`;
+    /// `done == true` on the final frame carrying the exit code).
+    MachineExecOutput = 0x1050,
+
     // Special types.
     Empty = 0x0000,
     Error = 0xFFFF,
@@ -219,6 +229,8 @@ impl MessageType {
             0x0041 => Some(Self::SandboxRestoreRequest),
             0x0042 => Some(Self::SandboxListSnapshotsRequest),
             0x0043 => Some(Self::SandboxDeleteSnapshotRequest),
+            // Machine-level exec.
+            0x0050 => Some(Self::MachineExecRequest),
             // Responses.
             0x1001 => Some(Self::PingResponse),
             0x1002 => Some(Self::GetSystemInfoResponse),
@@ -259,6 +271,7 @@ impl MessageType {
             0x1041 => Some(Self::SandboxRestoreResponse),
             0x1042 => Some(Self::SandboxListSnapshotsResponse),
             0x1043 => Some(Self::SandboxDeleteSnapshotResponse),
+            0x1050 => Some(Self::MachineExecOutput),
             0x0000 => Some(Self::Empty),
             0xFFFF => Some(Self::Error),
             _ => None,
@@ -389,6 +402,9 @@ mod tests {
             (0x1041, MessageType::SandboxRestoreResponse),
             (0x1042, MessageType::SandboxListSnapshotsResponse),
             (0x1043, MessageType::SandboxDeleteSnapshotResponse),
+            // Machine-level exec.
+            (0x0050, MessageType::MachineExecRequest),
+            (0x1050, MessageType::MachineExecOutput),
         ];
 
         for (raw, expected) in CASES {

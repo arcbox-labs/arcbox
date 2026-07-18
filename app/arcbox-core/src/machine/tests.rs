@@ -277,3 +277,27 @@ async fn test_create_without_shim_boots_rootfs_directly() {
     );
     assert!(!cmdline.contains("init="), "{cmdline}");
 }
+
+#[tokio::test]
+async fn test_assign_cid_skips_cids_held_by_other_machines() {
+    let temp_dir = tempdir().unwrap();
+    let machine_manager = test_machine_manager(temp_dir.path());
+
+    machine_manager
+        .register_mock_machine("holder-a", 3)
+        .unwrap();
+    machine_manager
+        .register_mock_machine("holder-b", 5)
+        .unwrap();
+
+    let name = machine_manager
+        .create(MachineConfig {
+            name: "fresh".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let (_, cid) = machine_manager.assign_cid_for_start(&name).unwrap();
+    assert_eq!(cid, 4, "lowest CID not held by another machine");
+}
