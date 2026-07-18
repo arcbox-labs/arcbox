@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.22](https://github.com/arcboxlabs/arcbox/compare/v0.4.21...v0.4.22) (2026-07-18)
+
+
+### Features
+
+* **agent,api:** resolve image layer paths via ephemeral containerd views ([6bd7bdc](https://github.com/arcboxlabs/arcbox/commit/6bd7bdc8ede6b18b9825520a4431e1c9f625aa67))
+* resolve image layer paths for the Images Files tab (c8d) ([#433](https://github.com/arcboxlabs/arcbox/issues/433)) ([6bd7bdc](https://github.com/arcboxlabs/arcbox/commit/6bd7bdc8ede6b18b9825520a4431e1c9f625aa67))
+
 ## [0.4.21](https://github.com/arcboxlabs/arcbox/compare/v0.4.20...v0.4.21) (2026-07-17)
 
 
