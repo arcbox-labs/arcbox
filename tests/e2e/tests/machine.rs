@@ -124,6 +124,9 @@ fn scenario(daemon: &mut DaemonHandle, metrics: &mut RunMetrics) -> Result<()> {
                 memory: 1024 * 1024 * 1024,
                 disk_size: 2 * 1024 * 1024 * 1024,
                 distro: "alpine".to_owned(),
+                // The mirror carries multiple alpine releases; pin one so the
+                // resolver is unambiguous.
+                version: "3.24".to_owned(),
                 ..Default::default()
             }),
         )

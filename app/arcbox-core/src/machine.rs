@@ -647,6 +647,7 @@ impl MachineManager {
             }
 
             if std::time::Instant::now() >= deadline {
+                self.log_console_tail(name);
                 return Err(CoreError::Machine(format!(
                     "Machine '{name}' agent did not report a routable IP within timeout"
                 )));
@@ -852,6 +853,40 @@ impl MachineManager {
 
         self.vm_manager.read_console_output(&machine.vm_id)
     }
+
+    /// Logs the tail of a machine's console and agent-log pipes at WARN, for
+    /// diagnosing a boot that never reached agent readiness.
+    ///
+    /// Machine VMs (unlike the System VM) have no background serial drain, so
+    /// early-boot output — including a kernel panic or a shim `poweroff` —
+    /// sits unread in the host-side console pipe buffer and is recoverable
+    /// here even after the guest has died.
+    #[cfg(target_os = "macos")]
+    fn log_console_tail(&self, name: &str) {
+        // Read the vm_id directly: the machine may already be non-Running
+        // (an early guest death), which the state-gated readers reject.
+        let vm_id = match self.machines.read() {
+            Ok(machines) => machines.get(name).map(|m| m.vm_id.clone()),
+            Err(_) => None,
+        };
+        let Some(vm_id) = vm_id else { return };
+        for (label, output) in [
+            ("console", self.vm_manager.read_console_output(&vm_id)),
+            ("agent-log", self.vm_manager.read_agent_log_output(&vm_id)),
+        ] {
+            let Ok(text) = output else { continue };
+            let tail: Vec<&str> = text.lines().rev().take(40).collect();
+            if tail.is_empty() {
+                continue;
+            }
+            for line in tail.iter().rev() {
+                tracing::warn!(machine = %name, "machine {label}: {line}");
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn log_console_tail(&self, _name: &str) {}
 
     /// Reads agent log output (hvc1) for a running machine (macOS only).
     #[cfg(target_os = "macos")]
