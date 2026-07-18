@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.23](https://github.com/arcboxlabs/arcbox/compare/v0.4.22...v0.4.23) (2026-07-18)
+
+
+### Features
+
+* **core,api,agent:** machine boot shim contract — devices, cmdline, machine-init ([#432](https://github.com/arcboxlabs/arcbox/issues/432)) ([4744f96](https://github.com/arcboxlabs/arcbox/commit/4744f960f2751ffba3c3ef8a1c3fce797cb79384))
+* **core,api,cli:** machine service correctness — CID, stop semantics, inspect, summary distro ([#436](https://github.com/arcboxlabs/arcbox/issues/436)) ([f1cabc8](https://github.com/arcboxlabs/arcbox/commit/f1cabc8dd79afc7a8ded0ff73ed9933a6999b3e0))
+* **core,api:** honor the machine mounts parameter ([#438](https://github.com/arcboxlabs/arcbox/issues/438)) ([e6ff32e](https://github.com/arcboxlabs/arcbox/commit/e6ff32ee542b56a226ef79aaa92640ba31948bc1))
+* **core,api:** pull published distro rootfs images for machine create ([#431](https://github.com/arcboxlabs/arcbox/issues/431)) ([2b3fbd3](https://github.com/arcboxlabs/arcbox/commit/2b3fbd385c7ae52490bc7eff02d75bc7be1fd6da))
+* **pty,agent,core,api,cli:** interactive machine sessions — PTY primitives crate + bidi ExecSession ([#437](https://github.com/arcboxlabs/arcbox/issues/437)) ([ef94af1](https://github.com/arcboxlabs/arcbox/commit/ef94af184f2022964ff0ab043070b859165b3f2b))
+
+
+### Tests
+
+* **e2e:** machine lifecycle end to end ([#439](https://github.com/arcboxlabs/arcbox/issues/439)) ([991c077](https://github.com/arcboxlabs/arcbox/commit/991c07773a20e0596fbfa218532ec7e9a5618434))
+
+
+### Miscellaneous Chores
+
+* **assets:** bump boot assets to 0.6.6 ([#441](https://github.com/arcboxlabs/arcbox/issues/441)) ([709feff](https://github.com/arcboxlabs/arcbox/commit/709fefff8e21b627c14356ba2109d5f54eb105fd))
+
 ## [0.4.22](https://github.com/arcboxlabs/arcbox/compare/v0.4.21...v0.4.22) (2026-07-18)
 
 
