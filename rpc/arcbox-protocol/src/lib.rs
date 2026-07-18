@@ -94,15 +94,16 @@ pub mod image {
 pub mod agent {
     pub use super::v1::{
         AgentPingRequest, AgentPingResponse, ContainerFsPathsRequest, ContainerFsPathsResponse,
-        ContainerStats, DiskTrimRequest, DiskTrimResponse, KubernetesDeleteRequest,
-        KubernetesDeleteResponse, KubernetesKubeconfigRequest, KubernetesKubeconfigResponse,
-        KubernetesStartRequest, KubernetesStartResponse, KubernetesStatusRequest,
-        KubernetesStatusResponse, KubernetesStopRequest, KubernetesStopResponse, MachineStats,
-        MemoryPressureEvent, MmapReadFileRequest, MmapReadFileResponse, PortBindingsChanged,
-        PortBindingsRemoved, ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse,
-        RuntimeStatusRequest, RuntimeStatusResponse, ServiceStatus, ShutdownRequest,
-        ShutdownResponse, SystemInfo, WatchMemoryPressureRequest, WatchReadinessRequest,
-        WatchStatsRequest, memory_pressure_event, readiness_event,
+        ContainerStats, DiskTrimRequest, DiskTrimResponse, ImageFsPathsRequest,
+        ImageFsPathsResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
+        KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
+        KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
+        KubernetesStopRequest, KubernetesStopResponse, MachineStats, MemoryPressureEvent,
+        MmapReadFileRequest, MmapReadFileResponse, PortBindingsChanged, PortBindingsRemoved,
+        ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
+        RuntimeStatusResponse, ServiceStatus, ShutdownRequest, ShutdownResponse, SystemInfo,
+        WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
+        memory_pressure_event, readiness_event,
     };
 
     // Backward compatibility type aliases (short names without Agent prefix).
@@ -135,7 +136,8 @@ pub mod api {
     pub use super::v1::{
         Event, EventActor, EventsRequest, GetInfoRequest, GetInfoResponse, GetVersionRequest,
         GetVersionResponse, PruneRequest, PruneResponse, ResolveContainerFsRequest,
-        ResolveContainerFsResponse, SystemPingRequest, SystemPingResponse,
+        ResolveContainerFsResponse, ResolveImageFsRequest, ResolveImageFsResponse,
+        SystemPingRequest, SystemPingResponse,
     };
 
     // Volume service types
@@ -205,7 +207,8 @@ pub use v1::{
 pub use v1::{
     Event, EventActor, EventsRequest, GetInfoRequest, GetInfoResponse, GetVersionRequest,
     GetVersionResponse, PruneRequest, PruneResponse, ResolveContainerFsRequest,
-    ResolveContainerFsResponse, SystemPingRequest, SystemPingResponse,
+    ResolveContainerFsResponse, ResolveImageFsRequest, ResolveImageFsResponse, SystemPingRequest,
+    SystemPingResponse,
 };
 
 // API types - Volume

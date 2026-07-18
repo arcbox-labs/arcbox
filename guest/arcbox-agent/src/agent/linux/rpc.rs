@@ -136,6 +136,7 @@ async fn handle_request(request: RpcRequest) -> RequestResult {
         RpcRequest::ContainerFsPaths(req) => {
             RequestResult::Single(handle_container_fs_paths(req).await)
         }
+        RpcRequest::ImageFsPaths(req) => RequestResult::Single(handle_image_fs_paths(req).await),
         RpcRequest::KillAgent => RequestResult::Single(handle_kill_agent()),
         RpcRequest::WatchReadiness(_) => unreachable!("watch readiness is streaming"),
         RpcRequest::WatchMemoryPressure(_) => {
@@ -338,6 +339,36 @@ async fn handle_container_fs_paths(
         Err(e) => RpcResponse::Error(crate::rpc::ErrorResponse::new(
             libc::EIO,
             format!("container fs paths: {e}"),
+        )),
+    }
+}
+
+/// Handles an `ImageFsPaths` request.
+///
+/// Resolves an image's layer directories from its top layer chain ID via
+/// an ephemeral containerd View snapshot. The host reads the returned
+/// guest paths through the read-only NFS export.
+async fn handle_image_fs_paths(req: arcbox_protocol::agent::ImageFsPathsRequest) -> RpcResponse {
+    let chain_id = req.top_chain_id.as_str();
+    // Chain IDs are `sha256:` + 64 hex chars; charset-check the untrusted
+    // input before handing it to containerd as a snapshot key.
+    let is_valid = chain_id
+        .strip_prefix("sha256:")
+        .is_some_and(|d| d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()));
+    if !is_valid {
+        return RpcResponse::Error(crate::rpc::ErrorResponse::new(
+            libc::EINVAL,
+            format!("invalid top chain id {chain_id:?}"),
+        ));
+    }
+
+    match crate::containerd::image_snapshot_paths(chain_id).await {
+        Ok(paths) => RpcResponse::ImageFsPaths(arcbox_protocol::agent::ImageFsPathsResponse {
+            lower_dirs: paths.lower_dirs,
+        }),
+        Err(e) => RpcResponse::Error(crate::rpc::ErrorResponse::new(
+            libc::EIO,
+            format!("image fs paths: {e}"),
         )),
     }
 }

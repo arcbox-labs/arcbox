@@ -454,3 +454,18 @@ message ContainerFsPathsResponse {
     // Read-only layer directories, top-most first.
     repeated string lower_dirs = 2;
 }
+
+// Resolve an image's layer directories from containerd's snapshot
+// metadata (committed snapshots keyed by layer chain ID).
+message ImageFsPathsRequest {
+    // Chain ID of the image's top layer (`sha256:<64 hex>`), computed
+    // from the image config's diff_ids.
+    string top_chain_id = 1;
+}
+
+// Response to `ImageFsPathsRequest`. All paths are guest paths under the
+// containerd data mount.
+message ImageFsPathsResponse {
+    // Read-only layer directories, top-most first.
+    repeated string lower_dirs = 1;
+}

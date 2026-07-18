@@ -1,8 +1,10 @@
-//! Live check for `SystemService.ResolveContainerFs` and the containerd
-//! child NFS export: boots the System VM through a real daemon, runs a
-//! container that writes a marker into its rootfs, resolves the
-//! container's snapshot layer directories over gRPC, and reads the marker
-//! back through the host NFS mount (`<data_dir>/ArcBox/containerd/...`).
+//! Live check for `SystemService.ResolveContainerFs` / `ResolveImageFs`
+//! and the containerd child NFS export: boots the System VM through a real
+//! daemon, runs a container that writes a marker into its rootfs, resolves
+//! the container's snapshot layer directories over gRPC, reads the marker
+//! back through the host NFS mount (`<data_dir>/ArcBox/containerd/...`),
+//! then resolves the image's layers by top chain ID and checks they are
+//! visible through the same mount.
 
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -13,7 +15,8 @@ use arcbox_e2e::boot_assets::{resolve_boot_version, stage_dev_boot_assets};
 use arcbox_e2e::daemon::{DaemonConfig, DaemonHandle, connect_unix};
 use arcbox_e2e::docker::docker_output;
 use arcbox_grpc::SystemServiceClient;
-use arcbox_protocol::v1::ResolveContainerFsRequest;
+use arcbox_protocol::v1::{ResolveContainerFsRequest, ResolveImageFsRequest};
+use sha2::{Digest, Sha256};
 use tracing_subscriber::EnvFilter;
 
 static TRACING: Once = Once::new();
@@ -130,8 +133,84 @@ fn scenario(data_dir: &Path) -> Result<()> {
         bail!("lower layer not visible at {}", lower_host.display());
     }
 
+    image_scenario(data_dir, &image)?;
+
     tracing::info!("container fs resolution + NFS read-through check passed");
     Ok(())
+}
+
+/// Resolves the pulled image's layers by top chain ID and checks the top
+/// layer directory is visible through the NFS mount.
+fn image_scenario(data_dir: &Path, image: &str) -> Result<()> {
+    let layers_json = docker_output(
+        data_dir,
+        &["image", "inspect", "-f", "{{json .RootFS.Layers}}", image],
+        DOCKER_TIMEOUT,
+    )?;
+    let diff_ids: Vec<String> =
+        serde_json::from_str(layers_json.trim()).context("parsing image RootFS.Layers")?;
+    let top_chain_id = top_chain_id(&diff_ids)?;
+
+    let image_paths = resolve_image_fs(data_dir, &top_chain_id)?;
+    tracing::info!(
+        %top_chain_id,
+        lowers = image_paths.lower_dirs.len(),
+        "resolved image fs paths"
+    );
+
+    if image_paths.lower_dirs.len() != diff_ids.len() {
+        bail!(
+            "expected {} image layers, got {:?}",
+            diff_ids.len(),
+            image_paths.lower_dirs
+        );
+    }
+    for lower in &image_paths.lower_dirs {
+        if !lower.starts_with(CONTAINERD_PREFIX) {
+            bail!("image lower_dir {lower} not under {CONTAINERD_PREFIX}");
+        }
+    }
+    let top_host = host_path(data_dir, &image_paths.lower_dirs[0])?;
+    if !top_host.is_dir() {
+        bail!("image top layer not visible at {}", top_host.display());
+    }
+    Ok(())
+}
+
+/// Chain ID of the last layer, per the OCI image spec: the first chain ID
+/// is the first diff ID; each next one is `sha256(prev + " " + diff)`.
+fn top_chain_id(diff_ids: &[String]) -> Result<String> {
+    let (first, rest) = diff_ids
+        .split_first()
+        .context("image reports no rootfs layers")?;
+    let mut chain = first.clone();
+    for diff in rest {
+        let digest = Sha256::digest(format!("{chain} {diff}").as_bytes());
+        chain = format!("sha256:{digest:x}");
+    }
+    Ok(chain)
+}
+
+fn resolve_image_fs(
+    data_dir: &Path,
+    top_chain_id: &str,
+) -> Result<arcbox_protocol::v1::ResolveImageFsResponse> {
+    let socket = data_dir.join("run/arcbox.sock");
+    let top_chain_id = top_chain_id.to_owned();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime for ResolveImageFs")?
+        .block_on(async {
+            let channel = connect_unix(&socket).await?;
+            let mut client = SystemServiceClient::new(channel);
+            anyhow::Ok(
+                client
+                    .resolve_image_fs(ResolveImageFsRequest { top_chain_id })
+                    .await?
+                    .into_inner(),
+            )
+        })
 }
 
 fn resolve_container_fs(

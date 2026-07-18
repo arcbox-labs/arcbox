@@ -22,8 +22,9 @@ use arcbox_net::darwin::inbound_relay::{InboundListenerManager, InboundProtocol}
 #[cfg(not(target_os = "macos"))]
 use arcbox_net::port_forward::{PortForwardRule, PortForwarder};
 use arcbox_protocol::agent::{
-    ContainerFsPathsResponse, KubernetesDeleteResponse, KubernetesKubeconfigResponse,
-    KubernetesStartResponse, KubernetesStatusResponse, KubernetesStopResponse, ServiceStatus,
+    ContainerFsPathsResponse, ImageFsPathsResponse, KubernetesDeleteResponse,
+    KubernetesKubeconfigResponse, KubernetesStartResponse, KubernetesStatusResponse,
+    KubernetesStopResponse, ServiceStatus,
 };
 use assets::ensure_guest_binaries;
 use kubeconfig::{KUBERNETES_HOST_ENDPOINT, rewrite_kubeconfig_server};
@@ -528,6 +529,32 @@ impl Runtime {
                 .map_err(|e| CoreError::Vm(format!("container fs paths task panicked: {e}")))?
         } else {
             agent.container_fs_paths(container_id).await
+        }
+    }
+
+    /// Resolves an image's layer directories (guest paths) from its top
+    /// layer chain ID via containerd snapshot metadata in the System VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the System VM is not running, the agent is
+    /// unreachable, or the image's snapshot chain is absent.
+    pub async fn image_fs_paths(&self, top_chain_id: &str) -> Result<ImageFsPathsResponse> {
+        // Same transport contract as `container_fs_paths`: blocking connect
+        // off the executor, then dispatch on the transport kind.
+        let machine_manager = Arc::clone(&self.machine_manager);
+        let mut agent = tokio::task::spawn_blocking(move || {
+            machine_manager.connect_agent(DEFAULT_MACHINE_NAME)
+        })
+        .await
+        .map_err(|e| CoreError::Vm(format!("agent connect task panicked: {e}")))??;
+        if agent.is_blocking() {
+            let id = top_chain_id.to_string();
+            tokio::task::spawn_blocking(move || agent.image_fs_paths_blocking(&id))
+                .await
+                .map_err(|e| CoreError::Vm(format!("image fs paths task panicked: {e}")))?
+        } else {
+            agent.image_fs_paths(top_chain_id).await
         }
     }
 

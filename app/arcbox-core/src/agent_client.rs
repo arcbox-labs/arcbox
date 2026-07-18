@@ -11,13 +11,13 @@ use arcbox_constants::ports::AGENT_PORT;
 use arcbox_constants::wire::MessageType;
 use arcbox_protocol::agent::{
     ContainerFsPathsRequest, ContainerFsPathsResponse, DiskTrimRequest, DiskTrimResponse,
-    KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
-    KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
-    KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
-    KubernetesStopResponse, MachineStats, MemoryPressureEvent, MmapReadFileRequest,
-    MmapReadFileResponse, PingRequest, PingResponse, ReadinessEvent, RuntimeEnsureRequest,
-    RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse, SystemInfo,
-    WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
+    ImageFsPathsRequest, ImageFsPathsResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
+    KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
+    KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
+    KubernetesStopRequest, KubernetesStopResponse, MachineStats, MemoryPressureEvent,
+    MmapReadFileRequest, MmapReadFileResponse, PingRequest, PingResponse, ReadinessEvent,
+    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
+    SystemInfo, WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
 };
 use arcbox_protocol::sandbox_v1::{
     CheckpointRequest, CheckpointResponse, CreateSandboxRequest, CreateSandboxResponse,
@@ -899,6 +899,45 @@ impl AgentClient {
             MessageType::ContainerFsPathsRequest,
             &payload,
             MessageType::ContainerFsPathsResponse,
+        )
+    }
+
+    /// Resolves an image's layer directories (guest paths) from its top
+    /// layer chain ID via containerd snapshot metadata in the guest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the image's snapshot chain
+    /// is absent (e.g. the image was removed).
+    pub async fn image_fs_paths(&mut self, top_chain_id: &str) -> Result<ImageFsPathsResponse> {
+        let payload = ImageFsPathsRequest {
+            top_chain_id: top_chain_id.to_string(),
+        }
+        .encode_to_vec();
+        self.unary_rpc(
+            MessageType::ImageFsPathsRequest,
+            &payload,
+            MessageType::ImageFsPathsResponse,
+        )
+        .await
+    }
+
+    /// Blocking variant of [`Self::image_fs_paths`] for the HV socketpair
+    /// transport. Call from `spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the image's snapshot chain
+    /// is absent (e.g. the image was removed).
+    pub fn image_fs_paths_blocking(&mut self, top_chain_id: &str) -> Result<ImageFsPathsResponse> {
+        let payload = ImageFsPathsRequest {
+            top_chain_id: top_chain_id.to_string(),
+        }
+        .encode_to_vec();
+        self.unary_rpc_blocking(
+            MessageType::ImageFsPathsRequest,
+            &payload,
+            MessageType::ImageFsPathsResponse,
         )
     }
 
