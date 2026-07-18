@@ -85,6 +85,7 @@ const DOCKER_DATA_IMAGE_NAME: &str = "docker.img";
 /// and prevents users from hitting artificial limits.
 const DOCKER_DATA_IMAGE_SIZE_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
 
+pub(crate) use boot::ensure_sparse_block_image;
 pub use health::HealthMonitor;
 pub use recovery::{BackoffStrategy, RecoveryAction, RecoveryPolicy};
 pub use types::{DefaultVmConfig, VmLifecycleConfig, VmLifecycleState};

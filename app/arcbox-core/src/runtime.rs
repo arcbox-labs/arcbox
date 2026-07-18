@@ -90,6 +90,8 @@ pub struct Runtime {
     /// macOS guest machine manager (Apple Silicon only).
     #[cfg(target_os = "macos")]
     mac_machine_manager: Arc<MacMachineManager>,
+    /// Linux machine image registry (published distro rootfs images).
+    machine_image_manager: Arc<crate::machine_image::MachineImageManager>,
     /// Inbound listener managers keyed by machine name, for port
     /// forwarding via L2 frame injection (macOS). Each utility VM owns its
     /// own bridge interface and therefore its own listener.
@@ -214,6 +216,10 @@ impl Runtime {
         #[cfg(target_os = "macos")]
         let mac_machine_manager = Arc::new(MacMachineManager::new(&config.data_dir));
 
+        let machine_image_manager = Arc::new(crate::machine_image::MachineImageManager::new(
+            &config.data_dir,
+        ));
+
         let stats_hub = crate::stats_hub::StatsHub::new(crate::stats_hub::AgentStatsSource::new(
             Arc::clone(&machine_manager),
             DEFAULT_MACHINE_NAME,
@@ -230,6 +236,7 @@ impl Runtime {
             migration_manager,
             #[cfg(target_os = "macos")]
             mac_machine_manager,
+            machine_image_manager,
             #[cfg(target_os = "macos")]
             inbound_listeners: Arc::new(TokioRwLock::new(HashMap::new())),
             #[cfg(target_os = "macos")]
@@ -294,6 +301,12 @@ impl Runtime {
     #[must_use]
     pub const fn mac_machine_manager(&self) -> &Arc<MacMachineManager> {
         &self.mac_machine_manager
+    }
+
+    /// Returns the Linux machine image registry.
+    #[must_use]
+    pub const fn machine_image_manager(&self) -> &Arc<crate::machine_image::MachineImageManager> {
+        &self.machine_image_manager
     }
 
     /// Returns the VM lifecycle manager.

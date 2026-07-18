@@ -72,6 +72,15 @@ pub struct MachineInfo {
     pub created_at: DateTime<Utc>,
 }
 
+/// A pulled distro rootfs image a machine boots from.
+#[derive(Debug, Clone)]
+pub struct MachineRootfs {
+    /// Host path of the rootfs image (from the machine image registry).
+    pub path: PathBuf,
+    /// Image format (`squashfs`), used for the kernel `rootfstype=`.
+    pub format: String,
+}
+
 /// Machine configuration.
 #[derive(Debug, Clone)]
 pub struct MachineConfig {
@@ -89,6 +98,11 @@ pub struct MachineConfig {
     pub cmdline: Option<String>,
     /// Block devices (e.g., EROFS rootfs image).
     pub block_devices: Vec<crate::vm::BlockDeviceConfig>,
+    /// Pulled distro rootfs image to boot from. When set, `create` attaches
+    /// it read-only as the first block device (vda), provisions a sparse
+    /// per-machine data disk after it, and defaults the kernel command line
+    /// to mount it as root.
+    pub rootfs: Option<MachineRootfs>,
     /// Distribution name (e.g., "alpine", "ubuntu").
     pub distro: Option<String>,
     /// Distribution version (e.g., "3.21", "24.04").
@@ -117,12 +131,24 @@ impl Default for MachineConfig {
             kernel: None,
             cmdline: None,
             block_devices: Vec::new(),
+            rootfs: None,
             distro: None,
             distro_version: None,
             backend: arcbox_vmm::VmBackend::default(),
             enable_rosetta: false,
         }
     }
+}
+
+/// Kernel command line for a distro machine: root on the read-only rootfs
+/// image at vda. The console device follows the boot-assets convention for
+/// the host architecture.
+fn default_distro_cmdline(rootfs_format: &str) -> String {
+    #[cfg(target_arch = "x86_64")]
+    let console = "ttyS0";
+    #[cfg(not(target_arch = "x86_64"))]
+    let console = "hvc0";
+    format!("console={console} root=/dev/vda ro rootfstype={rootfs_format} earlycon")
 }
 
 /// Machine manager.
@@ -280,14 +306,55 @@ impl MachineManager {
             shared_dirs.push(SharedDirConfig::new(MOUNT_PRIVATE, TAG_PRIVATE));
         }
 
+        // Distro machines boot the pulled rootfs image as read-only vda with
+        // a sparse per-machine data disk after it; plain VMs keep the
+        // caller-provided block devices untouched.
+        let (block_devices, cmdline, disk_path) = match &config.rootfs {
+            Some(rootfs) => {
+                // A distro rootfs carries no kernel; without an explicit one
+                // the VM would boot with an empty kernel path and fail
+                // obscurely. The boot-shim integration (stacked change)
+                // supplies the boot-assets kernel automatically.
+                if config.kernel.is_none() {
+                    return Err(CoreError::config(
+                        "distro machines require an explicit kernel (pass --kernel) \
+                         until the boot shim supplies one",
+                    ));
+                }
+                let data_disk = machine_dir.join("data.img");
+                crate::vm_lifecycle::ensure_sparse_block_image(
+                    &data_disk,
+                    config.disk_gb.saturating_mul(1024 * 1024 * 1024),
+                )?;
+                let mut devices = config.block_devices.clone();
+                devices.insert(
+                    0,
+                    crate::vm::BlockDeviceConfig {
+                        path: rootfs.path.to_string_lossy().into_owned(),
+                        read_only: true,
+                    },
+                );
+                devices.push(crate::vm::BlockDeviceConfig {
+                    path: data_disk.to_string_lossy().into_owned(),
+                    read_only: false,
+                });
+                let cmdline = config
+                    .cmdline
+                    .clone()
+                    .or_else(|| Some(default_distro_cmdline(&rootfs.format)));
+                (devices, cmdline, Some(data_disk))
+            }
+            None => (config.block_devices.clone(), config.cmdline.clone(), None),
+        };
+
         // Create underlying VM
         let vm_config = VmConfig {
             cpus: config.cpus,
             memory_mb: config.memory_mb,
             kernel: config.kernel.clone(),
-            cmdline: config.cmdline.clone(),
+            cmdline: cmdline.clone(),
             shared_dirs,
-            block_devices: config.block_devices.clone(),
+            block_devices: block_devices.clone(),
             rosetta: config.enable_rosetta,
             backend: config.backend,
             ..Default::default()
@@ -303,11 +370,11 @@ impl MachineManager {
             memory_mb: config.memory_mb,
             disk_gb: config.disk_gb,
             kernel: config.kernel,
-            cmdline: config.cmdline,
-            block_devices: config.block_devices,
+            cmdline,
+            block_devices,
             distro: config.distro,
             distro_version: config.distro_version,
-            disk_path: None,
+            disk_path,
             ssh_key_path: None,
             ip_address: None,
             backend: config.backend,
@@ -382,11 +449,16 @@ impl MachineManager {
     /// Waits for the guest agent to become ready and discovers the IP address.
     ///
     /// Polls the agent via vsock with exponential backoff. Once the agent
-    /// responds, queries `SystemInfo` to get the guest IP.
+    /// responds, queries `SystemInfo` to get the guest IP. The probe follows
+    /// the transport the backend hands out: async (VZ) attempts run on the
+    /// runtime; blocking (HV) attempts run inside `block_in_place`, because
+    /// the HV socketpair's rapid fd teardown stalls the tokio reactor (same
+    /// rationale as `wait_for_agent` in `vm_lifecycle`) — a per-attempt
+    /// blocking region, bounded by one RPC round-trip.
     ///
-    /// Runs the probe loop on a blocking thread to avoid tokio reactor
-    /// stalls from rapid socketpair fd teardown (same rationale as
-    /// `wait_for_agent` in `vm_lifecycle`).
+    /// Probe before the first sleep: failed probes are ~1ms (vsock RST via
+    /// the event-driven RX path), while sleeping first puts a full backoff
+    /// interval on every start even when the agent is already up.
     async fn wait_for_machine_ready(&self, name: &str) -> Result<()> {
         const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
         const INITIAL_DELAY_MS: u64 = 50;
@@ -394,82 +466,35 @@ impl MachineManager {
 
         tracing::info!("Waiting for machine '{}' agent to become ready...", name);
 
-        // block_in_place is used here (instead of spawn_blocking) because
-        // MachineManager is not Clone/Arc at this call site. block_in_place
-        // is acceptable: the total blocking time is bounded by PROBE_TIMEOUT
-        // (plus one backoff interval), and the blocking RPC uses
-        // BlockingVsockTransport (libc::poll) — no tokio reactor interaction.
-        //
-        // Probe before the first sleep: failed probes are ~1ms (vsock RST
-        // via the event-driven RX path), while sleeping first puts a full
-        // backoff interval on every start even when the agent is already up.
-        let probe_result: Result<String> = tokio::task::block_in_place(|| {
-            let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
-            let mut delay_ms = INITIAL_DELAY_MS;
-            let mut attempt: u32 = 0;
+        let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+        let mut delay_ms = INITIAL_DELAY_MS;
+        let mut attempt: u32 = 0;
 
-            loop {
-                attempt += 1;
+        let ip = loop {
+            attempt += 1;
 
-                match self.connect_agent(name) {
-                    Ok(mut agent) if agent.is_blocking() => match agent.ping_blocking() {
-                        Ok(resp) => {
-                            // Stale agents fail machine start loudly instead
-                            // of misbehaving under proto field skew.
-                            crate::agent_client::AgentClient::check_agent_protocol(&resp)?;
-                            tracing::debug!(
-                                "Machine '{}' agent reachable (version: {}, attempt {})",
-                                name,
-                                resp.version,
-                                attempt,
-                            );
-                            match agent.get_system_info_blocking() {
-                                Ok(info) => {
-                                    if let Some(ip) = select_routable_ip(&info.ip_addresses) {
-                                        return Ok(ip);
-                                    }
-                                    tracing::trace!(
-                                        "Machine '{}' no routable IP yet (attempt {})",
-                                        name,
-                                        attempt,
-                                    );
-                                }
-                                Err(e) => tracing::trace!(
-                                    "Machine '{}' get_system_info failed (attempt {attempt}): {e}",
-                                    name,
-                                ),
-                            }
-                        }
-                        Err(e) => tracing::trace!(
-                            "Machine '{}' ping failed (attempt {attempt}): {e}",
-                            name,
-                        ),
-                    },
-                    Ok(_agent) => {
-                        // Async transport (VZ/Linux) — skip in blocking context.
-                        tracing::trace!(
-                            "Machine '{}' async transport in blocking probe (attempt {})",
-                            name,
-                            attempt,
-                        );
-                    }
-                    Err(e) => tracing::trace!(
-                        "Machine '{}' connect failed (attempt {attempt}): {e}",
-                        name,
-                    ),
+            let probed = match self.connect_agent(name) {
+                Ok(agent) if agent.is_blocking() => {
+                    tokio::task::block_in_place(|| probe_ip_blocking(agent, name, attempt))?
                 }
-
-                if std::time::Instant::now() >= deadline {
-                    return Err(CoreError::Machine(format!(
-                        "Machine '{name}' agent did not report a routable IP within timeout"
-                    )));
+                Ok(agent) => probe_ip_async(agent, name, attempt).await?,
+                Err(e) => {
+                    tracing::trace!("Machine '{}' connect failed (attempt {attempt}): {e}", name);
+                    None
                 }
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                delay_ms = (delay_ms * 3 / 2).min(MAX_DELAY_MS);
+            };
+            if let Some(ip) = probed {
+                break ip;
             }
-        });
 
-        let ip = probe_result?;
+            if std::time::Instant::now() >= deadline {
+                return Err(CoreError::Machine(format!(
+                    "Machine '{name}' agent did not report a routable IP within timeout"
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            delay_ms = (delay_ms * 3 / 2).min(MAX_DELAY_MS);
+        };
 
         // Back on async context — update state.
         {
@@ -1017,6 +1042,74 @@ impl MachineManager {
         machines.insert(name.to_string(), info);
         tracing::debug!("Registered mock machine '{}' with CID {}", name, cid);
         Ok(())
+    }
+}
+
+/// One readiness attempt over the blocking (HV) transport: ping, protocol
+/// check, then IP discovery. `Ok(None)` means "not ready yet, retry";
+/// a protocol mismatch is fatal so stale agents fail machine start loudly
+/// instead of misbehaving under proto field skew.
+fn probe_ip_blocking(
+    mut agent: crate::agent_client::AgentClient,
+    name: &str,
+    attempt: u32,
+) -> Result<Option<String>> {
+    let resp = match agent.ping_blocking() {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::trace!("Machine '{}' ping failed (attempt {attempt}): {e}", name);
+            return Ok(None);
+        }
+    };
+    crate::agent_client::AgentClient::check_agent_protocol(&resp)?;
+    tracing::debug!(
+        "Machine '{}' agent reachable (version: {}, attempt {})",
+        name,
+        resp.version,
+        attempt,
+    );
+    match agent.get_system_info_blocking() {
+        Ok(info) => Ok(select_routable_ip(&info.ip_addresses)),
+        Err(e) => {
+            tracing::trace!(
+                "Machine '{}' get_system_info failed (attempt {attempt}): {e}",
+                name,
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// One readiness attempt over the async (VZ) transport; same contract as
+/// [`probe_ip_blocking`].
+async fn probe_ip_async(
+    mut agent: crate::agent_client::AgentClient,
+    name: &str,
+    attempt: u32,
+) -> Result<Option<String>> {
+    let resp = match agent.ping().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::trace!("Machine '{}' ping failed (attempt {attempt}): {e}", name);
+            return Ok(None);
+        }
+    };
+    crate::agent_client::AgentClient::check_agent_protocol(&resp)?;
+    tracing::debug!(
+        "Machine '{}' agent reachable (version: {}, attempt {})",
+        name,
+        resp.version,
+        attempt,
+    );
+    match agent.get_system_info().await {
+        Ok(info) => Ok(select_routable_ip(&info.ip_addresses)),
+        Err(e) => {
+            tracing::trace!(
+                "Machine '{}' get_system_info failed (attempt {attempt}): {e}",
+                name,
+            );
+            Ok(None)
+        }
     }
 }
 

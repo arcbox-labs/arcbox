@@ -56,6 +56,12 @@ pub enum CoreError {
     #[error("network error: {0}")]
     Net(#[from] arcbox_net::NetError),
 
+    /// Published-image registry error (index/manifest fetch, reference
+    /// parsing, name validation) shared by the macOS base-image and Linux
+    /// machine-image flows.
+    #[error("image error: {0}")]
+    Image(String),
+
     /// macOS guest image / clone error (a message that does not originate from
     /// Virtualization.framework — e.g. a path or serialization failure).
     #[cfg(target_os = "macos")]
@@ -91,6 +97,12 @@ impl CoreError {
     #[must_use]
     pub fn invalid_state(msg: impl Into<String>) -> Self {
         Self::Common(CommonError::invalid_state(msg))
+    }
+
+    /// Creates a new published-image registry error.
+    #[must_use]
+    pub fn image(msg: impl Into<String>) -> Self {
+        Self::Image(msg.into())
     }
 
     /// Creates a new macOS image error.
