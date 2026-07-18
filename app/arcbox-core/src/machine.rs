@@ -799,7 +799,11 @@ impl MachineManager {
         self.vm_manager.debug_snapshot(&machine.vm_id)
     }
 
-    /// Stops a machine.
+    /// Stops a machine (force).
+    ///
+    /// Accepts `Stopping` as well as `Running` so a force stop can preempt
+    /// an in-flight graceful stop instead of erroring for up to the whole
+    /// graceful-shutdown window.
     ///
     /// # Errors
     ///
@@ -811,7 +815,10 @@ impl MachineManager {
             .get_mut(name)
             .ok_or_else(|| CoreError::not_found(name.to_string()))?;
 
-        if machine.state != MachineState::Running {
+        if !matches!(
+            machine.state,
+            MachineState::Running | MachineState::Stopping
+        ) {
             return Err(CoreError::invalid_state(format!(
                 "machine '{name}' is not running"
             )));
@@ -965,20 +972,25 @@ impl MachineManager {
                 Ok(true)
             }
             Ok(false) => {
-                if let Ok(mut machines) = self.machines.write() {
-                    if let Some(machine) = machines.get_mut(name) {
-                        machine.state = MachineState::Running;
-                    }
-                }
+                self.rollback_stopping(name);
                 Ok(false)
             }
             Err(e) => {
-                if let Ok(mut machines) = self.machines.write() {
-                    if let Some(machine) = machines.get_mut(name) {
-                        machine.state = MachineState::Running;
-                    }
-                }
+                self.rollback_stopping(name);
                 Err(e)
+            }
+        }
+    }
+
+    /// Rolls a failed graceful stop back to `Running` — but only if the
+    /// machine is still `Stopping`: a concurrent force [`Self::stop`] may
+    /// have already stopped it, and its `Stopped` must not be overwritten.
+    fn rollback_stopping(&self, name: &str) {
+        if let Ok(mut machines) = self.machines.write() {
+            if let Some(machine) = machines.get_mut(name) {
+                if machine.state == MachineState::Stopping {
+                    machine.state = MachineState::Running;
+                }
             }
         }
     }
