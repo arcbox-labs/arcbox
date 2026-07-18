@@ -15,14 +15,14 @@ pub use arcbox_constants::wire::MessageType;
 use arcbox_protocol::Empty;
 use arcbox_protocol::agent::{
     ContainerFsPathsRequest, ContainerFsPathsResponse, DiskTrimRequest, DiskTrimResponse,
-    KubernetesDeleteRequest, KubernetesDeleteResponse, KubernetesKubeconfigRequest,
-    KubernetesKubeconfigResponse, KubernetesStartRequest, KubernetesStartResponse,
-    KubernetesStatusRequest, KubernetesStatusResponse, KubernetesStopRequest,
-    KubernetesStopResponse, MemoryPressureEvent, MmapReadFileRequest, MmapReadFileResponse,
-    PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved, ReadinessEvent,
-    RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest, RuntimeStatusResponse,
-    ShutdownRequest, ShutdownResponse, SystemInfo, WatchMemoryPressureRequest,
-    WatchReadinessRequest, WatchStatsRequest,
+    ImageFsPathsRequest, ImageFsPathsResponse, KubernetesDeleteRequest, KubernetesDeleteResponse,
+    KubernetesKubeconfigRequest, KubernetesKubeconfigResponse, KubernetesStartRequest,
+    KubernetesStartResponse, KubernetesStatusRequest, KubernetesStatusResponse,
+    KubernetesStopRequest, KubernetesStopResponse, MemoryPressureEvent, MmapReadFileRequest,
+    MmapReadFileResponse, PingRequest, PingResponse, PortBindingsChanged, PortBindingsRemoved,
+    ReadinessEvent, RuntimeEnsureRequest, RuntimeEnsureResponse, RuntimeStatusRequest,
+    RuntimeStatusResponse, ShutdownRequest, ShutdownResponse, SystemInfo,
+    WatchMemoryPressureRequest, WatchReadinessRequest, WatchStatsRequest,
 };
 
 /// Agent version string.
@@ -83,6 +83,7 @@ pub enum RpcRequest {
     MmapReadFile(MmapReadFileRequest),
     DiskTrim(DiskTrimRequest),
     ContainerFsPaths(ContainerFsPathsRequest),
+    ImageFsPaths(ImageFsPathsRequest),
     WatchReadiness(WatchReadinessRequest),
     WatchMemoryPressure(WatchMemoryPressureRequest),
     WatchStats(WatchStatsRequest),
@@ -112,6 +113,7 @@ pub enum RpcResponse {
     Error(ErrorResponse),
     MmapReadFile(MmapReadFileResponse),
     ContainerFsPaths(ContainerFsPathsResponse),
+    ImageFsPaths(ImageFsPathsResponse),
     /// Test-only: acknowledgement for [`RpcRequest::KillAgent`].
     KillAgent,
 }
@@ -139,6 +141,7 @@ impl RpcResponse {
             Self::Error(_) => MessageType::Error,
             Self::MmapReadFile(_) => MessageType::MmapReadFileResponse,
             Self::ContainerFsPaths(_) => MessageType::ContainerFsPathsResponse,
+            Self::ImageFsPaths(_) => MessageType::ImageFsPathsResponse,
             Self::KillAgent => MessageType::KillAgentResponse,
         }
     }
@@ -165,6 +168,7 @@ impl RpcResponse {
             Self::Error(err) => err.encode(),
             Self::MmapReadFile(msg) => msg.encode_to_vec(),
             Self::ContainerFsPaths(msg) => msg.encode_to_vec(),
+            Self::ImageFsPaths(msg) => msg.encode_to_vec(),
             Self::KillAgent => Empty::default().encode_to_vec(),
         }
     }
@@ -340,6 +344,10 @@ pub fn parse_request(msg_type: MessageType, payload: &[u8]) -> Result<RpcRequest
         MessageType::ContainerFsPathsRequest => {
             let req = ContainerFsPathsRequest::decode(payload)?;
             Ok(RpcRequest::ContainerFsPaths(req))
+        }
+        MessageType::ImageFsPathsRequest => {
+            let req = ImageFsPathsRequest::decode(payload)?;
+            Ok(RpcRequest::ImageFsPaths(req))
         }
         MessageType::WatchReadinessRequest => {
             let req = WatchReadinessRequest::decode(payload)?;

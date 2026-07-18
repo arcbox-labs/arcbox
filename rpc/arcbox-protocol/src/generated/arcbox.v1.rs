@@ -2294,6 +2294,27 @@ pub struct ContainerFsPathsResponse {
     #[prost(string, repeated, tag = "2")]
     pub lower_dirs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
+/// Resolve an image's layer directories from containerd's snapshot
+/// metadata (committed snapshots keyed by layer chain ID).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ImageFsPathsRequest {
+    /// Chain ID of the image's top layer (`sha256:<64 hex>`), computed
+    /// from the image config's diff_ids.
+    #[prost(string, tag = "1")]
+    pub top_chain_id: ::prost::alloc::string::String,
+}
+/// Response to `ImageFsPathsRequest`. All paths are guest paths under the
+/// containerd data mount.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ImageFsPathsResponse {
+    /// Read-only layer directories, top-most first.
+    #[prost(string, repeated, tag = "1")]
+    pub lower_dirs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
 /// Request to create a network.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2531,6 +2552,25 @@ pub struct ResolveContainerFsResponse {
     pub upper_dir: ::prost::alloc::string::String,
     /// Read-only layer directories, top-most first.
     #[prost(string, repeated, tag = "2")]
+    pub lower_dirs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Request to resolve an image's layer directories.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResolveImageFsRequest {
+    /// Chain ID of the image's top layer (`sha256:<64 hex>`).
+    #[prost(string, tag = "1")]
+    pub top_chain_id: ::prost::alloc::string::String,
+}
+/// An image's layer directories, as guest paths under the containerd data
+/// mount.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResolveImageFsResponse {
+    /// Read-only layer directories, top-most first.
+    #[prost(string, repeated, tag = "1")]
     pub lower_dirs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Diagnostic snapshot of the System VM's virtio devices and vCPUs.
