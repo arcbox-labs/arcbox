@@ -353,14 +353,13 @@ impl MachineManager {
         // vda/vdb/vdc expectations hold regardless of extra devices.
         let (kernel, block_devices, cmdline, disk_path) = match &config.rootfs {
             Some(rootfs) => {
-                // A distro rootfs carries no kernel; without an explicit one
-                // the VM would boot with an empty kernel path and fail
-                // obscurely. The boot-shim integration (stacked change)
-                // supplies the boot-assets kernel automatically.
-                if config.kernel.is_none() {
+                // A distro rootfs carries no kernel: the shim supplies the
+                // boot-assets kernel; without a shim an explicit kernel is
+                // required or the VM would boot with an empty kernel path.
+                if rootfs.shim.is_none() && config.kernel.is_none() {
                     return Err(CoreError::config(
-                        "distro machines require an explicit kernel (pass --kernel) \
-                         until the boot shim supplies one",
+                        "a distro rootfs without a boot shim requires an explicit \
+                         kernel (pass --kernel)",
                     ));
                 }
                 let data_disk = machine_dir.join("data.img");

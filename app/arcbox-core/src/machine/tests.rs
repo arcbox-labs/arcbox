@@ -233,10 +233,28 @@ async fn test_create_without_shim_boots_rootfs_directly() {
     let rootfs_img = temp_dir.path().join("rootfs.squashfs");
     std::fs::write(&rootfs_img, b"squash").unwrap();
 
+    // Without a shim, the rootfs alone cannot boot: an explicit kernel is
+    // required (custom-kernel testing path).
+    let err = machine_manager
+        .create(MachineConfig {
+            name: "plain-distro".to_string(),
+            disk_gb: 1,
+            rootfs: Some(MachineRootfs {
+                path: rootfs_img.clone(),
+                format: "squashfs".to_string(),
+                shim: None,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("explicit"), "{err}");
+
     machine_manager
         .create(MachineConfig {
             name: "plain-distro".to_string(),
             disk_gb: 1,
+            kernel: Some("/custom/kernel".to_string()),
             rootfs: Some(MachineRootfs {
                 path: rootfs_img.clone(),
                 format: "squashfs".to_string(),
@@ -251,7 +269,7 @@ async fn test_create_without_shim_boots_rootfs_directly() {
     let devices = &machine.block_devices;
     assert_eq!(devices.len(), 2);
     assert_eq!(devices[0].path, rootfs_img.to_string_lossy());
-    assert!(machine.kernel.is_none());
+    assert_eq!(machine.kernel.as_deref(), Some("/custom/kernel"));
     let cmdline = machine.cmdline.as_deref().unwrap();
     assert!(
         cmdline.contains("root=/dev/vda ro rootfstype=squashfs"),

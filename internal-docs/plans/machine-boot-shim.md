@@ -68,19 +68,25 @@ kernel + devices verbatim) for custom-kernel testing.
    `/arcbox` there; copy the shim's static busybox to `/newroot/bin/busybox`
    only if absent (the agent's DHCP path shells out to `/bin/busybox udhcpc`;
    Alpine already ships one, systemd distros don't).
-7. One-shot machine init inside the new root:
+7. Move `/proc`, `/sys`, `/dev` into `/newroot` **before anything runs
+   inside it**: the agent needs `/dev` for vsock and `/sys/class/net` for
+   interface discovery. All three moves are load-bearing (poweroff on
+   failure). This ordering is what the shipped `machine-init.sh` implements.
+8. One-shot machine init inside the new root:
    `chroot /newroot /arcbox/bin/arcbox-agent machine-init` — brings up eth0
    via DHCP and writes `/etc/resolv.conf` when the distro left none. Unlike
    the System VM's `agent init`, this must NOT tmpfs-over `/etc`/`/var`
    (the overlay already provides writable state and the distro owns those
    trees).
-8. Spawn the long-running agent, detached, inside the new root:
-   `chroot /newroot /arcbox/bin/arcbox-agent serve &` — it survives
-   `switch_root` (reparented to the distro init) and serves ping /
-   system-info / future exec over vsock.
-9. Move `/proc`, `/sys`, `/dev` into `/newroot`, then
-   `exec switch_root /newroot /sbin/init` — the distro's systemd (or
-   OpenRC on Alpine) becomes PID 1.
+9. Spawn the long-running agent, detached, inside the new root:
+   `chroot /newroot /arcbox/bin/arcbox-agent serve </newroot/dev/null …&` —
+   stdio must be opened via the moved `/dev`; the process survives the pivot
+   (reparented to the distro init) and serves ping / system-info / exec over
+   vsock.
+10. `cd /newroot && pivot_root . mnt && exec chroot . /sbin/init` — the
+    distro's systemd (or OpenRC on Alpine) becomes PID 1. busybox
+    `switch_root` is not usable here: it requires an initramfs root and the
+    shim boots from the EROFS block device.
 
 Failure policy mirrors rcS: any load-bearing step failing prints a console
 marker and powers off (`poweroff -f`), so the host sees a clean boot failure
