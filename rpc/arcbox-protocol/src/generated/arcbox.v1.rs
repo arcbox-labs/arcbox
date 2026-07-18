@@ -86,6 +86,991 @@ pub struct ResourceLimits {
     #[prost(int64, tag = "6")]
     pub memory_swap: i64,
 }
+/// Request to create a network.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateNetworkRequest {
+    /// Network name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Driver (e.g., "bridge", "host", "none").
+    #[prost(string, tag = "2")]
+    pub driver: ::prost::alloc::string::String,
+    /// Internal network (not connected to external network).
+    #[prost(bool, tag = "3")]
+    pub internal: bool,
+    /// Labels.
+    #[prost(map = "string, string", tag = "4")]
+    pub labels:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Enable IPv6.
+    #[prost(bool, tag = "5")]
+    pub enable_ipv6: bool,
+    /// IPAM configuration.
+    #[prost(message, optional, tag = "6")]
+    pub ipam: ::core::option::Option<IpamConfig>,
+}
+/// IPAM configuration.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct IpamConfig {
+    /// Driver name.
+    #[prost(string, tag = "1")]
+    pub driver: ::prost::alloc::string::String,
+    /// IPAM options.
+    #[prost(map = "string, string", tag = "2")]
+    pub options:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Subnet configurations.
+    #[prost(message, repeated, tag = "3")]
+    pub subnets: ::prost::alloc::vec::Vec<IpamSubnet>,
+}
+/// IPAM subnet configuration.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct IpamSubnet {
+    /// Subnet in CIDR format.
+    #[prost(string, tag = "1")]
+    pub subnet: ::prost::alloc::string::String,
+    /// Gateway address.
+    #[prost(string, tag = "2")]
+    pub gateway: ::prost::alloc::string::String,
+    /// IP range for allocation.
+    #[prost(string, tag = "3")]
+    pub ip_range: ::prost::alloc::string::String,
+}
+/// Response to create network.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateNetworkResponse {
+    /// Network ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Warning messages.
+    #[prost(string, repeated, tag = "2")]
+    pub warnings: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Request to remove a network.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoveNetworkRequest {
+    /// Network ID or name.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+}
+/// Request to list networks.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListNetworksRequest {
+    /// Filter by labels.
+    #[prost(map = "string, string", tag = "1")]
+    pub filters:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+}
+/// Response to list networks.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListNetworksResponse {
+    /// List of networks.
+    #[prost(message, repeated, tag = "1")]
+    pub networks: ::prost::alloc::vec::Vec<NetworkSummary>,
+}
+/// Summary information about a network.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NetworkSummary {
+    /// Network ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Network name.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    /// Driver.
+    #[prost(string, tag = "3")]
+    pub driver: ::prost::alloc::string::String,
+    /// Scope (local, global).
+    #[prost(string, tag = "4")]
+    pub scope: ::prost::alloc::string::String,
+    /// Created timestamp (RFC3339).
+    #[prost(string, tag = "5")]
+    pub created: ::prost::alloc::string::String,
+    /// Internal network.
+    #[prost(bool, tag = "6")]
+    pub internal: bool,
+    /// Attachable.
+    #[prost(bool, tag = "7")]
+    pub attachable: bool,
+    /// Labels.
+    #[prost(map = "string, string", tag = "8")]
+    pub labels:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+}
+/// Request to inspect a network.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InspectNetworkRequest {
+    /// Network ID or name.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Verbose output.
+    #[prost(bool, tag = "2")]
+    pub verbose: bool,
+}
+/// Detailed network information.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NetworkInfo {
+    /// Network ID.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Network name.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    /// Driver.
+    #[prost(string, tag = "3")]
+    pub driver: ::prost::alloc::string::String,
+    /// Scope.
+    #[prost(string, tag = "4")]
+    pub scope: ::prost::alloc::string::String,
+    /// Created timestamp (RFC3339).
+    #[prost(string, tag = "5")]
+    pub created: ::prost::alloc::string::String,
+    /// Internal network.
+    #[prost(bool, tag = "6")]
+    pub internal: bool,
+    /// Attachable.
+    #[prost(bool, tag = "7")]
+    pub attachable: bool,
+    /// Labels.
+    #[prost(map = "string, string", tag = "8")]
+    pub labels:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// IPAM configuration.
+    #[prost(message, optional, tag = "9")]
+    pub ipam: ::core::option::Option<IpamConfig>,
+    /// Connected containers.
+    #[prost(map = "string, message", tag = "10")]
+    pub containers: ::std::collections::HashMap<::prost::alloc::string::String, NetworkContainer>,
+    /// Driver options.
+    #[prost(map = "string, string", tag = "11")]
+    pub options:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+}
+/// Container connected to a network.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NetworkContainer {
+    /// Container name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Container endpoint ID.
+    #[prost(string, tag = "2")]
+    pub endpoint_id: ::prost::alloc::string::String,
+    /// IPv4 address.
+    #[prost(string, tag = "3")]
+    pub ipv4_address: ::prost::alloc::string::String,
+    /// IPv6 address.
+    #[prost(string, tag = "4")]
+    pub ipv6_address: ::prost::alloc::string::String,
+    /// MAC address.
+    #[prost(string, tag = "5")]
+    pub mac_address: ::prost::alloc::string::String,
+}
+/// The System VM's hypervisor backend.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SystemVmBackendInfo {
+    #[prost(enumeration = "SystemVmBackend", tag = "1")]
+    pub backend: i32,
+}
+/// Request to switch the System VM's hypervisor backend.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetSystemVmBackendRequest {
+    #[prost(enumeration = "SystemVmBackend", tag = "1")]
+    pub backend: i32,
+}
+/// Request to resolve a container's filesystem layer directories.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResolveContainerFsRequest {
+    /// Full container ID.
+    #[prost(string, tag = "1")]
+    pub container_id: ::prost::alloc::string::String,
+}
+/// A container's filesystem layer directories, as guest paths under the
+/// containerd data mount.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResolveContainerFsResponse {
+    /// Writable layer directory. Empty for read-only snapshots.
+    #[prost(string, tag = "1")]
+    pub upper_dir: ::prost::alloc::string::String,
+    /// Read-only layer directories, top-most first.
+    #[prost(string, repeated, tag = "2")]
+    pub lower_dirs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Request to resolve an image's layer directories.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResolveImageFsRequest {
+    /// Chain ID of the image's top layer (`sha256:<64 hex>`).
+    #[prost(string, tag = "1")]
+    pub top_chain_id: ::prost::alloc::string::String,
+}
+/// An image's layer directories, as guest paths under the containerd data
+/// mount.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ResolveImageFsResponse {
+    /// Read-only layer directories, top-most first.
+    #[prost(string, repeated, tag = "1")]
+    pub lower_dirs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Diagnostic snapshot of the System VM's virtio devices and vCPUs.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct VirtioDebugInfo {
+    #[prost(message, repeated, tag = "1")]
+    pub devices: ::prost::alloc::vec::Vec<VirtioDeviceDebug>,
+    /// Per-vCPU exit counters (custom-VMM backends; empty under VZ).
+    #[prost(message, repeated, tag = "2")]
+    pub vcpus: ::prost::alloc::vec::Vec<VcpuDebug>,
+    /// Times any component broadcast hv_vcpus_exit to ALL vCPUs.
+    #[prost(uint64, tag = "3")]
+    pub kick_broadcasts: u64,
+    /// Times the IRQ callback unparked ALL vCPU threads on an SPI assertion.
+    #[prost(uint64, tag = "4")]
+    pub unpark_broadcasts: u64,
+}
+/// Cumulative exit counters for one vCPU.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct VcpuDebug {
+    #[prost(uint32, tag = "1")]
+    pub vcpu: u32,
+    /// MMIO read exits.
+    #[prost(uint64, tag = "2")]
+    pub mmio_reads: u64,
+    /// MMIO write exits (includes every virtio QUEUE_NOTIFY doorbell).
+    #[prost(uint64, tag = "3")]
+    pub mmio_writes: u64,
+    /// WFI exits — the guest going idle.
+    #[prost(uint64, tag = "4")]
+    pub wfi: u64,
+    /// HVC exits (PSCI + ArcBox hypercalls).
+    #[prost(uint64, tag = "5")]
+    pub hvc: u64,
+    /// SMC exits.
+    #[prost(uint64, tag = "6")]
+    pub smc: u64,
+    /// Virtual-timer activations.
+    #[prost(uint64, tag = "7")]
+    pub vtimer: u64,
+    /// Times this vCPU was kicked out of hv_vcpu_run by hv_vcpus_exit.
+    #[prost(uint64, tag = "8")]
+    pub kicks_received: u64,
+    /// Trapped system-register accesses (treated RAZ/WI).
+    #[prost(uint64, tag = "9")]
+    pub sysreg: u64,
+    /// Unhandled exception classes and unknown exits.
+    #[prost(uint64, tag = "10")]
+    pub other: u64,
+}
+/// Snapshot of one virtio MMIO device.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct VirtioDeviceDebug {
+    /// Device ID within the VMM's device manager.
+    #[prost(uint32, tag = "1")]
+    pub id: u32,
+    /// Device type, e.g. "VirtioNet".
+    #[prost(string, tag = "2")]
+    pub device_type: ::prost::alloc::string::String,
+    /// Device name.
+    #[prost(string, tag = "3")]
+    pub name: ::prost::alloc::string::String,
+    /// MMIO device status register bits.
+    #[prost(uint32, tag = "4")]
+    pub status: u32,
+    /// Pending interrupt reasons not yet acknowledged by the guest.
+    #[prost(uint32, tag = "5")]
+    pub interrupt_status: u32,
+    /// Whether VIRTIO_F_EVENT_IDX was negotiated.
+    #[prost(bool, tag = "6")]
+    pub event_idx: bool,
+    /// Cumulative interrupts raised by the device.
+    #[prost(uint64, tag = "7")]
+    pub interrupts: u64,
+    /// Configured queues.
+    #[prost(message, repeated, tag = "8")]
+    pub queues: ::prost::alloc::vec::Vec<VirtioQueueDebug>,
+}
+/// Snapshot of one virtqueue. Ring fields are only present when the ring
+/// address was configured and lies inside guest RAM.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct VirtioQueueDebug {
+    /// Queue index within the device.
+    #[prost(uint32, tag = "1")]
+    pub index: u32,
+    /// Ring size negotiated by the driver.
+    #[prost(uint32, tag = "2")]
+    pub size: u32,
+    /// QUEUE_READY state.
+    #[prost(bool, tag = "3")]
+    pub ready: bool,
+    /// Cumulative guest kicks (QUEUE_NOTIFY writes).
+    #[prost(uint64, tag = "4")]
+    pub kicks: u64,
+    /// avail.idx — where the guest has published up to.
+    #[prost(uint32, optional, tag = "5")]
+    pub avail_idx: ::core::option::Option<u32>,
+    /// used.idx — where the device has completed up to. A persistent gap
+    /// behind avail_idx means the queue is wedged.
+    #[prost(uint32, optional, tag = "6")]
+    pub used_idx: ::core::option::Option<u32>,
+    /// avail.flags (bit 0 = VRING_AVAIL_F_NO_INTERRUPT).
+    #[prost(uint32, optional, tag = "7")]
+    pub avail_flags: ::core::option::Option<u32>,
+    /// used.flags (bit 0 = VRING_USED_F_NO_NOTIFY).
+    #[prost(uint32, optional, tag = "8")]
+    pub used_flags: ::core::option::Option<u32>,
+    /// used_event slot (guest → device kick threshold; EVENT_IDX only).
+    #[prost(uint32, optional, tag = "9")]
+    pub used_event: ::core::option::Option<u32>,
+    /// avail_event slot (device → guest interrupt threshold; EVENT_IDX only).
+    #[prost(uint32, optional, tag = "10")]
+    pub avail_event: ::core::option::Option<u32>,
+}
+/// Request to get system info.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetInfoRequest {}
+/// Response to get system info.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetInfoResponse {
+    /// Number of containers.
+    #[prost(int64, tag = "1")]
+    pub containers: i64,
+    /// Running containers.
+    #[prost(int64, tag = "2")]
+    pub containers_running: i64,
+    /// Paused containers.
+    #[prost(int64, tag = "3")]
+    pub containers_paused: i64,
+    /// Stopped containers.
+    #[prost(int64, tag = "4")]
+    pub containers_stopped: i64,
+    /// Number of images.
+    #[prost(int64, tag = "5")]
+    pub images: i64,
+    /// Number of machines.
+    #[prost(int64, tag = "6")]
+    pub machines: i64,
+    /// Running machines.
+    #[prost(int64, tag = "7")]
+    pub machines_running: i64,
+    /// Server version.
+    #[prost(string, tag = "8")]
+    pub server_version: ::prost::alloc::string::String,
+    /// Operating system.
+    #[prost(string, tag = "9")]
+    pub os: ::prost::alloc::string::String,
+    /// Architecture.
+    #[prost(string, tag = "10")]
+    pub arch: ::prost::alloc::string::String,
+    /// Total memory.
+    #[prost(int64, tag = "11")]
+    pub mem_total: i64,
+    /// Number of CPUs.
+    #[prost(int32, tag = "12")]
+    pub ncpu: i32,
+    /// Data directory.
+    #[prost(string, tag = "13")]
+    pub data_dir: ::prost::alloc::string::String,
+    /// Kernel version.
+    #[prost(string, tag = "14")]
+    pub kernel_version: ::prost::alloc::string::String,
+    /// Operating system type.
+    #[prost(string, tag = "15")]
+    pub os_type: ::prost::alloc::string::String,
+    /// Logging driver.
+    #[prost(string, tag = "16")]
+    pub logging_driver: ::prost::alloc::string::String,
+    /// Storage driver.
+    #[prost(string, tag = "17")]
+    pub storage_driver: ::prost::alloc::string::String,
+}
+/// Request to get version.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetVersionRequest {}
+/// Response to get version.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetVersionResponse {
+    /// Version string.
+    #[prost(string, tag = "1")]
+    pub version: ::prost::alloc::string::String,
+    /// API version.
+    #[prost(string, tag = "2")]
+    pub api_version: ::prost::alloc::string::String,
+    /// Minimum API version.
+    #[prost(string, tag = "3")]
+    pub min_api_version: ::prost::alloc::string::String,
+    /// Git commit.
+    #[prost(string, tag = "4")]
+    pub git_commit: ::prost::alloc::string::String,
+    /// Build time.
+    #[prost(string, tag = "5")]
+    pub build_time: ::prost::alloc::string::String,
+    /// OS.
+    #[prost(string, tag = "6")]
+    pub os: ::prost::alloc::string::String,
+    /// Architecture.
+    #[prost(string, tag = "7")]
+    pub arch: ::prost::alloc::string::String,
+    /// Go version (for compatibility).
+    #[prost(string, tag = "8")]
+    pub go_version: ::prost::alloc::string::String,
+}
+/// Request to ping the server.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SystemPingRequest {}
+/// Response to ping.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SystemPingResponse {
+    /// API version.
+    #[prost(string, tag = "1")]
+    pub api_version: ::prost::alloc::string::String,
+    /// Build version.
+    #[prost(string, tag = "2")]
+    pub build_version: ::prost::alloc::string::String,
+}
+/// Request to get events.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EventsRequest {
+    /// Only events since this timestamp (Unix seconds).
+    #[prost(int64, tag = "1")]
+    pub since: i64,
+    /// Only events until this timestamp (Unix seconds).
+    #[prost(int64, tag = "2")]
+    pub until: i64,
+    /// Filters.
+    #[prost(map = "string, string", tag = "3")]
+    pub filters:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+}
+/// System event.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Event {
+    /// Event type (container, image, network, volume, daemon).
+    #[prost(string, tag = "1")]
+    pub r#type: ::prost::alloc::string::String,
+    /// Action (create, start, stop, die, destroy, etc.).
+    #[prost(string, tag = "2")]
+    pub action: ::prost::alloc::string::String,
+    /// Actor that generated the event.
+    #[prost(message, optional, tag = "3")]
+    pub actor: ::core::option::Option<EventActor>,
+    /// Timestamp (Unix nanoseconds).
+    #[prost(int64, tag = "4")]
+    pub time_nano: i64,
+}
+/// Event actor.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EventActor {
+    /// ID of the object.
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    /// Attributes.
+    #[prost(map = "string, string", tag = "2")]
+    pub attributes:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+}
+/// Request to prune resources.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PruneRequest {
+    /// Types to prune: containers, images, networks, volumes, all.
+    #[prost(string, repeated, tag = "1")]
+    pub types: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Remove all unused resources, not just dangling ones.
+    #[prost(bool, tag = "2")]
+    pub all: bool,
+    /// Filters.
+    #[prost(map = "string, string", tag = "3")]
+    pub filters:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+}
+/// Response to prune.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PruneResponse {
+    /// Space reclaimed in bytes.
+    #[prost(uint64, tag = "1")]
+    pub space_reclaimed: u64,
+    /// Deleted containers.
+    #[prost(string, repeated, tag = "2")]
+    pub containers_deleted: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Deleted images.
+    #[prost(string, repeated, tag = "3")]
+    pub images_deleted: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Deleted networks.
+    #[prost(string, repeated, tag = "4")]
+    pub networks_deleted: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Deleted volumes.
+    #[prost(string, repeated, tag = "5")]
+    pub volumes_deleted: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Request to get the icon URL for a container image.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetImageIconRequest {
+    /// Fully qualified image name (e.g., "nginx", "localstack/localstack", "ghcr.io/astral-sh/uv").
+    #[prost(string, tag = "1")]
+    pub fqin: ::prost::alloc::string::String,
+}
+/// Response containing the icon URL.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetImageIconResponse {
+    /// Icon URL, empty if not found.
+    #[prost(string, tag = "1")]
+    pub url: ::prost::alloc::string::String,
+    /// Icon source (e.g., "docker_hub_logo", "docker_official_image", "ghcr_avatar").
+    #[prost(string, tag = "2")]
+    pub source: ::prost::alloc::string::String,
+}
+/// Request to create a volume.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateVolumeRequest {
+    /// Volume name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Driver name.
+    #[prost(string, tag = "2")]
+    pub driver: ::prost::alloc::string::String,
+    /// Driver options.
+    #[prost(map = "string, string", tag = "3")]
+    pub driver_opts:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Labels.
+    #[prost(map = "string, string", tag = "4")]
+    pub labels:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+}
+/// Response to create volume.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CreateVolumeResponse {
+    /// Volume name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Driver.
+    #[prost(string, tag = "2")]
+    pub driver: ::prost::alloc::string::String,
+    /// Mountpoint.
+    #[prost(string, tag = "3")]
+    pub mountpoint: ::prost::alloc::string::String,
+}
+/// Request to remove a volume.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RemoveVolumeRequest {
+    /// Volume name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Force removal.
+    #[prost(bool, tag = "2")]
+    pub force: bool,
+}
+/// Request to list volumes.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListVolumesRequest {
+    /// Filters.
+    #[prost(map = "string, string", tag = "1")]
+    pub filters:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+}
+/// Response to list volumes.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListVolumesResponse {
+    /// List of volumes.
+    #[prost(message, repeated, tag = "1")]
+    pub volumes: ::prost::alloc::vec::Vec<VolumeInfo>,
+    /// Warnings.
+    #[prost(string, repeated, tag = "2")]
+    pub warnings: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Request to inspect a volume.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct InspectVolumeRequest {
+    /// Volume name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+}
+/// Volume information.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct VolumeInfo {
+    /// Volume name.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Driver.
+    #[prost(string, tag = "2")]
+    pub driver: ::prost::alloc::string::String,
+    /// Mountpoint.
+    #[prost(string, tag = "3")]
+    pub mountpoint: ::prost::alloc::string::String,
+    /// Created timestamp (RFC3339).
+    #[prost(string, tag = "4")]
+    pub created: ::prost::alloc::string::String,
+    /// Status.
+    #[prost(map = "string, string", tag = "5")]
+    pub status:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Labels.
+    #[prost(map = "string, string", tag = "6")]
+    pub labels:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Scope (local, global).
+    #[prost(string, tag = "7")]
+    pub scope: ::prost::alloc::string::String,
+    /// Driver options.
+    #[prost(map = "string, string", tag = "8")]
+    pub options:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Usage data.
+    #[prost(message, optional, tag = "9")]
+    pub usage: ::core::option::Option<VolumeUsage>,
+}
+/// Volume usage data.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct VolumeUsage {
+    /// Size in bytes.
+    #[prost(int64, tag = "1")]
+    pub size: i64,
+    /// Reference count.
+    #[prost(int64, tag = "2")]
+    pub ref_count: i64,
+}
+/// Request to prepare a migration.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PrepareMigrationRequest {
+    /// Stable source runtime identifier (for example, "docker-desktop" or "orbstack").
+    #[prost(string, tag = "1")]
+    pub source_kind: ::prost::alloc::string::String,
+    /// Optional override for the source Docker-compatible socket path.
+    #[prost(string, tag = "2")]
+    pub source_socket_path: ::prost::alloc::string::String,
+    /// Allow prepare to include replace actions in the plan.
+    #[prost(bool, tag = "3")]
+    pub allow_replacements: bool,
+}
+/// Prepared migration summary.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PrepareMigrationResponse {
+    /// Opaque identifier for the prepared plan.
+    #[prost(string, tag = "1")]
+    pub plan_id: ::prost::alloc::string::String,
+    /// Source runtime identifier used for the plan.
+    #[prost(string, tag = "2")]
+    pub source_kind: ::prost::alloc::string::String,
+    /// Resolved source socket path used for the plan.
+    #[prost(string, tag = "3")]
+    pub source_socket_path: ::prost::alloc::string::String,
+    /// Number of images included in the plan.
+    #[prost(uint32, tag = "4")]
+    pub image_count: u32,
+    /// Number of volumes included in the plan.
+    #[prost(uint32, tag = "5")]
+    pub volume_count: u32,
+    /// Number of networks included in the plan.
+    #[prost(uint32, tag = "6")]
+    pub network_count: u32,
+    /// Number of containers included in the plan.
+    #[prost(uint32, tag = "7")]
+    pub container_count: u32,
+    /// Whether the plan would replace existing ArcBox resources (images, volumes,
+    /// networks, or containers that already exist on the target). When true,
+    /// RunMigrationRequest.allow_replacements must be set to confirm.
+    #[prost(bool, tag = "8")]
+    pub replacements_required: bool,
+    /// Non-fatal warnings discovered during preparation (for example, volume
+    /// blockers that will require stopping running source containers).
+    #[prost(string, repeated, tag = "9")]
+    pub warnings: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Request to run a prepared migration.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RunMigrationRequest {
+    /// Opaque identifier returned by PrepareMigration.
+    #[prost(string, tag = "1")]
+    pub plan_id: ::prost::alloc::string::String,
+    /// Confirms that the caller accepts any replace actions in the plan.
+    #[prost(bool, tag = "2")]
+    pub allow_replacements: bool,
+}
+/// Streaming migration progress event.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RunMigrationEvent {
+    /// Opaque identifier of the plan being executed.
+    #[prost(string, tag = "1")]
+    pub plan_id: ::prost::alloc::string::String,
+    /// High-level execution phase (for example, "prepare", "images", or "containers").
+    #[prost(string, tag = "2")]
+    pub phase: ::prost::alloc::string::String,
+    /// Optional resource name currently being processed.
+    #[prost(string, tag = "3")]
+    pub resource: ::prost::alloc::string::String,
+    /// Human-readable progress detail.
+    #[prost(string, tag = "4")]
+    pub message: ::prost::alloc::string::String,
+    /// Number of completed work items in the current phase.
+    #[prost(uint32, tag = "5")]
+    pub completed: u32,
+    /// Total work items expected in the current phase.
+    #[prost(uint32, tag = "6")]
+    pub total: u32,
+    /// Indicates that no more events will follow for this run.
+    #[prost(bool, tag = "7")]
+    pub done: bool,
+    /// Indicates whether the run completed successfully.
+    #[prost(bool, tag = "8")]
+    pub success: bool,
+}
+/// Shell input for interactive sessions.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ShellInput {
+    /// Input data.
+    #[prost(bytes = "vec", tag = "1")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+    /// Resize terminal.
+    #[prost(message, optional, tag = "2")]
+    pub resize: ::core::option::Option<TerminalSize>,
+}
+/// Shell output for interactive sessions.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ShellOutput {
+    /// Output data.
+    #[prost(bytes = "vec", tag = "1")]
+    pub data: ::prost::alloc::vec::Vec<u8>,
+    /// Exit code (only set when done).
+    #[prost(int32, tag = "2")]
+    pub exit_code: i32,
+    /// Is this the final message.
+    #[prost(bool, tag = "3")]
+    pub done: bool,
+}
+/// Terminal size.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TerminalSize {
+    /// Terminal width.
+    #[prost(uint32, tag = "1")]
+    pub width: u32,
+    /// Terminal height.
+    #[prost(uint32, tag = "2")]
+    pub height: u32,
+}
+/// Daemon startup progress and infrastructure health.
+/// Allows the desktop app (or any gRPC client) to observe daemon readiness
+/// without managing its lifecycle.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetupStatus {
+    /// Current daemon phase.
+    #[prost(enumeration = "setup_status::Phase", tag = "1")]
+    pub phase: i32,
+    /// Whether the DNS resolver file is installed.
+    #[prost(bool, tag = "2")]
+    pub dns_resolver_installed: bool,
+    /// Whether /var/run/docker.sock is symlinked to ArcBox.
+    #[prost(bool, tag = "3")]
+    pub docker_socket_linked: bool,
+    /// Whether the container subnet route is installed.
+    #[prost(bool, tag = "4")]
+    pub route_installed: bool,
+    /// Whether the default VM is running.
+    #[prost(bool, tag = "5")]
+    pub vm_running: bool,
+    /// Human-readable status message.
+    #[prost(string, tag = "6")]
+    pub message: ::prost::alloc::string::String,
+    /// Whether Docker CLI tools are installed.
+    #[prost(bool, tag = "7")]
+    pub docker_tools_installed: bool,
+    /// Fatal startup error description. Set only when phase == FAILED,
+    /// so streaming clients learn the cause instead of seeing a bare
+    /// disconnect when the daemon exits.
+    #[prost(string, tag = "8")]
+    pub error: ::prost::alloc::string::String,
+}
+/// Nested message and enum types in `SetupStatus`.
+pub mod setup_status {
+    /// Daemon startup phases, ordered by progression.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Phase {
+        Unspecified = 0,
+        Initializing = 1,
+        AssetsReady = 2,
+        VmStarting = 3,
+        VmReady = 4,
+        NetworkReady = 5,
+        Ready = 6,
+        Degraded = 7,
+        DownloadingAssets = 8,
+        CleaningUp = 9,
+        /// Startup failed fatally; the daemon exits shortly after
+        /// publishing this phase. See the `error` field for the cause.
+        Failed = 10,
+    }
+    impl Phase {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unspecified => "PHASE_UNSPECIFIED",
+                Self::Initializing => "INITIALIZING",
+                Self::AssetsReady => "ASSETS_READY",
+                Self::VmStarting => "VM_STARTING",
+                Self::VmReady => "VM_READY",
+                Self::NetworkReady => "NETWORK_READY",
+                Self::Ready => "READY",
+                Self::Degraded => "DEGRADED",
+                Self::DownloadingAssets => "DOWNLOADING_ASSETS",
+                Self::CleaningUp => "CLEANING_UP",
+                Self::Failed => "FAILED",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "PHASE_UNSPECIFIED" => Some(Self::Unspecified),
+                "INITIALIZING" => Some(Self::Initializing),
+                "ASSETS_READY" => Some(Self::AssetsReady),
+                "VM_STARTING" => Some(Self::VmStarting),
+                "VM_READY" => Some(Self::VmReady),
+                "NETWORK_READY" => Some(Self::NetworkReady),
+                "READY" => Some(Self::Ready),
+                "DEGRADED" => Some(Self::Degraded),
+                "DOWNLOADING_ASSETS" => Some(Self::DownloadingAssets),
+                "CLEANING_UP" => Some(Self::CleaningUp),
+                "FAILED" => Some(Self::Failed),
+                _ => None,
+            }
+        }
+    }
+}
+/// Hypervisor backend for the single System VM.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SystemVmBackend {
+    /// Unset; rejected by SetSystemVmBackend.
+    Unspecified = 0,
+    /// Hypervisor.framework — ArcBox's custom VMM (amd64 via FEX). macOS 15+.
+    Hv = 1,
+    /// Virtualization.framework — Apple-managed execution. The default.
+    Vz = 2,
+}
+impl SystemVmBackend {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SYSTEM_VM_BACKEND_UNSPECIFIED",
+            Self::Hv => "SYSTEM_VM_BACKEND_HV",
+            Self::Vz => "SYSTEM_VM_BACKEND_VZ",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SYSTEM_VM_BACKEND_UNSPECIFIED" => Some(Self::Unspecified),
+            "SYSTEM_VM_BACKEND_HV" => Some(Self::Hv),
+            "SYSTEM_VM_BACKEND_VZ" => Some(Self::Vz),
+            _ => None,
+        }
+    }
+}
 /// Request to create a machine.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -435,6 +1420,34 @@ pub struct MachineExecRequest {
     /// Allocate TTY.
     #[prost(bool, tag = "6")]
     pub tty: bool,
+    /// Initial terminal size (interactive sessions).
+    #[prost(message, optional, tag = "7")]
+    pub tty_size: ::core::option::Option<TerminalSize>,
+}
+/// One client message on an interactive machine session.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineExecInput {
+    #[prost(oneof = "machine_exec_input::Payload", tags = "1, 2, 3")]
+    pub payload: ::core::option::Option<machine_exec_input::Payload>,
+}
+/// Nested message and enum types in `MachineExecInput`.
+pub mod machine_exec_input {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        /// Must be the first message: what to run.
+        #[prost(message, tag = "1")]
+        Init(super::MachineExecRequest),
+        /// Raw stdin bytes; empty means stdin EOF.
+        #[prost(bytes, tag = "2")]
+        Stdin(::prost::alloc::vec::Vec<u8>),
+        /// Terminal resize.
+        #[prost(message, tag = "3")]
+        Resize(super::TerminalSize),
+    }
 }
 /// Exec output from a machine.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2321,991 +3334,6 @@ pub struct ImageFsPathsResponse {
     /// Read-only layer directories, top-most first.
     #[prost(string, repeated, tag = "1")]
     pub lower_dirs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-/// Request to create a network.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CreateNetworkRequest {
-    /// Network name.
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// Driver (e.g., "bridge", "host", "none").
-    #[prost(string, tag = "2")]
-    pub driver: ::prost::alloc::string::String,
-    /// Internal network (not connected to external network).
-    #[prost(bool, tag = "3")]
-    pub internal: bool,
-    /// Labels.
-    #[prost(map = "string, string", tag = "4")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// Enable IPv6.
-    #[prost(bool, tag = "5")]
-    pub enable_ipv6: bool,
-    /// IPAM configuration.
-    #[prost(message, optional, tag = "6")]
-    pub ipam: ::core::option::Option<IpamConfig>,
-}
-/// IPAM configuration.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct IpamConfig {
-    /// Driver name.
-    #[prost(string, tag = "1")]
-    pub driver: ::prost::alloc::string::String,
-    /// IPAM options.
-    #[prost(map = "string, string", tag = "2")]
-    pub options:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// Subnet configurations.
-    #[prost(message, repeated, tag = "3")]
-    pub subnets: ::prost::alloc::vec::Vec<IpamSubnet>,
-}
-/// IPAM subnet configuration.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct IpamSubnet {
-    /// Subnet in CIDR format.
-    #[prost(string, tag = "1")]
-    pub subnet: ::prost::alloc::string::String,
-    /// Gateway address.
-    #[prost(string, tag = "2")]
-    pub gateway: ::prost::alloc::string::String,
-    /// IP range for allocation.
-    #[prost(string, tag = "3")]
-    pub ip_range: ::prost::alloc::string::String,
-}
-/// Response to create network.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct CreateNetworkResponse {
-    /// Network ID.
-    #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
-    /// Warning messages.
-    #[prost(string, repeated, tag = "2")]
-    pub warnings: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-/// Request to remove a network.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RemoveNetworkRequest {
-    /// Network ID or name.
-    #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
-}
-/// Request to list networks.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListNetworksRequest {
-    /// Filter by labels.
-    #[prost(map = "string, string", tag = "1")]
-    pub filters:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-}
-/// Response to list networks.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListNetworksResponse {
-    /// List of networks.
-    #[prost(message, repeated, tag = "1")]
-    pub networks: ::prost::alloc::vec::Vec<NetworkSummary>,
-}
-/// Summary information about a network.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct NetworkSummary {
-    /// Network ID.
-    #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
-    /// Network name.
-    #[prost(string, tag = "2")]
-    pub name: ::prost::alloc::string::String,
-    /// Driver.
-    #[prost(string, tag = "3")]
-    pub driver: ::prost::alloc::string::String,
-    /// Scope (local, global).
-    #[prost(string, tag = "4")]
-    pub scope: ::prost::alloc::string::String,
-    /// Created timestamp (RFC3339).
-    #[prost(string, tag = "5")]
-    pub created: ::prost::alloc::string::String,
-    /// Internal network.
-    #[prost(bool, tag = "6")]
-    pub internal: bool,
-    /// Attachable.
-    #[prost(bool, tag = "7")]
-    pub attachable: bool,
-    /// Labels.
-    #[prost(map = "string, string", tag = "8")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-}
-/// Request to inspect a network.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct InspectNetworkRequest {
-    /// Network ID or name.
-    #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
-    /// Verbose output.
-    #[prost(bool, tag = "2")]
-    pub verbose: bool,
-}
-/// Detailed network information.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct NetworkInfo {
-    /// Network ID.
-    #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
-    /// Network name.
-    #[prost(string, tag = "2")]
-    pub name: ::prost::alloc::string::String,
-    /// Driver.
-    #[prost(string, tag = "3")]
-    pub driver: ::prost::alloc::string::String,
-    /// Scope.
-    #[prost(string, tag = "4")]
-    pub scope: ::prost::alloc::string::String,
-    /// Created timestamp (RFC3339).
-    #[prost(string, tag = "5")]
-    pub created: ::prost::alloc::string::String,
-    /// Internal network.
-    #[prost(bool, tag = "6")]
-    pub internal: bool,
-    /// Attachable.
-    #[prost(bool, tag = "7")]
-    pub attachable: bool,
-    /// Labels.
-    #[prost(map = "string, string", tag = "8")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// IPAM configuration.
-    #[prost(message, optional, tag = "9")]
-    pub ipam: ::core::option::Option<IpamConfig>,
-    /// Connected containers.
-    #[prost(map = "string, message", tag = "10")]
-    pub containers: ::std::collections::HashMap<::prost::alloc::string::String, NetworkContainer>,
-    /// Driver options.
-    #[prost(map = "string, string", tag = "11")]
-    pub options:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-}
-/// Container connected to a network.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct NetworkContainer {
-    /// Container name.
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// Container endpoint ID.
-    #[prost(string, tag = "2")]
-    pub endpoint_id: ::prost::alloc::string::String,
-    /// IPv4 address.
-    #[prost(string, tag = "3")]
-    pub ipv4_address: ::prost::alloc::string::String,
-    /// IPv6 address.
-    #[prost(string, tag = "4")]
-    pub ipv6_address: ::prost::alloc::string::String,
-    /// MAC address.
-    #[prost(string, tag = "5")]
-    pub mac_address: ::prost::alloc::string::String,
-}
-/// The System VM's hypervisor backend.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SystemVmBackendInfo {
-    #[prost(enumeration = "SystemVmBackend", tag = "1")]
-    pub backend: i32,
-}
-/// Request to switch the System VM's hypervisor backend.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SetSystemVmBackendRequest {
-    #[prost(enumeration = "SystemVmBackend", tag = "1")]
-    pub backend: i32,
-}
-/// Request to resolve a container's filesystem layer directories.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ResolveContainerFsRequest {
-    /// Full container ID.
-    #[prost(string, tag = "1")]
-    pub container_id: ::prost::alloc::string::String,
-}
-/// A container's filesystem layer directories, as guest paths under the
-/// containerd data mount.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ResolveContainerFsResponse {
-    /// Writable layer directory. Empty for read-only snapshots.
-    #[prost(string, tag = "1")]
-    pub upper_dir: ::prost::alloc::string::String,
-    /// Read-only layer directories, top-most first.
-    #[prost(string, repeated, tag = "2")]
-    pub lower_dirs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-/// Request to resolve an image's layer directories.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ResolveImageFsRequest {
-    /// Chain ID of the image's top layer (`sha256:<64 hex>`).
-    #[prost(string, tag = "1")]
-    pub top_chain_id: ::prost::alloc::string::String,
-}
-/// An image's layer directories, as guest paths under the containerd data
-/// mount.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ResolveImageFsResponse {
-    /// Read-only layer directories, top-most first.
-    #[prost(string, repeated, tag = "1")]
-    pub lower_dirs: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-/// Diagnostic snapshot of the System VM's virtio devices and vCPUs.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct VirtioDebugInfo {
-    #[prost(message, repeated, tag = "1")]
-    pub devices: ::prost::alloc::vec::Vec<VirtioDeviceDebug>,
-    /// Per-vCPU exit counters (custom-VMM backends; empty under VZ).
-    #[prost(message, repeated, tag = "2")]
-    pub vcpus: ::prost::alloc::vec::Vec<VcpuDebug>,
-    /// Times any component broadcast hv_vcpus_exit to ALL vCPUs.
-    #[prost(uint64, tag = "3")]
-    pub kick_broadcasts: u64,
-    /// Times the IRQ callback unparked ALL vCPU threads on an SPI assertion.
-    #[prost(uint64, tag = "4")]
-    pub unpark_broadcasts: u64,
-}
-/// Cumulative exit counters for one vCPU.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct VcpuDebug {
-    #[prost(uint32, tag = "1")]
-    pub vcpu: u32,
-    /// MMIO read exits.
-    #[prost(uint64, tag = "2")]
-    pub mmio_reads: u64,
-    /// MMIO write exits (includes every virtio QUEUE_NOTIFY doorbell).
-    #[prost(uint64, tag = "3")]
-    pub mmio_writes: u64,
-    /// WFI exits — the guest going idle.
-    #[prost(uint64, tag = "4")]
-    pub wfi: u64,
-    /// HVC exits (PSCI + ArcBox hypercalls).
-    #[prost(uint64, tag = "5")]
-    pub hvc: u64,
-    /// SMC exits.
-    #[prost(uint64, tag = "6")]
-    pub smc: u64,
-    /// Virtual-timer activations.
-    #[prost(uint64, tag = "7")]
-    pub vtimer: u64,
-    /// Times this vCPU was kicked out of hv_vcpu_run by hv_vcpus_exit.
-    #[prost(uint64, tag = "8")]
-    pub kicks_received: u64,
-    /// Trapped system-register accesses (treated RAZ/WI).
-    #[prost(uint64, tag = "9")]
-    pub sysreg: u64,
-    /// Unhandled exception classes and unknown exits.
-    #[prost(uint64, tag = "10")]
-    pub other: u64,
-}
-/// Snapshot of one virtio MMIO device.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct VirtioDeviceDebug {
-    /// Device ID within the VMM's device manager.
-    #[prost(uint32, tag = "1")]
-    pub id: u32,
-    /// Device type, e.g. "VirtioNet".
-    #[prost(string, tag = "2")]
-    pub device_type: ::prost::alloc::string::String,
-    /// Device name.
-    #[prost(string, tag = "3")]
-    pub name: ::prost::alloc::string::String,
-    /// MMIO device status register bits.
-    #[prost(uint32, tag = "4")]
-    pub status: u32,
-    /// Pending interrupt reasons not yet acknowledged by the guest.
-    #[prost(uint32, tag = "5")]
-    pub interrupt_status: u32,
-    /// Whether VIRTIO_F_EVENT_IDX was negotiated.
-    #[prost(bool, tag = "6")]
-    pub event_idx: bool,
-    /// Cumulative interrupts raised by the device.
-    #[prost(uint64, tag = "7")]
-    pub interrupts: u64,
-    /// Configured queues.
-    #[prost(message, repeated, tag = "8")]
-    pub queues: ::prost::alloc::vec::Vec<VirtioQueueDebug>,
-}
-/// Snapshot of one virtqueue. Ring fields are only present when the ring
-/// address was configured and lies inside guest RAM.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct VirtioQueueDebug {
-    /// Queue index within the device.
-    #[prost(uint32, tag = "1")]
-    pub index: u32,
-    /// Ring size negotiated by the driver.
-    #[prost(uint32, tag = "2")]
-    pub size: u32,
-    /// QUEUE_READY state.
-    #[prost(bool, tag = "3")]
-    pub ready: bool,
-    /// Cumulative guest kicks (QUEUE_NOTIFY writes).
-    #[prost(uint64, tag = "4")]
-    pub kicks: u64,
-    /// avail.idx — where the guest has published up to.
-    #[prost(uint32, optional, tag = "5")]
-    pub avail_idx: ::core::option::Option<u32>,
-    /// used.idx — where the device has completed up to. A persistent gap
-    /// behind avail_idx means the queue is wedged.
-    #[prost(uint32, optional, tag = "6")]
-    pub used_idx: ::core::option::Option<u32>,
-    /// avail.flags (bit 0 = VRING_AVAIL_F_NO_INTERRUPT).
-    #[prost(uint32, optional, tag = "7")]
-    pub avail_flags: ::core::option::Option<u32>,
-    /// used.flags (bit 0 = VRING_USED_F_NO_NOTIFY).
-    #[prost(uint32, optional, tag = "8")]
-    pub used_flags: ::core::option::Option<u32>,
-    /// used_event slot (guest → device kick threshold; EVENT_IDX only).
-    #[prost(uint32, optional, tag = "9")]
-    pub used_event: ::core::option::Option<u32>,
-    /// avail_event slot (device → guest interrupt threshold; EVENT_IDX only).
-    #[prost(uint32, optional, tag = "10")]
-    pub avail_event: ::core::option::Option<u32>,
-}
-/// Request to get system info.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct GetInfoRequest {}
-/// Response to get system info.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct GetInfoResponse {
-    /// Number of containers.
-    #[prost(int64, tag = "1")]
-    pub containers: i64,
-    /// Running containers.
-    #[prost(int64, tag = "2")]
-    pub containers_running: i64,
-    /// Paused containers.
-    #[prost(int64, tag = "3")]
-    pub containers_paused: i64,
-    /// Stopped containers.
-    #[prost(int64, tag = "4")]
-    pub containers_stopped: i64,
-    /// Number of images.
-    #[prost(int64, tag = "5")]
-    pub images: i64,
-    /// Number of machines.
-    #[prost(int64, tag = "6")]
-    pub machines: i64,
-    /// Running machines.
-    #[prost(int64, tag = "7")]
-    pub machines_running: i64,
-    /// Server version.
-    #[prost(string, tag = "8")]
-    pub server_version: ::prost::alloc::string::String,
-    /// Operating system.
-    #[prost(string, tag = "9")]
-    pub os: ::prost::alloc::string::String,
-    /// Architecture.
-    #[prost(string, tag = "10")]
-    pub arch: ::prost::alloc::string::String,
-    /// Total memory.
-    #[prost(int64, tag = "11")]
-    pub mem_total: i64,
-    /// Number of CPUs.
-    #[prost(int32, tag = "12")]
-    pub ncpu: i32,
-    /// Data directory.
-    #[prost(string, tag = "13")]
-    pub data_dir: ::prost::alloc::string::String,
-    /// Kernel version.
-    #[prost(string, tag = "14")]
-    pub kernel_version: ::prost::alloc::string::String,
-    /// Operating system type.
-    #[prost(string, tag = "15")]
-    pub os_type: ::prost::alloc::string::String,
-    /// Logging driver.
-    #[prost(string, tag = "16")]
-    pub logging_driver: ::prost::alloc::string::String,
-    /// Storage driver.
-    #[prost(string, tag = "17")]
-    pub storage_driver: ::prost::alloc::string::String,
-}
-/// Request to get version.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct GetVersionRequest {}
-/// Response to get version.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct GetVersionResponse {
-    /// Version string.
-    #[prost(string, tag = "1")]
-    pub version: ::prost::alloc::string::String,
-    /// API version.
-    #[prost(string, tag = "2")]
-    pub api_version: ::prost::alloc::string::String,
-    /// Minimum API version.
-    #[prost(string, tag = "3")]
-    pub min_api_version: ::prost::alloc::string::String,
-    /// Git commit.
-    #[prost(string, tag = "4")]
-    pub git_commit: ::prost::alloc::string::String,
-    /// Build time.
-    #[prost(string, tag = "5")]
-    pub build_time: ::prost::alloc::string::String,
-    /// OS.
-    #[prost(string, tag = "6")]
-    pub os: ::prost::alloc::string::String,
-    /// Architecture.
-    #[prost(string, tag = "7")]
-    pub arch: ::prost::alloc::string::String,
-    /// Go version (for compatibility).
-    #[prost(string, tag = "8")]
-    pub go_version: ::prost::alloc::string::String,
-}
-/// Request to ping the server.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SystemPingRequest {}
-/// Response to ping.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SystemPingResponse {
-    /// API version.
-    #[prost(string, tag = "1")]
-    pub api_version: ::prost::alloc::string::String,
-    /// Build version.
-    #[prost(string, tag = "2")]
-    pub build_version: ::prost::alloc::string::String,
-}
-/// Request to get events.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct EventsRequest {
-    /// Only events since this timestamp (Unix seconds).
-    #[prost(int64, tag = "1")]
-    pub since: i64,
-    /// Only events until this timestamp (Unix seconds).
-    #[prost(int64, tag = "2")]
-    pub until: i64,
-    /// Filters.
-    #[prost(map = "string, string", tag = "3")]
-    pub filters:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-}
-/// System event.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Event {
-    /// Event type (container, image, network, volume, daemon).
-    #[prost(string, tag = "1")]
-    pub r#type: ::prost::alloc::string::String,
-    /// Action (create, start, stop, die, destroy, etc.).
-    #[prost(string, tag = "2")]
-    pub action: ::prost::alloc::string::String,
-    /// Actor that generated the event.
-    #[prost(message, optional, tag = "3")]
-    pub actor: ::core::option::Option<EventActor>,
-    /// Timestamp (Unix nanoseconds).
-    #[prost(int64, tag = "4")]
-    pub time_nano: i64,
-}
-/// Event actor.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct EventActor {
-    /// ID of the object.
-    #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
-    /// Attributes.
-    #[prost(map = "string, string", tag = "2")]
-    pub attributes:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-}
-/// Request to prune resources.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PruneRequest {
-    /// Types to prune: containers, images, networks, volumes, all.
-    #[prost(string, repeated, tag = "1")]
-    pub types: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Remove all unused resources, not just dangling ones.
-    #[prost(bool, tag = "2")]
-    pub all: bool,
-    /// Filters.
-    #[prost(map = "string, string", tag = "3")]
-    pub filters:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-}
-/// Response to prune.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PruneResponse {
-    /// Space reclaimed in bytes.
-    #[prost(uint64, tag = "1")]
-    pub space_reclaimed: u64,
-    /// Deleted containers.
-    #[prost(string, repeated, tag = "2")]
-    pub containers_deleted: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Deleted images.
-    #[prost(string, repeated, tag = "3")]
-    pub images_deleted: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Deleted networks.
-    #[prost(string, repeated, tag = "4")]
-    pub networks_deleted: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// Deleted volumes.
-    #[prost(string, repeated, tag = "5")]
-    pub volumes_deleted: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-/// Request to get the icon URL for a container image.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct GetImageIconRequest {
-    /// Fully qualified image name (e.g., "nginx", "localstack/localstack", "ghcr.io/astral-sh/uv").
-    #[prost(string, tag = "1")]
-    pub fqin: ::prost::alloc::string::String,
-}
-/// Response containing the icon URL.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct GetImageIconResponse {
-    /// Icon URL, empty if not found.
-    #[prost(string, tag = "1")]
-    pub url: ::prost::alloc::string::String,
-    /// Icon source (e.g., "docker_hub_logo", "docker_official_image", "ghcr_avatar").
-    #[prost(string, tag = "2")]
-    pub source: ::prost::alloc::string::String,
-}
-/// Request to create a volume.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CreateVolumeRequest {
-    /// Volume name.
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// Driver name.
-    #[prost(string, tag = "2")]
-    pub driver: ::prost::alloc::string::String,
-    /// Driver options.
-    #[prost(map = "string, string", tag = "3")]
-    pub driver_opts:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// Labels.
-    #[prost(map = "string, string", tag = "4")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-}
-/// Response to create volume.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct CreateVolumeResponse {
-    /// Volume name.
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// Driver.
-    #[prost(string, tag = "2")]
-    pub driver: ::prost::alloc::string::String,
-    /// Mountpoint.
-    #[prost(string, tag = "3")]
-    pub mountpoint: ::prost::alloc::string::String,
-}
-/// Request to remove a volume.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RemoveVolumeRequest {
-    /// Volume name.
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// Force removal.
-    #[prost(bool, tag = "2")]
-    pub force: bool,
-}
-/// Request to list volumes.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListVolumesRequest {
-    /// Filters.
-    #[prost(map = "string, string", tag = "1")]
-    pub filters:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-}
-/// Response to list volumes.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ListVolumesResponse {
-    /// List of volumes.
-    #[prost(message, repeated, tag = "1")]
-    pub volumes: ::prost::alloc::vec::Vec<VolumeInfo>,
-    /// Warnings.
-    #[prost(string, repeated, tag = "2")]
-    pub warnings: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-/// Request to inspect a volume.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct InspectVolumeRequest {
-    /// Volume name.
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-}
-/// Volume information.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct VolumeInfo {
-    /// Volume name.
-    #[prost(string, tag = "1")]
-    pub name: ::prost::alloc::string::String,
-    /// Driver.
-    #[prost(string, tag = "2")]
-    pub driver: ::prost::alloc::string::String,
-    /// Mountpoint.
-    #[prost(string, tag = "3")]
-    pub mountpoint: ::prost::alloc::string::String,
-    /// Created timestamp (RFC3339).
-    #[prost(string, tag = "4")]
-    pub created: ::prost::alloc::string::String,
-    /// Status.
-    #[prost(map = "string, string", tag = "5")]
-    pub status:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// Labels.
-    #[prost(map = "string, string", tag = "6")]
-    pub labels:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// Scope (local, global).
-    #[prost(string, tag = "7")]
-    pub scope: ::prost::alloc::string::String,
-    /// Driver options.
-    #[prost(map = "string, string", tag = "8")]
-    pub options:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// Usage data.
-    #[prost(message, optional, tag = "9")]
-    pub usage: ::core::option::Option<VolumeUsage>,
-}
-/// Volume usage data.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct VolumeUsage {
-    /// Size in bytes.
-    #[prost(int64, tag = "1")]
-    pub size: i64,
-    /// Reference count.
-    #[prost(int64, tag = "2")]
-    pub ref_count: i64,
-}
-/// Request to prepare a migration.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PrepareMigrationRequest {
-    /// Stable source runtime identifier (for example, "docker-desktop" or "orbstack").
-    #[prost(string, tag = "1")]
-    pub source_kind: ::prost::alloc::string::String,
-    /// Optional override for the source Docker-compatible socket path.
-    #[prost(string, tag = "2")]
-    pub source_socket_path: ::prost::alloc::string::String,
-    /// Allow prepare to include replace actions in the plan.
-    #[prost(bool, tag = "3")]
-    pub allow_replacements: bool,
-}
-/// Prepared migration summary.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct PrepareMigrationResponse {
-    /// Opaque identifier for the prepared plan.
-    #[prost(string, tag = "1")]
-    pub plan_id: ::prost::alloc::string::String,
-    /// Source runtime identifier used for the plan.
-    #[prost(string, tag = "2")]
-    pub source_kind: ::prost::alloc::string::String,
-    /// Resolved source socket path used for the plan.
-    #[prost(string, tag = "3")]
-    pub source_socket_path: ::prost::alloc::string::String,
-    /// Number of images included in the plan.
-    #[prost(uint32, tag = "4")]
-    pub image_count: u32,
-    /// Number of volumes included in the plan.
-    #[prost(uint32, tag = "5")]
-    pub volume_count: u32,
-    /// Number of networks included in the plan.
-    #[prost(uint32, tag = "6")]
-    pub network_count: u32,
-    /// Number of containers included in the plan.
-    #[prost(uint32, tag = "7")]
-    pub container_count: u32,
-    /// Whether the plan would replace existing ArcBox resources (images, volumes,
-    /// networks, or containers that already exist on the target). When true,
-    /// RunMigrationRequest.allow_replacements must be set to confirm.
-    #[prost(bool, tag = "8")]
-    pub replacements_required: bool,
-    /// Non-fatal warnings discovered during preparation (for example, volume
-    /// blockers that will require stopping running source containers).
-    #[prost(string, repeated, tag = "9")]
-    pub warnings: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-}
-/// Request to run a prepared migration.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RunMigrationRequest {
-    /// Opaque identifier returned by PrepareMigration.
-    #[prost(string, tag = "1")]
-    pub plan_id: ::prost::alloc::string::String,
-    /// Confirms that the caller accepts any replace actions in the plan.
-    #[prost(bool, tag = "2")]
-    pub allow_replacements: bool,
-}
-/// Streaming migration progress event.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RunMigrationEvent {
-    /// Opaque identifier of the plan being executed.
-    #[prost(string, tag = "1")]
-    pub plan_id: ::prost::alloc::string::String,
-    /// High-level execution phase (for example, "prepare", "images", or "containers").
-    #[prost(string, tag = "2")]
-    pub phase: ::prost::alloc::string::String,
-    /// Optional resource name currently being processed.
-    #[prost(string, tag = "3")]
-    pub resource: ::prost::alloc::string::String,
-    /// Human-readable progress detail.
-    #[prost(string, tag = "4")]
-    pub message: ::prost::alloc::string::String,
-    /// Number of completed work items in the current phase.
-    #[prost(uint32, tag = "5")]
-    pub completed: u32,
-    /// Total work items expected in the current phase.
-    #[prost(uint32, tag = "6")]
-    pub total: u32,
-    /// Indicates that no more events will follow for this run.
-    #[prost(bool, tag = "7")]
-    pub done: bool,
-    /// Indicates whether the run completed successfully.
-    #[prost(bool, tag = "8")]
-    pub success: bool,
-}
-/// Shell input for interactive sessions.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ShellInput {
-    /// Input data.
-    #[prost(bytes = "vec", tag = "1")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
-    /// Resize terminal.
-    #[prost(message, optional, tag = "2")]
-    pub resize: ::core::option::Option<TerminalSize>,
-}
-/// Shell output for interactive sessions.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ShellOutput {
-    /// Output data.
-    #[prost(bytes = "vec", tag = "1")]
-    pub data: ::prost::alloc::vec::Vec<u8>,
-    /// Exit code (only set when done).
-    #[prost(int32, tag = "2")]
-    pub exit_code: i32,
-    /// Is this the final message.
-    #[prost(bool, tag = "3")]
-    pub done: bool,
-}
-/// Terminal size.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct TerminalSize {
-    /// Terminal width.
-    #[prost(uint32, tag = "1")]
-    pub width: u32,
-    /// Terminal height.
-    #[prost(uint32, tag = "2")]
-    pub height: u32,
-}
-/// Daemon startup progress and infrastructure health.
-/// Allows the desktop app (or any gRPC client) to observe daemon readiness
-/// without managing its lifecycle.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct SetupStatus {
-    /// Current daemon phase.
-    #[prost(enumeration = "setup_status::Phase", tag = "1")]
-    pub phase: i32,
-    /// Whether the DNS resolver file is installed.
-    #[prost(bool, tag = "2")]
-    pub dns_resolver_installed: bool,
-    /// Whether /var/run/docker.sock is symlinked to ArcBox.
-    #[prost(bool, tag = "3")]
-    pub docker_socket_linked: bool,
-    /// Whether the container subnet route is installed.
-    #[prost(bool, tag = "4")]
-    pub route_installed: bool,
-    /// Whether the default VM is running.
-    #[prost(bool, tag = "5")]
-    pub vm_running: bool,
-    /// Human-readable status message.
-    #[prost(string, tag = "6")]
-    pub message: ::prost::alloc::string::String,
-    /// Whether Docker CLI tools are installed.
-    #[prost(bool, tag = "7")]
-    pub docker_tools_installed: bool,
-    /// Fatal startup error description. Set only when phase == FAILED,
-    /// so streaming clients learn the cause instead of seeing a bare
-    /// disconnect when the daemon exits.
-    #[prost(string, tag = "8")]
-    pub error: ::prost::alloc::string::String,
-}
-/// Nested message and enum types in `SetupStatus`.
-pub mod setup_status {
-    /// Daemon startup phases, ordered by progression.
-    #[derive(serde::Serialize, serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-    #[repr(i32)]
-    pub enum Phase {
-        Unspecified = 0,
-        Initializing = 1,
-        AssetsReady = 2,
-        VmStarting = 3,
-        VmReady = 4,
-        NetworkReady = 5,
-        Ready = 6,
-        Degraded = 7,
-        DownloadingAssets = 8,
-        CleaningUp = 9,
-        /// Startup failed fatally; the daemon exits shortly after
-        /// publishing this phase. See the `error` field for the cause.
-        Failed = 10,
-    }
-    impl Phase {
-        /// String value of the enum field names used in the ProtoBuf definition.
-        ///
-        /// The values are not transformed in any way and thus are considered stable
-        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-        pub fn as_str_name(&self) -> &'static str {
-            match self {
-                Self::Unspecified => "PHASE_UNSPECIFIED",
-                Self::Initializing => "INITIALIZING",
-                Self::AssetsReady => "ASSETS_READY",
-                Self::VmStarting => "VM_STARTING",
-                Self::VmReady => "VM_READY",
-                Self::NetworkReady => "NETWORK_READY",
-                Self::Ready => "READY",
-                Self::Degraded => "DEGRADED",
-                Self::DownloadingAssets => "DOWNLOADING_ASSETS",
-                Self::CleaningUp => "CLEANING_UP",
-                Self::Failed => "FAILED",
-            }
-        }
-        /// Creates an enum from field names used in the ProtoBuf definition.
-        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-            match value {
-                "PHASE_UNSPECIFIED" => Some(Self::Unspecified),
-                "INITIALIZING" => Some(Self::Initializing),
-                "ASSETS_READY" => Some(Self::AssetsReady),
-                "VM_STARTING" => Some(Self::VmStarting),
-                "VM_READY" => Some(Self::VmReady),
-                "NETWORK_READY" => Some(Self::NetworkReady),
-                "READY" => Some(Self::Ready),
-                "DEGRADED" => Some(Self::Degraded),
-                "DOWNLOADING_ASSETS" => Some(Self::DownloadingAssets),
-                "CLEANING_UP" => Some(Self::CleaningUp),
-                "FAILED" => Some(Self::Failed),
-                _ => None,
-            }
-        }
-    }
-}
-/// Hypervisor backend for the single System VM.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum SystemVmBackend {
-    /// Unset; rejected by SetSystemVmBackend.
-    Unspecified = 0,
-    /// Hypervisor.framework — ArcBox's custom VMM (amd64 via FEX). macOS 15+.
-    Hv = 1,
-    /// Virtualization.framework — Apple-managed execution. The default.
-    Vz = 2,
-}
-impl SystemVmBackend {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            Self::Unspecified => "SYSTEM_VM_BACKEND_UNSPECIFIED",
-            Self::Hv => "SYSTEM_VM_BACKEND_HV",
-            Self::Vz => "SYSTEM_VM_BACKEND_VZ",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "SYSTEM_VM_BACKEND_UNSPECIFIED" => Some(Self::Unspecified),
-            "SYSTEM_VM_BACKEND_HV" => Some(Self::Hv),
-            "SYSTEM_VM_BACKEND_VZ" => Some(Self::Vz),
-            _ => None,
-        }
-    }
 }
 /// Subscription request for machine stats.
 #[derive(serde::Serialize, serde::Deserialize)]

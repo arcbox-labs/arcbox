@@ -198,6 +198,7 @@ dependencies = [
  "arcbox-ext4",
  "arcbox-logging",
  "arcbox-protocol",
+ "arcbox-pty",
  "arcbox-vm",
  "async-trait",
  "bytes",
@@ -814,6 +815,14 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "arcbox-pty"
+version = "0.4.22"
+dependencies = [
+ "libc",
+ "nix 0.29.0",
 ]
 
 [[package]]

@@ -1,0 +1,16 @@
+[package]
+name = "arcbox-pty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "PTY session primitives shared by ArcBox guest agents"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+nix = { workspace = true, features = ["term", "user", "process", "fs"] }
+
+[lints]
+workspace = true

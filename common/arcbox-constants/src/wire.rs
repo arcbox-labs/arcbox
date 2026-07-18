@@ -113,6 +113,12 @@ pub enum MessageType {
     /// [`Self::MachineExecOutput`] frames (payload:
     /// `arcbox.v1.MachineExecRequest`).
     MachineExecRequest = 0x0050,
+    /// Stdin bytes for an interactive machine session (raw payload; empty
+    /// payload means stdin EOF).
+    MachineExecInput = 0x0051,
+    /// Terminal resize for an interactive machine session (payload:
+    /// `arcbox.v1.TerminalSize`).
+    MachineExecResize = 0x0052,
 
     // Response types (0x1000 - 0x1FFF).
     PingResponse = 0x1001,
@@ -231,6 +237,8 @@ impl MessageType {
             0x0043 => Some(Self::SandboxDeleteSnapshotRequest),
             // Machine-level exec.
             0x0050 => Some(Self::MachineExecRequest),
+            0x0051 => Some(Self::MachineExecInput),
+            0x0052 => Some(Self::MachineExecResize),
             // Responses.
             0x1001 => Some(Self::PingResponse),
             0x1002 => Some(Self::GetSystemInfoResponse),
@@ -404,6 +412,8 @@ mod tests {
             (0x1043, MessageType::SandboxDeleteSnapshotResponse),
             // Machine-level exec.
             (0x0050, MessageType::MachineExecRequest),
+            (0x0051, MessageType::MachineExecInput),
+            (0x0052, MessageType::MachineExecResize),
             (0x1050, MessageType::MachineExecOutput),
         ];
 

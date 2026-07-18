@@ -1,11 +1,13 @@
 //! Machine management commands.
 
 use anyhow::{Context, Result};
+use arcbox_cli::terminal::{RawModeGuard, TerminalSize};
 use arcbox_grpc::v1::machine_service_client::MachineServiceClient;
+use arcbox_protocol::v1::TerminalSize as ProtoTerminalSize;
 use arcbox_protocol::v1::{
     CreateMachineRequest, DirectoryMount, InspectMachineRequest, ListMachinesRequest,
-    MachineAgentRequest, MachineExecRequest, RemoveMachineRequest, StartMachineRequest,
-    StopMachineRequest,
+    MachineAgentRequest, MachineExecInput, MachineExecRequest, RemoveMachineRequest,
+    StartMachineRequest, StopMachineRequest, machine_exec_input,
 };
 use clap::{Args, Subcommand};
 use humantime::format_duration;
@@ -16,7 +18,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
+use tokio::io::AsyncReadExt as _;
 use tokio::net::UnixStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::codegen::{Service, http::Uri};
 use tonic::transport::{Channel, Endpoint};
 
@@ -553,13 +557,120 @@ async fn execute_info(args: InfoArgs) -> Result<()> {
 
 async fn execute_ssh(args: SshArgs) -> Result<()> {
     if args.command.is_empty() {
-        anyhow::bail!(
-            "interactive machine sessions are not available yet; \
-             run a command instead: arcbox machine ssh {} <command>",
-            args.name
-        );
+        return exec_session_interactive(&args.name, vec!["/bin/sh".to_string(), "-l".to_string()])
+            .await;
     }
     exec_via_grpc(&args.name, args.command, HashMap::new(), false).await
+}
+
+/// Runs an interactive PTY session in a machine: local terminal in raw mode,
+/// stdin and SIGWINCH resizes pumped up, merged PTY output written to stdout.
+async fn exec_session_interactive(name: &str, cmd: Vec<String>) -> Result<()> {
+    let mut client = machine_client().await?;
+
+    let (msg_tx, msg_rx) = tokio::sync::mpsc::channel::<MachineExecInput>(16);
+
+    let tty_size = TerminalSize::current().ok().map(|s| ProtoTerminalSize {
+        width: u32::from(s.cols),
+        height: u32::from(s.rows),
+    });
+
+    // The first message in the stream must be the Init payload.
+    msg_tx
+        .send(MachineExecInput {
+            payload: Some(machine_exec_input::Payload::Init(MachineExecRequest {
+                id: name.to_string(),
+                cmd,
+                tty: true,
+                tty_size,
+                ..Default::default()
+            })),
+        })
+        .await
+        .context("Failed to send exec session init")?;
+
+    let raw_guard = RawModeGuard::new()?;
+
+    // Resize pump: SIGWINCH → resize messages.
+    let resize_tx = msg_tx.clone();
+    match arcbox_cli::terminal::ResizeWatcher::new() {
+        Ok(mut watcher) => {
+            tokio::spawn(async move {
+                while let Some(size) = watcher.recv().await {
+                    let msg = MachineExecInput {
+                        payload: Some(machine_exec_input::Payload::Resize(ProtoTerminalSize {
+                            width: u32::from(size.cols),
+                            height: u32::from(size.rows),
+                        })),
+                    };
+                    if resize_tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        Err(e) => tracing::warn!(error = %e, "terminal resize forwarding disabled"),
+    }
+
+    // Stdin pump: local terminal → session stream.
+    let stdin_tx = msg_tx;
+    tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let mut buf = [0u8; 1024];
+        loop {
+            match stdin.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if stdin_tx
+                        .send(MachineExecInput {
+                            payload: Some(machine_exec_input::Payload::Stdin(buf[..n].to_vec())),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut stream = client
+        .exec_session(tonic::Request::new(ReceiverStream::new(msg_rx)))
+        .await
+        .context("Failed to open machine exec session")?
+        .into_inner();
+
+    let mut exit_code = 0i32;
+    let mut received_done = false;
+    while let Some(output) = stream
+        .message()
+        .await
+        .context("Failed to read session output")?
+    {
+        if !output.data.is_empty() {
+            // The PTY merges stdout/stderr into one stream.
+            std::io::stdout()
+                .write_all(&output.data)
+                .context("Failed to write output")?;
+            std::io::stdout().flush()?;
+        }
+        if output.done {
+            exit_code = output.exit_code;
+            received_done = true;
+        }
+    }
+
+    // Restore the terminal before exiting.
+    drop(raw_guard);
+
+    if !received_done {
+        anyhow::bail!("session stream closed without a terminal status frame");
+    }
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
 }
 
 async fn execute_exec(args: ExecArgs) -> Result<()> {
@@ -582,6 +693,7 @@ async fn exec_via_grpc(
             user: String::new(),
             env,
             tty,
+            tty_size: None,
         }))
         .await
         .context("Failed to execute command in machine")?

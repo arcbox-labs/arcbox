@@ -5,6 +5,7 @@ members = [
     # L0: Common (MIT OR Apache-2.0)
     # ============================================
     "common/arcbox-constants",
+    "common/arcbox-pty",
     "common/arcbox-error",
     "common/arcbox-dns",
     "common/arcbox-asset",
