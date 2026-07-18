@@ -98,6 +98,18 @@ pub struct BootShim {
     pub rootfs: PathBuf,
 }
 
+/// A host directory mounted into a machine (per-machine VirtioFS share).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MachineMount {
+    /// Host directory to share.
+    pub host_path: String,
+    /// Guest mount point (absolute; must not contain `,` or `=`, which the
+    /// cmdline mount table uses as separators).
+    pub guest_path: String,
+    /// Whether the share is read-only.
+    pub read_only: bool,
+}
+
 /// Machine configuration.
 #[derive(Debug, Clone)]
 pub struct MachineConfig {
