@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "arcbox-pty"
-version = "0.4.20"
+version = "0.4.22"
 dependencies = [
  "libc",
  "nix 0.29.0",

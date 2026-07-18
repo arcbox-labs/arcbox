@@ -11,6 +11,7 @@ syntax = "proto3";
 
 package arcbox.v1;
 
+import "api.proto";
 import "common.proto";
 
 // MachineService manages Linux virtual machines. macOS guests are disposable,
