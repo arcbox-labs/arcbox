@@ -72,6 +72,8 @@ pub struct MachineInfo {
     pub created_at: DateTime<Utc>,
     /// Last successful start time.
     pub started_at: Option<DateTime<Utc>>,
+    /// Host directories shared into the machine (shim machines).
+    pub mounts: Vec<MachineMount>,
 }
 
 /// A pulled distro rootfs image a machine boots from.
@@ -132,6 +134,10 @@ pub struct MachineConfig {
     /// per-machine data disk after it, and defaults the kernel command line
     /// to mount it as root.
     pub rootfs: Option<MachineRootfs>,
+    /// Host directories mounted into the machine as per-machine VirtioFS
+    /// shares. Honored on shim machines (the shim mounts them into the new
+    /// root); ignored elsewhere.
+    pub mounts: Vec<MachineMount>,
     /// Distribution name (e.g., "alpine", "ubuntu").
     pub distro: Option<String>,
     /// Distribution version (e.g., "3.21", "24.04").
@@ -161,6 +167,7 @@ impl Default for MachineConfig {
             cmdline: None,
             block_devices: Vec::new(),
             rootfs: None,
+            mounts: Vec::new(),
             distro: None,
             distro_version: None,
             backend: arcbox_vmm::VmBackend::default(),
@@ -191,18 +198,64 @@ fn default_distro_cmdline(rootfs_format: &str) -> String {
 
 /// Kernel command line for the machine boot shim: the shim EROFS boots as
 /// root and stages the distro rootfs + data disk named by the `arcbox.*`
-/// keys (see `internal-docs/plans/machine-boot-shim.md`).
-fn machine_shim_cmdline(rootfs_format: &str) -> String {
+/// keys (see `internal-docs/plans/machine-boot-shim.md`). User mounts ride
+/// along as a `tag=guest_path[:ro]` table the shim replays.
+fn machine_shim_cmdline(rootfs_format: &str, mounts: &[MachineMount]) -> String {
     use arcbox_constants::cmdline::{
-        MACHINE_DATA_KEY, MACHINE_INIT_PATH, MACHINE_ROOTFS_KEY, MACHINE_ROOTFS_TYPE_KEY,
+        MACHINE_DATA_KEY, MACHINE_INIT_PATH, MACHINE_MOUNTS_KEY, MACHINE_ROOTFS_KEY,
+        MACHINE_ROOTFS_TYPE_KEY,
     };
     let console = boot_console();
-    format!(
+    let mut cmdline = format!(
         "console={console} root=/dev/vda ro rootfstype=erofs earlycon \
          init={MACHINE_INIT_PATH} \
          {MACHINE_ROOTFS_KEY}/dev/vdb {MACHINE_ROOTFS_TYPE_KEY}{rootfs_format} \
          {MACHINE_DATA_KEY}/dev/vdc"
-    )
+    );
+    if !mounts.is_empty() {
+        let table = mounts
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let ro = if m.read_only { ":ro" } else { "" };
+                format!("{}={}{ro}", mount_tag(i), m.guest_path)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        cmdline.push(' ');
+        cmdline.push_str(MACHINE_MOUNTS_KEY);
+        cmdline.push_str(&table);
+    }
+    cmdline
+}
+
+/// VirtioFS tag for the machine's `i`-th user mount.
+fn mount_tag(index: usize) -> String {
+    format!("m{index}")
+}
+
+/// Validates a user mount: the host path must exist and the guest path must
+/// be absolute and free of the cmdline table separators.
+fn validate_mount(mount: &MachineMount) -> Result<()> {
+    if !std::path::Path::new(&mount.host_path).is_dir() {
+        return Err(CoreError::config(format!(
+            "mount host path '{}' is not a directory",
+            mount.host_path
+        )));
+    }
+    if !mount.guest_path.starts_with('/') {
+        return Err(CoreError::config(format!(
+            "mount guest path '{}' must be absolute",
+            mount.guest_path
+        )));
+    }
+    if mount.guest_path.contains(',') || mount.guest_path.contains('=') {
+        return Err(CoreError::config(format!(
+            "mount guest path '{}' must not contain ',' or '='",
+            mount.guest_path
+        )));
+    }
+    Ok(())
 }
 
 /// Machine manager.
@@ -288,6 +341,7 @@ impl MachineManager {
                     backend: persisted.backend,
                     created_at: persisted.created_at,
                     started_at: persisted.started_at,
+                    mounts: persisted.mounts.clone(),
                 };
                 machines.insert(persisted.name.clone(), info);
             }
@@ -361,6 +415,24 @@ impl MachineManager {
             shared_dirs.push(SharedDirConfig::new(MOUNT_PRIVATE, TAG_PRIVATE));
         }
 
+        // User mounts become per-machine VirtioFS shares (tags m0, m1, …);
+        // the shim replays the cmdline mount table into the new root. Only
+        // meaningful behind the shim — reject elsewhere instead of silently
+        // dropping them.
+        if !config.mounts.is_empty() {
+            if config.rootfs.as_ref().is_none_or(|r| r.shim.is_none()) {
+                return Err(CoreError::config(
+                    "mounts require a shim-booted distro machine",
+                ));
+            }
+            for (i, mount) in config.mounts.iter().enumerate() {
+                validate_mount(mount)?;
+                let mut share = SharedDirConfig::new(mount.host_path.clone(), mount_tag(i));
+                share.read_only = mount.read_only;
+                shared_dirs.push(share);
+            }
+        }
+
         // Distro machines boot the pulled rootfs image (behind the boot shim
         // when configured) with a sparse per-machine data disk; plain VMs
         // keep the caller-provided kernel and block devices untouched.
@@ -407,7 +479,7 @@ impl MachineManager {
                 });
                 let cmdline = config.cmdline.clone().or_else(|| {
                     Some(match &rootfs.shim {
-                        Some(_) => machine_shim_cmdline(&rootfs.format),
+                        Some(_) => machine_shim_cmdline(&rootfs.format, &config.mounts),
                         None => default_distro_cmdline(&rootfs.format),
                     })
                 });
@@ -454,6 +526,7 @@ impl MachineManager {
             backend: config.backend,
             created_at: Utc::now(),
             started_at: None,
+            mounts: config.mounts,
         };
 
         // Persist the machine config
@@ -1133,6 +1206,7 @@ impl MachineManager {
             backend: arcbox_vmm::VmBackend::default(),
             created_at: Utc::now(),
             started_at: None,
+            mounts: Vec::new(),
         };
 
         machines.insert(name.to_string(), info);

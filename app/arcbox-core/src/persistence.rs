@@ -59,6 +59,9 @@ pub struct PersistedMachine {
     /// Last successful start timestamp.
     #[serde(default)]
     pub started_at: Option<DateTime<Utc>>,
+    /// Host directories shared into the machine.
+    #[serde(default)]
+    pub mounts: Vec<crate::machine::MachineMount>,
 }
 
 /// Default creation time for backward compatibility with old configs.
@@ -144,6 +147,7 @@ impl From<&MachineInfo> for PersistedMachine {
             backend: info.backend,
             created_at: info.created_at,
             started_at: info.started_at,
+            mounts: info.mounts.clone(),
         }
     }
 }
@@ -321,6 +325,7 @@ mod tests {
         let info = MachineInfo {
             name: "test-vm".to_string(),
             started_at: None,
+            mounts: Vec::new(),
             state: MachineState::Created,
             vm_id: VmId::new(),
             cpus: 4,
@@ -363,6 +368,7 @@ mod tests {
             let info = MachineInfo {
                 name: name.to_string(),
                 started_at: None,
+                mounts: Vec::new(),
                 state: MachineState::Created,
                 vm_id: VmId::new(),
                 cpus: 2,
@@ -398,6 +404,7 @@ mod tests {
         let info = MachineInfo {
             name: "test-vm".to_string(),
             started_at: None,
+            mounts: Vec::new(),
             state: MachineState::Created,
             vm_id: VmId::new(),
             cpus: 2,
@@ -431,6 +438,7 @@ mod tests {
         let info = MachineInfo {
             name: "test-vm".to_string(),
             started_at: None,
+            mounts: Vec::new(),
             state: MachineState::Created,
             vm_id: VmId::new(),
             cpus: 2,
@@ -479,6 +487,7 @@ mod tests {
         let info = MachineInfo {
             name: "crash-vm".to_string(),
             started_at: None,
+            mounts: Vec::new(),
             state: MachineState::Running,
             vm_id: VmId::new(),
             cpus: 2,

@@ -144,6 +144,15 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             },
             block_devices: Vec::new(),
             rootfs,
+            mounts: req
+                .mounts
+                .iter()
+                .map(|m| arcbox_core::machine::MachineMount {
+                    host_path: m.host_path.clone(),
+                    guest_path: m.guest_path.clone(),
+                    read_only: m.readonly,
+                })
+                .collect(),
             backend: arcbox_core::VmBackend::default(),
             enable_rosetta: false,
         };
@@ -311,7 +320,15 @@ impl machine_service_server::MachineService for MachineServiceImpl {
             }),
             created: Some(timestamp(machine.created_at)),
             started_at: machine.started_at.map(timestamp),
-            mounts: vec![],
+            mounts: machine
+                .mounts
+                .iter()
+                .map(|m| arcbox_protocol::v1::DirectoryMount {
+                    host_path: m.host_path.clone(),
+                    guest_path: m.guest_path.clone(),
+                    readonly: m.read_only,
+                })
+                .collect(),
         }))
     }
 

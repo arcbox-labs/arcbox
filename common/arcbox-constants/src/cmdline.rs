@@ -46,8 +46,9 @@ pub const MACHINE_DATA_KEY: &str = "arcbox.machine_data=";
 /// `arcbox-vmm` (`darwin_hv::pl011`), the crate that owns the emulator.
 pub const HV_EARLYCON_DIRECTIVE: &str = "earlycon=pl011,0x0b000000";
 
-/// Kernel cmdline key carrying the machine's user mounts as
-/// `tag=guest_path[:ro]` entries joined by commas (e.g.
+/// Kernel cmdline key carrying the machine's user mounts.
+///
+/// The value is `tag=guest_path[:ro]` entries joined by commas (e.g.
 /// `m0=/work,m1=/data:ro`). Each tag names a per-machine VirtioFS share the
 /// shim mounts into the new root after staging the overlay. Guest paths are
 /// validated host-side to contain neither `,` nor `=`.
