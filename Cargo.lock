@@ -817,6 +817,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-pty"
+version = "0.4.20"
+dependencies = [
+ "libc",
+ "nix 0.29.0",
+]
+
+[[package]]
 name = "arcbox-route"
 version = "0.4.22"
 dependencies = [

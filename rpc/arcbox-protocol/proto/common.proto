@@ -22,6 +22,14 @@ message Timestamp {
     int32 nanos = 2;
 }
 
+// Terminal dimensions in character cells.
+message TerminalSize {
+    // Columns.
+    uint32 width = 1;
+    // Rows.
+    uint32 height = 2;
+}
+
 // Key-value pair for labels, environment variables, etc.
 message KeyValue {
     string key = 1;

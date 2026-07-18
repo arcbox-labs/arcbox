@@ -44,8 +44,13 @@ service MachineService {
     // discards free blocks so the host punches them out of the sparse image.
     rpc CompactDisk(MachineAgentRequest) returns (Empty);
 
-    // Executes a command in a machine.
+    // Executes a command in a machine (non-interactive: stdin closed).
     rpc Exec(MachineExecRequest) returns (stream MachineExecOutput);
+
+    // Interactive machine session: the first message must carry `init`;
+    // subsequent messages stream stdin bytes and terminal resizes. Output
+    // frames mirror Exec, with stdout/stderr merged by the PTY.
+    rpc ExecSession(stream MachineExecInput) returns (stream MachineExecOutput);
 
     // Gets the SSH connection info.
     rpc SSHInfo(SSHInfoRequest) returns (SSHInfoResponse);
@@ -284,6 +289,20 @@ message MachineExecRequest {
     map<string, string> env = 5;
     // Allocate TTY.
     bool tty = 6;
+    // Initial terminal size (interactive sessions).
+    TerminalSize tty_size = 7;
+}
+
+// One client message on an interactive machine session.
+message MachineExecInput {
+    oneof payload {
+        // Must be the first message: what to run.
+        MachineExecRequest init = 1;
+        // Raw stdin bytes; empty means stdin EOF.
+        bytes stdin = 2;
+        // Terminal resize.
+        TerminalSize resize = 3;
+    }
 }
 
 // Exec output from a machine.
