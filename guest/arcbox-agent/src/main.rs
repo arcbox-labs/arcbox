@@ -71,6 +71,11 @@ enum Mode {
     /// One-shot system initialization (`arcbox-agent init`), run by busybox init's
     /// sysinit (rcS) before the agent is respawned. Performs `init_system` and exits.
     Init,
+    /// One-shot distro machine initialization (`arcbox-agent machine-init`),
+    /// run by the machine boot shim inside the overlay root before
+    /// `switch_root`. Brings networking up and exits; the distro init owns
+    /// everything else.
+    MachineInit,
     /// Long-running agent (default / `serve`): vsock RPC listener and background
     /// services. busybox init respawns it if it exits.
     Serve,
@@ -78,11 +83,13 @@ enum Mode {
 
 /// Selects the startup [`Mode`] from `args` (typically `std::env::args()`).
 ///
-/// `arcbox-agent init` runs one-shot system initialization; anything else — no
-/// subcommand or `serve` — runs the long-running agent.
+/// `arcbox-agent init` runs one-shot system initialization, `arcbox-agent
+/// machine-init` the distro-machine variant; anything else — no subcommand or
+/// `serve` — runs the long-running agent.
 fn parse_mode(args: &[String]) -> Mode {
     match args.get(1).map(String::as_str) {
         Some("init") => Mode::Init,
+        Some("machine-init") => Mode::MachineInit,
         _ => Mode::Serve,
     }
 }
@@ -168,6 +175,14 @@ async fn main() -> Result<()> {
     // `arcbox-agent init` is the one-shot system-init entry that busybox init's
     // sysinit (rcS) runs before respawning the long-running agent: it performs the
     // system initialization and exits without starting the serving stack.
+    if parse_mode(&std::env::args().collect::<Vec<_>>()) == Mode::MachineInit {
+        tracing::info!("Running one-shot machine initialization");
+        // No critical-mount verification: the machine root is the distro's
+        // own writable overlay, not the tmpfs-staged EROFS layout.
+        init::machine_init();
+        return Ok(());
+    }
+
     if parse_mode(&std::env::args().collect::<Vec<_>>()) == Mode::Init {
         tracing::info!("Running one-shot system initialization");
         init::init_system();
@@ -256,6 +271,11 @@ mod tests {
     #[test]
     fn init_subcommand_selects_init_mode() {
         assert_eq!(parse_mode(&argv(&["init"])), Mode::Init);
+    }
+
+    #[test]
+    fn machine_init_subcommand_selects_machine_init_mode() {
+        assert_eq!(parse_mode(&argv(&["machine-init"])), Mode::MachineInit);
     }
 
     #[test]

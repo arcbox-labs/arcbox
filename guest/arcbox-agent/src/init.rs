@@ -481,6 +481,39 @@ mod platform {
         setup_sandbox_forwarding();
     }
 
+    /// One-shot init for distro machines (boot shim path).
+    ///
+    /// The overlay root is the distro's own filesystem: no tmpfs staging and
+    /// no `/etc` population — the distro init owns those. Only networking is
+    /// brought up here (mirrored images ship without the incus network
+    /// config, so nothing in the guest would configure eth0 otherwise), plus
+    /// a resolver when the distro image left none.
+    pub fn machine_init() {
+        run_init_cmd(
+            "/bin/busybox",
+            &["ip", "link", "set", "lo", "up"],
+            "ip link lo up",
+            Duration::from_secs(5),
+        );
+        configure_primary_interface_dhcp();
+        write_machine_resolv_conf();
+    }
+
+    /// Points `/etc/resolv.conf` at the NAT gateway resolver (10.0.2.1), but
+    /// only when the distro has no usable resolver of its own — a
+    /// systemd-resolved symlink or a non-empty file is left alone.
+    fn write_machine_resolv_conf() {
+        let path = Path::new("/etc/resolv.conf");
+        if let Ok(meta) = fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() || meta.len() > 0 {
+                return;
+            }
+        }
+        if let Err(e) = fs::write(path, "nameserver 10.0.2.1\n") {
+            tracing::warn!(error = %e, "failed to write /etc/resolv.conf");
+        }
+    }
+
     fn configure_primary_interface_dhcp() {
         let Some(interface) = detect_primary_interface() else {
             tracing::warn!("no non-loopback network interface found for DHCP");
@@ -898,11 +931,16 @@ fn docker_daemon_json() -> String {
 }
 
 #[cfg(target_os = "linux")]
-pub use platform::init_system;
+pub use platform::{init_system, machine_init};
 
 #[cfg(not(target_os = "linux"))]
 pub fn init_system() {
     tracing::warn!("init_system is only functional on Linux");
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn machine_init() {
+    tracing::warn!("machine_init is only functional on Linux");
 }
 
 /// The writable tmpfs layers the long-running agent cannot function without:
