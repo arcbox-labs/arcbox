@@ -118,6 +118,14 @@ pub struct Runtime {
     /// Fan-out for System VM machine stats: one guest stream shared by all
     /// subscribers, none while nobody watches.
     stats_hub: Arc<crate::stats_hub::StatsHub<crate::stats_hub::AgentStatsSource>>,
+    /// Per-machine stats hubs, created lazily on first watch (the System VM
+    /// hub lives in `stats_hub`). A hub whose machine is gone simply fails
+    /// its next open; idle hubs hold no guest stream.
+    machine_stats_hubs: Arc<
+        TokioRwLock<
+            HashMap<String, Arc<crate::stats_hub::StatsHub<crate::stats_hub::AgentStatsSource>>>,
+        >,
+    >,
 }
 
 /// Parameters of one sandbox port exposure (the host listener half).
@@ -247,6 +255,7 @@ impl Runtime {
             dns_entries: Arc::new(TokioRwLock::new(HashMap::new())),
             container_aliases: Arc::new(TokioRwLock::new(HashMap::new())),
             stats_hub,
+            machine_stats_hubs: Arc::new(TokioRwLock::new(HashMap::new())),
         })
     }
 
@@ -258,6 +267,28 @@ impl Runtime {
         &self,
     ) -> tokio::sync::broadcast::Receiver<arcbox_protocol::agent::MachineStats> {
         self.stats_hub.subscribe()
+    }
+
+    /// Subscribes to live stats for a named machine, lazily creating its
+    /// fan-out hub. The default machine reuses the System VM hub.
+    pub async fn subscribe_machine_stats_for(
+        &self,
+        name: &str,
+    ) -> tokio::sync::broadcast::Receiver<arcbox_protocol::agent::MachineStats> {
+        if name == DEFAULT_MACHINE_NAME {
+            return self.stats_hub.subscribe();
+        }
+        if let Some(hub) = self.machine_stats_hubs.read().await.get(name) {
+            return hub.subscribe();
+        }
+        let mut hubs = self.machine_stats_hubs.write().await;
+        let hub = hubs.entry(name.to_string()).or_insert_with(|| {
+            crate::stats_hub::StatsHub::new(crate::stats_hub::AgentStatsSource::new(
+                Arc::clone(&self.machine_manager),
+                name,
+            ))
+        });
+        hub.subscribe()
     }
 
     /// Returns the configuration.

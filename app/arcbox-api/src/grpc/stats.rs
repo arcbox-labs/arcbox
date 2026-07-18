@@ -53,13 +53,16 @@ impl stats_service_server::StatsService for StatsServiceImpl {
         request: Request<StatsWatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
         let req = request.into_inner();
-        if !req.machine_id.is_empty() && req.machine_id != DEFAULT_MACHINE_NAME {
-            return Err(Status::unimplemented(
-                "per-machine stats are not implemented yet; omit machine_id for the System VM",
-            ));
-        }
+        let machine_id = if req.machine_id.is_empty() {
+            DEFAULT_MACHINE_NAME.to_string()
+        } else {
+            req.machine_id
+        };
         let runtime = std::sync::Arc::clone(self.runtime.ready()?);
-        let mut rx = runtime.subscribe_machine_stats();
+        if machine_id != DEFAULT_MACHINE_NAME && !runtime.machine_manager().exists(&machine_id) {
+            return Err(Status::not_found(format!("machine '{machine_id}'")));
+        }
+        let mut rx = runtime.subscribe_machine_stats_for(&machine_id).await;
         let stream = async_stream::stream! {
             loop {
                 match rx.recv().await {
