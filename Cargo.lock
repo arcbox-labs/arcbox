@@ -198,6 +198,7 @@ dependencies = [
  "arcbox-ext4",
  "arcbox-logging",
  "arcbox-protocol",
+ "arcbox-pty",
  "arcbox-vm",
  "async-trait",
  "bytes",
