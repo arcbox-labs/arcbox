@@ -308,13 +308,21 @@ impl MachineManager {
                 );
             }
 
-            // Reconstruct VmConfig from persisted data.
+            // Reconstruct VmConfig from persisted data, including the
+            // machine's own VirtioFS shares (tags must match what the
+            // persisted cmdline mount table references).
+            let mut vm_shared_dirs = shared_dirs.clone();
+            for (i, mount) in persisted.mounts.iter().enumerate() {
+                let mut share = SharedDirConfig::new(mount.host_path.clone(), mount_tag(i));
+                share.read_only = mount.read_only;
+                vm_shared_dirs.push(share);
+            }
             let vm_config = VmConfig {
                 cpus: persisted.cpus,
                 memory_mb: persisted.memory_mb,
                 kernel: persisted.kernel.clone(),
                 cmdline: persisted.cmdline.clone(),
-                shared_dirs: shared_dirs.clone(),
+                shared_dirs: vm_shared_dirs,
                 block_devices: persisted.block_devices.clone(),
                 backend: persisted.backend,
                 ..Default::default()
