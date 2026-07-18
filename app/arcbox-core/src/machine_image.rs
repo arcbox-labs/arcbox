@@ -78,6 +78,10 @@ pub struct MachineImageStream {
     pub distro: String,
     /// Distro release (`noble`).
     pub release: String,
+    /// Human-readable release title (`24.04`); absent on indexes published
+    /// before the field existed.
+    #[serde(default)]
+    pub release_title: Option<String>,
     /// Image architecture (`arm64` / `amd64`).
     pub arch: String,
     /// Image variant (`default`).
@@ -367,7 +371,11 @@ impl MachineImageManager {
                         s.distro == *distro
                             && s.arch == *arch
                             && s.variant == "default"
-                            && release.as_ref().is_none_or(|r| s.release == *r)
+                            // Accept the codename (`noble`) or the
+                            // user-facing title (`24.04`).
+                            && release.as_ref().is_none_or(|r| {
+                                s.release == *r || s.release_title.as_deref() == Some(r)
+                            })
                     })
                     .collect();
                 matches.sort_by_key(|(name, _)| (*name).clone());
@@ -555,7 +563,7 @@ mod tests {
             images.insert(
                 name.clone(),
                 serde_json::json!({
-                    "distro": d, "release": r, "arch": a, "variant": "default",
+                    "distro": d, "release": r, "release_title": format!("title-{r}"), "arch": a, "variant": "default",
                     "latest": latest, "versions": versions,
                 }),
             );
