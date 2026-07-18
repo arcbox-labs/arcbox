@@ -2,15 +2,18 @@
 
 use std::pin::Pin;
 
+use arcbox_core::ExecSessionInput;
 use arcbox_core::machine_image;
 use arcbox_grpc::v1::machine_service_server;
 use arcbox_protocol::v1::{
     CreateMachineRequest, CreateMachineResponse, Empty, InspectMachineRequest, ListMachinesRequest,
-    ListMachinesResponse, MachineAgentRequest, MachineExecOutput, MachineExecRequest, MachineInfo,
-    MachineNetwork, MachinePingResponse, MachineSummary, MachineSystemInfo, RemoveMachineRequest,
-    StartMachineRequest, StopMachineRequest,
+    ListMachinesResponse, MachineAgentRequest, MachineExecInput, MachineExecOutput,
+    MachineExecRequest, MachineInfo, MachineNetwork, MachinePingResponse, MachineSummary,
+    MachineSystemInfo, RemoveMachineRequest, StartMachineRequest, StopMachineRequest,
+    machine_exec_input,
 };
 use tokio_stream::Stream;
+use tokio_stream::StreamExt as _;
 use tonic::{Request, Response, Status};
 
 use super::{SharedRuntime, SharedRuntimeExt};
@@ -447,5 +450,84 @@ impl machine_service_server::MachineService for MachineServiceImpl {
     ) -> Result<Response<arcbox_protocol::v1::SshInfoResponse>, Status> {
         // TODO: Implement SSH info.
         Err(Status::unimplemented("ssh_info not implemented"))
+    }
+
+    type ExecSessionStream =
+        Pin<Box<dyn Stream<Item = Result<MachineExecOutput, Status>> + Send + 'static>>;
+
+    /// Interactive machine exec: a bidi PTY session bridged to the agent's
+    /// machine-exec frames. The first client message must carry Init; stdin
+    /// and resize messages follow on the same stream.
+    async fn exec_session(
+        &self,
+        request: Request<tonic::Streaming<MachineExecInput>>,
+    ) -> Result<Response<Self::ExecSessionStream>, Status> {
+        let mut stream = request.into_inner();
+
+        let first = stream.next().await.ok_or_else(|| {
+            Status::invalid_argument("exec session: stream closed before Init message")
+        })??;
+        let exec_req = match first.payload {
+            Some(machine_exec_input::Payload::Init(req)) => req,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "exec session: first message must be Init",
+                ));
+            }
+        };
+
+        let agent = self
+            .runtime
+            .ready()?
+            .get_agent(&exec_req.id)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        // Feed remaining gRPC input (stdin + TTY resizes) into a channel for
+        // the core layer. Stream end sends the empty-stdin EOF sentinel.
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Some(Ok(input)) = stream.next().await {
+                let msg = match input.payload {
+                    Some(machine_exec_input::Payload::Stdin(data)) => ExecSessionInput::Stdin(data),
+                    Some(machine_exec_input::Payload::Resize(size)) => ExecSessionInput::Resize {
+                        width: u16::try_from(size.width).unwrap_or(u16::MAX),
+                        height: u16::try_from(size.height).unwrap_or(u16::MAX),
+                    },
+                    _ => continue,
+                };
+                if in_tx.send(msg).await.is_err() {
+                    return;
+                }
+            }
+            let _ = in_tx.send(ExecSessionInput::Stdin(Vec::new())).await;
+        });
+
+        let mut out_rx = agent
+            .machine_exec_session(exec_req, in_rx)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let out_stream = async_stream::stream! {
+            while let Some(item) = out_rx.recv().await {
+                match item {
+                    Ok(output) => {
+                        let done = output.done;
+                        yield Ok(output);
+                        if done {
+                            break;
+                        }
+                    }
+                    Err(arcbox_core::error::CoreError::Agent { code: 400, message }) => {
+                        yield Err(Status::invalid_argument(message));
+                        break;
+                    }
+                    Err(e) => {
+                        yield Err(Status::internal(e.to_string()));
+                        break;
+                    }
+                }
+            }
+        };
+        Ok(Response::new(Box::pin(out_stream)))
     }
 }
