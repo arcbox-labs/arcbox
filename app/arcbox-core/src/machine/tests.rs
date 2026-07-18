@@ -301,3 +301,90 @@ async fn test_assign_cid_skips_cids_held_by_other_machines() {
     let (_, cid) = machine_manager.assign_cid_for_start(&name).unwrap();
     assert_eq!(cid, 4, "lowest CID not held by another machine");
 }
+
+#[tokio::test]
+async fn test_create_with_mounts_extends_cmdline_and_persists() {
+    let temp_dir = tempdir().unwrap();
+    let machine_manager = test_machine_manager(temp_dir.path());
+
+    let rootfs_img = temp_dir.path().join("rootfs.squashfs");
+    std::fs::write(&rootfs_img, b"squash").unwrap();
+    let host_share = temp_dir.path().join("share");
+    std::fs::create_dir(&host_share).unwrap();
+
+    let shim = BootShim {
+        kernel: temp_dir.path().join("kernel"),
+        rootfs: temp_dir.path().join("shim.erofs"),
+    };
+    let mounts = vec![
+        MachineMount {
+            host_path: host_share.to_string_lossy().into_owned(),
+            guest_path: "/work".to_string(),
+            read_only: false,
+        },
+        MachineMount {
+            host_path: host_share.to_string_lossy().into_owned(),
+            guest_path: "/data".to_string(),
+            read_only: true,
+        },
+    ];
+
+    machine_manager
+        .create(MachineConfig {
+            name: "mounted".to_string(),
+            disk_gb: 1,
+            rootfs: Some(MachineRootfs {
+                path: rootfs_img.clone(),
+                format: "squashfs".to_string(),
+                shim: Some(shim.clone()),
+            }),
+            mounts: mounts.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let machine = machine_manager.get("mounted").unwrap();
+    let cmdline = machine.cmdline.as_deref().unwrap();
+    assert!(
+        cmdline.contains(&format!(
+            "{}m0=/work,m1=/data:ro",
+            arcbox_constants::cmdline::MACHINE_MOUNTS_KEY
+        )),
+        "{cmdline}"
+    );
+    assert_eq!(machine.mounts.len(), 2);
+    assert_eq!(machine.mounts[1].guest_path, "/data");
+    assert!(machine.mounts[1].read_only);
+
+    // Mounts are rejected off the shim path and validated for separators.
+    let err = machine_manager
+        .create(MachineConfig {
+            name: "no-shim-mounts".to_string(),
+            mounts: mounts.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("shim"), "{err}");
+
+    let err = machine_manager
+        .create(MachineConfig {
+            name: "bad-guest-path".to_string(),
+            disk_gb: 1,
+            rootfs: Some(MachineRootfs {
+                path: rootfs_img,
+                format: "squashfs".to_string(),
+                shim: Some(shim),
+            }),
+            mounts: vec![MachineMount {
+                host_path: host_share.to_string_lossy().into_owned(),
+                guest_path: "/with,comma".to_string(),
+                read_only: false,
+            }],
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("','"), "{err}");
+}

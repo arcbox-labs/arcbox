@@ -377,6 +377,7 @@ impl LifecycleShared {
             cmdline: Some(boot.cmdline),
             block_devices,
             rootfs: None,
+            mounts: Vec::new(),
             distro: None,
             distro_version: None,
             backend: self.backend(),
