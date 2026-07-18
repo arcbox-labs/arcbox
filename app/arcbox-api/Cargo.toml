@@ -9,6 +9,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+arcbox-constants = { workspace = true }
+chrono = { workspace = true }
 arcbox-core = { workspace = true }
 arcbox-protocol = { workspace = true }
 arcbox-grpc = { workspace = true }

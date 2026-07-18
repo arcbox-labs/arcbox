@@ -241,7 +241,8 @@ pub struct RemoveMachineRequest {
     /// Force removal.
     #[prost(bool, tag = "2")]
     pub force: bool,
-    /// Remove volumes.
+    /// Ignored: machine removal always deletes the machine directory
+    /// (including the data disk). Retained for wire compatibility.
     #[prost(bool, tag = "3")]
     pub volumes: bool,
 }
@@ -292,6 +293,12 @@ pub struct MachineSummary {
     /// Creation timestamp.
     #[prost(int64, tag = "8")]
     pub created: i64,
+    /// Distribution name (e.g., "ubuntu"); empty for plain VMs.
+    #[prost(string, tag = "9")]
+    pub distro: ::prost::alloc::string::String,
+    /// Distribution release (e.g., "noble").
+    #[prost(string, tag = "10")]
+    pub distro_version: ::prost::alloc::string::String,
 }
 /// Request to inspect a machine.
 #[derive(serde::Serialize, serde::Deserialize)]

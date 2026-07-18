@@ -180,9 +180,6 @@ pub struct RemoveArgs {
     /// Force removal
     #[arg(short, long)]
     pub force: bool,
-    /// Remove associated volumes
-    #[arg(short, long)]
-    pub volumes: bool,
 }
 
 #[derive(Args)]
@@ -369,7 +366,9 @@ async fn execute_remove(args: RemoveArgs) -> Result<()> {
         .remove(tonic::Request::new(RemoveMachineRequest {
             id: args.name.clone(),
             force: args.force,
-            volumes: args.volumes,
+            // Removal always deletes the machine directory; the wire field
+            // is retained for compatibility only.
+            volumes: false,
         }))
         .await
         .context("Failed to remove machine")?;
@@ -405,15 +404,23 @@ async fn execute_list(args: ListArgs) -> Result<()> {
 
     // Print header
     println!(
-        "{:<20} {:<12} {:<6} {:<12} {:<10}",
-        "NAME", "STATE", "CPUS", "MEMORY", "DISK"
+        "{:<20} {:<18} {:<12} {:<6} {:<12} {:<10}",
+        "NAME", "DISTRO", "STATE", "CPUS", "MEMORY", "DISK"
     );
 
     // Print machines
     for machine in &machines {
+        let distro = if machine.distro.is_empty() {
+            "-".to_string()
+        } else if machine.distro_version.is_empty() {
+            machine.distro.clone()
+        } else {
+            format!("{}:{}", machine.distro, machine.distro_version)
+        };
         println!(
-            "{:<20} {:<12} {:<6} {:<12} {:<10}",
+            "{:<20} {:<18} {:<12} {:<6} {:<12} {:<10}",
             machine.name,
+            distro,
             title_case_state(&machine.state),
             machine.cpus,
             format!("{} MB", machine.memory / (1024 * 1024)),

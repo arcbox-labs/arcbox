@@ -56,6 +56,9 @@ pub struct PersistedMachine {
     /// Creation timestamp.
     #[serde(default = "default_created_at")]
     pub created_at: DateTime<Utc>,
+    /// Last successful start timestamp.
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
 }
 
 /// Default creation time for backward compatibility with old configs.
@@ -140,6 +143,7 @@ impl From<&MachineInfo> for PersistedMachine {
             vm_id: info.vm_id.to_string(),
             backend: info.backend,
             created_at: info.created_at,
+            started_at: info.started_at,
         }
     }
 }
@@ -316,6 +320,7 @@ mod tests {
         let created_at = Utc::now();
         let info = MachineInfo {
             name: "test-vm".to_string(),
+            started_at: None,
             state: MachineState::Created,
             vm_id: VmId::new(),
             cpus: 4,
@@ -357,6 +362,7 @@ mod tests {
         for name in ["vm1", "vm2", "vm3"] {
             let info = MachineInfo {
                 name: name.to_string(),
+                started_at: None,
                 state: MachineState::Created,
                 vm_id: VmId::new(),
                 cpus: 2,
@@ -391,6 +397,7 @@ mod tests {
 
         let info = MachineInfo {
             name: "test-vm".to_string(),
+            started_at: None,
             state: MachineState::Created,
             vm_id: VmId::new(),
             cpus: 2,
@@ -423,6 +430,7 @@ mod tests {
 
         let info = MachineInfo {
             name: "test-vm".to_string(),
+            started_at: None,
             state: MachineState::Created,
             vm_id: VmId::new(),
             cpus: 2,
@@ -470,6 +478,7 @@ mod tests {
 
         let info = MachineInfo {
             name: "crash-vm".to_string(),
+            started_at: None,
             state: MachineState::Running,
             vm_id: VmId::new(),
             cpus: 2,
