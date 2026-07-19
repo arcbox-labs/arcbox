@@ -574,9 +574,13 @@ impl machine_service_server::MachineService for MachineServiceImpl {
                         }
                         yield Ok(machine_event);
                     }
-                    // Dropped events under load: the client re-lists on the next
-                    // event it sees, so a gap only delays convergence.
-                    Err(RecvError::Lagged(_)) => {}
+                    // Dropped events under load: emit a resync signal so the
+                    // client re-lists even if the missed event would have been
+                    // filtered out here (otherwise a filtered `stopped` could be
+                    // lost with no later matching event to recover from).
+                    Err(RecvError::Lagged(_)) => {
+                        yield Ok(resync_event());
+                    }
                     Err(RecvError::Closed) => break,
                 }
             }
@@ -584,6 +588,13 @@ impl machine_service_server::MachineService for MachineServiceImpl {
 
         Ok(Response::new(Box::pin(stream)))
     }
+}
+
+/// Current wall-clock time as Unix nanoseconds (saturating).
+fn now_unix_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
 
 /// Maps a system event to its machine-lifecycle wire form, or `None` for
@@ -596,22 +607,31 @@ fn to_machine_event(event: &arcbox_core::event::Event) -> Option<MachineEvent> {
         Event::MachineStarted { name } => (name, "started"),
         Event::MachineIdle { name } => (name, "idle"),
         Event::MachineStopped { name } => (name, "stopped"),
+        Event::MachineRemoved { name } => (name, "removed"),
         _ => return None,
     };
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
     Some(MachineEvent {
         name: name.clone(),
         action: action.to_owned(),
-        timestamp,
+        timestamp: now_unix_nanos(),
         attributes: std::collections::HashMap::new(),
     })
 }
 
+/// A filter-independent signal that the client should re-list because events
+/// were dropped. Carries no machine name and the reserved `resync` action.
+fn resync_event() -> MachineEvent {
+    MachineEvent {
+        name: String::new(),
+        action: "resync".to_owned(),
+        timestamp: now_unix_nanos(),
+        attributes: std::collections::HashMap::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::to_machine_event;
+    use super::{resync_event, to_machine_event};
     use arcbox_core::event::Event;
 
     #[test]
@@ -621,6 +641,7 @@ mod tests {
             (Event::MachineStarted { name: "m".into() }, "started"),
             (Event::MachineIdle { name: "m".into() }, "idle"),
             (Event::MachineStopped { name: "m".into() }, "stopped"),
+            (Event::MachineRemoved { name: "m".into() }, "removed"),
         ];
         for (event, action) in cases {
             let mapped = to_machine_event(&event).expect("machine event maps");
@@ -633,5 +654,12 @@ mod tests {
     fn ignores_non_machine_events() {
         assert!(to_machine_event(&Event::VmStarted { id: "vm".into() }).is_none());
         assert!(to_machine_event(&Event::ContainerRouteInstalled { name: "m".into() }).is_none());
+    }
+
+    #[test]
+    fn resync_event_carries_no_name() {
+        let event = resync_event();
+        assert_eq!(event.action, "resync");
+        assert!(event.name.is_empty());
     }
 }

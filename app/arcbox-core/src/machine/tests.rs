@@ -2,8 +2,51 @@ use super::*;
 use tempfile::tempdir;
 
 fn test_machine_manager(data_dir: &std::path::Path) -> MachineManager {
+    test_machine_manager_with_bus(data_dir, crate::event::EventBus::new())
+}
+
+fn test_machine_manager_with_bus(
+    data_dir: &std::path::Path,
+    event_bus: crate::event::EventBus,
+) -> MachineManager {
     let vm_manager = Arc::new(VmManager::new(data_dir.join("snapshots")));
-    MachineManager::new(vm_manager, data_dir.to_path_buf(), None)
+    MachineManager::new(vm_manager, data_dir.to_path_buf(), None, event_bus)
+}
+
+#[tokio::test]
+async fn create_publishes_machine_created_for_user_machines_only() {
+    use crate::event::{Event, EventBus};
+
+    let temp_dir = tempdir().unwrap();
+    let bus = EventBus::new();
+    let mut rx = bus.subscribe();
+    let manager = test_machine_manager_with_bus(temp_dir.path(), bus);
+
+    manager
+        .create(MachineConfig {
+            name: "work".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(rx.try_recv(), Ok(Event::MachineCreated { name }) if name == "work"),
+        "creating a user machine must publish MachineCreated"
+    );
+
+    // The default System VM's lifecycle events come from its own lifecycle
+    // actor; MachineManager must not double-publish for it.
+    manager
+        .create(MachineConfig {
+            name: "default".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "creating the default machine must not publish from MachineManager"
+    );
 }
 
 #[tokio::test]

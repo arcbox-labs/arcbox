@@ -201,6 +201,7 @@ impl Runtime {
             Arc::clone(&vm_manager),
             config.data_dir.clone(),
             shared_dns_table,
+            event_bus.clone(),
         ));
 
         // Build the single System VM. The daemon runs one utility VM (default
