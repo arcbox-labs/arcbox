@@ -68,8 +68,7 @@ fn block_device_size(device: &str) -> Option<u64> {
 /// exposes a smaller disk than the one the filesystem was grown against (the
 /// VZ→HV capacity bug). The data is intact; switching the engine back recovers.
 fn check_device_fits_filesystem(device: &str) -> Result<(), String> {
-    let (Some(fs_bytes), Some(dev_bytes)) =
-        (btrfs_total_bytes(device), block_device_size(device))
+    let (Some(fs_bytes), Some(dev_bytes)) = (btrfs_total_bytes(device), block_device_size(device))
     else {
         return Ok(());
     };
