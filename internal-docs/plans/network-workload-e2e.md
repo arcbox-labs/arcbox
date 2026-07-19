@@ -149,11 +149,29 @@ reproduced under plain workloads:
    the datapath under measurement. The workload suite therefore runs the
    daemon at `info,arcbox_net=debug`.
 
-Status: W2–W4 are **red by design** until the TcpBridge fixes land (only
-ACK bytes actually written in-order; honor the guest's receive window or
-retransmit; make both loss paths log at WARN). Same convention as the fault
-plan's Tier 3: the suite is the regression net that flips green with the
-fix, and the strict assertions stay.
+**Resolved 2026-07-20** — the suite runs green end to end. Three product
+fixes, each accepted by these scenarios:
+
+1. Upload in-order ACK discipline (`last_ack` advances only over bytes
+   actually written; dup-ACKs solicit guest fast retransmit; FIN defers
+   past gaps) — W2 byte-exact.
+2. Guest-window flow control **plus sender-side retransmission** (in-flight
+   bytes buffered, window capped at 256 KiB, triple-dup-ACK fast retransmit,
+   200 ms–2 s RTO, FIN retransmitted too). The deeper finding: the lossless
+   L2 contract ends at guest `eth0` — the bridge→veth→container-netns
+   backlog drops under burst (64 flows through one veth wedged 61/64;
+   spread across 8 containers only 5/64), so the shim, as the download
+   direction's sender-side TCP, must retransmit. Window gating alone made
+   bursts *worse* by turning each drop into a full-window deadlock — W3.
+3. Idle-datapath wakeups (connect-resolved waker + 20 ms poll tick while
+   flows exist): a quiet loop only woke on guest frames or a 1 s tick, so
+   every fresh connection paid up to a second twice (SYN-ACK, then first
+   response bytes) — invisible under sustained transfer, ~2 s/request when
+   sequential. Churn went from 127-of-500-in-240 s to 19 ms/request — W4.
+
+The strict assertions stay as the permanent regression net; only the
+observability WARNs from the original finding list remain future work
+(loss-recovery events currently log at debug).
 
 ## Runtime budget
 
