@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use arcbox_hv::{ExceptionClass, HvVcpu, MmioInfo, VcpuExit};
 
 use super::hvc_blk::{
-    ARCBOX_HVC_BLK_FLUSH, ARCBOX_HVC_BLK_READ, ARCBOX_HVC_BLK_WRITE, ARCBOX_HVC_PROBE,
-    handle_hvc_blk_flush, handle_hvc_blk_io,
+    ARCBOX_HVC_BLK_CAPACITY, ARCBOX_HVC_BLK_FLUSH, ARCBOX_HVC_BLK_READ, ARCBOX_HVC_BLK_WRITE,
+    ARCBOX_HVC_PROBE, handle_hvc_blk_capacity, handle_hvc_blk_flush, handle_hvc_blk_io,
 };
 use super::psci::{CpuPower, PsciExit, handle_psci};
 use super::{HvVcpuIds, Pl011, Pl031, VcpuThreadHandles};
@@ -562,6 +562,10 @@ pub(super) fn vcpu_run_loop(vcpu_id: u32, boot: VcpuBoot, ctx: VcpuContext) {
                         }
                         ARCBOX_HVC_BLK_FLUSH => {
                             let result = handle_hvc_blk_flush(&vcpu, &hvc_blk_fds);
+                            let _ = vcpu.set_reg(reg::X0, result);
+                        }
+                        ARCBOX_HVC_BLK_CAPACITY => {
+                            let result = handle_hvc_blk_capacity(&vcpu, &hvc_blk_fds);
                             let _ = vcpu.set_reg(reg::X0, result);
                         }
                         _ => {

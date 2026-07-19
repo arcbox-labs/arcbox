@@ -139,6 +139,13 @@ async fn acquire_lock(early: EarlyContext) -> Result<DaemonContext> {
 /// On non-macOS this is a no-op (no XPC helpers).
 #[cfg(target_os = "macos")]
 async fn wait_for_resources(ctx: &DaemonContext) -> Result<()> {
+    // Remove a stale Docker socket from a previous session up front. It is
+    // otherwise (re)bound only in start_runtime_services, so if a later phase
+    // (e.g. VM boot) fails, a leftover socket makes clients hit "connection
+    // refused" against a dead listener instead of seeing the daemon as
+    // not-yet-ready. Mirrors the gRPC socket's early unlink-then-bind.
+    let _ = std::fs::remove_file(&ctx.layout.docker_socket);
+
     let docker_imgs = resource_cleanup::disk_image_paths(&ctx.layout.data_subdir);
     let decision = resource_cleanup::decide(
         ctx.daemon_lock.displaced_stale_daemon(),
