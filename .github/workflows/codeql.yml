@@ -1,0 +1,67 @@
+name: "CodeQL"
+
+# Advanced setup, migrated from default setup. Default setup ran Swift under
+# autobuild, which invoked a bare `swift build` on the arcbox-vz shim; that
+# build cannot resolve the Virtualization.framework Mac-guest APIs
+# (VZMacPlatformConfiguration et al.) without the project's real SDK context,
+# so every PR got a spurious red "Analyze (swift)" even though the shim builds
+# fine in the release pipeline.
+#
+# Swift is dropped rather than analyzed here: the CodeQL Swift extractor does
+# not support build-mode: none, and its only other modes (autobuild, manual)
+# both require the same shim build that CI cannot satisfy. actions and rust
+# extract without a build (buildless), so no compilation — and no false build
+# failure — occurs. When editing, keep the job name "Analyze (<language>)" so
+# it keeps matching any required-status-check rules carried over from default
+# setup.
+#
+# NOTE: default setup must be disabled (code-scanning default-setup ->
+# not-configured) before this workflow's results can be processed; while it
+# stays enabled, advanced-configuration SARIF uploads are rejected.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    # Weekly, matching the cadence default setup used.
+    - cron: "31 7 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            runner: ubuntu-latest
+          - language: rust
+            runner: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
